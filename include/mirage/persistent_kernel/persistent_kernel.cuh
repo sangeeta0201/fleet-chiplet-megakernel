@@ -20,11 +20,10 @@
 #endif
 #include "mpk_atoms.cuh"
 #include "runtime_header.h"
-#ifdef USE_NVSHMEM
-#include <mpi.h>
-#include <nvshmem.h>
-#include <nvshmemx.h>
-#endif
+// Backend-agnostic SHMEM comm shim (NVSHMEM / rocSHMEM / single-PE no-op).
+// Provides mpk_putmem_signal_block, MPK_SIGNAL_ADD, and the host mpk_shmem_*
+// wrappers to both the megakernel host code and the emitted allreduce tasks.
+#include "comm/mpk_comm.cuh"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -1555,13 +1554,17 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
         }
 #endif
         if (is_nvshmem_event(event_id)) {
-#ifdef USE_NVSHMEM
-          nvshmem_signal_wait_until(
+          // Cross-GPU dependency: a remote PE increments this symmetric event
+          // counter via put+signal (SIGNAL_ADD). Wait through the backend's
+          // signal primitive so the remote write is observed past the local
+          // cache hierarchy. Under USE_ROCSHMEM this was previously compiled
+          // out entirely, which let the consumer run before the remote slice
+          // landed. GE (not EQ): the counter is a monotonic atomic-add, so a
+          // fast peer can push it past the threshold before we sample it.
+          mpk_shmem_signal_wait_ge(
               reinterpret_cast<uint64_t *>(
                   &config.all_event_counters[event_index]),
-              NVSHMEM_CMP_EQ,
               needed_counts);
-#endif
         } else {
 #ifdef MPK_ENABLE_TIMING
           unsigned long long dep_start = clock64();
@@ -3519,8 +3522,15 @@ __global__ void scheduler_kernel(RuntimeConfig config) {
 template <typename DT>
 DT *gpu_malloc(size_t size) {
   void *dst_ptr;
-#ifdef USE_NVSHMEM
+#if defined(USE_NVSHMEM)
   dst_ptr = nvshmem_malloc(size);
+#elif defined(USE_ROCSHMEM)
+  // Multi-GPU: buffers reached by a cross-PE put+signal (notably
+  // all_event_counters, the inter-GPU event-trigger counters) MUST live in the
+  // symmetric heap so a remote PE's signal lands at the matching offset. A
+  // plain hipMalloc here would make those addresses non-symmetric and corrupt
+  // the remote signal, silently yielding wrong allreduce results.
+  dst_ptr = mpk_shmem_malloc(size);
 #else
   (void)cudaMalloc(&dst_ptr, size);
 #endif
@@ -3528,8 +3538,10 @@ DT *gpu_malloc(size_t size) {
 }
 
 void gpu_free(void *ptr) {
-#ifdef USE_NVSHMEM
+#if defined(USE_NVSHMEM)
   nvshmem_free(ptr);
+#elif defined(USE_ROCSHMEM)
+  mpk_shmem_free(ptr);
 #else
   (void)cudaFree(ptr);
 #endif
@@ -3763,6 +3775,19 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   int npes = nvshmem_n_pes();
   int mype_node = nvshmem_team_my_pe(NVSHMEMX_TEAM_NODE);
   printf("mype(%d) npes(%d) mype_node(%d)\n", mype, npes, mype_node);
+#elif defined(USE_ROCSHMEM)
+  // rocSHMEM bootstraps MPI internally; the target device must already be
+  // selected (the cudaSetDevice above) before rocshmem_init().
+  rocshmem::rocshmem_init();
+  rocshmem::rocshmem_barrier_all();
+  int mype = rocshmem::rocshmem_my_pe();
+  int npes = rocshmem::rocshmem_n_pes();
+  printf("mype(%d) npes(%d)\n", mype, npes);
+  // rocSHMEM's IPC init (symmetric-heap reservation + peer-access enable) can
+  // leave the current HIP device != my_rank, unlike NVSHMEM which preserves it.
+  // Re-assert it so the subsequent device-to-device weight staging (which reads
+  // this rank's torch tensors on device my_rank) runs on the right device.
+  (void)cudaSetDevice(my_rank);
 #else
   int mype = 0;
   int npes = 1;
@@ -4817,9 +4842,9 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
                                  cudaEventDisableTiming);
 
   init_request_resources();
-#ifdef USE_NVSHMEM
+#if defined(USE_NVSHMEM) || defined(USE_ROCSHMEM)
   // Add a global barrier for all init_kernel to complete
-  nvshmem_barrier_all();
+  mpk_shmem_barrier_all();
 #endif
 }
 
@@ -4837,8 +4862,8 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                                        end_of_task_graph_event_pos);
     (void)cudaEventRecord(global_runtime_config.prepare_done_event,
                           default_stream);
-#ifdef USE_NVSHMEM
-    nvshmem_barrier_all();
+#if defined(USE_NVSHMEM) || defined(USE_ROCSHMEM)
+    mpk_shmem_barrier_all();
 #endif
   }
   int num_schedulers = global_runtime_config.num_local_schedulers +
@@ -5690,9 +5715,9 @@ extern "C" void finalize_persistent_kernel() {
   }
   gpu_free(global_runtime_config.sched_queues);
   gpu_free(global_runtime_config.first_tasks);
-#ifdef USE_NVSHMEM
-  nvshmem_barrier_all();
-  nvshmem_finalize();
+#if defined(USE_NVSHMEM) || defined(USE_ROCSHMEM)
+  mpk_shmem_barrier_all();
+  mpk_shmem_finalize();
 #endif
   // Free worker and scheduler streams
   (void)cudaEventDestroy(global_runtime_config.prepare_done_event);

@@ -940,7 +940,7 @@ TaskGraphResult print_task_graph(
         for (int i = 0; i < desc.tensor.num_dims; i++) {
           size *= desc.tensor.dim[i];
         }
-        code.e("void *$ = nvshmem_malloc($);", desc.name, size);
+        code.e("void *$ = mpk_shmem_malloc($);", desc.name, size);
         code.e("assert($ != nullptr);", desc.name);
         if (use_json_format) {
           code.e("all_tensors[\"$\"] = $;", desc.name, desc.name);

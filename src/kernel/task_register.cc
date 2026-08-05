@@ -3156,18 +3156,18 @@ int TaskRegister::register_reduce_task(threadblock::Graph const &bgraph,
   c.e("assert(gpu_id < runtime_config.num_gpus);");
   c.e("assert(gpu_id != runtime_config.my_gpu_id);");
   c.e("for (int i = 0; i < $; i++) {", batch_size);
-  c.e("  nvshmemx_putmem_signal_block(");
+  c.e("  mpk_putmem_signal_block(");
   c.e("      reinterpret_cast<char*>(task_desc->output_ptrs[0]) + i * $ * "
       "sizeof(bfloat16),",
       input_stride);
   c.e("      reinterpret_cast<char*>(task_desc->input_ptrs[0]) + i * $ * "
       "sizeof(bfloat16),",
       output_stride);
-  c.e("      task_desc->xfer_size_in_bytes / $,", batch_size);
+  c.e("      task_desc->task_metadata.xfer_size_in_bytes / $,", batch_size);
   c.e("      reinterpret_cast<uint64_t "
       "*>(&runtime_config.all_event_counters[event_index]),");
   c.e("      1 /*signal*/,");
-  c.e("      NVSHMEM_SIGNAL_ADD,");
+  c.e("      MPK_SIGNAL_ADD,");
   c.e("      gpu_id);");
   c.e("}");
   register_task_variant(TASK_NVSHMEM_COPY, c.to_string());

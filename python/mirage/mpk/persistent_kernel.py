@@ -147,6 +147,9 @@ def get_compile_command(
     py_so_path,
     profiling,
     use_nvshmem,
+    use_rocshmem=False,
+    rocshmem_inc_path=None,
+    rocshmem_lib_path=None,
     num_workers=None,
     num_local_schedulers=None,
     num_remote_schedulers=None,
@@ -291,7 +294,10 @@ def get_compile_command(
             "-x", "hip",
             file_name,
             "-O2",  # -O3 causes LLVM AMDGPU register allocator to hang on large fused kernels
-            "--save-temps",  # TEMP: dump assembly for v_mov analysis
+            # NOTE: do NOT add --save-temps here. Under multi-GPU SPMD both ranks
+            # share a cwd and compile an input named test.cu, so --save-temps
+            # dumps colliding intermediate object files (test-hip-amdgcn-*.o),
+            # corrupting the device link (undefined __hip_gpubin_handle).
             # Omit -lineinfo for ROCm: hipcc forwards it to ld.lld which treats it as -l lineinfo
             f"-I{py_include_dir}",
             f"-I{mirage_inc_path}",
@@ -374,7 +380,15 @@ def get_compile_command(
             flags = flags + ["-DMPK_FUSED_TAIL_TIMING"]
         if int(os.environ.get("MPK_K2944_DEBUG", "0")) == 1:
             flags = flags + ["-DMPK_K2944_DEBUG"]
-        if int(os.environ.get("PRECOMPUTED_DISPATCH", "1")) == 1:
+        # The precomputed worker-dispatch template is baked from single-GPU task
+        # timing. Under multi-GPU (rocSHMEM) the cross-GPU put+signal waits
+        # perturb that timing and the fixed template deadlocks: a worker parks
+        # on a task it must itself produce, the ranks drift apart, and the run
+        # hangs. Force the dynamic scheduler-dispatch path for multi-GPU;
+        # single-GPU keeps the precomputed fast path. An explicit
+        # PRECOMPUTED_DISPATCH=0 still disables it everywhere.
+        precomputed_default = "0" if use_rocshmem else "1"
+        if int(os.environ.get("PRECOMPUTED_DISPATCH", precomputed_default)) == 1:
             flags = flags + ["-DMPK_PRECOMPUTED_DISPATCH"]
             flags = flags + ["-DMPK_FUSED_LAYER_BATCHING"]
         if int(os.environ.get("MPK_NIL_TRIPWIRE", "0")) == 1:
@@ -400,6 +414,10 @@ def get_compile_command(
             # Force seqlen_q=1: uses merge path only (faster decode, slower prefill)
             flags = flags + ["-DMPK_MAX_TOKENS_PER_REQUEST=1"]
         amdgpu_target = os.environ.get("AMDGPU_TARGETS", "gfx950")
+        if use_rocshmem:
+            # rocSHMEM's IPC backend requires an xnack-off code object on gfx950.
+            if ":" not in amdgpu_target:
+                amdgpu_target = f"{amdgpu_target}:xnack-"
         specific_cmd = [
             f"--offload-arch={amdgpu_target}",
             f"-L{rocm_lib}",
@@ -408,6 +426,31 @@ def get_compile_command(
             "-lrocblas",
             "-lhipblas",
         ]
+        if use_rocshmem:
+            # Device-initiated one-sided communication (rocSHMEM), the AMD
+            # analog of NVSHMEM. -fgpu-rdc + --hip-link are the HIP equivalents
+            # of nvcc's -rdc=true device link, required so the megakernel can
+            # call rocSHMEM device functions across translation units.
+            rocshmem_lib_archive = os.path.join(rocshmem_lib_path, "librocshmem.a")
+            common_cmd = common_cmd + [
+                f"-I{rocshmem_inc_path}",
+                f"-I{mpi_inc_path}",
+            ]
+            flags = flags + [
+                "-DUSE_ROCSHMEM",
+                "-fgpu-rdc",
+                "--hip-link",
+            ]
+            specific_cmd = specific_cmd + [
+                # Reset the input language ("-x hip" is still active from
+                # common_cmd) so the driver treats the rocSHMEM archive as a
+                # link input rather than compiling it as HIP source.
+                "-x", "none",
+                rocshmem_lib_archive,
+                f"-L{mpi_lib_path}",
+                "-lmpi",
+                "-lhsa-runtime64",
+            ]
         return common_cmd + specific_cmd + flags
 
     if profiling:
@@ -459,7 +502,10 @@ class PersistentKernel:
         self.meta_tensors = meta_tensors
         self.profiler_tensor = profiler_tensor
         self.trace_name = trace_name
-        self.use_nvshmem = True if world_size > 1 else False
+        # Multi-GPU comm backend: NVSHMEM on CUDA, rocSHMEM on ROCm.
+        _is_rocm = bool(getattr(torch.version, "hip", None))
+        self.use_nvshmem = (world_size > 1) and not _is_rocm
+        self.use_rocshmem = (world_size > 1) and _is_rocm
         self.spec_decode_config = spec_decode_config
         self._spec_decode_handlers = {
             "promptlookup": self.prompt_lookup_spec_handler,
@@ -4287,13 +4333,22 @@ class PersistentKernel:
         output_dir = kwargs.get("output_dir", None)
 
         MIRAGE_ROOT, INCLUDE_PATH, DEPS_PATH = get_key_paths()
+        # Each rank bakes its own (process-local) torch device pointers into the
+        # generated test.cu, so multi-GPU SPMD runs MUST NOT share an output
+        # directory; otherwise the ranks race on the same file/.so and one rank
+        # compiles the other rank's pointers (-> cudaMemcpy DtoD "invalid
+        # argument"). Give each rank its own directory when world_size > 1.
+        if self.world_size > 1:
+            base_output_dir = f"./permanent_output_dir_rank{self.mpi_rank}/"
+        else:
+            base_output_dir = "./permanent_output_dir/"
         if self.mode == "online_notoken" or self.mode == "online" or self.mode == "multi_turn":
             # We will init for multiple times so the output directory should be permanent
-            tempdir = "./permanent_output_dir/"
+            tempdir = base_output_dir
         else:
             tempdir_obj = tempfile.TemporaryDirectory()
             #tempdir = tempdir_obj.name
-            tempdir = "./permanent_output_dir/"
+            tempdir = base_output_dir
         os.makedirs(tempdir, exist_ok=True)
         results = self.kn_graph.generate_task_graph(num_gpus=self.world_size, my_gpu_id=self.mpi_rank)
 
@@ -4362,6 +4417,8 @@ class PersistentKernel:
 
         NVSHMEM_INC_PATH = None
         NVSHMEM_LIB_PATH = None
+        ROCSHMEM_INC_PATH = None
+        ROCSHMEM_LIB_PATH = None
         MPI_INC_PATH = None
         MPI_LIB_PATH = None
         if self.use_nvshmem:
@@ -4426,6 +4483,58 @@ class PersistentKernel:
                         f"Cannot find libmpi.so, please set environment variable MPI_LIB_PATH"
                     )
 
+        if self.use_rocshmem:
+            # find rocSHMEM include folder
+            if "ROCSHMEM_INC_PATH" in os.environ:
+                ROCSHMEM_INC_PATH = os.environ.get("ROCSHMEM_INC_PATH")
+            else:
+                ROCSHMEM_INC_PATH = os.path.join(
+                    os.path.expanduser("~"), "rocshmem", "include"
+                )
+            header_file_path = os.path.join(
+                ROCSHMEM_INC_PATH, "rocshmem", "rocshmem.hpp"
+            )
+            if not os.path.exists(header_file_path):
+                raise RuntimeError(
+                    f"Cannot find rocshmem/rocshmem.hpp at {header_file_path}, "
+                    "please set environment variable ROCSHMEM_INC_PATH"
+                )
+            # find rocSHMEM static library (librocshmem.a)
+            if "ROCSHMEM_LIB_PATH" in os.environ:
+                ROCSHMEM_LIB_PATH = os.environ.get("ROCSHMEM_LIB_PATH")
+            else:
+                ROCSHMEM_LIB_PATH = os.path.join(
+                    os.path.expanduser("~"), "rocshmem", "lib"
+                )
+            lib_file_path = os.path.join(ROCSHMEM_LIB_PATH, "librocshmem.a")
+            if not os.path.exists(lib_file_path):
+                raise RuntimeError(
+                    f"Cannot find librocshmem.a at {lib_file_path}, "
+                    "please set environment variable ROCSHMEM_LIB_PATH"
+                )
+            # find mpi include folder (rocSHMEM bootstraps through MPI)
+            if "MPI_INC_PATH" in os.environ:
+                MPI_INC_PATH = os.environ.get("MPI_INC_PATH")
+            else:
+                MPI_INC_PATH = "/usr/lib/x86_64-linux-gnu/openmpi/include"
+            header_file_path = os.path.join(MPI_INC_PATH, "mpi.h")
+            if not os.path.exists(header_file_path):
+                raise RuntimeError(
+                    f"Cannot find mpi.h at {header_file_path}, "
+                    "please set environment variable MPI_INC_PATH"
+                )
+            # find mpi shared library
+            if "MPI_LIB_PATH" in os.environ:
+                MPI_LIB_PATH = os.environ.get("MPI_LIB_PATH")
+            else:
+                MPI_LIB_PATH = "/usr/lib/x86_64-linux-gnu/openmpi/lib"
+            lib_file_path = os.path.join(MPI_LIB_PATH, "libmpi.so")
+            if not os.path.exists(lib_file_path):
+                raise RuntimeError(
+                    f"Cannot find libmpi.so at {lib_file_path}, "
+                    "please set environment variable MPI_LIB_PATH"
+                )
+
         cc_cmd = get_compile_command(
             mpk=self,
             target_cc=self.target_cc,
@@ -4442,6 +4551,9 @@ class PersistentKernel:
             py_so_path=so_path,
             profiling=True if self.profiler_tensor is not None else False,
             use_nvshmem=self.use_nvshmem,
+            use_rocshmem=self.use_rocshmem,
+            rocshmem_inc_path=ROCSHMEM_INC_PATH,
+            rocshmem_lib_path=ROCSHMEM_LIB_PATH,
             num_workers=self.num_workers,
             num_local_schedulers=self.num_local_schedulers, 
             num_remote_schedulers=self.num_remote_schedulers,
