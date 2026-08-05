@@ -98,12 +98,41 @@ static PyObject *set_rope_tables_func(PyObject *self, PyObject *args) {
   Py_RETURN_NONE;
 }
 
+static PyObject *read_shmem_alloc_func(PyObject *self, PyObject *args) {
+  int index;
+  PyObject *py_dst;
+  unsigned long long nbytes;
+  if (!PyArg_ParseTuple(args, "iOK", &index, &py_dst, &nbytes)) {
+    PyErr_SetString(PyExc_TypeError, "Expected (index, dst_ptr, nbytes)");
+    return NULL;
+  }
+  void *dst = PyLong_AsVoidPtr(py_dst);
+  int rc = mpk_read_shmem_alloc(index, dst, (size_t)nbytes);
+  return PyLong_FromLong((long)rc);
+}
+
+static PyObject *num_shmem_allocs_func(PyObject *self, PyObject *args) {
+  return PyLong_FromLong((long)mpk_num_shmem_allocs());
+}
+
+static PyObject *shmem_alloc_size_func(PyObject *self, PyObject *args) {
+  int index;
+  if (!PyArg_ParseTuple(args, "i", &index)) {
+    PyErr_SetString(PyExc_TypeError, "Expected (index)");
+    return NULL;
+  }
+  return PyLong_FromUnsignedLongLong(mpk_shmem_alloc_size(index));
+}
+
 static PyMethodDef ModuleMethods[] = {
   {"init_func", init_func, METH_VARARGS, "initialize persistent kernel"},
   {"init_request_func", init_request_func, METH_VARARGS, "initialize request resources"},
   {"launch_func", launch_func, METH_VARARGS, "launch persistent kernel"},
   {"finalize_func", finalize_func, METH_VARARGS, "finalize persistent kernel"},
   {"set_rope_tables_func", set_rope_tables_func, METH_VARARGS, "set RoPE cos/sin tables"},
+  {"read_shmem_alloc_func", read_shmem_alloc_func, METH_VARARGS, "snapshot symmetric-heap alloc into device buffer"},
+  {"num_shmem_allocs_func", num_shmem_allocs_func, METH_VARARGS, "number of recorded symmetric-heap allocs"},
+  {"shmem_alloc_size_func", shmem_alloc_size_func, METH_VARARGS, "byte size of a recorded symmetric-heap alloc"},
   {NULL, NULL, 0, NULL} // sentinel
 };
 
@@ -4573,6 +4602,9 @@ class PersistentKernel:
         self.init_request_func = getattr(mod, "init_request_func")
         self.finalize_func = getattr(mod, "finalize_func")
         self._set_rope_tables_func = getattr(mod, "set_rope_tables_func", None)
+        self._read_shmem_alloc_func = getattr(mod, "read_shmem_alloc_func", None)
+        self._num_shmem_allocs_func = getattr(mod, "num_shmem_allocs_func", None)
+        self._shmem_alloc_size_func = getattr(mod, "shmem_alloc_size_func", None)
         print("Finished megakernel compilation...")
 
         #meta_tensors_ptr = [tensor.data_ptr() for tensor in self.meta_tensors]
@@ -4613,6 +4645,25 @@ class PersistentKernel:
         assert self._is_compiled, "Must call compile() before set_rope_tables()"
         assert self._set_rope_tables_func is not None
         self._set_rope_tables_func(cos_tensor.data_ptr(), sin_tensor.data_ptr())
+
+    def num_shmem_allocs(self) -> int:
+        """Number of recorded symmetric-heap (nvshmem/rocshmem) allocations."""
+        assert self._num_shmem_allocs_func is not None
+        return int(self._num_shmem_allocs_func())
+
+    def shmem_alloc_size(self, index: int) -> int:
+        """Byte size of the index-th symmetric-heap allocation (0 if invalid)."""
+        assert self._shmem_alloc_size_func is not None
+        return int(self._shmem_alloc_size_func(index))
+
+    def read_shmem_alloc(self, index: int, dst_tensor: "torch.Tensor") -> int:
+        """Snapshot the index-th symmetric-heap allocation into dst_tensor
+        (a CUDA tensor). Returns 0 on success, -1 on bad index/size."""
+        assert self._read_shmem_alloc_func is not None
+        nbytes = dst_tensor.numel() * dst_tensor.element_size()
+        return int(
+            self._read_shmem_alloc_func(index, dst_tensor.data_ptr(), nbytes)
+        )
 
     def __call__(self, **kwargs):
         stream = kwargs.get("default_stream", None)

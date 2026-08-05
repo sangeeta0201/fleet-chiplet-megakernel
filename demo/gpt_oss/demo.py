@@ -1275,19 +1275,45 @@ if __name__ == "__main__":
         else:
             ck_fmha_o_acc = None
         attn_proj_out = make_tensor("attn_proj_out", (bs, PADDED_HIDDEN_SIZE))
+        attn_proj_copy = make_tensor("attn_proj_copy", (bs, PADDED_HIDDEN_SIZE))
         if world_size > 1:
-            allreduce_buf = mpk.new_tensor(
-                dims=(world_size, bs, PADDED_HIDDEN_SIZE),
-                dtype=mi.bfloat16,
-                name="all_reduce_buf",
-                io_category="nvshmem_tensor",
-            )
+            # PER-LAYER symmetric gather buffers. The gather buffer is written by
+            # the PEER's put (SIGNAL_ADD) and read by MY reduce. It lives at a
+            # FIXED slot (peer_gpu_id) every layer, so if all layers share one
+            # buffer, the peer's NEXT-layer put can clobber it before MY current
+            # reduce reads it (a cross-rank WAR the event/signal system does not
+            # guard — it only enforces RAW). This is a timing-dependent race that
+            # makes multi-GPU decode NON-DETERMINISTIC (confirmed: identical build
+            # produces different output run-to-run; divergence scales with the
+            # number of allreduces/token). Giving each layer its own gather buffer
+            # removes the dominant cross-layer WAR.
+            allreduce_buf_list = [
+                mpk.new_tensor(
+                    dims=(world_size, bs, PADDED_HIDDEN_SIZE),
+                    dtype=mi.bfloat16,
+                    name=f"all_reduce_buf_{li}",
+                    io_category="nvshmem_tensor",
+                )
+                for li in range(num_layers)
+            ]
+            allreduce_buf = allreduce_buf_list[0]
             attn_allreduce_out = mpk.new_tensor(
                 dims=(bs, PADDED_HIDDEN_SIZE),
                 dtype=mi.bfloat16,
                 name="attn_allreduce_out",
                 io_category="nvshmem_tensor",
             )
+            # Dedicated per-layer buffer for the MoE (expert-parallel) allreduce.
+            moe_allreduce_buf_list = [
+                mpk.new_tensor(
+                    dims=(world_size, bs, PADDED_HIDDEN_SIZE),
+                    dtype=mi.bfloat16,
+                    name=f"moe_all_reduce_buf_{li}",
+                    io_category="nvshmem_tensor",
+                )
+                for li in range(num_layers)
+            ]
+            moe_allreduce_buf = moe_allreduce_buf_list[0]
         else:
             allreduce_buf = make_tensor("all_reduce_buf", (world_size, bs, PADDED_HIDDEN_SIZE))
             attn_allreduce_out = make_tensor("attn_allreduce_out", (bs, PADDED_HIDDEN_SIZE))
@@ -1304,6 +1330,31 @@ if __name__ == "__main__":
         #   [8*16]: global_arrive (leader count)
         #   [9*16]: topk_counter
         # Total: 160 int32 = 640 bytes (10 cache lines, no false sharing)
+        # Expert-parallel MoE: shard the 128 experts across ranks. When OFF
+        # (default for now / single-GPU) every rank computes all experts
+        # (replicated) and the MoE output is NOT allreduced — used to validate
+        # attention TP in isolation. When ON, each rank owns NUM_EXPERTS//ws
+        # experts, produces a partial sum, and the MoE output is SUM-allreduced.
+        moe_ep = world_size > 1 and os.environ.get("MOE_EP", "0") == "1"
+        # Expert-parallel sharding: rank owns experts [ep_base, ep_base+ep_local).
+        # Router/top-k/mask/barrier stay replicated global; only expert weights
+        # are sliced per rank (giving the ~2x memory/compute win).
+        # EP_NOSLICE isolation test: keep the moe_ep combine path (MoE allreduce)
+        # but do NOT slice the expert weights. Both ranks compute the FULL 128-expert
+        # weighted sum, so each partial == full sum. The SUM-allreduce then yields
+        # 2*W + x (rank0 folds residual). If output is a recognizable "doubled-MoE"
+        # degradation, the allreduce sums correctly and the bug is in slicing/local_eid.
+        # If it collapses identically to the sliced case, the MoE allreduce is broken.
+        ep_noslice = os.environ.get("EP_NOSLICE", "0") == "1"
+        if moe_ep and not ep_noslice:
+            assert num_experts % world_size == 0, \
+                f"num_experts={num_experts} must be divisible by world_size={world_size}"
+            ep_local = num_experts // world_size
+            ep_base = rank * ep_local
+        else:
+            ep_local = num_experts
+            ep_base = 0
+        ep_slice = moe_ep and not ep_noslice
         fuse_oproj_moe = os.environ.get("FUSE_OPROJ_MOE", "0") == "1"
         fuse_oproj_topk = os.environ.get("FUSE_OPROJ_TOPK", "1") == "1"
         if fuse_full_layer:
@@ -1349,7 +1400,52 @@ if __name__ == "__main__":
         # F32 workspace for W2 atomicAdd: replaces MulSumAdd standalone task
         moe_workspace_f32 = make_tensor("moe_workspace_f32", (bs, PADDED_HIDDEN_SIZE), torch_dtype=torch.float32)
         mlp_weighted_sum_out = make_tensor("mlp_weighted_sum_out", (bs, PADDED_HIDDEN_SIZE))
-        mlp_final = make_tensor("mlp_final", (bs, PADDED_HIDDEN_SIZE))
+        # Grid-matched copy of the partial MoE output: the allreduce requires its
+        # producer to run at the allreduce grid (PADDED_HIDDEN//64); residual_add
+        # runs at grid (1,1,1), so we copy through this buffer first (mirrors the
+        # attention allreduce path's attn_proj_copy).
+        mlp_partial_copy = make_tensor("mlp_partial_copy", (bs, PADDED_HIDDEN_SIZE))
+        if world_size > 1:
+            # MoE allreduce output must live in the symmetric heap, exactly like
+            # the attention allreduce output (attn_allreduce_out) and qwen3's
+            # mlp_final. A plain cuda tensor here corrupted rank0's reduce read.
+            mlp_final = mpk.new_tensor(
+                dims=(bs, PADDED_HIDDEN_SIZE),
+                dtype=mi.bfloat16,
+                name="mlp_final",
+                io_category="nvshmem_tensor",
+            )
+        else:
+            mlp_final = make_tensor("mlp_final", (bs, PADDED_HIDDEN_SIZE))
+        # Diagnostic snapshot of the post-allreduce mlp_final. mlp_final is an
+        # nvshmem tensor with no torch backing, so verify cannot see it directly.
+        # We snapshot it from the symmetric heap into this plain buffer via
+        # mpk.read_shmem_alloc() right before the verify comparison. Not a graph
+        # tensor (would perturb the task graph); just a host-visible sink.
+        mlp_final_dbg_t = None
+        if world_size > 1 and (args.verify or os.environ.get("MLP_DBG")):
+            mlp_final_dbg_t = torch.zeros((bs, PADDED_HIDDEN_SIZE),
+                                          dtype=torch.bfloat16, device="cuda")
+            _tensor_refs["mlp_final_dbg"] = mlp_final_dbg_t
+            verify_tensors["mlp_final_dbg"] = mlp_final_dbg_t
+            # Snapshot of the post-allreduce attention output (attn_allreduce_out),
+            # the residual x folded into the MoE combine. Used to test whether the
+            # attention allreduce truly sums p0+p1 or just returns rank0's partial.
+            attn_ar_dbg_t = torch.zeros((bs, PADDED_HIDDEN_SIZE),
+                                        dtype=torch.bfloat16, device="cuda")
+            _tensor_refs["attn_ar_dbg"] = attn_ar_dbg_t
+            verify_tensors["attn_ar_dbg"] = attn_ar_dbg_t
+        # EP only: holds the post-allreduce result after the residual is folded
+        # in exactly once (bias_add). Separate buffer so the residual add does not
+        # alias the nvshmem allreduce output (WAR hazard) and the next layer reads
+        # a stable plain tensor.
+        mlp_ep_out = make_tensor("mlp_ep_out", (bs, PADDED_HIDDEN_SIZE))
+        # Tensor-parallel residual handling: o_proj / MoE are row/expert-parallel,
+        # so each rank produces a PARTIAL output that is SUM-allreduced. The
+        # residual (and o_proj bias) must be added exactly once, so non-rank0
+        # ranks fold a ZERO residual; rank0 folds the real residual. This keeps
+        # the existing res_bias kernels usable (no separate post-allreduce add).
+        zero_residual = make_tensor("zero_residual", (bs, PADDED_HIDDEN_SIZE))
         # Argmax — fused into LM head GEMM (type 218, norm-once):
         # each worker writes one (bf16 max, int64 abs_idx). num_workers = 240.
         argmax_part_value = make_tensor("argmax_part_value", (bs, mpk.num_workers))
@@ -1417,6 +1513,8 @@ if __name__ == "__main__":
                 target_out_dim=2 * PADDED_INTERMEDIATE_SIZE,
                 target_num_blocks=w13_target_num_blocks,
             )
+            if ep_slice:
+                gu_packed = gu_packed[ep_base:ep_base + ep_local].contiguous()
             moe_gate_up_proj_weights.append(gu_packed)
 
             # down_proj: blocks [E, hidden, nb, 16], scales [E, hidden, nb]
@@ -1427,6 +1525,8 @@ if __name__ == "__main__":
                 target_out_dim=PADDED_HIDDEN_SIZE,
                 target_num_blocks=w2_target_num_blocks,
             )
+            if ep_slice:
+                dp_packed = dp_packed[ep_base:ep_base + ep_local].contiguous()
             moe_down_proj_weights.append(dp_packed)
 
             # Biases: pad to padded dimensions (2D for gang kernel)
@@ -1434,12 +1534,16 @@ if __name__ == "__main__":
             if gu_bias.shape[1] < 2 * PADDED_INTERMEDIATE_SIZE:
                 gu_bias = torch.nn.functional.pad(
                     gu_bias, (0, 2 * PADDED_INTERMEDIATE_SIZE - gu_bias.shape[1]))
+            if ep_slice:
+                gu_bias = gu_bias[ep_base:ep_base + ep_local]
             moe_gate_up_proj_biases.append(gu_bias.contiguous())
 
             dp_bias = experts.down_proj_bias.data.to("cuda")  # [E, hidden]
             if dp_bias.shape[1] < PADDED_HIDDEN_SIZE:
                 dp_bias = torch.nn.functional.pad(
                     dp_bias, (0, PADDED_HIDDEN_SIZE - dp_bias.shape[1]))
+            if ep_slice:
+                dp_bias = dp_bias[ep_base:ep_base + ep_local]
             moe_down_proj_biases.append(dp_bias.contiguous())
 
             # Free MXFP4 buffers for this layer to save memory
@@ -1483,6 +1587,11 @@ if __name__ == "__main__":
         fused_tail_done = False
         for i in range(num_layers):
             layer = model.model.layers[i]
+            if world_size > 1:
+                # Select this layer's dedicated symmetric gather buffers to avoid
+                # the cross-rank WAR race on a shared gather slot (see alloc site).
+                allreduce_buf = allreduce_buf_list[i]
+                moe_allreduce_buf = moe_allreduce_buf_list[i]
             # === Attention block ===
             # RMSNorm — pad weight; kernel uses actual_hidden_dim for RMS mean
             # (avoids bf16 rounding error from scale factor)
@@ -1560,21 +1669,38 @@ if __name__ == "__main__":
                 # Fused QKV + KV cache update: epilogue applies RoPE and
                 # writes Q→q_workspace, K/V→paged caches directly.
                 if world_size > 1:
-                    mpk.gang_rmsnorm_linear_mxfp4_bias_kvupd_layer(
+                    # Multi-GPU: the fused gang_rmsnorm_linear_mxfp4_bias_kvupd
+                    # kernel hard-maps kv_head = physical XCD id (requires
+                    # num_kv_heads == 8 XCDs). With tensor parallelism the local
+                    # KV-head count is 8//world_size (=4 for 2 GPUs), so that
+                    # XCD-based mapping breaks (K/V cache never written). Use the
+                    # non-fused path instead, mirroring qwen3's working TP path:
+                    #   (1) plain MXFP4 QKV linear -> attn_in (interleaved by KV
+                    #       group), then (2) a separate kv_cache_update task whose
+                    #       grid is sized by num_local_kv_heads (not XCD count).
+                    mpk.gang_rmsnorm_linear_mxfp4_bias_layer(
                         norm_input=x,
                         norm_weight=w_norm,
                         norm_output=rmsnorm_out,
                         mxfp4_weight=w_qkv_mxfp4,
                         bias=w_qkv_bias,
-                        k_cache=k_cache,
-                        v_cache=v_cache,
-                        q_workspace=ck_fmha_q_ws,
+                        output=attn_in,
                         actual_hidden_dim=hidden_size,
                         output_per_wg=qkv_output_per_wg,
-                        head_dim=head_dim,
-                        num_q_per_kv=q_per_kv,
-                        kv_stride=kv_stride,
-                        q_ws_stride=q_ws_stride,
+                        output_stride=fused_qkv_dim,
+                        block_dim=(256, 1, 1),
+                    )
+                    mpk.kv_cache_update_layer(
+                        input=attn_in,
+                        k_cache=k_cache,
+                        v_cache=v_cache,
+                        q_norm=None,  # GPT-OSS has no QK norm
+                        k_norm=None,
+                        cos_pos_embed=cos_pos_embed,
+                        sin_pos_embed=sin_pos_embed,
+                        q_workspace=ck_fmha_q_ws,
+                        grid_dim=(mpk.max_num_batched_requests,
+                                  num_local_kv_heads, 1),
                         block_dim=(256, 1, 1),
                     )
                 elif fuse_full_layer and world_size == 1:
@@ -1927,12 +2053,23 @@ if __name__ == "__main__":
                 layer.self_attn.o_proj.weight,
                 target_rows=PADDED_HIDDEN_SIZE,
             )
-            # O-proj bias: pad from hidden_size to PADDED_HIDDEN_SIZE
+            # O-proj bias: pad from hidden_size to PADDED_HIDDEN_SIZE.
+            # Row-parallel o_proj is SUM-allreduced, so the bias must be added
+            # exactly once: zero it on non-rank0 ranks (rank0 carries the bias).
             o_bias = pad_weight_1d(
                 layer.self_attn.o_proj.bias.data.to("cuda"),
                 PADDED_HIDDEN_SIZE
             ).unsqueeze(0).contiguous()  # [1, PADDED_HIDDEN_SIZE]
+            # Row-parallel o_proj output is SUM-allreduced across ranks, so the
+            # residual and bias must be added exactly once. Add them on rank 0
+            # only; zero them on every other rank.
+            if world_size > 1 and rank != 0:
+                o_bias = torch.zeros_like(o_bias)
             w_o_bias = _attach_input_keep(o_bias, f"layer_{i}_o_bias")
+            if world_size > 1 and rank != 0:
+                o_residual = zero_residual
+            else:
+                o_residual = x
 
             if is_rocm:
                 # Quantize/pack O-proj weight
@@ -2041,7 +2178,7 @@ if __name__ == "__main__":
                     mpk.gang_linear_mxfp4_res_bias_layer(
                         input=attn_out,
                         mxfp4_weight=w_o_mxfp4,
-                        residual=x,
+                        residual=o_residual,
                         bias=w_o_bias,
                         output=attn_proj_out,
                         output_per_wg=o_output_per_wg,
@@ -2053,7 +2190,7 @@ if __name__ == "__main__":
                     mpk.gang_linear_with_residual_layer(
                         input=attn_out,
                         weight=w_o_t,
-                        residual=x,
+                        residual=o_residual,
                         output=attn_proj_out,
                         tile_n=64,
                         output_stride=PADDED_HIDDEN_SIZE,
@@ -2067,11 +2204,22 @@ if __name__ == "__main__":
                 x = attn_proj_out
 
                 if world_size > 1:
-                    mpk.allreduce_layer(
+                    # The mxfp4 gang o_proj runs grid (8,1,1). The allreduce
+                    # (allgather+reduce) is only known-correct at grid
+                    # (hidden//64) (matches qwen3). Decouple via a grid-46
+                    # identity copy so the allreduce can use its own grid.
+                    ar_grid = (PADDED_HIDDEN_SIZE // 64, 1, 1)
+                    mpk.identity_layer(
                         input=attn_proj_out,
+                        output=attn_proj_copy,
+                        grid_dim=ar_grid,
+                        block_dim=(128, 1, 1),
+                    )
+                    mpk.allreduce_layer(
+                        input=attn_proj_copy,
                         buffer=allreduce_buf,
                         output=attn_allreduce_out,
-                        grid_dim=(PADDED_HIDDEN_SIZE // 64, 1, 1),
+                        grid_dim=ar_grid,
                         block_dim=(128, 1, 1),
                     )
                     x = attn_allreduce_out
@@ -2148,13 +2296,65 @@ if __name__ == "__main__":
                     w13_output_per_wg=w13_output_per_wg,
                     w2_output_per_wg=w2_output_per_wg,
                     block_dim=(256, 1, 1),
+                    num_experts_global=num_experts,
                 )
 
             # MoE residual add: W2 epilogue already did routing_weight*result
             # → atomicAdd to moe_workspace_f32. Just add residual + zero workspace.
             # For single-GPU layers 0..(n-2), defer into next layer's QKV prologue
             # (resaddf32 variant). Last layer + multi-GPU run standalone.
-            if i == num_layers - 1 or world_size > 1:
+            # Under expert-parallel the MoE output is a PARTIAL sum that gets
+            # SUM-allreduced, so the residual is folded only on rank0 (added once).
+            if moe_ep:
+                # Expert-parallel combine, mirroring the PROVEN-correct attention
+                # o_proj allreduce (which folds the residual on rank0 BEFORE the
+                # allreduce and consumes the allreduce output directly as the next
+                # layer's input — no intra-layer post-allreduce task).
+                #
+                # Each rank holds a PARTIAL weighted sum over only its experts.
+                # rank0 folds the real residual into its partial; other ranks fold
+                # a ZERO residual. The SUM-allreduce then yields
+                #   (p0 + x) + p1 + ... = full_weighted_sum + x
+                # so the residual is added exactly once. x = mlp_final directly,
+                # letting the NEXT layer's ops carry the allreduce dependency
+                # (the previous symmetric scheme added a bias_add that consumed
+                # the allreduce output within the same layer — a cross-task dep
+                # through the nvshmem heap that read stale mlp_final).
+                ar_grid = (PADDED_HIDDEN_SIZE // 64, 1, 1)
+                # EP_FOLD_RANK: which rank folds the real residual (default 0).
+                # Isolation probe: set to world_size-1 to fold on the LAST rank.
+                # If the MoE allreduce truly sums, moving the fold changes nothing
+                # (residual still added once). If it silently returns rank0's
+                # partial, folding on a non-zero rank makes the residual vanish.
+                _fold_rank = int(os.environ.get("EP_FOLD_RANK", "0"))
+                moe_residual = x if rank == _fold_rank else zero_residual
+                mpk.moe_residual_add_f32_layer(
+                    workspace_f32=moe_workspace_f32,
+                    residual=moe_residual,
+                    output=mlp_weighted_sum_out,
+                    grid_dim=(1, 1, 1),
+                    block_dim=(256, 1, 1),
+                )
+                # The allreduce requires its producer to share its grid/partition
+                # map. residual_add ran at grid (1,1,1), so decouple via a
+                # grid-matched identity copy (mirrors the attention allreduce).
+                mpk.identity_layer(
+                    input=mlp_weighted_sum_out,
+                    output=mlp_partial_copy,
+                    grid_dim=ar_grid,
+                    block_dim=(128, 1, 1),
+                )
+                mpk.allreduce_layer(
+                    input=mlp_partial_copy,
+                    buffer=moe_allreduce_buf,
+                    output=mlp_final,
+                    grid_dim=ar_grid,
+                    block_dim=(128, 1, 1),
+                )
+                x = mlp_final
+            elif i == num_layers - 1 or world_size > 1:
+                # Non-EP (replicated MoE): the full weighted sum is already present
+                # on every rank, so fold the residual directly.
                 mpk.moe_residual_add_f32_layer(
                     workspace_f32=moe_workspace_f32,
                     residual=x,
@@ -2163,16 +2363,6 @@ if __name__ == "__main__":
                     block_dim=(256, 1, 1),
                 )
                 x = mlp_weighted_sum_out
-
-            if world_size > 1:
-                mpk.allreduce_layer(
-                    input=mlp_weighted_sum_out,
-                    buffer=allreduce_buf,
-                    output=mlp_final,
-                    grid_dim=(PADDED_HIDDEN_SIZE // 64, 1, 1),
-                    block_dim=(256, 1, 1),
-                )
-                x = mlp_final
 
         if not fused_tail_done:
             # Final RMSNorm + LM head (fused MXFP4: FP4 weights × FP8 activations)
@@ -2722,12 +2912,112 @@ if __name__ == "__main__":
                   f"over {_fwd_total_iters} iters")
         print("=" * 80)
 
+        # === MLP_DBG: env-gated readback of post-allreduce mlp_final (no verify) ===
+        # Uses sys.stderr.write so it emits on ALL ranks (print is a no-op on
+        # rank!=0, see line ~380). Both ranks reach this block.
+        if os.environ.get("MLP_DBG") and mlp_final_dbg_t is not None:
+            def _eprint(s):
+                sys.stderr.write(s + "\n"); sys.stderr.flush()
+            try:
+                torch.cuda.synchronize()
+                n_alloc = mpk.num_shmem_allocs()
+                exp_bytes = bs * PADDED_HIDDEN_SIZE * 2  # bf16
+                sizes = [mpk.shmem_alloc_size(i) for i in range(n_alloc)]
+                matches = [i for i, s in enumerate(sizes) if s == exp_bytes]
+                _env_idx = os.environ.get("MLP_FINAL_IDX")
+                if _env_idx is not None:
+                    mlp_idx = int(_env_idx)
+                elif len(matches) >= 2:
+                    mlp_idx = matches[1]
+                elif len(matches) == 1:
+                    mlp_idx = matches[0]
+                else:
+                    mlp_idx = -1
+                _eprint(f"[MLP_DBG R{rank}] exp_bytes={exp_bytes} mlp_idx={mlp_idx} "
+                        f"nmatch={len(matches)}")
+                if mlp_idx >= 0:
+                    rc = mpk.read_shmem_alloc(mlp_idx, mlp_final_dbg_t)
+                    _f = mlp_final_dbg_t.float()
+                    _eprint(f"[MLP_DBG R{rank}] mlp_final rc={rc} "
+                            f"norm={_f.norm().item():.4f} mean={_f.mean().item():.6f} "
+                            f"absmax={_f.abs().max().item():.4f} "
+                            f"first8={_f.flatten()[:8].tolist()}")
+                # PRE-AR partial (this rank's own MoE partial + rank0-folded
+                # residual). Torch-backed, differs per rank. rank0_partial +
+                # rank1_partial should == mlp_final if the AR sums correctly.
+                _pc = _tensor_refs.get("mlp_partial_copy")
+                if _pc is not None:
+                    _pf = _pc.float()
+                    _eprint(f"[MLP_DBG R{rank}] mlp_partial_copy(pre-AR) "
+                            f"norm={_pf.norm().item():.4f} mean={_pf.mean().item():.6f} "
+                            f"absmax={_pf.abs().max().item():.4f} "
+                            f"first8={_pf.flatten()[:8].tolist()}")
+                # Attention output (post-AR) = the residual x feeding the MoE block.
+                # If this is stable run-to-run but mlp_partial varies, the race is in
+                # the MoE compute; if this varies too, it is upstream in attention.
+                if attn_ar_dbg_t is not None and len(matches) >= 1:
+                    rc3 = mpk.read_shmem_alloc(matches[0], attn_ar_dbg_t)
+                    _af = attn_ar_dbg_t.float()
+                    _eprint(f"[MLP_DBG R{rank}] attn_allreduce_out rc={rc3} "
+                            f"norm={_af.norm().item():.4f} mean={_af.mean().item():.6f} "
+                            f"absmax={_af.abs().max().item():.4f} "
+                            f"first8={_af.flatten()[:8].tolist()}")
+                # rmsnorm_out_moe: MoE-kernel INPUT (post-rmsnorm of x). Torch-backed.
+                _rn = _tensor_refs.get("rmsnorm_out_moe")
+                if _rn is not None:
+                    _rf = _rn.float()
+                    _eprint(f"[MLP_DBG R{rank}] rmsnorm_out_moe(MoE-in) "
+                            f"norm={_rf.norm().item():.4f} "
+                            f"first8={_rf.flatten()[:8].tolist()}")
+            except Exception as _e:
+                sys.stderr.write(f"[MLP_DBG R{rank}] snapshot failed: {_e}\n")
+
         # === Verification: compare Mirage intermediates with PyTorch reference ===
         if args.verify and verify_tensors:
             print("\n" + "=" * 80)
             print("VERIFICATION: Comparing Mirage intermediates with PyTorch reference")
             print("=" * 80)
             torch.cuda.synchronize()
+
+            # Snapshot the post-allreduce mlp_final (nvshmem tensor, no torch
+            # backing) from the symmetric heap so we can check
+            # mlp_final == rank0_partial + rank1_partial.
+            if mlp_final_dbg_t is not None:
+                try:
+                    n_alloc = mpk.num_shmem_allocs()
+                    exp_bytes = bs * PADDED_HIDDEN_SIZE * 2  # bf16
+                    sizes = [mpk.shmem_alloc_size(i) for i in range(n_alloc)]
+                    sys.stderr.write(f"[R{rank}] shmem allocs (idx:size): "
+                          f"{list(enumerate(sizes))}  exp_mlp_bytes={exp_bytes}  matches={matches if False else [i for i, s in enumerate(sizes) if s == exp_bytes]}\n")
+                    sys.stderr.flush()
+                    matches = [i for i, s in enumerate(sizes) if s == exp_bytes]
+                    # order in test.cu: all_reduce_buf, attn_allreduce_out,
+                    # moe_all_reduce_buf, mlp_final -> mlp_final is 2nd match.
+                    _env_idx = os.environ.get("MLP_FINAL_IDX")
+                    if _env_idx is not None:
+                        mlp_idx = int(_env_idx)
+                    elif len(matches) >= 2:
+                        mlp_idx = matches[1]
+                    elif len(matches) == 1:
+                        mlp_idx = matches[0]
+                    else:
+                        mlp_idx = -1
+                    if mlp_idx >= 0:
+                        rc = mpk.read_shmem_alloc(mlp_idx, mlp_final_dbg_t)
+                        sys.stderr.write(f"[R{rank}] read_shmem_alloc(mlp_final idx={mlp_idx}) rc={rc} val[:8]={mlp_final_dbg_t[0,:8].float().tolist()}\n")
+                        sys.stderr.flush()
+                    else:
+                        print(f"[R{rank}] could not locate mlp_final alloc")
+                except Exception as _e:
+                    print(f"[R{rank}] mlp_final snapshot failed: {_e}")
+                # attn_allreduce_out is the 1st size-match at 5888 bytes.
+                try:
+                    if len(matches) >= 1 and attn_ar_dbg_t is not None:
+                        attn_idx = matches[0]
+                        rc2 = mpk.read_shmem_alloc(attn_idx, attn_ar_dbg_t)
+                        print(f"[R{rank}] attn_allreduce_out read idx={attn_idx} rc={rc2}")
+                except Exception as _e:
+                    print(f"[R{rank}] attn_ar snapshot failed: {_e}")
 
             # Debug: check q_workspace and k_cache values
             q_ws_nz = (ck_fmha_q_ws_tensor.abs() > 1e-6).sum().item()
@@ -2833,7 +3123,7 @@ if __name__ == "__main__":
             # 3b. Manual attention from MG attn_in (which matches PT perfectly)
             mg_attn_out = verify_tensors.get("attn_out")
             mg_attn_in_v = verify_tensors.get("attn_in")
-            if mg_attn_out is not None and mg_attn_in_v is not None:
+            if world_size == 1 and mg_attn_out is not None and mg_attn_in_v is not None:
                 from models.modeling_gpt_oss import apply_rotary_pos_emb_neox
                 # Parse QKV from interleaved layout
                 qkv = mg_attn_in_v[0]  # [5120]
@@ -2996,9 +3286,22 @@ if __name__ == "__main__":
                 nonzero = (mg_attn_out.abs() > 1e-6).sum().item()
                 print(f"  MG attn_out non-zero: {nonzero} / {mg_attn_out.numel()}")
 
+            # 4a2. Attention allreduce probe: is attn_allreduce_out == p0+p1 or just p0?
+            mg_attn_ar = verify_tensors.get("attn_ar_dbg")
+            mg_aproj_p = verify_tensors.get("attn_proj_out")
+            if mg_attn_ar is not None and mg_aproj_p is not None:
+                import builtins as _bi2
+                _pp = lambda *a: _bi2.print(f"[R{rank}]", *a, flush=True)
+                d_ar_vs_partial = (mg_attn_ar[0].float() - mg_aproj_p[0].float()).abs().max().item()
+                _pp("--- ATTN ALLREDUCE PROBE ---")
+                _pp("  attn_proj_out (local partial)[:8]:", mg_aproj_p[0, :8].float().tolist())
+                _pp("  attn_allreduce_out (post-AR)[:8]: ", mg_attn_ar[0, :8].float().tolist())
+                _pp("  max|AR - local_partial| =", f"{d_ar_vs_partial:.4f}")
+                _pp("  AR nonzero:", f"{(mg_attn_ar.abs()>1e-6).sum().item()}/{mg_attn_ar.numel()}")
+
             # 4b. O-proj + residual (manual computation from attn_out)
             mg_attn_proj = verify_tensors.get("attn_proj_out")
-            if mg_attn_out is not None and mg_attn_proj is not None:
+            if world_size == 1 and mg_attn_out is not None and mg_attn_proj is not None:
                 # O-proj: attn_out [1, 4096] @ o_proj.weight.T [4096, 2880] + o_proj.bias
                 w_o = layer.self_attn.o_proj.weight.to("cuda")  # [2880, 4096]
                 b_o = layer.self_attn.o_proj.bias.data.to("cuda")  # [2880]
@@ -3103,11 +3406,15 @@ if __name__ == "__main__":
             mg_weights = verify_tensors.get("moe_topk_weight")
             mg_mask = verify_tensors.get("moe_mask")
             if mg_routing is not None and mg_weights is not None:
-                print(f"\n--- MoE Routing ---")
-                print(f"  Routing weights: {mg_weights[0].tolist()}")
+                import builtins as _bi2
+                _bi2.print(f"[R{rank}] --- MoE Routing ---", flush=True)
+                _bi2.print(f"[R{rank}]   Routing weights: {mg_weights[0].tolist()}", flush=True)
                 # Find which experts are active (routing_indices != 0)
                 active = (mg_routing[:, 0] != 0).nonzero().squeeze(-1)
-                print(f"  Active experts: {active.tolist()}")
+                _bi2.print(f"[R{rank}]   Active experts: {active.tolist()}", flush=True)
+                if mg_mask is not None:
+                    _cnt = mg_mask[num_experts].item()
+                    _bi2.print(f"[R{rank}]   moe_mask compact [0:{_cnt}]: {mg_mask[:_cnt].tolist()}", flush=True)
                 for e in active.tolist():
                     slot = mg_routing[e, 0].item()
                     print(f"    Expert {e} -> slot {slot - 1} (raw={slot})")
@@ -3161,7 +3468,17 @@ if __name__ == "__main__":
                 layer = model.model.layers[last_layer_idx]
                 experts_ref = layer.mlp.experts
 
+                # EP-aware per-rank reference: only sum experts THIS rank owns.
+                # Uses GLOBAL unsliced biases from experts_ref (padded on the fly).
+                _ep_lo = ep_base if moe_ep else 0
+                _ep_hi = (ep_base + ep_local) if moe_ep else num_experts
+                gu_bias_all = experts_ref.gate_up_proj_bias.data.to("cuda")  # [E, 2*inter]
+                dp_bias_all = experts_ref.down_proj_bias.data.to("cuda")     # [E, hidden]
+                owned_active = []
                 for e_idx in active.tolist():
+                    if not (_ep_lo <= e_idx < _ep_hi):
+                        continue
+                    owned_active.append(e_idx)
                     slot = mg_routing[e_idx, 0].item() - 1
                     weight = mg_weights_t[0, slot].item()
                     # W13: dequant gate_up from blocks/scales
@@ -3171,7 +3488,8 @@ if __name__ == "__main__":
                         target_out_dim=2*PADDED_INTERMEDIATE_SIZE,
                         target_reduction=PADDED_HIDDEN_SIZE)[0]
                     gate_up = (pt_moe_input.float() @ gate_up_w.float().T).bfloat16()
-                    gu_bias = moe_combined_biases[last_layer_idx][e_idx, :2*PADDED_INTERMEDIATE_SIZE]
+                    gu_bias = torch.nn.functional.pad(
+                        gu_bias_all[e_idx], (0, 2*PADDED_INTERMEDIATE_SIZE - gu_bias_all.shape[1]))
                     gate_up = gate_up + gu_bias
                     # SwigluOAI
                     activated = swigluoai(gate_up.unsqueeze(0)).squeeze(0)
@@ -3182,25 +3500,76 @@ if __name__ == "__main__":
                         target_out_dim=PADDED_HIDDEN_SIZE,
                         target_reduction=PADDED_INTERMEDIATE_SIZE)[0]
                     down_out = (activated.float() @ down_w.float().T).bfloat16()
-                    dp_bias = moe_combined_biases[last_layer_idx][e_idx, 2*PADDED_INTERMEDIATE_SIZE:]
+                    dp_bias = torch.nn.functional.pad(
+                        dp_bias_all[e_idx], (0, PADDED_HIDDEN_SIZE - dp_bias_all.shape[1]))
                     down_out = down_out + dp_bias
                     pt_moe_out += down_out.float() * weight
                     del gate_up_w, down_w, gu_blk, gu_sc, dp_blk, dp_sc
 
-                pt_layer_out = pt_moe_out.bfloat16() + mg_attn_proj[0]  # residual
+                import builtins as _bi
+                _rp = lambda *a, **k: _bi.print(f"[R{rank}]", *a, flush=True, **k)
+                _rp(f"\n[EP rank {rank}] owns experts [{_ep_lo},{_ep_hi}); "
+                      f"owned active this token: {owned_active}")
+                # mg_final = owned-partial + folded residual. rank that folds x adds it;
+                # others fold zero. Default fold rank = 0. So rank!=0 => no residual.
+                _fold_rank = int(os.environ.get("EP_FOLD_RANK", "0"))
+                if moe_ep and rank != _fold_rank:
+                    pt_layer_out = pt_moe_out.bfloat16()  # no residual on non-fold rank
+                else:
+                    pt_layer_out = pt_moe_out.bfloat16() + mg_attn_proj[0]  # residual
 
-                print(f"\n--- MoE Weighted Sum + Residual (layer output) ---")
-                print(f"  PT layer_out[:8]: {pt_layer_out[:8].float().tolist()}")
-                print(f"  MG final[:8]: {mg_final[0, :8].float().tolist()}")
+                _rp(f"\n--- MoE Weighted Sum + Residual (layer output) ---")
+                _rp(f"  PT layer_out[:8]: {pt_layer_out[:8].float().tolist()}")
+                _rp(f"  MG final[:8]: {mg_final[0, :8].float().tolist()}")
                 diff = (pt_layer_out - mg_final[0]).abs().max().item()
-                print(f"  Max abs diff: {diff:.6f}")
+                _rp(f"  Max abs diff: {diff:.6f}")
                 if diff > 0.01:
                     diffs = (pt_layer_out - mg_final[0]).abs().float()
                     top_diff_vals, top_diff_idx = diffs.topk(5)
-                    print(f"  Top-5 diff indices: {top_diff_idx.tolist()}")
-                    print(f"  Top-5 diff values: {top_diff_vals.tolist()}")
+                    _rp(f"  Top-5 diff indices: {top_diff_idx.tolist()}")
+                    _rp(f"  Top-5 diff values: {top_diff_vals.tolist()}")
                 nonzero = (mg_final.abs() > 1e-6).sum().item()
-                print(f"  Non-zero elements: {nonzero} / {mg_final.numel()}")
+                _rp(f"  Non-zero elements: {nonzero} / {mg_final.numel()}")
+
+                # ── Post-allreduce check: full ALL-experts reference vs mlp_final ──
+                # mlp_final should equal sum over ALL active experts + residual x,
+                # regardless of rank (allreduce output is identical on both ranks).
+                mg_ar = verify_tensors.get("mlp_final_dbg")
+                if mg_ar is not None:
+                    pt_full = torch.zeros(PADDED_HIDDEN_SIZE, dtype=torch.float32, device="cuda")
+                    for e_idx in active.tolist():
+                        slot = mg_routing[e_idx, 0].item() - 1
+                        weight = mg_weights_t[0, slot].item()
+                        gu_blk = experts_ref.gate_up_proj_blocks[e_idx:e_idx+1].to("cuda")
+                        gu_sc = experts_ref.gate_up_proj_scales[e_idx:e_idx+1].to("cuda")
+                        gate_up_w = dequant_mxfp4_to_bf16(gu_blk, gu_sc,
+                            target_out_dim=2*PADDED_INTERMEDIATE_SIZE,
+                            target_reduction=PADDED_HIDDEN_SIZE)[0]
+                        gate_up = (pt_moe_input.float() @ gate_up_w.float().T).bfloat16()
+                        gu_bias = torch.nn.functional.pad(
+                            gu_bias_all[e_idx], (0, 2*PADDED_INTERMEDIATE_SIZE - gu_bias_all.shape[1]))
+                        gate_up = gate_up + gu_bias
+                        activated = swigluoai(gate_up.unsqueeze(0)).squeeze(0)
+                        dp_blk = experts_ref.down_proj_blocks[e_idx:e_idx+1].to("cuda")
+                        dp_sc = experts_ref.down_proj_scales[e_idx:e_idx+1].to("cuda")
+                        down_w = dequant_mxfp4_to_bf16(dp_blk, dp_sc,
+                            target_out_dim=PADDED_HIDDEN_SIZE,
+                            target_reduction=PADDED_INTERMEDIATE_SIZE)[0]
+                        down_out = (activated.float() @ down_w.float().T).bfloat16()
+                        dp_bias = torch.nn.functional.pad(
+                            dp_bias_all[e_idx], (0, PADDED_HIDDEN_SIZE - dp_bias_all.shape[1]))
+                        down_out = down_out + dp_bias
+                        pt_full += down_out.float() * weight
+                        del gate_up_w, down_w, gu_blk, gu_sc, dp_blk, dp_sc
+                    pt_full_out = pt_full.bfloat16() + mg_attn_proj[0]  # residual once
+                    _rp(f"\n--- POST-ALLREDUCE mlp_final vs FULL all-experts ref ---")
+                    _rp(f"  PT full[:8]: {pt_full_out[:8].float().tolist()}")
+                    _rp(f"  MG mlp_final[:8]: {mg_ar[0, :8].float().tolist()}")
+                    fdiff = (pt_full_out - mg_ar[0]).abs()
+                    _rp(f"  Max abs diff: {fdiff.max().item():.6f}")
+                    tv, ti = fdiff.float().topk(5)
+                    _rp(f"  Top-5 diff idx: {ti.tolist()}  vals: {tv.tolist()}")
+                    _rp(f"  MG mlp_final nonzero: {(mg_ar.abs()>1e-6).sum().item()}/{mg_ar.numel()}")
                 # What token would PT MoE produce?
                 x_f = pt_layer_out.float()
                 sum_sq = (x_f ** 2).sum()

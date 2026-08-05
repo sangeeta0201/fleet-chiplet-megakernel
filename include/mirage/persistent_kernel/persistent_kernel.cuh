@@ -3727,6 +3727,38 @@ extern "C" void set_rope_tables(void *cos_ptr, void *sin_ptr) {
   global_runtime_config.rope_sin_ptr = sin_ptr;
 }
 
+// Diagnostic: copy `nbytes` from the `index`-th symmetric-heap allocation
+// (allocation order recorded in mpk_shmem_alloc_registry) into device buffer
+// `dst`. Returns 0 on success, -1 on bad index / size. Used by --verify to
+// snapshot the post-allreduce mlp_final tensor -- a symmetric-heap tensor with
+// no torch backing, so the Python side cannot otherwise read it.
+extern "C" int mpk_read_shmem_alloc(int index, void *dst, size_t nbytes) {
+  auto &reg = mpk_shmem_alloc_registry();
+  if (index < 0 || index >= (int)reg.size()) {
+    return -1;
+  }
+  if (nbytes > reg[index].second || reg[index].first == nullptr) {
+    return -1;
+  }
+  (void)cudaMemcpy(dst, reg[index].first, nbytes, cudaMemcpyDeviceToDevice);
+  (void)cudaDeviceSynchronize();
+  return 0;
+}
+
+// Diagnostic: number of recorded symmetric-heap allocations.
+extern "C" int mpk_num_shmem_allocs() {
+  return (int)mpk_shmem_alloc_registry().size();
+}
+
+// Diagnostic: byte size of the index-th symmetric-heap allocation, or 0.
+extern "C" unsigned long long mpk_shmem_alloc_size(int index) {
+  auto &reg = mpk_shmem_alloc_registry();
+  if (index < 0 || index >= (int)reg.size()) {
+    return 0ULL;
+  }
+  return (unsigned long long)reg[index].second;
+}
+
 extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
                                        void *profiler_buffer,
                                        int my_rank,
