@@ -522,6 +522,33 @@ class GptOssForCausalLM(GptOssPreTrainedModel):
         # Value: {"blocks": tensor, "scales": tensor}
         mxfp4_pending = {}
 
+        # Tensor-parallel: rank owns a shard of the attention heads. The model
+        # is constructed with per-rank (halved) attention dims, but the
+        # checkpoint stores full weights, so slice each rank's shard at load.
+        tp_rank = int(os.environ.get("RANK", "0"))
+        head_dim = config.head_dim
+        lq = (config.num_attention_heads // world_size) * head_dim   # local q cols
+        lkv = (config.num_key_value_heads // world_size) * head_dim  # local k/v cols
+        lsink = config.num_attention_heads // world_size            # local sinks
+
+        def _shard_attn(name, t):
+            """Slice a full attention weight to this rank's shard (world_size>1)."""
+            if world_size <= 1:
+                return t
+            if ".self_attn.q_proj.weight" in name or ".self_attn.q_proj.bias" in name:
+                return t[tp_rank * lq:(tp_rank + 1) * lq]
+            if ".self_attn.k_proj.weight" in name or ".self_attn.k_proj.bias" in name:
+                return t[tp_rank * lkv:(tp_rank + 1) * lkv]
+            if ".self_attn.v_proj.weight" in name or ".self_attn.v_proj.bias" in name:
+                return t[tp_rank * lkv:(tp_rank + 1) * lkv]
+            if ".self_attn.o_proj.weight" in name:
+                # row-parallel: slice input columns (dim 1)
+                return t[:, tp_rank * lq:(tp_rank + 1) * lq]
+            if ".self_attn.sinks" in name:
+                return t[tp_rank * lsink:(tp_rank + 1) * lsink]
+            # o_proj.bias kept full (added once on rank0 in the megakernel)
+            return t
+
         for sf_file in safetensor_files:
             state_dict = load_file(sf_file, device="cpu")
             mapped = {}
@@ -541,7 +568,7 @@ class GptOssForCausalLM(GptOssPreTrainedModel):
                         mxfp4_pending[base] = {}
                     mxfp4_pending[base][suffix] = tensor
                     continue
-                mapped[name] = tensor
+                mapped[name] = _shard_attn(name, tensor)
 
             missing, unexpected = model.load_state_dict(mapped, strict=False)
             if unexpected:

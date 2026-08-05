@@ -1056,7 +1056,8 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         std::make_tuple(5, 1, TASK_GANG_MOE_W2_LINEAR_MXFP4_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[2]; // total_tiles_per_xcd
   } else if (name == "gang_moe_fused_mxfp4_mi300") {
-    assert(params.size() == 4);
+    // 4 tile/dispatch params + expert_base + num_local_experts (expert-parallel)
+    assert(params.size() == 6);
     int variant_id = task_register->register_gang_moe_fused_mxfp4_mi300_task(
         customized->bgraph, params);
     task_config[op] =

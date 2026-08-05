@@ -2555,11 +2555,16 @@ int TaskRegister::register_gang_moe_linear_mxfp4_mi300_task(
 // w2_output_per_wg]
 int TaskRegister::register_gang_moe_fused_mxfp4_mi300_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 4);
+  assert(params.size() == 6);
   int tiles_per_expert = params[0];
   int w13_output_per_wg = params[1];
   int total_tiles_per_xcd = params[2];
   int w2_output_per_wg = params[3];
+  // Expert-parallel: rank owns experts [expert_base, expert_base +
+  // num_local_experts). For single-GPU these are 0 and the global expert
+  // count, so the kernel's ownership test is a no-op.
+  int expert_base = params[4];
+  int num_local_experts = params[5];
   (void)tiles_per_expert;
   (void)total_tiles_per_xcd;
 
@@ -2586,9 +2591,18 @@ int TaskRegister::register_gang_moe_fused_mxfp4_mi300_task(
   int batch_size = input_ops[0]->dtensor.dim[0];
   int hidden_size = input_ops[0]->dtensor.dim[1];
 
-  // input[1]: gate_up weights [E, expert_wgs, wg_bytes]
+  // input[1]: gate_up weights [E_local, expert_wgs, wg_bytes]
+  // Under expert-parallel this is the *local* expert count (sliced per rank);
+  // single-GPU it equals the global count.
   assert(input_ops[1]->dtensor.num_dims == 3);
-  int num_experts = input_ops[1]->dtensor.dim[0];
+  int num_local_experts_weight = input_ops[1]->dtensor.dim[0];
+  (void)num_local_experts_weight;
+
+  // input[3]: routing [E_global, batch] -- routing/mask/barrier stay
+  // replicated global structures, so the kernel's NUM_EXPERTS must be the
+  // global count, not the sliced weight count.
+  assert(input_ops[3]->dtensor.num_dims == 2);
+  int num_experts = input_ops[3]->dtensor.dim[0];
 
   // output[0]: swiglu_out [batch, topk, intermediate_size]
   assert(output_ops[0]->dtensor.num_dims == 3);
@@ -2597,14 +2611,17 @@ int TaskRegister::register_gang_moe_fused_mxfp4_mi300_task(
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
-  code.e("kernel::gang_moe_fused_mxfp4_kernel_mi300<$, $, $, $, $, $, $>(",
+  code.e("kernel::gang_moe_fused_mxfp4_kernel_mi300<$, $, $, $, $, $, $, $, "
+         "$>(",
          batch_size,
          intermediate_size,
          hidden_size,
          num_experts,
          num_topk,
          w13_output_per_wg,
-         w2_output_per_wg);
+         w2_output_per_wg,
+         expert_base,
+         num_local_experts);
   code.e("    task_desc->input_ptrs[0],"); // input [batch, hidden]
   code.e("    task_desc->input_ptrs[1],"); // gate_up weights [E, W13_WGS,
                                            // wg_bytes]

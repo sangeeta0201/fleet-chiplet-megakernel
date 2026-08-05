@@ -1967,6 +1967,7 @@ class PersistentKernel:
         w13_output_per_wg: int = 128,
         w2_output_per_wg: int = 64,
         block_dim: tuple = (256, 1, 1),
+        num_experts_global: int = None,
     ):
         """Fused W13+SwiGLU+W2 MoE gang kernel with per-expert pipelining.
         Single gang task replaces separate W13 and W2 tasks. Phase-ordered
@@ -1994,7 +1995,20 @@ class PersistentKernel:
         assert self.target_cc in (94, 95), "Fused MoE MXFP4 only supported on MI300/MI350"
 
         batch_size = self.max_num_batched_tokens
-        num_experts = gate_up_weight.dim(0)
+        # Expert-parallel: gate_up_weight is sliced to this rank's local experts.
+        # The routing/mask/tile space stays GLOBAL, so tile/pad/dispatch math uses
+        # num_experts_global; only the weight storage is local (num_local_experts).
+        num_local_experts = gate_up_weight.dim(0)
+        if num_experts_global is None:
+            num_experts_global = num_local_experts
+        num_experts = num_experts_global
+        # Only shard the expert range when weights are actually sliced per rank
+        # (expert-parallel). When replicated (num_local_experts == global), every
+        # rank owns the full [0, num_experts) range.
+        if num_local_experts < num_experts_global:
+            expert_base = self.mpi_rank * num_local_experts
+        else:
+            expert_base = 0
         w13_wgs = gate_up_weight.dim(1)  # 2*intermediate/W13_OPW
         w2_wgs = down_weight.dim(1)      # hidden/W2_OPW
 
@@ -2040,7 +2054,8 @@ class PersistentKernel:
         )
         self.kn_graph.register_task(
             tb_graph, "gang_moe_fused_mxfp4_mi300",
-            [tiles_per_expert, w13_output_per_wg, total_tiles_per_xcd, w2_output_per_wg],
+            [tiles_per_expert, w13_output_per_wg, total_tiles_per_xcd, w2_output_per_wg,
+             expert_base, num_local_experts],
         )
 
     def gang_moe_swiglu_w2_mxfp4_layer(

@@ -94,7 +94,9 @@ template <int BATCH_SIZE,
           int NUM_EXPERTS,
           int NUM_TOPK,
           int W13_OUTPUT_PER_WG,
-          int W2_OUTPUT_PER_WG>
+          int W2_OUTPUT_PER_WG,
+          int EXPERT_BASE = 0,
+          int NUM_LOCAL_EXPERTS = NUM_EXPERTS>
 __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     void const *input_ptr,          // [batch, hidden] BF16
     void const *gate_up_weight_ptr, // [E, W13_WGS, wg_bytes] MXFP4 (interleaved
@@ -225,6 +227,18 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
           (((unsigned long long)(unsigned char)num_activated_experts) << 32) |
           (((unsigned long long)(is_w2 ? 1 : 0)) << 40));
   int expert_id = d_mask[expert_idx];
+  // Expert-parallel ownership: this rank only computes experts it owns.
+  // Routing/mask/barrier are replicated global structures keyed by expert_id;
+  // only weight/bias storage is local (indexed by local_eid). Skipping both the
+  // W13 (producer) and W2 (consumer) tiles of a non-owned expert means that
+  // expert's per-expert barrier is never used on this rank -> no deadlock.
+  // For single-GPU EXPERT_BASE=0 and NUM_LOCAL_EXPERTS=NUM_EXPERTS, so the
+  // test is always false and local_eid == expert_id.
+  if (expert_id < EXPERT_BASE || expert_id >= EXPERT_BASE + NUM_LOCAL_EXPERTS) {
+    MPK_WS_MARK(8104, global_tile); // exit: expert not owned by this rank
+    return;
+  }
+  int local_eid = expert_id - EXPERT_BASE;
   int const *expert_routing = d_routing + expert_id * BATCH_SIZE;
 
   if (tok_idx >= BATCH_SIZE) {
@@ -255,7 +269,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 
     // Weight pointers
     uint8_t const *expert_weight =
-        W_gate_up + static_cast<int64_t>(expert_id) * W13_EXPERT_BYTES;
+        W_gate_up + static_cast<int64_t>(local_eid) * W13_EXPERT_BYTES;
     uint8_t const *wg_data =
         expert_weight + static_cast<int64_t>(wg_idx) * W13_WG_BYTES;
     uint8_t const *wg_scales = wg_data + W13_WG_DATA;
@@ -761,10 +775,10 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                 wg_idx * W13_OUTPUT_PER_WG + wave_tile_0 * 16 + g * 4 + i;
             if (out_n + 1 < W13_OUTPUT_SIZE) {
               unsigned bt_g =
-                  (unsigned)d_w13_bias[expert_id * W13_OUTPUT_SIZE + out_n]
+                  (unsigned)d_w13_bias[local_eid * W13_OUTPUT_SIZE + out_n]
                   << 16;
               unsigned bt_u =
-                  (unsigned)d_w13_bias[expert_id * W13_OUTPUT_SIZE + out_n + 1]
+                  (unsigned)d_w13_bias[local_eid * W13_OUTPUT_SIZE + out_n + 1]
                   << 16;
               float bias_g;
               __builtin_memcpy(&bias_g, &bt_g, 4);
@@ -983,11 +997,11 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                   wg_idx * W13_OUTPUT_PER_WG + wave_tile_1 * 16 + g * 4 + i;
               if (out_n + 1 < W13_OUTPUT_SIZE) {
                 unsigned bt_g =
-                    (unsigned)d_w13_bias[expert_id * W13_OUTPUT_SIZE + out_n]
+                    (unsigned)d_w13_bias[local_eid * W13_OUTPUT_SIZE + out_n]
                     << 16;
                 unsigned bt_u =
                     (unsigned)
-                        d_w13_bias[expert_id * W13_OUTPUT_SIZE + out_n + 1]
+                        d_w13_bias[local_eid * W13_OUTPUT_SIZE + out_n + 1]
                     << 16;
                 float bias_g;
                 __builtin_memcpy(&bias_g, &bt_g, 4);
@@ -1202,9 +1216,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
           int out_n = wg_idx * W13_OUTPUT_PER_WG + wave_tile * 16 + g * 4 + i;
           if (out_n + 1 < W13_OUTPUT_SIZE) {
             unsigned bt_g =
-                (unsigned)d_w13_bias[expert_id * W13_OUTPUT_SIZE + out_n] << 16;
+                (unsigned)d_w13_bias[local_eid * W13_OUTPUT_SIZE + out_n] << 16;
             unsigned bt_u =
-                (unsigned)d_w13_bias[expert_id * W13_OUTPUT_SIZE + out_n + 1]
+                (unsigned)d_w13_bias[local_eid * W13_OUTPUT_SIZE + out_n + 1]
                 << 16;
             float bias_g;
             __builtin_memcpy(&bias_g, &bt_g, 4);
@@ -1290,7 +1304,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   MPK_WS_MARK(8300, global_tile); // W2 entry
   // Weight pointers — depend only on expert_id/wg_idx, available before barrier
   uint8_t const *expert_weight =
-      W_down + static_cast<int64_t>(expert_id) * W2_EXPERT_BYTES;
+      W_down + static_cast<int64_t>(local_eid) * W2_EXPERT_BYTES;
   uint8_t const *wg_data =
       expert_weight + static_cast<int64_t>(wg_idx) * W2_WG_BYTES;
   uint8_t const *wg_scales = wg_data + W2_WG_DATA;
@@ -1601,7 +1615,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       if (col == 0 && out_n_base < W2_OUTPUT_SIZE) {
         float const *rw_ptr = &d_routing_weight[tok_idx * NUM_TOPK + topk_slot];
         unsigned short const *bias_ptr =
-            &d_w2_bias[expert_id * W2_OUTPUT_SIZE + out_n_base];
+            &d_w2_bias[local_eid * W2_OUTPUT_SIZE + out_n_base];
         asm volatile("global_load_dword %0, %2, off\n"
                      "global_load_dwordx2 %1, %3, off"
                      : "=&v"(pf_rw), "=&v"(pf_bias)
@@ -1972,7 +1986,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
           float const *rw_ptr =
               &d_routing_weight[tok_idx * NUM_TOPK + topk_slot];
           unsigned short const *bias_ptr =
-              &d_w2_bias[expert_id * W2_OUTPUT_SIZE + out_n_base];
+              &d_w2_bias[local_eid * W2_OUTPUT_SIZE + out_n_base];
           asm volatile("global_load_dword %0, %2, off\n"
                        "global_load_dwordx2 %1, %3, off"
                        : "=&v"(pf_rw), "=&v"(pf_bias)

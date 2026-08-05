@@ -10,7 +10,7 @@ FLEET_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # *different* checkout, so both must be pinned or the run silently exercises
 # the wrong codebase.
 export MIRAGE_HOME="$FLEET_HOME"
-export PYTHONPATH="$FLEET_HOME/python:${PYTHONPATH}"
+export PYTHONPATH="$FLEET_HOME/python:${PYTHONPATH:-}"
 
 export USE_FP8_ACT=1
 
@@ -24,11 +24,11 @@ if [ -d /home/claudeuser/ompi/lib ]; then
   export MPI_INC_PATH="${MPI_INC_PATH:-/home/claudeuser/ompi/include}"
   export MPI_LIB_PATH="${MPI_LIB_PATH:-/home/claudeuser/ompi/lib}"
   export PATH="/home/claudeuser/ompi/bin:$PATH"
-  export LD_LIBRARY_PATH="/home/claudeuser/ompi/lib:/home/claudeuser/ucx/lib:/opt/rocm/lib:$LD_LIBRARY_PATH"
+  export LD_LIBRARY_PATH="/home/claudeuser/ompi/lib:/home/claudeuser/ucx/lib:/opt/rocm/lib:${LD_LIBRARY_PATH:-}"
 else
   export MPI_INC_PATH="${MPI_INC_PATH:-/usr/lib/x86_64-linux-gnu/openmpi/include}"
   export MPI_LIB_PATH="${MPI_LIB_PATH:-/usr/lib/x86_64-linux-gnu/openmpi/lib}"
-  export LD_LIBRARY_PATH="$MPI_LIB_PATH:/opt/rocm/lib:$LD_LIBRARY_PATH"
+  export LD_LIBRARY_PATH="$MPI_LIB_PATH:/opt/rocm/lib:${LD_LIBRARY_PATH:-}"
 fi
 
 # Every knob the multi-GPU path reads, forwarded to both ranks by mpirun.
@@ -48,6 +48,7 @@ MPK_FORWARD_VARS=(
   MPK_OVERLAP_XGPU MPK_DEVICE_ACCUM
   FUSE_FULL_LAYER FUSE_FULL_LAYER_MGPU FUSE_QKV_ATTN FUSE_OPROJ_MOE
   PRECOMPUTED_DISPATCH USE_GANG PPL_MODE PPL_MXFP4_MATCH
+  MLP_DBG MLP_FINAL_IDX
 )
 
 mpk_x_args() {
