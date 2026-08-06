@@ -549,14 +549,43 @@ if __name__ == "__main__":
     if rank != 0:
         print = lambda *_, **__: None
 
+    # ATTN_DP: data-parallel attention instead of tensor-parallel.
+    #
+    # Under TP the attention heads are split across ranks and o_proj is row-
+    # parallel, so its output must be SUM-allreduced before the router sees it.
+    # That is allreduce #1, and with the MoE combine (#2) it makes 72 cross-GPU
+    # syncs per token over 36 layers. At bs=1 there is no other work to hide
+    # them behind: measured per-layer gap is 59.93us against 33.60us of compute
+    # (see MULTI_GPU_NOTES.md), so the syncs, not the math, are the latency.
+    #
+    # Under DP every rank keeps ALL 64 q / 8 kv heads and the whole KV cache,
+    # and runs the identical attention on the identical token. The result is
+    # already complete on both ranks, so allreduce #1 disappears entirely --
+    # 72 syncs become 36. The cost is that attention compute and KV-cache
+    # memory are replicated rather than split, which at bs=1 is nearly free:
+    # attention is a tiny share of the step and the KV cache for one sequence
+    # is small. It stops being free at large batch or long context.
+    #
+    # Because the result is complete per-rank, the residual and the o_proj bias
+    # must be added on EVERY rank (under TP they are added on rank0 only, since
+    # the allreduce would otherwise sum them world_size times).
+    attn_dp = world_size > 1 and os.environ.get("ATTN_DP", "0") == "1"
+    # The effective world size for anything that shards attention. Passing this
+    # to from_pretrained is what disables _shard_attn and sizes the KV cache /
+    # q_proj / o_proj / sinks for the full head count.
+    attn_ws = 1 if attn_dp else world_size
+
     print("Input arguments:", args)
     print(f"world_size({world_size}) rank({rank})")
+    if attn_dp:
+        print("[ATTN_DP] attention replicated per rank; "
+              "attn allreduce (#1) removed")
     torch.set_default_dtype(torch.bfloat16)
     torch.cuda.set_device(rank)
 
     with torch.device("cuda"):
         model = GptOssForCausalLM.from_pretrained(
-            args.model_path, world_size,
+            args.model_path, attn_ws,
             max_num_pages=args.max_num_pages, page_size=args.page_size
         ).to(dtype=torch.bfloat16, device="cuda")
         tokenizer = AutoTokenizer.from_pretrained(args.model_path)
@@ -658,8 +687,9 @@ if __name__ == "__main__":
     intermediate_size = config.intermediate_size  # 2880
     num_q_heads = config.num_attention_heads  # 64
     num_kv_heads = config.num_key_value_heads  # 8
-    num_local_q_heads = num_q_heads // world_size
-    num_local_kv_heads = num_kv_heads // world_size
+    # attn_ws, not world_size: under ATTN_DP every rank owns every head.
+    num_local_q_heads = num_q_heads // attn_ws
+    num_local_kv_heads = num_kv_heads // attn_ws
     head_dim = config.head_dim                # 64
     fused_qkv_dim = (num_local_q_heads + 2 * num_local_kv_heads) * head_dim  # 5120
     num_experts = config.num_local_experts    # 128
@@ -1746,6 +1776,14 @@ if __name__ == "__main__":
                     # KV-head count is 8//world_size (=4 for 2 GPUs), so that
                     # XCD-based mapping breaks (K/V cache never written). Use the
                     # non-fused path instead, mirroring qwen3's working TP path:
+                    #
+                    # TODO: under ATTN_DP num_local_kv_heads is back to 8, so the
+                    # XCD mapping holds and this could gate on `attn_ws > 1`
+                    # instead, folding the kv_cache_update task back into the QKV
+                    # gang. Left alone deliberately: that flips three coupled
+                    # conditions (here, the fuse_qkv_attn branch below, and the
+                    # standalone-attention guard) and DP is being landed with
+                    # correctness measured one variable at a time.
                     #   (1) plain MXFP4 QKV linear -> attn_in (interleaved by KV
                     #       group), then (2) a separate kv_cache_update task whose
                     #       grid is sized by num_local_kv_heads (not XCD count).
@@ -2134,10 +2172,16 @@ if __name__ == "__main__":
             # Row-parallel o_proj output is SUM-allreduced across ranks, so the
             # residual and bias must be added exactly once. Add them on rank 0
             # only; zero them on every other rank.
-            if world_size > 1 and rank != 0:
+            #
+            # Under ATTN_DP there is no allreduce here -- each rank's o_proj
+            # output is already the complete result -- so both must be added on
+            # EVERY rank. Zeroing them on rank 1 under DP would leave rank 1
+            # with a residual-free hidden state, and the two ranks would then
+            # diverge from the next layer onward.
+            if world_size > 1 and rank != 0 and not attn_dp:
                 o_bias = torch.zeros_like(o_bias)
             w_o_bias = _attach_input_keep(o_bias, f"layer_{i}_o_bias")
-            if world_size > 1 and rank != 0:
+            if world_size > 1 and rank != 0 and not attn_dp:
                 o_residual = zero_residual
             else:
                 o_residual = x
@@ -2274,7 +2318,7 @@ if __name__ == "__main__":
                     print(f"  bias pad [2880:] all zero: {(o_bias[0, 2880:].abs().max().item() == 0)}")
                 x = attn_proj_out
 
-                if world_size > 1:
+                if world_size > 1 and not attn_dp:
                     # The mxfp4 gang o_proj runs grid (8,1,1). The allreduce
                     # (allgather+reduce) is only known-correct at grid
                     # (hidden//64) (matches qwen3). Decouple via a grid-46
