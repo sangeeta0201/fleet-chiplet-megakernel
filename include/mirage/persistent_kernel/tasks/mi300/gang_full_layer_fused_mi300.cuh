@@ -542,23 +542,26 @@ __device__ __noinline__ void
     constexpr int OPROJ_SLPT = (OPROJ_N16_SCALE + 255) / 256;
     constexpr int OPROJ_SCALE_PAD = OPROJ_SLPT * 256 * 16;
 
-    // Activations are FP8 E4M3: one byte per element, one E8M0 scale byte per
-    // 32-element block. See _gang_wave_parallel_fp8_quant.
-    constexpr int OPROJ_FP_TOK = OPROJ_REDUCTION_SIZE;
-    constexpr int OPROJ_FP_SCL = OPROJ_NUM_B32;
+    // Weight region base. This must agree byte-for-byte with the O-proj
+    // kernel's own OPROJ_LDS_OFF -- the DMA below writes where this says and
+    // the MFMA reads where that says, and a mismatch is silent wrong
+    // numerics. Both derive it from the same constexpr function.
     constexpr int OPROJ_LDS_W_OFF =
-        ((OPROJ_FP_TOK + OPROJ_FP_SCL + 15) / 16) * 16;
+        oproj_lds_w_off(QKV_BATCH_SIZE, OPROJ_REDUCTION_SIZE);
 
     extern __shared__ char _oproj_pf_smem[];
 
     int oproj_tile_idx_pf = xcd_id * oproj_topk_tiles_per_xcd + xcd_rank;
-    int oproj_tok_pf =
+    // Tile space is (column block, weight group) now, matching the O-proj
+    // kernel's decode. The weight group is what selects the DMA source; the
+    // column block only decides whether this tile has any live token at all.
+    int oproj_bblk_pf =
         (xcd_rank % oproj_topk_tiles_per_xcd) / oproj_n_wgs_per_xcd;
     int oproj_wg_pf =
         (xcd_rank % oproj_topk_tiles_per_xcd) % oproj_n_wgs_per_xcd;
 
     if (xcd_rank < oproj_topk_tiles_per_xcd &&
-        oproj_tok_pf < num_active_tokens) {
+        oproj_bblk_pf * 16 < num_active_tokens) {
       uint8_t const *oproj_W = (uint8_t const *)input_ptrs[9];
       uint32_t oproj_buf_range =
           static_cast<uint32_t>(oproj_n_wgs_per_xcd) * OPROJ_WG_BYTES;

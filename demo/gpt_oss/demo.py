@@ -529,15 +529,12 @@ if __name__ == "__main__":
     ppl_mode = os.environ.get("PPL_MODE", "0") == "1"
     ppl_token_ids = None
     if ppl_mode:
-        if args.use_mirage and args.max_num_batched_tokens != 1:
-            # The LM head task RMSNorms batch_count rows but feeds only row 0
-            # to the GEMM, so a multi-token iteration would emit one logit row
-            # for a batch of positions. Perplexity needs one row per position.
-            raise ValueError(
-                "PPL_MODE requires --max-num-batched-tokens 1; the LM head "
-                f"emits one logit row per iteration (got "
-                f"{args.max_num_batched_tokens})."
-            )
+        # The bs==1 restriction that used to live here is gone: the LM head
+        # RMSNormed batch_count rows but fed only row 0 to the GEMM, so a
+        # multi-token iteration emitted one logit row for a whole batch of
+        # positions. It now packs tokens onto the MFMA's N axis (token `col`
+        # occupies column `col`) and writes one row per position with
+        # argmax_row_stride, which is exactly what perplexity needs.
         if args.use_mirage and os.environ.get("FUSE_TAIL", "0") == "1":
             # The fused tail never dereferences its lm_logits output pointer,
             # so it has no logits sink to attach.
@@ -2556,29 +2553,47 @@ if __name__ == "__main__":
                       f"kernel_token={kernel_top} -> {ok}")
 
                 # Stronger: the same last iteration also left 240 per-worker
-                # (max, abs_idx) pairs in argmax_part_*. Each worker owns a
-                # known set of 64-column tiles, so recomputing its max from
-                # the sink and comparing checks every column of the row, not
-                # just the single winner above.
-                pv = _tensor_refs["argmax_part_value"][0].float()
-                pi = _tensor_refs["argmax_part_index"][0]
+                # (max, abs_idx) pairs in argmax_part_* for EACH of its token
+                # rows. Each worker owns a known set of 64-column tiles, so
+                # recomputing its max from the sink and comparing checks every
+                # column of the row, not just the single winner above.
+                #
+                # argmax_part_* is [batch, num_workers] and row `t` holds the
+                # partials for the token the last iteration placed at sink row
+                # `last_base + t`. Indexing it at [0] and comparing against
+                # sink row n_ppl is only correct at bs==1, where the last
+                # iteration carried a single token and those two coincide; at
+                # bs>1 row 0 belongs to the *first* token of the final chunk
+                # and mismatches every column. Derive the base instead and
+                # check all the rows the last iteration actually wrote.
+                bt = args.max_num_batched_tokens
+                # Scored sink rows are 1..n_ppl. Prefill consumes `bt` tokens
+                # per iteration, so the final chunk covers the last
+                # `n_last = ((n_ppl - 1) % bt) + 1` of them.
+                n_last = ((n_ppl - 1) % bt) + 1
+                last_base = n_ppl - n_last + 1
                 wpx = mpk.num_workers // 8               # workers per XCD
                 nwg = (vocab_size // lm_head_output_per_wg) // 8
-                sink_row = ppl_logits_torch[n_ppl]
-                bad_idx = bad_val = 0
+                # Column sets are token-independent -- build them once.
+                col_sets = []
                 for p in range(8):
                     pstart = p * nwg * lm_head_output_per_wg
                     for r in range(wpx):
-                        cols = torch.cat([
+                        col_sets.append(torch.cat([
                             torch.arange(
                                 pstart + wg * lm_head_output_per_wg,
                                 pstart + (wg + 1) * lm_head_output_per_wg,
                                 device="cuda")
                             for wg in range(r, nwg, wpx)
-                        ])
+                        ]))
+                bad_idx = bad_val = 0
+                for t in range(n_last):
+                    pv = _tensor_refs["argmax_part_value"][t].float()
+                    pi = _tensor_refs["argmax_part_index"][t]
+                    sink_row = ppl_logits_torch[last_base + t]
+                    for w, cols in enumerate(col_sets):
                         vals = sink_row[cols]
                         k = int(vals.argmax().item())
-                        w = p * wpx + r
                         if int(cols[k].item()) != int(pi[w].item()):
                             bad_idx += 1
                         # argmax_part_value is bf16: 8 mantissa bits, so
@@ -2587,7 +2602,8 @@ if __name__ == "__main__":
                                 0.02 * max(1.0, abs(float(pv[w]))):
                             bad_val += 1
                 print(f"[PPL] sink/per-worker-argmax check over all "
-                      f"{mpk.num_workers} workers: "
+                      f"{mpk.num_workers} workers x {n_last} token rows "
+                      f"(sink rows {last_base}..{last_base + n_last - 1}): "
                       f"{bad_idx} index mismatches, {bad_val} value "
                       f"mismatches -> "
                       f"{'OK' if bad_idx == 0 and bad_val == 0 else 'MISMATCH'}")

@@ -1919,13 +1919,24 @@ class PersistentKernel:
         assert self.target_cc in (94, 95), "Fused MoE MXFP4 only supported on MI300/MI350"
 
         batch_size = self.max_num_batched_tokens
+        # Tokens ride the MFMA's N axis (16 columns), not the tile axis, so a
+        # phase needs one tile block per 16 tokens rather than one per token.
+        # At batch_size <= 16 this is 1 and every count below is arithmetically
+        # what it was before packing. Only the N-packed kernels use this; the
+        # unpacked variants above still multiply by batch_size.
+        n_bblk = (batch_size + 15) // 16
         num_experts = gate_up_weight.dim(0)
         w13_wgs = gate_up_weight.dim(1)  # 2*intermediate/W13_OPW
         w2_wgs = down_weight.dim(1)      # hidden/W2_OPW
 
         # Combined tile count: W13 tiles + W2 tiles (phase-ordered in kernel)
-        w13_tiles = batch_size * w13_wgs
-        w2_tiles = batch_size * w2_wgs
+        # Must match gang_moe_fused_mxfp4_mi300.cuh's W13_TILES/W2_TILES. The
+        # kernel drops the token axis from the tile space so that every tile it
+        # counts actually arrives at the W13->W2 barrier; if this host count
+        # disagrees, the `% W13_TILES` modulus there never fires and the W2
+        # workers spin forever.
+        w13_tiles = n_bblk * w13_wgs
+        w2_tiles = n_bblk * w2_wgs
         tiles_per_expert = w13_tiles + w2_tiles
 
         num_topk = swiglu_out.dim(1)
@@ -2845,10 +2856,16 @@ class PersistentKernel:
         assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
 
         batch_size = self.max_num_batched_tokens
+        # Tokens ride the MFMA's N axis (16 columns), not the tile axis, so a
+        # phase needs one tile block per 16 tokens rather than one per token.
+        # At batch_size <= 16 this is 1 and every count below is arithmetically
+        # what it was before packing. Only the N-packed kernels use this; the
+        # unpacked variants above still multiply by batch_size.
+        n_bblk = (batch_size + 15) // 16
         n_wgs = mxfp4_weight.dim(0)
         assert n_wgs % 8 == 0
         n_wgs_per_xcd = n_wgs // 8
-        total_tiles_per_xcd = batch_size * n_wgs_per_xcd
+        total_tiles_per_xcd = n_bblk * n_wgs_per_xcd
         grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         # 6 inputs
@@ -2915,10 +2932,16 @@ class PersistentKernel:
         assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
 
         batch_size = self.max_num_batched_tokens
+        # Tokens ride the MFMA's N axis (16 columns), not the tile axis, so a
+        # phase needs one tile block per 16 tokens rather than one per token.
+        # At batch_size <= 16 this is 1 and every count below is arithmetically
+        # what it was before packing. Only the N-packed kernels use this; the
+        # unpacked variants above still multiply by batch_size.
+        n_bblk = (batch_size + 15) // 16
         n_wgs = mxfp4_weight.dim(0)
         assert n_wgs % 8 == 0
         n_wgs_per_xcd = n_wgs // 8
-        total_qkv_tiles_per_xcd = batch_size * n_wgs_per_xcd
+        total_qkv_tiles_per_xcd = n_bblk * n_wgs_per_xcd
 
         has_sinks = 1 if sinks is not None else 0
         q_workspace_stride = q_workspace.dim(1)
@@ -3069,12 +3092,18 @@ class PersistentKernel:
         assert output.num_dims == 2
         assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
         batch_size = self.max_num_batched_tokens
+        # Tokens ride the MFMA's N axis (16 columns), not the tile axis, so a
+        # phase needs one tile block per 16 tokens rather than one per token.
+        # At batch_size <= 16 this is 1 and every count below is arithmetically
+        # what it was before packing. Only the N-packed kernels use this; the
+        # unpacked variants above still multiply by batch_size.
+        n_bblk = (batch_size + 15) // 16
 
         # O-PROJ tiling
         n_wgs = mxfp4_weight.dim(0)
         assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
         n_wgs_per_xcd = n_wgs // 8
-        oproj_tiles_per_xcd = batch_size * n_wgs_per_xcd
+        oproj_tiles_per_xcd = n_bblk * n_wgs_per_xcd
 
         # TopK tiling (one expert per worker)
         router_output_size = router_weight.dim(0)
@@ -3171,12 +3200,18 @@ class PersistentKernel:
         assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
 
         batch_size = self.max_num_batched_tokens
+        # Tokens ride the MFMA's N axis (16 columns), not the tile axis, so a
+        # phase needs one tile block per 16 tokens rather than one per token.
+        # At batch_size <= 16 this is 1 and every count below is arithmetically
+        # what it was before packing. Only the N-packed kernels use this; the
+        # unpacked variants above still multiply by batch_size.
+        n_bblk = (batch_size + 15) // 16
 
         # O-PROJ tiling (same as task 213)
         n_wgs = oproj_weight.dim(0)
         assert n_wgs % 8 == 0
         n_wgs_per_xcd = n_wgs // 8
-        oproj_tiles_per_xcd = batch_size * n_wgs_per_xcd
+        oproj_tiles_per_xcd = n_bblk * n_wgs_per_xcd
 
         # TopK tiling (same as task 213)
         router_output_size = router_weight.dim(0)
@@ -3200,8 +3235,13 @@ class PersistentKernel:
         max_activated = min(num_topk * batch_size, moe_num_experts)
         PAD_MULTIPLE = 240
 
-        w13_tiles = batch_size * w13_wgs
-        w2_tiles = batch_size * w2_wgs
+        # Must match gang_moe_fused_mxfp4_mi300.cuh's W13_TILES/W2_TILES. The
+        # kernel drops the token axis from the tile space so that every tile it
+        # counts actually arrives at the W13->W2 barrier; if this host count
+        # disagrees, the `% W13_TILES` modulus there never fires and the W2
+        # workers spin forever.
+        w13_tiles = n_bblk * w13_wgs
+        w2_tiles = n_bblk * w2_wgs
         total_w13_real = max_activated * w13_tiles
         total_w13_padded = ((total_w13_real + PAD_MULTIPLE - 1) // PAD_MULTIPLE) * PAD_MULTIPLE
         total_w2 = max_activated * w2_tiles
@@ -3331,12 +3371,17 @@ class PersistentKernel:
         assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
 
         batch_size = self.max_num_batched_tokens
+        # Tokens ride the MFMA's N axis (16 columns), not the tile axis, so a
+        # phase needs one tile block per 16 tokens rather than one per token.
+        # At batch_size <= 16 this is 1 and every count below is arithmetically
+        # what it was before packing.
+        n_bblk = (batch_size + 15) // 16
 
         # QKV tiling (from type 214)
         qkv_n_wgs = qkv_weight.dim(0)
         assert qkv_n_wgs % 8 == 0
         qkv_n_wgs_per_xcd = qkv_n_wgs // 8
-        total_qkv_tiles_per_xcd = batch_size * qkv_n_wgs_per_xcd
+        total_qkv_tiles_per_xcd = n_bblk * qkv_n_wgs_per_xcd
 
         has_sinks = 1 if sinks is not None else 0
         q_workspace_stride = q_workspace.dim(1)
@@ -3346,7 +3391,7 @@ class PersistentKernel:
         oproj_n_wgs = oproj_weight.dim(0)
         assert oproj_n_wgs % 8 == 0
         oproj_n_wgs_per_xcd = oproj_n_wgs // 8
-        oproj_tiles_per_xcd = batch_size * oproj_n_wgs_per_xcd
+        oproj_tiles_per_xcd = n_bblk * oproj_n_wgs_per_xcd
         oproj_output_stride = norm_scratch_post.dim(1)
 
         # TopK tiling
@@ -3366,8 +3411,13 @@ class PersistentKernel:
 
         intermediate_size = swiglu_out.dim(2)
 
-        w13_tiles = batch_size * w13_wgs
-        w2_tiles = batch_size * w2_wgs
+        # Must match gang_moe_fused_mxfp4_mi300.cuh's W13_TILES/W2_TILES. The
+        # kernel drops the token axis from the tile space so that every tile it
+        # counts actually arrives at the W13->W2 barrier; if this host count
+        # disagrees, the `% W13_TILES` modulus there never fires and the W2
+        # workers spin forever.
+        w13_tiles = n_bblk * w13_wgs
+        w2_tiles = n_bblk * w2_wgs
         total_w13_real = max_activated * w13_tiles
         total_w13_padded = ((total_w13_real + PAD_MULTIPLE - 1) // PAD_MULTIPLE) * PAD_MULTIPLE
         total_w2 = max_activated * w2_tiles
@@ -3519,12 +3569,18 @@ class PersistentKernel:
         assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
 
         batch_size = self.max_num_batched_tokens
+        # Tokens ride the MFMA's N axis (16 columns), not the tile axis, so a
+        # phase needs one tile block per 16 tokens rather than one per token.
+        # At batch_size <= 16 this is 1 and every count below is arithmetically
+        # what it was before packing. Only the N-packed kernels use this; the
+        # unpacked variants above still multiply by batch_size.
+        n_bblk = (batch_size + 15) // 16
 
         # QKV tiling
         qkv_n_wgs = qkv_weight.dim(0)
         assert qkv_n_wgs % 8 == 0
         qkv_n_wgs_per_xcd = qkv_n_wgs // 8
-        total_qkv_tiles_per_xcd = batch_size * qkv_n_wgs_per_xcd
+        total_qkv_tiles_per_xcd = n_bblk * qkv_n_wgs_per_xcd
 
         has_sinks = 1 if sinks is not None else 0
         q_workspace_stride = q_workspace.dim(1)
@@ -3533,7 +3589,7 @@ class PersistentKernel:
         # O-PROJ tiling
         oproj_n_wgs = oproj_weight.dim(0)
         assert oproj_n_wgs % 8 == 0
-        oproj_tiles_per_xcd = batch_size * (oproj_n_wgs // 8)
+        oproj_tiles_per_xcd = n_bblk * (oproj_n_wgs // 8)
         oproj_output_stride = norm_scratch_post.dim(1)
 
         # TopK tiling
@@ -3553,8 +3609,13 @@ class PersistentKernel:
 
         intermediate_size = swiglu_out.dim(2)
 
-        w13_tiles = batch_size * w13_wgs
-        w2_tiles = batch_size * w2_wgs
+        # Must match gang_moe_fused_mxfp4_mi300.cuh's W13_TILES/W2_TILES. The
+        # kernel drops the token axis from the tile space so that every tile it
+        # counts actually arrives at the W13->W2 barrier; if this host count
+        # disagrees, the `% W13_TILES` modulus there never fires and the W2
+        # workers spin forever.
+        w13_tiles = n_bblk * w13_wgs
+        w2_tiles = n_bblk * w2_wgs
         total_w13_real = max_activated * w13_tiles
         total_w13_padded = ((total_w13_real + PAD_MULTIPLE - 1) // PAD_MULTIPLE) * PAD_MULTIPLE
         total_w2 = max_activated * w2_tiles

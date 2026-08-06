@@ -237,7 +237,10 @@ __device__ __forceinline__ int get_xcd_id() {
 // Without this, inlining TopK into the persistent_kernel function causes the
 // compiler's instruction scheduler to pessimize the CK GEMM pipeline, making
 // ALL task types ~5-12% slower.
-template <typename T, int NUM_EXPERTS, int K>
+// ROUTING_ROW_STRIDE is the *allocated* row stride of routing_indices
+// (BATCH_SIZE), which is not num_active_tokens -- see the note on
+// topk_softmax_mi300_task_impl's routing_row_stride parameter.
+template <typename T, int NUM_EXPERTS, int K, int ROUTING_ROW_STRIDE>
 __device__ __attribute__((noinline)) void
     topk_noinline(void *logits_scratch_ptr,
                   void *topk_weight_ptr,
@@ -263,6 +266,7 @@ __device__ __attribute__((noinline)) void
                                /*BYTES_PER_LDG=*/16>(logits_base,
                                                      topk_weight_ptr,
                                                      num_active_tokens,
+                                                     ROUTING_ROW_STRIDE,
                                                      K,
                                                      routing_indices_ptr,
                                                      active_expert_ids_ptr,
@@ -463,7 +467,7 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
 
   // ═══ Step 4: Last worker runs TopK softmax ═══
   if (completed == total_gang_tiles) {
-    gang_rmsnorm_topk_detail::topk_noinline<T, NUM_EXPERTS, K>(
+    gang_rmsnorm_topk_detail::topk_noinline<T, NUM_EXPERTS, K, BATCH_SIZE>(
         logits_scratch_ptr,
         topk_weight_ptr,
         routing_indices_ptr,

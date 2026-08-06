@@ -32,8 +32,17 @@ python3 demo/gpt_oss/demo.py --use-mirage \
 ```
 
 Read the **`Decode avg`** line for per-token decode latency (~2.0 ms/tok). Drop
-`--use-mirage` to run the PyTorch reference instead. Only **batch size 1** is
-supported for GPT-OSS 120B.
+`--use-mirage` to run the PyTorch reference instead.
+
+GPT-OSS 120B supports **up to 16 tokens per iteration** in a single request
+(`--max-num-batched-tokens 1..16`). Tokens ride the N axis of the
+`16x16x128` scaled-MFMA instruction, which was already computing 16 columns for
+one token, so the dense GEMMs cost the same for 16 tokens as for 1 and only the
+MoE grows — with the number of *distinct* experts the batch activates, not with
+the token count. Measured prefill: 2.09 / 4.06 / 5.11 / 6.55 / 8.51 ms at
+1 / 2 / 4 / 8 / 16 tokens, i.e. 16 tokens for 4.1x the cost of one. Multiple
+concurrent *requests* (`--max-num-batched-requests > 1`) are not supported yet;
+attention still assumes a single KV cache.
 
 ### Correctness test (Torch vs Mirage)
 
