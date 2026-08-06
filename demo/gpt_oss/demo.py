@@ -1473,6 +1473,14 @@ if __name__ == "__main__":
             oproj_topk_counters = make_tensor("oproj_topk_counters", (counter_size,), torch_dtype=torch.int32)
         # Hierarchical barrier for fused QKV+Attention kernel [16 int32]:
         # [0..7]: per-XCD QKV arrival counters, [8]: global leader count
+        # Under DATA-PARALLEL attention with replicated MoE there is not a single
+        # collective left in the step: every rank runs the complete model on the
+        # same token. Per rank the task graph is therefore identical to the
+        # single-GPU one, so every single-GPU fusion is legal. The `world_size==1`
+        # guards below exist because TENSOR parallelism breaks them (sharded KV
+        # heads break the kv_head=xcd_id mapping; a mid-layer allreduce splits
+        # o_proj from the router) -- neither applies here. Gate on this instead.
+        dp_local = attn_dp and not moe_ep
         fuse_qkv_attn = os.environ.get("FUSE_QKV_ATTN", "1") == "1"
         # Gang QKV+Attn fusion uses the chunks=1 internal attention path; for
         # chunks>1 we fall back to separate QKV→attn→merge tasks.
@@ -1769,21 +1777,18 @@ if __name__ == "__main__":
             if use_ck_fmha and args.split_kv_cache and qkv_output_per_wg >= head_dim:
                 # Fused QKV + KV cache update: epilogue applies RoPE and
                 # writes Q→q_workspace, K/V→paged caches directly.
-                if world_size > 1:
-                    # Multi-GPU: the fused gang_rmsnorm_linear_mxfp4_bias_kvupd
-                    # kernel hard-maps kv_head = physical XCD id (requires
+                if world_size > 1 and not dp_local:
+                    # Multi-GPU TENSOR-PARALLEL: the fused
+                    # gang_rmsnorm_linear_mxfp4_bias_kvupd kernel hard-maps
+                    # kv_head = physical XCD id (requires
                     # num_kv_heads == 8 XCDs). With tensor parallelism the local
                     # KV-head count is 8//world_size (=4 for 2 GPUs), so that
                     # XCD-based mapping breaks (K/V cache never written). Use the
                     # non-fused path instead, mirroring qwen3's working TP path:
                     #
-                    # TODO: under ATTN_DP num_local_kv_heads is back to 8, so the
-                    # XCD mapping holds and this could gate on `attn_ws > 1`
-                    # instead, folding the kv_cache_update task back into the QKV
-                    # gang. Left alone deliberately: that flips three coupled
-                    # conditions (here, the fuse_qkv_attn branch below, and the
-                    # standalone-attention guard) and DP is being landed with
-                    # correctness measured one variable at a time.
+                    # Under DATA-PARALLEL attention num_local_kv_heads is back to
+                    # 8, so the XCD mapping is valid again and dp_local falls
+                    # through to the proven single-GPU fused branches below.
                     #   (1) plain MXFP4 QKV linear -> attn_in (interleaved by KV
                     #       group), then (2) a separate kv_cache_update task whose
                     #       grid is sized by num_local_kv_heads (not XCD count).
@@ -1812,7 +1817,7 @@ if __name__ == "__main__":
                                   num_local_kv_heads, 1),
                         block_dim=(256, 1, 1),
                     )
-                elif fuse_full_layer and world_size == 1:
+                elif fuse_full_layer and (world_size == 1 or dp_local):
                     # Full-layer fused: QKV+Attn+O-proj+TopK+MoE in one dispatch
                     # O-proj weight prep (moved up from below)
                     w_o = pad_weight_2d(
@@ -2064,7 +2069,7 @@ if __name__ == "__main__":
                     )
                     x = mlp_weighted_sum_out
 
-                if not fuse_qkv_attn or i == 0 or world_size > 1:
+                if not fuse_qkv_attn or i == 0 or (world_size > 1 and not dp_local):
                     # Separate attention task (layer 0 or unfused path).
                     # For chunks>1, write float partials to ck_fmha_o_acc and
                     # apply sinks in the merge step (decode kernel only fuses
@@ -2212,7 +2217,7 @@ if __name__ == "__main__":
             router_bias = layer.mlp.router.bias.data.to("cuda").unsqueeze(0).contiguous()  # [1, 128]
             w_router_bias = _attach_input_keep(router_bias, f"layer_{i}_router_bias")
 
-            if is_rocm and fuse_oproj_moe and world_size == 1:
+            if is_rocm and fuse_oproj_moe and (world_size == 1 or dp_local):
                 # Fused O-PROJ + TopK + MoE in a single gang task (type 215)
                 w_gatedup = _attach_input_keep(
                     moe_gate_up_proj_weights[i], f"layer_{i}_gate_up_proj"
@@ -2263,7 +2268,7 @@ if __name__ == "__main__":
                     block_dim=(256, 1, 1),
                 )
                 x = attn_proj_out
-            elif is_rocm and fuse_oproj_topk and world_size == 1:
+            elif is_rocm and fuse_oproj_topk and (world_size == 1 or dp_local):
                 # Fused O-PROJ + RMSNorm + Router + TopK in single gang task
                 mpk.gang_linear_mxfp4_res_bias_rmsnorm_topk_layer(
                     input=attn_out,
@@ -2344,7 +2349,7 @@ if __name__ == "__main__":
                     )
                     x = attn_allreduce_out
 
-                if world_size == 1:
+                if world_size == 1 or dp_local:
                     # Fused RMSNorm + Router linear + TopK softmax
                     mpk.gang_rmsnorm_linear_bias_topk_layer(
                         norm_input=x,
@@ -2384,7 +2389,7 @@ if __name__ == "__main__":
                         block_dim=(256, 1, 1),
                     )
 
-            if not (is_rocm and fuse_oproj_moe and world_size == 1):
+            if not (is_rocm and fuse_oproj_moe and (world_size == 1 or dp_local)):
                 # Fused W13+SwiGLU+W2 gang MXFP4 (single task, per-expert barrier)
                 # Phase-ordered: all W13 tiles before all W2 tiles.
                 # Eliminates scheduler gap between W13→W2 events.
@@ -2473,7 +2478,7 @@ if __name__ == "__main__":
                     block_dim=(128, 1, 1),
                 )
                 x = mlp_final
-            elif i == num_layers - 1 or world_size > 1:
+            elif i == num_layers - 1 or (world_size > 1 and not dp_local):
                 # Non-EP (replicated MoE): the full weighted sum is already present
                 # on every rank, so fold the residual directly.
                 mpk.moe_residual_add_f32_layer(

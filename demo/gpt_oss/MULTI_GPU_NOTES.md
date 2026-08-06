@@ -121,6 +121,53 @@ checking that rank0's partial + rank1's partial equalled the post-allreduce
 tests the allreduce, not the experts. Reading the generated text catches it
 immediately.
 
+## 3d. Fusion under DP: enabled, but the payload fusion is broken on 1 GPU too
+
+Under `ATTN_DP=1 MOE_EP=0` there is not one collective left in the step: each
+rank runs the complete model on the same token, so per rank the task graph is
+*identical* to the single-GPU one and every single-GPU fusion is legal. The
+seven `world_size == 1` fusion guards were gating on the wrong thing — they
+exist because TENSOR parallelism breaks fusion (sharded KV heads break the
+`kv_head == xcd_id` mapping; a mid-layer allreduce splits o_proj from the
+router), and neither applies here. They now gate on
+`dp_local = attn_dp and not moe_ep`.
+
+Measured, 2 GPU, DP + replicated MoE, decode ms/token:
+
+| FUSE_QKV_ATTN | FUSE_OPROJ_TOPK | FUSE_FULL_LAYER | ms | output |
+|---|---|---|---|---|
+| 0 | 0 | 0 | 4.013 | correct |
+| 1 | 0 | 0 | 4.015 | correct |
+| 0 | 1 | 0 | 3.774 | **0 tokens** |
+| 1 | 1 | 0 | 3.777 | **0 tokens** |
+| any | any | 1 | — | **hangs** (spins forever in the megakernel) |
+
+(These are wall numbers for this launcher, ~0.46 ms above the 3.555 ms quoted
+in 3b, which used a different measurement point; compare rows to each other.)
+
+Read off: QKV+attn fusion is free (4.015 vs 4.013 — no gain, no harm), and the
+entire 0.24 ms is in o_proj+TopK fusion, which does not work.
+
+**It does not work on ONE GPU either.** `FUSE_OPROJ_TOPK=1 FUSE_FULL_LAYER=0`
+on `run_1gpu.sh` also generates 0 tokens (with or without QKV fusion). So this
+is a pre-existing broken sub-configuration, not a DP regression: the standalone
+`gang_linear_mxfp4_res_bias_rmsnorm_topk` task is only exercised in production
+inside the full-layer monolith, where it is reached through a different
+counter/barrier setup. The DP gating change did not cause it and does not have
+to fix it; it just made it reachable from a 2-GPU launcher.
+
+`FUSE_FULL_LAYER=1` (the monolith, the config that is actually correct and fast
+on 1 GPU) hangs under 2 GPUs: both GPUs pin at 100% and produce nothing for
+50 minutes. The gang barrier inside the monolith arrives once per *task graph*,
+and multi-GPU gives each worker a second queue
+(`persistent_kernel.cuh:1162`, `worker_queues[1] = worker_id + num_workers`),
+so worker->tile accounting that holds at `num_gpus == 1` does not hold here.
+Not diagnosed further.
+
+So the fusion path is now open under DP, but it buys nothing until the
+o_proj+TopK gang task is fixed — and fixing it is a single-GPU debugging job,
+reproducible without mpirun.
+
 ## 4. Tile geometry: no staircase to pipeline against
 
 o_proj emits `2880/16 = 184` tiles (`o_output_per_wg = 16`) against 240
