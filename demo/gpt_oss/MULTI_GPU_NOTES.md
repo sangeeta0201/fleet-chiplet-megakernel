@@ -132,7 +132,8 @@ exist because TENSOR parallelism breaks fusion (sharded KV heads break the
 router), and neither applies here. They now gate on
 `dp_local = attn_dp and not moe_ep`.
 
-Measured, 2 GPU, DP + replicated MoE, decode ms/token:
+Measured, 2 GPU, DP + replicated MoE, decode ms/token, **dynamic dispatch**
+(`PRECOMPUTED_DISPATCH=0`):
 
 | FUSE_QKV_ATTN | FUSE_OPROJ_TOPK | FUSE_FULL_LAYER | ms | output |
 |---|---|---|---|---|
@@ -142,31 +143,63 @@ Measured, 2 GPU, DP + replicated MoE, decode ms/token:
 | 1 | 1 | 0 | 3.777 | **0 tokens** |
 | any | any | 1 | — | **hangs** (spins forever in the megakernel) |
 
-(These are wall numbers for this launcher, ~0.46 ms above the 3.555 ms quoted
-in 3b, which used a different measurement point; compare rows to each other.)
-
 Read off: QKV+attn fusion is free (4.015 vs 4.013 — no gain, no harm), and the
 entire 0.24 ms is in o_proj+TopK fusion, which does not work.
 
-**It does not work on ONE GPU either.** `FUSE_OPROJ_TOPK=1 FUSE_FULL_LAYER=0`
-on `run_1gpu.sh` also generates 0 tokens (with or without QKV fusion). So this
-is a pre-existing broken sub-configuration, not a DP regression: the standalone
-`gang_linear_mxfp4_res_bias_rmsnorm_topk` task is only exercised in production
-inside the full-layer monolith, where it is reached through a different
-counter/barrier setup. The DP gating change did not cause it and does not have
-to fix it; it just made it reachable from a 2-GPU launcher.
+**FUSE_OPROJ_TOPK does not work on ONE GPU either.** `FUSE_OPROJ_TOPK=1
+FUSE_FULL_LAYER=0` on `run_1gpu.sh` also generates 0 tokens (with or without
+QKV fusion). Pre-existing broken sub-configuration, not a DP regression: the
+standalone `gang_linear_mxfp4_res_bias_rmsnorm_topk` task is only exercised in
+production inside the full-layer monolith, where it is reached through a
+different counter/barrier setup. The DP gating change just made it reachable
+from a 2-GPU launcher.
 
-`FUSE_FULL_LAYER=1` (the monolith, the config that is actually correct and fast
-on 1 GPU) hangs under 2 GPUs: both GPUs pin at 100% and produce nothing for
-50 minutes. The gang barrier inside the monolith arrives once per *task graph*,
-and multi-GPU gives each worker a second queue
-(`persistent_kernel.cuh:1162`, `worker_queues[1] = worker_id + num_workers`),
-so worker->tile accounting that holds at `num_gpus == 1` does not hold here.
-Not diagnosed further.
+### The monolith hang is a dynamic-dispatch bug, not a multi-GPU bug
 
-So the fusion path is now open under DP, but it buys nothing until the
-o_proj+TopK gang task is fixed — and fixing it is a single-GPU debugging job,
-reproducible without mpirun.
+The `FUSE_FULL_LAYER=1` hang above reproduces on **one** GPU with
+`PRECOMPUTED_DISPATCH=0` — same signature, stops at
+`[HOST_DBG] launch_persistent_kernel ENTER` and spins. Nothing to do with the
+second worker queue at `persistent_kernel.cuh:1162` (an earlier note here said
+that; it was wrong).
+
+Cause is a gang-rank / dispatch mismatch. Under **precomputed** dispatch a gang
+worker takes its XCD-local rank straight from the template
+(`persistent_kernel.cuh:2022-2047`, `block_xcd_local_rank = pc_xcd_rank`), so
+ranks are dense `0..dispatch_count-1` and every tile is claimed. Under
+**dynamic** dispatch the scheduler broadcasts to `my_workers[widx]` for
+`widx < dispatch_count` (`:3228-3240`) but never transmits `widx`; the worker
+re-derives its rank by scanning `worker_xcd_map` for all workers with a lower
+global id on the same XCD. The two orderings do not agree, so the dispatched
+set gets sparse/duplicated ranks, some tiles are never computed, and the
+hierarchical barrier (which waits for `total_oproj_tiles` arrivals) never
+completes.
+
+Fix, if the dynamic path is ever needed: have the scheduler transmit `widx` as
+the gang rank, mirroring what precomputed already does. Not needed for the
+configuration below, which is faster anyway.
+
+### DP + precomputed + monolith: 2.135 ms on 2 GPUs
+
+With `PRECOMPUTED_DISPATCH=1` the monolith runs under 2-GPU DP and matches
+single GPU exactly:
+
+| config | decode ms/iter | output |
+|---|---|---|
+| 1 GPU, monolith + precomputed | 2.138 | correct |
+| **2 GPU DP, monolith + precomputed** | **2.135** | correct ("Paris") |
+| 2 GPU DP, unfused + dynamic | 3.777 | correct |
+
+Why it works where everything else deadlocked: `ATTN_DP=1 MOE_EP=0` emits
+**zero cross-GPU events**, so precomputed dispatch never reaches the cross-GPU
+signaling path (`is_nvshmem_event`, `:544/:1556/:2643`) that deadlocks it under
+TP, and precomputed supplies the gang rank directly so the dynamic-dispatch bug
+above never fires. The per-rank task graph is byte-for-byte the single-GPU one.
+
+**This config shards nothing.** Both ranks run the whole model on the same
+token, so 2.135 ms is single-GPU latency bought with two GPUs — zero speedup,
+and zero multi-GPU overhead. Its value is as a floor: it proves the fused +
+precomputed fast path survives multi-GPU intact, so any real sharding
+(EP MoE, §3c) starts from 2.135 rather than from 3.777.
 
 ## 4. Tile geometry: no staircase to pipeline against
 
