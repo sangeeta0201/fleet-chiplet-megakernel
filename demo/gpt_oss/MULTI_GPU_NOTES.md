@@ -60,6 +60,53 @@ just be overlapped.** That is what ATTN_DP (deletes allreduce #1, 72 -> 36
 syncs) and the fused o_proj+put (deletes the identity + copy tasks around the
 remaining one) are for.
 
+## 3b. ATTN_DP: deleting allreduce #1 is worth 0.774 ms
+
+`ATTN_DP=1` (`run_mp2_dp.sh`) replicates attention on both ranks instead of
+splitting the heads, so o_proj's output is already complete per-rank and the
+attention allreduce disappears. 72 syncs/token -> 36.
+
+| config | ms/token | output |
+|---|---|---|
+| 1 GPU | 2.138 | correct |
+| 2 GPU, TP attn + replicated MoE | 4.329 | correct |
+| 2 GPU, DP attn + no allreduce | 3.555 | correct |
+| 2 GPU, DP attn + EP MoE | 4.453 | **garbage** |
+| 2 GPU, TP attn + EP MoE | 5.224 | **garbage** |
+| 2 GPU, DP attn + EP_NOSLICE | 4.531 | doubled-MoE (expected) |
+
+Correctness: DP passes **4/4** prompts at 256 new tokens against the 1-GPU
+reference (`compare_tokens.py`, prefix agreement 21-66 tokens).
+
+Two things to read off this. First, the 0.774 ms saved by removing one of the
+two collectives is close to half the ~1.8 ms fixed sync cost from section 2 —
+consistent with the collectives being the cost and roughly equal to each other.
+Second, 3.555 ms is *still* well above single-GPU's 2.138 ms with only 36 syncs
+left, so removing the remaining allreduce is necessary but probably not
+sufficient either.
+
+Note the DP-no-allreduce row shards nothing: both ranks run the whole model
+redundantly. It is a correctness reference and a latency floor for "DP
+attention + one collective", not a shippable configuration.
+
+## 3c. Expert parallelism is broken (blocks the useful config)
+
+DP+EP is the configuration that actually halves the weights while keeping one
+collective, and it emits garbage. So does TP+EP, so this is independent of
+ATTN_DP.
+
+`EP_NOSLICE=1` (keep the MoE allreduce, do NOT slice expert weights, so both
+ranks compute the full sum and the allreduce yields 2*W + x) produces the
+*predicted* doubled-MoE degradation: "The capital capital? The user capital?".
+That is the isolation the flag exists for — **the MoE allreduce sums correctly
+and the bug is in the expert slicing / local_eid mapping**.
+
+Worth noting how this got missed: commit 428b74b verified EP by checking that
+rank0's partial + rank1's partial equalled the post-allreduce `mlp_final`. That
+is self-consistent even when both partials are wrong — it tests the allreduce,
+not the experts. The check it needed was the sum against the *replicated*
+reference, or simply reading the generated text.
+
 ## 4. Tile geometry: no staircase to pipeline against
 
 o_proj emits `2880/16 = 184` tiles (`o_output_per_wg = 16`) against 240
