@@ -135,6 +135,19 @@ pipelining.
 The epilogue writes disjoint column slices per workgroup
 (`gang_linear_mxfp4_res_bias_mi300.cuh:~358`), so a fused put there is legal.
 
+**But under ATTN_DP that put no longer exists.** Fusing o_proj+put was the plan
+for reclaiming the identity + copy dispatches around allreduce #1; deleting the
+allreduce outright removed all three tasks instead, which strictly dominates
+fusing them. The o_proj epilogue now writes a plain local result.
+
+The fusion idea still applies to the *surviving* collective, the MoE AR#2
+combine, which is still emitted as three tasks (`moe_residual_add_f32` ->
+`identity` -> `allreduce`, demo.py:2452-2470). Upstream mirage already has this
+as `MPK_INLINE_AR2`: fold + grid-bridge collapsed into one grid-partitioned
+fold-copy task at ar_grid, measured at -0.217 ms/token on 2x MI350. Porting it
+is the natural next task-elimination step -- but it is gated on EP being
+correct, since `inline_ar2` requires `moe_ep`.
+
 ## 5. AR granularity coarsening is broken on this branch
 
 `_ar_elems_per_block()` in `demo.py` defaults to **no coarsening** (64
