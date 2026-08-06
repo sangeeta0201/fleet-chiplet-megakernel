@@ -25,7 +25,10 @@ DEFAULT_MODEL_PATH = os.environ.get("GPT_OSS_MODEL_PATH", "openai/gpt-oss-120b")
 # CI correctness-dump defaults. Torch vs Mirage token dumps land here for
 # tests/ci-tests/test_gpt_oss_inference_output.py.
 DEFAULT_SAVE_DIR = os.path.join("outputs", "gpt_oss")
-MAX_SAVE_TOKENS = 100
+# The CI test compares 100 tokens. Long-output correctness sweeps need the
+# whole generation, otherwise a divergence past token 100 is invisible in the
+# dump and the run looks clean.
+MAX_SAVE_TOKENS = int(os.environ.get("MAX_SAVE_TOKENS", "100"))
 
 # GPT-OSS 120B dimensions
 # hidden_size=2880, intermediate_size=2880
@@ -159,6 +162,58 @@ def max_factor_leq_n(m: int, n: int) -> int:
                 max_factor = max(max_factor, m // i)
         i += 1
     return max_factor
+
+
+def _ar_elems_per_block(padded_hidden: int, which: str) -> int:
+    """Elements-per-block for a cross-GPU allreduce, i.e. its granularity.
+
+    DEFAULTS TO 64 (grid 46) -- coarsening is OPT-IN and currently INCORRECT on
+    this branch. Read the whole docstring before enabling it.
+
+    The idea: the layout packs 64 bf16 per block, so the collective becomes
+    padded_hidden/64 = 46 separate put+signal transactions per layer per rank.
+    The payload is only ~11.5 KB/layer, so it is not bandwidth-bound -- the cost
+    is transaction and signal COUNT. Coarsening is a large, real speedup, and it
+    is reported working on mirage's amd-multi-gpu-rocshmem branch for AR#2:
+
+        grid 46 (64 elem/blk) 4.332 ms | 23 -> 4.135 | 16 -> 4.041
+        grid  8 (368)         3.976 ms |  4 (736) -> 3.873 | 2 (1472) -> 3.934
+
+    On THIS branch it is fast and WRONG, in both collectives, measured on
+    2xMI350 with everything else held fixed:
+
+        AR#1, 256-token generation:  grid 46 -> 4.369 ms, coherent
+                                     grid  4 -> 3.98  ms, "The The This is a
+                                                bit of. The 1.0."
+        AR#2, MOE_EP=1 EP_NOSLICE=1: grid 46 -> 5.286 ms, coherent
+                                     grid  4 -> 4.760 ms, "isos-history Pers
+                                                diagramHEL Ve Esc diagram"
+
+    So ~0.4-0.5 ms/token is genuinely sitting here, but something in this
+    branch's reduce/allgather lowering does not tolerate a partition other than
+    64 elems/block. That is the bug to find -- not a knob to flip. Until then
+    the default stays at the known-correct 64.
+
+    Returns the smallest elems-per-block that divides padded_hidden and still
+    yields <= {which}_TARGET_GRID blocks -- i.e. the LARGEST grid within the
+    target. Scanning descending would return the largest divisor and collapse
+    to grid 1, losing the parallelism that makes grid 4 the measured optimum.
+    A hardcoded element count would not port to another hidden size
+    (2944 = 2^7 x 23, so exact divisors are sparse).
+    """
+    epb_env = os.environ.get(f"{which}_ELEMS_PER_BLOCK")
+    if epb_env is not None:
+        epb = int(epb_env)
+        assert padded_hidden % epb == 0, \
+            f"{which}_ELEMS_PER_BLOCK={epb} must divide {padded_hidden}"
+        return epb
+    # Default 46 == padded_hidden/64, i.e. no coarsening.
+    target_grid = int(os.environ.get(f"{which}_TARGET_GRID",
+                                     str(padded_hidden // 64)))
+    for c in range(1, padded_hidden + 1):
+        if padded_hidden % c == 0 and padded_hidden // c <= target_grid:
+            return c
+    return padded_hidden
 
 
 def pad_weight_1d(w: torch.Tensor, target_size: int, pad_value: float = 0.0):
@@ -2208,7 +2263,12 @@ if __name__ == "__main__":
                     # (allgather+reduce) is only known-correct at grid
                     # (hidden//64) (matches qwen3). Decouple via a grid-46
                     # identity copy so the allreduce can use its own grid.
-                    ar_grid = (PADDED_HIDDEN_SIZE // 64, 1, 1)
+                    #
+                    # Coarsening is opt-in via AR1_TARGET_GRID and currently
+                    # produces garbage on this branch -- see
+                    # _ar_elems_per_block for the measurements.
+                    ar_grid = (PADDED_HIDDEN_SIZE // _ar_elems_per_block(
+                        PADDED_HIDDEN_SIZE, "AR1"), 1, 1)
                     mpk.identity_layer(
                         input=attn_proj_out,
                         output=attn_proj_copy,
@@ -2320,7 +2380,8 @@ if __name__ == "__main__":
                 # (the previous symmetric scheme added a bias_add that consumed
                 # the allreduce output within the same layer — a cross-task dep
                 # through the nvshmem heap that read stale mlp_final).
-                ar_grid = (PADDED_HIDDEN_SIZE // 64, 1, 1)
+                ar_grid = (PADDED_HIDDEN_SIZE // _ar_elems_per_block(
+                    PADDED_HIDDEN_SIZE, "AR2"), 1, 1)
                 # EP_FOLD_RANK: which rank folds the real residual (default 0).
                 # Isolation probe: set to world_size-1 to fold on the LAST rank.
                 # If the MoE allreduce truly sums, moving the fold changes nothing
