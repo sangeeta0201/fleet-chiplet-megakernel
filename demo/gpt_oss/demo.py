@@ -664,6 +664,22 @@ if __name__ == "__main__":
     fused_qkv_dim = (num_local_q_heads + 2 * num_local_kv_heads) * head_dim  # 5120
     num_experts = config.num_local_experts    # 128
     num_experts_per_tok = config.num_experts_per_tok  # 4
+    # PERF PROBE (MOE_TOPK): override the router's top-k. Output is WRONG for
+    # k != config value -- this exists to price MoE work against the rest of
+    # the step, not to run the model.
+    #
+    # It is the single-GPU analogue of what 2-GPU expert-parallelism does to
+    # each rank: EP over N ranks leaves a rank computing ~topk/N experts (plus
+    # routing imbalance). So single-GPU at MOE_TOPK=2 is the latency 2-GPU EP
+    # would reach if its communication were perfectly overlapped -- i.e. the
+    # target, measured on one GPU with zero cross-GPU sync in it.
+    _topk_env = os.environ.get("MOE_TOPK")
+    if _topk_env is not None:
+        num_experts_per_tok = int(_topk_env)
+        assert 1 <= num_experts_per_tok <= config.num_experts_per_tok
+        print(f"[PROBE] MOE_TOPK={num_experts_per_tok} "
+              f"(config={config.num_experts_per_tok}) -- OUTPUT IS WRONG, "
+              f"latency probe only")
 
     # Per-layer sliding window: even layers use sliding_window, odd use full attention
     layer_types = getattr(config, 'layer_types', None)
