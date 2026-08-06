@@ -95,17 +95,31 @@ DP+EP is the configuration that actually halves the weights while keeping one
 collective, and it emits garbage. So does TP+EP, so this is independent of
 ATTN_DP.
 
-`EP_NOSLICE=1` (keep the MoE allreduce, do NOT slice expert weights, so both
-ranks compute the full sum and the allreduce yields 2*W + x) produces the
-*predicted* doubled-MoE degradation: "The capital capital? The user capital?".
-That is the isolation the flag exists for — **the MoE allreduce sums correctly
-and the bug is in the expert slicing / local_eid mapping**.
+Two isolations have been run, and they do not point where you would expect:
 
-Worth noting how this got missed: commit 428b74b verified EP by checking that
-rank0's partial + rank1's partial equalled the post-allreduce `mlp_final`. That
-is self-consistent even when both partials are wrong — it tests the allreduce,
-not the experts. The check it needed was the sum against the *replicated*
-reference, or simply reading the generated text.
+* `EP_NOSLICE=1` (keep the MoE allreduce, do NOT slice expert weights, so both
+  ranks compute the full sum and the allreduce yields 2*W + x) produces the
+  *predicted* doubled-MoE degradation: "The capital capital? The user capital?".
+  So **the MoE allreduce sums correctly.**
+* `--verify` on DP+EP shows routing is correctly global and disjoint (rank0
+  owns active expert [36], rank1 owns [98, 111, 116]), each rank's partial
+  matches its EP-aware PyTorch reference, and post-allreduce `mlp_final`
+  matches the FULL all-experts reference (top-8 elements agree; max abs diff
+  256 against values of order 1000). So **the last-layer EP arithmetic is
+  approximately right too.**
+
+Which means the obvious suspect — the slicing / local_eid mapping — is not
+obviously guilty, and the failure is something that only shows up over 36
+layers: per-layer error compounding, or a race the single-layer snapshot does
+not catch. The per-layer diffs above (32 and 96 on ~1000) are larger than the
+replicated path's, which would fit compounding. Unresolved; this is the next
+thing to chase.
+
+Worth noting how it got missed originally: commit 428b74b verified EP by
+checking that rank0's partial + rank1's partial equalled the post-allreduce
+`mlp_final`. That is self-consistent even when both partials are wrong — it
+tests the allreduce, not the experts. Reading the generated text catches it
+immediately.
 
 ## 4. Tile geometry: no staircase to pipeline against
 
