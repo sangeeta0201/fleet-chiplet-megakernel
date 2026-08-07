@@ -89,7 +89,59 @@ Note the DP-no-allreduce row shards nothing: both ranks run the whole model
 redundantly. It is a correctness reference and a latency floor for "DP
 attention + one collective", not a shippable configuration.
 
-## 3c. Expert parallelism is broken (blocks the useful config)
+## 3c. Expert parallelism: FIXED. It was a missing exit barrier.
+
+**Resolved.** DP+EP with the collective inlined into the monolith passes 4/4
+prompts at 256 tokens. The cause is below; the original investigation notes
+are kept after it because their two isolations were correct and are what
+narrowed it down.
+
+The last line of the original entry guessed right: "a race the single-layer
+snapshot does not catch." Specifically, the combine had **no exit fence**.
+The cross-rank exchange runs on 8 of 240 workers (workgroup 0 of each XCD);
+the other 232 fell out of the MoE barrier straight into the next layer, and
+because the multi-layer replay loop re-enters the same function with swapped
+pointer tables, "the next layer" starts immediately. Three overlapping
+corruptions followed:
+
+  * the next layer's QKV prologue read the combined output before the reduce
+    wrote it,
+  * its Phase 7 overwrote `attn_proj_out` while the fold was still reading it
+    as the residual,
+  * its Phase 8 `atomicAdd`ed into `moe_workspace_f32` around the fold's
+    zeroing of that same buffer.
+
+All three are timing-dependent and none is visible in a single-layer
+`--verify` snapshot -- which is exactly why the two isolations below both came
+back clean. It also explains the "error compounding" reading: the per-layer
+diffs of 32 and 96 on ~1000 were not accumulated rounding, they were a race
+landing partially.
+
+Fix: phase 9e, a per-XCD release flag written by the combiner and polled by
+every other worker before it leaves the layer
+(`gang_full_layer_fused_mi300.cuh`). Two smaller defects were fixed alongside
+it and either alone was fatal: the per-layer signal array (a signal counter
+compared against a run-monotonic threshold must be shared across layers, or it
+only ever reaches +1 per token and hangs on layer 1), and the counter buffer
+being 832 ints while the EP barriers needed 1216.
+
+Cost, measured back-to-back, `MAX_SEQ_LENGTH=128`, decode steady-state:
+
+| config                                 | ms/token | tokens    |
+|----------------------------------------|----------|-----------|
+| 2 GPU DP, monolith + precomputed       | 2.122    | 4/4 @ 256 |
+| 2 GPU DP+EP, monolith + inline combine | 2.892    | 4/4 @ 256 |
+
+So +0.77 ms for the one remaining collective, even fully inlined with zero
+scheduler round-trips. That is the honest number: the fusion removed the
+deadlock and the 72 round-trips per token, but 36 cross-GPU syncs on the
+critical path still cost more than the halved expert work saves at bs=1. EP's
+win here is memory capacity, not decode latency. Worth noting that
+0.77 ms / 36 layers = 21 us per sync, which is close to bare put+signal+wait
+latency -- there is not much fusion left to extract, so a faster EP needs
+FEWER syncs (batching layers between collectives), not a cheaper one.
+
+### Original investigation (kept -- the isolations were sound)
 
 DP+EP is the configuration that actually halves the weights while keeping one
 collective, and it emits garbage. So does TP+EP, so this is independent of

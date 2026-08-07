@@ -24,6 +24,7 @@
 // Provides mpk_putmem_signal_block, MPK_SIGNAL_ADD, and the host mpk_shmem_*
 // wrappers to both the megakernel host code and the emitted allreduce tasks.
 #include "comm/mpk_comm.cuh"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -2252,6 +2253,22 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               int n_tile_start = (int)task_desc->task_metadata.n_tile_start;
               int n_tile_count = (int)task_desc->task_metadata.n_tile_count;
               int my_tiles = 0;
+
+              // Rebase the host-stamped layer index onto the run-monotonic
+              // counter the fused kernel's barriers require -- the same value
+              // the replay loop computes, (iter-1)*num_layers + layer. The
+              // barrier counters are never reset, so a per-iteration index
+              // would satisfy every layer's release from iteration 1 onward.
+              // task_desc points at a reused shared-memory slot, so the store
+              // must be visible block-wide before any worker enters the task.
+              if (threadIdx.x == 0 && config.ml_scanned_layers > 0) {
+                int stamped_layer = task_desc->task_metadata._linear_reserved;
+                task_desc->task_metadata._linear_reserved =
+                    (int32_t)((pc_iter - 1) * config.ml_scanned_layers +
+                              stamped_layer);
+              }
+              __syncthreads();
+
               for (int t = block_xcd_local_rank; t < n_tile_count;
                    t += block_workers_on_xcd) {
                 _execute_gang_task(task_desc, config, n_tile_start + t);
@@ -3977,6 +3994,62 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
            n_events_pre);
     fflush(stdout);
 
+    // Multi-layer replay is only legal when the fused layers are back-to-back.
+    // The replay loop runs all 36 layers inside ONE task without returning to
+    // the scheduler, so it cannot execute anything the graph placed *between*
+    // layers. Compaction then deletes layers 1..35, and whatever sat between
+    // them keeps its dependent events -- events nothing triggers any more. The
+    // graph stalls with N-1 dead events and no error.
+    //
+    // This is exactly what expert-parallel MoE does: it inserts a
+    // residual-fold + allreduce after every layer's combine. Detect the gap
+    // and fall back to per-layer dispatch (slower, but the graph runs).
+    // Stamp each fused task with its layer index.
+    //
+    // The fused kernel derives every barrier release value from
+    // task_layer_idx == task_metadata._linear_reserved (see the layer-counter
+    // discussion in gang_full_layer_fused_mi300.cuh). Until now the ONLY
+    // writer of that field was the replay loop, so on the per-layer dispatch
+    // path the kernel read whatever the host happened to leave in the union --
+    // and waited on epoch values no producer would ever reach. Stamping here
+    // makes the field meaningful on both paths; replay overwrites it with the
+    // same number.
+    global_runtime_config.ml_scanned_layers = ml_layers;
+    for (int L = 0; L < ml_layers; L++) {
+      for (int xcd = 0; xcd < NUM_XCDS_ML; xcd++) {
+        all_tasks[fused_layer_positions[L] + xcd]
+            .task_metadata._linear_reserved = L;
+      }
+    }
+
+    // MPK_ML_REPLAY=0 forces the fallback on a graph that would otherwise
+    // qualify. This is the only way to run the per-layer fused dispatch path
+    // on a config where replay is legal, which is what isolates a bug in that
+    // path from a bug in whatever made replay illegal.
+    {
+      char const *rep = getenv("MPK_ML_REPLAY");
+      if (rep && atoi(rep) == 0 && ml_layers > 1) {
+        printf("[MPK] Multi-layer table: DISABLED by MPK_ML_REPLAY=0\n");
+        fflush(stdout);
+        ml_layers = 1;
+      }
+    }
+
+    int inter_layer_gap = 0;
+    for (int L = 1; L < ml_layers; L++) {
+      size_t gap = fused_layer_positions[L] -
+                   (fused_layer_positions[L - 1] + NUM_XCDS_ML);
+      inter_layer_gap += (int)gap;
+    }
+    if (ml_layers > 1 && inter_layer_gap > 0) {
+      printf("[MPK] Multi-layer table: DISABLED -- %d task(s) sit between "
+             "fused layers (per-layer collectives?). Replay would delete "
+             "them; falling back to per-layer dispatch.\n",
+             inter_layer_gap);
+      fflush(stdout);
+      ml_layers = 1; // skip compaction below
+    }
+
     if (ml_layers > 1) {
       // Build per-XCD pointer tables from all layers BEFORE compaction
       std::vector<void *> h_input_table(NUM_XCDS_ML * ml_layers * ML_N_IN);
@@ -4270,6 +4343,7 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   }
 #else
   global_runtime_config.ml_num_layers = 0;
+  global_runtime_config.ml_scanned_layers = 0;
 #endif // MPK_FUSED_LAYER_BATCHING
 
   // =========================================================================
@@ -4396,6 +4470,31 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
           h_gang_dispatch_count[tev_idx] += dispatch_count;
         }
       }
+    }
+
+    // Sort each worker's queue into task-index order.
+    //
+    // Workers execute their queue strictly front-to-back and block on each
+    // task's dependency event, so a queue whose order disagrees with the
+    // graph's topological order deadlocks: the worker parks on a late task
+    // while an earlier one -- which some other worker is waiting on -- sits
+    // behind it, unreachable.
+    //
+    // The queues are built by iterating event groups, and event index order is
+    // NOT topological with respect to task index. On the single-fused-layer
+    // graphs this never showed, because compaction left one event group per
+    // stage and the orders coincided. Under expert parallelism there are ~100
+    // groups per layer and they do not: 8 workers (one per XCD) were observed
+    // parked on a layer-4 collective while 97 others spun in layer 4's
+    // monolith barriers short_by=1, waiting on exactly those 8.
+    //
+    // dfs_create_events_add_tasks assigns task indices in dependency order, so
+    // ascending task index is a valid topological order and sorting is enough.
+    // begin_task_graph (position 1) and the orphans are already ahead of the
+    // main range by index, so this does not disturb them.
+    for (int i = 0; i < total_template_entries; i++) {
+      size_t *q = h_tmpl.data() + (size_t)i * max_tpw;
+      std::sort(q, q + h_tmpl_len[i]);
     }
 
     int gang_barrier_events = 0;

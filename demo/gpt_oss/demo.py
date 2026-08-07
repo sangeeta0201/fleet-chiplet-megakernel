@@ -1267,6 +1267,13 @@ if __name__ == "__main__":
               f"ck_fmha_num_kv_chunks={ck_fmha_num_kv_chunks} "
               f"(max {MAX_KV_CHUNKS})")
         fuse_tail = os.environ.get("FUSE_TAIL", "0") == "1"
+        # The lmhead monolith (type 217) folds the LM head into the last layer's
+        # gang task, which under expert parallelism would read this rank's
+        # PARTIAL MoE sum -- the combine allreduce has not happened yet at that
+        # point. It also carries no expert-ownership window. Force it off; the
+        # standalone tail after the allreduce is correct.
+        if world_size > 1 and os.environ.get("MOE_EP", "0") == "1":
+            fuse_tail = False
 
         if args.profiling:
             profiler_tensor = torch.zeros(
@@ -1456,6 +1463,9 @@ if __name__ == "__main__":
             ep_local = num_experts
             ep_base = 0
         ep_slice = moe_ep and not ep_noslice
+        # The single rank that folds the real residual into its MoE partial,
+        # so that after the cross-rank SUM the residual appears exactly once.
+        _ep_fold_rank = int(os.environ.get("EP_FOLD_RANK", "0"))
         fuse_oproj_moe = os.environ.get("FUSE_OPROJ_MOE", "0") == "1"
         fuse_oproj_topk = os.environ.get("FUSE_OPROJ_TOPK", "1") == "1"
         if fuse_full_layer:
@@ -1469,7 +1479,17 @@ if __name__ == "__main__":
             #   20*16 (320): qkv_epoch[0..7] per-XCD epoch flags
             #   28*16 (448): chunk_barrier[0..7] per-XCD chunk arrival
             #   36*16 (576): attn_xcd_release[0..7] per-XCD release flags
+            #   48*16 (768): ep_moe_done            (inline EP combine only)
+            #   49*16 (784): ep_combine_release[0..7]
+            #   58*16 (928): ep_fold_done[0..7]
+            #   67*16 (1072): ep_combine_done[0..7]
+            # Must match FULL_LAYER_EP_COUNTER_SIZE in
+            # gang_full_layer_fused_mi300.cuh. The EP phase's four barriers do
+            # not fit in 832/896; undersizing here silently corrupts whatever
+            # torch allocated next.
             counter_size = 896 if fuse_tail else 832
+            if attn_dp and moe_ep:
+                counter_size = max(counter_size, 76 * 16)
             oproj_topk_counters = make_tensor("oproj_topk_counters", (counter_size,), torch_dtype=torch.int32)
         # Hierarchical barrier for fused QKV+Attention kernel [16 int32]:
         # [0..7]: per-XCD QKV arrival counters, [8]: global leader count
@@ -1481,6 +1501,18 @@ if __name__ == "__main__":
         # heads break the kv_head=xcd_id mapping; a mid-layer allreduce splits
         # o_proj from the router) -- neither applies here. Gate on this instead.
         dp_local = attn_dp and not moe_ep
+        # Expert-parallel MoE keeps ONE collective (the MoE combine) but leaves
+        # everything upstream of it -- QKV, attention, o_proj, router, top-k --
+        # per-rank identical to single GPU, exactly as under dp_local. So the
+        # intra-layer fusions are legal here too; the only thing EP changes is
+        # that the layer's output is a partial sum needing an allreduce, which
+        # is appended after the monolith rather than folded into the next
+        # layer's QKV prologue. Requires DP attention: under TP the sharded KV
+        # heads still break the kv_head==xcd_id mapping in the fused QKV task.
+        dp_ep_fused = attn_dp and moe_ep
+        # Either way the per-rank graph up to the MoE combine is the single-GPU
+        # one, which is what every fusion guard below actually needs.
+        dp_fusable = dp_local or dp_ep_fused
         fuse_qkv_attn = os.environ.get("FUSE_QKV_ATTN", "1") == "1"
         # Gang QKV+Attn fusion uses the chunks=1 internal attention path; for
         # chunks>1 we fall back to separate QKV→attn→merge tasks.
@@ -1549,6 +1581,59 @@ if __name__ == "__main__":
         # alias the nvshmem allreduce output (WAR hazard) and the next layer reads
         # a stable plain tensor.
         mlp_ep_out = make_tensor("mlp_ep_out", (bs, PADDED_HIDDEN_SIZE))
+        # Inline EP combine (Phase 9 of the monolith).
+        #
+        # The gather buffer is PER LAYER, for the same cross-layer WAR reason
+        # the dispatched allreduce needed per-layer buffers: a peer's
+        # next-layer put targets a fixed slot, so a shared buffer lets it
+        # clobber the partial my current reduce is still reading. The event
+        # system only enforces RAW, and with the collective inlined there is
+        # no event between the peer's put and my read at all.
+        #
+        # The signal array is SHARED across all layers, and must be. Phase 9
+        # keys its threshold off the run-monotonic layer counter
+        # ((iter-1)*num_layers + layer + 1), the same counter every other
+        # barrier in the monolith uses -- nothing to reset, no shared read to
+        # race on. A per-layer signal array only ever reaches +1 per TOKEN, so
+        # layer 1 would wait for 2 and see 1: an immediate hang on the second
+        # layer (observed). One shared array accumulates exactly one SIGNAL_ADD
+        # per (peer, layer) and matches the monotonic threshold. There is no
+        # WAR hazard on a signal because it is a monotone counter, never reset
+        # and never re-read for an older value.
+        #
+        # Both must live in the symmetric heap: put+signal addresses the peer
+        # by offset, so a plain hipMalloc would land the write somewhere
+        # unrelated on the remote rank.
+        ep_gather_list = []
+        ep_signal_list = []
+        ep_combined_list = []
+        if world_size > 1:
+            ep_gather_list = [
+                mpk.new_tensor(
+                    dims=(world_size, bs, PADDED_HIDDEN_SIZE),
+                    dtype=mi.bfloat16,
+                    name=f"ep_gather_{li}",
+                    io_category="nvshmem_tensor",
+                )
+                for li in range(num_layers)
+            ]
+            # uint64 counters, one 64-byte line per PE so peers' SIGNAL_ADDs
+            # never share a line. Declared as int32 because that is what
+            # get_datatype_size() supports (mi.uint64 asserts); only the byte
+            # count matters here, and the kernel reinterprets the base pointer
+            # as uint64*. 16 int32 == 8 uint64 == 64 bytes per PE.
+            ep_signal = mpk.new_tensor(
+                dims=(world_size * 16,),
+                dtype=mi.int32,
+                name="ep_signal",
+                io_category="nvshmem_tensor",
+            )
+            ep_signal_list = [ep_signal] * num_layers
+            # Plain tensors: only read locally, by the next layer's prologue.
+            ep_combined_list = [
+                make_tensor(f"ep_combined_{li}", (bs, PADDED_HIDDEN_SIZE))
+                for li in range(num_layers)
+            ]
         # Tensor-parallel residual handling: o_proj / MoE are row/expert-parallel,
         # so each rank produces a PARTIAL output that is SUM-allreduced. The
         # residual (and o_proj bias) must be added exactly once, so non-rank0
@@ -1777,7 +1862,7 @@ if __name__ == "__main__":
             if use_ck_fmha and args.split_kv_cache and qkv_output_per_wg >= head_dim:
                 # Fused QKV + KV cache update: epilogue applies RoPE and
                 # writes Q→q_workspace, K/V→paged caches directly.
-                if world_size > 1 and not dp_local:
+                if world_size > 1 and not dp_fusable:
                     # Multi-GPU TENSOR-PARALLEL: the fused
                     # gang_rmsnorm_linear_mxfp4_bias_kvupd kernel hard-maps
                     # kv_head = physical XCD id (requires
@@ -1817,7 +1902,7 @@ if __name__ == "__main__":
                                   num_local_kv_heads, 1),
                         block_dim=(256, 1, 1),
                     )
-                elif fuse_full_layer and (world_size == 1 or dp_local):
+                elif fuse_full_layer and (world_size == 1 or dp_fusable):
                     # Full-layer fused: QKV+Attn+O-proj+TopK+MoE in one dispatch
                     # O-proj weight prep (moved up from below)
                     w_o = pad_weight_2d(
@@ -2003,11 +2088,28 @@ if __name__ == "__main__":
                             sliding_window=per_layer_sliding_window[i],
                             w13_output_per_wg=w13_output_per_wg,
                             w2_output_per_wg=w2_output_per_wg,
+                            expert_base=ep_base if ep_slice else 0,
+                            num_local_experts=ep_local,
+                            # Inline EP combine: fuses the cross-rank MoE sum
+                            # into the monolith's epilogue. None on every other
+                            # config, which compiles Phase 9 out entirely.
+                            ep_gather=ep_gather_list[i] if dp_ep_fused else None,
+                            ep_signal=ep_signal_list[i] if dp_ep_fused else None,
+                            ep_combined=ep_combined_list[i] if dp_ep_fused else None,
+                            ep_fold_rank=_ep_fold_rank,
                             block_dim=(256, 1, 1),
                         )
                     x = attn_proj_out
-                    # Last layer needs explicit residual add (f32→bf16)
-                    if i == num_layers - 1 and not fused_tail_done:
+                    if dp_ep_fused:
+                        # The monolith's Phase 9 already folded the residual,
+                        # summed across ranks and zeroed the workspace. Its
+                        # output is the complete residual stream, which the
+                        # next layer's QKV prologue reads as `residual`.
+                        x = ep_combined_list[i]
+                        # No last-layer residual add needed either: Phase 9's
+                        # fold already produced the complete bf16 value.
+                    elif i == num_layers - 1 and not fused_tail_done:
+                        # Last layer needs explicit residual add (f32→bf16)
                         mpk.moe_residual_add_f32_layer(
                             workspace_f32=moe_workspace_f32,
                             residual=x,
@@ -2069,7 +2171,7 @@ if __name__ == "__main__":
                     )
                     x = mlp_weighted_sum_out
 
-                if not fuse_qkv_attn or i == 0 or (world_size > 1 and not dp_local):
+                if not fuse_qkv_attn or i == 0 or (world_size > 1 and not dp_fusable):
                     # Separate attention task (layer 0 or unfused path).
                     # For chunks>1, write float partials to ck_fmha_o_acc and
                     # apply sinks in the merge step (decode kernel only fuses
@@ -2217,7 +2319,7 @@ if __name__ == "__main__":
             router_bias = layer.mlp.router.bias.data.to("cuda").unsqueeze(0).contiguous()  # [1, 128]
             w_router_bias = _attach_input_keep(router_bias, f"layer_{i}_router_bias")
 
-            if is_rocm and fuse_oproj_moe and (world_size == 1 or dp_local):
+            if is_rocm and fuse_oproj_moe and (world_size == 1 or dp_fusable):
                 # Fused O-PROJ + TopK + MoE in a single gang task (type 215)
                 w_gatedup = _attach_input_keep(
                     moe_gate_up_proj_weights[i], f"layer_{i}_gate_up_proj"
@@ -2268,7 +2370,7 @@ if __name__ == "__main__":
                     block_dim=(256, 1, 1),
                 )
                 x = attn_proj_out
-            elif is_rocm and fuse_oproj_topk and (world_size == 1 or dp_local):
+            elif is_rocm and fuse_oproj_topk and (world_size == 1 or dp_fusable):
                 # Fused O-PROJ + RMSNorm + Router + TopK in single gang task
                 mpk.gang_linear_mxfp4_res_bias_rmsnorm_topk_layer(
                     input=attn_out,
@@ -2349,7 +2451,7 @@ if __name__ == "__main__":
                     )
                     x = attn_allreduce_out
 
-                if world_size == 1 or dp_local:
+                if world_size == 1 or dp_fusable:
                     # Fused RMSNorm + Router linear + TopK softmax
                     mpk.gang_rmsnorm_linear_bias_topk_layer(
                         norm_input=x,
@@ -2389,7 +2491,7 @@ if __name__ == "__main__":
                         block_dim=(256, 1, 1),
                     )
 
-            if not (is_rocm and fuse_oproj_moe and (world_size == 1 or dp_local)):
+            if not (is_rocm and fuse_oproj_moe and (world_size == 1 or dp_fusable)):
                 # Fused W13+SwiGLU+W2 gang MXFP4 (single task, per-expert barrier)
                 # Phase-ordered: all W13 tiles before all W2 tiles.
                 # Eliminates scheduler gap between W13→W2 events.

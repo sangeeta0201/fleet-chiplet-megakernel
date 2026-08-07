@@ -472,8 +472,13 @@ struct RuntimeConfig {
                               // padded)
   int *ml_barrier_global;     // [16] global arrival counter
   int *ml_barrier_release;    // [8 * 16] per-XCD release flags
-  int ml_num_layers;          // 0 = disabled, 36 = enabled
+  int ml_num_layers;          // 0 = replay disabled, 36 = enabled
   int ml_workers_per_xcd;     // workers per XCD for barrier threshold
+  // Fused layers the host scan found, regardless of whether replay was
+  // enabled. The per-layer dispatch path needs it to turn a task's stamped
+  // layer index into the run-monotonic counter the fused kernel's barriers
+  // key off; ml_num_layers is 0 there and cannot serve.
+  int ml_scanned_layers;
 #endif
 #ifdef MIRAGE_BACKEND_USE_ROCM
   hipStream_t worker_stream, scheduler_stream;

@@ -3407,11 +3407,32 @@ class PersistentKernel:
         sliding_window: int = 0,
         w13_output_per_wg: int = 128,
         w2_output_per_wg: int = 64,
+        expert_base: int = 0,
+        num_local_experts: int = None,
+        # Inline expert-parallel combine (Phase 9)
+        ep_gather: DTensor = None,
+        ep_signal: DTensor = None,
+        ep_combined: DTensor = None,
+        ep_fold_rank: int = 0,
         block_dim: tuple = (256, 1, 1),
     ):
         """Full-layer fused gang task: QKV+Attn+O-proj+TopK+MoE.
         Combines task 214 and 215 into one gang task per layer.
-        24 inputs, 11 outputs.
+        24 inputs, 11 outputs (26/12 with the inline EP combine).
+
+        Under expert parallelism the caller passes sliced gate_up/down weights
+        and biases plus the ownership window [expert_base, expert_base +
+        num_local_experts). Routing, mask and barrier stay replicated global
+        and keyed by global expert id; only weight storage is local. Defaults
+        reproduce the single-GPU identity mapping.
+
+        Passing ep_gather/ep_signal/ep_combined additionally fuses the MoE
+        cross-rank combine into the task, replacing the three dispatched tasks
+        (moe_residual_add_f32 -> identity -> allreduce) that used to follow it.
+        ep_gather and ep_signal must be symmetric-heap tensors
+        (io_category="nvshmem_tensor"); ep_combined carries the layer output
+        and is read by the next layer as its residual. Omitting them keeps the
+        single-GPU / replicated-MoE behaviour exactly as before.
         """
         assert residual.num_dims == 2
         assert qkv_weight.num_dims == 2
@@ -3419,6 +3440,22 @@ class PersistentKernel:
         assert gate_up_weight.num_dims == 3
         assert down_weight.num_dims == 3
         assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+
+        ep_inline = ep_gather is not None
+        if ep_inline:
+            assert ep_signal is not None and ep_combined is not None, \
+                "inline EP combine needs ep_gather, ep_signal and ep_combined"
+            assert self.world_size > 1, \
+                "inline EP combine requires world_size > 1"
+            assert ep_gather.num_dims == 3  # (world_size, batch, hidden)
+            assert ep_gather.dim(0) == self.world_size
+            assert ep_combined.num_dims == 2
+            # One 64-byte line per PE so a peer's SIGNAL_ADD never shares a
+            # line with another's (FULL_LAYER_EP_SIGNAL_STRIDE in the kernel).
+            # 64 bytes (one cache line) of signal space per PE. Declared in
+            # int32 units because mi.uint64 has no get_datatype_size() entry;
+            # the kernel reinterprets the pointer as uint64*.
+            assert ep_signal.dim(0) >= self.world_size * 16
 
         batch_size = self.max_num_batched_tokens
 
@@ -3447,11 +3484,18 @@ class PersistentKernel:
         total_oproj_tiles = max(oproj_tiles_per_xcd, router_tile_n) * 8
 
         # MoE tiling (from type 187/215)
-        moe_num_experts = gate_up_weight.dim(0)
+        # gate_up_weight.dim(0) is the LOCAL expert count under expert
+        # parallelism, but the tile space must cover every GLOBALLY activated
+        # expert: tiles are decoded against the replicated global mask and
+        # non-owned experts early-return inside the kernel. Sizing the tile
+        # space with the local count would drop the tiles of experts owned by
+        # higher ranks.
+        if num_local_experts is None:
+            num_local_experts = gate_up_weight.dim(0)
         w13_wgs = gate_up_weight.dim(1)
         w2_wgs = down_weight.dim(1)
         num_topk = swiglu_out.dim(1)
-        max_activated = min(num_topk * batch_size, moe_num_experts)
+        max_activated = min(num_topk * batch_size, num_experts)
         PAD_MULTIPLE = 240
 
         intermediate_size = swiglu_out.dim(2)
@@ -3494,6 +3538,13 @@ class PersistentKernel:
         tb_graph.new_input(moe_barrier, (-1, -1, -1), -1, True)         # [21]
         tb_graph.new_input(swiglu_out, (-1, 2, -1), -1, True)           # [22]
         tb_graph.new_input(o_acc_f32, (-1, -1, -1), -1, True)           # [23]
+        # Inline-EP inputs. The runtime splits this flat operator list at the
+        # registered num_inputs, so these must sit BETWEEN the inputs and the
+        # outputs -- appending them at the end would reclassify x_output and
+        # k_cache as inputs and shift every output index the kernel hard-codes.
+        if ep_inline:
+            tb_graph.new_input(ep_gather, (-1, -1, -1), -1, True)       # [24]
+            tb_graph.new_input(ep_signal, (-1, -1, -1), -1, True)       # [25]
         # 11 outputs
         tb_graph.new_input(x_output, (-1, -1, -1), -1, True)            # [0]
         tb_graph.new_input(k_cache, (-1, -1, -1), -1, True)             # [1]
@@ -3507,16 +3558,23 @@ class PersistentKernel:
         tb_graph.new_input(routing_weight_moe, (-1, -1, -1), -1, True)  # [9]
         tb_graph.new_input(moe_workspace_f32, (-1, -1, -1), -1, True)   # [10]
 
+        # 12th output, EP only.
+        if ep_inline:
+            tb_graph.new_input(ep_combined, (-1, -1, -1), -1, True)     # [11]
+
+        # Must mirror the tb_graph operator order exactly.
         self.kn_graph.customized(
             [workspace_f32, residual, norm_weight_pre, norm_scratch_pre,
              qkv_weight, qkv_bias, sinks_or_placeholder, qkv_barrier, lse_acc,
              oproj_weight, oproj_bias, norm_weight_post, norm_scratch_post,
              router_weight, router_bias, logits_scratch, oproj_counters,
              gate_up_weight, down_weight, w13_bias, w2_bias,
-             moe_barrier, swiglu_out, o_acc_f32,
-             x_output, k_cache, v_cache, q_workspace, o_acc,
-             attn_proj_out, topk_weight, routing_indices,
-             active_expert_ids, routing_weight_moe, moe_workspace_f32],
+             moe_barrier, swiglu_out, o_acc_f32]
+            + ([ep_gather, ep_signal] if ep_inline else [])
+            + [x_output, k_cache, v_cache, q_workspace, o_acc,
+               attn_proj_out, topk_weight, routing_indices,
+               active_expert_ids, routing_weight_moe, moe_workspace_f32]
+            + ([ep_combined] if ep_inline else []),
             tb_graph,
         )
         self.kn_graph.register_task(
@@ -3530,7 +3588,11 @@ class PersistentKernel:
              num_experts, topk_k, router_tile_n, total_topk_tiles,
              oproj_tiles_per_xcd, moe_total_tiles_per_xcd,
              w13_output_per_wg, w2_output_per_wg,
-             intermediate_size, workers_per_xcd]
+             intermediate_size, workers_per_xcd,
+             expert_base, num_local_experts,
+             self.world_size if ep_inline else 1,
+             self.mpi_rank if ep_inline else 0,
+             ep_fold_rank]
         )
 
     def gang_full_layer_with_lmhead_fused_layer(

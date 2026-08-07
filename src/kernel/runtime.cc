@@ -942,6 +942,14 @@ TaskGraphResult print_task_graph(
         }
         code.e("void *$ = mpk_shmem_malloc($);", desc.name, size);
         code.e("assert($ != nullptr);", desc.name);
+        // Neither nvshmem_malloc nor rocshmem_malloc guarantees zeroed
+        // memory. Gather buffers are fully overwritten before being read, so
+        // they never cared, but signal counters are compared against an
+        // absolute threshold from the first layer onward -- garbage here is
+        // either an instant hang or a collective that returns before the peer
+        // wrote. Zero every symmetric allocation once at init; it costs
+        // nothing outside setup.
+        code.e("CUDA_CHECK(cudaMemset($, 0, $));", desc.name, size);
         if (use_json_format) {
           code.e("all_tensors[\"$\"] = $;", desc.name, desc.name);
         }

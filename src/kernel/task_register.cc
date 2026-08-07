@@ -1992,7 +1992,7 @@ int TaskRegister::register_gang_oproj_topk_moe_fused_mi300_task(
 //                active_expert_ids, moe_routing_weight, moe_workspace_f32]
 int TaskRegister::register_gang_full_layer_fused_mi300_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 29);
+  assert(params.size() == 34);
   int qkv_output_per_wg = params[0];
   int qkv_n_wgs_per_xcd = params[1];
   int total_qkv_tiles_per_xcd = params[2];
@@ -2022,11 +2022,23 @@ int TaskRegister::register_gang_full_layer_fused_mi300_task(
   int w2_output_per_wg = params[26];
   int moe_intermediate_size = params[27];
   int workers_per_xcd = params[28];
+  // Expert-parallel: this rank owns experts
+  // [moe_expert_base, moe_expert_base + moe_num_local_experts). Single-GPU and
+  // replicated-MoE pass 0 / num_experts, which the kernel treats as identity.
+  int moe_expert_base = params[29];
+  int moe_num_local_experts = params[30];
+  // Inline EP combine (Phase 9). ep_world_size == 1 compiles the phase out and
+  // the task keeps its 24/11 tensor arity; > 1 adds the gather buffer, the
+  // signal array, and the combined output.
+  int ep_world_size = params[31];
+  int ep_my_pe = params[32];
+  int ep_fold_pe = params[33];
+  bool ep_inline = ep_world_size > 1;
 
   std::vector<tb::TBInputOp *> input_ops;
   std::vector<tb::TBInputOp *> output_ops;
-  int num_inputs = 24;
-  int num_outputs = 11;
+  int num_inputs = ep_inline ? 26 : 24;
+  int num_outputs = ep_inline ? 12 : 11;
 
   assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
   for (auto const &op : bgraph.operators) {
@@ -2053,9 +2065,9 @@ int TaskRegister::register_gang_full_layer_fused_mi300_task(
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
   // 22 template parameters + DECODE_ONLY=true (compile out prefill attention
-  // path)
+  // path) + the 2 expert-parallel ownership bounds + the 3 inline-combine ones
   code.e("kernel::gang_full_layer_fused_kernel_mi300<$, $, $, $, $, $, $, $, "
-         "$, $, $, $, $, $, $, $, $, $, $, $, $, $, true>(",
+         "$, $, $, $, $, $, $, $, $, $, $, $, $, $, true, $, $, $, $, $>(",
          batch_size,
          qkv_output_per_wg,
          qkv_reduction_size,
@@ -2077,7 +2089,12 @@ int TaskRegister::register_gang_full_layer_fused_mi300_task(
          moe_intermediate_size,
          moe_hidden_size,
          w13_output_per_wg,
-         w2_output_per_wg);
+         w2_output_per_wg,
+         moe_expert_base,
+         moe_num_local_experts,
+         ep_world_size,
+         ep_my_pe,
+         ep_fold_pe);
   // Pass input/output pointer arrays directly (2 params instead of 34)
   code.e("    task_desc->input_ptrs,");
   code.e("    task_desc->output_ptrs,");

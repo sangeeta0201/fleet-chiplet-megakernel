@@ -758,12 +758,19 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         16, 6, TASK_GANG_OPROJ_TOPK_MOE_FUSED_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[15]; // workers_per_xcd (30)
   } else if (name == "gang_full_layer_fused_mi300") {
-    assert(params.size() == 29 &&
-           "gang_full_layer_fused_mi300 needs 29 params");
+    assert(params.size() == 34 &&
+           "gang_full_layer_fused_mi300 needs 34 params");
     int variant_id = task_register->register_gang_full_layer_fused_mi300_task(
         customized->bgraph, params);
-    task_config[op] =
-        std::make_tuple(24, 11, TASK_GANG_FULL_LAYER_FUSED_MI300, variant_id);
+    // params[31] = ep_world_size. > 1 adds the inline-combine tensors:
+    // 2 inputs (symmetric gather buffer, signal array) and 1 output (the
+    // combined residual stream). Must agree with the arity the task
+    // registration computes.
+    bool ep_inline = params[31] > 1;
+    task_config[op] = std::make_tuple(ep_inline ? 26 : 24,
+                                      ep_inline ? 12 : 11,
+                                      TASK_GANG_FULL_LAYER_FUSED_MI300,
+                                      variant_id);
     gang_task_tiles_per_xcd[op] = params[28]; // workers_per_xcd (30)
   } else if (name == "gang_full_layer_with_lmhead_fused_mi300") {
     assert(params.size() == 33 &&
