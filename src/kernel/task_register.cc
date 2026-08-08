@@ -1992,7 +1992,7 @@ int TaskRegister::register_gang_oproj_topk_moe_fused_mi300_task(
 //                active_expert_ids, moe_routing_weight, moe_workspace_f32]
 int TaskRegister::register_gang_full_layer_fused_mi300_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 34);
+  assert(params.size() == 36);
   int qkv_output_per_wg = params[0];
   int qkv_n_wgs_per_xcd = params[1];
   int total_qkv_tiles_per_xcd = params[2];
@@ -2034,6 +2034,10 @@ int TaskRegister::register_gang_full_layer_fused_mi300_task(
   int ep_my_pe = params[32];
   int ep_fold_pe = params[33];
   bool ep_inline = ep_world_size > 1;
+  // Slot-parallel expert split: own activated-list slots congruent to
+  // ep_slot_me mod ep_slot_ws rather than an id range. 1/0 = disabled.
+  int ep_slot_ws = params[34];
+  int ep_slot_me = params[35];
 
   std::vector<tb::TBInputOp *> input_ops;
   std::vector<tb::TBInputOp *> output_ops;
@@ -2066,8 +2070,10 @@ int TaskRegister::register_gang_full_layer_fused_mi300_task(
   code.inc_indent();
   // 22 template parameters + DECODE_ONLY=true (compile out prefill attention
   // path) + the 2 expert-parallel ownership bounds + the 3 inline-combine ones
+  // + the 2 slot-split ones
   code.e("kernel::gang_full_layer_fused_kernel_mi300<$, $, $, $, $, $, $, $, "
-         "$, $, $, $, $, $, $, $, $, $, $, $, $, $, true, $, $, $, $, $>(",
+         "$, $, $, $, $, $, $, $, $, $, $, $, $, $, true, $, $, $, $, $, $, "
+         "$>(",
          batch_size,
          qkv_output_per_wg,
          qkv_reduction_size,
@@ -2094,7 +2100,9 @@ int TaskRegister::register_gang_full_layer_fused_mi300_task(
          moe_num_local_experts,
          ep_world_size,
          ep_my_pe,
-         ep_fold_pe);
+         ep_fold_pe,
+         ep_slot_ws,
+         ep_slot_me);
   // Pass input/output pointer arrays directly (2 params instead of 34)
   code.e("    task_desc->input_ptrs,");
   code.e("    task_desc->output_ptrs,");

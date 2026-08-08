@@ -96,7 +96,25 @@ template <int BATCH_SIZE,
           int W13_OUTPUT_PER_WG,
           int W2_OUTPUT_PER_WG,
           int EXPERT_BASE = 0,
-          int NUM_LOCAL_EXPERTS = NUM_EXPERTS>
+          int NUM_LOCAL_EXPERTS = NUM_EXPERTS,
+          // Slot-parallel expert assignment. Instead of owning a contiguous
+          // *id* range, a rank owns the activated-list SLOTS congruent to
+          // EP_SLOT_ME mod EP_SLOT_WS. Weights must be replicated (all
+          // NUM_EXPERTS present locally), which costs nothing here: 63.7 GB
+          // of MXFP4 experts against 252 GB of HBM.
+          //
+          // Why this is better balanced than the id split: active_expert_ids
+          // holds exactly k=4 entries, so slots split 2/2 every time. An id
+          // range splits by *parity of whichever ids won*, which is 3-1 half
+          // the time and 4-0 an eighth of the time -- expected 2.75 experts
+          // on the critical rank instead of 2.0, and that straggler is what
+          // Phase 9's GPU-wide barrier waits for.
+          //
+          // Both ranks read the same replicated, score-ordered
+          // active_expert_ids, so the partition agrees across ranks with no
+          // communication. EP_SLOT_WS == 1 disables it.
+          int EP_SLOT_WS = 1,
+          int EP_SLOT_ME = 0>
 __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     void const *input_ptr,          // [batch, hidden] BF16
     void const *gate_up_weight_ptr, // [E, W13_WGS, wg_bytes] MXFP4 (interleaved
@@ -234,11 +252,24 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // expert's per-expert barrier is never used on this rank -> no deadlock.
   // For single-GPU EXPERT_BASE=0 and NUM_LOCAL_EXPERTS=NUM_EXPERTS, so the
   // test is always false and local_eid == expert_id.
-  if (expert_id < EXPERT_BASE || expert_id >= EXPERT_BASE + NUM_LOCAL_EXPERTS) {
+  if constexpr (EP_SLOT_WS > 1) {
+    // Slot-parallel ownership: partition the activated list, not the id
+    // space. expert_idx is already the rank in the score-sorted list that
+    // topk_softmax wrote (active_expert_ids[k_idx] = expert, k_idx ascending
+    // by score), and routing is replicated, so every rank computes the same
+    // split from the same data.
+    if (expert_idx % EP_SLOT_WS != EP_SLOT_ME) {
+      MPK_WS_MARK(8104, global_tile); // exit: slot not owned by this rank
+      return;
+    }
+  } else if (expert_id < EXPERT_BASE ||
+             expert_id >= EXPERT_BASE + NUM_LOCAL_EXPERTS) {
     MPK_WS_MARK(8104, global_tile); // exit: expert not owned by this rank
     return;
   }
-  int local_eid = expert_id - EXPERT_BASE;
+  // Slot-parallel replicates the weights, so the local index is the global
+  // one; the id split packs its owned range down to [0, NUM_LOCAL_EXPERTS).
+  int local_eid = (EP_SLOT_WS > 1) ? expert_id : (expert_id - EXPERT_BASE);
   int const *expert_routing = d_routing + expert_id * BATCH_SIZE;
 
   if (tok_idx >= BATCH_SIZE) {

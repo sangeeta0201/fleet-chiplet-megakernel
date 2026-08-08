@@ -112,6 +112,37 @@ mpk_shmem_signal_wait_ge(uint64_t *sig_addr, uint64_t val) {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// Direct peer address translation.
+//
+// Returns a pointer THIS PE can dereference that aliases the symmetric-heap
+// object `dest` on PE `pe`, or nullptr if that PE is not directly addressable.
+// On a single node with XGMI and the IPC backend every peer is mapped, so this
+// succeeds and ordinary stores to the returned address land in the peer's HBM.
+//
+// Why this and not putmem_signal: putmem_signal is a work-group collective that
+// builds a descriptor and hands the transfer to a DMA engine. That is the right
+// trade for a large message, but the EP combine moves 5.8 KB -- 0.09 us of wire
+// time at 64 GB/s -- so the fixed cost of setting up the transfer dominates the
+// transfer itself. With a peer pointer the producing work-group simply stores
+// its result at the remote address as part of the epilogue it was already
+// running, and the write travels over the same XGMI link with none of the
+// setup. The cost of the exchange collapses to the cost of the stores.
+//
+// The returned pointer is stable for the lifetime of the allocation, so callers
+// resolve it once and reuse it rather than calling this per layer.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void *mpk_shmem_peer_ptr(void const *dest, int pe) {
+#if defined(USE_NVSHMEM)
+  return nvshmem_ptr(dest, pe);
+#elif defined(USE_ROCSHMEM)
+  return rocshmem::rocshmem_ptr(dest, pe);
+#else
+  (void)pe;
+  return const_cast<void *>(dest);
+#endif
+}
+
 // Optional per-work-group SHMEM context lifetime hooks. NVSHMEM needs none;
 // rocSHMEM's IPC single-node backend does not require them either (kept as
 // no-op hooks so other rocSHMEM backends can opt in later without touching the

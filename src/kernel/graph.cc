@@ -758,8 +758,8 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         16, 6, TASK_GANG_OPROJ_TOPK_MOE_FUSED_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[15]; // workers_per_xcd (30)
   } else if (name == "gang_full_layer_fused_mi300") {
-    assert(params.size() == 34 &&
-           "gang_full_layer_fused_mi300 needs 34 params");
+    assert(params.size() == 36 &&
+           "gang_full_layer_fused_mi300 needs 36 params");
     int variant_id = task_register->register_gang_full_layer_fused_mi300_task(
         customized->bgraph, params);
     // params[31] = ep_world_size. > 1 adds the inline-combine tensors:

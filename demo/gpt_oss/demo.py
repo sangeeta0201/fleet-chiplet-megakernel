@@ -1454,7 +1454,29 @@ if __name__ == "__main__":
         # degradation, the allreduce sums correctly and the bug is in slicing/local_eid.
         # If it collapses identically to the sliced case, the MoE allreduce is broken.
         ep_noslice = os.environ.get("EP_NOSLICE", "0") == "1"
-        if moe_ep and not ep_noslice:
+        # EP_SLOT: partition the ACTIVATED expert list by slot instead of
+        # partitioning the expert id space. active_expert_ids always holds
+        # exactly top_k entries and is score-ordered and replicated, so slots
+        # split evenly (2/2 at top_k=4) on every token, whereas an id split
+        # lands 3-1 half the time and 4-0 an eighth of the time. Phase 9's
+        # GPU-wide barrier waits for the straggler rank, so that imbalance is
+        # directly on the critical path.
+        #
+        # The cost is replicated expert weights: 63.7 GB of MXFP4 experts on
+        # every rank instead of half that. On a 252 GB MI350 that is free, but
+        # it does give up EP's memory-capacity win -- this is a pure latency
+        # play, and a model that only fits when sharded cannot use it.
+        ep_slot = (world_size > 1 and moe_ep
+                   and os.environ.get("EP_SLOT", "0") == "1")
+        # Inline-EP combine ablation; see MPK_EP_ABLATE in
+        # gang_full_layer_fused_mi300.cuh. Non-zero means WRONG OUTPUT by
+        # construction -- latency attribution only.
+        ep_ablate = int(os.environ.get("MPK_EP_ABLATE", "0"))
+        if ep_ablate:
+            print(f"[EP_ABLATE={ep_ablate}] Phase 9 "
+                  f"{'put/wait removed' if ep_ablate == 1 else 'removed'} -- "
+                  f"OUTPUT IS WRONG, latency attribution only")
+        if moe_ep and not ep_noslice and not ep_slot:
             assert num_experts % world_size == 0, \
                 f"num_experts={num_experts} must be divisible by world_size={world_size}"
             ep_local = num_experts // world_size
@@ -1462,7 +1484,12 @@ if __name__ == "__main__":
         else:
             ep_local = num_experts
             ep_base = 0
-        ep_slice = moe_ep and not ep_noslice
+        # Slot-parallel needs the FULL replicated weight tensors: it selects by
+        # activated-list position, so any expert id can land on any rank.
+        ep_slice = moe_ep and not ep_noslice and not ep_slot
+        if ep_slot:
+            print(f"[EP_SLOT] rank {rank} owns activated slots "
+                  f"{rank}::{world_size} (weights replicated)")
         # The single rank that folds the real residual into its MoE partial,
         # so that after the cross-rank SUM the residual appears exactly once.
         _ep_fold_rank = int(os.environ.get("EP_FOLD_RANK", "0"))
@@ -1483,13 +1510,14 @@ if __name__ == "__main__":
             #   49*16 (784): ep_combine_release[0..7]
             #   58*16 (928): ep_fold_done[0..7]
             #   67*16 (1072): ep_combine_done[0..7]
+            #   76*16 (1216): ep_xcd_arrive[0..7]  (two-level 9a tree)
             # Must match FULL_LAYER_EP_COUNTER_SIZE in
-            # gang_full_layer_fused_mi300.cuh. The EP phase's four barriers do
+            # gang_full_layer_fused_mi300.cuh. The EP phase's barriers do
             # not fit in 832/896; undersizing here silently corrupts whatever
             # torch allocated next.
             counter_size = 896 if fuse_tail else 832
             if attn_dp and moe_ep:
-                counter_size = max(counter_size, 76 * 16)
+                counter_size = max(counter_size, 85 * 16)
             oproj_topk_counters = make_tensor("oproj_topk_counters", (counter_size,), torch_dtype=torch.int32)
         # Hierarchical barrier for fused QKV+Attention kernel [16 int32]:
         # [0..7]: per-XCD QKV arrival counters, [8]: global leader count
@@ -2090,6 +2118,8 @@ if __name__ == "__main__":
                             w2_output_per_wg=w2_output_per_wg,
                             expert_base=ep_base if ep_slice else 0,
                             num_local_experts=ep_local,
+                            ep_slot_ws=world_size if ep_slot else 1,
+                            ep_slot_me=rank if ep_slot else 0,
                             # Inline EP combine: fuses the cross-rank MoE sum
                             # into the monolith's epilogue. None on every other
                             # config, which compiles Phase 9 out entirely.
@@ -2100,7 +2130,20 @@ if __name__ == "__main__":
                             block_dim=(256, 1, 1),
                         )
                     x = attn_proj_out
-                    if dp_ep_fused:
+                    if dp_ep_fused and ep_ablate == 2:
+                        # Phase 9 is compiled out, so nothing wrote
+                        # ep_combined and nothing zeroed the workspace. Use
+                        # the dp_local dataflow instead: the next layer's QKV
+                        # prologue consumes moe_workspace_f32 + residual and
+                        # zeroes it, exactly as with replicated experts. The
+                        # result is each rank's own partial sum -- WRONG
+                        # output, but a stable, correctly-shaped model whose
+                        # only difference from the DP baseline is that the
+                        # experts are sliced 64/64. That is the point: it
+                        # prices EP's compute saving with none of the
+                        # combine's cost.
+                        pass
+                    elif dp_ep_fused:
                         # The monolith's Phase 9 already folded the residual,
                         # summed across ranks and zeroed the workspace. Its
                         # output is the complete residual stream, which the
@@ -3704,7 +3747,14 @@ if __name__ == "__main__":
                 dp_bias_all = experts_ref.down_proj_bias.data.to("cuda")     # [E, hidden]
                 owned_active = []
                 for e_idx in active.tolist():
-                    if not (_ep_lo <= e_idx < _ep_hi):
+                    if ep_slot:
+                        # Ownership is by position in the score-sorted
+                        # activated list, not by id. mg_routing[e, 0] - 1 is
+                        # that position (the k_idx topk_softmax stored), which
+                        # is exactly the expert_idx the kernel tests.
+                        if (mg_routing[e_idx, 0].item() - 1) % world_size != rank:
+                            continue
+                    elif not (_ep_lo <= e_idx < _ep_hi):
                         continue
                     owned_active.append(e_idx)
                     slot = mg_routing[e_idx, 0].item() - 1

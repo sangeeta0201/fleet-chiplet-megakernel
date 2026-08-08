@@ -409,6 +409,13 @@ def get_compile_command(
             flags = flags + ["-DMPK_FUSED_TAIL_TIMING"]
         if int(os.environ.get("MPK_K2944_DEBUG", "0")) == 1:
             flags = flags + ["-DMPK_K2944_DEBUG"]
+        # Inline-EP combine ablation. 1 = keep every barrier but drop the
+        # cross-GPU put/wait; 2 = drop Phase 9 entirely but keep the 64/64
+        # expert slicing. BOTH PRODUCE WRONG OUTPUT -- they exist to price the
+        # collective's parts against the DP baseline, nothing else.
+        _ep_ablate = int(os.environ.get("MPK_EP_ABLATE", "0"))
+        if _ep_ablate:
+            flags = flags + [f"-DMPK_EP_ABLATE={_ep_ablate}"]
         # The precomputed worker-dispatch template is baked from single-GPU task
         # timing. Under multi-GPU (rocSHMEM) the cross-GPU put+signal waits
         # perturb that timing and the fixed template deadlocks: a worker parks
@@ -3414,6 +3421,12 @@ class PersistentKernel:
         ep_signal: DTensor = None,
         ep_combined: DTensor = None,
         ep_fold_rank: int = 0,
+        # Slot-parallel expert split. When ep_slot_ws > 1 the rank owns the
+        # activated-list slots congruent to ep_slot_me, and gate_up/down must
+        # be the FULL replicated weights (expert_base=0,
+        # num_local_experts=num_experts).
+        ep_slot_ws: int = 1,
+        ep_slot_me: int = 0,
         block_dim: tuple = (256, 1, 1),
     ):
         """Full-layer fused gang task: QKV+Attn+O-proj+TopK+MoE.
@@ -3592,7 +3605,8 @@ class PersistentKernel:
              expert_base, num_local_experts,
              self.world_size if ep_inline else 1,
              self.mpi_rank if ep_inline else 0,
-             ep_fold_rank]
+             ep_fold_rank,
+             ep_slot_ws, ep_slot_me]
         )
 
     def gang_full_layer_with_lmhead_fused_layer(
