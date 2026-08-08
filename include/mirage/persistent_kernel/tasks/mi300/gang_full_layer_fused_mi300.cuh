@@ -958,9 +958,12 @@ __device__ __noinline__ void
     // every other barrier here uses, so nothing is reset between layers and no
     // worker has to observe a shared value to agree on the target.
     int const ep_expected = layer_counter + 1;
-    // Each peer contributes one SIGNAL_ADD of 1 per layer.
-    uint64_t const ep_sig_expected =
-        (uint64_t)(EP_WORLD_SIZE - 1) * (uint64_t)ep_expected;
+    // One signal line per producing PE, and the consumer waits on each line
+    // separately, so a line's threshold is just the layer count -- one arrival
+    // per layer from its one writer. This used to be (EP_WORLD_SIZE - 1) *
+    // ep_expected, which is the same thing at world size 2 and too high at any
+    // larger size: a line would never reach it and the wait would hang.
+    uint64_t const ep_sig_expected = (uint64_t)ep_expected;
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
     _ep_t0 = __builtin_amdgcn_s_memrealtime();
@@ -1121,6 +1124,11 @@ __device__ __noinline__ void
         // accumulate, so it stays idempotent and the consumer's threshold is
         // unchanged from the staged path -- but it must be issued only once the
         // whole payload is there, hence the local count first.
+        //
+        // One signal per PE, not one per (PE, XCD). Splitting it so each XCD
+        // pair handshakes privately is the obvious next move -- the consumer
+        // below reads only its own columns -- and it deadlocks. Left as one
+        // signal until that is understood; see the note on the consumer.
         if (tid == 0) {
           int prev_f = atom_add_release_gpu_s32(ep_fold_done, 1);
           if (prev_f % 8 == 7) {
@@ -1178,14 +1186,12 @@ __device__ __noinline__ void
     // correct without a second GPU-wide barrier.
     if (xcd_rank == 0) {
       if (tid == 0) {
-        // Every slice of the LOCAL fold, not just this XCD's: the reduce reads
-        // the whole gather slot. ep_release was already consumed above (it is
-        // what let this workgroup start folding), so the wait here is on the
-        // 8-way fold count that follows it.
-        int _obs;
-        while ((_obs = ld_nt_s32(ep_fold_done)) < 8 * ep_expected) {
-          __builtin_amdgcn_s_sleep(1);
-        }
+        // No wait on the local fold. This workgroup reduces exactly the column
+        // slice it just folded, so the local half of its input is its own
+        // store, already ordered by the vmcnt(0) + fence above. The
+        // 8 * ep_expected wait that used to be here existed only because the
+        // reduce ranged over the whole slot; once the two ranges are the same,
+        // it was pure coupling to the slowest sibling XCD. Worth ~0.04 ms.
 #if MPK_EP_ABLATE != 1 && MPK_EP_ABLATE != 5
         if constexpr (EP_WORLD_SIZE == 2) {
           // Poll the signal directly rather than through the backend's
@@ -1194,6 +1200,16 @@ __device__ __noinline__ void
           // remote write is observed past the local cache hierarchy either way
           // -- which was the only reason the backend primitive was needed here.
           // This keeps the poll a plain load instead of a call into rocSHMEM.
+          //
+          // One signal for the whole peer slot, even though this workgroup
+          // reads only its own columns of it. Giving each XCD pair its own
+          // signal slot within the peer's 8-uint64 line -- so XCD x waits only
+          // on the peer's XCD x, which is the only producer of the columns it
+          // reads -- should be correct and is not: it deadlocks on the first
+          // token, with or without the local all-8 fold gate restored, so the
+          // slot indexing is the variable and not the removed wait. Untangling
+          // that is the next thing worth doing here; it is the last all-8
+          // coupling left in the layer.
           uint64_t *peer_sig =
               ep_signal + (size_t)(1 - EP_MY_PE) * FULL_LAYER_EP_SIGNAL_STRIDE;
           while (ld_nt_u64(reinterpret_cast<unsigned long long *>(peer_sig)) <
@@ -1201,6 +1217,8 @@ __device__ __noinline__ void
             __builtin_amdgcn_s_sleep(1);
           }
         } else {
+          // Staged fallback: one transfer per peer carries the whole slot and
+          // signals slot 0 of p's line, so every XCD waits on that one slot.
           for (int p = 0; p < EP_WORLD_SIZE; p++) {
             if (p == EP_MY_PE) {
               continue;
@@ -1238,23 +1256,25 @@ __device__ __noinline__ void
 #if MPK_EP_ABLATE != 5
       __hip_bfloat16 *ep_out =
           reinterpret_cast<__hip_bfloat16 *>(output_ptrs[11]);
-      // Slice over the whole slot, not over columns: the fold's column split is
-      // per row, but the reduce is row-agnostic, so this stays correct when
-      // QKV_BATCH_SIZE > 1.
-      constexpr int EP_RED_CHUNK = ((int)EP_SLOT_ELEMS + 7) / 8;
-      int const ep_red_lo = xcd_id * EP_RED_CHUNK;
-      int const ep_red_hi = (ep_red_lo + EP_RED_CHUNK) < (int)EP_SLOT_ELEMS
-                                ? (ep_red_lo + EP_RED_CHUNK)
-                                : (int)EP_SLOT_ELEMS;
-      for (int idx = ep_red_lo + tid; idx < ep_red_hi; idx += blockDim.x) {
-        float acc = 0.0f;
-        for (int p = 0; p < EP_WORLD_SIZE; p++) {
-          acc += (float)ep_gather[(size_t)p * EP_SLOT_ELEMS + idx];
+      // EXACTLY the columns this XCD folded, on every row -- not an arbitrary
+      // eighth of the flat slot. That identity is what lets the wait above be
+      // a single-peer, single-line poll: this workgroup consumes only its own
+      // local store and the matching remote slice, both of which it has
+      // already observed. Any other partition would reintroduce a dependency
+      // on a sibling XCD and with it the all-8 barrier.
+      for (int row = 0; row < QKV_BATCH_SIZE; ++row) {
+        size_t const row_base = (size_t)row * QKV_REDUCTION_SIZE;
+        for (int c = ep_col_lo + tid; c < ep_col_hi; c += blockDim.x) {
+          size_t idx = row_base + c;
+          float acc = 0.0f;
+          for (int p = 0; p < EP_WORLD_SIZE; p++) {
+            acc += (float)ep_gather[(size_t)p * EP_SLOT_ELEMS + idx];
+          }
+          __hip_bfloat16 v = (__hip_bfloat16)acc;
+          unsigned short bits;
+          __builtin_memcpy(&bits, &v, 2);
+          st_wt_u16((void *)&ep_out[idx], bits);
         }
-        __hip_bfloat16 v = (__hip_bfloat16)acc;
-        unsigned short bits;
-        __builtin_memcpy(&bits, &v, 2);
-        st_wt_u16((void *)&ep_out[idx], bits);
       }
 #endif
       __syncthreads();
