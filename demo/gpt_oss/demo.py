@@ -1510,14 +1510,14 @@ if __name__ == "__main__":
             #   49*16 (784): ep_combine_release[0..7]
             #   58*16 (928): ep_fold_done[0..7]
             #   67*16 (1072): ep_combine_done[0..7]
-            #   76*16 (1216): ep_xcd_arrive[0..7]  (two-level 9a tree)
+            #   77*16 (1232): ep_xcd_arrive[0..7]  (two-level 9a tree)
             # Must match FULL_LAYER_EP_COUNTER_SIZE in
             # gang_full_layer_fused_mi300.cuh. The EP phase's barriers do
             # not fit in 832/896; undersizing here silently corrupts whatever
             # torch allocated next.
             counter_size = 896 if fuse_tail else 832
             if attn_dp and moe_ep:
-                counter_size = max(counter_size, 85 * 16)
+                counter_size = max(counter_size, 86 * 16)
             oproj_topk_counters = make_tensor("oproj_topk_counters", (counter_size,), torch_dtype=torch.int32)
         # Hierarchical barrier for fused QKV+Attention kernel [16 int32]:
         # [0..7]: per-XCD QKV arrival counters, [8]: global leader count

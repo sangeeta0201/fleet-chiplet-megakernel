@@ -59,15 +59,18 @@ static constexpr int FULL_LAYER_ATTN_XCD_RELEASE_SLOT = 36 * 16;
 static constexpr int FULL_LAYER_EP_MOE_DONE_SLOT = 48 * 16;      // 768
 static constexpr int FULL_LAYER_EP_RELEASE_SLOT = 49 * 16;       // 784..896
 static constexpr int FULL_LAYER_EP_FOLD_DONE_SLOT = 58 * 16;     // 928..1040
-static constexpr int FULL_LAYER_EP_COMBINE_DONE_SLOT = 67 * 16;  // 1072..1184
+// Nine lines, not eight: [0] is the accumulator the 8 slice-reducers count into
+// and [1+x] is XCD x's release flag. The reduce is sliced across XCDs, so an
+// XCD's own completion no longer means the residual is whole.
+static constexpr int FULL_LAYER_EP_COMBINE_DONE_SLOT = 67 * 16;  // 1072..1216
 // Per-XCD MoE arrival counters for the two-level 9a tree. One 64-byte line per
 // XCD, so the 30 workers of an XCD contend only with each other.
-static constexpr int FULL_LAYER_EP_XCD_ARRIVE_SLOT = 76 * 16;    // 1216..1328
+static constexpr int FULL_LAYER_EP_XCD_ARRIVE_SLOT = 77 * 16;    // 1232..1344
 static constexpr int FULL_LAYER_EP_XCD_STRIDE = 16;
 // Highest int the EP phase touches, + one slot of headroom. Kept next to the
 // slots so the two cannot drift apart; demo.py asserts against it indirectly
 // by allocating this many ints.
-static constexpr int FULL_LAYER_EP_COUNTER_SIZE = 85 * 16;       // 1360
+static constexpr int FULL_LAYER_EP_COUNTER_SIZE = 86 * 16;       // 1376
 // Stride between per-PE signal slots, in uint64. One 64-byte line each so a
 // peer's SIGNAL_ADD never shares a line with another peer's.
 static constexpr int FULL_LAYER_EP_SIGNAL_STRIDE = 8;
@@ -92,10 +95,14 @@ static constexpr int FULL_LAYER_EP_SIGNAL_STRIDE = 8;
 // The remote store is write-through (sc0 sc1) because the peer must observe it
 // without a flush of this rank's L2 -- the same reason every cross-XCD release
 // flag here is st_wt_u32.
+// col_lo/col_hi restrict the fold to a column slice, so the 8 XCD workgroups
+// that are awake anyway can each take 1/8 of the work instead of one workgroup
+// doing all of it while 239 workers idle. The slices are disjoint, so no
+// coordination is needed between them beyond the arrival count that follows.
 template <int BATCH_SIZE, int OUTPUT_SIZE, int OUTPUT_STRIDE, bool FOLD>
 __device__ __forceinline__ void _full_layer_ep_fold_partial(
     void *workspace_f32_ptr, void const *residual_ptr, void *output_ptr,
-    void *peer_out_ptr = nullptr) {
+    void *peer_out_ptr = nullptr, int col_lo = 0, int col_hi = OUTPUT_SIZE) {
   float *__restrict__ d_ws = static_cast<float *>(workspace_f32_ptr);
   unsigned short const *__restrict__ d_res =
       static_cast<unsigned short const *>(residual_ptr);
@@ -113,8 +120,9 @@ __device__ __forceinline__ void _full_layer_ep_fold_partial(
     // transaction, so the narrow form would double the packet count for the
     // same payload. OUTPUT_SIZE is the padded hidden dim (even); the odd tail
     // below exists only so the helper stays correct for any width.
-    int const pairs = OUTPUT_SIZE >> 1;
-    for (int p = threadIdx.x; p < pairs; p += blockDim.x) {
+    int const pair_lo = col_lo >> 1;
+    int const pair_hi = col_hi >> 1;
+    for (int p = pair_lo + threadIdx.x; p < pair_hi; p += blockDim.x) {
       int off = p << 1;
       unsigned packed = 0;
 #pragma unroll
@@ -138,7 +146,7 @@ __device__ __forceinline__ void _full_layer_ep_fold_partial(
         st_wt_u32((void *)&peer_row[off], packed);
       }
     }
-    if ((OUTPUT_SIZE & 1) && threadIdx.x == 0) {
+    if ((OUTPUT_SIZE & 1) && threadIdx.x == 0 && col_hi == OUTPUT_SIZE) {
       int off = OUTPUT_SIZE - 1;
       float v = ws_row[off];
       ws_row[off] = 0.0f;
@@ -1012,15 +1020,65 @@ __device__ __noinline__ void
     if (is_last_on_gpu) {
       threadfence_gpu();
     }
-    // Broadcast the closer's identity to its whole workgroup: the fold is a
-    // 256-thread loop, and only tid 0 evaluated the test above.
+    // The closer releases every XCD immediately, before folding anything. The
+    // fold is then done by all 8 XCD workgroups in parallel, each on its own
+    // column slice, rather than by this one workgroup while 239 workers idle.
+    //
+    // Measured: the bare rendezvous costs 0.29 ms/token (MPK_EP_ABLATE=5) and
+    // adding the single-workgroup fold + reduce took it to 0.59 -- the fold was
+    // as expensive as the barrier that gated it, because 11.8 KB of f32 reads
+    // and 5.8 KB of XGMI stores were running at 1/240 of the machine. Slicing
+    // it 8 ways puts that work on hardware that is already awake and waiting.
+    if (is_last_on_gpu) {
+      for (int x = 0; x < 8; x++) {
+        st_wt_u32((void *)&ep_release[x * FULL_LAYER_EP_XCD_STRIDE],
+                  (unsigned)ep_expected);
+      }
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    }
+
+    // Every XCD's workgroup 0 waits for the release, then folds its slice.
     __shared__ int s_ep_closer;
     if (tid == 0) {
-      s_ep_closer = is_last_on_gpu ? 1 : 0;
+      s_ep_closer = 0;
+      if (xcd_rank == 0) {
+        int _obs;
+        while ((_obs = ld_nt_s32(
+                    &ep_release[xcd_id * FULL_LAYER_EP_XCD_STRIDE])) <
+               ep_expected) {
+          __builtin_amdgcn_s_sleep(1);
+        }
+        s_ep_closer = 1;
+      }
     }
     __syncthreads();
 
+    // Column slice for this XCD. Rounded to an even boundary so the packed
+    // 32-bit peer stores never straddle two slices.
+    constexpr int EP_FOLD_COLS = QKV_REDUCTION_SIZE;
+    constexpr int EP_FOLD_CHUNK = ((EP_FOLD_COLS + 7) / 8 + 1) & ~1;
+    int const ep_col_lo = xcd_id * EP_FOLD_CHUNK;
+    int const ep_col_hi = (ep_col_lo + EP_FOLD_CHUNK) < EP_FOLD_COLS
+                              ? (ep_col_lo + EP_FOLD_CHUNK)
+                              : EP_FOLD_COLS;
+
+    // MPK_EP_ABLATE=5 keeps the 9a rendezvous and the 9e exit fence but drops
+    // everything in between: no fold, no transfer, no reduce. The barrier
+    // structure alone. This is the one measurement that separates "the GPU-wide
+    // rendezvous is inherently expensive" from "the work it gates is". WRONG
+    // OUTPUT: nothing writes ep_combined and the workspace is never zeroed.
+#if MPK_EP_ABLATE == 5
+    if (s_ep_closer && tid == 0) {
+      for (int x = 0; x < 8; x++) {
+        st_wt_u32((void *)&ep_release[x * FULL_LAYER_EP_XCD_STRIDE],
+                  (unsigned)ep_expected);
+      }
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    }
+    if (false) {
+#else
     if (s_ep_closer) {
+#endif
       asm volatile("buffer_inv" ::: "memory");
       // Fold straight into the peer's gather slot as well as my own. peer_slot
       // is this rank's slot in the PEER's copy of the symmetric buffer, so
@@ -1039,6 +1097,7 @@ __device__ __noinline__ void
       // not a per-thread one: the staged fallback below is a work-group
       // collective and every thread must agree on whether to enter it.
       bool const ep_direct = (peer_slot != nullptr);
+      // This XCD's slice only. All 8 run concurrently on disjoint columns.
       _full_layer_ep_fold_partial<QKV_BATCH_SIZE,
                                   QKV_REDUCTION_SIZE,
                                   QKV_REDUCTION_SIZE,
@@ -1046,61 +1105,66 @@ __device__ __noinline__ void
           output_ptrs[10],                      // moe_workspace_f32
           output_ptrs[5],                       // attn_proj_out (residual)
           ep_gather + EP_MY_PE * EP_SLOT_ELEMS, // my slot
-          peer_slot);                           // peer's copy of my slot
+          peer_slot,                            // peer's copy of my slot
+          ep_col_lo,
+          ep_col_hi);
       __syncthreads();
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       threadfence_gpu();
 
 #if MPK_EP_ABLATE != 1
       if (ep_direct) {
-        // The payload is already in the peer's memory, ordered ahead of this
-        // store by the fence above. All that is left is to tell the peer, and
-        // one remote store does it -- a put+signal descriptor here would only
-        // re-send data the peer already has.
+        // My slice is in the peer's memory, ordered ahead of the arrival by the
+        // fence above. Count the slice in; the 8th one to land tells the peer.
         //
-        // A plain store, not an atomic add: with a single peer this slot has
-        // exactly one remote writer, so there is nothing to accumulate. The
-        // value stored is the same run-monotonic count every other barrier in
-        // this file uses (for EP_WORLD_SIZE == 2, ep_sig_expected ==
-        // ep_expected), which keeps the consumer's threshold identical to the
-        // staged path and makes the store idempotent.
+        // The signal is a store of the run-monotonic count rather than an
+        // accumulate, so it stays idempotent and the consumer's threshold is
+        // unchanged from the staged path -- but it must be issued only once the
+        // whole payload is there, hence the local count first.
         if (tid == 0) {
-          uint64_t *peer_sig = reinterpret_cast<uint64_t *>(mpk_shmem_peer_ptr(
-              ep_signal + (size_t)EP_MY_PE * FULL_LAYER_EP_SIGNAL_STRIDE,
-              1 - EP_MY_PE));
-          st_wt_u64((void *)peer_sig, (unsigned long long)ep_sig_expected);
-          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          int prev_f = atom_add_release_gpu_s32(ep_fold_done, 1);
+          if (prev_f % 8 == 7) {
+            uint64_t *peer_sig =
+                reinterpret_cast<uint64_t *>(mpk_shmem_peer_ptr(
+                    ep_signal + (size_t)EP_MY_PE * FULL_LAYER_EP_SIGNAL_STRIDE,
+                    1 - EP_MY_PE));
+            st_wt_u64((void *)peer_sig, (unsigned long long)ep_sig_expected);
+            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          }
         }
       } else {
         // No direct mapping (or world > 2): stage it. putmem_signal is a
-        // work-group collective, so all 256 threads reach this.
-        for (int p = 0; p < EP_WORLD_SIZE; p++) {
-          if (p == EP_MY_PE) {
-            continue;
+        // work-group collective and sends the whole slot, so only one XCD may
+        // issue it, and only after every slice has been folded locally.
+        __shared__ int s_ep_put;
+        if (tid == 0) {
+          int prev_f = atom_add_release_gpu_s32(ep_fold_done, 1);
+          s_ep_put = (prev_f % 8 == 7) ? 1 : 0;
+        }
+        __syncthreads();
+        if (s_ep_put) {
+          asm volatile("buffer_inv" ::: "memory");
+          for (int p = 0; p < EP_WORLD_SIZE; p++) {
+            if (p == EP_MY_PE) {
+              continue;
+            }
+            mpk_putmem_signal_block(
+                ep_gather + EP_MY_PE * EP_SLOT_ELEMS,
+                ep_gather + EP_MY_PE * EP_SLOT_ELEMS,
+                EP_SLOT_BYTES,
+                ep_signal + (size_t)EP_MY_PE * FULL_LAYER_EP_SIGNAL_STRIDE,
+                1,
+                MPK_SIGNAL_ADD,
+                p);
           }
-          mpk_putmem_signal_block(
-              ep_gather + EP_MY_PE * EP_SLOT_ELEMS,
-              ep_gather + EP_MY_PE * EP_SLOT_ELEMS,
-              EP_SLOT_BYTES,
-              ep_signal + (size_t)EP_MY_PE * FULL_LAYER_EP_SIGNAL_STRIDE,
-              1,
-              MPK_SIGNAL_ADD,
-              p);
         }
       }
 #else
       (void)ep_direct;
-#endif
-      // Local fold and remote payload are both published. Release every XCD in
-      // one shot: this is the ONLY release chain in the phase now.
       if (tid == 0) {
-        for (int x = 0; x < 8; x++) {
-          st_wt_u32((void *)&ep_release[x * FULL_LAYER_EP_XCD_STRIDE],
-                    (unsigned)ep_expected);
-        }
-        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        atom_add_release_gpu_s32(ep_fold_done, 1);
       }
-      (void)ep_fold_done;
+#endif
     }
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
@@ -1114,15 +1178,15 @@ __device__ __noinline__ void
     // correct without a second GPU-wide barrier.
     if (xcd_rank == 0) {
       if (tid == 0) {
-        // One wait, not two: ep_release is now published after the fold and
-        // after the remote payload, so it covers both.
+        // Every slice of the LOCAL fold, not just this XCD's: the reduce reads
+        // the whole gather slot. ep_release was already consumed above (it is
+        // what let this workgroup start folding), so the wait here is on the
+        // 8-way fold count that follows it.
         int _obs;
-        while ((_obs = ld_nt_s32(
-                    &ep_release[xcd_id * FULL_LAYER_EP_XCD_STRIDE])) <
-               ep_expected) {
+        while ((_obs = ld_nt_s32(ep_fold_done)) < 8 * ep_expected) {
           __builtin_amdgcn_s_sleep(1);
         }
-#if MPK_EP_ABLATE != 1
+#if MPK_EP_ABLATE != 1 && MPK_EP_ABLATE != 5
         if constexpr (EP_WORLD_SIZE == 2) {
           // Poll the signal directly rather than through the backend's
           // wait_until. Both the direct store and rocSHMEM's SIGNAL_ADD land at
@@ -1160,28 +1224,56 @@ __device__ __noinline__ void
       //
       // Its own output slot, not output_ptrs[0]: that one is the pre-attention
       // residual stream, which Phase 7 is still reading as o_proj's residual.
-      // All 8 XCDs write the same values here rather than one XCD writing and
-      // the rest relying on a cross-XCD flush -- next layer's Phase 1 readers
-      // are on the same XCD as their writer, which is L2-coherent by
-      // construction.
+      //
+      // Every XCD used to compute the WHOLE sum here -- 8 workgroups doing
+      // byte-identical work -- on the reasoning that a next-layer reader is
+      // always on the same XCD as its writer, so no cross-XCD flush is needed.
+      // That is true but it is not a reason to recompute: each XCD now sums
+      // only its own slice and writes it through (sc0 sc1), so the result is
+      // visible to every XCD regardless of which one produced it. Same total
+      // stores, an eighth of the loads, and no redundant arithmetic.
+      //
+      // The exit barrier below is what makes this safe: no worker leaves the
+      // layer until all 8 slices are published.
+#if MPK_EP_ABLATE != 5
       __hip_bfloat16 *ep_out =
           reinterpret_cast<__hip_bfloat16 *>(output_ptrs[11]);
-      for (int idx = tid; idx < (int)EP_SLOT_ELEMS; idx += blockDim.x) {
+      // Slice over the whole slot, not over columns: the fold's column split is
+      // per row, but the reduce is row-agnostic, so this stays correct when
+      // QKV_BATCH_SIZE > 1.
+      constexpr int EP_RED_CHUNK = ((int)EP_SLOT_ELEMS + 7) / 8;
+      int const ep_red_lo = xcd_id * EP_RED_CHUNK;
+      int const ep_red_hi = (ep_red_lo + EP_RED_CHUNK) < (int)EP_SLOT_ELEMS
+                                ? (ep_red_lo + EP_RED_CHUNK)
+                                : (int)EP_SLOT_ELEMS;
+      for (int idx = ep_red_lo + tid; idx < ep_red_hi; idx += blockDim.x) {
         float acc = 0.0f;
         for (int p = 0; p < EP_WORLD_SIZE; p++) {
           acc += (float)ep_gather[(size_t)p * EP_SLOT_ELEMS + idx];
         }
-        ep_out[idx] = (__hip_bfloat16)acc;
+        __hip_bfloat16 v = (__hip_bfloat16)acc;
+        unsigned short bits;
+        __builtin_memcpy(&bits, &v, 2);
+        st_wt_u16((void *)&ep_out[idx], bits);
       }
+#endif
       __syncthreads();
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       threadfence_gpu();
 
-      // Release this XCD's remaining 29 workers (9e below).
+      // Count this slice in. The reduce is now sliced across XCDs, so an XCD's
+      // own flag no longer means the residual is complete -- it means 1/8 of it
+      // is. The last slice to land releases everyone.
       if (tid == 0) {
-        st_wt_u32((void *)&ep_combine_done[xcd_id * FULL_LAYER_EP_XCD_STRIDE],
-                  (unsigned)ep_expected);
-        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        int prev_c = atom_add_release_gpu_s32(ep_combine_done, 1);
+        if (prev_c % 8 == 7) {
+          for (int x = 0; x < 8; x++) {
+            st_wt_u32(
+                (void *)&ep_combine_done[(1 + x) * FULL_LAYER_EP_XCD_STRIDE],
+                (unsigned)ep_expected);
+          }
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        }
       }
     }
 
@@ -1214,12 +1306,17 @@ __device__ __noinline__ void
     // non-combining workers run straight into the next layer while the combine
     // is still in flight, which is exactly the WAR hazard documented above:
     // WRONG OUTPUT, latency attribution only.
+    //
+    // EVERY worker waits now, including the combiners: with the reduce sliced,
+    // an XCD's own workgroup 0 has produced only its eighth of the residual and
+    // must still see the other seven before the next layer reads them.
 #if MPK_EP_ABLATE != 4
-    if (xcd_rank != 0) {
+    {
       if (tid == 0) {
         int _obs;
         while ((_obs = ld_nt_s32(
-                    &ep_combine_done[xcd_id * FULL_LAYER_EP_XCD_STRIDE])) <
+                    &ep_combine_done[(1 + xcd_id) *
+                                     FULL_LAYER_EP_XCD_STRIDE])) <
                ep_expected) {
           __builtin_amdgcn_s_sleep(1);
         }
