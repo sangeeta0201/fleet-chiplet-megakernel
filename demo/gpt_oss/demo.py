@@ -2126,6 +2126,19 @@ if __name__ == "__main__":
                             ep_gather=ep_gather_list[i] if dp_ep_fused else None,
                             ep_signal=ep_signal_list[i] if dp_ep_fused else None,
                             ep_combined=ep_combined_list[i] if dp_ep_fused else None,
+                            # The reduce, fused into this layer's QKV prologue:
+                            # it sums the PREVIOUS layer's per-rank slots in the
+                            # pass it already makes over that vector. Layer 0
+                            # has no predecessor and reads the embedding.
+                            ep_prev_gather=(
+                                ep_gather_list[i - 1]
+                                if (dp_ep_fused and i > 0) else None
+                            ),
+                            # Only the last layer's consumer is a separate task
+                            # (the tail), so only it materializes the sum.
+                            ep_write_combined=(
+                                dp_ep_fused and i == num_layers - 1
+                            ),
                             ep_fold_rank=_ep_fold_rank,
                             block_dim=(256, 1, 1),
                         )
@@ -2144,13 +2157,19 @@ if __name__ == "__main__":
                         # combine's cost.
                         pass
                     elif dp_ep_fused:
-                        # The monolith's Phase 9 already folded the residual,
-                        # summed across ranks and zeroed the workspace. Its
-                        # output is the complete residual stream, which the
-                        # next layer's QKV prologue reads as `residual`.
+                        # Phase 9 folded the residual, exchanged partials and
+                        # zeroed the workspace, but for layers 0..n-2 it did NOT
+                        # sum: the next layer's prologue does that itself from
+                        # ep_prev_gather. So ep_combined_list[i] is written on
+                        # the LAST layer only, where the consumer is the tail
+                        # task and there is no prologue to fuse into.
+                        #
+                        # Threading it through `x` regardless keeps the graph
+                        # edge that orders layer i before layer i+1; on the
+                        # intermediate layers the kernel ignores the pointer
+                        # (EP_PREV_SLOTS > 1 selects input[26] instead), and on
+                        # the last one this is the value the tail reads.
                         x = ep_combined_list[i]
-                        # No last-layer residual add needed either: Phase 9's
-                        # fold already produced the complete bf16 value.
                     elif i == num_layers - 1 and not fused_tail_done:
                         # Last layer needs explicit residual add (f32→bf16)
                         mpk.moe_residual_add_f32_layer(

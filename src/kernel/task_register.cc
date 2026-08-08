@@ -1992,7 +1992,7 @@ int TaskRegister::register_gang_oproj_topk_moe_fused_mi300_task(
 //                active_expert_ids, moe_routing_weight, moe_workspace_f32]
 int TaskRegister::register_gang_full_layer_fused_mi300_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 36);
+  assert(params.size() == 38);
   int qkv_output_per_wg = params[0];
   int qkv_n_wgs_per_xcd = params[1];
   int total_qkv_tiles_per_xcd = params[2];
@@ -2038,10 +2038,17 @@ int TaskRegister::register_gang_full_layer_fused_mi300_task(
   // ep_slot_me mod ep_slot_ws rather than an id range. 1/0 = disabled.
   int ep_slot_ws = params[34];
   int ep_slot_me = params[35];
+  // The EP reduce, dissolved into this layer's QKV prologue: > 1 means
+  // input[26] is the PREVIOUS layer's gather buffer and Phase 1 sums its slots
+  // instead of reading a combined residual. ep_write_combined marks the one
+  // layer (the last) whose consumer is a separate task and therefore still
+  // needs the sum materialized into output[11].
+  int ep_prev_slots = params[36];
+  bool ep_write_combined = params[37] != 0;
 
   std::vector<tb::TBInputOp *> input_ops;
   std::vector<tb::TBInputOp *> output_ops;
-  int num_inputs = ep_inline ? 26 : 24;
+  int num_inputs = ep_inline ? (ep_prev_slots > 1 ? 27 : 26) : 24;
   int num_outputs = ep_inline ? 12 : 11;
 
   assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
@@ -2070,10 +2077,10 @@ int TaskRegister::register_gang_full_layer_fused_mi300_task(
   code.inc_indent();
   // 22 template parameters + DECODE_ONLY=true (compile out prefill attention
   // path) + the 2 expert-parallel ownership bounds + the 3 inline-combine ones
-  // + the 2 slot-split ones
+  // + the 2 slot-split ones + the 2 dissolved-reduce ones
   code.e("kernel::gang_full_layer_fused_kernel_mi300<$, $, $, $, $, $, $, $, "
          "$, $, $, $, $, $, $, $, $, $, $, $, $, $, true, $, $, $, $, $, $, "
-         "$>(",
+         "$, $, $>(",
          batch_size,
          qkv_output_per_wg,
          qkv_reduction_size,
@@ -2102,7 +2109,9 @@ int TaskRegister::register_gang_full_layer_fused_mi300_task(
          ep_my_pe,
          ep_fold_pe,
          ep_slot_ws,
-         ep_slot_me);
+         ep_slot_me,
+         ep_prev_slots,
+         ep_write_combined);
   // Pass input/output pointer arrays directly (2 params instead of 34)
   code.e("    task_desc->input_ptrs,");
   code.e("    task_desc->output_ptrs,");

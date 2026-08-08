@@ -2035,13 +2035,34 @@ __device__ __noinline__ void gang_resaddf32_rmsnorm_linear_mxfp4_bias_kernel(
 // ── KVUpd variant: ResAddF32 + RMSNorm + MXFP4 + KV Cache Update ───────
 // Replaces gang_mulsumradd_rmsnorm_linear_mxfp4_bias_kvupd_kernel for layers
 // 1+.
+//
+// EP_PEER_SLOTS > 0 folds the expert-parallel cross-rank SUM into this
+// prologue. `residual_ptr` then points at the symmetric gather buffer --
+// EP_PEER_SLOTS consecutive [batch, REDUCTION_SIZE] bf16 slots, one per rank,
+// each holding that rank's partial (with the true residual already folded into
+// exactly one of them) -- and this loop sums them instead of reading one
+// pre-combined vector.
+//
+// The point is not the arithmetic, which is the same adds either way. It is
+// that the previous owner of those adds was a separate reduce pass at the end
+// of the layer, and that pass needed an exit barrier behind it so no worker
+// entered the next layer before the combined vector was whole. Reading the
+// slots here instead means the consumer IS the reduction: there is no window
+// between "combined" and "consumed" for a barrier to protect, so the barrier
+// goes away with it. This is only available because the whole model is one
+// kernel -- a separate consumer kernel could not see the producer's slots
+// without a launch boundary doing exactly the synchronization being removed.
+//
+// The two loads are independent and both issue before either is waited on, so
+// the second slot costs no extra latency, just bandwidth: 5.8 KB per layer.
 template <int BATCH_SIZE,
           int OUTPUT_PER_WG,
           int REDUCTION_SIZE,
           int ACTUAL_HIDDEN_DIM,
           int HEAD_DIM,
           int NUM_Q_PER_KV,
-          int PAGE_SIZE>
+          int PAGE_SIZE,
+          int EP_PEER_SLOTS = 0>
 __device__ __noinline__ void
     gang_resaddf32_rmsnorm_linear_mxfp4_bias_kvupd_kernel(
         void *workspace_f32_ptr,  // [batch, REDUCTION_SIZE] f32 (read + zero)
@@ -2193,6 +2214,33 @@ __device__ __noinline__ void
           __builtin_memcpy(&rv1, &r1, 4);
           __builtin_memcpy(&rv2, &r2, 4);
           __builtin_memcpy(&rv3, &r3, 4);
+
+          // The other ranks' slots, when this prologue is also the EP
+          // reduction. Slot stride is the whole [batch, REDUCTION_SIZE] plane;
+          // slot 0 is the base res_base already read above.
+          if constexpr (EP_PEER_SLOTS > 1) {
+#pragma unroll
+            for (int p = 1; p < EP_PEER_SLOTS; p++) {
+              uint2 pk;
+              __builtin_memcpy(
+                  &pk,
+                  res_base + (size_t)p * BATCH_SIZE * REDUCTION_SIZE + off,
+                  8);
+              unsigned p0 = (pk.x & 0xFFFFu) << 16;
+              unsigned p1 = pk.x & 0xFFFF0000u;
+              unsigned p2 = (pk.y & 0xFFFFu) << 16;
+              unsigned p3 = pk.y & 0xFFFF0000u;
+              float pv0, pv1, pv2, pv3;
+              __builtin_memcpy(&pv0, &p0, 4);
+              __builtin_memcpy(&pv1, &p1, 4);
+              __builtin_memcpy(&pv2, &p2, 4);
+              __builtin_memcpy(&pv3, &p3, 4);
+              rv0 += pv0;
+              rv1 += pv1;
+              rv2 += pv2;
+              rv3 += pv3;
+            }
+          }
 
           float s0 = ws4.x + rv0;
           float s1 = ws4.y + rv1;

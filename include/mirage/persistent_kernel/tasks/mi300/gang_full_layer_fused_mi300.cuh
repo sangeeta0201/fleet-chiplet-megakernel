@@ -168,6 +168,44 @@ __device__ __forceinline__ void _full_layer_ep_fold_partial(
   }
 }
 
+// Wait until every OTHER PE's slot of the symmetric gather buffer has landed
+// for this layer. Single-threaded; the caller decides which thread runs it.
+//
+// At world size 2 this is one plain non-temporal load in a loop rather than a
+// call into rocSHMEM: the direct peer store and rocSHMEM's SIGNAL_ADD land at
+// the same symmetric address, and ld_nt_u64 observes it past the local cache
+// hierarchy either way, which was the only reason the backend primitive was
+// needed. Wider worlds keep the staged path.
+//
+// Many workers may poll the same address concurrently and that is fine: a load
+// is not a coherence transaction the way an atomic is, and the line is
+// read-only until its one writer touches it once per layer. The 240-deep
+// arrival tree in 9a exists because atomicAdds to one address serialize; reads
+// to one address do not.
+template <int EP_WORLD_SIZE, int EP_MY_PE>
+__device__ __forceinline__ void
+    _full_layer_ep_wait_peers(uint64_t *ep_signal, uint64_t ep_sig_expected) {
+  if constexpr (EP_WORLD_SIZE == 2) {
+    uint64_t *peer_sig =
+        ep_signal + (size_t)(1 - EP_MY_PE) * FULL_LAYER_EP_SIGNAL_STRIDE;
+    while (ld_nt_u64(reinterpret_cast<unsigned long long *>(peer_sig)) <
+           (unsigned long long)ep_sig_expected) {
+      __builtin_amdgcn_s_sleep(1);
+    }
+  } else {
+    // Staged fallback: one transfer per peer carries the whole slot and
+    // signals slot 0 of p's line, so every waiter watches that one slot.
+    for (int p = 0; p < EP_WORLD_SIZE; p++) {
+      if (p == EP_MY_PE) {
+        continue;
+      }
+      mpk_shmem_signal_wait_ge(
+          ep_signal + (size_t)p * FULL_LAYER_EP_SIGNAL_STRIDE,
+          ep_sig_expected);
+    }
+  }
+}
+
 template <int QKV_BATCH_SIZE,
           int QKV_OUTPUT_PER_WG,
           int QKV_REDUCTION_SIZE,
@@ -210,7 +248,25 @@ template <int QKV_BATCH_SIZE,
           // Slot-parallel expert split (see gang_moe_fused_mxfp4_mi300.cuh).
           // Replaces the id-range split when > 1; requires replicated weights.
           int EP_SLOT_WS = 1,
-          int EP_SLOT_ME = 0>
+          int EP_SLOT_ME = 0,
+          // The EP reduction, dissolved into this layer's QKV prologue.
+          //
+          // > 1 means input_ptrs[26] is the PREVIOUS layer's symmetric gather
+          // buffer -- [EP_PREV_SLOTS, batch, QKV_REDUCTION_SIZE], one slot per
+          // rank holding that rank's partial -- and Phase 1 reads it in place
+          // of input_ptrs[1], summing the slots in the same pass it already
+          // makes over that vector to compute the sum of squares. There is no
+          // separate reduce and no barrier around one.
+          //
+          // Layer 0 has no predecessor and so passes 1: its residual is the
+          // embedding, an ordinary 2-D tensor in input_ptrs[1].
+          int EP_PREV_SLOTS = 1,
+          // Whether this layer's Phase 9 also materializes the sum into
+          // output_ptrs[11]. Only the LAST layer needs it, because the tail
+          // (final RMSNorm + LM head) is a separate task that reads a plain 2-D
+          // tensor and has no slot-summing prologue to fold the reduce into.
+          // Every other layer leaves the exchange as the last thing it does.
+          bool EP_WRITE_COMBINED = false>
 __device__ __noinline__ void
     gang_full_layer_fused_kernel_mi300(void *const *input_ptrs,
                                        void *const *output_ptrs,
@@ -394,15 +450,39 @@ __device__ __noinline__ void
   // ══════════════════════════════════════════════════════════════════
   MPK_TW_SUB(10, xcd_rank);
   if (xcd_rank < total_qkv_tiles_per_xcd) {
+    // Under EP the "residual" this prologue reads is the PREVIOUS layer's
+    // symmetric gather buffer, and the prologue performs the cross-rank SUM
+    // itself as part of the pass it already makes over that vector. See
+    // EP_PEER_SLOTS in gang_rmsnorm_linear_mxfp4_bias_mi300.cuh: it is what
+    // lets Phase 9 end at the exchange instead of running a reduce and an exit
+    // barrier after it. Slot 0 of the gather buffer sits exactly where an
+    // ordinary residual would, so the pointer arithmetic is identical and
+    // EP_PREV_SLOTS == 1 (layer 0, or no EP at all) reads it as one.
+    void const *qkv_residual =
+        (EP_PREV_SLOTS > 1) ? input_ptrs[26] : input_ptrs[1];
+
+    // The peer's slot is NOT waited on here, even though these 8 workers are
+    // its only readers and this is the first instruction that needs it.
+    //
+    // Moving the wait here was the obvious "dependency at the point of use"
+    // play and it measured slower: 2.542 vs 2.528 ms/token. The reason is
+    // where each placement sits relative to the rest of the layer. At the end
+    // of the previous layer the wait trails everything -- the peer is running
+    // the same layer on the same schedule, so its store has effectively
+    // already landed by the time anyone looks. Here it sits UPSTREAM of the
+    // Phase 2 QKV barrier, which gates all of attention, so any residual
+    // latency serializes with the whole layer instead of overlapping the
+    // layer boundary. The wait stays in 9d.
     gang_resaddf32_rmsnorm_linear_mxfp4_bias_kvupd_kernel<QKV_BATCH_SIZE,
                                                           QKV_OUTPUT_PER_WG,
                                                           QKV_REDUCTION_SIZE,
                                                           ACTUAL_HIDDEN_DIM,
                                                           HEAD_DIM,
                                                           NUM_Q_PER_KV,
-                                                          PAGE_SIZE>(
+                                                          PAGE_SIZE,
+                                                          EP_PREV_SLOTS>(
         input_ptrs[0],
-        input_ptrs[1],
+        qkv_residual,
         input_ptrs[2],
         input_ptrs[3],
         input_ptrs[4],
@@ -1137,6 +1217,16 @@ __device__ __noinline__ void
                     ep_signal + (size_t)EP_MY_PE * FULL_LAYER_EP_SIGNAL_STRIDE,
                     1 - EP_MY_PE));
             st_wt_u64((void *)peer_sig, (unsigned long long)ep_sig_expected);
+            // Same store, local copy: this thread has just observed all 8
+            // local slices, which is precisely what a worker leaving this
+            // layer needs to know about its OWN rank's slot. Publishing it on
+            // the local signal line rather than a separate flag means the
+            // consumer's wait is two loads in one loop instead of two
+            // rendezvous -- and it is written by the thread that already knew
+            // the answer, so it adds no hop.
+            st_wt_u64((void *)(ep_signal + (size_t)EP_MY_PE *
+                                               FULL_LAYER_EP_SIGNAL_STRIDE),
+                      (unsigned long long)ep_sig_expected);
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
           }
         }
@@ -1150,6 +1240,12 @@ __device__ __noinline__ void
           s_ep_put = (prev_f % 8 == 7) ? 1 : 0;
         }
         __syncthreads();
+        if (s_ep_put && tid == 0) {
+          st_wt_u64((void *)(ep_signal +
+                             (size_t)EP_MY_PE * FULL_LAYER_EP_SIGNAL_STRIDE),
+                    (unsigned long long)ep_sig_expected);
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        }
         if (s_ep_put) {
           asm volatile("buffer_inv" ::: "memory");
           for (int p = 0; p < EP_WORLD_SIZE; p++) {
@@ -1180,54 +1276,60 @@ __device__ __noinline__ void
     _ep_t2 = _ep_t1;
 #endif
 
-    // ── 9d: wait for the local fold + every peer's slot, then reduce ────
-    // Each XCD's workgroup 0 waits and reduces independently. Waiting here
-    // rather than only on the folding workgroup keeps the other 7 XCDs' reduce
-    // correct without a second GPU-wide barrier.
-    if (xcd_rank == 0) {
+    // ── 9d: wait for THIS rank's slot to be complete. No reduce. ────────
+    //
+    // There is no reduce pass here any more and no exit barrier after it. The
+    // next layer's QKV prologue reads the gather buffer directly and sums the
+    // slots as part of the pass it already makes over that vector
+    // (EP_PEER_SLOTS in gang_rmsnorm_linear_mxfp4_bias_mi300.cuh).
+    //
+    // What that removes is a hop, not just work. The old shape was
+    // peer -> combiner (9d) -> everyone (9e): the release could not start
+    // until a reduce it gated had finished, so every worker paid the peer
+    // latency plus a reduce plus a second GPU-internal round trip. Now the
+    // reduce lives in a consumer that was already loading those bytes and
+    // there is nothing to release.
+    //
+    // The PEER's slot is not waited on here. Its only reader is the next
+    // layer's QKV prologue, which is 8 of 240 workers, so that wait belongs at
+    // the point of use (Phase 1, gated on EP_PREV_SLOTS) rather than at the
+    // layer boundary where it stalls 232 workers that never touch those bytes.
+    // Per-layer gather buffers are what make that safe: layer i's buffer is
+    // written only in layer i and read only in layer i+1, so a worker running
+    // ahead cannot clobber a slot the peer has yet to fill.
+    //
+    // Every worker, not workgroup 0: with no combiner there is no one to
+    // release the others, and nothing to release them for.
+    {
       if (tid == 0) {
-        // No wait on the local fold. This workgroup reduces exactly the column
-        // slice it just folded, so the local half of its input is its own
-        // store, already ordered by the vmcnt(0) + fence above. The
-        // 8 * ep_expected wait that used to be here existed only because the
-        // reduce ranged over the whole slot; once the two ranges are the same,
-        // it was pure coupling to the slowest sibling XCD. Worth ~0.04 ms.
+        // This rank's OWN slot: its 8 column slices are written by 8 different
+        // XCDs, so a worker cannot know the local half is complete from its own
+        // store alone. The gate is published on this rank's signal line by the
+        // same thread that observed the 8th local fold, so it costs a load and
+        // no extra rendezvous -- and unlike the peer's line it is purely
+        // on-GPU, no XGMI round trip in the critical path.
+        //
+        // It also covers the two WAR hazards the old exit barrier covered: the
+        // fold reads attn_proj_out (which the next layer's Phase 7 overwrites)
+        // and zeroes moe_workspace_f32 (which the next layer's Phase 8
+        // atomicAdds into). Both are ordered behind this signal, and both are
+        // strictly local -- another reason the peer's line does not belong
+        // here.
 #if MPK_EP_ABLATE != 1 && MPK_EP_ABLATE != 5
-        if constexpr (EP_WORLD_SIZE == 2) {
-          // Poll the signal directly rather than through the backend's
-          // wait_until. Both the direct store and rocSHMEM's SIGNAL_ADD land at
-          // this same symmetric address, and ld_nt_u64 is non-temporal, so the
-          // remote write is observed past the local cache hierarchy either way
-          // -- which was the only reason the backend primitive was needed here.
-          // This keeps the poll a plain load instead of a call into rocSHMEM.
-          //
-          // One signal for the whole peer slot, even though this workgroup
-          // reads only its own columns of it. Giving each XCD pair its own
-          // signal slot within the peer's 8-uint64 line -- so XCD x waits only
-          // on the peer's XCD x, which is the only producer of the columns it
-          // reads -- should be correct and is not: it deadlocks on the first
-          // token, with or without the local all-8 fold gate restored, so the
-          // slot indexing is the variable and not the removed wait. Untangling
-          // that is the next thing worth doing here; it is the last all-8
-          // coupling left in the layer.
-          uint64_t *peer_sig =
-              ep_signal + (size_t)(1 - EP_MY_PE) * FULL_LAYER_EP_SIGNAL_STRIDE;
-          while (ld_nt_u64(reinterpret_cast<unsigned long long *>(peer_sig)) <
-                 (unsigned long long)ep_sig_expected) {
-            __builtin_amdgcn_s_sleep(1);
-          }
-        } else {
-          // Staged fallback: one transfer per peer carries the whole slot and
-          // signals slot 0 of p's line, so every XCD waits on that one slot.
-          for (int p = 0; p < EP_WORLD_SIZE; p++) {
-            if (p == EP_MY_PE) {
-              continue;
-            }
-            mpk_shmem_signal_wait_ge(
-                ep_signal + (size_t)p * FULL_LAYER_EP_SIGNAL_STRIDE,
-                ep_sig_expected);
-          }
+        uint64_t *self_sig =
+            ep_signal + (size_t)EP_MY_PE * FULL_LAYER_EP_SIGNAL_STRIDE;
+        while (ld_nt_u64(reinterpret_cast<unsigned long long *>(self_sig)) <
+               (unsigned long long)ep_sig_expected) {
+          __builtin_amdgcn_s_sleep(1);
         }
+        // The peer's slot, waited on here rather than at its point of use in
+        // the next layer's QKV prologue. Both ranks run the same layer on the
+        // same schedule, so by the time a worker reaches this line the peer's
+        // store has effectively already landed and the poll is free; pushing
+        // it into Phase 1 instead puts it upstream of the QKV barrier that
+        // gates all of attention, and measured 2.542 vs 2.528 ms/token.
+        _full_layer_ep_wait_peers<EP_WORLD_SIZE, EP_MY_PE>(ep_signal,
+                                                           ep_sig_expected);
 #else
         (void)ep_signal;
         (void)ep_sig_expected;
@@ -1235,64 +1337,52 @@ __device__ __noinline__ void
       }
       __syncthreads();
       asm volatile("buffer_inv" ::: "memory");
-
-      // output_ptrs[11] = sum over PEs of gather[p]. This is what the next
-      // layer's QKV prologue reads as `residual`; the workspace it also reads
-      // was zeroed in 9b, so the prologue's 0 + complete_value is correct.
+      // For every layer but the last, nothing else happens here. There used to
+      // be a reduce writing output_ptrs[11], then a release flag, then an exit
+      // barrier every worker waited on; all three are gone, because the sum is
+      // produced by the NEXT layer's QKV prologue straight out of the gather
+      // buffer (EP_PEER_SLOTS) -- so there is no combined vector to publish and
+      // no window between publishing and consuming for a barrier to protect.
       //
-      // Its own output slot, not output_ptrs[0]: that one is the pre-attention
-      // residual stream, which Phase 7 is still reading as o_proj's residual.
-      //
-      // Every XCD used to compute the WHOLE sum here -- 8 workgroups doing
-      // byte-identical work -- on the reasoning that a next-layer reader is
-      // always on the same XCD as its writer, so no cross-XCD flush is needed.
-      // That is true but it is not a reason to recompute: each XCD now sums
-      // only its own slice and writes it through (sc0 sc1), so the result is
-      // visible to every XCD regardless of which one produced it. Same total
-      // stores, an eighth of the loads, and no redundant arithmetic.
-      //
-      // The exit barrier below is what makes this safe: no worker leaves the
-      // layer until all 8 slices are published.
-#if MPK_EP_ABLATE != 5
-      __hip_bfloat16 *ep_out =
-          reinterpret_cast<__hip_bfloat16 *>(output_ptrs[11]);
-      // EXACTLY the columns this XCD folded, on every row -- not an arbitrary
-      // eighth of the flat slot. That identity is what lets the wait above be
-      // a single-peer, single-line poll: this workgroup consumes only its own
-      // local store and the matching remote slice, both of which it has
-      // already observed. Any other partition would reintroduce a dependency
-      // on a sibling XCD and with it the all-8 barrier.
-      for (int row = 0; row < QKV_BATCH_SIZE; ++row) {
-        size_t const row_base = (size_t)row * QKV_REDUCTION_SIZE;
-        for (int c = ep_col_lo + tid; c < ep_col_hi; c += blockDim.x) {
-          size_t idx = row_base + c;
-          float acc = 0.0f;
-          for (int p = 0; p < EP_WORLD_SIZE; p++) {
-            acc += (float)ep_gather[(size_t)p * EP_SLOT_ELEMS + idx];
+      // The last layer is the exception: its consumer is the tail (final
+      // RMSNorm + LM head), a separate task with a plain 2-D input and no
+      // slot-summing prologue to fold into. So exactly one layer out of 36
+      // still materializes the sum and still needs the exit barrier that makes
+      // it visible. 1/36 of the old cost.
+      if constexpr (EP_WRITE_COMBINED) {
+        __hip_bfloat16 *ep_out =
+            reinterpret_cast<__hip_bfloat16 *>(output_ptrs[11]);
+        // EXACTLY the columns this XCD folded, on every row. That identity is
+        // what lets the wait above be a per-slot poll rather than a full
+        // cross-XCD rendezvous: this workgroup consumes only its own local
+        // store and the matching remote slice.
+        for (int row = 0; row < QKV_BATCH_SIZE; ++row) {
+          size_t const row_base = (size_t)row * QKV_REDUCTION_SIZE;
+          for (int c = ep_col_lo + tid; c < ep_col_hi; c += blockDim.x) {
+            size_t idx = row_base + c;
+            float acc = 0.0f;
+            for (int p = 0; p < EP_WORLD_SIZE; p++) {
+              acc += (float)ep_gather[(size_t)p * EP_SLOT_ELEMS + idx];
+            }
+            __hip_bfloat16 v = (__hip_bfloat16)acc;
+            unsigned short bits;
+            __builtin_memcpy(&bits, &v, 2);
+            st_wt_u16((void *)&ep_out[idx], bits);
           }
-          __hip_bfloat16 v = (__hip_bfloat16)acc;
-          unsigned short bits;
-          __builtin_memcpy(&bits, &v, 2);
-          st_wt_u16((void *)&ep_out[idx], bits);
         }
-      }
-#endif
-      __syncthreads();
-      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-      threadfence_gpu();
-
-      // Count this slice in. The reduce is now sliced across XCDs, so an XCD's
-      // own flag no longer means the residual is complete -- it means 1/8 of it
-      // is. The last slice to land releases everyone.
-      if (tid == 0) {
-        int prev_c = atom_add_release_gpu_s32(ep_combine_done, 1);
-        if (prev_c % 8 == 7) {
-          for (int x = 0; x < 8; x++) {
-            st_wt_u32(
-                (void *)&ep_combine_done[(1 + x) * FULL_LAYER_EP_XCD_STRIDE],
-                (unsigned)ep_expected);
+        __syncthreads();
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        threadfence_gpu();
+        if (tid == 0) {
+          int prev_c = atom_add_release_gpu_s32(ep_combine_done, 1);
+          if (prev_c % 8 == 7) {
+            for (int x = 0; x < 8; x++) {
+              st_wt_u32(
+                  (void *)&ep_combine_done[(1 + x) * FULL_LAYER_EP_XCD_STRIDE],
+                  (unsigned)ep_expected);
+            }
+            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
           }
-          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         }
       }
     }
@@ -1301,51 +1391,36 @@ __device__ __noinline__ void
     _ep_t3 = __builtin_amdgcn_s_memrealtime();
 #endif
 
-    // ── 9e: exit barrier -- EVERY worker waits for the combine ──────────
+    // ── 9e: exit barrier, last layer only. ───────────────────────────────
     //
-    // Without this the layer has no exit fence and the collective is simply
-    // unsound. 9b..9d run on 8 of 240 workers; the other 232 fall out of 9a
-    // straight into the next layer (the ml replay loop just re-enters this
-    // same function), and three things go wrong at once:
+    // This used to run on every layer: the combiner published a per-XCD release
+    // flag once its slice of the reduce had landed and all 240 workers polled
+    // it. It existed because the reduce was a distinct step producing a
+    // distinct buffer (output_ptrs[11]) that the next layer read, so the layer
+    // needed an exit fence between "combined" and "consumed".
     //
-    //   - the next layer's QKV prologue reads output_ptrs[11] as its residual
-    //     before 9d has written it,
-    //   - its Phase 7 overwrites attn_proj_out, which 9b is still reading as
-    //     the residual to fold,
-    //   - its Phase 8 atomicAdds into moe_workspace_f32 before/while 9b zeroes
-    //     it, so this layer's zeroing eats part of the next layer's partial.
+    // With the reduce dissolved into the next layer's QKV prologue there is no
+    // such buffer and no such window. Everything a worker must establish before
+    // leaving -- both slots of the gather buffer complete, hence the fold's
+    // reads of attn_proj_out and its zeroing of moe_workspace_f32 done -- is
+    // established by the two-slot wait in 9d, which every worker takes. The
+    // release chain went from
+    //   peer -> combiner -> everyone  (two sequential hops)
+    // to
+    //   peer -> everyone              (one, polled in parallel by all 240).
     //
-    // All three are timing-dependent, and all three produce exactly what was
-    // observed: a model that runs at full speed and emits fluent-shaped
-    // garbage. The per-XCD release flag is written by the combiner and
-    // polled by everyone; ep_expected is the same run-monotonic value, so
-    // nothing needs resetting.
-    // MPK_EP_ABLATE=4 drops ONLY this barrier, leaving 9a..9d intact. It prices
-    // the exit fence -- i.e. how much of Phase 9's cost is the loss of
-    // cross-layer overlap rather than the combine itself. Without it the 232
-    // non-combining workers run straight into the next layer while the combine
-    // is still in flight, which is exactly the WAR hazard documented above:
-    // WRONG OUTPUT, latency attribution only.
-    //
-    // EVERY worker waits now, including the combiners: with the reduce sliced,
-    // an XCD's own workgroup 0 has produced only its eighth of the residual and
-    // must still see the other seven before the next layer reads them.
-#if MPK_EP_ABLATE != 4
-    {
+    // It survives only on the last layer, where output_ptrs[11] IS written and
+    // a separate tail task reads it.
+    if constexpr (EP_WRITE_COMBINED) {
       if (tid == 0) {
-        int _obs;
-        while ((_obs = ld_nt_s32(
-                    &ep_combine_done[(1 + xcd_id) *
-                                     FULL_LAYER_EP_XCD_STRIDE])) <
+        while (ld_nt_s32(&ep_combine_done[(1 + xcd_id) *
+                                          FULL_LAYER_EP_XCD_STRIDE]) <
                ep_expected) {
           __builtin_amdgcn_s_sleep(1);
         }
       }
       __syncthreads();
     }
-#else
-    (void)ep_combine_done;
-#endif
     asm volatile("buffer_inv" ::: "memory");
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
     _ep_t4 = __builtin_amdgcn_s_memrealtime();
@@ -1354,10 +1429,9 @@ __device__ __noinline__ void
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
   __syncthreads();
-  // Phase 9 breakdown. Printed from two roles because they see different
-  // halves of it: xcd_rank==0 is the COMBINER (it does 9d's wait+reduce and
-  // skips 9e), while xcd_rank==1 is a FOLLOWER (it skips 9d and blocks in
-  // 9e). Reading only the combiner would price the exit barrier at zero.
+  // Phase 9 breakdown. Still printed from two roles: xcd_rank==0 also FOLDS
+  // (9b/9c) while every other rank only waits, so their 9bc/9d split differs
+  // even though both now take the same 9d wait. 9e is gone and reads ~0.
   if constexpr (EP_WORLD_SIZE > 1) {
     if (tid == 0 && (xcd_rank == 0 || xcd_rank == 1) && _ep_t0 > 0) {
       double b9a = (double)(_ep_t1 - _ep_t0) * 10.0 / 1000.0;
@@ -1366,10 +1440,10 @@ __device__ __noinline__ void
       double b9e = (double)(_ep_t4 - _ep_t3) * 10.0 / 1000.0;
       double btot = (double)(_ep_t4 - _ep_t0) * 10.0 / 1000.0;
       printf("[EP_PHASE9] xcd=%d role=%s 9a_moe_barrier=%.1f "
-             "9bc_fold_put=%.1f 9d_wait_reduce=%.1f 9e_exit=%.1f "
+             "9bc_fold_put=%.1f 9d_wait=%.1f 9e_gone=%.1f "
              "total=%.1f us\n",
              xcd_id,
-             xcd_rank == 0 ? "combiner" : "follower",
+             xcd_rank == 0 ? "folder" : "follower",
              b9a,
              b9bc,
              b9d,

@@ -3421,6 +3421,17 @@ class PersistentKernel:
         ep_signal: DTensor = None,
         ep_combined: DTensor = None,
         ep_fold_rank: int = 0,
+        # The EP reduce, dissolved into this layer's QKV prologue. Pass the
+        # PREVIOUS layer's ep_gather and the prologue sums its per-rank slots
+        # in the pass it already makes over that vector, instead of reading a
+        # combined residual that a separate reduce + exit barrier had to
+        # produce. None on layer 0 (its residual is the embedding) and on every
+        # non-EP config.
+        ep_prev_gather: DTensor = None,
+        # True only on the layer whose consumer is a separate task -- the last
+        # one, read by the tail. That layer still materializes the sum into
+        # ep_combined and still pays the exit barrier; the other 35 do not.
+        ep_write_combined: bool = False,
         # Slot-parallel expert split. When ep_slot_ws > 1 the rank owns the
         # activated-list slots congruent to ep_slot_me, and gate_up/down must
         # be the FULL replicated weights (expert_base=0,
@@ -3463,6 +3474,12 @@ class PersistentKernel:
             assert ep_gather.num_dims == 3  # (world_size, batch, hidden)
             assert ep_gather.dim(0) == self.world_size
             assert ep_combined.num_dims == 2
+            if ep_prev_gather is not None:
+                assert ep_prev_gather.num_dims == 3
+                assert ep_prev_gather.dim(0) == self.world_size
+        else:
+            assert ep_prev_gather is None, \
+                "ep_prev_gather only means anything with the inline EP combine"
             # One 64-byte line per PE so a peer's SIGNAL_ADD never shares a
             # line with another's (FULL_LAYER_EP_SIGNAL_STRIDE in the kernel).
             # 64 bytes (one cache line) of signal space per PE. Declared in
@@ -3558,6 +3575,8 @@ class PersistentKernel:
         if ep_inline:
             tb_graph.new_input(ep_gather, (-1, -1, -1), -1, True)       # [24]
             tb_graph.new_input(ep_signal, (-1, -1, -1), -1, True)       # [25]
+            if ep_prev_gather is not None:
+                tb_graph.new_input(ep_prev_gather, (-1, -1, -1), -1, True)  # [26]
         # 11 outputs
         tb_graph.new_input(x_output, (-1, -1, -1), -1, True)            # [0]
         tb_graph.new_input(k_cache, (-1, -1, -1), -1, True)             # [1]
@@ -3584,6 +3603,8 @@ class PersistentKernel:
              gate_up_weight, down_weight, w13_bias, w2_bias,
              moe_barrier, swiglu_out, o_acc_f32]
             + ([ep_gather, ep_signal] if ep_inline else [])
+            + ([ep_prev_gather] if ep_inline and ep_prev_gather is not None
+               else [])
             + [x_output, k_cache, v_cache, q_workspace, o_acc,
                attn_proj_out, topk_weight, routing_indices,
                active_expert_ids, routing_weight_moe, moe_workspace_f32]
@@ -3606,7 +3627,10 @@ class PersistentKernel:
              self.world_size if ep_inline else 1,
              self.mpi_rank if ep_inline else 0,
              ep_fold_rank,
-             ep_slot_ws, ep_slot_me]
+             ep_slot_ws, ep_slot_me,
+             (self.world_size
+              if (ep_inline and ep_prev_gather is not None) else 1),
+             1 if (ep_inline and ep_write_combined) else 0]
         )
 
     def gang_full_layer_with_lmhead_fused_layer(
