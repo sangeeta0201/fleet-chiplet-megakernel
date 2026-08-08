@@ -43,8 +43,26 @@ namespace kernel {
 
 static constexpr int FULL_LAYER_ATTN_GLOBAL_COUNTER_SLOT = 19 * 16;
 static constexpr int FULL_LAYER_QKV_EPOCH_SLOT = 20 * 16;
-static constexpr int FULL_LAYER_CHUNK_BARRIER_SLOT = 28 * 16;
 static constexpr int FULL_LAYER_ATTN_XCD_RELEASE_SLOT = 36 * 16;
+
+// The chunk barrier is the one counter whose size depends on NUM_REQS: it needs
+// one line per (XCD, request) so that the last chunk to arrive *for a given
+// request* is the worker that merges *that* request. It therefore spans
+// 8 * NUM_REQS lines = 128 * NUM_REQS ints.
+//
+// It used to live at 28 * 16, which is fine at NUM_REQS == 1 (8 lines, ending
+// just below attn_xcd_release at 36 * 16) but grows straight through the
+// fused-tail counters that gang_full_layer_with_lmhead_fused_mi300.cuh pins at
+// the absolute literals 44*16 .. 47*16. At NUM_REQS >= 3 chunk arrivals would
+// be written on top of the MoE-done / resadd-done / lmhead-done flags. That is
+// latent today only because type 217 is dead behind an early `return`, and it
+// would come back as silent corruption the moment FUSE_TAIL is re-enabled.
+//
+// Moving the barrier above every fixed slot instead of moving attn_xcd_release
+// keeps every other counter at the address it has today, so nothing else in
+// either file has to change. Callers must size the counter buffer to
+// FULL_LAYER_CHUNK_BARRIER_SLOT + 128 * NUM_REQS (see demo.py counter_size).
+static constexpr int FULL_LAYER_CHUNK_BARRIER_SLOT = 48 * 16;
 
 template <int QKV_BATCH_SIZE,
           int QKV_OUTPUT_PER_WG,
@@ -68,7 +86,8 @@ template <int QKV_BATCH_SIZE,
           int MOE_HIDDEN_SIZE,
           int MOE_W13_OUTPUT_PER_WG,
           int MOE_W2_OUTPUT_PER_WG,
-          bool DECODE_ONLY = false>
+          bool DECODE_ONLY = false,
+          int NUM_REQS = 1>
 __device__ __noinline__ void
     gang_full_layer_fused_kernel_mi300(void *const *input_ptrs,
                                        void *const *output_ptrs,
@@ -116,6 +135,21 @@ __device__ __noinline__ void
 
   int xcd_rank = tile_idx % workers_per_xcd;
   int tid = threadIdx.x;
+
+  // Attention work is (request, kv_head, kv_chunk). kv_head is bound to the
+  // XCD (kv_head_idx = xcd_id below), so the request and chunk axes both have
+  // to fit in xcd_rank -- the 30 workers on this XCD. The host keeps
+  // NUM_KV_CHUNKS = workers_per_xcd / NUM_REQS so this never exceeds 30.
+  //
+  // NUM_REQS is the *compile-time* MPK_MAX_NUM_BATCHED_REQUESTS, never the live
+  // request count. prepare_next_batch pads unused slots so
+  // qo_indptr[i] == qo_indptr[i+1], and every attention/merge callee
+  // early-returns on that *inside itself* -- so a padded slot still arrives at
+  // the chunk barrier below. Keeping the participant set fixed is what makes
+  // every modulus here independent of how many requests happen to be live.
+  constexpr int ATTN_PARTICIPANTS = NUM_REQS * NUM_KV_CHUNKS;
+  int const attn_req = xcd_rank / NUM_KV_CHUNKS;
+  int const attn_chunk = xcd_rank % NUM_KV_CHUNKS;
 
   // Invalidate vL1 to ensure we read fresh MoE atomicAdd results from L2.
   // Without this, stale zeros from QKV's workspace zeroing (flat_store in
@@ -203,9 +237,14 @@ __device__ __noinline__ void
   // so the participant set is free to be the set that actually needs the
   // barrier. This is the pre-f1fa720 participant set, now safe to use because
   // nothing reads a shared counter -- it measured neutral, not faster.
-  int const qkv_epoch_participants = total_qkv_tiles_per_xcd > NUM_KV_CHUNKS
+  //
+  // The max() is what keeps the guard and the modulus in agreement: attention
+  // workers *wait* on this epoch, so they must also be counted as arriving.
+  // With multiple requests the attention set is ATTN_PARTICIPANTS, not
+  // NUM_KV_CHUNKS, and this has to track it or the modulus never fires.
+  int const qkv_epoch_participants = total_qkv_tiles_per_xcd > ATTN_PARTICIPANTS
                                          ? total_qkv_tiles_per_xcd
-                                         : NUM_KV_CHUNKS;
+                                         : ATTN_PARTICIPANTS;
 
   // Publish the layer counter the MoE W13->W2 barrier keys off.
   //
@@ -349,8 +388,8 @@ __device__ __noinline__ void
   MPK_TW_SUB(30, xcd_rank);
   MPK_WS_PHASE(30, qkv_epoch_expected, xcd_id);
   {
-    if (xcd_rank < NUM_KV_CHUNKS) {
-      int kv_chunk_idx = xcd_rank;
+    if (xcd_rank < ATTN_PARTICIPANTS) {
+      int kv_chunk_idx = attn_chunk;
       using bf16_t = __hip_bfloat16;
       void const *offset_k = reinterpret_cast<bf16_t const *>(output_ptrs[1]) +
                              static_cast<size_t>(xcd_id) * HEAD_DIM;
@@ -379,7 +418,7 @@ __device__ __noinline__ void
           kv_indptr,
           kv_indices,
           kv_last_page_len,
-          /*request_id=*/0,
+          /*request_id=*/attn_req,
           /*kv_head_idx=*/xcd_id,
           kv_chunk_idx,
           attn_scale,
@@ -434,11 +473,24 @@ __device__ __noinline__ void
       // reached L2 before tid 0's release atomic. Workgroup-scope fences emit
       // no instruction at all on gfx950, so they cannot substitute -- the
       // consumer is a different block.
+      //
+      // One barrier line per (XCD, request). The modulus stays NUM_KV_CHUNKS,
+      // so the releaser is the last chunk to arrive *for this request* and it
+      // merges *this* request -- exactly the invariant the single-request code
+      // had, replicated NUM_REQS times.
+      //
+      // A single shared line with modulus ATTN_PARTICIPANTS would also be a
+      // correct barrier, but the releaser's identity would then carry no
+      // information about which request finished, so it would have to merge all
+      // NUM_REQS requests serially. That puts (NUM_REQS-1) merges on the
+      // critical path of every one of the 36 layers, while these per-request
+      // merges run on workers that would otherwise just spin in Phase 6.
       __syncthreads();
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       __shared__ int s_chunk_prev;
       if (tid == 0) {
-        s_chunk_prev = atom_add_release_gpu_s32(&chunk_barrier[xcd_id * 16], 1);
+        s_chunk_prev = atom_add_release_gpu_s32(
+            &chunk_barrier[(xcd_id * NUM_REQS + attn_req) * 16], 1);
       }
       __syncthreads();
 
@@ -480,7 +532,7 @@ __device__ __noinline__ void
             qo_indptr,
             kv_indptr,
             kv_last_page_len,
-            /*request_id=*/0,
+            /*request_id=*/attn_req,
             reinterpret_cast<__hip_bfloat16 *>(
                 output_ptrs[4]), // attn_out (bf16)
             /*kv_head_idx=*/xcd_id,
@@ -492,8 +544,30 @@ __device__ __noinline__ void
         // Wait for all write-through stores from merge to complete
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         if (tid == 0) {
+          // attn_global is bumped exactly ATTN_ARRIVALS times per layer: the
+          // modulus above fires once per (XCD, request), and every empty-work
+          // early return lives *inside* a callee, so no arrival is ever
+          // skipped. Round the snapshot up to the next multiple of that count.
+          //
+          // The read is safe without a barrier even though every other counter
+          // in this file was converted to a layer-counter derivation: this
+          // worker has finished layer L-1 (so v >= ATTN_ARRIVALS * L) and no
+          // XCD can enter layer L+1 until this very arrival fires the release
+          // (so v < ATTN_ARRIVALS * (L+1)). Deriving the target from
+          // task_layer_idx instead would be wrong here -- the layer counter
+          // restarts at 0 on every kernel launch while this counter is a host
+          // allocation that is never reset, so a warmup pass would leave every
+          // later launch waiting on a value already in the past.
+          //
+          // This must stay a division, not `(v | (ATTN_ARRIVALS-1)) + 1`. The
+          // bitwise form only rounds up to a power of two, so it silently
+          // releases early at NUM_REQS in {3,5,6,7} -- the merge output would
+          // be read before it is written.
+          constexpr int ATTN_ARRIVALS = 8 * NUM_REQS;
           int attn_expected =
-              (__atomic_load_n(attn_global, __ATOMIC_RELAXED) | 7) + 1;
+              (__atomic_load_n(attn_global, __ATOMIC_RELAXED) / ATTN_ARRIVALS +
+               1) *
+              ATTN_ARRIVALS;
           int prev = atom_add_release_gpu_s32(attn_global, 1);
           if (prev == attn_expected - 1) {
             // LAST XCD to arrive: fan out per-XCD release flags via st_wt

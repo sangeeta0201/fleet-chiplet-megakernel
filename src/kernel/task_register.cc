@@ -1239,6 +1239,9 @@ int TaskRegister::register_gang_rmsnorm_linear_mxfp4_bias_argmax_mi300_task(
   }
   // Row to write in the logits buffer: the position being scored. step[0] is
   // the last consumed position, so the token produced here lands at step+1.
+  // NOTE: single-request only. With MPK_MAX_NUM_BATCHED_REQUESTS > 1 every
+  // request would write this same row and race. The host gates PPL_MODE on
+  // max_num_batched_requests == 1 (demo/gpt_oss/demo.py).
   code.e("    runtime_config.step[0] + 1,");
   code.e("    runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS],");
   code.e("    $,", n_wgs_per_xcd);
@@ -2065,9 +2068,10 @@ int TaskRegister::register_gang_full_layer_fused_mi300_task(
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
-  // 22 template parameters + DECODE_ONLY
+  // 22 template parameters + DECODE_ONLY + NUM_REQS
   code.e("kernel::gang_full_layer_fused_kernel_mi300<$, $, $, $, $, $, $, $, "
-         "$, $, $, $, $, $, $, $, $, $, $, $, $, $, $>(",
+         "$, $, $, $, $, $, $, $, $, $, $, $, $, $, $, "
+         "MPK_MAX_NUM_BATCHED_REQUESTS>(",
          batch_size,
          qkv_output_per_wg,
          qkv_reduction_size,
