@@ -926,11 +926,33 @@ __device__ __noinline__ void
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
   unsigned long long _fused_t3 = __builtin_amdgcn_s_memrealtime();
+  // Entry spread into Phase 8, measured the same way as the 9a arrival spread.
+  // 9a's spread is 19.4 us; the question this answers is whether MoE CREATES
+  // that skew (entry spread small, exit spread large -> tile imbalance, fix the
+  // partition) or merely INHERITS it (both large -> the skew predates MoE and
+  // no MoE-side balancing helps). Reset by the same closer that reads it.
+  if (threadIdx.x == 0) {
+    atomicMin(&g_ep8_arr_min, _fused_t3);
+    atomicMax(&g_ep8_arr_max, _fused_t3);
+  }
 #endif
 
   // ══════════════════════════════════════════════════════════════════
   // Phase 8: MoE (W13+SwiGLU+W2)
   // ══════════════════════════════════════════════════════════════════
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+  {
+    int _wid = xcd_id * workers_per_xcd + xcd_rank;
+    if (threadIdx.x == 0 && _wid < MOE_OCC_WORKERS) {
+      unsigned long long _n = 0;
+      for (int _t = xcd_rank; _t < moe_total_tiles_per_xcd;
+           _t += workers_per_xcd) {
+        _n++;
+      }
+      atomicAdd(&g_moe_tiles[_wid], _n);
+    }
+  }
+#endif
   for (int moe_t = xcd_rank; moe_t < moe_total_tiles_per_xcd;
        moe_t += workers_per_xcd) {
     MPK_TW_SUB(80, moe_t);
@@ -1078,6 +1100,11 @@ __device__ __noinline__ void
         unsigned long long _a = _ep_t0;
         atomicMin(&g_ep9_arr_min, _a);
         atomicMax(&g_ep9_arr_max, _a);
+        // Phase 8 occupancy for THIS worker: entry (_fused_t3) to arrival.
+        int _wid = xcd_id * workers_per_xcd + xcd_rank;
+        if (_wid < MOE_OCC_WORKERS && _a >= _fused_t3) {
+          atomicAdd(&g_moe_busy_ns[_wid], _a - _fused_t3);
+        }
       }
 #endif
       int prev_x = atom_add_release_gpu_s32(
@@ -1121,14 +1148,71 @@ __device__ __noinline__ void
       unsigned long long span = (hi >= lo) ? (hi - lo) : 0;
       atomicAdd(&g_ep9_arr_span_sum, span);
       atomicMax(&g_ep9_arr_span_max, span);
+      unsigned long long lo8 = g_ep8_arr_min, hi8 = g_ep8_arr_max;
+      unsigned long long span8 = (hi8 >= lo8) ? (hi8 - lo8) : 0;
+      atomicAdd(&g_ep8_arr_span_sum, span8);
+      atomicMax(&g_ep8_arr_span_max, span8);
       unsigned long long an = atomicAdd(&g_ep9_arr_n, 1ull);
       g_ep9_arr_min = ~0ull;
       g_ep9_arr_max = 0ull;
+      g_ep8_arr_min = ~0ull;
+      g_ep8_arr_max = 0ull;
       if (an == 36ull * 100ull) {
-        printf("[EP9ARR] n=%llu arrival_spread_us mean=%.3f max=%.3f\n",
+        printf("[EP9ARR] n=%llu p8_entry_spread_us mean=%.3f max=%.3f | "
+               "p9_entry_spread_us mean=%.3f max=%.3f\n",
                an,
+               (double)g_ep8_arr_span_sum / an / 100.0,
+               (double)g_ep8_arr_span_max / 100.0,
                (double)g_ep9_arr_span_sum / an / 100.0,
                (double)g_ep9_arr_span_max / 100.0);
+        // Per-worker MoE occupancy, one line per XCD to keep the printf
+        // count trivial. Values are per layer-instance: busy_us is Phase 8
+        // entry -> 9a arrival, tiles is loop trips handed to that worker.
+        for (int x = 0; x < 8; x++) {
+          double bmin = 1e30, bmax = 0.0, bsum = 0.0;
+          unsigned long long tmin = ~0ull, tmax = 0;
+          for (int r = 0; r < 30; r++) {
+            int w = x * 30 + r;
+            // One sample per worker per layer, and `an` counts layers, so this
+            // is already per-layer; ticks -> us is /100.
+            double b = (double)g_moe_busy_ns[w] / an / 100.0;
+            unsigned long long t = g_moe_tiles[w];
+            bsum += b;
+            if (b < bmin) {
+              bmin = b;
+            }
+            if (b > bmax) {
+              bmax = b;
+            }
+            if (t < tmin) {
+              tmin = t;
+            }
+            if (t > tmax) {
+              tmax = t;
+            }
+          }
+          printf("[MOEOCC] xcd=%d busy_us min=%.2f mean=%.2f max=%.2f | "
+                 "tiles min=%llu max=%llu\n",
+                 x,
+                 bmin,
+                 bsum / 30.0,
+                 bmax,
+                 tmin,
+                 tmax);
+        }
+        // Per-TILE cost, averaged over every tile executed on this rank.
+        // w2_bar is the W13->W2 per-expert barrier poll, which is included in
+        // w2_tot; w2_tot - w2_bar is W2's own compute.
+        printf("[MOETILE] w13 n=%llu us=%.2f | w2 n=%llu tot=%.2f bar=%.2f "
+               "compute=%.2f\n",
+               g_moe_w13_n,
+               g_moe_w13_n ? (double)g_moe_w13_ns / g_moe_w13_n / 100.0 : 0.0,
+               g_moe_w2_n,
+               g_moe_w2_n ? (double)g_moe_w2_ns / g_moe_w2_n / 100.0 : 0.0,
+               g_moe_w2_n ? (double)g_moe_w2bar_ns / g_moe_w2_n / 100.0 : 0.0,
+               g_moe_w2_n ? (double)(g_moe_w2_ns - g_moe_w2bar_ns) /
+                                g_moe_w2_n / 100.0
+                          : 0.0);
       }
     }
 #endif

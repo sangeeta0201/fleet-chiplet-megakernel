@@ -205,10 +205,28 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #endif
 
   int global_tile = tile_idx * 8 + xcd_id;
-  int total_w13_real = num_activated_experts * W13_TILES;
+  // Under slot-parallel EP the tile space is built over the experts THIS rank
+  // owns, not over the whole activated list. Sizing it for all of them and
+  // then early-returning the non-owned tiles looks free -- the skipped tile
+  // costs nothing -- but it is not, because the tile index is what maps work
+  // to workers. Owned tiles come in runs of W13_TILES/W2_TILES, and a run
+  // against the stride-30 worker map aliases: measured 1 or 2 real tiles per
+  // worker where 182 tiles over 240 workers should never exceed 1, with the
+  // 2-tile workers taking 12.8 us against 1.0 for the idle ones. That spread
+  // is what Phase 9's barrier then waits out.
+  //
+  // Compacting is exact, not approximate: ownership is expert_idx % WS == ME,
+  // so the owned experts are a strided subsequence of the activated list and
+  // compact slot c maps back to activated index c * WS + ME. Both ranks
+  // compute the same split from the same replicated routing.
+  int const ep_owned_experts =
+      (EP_SLOT_WS > 1)
+          ? ((num_activated_experts - EP_SLOT_ME + EP_SLOT_WS - 1) / EP_SLOT_WS)
+          : num_activated_experts;
+  int total_w13_real = ep_owned_experts * W13_TILES;
   int total_w13 =
       ((total_w13_real + PAD_MULTIPLE - 1) / PAD_MULTIPLE) * PAD_MULTIPLE;
-  int total_w2 = num_activated_experts * W2_TILES;
+  int total_w2 = ep_owned_experts * W2_TILES;
   int total_tiles = total_w13 + total_w2;
   if (global_tile >= total_tiles) {
     MPK_WS_MARK(8100, global_tile); // exit: past end of tile range
@@ -220,8 +238,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   if (!is_w2) {
     expert_idx = global_tile / W13_TILES;
     phase_tile = global_tile % W13_TILES;
-    // Padding tile: expert_idx beyond activated range → skip
-    if (expert_idx >= num_activated_experts) {
+    // Padding tile: beyond the OWNED range → skip. (Without EP, owned ==
+    // activated and this is the same test as before.)
+    if (expert_idx >= ep_owned_experts) {
       MPK_WS_MARK(8101, global_tile); // exit: W13 padding tile
       return;
     }
@@ -229,6 +248,17 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     int w2_tile = global_tile - total_w13;
     expert_idx = w2_tile / W2_TILES;
     phase_tile = w2_tile % W2_TILES;
+  }
+  // Compact slot -> activated-list index. Everything downstream (d_mask, the
+  // per-expert barrier, the routing table) is keyed by the activated index on
+  // BOTH ranks, so the expansion has to happen here, before any of them are
+  // touched. Identity when EP_SLOT_WS == 1.
+  if constexpr (EP_SLOT_WS > 1) {
+    expert_idx = expert_idx * EP_SLOT_WS + EP_SLOT_ME;
+    if (expert_idx >= num_activated_experts) {
+      MPK_WS_MARK(8101, global_tile); // exit: past activated list
+      return;
+    }
   }
 
   int n_wgs = is_w2 ? W2_WGS : W13_WGS;
@@ -253,15 +283,11 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // For single-GPU EXPERT_BASE=0 and NUM_LOCAL_EXPERTS=NUM_EXPERTS, so the
   // test is always false and local_eid == expert_id.
   if constexpr (EP_SLOT_WS > 1) {
-    // Slot-parallel ownership: partition the activated list, not the id
-    // space. expert_idx is already the rank in the score-sorted list that
-    // topk_softmax wrote (active_expert_ids[k_idx] = expert, k_idx ascending
-    // by score), and routing is replicated, so every rank computes the same
-    // split from the same data.
-    if (expert_idx % EP_SLOT_WS != EP_SLOT_ME) {
-      MPK_WS_MARK(8104, global_tile); // exit: slot not owned by this rank
-      return;
-    }
+    // Ownership is already established: the tile space is built over owned
+    // experts only and expert_idx was expanded from a compact slot, so
+    // expert_idx % EP_SLOT_WS == EP_SLOT_ME holds by construction. The filter
+    // that used to live here ran AFTER a full-size tile space had been laid
+    // out, which is what made the work distribution lumpy.
   } else if (expert_id < EXPERT_BASE ||
              expert_id >= EXPERT_BASE + NUM_LOCAL_EXPERTS) {
     MPK_WS_MARK(8104, global_tile); // exit: expert not owned by this rank
@@ -291,6 +317,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // ══════════════════════════════════════════════════════════════════════════
   // PHASE 0: W13 + SwiGLU → write BF16 to swiglu_out
   // ══════════════════════════════════════════════════════════════════════════
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+  unsigned long long _mt_tile0 = __builtin_amdgcn_s_memrealtime();
+#endif
   if (!is_w2) {
     MOE_DBG_SUBPHASE(2000);
     MPK_WS_MARK(8200, global_tile); // W13 compute
@@ -1514,6 +1543,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     }
   }
 
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+  unsigned long long _mt_bar0 = __builtin_amdgcn_s_memrealtime();
+#endif
   // All threads poll per-XCD release flag independently.
   // Eliminates tid==0 + __syncthreads — each thread confirms barrier itself.
   {
@@ -1565,6 +1597,12 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     // block can be split across the barrier.
     MPK_WS_WAVE_EXIT(warp_id);
   }
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+  if (tid == 0) {
+    atomicAdd(&g_moe_w2bar_ns,
+              __builtin_amdgcn_s_memrealtime() - _mt_bar0);
+  }
+#endif
   MOE_DBG_SUBPHASE(3002);
   MPK_WS_MARK(8302, global_tile); // W2: cleared W13->W2 barrier
 
@@ -2069,6 +2107,20 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 
   __syncthreads();
 
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+  // End of the tile, both kinds. w13 total covers compute; w2 total covers the
+  // barrier poll AND compute, so w2 minus w2bar is W2's own work.
+  if (tid == 0) {
+    unsigned long long _dt = __builtin_amdgcn_s_memrealtime() - _mt_tile0;
+    if (is_w2) {
+      atomicAdd(&g_moe_w2_ns, _dt);
+      atomicAdd(&g_moe_w2_n, 1ull);
+    } else {
+      atomicAdd(&g_moe_w13_ns, _dt);
+      atomicAdd(&g_moe_w13_n, 1ull);
+    }
+  }
+#endif
 #ifdef MPK_EP_SKEW_PROBE
   // EP skew probe. One timestamp per W2 tile, taken after its atomicAdds have
   // retired, recorded as a max into the column slice that tile wrote and into

@@ -108,6 +108,30 @@ __device__ unsigned long long g_ep9_arr_max;
 __device__ unsigned long long g_ep9_arr_span_sum;
 __device__ unsigned long long g_ep9_arr_span_max;
 __device__ unsigned long long g_ep9_arr_n;
+// Same, for entry into Phase 8 (MoE). Comparing the two spreads says whether
+// MoE creates the skew or inherits it.
+__device__ unsigned long long g_ep8_arr_min = ~0ull;
+__device__ unsigned long long g_ep8_arr_max;
+__device__ unsigned long long g_ep8_arr_span_sum;
+__device__ unsigned long long g_ep8_arr_span_max;
+// Per-worker MoE occupancy, indexed by worker (xcd*30 + xcd_rank).
+// g_moe_busy_ns is the time each worker spends between entering Phase 8 and
+// reaching 9a; g_moe_tiles is how many tiles it was handed. If busy time is
+// flat the barrier is waiting on something other than MoE work; if it tracks
+// the tile count, the tile->worker map is the problem.
+#define MOE_OCC_WORKERS 240
+__device__ unsigned long long g_moe_busy_ns[MOE_OCC_WORKERS];
+__device__ unsigned long long g_moe_tiles[MOE_OCC_WORKERS];
+__device__ unsigned long long g_moe_occ_iters;
+// Where a MoE worker's time actually goes: w13 compute, the W13->W2 per-expert
+// barrier poll, and W2 compute. The occupancy probe shows workers holding at
+// most 2 tiles yet spanning 1-12 us, so the cost is inside a tile, not in the
+// number of them. These three say which part.
+__device__ unsigned long long g_moe_w13_ns;
+__device__ unsigned long long g_moe_w2bar_ns;
+__device__ unsigned long long g_moe_w2_ns;
+__device__ unsigned long long g_moe_w13_n;
+__device__ unsigned long long g_moe_w2_n;
 #endif
 
 #ifdef MPK_ENABLE_SPAN_TIMING

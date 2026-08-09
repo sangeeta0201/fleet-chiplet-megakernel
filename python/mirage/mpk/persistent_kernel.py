@@ -3311,9 +3311,19 @@ class PersistentKernel:
 
         w13_tiles = batch_size * w13_wgs
         w2_tiles = batch_size * w2_wgs
-        total_w13_real = max_activated * w13_tiles
+        # Slot-parallel EP builds the tile space over the experts this rank
+        # OWNS, so the loop bound must shrink to match; the device-side decode
+        # in gang_moe_fused_mxfp4_mi300.cuh does the same arithmetic. Sizing
+        # this for the full activated list would not be wrong -- the extra
+        # trips decode past total_tiles and return -- but it costs a poll per
+        # worker per layer for nothing.
+        _ep_ws = 1
+        _ep_me = 0
+        _owned = ((max_activated - _ep_me + _ep_ws - 1) // _ep_ws
+                  if _ep_ws > 1 else max_activated)
+        total_w13_real = _owned * w13_tiles
         total_w13_padded = ((total_w13_real + PAD_MULTIPLE - 1) // PAD_MULTIPLE) * PAD_MULTIPLE
-        total_w2 = max_activated * w2_tiles
+        total_w2 = _owned * w2_tiles
         total_tiles_all = total_w13_padded + total_w2
         moe_total_tiles_per_xcd = (total_tiles_all + 7) // 8
 
@@ -3544,9 +3554,19 @@ class PersistentKernel:
 
         w13_tiles = batch_size * w13_wgs
         w2_tiles = batch_size * w2_wgs
-        total_w13_real = max_activated * w13_tiles
+        # Slot-parallel EP builds the tile space over the experts this rank
+        # OWNS, so the loop bound must shrink to match; the device-side decode
+        # in gang_moe_fused_mxfp4_mi300.cuh does the same arithmetic. Sizing
+        # this for the full activated list would not be wrong -- the extra
+        # trips decode past total_tiles and return -- but it costs a poll per
+        # worker per layer for nothing.
+        _ep_ws = ep_slot_ws
+        _ep_me = ep_slot_me
+        _owned = ((max_activated - _ep_me + _ep_ws - 1) // _ep_ws
+                  if _ep_ws > 1 else max_activated)
+        total_w13_real = _owned * w13_tiles
         total_w13_padded = ((total_w13_real + PAD_MULTIPLE - 1) // PAD_MULTIPLE) * PAD_MULTIPLE
-        total_w2 = max_activated * w2_tiles
+        total_w2 = _owned * w2_tiles
         total_tiles_all = total_w13_padded + total_w2
         moe_total_tiles_per_xcd = (total_tiles_all + 7) // 8
 
@@ -3757,9 +3777,19 @@ class PersistentKernel:
 
         w13_tiles = batch_size * w13_wgs
         w2_tiles = batch_size * w2_wgs
-        total_w13_real = max_activated * w13_tiles
+        # Slot-parallel EP builds the tile space over the experts this rank
+        # OWNS, so the loop bound must shrink to match; the device-side decode
+        # in gang_moe_fused_mxfp4_mi300.cuh does the same arithmetic. Sizing
+        # this for the full activated list would not be wrong -- the extra
+        # trips decode past total_tiles and return -- but it costs a poll per
+        # worker per layer for nothing.
+        _ep_ws = 1
+        _ep_me = 0
+        _owned = ((max_activated - _ep_me + _ep_ws - 1) // _ep_ws
+                  if _ep_ws > 1 else max_activated)
+        total_w13_real = _owned * w13_tiles
         total_w13_padded = ((total_w13_real + PAD_MULTIPLE - 1) // PAD_MULTIPLE) * PAD_MULTIPLE
-        total_w2 = max_activated * w2_tiles
+        total_w2 = _owned * w2_tiles
         total_tiles_all = total_w13_padded + total_w2
         moe_total_tiles_per_xcd = (total_tiles_all + 7) // 8
 
