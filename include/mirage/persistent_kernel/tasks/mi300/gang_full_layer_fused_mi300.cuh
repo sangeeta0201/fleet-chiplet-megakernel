@@ -1082,6 +1082,7 @@ __device__ __noinline__ void
     _ep_t0 = __builtin_amdgcn_s_memrealtime();
 #endif
 
+    MPK_WS_PHASE(91, qkv_epoch_expected, xcd_id);
     // ── 9a: GPU-wide MoE barrier, as a two-level tree ───────────────────
     // Every worker, not just this XCD's: W2 tiles for an expert can be
     // executed by any XCD, so the partial is not complete until all 240 have
@@ -1139,6 +1140,7 @@ __device__ __noinline__ void
       }
     }
 
+    MPK_WS_PHASE(92, qkv_epoch_expected, xcd_id);
     // ── 9b/9c: fold + stream, run BY the worker that closed the barrier ──
     //
     // This used to be a separate step: 9a released 8 flags, XCD 0's workgroup 0
@@ -1353,7 +1355,21 @@ __device__ __noinline__ void
 #else
     if (s_ep_closer) {
 #endif
+      MPK_WS_PHASE(93, qkv_epoch_expected, xcd_id);
       asm volatile("buffer_inv" ::: "memory");
+      //
+      // MEASURED, 2026-08-09: on this build ep_direct is FALSE on both ranks.
+      // rocshmem_ptr() returns nullptr for the symmetric ep_gather allocation,
+      // so the direct fold-into-peer-memory path below has never executed and
+      // every layer goes through the staged putmem_signal fallback instead.
+      // Run with MPK_EP_SIG_DBG=1 and read the [EPPATH] line to re-check.
+      //
+      // That matters for what the EP numbers mean: the collective cost being
+      // tuned is a staged put + signal, not the direct peer store the comments
+      // below describe. Restoring the direct path is a bigger lever than any
+      // reshaping of the signal protocol -- which is where the per-(PE,XCD)
+      // signal-line work went, and why it could not pay off.
+      //
       // Fold straight into the peer's gather slot as well as my own. peer_slot
       // is this rank's slot in the PEER's copy of the symmetric buffer, so
       // after the fold both GPUs hold my partial and nothing further has to be
@@ -1371,6 +1387,17 @@ __device__ __noinline__ void
       // not a per-thread one: the staged fallback below is a work-group
       // collective and every thread must agree on whether to enter it.
       bool const ep_direct = (peer_slot != nullptr);
+#ifdef MPK_EP_SIG_DBG
+      // Which of the two publication paths is actually live. The direct one
+      // needs mpk_shmem_peer_ptr to hand back a usable mapping of the peer's
+      // symmetric allocation; if it returns null every layer silently goes
+      // through the staged putmem_signal instead, and no amount of tuning the
+      // direct path changes anything.
+      if (tid == 0 && xcd_id == 0 && layer_counter == 0) {
+        printf("[EPPATH] pe=%d ep_direct=%d peer_slot=%p\n",
+               EP_MY_PE, (int)ep_direct, (void *)peer_slot);
+      }
+#endif
       // This XCD's slice only. All 8 run concurrently on disjoint columns.
       _full_layer_ep_fold_partial<QKV_BATCH_SIZE,
                                   QKV_REDUCTION_SIZE,
@@ -1466,6 +1493,7 @@ __device__ __noinline__ void
     _ep_t2 = __builtin_amdgcn_s_memrealtime();
 #endif
 
+    MPK_WS_PHASE(94, qkv_epoch_expected, xcd_id);
     // ── 9d: wait for THIS rank's slot to be complete. No reduce. ────────
     //
     // There is no reduce pass here any more and no exit barrier after it. The
@@ -1588,6 +1616,7 @@ __device__ __noinline__ void
     _ep_t3 = __builtin_amdgcn_s_memrealtime();
 #endif
 
+    MPK_WS_PHASE(95, qkv_epoch_expected, xcd_id);
     // ── 9e: exit barrier, last layer only. ───────────────────────────────
     //
     // This used to run on every layer: the combiner published a per-XCD release

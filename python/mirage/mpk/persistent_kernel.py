@@ -428,6 +428,13 @@ def get_compile_command(
         _ep_ablate = int(os.environ.get("MPK_EP_ABLATE", "0"))
         if _ep_ablate:
             flags = flags + [f"-DMPK_EP_ABLATE={_ep_ablate}"]
+        if int(os.environ.get("MPK_EP_SIG_DBG", "0")) == 1:
+            # EP collective diagnostics: prints, once per rank, which of the
+            # two Phase 9 publication paths is actually live. Cheap enough to
+            # leave reachable, and the one thing worth checking first whenever
+            # an EP latency number looks unexplained -- see the [EPPATH] probe
+            # in gang_full_layer_fused_mi300.cuh.
+            flags = flags + ["-DMPK_EP_SIG_DBG"]
         # The precomputed worker-dispatch template is baked from single-GPU task
         # timing. Under multi-GPU (rocSHMEM) the cross-GPU put+signal waits
         # perturb that timing and the fixed template deadlocks: a worker parks

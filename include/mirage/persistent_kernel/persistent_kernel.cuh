@@ -5505,6 +5505,25 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                     case 90:
                       pn = "P9-layer-done";
                       break;
+                    // Phase 9's sub-stages. A hang here is a collective hang,
+                    // and which stage it is decides where to look: 9a is the
+                    // GPU-wide MoE arrival, 9b/9c the fold + peer store, 9d
+                    // the self/peer signal wait, 9e the last-layer exit.
+                    case 91:
+                      pn = "P9a-moe-arrive";
+                      break;
+                    case 92:
+                      pn = "P9bc-fold-release";
+                      break;
+                    case 93:
+                      pn = "P9bc-folding";
+                      break;
+                    case 94:
+                      pn = "P9d-sig-wait";
+                      break;
+                    case 95:
+                      pn = "P9e-exit";
+                      break;
                   }
                 }
                 int *a = g_dbg_h_worker_state + g_dbg_num_workers * 8 + w * 4;
