@@ -17,8 +17,15 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <utility>
 #include <vector>
+
+// ld_nt_u64 / st_wt_u64. This header inlines the rocSHMEM device primitives it
+// needs (see mpk_shmem_signal_wait_ge and mpk_shmem_peer_ptr below) and those
+// are built out of these, so the dependency is real rather than incidental --
+// do not rely on the includer having pulled it in first.
+#include "mpk_atoms.cuh"
 
 #if defined(USE_NVSHMEM)
 #include <mpi.h>
@@ -97,10 +104,40 @@ mpk_shmem_signal_wait_ge(uint64_t *sig_addr, uint64_t val) {
                reinterpret_cast<unsigned long long *>(sig_addr),
                __ATOMIC_RELAXED));
 #endif
-  rocshmem::rocshmem_ulonglong_wait_until(
-      reinterpret_cast<unsigned long long *>(sig_addr),
-      rocshmem::ROCSHMEM_CMP_GE,
-      static_cast<unsigned long long>(val));
+  // Inlined rather than calling rocshmem_ulonglong_wait_until. That entry
+  // point is declared ATTR_NO_INLINE in rocshmem_COLL.hpp and reaches the
+  // comparison through Context's static-cast DISPATCH, so it stays a real
+  // out-of-line call across the device link -- it is present in this kernel's
+  // disassembly as _ZN8rocshmem29rocshmem_ulonglong_wait_untilEPyiy, and its
+  // spin loop spills the loaded value to scratch and reloads it on every poll
+  // iteration:
+  //
+  //   global_load_dwordx2 v[6:7], v[0:1], off sc0 sc1
+  //   flat_store_dwordx2  v[4:5], v[6:7] sc0 sc1   <- to private
+  //   flat_load_dwordx2   v[6:7], v[4:5] sc0 sc1   <- straight back
+  //   v_cmp_ge_u64_e32 vcc, v[6:7], v[2:3]
+  //
+  // A waiting work-group holds its VGPRs and its slot on the CU either way,
+  // so the round-trip buys nothing; it is an artifact of the value crossing a
+  // function boundary the library could not inline through. What the library
+  // actually does that matters is Context::test -> uncached_load, which on
+  // gfx942/gfx950 is `global_load_dwordx2 ... sc0 sc1` + `s_waitcnt vmcnt(0)`
+  // -- a load that misses the local cache hierarchy so a peer's store is
+  // observed. ld_nt_u64 is the same load with `nt` instead of `sc0 sc1`;
+  // both bypass L2 on this part, and the `nt` form is what the 2-PE peer wait
+  // in gang_full_layer_fused_mi300.cuh already polls with.
+  //
+  // The s_sleep is an addition, not a translation: rocSHMEM's loop is a bare
+  // `while (!test(...))`, which issues back-to-back uncached loads at full
+  // rate. Backing off keeps a spinning waiter from consuming the memory
+  // pipeline that the producer it is waiting on needs.
+  {
+    unsigned long long *p = reinterpret_cast<unsigned long long *>(sig_addr);
+    unsigned long long const want = static_cast<unsigned long long>(val);
+    while (ld_nt_u64(p) < want) {
+      __builtin_amdgcn_s_sleep(1);
+    }
+  }
 #ifdef MPK_COMM_DEBUG
   if (threadIdx.x == 0)
     printf("[COMM] wait EXIT  sig=%p val=%llu\n", (void *)sig_addr,
@@ -131,15 +168,129 @@ mpk_shmem_signal_wait_ge(uint64_t *sig_addr, uint64_t val) {
 //
 // The returned pointer is stable for the lifetime of the allocation, so callers
 // resolve it once and reuse it rather than calling this per layer.
+//
+// Implemented as one add against a per-peer constant instead of a call into
+// rocshmem_ptr. The reason that is legitimate, from rocSHMEM's own sources:
+// IPCContext::shmem_ptr (and putmem, and getmem -- they all share the
+// arithmetic) computes
+//
+//     ipc_bases[pe] + (dest - ipc_bases[my_pe])
+//
+// which regroups to `dest + (ipc_bases[pe] - ipc_bases[my_pe])`. That
+// parenthesised term does not depend on `dest`. It cannot: ipcHostInit takes a
+// SINGLE hipIpcGetMemHandle over the whole symmetric heap base and the peer
+// opens that one handle with hipIpcOpenMemHandle, so there is exactly one base
+// per PE and one delta covering every symmetric object for the process
+// lifetime. Recomputing it per call re-walks a four-deep dependent load chain
+// (ROCSHMEM_CTX_DEFAULT -> ctx_opaque -> ipcImpl_.ipc_bases -> two indexed
+// loads) to arrive at the same number every time.
+//
+// So the delta is sampled once at init (mpk_shmem_init_peer_deltas below, which
+// is where the one rocSHMEM call now lives) and the hot path is an add.
 // ---------------------------------------------------------------------------
+#define MPK_MAX_PES 16
+
+#if defined(USE_ROCSHMEM)
+// Byte offset from a local symmetric address to the same object on peer `pe`.
+// Only meaningful where the matching bit of mpk_peer_heap_valid_d is set --
+// a zero delta is legitimate (it is what pe == my_pe gives), so the validity
+// has to be carried separately rather than inferred from the value.
+__device__ int64_t mpk_peer_heap_delta_d[MPK_MAX_PES];
+__device__ uint32_t mpk_peer_heap_valid_d;
+#endif
+
+// Fetch the peer delta, or report that this peer has no direct mapping.
+// Callers that translate more than one address to the same peer should call
+// this once and add the delta themselves.
+__device__ __forceinline__ bool mpk_shmem_peer_delta(int pe, int64_t *out) {
+#if defined(USE_NVSHMEM)
+  (void)pe;
+  (void)out;
+  return false; // NVSHMEM path keeps using nvshmem_ptr per address.
+#elif defined(USE_ROCSHMEM)
+  if (pe < 0 || pe >= MPK_MAX_PES ||
+      ((mpk_peer_heap_valid_d >> pe) & 1u) == 0u) {
+    return false;
+  }
+  *out = mpk_peer_heap_delta_d[pe];
+  return true;
+#else
+  (void)pe;
+  *out = 0;
+  return true;
+#endif
+}
+
 __device__ __forceinline__ void *mpk_shmem_peer_ptr(void const *dest, int pe) {
 #if defined(USE_NVSHMEM)
   return nvshmem_ptr(dest, pe);
-#elif defined(USE_ROCSHMEM)
-  return rocshmem::rocshmem_ptr(dest, pe);
 #else
-  (void)pe;
-  return const_cast<void *>(dest);
+  int64_t delta = 0;
+  if (!mpk_shmem_peer_delta(pe, &delta)) {
+    return nullptr;
+  }
+  return const_cast<char *>(reinterpret_cast<char const *>(dest)) + delta;
+#endif
+}
+
+#if defined(USE_ROCSHMEM)
+// Sample the deltas. One thread, once, at init -- the only place the megakernel
+// still calls a rocSHMEM device function on the EP path.
+//
+// `probe` must be an address in the symmetric heap; any one will do, since the
+// delta is heap-wide. A peer whose translation comes back null (or whose result
+// is not a constant offset, which would mean the single-base assumption above
+// is wrong on this backend) is left invalid, so mpk_shmem_peer_ptr returns
+// nullptr for it and callers take their staged fallback exactly as before.
+__global__ void mpk_init_peer_deltas_kernel(void *probe, int my_pe, int n_pes) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) {
+    return;
+  }
+  uint32_t valid = 0;
+  for (int pe = 0; pe < n_pes && pe < MPK_MAX_PES; pe++) {
+    void *p = rocshmem::rocshmem_ptr(probe, pe);
+    if (p == nullptr) {
+      continue;
+    }
+    int64_t delta = reinterpret_cast<char *>(p) - reinterpret_cast<char *>(probe);
+    // Cross-check on a second address in the same heap. If the backend ever
+    // stops being a single flat mapping this catches it here, at init, rather
+    // than as silent corruption 36 layers deep.
+    void *probe2 = reinterpret_cast<char *>(probe) + 64;
+    void *p2 = rocshmem::rocshmem_ptr(probe2, pe);
+    if (p2 == nullptr ||
+        (reinterpret_cast<char *>(p2) - reinterpret_cast<char *>(probe2)) !=
+            delta) {
+      printf("[MPK] peer delta for pe=%d is not heap-wide constant; "
+             "direct peer stores disabled for that peer\n",
+             pe);
+      continue;
+    }
+    mpk_peer_heap_delta_d[pe] = delta;
+    valid |= (1u << pe);
+  }
+  (void)my_pe;
+  mpk_peer_heap_valid_d = valid;
+}
+#endif
+
+// Host entry: call once after the symmetric heap has been allocated and before
+// the megakernel launches. `probe` is any symmetric-heap pointer.
+__host__ inline void mpk_shmem_init_peer_deltas(void *probe) {
+#if defined(USE_ROCSHMEM)
+  if (probe == nullptr) {
+    fprintf(stderr,
+            "[MPK] no symmetric allocation to probe; direct peer stores "
+            "disabled\n");
+    return;
+  }
+  int my_pe = rocshmem::rocshmem_my_pe();
+  int n_pes = rocshmem::rocshmem_n_pes();
+  hipLaunchKernelGGL(mpk_init_peer_deltas_kernel, dim3(1), dim3(1), 0, 0, probe,
+                     my_pe, n_pes);
+  (void)hipDeviceSynchronize();
+#else
+  (void)probe;
 #endif
 }
 

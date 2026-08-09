@@ -1368,7 +1368,9 @@ __device__ __noinline__ void
       // the legitimate "no peer mapping" answer. Confirm the direct path is
       // live with MPK_EP_SIG_DBG=1 and read the [EPPATH] line; ep_direct=1 on
       // both ranks is the only evidence that these comments describe the code
-      // that actually runs.
+      // that actually runs. The patch is still required after the peer-delta
+      // change below: init samples the mapping through rocshmem_ptr once, so a
+      // stub there yields no valid delta and every peer stays unmapped.
       //
       // Fold straight into the peer's gather slot as well as my own. peer_slot
       // is this rank's slot in the PEER's copy of the symmetric buffer, so
@@ -1376,11 +1378,21 @@ __device__ __noinline__ void
       // transferred. For EP_WORLD_SIZE == 2 there is exactly one peer, which is
       // the configuration this path serves; wider worlds fall back to the
       // staged put below.
+      //
+      // One delta, two addresses. The gather slot and the signal line are both
+      // symmetric-heap objects and the local->peer offset is heap-wide (see
+      // mpk_comm.cuh), so translating the signal below costs an add and no
+      // second lookup. Resolving both here also means the per-layer cost of the
+      // translation is that add, not a walk down the rocSHMEM context.
       __hip_bfloat16 *peer_slot = nullptr;
+      int64_t ep_peer_delta = 0;
 #if MPK_EP_ABLATE != 1
       if constexpr (EP_WORLD_SIZE == 2) {
-        peer_slot = reinterpret_cast<__hip_bfloat16 *>(mpk_shmem_peer_ptr(
-            ep_gather + EP_MY_PE * EP_SLOT_ELEMS, 1 - EP_MY_PE));
+        if (mpk_shmem_peer_delta(1 - EP_MY_PE, &ep_peer_delta)) {
+          peer_slot = reinterpret_cast<__hip_bfloat16 *>(
+              reinterpret_cast<char *>(ep_gather + EP_MY_PE * EP_SLOT_ELEMS) +
+              ep_peer_delta);
+        }
       }
 #endif
       // Whether the direct path is live has to be a work-group-wide decision,
@@ -1430,10 +1442,13 @@ __device__ __noinline__ void
         if (tid == 0) {
           int prev_f = atom_add_release_gpu_s32(ep_fold_done, 1);
           if (prev_f % 8 == 7) {
-            uint64_t *peer_sig =
-                reinterpret_cast<uint64_t *>(mpk_shmem_peer_ptr(
-                    ep_signal + (size_t)EP_MY_PE * FULL_LAYER_EP_SIGNAL_STRIDE,
-                    1 - EP_MY_PE));
+            // Same heap-wide delta resolved above; ep_direct being true is
+            // what makes it valid.
+            uint64_t *peer_sig = reinterpret_cast<uint64_t *>(
+                reinterpret_cast<char *>(ep_signal +
+                                         (size_t)EP_MY_PE *
+                                             FULL_LAYER_EP_SIGNAL_STRIDE) +
+                ep_peer_delta);
             st_wt_u64((void *)peer_sig, (unsigned long long)ep_sig_expected);
             // Same store, local copy: this thread has just observed all 8
             // local slices, which is precisely what a worker leaving this

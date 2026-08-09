@@ -3985,6 +3985,24 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   std::vector<EventDesc> all_events;
   std::vector<TaskId> first_tasks;
   _init_persistent_kernel(all_fulltasks, all_events, first_tasks, npes, mype);
+
+  // Sample the symmetric-heap peer deltas now that _init_persistent_kernel has
+  // done every mpk_shmem_malloc. This is what lets the EP combine translate a
+  // local symmetric address to its peer with an add instead of a call into
+  // rocshmem_ptr on the hot path -- see mpk_comm.cuh. Any recorded symmetric
+  // allocation serves as the probe; the delta is heap-wide, not per-object.
+  {
+    auto &reg = mpk_shmem_alloc_registry();
+    void *probe = nullptr;
+    for (auto const &a : reg) {
+      if (a.first != nullptr) {
+        probe = a.first;
+        break;
+      }
+    }
+    mpk_shmem_init_peer_deltas(probe);
+  }
+
   std::vector<TaskDesc> all_tasks;
   for (auto const &ft : all_fulltasks) {
     TaskDesc task_desc(ft);
