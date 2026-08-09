@@ -1032,6 +1032,17 @@ __device__ __noinline__ void
   //                    baseline with none of the combine's cost. Output is a
   //                    partial sum -- garbage, and the next layer's prologue
   //                    reads the un-zeroed workspace too.
+  //   MPK_EP_ABLATE=6  keep 9a, the fold and the peer put, but let the 232
+  //                    workers that do NOT fold leave without waiting in 9d.
+  //                    The folding workgroups (xcd_rank == 0) still take the
+  //                    full wait, so the transfer is still ordered; what goes
+  //                    away is 232 workers sitting on a signal for work they
+  //                    never read. Prices the ceiling of ping-pong buffering
+  //                    attn_proj_out / moe_workspace_f32, which is what would
+  //                    make this legal -- both hazards 9d covers are WAR
+  //                    against the NEXT layer's reuse of those two buffers.
+  //                    WRONG OUTPUT as written: with one buffer a fast worker
+  //                    does clobber them.
 #ifndef MPK_EP_ABLATE
 #define MPK_EP_ABLATE 0
 #endif
@@ -1495,6 +1506,10 @@ __device__ __noinline__ void
         // strictly local -- another reason the peer's line does not belong
         // here.
 #if MPK_EP_ABLATE != 1 && MPK_EP_ABLATE != 5
+#if MPK_EP_ABLATE == 6
+        // Only the folding workgroups wait. See the knob comment above.
+        if (xcd_rank == 0) {
+#endif
         uint64_t *self_sig =
             ep_signal + (size_t)EP_MY_PE * FULL_LAYER_EP_SIGNAL_STRIDE;
         while (ld_nt_u64(reinterpret_cast<unsigned long long *>(self_sig)) <
@@ -1509,6 +1524,9 @@ __device__ __noinline__ void
         // gates all of attention, and measured 2.542 vs 2.528 ms/token.
         _full_layer_ep_wait_peers<EP_WORLD_SIZE, EP_MY_PE>(ep_signal,
                                                            ep_sig_expected);
+#if MPK_EP_ABLATE == 6
+        }
+#endif
 #else
         (void)ep_signal;
         (void)ep_sig_expected;

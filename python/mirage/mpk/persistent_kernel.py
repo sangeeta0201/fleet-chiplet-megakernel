@@ -3499,15 +3499,15 @@ class PersistentKernel:
             if ep_prev_gather is not None:
                 assert ep_prev_gather.num_dims == 3
                 assert ep_prev_gather.dim(0) == self.world_size
-        else:
-            assert ep_prev_gather is None, \
-                "ep_prev_gather only means anything with the inline EP combine"
             # One 64-byte line per PE so a peer's SIGNAL_ADD never shares a
             # line with another's (FULL_LAYER_EP_SIGNAL_STRIDE in the kernel).
             # 64 bytes (one cache line) of signal space per PE. Declared in
             # int32 units because mi.uint64 has no get_datatype_size() entry;
             # the kernel reinterprets the pointer as uint64*.
             assert ep_signal.dim(0) >= self.world_size * 16
+        else:
+            assert ep_prev_gather is None, \
+                "ep_prev_gather only means anything with the inline EP combine"
 
         batch_size = self.max_num_batched_tokens
 
