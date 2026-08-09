@@ -2069,6 +2069,37 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 
   __syncthreads();
 
+#ifdef MPK_EP_SKEW_PROBE
+  // EP skew probe. One timestamp per W2 tile, taken after its atomicAdds have
+  // retired, recorded as a max into the column slice that tile wrote and into
+  // the GPU-wide maximum. Phase 9 then reports (gpu_last - slice_last) per
+  // slice: the time a per-slice release could have shipped that slice early.
+  //
+  // Keyed by the SAME slice arithmetic Phase 9 folds with -- EP_FOLD_CHUNK is
+  // ceil(QKV_REDUCTION_SIZE/8) rounded up to even -- so a slice here is exactly
+  // the columns one XCD's fold reads. Anything else would compare two different
+  // partitions and the answer would be meaningless.
+  if (is_w2 && tid == 0) {
+    unsigned long long t = __builtin_amdgcn_s_memrealtime();
+    // wg_idx covers columns [wg_idx*W2_OUTPUT_PER_WG, +W2_OUTPUT_PER_WG).
+    // QKV_REDUCTION_SIZE is the PADDED hidden size and HIDDEN_SIZE is not, but
+    // the fold's chunk is derived from the padded one; recompute it the same
+    // way rather than assuming the two partitions coincide.
+    constexpr int SKEW_PAD = ((HIDDEN_SIZE + 63) / 64) * 64;
+    constexpr int SKEW_CHUNK = ((SKEW_PAD + 7) / 8 + 1) & ~1;
+    int c_lo = wg_idx * W2_OUTPUT_PER_WG;
+    int c_hi = c_lo + W2_OUTPUT_PER_WG - 1;
+    int s_lo = c_lo / SKEW_CHUNK;
+    int s_hi = c_hi / SKEW_CHUNK;
+    // A W2 workgroup's output span can straddle two fold slices; both are
+    // gated on it, so both take the timestamp.
+    for (int s = s_lo; s <= s_hi && s < EP_SKEW_SLICES; s++) {
+      atomicMax(&g_ep_slice_last[s], t);
+    }
+    atomicMax(&g_ep_gpu_last, t);
+  }
+#endif
+
 #if 0 // W2 reporting disabled — timestamps not captured
     {
       g_subphase_scratch[7] = __builtin_amdgcn_s_memrealtime();

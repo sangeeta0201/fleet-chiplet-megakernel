@@ -409,6 +409,18 @@ def get_compile_command(
             flags = flags + ["-DMPK_FUSED_TAIL_TIMING"]
         if int(os.environ.get("MPK_K2944_DEBUG", "0")) == 1:
             flags = flags + ["-DMPK_K2944_DEBUG"]
+        if int(os.environ.get("MPK_EP9_ONLY", "0")) == 1:
+            # Phase 9 breakdown only: keeps the accumulate-and-dump-once EP9
+            # report and compiles out the per-layer FUSED_PHASE printf, which
+            # on its own takes the iteration from 2.5 ms to ~440 ms.
+            flags = flags + ["-DMPK_EP9_ONLY", "-DMPK_ENABLE_DEVICE_TASK_TIMING"]
+        if int(os.environ.get("MPK_EP_SKEW_PROBE", "0")) == 1:
+            # Measures how much earlier a column slice's W2 tiles finish than
+            # the last W2 tile on the GPU -- i.e. the headroom a per-slice
+            # "send as you go" release could claim over the current GPU-wide
+            # Phase 9 barrier. One timestamp per W2 tile, so cheap, but it
+            # still perturbs; do not quote latency from a probe run.
+            flags = flags + ["-DMPK_EP_SKEW_PROBE"]
         # Inline-EP combine ablation. 1 = keep every barrier but drop the
         # cross-GPU put/wait; 2 = drop Phase 9 entirely but keep the 64/64
         # expert slicing. BOTH PRODUCE WRONG OUTPUT -- they exist to price the

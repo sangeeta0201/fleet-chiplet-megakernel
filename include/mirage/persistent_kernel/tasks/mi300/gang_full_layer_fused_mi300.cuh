@@ -1071,6 +1071,15 @@ __device__ __noinline__ void
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     bool is_last_on_gpu = false;
     if (tid == 0) {
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+      // Arrival instant of THIS workgroup, before it touches the counter.
+      // min/max over the 240 give the spread the barrier is absorbing.
+      {
+        unsigned long long _a = _ep_t0;
+        atomicMin(&g_ep9_arr_min, _a);
+        atomicMax(&g_ep9_arr_max, _a);
+      }
+#endif
       int prev_x = atom_add_release_gpu_s32(
           &ep_xcd_arrive[xcd_id * FULL_LAYER_EP_XCD_STRIDE], 1);
       if (prev_x % workers_per_xcd == workers_per_xcd - 1) {
@@ -1103,6 +1112,26 @@ __device__ __noinline__ void
     if (is_last_on_gpu) {
       threadfence_gpu();
     }
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+    // Read the arrival spread from the closer: it has just observed the 240th
+    // arrival, so min/max are final for this layer and no one has started the
+    // next. Reset here for the same reason.
+    if (is_last_on_gpu && tid == 0) {
+      unsigned long long lo = g_ep9_arr_min, hi = g_ep9_arr_max;
+      unsigned long long span = (hi >= lo) ? (hi - lo) : 0;
+      atomicAdd(&g_ep9_arr_span_sum, span);
+      atomicMax(&g_ep9_arr_span_max, span);
+      unsigned long long an = atomicAdd(&g_ep9_arr_n, 1ull);
+      g_ep9_arr_min = ~0ull;
+      g_ep9_arr_max = 0ull;
+      if (an == 36ull * 100ull) {
+        printf("[EP9ARR] n=%llu arrival_spread_us mean=%.3f max=%.3f\n",
+               an,
+               (double)g_ep9_arr_span_sum / an / 100.0,
+               (double)g_ep9_arr_span_max / 100.0);
+      }
+    }
+#endif
     // The closer releases every XCD immediately, before folding anything. The
     // fold is then done by all 8 XCD workgroups in parallel, each on its own
     // column slice, rather than by this one workgroup while 239 workers idle.
@@ -1112,6 +1141,66 @@ __device__ __noinline__ void
     // as expensive as the barrier that gated it, because 11.8 KB of f32 reads
     // and 5.8 KB of XGMI stores were running at 1/240 of the machine. Slicing
     // it 8 ways puts that work on hardware that is already awake and waiting.
+#ifdef MPK_EP_SKEW_PROBE
+    // Read the probe from the ONE worker that has just observed every W2 tile
+    // on the GPU. At this instant g_ep_slice_last[] and g_ep_gpu_last are final
+    // for this layer and nothing has started the next one, so the sample needs
+    // no barrier of its own. Reset here too, for the same reason.
+    if (is_last_on_gpu) {
+      unsigned long long gpu_last = g_ep_gpu_last;
+      int slot = g_ep_skew_n % EP_SKEW_HIST;
+      unsigned long long span_min = ~0ull;
+      for (int s = 0; s < EP_SKEW_SLICES; s++) {
+        unsigned long long sl = g_ep_slice_last[s];
+        // Headroom for slice s: how long it sat complete while the barrier
+        // waited for the rest of the GPU.
+        g_ep_skew_hist[slot][s] = (sl > 0 && gpu_last >= sl) ? (gpu_last - sl) : 0;
+        if (sl > 0 && sl < span_min) {
+          span_min = sl;
+        }
+        g_ep_slice_last[s] = 0;
+      }
+      // Span = last tile anywhere minus the FIRST slice to complete: the total
+      // spread of W2 completion, i.e. the most any scheme could overlap.
+      g_ep_skew_span[slot] = (span_min != ~0ull) ? (gpu_last - span_min) : 0;
+      g_ep_gpu_last = 0;
+      g_ep_skew_n = g_ep_skew_n + 1;
+      // Dump from here rather than the TERMINATE path: this block is on the
+      // hot path and certain to run, and at n=3600 we are well past prefill
+      // (72 iters x 36 layers = 2592) and into decode steady state. One
+      // worker, once, so the printf does not perturb the measurement.
+      if (g_ep_skew_n == 3600) {
+        printf("[EPSKEW] n=%d window=%d unit=us (1 tick = 10ns)\n",
+               g_ep_skew_n,
+               EP_SKEW_HIST);
+        for (int s = 0; s < EP_SKEW_SLICES; s++) {
+          unsigned long long sum = 0, mx = 0;
+          for (int i = 0; i < EP_SKEW_HIST; i++) {
+            unsigned long long v = g_ep_skew_hist[i][s];
+            sum += v;
+            if (v > mx) {
+              mx = v;
+            }
+          }
+          printf("[EPSKEW] slice%d mean=%.3f max=%.3f\n",
+                 s,
+                 (double)sum / EP_SKEW_HIST / 100.0,
+                 (double)mx / 100.0);
+        }
+        unsigned long long ssum = 0, smx = 0;
+        for (int i = 0; i < EP_SKEW_HIST; i++) {
+          unsigned long long v = g_ep_skew_span[i];
+          ssum += v;
+          if (v > smx) {
+            smx = v;
+          }
+        }
+        printf("[EPSKEW] span mean=%.3f max=%.3f\n",
+               (double)ssum / EP_SKEW_HIST / 100.0,
+               (double)smx / 100.0);
+      }
+    }
+#endif
     if (is_last_on_gpu) {
       for (int x = 0; x < 8; x++) {
         st_wt_u32((void *)&ep_release[x * FULL_LAYER_EP_XCD_STRIDE],
@@ -1135,6 +1224,13 @@ __device__ __noinline__ void
       }
     }
     __syncthreads();
+
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+    // 9a ends HERE, not after the fold. The old placement folded the two
+    // together and reported 9bc as 0, which is how the fold's cost stayed
+    // hidden inside the "barrier" number.
+    _ep_t1 = __builtin_amdgcn_s_memrealtime();
+#endif
 
     // Column slice for this XCD. Rounded to an even boundary so the packed
     // 32-bit peer stores never straddle two slices.
@@ -1272,8 +1368,7 @@ __device__ __noinline__ void
     }
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
-    _ep_t1 = __builtin_amdgcn_s_memrealtime();
-    _ep_t2 = _ep_t1;
+    _ep_t2 = __builtin_amdgcn_s_memrealtime();
 #endif
 
     // ── 9d: wait for THIS rank's slot to be complete. No reduce. ────────
@@ -1433,24 +1528,49 @@ __device__ __noinline__ void
   // (9b/9c) while every other rank only waits, so their 9bc/9d split differs
   // even though both now take the same 9d wait. 9e is gone and reads ~0.
   if constexpr (EP_WORLD_SIZE > 1) {
+    // Accumulate, do NOT print per layer. Printing here fires 36 layers x 16
+    // reporting workgroups x 126 iters = ~146k printfs and takes the iteration
+    // from 2.5 ms to 441 ms -- the breakdown then describes the printf, not the
+    // collective. Accumulate into globals and dump once, from the hot path,
+    // deep enough into decode that prefill is out of the average.
     if (tid == 0 && (xcd_rank == 0 || xcd_rank == 1) && _ep_t0 > 0) {
-      double b9a = (double)(_ep_t1 - _ep_t0) * 10.0 / 1000.0;
-      double b9bc = (double)(_ep_t2 - _ep_t1) * 10.0 / 1000.0;
-      double b9d = (double)(_ep_t3 - _ep_t2) * 10.0 / 1000.0;
-      double b9e = (double)(_ep_t4 - _ep_t3) * 10.0 / 1000.0;
-      double btot = (double)(_ep_t4 - _ep_t0) * 10.0 / 1000.0;
-      printf("[EP_PHASE9] xcd=%d role=%s 9a_moe_barrier=%.1f "
-             "9bc_fold_put=%.1f 9d_wait=%.1f 9e_gone=%.1f "
-             "total=%.1f us\n",
-             xcd_id,
-             xcd_rank == 0 ? "folder" : "follower",
-             b9a,
-             b9bc,
-             b9d,
-             b9e,
-             btot);
+      int r = (xcd_rank == 0) ? 0 : 1;
+      atomicAdd(&g_ep9_ns[r][0], (unsigned long long)(_ep_t1 - _ep_t0));
+      atomicAdd(&g_ep9_ns[r][1], (unsigned long long)(_ep_t2 - _ep_t1));
+      atomicAdd(&g_ep9_ns[r][2], (unsigned long long)(_ep_t3 - _ep_t2));
+      atomicAdd(&g_ep9_ns[r][3], (unsigned long long)(_ep_t4 - _ep_t3));
+      unsigned long long n = atomicAdd(&g_ep9_cnt[r], 1ull);
+      // 8 workgroups per role per layer x 36 layers = 288 per iteration.
+      // Dump at iteration ~100, well past the 72 prefill tokens.
+      if (r == 0 && n == 288ull * 100ull) {
+        for (int rr = 0; rr < 2; rr++) {
+          unsigned long long c = g_ep9_cnt[rr];
+          if (c == 0) {
+            continue;
+          }
+          // Ticks -> us per layer-instance: 1 tick = 10 ns.
+          printf("[EP9] role=%s n=%llu per_layer_us 9a=%.3f 9bc=%.3f "
+                 "9d=%.3f 9e=%.3f tot=%.3f | x36 ms=%.3f\n",
+                 rr == 0 ? "folder" : "follower",
+                 c,
+                 (double)g_ep9_ns[rr][0] / c / 100.0,
+                 (double)g_ep9_ns[rr][1] / c / 100.0,
+                 (double)g_ep9_ns[rr][2] / c / 100.0,
+                 (double)g_ep9_ns[rr][3] / c / 100.0,
+                 (double)(g_ep9_ns[rr][0] + g_ep9_ns[rr][1] + g_ep9_ns[rr][2] +
+                          g_ep9_ns[rr][3]) /
+                     c / 100.0,
+                 (double)(g_ep9_ns[rr][0] + g_ep9_ns[rr][1] + g_ep9_ns[rr][2] +
+                          g_ep9_ns[rr][3]) /
+                     c / 100.0 * 36.0 / 1000.0);
+        }
+      }
     }
   }
+  // MPK_EP9_ONLY suppresses the per-layer full-phase dump so the Phase 9
+  // accumulators above can be read from a run that still executes at ~2.5 ms.
+  // With both live the printf volume alone costs 440 ms/iter.
+#ifndef MPK_EP9_ONLY
   if (tid == 0 && xcd_rank == 0) {
     unsigned long long _fused_t4 = __builtin_amdgcn_s_memrealtime();
     double p1_5 = (double)(_fused_t1 - _fused_t0) * 10.0 / 1000.0;
@@ -1499,6 +1619,7 @@ __device__ __noinline__ void
            flush_sig,
            wait_others);
   }
+#endif // MPK_EP9_ONLY
 #endif
   MPK_TW_SUB(90, tile_idx);
   MPK_WS_PHASE(90, qkv_epoch_expected, xcd_id);

@@ -57,6 +57,59 @@ __device__ unsigned long long g_subphase_scratch[8];
 __device__ unsigned long long g_fused_phase_ns[4];
 #endif
 
+// ── EP skew probe ──────────────────────────────────────────────────────────
+//
+// Phase 9 waits for ALL 240 workers before folding, but a given column of the
+// residual is only written by the W2 tiles whose output slice covers it --
+// ~2 tiles per rank at top_k=4, not 240. If those tiles finish much earlier
+// than the last worker on the GPU, the barrier is buying nothing for that
+// column and a per-slice release could ship it early. If they finish at
+// roughly the same time, there is nothing to overlap and the whole
+// send-as-you-go idea is dead regardless of how it is implemented.
+//
+// This measures exactly that gap, and nothing else:
+//   g_ep_slice_last[x] = timestamp of the last W2 atomicAdd into XCD x's
+//                        column slice (max over contributing tiles)
+//   g_ep_gpu_last      = timestamp of the last W2 tile anywhere on the GPU
+// The difference, per slice, is the headroom a per-slice release could claim.
+//
+// Written with plain atomics on device globals from the W2 epilogue only
+// (one per tile, not per element), so the probe does not perturb the compute
+// it is measuring. Off unless MPK_EP_SKEW_PROBE is defined.
+#ifdef MPK_EP_SKEW_PROBE
+#define EP_SKEW_SLICES 8
+#define EP_SKEW_HIST 64
+__device__ unsigned long long g_ep_slice_last[EP_SKEW_SLICES];
+__device__ unsigned long long g_ep_gpu_last;
+__device__ unsigned long long g_ep_layer_t0;
+// Per-layer samples of (gpu_last - slice_last), in units of s_memrealtime
+// ticks (100 MHz => 10 ns/tick). Ring of the most recent EP_SKEW_HIST layers.
+__device__ unsigned long long g_ep_skew_hist[EP_SKEW_HIST][EP_SKEW_SLICES];
+__device__ unsigned long long g_ep_skew_span[EP_SKEW_HIST];
+__device__ int g_ep_skew_n;
+#endif
+
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+// Phase 9 breakdown accumulators, in s_memrealtime ticks (10 ns).
+// [role][9a, 9bc, 9d, 9e]; role 0 = folder (xcd_rank 0), 1 = follower.
+// Accumulated rather than printed per layer -- see the dump site in
+// gang_full_layer_fused_mi300.cuh for why.
+__device__ unsigned long long g_ep9_ns[2][4];
+__device__ unsigned long long g_ep9_cnt[2];
+// Worker ARRIVAL spread at 9a: min/max over all 240 workgroups of the instant
+// they reach Phase 9, reset each layer. The W2-tile skew probe says tile
+// completion spreads only 0.48 us, but a worker's last act is not necessarily a
+// W2 tile, so tile spread does not bound worker spread. This measures the thing
+// the barrier actually waits on.
+// Initialized to ~0 so the first atomicMin takes; the closer resets it to ~0
+// again at the end of every layer.
+__device__ unsigned long long g_ep9_arr_min = ~0ull;
+__device__ unsigned long long g_ep9_arr_max;
+__device__ unsigned long long g_ep9_arr_span_sum;
+__device__ unsigned long long g_ep9_arr_span_max;
+__device__ unsigned long long g_ep9_arr_n;
+#endif
+
 #ifdef MPK_ENABLE_SPAN_TIMING
 // g_span_active declared early so task kernels (included via task_header.cuh)
 // can see it
@@ -1877,6 +1930,46 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                  (double)poll / 1000.0 / n_iters,
                  (double)moe / 1000.0 / n_iters,
                  n_iters);
+        }
+      }
+#endif
+#ifdef MPK_EP_SKEW_PROBE
+      if (threadIdx.x == 0 && worker_id == 0) {
+        int n = g_ep_skew_n;
+        int have = (n < EP_SKEW_HIST) ? n : EP_SKEW_HIST;
+        if (have > 0) {
+          // s_memrealtime is the 100 MHz constant clock: 1 tick = 10 ns.
+          // Report the mean and the max over the retained layers; the max is
+          // what matters, because a per-slice release only helps if the slice
+          // is reliably early, not occasionally early.
+          printf("[EPSKEW] layers=%d (ring holds %d) unit=us\n", n, have);
+          for (int s = 0; s < EP_SKEW_SLICES; s++) {
+            unsigned long long sum = 0, mx = 0;
+            for (int i = 0; i < have; i++) {
+              unsigned long long v = g_ep_skew_hist[i][s];
+              sum += v;
+              if (v > mx) {
+                mx = v;
+              }
+            }
+            printf("[EPSKEW] slice%d mean=%.3f max=%.3f\n",
+                   s,
+                   (double)sum / have / 100.0,
+                   (double)mx / 100.0);
+          }
+          unsigned long long ssum = 0, smx = 0;
+          for (int i = 0; i < have; i++) {
+            unsigned long long v = g_ep_skew_span[i];
+            ssum += v;
+            if (v > smx) {
+              smx = v;
+            }
+          }
+          // span = gpu_last - earliest slice_last: the total W2 tail spread.
+          // No per-slice scheme can claim more than this.
+          printf("[EPSKEW] span mean=%.3f max=%.3f\n",
+                 (double)ssum / have / 100.0,
+                 (double)smx / 100.0);
         }
       }
 #endif
