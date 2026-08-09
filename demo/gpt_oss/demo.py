@@ -1715,6 +1715,13 @@ if __name__ == "__main__":
         # SwiGLU is fused into W2's input quantization step (no separate task)
         w13_output_per_wg = 128  # W13: 48→24 tiles/XCD, max 1 tile/worker (no stragglers)
         w2_output_per_wg = 64   # W2: 24 tiles/XCD (OPW=128 regressed 7% even with prefetch)
+        # Overridable because the right value differs under EP. At bs=1 the MoE
+        # is latency-bound on W13 -> per-expert barrier -> W2, not on tile
+        # count, and EP halves the expert count -- so it frees workers that a
+        # SMALLER tile could use to shorten that chain. 64 was tuned on the
+        # 1-GPU path where no workers are spare.
+        w13_output_per_wg = int(os.environ.get("W13_OPW", w13_output_per_wg))
+        w2_output_per_wg = int(os.environ.get("W2_OPW", w2_output_per_wg))
         print(f"Packing MXFP4 MoE expert weights ({num_layers} layers, "
               f"W13_OPW={w13_output_per_wg}, W2_OPW={w2_output_per_wg})...")
         moe_gate_up_proj_weights = []  # [E, expert_wgs, wg_bytes] uint8

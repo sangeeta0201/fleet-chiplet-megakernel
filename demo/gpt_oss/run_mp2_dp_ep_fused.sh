@@ -51,6 +51,17 @@ export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-6,7}"
 export ROCSHMEM_MAX_NUM_CONTEXTS="${ROCSHMEM_MAX_NUM_CONTEXTS:-2}"
 export ATTN_DP=1
 export MOE_EP=1
+# Slot-parallel expert ownership (activated-list position, weights replicated)
+# rather than an expert-id window. Splits 2/2 on every token instead of 3-1 half
+# the time, and lets the tile space be built over owned experts only.
+# Measured 2.484 vs 2.520 ms for the id split.
+export EP_SLOT="${EP_SLOT:-1}"
+# W13 tile size, EP-specific. The 1-GPU default of 128 was tuned where no
+# worker is spare; under EP only half the experts run here, so 64 spends the
+# freed workers on shortening the W13 -> per-expert barrier -> W2 chain that
+# actually sets MoE latency at bs=1. Measured 2.352 vs 2.484 under EP, and
+# 2.251 vs 2.133 on ONE GPU -- it is a win only when EP has freed the workers.
+export W13_OPW="${W13_OPW:-64}"
 export FUSE_FULL_LAYER="${FUSE_FULL_LAYER:-1}"
 export PRECOMPUTED_DISPATCH="${PRECOMPUTED_DISPATCH:-1}"
 
