@@ -16,15 +16,27 @@
 // MoE residual addition from float32 workspace for MI300/MI350.
 //
 // Replaces moe_mul_sum_add when W2 already did routing weight multiplication
-// and float32 atomicAdd into a workspace buffer.
+// and wrote each expert's contribution to its own slot of the f32 workspace.
 //
-// output[b, h] = bf16(workspace_f32[b, h] + residual_bf16[b, h])
-// workspace_f32[b, h] = 0.0f  (zero for next iteration)
+// output[b, h] = bf16(sum_s workspace_f32[b, s, h] + residual_bf16[b, h])
+//
+// The slot sum runs in fixed compile-time order and touches only row `b`, so
+// the result cannot depend on expert arrival order or on batch composition.
+// See moe_ws_layout.cuh.
+//
+// This one consumer still zeroes, even though the producer now assigns rather
+// than accumulates. It is the LAST layer's consumer, and the next thing to read
+// the workspace is layer 0's QKV prologue on the following iteration -- which
+// adds it to the embedding unconditionally, before any MoE has run. Leave it
+// populated and every token double-counts layer 35's MoE output. The
+// per-layer prologues need no zero pass; this boundary does.
 
 #pragma once
 
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
+
+#include "moe_ws_layout.cuh"
 
 namespace kernel {
 
@@ -37,22 +49,34 @@ __device__ __forceinline__ void moe_residual_add_f32_mi300_impl(
   unsigned short *__restrict__ d_out =
       static_cast<unsigned short *>(output_ptr);
 
-  // Vectorized: float4 for f32 workspace load+zero, uint2 for bf16
-  // residual/output
+  // Vectorized: float4 for f32 workspace loads, uint2 for bf16 residual/output
   constexpr int VEC = 4;
   constexpr int BLOCK_VEC = 256 * VEC; // assumes blockDim.x == 256
+
   float4 zero4 = {0.0f, 0.0f, 0.0f, 0.0f};
 
   for (int row = 0; row < BATCH_SIZE; ++row) {
-    float *ws_row = d_ws + row * OUTPUT_STRIDE;
+    float *ws_row = d_ws + moe_ws_offset(row, 0, OUTPUT_STRIDE);
     unsigned short const *res_row = d_res + row * OUTPUT_STRIDE;
     unsigned short *out_row = d_out + row * OUTPUT_STRIDE;
 
 #pragma unroll
     for (int off = threadIdx.x * VEC; off < OUTPUT_SIZE; off += BLOCK_VEC) {
-      // Vectorized load: 4 f32 from workspace (flat_load_dwordx4)
+      // Vectorized load: 4 f32 per topk slot (flat_load_dwordx4), summed in
+      // fixed slot order.
       float4 ws4;
       __builtin_memcpy(&ws4, ws_row + off, 16);
+      __builtin_memcpy(ws_row + off, &zero4, 16);
+#pragma unroll
+      for (int s = 1; s < MOE_WS_SLOTS; s++) {
+        float4 slot4;
+        __builtin_memcpy(&slot4, ws_row + s * OUTPUT_STRIDE + off, 16);
+        __builtin_memcpy(ws_row + s * OUTPUT_STRIDE + off, &zero4, 16);
+        ws4.x += slot4.x;
+        ws4.y += slot4.y;
+        ws4.z += slot4.z;
+        ws4.w += slot4.w;
+      }
 
       // Vectorized load: 4 bf16 from residual as uint2 (flat_load_dwordx2)
       uint2 res_packed;
@@ -88,9 +112,6 @@ __device__ __forceinline__ void moe_residual_add_f32_mi300_impl(
       out_packed.x = (unsigned)f2bf16(s0) | ((unsigned)f2bf16(s1) << 16);
       out_packed.y = (unsigned)f2bf16(s2) | ((unsigned)f2bf16(s3) << 16);
       __builtin_memcpy(out_row + off, &out_packed, 8);
-
-      // Zero workspace (flat_store_dwordx4)
-      __builtin_memcpy(ws_row + off, &zero4, 16);
     }
   }
 }

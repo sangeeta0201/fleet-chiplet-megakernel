@@ -1450,8 +1450,13 @@ if __name__ == "__main__":
         swiglu_out = make_tensor("swiglu_out", (bs, num_experts_per_tok, PADDED_INTERMEDIATE_SIZE))
         # W2 output: [bs, top_k, padded_hidden]
         mlp_out = make_tensor("mlp_out", (bs, num_experts_per_tok, PADDED_HIDDEN_SIZE))
-        # F32 workspace for W2 atomicAdd: replaces MulSumAdd standalone task
-        moe_workspace_f32 = make_tensor("moe_workspace_f32", (bs, PADDED_HIDDEN_SIZE), torch_dtype=torch.float32)
+        # F32 workspace for W2 output: one private slab per (token, topk slot),
+        # laid out [bs, top_k, padded_hidden] but kept 2-D so the existing
+        # num_dims == 2 asserts hold. The slot axis is what makes the reduction
+        # deterministic -- W2 stores (no atomicAdd) and the consumer sums the
+        # slots of its own row in fixed order. See moe_ws_layout.cuh, whose
+        # MOE_WS_SLOTS must equal num_experts_per_tok.
+        moe_workspace_f32 = make_tensor("moe_workspace_f32", (bs, num_experts_per_tok * PADDED_HIDDEN_SIZE), torch_dtype=torch.float32)
         mlp_weighted_sum_out = make_tensor("mlp_weighted_sum_out", (bs, PADDED_HIDDEN_SIZE))
         mlp_final = make_tensor("mlp_final", (bs, PADDED_HIDDEN_SIZE))
         # Argmax — fused into LM head GEMM (type 218, norm-once):
@@ -2873,6 +2878,29 @@ if __name__ == "__main__":
             print("=" * 80)
             torch.cuda.synchronize()
 
+            # Row-symmetry sweep. Every captured tensor is [rows, ...] with one
+            # row per batch slot. Run with identical prompts in every slot: any
+            # tensor whose rows differ names a reduction whose result depends on
+            # arrival order or on batch composition. The FIRST such tensor in
+            # dataflow order is the defect; everything after it is downstream.
+            if bs > 1:
+                print("\n--- Row symmetry (identical prompts => rows must match) ---")
+                for _nm in sorted(verify_tensors):
+                    _t = verify_tensors[_nm]
+                    if _t.dim() < 1 or _t.shape[0] < 2:
+                        continue
+                    _r0 = _t[0].float()
+                    _worst, _worst_r = 0.0, -1
+                    for _r in range(1, _t.shape[0]):
+                        _d = (_t[_r].float() - _r0).abs().max().item()
+                        if _d > _worst:
+                            _worst, _worst_r = _d, _r
+                    _flag = "  <-- DIFFERS" if _worst > 0 else ""
+                    _norms = [f"{_t[_i].float().norm().item():.4g}"
+                              for _i in range(min(_t.shape[0], 4))]
+                    print(f"  {_nm:28s} rows={_t.shape[0]} max|row_i-row_0|="
+                          f"{_worst:.6g} (row {_worst_r}) norms={_norms}{_flag}")
+
             # Debug: check q_workspace and k_cache values
             q_ws_nz = (ck_fmha_q_ws_tensor.abs() > 1e-6).sum().item()
             print(f"  [DEBUG] q_workspace non-zero: {q_ws_nz} / {ck_fmha_q_ws_tensor.numel()}")
@@ -3280,16 +3308,20 @@ if __name__ == "__main__":
                     nonzero_k = (mg_mlp_out[0, k].abs() > 1e-6).sum().item()
                     print(f"  Slot {k}[:8]: {vals}  (nonzero: {nonzero_k}/{mg_mlp_out.shape[-1]})")
 
-            # 9d. MoE workspace_f32 (atomicAdd accumulator used in fused path)
+            # 9d. MoE workspace_f32 (per-(token, topk slot) W2 output, fused path)
             mg_ws_f32 = verify_tensors.get("moe_workspace_f32")
             if mg_ws_f32 is not None:
-                print(f"\n--- MoE workspace_f32 (atomicAdd output) ---")
-                ws_vals = mg_ws_f32[0, :8].float().tolist()
-                ws_nonzero = (mg_ws_f32[0].abs() > 1e-6).sum().item()
-                ws_norm = mg_ws_f32[0, :hidden_size].float().norm().item()
+                # Stored flat as [bs, top_k * PADDED_HIDDEN_SIZE]; the consumer
+                # sums the slot axis, so do the same here before comparing.
+                ws_slots = mg_ws_f32[0].view(num_experts_per_tok, -1).float()
+                ws_sum = ws_slots.sum(dim=0)
+                print(f"\n--- MoE workspace_f32 (slot-summed W2 output) ---")
+                ws_vals = ws_sum[:8].tolist()
+                ws_nonzero = (ws_sum.abs() > 1e-6).sum().item()
+                ws_norm = ws_sum[:hidden_size].norm().item()
                 print(f"  ws_f32[:8]: {ws_vals}")
-                print(f"  nonzero: {ws_nonzero}/{mg_ws_f32.shape[-1]}, norm: {ws_norm:.4f}")
-                print(f"  pad region [{hidden_size}:] max: {mg_ws_f32[0, hidden_size:].abs().max().item():.6f}")
+                print(f"  nonzero: {ws_nonzero}/{ws_sum.shape[-1]}, norm: {ws_norm:.4f}")
+                print(f"  pad region [{hidden_size}:] max: {ws_sum[hidden_size:].abs().max().item():.6f}")
 
                 # Note: mlp_mid (W13 output) is also available for debugging if needed
 

@@ -36,6 +36,7 @@
 #pragma once
 #include "tasks/mi300/gang_moe_linear_mxfp4_mi300.cuh" // FP4xFP8 type defs + helpers
 #include "tasks/mi300/gang_rmsnorm_linear_bias_mi300.cuh" // RMSNorm prologue
+#include "tasks/mi300/moe_ws_layout.cuh" // MOE_WS_SLOTS, moe_ws_offset()
 
 namespace kernel {
 
@@ -1761,15 +1762,27 @@ __device__ __noinline__ void gang_resaddf32_rmsnorm_linear_mxfp4_bias_kernel(
         // REDUCTION_SIZE / (blockDim.x * VEC) iterations per thread
         // e.g. 3072 / (256 * 4) = 3 iterations — fully unrollable
         constexpr int BLOCK_VEC = 256 * VEC; // elements per block per iteration
-        float *ws_base = d_ws + b * REDUCTION_SIZE;
+        float const *ws_base = d_ws + moe_ws_offset(b, 0, REDUCTION_SIZE);
         unsigned short const *res_base = d_residual + b * REDUCTION_SIZE;
         unsigned short *xout_base = d_x_out + b * REDUCTION_SIZE;
 
 #pragma unroll
         for (int off = tid * VEC; off < REDUCTION_SIZE; off += BLOCK_VEC) {
-          // Vectorized load: 4 f32 from workspace (flat_load_dwordx4)
+          // Vectorized load: 4 f32 from workspace (flat_load_dwordx4), then
+          // sum the remaining expert slots in fixed slot order. See
+          // moe_ws_layout.cuh for why this is a per-slot reduction here rather
+          // than an atomicAdd in the W2 epilogue.
           float4 ws4;
           __builtin_memcpy(&ws4, ws_base + off, 16);
+#pragma unroll
+          for (int s = 1; s < MOE_WS_SLOTS; s++) {
+            float4 slot4;
+            __builtin_memcpy(&slot4, ws_base + s * REDUCTION_SIZE + off, 16);
+            ws4.x += slot4.x;
+            ws4.y += slot4.y;
+            ws4.z += slot4.z;
+            ws4.w += slot4.w;
+          }
 
           // Vectorized load: 4 bf16 from residual as uint2 (flat_load_dwordx2)
           uint2 res_packed;
@@ -2089,28 +2102,11 @@ __device__ __noinline__ void gang_resaddf32_rmsnorm_linear_mxfp4_bias_kernel(
     }
   }
 
-  // ── Zero workspace_f32 for next iteration ──────────────────────────────
-  // Done AFTER all MFMA computation so all gang workers have finished reading.
-  // Only one worker (tile_idx % n_wgs_per_xcd == 0) does this to avoid races.
-  // Vectorized: float4 zero stores (flat_store_dwordx4).
-  {
-    int wg_idx = tile_idx % n_wgs_per_xcd;
-    if (wg_idx == 0) {
-      float *d_ws = (float *)workspace_f32_ptr;
-      int batch_count_z =
-          (num_active_tokens < BATCH_SIZE) ? num_active_tokens : BATCH_SIZE;
-      constexpr int VEC = 4;
-      constexpr int BLOCK_VEC = 256 * VEC;
-      float4 zero4 = {0.0f, 0.0f, 0.0f, 0.0f};
-      for (int b = 0; b < batch_count_z; b++) {
-        float *ws_row = d_ws + b * REDUCTION_SIZE;
-#pragma unroll
-        for (int off = tid * VEC; off < REDUCTION_SIZE; off += BLOCK_VEC) {
-          __builtin_memcpy(ws_row + off, &zero4, 16);
-        }
-      }
-    }
-  }
+  // ── No workspace zeroing ───────────────────────────────────────────────
+  // Every (token, slot, hidden) element is assigned by exactly one W2 tile per
+  // layer, so nothing stale survives and there is nothing to clear. The old
+  // per-token layout needed this pass because it accumulated with atomicAdd.
+  // See moe_ws_layout.cuh.
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   if (_sp_rec) {
@@ -2300,14 +2296,30 @@ __device__ __noinline__ void
       {
         constexpr int VEC = 4;
         constexpr int BLOCK_VEC = 256 * VEC;
-        float *ws_base = d_ws + b * REDUCTION_SIZE;
+        float const *ws_base =
+            d_ws + moe_ws_offset(b, 0, REDUCTION_SIZE);
         unsigned short const *res_base = d_residual + b * REDUCTION_SIZE;
         unsigned short *xout_base = d_x_out + b * REDUCTION_SIZE;
 
 #pragma unroll
         for (int off = tid * VEC; off < REDUCTION_SIZE; off += BLOCK_VEC) {
+          // Sum the MoE expert contributions here, in fixed slot order, rather
+          // than letting the W2 epilogue atomicAdd them into one slab. The
+          // order is a compile-time constant, so this row's result does not
+          // depend on the order experts happened to retire, nor on what else
+          // is in the batch. That is what makes identical prompts in different
+          // slots produce identical output. See moe_ws_layout.cuh.
           float4 ws4;
           __builtin_memcpy(&ws4, ws_base + off, 16);
+#pragma unroll
+          for (int s = 1; s < MOE_WS_SLOTS; s++) {
+            float4 slot4;
+            __builtin_memcpy(&slot4, ws_base + s * REDUCTION_SIZE + off, 16);
+            ws4.x += slot4.x;
+            ws4.y += slot4.y;
+            ws4.z += slot4.z;
+            ws4.w += slot4.w;
+          }
           uint2 res_packed;
           __builtin_memcpy(&res_packed, res_base + off, 8);
 
@@ -2819,27 +2831,18 @@ __device__ __noinline__ void
     }
   }
 
-  // ── Zero workspace_f32 for next iteration ──────────────────────────────
-  // Done AFTER all MFMA computation so all gang workers have finished reading.
-  // Only one worker (tile_idx % n_wgs_per_xcd == 0) does this to avoid races.
-  // Uses write-through stores (sc0 sc1) so zeros are visible to MoE's
-  // cross-XCD coherent atomicAdd in fused kernels (task 216).
-  {
-    int wg_idx_z = tile_idx % n_wgs_per_xcd;
-    if (wg_idx_z == 0) {
-      float *d_ws = (float *)workspace_f32_ptr;
-      int batch_count_z =
-          (num_active_tokens < BATCH_SIZE) ? num_active_tokens : BATCH_SIZE;
-      for (int b = 0; b < batch_count_z; b++) {
-        float *ws_row = d_ws + b * REDUCTION_SIZE;
-#pragma unroll
-        for (int off = tid * 4; off < REDUCTION_SIZE; off += 256 * 4) {
-          st_wt_zero128((void *)&ws_row[off]);
-        }
-      }
-      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-    }
-  }
+  // ── No workspace zeroing ───────────────────────────────────────────────
+  // The old layout accumulated with atomicAdd, so it had to be cleared before
+  // the next layer could add into it. The per-slot layout is *assigned*, not
+  // accumulated: every (token, slot, hidden) element is written exactly once
+  // per layer by its one owning W2 tile, so there is nothing stale to clear.
+  // Dropping this also removes a full write-through pass over the workspace
+  // (st_wt bypasses L2 to HBM) from every layer. See moe_ws_layout.cuh.
+  //
+  // This holds only while coverage is total: a token routes to exactly
+  // MOE_WS_SLOTS experts and wg_idx partitions the hidden axis. Padding expert
+  // slots have no active token, write nothing, and own no (token, slot) pair,
+  // so they cannot leave a hole.
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   if (_sp_rec) {

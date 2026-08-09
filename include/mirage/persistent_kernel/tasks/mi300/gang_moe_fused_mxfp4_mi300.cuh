@@ -45,6 +45,7 @@
 
 #pragma once
 #include "tasks/mi300/gang_moe_linear_mxfp4_mi300.cuh" // reuse type defs + helpers
+#include "tasks/mi300/moe_ws_layout.cuh" // MOE_WS_SLOTS, moe_ws_offset()
 #include "tasks/mi300/swigluoai_mi300.cuh"             // fast_swigluoai()
 
 #if defined(MPK_NIL_TRIPWIRE) && defined(MPK_TW_SUB)
@@ -233,6 +234,13 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   constexpr int MAX_ACTIVATED =
       (NUM_TOPK * BATCH_SIZE < NUM_EXPERTS) ? NUM_TOPK * BATCH_SIZE
                                             : NUM_EXPERTS;
+
+  // The output workspace is indexed by topk slot, so its slot count must be
+  // this model's experts-per-token. If they disagree, slot writes alias across
+  // tokens (too few) or the consumer sums uninitialized slabs (too many) --
+  // both silent. Consumers derive the same stride from MOE_WS_SLOTS.
+  static_assert(NUM_TOPK == MOE_WS_SLOTS,
+                "MOE_WS_SLOTS in moe_ws_layout.cuh must equal NUM_TOPK");
 
   int global_tile = tile_idx * 8 + xcd_id;
   constexpr int TOTAL_W13_REAL = MAX_ACTIVATED * W13_TILES;
@@ -2079,15 +2087,26 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         __builtin_memcpy(&bv1, &bt1, 4);
         __builtin_memcpy(&bv2, &bt2, 4);
         __builtin_memcpy(&bv3, &bt3, 4);
-        // The atomicAdd fans across up to 16 rows now instead of hammering
-        // one -- same total count, better L2 behaviour.
-        int ws_base = my_tok * HIDDEN_SIZE + out_n_base;
-        atomicAdd(&d_workspace_f32[ws_base + 0], (acc[0] + bv0) * pf_rw);
-        atomicAdd(&d_workspace_f32[ws_base + 1], (acc[1] + bv1) * pf_rw);
-        atomicAdd(&d_workspace_f32[ws_base + 2], (acc[2] + bv2) * pf_rw);
-        if (out_n_base + 3 < W2_OUTPUT_SIZE) {
-          atomicAdd(&d_workspace_f32[ws_base + 3], (acc[3] + bv3) * pf_rw);
-        }
+        // Stores, not atomicAdd: this tile is the ONLY writer of
+        // (my_tok, topk_slot, out_n_base..+3). A token routes to a given
+        // expert at most once, so topk_slot is unique per (token, expert), and
+        // wg_idx partitions the hidden axis across tiles. See moe_ws_layout.cuh
+        // for why the shared per-token accumulator broke row symmetry at B>1.
+        //
+        // Write-through (sc0 sc1) is mandatory, not an optimization: the
+        // consumer runs on a different XCD and MI300/MI350 L2 is not coherent
+        // across XCDs, so a plain store would be invisible to it. The atomicAdd
+        // this replaced went to the coherent point implicitly. `ws_base` is
+        // 16B-aligned -- out_n_base steps by 4 floats and both HIDDEN_SIZE and
+        // W2_OUTPUT_SIZE are multiples of 4 -- so all four lanes always store
+        // and one dwordx4 covers them.
+        int ws_base =
+            moe_ws_offset(my_tok, topk_slot, HIDDEN_SIZE) + out_n_base;
+        float4 wv = {(acc[0] + bv0) * pf_rw,
+                     (acc[1] + bv1) * pf_rw,
+                     (acc[2] + bv2) * pf_rw,
+                     (acc[3] + bv3) * pf_rw};
+        st_wt_f32x4(&d_workspace_f32[ws_base], wv);
       }
     }
 
@@ -2316,13 +2335,16 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
           __builtin_memcpy(&bv1, &bt1, 4);
           __builtin_memcpy(&bv2, &bt2, 4);
           __builtin_memcpy(&bv3, &bt3, 4);
-          int ws_base = my_tok * HIDDEN_SIZE + out_n_base;
-          atomicAdd(&d_workspace_f32[ws_base + 0], (acc[0] + bv0) * pf_rw);
-          atomicAdd(&d_workspace_f32[ws_base + 1], (acc[1] + bv1) * pf_rw);
-          atomicAdd(&d_workspace_f32[ws_base + 2], (acc[2] + bv2) * pf_rw);
-          if (out_n_base + 3 < W2_OUTPUT_SIZE) {
-            atomicAdd(&d_workspace_f32[ws_base + 3], (acc[3] + bv3) * pf_rw);
-          }
+          // Write-through store -- sole writer of this (token, slot, hidden)
+          // range, and the consumer is on another XCD. See the tile_iter=0
+          // epilogue above and moe_ws_layout.cuh.
+          int ws_base =
+              moe_ws_offset(my_tok, topk_slot, HIDDEN_SIZE) + out_n_base;
+          float4 wv = {(acc[0] + bv0) * pf_rw,
+                       (acc[1] + bv1) * pf_rw,
+                       (acc[2] + bv2) * pf_rw,
+                       (acc[3] + bv3) * pf_rw};
+          st_wt_f32x4(&d_workspace_f32[ws_base], wv);
         }
       }
     }
