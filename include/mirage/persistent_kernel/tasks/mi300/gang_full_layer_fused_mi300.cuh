@@ -1358,17 +1358,17 @@ __device__ __noinline__ void
       MPK_WS_PHASE(93, qkv_epoch_expected, xcd_id);
       asm volatile("buffer_inv" ::: "memory");
       //
-      // MEASURED, 2026-08-09: on this build ep_direct is FALSE on both ranks.
-      // rocshmem_ptr() returns nullptr for the symmetric ep_gather allocation,
-      // so the direct fold-into-peer-memory path below has never executed and
-      // every layer goes through the staged putmem_signal fallback instead.
-      // Run with MPK_EP_SIG_DBG=1 and read the [EPPATH] line to re-check.
+      // REQUIRES patches/rocshmem-ipc-shmem-ptr.patch. Stock rocSHMEM stubs
+      // out IPCContext::shmem_ptr to return nullptr, so ep_direct is false and
+      // every layer silently takes the staged putmem_signal fallback below --
+      // which is what all EP numbers before 2026-08-09 were measuring. With
+      // the patch: 2.378 -> 2.229 ms/iter, 4/4 correctness.
       //
-      // That matters for what the EP numbers mean: the collective cost being
-      // tuned is a staged put + signal, not the direct peer store the comments
-      // below describe. Restoring the direct path is a bigger lever than any
-      // reshaping of the signal protocol -- which is where the per-(PE,XCD)
-      // signal-line work went, and why it could not pay off.
+      // The failure mode is silent by construction, because nullptr is also
+      // the legitimate "no peer mapping" answer. Confirm the direct path is
+      // live with MPK_EP_SIG_DBG=1 and read the [EPPATH] line; ep_direct=1 on
+      // both ranks is the only evidence that these comments describe the code
+      // that actually runs.
       //
       // Fold straight into the peer's gather slot as well as my own. peer_slot
       // is this rank's slot in the PEER's copy of the symmetric buffer, so
