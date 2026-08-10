@@ -1167,9 +1167,16 @@ __device__ __noinline__ void
     // another. The worker that closes 9a already knows the GPU is done -- it is
     // the one that observed the last arrival -- so it just does the fold itself
     // and publishes once. One release chain per layer instead of three.
-    if (is_last_on_gpu) {
-      threadfence_gpu();
-    }
+    //
+    // No threadfence_gpu() for the closer either. It is a release fence, and
+    // between its arrival atomic and here it has written nothing to release:
+    // the ep_release flags below are st_wt_u32 and the fold's stores are all
+    // write-through now. The acquire it actually needs -- seeing the W2
+    // atomicAdds other XCDs made into the workspace -- is the buffer_inv before
+    // the fold, which is a different instruction and still there. This one is
+    // left over from when 9a's job was to release flags to a separate folding
+    // workgroup, and it costs a whole-L2 writeback on the single worker every
+    // other worker on the GPU is waiting for.
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
     // Read the arrival spread from the closer: it has just observed the 240th
     // arrival, so min/max are final for this layer and no one has started the
