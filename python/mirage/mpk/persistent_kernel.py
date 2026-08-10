@@ -414,6 +414,21 @@ def get_compile_command(
             # report and compiles out the per-layer FUSED_PHASE printf, which
             # on its own takes the iteration from 2.5 ms to ~440 ms.
             flags = flags + ["-DMPK_EP9_ONLY", "-DMPK_ENABLE_DEVICE_TASK_TIMING"]
+        if int(os.environ.get("MPK_EP_WAIT_AT_USE", "0")) == 1:
+            # Moves Phase 9d's cross-GPU peer wait to its point of use in the
+            # next layer's QKV prologue. Both placements are CORRECT -- the
+            # gather buffers are per-layer, so deferring the wait exposes no
+            # WAR hazard -- so unlike MPK_EP_ABLATE this is a scheduling knob
+            # and its output must still pass the correctness suite.
+            flags = flags + ["-DMPK_EP_WAIT_AT_USE=1"]
+        if int(os.environ.get("MPK_MOE_NOPAD", "0")) == 1:
+            # Drops the 240-tile W13 padding when W13 already fits in one
+            # round, so the freed slots carry real W2 tiles that can overlap
+            # their weight prefetch with the W13 phase. EP-only in practice
+            # (1-GPU W13 overflows the round and keeps the padding). CORRECT
+            # output: it reorders which worker runs which tile, not what any
+            # tile computes.
+            flags = flags + ["-DMPK_MOE_NOPAD"]
         if int(os.environ.get("MPK_W2_HALFK", "0")) == 1:
             # Halves W2's MFMA iteration count to price a K-split of W2 against
             # the W13 -> barrier -> W2 chain that sets Phase 8's length. See the

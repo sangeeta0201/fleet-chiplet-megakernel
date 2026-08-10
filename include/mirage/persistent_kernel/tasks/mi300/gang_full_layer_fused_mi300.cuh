@@ -75,6 +75,26 @@ static constexpr int FULL_LAYER_EP_COUNTER_SIZE = 86 * 16;       // 1376
 // peer's SIGNAL_ADD never shares a line with another peer's.
 static constexpr int FULL_LAYER_EP_SIGNAL_STRIDE = 8;
 
+// Hoisted from the Phase 9 block: MPK_EP_WAIT_AT_USE's wait sits in Phase 1,
+// upstream of where this used to be defined, and must not compile in under an
+// ablation that suppresses the peer signal it waits on.
+#ifndef MPK_EP_ABLATE
+#define MPK_EP_ABLATE 0
+#endif
+
+// Move Phase 9d's peer wait to its point of use in the next layer's QKV
+// prologue. Both placements are correct -- see the long comment at the Phase 1
+// site -- so this is a pure scheduling knob, not an ablation. Forced off under
+// any ablation that drops the peer store (1, 5) or Phase 9 as a whole (2):
+// with nothing signalling, a deferred wait would spin forever.
+#ifndef MPK_EP_WAIT_AT_USE
+#define MPK_EP_WAIT_AT_USE 0
+#endif
+#if MPK_EP_ABLATE != 0
+#undef MPK_EP_WAIT_AT_USE
+#define MPK_EP_WAIT_AT_USE 0
+#endif
+
 // Fold this rank's MoE partial out of the f32 workspace into bf16, optionally
 // adding the residual, and zero the workspace.
 //
@@ -479,8 +499,9 @@ __device__ __noinline__ void
     void const *qkv_residual =
         (EP_PREV_SLOTS > 1) ? input_ptrs[26] : input_ptrs[1];
 
-    // The peer's slot is NOT waited on here, even though these 8 workers are
-    // its only readers and this is the first instruction that needs it.
+    // The peer's slot is NOT waited on here by default, even though these 8
+    // workers are its only readers and this is the first instruction that
+    // needs it.
     //
     // Moving the wait here was the obvious "dependency at the point of use"
     // play and it measured slower: 2.542 vs 2.528 ms/token. The reason is
@@ -490,7 +511,44 @@ __device__ __noinline__ void
     // already landed by the time anyone looks. Here it sits UPSTREAM of the
     // Phase 2 QKV barrier, which gates all of attention, so any residual
     // latency serializes with the whole layer instead of overlapping the
-    // layer boundary. The wait stays in 9d.
+    // layer boundary.
+    //
+    // MPK_EP_WAIT_AT_USE=1 re-tests that placement. The original measurement
+    // was taken at a ~2.53 ms operating point, before the write-through fold
+    // and the two L2-writeback removals; the peer wait is a much larger share
+    // of what remains now, so the balance may have moved. What makes the move
+    // legal at all is that the gather buffers are per-layer (ep_gather_{li} in
+    // demo.py) -- layer i's slot is written only in layer i and read only in
+    // layer i+1, so deferring the wait cannot expose a WAR hazard. The
+    // threshold is layer_counter, not layer_counter + 1: what is awaited is
+    // the PREVIOUS layer's signal, and that layer published (its own
+    // layer_counter) + 1 == this layer's layer_counter.
+    //
+    // Only the local self-wait stays in 9d under this flag. It is not about
+    // the peer at all -- it covers two purely local WAR hazards (the fold
+    // reads attn_proj_out, which the next layer's Phase 7 overwrites, and it
+    // zeroes moe_workspace_f32, which the next layer's Phase 8 atomicAdds
+    // into), so it cannot move to a consumer that touches neither.
+#if MPK_EP_WAIT_AT_USE
+    if constexpr (EP_PREV_SLOTS > 1 && EP_WORLD_SIZE > 1) {
+      if (tid == 0) {
+        uint64_t *_prev_peer_sig = reinterpret_cast<uint64_t *>(input_ptrs[25]) +
+                                   (size_t)(1 - EP_MY_PE) *
+                                       FULL_LAYER_EP_SIGNAL_STRIDE;
+        while (ld_nt_u64(reinterpret_cast<unsigned long long *>(
+                   _prev_peer_sig)) < (unsigned long long)layer_counter) {
+          __builtin_amdgcn_s_sleep(1);
+        }
+      }
+      __syncthreads();
+      // The peer's bytes arrived by write-through store, so they are in HBM,
+      // not in this XCD's L2 -- but a stale line for those addresses may still
+      // sit in this workgroup's vL1 from the previous layer's read of the same
+      // per-layer buffer's neighbours. Plain buffer_inv (no sc1) is the right
+      // scope: vL1 only, leaving L2 alone.
+      asm volatile("buffer_inv" ::: "memory");
+    }
+#endif
     gang_resaddf32_rmsnorm_linear_mxfp4_bias_kvupd_kernel<QKV_BATCH_SIZE,
                                                           QKV_OUTPUT_PER_WG,
                                                           QKV_REDUCTION_SIZE,
@@ -1601,8 +1659,22 @@ __device__ __noinline__ void
         // store has effectively already landed and the poll is free; pushing
         // it into Phase 1 instead puts it upstream of the QKV barrier that
         // gates all of attention, and measured 2.542 vs 2.528 ms/token.
+        //
+        // MPK_EP_WAIT_AT_USE=1 moves it to Phase 1 anyway, to re-price that
+        // measurement now that the fold is write-through and the two L2
+        // writebacks are gone. The last layer is the exception: its consumer
+        // is the tail task, not a QKV prologue, so there is nowhere downstream
+        // to move the wait to and EP_WRITE_COMBINED reads all slots right
+        // below. It keeps the wait here under either setting.
+#if !MPK_EP_WAIT_AT_USE
         _full_layer_ep_wait_peers<EP_WORLD_SIZE, EP_MY_PE>(ep_signal,
                                                            ep_sig_expected);
+#else
+        if constexpr (EP_WRITE_COMBINED) {
+          _full_layer_ep_wait_peers<EP_WORLD_SIZE, EP_MY_PE>(ep_signal,
+                                                             ep_sig_expected);
+        }
+#endif
 #if MPK_EP_ABLATE == 6
         }
 #endif
@@ -1749,6 +1821,66 @@ __device__ __noinline__ void
       }
     }
   }
+  // Phases 1-8, accumulated and dumped once -- the same treatment as the EP9
+  // block above and for the same reason. This is the breakdown for the 1.923 ms
+  // that Phase 9 does NOT explain: until now the only per-phase numbers came
+  // from the per-layer [FUSED_PHASE] printf below, which perturbs the iteration
+  // by ~200x and so cannot be read even relatively.
+  //
+  // One reporting workgroup per XCD (xcd_rank == 0), which is the same worker
+  // the printf below uses, so the two describe the same thing at very different
+  // cost. That worker holds a real W13 tile in Phase 8, so its p8 is the
+  // W13 -> barrier -> W2 chain rather than a padding tile's early exit.
+  {
+    unsigned long long _fp_t4 = __builtin_amdgcn_s_memrealtime();
+    if (tid == 0 && xcd_rank == 0 && _fused_t0a > 0 && _fused_t0b > 0) {
+      atomicAdd(&g_fp_ns[0], (unsigned long long)(_fused_t0a - _fused_t0));
+      atomicAdd(&g_fp_ns[1], (unsigned long long)(_fused_t0b - _fused_t0a));
+      // attn / merge only exist on workers that ran an attention chunk.
+      if (_fused_t0c > 0) {
+        atomicAdd(&g_fp_ns[2], (unsigned long long)(_fused_t0c - _fused_t0b));
+        if (_fused_t0d > 0) {
+          atomicAdd(&g_fp_ns[3], (unsigned long long)(_fused_t0d - _fused_t0c));
+          atomicAdd(&g_fp_ns[4], (unsigned long long)(_fused_t1 - _fused_t0d));
+        } else {
+          atomicAdd(&g_fp_ns[4], (unsigned long long)(_fused_t1 - _fused_t0c));
+        }
+      }
+      atomicAdd(&g_fp_ns[5], (unsigned long long)(_fused_t2 - _fused_t1));
+      atomicAdd(&g_fp_ns[6], (unsigned long long)(_fused_t3 - _fused_t2));
+      atomicAdd(&g_fp_ns[7], (unsigned long long)(_fp_t4 - _fused_t3));
+      unsigned long long fn = atomicAdd(&g_fp_cnt, 1ull);
+      // 8 XCDs x 36 layers = 288 per iteration; dump at ~iteration 100, past
+      // the 72 prefill tokens. Same cadence as the EP9 dump.
+      if (fn == 288ull * 100ull) {
+        double c = (double)g_fp_cnt;
+        // Ticks -> us per layer-instance: 1 tick = 10 ns, so /100.
+        double v[8];
+        for (int k = 0; k < 8; k++) {
+          v[k] = (double)g_fp_ns[k] / c / 100.0;
+        }
+        double tot = 0;
+        for (int k = 0; k < 8; k++) {
+          tot += v[k];
+        }
+        printf("[FP18] n=%.0f per_layer_us qkv_gemm=%.3f qkv_bar=%.3f "
+               "attn=%.3f merge=%.3f wait=%.3f xcd_bar=%.3f oproj_topk=%.3f "
+               "moe=%.3f | tot=%.3f x36ms=%.3f\n",
+               c,
+               v[0],
+               v[1],
+               v[2],
+               v[3],
+               v[4],
+               v[5],
+               v[6],
+               v[7],
+               tot,
+               tot * 36.0 / 1000.0);
+      }
+    }
+  }
+
   // MPK_EP9_ONLY suppresses the per-layer full-phase dump so the Phase 9
   // accumulators above can be read from a run that still executes at ~2.5 ms.
   // With both live the printf volume alone costs 440 ms/iter.

@@ -96,6 +96,14 @@ __device__ int g_ep_skew_n;
 // gang_full_layer_fused_mi300.cuh for why.
 __device__ unsigned long long g_ep9_ns[2][4];
 __device__ unsigned long long g_ep9_cnt[2];
+// Phases 1-8 breakdown, same accumulate-and-dump-once treatment as g_ep9_ns
+// and for the same reason: the per-layer [FUSED_PHASE] printf takes the
+// iteration from 2.5 ms to ~440 ms, so its numbers describe the printf.
+// Slots: [0] qkv_gemm  [1] qkv_barrier  [2] attn  [3] merge+flush
+//        [4] wait_others (to the cross-XCD barrier)  [5] Phase 6 xcd_barrier
+//        [6] Phase 7 oproj+topk  [7] Phase 8 MoE
+__device__ unsigned long long g_fp_ns[8];
+__device__ unsigned long long g_fp_cnt;
 // Worker ARRIVAL spread at 9a: min/max over all 240 workgroups of the instant
 // they reach Phase 9, reset each layer. The W2-tile skew probe says tile
 // completion spreads only 0.48 us, but a worker's last act is not necessarily a

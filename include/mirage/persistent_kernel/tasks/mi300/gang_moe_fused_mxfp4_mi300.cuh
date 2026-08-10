@@ -242,8 +242,39 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
           ? ((num_activated_experts - EP_SLOT_ME + EP_SLOT_WS - 1) / EP_SLOT_WS)
           : num_activated_experts;
   int total_w13_real = ep_owned_experts * W13_TILES;
+  // Padding earns its keep only when W13 overflows round 0. On the 1-GPU path
+  // it does: 4 activated experts * W13_TILES = 384 real tiles against 240
+  // workers, so W13 spills into round 1 and without padding the round-1 W2
+  // tiles would be interleaved with W13 tiles that still gate them.
+  //
+  // Under EP the picture inverts. 2 owned experts = 192 real W13 tiles, which
+  // fit in round 0 with 48 slots to spare, and padding fills those 48 slots
+  // with no-ops. The workers holding them (r=24-29) finish in ~1 us and idle,
+  // while all 96 W2 tiles land in round 1 on r=0-11 -- workers that just spent
+  // ~10 us on a real W13 tile. That placement forfeits the W2 weight prefetch:
+  // the buffer_load_lds below is deliberately issued BEFORE the W13 barrier
+  // poll so its ~3 us of HBM latency hides behind the wait, but a worker that
+  // is still computing W13 does not reach the prefetch until the wait is
+  // already over.
+  //
+  // MPK_MOE_NOPAD drops the padding when W13 fits in one round, so those 48
+  // slots carry real W2 tiles instead. W13's completion time is unchanged --
+  // every real W13 tile is still in round 0 -- and 48 of the 96 W2 tiles now
+  // issue their weight loads at t~0 and overlap the entire W13 phase.
+  //
+  // The guard is what keeps the 1-GPU behaviour intact: at 384 real tiles the
+  // condition is false and the padding stays exactly as before.
+  bool const w13_fits_one_round = (total_w13_real <= PAD_MULTIPLE);
+#ifdef MPK_MOE_NOPAD
+  int total_w13 =
+      w13_fits_one_round
+          ? total_w13_real
+          : ((total_w13_real + PAD_MULTIPLE - 1) / PAD_MULTIPLE) * PAD_MULTIPLE;
+#else
+  (void)w13_fits_one_round;
   int total_w13 =
       ((total_w13_real + PAD_MULTIPLE - 1) / PAD_MULTIPLE) * PAD_MULTIPLE;
+#endif
   int total_w2 = ep_owned_experts * W2_TILES;
   int total_tiles = total_w13 + total_w2;
   if (global_tile >= total_tiles) {
