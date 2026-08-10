@@ -171,7 +171,13 @@ __device__ __attribute__((always_inline)) void
         total_topk_tiles,
         oproj_topk_tiles_per_xcd,
         oproj_tile_idx,
-        routing_ready);
+        routing_ready,
+        // layer_epoch = 0: keep the callee's snapshot form. `expected` above is
+        // itself a snapshot (ld_nt of routing_ready + 1) taken before Phase 1,
+        // so feeding it in would propagate the same race rather than remove it.
+        // This task type is not the one the fused full-layer path uses; giving
+        // it a real layer counter is a separate change with its own soak.
+        /*layer_epoch=*/0);
   }
 
 #ifdef MPK_FUSED_PHASE_TIMING

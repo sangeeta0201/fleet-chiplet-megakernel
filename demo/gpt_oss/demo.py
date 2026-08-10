@@ -1359,6 +1359,9 @@ if __name__ == "__main__":
             bs, lse_dim1, dtype=torch.float32, device="cuda")
         ck_fmha_lse_acc = mpk.attach_input(
             torch_tensor=ck_fmha_lse_acc_tensor, name="ck_fmha_lse_acc")
+        if args.verify:
+            verify_tensors["ck_fmha_lse_acc"] = ck_fmha_lse_acc_tensor
+            verify_tensors["ck_fmha_q_workspace"] = ck_fmha_q_ws_tensor
 
         attn_out = make_tensor("attn_out", (bs, num_local_q_heads * head_dim))
         # When CK_FMHA_NUM_KV_CHUNKS > 1 the decode kernel writes per-chunk float
@@ -1369,6 +1372,8 @@ if __name__ == "__main__":
                 bs, o_acc_dim1, dtype=torch.float32, device="cuda")
             ck_fmha_o_acc = mpk.attach_input(
                 torch_tensor=ck_fmha_o_acc_tensor, name="ck_fmha_o_acc")
+            if args.verify:
+                verify_tensors["ck_fmha_o_acc"] = ck_fmha_o_acc_tensor
         else:
             ck_fmha_o_acc = None
         attn_proj_out = make_tensor("attn_proj_out", (bs, PADDED_HIDDEN_SIZE))
@@ -1421,7 +1426,12 @@ if __name__ == "__main__":
             # its historical 28*16) precisely because it is the only region
             # that grows with B; keeping it last means every other slot address
             # is unchanged at any batch width.
-            counter_size = 768 + 128 * args.max_num_batched_requests
+            # + 272 ints on top for the layer-boundary global barrier: 8
+            # per-XCD arrival lines, one global arrival line, and 8 per-XCD
+            # release lines, 16 ints each. It sits immediately above the chunk
+            # barrier -- see FULL_LAYER_LAYER_BARRIER_SLOT in
+            # gang_full_layer_fused_mi300.cuh.
+            counter_size = 768 + 128 * args.max_num_batched_requests + 272
             oproj_topk_counters = make_tensor("oproj_topk_counters", (counter_size,), torch_dtype=torch.int32)
         # Hierarchical barrier for fused QKV+Attention kernel [16 int32]:
         # [0..7]: per-XCD QKV arrival counters, [8]: global leader count
@@ -1655,6 +1665,12 @@ if __name__ == "__main__":
             w_k_norm = None
             k_cache = _attach_input_keep(model.model.kv_cache[0][i], f"layer_{i}_k_cache")
             v_cache = _attach_input_keep(model.model.kv_cache[1][i], f"layer_{i}_v_cache")
+            if args.verify and (i < 2 or os.environ.get("MPK_KV_ALL")):
+                # Layers 0-1 only: the KV cache is the one attention input
+                # written by a different task than the one that reads it, so a
+                # stale or racy read shows up here first.
+                verify_tensors[f"L{i}_k_cache"] = model.model.kv_cache[0][i]
+                verify_tensors[f"L{i}_v_cache"] = model.model.kv_cache[1][i]
 
             # Per-head attention sinks (GPT-OSS specific)
             w_sinks = _attach_input_keep(
@@ -2871,8 +2887,57 @@ if __name__ == "__main__":
                   f"over {_fwd_total_iters} iters")
         print("=" * 80)
 
+        # Run-to-run bitwise fingerprint. MPK is nondeterministic even at B=1,
+        # and the divergence accumulates over ~20 tokens, so generated text is
+        # a terrible oracle: it says "differs" long after the first bad bit.
+        # Dump a hash of every captured intermediate plus the token ids, run
+        # twice, and diff -- the FIRST differing tensor localizes the defect.
+        # Pair with --max-seq-length == prompt_len+1 for a prefill-only run,
+        # which has no autoregressive feedback at all.
+        if os.environ.get("MPK_FINGERPRINT") and verify_tensors:
+            torch.cuda.synchronize()
+            import hashlib as _hl
+            _fp = {}
+            for _nm in sorted(verify_tensors):
+                _t = verify_tensors[_nm].detach().cpu()
+                # view as uint8 -- bf16 has no numpy dtype, and we want the
+                # raw bits anyway, not a value-preserving cast.
+                _b = _t.contiguous().view(torch.uint8).numpy().tobytes()
+                _fp[_nm] = _hl.sha1(_b).hexdigest()[:16]
+            _fp["__tokens__"] = _hl.sha1(
+                tokens.detach().cpu().numpy().tobytes()).hexdigest()[:16]
+            _fp["__step__"] = str(step.tolist())
+            with open(os.environ["MPK_FINGERPRINT"], "w") as _f:
+                for _k in sorted(_fp):
+                    _f.write(f"{_k} {_fp[_k]}\n")
+            print(f"[FP] wrote {os.environ['MPK_FINGERPRINT']}")
+            if os.environ.get("MPK_DUMP_TENSORS"):
+                _dump = {_k: verify_tensors[_k].detach().cpu()
+                         for _k in verify_tensors}
+                # The token ids and per-request step are what make a dump
+                # interpretable: without them a row-to-row difference in
+                # embed_out cannot be told apart from "these rows embedded
+                # different tokens", which is expected once any request has
+                # generated even one token of its own.
+                _dump["__step_t__"] = step.detach().cpu().clone()
+                # The tokens actually consumed by the *last* forward pass.
+                # embed_out rows can only be compared against each other once
+                # these are known equal; at the end of a run that generated a
+                # token they are not, and every downstream row difference is
+                # then legitimate rather than a defect.
+                _dump["__input_tokens_t__"] = input_tokens.detach().cpu().clone()
+                _dump["__tokens_t__"] = tokens.detach().cpu().clone()
+                _dump["__plen_t__"] = prompt_lengths.detach().cpu().clone()
+                torch.save(_dump, os.environ["MPK_DUMP_TENSORS"])
+                print(f"[FP] dumped tensors to {os.environ['MPK_DUMP_TENSORS']}")
+
         # === Verification: compare Mirage intermediates with PyTorch reference ===
-        if args.verify and verify_tensors:
+        # MPK_FP_ONLY skips the Torch reference pass below. That pass builds a
+        # second full copy of the model's activations and OOMs at larger
+        # --max-layers, which kills the process *before* the fingerprint above
+        # is written. When all you want is the run-to-run bitwise fingerprint,
+        # the reference is dead weight.
+        if args.verify and verify_tensors and not os.environ.get("MPK_FP_ONLY"):
             print("\n" + "=" * 80)
             print("VERIFICATION: Comparing Mirage intermediates with PyTorch reference")
             print("=" * 80)

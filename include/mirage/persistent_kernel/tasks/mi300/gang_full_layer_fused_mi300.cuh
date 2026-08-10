@@ -64,6 +64,16 @@ static constexpr int FULL_LAYER_ATTN_XCD_RELEASE_SLOT = 36 * 16;
 // FULL_LAYER_CHUNK_BARRIER_SLOT + 128 * NUM_REQS (see demo.py counter_size).
 static constexpr int FULL_LAYER_CHUNK_BARRIER_SLOT = 48 * 16;
 
+// Layer-boundary global barrier: one line per XCD, immediately above the chunk
+// barrier's 8 * NUM_REQS lines. See the barrier itself at the end of this file
+// for why a *global* (all-XCD) rendezvous is required and a threadfence is not
+// enough. Callers must size the counter buffer to
+// FULL_LAYER_LAYER_BARRIER_SLOT + 272: 8 per-XCD arrival lines, one global
+// arrival line, and 8 per-XCD release lines (see demo.py counter_size).
+static constexpr int FULL_LAYER_LAYER_BARRIER_SLOT(int num_reqs) {
+  return FULL_LAYER_CHUNK_BARRIER_SLOT + 128 * num_reqs;
+}
+
 template <int QKV_BATCH_SIZE,
           int QKV_OUTPUT_PER_WG,
           int QKV_REDUCTION_SIZE,
@@ -151,10 +161,34 @@ __device__ __noinline__ void
   int const attn_req = xcd_rank / NUM_KV_CHUNKS;
   int const attn_chunk = xcd_rank % NUM_KV_CHUNKS;
 
-  // Invalidate vL1 to ensure we read fresh MoE atomicAdd results from L2.
-  // Without this, stale zeros from QKV's workspace zeroing (flat_store in
-  // previous iteration) can persist in vL1 across gang task boundaries.
-  asm volatile("buffer_inv" ::: "memory");
+  // Layer-boundary ACQUIRE. This must be `sc1` (vL1 + L2), not a plain
+  // `buffer_inv` (vL1 only).
+  //
+  // The comment this replaces described the world before moe_ws_layout.cuh:
+  // the MoE W2 epilogue accumulated into the workspace with `atomicAdd`, which
+  // reaches the device-coherent point implicitly, so a consumer only had to
+  // drop its own vL1 to see it. Those atomics are now plain write-through
+  // stores (`st_wt_f32x4`, sc0 sc1), which bypass L2 and land in HBM. The
+  // acquire side was never upgraded to match.
+  //
+  // The consequence is a stale read, and it is confined to exactly the shape
+  // observed: the W2 tile that wrote a given (token, slot, hidden) element runs
+  // on a different XCD than the QKV prologue that reads it, and MI300/MI350 L2
+  // is not coherent across XCDs. If this reader's L2 still holds the line from
+  // *last* layer's read of the same address, `buffer_inv` leaves it there and
+  // the load is served from L2 -- returning the previous layer's value. Whether
+  // a given line survives depends on inter-XCD L2 eviction timing, so it varies
+  // run to run.
+  //
+  // That is why layer 0 is bit-identical across runs while layers 1..35 all
+  // differ: on layer 0 the workspace was just zeroed and there is no prior
+  // value for a stale line to hold. Layer 1 is the first layer with a real
+  // predecessor, and it is the first to diverge.
+  //
+  // Cost is one L2 invalidate per worker per layer, which is what an acquire
+  // against a write-through producer actually costs. The Phase 9 barrier
+  // already documents this instruction as being here; it just was not.
+  asm volatile("buffer_inv sc1" ::: "memory");
 
   // NOTE: the layer counter that the MoE W13->W2 barrier derives its release
   // value from is published further down, once qkv_epoch_expected is known.
@@ -485,8 +519,15 @@ __device__ __noinline__ void
       // NUM_REQS requests serially. That puts (NUM_REQS-1) merges on the
       // critical path of every one of the 36 layers, while these per-request
       // merges run on workers that would otherwise just spin in Phase 6.
-      __syncthreads();
+      // Drain, THEN rendezvous, THEN arrive. The order matters and was wrong
+      // here: with __syncthreads() first, wave 0 can clear its own vmcnt and
+      // execute tid 0's arrival while waves 1-3 have not yet retired the
+      // partials they wrote -- s_waitcnt is a per-wave counter, and s_barrier
+      // carries no vmcnt guarantee for the *other* waves. Draining before the
+      // barrier makes the rendezvous the point at which all four waves are
+      // known to have retired, which is what the arrival needs to publish.
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      __syncthreads();
       __shared__ int s_chunk_prev;
       if (tid == 0) {
         s_chunk_prev = atom_add_release_gpu_s32(
@@ -541,35 +582,66 @@ __device__ __noinline__ void
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
         _merge_done = __builtin_amdgcn_s_memrealtime();
 #endif
-        // Wait for all write-through stores from merge to complete
+        // Wait for all write-through stores from merge to complete.
+        //
+        // The __syncthreads() is load-bearing and was missing. merge's st_wt
+        // stores are issued by all 256 threads (its work loop is strided by
+        // `group_id = threadIdx.x / THREADS_PER_TOKEN`, covering every wave),
+        // but only tid 0 publishes the release below. s_waitcnt vmcnt(0) is a
+        // *per-wave* counter, so wave 0 draining its own stores says nothing
+        // about waves 1-3 -- their attn_out writes can still be in flight when
+        // attn_global is bumped and the release flags fan out.
+        //
+        // The consumer is Phase 7's O-proj, which reads attn_out from a
+        // different block. The corruption is silent and batch-size-dependent:
+        // it shows up as nondeterministic attn_proj_out confined to the
+        // workers that clear the release poll earliest -- those with no Phase 1
+        // QKV work, i.e. wg_idx >= total_qkv_tiles_per_xcd.
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        __syncthreads();
         if (tid == 0) {
           // attn_global is bumped exactly ATTN_ARRIVALS times per layer: the
           // modulus above fires once per (XCD, request), and every empty-work
           // early return lives *inside* a callee, so no arrival is ever
-          // skipped. Round the snapshot up to the next multiple of that count.
+          // skipped. The releaser is therefore the arrival whose *own* return
+          // value is the last of a group of ATTN_ARRIVALS -- a pure function
+          // of this atomic's result, reading nothing shared.
           //
-          // The read is safe without a barrier even though every other counter
-          // in this file was converted to a layer-counter derivation: this
-          // worker has finished layer L-1 (so v >= ATTN_ARRIVALS * L) and no
-          // XCD can enter layer L+1 until this very arrival fires the release
-          // (so v < ATTN_ARRIVALS * (L+1)). Deriving the target from
-          // task_layer_idx instead would be wrong here -- the layer counter
-          // restarts at 0 on every kernel launch while this counter is a host
-          // allocation that is never reset, so a warmup pass would leave every
-          // later launch waiting on a value already in the past.
+          // This used to snapshot the counter and round up:
           //
-          // This must stay a division, not `(v | (ATTN_ARRIVALS-1)) + 1`. The
-          // bitwise form only rounds up to a power of two, so it silently
-          // releases early at NUM_REQS in {3,5,6,7} -- the merge output would
-          // be read before it is written.
+          //   v = relaxed_load(attn_global);
+          //   expected = (v / ATTN_ARRIVALS + 1) * ATTN_ARRIVALS;
+          //   if (atom_add(attn_global, 1) == expected - 1) release;
+          //
+          // which is only correct if the snapshot lands in this layer's group.
+          // Nothing enforced that. All 36 layers run inside one task with only
+          // a per-block __syncthreads between them, so a worker that reaches
+          // here before the previous layer's last arrival reads a `v` from the
+          // *previous* group, computes `expected` one full ATTN_ARRIVALS too
+          // low, and then satisfies `prev == expected - 1` with its own bump --
+          // firing this layer's release when as few as one of the merges has
+          // run. The consumer's Phase 6 poll clears immediately and O-proj
+          // reads attn_out rows that no merge has written yet.
+          //
+          // That is exactly the observed defect: silent, run-to-run varying,
+          // and concentrated in the high-numbered requests (whose merges finish
+          // last) and in the workers that reach Phase 6 earliest (xcd_rank >=
+          // total_qkv_tiles_per_xcd, i.e. the wg >= 10 block). It also explains
+          // why a delay *anywhere* in Phase 6 -- before the poll or after it --
+          // cleaned it up completely while no fence on either side did
+          // anything: the data was never unflushed, it was simply not computed
+          // yet, and the delay just gave the real merges time to land.
+          //
+          // The modulus removes the race at its source: no shared read, nothing
+          // to order, and no dependence on the value being sampled inside the
+          // right group. It is also self-healing across kernel relaunches (the
+          // counter is a host allocation that is never reset) and correct at
+          // every NUM_REQS -- unlike `(v | (ATTN_ARRIVALS-1)) + 1`, which only
+          // rounds to a power of two and released early at NUM_REQS in
+          // {3,5,6,7}.
           constexpr int ATTN_ARRIVALS = 8 * NUM_REQS;
-          int attn_expected =
-              (__atomic_load_n(attn_global, __ATOMIC_RELAXED) / ATTN_ARRIVALS +
-               1) *
-              ATTN_ARRIVALS;
           int prev = atom_add_release_gpu_s32(attn_global, 1);
-          if (prev == attn_expected - 1) {
+          if ((prev % ATTN_ARRIVALS) == ATTN_ARRIVALS - 1) {
             // LAST XCD to arrive: fan out per-XCD release flags via st_wt
             // (write-through to HBM, bypasses L2 — guarantees ld_nt sees it).
             // This eliminates the cross-XCD poll of attn_global, which hangs
@@ -690,8 +762,58 @@ __device__ __noinline__ void
       __builtin_amdgcn_s_sleep(1);
     }
   }
-  asm volatile("buffer_inv" ::: "memory");
+  // Cross-XCD ACQUIRE for attn_out. Must be `sc1` (vL1 + L2).
+  //
+  // The producer is the Phase 5 merge, which writes attn_out with st_wt
+  // (WRITE_THROUGH=true) -- sc0 sc1, bypassing L2 and landing in HBM. The
+  // consumer is Phase 7's O-proj on a *different* XCD (the merge that produced
+  // a given kv_head runs on the XCD that owns it), and MI300/MI350 L2 is not
+  // coherent across XCDs.
+  //
+  // Plain `buffer_inv` drops vL1 only. This same worker read the same attn_out
+  // addresses one layer ago, so its L2 still holds those lines -- and the load
+  // is served from L2, returning the *previous* layer's attention output.
+  // Which lines survive depends on inter-XCD L2 eviction timing, hence run to
+  // run variation.
+  //
+  // This is distinct from the Phase 5 barrier's `buffer_inv` (no sc1), which
+  // is correct as written: that one is intra-XCD (the chunk barrier is
+  // per-XCD), so the producers share this L2 and invalidating it would discard
+  // their partials. Here the producer is remote and the invalidate is required.
+  // Retire the Phase 6 weight DMA BEFORE invalidating, not after.
+  //
+  // buffer_load_lds retires on vmcnt, and it was issued above so it overlaps
+  // the release poll. Draining first keeps `buffer_inv sc1` -- which drops L2,
+  // what those `sc0 nt` global->LDS reads are sourcing -- from landing while
+  // they are still in flight. The wait has to happen before the MFMA reads LDS
+  // regardless, so ordering it ahead of the invalidate costs nothing.
+  //
+  // This ordering is defensive, not the fix for any observed bug. The wg >= 10
+  // corruption that was originally attributed here was the fused layer's
+  // barrier release value being -1 (see the layer_counter comment above and
+  // persistent_kernel.cuh's per-layer dispatch loop): every barrier was a
+  // no-op, so O-proj ran against attn_out that the merges had not written yet.
+  // That also explains the evidence that never fit a DMA race -- a delay
+  // *before* the release poll cleaned it up just as completely as one after,
+  // and neither an extra invalidate nor a system-scope fence on either side
+  // changed anything.
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  asm volatile("buffer_inv sc1" ::: "memory");
+  // Publish the Phase 6 O-proj weight DMA to the whole block.
+  //
+  // buffer_load_lds retires on vmcnt, and the drain above is per-wave -- it
+  // covers only the loads *this* wave issued. Each wave DMAs its own
+  // 1024-byte slices (j*4096 + pf_warp_id*1024), and those slices tile the
+  // weight region contiguously, so the tile every wave then reads for its
+  // K-range is interleaved across all four waves' slices. Wave 0's MFMA reads
+  // bytes wave 3 loaded; without a rendezvous it can read them before they
+  // land, and the B operand is whatever LDS held from the previous layer.
+  //
+  // Silent wrong numerics, no fault: the stale bytes are still a valid MXFP4
+  // encoding, so the tile computes cleanly against garbage weights. It shows
+  // up in attn_proj_out as columns carrying ~2000-magnitude values where the
+  // correct output tops out near 33.
+  __syncthreads();
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
   unsigned long long _fused_t2 = __builtin_amdgcn_s_memrealtime();
@@ -738,6 +860,11 @@ __device__ __noinline__ void
           oproj_topk_tiles_per_xcd,
           oproj_tile_idx,
           routing_ready,
+          // layer_epoch: the O-proj hierarchical barrier's release target.
+          // Same layer-derived value as the other three counters in this file
+          // -- passing it explicitly is what lets that barrier stop
+          // snapshotting "current value + 1", which races with the releaser.
+          qkv_epoch_expected,
           // ts_base: the O-proj/TopK kernel's optional per-sub-op timestamp
           // sink. Nothing here reads those slots -- the [FUSED_PHASE] printf
           // below derives every number from _fused_t0.._fused_t4, which are
@@ -767,7 +894,20 @@ __device__ __noinline__ void
       __builtin_amdgcn_s_sleep(1);
     }
   }
-  asm volatile("buffer_inv" ::: "memory");
+  // Cross-XCD ACQUIRE for the routing data. Must be `sc1` (vL1 + L2).
+  //
+  // What this poll gates is active_expert_ids / routing_indices / topk_weight,
+  // all written by the single TopK worker with st_wt (sc0 sc1) -- straight to
+  // HBM, bypassing L2. Every MoE worker on the other seven XCDs reads them
+  // here, and L2 is not coherent across XCDs, so dropping vL1 alone leaves
+  // this XCD's L2 free to serve the previous layer's routing.
+  //
+  // A stale read here is not a crash: last layer's expert ids and route values
+  // are all in range, so the token is quietly routed through the wrong
+  // experts. That is the same failure the release-side fence in
+  // gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh describes -- this is its
+  // acquire-side counterpart, which was never written.
+  asm volatile("buffer_inv sc1" ::: "memory");
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
   unsigned long long _fused_t3 = __builtin_amdgcn_s_memrealtime();
@@ -799,6 +939,144 @@ __device__ __noinline__ void
                                                             input_ptrs[21],
                                                             moe_t);
   }
+
+  // ══════════════════════════════════════════════════════════════════
+  // Phase 9: Layer-boundary GLOBAL barrier
+  //
+  // The next layer's QKV prologue (ResAddF32) reads moe_workspace_f32 -- the
+  // buffer this layer's W2 epilogue just wrote. moe_ws_layout.cuh guarantees
+  // every (token, slot, hidden) element has exactly one writer, so there is no
+  // accumulator race *within* a layer. What was missing is the guarantee that
+  // the writer has run *at all* before the next layer reads.
+  //
+  // Nothing provided it. All 36 layers run inside one persistent dispatch (the
+  // `ml` loop in persistent_kernel.cuh), and the only thing between them is:
+  //
+  //     if (threadIdx.x == 0 && block_xcd_local_rank == 0) threadfence_gpu();
+  //     __syncthreads();
+  //
+  // Both are per-workgroup. `__syncthreads` synchronizes the 256 threads of
+  // *this* block and says nothing about the other 239 workers, and
+  // `threadfence_gpu` is a memory *ordering* fence, not a rendezvous -- it
+  // makes this worker's prior writes visible if someone reads them later, but
+  // it never makes anyone wait. So a workgroup that finished its MoE tiles
+  // could roll straight into layer N+1 and read workspace slots belonging to
+  // tokens whose W2 tiles were still executing on another XCD.
+  //
+  // The result is not a hang and not garbage: the reader gets the *previous*
+  // layer's value for those elements (the buffer is deliberately never zeroed
+  // -- coverage is total, so nothing clears it), which is a plausible-looking
+  // float. Which elements lose the race depends on inter-XCD timing, so it
+  // varies run to run. That is precisely the observed signature: layer 0's K/V
+  // is bit-identical across runs because on the first layer the workspace has
+  // just been zeroed and there is no prior value to read, while layer 1 -- the
+  // first layer with a real predecessor -- diverges at decode step 0.
+  //
+  // The barrier is a two-level rendezvous over the same counter block every
+  // other phase here uses: each XCD elects one worker to publish its arrival,
+  // then everyone waits for all 8 XCDs to reach this layer.
+  //
+  // The release target is a snapshot-free function of task_layer_idx, which
+  // persistent_kernel.cuh computes as (pc_iter - 1) * num_layers + ml --
+  // monotonic across the whole run and identical on every worker, so there is
+  // nothing to race and a relaunch cannot wait on a value already in the past.
+  //
+  // Cost is one cross-XCD rendezvous per layer. That is the price of the
+  // dependency actually being there; the previous code was fast because it
+  // simply did not wait.
+#ifndef MPK_NO_LAYER_BARRIER
+  {
+    // Two-level rendezvous. Slot layout, one 16-int line each:
+    //   layer_local[x]   : arrivals from XCD x's own workers_per_xcd workers
+    //   layer_global[0]  : one arrival per XCD, bumped by that XCD's last
+    //   layer_release[x] : release flag for XCD x, broadcast by the last XCD
+    //
+    // The tree is the whole point. A flat barrier -- 240 workgroups each
+    // bumping one shared counter and then polling eight remote lines -- is
+    // correct but measures ~1.0 ms/iter over 36 layers on this machine,
+    // because every one of those 240 atomics is a cross-die read-modify-write
+    // serialising on a single cache line, and the poll adds 240 waves x 8
+    // cache-bypassing loads of lines homed on other dies. Phase 6's barrier
+    // is cheap precisely because it only ever puts 8 * NUM_REQS atomics on
+    // its shared line. This gets to the same 8 by aggregating per-XCD first,
+    // and borrows Phase 6's arrive-then-broadcast release so no worker polls
+    // a line owned by another die.
+    int *layer_local =
+        oproj_counters_base + FULL_LAYER_LAYER_BARRIER_SLOT(NUM_REQS);
+    int *layer_global = layer_local + 8 * 16;
+    int *layer_release = layer_global + 16;
+
+    // Every worker must retire its own MoE stores before its arrival is
+    // published: vmcnt is per-wave, so neither the release on the atomic nor
+    // s_barrier covers the other waves. Drain, then barrier, then arrive --
+    // the same ordering the other release sites in this file use.
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    __syncthreads();
+
+    if (tid == 0) {
+      // Snapshot this XCD's release line *before* arriving. Layer L's release
+      // is written only after all 240 workers arrive, this one included, so
+      // at this instant the line still holds layer L-1's value -- and it
+      // holds at least that, because this worker cleared layer L-1's release
+      // to get here. So `rel_prev` is exactly layer L-1's value on every
+      // worker, and "layer L has released" is exactly "the line moved".
+      //
+      // This is why the wait target is a snapshot rather than a function of
+      // task_layer_idx: this counter block is a host allocation that is never
+      // reset, while task_layer_idx restarts at 0 on every kernel launch
+      // (pc_iter is __shared__). A layer-derived target would make every
+      // relaunch after a warmup wait on a value already in the past and hang
+      // all 240 workers. Same reasoning as the attn_global bump above.
+      int const rel_prev = ld_nt_s32(&layer_release[xcd_id * 16]);
+
+      // The two arrival targets are division snapshots for the same reason,
+      // and are race-free because the barrier each belongs to bounds it.
+      // Division, never `(v | mask) + 1`: workers_per_xcd is 30, not a power
+      // of two, so the bitwise form would release early.
+      //
+      // For the local counter: every worker on this XCD has cleared layer
+      // L-1's release (so v >= workers_per_xcd * L) and none can reach layer
+      // L+1's arrival without layer L's release, which needs this very
+      // arrival (so v < workers_per_xcd * (L+1)). For the global counter the
+      // same argument runs one level up, over the 8 XCDs.
+      int local_expected =
+          (__atomic_load_n(&layer_local[xcd_id * 16], __ATOMIC_RELAXED) /
+               workers_per_xcd +
+           1) *
+          workers_per_xcd;
+      int local_prev =
+          atom_add_release_gpu_s32(&layer_local[xcd_id * 16], 1);
+
+      if (local_prev == local_expected - 1) {
+        // Last worker on this XCD: this XCD's MoE stores are all retired, so
+        // publish one arrival on behalf of the whole die.
+        int global_expected =
+            (__atomic_load_n(layer_global, __ATOMIC_RELAXED) / 8 + 1) * 8;
+        int global_prev = atom_add_release_gpu_s32(layer_global, 1);
+        if (global_prev == global_expected - 1) {
+          // Last XCD overall: fan the release out with st_wt (write-through,
+          // bypasses L2) so every worker polls a line it already owns.
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          for (int x = 0; x < 8; x++) {
+            st_wt_u32((void *)&layer_release[x * 16],
+                      (unsigned)global_expected);
+          }
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        }
+      }
+
+      while (ld_nt_s32(&layer_release[xcd_id * 16]) <= rel_prev) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+      __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    }
+    __syncthreads();
+    // No invalidate here: the task body re-entered for the next layer opens
+    // with `buffer_inv sc1` (the layer-boundary acquire near the top of this
+    // function), which is the same instruction against the same data. Issuing
+    // it twice per layer costs a full L2 invalidate for nothing.
+  }
+#endif
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
   __syncthreads();

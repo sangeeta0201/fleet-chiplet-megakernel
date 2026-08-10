@@ -122,6 +122,13 @@ __device__ __attribute__((noinline)) void
         // Optional: when non-null, the TopK-completing worker writes 1 here
         // via st_wt_u32 so the fused wrapper can poll before MoE.
         int *routing_ready_ptr = nullptr,
+        // Per-layer epoch for the Phase 2 barrier release target. Must be a
+        // value that is monotonic across the whole run, bumps exactly once per
+        // invocation of this barrier, and is computable by every worker without
+        // reading shared state -- the fused callers pass layer_counter + 1.
+        // 0 means "no layer loop", which selects the snapshot form; see the
+        // comment at oproj_release_expected for why that is only safe there.
+        int layer_epoch = 0,
         // Optional: per-worker timestamp ring buffer pointer (g_fused_ts).
         // When non-null, writes slots 9 (oproj_done), 10 (barrier_done),
         // 11 (rmsnorm_router_done) for sub-phase breakdown.
@@ -731,8 +738,13 @@ oproj_barrier :
     ts_base[9] = __builtin_amdgcn_s_memrealtime(); // slot 9: oproj_mfma_done
   }
 #endif
-  __syncthreads();
+  // Drain BEFORE the rendezvous, not after. `s_waitcnt` is a per-wave
+  // guarantee: run after __syncthreads it only retires wave 0's stores, and
+  // tid 0 then publishes an arrival advertising output that waves 1..3 may
+  // still have in flight. Draining first makes every wave's stores retire,
+  // and the barrier then makes that true block-wide.
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  __syncthreads();
 
   // ── Prefetch gamma + router weights during barrier wait ──────────
   // These are data-independent of O-proj output.
@@ -746,14 +758,69 @@ oproj_barrier :
   i32x2_pf_t w_pf_buf[MAX_ITERS_PF];
 
   {
-    // Mechanism C: single global arrive + per-XCD release flags
-    // Uses monotonically increasing expected values (no reset needed)
-    // All threads read release_expected independently (ld_nt is uniform),
-    // eliminating shared variables and both __syncthreads.
-    int oproj_release_expected =
-        ld_nt_s32(&hier_barrier[xcd_id * HIER_STRIDE]) + 1;
+    // Mechanism C: single global arrive + per-XCD release flags.
+    //
+    // The release target is derived from the layer counter, not snapshotted.
+    // It used to be `ld_nt_s32(&hier_barrier[xcd_id*16]) + 1` -- "whatever is
+    // there now, plus one" -- which is only correct if every one of the 184
+    // workers performs that read before *any* XCD's releaser overwrites the
+    // slot. Nothing orders those two events: the read sits after this block's
+    // own __syncthreads, but the releaser is a different workgroup on a
+    // different XCD, and it can fan out the eight release flags while a worker
+    // here has not yet taken its snapshot.
+    //
+    // A worker that reads *after* the update computes a target one lower than
+    // the value already published, so its poll is satisfied on entry: it falls
+    // straight through and reads attn_proj_out while the other XCDs' O-proj
+    // stores are still in flight. O-proj writes column-partitioned and the
+    // RMSNorm below reads the full row, so seven eighths of what it consumes
+    // may not be written yet. The observable signature is exact -- rmsnorm_out
+    // differing run to run while attn_proj_out, the settled HBM content, is
+    // bit-identical.
+    //
+    // This is the same defect the fused kernel already fixed for the other
+    // three counters (see the layer_counter block in
+    // gang_full_layer_fused_mi300.cuh: "These used to be snapshots of current
+    // value + 1"). This barrier was the one holdout.
+    //
+    // `layer_epoch` is that counter, passed in by the caller rather than read
+    // from a shared location: (iterations * num_layers + layer) + 1, monotonic,
+    // never reset, and identical for every worker with nothing to order. The
+    // two fused callers both have it in hand. The standalone task type
+    // (register_gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300_task) has no
+    // layer loop -- it is one task per dispatch -- so it passes 0 and keeps the
+    // snapshot, which is safe there precisely because there is no second layer
+    // to race with.
+    int const oproj_release_expected =
+        layer_epoch > 0 ? layer_epoch
+                        : ld_nt_s32(&hier_barrier[xcd_id * HIER_STRIDE]) + 1;
 
     if (tid == 0) {
+      // GPU-scope release fence before the arrival.
+      //
+      // atom_add_release_gpu_s32 is not a release on AMD -- its own definition
+      // (mpk_atoms.cuh) emits only `flat_atomic_add ... sc0 sc1; s_waitcnt`,
+      // with the comment "Ordering provided by explicit threadfence_gpu()
+      // before this call." That call was never made here.
+      //
+      // The drain above (`s_waitcnt vmcnt(0)` + __syncthreads) retires this
+      // block's O-proj stores, which is what a *same-XCD* consumer needs. But
+      // this barrier is global: the workers released by it read
+      // attn_proj_out columns produced on all eight XCDs, and MI300/MI350 L2
+      // is not coherent across XCDs. Retiring a store means it reached this
+      // XCD's L2, not that a remote XCD can see it.
+      //
+      // threadfence_gpu lowers to `buffer_wbl2 sc1; s_waitcnt vmcnt(0)` on
+      // gfx950 -- the L2->HBM writeback that actually makes those columns
+      // visible to the other seven XCDs. Without it the release flag (st_wt,
+      // straight to HBM) can overtake the data it advertises.
+      //
+      // Contrast Phase 4's chunk barrier in gang_full_layer_fused_mi300.cuh,
+      // which deliberately does *not* do this: that barrier is per-XCD, so
+      // its producers and consumer share one L2 and the writeback would be
+      // pure cost. Here the consumer is remote and the writeback is the whole
+      // point. Only the arriving thread of each block pays it.
+      threadfence_gpu();
       // Single global arrival (all workers increment one counter)
       int prev_global =
           atom_add_release_gpu_s32(&hier_barrier[8 * HIER_STRIDE], 1);
@@ -792,7 +859,6 @@ oproj_barrier :
     }
 
     // All threads poll per-XCD release flag independently.
-    // Eliminates __syncthreads — each thread confirms the barrier itself.
     // ld_nt coalesces across waves, so no extra HBM traffic.
     while (ld_nt_s32(&hier_barrier[xcd_id * HIER_STRIDE]) <
            oproj_release_expected) {
@@ -800,8 +866,51 @@ oproj_barrier :
     }
   }
 
-  // Invalidate L2 so we read fresh O-PROJ output from HBM
-  asm volatile("buffer_inv" ::: "memory");
+  // Rendezvous before the acquire. The per-thread poll above establishes, for
+  // each wave independently, that the barrier has been released -- and that
+  // used to be the whole argument for dropping this __syncthreads ("each
+  // thread confirms the barrier itself"). It is not sufficient, because the
+  // acquire that follows is `buffer_inv`, which is a *per-wave* instruction
+  // acting on caches the whole CU shares.
+  //
+  // Without the rendezvous: wave 0 clears its poll, invalidates, and begins
+  // reading attn_proj_out through vL1/L2 -- repopulating those lines. Wave 3
+  // has not cleared its poll yet, so some of the lines wave 0 just pulled in
+  // are pre-barrier values from XCDs that had not finished storing. Wave 3
+  // then runs its own buffer_inv, but that invalidate happens *before* it
+  // reads, and the stale lines were already re-cached by wave 0 after it. The
+  // sc1 invalidate cannot undo a fill that a sibling wave performs behind it.
+  //
+  // Draining, rendezvousing, then invalidating makes the invalidate the first
+  // memory event any wave performs after the barrier is known released
+  // block-wide, which is what the acquire has to mean. This is the read side of
+  // the same drain-then-rendezvous discipline the release sides in this file
+  // already follow.
+  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  __syncthreads();
+
+  // Cross-XCD ACQUIRE for the O-proj output. Must be `sc1` (vL1 + L2).
+  //
+  // The barrier above is global, not per-XCD: every O-proj worker on all eight
+  // XCDs increments hier_barrier[8*16], and the last arrival releases all of
+  // them. It has to be, because O-proj *writes* column-partitioned -- worker
+  // (xcd, wg) owns columns xcd*368 + wg*16 .. +16 -- while the RMSNorm below
+  // reads all ACTUAL_HIDDEN_DIM columns of its token row. Seven eighths of
+  // what each worker reads here was produced on a different XCD, and
+  // MI300/MI350 L2 is not coherent across XCDs.
+  //
+  // The producer is `st_wt_u64` (sc0 sc1), so the data bypasses L2 and lands
+  // in HBM. Plain `buffer_inv` drops vL1 only. This same worker read these
+  // same addresses one layer ago, so its L2 still holds those lines and the
+  // load is served from L2 -- returning the *previous* layer's O-proj output.
+  // Which lines survive depends on L2 eviction timing, hence run to run
+  // variation. The observable signature is exact: rows of `rmsnorm_out`
+  // differing between two runs whose `attn_proj_out` (the settled HBM content)
+  // is bit-identical -- the norm read something that is not what is in memory.
+  //
+  // The comment this replaces already said "Invalidate L2"; the instruction
+  // simply never encoded it.
+  asm volatile("buffer_inv sc1" ::: "memory");
   // Drain prefetched gamma + router weight loads (issued before barrier).
   // NT loads bypass L2, unaffected by buffer_inv.
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
@@ -872,7 +981,32 @@ oproj_barrier :
     i32x2_t w_cache[MAX_ITERS];
     int n_cached = 0;
 
+    // Two independent cross-wave reductions run in this phase, and they must
+    // not share storage. `red` carries the ssq reduction and then, at red[0],
+    // the *broadcast* of irms, which every one of the 256 threads reads. The
+    // dp reduction that follows used to write red[wave] -- so wave 0's
+    // `red[0] = dp` lands on the very slot waves 1..3 are still reading irms
+    // from.
+    //
+    // Nothing separates the two: the `__syncthreads()` after the irms store is
+    // the *last* barrier before pass 2, and pass 2 both reads irms and writes
+    // dp. Worse, irms is consumed inside pass 2's unrolled loop (n = h*irms*g),
+    // so the compiler is free to keep re-reading the LDS slot rather than
+    // hoisting it into a VGPR -- which widens the window from a few
+    // instructions to the whole loop.
+    //
+    // A wave that reads a clobbered irms computes a wrong norm for its quarter
+    // of the row. That value is *stored* to norm_output (the MoE's input) and
+    // folded into the router dot product, so the damage lands in
+    // rmsnorm_out_moe and in the routing decision at once -- and it is timing
+    // dependent, hence different every run. Which quarter of the row is hit
+    // depends on which wave loses the race, so the corruption is spread evenly
+    // across the row rather than confined to one workgroup's columns.
+    //
+    // Giving dp its own slots removes the aliasing outright; 64 bytes of LDS
+    // is cheaper than a third barrier on the critical path.
     __shared__ float red[16];
+    __shared__ float red_dp[16];
 
     // This worker owns router expert `local_tile` for *every* token. The
     // pipeline below used to run once with no token offset anywhere, so at
@@ -1037,9 +1171,10 @@ oproj_barrier :
         dp += __shfl_xor(dp, off);
       }
 
-      // Cross-wave LDS reduce
+      // Cross-wave LDS reduce. Into red_dp, not red: red[0] is still serving
+      // as the irms broadcast that pass 2 above reads.
       if (lane == 0) {
-        red[wave] = dp;
+        red_dp[wave] = dp;
       }
       __syncthreads();
 
@@ -1050,7 +1185,7 @@ oproj_barrier :
       if (tid == 0) {
         float s = 0.0f;
         for (int w = 0; w < NUM_WAVES; w++) {
-          s += red[w];
+          s += red_dp[w];
         }
         if (d_rbias) {
           s += __bfloat162float(d_rbias[local_tile]);
@@ -1088,8 +1223,13 @@ topk_barrier :
         __builtin_amdgcn_s_memrealtime(); // slot 11: rmsnorm_router_done
   }
 #endif
-  __syncthreads();
+  // Drain BEFORE the rendezvous, not after. `s_waitcnt` is a per-wave
+  // guarantee: run after __syncthreads it only retires wave 0's stores, and
+  // tid 0 then publishes an arrival advertising output that waves 1..3 may
+  // still have in flight. Draining first makes every wave's stores retire,
+  // and the barrier then makes that true block-wide.
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  __syncthreads();
 
   __shared__ int s_topk_done;
   if (tid == 0) {
@@ -1111,10 +1251,15 @@ topk_barrier :
         active_expert_ids_ptr,
         topk_counter,
         num_active_tokens);
-    // topk_noinline resets topk_counter internally
-    // topk_noinline's return has per-thread s_waitcnt, but thread 0 could reach
-    // threadfence_gpu before other threads finish their stores. syncthreads
-    // ensures all threads complete TopK stores before thread 0 flushes L2→HBM.
+    // topk_noinline resets topk_counter internally.
+    //
+    // Drain then rendezvous. __syncthreads alone is NOT enough here: it makes
+    // every wave *reach* this point, but `s_waitcnt` is per-wave, so a wave
+    // can arrive at the barrier with its routing_indices / active_expert_ids
+    // stores still in flight. tid 0 then fences and publishes the release,
+    // advertising data that has not landed. Each wave must retire its own
+    // stores first; the barrier then makes that true block-wide.
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     __syncthreads();
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
     if (tid == 0 && ts_base) {

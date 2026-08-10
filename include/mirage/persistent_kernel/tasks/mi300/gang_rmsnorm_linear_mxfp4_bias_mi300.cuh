@@ -2730,6 +2730,30 @@ __device__ __noinline__ void
       // Position metadata is per token and already in s_global_pos /
       // s_dst_idx. RoPE scratch aliases the token region, which is dead now
       // that the MFMA has retired.
+      //
+      // "Retired" is a per-WAVE property, and this is a 4-wave block. The asm
+      // above ends with s_waitcnt lgkmcnt(0), so when *this* wave falls out of
+      // it, *its* ds_reads have landed -- but nothing has ordered it against
+      // the other three waves, which may still be issuing the ds_read_b128
+      // pair that feeds their own MFMA. s_rope is _rnlm_smem, i.e. byte 0 of
+      // s_tok_fp8, so wave 0's step-1 stores land exactly on token row 0's
+      // activations: s_rope halfword (t*HEAD_DIM + ...) is byte 128*t + ...,
+      // and token row 0's MFMA iteration i reads bytes [128*i, 128*i+128).
+      // Wave 0 writing rope token t therefore destroys iteration t of token
+      // row 0 for whichever wave has not read it yet.
+      //
+      // That makes the corruption window exactly TOK_ROWS of the 23 MFMA
+      // iterations -- it scales with the batch width, is confined to token row
+      // 0 (col == 0), and vanishes at TOK_ROWS == 1 only because a single
+      // iteration is a narrow enough target to almost always lose the race.
+      // It is why row 0's Q/K diverged from rows 1..B-1 with identical
+      // prompts, and why B=8 was the reliable repro.
+      //
+      // One block-wide rendezvous closes it: every wave's ds_reads are
+      // complete when it arrives here, so the aliased region really is dead
+      // before the first store. The epilogue's own __syncthreads calls are all
+      // *after* its step-1 stores and cannot substitute.
+      __syncthreads();
       int kv_head = _kvupd_get_xcd_id();
       unsigned short const *cos_base = (unsigned short const *)cos_ptr;
       unsigned short const *sin_base = (unsigned short const *)sin_ptr;

@@ -347,6 +347,8 @@ def get_compile_command(
             flags = flags + ["-DMPK_ENABLE_DEVICE_TASK_TIMING"]
         if int(os.environ.get("MPK_DEVICE_ACCUM", "0")) == 1:
             flags = flags + ["-DMPK_ENABLE_DEVICE_TASK_ACCUM"]
+        if int(os.environ.get("MPK_NO_LAYER_BARRIER", "0")) == 1:
+            flags = flags + ["-DMPK_NO_LAYER_BARRIER"]
         if int(os.environ.get("MPK_SUBPHASE_TIMING", "0")) == 1:
             flags = flags + ["-DMPK_ENABLE_SUBPHASE_TIMING"]
         if int(os.environ.get("MPK_MOE_SUBPHASE", "0")) == 1:
@@ -374,6 +376,10 @@ def get_compile_command(
             flags = flags + ["-DMPK_FUSED_TAIL_TIMING"]
         if int(os.environ.get("MPK_K2944_DEBUG", "0")) == 1:
             flags = flags + ["-DMPK_K2944_DEBUG"]
+        # Escape hatch for one-off diagnostic defines (e.g. -DMPK_DIAG_SETTLE).
+        # Space-separated; passed through verbatim to the JIT compile.
+        if os.environ.get("MPK_EXTRA_FLAGS"):
+            flags = flags + os.environ["MPK_EXTRA_FLAGS"].split()
         if int(os.environ.get("PRECOMPUTED_DISPATCH", "1")) == 1:
             flags = flags + ["-DMPK_PRECOMPUTED_DISPATCH"]
             flags = flags + ["-DMPK_FUSED_LAYER_BATCHING"]
