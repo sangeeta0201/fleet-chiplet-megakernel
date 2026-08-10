@@ -414,6 +414,12 @@ def get_compile_command(
             # report and compiles out the per-layer FUSED_PHASE printf, which
             # on its own takes the iteration from 2.5 ms to ~440 ms.
             flags = flags + ["-DMPK_EP9_ONLY", "-DMPK_ENABLE_DEVICE_TASK_TIMING"]
+        if int(os.environ.get("MPK_W2_HALFK", "0")) == 1:
+            # Halves W2's MFMA iteration count to price a K-split of W2 against
+            # the W13 -> barrier -> W2 chain that sets Phase 8's length. See the
+            # W2_MFMA_ITERS definition in gang_moe_fused_mxfp4_mi300.cuh.
+            # WRONG OUTPUT: latency attribution only.
+            flags = flags + ["-DMPK_W2_HALFK"]
         if int(os.environ.get("MPK_EP_SKEW_PROBE", "0")) == 1:
             # Measures how much earlier a column slice's W2 tiles finish than
             # the last W2 tile on the GPU -- i.e. the headroom a per-slice

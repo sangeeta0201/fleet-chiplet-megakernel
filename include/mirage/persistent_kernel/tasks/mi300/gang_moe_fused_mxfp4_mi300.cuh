@@ -154,7 +154,25 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   constexpr int W2_WGS = W2_OUTPUT_SIZE / W2_OUTPUT_PER_WG;
   constexpr int64_t W2_EXPERT_BYTES =
       static_cast<int64_t>(W2_WGS) * W2_WG_BYTES;
+  // MPK_W2_HALFK: run half the K-loop and keep everything else identical.
+  // This is the price tag for a K-split of W2, measured before writing one.
+  //
+  // The chain that sets Phase 8's length is W13 -> per-expert barrier -> W2 on
+  // the 12 workers per XCD that draw a W2 tile (see the MOEOCC dump: 17.5 us
+  // busy against 1.0 for the 6 that draw only padding). Splitting W2's K would
+  // halve its share of that chain and hand the second half to workers that are
+  // idle today; the partial sums need no new combine because the epilogue
+  // already atomicAdds into moe_workspace_f32. Whether that is worth the index
+  // surgery depends entirely on how much of the 5.7 us W2 compute is the MFMA
+  // loop rather than the weight load and quant around it, and halving the
+  // iteration count answers exactly that.
+  //
+  // WRONG OUTPUT: half the reduction is simply dropped, not redistributed.
+#ifdef MPK_W2_HALFK
+  constexpr int W2_MFMA_ITERS = W2_K / 128 / 2;
+#else
   constexpr int W2_MFMA_ITERS = W2_K / 128;
+#endif
   constexpr int W2_TILES = BATCH_SIZE * W2_WGS;
 
   // Common constants

@@ -128,7 +128,6 @@ __device__ __forceinline__ void _full_layer_ep_fold_partial(
 #pragma unroll
       for (int j = 0; j < 2; ++j) {
         float v = ws_row[off + j];
-        ws_row[off + j] = 0.0f;
         if constexpr (FOLD) {
           unsigned rbits = (unsigned)res_row[off + j] << 16;
           float rv;
@@ -139,9 +138,28 @@ __device__ __forceinline__ void _full_layer_ep_fold_partial(
         __builtin_memcpy(&u, &v, 4);
         unsigned rounding_bias = ((u >> 16) & 1) + 0x7FFFu;
         unsigned short bf = (unsigned short)((u + rounding_bias) >> 16);
-        out_row[off + j] = bf;
         packed |= ((unsigned)bf) << (16 * j);
       }
+      // The LOCAL slot is written write-through too, as one 32-bit store rather
+      // than two 16-bit ones -- `packed` is already assembled for the peer.
+      //
+      // The point is not the store width, it is what write-through lets the
+      // caller drop. This slot's consumer is the next layer's QKV prologue on
+      // every XCD, so a plain store needs an agent-scope release to become
+      // visible, and threadfence_gpu() on gfx950 is `buffer_wbl2 sc1` -- an
+      // L2->HBM writeback of the WHOLE cache, run by all 8 folding workgroups
+      // on all 36 layers. st_wt puts these bytes past L2 on the store itself,
+      // which is the only data the fence was there to publish (the workspace
+      // zeroing below is read back by this same XCD's Phase 8 atomicAdds, and
+      // those go through L2 anyway).
+      st_wt_u32((void *)&out_row[off], packed);
+      // The zeroing has to be write-through for the same reason, and it is the
+      // one that makes dropping the fence sound. Its consumer is the next
+      // layer's Phase 8 atomicAdd, and a W2 tile writing these columns can land
+      // on ANY XCD -- the tile->column map is by wg_idx, not by XCD -- so a
+      // plain store into this XCD's L2 is not enough. Two floats, one 8-byte
+      // store, the same pair the fold just read.
+      st_wt_u64((void *)&ws_row[off], 0ull);
       if (peer_row) {
         st_wt_u32((void *)&peer_row[off], packed);
       }
@@ -149,7 +167,6 @@ __device__ __forceinline__ void _full_layer_ep_fold_partial(
     if ((OUTPUT_SIZE & 1) && threadIdx.x == 0 && col_hi == OUTPUT_SIZE) {
       int off = OUTPUT_SIZE - 1;
       float v = ws_row[off];
-      ws_row[off] = 0.0f;
       if constexpr (FOLD) {
         unsigned rbits = (unsigned)res_row[off] << 16;
         float rv;
@@ -160,7 +177,8 @@ __device__ __forceinline__ void _full_layer_ep_fold_partial(
       __builtin_memcpy(&u, &v, 4);
       unsigned rounding_bias = ((u >> 16) & 1) + 0x7FFFu;
       unsigned short bf = (unsigned short)((u + rounding_bias) >> 16);
-      out_row[off] = bf;
+      st_wt_u16((void *)&out_row[off], bf);
+      st_wt_u32((void *)&ws_row[off], 0u);
       if (peer_row) {
         st_wt_u16((void *)&peer_row[off], bf);
       }
@@ -1422,8 +1440,19 @@ __device__ __noinline__ void
           ep_col_lo,
           ep_col_hi);
       __syncthreads();
+      // No threadfence_gpu() here. Every store the fold makes -- the local slot,
+      // the peer's slot, and the workspace zeroing -- is now write-through, so
+      // there is nothing sitting in this XCD's L2 for an agent-scope release to
+      // publish. What remains is the part that was always load-bearing:
+      // s_waitcnt vmcnt(0) retires all 256 threads' stores before tid 0's
+      // arrival atomic below, so a consumer that observes the count observes
+      // the bytes.
+      //
+      // The fence was `buffer_wbl2 sc1` on gfx950, an L2->HBM writeback of the
+      // whole cache paid by all 8 folding workgroups on all 36 layers -- the
+      // same cost the Phase 4/5 chunk barrier removed for the same reason (see
+      // the note on db48239 above).
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-      threadfence_gpu();
 
 #if MPK_EP_ABLATE != 1
       if (ep_direct) {
