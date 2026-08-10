@@ -102,8 +102,16 @@ __device__ unsigned long long g_ep9_cnt[2];
 // Slots: [0] qkv_gemm  [1] qkv_barrier  [2] attn  [3] merge+flush
 //        [4] wait_others (to the cross-XCD barrier)  [5] Phase 6 xcd_barrier
 //        [6] Phase 7 oproj+topk  [7] Phase 8 MoE
-__device__ unsigned long long g_fp_ns[8];
+//        [8] Phase 7 split: oproj+router compute only (so [6] - [8] is the
+//            Phase 7b routing_ready wait)
+__device__ unsigned long long g_fp_ns[9];
 __device__ unsigned long long g_fp_cnt;
+// Inside Phase 7's compute half, which is the only part a row-shard of o_proj
+// could halve. [0] o_proj MFMA, [1] the GPU-wide o_proj barrier, [2] RMSNorm +
+// router GEMV. Only [0] is shardable: RMSNorm and the router read the whole
+// hidden vector by definition, so they stay replicated on both ranks.
+__device__ unsigned long long g_op3_ns[3];
+__device__ unsigned long long g_op3_cnt;
 // Worker ARRIVAL spread at 9a: min/max over all 240 workgroups of the instant
 // they reach Phase 9, reset each layer. The W2-tile skew probe says tile
 // completion spreads only 0.48 us, but a worker's last act is not necessarily a

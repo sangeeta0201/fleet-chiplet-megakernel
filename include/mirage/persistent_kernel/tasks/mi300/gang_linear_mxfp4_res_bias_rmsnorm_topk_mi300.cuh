@@ -148,6 +148,12 @@ __device__ __attribute__((noinline)) void
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   unsigned long long _sp_t0 = __builtin_amdgcn_s_memrealtime();
 #endif
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+  // See the [OP3] dump below. Taken unconditionally rather than under
+  // `ts_base`, which the fused wrapper passes as nullptr.
+  unsigned long long _op3_t0 = __builtin_amdgcn_s_memrealtime();
+  unsigned long long _op3_t1 = 0, _op3_t2 = 0;
+#endif
 
   int batch_count =
       (num_active_tokens < BATCH_SIZE) ? num_active_tokens : BATCH_SIZE;
@@ -706,6 +712,7 @@ oproj_barrier :
   if (tid == 0 && ts_base) {
     ts_base[9] = __builtin_amdgcn_s_memrealtime(); // slot 9: oproj_mfma_done
   }
+  _op3_t1 = __builtin_amdgcn_s_memrealtime();
 #endif
   __syncthreads();
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
@@ -796,6 +803,7 @@ oproj_barrier :
     ts_base[10] =
         __builtin_amdgcn_s_memrealtime(); // slot 10: oproj_barrier_done
   }
+  _op3_t2 = __builtin_amdgcn_s_memrealtime();
 #endif
 
   // ════════════════════════════════════════════════════════════════════════
@@ -1030,6 +1038,29 @@ topk_barrier :
   if (tid == 0 && ts_base) {
     ts_base[11] =
         __builtin_amdgcn_s_memrealtime(); // slot 11: rmsnorm_router_done
+  }
+  // Accumulated split of Phase 7's compute half, independent of ts_base (the
+  // fused wrapper passes nullptr there). Sizes the o_proj row-shard: only
+  // _op3_mfma is replicated work a shard removes, and it has to beat the
+  // ~2.2 us mid-layer exchange the shard would add before the router.
+  if (tid == 0 && _op3_t0 > 0) {
+    unsigned long long _op3_t3 = __builtin_amdgcn_s_memrealtime();
+    atomicAdd(&g_op3_ns[0], (unsigned long long)(_op3_t1 - _op3_t0));
+    atomicAdd(&g_op3_ns[1], (unsigned long long)(_op3_t2 - _op3_t1));
+    atomicAdd(&g_op3_ns[2], (unsigned long long)(_op3_t3 - _op3_t2));
+    unsigned long long _on = atomicAdd(&g_op3_cnt, 1ull);
+    // Router tiles per layer x 36 layers; dump once, deep into decode. The
+    // exact per-iteration count varies with router_tile_n, so key off a round
+    // number large enough to be past prefill rather than an exact multiple.
+    if (_on == 200000ull) {
+      double c = (double)g_op3_cnt;
+      printf("[OP3] n=%.0f per_layer_us oproj_mfma=%.3f oproj_bar=%.3f "
+             "rmsnorm_router=%.3f\n",
+             c,
+             (double)g_op3_ns[0] / c / 100.0,
+             (double)g_op3_ns[1] / c / 100.0,
+             (double)g_op3_ns[2] / c / 100.0);
+    }
   }
 #endif
   __syncthreads();

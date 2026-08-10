@@ -978,6 +978,14 @@ __device__ __noinline__ void
     }
   }
 
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+  // Splits Phase 7's [FP18] number into o_proj+router COMPUTE and the Phase 7b
+  // routing_ready WAIT. The two have opposite implications: only the compute
+  // half is replicated work that row-sharding o_proj across EP ranks could
+  // remove, while the wait half would just turn into a longer wait.
+  unsigned long long _fused_t2b = __builtin_amdgcn_s_memrealtime();
+#endif
+
   // ══════════════════════════════════════════════════════════════════
   // Phase 7b: wait for TopK (XCD-local release flag)
   // ══════════════════════════════════════════════════════════════════
@@ -1849,23 +1857,26 @@ __device__ __noinline__ void
       atomicAdd(&g_fp_ns[5], (unsigned long long)(_fused_t2 - _fused_t1));
       atomicAdd(&g_fp_ns[6], (unsigned long long)(_fused_t3 - _fused_t2));
       atomicAdd(&g_fp_ns[7], (unsigned long long)(_fp_t4 - _fused_t3));
+      atomicAdd(&g_fp_ns[8], (unsigned long long)(_fused_t2b - _fused_t2));
       unsigned long long fn = atomicAdd(&g_fp_cnt, 1ull);
       // 8 XCDs x 36 layers = 288 per iteration; dump at ~iteration 100, past
       // the 72 prefill tokens. Same cadence as the EP9 dump.
       if (fn == 288ull * 100ull) {
         double c = (double)g_fp_cnt;
         // Ticks -> us per layer-instance: 1 tick = 10 ns, so /100.
-        double v[8];
-        for (int k = 0; k < 8; k++) {
+        double v[9];
+        for (int k = 0; k < 9; k++) {
           v[k] = (double)g_fp_ns[k] / c / 100.0;
         }
+        // v[8] is a SUBDIVISION of v[6], not another phase -- excluded from
+        // the total, reported as oproj_cmp / oproj_wait.
         double tot = 0;
         for (int k = 0; k < 8; k++) {
           tot += v[k];
         }
         printf("[FP18] n=%.0f per_layer_us qkv_gemm=%.3f qkv_bar=%.3f "
                "attn=%.3f merge=%.3f wait=%.3f xcd_bar=%.3f oproj_topk=%.3f "
-               "moe=%.3f | tot=%.3f x36ms=%.3f\n",
+               "(cmp=%.3f wait=%.3f) moe=%.3f | tot=%.3f x36ms=%.3f\n",
                c,
                v[0],
                v[1],
@@ -1874,6 +1885,8 @@ __device__ __noinline__ void
                v[4],
                v[5],
                v[6],
+               v[8],
+               v[6] - v[8],
                v[7],
                tot,
                tot * 36.0 / 1000.0);
