@@ -447,6 +447,43 @@ if __name__ == "__main__":
             _tensor_refs[name] = t
             return mpk.attach_input(torch_tensor=t, name=name)
 
+        GANG_TILE_N = int(os.environ.get("GANG_TILE_N", "64"))
+        GANG_WGM = int(os.environ.get("GANG_WGM", "0"))
+        # o_proj split-K. The split-K kernel tiles K at KPerBlock = 256, so a
+        # split is only legal when it divides the reduction into whole 256-
+        # element steps; otherwise fall back to the output-parallel GEMM.
+        # Default off: measured 10.70 ms/token at k_splits=4 and 10.86 at 8,
+        # against 10.16 with the plain output-parallel GEMM. Decode latency
+        # here tracks the *number of ops in the task chain*, not tasks per op,
+        # so spending more workers on one op only adds merge traffic.
+        GANG_K_SPLITS = int(os.environ.get("GANG_K_SPLITS", "1"))
+        # The absorbed o_proj reduces over the attention output, one kv_lora
+        # row per q head. Padded heads carry zero o_absorbed columns, so on a
+        # checkpoint whose head count is not a multiple of 16 the GEMM spends
+        # (num_heads_pad - num_heads) / num_heads_pad of its weight traffic --
+        # 37.5% on GLM-4.7-Flash's 20 -> 32 -- multiplying by zeros. It is the
+        # largest single op in the decode chain, so that waste is worth
+        # removing. The only rule this GEMM puts on its reduction is
+        # KPerBlock = 256, and the real heads occupy the leading columns, so
+        # when num_heads * kv_lora is already 256-aligned we can hand it the
+        # unpadded weight and stop the reduction short of the padding.
+        # The q side cannot do this: q_b's *output* must stay 512-aligned and
+        # keep the num_heads_pad * qk_dim stride that MLA decode indexes with.
+        o_proj_red = num_heads * kv_lora
+        if o_proj_red % 256 != 0:
+            o_proj_red = num_heads_pad * kv_lora
+        n_tiles_xcd = hidden_size // 8 // GANG_TILE_N
+        # The split-K task still derives its reduction from the input tensor's
+        # width, so it cannot see a de-padded weight; the two are exclusive.
+        use_splitk_oproj = (GANG_K_SPLITS > 1
+                            and o_proj_red == num_heads_pad * kv_lora
+                            and o_proj_red % (GANG_K_SPLITS * 256) == 0)
+        print(f"[CFG] o_proj K={o_proj_red} out={hidden_size} "
+              f"n_tiles/XCD={n_tiles_xcd} split-K="
+              f"{GANG_K_SPLITS if use_splitk_oproj else 1} -> "
+              f"{n_tiles_xcd * (GANG_K_SPLITS if use_splitk_oproj else 1) * 8}"
+              f" tasks (of {num_workers} workers)")
+
         y = make_tensor("embed_out", (bs, hidden_size))
         rmsnorm_out = make_tensor("rmsnorm_out", (bs, hidden_size))
         qkv_a_out = make_tensor("qkv_a_out", (bs, qkv_a_pad))
@@ -466,6 +503,26 @@ if __name__ == "__main__":
         else:
             mla_o_acc = None
         attn_proj_out = make_tensor("attn_proj_out", (bs, hidden_size))
+        # Split-K accumulator for the absorbed o_proj. Absorption widens that
+        # GEMM's reduction to num_heads_pad * kv_lora (16384 on Flash) while
+        # its output stays at hidden_size, and gang GEMMs only split the
+        # output: hidden/8 XCDs/tile_n = 4 tiles per XCD, i.e. 32 of 240
+        # workers. Splitting K as well brings the rest of the machine in; the
+        # partials merge through this f32 buffer.
+        #
+        # The buffer is *wider than hidden_size on purpose*. Each XCD gets
+        # dim 1 / 8, and `register_gang_splitk_linear_res_mi300_task` puts that
+        # XCD's per-n_tile done counters immediately after its float data, at
+        # `input_ptrs[3] + bs * n_tiles * tile_n`. Sized at exactly
+        # hidden_size, that lands inside the *next* XCD's accumulator (and off
+        # the end for XCD 7), which silently corrupts o_proj -- the decode
+        # degenerates to a single repeated token. So give every chunk
+        # n_tiles_xcd extra floats to hold its own counters. The kernel's row
+        # stride stays n_tiles*tile_n, so this only holds at bs == 1.
+        assert bs == 1, "split-K o_proj workspace layout assumes bs == 1"
+        splitk_ws = make_tensor("splitk_workspace",
+                                (bs, hidden_size + 8 * n_tiles_xcd),
+                                torch_dtype=torch.float32)
         rmsnorm_out_moe = make_tensor("rmsnorm_out_moe", (bs, hidden_size))
         layer_out = make_tensor("layer_out", (bs, hidden_size))
 
@@ -543,8 +600,6 @@ if __name__ == "__main__":
                 p.data = torch.empty(0, dtype=p.data.dtype,
                                      device=p.data.device)
 
-        GANG_TILE_N = int(os.environ.get("GANG_TILE_N", "64"))
-        GANG_WGM = int(os.environ.get("GANG_WGM", "0"))
 
         # ── Graph ────────────────────────────────────────────────────────────
         w_embed = _attach_input_keep(model.model.embed_tokens.weight.data,
@@ -591,9 +646,13 @@ if __name__ == "__main__":
             q_b_absorbed = absorb_q_b(
                 attn.q_b_proj.weight.data, attn._w_uk,
                 num_heads, qk_nope, qk_rope, q_lora).to(torch.bfloat16)
-            # Zero columns over the latent half of the fused row: q_b reduces
-            # over the whole thing and must ignore everything past q_lora.
-            q_b_absorbed = pad_cols(q_b_absorbed, qkv_a_pad)
+            # q_b only wants the q_a half of the fused [q_a | latent] row, so
+            # it reduces over q_lora_pad rather than the full qkv_a_pad. Both
+            # are legal reductions (256-aligned) and the q_a half leads the
+            # row, but stopping at q_lora_pad halves the widest weight in the
+            # model -- [num_heads_pad * qk_dim, qkv_a_pad] is 75.5 MB/layer on
+            # Flash, and every column past q_lora_pad is zero.
+            q_b_absorbed = pad_cols(q_b_absorbed, q_lora_pad)
             q_b_absorbed = pad_rows(q_b_absorbed, num_heads_pad * qk_dim)
             w_q_b = _attach_input_keep(q_b_absorbed,
                                        f"layer_{i}_q_b_absorbed")
@@ -601,7 +660,7 @@ if __name__ == "__main__":
             o_absorbed = absorb_o_proj(
                 attn.o_proj.weight.data, attn._w_uv,
                 num_heads, v_head, kv_lora).to(torch.bfloat16)
-            o_absorbed = pad_cols(o_absorbed, num_heads_pad * kv_lora)
+            o_absorbed = pad_cols(o_absorbed, o_proj_red)
             w_o = _attach_input_keep(o_absorbed, f"layer_{i}_o_absorbed")
 
             attn._w_uk = None
@@ -640,6 +699,7 @@ if __name__ == "__main__":
                 output=q_absorbed,
                 actual_hidden_dim=q_lora,
                 norm_span=q_lora_pad,
+                reduction_size=q_lora_pad,
                 tile_n=GANG_TILE_N,
                 output_stride=num_heads_pad * qk_dim,
                 wgm=GANG_WGM,
@@ -683,16 +743,30 @@ if __name__ == "__main__":
                     block_dim=(256, 1, 1),
                 )
             # 5. absorbed o_proj + residual
-            mpk.gang_linear_with_residual_layer(
-                input=attn_out,
-                weight=w_o,
-                residual=x,
-                output=attn_proj_out,
-                tile_n=GANG_TILE_N,
-                output_stride=hidden_size,
-                wgm=GANG_WGM,
-                block_dim=(256, 1, 1),
-            )
+            if use_splitk_oproj:
+                mpk.gang_splitk_linear_with_residual_layer(
+                    input=attn_out,
+                    weight=w_o,
+                    residual=x,
+                    workspace=splitk_ws,
+                    output=attn_proj_out,
+                    tile_n=GANG_TILE_N,
+                    output_stride=hidden_size,
+                    k_splits=GANG_K_SPLITS,
+                    block_dim=(256, 1, 1),
+                )
+            else:
+                mpk.gang_linear_with_residual_layer(
+                    input=attn_out,
+                    weight=w_o,
+                    residual=x,
+                    output=attn_proj_out,
+                    tile_n=GANG_TILE_N,
+                    output_stride=hidden_size,
+                    wgm=GANG_WGM,
+                    reduction_size=o_proj_red,
+                    block_dim=(256, 1, 1),
+                )
 
             w_norm_moe = _attach_input_keep(
                 layer.post_attention_layernorm.weight.data,

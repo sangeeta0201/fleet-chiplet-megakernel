@@ -844,7 +844,7 @@ int TaskRegister::register_gang_linear_mi300_task(
 //          n_tiles_per_xcd, wgm]
 int TaskRegister::register_gang_linear_res_mi300_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 7);
+  assert(params.size() == 8);
   int output_stride = params[0];
   int tile_n = params[1];
   int m_tiles = params[2];
@@ -852,6 +852,10 @@ int TaskRegister::register_gang_linear_res_mi300_task(
   int total_tiles_per_xcd = params[4];
   int n_tiles_per_xcd = params[5];
   int wgm = params[6];
+  // Optional override; 0 means "reduce over the whole input row". A caller
+  // passes this when the input is deliberately wider than the weight, so the
+  // GEMM can stop short of a padded tail instead of multiplying by zeros.
+  int reduction_override = params[7];
 
   int reduction_size = 0;
   std::vector<tb::TBInputOp *> input_ops;
@@ -867,7 +871,9 @@ int TaskRegister::register_gang_linear_res_mi300_task(
     }
   }
   assert(input_ops[0]->dtensor.num_dims == 2);
-  reduction_size = input_ops[0]->dtensor.dim[1];
+  reduction_size = reduction_override > 0 ? reduction_override
+                                          : input_ops[0]->dtensor.dim[1];
+  assert(reduction_size <= input_ops[0]->dtensor.dim[1]);
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
@@ -1002,7 +1008,7 @@ int TaskRegister::register_gang_splitk_linear_res_bias_mi300_task(
 // Outputs: [linear_output]
 int TaskRegister::register_gang_rmsnorm_linear_bias_mi300_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 8 || params.size() == 9);
+  assert(params.size() >= 8 && params.size() <= 10);
   int output_stride = params[0];
   int tile_n = params[1];
   int m_tiles = params[2];
@@ -1034,9 +1040,18 @@ int TaskRegister::register_gang_rmsnorm_linear_bias_mi300_task(
   // Optional 9th param: the leading span of the row the RMS sum runs over.
   // Defaults to the whole row; GLM's q_a_layernorm passes the padded q_lora
   // width because its input row is the fused [q_a | kv_latent] projection.
-  int norm_span = params.size() == 9 ? params[8] : reduction_size;
+  int norm_span = params.size() >= 9 ? params[8] : reduction_size;
   assert(norm_span > 0 && norm_span <= reduction_size);
   assert(actual_hidden_dim <= norm_span);
+  // Optional 10th param: shorten the reduction itself, dropping a zero-padded
+  // tail from the GEMM instead of multiplying the weight against it. The
+  // extent doubles as the row stride, so this is single-row only.
+  if (params.size() == 10) {
+    assert(params[9] > 0 && params[9] <= reduction_size);
+    assert(norm_span <= params[9]);
+    assert(m_per_tile == 1);
+    reduction_size = params[9];
+  }
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();

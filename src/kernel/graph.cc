@@ -590,7 +590,7 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     task_config[op] = std::make_tuple(2, 1, TASK_GANG_LINEAR_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[4]; // total_tiles_per_xcd (m*n)
   } else if (name == "gang_linear_res_mi300") {
-    assert(params.size() == 7);
+    assert(params.size() == 8);
     int variant_id = task_register->register_gang_linear_res_mi300_task(
         customized->bgraph, params);
     task_config[op] =
@@ -616,10 +616,10 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         5, 1, TASK_GANG_SPLITK_LINEAR_RES_BIAS_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[2] * params[3]; // n_tiles × k_splits
   } else if (name == "gang_rmsnorm_linear_bias_mi300") {
-    assert((params.size() == 8 || params.size() == 9) &&
+    assert(params.size() >= 8 && params.size() <= 10 &&
            "gang_rmsnorm_linear_bias_mi300 needs [o_stride, tile_n, m_tiles, "
            "m_per_tile, total_tiles, n_tiles, wgm, actual_hidden_dim, "
-           "(norm_span)]");
+           "(norm_span), (reduction_size)]");
     int variant_id =
         task_register->register_gang_rmsnorm_linear_bias_mi300_task(
             customized->bgraph, params);

@@ -2416,9 +2416,17 @@ class PersistentKernel:
         output_stride: int,
         m_tiles: int = 1,
         wgm: int = 0,
+        reduction_size: int = 0,
         block_dim: tuple = (256, 1, 1),
     ):
-        """Gang linear with residual + HipKittens Algorithm 1 windowed traversal."""
+        """Gang linear with residual + HipKittens Algorithm 1 windowed traversal.
+
+        `reduction_size` defaults to the full input row. Pass a smaller value
+        (and a correspondingly narrow weight) when the input carries a padded
+        tail the GEMM should skip -- the task chain matches producers to
+        consumers by tensor guid, so the input has to stay the full tensor the
+        previous op wrote even when only a prefix of it is meaningful.
+        """
         assert input.num_dims == 2
         assert weight.num_dims == 2
         assert residual.num_dims == 2
@@ -2442,13 +2450,15 @@ class PersistentKernel:
         tb_graph.new_input(residual, (1, -1, -1), 1, True)
         # output: partition dim 1 (columns) by bid.x
         tb_graph.new_input(output, (1, -1, -1), -1, True)
+        assert reduction_size == 0 or reduction_size == weight.dim(1), (
+            "reduction_size must match the weight's reduction extent")
         self.kn_graph.customized([input, weight, residual, output], tb_graph)
         # params: [output_stride, tile_n, m_tiles, m_per_tile, total_tiles_per_xcd,
-        #          n_tiles_per_xcd, wgm]
+        #          n_tiles_per_xcd, wgm, reduction_size]
         self.kn_graph.register_task(
             tb_graph, "gang_linear_res_mi300",
             [output_stride, tile_n, m_tiles, m_per_tile, total_tiles_per_xcd,
-             n_tiles_per_xcd, wgm]
+             n_tiles_per_xcd, wgm, reduction_size]
         )
 
 
@@ -2506,6 +2516,7 @@ class PersistentKernel:
         m_tiles: int = 1,
         wgm: int = 0,
         norm_span: int = 0,
+        reduction_size: int = 0,
         block_dim: tuple = (256, 1, 1),
     ):
         """Fused RMSNorm + Gang Linear + Bias.
@@ -2528,6 +2539,15 @@ class PersistentKernel:
         besides the normed vector and its zero padding -- GLM's q_a_layernorm
         reads the fused ``[q_a | kv_latent]`` projection and must leave the
         latent columns out of the denominator.
+
+        ``reduction_size`` (default: the whole row) narrows *both* the norm and
+        the GEMM to a leading prefix of the row. Where ``norm_span`` still
+        normalises and multiplies the full width and only shortens the RMS
+        denominator, this drops the tail from the GEMM entirely -- worth it
+        when the tail is zero padding, since the weight columns against it are
+        dead traffic. Requires ``m_per_tile == 1``: the kernel takes the
+        reduction extent as the row stride too, so a narrowed value only
+        addresses correctly when there is a single row.
         """
         assert norm_input.num_dims == 2
         assert linear_weight.num_dims == 2
@@ -2557,9 +2577,18 @@ class PersistentKernel:
         )
         params = [output_stride, tile_n, m_tiles, m_per_tile,
                   total_tiles_per_xcd, n_tiles_per_xcd, wgm, actual_hidden_dim]
+        if reduction_size and not norm_span:
+            norm_span = reduction_size
         if norm_span:
             assert actual_hidden_dim <= norm_span <= norm_input.dim(1)
             params.append(norm_span)
+        if reduction_size:
+            assert norm_span <= reduction_size <= norm_input.dim(1)
+            assert reduction_size == linear_weight.dim(1), (
+                "reduction_size must match the linear weight's reduction extent")
+            assert m_per_tile == 1, (
+                "a narrowed reduction doubles as the row stride; needs one row")
+            params.append(reduction_size)
         self.kn_graph.register_task(
             tb_graph, "gang_rmsnorm_linear_bias_mi300", params
         )
