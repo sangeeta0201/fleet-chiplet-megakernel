@@ -1147,6 +1147,105 @@ int TaskRegister::register_gang_rmsnorm_linear_bias_topk_mi300_task(
                                code.to_string());
 }
 
+// Same fusion as above, with the `noaux_tc` router tail (GLM / DeepSeek):
+// sigmoid scores plus an additive selection bias instead of a softmax.
+//
+// Two shape differences follow from that tail and are asserted below. The bias
+// is the full [num_experts] correction vector rather than an XCD-partitioned
+// slice, because the tail needs all of it and no worker folds its own element
+// into a logit. And the routing tables are sized for the *total* expert count:
+// GLM's always-on shared expert rides along as one extra row and one extra
+// routing slot, so it is inferred from the gap rather than passed in.
+//
+// params: the 11 of the softmax variant, plus
+//         [11] routed_scaling_factor in 1/1000 units (GLM-5: 2500 => 2.5f)
+//         [12] norm_topk_prob (0/1)
+int TaskRegister::register_gang_rmsnorm_linear_bias_topk_sigmoid_mi300_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 13);
+  int output_stride = params[0];
+  int tile_n = params[1];
+  int m_tiles = params[2];
+  int m_per_tile = params[3];
+  int total_tiles_per_xcd = params[4];
+  int n_tiles_per_xcd = params[5];
+  int wgm = params[6];
+  int actual_hidden_dim = params[7];
+  int num_experts = params[8];
+  int num_experts_per_tok = params[9];
+  int total_gang_tiles = params[10];
+  (void)total_tiles_per_xcd;
+
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 7;  // norm_input, norm_weight, norm_output, linear_weight,
+                       // bias, logits_scratch, gang_counter
+  int num_outputs = 3; // topk_weight, routing_indices, active_expert_ids
+
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  // input[0] is norm_input [batch, reduction_size]
+  assert(input_ops[0]->dtensor.num_dims == 2);
+  int batch_size = input_ops[0]->dtensor.dim[0];
+  int reduction_size = input_ops[0]->dtensor.dim[1];
+
+  // e_score_correction_bias: the whole [num_experts] vector, unpartitioned.
+  assert(input_ops[4]->dtensor.num_dims == 1);
+  assert(input_ops[4]->output_tensors[0].dim[0] == num_experts);
+
+  assert(output_ops[0]->output_tensors[0].num_dims == 2);
+  assert(output_ops[1]->output_tensors[0].num_dims == 2);
+  assert(output_ops[2]->output_tensors[0].num_dims == 1);
+  int num_total_experts = output_ops[1]->output_tensors[0].dim[0];
+  int num_shared_experts = num_total_experts - num_experts;
+  assert(num_shared_experts == 0 || num_shared_experts == 1);
+  assert(output_ops[1]->output_tensors[0].dim[1] == batch_size);
+  assert(output_ops[0]->output_tensors[0].dim[0] == batch_size);
+  assert(output_ops[0]->output_tensors[0].dim[1] ==
+         num_experts_per_tok + num_shared_experts);
+  assert(output_ops[2]->output_tensors[0].dim[0] == num_total_experts + 1);
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::gang_rmsnorm_linear_bias_topk_kernel<bfloat16, $, $, $, $, "
+         "$, true>(",
+         m_per_tile,
+         reduction_size,
+         actual_hidden_dim,
+         num_experts,
+         num_experts_per_tok);
+  code.e("    task_desc->input_ptrs[0],");  // norm_input
+  code.e("    task_desc->input_ptrs[1],");  // norm_weight
+  code.e("    task_desc->input_ptrs[2],");  // norm_output scratch
+  code.e("    task_desc->input_ptrs[3],");  // linear_weight
+  code.e("    task_desc->input_ptrs[4],");  // e_score_correction_bias
+  code.e("    task_desc->input_ptrs[5],");  // logits_scratch
+  code.e("    task_desc->input_ptrs[6],");  // gang_counter
+  code.e("    task_desc->output_ptrs[0],"); // topk_weight
+  code.e("    task_desc->output_ptrs[1],"); // routing_indices
+  code.e("    task_desc->output_ptrs[2],"); // active_expert_ids
+  code.e("    runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS],");
+  code.e("    $,", tile_n);
+  code.e("    $,", output_stride);
+  code.e("    $,", m_tiles);
+  code.e("    $,", n_tiles_per_xcd);
+  code.e("    $,", wgm);
+  code.e("    tile_idx,");
+  code.e("    $,", total_gang_tiles);
+  code.e("    $,", params[12] != 0 ? "true" : "false");
+  code.e("    $ / 1000.0f,", params[11]);
+  code.e("    $);", num_shared_experts);
+  return register_task_variant(TASK_GANG_RMSNORM_LINEAR_BIAS_TOPK_MI300,
+                               code.to_string());
+}
+
 // Fused RMSNorm + MXFP4 Gang Linear + Bias.
 // params: [output_stride, output_per_wg, n_wgs_per_xcd, total_tiles_per_xcd,
 //          actual_hidden_dim]

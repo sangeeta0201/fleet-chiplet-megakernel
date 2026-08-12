@@ -16,6 +16,7 @@
  */
 #pragma once
 #include "gang_linear_mi300.cuh"
+#include "moe_topk_sigmoid_bias_mi300.cuh"
 #include "moe_topk_softmax_mi300.cuh"
 #include <hip/hip_bf16.h>
 
@@ -294,6 +295,57 @@ __device__ __attribute__((noinline)) void
     *static_cast<int *>(gang_counter_ptr) = 0;
   }
 }
+
+// `noaux_tc` counterpart of topk_noinline, for GLM / DeepSeek-style routers.
+//
+// The bias behaves differently here and that difference reaches back into the
+// GEMV: `e_score_correction_bias` steers the top-k *choice* through
+// sigmoid(logit) + bias, but the weight that gets emitted comes from the
+// unbiased sigmoid. So the caller must leave the logit alone and hand the full
+// bias vector down to this tail, instead of folding one element into its own
+// logit the way the softmax path does.
+template <typename T, int NUM_EXPERTS, int K>
+__device__ __attribute__((noinline)) void
+    topk_sigmoid_noinline(void *logits_scratch_ptr,
+                          void *bias_ptr,
+                          void *topk_weight_ptr,
+                          void *routing_indices_ptr,
+                          void *active_expert_ids_ptr,
+                          void *gang_counter_ptr,
+                          int num_active_tokens,
+                          bool renormalize,
+                          float routed_scaling_factor,
+                          int num_shared_experts) {
+  constexpr int CHUNK_N = NUM_EXPERTS / 8;
+  int xcd_id = get_xcd_id();
+  void *logits_base = static_cast<T *>(logits_scratch_ptr) -
+                      static_cast<int64_t>(xcd_id) * CHUNK_N;
+
+  asm volatile("buffer_inv" ::: "memory");
+
+  topk_sigmoid_bias_mi300_task_impl<T,
+                                    /*VPT=*/8,
+                                    NUM_EXPERTS,
+                                    /*WARPS_PER_CTA=*/4,
+                                    /*BYTES_PER_LDG=*/16>(
+      logits_base,
+      bias_ptr,
+      topk_weight_ptr,
+      num_active_tokens,
+      K,
+      routing_indices_ptr,
+      active_expert_ids_ptr,
+      0,
+      NUM_EXPERTS,
+      renormalize,
+      routed_scaling_factor,
+      num_shared_experts);
+
+  // Reset counter for the next layer's use.
+  if (threadIdx.x == 0) {
+    *static_cast<int *>(gang_counter_ptr) = 0;
+  }
+}
 } // namespace gang_rmsnorm_topk_detail
 
 // Croc-style fused RMSNorm + Gate GEMV + TopK.
@@ -304,19 +356,25 @@ __device__ __attribute__((noinline)) void
 //      Also writes norm_output (for downstream MoE FP8 quant) as side-effect
 //   3. Writes 1 logit via write-through store
 //   4. atomicAdd barrier; last worker runs TopK softmax
+//
+// SIGMOID_BIAS switches the tail to the `noaux_tc` router (GLM / DeepSeek):
+// sigmoid scores with an additive selection bias instead of a softmax. Steps
+// 1-3 are identical; only the treatment of `bias_ptr` and the tail differ.
 template <typename T,
           int BATCH_SIZE,
           int REDUCTION_SIZE,
           int ACTUAL_HIDDEN_DIM,
           int NUM_EXPERTS,
-          int K>
+          int K,
+          bool SIGMOID_BIAS = false>
 __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     void const *norm_input_ptr,  // input_ptrs[0]: [batch, REDUCTION_SIZE]
     void const *norm_weight_ptr, // input_ptrs[1]: [REDUCTION_SIZE]
     void *norm_output_ptr, // input_ptrs[2]: [batch, REDUCTION_SIZE] scratch
     void const
         *gate_weight_ptr,     // input_ptrs[3]: [chunk_N, REDUCTION_SIZE] bf16
-    void const *bias_ptr,     // input_ptrs[4]: [chunk_N] bf16 (XCD-partitioned)
+    void const *bias_ptr,     // input_ptrs[4]: [chunk_N] bf16 (XCD-partitioned;
+                              // the whole [NUM_EXPERTS] under SIGMOID_BIAS)
     void *logits_scratch_ptr, // input_ptrs[5]: XCD-partitioned [batch, chunk_N]
     void *gang_counter_ptr,   // input_ptrs[6]: [1] int32 atomic counter
     void *topk_weight_ptr,    // output_ptrs[0]: [batch, K] float
@@ -329,7 +387,11 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     int n_tiles,
     int wgm,
     int tile_idx,
-    int total_gang_tiles) {
+    int total_gang_tiles,
+    // SIGMOID_BIAS only; ignored by the softmax tail.
+    bool renormalize = true,
+    float routed_scaling_factor = 1.0f,
+    int num_shared_experts = 0) {
 
   using bf16 = __hip_bfloat16;
   bf16 const *__restrict__ d_hidden = static_cast<bf16 const *>(norm_input_ptr);
@@ -460,7 +522,10 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     for (int w = 0; w < NUM_WAVES; w++) {
       s += red[w];
     }
-    if (d_bias) {
+    // `noaux_tc` keeps its bias out of the logit -- it only steers selection,
+    // and the weight that gets emitted comes from the unbiased sigmoid. The
+    // tail applies it. Everyone else folds it in here as an ordinary GEMV bias.
+    if (!SIGMOID_BIAS && d_bias) {
       s += __bfloat162float(d_bias[tile_idx]);
     }
     bf16 bval = __float2bfloat16(s);
@@ -480,15 +545,29 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   __syncthreads();
   int completed = s_completed;
 
-  // ═══ Step 4: Last worker runs TopK softmax ═══
+  // ═══ Step 4: Last worker runs TopK ═══
   if (completed == total_gang_tiles) {
-    gang_rmsnorm_topk_detail::topk_noinline<T, NUM_EXPERTS, K>(
-        logits_scratch_ptr,
-        topk_weight_ptr,
-        routing_indices_ptr,
-        active_expert_ids_ptr,
-        gang_counter_ptr,
-        num_active_tokens);
+    if constexpr (SIGMOID_BIAS) {
+      gang_rmsnorm_topk_detail::topk_sigmoid_noinline<T, NUM_EXPERTS, K>(
+          logits_scratch_ptr,
+          const_cast<void *>(bias_ptr),
+          topk_weight_ptr,
+          routing_indices_ptr,
+          active_expert_ids_ptr,
+          gang_counter_ptr,
+          num_active_tokens,
+          renormalize,
+          routed_scaling_factor,
+          num_shared_experts);
+    } else {
+      gang_rmsnorm_topk_detail::topk_noinline<T, NUM_EXPERTS, K>(
+          logits_scratch_ptr,
+          topk_weight_ptr,
+          routing_indices_ptr,
+          active_expert_ids_ptr,
+          gang_counter_ptr,
+          num_active_tokens);
+    }
   }
 }
 

@@ -540,6 +540,11 @@ if __name__ == "__main__":
                                torch_dtype=torch.int32)
         moe_topk_weight = make_tensor("moe_topk_weight", (bs, topk_total),
                                       torch_dtype=torch.float32)
+        # Cross-XCD arrival counter for the fused router. The last of the
+        # num_experts workers to land runs the TopK tail, then resets this to
+        # 0 for the next layer, so one buffer serves all of them.
+        router_topk_counter = make_tensor("router_topk_counter", (1,),
+                                          torch_dtype=torch.int32)
         moe_mid = make_tensor("moe_mid", (bs, topk_total, 2 * moe_inter))
         moe_act = make_tensor("moe_act", (bs, topk_total, moe_inter))
         moe_out = make_tensor("moe_out", (bs, topk_total, hidden_size))
@@ -845,34 +850,37 @@ if __name__ == "__main__":
                 _release(e.gate_proj.weight, e.up_proj.weight,
                          e.down_proj.weight)
 
-            # post_attention_layernorm. Nothing to fuse it with: the router
-            # GEMM is too narrow for the gang path, and the expert GEMMs are
-            # gathered.
-            mpk.rmsnorm_layer(
-                input=attn_proj_out,
-                weight=w_norm_moe,
-                output=rmsnorm_out_moe,
-                grid_dim=(args.max_num_batched_tokens, 1, 1),
-                block_dim=(256, 1, 1),
-            )
-
-            # Router. num_experts/8 is 32 or 8, both below the gang GEMM's
-            # 64-wide N tile, so this stays on the non-gang linear task.
-            mpk.linear_layer(
-                input=rmsnorm_out_moe,
-                weight=w_router,
-                output=moe_gate_out,
-                grid_dim=(1, 1, 1),
-                block_dim=(256, 1, 1),
-            )
-            mpk.moe_topk_sigmoid_bias_routing_layer(
-                input=moe_gate_out,
+            # post_attention_layernorm + router GEMV + routing, fused.
+            #
+            # Kept apart these were three consecutive single-task ops -- the
+            # rmsnorm ran on one worker per token, the router GEMM was too
+            # narrow for the gang tile (num_experts/8 falls under the 64-wide
+            # N tile), and the routing task is inherently serial. Three
+            # dispatch barriers per layer with 239 of 240 workers idle.
+            #
+            # The Croc-style fusion instead gives one worker to each expert:
+            # every worker recomputes the (identical) RMSNorm, does its own
+            # row of the gate GEMV, and the last one across all 8 XCDs runs
+            # the TopK tail behind an atomic-counter barrier. The redundant
+            # norm is far cheaper than the barriers it replaces.
+            mpk.gang_rmsnorm_linear_bias_topk_sigmoid_layer(
+                norm_input=attn_proj_out,
+                norm_weight=w_norm_moe,
+                norm_output=rmsnorm_out_moe,
+                linear_weight=w_router,
                 bias=w_router_bias,
-                output=(moe_topk_weight, moe_routing_indices, moe_mask),
-                grid_dim=(1, 1, 1),
-                block_dim=(256, 1, 1),
+                logits_scratch=moe_gate_out,
+                gang_counter=router_topk_counter,
+                topk_weight=moe_topk_weight,
+                routing_indices=moe_routing_indices,
+                active_expert_ids=moe_mask,
+                actual_hidden_dim=hidden_size,
+                tile_n=1,
+                output_stride=num_experts,
+                num_experts_per_tok=topk,
                 routed_scaling_factor=config.routed_scaling_factor,
                 norm_topk_prob=config.norm_topk_prob,
+                block_dim=(256, 1, 1),
             )
             mpk.gang_moe_w13_linear_layer(
                 input=rmsnorm_out_moe,

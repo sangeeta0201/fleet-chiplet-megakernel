@@ -115,6 +115,13 @@ def main():
     counts = np.bincount(tt_be, minlength=ntypes)
     depwait = np.bincount(tt_fb, weights=d_depwait, minlength=ntypes)
 
+    # Slowest single call of each type. For a gang task whose workers all run
+    # concurrently this -- not the mean -- is what the critical path pays, and
+    # the two diverge sharply when one worker does extra serial work (a fused
+    # kernel's TopK tail, say) while its peers just exit.
+    slowest = np.zeros(ntypes)
+    np.maximum.at(slowest, tt_be, d_compute)
+
     if counts.sum() == 0:
         print("no complete BEGIN/END pairs -- was the build made with "
               "--profiling and the buffer large enough?")
@@ -128,8 +135,8 @@ def main():
     total_depwait = depwait.sum() / tpu / it
 
     print(f"\n{'task type':<52}{'n/iter':>8}{'compute us':>12}"
-          f"{'us/call':>10}{'depwait us':>12}")
-    print("-" * 94)
+          f"{'us/call':>10}{'max/call':>10}{'depwait us':>12}")
+    print("-" * 104)
     shown = 0
     for t in order:
         if counts[t] == 0:
@@ -137,14 +144,15 @@ def main():
         n = counts[t] / it
         c = compute[t] / tpu / it
         print(f"{names.get(int(t), f'<{t}>'):<52}{n:>8.0f}{c:>12.1f}"
-              f"{c / max(n, 1):>10.2f}{depwait[t] / tpu / it:>12.1f}")
+              f"{c / max(n, 1):>10.2f}{slowest[t] / tpu:>10.2f}"
+              f"{depwait[t] / tpu / it:>12.1f}")
         shown += 1
         if shown >= args.top:
             break
-    print("-" * 94)
+    print("-" * 104)
     print(f"{'TOTAL (summed over workers, per iter)':<52}"
           f"{counts.sum() / it:>8.0f}{total_compute:>12.1f}"
-          f"{'':>10}{total_depwait:>12.1f}")
+          f"{'':>10}{'':>10}{total_depwait:>12.1f}")
 
     # Critical path: the megakernel is one long linear chain, so the useful
     # wall-clock proxy is the span from first BEGIN to last END.

@@ -127,6 +127,9 @@ public:
   // MI300 fused RMSNorm + gang linear + bias + TopK softmax
   int register_gang_rmsnorm_linear_bias_topk_mi300_task(
       threadblock::Graph const &bgraph, std::vector<int> const &params);
+  // MI300 fused RMSNorm + gang linear + `noaux_tc` sigmoid/bias TopK
+  int register_gang_rmsnorm_linear_bias_topk_sigmoid_mi300_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
   // MI300 fused RMSNorm + MXFP4 gang linear + bias
   int register_gang_rmsnorm_linear_mxfp4_bias_mi300_task(
       threadblock::Graph const &bgraph, std::vector<int> const &params);

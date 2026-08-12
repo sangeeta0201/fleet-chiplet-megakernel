@@ -2666,6 +2666,106 @@ class PersistentKernel:
              num_experts_per_tok, total_gang_tiles]
         )
 
+    def gang_rmsnorm_linear_bias_topk_sigmoid_layer(
+        self,
+        norm_input: DTensor,
+        norm_weight: DTensor,
+        norm_output: DTensor,
+        linear_weight: DTensor,
+        bias: DTensor,
+        logits_scratch: DTensor,
+        gang_counter: DTensor,
+        topk_weight: DTensor,
+        routing_indices: DTensor,
+        active_expert_ids: DTensor,
+        actual_hidden_dim: int,
+        tile_n: int,
+        output_stride: int,
+        num_experts_per_tok: int = 4,
+        routed_scaling_factor: float = 1.0,
+        norm_topk_prob: bool = True,
+        m_tiles: int = 1,
+        wgm: int = 0,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Fused RMSNorm + Gang Linear + `noaux_tc` sigmoid/bias TopK.
+
+        The GLM / DeepSeek counterpart of gang_rmsnorm_linear_bias_topk_layer.
+        It collapses the three single-task ops that used to open every MoE
+        layer -- rmsnorm, the router GEMV, and the routing task -- into one
+        gang task spread over num_experts workers.
+
+        Two things differ from the softmax variant, both because of how
+        `noaux_tc` uses its bias. ``bias`` is ``e_score_correction_bias``: it
+        steers selection via sigmoid(logit) + bias but never reaches the
+        emitted weight, so it stays out of the GEMV and is declared
+        unpartitioned -- the TopK tail reads all num_experts entries.
+        ``routing_indices`` / ``active_expert_ids`` are sized for the *total*
+        expert count, one row past num_experts when a shared expert rides along
+        as an extra routing slot; the kernel infers it from that gap.
+
+        Inputs (7): norm_input, norm_weight, norm_output (scratch),
+                    linear_weight, bias, logits_scratch (scratch),
+                    gang_counter (scratch).
+        Outputs (3): topk_weight, routing_indices, active_expert_ids.
+        """
+        assert norm_input.num_dims == 2
+        assert linear_weight.num_dims == 2
+        assert logits_scratch.num_dims == 2
+        assert bias.num_dims == 1  # (num_experts,)
+        assert routing_indices.num_dims == 2  # (num_total_experts, batch)
+        assert active_expert_ids.num_dims == 1  # (num_total_experts + 1,)
+        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+        batch_size = self.max_num_batched_tokens
+        num_experts = output_stride  # router output width = num_experts
+        assert bias.dim(0) == num_experts
+        num_shared_experts = routing_indices.dim(0) - num_experts
+        assert num_shared_experts in (0, 1)
+        assert topk_weight.dim(1) == num_experts_per_tok + num_shared_experts
+        output_size = linear_weight.dim(0)
+        assert output_size % 8 == 0
+        chunk_n = output_size // 8
+        assert chunk_n % tile_n == 0
+        n_tiles_per_xcd = chunk_n // tile_n
+        assert batch_size % m_tiles == 0
+        m_per_tile = batch_size // m_tiles
+        total_tiles_per_xcd = n_tiles_per_xcd * m_tiles
+        total_gang_tiles = total_tiles_per_xcd * 8  # 8 XCDs on MI300X
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        # 7 inputs
+        tb_graph.new_input(norm_input, (-1, -1, -1), 1, True)
+        tb_graph.new_input(norm_weight, (-1, -1, -1), 0, True)
+        tb_graph.new_input(norm_output, (-1, -1, -1), 1, True)
+        tb_graph.new_input(linear_weight, (0, -1, -1), 1, True)
+        tb_graph.new_input(bias, (-1, -1, -1), 0, True)
+        tb_graph.new_input(logits_scratch, (1, -1, -1), 1, True)
+        tb_graph.new_input(gang_counter, (-1, -1, -1), 0, True)
+        # 3 outputs
+        tb_graph.new_input(topk_weight, (0, -1, -1), -1, True)
+        tb_graph.new_input(routing_indices, (-1, -1, -1), -1, True)
+        tb_graph.new_input(active_expert_ids, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [norm_input, norm_weight, norm_output, linear_weight, bias,
+             logits_scratch, gang_counter,
+             topk_weight, routing_indices, active_expert_ids],
+            tb_graph,
+        )
+        # routed_scaling_factor travels as an int (register_task takes ints
+        # only); 1/1000 units is exact for the values these configs use.
+        scaling_milli = int(round(routed_scaling_factor * 1000.0))
+        assert abs(scaling_milli / 1000.0 - routed_scaling_factor) < 1e-9, (
+            f"routed_scaling_factor {routed_scaling_factor} not representable "
+            "in 1/1000 units"
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_rmsnorm_linear_bias_topk_sigmoid_mi300",
+            [output_stride, tile_n, m_tiles, m_per_tile, total_tiles_per_xcd,
+             n_tiles_per_xcd, wgm, actual_hidden_dim, num_experts,
+             num_experts_per_tok, total_gang_tiles,
+             scaling_milli, 1 if norm_topk_prob else 0]
+        )
+
     def gang_rmsnorm_linear_mxfp4_bias_layer(
         self,
         norm_input: DTensor,
