@@ -518,13 +518,29 @@ if __name__ == "__main__":
         o_proj_red = num_heads * kv_lora
         if o_proj_red % 256 != 0:
             o_proj_red = num_heads_pad * kv_lora
-        n_tiles_xcd = hidden_size // 8 // GANG_TILE_N
+        # The other way to un-starve o_proj, and the one that works: keep the
+        # op output-parallel but make the tiles narrower. The 64-column floor
+        # came from the 16x64x256 MFMA tile, and at batch 1 that tile was
+        # discarding 15 of its 16 rows to begin with, so dropping MFMA for a
+        # plain GEMV costs nothing and lets tile_n go to 8. That is 256 tiles
+        # instead of 32, and the partial sums never leave registers.
+        # Measured sweep at K=10240, out=2048 (ms/iter): 4 -> 7.185, 8 -> 7.354,
+        # 16 -> 7.135, 32 -> 7.788, 64 -> 9.141 (CK MFMA at 64: 7.896). Not
+        # monotonic, because tile count has to land well on 30 workers/XCD: 16
+        # gives 16 tiles and one clean round, 8 gives 32 tiles and spends a
+        # whole second round on two of them. 0 restores the CK path.
+        OPROJ_GEMV_ROWS = int(os.environ.get("GLM_OPROJ_GEMV_ROWS", "16"))
+        use_gemv_oproj = OPROJ_GEMV_ROWS > 0 and not (
+            GANG_K_SPLITS > 1 and o_proj_red % (GANG_K_SPLITS * 256) == 0)
+        oproj_tile_n = OPROJ_GEMV_ROWS if use_gemv_oproj else GANG_TILE_N
+        n_tiles_xcd = hidden_size // 8 // oproj_tile_n
         # The split-K task takes a reduction_override now, so de-padding and
         # split-K compose: it reduces over the leading o_proj_red columns and
         # splits *those* k_splits ways.
         use_splitk_oproj = (GANG_K_SPLITS > 1
                             and o_proj_red % (GANG_K_SPLITS * 256) == 0)
         print(f"[CFG] o_proj K={o_proj_red} out={hidden_size} "
+              f"tile_n={oproj_tile_n} gemv={int(use_gemv_oproj)} "
               f"n_tiles/XCD={n_tiles_xcd} split-K="
               f"{GANG_K_SPLITS if use_splitk_oproj else 1} -> "
               f"{n_tiles_xcd * (GANG_K_SPLITS if use_splitk_oproj else 1) * 8}"
@@ -814,10 +830,11 @@ if __name__ == "__main__":
                     weight=w_o,
                     residual=x,
                     output=attn_proj_out,
-                    tile_n=GANG_TILE_N,
+                    tile_n=oproj_tile_n,
                     output_stride=hidden_size,
                     wgm=GANG_WGM,
                     reduction_size=o_proj_red,
+                    gemv=use_gemv_oproj,
                     block_dim=(256, 1, 1),
                 )
 

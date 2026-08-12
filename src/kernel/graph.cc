@@ -590,7 +590,9 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     task_config[op] = std::make_tuple(2, 1, TASK_GANG_LINEAR_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[4]; // total_tiles_per_xcd (m*n)
   } else if (name == "gang_linear_res_mi300") {
-    assert(params.size() == 8);
+    assert(params.size() == 9 &&
+           "gang_linear_res_mi300 needs [o_stride, tile_n, m_tiles, "
+           "m_per_tile, total_tiles, n_tiles, wgm, reduction, gemv_rows]");
     int variant_id = task_register->register_gang_linear_res_mi300_task(
         customized->bgraph, params);
     task_config[op] =

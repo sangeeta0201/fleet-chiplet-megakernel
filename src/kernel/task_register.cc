@@ -855,7 +855,7 @@ int TaskRegister::register_gang_linear_mi300_task(
 //          n_tiles_per_xcd, wgm]
 int TaskRegister::register_gang_linear_res_mi300_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 8);
+  assert(params.size() == 9);
   int output_stride = params[0];
   int tile_n = params[1];
   int m_tiles = params[2];
@@ -867,6 +867,10 @@ int TaskRegister::register_gang_linear_res_mi300_task(
   // passes this when the input is deliberately wider than the weight, so the
   // GEMM can stop short of a padded tail instead of multiplying by zeros.
   int reduction_override = params[7];
+  // 0 = CK MFMA path. Non-zero swaps in the narrow-tile GEMV, which is the
+  // same op with the N>=64 tile constraint lifted, so that a hidden-width
+  // projection can spread over more than 32 of the 240 workers.
+  int gemv_rows = params[8];
 
   int reduction_size = 0;
   std::vector<tb::TBInputOp *> input_ops;
@@ -888,9 +892,21 @@ int TaskRegister::register_gang_linear_res_mi300_task(
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
-  code.e("kernel::gang_linear_residual_kernel<bfloat16, $, $>(",
-         m_per_tile,
-         reduction_size);
+  if (gemv_rows > 0) {
+    assert(gemv_rows == tile_n &&
+           "gemv_rows is the compile-time form of tile_n; they must agree");
+    assert(input_ops[1]->dtensor.dim[1] == reduction_size &&
+           "the GEMV indexes weight rows at stride REDUCTION_SIZE, so a "
+           "narrowed reduction needs a correspondingly narrow weight");
+    code.e("kernel::gang_gemv_kernel<bfloat16, $, $, $, true>(",
+           m_per_tile,
+           reduction_size,
+           gemv_rows);
+  } else {
+    code.e("kernel::gang_linear_residual_kernel<bfloat16, $, $>(",
+           m_per_tile,
+           reduction_size);
+  }
   code.e("    task_desc->input_ptrs[0],");
   code.e("    task_desc->input_ptrs[1],");
   code.e("    task_desc->input_ptrs[2],");

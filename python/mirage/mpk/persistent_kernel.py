@@ -2472,6 +2472,7 @@ class PersistentKernel:
         m_tiles: int = 1,
         wgm: int = 0,
         reduction_size: int = 0,
+        gemv: bool = False,
         block_dim: tuple = (256, 1, 1),
     ):
         """Gang linear with residual + HipKittens Algorithm 1 windowed traversal.
@@ -2481,6 +2482,12 @@ class PersistentKernel:
         tail the GEMM should skip -- the task chain matches producers to
         consumers by tensor guid, so the input has to stay the full tensor the
         previous op wrote even when only a prefix of it is meaningful.
+
+        `gemv` swaps the CK MFMA tile for the narrow-tile GEMV, which lifts the
+        tile_n >= 64 floor the 16x64x256 MFMA imposes. Set it when the output
+        is only hidden_size wide, so tile_n can drop to 8 and the op gets 256
+        tiles instead of 32 -- see gang_gemv_mi300.cuh. At batch 1 the MFMA was
+        discarding 15 of its 16 rows anyway.
         """
         assert input.num_dims == 2
         assert weight.num_dims == 2
@@ -2507,13 +2514,19 @@ class PersistentKernel:
         tb_graph.new_input(output, (1, -1, -1), -1, True)
         assert reduction_size == 0 or reduction_size == weight.dim(1), (
             "reduction_size must match the weight's reduction extent")
+        if gemv:
+            assert tile_n >= 4 and (tile_n & (tile_n - 1)) == 0, (
+                f"gemv tile_n must be a power of two >= 4, got {tile_n}")
+            assert m_per_tile == 1, (
+                "the gemv reads the input at row stride reduction_size, which "
+                "only matches the tensor when there is one row per tile")
         self.kn_graph.customized([input, weight, residual, output], tb_graph)
         # params: [output_stride, tile_n, m_tiles, m_per_tile, total_tiles_per_xcd,
-        #          n_tiles_per_xcd, wgm, reduction_size]
+        #          n_tiles_per_xcd, wgm, reduction_size, gemv_rows]
         self.kn_graph.register_task(
             tb_graph, "gang_linear_res_mi300",
             [output_stride, tile_n, m_tiles, m_per_tile, total_tiles_per_xcd,
-             n_tiles_per_xcd, wgm, reduction_size]
+             n_tiles_per_xcd, wgm, reduction_size, tile_n if gemv else 0]
         )
 
 
