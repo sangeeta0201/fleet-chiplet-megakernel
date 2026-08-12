@@ -70,6 +70,17 @@ hipcc -o test_mla_kv_cache_update test_mla_kv_cache_update.hip \
     -I ../../include \
     -I ../../include/mirage/persistent_kernel
 
+# gfx950-only, same reason as the hazard regression above.
+if [ "${GFX_ARCH:-gfx950}" = "gfx950" ]; then
+    echo "Building MXFP8 scaled-MFMA operand layout probe..."
+    hipcc -o test_mxfp8_mfma_layout test_mxfp8_mfma_layout.hip \
+        -D__HIP_PLATFORM_AMD__ \
+        --offload-arch=gfx950 \
+        -munsafe-fp-atomics \
+        -O3 \
+        -std=c++17
+fi
+
 echo "Build complete!"
 echo ""
 echo "Run with: ./test_mfma_simple"
@@ -78,3 +89,4 @@ echo "          ./test_moe_topk_sigmoid_bias [num_rows] [num_shared]"
 echo "          ./test_rope_interleave_partial"
 echo "          ./test_mla_decode"
 echo "          ./test_mla_kv_cache_update"
+echo "          ./test_mxfp8_mfma_layout                  # gfx950 only"
