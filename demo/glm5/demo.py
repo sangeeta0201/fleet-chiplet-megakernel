@@ -472,6 +472,17 @@ if __name__ == "__main__":
         # against 10.16 with the plain output-parallel GEMM. Decode latency
         # here tracks the *number of ops in the task chain*, not tasks per op,
         # so spending more workers on one op only adds merge traffic.
+        #
+        # Re-measured at the 8.025 ms baseline, after reduction_override let
+        # split-K compose with the de-padded weight: 9.289 / 8.525 / 8.620 ms
+        # at k = 2 / 4 / 8. Still a clear loss, and the starvation it is aimed
+        # at is real -- o_proj holds 23% of the token's bytes and 21% of the
+        # critical path on 32 of 240 workers, moving 1.13 TB/s where the
+        # 240-worker MoE W13 manages 2.6. The partials are the problem, not
+        # the parallelism: every split round-trips fp32 through a global
+        # workspace and then spins on a done counter. Fixing this properly
+        # means merging the splits in LDS inside a fused layer task, the way
+        # gpt-oss's gang_full_layer_fused does, not through HBM.
         GANG_K_SPLITS = int(os.environ.get("GANG_K_SPLITS", "1"))
         # The absorbed o_proj reduces over the attention output, one kv_lora
         # row per q head. Padded heads carry zero o_absorbed columns, so on a
@@ -489,10 +500,10 @@ if __name__ == "__main__":
         if o_proj_red % 256 != 0:
             o_proj_red = num_heads_pad * kv_lora
         n_tiles_xcd = hidden_size // 8 // GANG_TILE_N
-        # The split-K task still derives its reduction from the input tensor's
-        # width, so it cannot see a de-padded weight; the two are exclusive.
+        # The split-K task takes a reduction_override now, so de-padding and
+        # split-K compose: it reduces over the leading o_proj_red columns and
+        # splits *those* k_splits ways.
         use_splitk_oproj = (GANG_K_SPLITS > 1
-                            and o_proj_red == num_heads_pad * kv_lora
                             and o_proj_red % (GANG_K_SPLITS * 256) == 0)
         print(f"[CFG] o_proj K={o_proj_red} out={hidden_size} "
               f"n_tiles/XCD={n_tiles_xcd} split-K="
@@ -771,6 +782,7 @@ if __name__ == "__main__":
                     tile_n=GANG_TILE_N,
                     output_stride=hidden_size,
                     k_splits=GANG_K_SPLITS,
+                    reduction_size=o_proj_red,
                     block_dim=(256, 1, 1),
                 )
             else:

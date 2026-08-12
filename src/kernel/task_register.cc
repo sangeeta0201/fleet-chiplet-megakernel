@@ -705,11 +705,17 @@ int TaskRegister::register_gang_ksplit_finalize_mi300_task(
 // better worker utilization. Uses XCD-local atomics for merge.
 int TaskRegister::register_gang_splitk_linear_res_mi300_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 4);
+  assert(params.size() == 5);
   int output_stride = params[0];
   int tile_n = params[1];
   int n_tiles_per_xcd = params[2];
   int k_splits = params[3];
+  // 0 = derive the reduction from the input tensor's width, as before. A
+  // non-zero value stops the reduction short of it, which is what lets this
+  // task see a de-padded weight: the absorbed o_proj's input carries
+  // num_heads_pad * kv_lora columns but only the leading num_heads * kv_lora
+  // of them have non-zero weight rows behind them.
+  int reduction_override = params[4];
 
   int reduction_size = 0;
   std::vector<tb::TBInputOp *> input_ops;
@@ -728,6 +734,11 @@ int TaskRegister::register_gang_splitk_linear_res_mi300_task(
   }
   assert(input_ops[0]->dtensor.num_dims == 2);
   reduction_size = input_ops[0]->dtensor.dim[1];
+  if (reduction_override > 0) {
+    assert(reduction_override <= reduction_size);
+    reduction_size = reduction_override;
+  }
+  assert(reduction_size % k_splits == 0);
   int m_per_tile = input_ops[0]->dtensor.dim[0];
 
   mirage::transpiler::CodeKeeper code;

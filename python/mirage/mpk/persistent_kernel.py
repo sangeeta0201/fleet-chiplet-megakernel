@@ -2327,10 +2327,15 @@ class PersistentKernel:
         output_stride: int,
         k_splits: int = 4,
         block_dim: tuple = (256, 1, 1),
+        reduction_size: int = None,
     ):
         """Gang split-K linear with residual: splits K within XCD for better utilization.
         8 tasks (1 per XCD), each with n_tiles × k_splits total tiles.
-        Uses XCD-local atomics for merge (cheaper than GPU-scope)."""
+        Uses XCD-local atomics for merge (cheaper than GPU-scope).
+
+        reduction_size stops the reduction short of the input tensor's width,
+        for a weight whose trailing columns are all zero (the de-padded
+        absorbed o_proj). Defaults to the full width."""
         assert self.target_cc in (94, 95)
         batch_size = self.max_num_batched_tokens
         output_size = weight.dim(0)
@@ -2338,7 +2343,10 @@ class PersistentKernel:
         chunk_n = output_size // 8
         assert chunk_n % tile_n == 0
         n_tiles_per_xcd = chunk_n // tile_n
-        reduction_size = weight.dim(1) if weight.num_dims == 2 else input.dim(1)
+        if reduction_size is None:
+            reduction_size = (weight.dim(1) if weight.num_dims == 2
+                              else input.dim(1))
+        assert 0 < reduction_size <= input.dim(1)
         assert reduction_size % k_splits == 0, f"K={reduction_size} not divisible by k_splits={k_splits}"
         total_tiles = n_tiles_per_xcd * k_splits
         grid_dim = (8, 1, 1)
@@ -2351,7 +2359,8 @@ class PersistentKernel:
         self.kn_graph.customized([input, weight, residual, workspace, output], tb_graph)
         self.kn_graph.register_task(
             tb_graph, "gang_splitk_linear_res_mi300",
-            [output_stride, tile_n, n_tiles_per_xcd, k_splits]
+            [output_stride, tile_n, n_tiles_per_xcd, k_splits,
+             reduction_size if reduction_size != input.dim(1) else 0]
         )
 
     def gang_rmsnorm_layer(

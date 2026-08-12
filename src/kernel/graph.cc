@@ -819,9 +819,9 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         std::make_tuple(2, 1, TASK_GANG_KSPLIT_FINALIZE_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[2]; // finalize tiles per XCD
   } else if (name == "gang_splitk_linear_res_mi300") {
-    assert(params.size() == 4 &&
+    assert(params.size() == 5 &&
            "gang_splitk_linear_res_mi300 needs [o_stride, tile_n, "
-           "n_tiles_per_xcd, k_splits]");
+           "n_tiles_per_xcd, k_splits, reduction_override]");
     int variant_id = task_register->register_gang_splitk_linear_res_mi300_task(
         customized->bgraph, params);
     task_config[op] =
