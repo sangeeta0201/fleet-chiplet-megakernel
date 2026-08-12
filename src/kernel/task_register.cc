@@ -6721,7 +6721,9 @@ int TaskRegister::register_paged_attention_ck_fmha_merge_mi300_task(
   // params[3]: page_size
   // params[4]: num_kv_heads
   // params[5]: num_kv_chunks
-  assert(params.size() == 6);
+  // params[6]: dim_splits (1 = one task per kv head, the GQA default)
+  // params[7]: write_through (st_wt the bf16 output straight past L2)
+  assert(params.size() == 8);
   std::vector<tb::TBInputOp *> input_ops;
   std::vector<tb::TBInputOp *> output_ops;
   // num_inputs is 2 (lse, o) or 3 (lse, o, sinks). The Python wrapper appends
@@ -6747,6 +6749,9 @@ int TaskRegister::register_paged_attention_ck_fmha_merge_mi300_task(
   int page_size = params[3];
   int num_kv_heads = params[4];
   int num_kv_chunks = params[5];
+  int dim_splits = params[6];
+  assert(dim_splits >= 1 && head_dim % dim_splits == 0);
+  bool write_through = params[7] != 0;
 
   int max_tokens = input_ops[0]->dtensor.dim[0];
 
@@ -6756,13 +6761,15 @@ int TaskRegister::register_paged_attention_ck_fmha_merge_mi300_task(
   code.inc_indent();
   // Use dedicated CK FMHA merge kernel that handles separate lse/o and output
   // strides
-  code.e("kernel::merge_splitkv_ck_fmha<bfloat16, $, $, $, $, $, $>(",
+  code.e("kernel::merge_splitkv_ck_fmha<bfloat16, $, $, $, $, $, $, $, $>(",
          num_q_heads_per_kv,
          num_kv_heads, // NUM_QO_GROUPS (for output stride)
          head_dim,
          num_kv_chunks,
          SEQ_LEN_PER_BLOCK,
-         page_size);
+         page_size,
+         write_through ? "true" : "false",
+         dim_splits);
   code.e(
       "    reinterpret_cast<float const*>(task_desc->input_ptrs[0]),"); // lse_acc
   code.e(

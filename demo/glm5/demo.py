@@ -368,9 +368,25 @@ if __name__ == "__main__":
             _kv_tiles = max(1, (args.max_seq_length + 63) // 64)
             num_kv_chunks = max(1, min(8 // max(1, num_q_groups), _kv_tiles))
         assert num_kv_chunks >= 1
+        # The merge is otherwise one task per q group -- 2 CUs of 256, each
+        # thread carrying kv_lora/16 = 32 unrolled softmax chains. Slice the
+        # 512-wide latent so the merge fans out instead. 8 slices puts
+        # kv_lora/8/16 = 4 dims on each thread across 16 tasks.
+        MLA_MERGE_DIM_SPLITS = int(
+            os.environ.get("GLM_MLA_MERGE_DIM_SPLITS", "16"))
+        assert kv_lora % (MLA_MERGE_DIM_SPLITS * 16) == 0
+        # Off by default: measured a dead heat (8.025 vs 8.026 ms). The win it
+        # buys gpt-oss is deleting a separate readback+flush pass inside the
+        # fused layer task, and there is no such pass here while the merge is
+        # still its own task. At dim_splits=16 each thread writes 2 bf16 and
+        # the store path is not the bottleneck either way. Kept plumbed for
+        # when the merge moves inside a fused MLA layer.
+        MLA_MERGE_WRITE_THROUGH = (
+            os.environ.get("GLM_MLA_MERGE_WT", "0") == "1")
         print(f"[CFG] q_heads={num_heads}->{num_heads_pad} "
               f"q_groups={num_q_groups} kv_chunks={num_kv_chunks} "
-              f"latent_row={qk_dim} q_lora={q_lora}->{q_lora_pad}")
+              f"latent_row={qk_dim} q_lora={q_lora}->{q_lora_pad} "
+              f"merge_dim_splits={MLA_MERGE_DIM_SPLITS}")
 
         num_workers, num_schedulers = mi.get_configurations_from_gpu(rank)
 
@@ -738,8 +754,11 @@ if __name__ == "__main__":
                     output=attn_out,
                     attention_params=(num_heads_pad, kv_lora, num_kv_chunks,
                                       num_q_groups),
-                    grid_dim=(args.max_num_batched_requests, num_q_groups, 1),
+                    grid_dim=(args.max_num_batched_requests,
+                              num_q_groups * MLA_MERGE_DIM_SPLITS, 1),
                     block_dim=(256, 1, 1),
+                    dim_splits=MLA_MERGE_DIM_SPLITS,
+                    write_through=MLA_MERGE_WRITE_THROUGH,
                 )
             # 5. absorbed o_proj + residual
             if use_splitk_oproj:

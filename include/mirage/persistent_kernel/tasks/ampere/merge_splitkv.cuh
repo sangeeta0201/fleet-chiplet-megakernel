@@ -143,6 +143,20 @@ __device__ __forceinline__ void
 // o layout:    same indexing * HEAD_DIM + d
 // output layout: output[token * NUM_QO_GROUPS * QO_PER_KV * HEAD_DIM
 //                       + kv_head * QO_PER_KV * HEAD_DIM + head * HEAD_DIM + d]
+//
+// DIM_SPLITS fans one kv_head's merge across several tasks, each owning a
+// contiguous HEAD_DIM / DIM_SPLITS slice. The parallelism here is otherwise
+// capped at NUM_QO_GROUPS blocks, which is fine at GQA head dims but starves
+// on absorbed MLA: HEAD_DIM is the 512-wide latent, so a 16-head group leaves
+// each thread carrying HEAD_DIM / 16 = 32 fully-unrolled online-softmax chains
+// of NUM_KV_CHUNKS dependent loads apiece, on one CU of 256. Splitting the dim
+// range costs nothing but a re-read of the (tiny) LSE column per slice -- the
+// o_acc reads stay perfectly partitioned. DIM_SPLITS == 1 is the original
+// code path exactly.
+//
+// The slice index rides in on kv_head_idx rather than a separate argument so
+// that callers keep passing merge_task_offset straight through; the kernel
+// decomposes it because only it knows DIM_SPLITS.
 template <typename T,
           int NUM_QO_HEADS_PER_KV,
           int NUM_QO_GROUPS,
@@ -150,7 +164,8 @@ template <typename T,
           int NUM_KV_CHUNKS,
           int KV_CHUNK_SIZE = 128,
           int PAGE_SIZE = 4096,
-          bool WRITE_THROUGH = false>
+          bool WRITE_THROUGH = false,
+          int DIM_SPLITS = 1>
 __device__ __forceinline__ void
     merge_splitkv_ck_fmha(float const *lse_ptr,
                           float const *o_ptr,
@@ -159,8 +174,15 @@ __device__ __forceinline__ void
                           int const *paged_kv_last_page_len_buffer_ptr,
                           int16_t request_id,
                           T *output_ptr,
-                          int kv_head_idx,
+                          int merge_task_offset,
                           void const *sinks_ptr = nullptr) {
+
+  static_assert(HEAD_DIM % DIM_SPLITS == 0,
+                "DIM_SPLITS must divide HEAD_DIM evenly");
+  int const kv_head_idx =
+      (DIM_SPLITS == 1) ? merge_task_offset : (merge_task_offset / DIM_SPLITS);
+  int const dim_slice =
+      (DIM_SPLITS == 1) ? 0 : (merge_task_offset % DIM_SPLITS);
 
   int const first_token_pos = qo_indptr_buffer_ptr[request_id];
   int const last_token_pos = qo_indptr_buffer_ptr[request_id + 1];
@@ -187,8 +209,12 @@ __device__ __forceinline__ void
   // Use 32 threads per head to match work items (1 token * 8 heads = 8 groups =
   // 256/32)
   constexpr int THREADS_PER_TOKEN = (NUM_QO_HEADS_PER_KV <= 8) ? 32 : 16;
-  constexpr int VAL_PER_THREAD = HEAD_DIM / THREADS_PER_TOKEN;
+  constexpr int DIM_PER_SLICE = HEAD_DIM / DIM_SPLITS;
+  constexpr int VAL_PER_THREAD = DIM_PER_SLICE / THREADS_PER_TOKEN;
   constexpr int num_groups = NUM_THREADS / THREADS_PER_TOKEN;
+  static_assert(VAL_PER_THREAD >= 1,
+                "DIM_SPLITS too large: fewer than one dim per thread");
+  int const dim_base = dim_slice * DIM_PER_SLICE;
 
   int thread_in_group = threadIdx.x % THREADS_PER_TOKEN;
   int group_id = threadIdx.x / THREADS_PER_TOKEN;
@@ -217,7 +243,7 @@ __device__ __forceinline__ void
     // Base output offset for this token+head (dims start here)
     int out_offset_base = (first_token_pos + token_idx) * OUT_TOKEN_STRIDE +
                           kv_head_idx * NUM_QO_HEADS_PER_KV * HEAD_DIM +
-                          head_idx * HEAD_DIM +
+                          head_idx * HEAD_DIM + dim_base +
                           thread_in_group * VAL_PER_THREAD;
 
     // Compute all VAL_PER_THREAD dimensions
@@ -235,8 +261,8 @@ __device__ __forceinline__ void
                          (first_token_pos + token_idx) * LSE_TOKEN_STRIDE +
                          lse_kv_offset;
         int lse_offset = lse_linear;
-        int o_offset =
-            lse_linear * HEAD_DIM + thread_in_group * VAL_PER_THREAD + i;
+        int o_offset = lse_linear * HEAD_DIM + dim_base +
+                       thread_in_group * VAL_PER_THREAD + i;
 
         // CK FMHA stores LSE in natural log scale; convert to log2 for ptx_exp2
         float other_m = lse_ptr[lse_offset] * 1.44269504088896340736f,

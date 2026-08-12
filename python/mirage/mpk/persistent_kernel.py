@@ -1206,7 +1206,14 @@ class PersistentKernel:
         grid_dim: tuple,
         block_dim: tuple,
         sinks: DTensor = None,
+        dim_splits: int = 1,
+        write_through: bool = False,
     ):
+        # dim_splits > 1 splits each kv head's merge across that many tasks,
+        # one per contiguous head_dim slice. grid.y must then be
+        # num_kv_heads * dim_splits, and the kernel reads bid.y as
+        # (kv_head * dim_splits + slice). Only worth it when head_dim is wide
+        # relative to num_kv_heads, i.e. absorbed MLA.
         # lse: 2D (num_tokens, num_kv_heads * chunks * qo_per_kv)
         # output_tmp: 2D (num_tokens, num_kv_heads * chunks * qo_per_kv * head_dim)
         # output: 2D (num_tokens, num_q_heads * head_dim)
@@ -1223,9 +1230,15 @@ class PersistentKernel:
         num_kv_chunks = attention_params[2]
         num_kv_heads = attention_params[3]
         num_qo_heads_per_kv = num_q_heads // num_kv_heads
-        # params: num_qo_heads_per_kv, head_dim, max_seq_len, page_size, num_kv_heads, num_kv_chunks
+        assert dim_splits >= 1 and head_dim % dim_splits == 0
+        assert grid_dim[1] == num_kv_heads * dim_splits, (
+            f"grid.y must be num_kv_heads * dim_splits "
+            f"({num_kv_heads} * {dim_splits}), got {grid_dim[1]}")
+        # params: num_qo_heads_per_kv, head_dim, max_seq_len, page_size,
+        #         num_kv_heads, num_kv_chunks, dim_splits, write_through
         params = [num_qo_heads_per_kv, head_dim, self.max_seq_length,
-                  self.page_size, num_kv_heads, num_kv_chunks]
+                  self.page_size, num_kv_heads, num_kv_chunks, dim_splits,
+                  1 if write_through else 0]
 
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         # No partitioning — merge kernel handles all offsets internally
