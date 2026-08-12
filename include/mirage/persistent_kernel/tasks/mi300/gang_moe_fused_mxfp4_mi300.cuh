@@ -168,11 +168,43 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // iteration count answers exactly that.
   //
   // WRONG OUTPUT: half the reduction is simply dropped, not redistributed.
-#ifdef MPK_W2_HALFK
-  constexpr int W2_MFMA_ITERS = W2_K / 128 / 2;
+  //
+  // MPK_W2_SPLITK is the real thing the comment above priced: split W2's K in
+  // two and give each half its own tile, so the tile count doubles and every
+  // worker loads half the weight bytes. Under EP (2 owned experts) W2 is only
+  // W2_WGS * 2 = 92 tiles against 240 workers -- 38% occupancy -- and a
+  // constant-total-bytes microbenchmark of exactly this access pattern reads
+  // 2114 GB/s at 92 workgroups against 2885 at 184. Both halves atomicAdd into
+  // moe_workspace_f32, so no new combine step is needed; the bias is gated to
+  // half 0 so it is counted once.
+//
+  // The split is in units of whole MFMA iterations, not raw K. W2_K is 2944 =
+  // 23 * 128 and 23 is prime, so there is no even 2-way split: the halves are
+  // 12 and 11 iterations. That makes the iteration count and every row stride
+  // a RUNTIME value under split-K, which is why the constants below are sized
+  // for the larger half and the actual extents are recomputed per tile.
+#ifdef MPK_W2_SPLITK
+  constexpr int W2_SPLITK = 2;
 #else
-  constexpr int W2_MFMA_ITERS = W2_K / 128;
+  constexpr int W2_SPLITK = 1;
 #endif
+  static_assert(W2_K % 128 == 0, "W2_K must be a whole number of MFMA steps");
+  constexpr int W2_TOTAL_ITERS = W2_K / 128; // 23
+  constexpr int W2_ITERS_MAX =
+      (W2_TOTAL_ITERS + W2_SPLITK - 1) / W2_SPLITK; // 12 split, 23 not
+  // One MFMA iteration covers 128 K-elements = 64 packed-FP4 bytes and 4
+  // scale bytes per output row.
+  constexpr int W2_ROW_H = W2_ITERS_MAX * 64;   // data bytes/row, larger half
+  constexpr int W2_BLK32_H = W2_ITERS_MAX * 4;  // scale bytes/row, larger half
+#ifdef MPK_W2_HALFK
+  constexpr int W2_MFMA_ITERS = W2_TOTAL_ITERS / 2;
+#else
+  constexpr int W2_MFMA_ITERS = W2_TOTAL_ITERS;
+#endif
+  // s_tok_fp8 always holds the FULL K (the quant is unsplit), so the LDS
+  // weight base must clear W2_K + all W2_K/128 token scales -- not
+  // W2_MFMA_ITERS, which is halved under split-K.
+  constexpr int W2_TOK_SCALES = W2_K / 128;
   constexpr int W2_TILES = BATCH_SIZE * W2_WGS;
 
   // Common constants
@@ -275,7 +307,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   int total_w13 =
       ((total_w13_real + PAD_MULTIPLE - 1) / PAD_MULTIPLE) * PAD_MULTIPLE;
 #endif
-  int total_w2 = ep_owned_experts * W2_TILES;
+  int total_w2 = ep_owned_experts * W2_TILES * W2_SPLITK;
   int total_tiles = total_w13 + total_w2;
   if (global_tile >= total_tiles) {
     MPK_WS_MARK(8100, global_tile); // exit: past end of tile range
@@ -284,6 +316,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 
   bool is_w2 = (global_tile >= total_w13);
   int expert_idx, phase_tile;
+  int k_half = 0;
   if (!is_w2) {
     expert_idx = global_tile / W13_TILES;
     phase_tile = global_tile % W13_TILES;
@@ -295,6 +328,14 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     }
   } else {
     int w2_tile = global_tile - total_w13;
+    if constexpr (W2_SPLITK > 1) {
+      // k_half is the FAST index: the two halves of one output tile land on
+      // adjacent tile slots, so each wg's placement neighbourhood (and hence
+      // its XCD/column relationship) is what it was before the split.
+      k_half = w2_tile % W2_SPLITK;
+      w2_tile /= W2_SPLITK;
+    }
+    (void)k_half;
     expert_idx = w2_tile / W2_TILES;
     phase_tile = w2_tile % W2_TILES;
   }
@@ -1419,12 +1460,20 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   uint8_t const *wg_scales = wg_data + W2_WG_DATA;
 
   constexpr int W2_TILE_ROWS = 16;
-  constexpr int W2_TILE_DATA = W2_TILE_ROWS * (W2_K / 2);
-  constexpr int W2_TILE_SCALE = W2_TILE_ROWS * W2_NUM_BLK32;
+  // Under split-K a tile covers 16 rows x W2_ROW_H bytes (half a row each),
+  // so both the LDS footprint and the load count halve. W2_ROW_H == W2_K/2
+  // and these reduce to the original values when W2_SPLITK == 1.
+  constexpr int W2_TILE_DATA = W2_TILE_ROWS * W2_ROW_H;
+  constexpr int W2_TILE_SCALE = W2_TILE_ROWS * W2_BLK32_H;
   constexpr int w2_n16_data = W2_TILE_DATA / 16;
   constexpr int W2_LPT = (w2_n16_data + 255) / 256;
   constexpr int W2_TILE_DATA_PADDED = W2_LPT * 256 * 16;
   constexpr int W2_TILE_BYTES = W2_TILE_DATA_PADDED + W2_TILE_SCALE;
+  // 16-byte units per row-half, for the row-strided source addressing below.
+  constexpr int W2_U16_PER_ROW = W2_ROW_H / 16;
+  static_assert(W2_SPLITK == 1 || W2_TILES_PER_WAVE == 1,
+                "W2 split-K assumes a single tile per wave (W2_OPW == 64); "
+                "the tile_iter=1 reload path is not split-K aware");
 
   // ── W2 weight prefetch + barrier wait overlap ────────────────────────────
   // Strategy: issue buffer_load_lds for W2 weights BEFORE barrier poll so
@@ -1436,9 +1485,26 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // barrier)
   i32x4_t w2_rsrc =
       make_w_buffer_rsrc(expert_weight, static_cast<uint32_t>(W2_EXPERT_BYTES));
-  uint32_t w2_wg_voff_base = static_cast<uint32_t>(wg_idx) * W2_WG_BYTES;
+  // Split-K iteration window. 23 iterations split 2 ways is 12 + 11, so half 1
+  // would be a short block. Rather than make the load count vary, half 1 backs
+  // its window up to start at iteration 23-12=11 and loads a full 12: it then
+  // runs all 12 while half 0 runs only the first 11, so together they cover
+  // [0,11) + [11,23) = every iteration exactly once. The loads stay uniform
+  // and no bounds check is needed. w2_iter_lo is the FIRST iteration this tile
+  // loads; w2_iters is how many it actually multiplies.
+  int const w2_iter_lo =
+      (W2_SPLITK > 1) ? (k_half ? (W2_TOTAL_ITERS - W2_ITERS_MAX) : 0) : 0;
+  int const w2_iters =
+      (W2_SPLITK > 1)
+          ? (k_half ? W2_ITERS_MAX : (W2_TOTAL_ITERS - W2_ITERS_MAX))
+          : W2_MFMA_ITERS;
+  // Byte offset of the window inside a weight row / scale row.
+  int const w2_row_off = w2_iter_lo * 64;
+  int const w2_sc_off = w2_iter_lo * 4;
+  uint32_t w2_wg_voff_base = static_cast<uint32_t>(wg_idx) * W2_WG_BYTES +
+                             static_cast<uint32_t>(w2_row_off);
 
-  constexpr int LDS_W2_OFF = ((W2_K + W2_MFMA_ITERS + 15) / 16) * 16;
+  constexpr int LDS_W2_OFF = ((W2_K + W2_TOK_SCALES + 15) / 16) * 16;
   static_assert(LDS_W2_OFF + W2_TILE_BYTES * NUM_WAVES <= 155 * 1024,
                 "W2 LDS weight tiles exceed MI350X LDS budget");
   uint8_t *lds_w2_base = (uint8_t *)_fused_smem + LDS_W2_OFF;
@@ -1462,19 +1528,40 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   {
     unsigned lds_w2_off = (unsigned)(uintptr_t)(lds_w2_base + warp_id * 1024);
     unsigned w2v[24], w2m[24];
+    // The asm below is hardwired to 24 loads, which is exactly
+    // NUM_WAVES * W2_LPT at W2_LPT == 6 (the unsplit tile). Split-K halves the
+    // tile so W2_LPT is 3 and only 12 slots are real; the rest must still hold
+    // a defined address. Point them at slot 0 -- the same bytes to the same LDS
+    // offset, so the replay is idempotent rather than merely harmless.
+#pragma unroll
+    for (int s = 0; s < 24; s++) {
+      w2v[s] = 0;
+      w2m[s] = 0;
+    }
 #pragma unroll
     for (int t = 0; t < NUM_WAVES; t++) {
 #pragma unroll
       for (int j = 0; j < W2_LPT; j++) {
         int idx = tid + j * 256;
         int clamped = idx < w2_n16_data ? idx : w2_n16_data - 1;
+        // A tile row is only W2_ROW_H bytes but HBM rows are W2_K/2 apart, so
+        // the 16-byte unit index has to be split into (row, offset). Identity
+        // when W2_SPLITK == 1: W2_U16_PER_ROW is then W2_K/32 and this is
+        // exactly clamped * 16.
+        int w2_row = clamped / W2_U16_PER_ROW;
+        int w2_off = clamped % W2_U16_PER_ROW;
         w2v[t * W2_LPT + j] =
             w2_wg_voff_base +
             static_cast<uint32_t>(t * W2_TILE_ROWS * (W2_K / 2)) +
-            static_cast<uint32_t>(clamped * 16);
+            static_cast<uint32_t>(w2_row * (W2_K / 2) + w2_off * 16);
         w2m[t * W2_LPT + j] = __builtin_amdgcn_readfirstlane(
             lds_w2_off + t * W2_TILE_BYTES + j * 4096);
       }
+    }
+#pragma unroll
+    for (int s = NUM_WAVES * W2_LPT; s < 24; s++) {
+      w2v[s] = w2v[0];
+      w2m[s] = w2m[0];
     }
     asm volatile("s_mov_b32 m0, %[m0]\n  buffer_load_dwordx4 %[v0],  %[rsrc], "
                  "0 offen sc0 nt lds\n"
@@ -1580,8 +1667,34 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // Issue scale loads concurrently with buffer_load_lds
   constexpr int W2_TOTAL_SC_DW4 = (W2_TILE_SCALE * NUM_WAVES) / 16;
   constexpr int W2_SC_LPT = (W2_TOTAL_SC_DW4 + 255) / 256;
+  // Split-K reads scales a DWORD at a time, not a dwordx4. The unsplit path
+  // can use 16-byte loads because a wg's scales are one contiguous run, but a
+  // K-window is a strided slice: rows are W2_NUM_BLK32 = 92 bytes apart and
+  // half 1 starts 44 bytes in. Neither is 16-byte aligned; both are 4-byte
+  // aligned (92 = 4*23, 44 = 4*11), so dwords are the largest legal unit.
+  constexpr int W2_TOTAL_SC_DW = W2_TILE_SCALE * NUM_WAVES / 4;
+  constexpr int W2_SC_LPT_DW = (W2_TOTAL_SC_DW + 255) / 256;
+  constexpr int W2_SC_DW_PER_ROW = W2_BLK32_H / 4;
+  constexpr int W2_SC_DW_PER_TILE = W2_TILE_SCALE / 4;
   i32x4_t w2_sc_buf[W2_SC_LPT];
-  {
+  unsigned w2_sc_dw[W2_SC_LPT_DW];
+  if constexpr (W2_SPLITK > 1) {
+    uint8_t const *sc_src8 = wg_scales + w2_sc_off;
+#pragma unroll
+    for (int j = 0; j < W2_SC_LPT_DW; j++) {
+      int idx = tid + j * 256;
+      if (idx < W2_TOTAL_SC_DW) {
+        int sc_tile = idx / W2_SC_DW_PER_TILE;
+        int sc_off = idx % W2_SC_DW_PER_TILE;
+        int sc_row = sc_off / W2_SC_DW_PER_ROW;
+        int sc_boff = sc_off % W2_SC_DW_PER_ROW;
+        w2_sc_dw[j] = *(unsigned const *)(sc_src8 +
+                                          (sc_tile * W2_TILE_ROWS + sc_row) *
+                                              W2_NUM_BLK32 +
+                                          sc_boff * 4);
+      }
+    }
+  } else {
     i32x4_t const *sc_src = (i32x4_t const *)wg_scales;
 #pragma unroll
     for (int j = 0; j < W2_SC_LPT; j++) {
@@ -1675,7 +1788,19 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   MPK_WS_MARK(8304, global_tile); // W2: drain HBM loads
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
   asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
-  {
+  if constexpr (W2_SPLITK > 1) {
+#pragma unroll
+    for (int j = 0; j < W2_SC_LPT_DW; j++) {
+      int idx = tid + j * 256;
+      if (idx < W2_TOTAL_SC_DW) {
+        int tile = idx / W2_SC_DW_PER_TILE;
+        int off = idx % W2_SC_DW_PER_TILE;
+        unsigned *dst_sc = (unsigned *)(lds_w2_base + tile * W2_TILE_BYTES +
+                                        W2_TILE_DATA_PADDED);
+        dst_sc[off] = w2_sc_dw[j];
+      }
+    }
+  } else {
     constexpr int W2_SC_DW4_PER_TILE = W2_TILE_SCALE / 16;
 #pragma unroll
     for (int j = 0; j < W2_SC_LPT; j++) {
@@ -1706,13 +1831,13 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // same LDS slots before its MFMA loop — matching the W13 dual-tile pattern.
   {
     constexpr int W2_TILE_ROWS_L = 16;
-    constexpr int W2_TILE_DATA_L = W2_TILE_ROWS_L * (W2_K / 2);
-    constexpr int W2_TILE_SCALE_L = W2_TILE_ROWS_L * W2_NUM_BLK32;
+    constexpr int W2_TILE_DATA_L = W2_TILE_ROWS_L * W2_ROW_H;
+    constexpr int W2_TILE_SCALE_L = W2_TILE_ROWS_L * W2_BLK32_H;
     constexpr int w2_n16_L = W2_TILE_DATA_L / 16;
     constexpr int W2_LPT_L = (w2_n16_L + 255) / 256;
     constexpr int W2_TILE_DATA_PADDED_L = W2_LPT_L * 256 * 16;
     constexpr int W2_TILE_BYTES_L = W2_TILE_DATA_PADDED_L + W2_TILE_SCALE_L;
-    constexpr int LDS_W2_OFF_L = ((W2_K + W2_MFMA_ITERS + 15) / 16) * 16;
+    constexpr int LDS_W2_OFF_L = ((W2_K + W2_TOK_SCALES + 15) / 16) * 16;
     uint8_t *lds_w2_base_l = (uint8_t *)_fused_smem + LDS_W2_OFF_L;
 
     // ── tile_iter=0: weights already in LDS from pre-load ──────────────
@@ -1723,8 +1848,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       uint8_t *lds_w2_scales = lds_w2_data + W2_TILE_DATA_PADDED_L;
 
       int w_row_local = col;
-      int const row_data_base = w_row_local * (W2_K / 2);
-      int const row_scale_base = w_row_local * W2_NUM_BLK32;
+      // LDS holds this half packed densely, so rows stride by the half size.
+      int const row_data_base = w_row_local * W2_ROW_H;
+      int const row_scale_base = w_row_local * W2_BLK32_H;
 
       // Prefetch epilogue data before MFMA loop so loads fly during compute.
       int out_n_base = wg_idx * W2_OUTPUT_PER_WG + wave_tile_0 * 16 + g * 4;
@@ -1754,8 +1880,15 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             (unsigned)(uintptr_t)(lds_w2_data + row_data_base + g * 16);
         unsigned w2_ws_addr =
             (unsigned)(uintptr_t)(lds_w2_scales + row_scale_base + g);
-        unsigned w2_t_addr = (unsigned)(uintptr_t)(s_tok_fp8 + g * 16);
-        unsigned w2_ts_addr = (unsigned)(uintptr_t)(s_tok_scales);
+        // The FP8 quant covers the full K in every tile, so this tile's slice
+        // of the token vector starts at its window's first iteration:
+        // 128 fp8 bytes per iteration for the data, 1 scale byte per
+        // iteration. The asm walks scales as tsa + s13, so offsetting the
+        // base is sufficient.
+        unsigned w2_t_addr =
+            (unsigned)(uintptr_t)(s_tok_fp8 + w2_iter_lo * 128 + g * 16);
+        unsigned w2_ts_addr =
+            (unsigned)(uintptr_t)(s_tok_scales + w2_iter_lo);
         asm volatile(
             // Zero accumulator
             // ── Two disjoint operand banks ──
@@ -1802,7 +1935,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             "ds_read_b128 v[36:39], %[ta] offset:64\n"
             "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], "
             "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
-            "s_cmpk_lt_i32 s13, %[iters_m1]\n"
+            // s_cmp, not s_cmpk: the trip count is an SGPR under split-K (23
+            // iterations split 12/11), and s_cmpk only takes a literal.
+            "s_cmp_lt_i32 s13, %[iters_m1]\n"
             "s_cbranch_scc0 W2_T0_TAIL_B1_%=\n"
 
             // ---- consume bank 1, prefetch into bank 0 ----
@@ -1819,7 +1954,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             "ds_read_b128 v[12:15], %[ta] offset:64\n"
             "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], "
             "a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
-            "s_cmpk_lt_i32 s13, %[iters_m1]\n"
+            "s_cmp_lt_i32 s13, %[iters_m1]\n"
             "s_cbranch_scc1 PIPELINED_W2_T0_%=\n"
 
             // ── Final MFMA ──
@@ -1856,7 +1991,12 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
               [wa] "+v"(w2_w_addr),
               [wsa] "+v"(w2_ws_addr),
               [ta] "+v"(w2_t_addr)
-            : [tsa] "v"(w2_ts_addr), [iters_m1] "n"(W2_MFMA_ITERS - 1)
+            // readfirstlane: w2_iters is uniform across the block (it derives
+            // from the tile index) but the compiler only knows it came from a
+            // thread-varying computation, so without this it lands in a VGPR
+            // and s_cmp rejects it.
+            : [tsa] "v"(w2_ts_addr),
+              [iters_m1] "s"(__builtin_amdgcn_readfirstlane(w2_iters - 1))
             : "memory",
               "s13",
               "v7",
@@ -1907,6 +2047,14 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         __builtin_memcpy(&bv1, &bt1, 4);
         __builtin_memcpy(&bv2, &bt2, 4);
         __builtin_memcpy(&bv3, &bt3, 4);
+        // Split-K: the two halves both atomicAdd into the same accumulator,
+        // so the bias must be added by exactly one of them.
+        if (k_half != 0) {
+          bv0 = 0.0f;
+          bv1 = 0.0f;
+          bv2 = 0.0f;
+          bv3 = 0.0f;
+        }
         int ws_base = tok_idx * HIDDEN_SIZE + out_n_base;
         atomicAdd(&d_workspace_f32[ws_base + 0], (acc[0] + bv0) * pf_rw);
         atomicAdd(&d_workspace_f32[ws_base + 1], (acc[1] + bv1) * pf_rw);

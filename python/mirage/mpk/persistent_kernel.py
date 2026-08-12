@@ -435,6 +435,14 @@ def get_compile_command(
             # W2_MFMA_ITERS definition in gang_moe_fused_mxfp4_mi300.cuh.
             # WRONG OUTPUT: latency attribution only.
             flags = flags + ["-DMPK_W2_HALFK"]
+        if int(os.environ.get("MPK_W2_SPLITK", "0")) == 1:
+            # Splits W2's K in two, doubling the W2 tile count so each worker
+            # loads half the weight bytes. Under EP a rank owns 2 experts, so
+            # W2 is 92 tiles on 240 workers (38% occupancy); the split takes it
+            # to 184. Both halves atomicAdd into moe_workspace_f32, so no new
+            # combine is needed. CORRECT output: it redistributes the reduction
+            # rather than dropping it (unlike MPK_W2_HALFK above).
+            flags = flags + ["-DMPK_W2_SPLITK"]
         if int(os.environ.get("MPK_EP_SKEW_PROBE", "0")) == 1:
             # Measures how much earlier a column slice's W2 tiles finish than
             # the last W2 tile on the GPU -- i.e. the headroom a per-slice
@@ -3351,7 +3359,12 @@ class PersistentKernel:
                   if _ep_ws > 1 else max_activated)
         total_w13_real = _owned * w13_tiles
         total_w13_padded = ((total_w13_real + PAD_MULTIPLE - 1) // PAD_MULTIPLE) * PAD_MULTIPLE
-        total_w2 = _owned * w2_tiles
+        # MPK_W2_SPLITK doubles the W2 tile space on the device (each tile
+        # covers half of K), so the host loop bound has to double too --
+        # otherwise the un-dispatched half never arrives and the W13->W2
+        # per-expert barrier hangs.
+        _w2_splitk = 2 if int(os.environ.get("MPK_W2_SPLITK", "0")) == 1 else 1
+        total_w2 = _owned * w2_tiles * _w2_splitk
         total_tiles_all = total_w13_padded + total_w2
         moe_total_tiles_per_xcd = (total_tiles_all + 7) // 8
 
@@ -3594,7 +3607,12 @@ class PersistentKernel:
                   if _ep_ws > 1 else max_activated)
         total_w13_real = _owned * w13_tiles
         total_w13_padded = ((total_w13_real + PAD_MULTIPLE - 1) // PAD_MULTIPLE) * PAD_MULTIPLE
-        total_w2 = _owned * w2_tiles
+        # MPK_W2_SPLITK doubles the W2 tile space on the device (each tile
+        # covers half of K), so the host loop bound has to double too --
+        # otherwise the un-dispatched half never arrives and the W13->W2
+        # per-expert barrier hangs.
+        _w2_splitk = 2 if int(os.environ.get("MPK_W2_SPLITK", "0")) == 1 else 1
+        total_w2 = _owned * w2_tiles * _w2_splitk
         total_tiles_all = total_w13_padded + total_w2
         moe_total_tiles_per_xcd = (total_tiles_all + 7) // 8
 
@@ -3817,7 +3835,12 @@ class PersistentKernel:
                   if _ep_ws > 1 else max_activated)
         total_w13_real = _owned * w13_tiles
         total_w13_padded = ((total_w13_real + PAD_MULTIPLE - 1) // PAD_MULTIPLE) * PAD_MULTIPLE
-        total_w2 = _owned * w2_tiles
+        # MPK_W2_SPLITK doubles the W2 tile space on the device (each tile
+        # covers half of K), so the host loop bound has to double too --
+        # otherwise the un-dispatched half never arrives and the W13->W2
+        # per-expert barrier hangs.
+        _w2_splitk = 2 if int(os.environ.get("MPK_W2_SPLITK", "0")) == 1 else 1
+        total_w2 = _owned * w2_tiles * _w2_splitk
         total_tiles_all = total_w13_padded + total_w2
         moe_total_tiles_per_xcd = (total_tiles_all + 7) // 8
 
