@@ -372,18 +372,26 @@ if __name__ == "__main__":
         assert (2 * dense_inter) % GANG_OUT_ALIGN == 0
         assert dense_inter % GANG_RED_ALIGN == 0
 
-        # Split KV along the sequence across the 8 XCDs. MLA has a single
-        # shared latent head, so the gpt-oss `kv_head == xcd_id` mapping does
-        # not carry over -- instead each XCD claims one (q_group, kv_chunk)
-        # work item and the merge task recombines them. Aim for exactly 8 work
-        # items so every XCD gets one.
+        # Split KV along the sequence and spread the (q_group, kv_chunk) work
+        # items over the workers; the merge task recombines them. MLA has a
+        # single shared latent head, so the gpt-oss `kv_head == xcd_id` mapping
+        # does not carry over.
+        #
+        # This used to target exactly 8 work items, one per XCD, which left the
+        # decode running 8-way parallel on a 240-worker machine -- 656 us of
+        # exclusive critical path at peak parallelism 8. An XCD hosts 30
+        # workers, not one, so the useful target is q_groups * chunks large
+        # enough to fill them, bounded by how finely the KV actually splits.
+        # Measured (ms/iter): 4 -> 7.127, 8 -> 7.038, 16 -> 6.995, 32 -> 7.512.
+        # Past 16 the merge's own fan-out and the per-chunk prologue cost more
+        # than the added parallelism returns.
         num_q_groups = num_heads_pad // 16
         _env_chunks = os.environ.get("GLM_MLA_NUM_KV_CHUNKS")
         if _env_chunks is not None:
             num_kv_chunks = int(_env_chunks)
         else:
             _kv_tiles = max(1, (args.max_seq_length + 63) // 64)
-            num_kv_chunks = max(1, min(8 // max(1, num_q_groups), _kv_tiles))
+            num_kv_chunks = max(1, min(16, _kv_tiles))
         assert num_kv_chunks >= 1
         # The merge is otherwise one task per q group -- 2 CUs of 256, each
         # thread carrying kv_lora/16 = 32 unrolled softmax chains. Slice the
