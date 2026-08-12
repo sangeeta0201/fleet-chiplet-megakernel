@@ -29,15 +29,24 @@
  * scalar dequantize-and-sum. Quantization error is common to both sides, so
  * only a layout mismatch can separate them.
  *
- * Measured on gfx950 (MI355X):
+ * Measured on gfx950 (MI355X). max_rel normalizes the residual by the largest
+ * output in the tile and is what separates the layouts; max_eps normalizes it
+ * by that output's own sum|product|, which is the scale the MXFP8 kernel tests
+ * budget against:
  *
- *   loader   scales      max_rel
- *   split    split32     4.186e-01
- *   split    contig32    8.270e-06   <- correct
- *   split    uniform128  8.270e-06      (degenerate, see below)
- *   contig   split32     1.071e+00
- *   contig   contig32    9.423e-01
- *   contig   uniform128  9.273e-01
+ *   loader   scales      max_rel     max_eps
+ *   split    split32     4.186e-01   1.204e-01
+ *   split    contig32    8.250e-06   2.049e-06   <- correct
+ *   split    uniform128  8.250e-06   2.049e-06      (degenerate, see below)
+ *   contig   split32     1.071e+00   2.792e-01
+ *   contig   contig32    9.423e-01   2.286e-01
+ *   contig   uniform128  9.273e-01   2.347e-01
+ *
+ * The correct row is not zero: the MFMA's fp8 path does not reproduce a scalar
+ * dequantize-and-sum exactly. Summation order accounts for ~6e-8 of that, so
+ * the rest is the instruction itself, at the scale of E4M3's smallest denormal.
+ * test_mxfp8_moe measures the same effect on real GEMM shapes and sets its
+ * MFMA_EPS from it.
  *
  * So the two mappings are independent of each other:
  *
@@ -261,23 +270,29 @@ __global__ void reference_kernel(uint8_t const *w_data,
                                  uint8_t const *a_data,
                                  uint8_t const *a_scales,
                                  float *out,
+                                 float *absum,
                                  int grouping) {
   int n = blockIdx.x * blockDim.x + threadIdx.x;
   if (n >= N) {
     return;
   }
-  float sum = 0.0f;
+  // Double, so that the residual reported against this is the MFMA's alone.
+  double sum = 0.0;
+  float mag = 0.0f;
   for (int ki = 0; ki < MFMA_ITERS; ki++) {
     float as = _e8m0_to_float(a_scales[ki]);
     for (int kl = 0; kl < K_PER_MFMA; kl++) {
       int k = ki * K_PER_MFMA + kl;
       int blk = ki * 4 + owner_g(kl, grouping);
       float ws = _e8m0_to_float(w_scales[(size_t)n * BLOCKS_PER_ROW + blk]);
-      sum += (_fp8_to_float(w_data[(size_t)n * K + k]) * ws) *
-             (_fp8_to_float(a_data[k]) * as);
+      float p = (_fp8_to_float(w_data[(size_t)n * K + k]) * ws) *
+                (_fp8_to_float(a_data[k]) * as);
+      sum += (double)p;
+      mag += fabsf(p);
     }
   }
   out[n] = sum;
+  absum[n] = mag;
 }
 
 template <int LOADER, int GROUPING>
@@ -356,6 +371,8 @@ int main() {
   HIP_CHECK(hipMalloc(&d_as, MFMA_ITERS));
   HIP_CHECK(hipMalloc(&d_ref, N * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_out, N * sizeof(float)));
+  float *d_absum;
+  HIP_CHECK(hipMalloc(&d_absum, N * sizeof(float)));
   HIP_CHECK(hipMemcpy(d_w, h_w.data(), h_w.size() * 2, hipMemcpyHostToDevice));
   HIP_CHECK(hipMemcpy(d_a, h_a.data(), h_a.size() * 2, hipMemcpyHostToDevice));
 
@@ -367,12 +384,21 @@ int main() {
   int best_l = -1, best_g = -1;
   double best = 1e30;
 
-  printf("%-8s %-11s %-12s %s\n", "loader", "scales", "max_rel", "verdict");
+  // max_rel normalizes by the largest output in the tile, which is what tells
+  // the six layouts apart. max_eps normalizes by that output's own sum|product|
+  // -- for the correct layout that ratio is the MFMA's intrinsic accumulation
+  // error, and the other tests budget against it, so it is worth reporting.
+  printf("%-8s %-11s %-12s %-12s %s\n",
+         "loader",
+         "scales",
+         "max_rel",
+         "max_eps",
+         "verdict");
   for (int l = 0; l < 2; l++) {
     for (int gr = 0; gr < 3; gr++) {
       pack_kernel<<<N, BLOCKS_PER_ROW>>>(d_w, d_wd, d_ws, N, gr);
       HIP_CHECK(hipDeviceSynchronize());
-      reference_kernel<<<1, N>>>(d_wd, d_ws, d_ad, d_as, d_ref, gr);
+      reference_kernel<<<1, N>>>(d_wd, d_ws, d_ad, d_as, d_ref, d_absum, gr);
       HIP_CHECK(hipDeviceSynchronize());
 
 #define LAUNCH(L, G)                                                           \
@@ -397,25 +423,29 @@ int main() {
 #undef LAUNCH
       HIP_CHECK(hipDeviceSynchronize());
 
-      std::vector<float> ref(N), got(N);
+      std::vector<float> ref(N), got(N), absum(N);
       HIP_CHECK(hipMemcpy(
           ref.data(), d_ref, N * sizeof(float), hipMemcpyDeviceToHost));
       HIP_CHECK(hipMemcpy(
           got.data(), d_out, N * sizeof(float), hipMemcpyDeviceToHost));
+      HIP_CHECK(hipMemcpy(
+          absum.data(), d_absum, N * sizeof(float), hipMemcpyDeviceToHost));
 
       double mag = 0.0;
       for (int i = 0; i < N; i++) {
         mag = fmax(mag, fabs(ref[i]));
       }
-      double max_rel = 0.0;
+      double max_rel = 0.0, max_absum = 0.0;
       for (int i = 0; i < N; i++) {
         max_rel = fmax(max_rel, fabs(got[i] - ref[i]) / fmax(mag, 1e-6));
+        max_absum = fmax(max_absum, fabs(got[i] - ref[i]) / absum[i]);
       }
       bool pass = max_rel < 1e-3;
-      printf("%-8s %-11s %-12.3e %s\n",
+      printf("%-8s %-11s %-12.3e %-12.3e %s\n",
              lname[l],
              gname[gr],
              max_rel,
+             max_absum,
              pass ? "MATCH" : "");
       if (max_rel < best) {
         best = max_rel;

@@ -91,6 +91,18 @@ if [ "${GFX_ARCH:-gfx950}" = "gfx950" ]; then
         -Wno-unused-result \
         -I ../../include \
         -I ../../include/mirage/persistent_kernel
+
+    echo "Building MXFP8 MoE W13/W2 gang linear test..."
+    hipcc -o test_mxfp8_moe test_mxfp8_moe.hip \
+        -D__HIP_PLATFORM_AMD__ \
+        -DMIRAGE_BACKEND_USE_ROCM \
+        --offload-arch=gfx950 \
+        -munsafe-fp-atomics \
+        -O3 \
+        -std=c++17 \
+        -Wno-unused-result \
+        -I ../../include \
+        -I ../../include/mirage/persistent_kernel
 fi
 
 echo "Build complete!"
@@ -103,3 +115,4 @@ echo "          ./test_mla_decode"
 echo "          ./test_mla_kv_cache_update"
 echo "          ./test_mxfp8_mfma_layout                  # gfx950 only"
 echo "          ./test_mxfp8_linear                       # gfx950 only"
+echo "          ./test_mxfp8_moe                          # gfx950 only"
