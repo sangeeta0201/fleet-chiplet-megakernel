@@ -58,10 +58,23 @@ hipcc -o test_mla_decode test_mla_decode.hip \
     -I ../../include \
     -I ../../include/mirage/persistent_kernel
 
+echo "Building GLM-5 absorbed MLA latent cache append test..."
+hipcc -o test_mla_kv_cache_update test_mla_kv_cache_update.hip \
+    -D__HIP_PLATFORM_AMD__ \
+    -DMIRAGE_BACKEND_USE_ROCM \
+    --offload-arch="${GFX_ARCH:-gfx950}" \
+    -munsafe-fp-atomics \
+    -O3 \
+    -std=c++17 \
+    -Wno-unused-result \
+    -I ../../include \
+    -I ../../include/mirage/persistent_kernel
+
 echo "Build complete!"
 echo ""
 echo "Run with: ./test_mfma_simple"
 echo "          ./test_mfma_pipeline_hazards [launches]   # gfx950 only"
-echo "          ./test_moe_topk_sigmoid_bias [num_rows]"
+echo "          ./test_moe_topk_sigmoid_bias [num_rows] [num_shared]"
 echo "          ./test_rope_interleave_partial"
 echo "          ./test_mla_decode"
+echo "          ./test_mla_kv_cache_update"

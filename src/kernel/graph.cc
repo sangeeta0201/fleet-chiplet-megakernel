@@ -616,9 +616,10 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         5, 1, TASK_GANG_SPLITK_LINEAR_RES_BIAS_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[2] * params[3]; // n_tiles × k_splits
   } else if (name == "gang_rmsnorm_linear_bias_mi300") {
-    assert(params.size() == 8 &&
+    assert((params.size() == 8 || params.size() == 9) &&
            "gang_rmsnorm_linear_bias_mi300 needs [o_stride, tile_n, m_tiles, "
-           "m_per_tile, total_tiles, n_tiles, wgm, actual_hidden_dim]");
+           "m_per_tile, total_tiles, n_tiles, wgm, actual_hidden_dim, "
+           "(norm_span)]");
     int variant_id =
         task_register->register_gang_rmsnorm_linear_bias_mi300_task(
             customized->bgraph, params);
@@ -970,6 +971,11 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         customized->bgraph, params);
     task_config[op] =
         std::make_tuple(7, 1, TASK_KV_CACHE_UPDATE_MI300, variant_id);
+  } else if (name == "mla_kv_cache_update_mi300") {
+    int variant_id = task_register->register_mla_kv_cache_update_mi300_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(6, 1, TASK_MLA_KV_CACHE_UPDATE_MI300, variant_id);
   } else if (name == "paged_attention_ck_fmha_split_kv_mi300") {
     int variant_id =
         task_register->register_paged_attention_ck_fmha_split_kv_mi300_task(

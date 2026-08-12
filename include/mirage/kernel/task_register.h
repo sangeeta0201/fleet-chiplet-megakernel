@@ -206,6 +206,8 @@ public:
   // MI300 CK FMHA batch-independent tasks
   int register_kv_cache_update_mi300_task(threadblock::Graph const &bgraph,
                                           std::vector<int> const &params);
+  int register_mla_kv_cache_update_mi300_task(threadblock::Graph const &bgraph,
+                                              std::vector<int> const &params);
   int register_paged_attention_ck_fmha_split_kv_mi300_task(
       threadblock::Graph const &bgraph, std::vector<int> const &params);
   int register_paged_attention_ck_fmha_merge_mi300_task(

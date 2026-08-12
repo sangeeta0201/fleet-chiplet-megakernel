@@ -29,12 +29,20 @@ using bf16 = __hip_bfloat16;
 //
 // STORAGE_DIM: number of bf16 elements stored along the hidden axis (padded)
 // ACTUAL_HIDDEN_DIM: divisor for the RMS mean (unpadded hidden size)
+// NORM_SPAN: number of leading elements the sum-of-squares runs over
 //
 // The norm weight is assumed zero-padded past ACTUAL_HIDDEN_DIM, so the
 // padded tail multiplies by zero. Sum-of-squares is taken over STORAGE_DIM
 // (the padded tail is also zero in input, since the producer pads with 0),
 // but the divisor uses ACTUAL_HIDDEN_DIM.
-template <int STORAGE_DIM, int ACTUAL_HIDDEN_DIM>
+//
+// NORM_SPAN < STORAGE_DIM is for GLM's q_a_layernorm, whose input row is the
+// fused `[q_a | kv_latent]` projection: only the leading q_a columns belong in
+// the RMS denominator, and the latent columns are decidedly not zero. The
+// whole row is still normalized-and-scaled on the way out, so the trailing
+// columns come out zero (the norm weight is zero there) and the downstream
+// GEMM's matching weight columns are zero too.
+template <int STORAGE_DIM, int ACTUAL_HIDDEN_DIM, int NORM_SPAN = STORAGE_DIM>
 __device__ __forceinline__ void rmsnorm_inline_amd(void const *input_ptr,
                                                    void const *weight_ptr,
                                                    void *output_ptr,
@@ -73,9 +81,14 @@ __device__ __forceinline__ void rmsnorm_inline_amd(void const *input_ptr,
 #pragma unroll
     for (int i = 0; i < 4; i++) {
       float vlo = __bfloat162float(lo[i]);
-      sum += vlo * vlo;
       float vhi = __bfloat162float(hi[i]);
-      sum += vhi * vhi;
+      if constexpr (NORM_SPAN == STORAGE_DIM) {
+        sum += vlo * vlo;
+        sum += vhi * vhi;
+      } else {
+        sum += (offset + i < NORM_SPAN) ? vlo * vlo : 0.0f;
+        sum += (offset + 4 + i < NORM_SPAN) ? vhi * vhi : 0.0f;
+      }
     }
   }
   // Scalar tail cache
@@ -85,7 +98,11 @@ __device__ __forceinline__ void rmsnorm_inline_amd(void const *input_ptr,
   for (int i = VEC_END + tid; i < STORAGE_DIM; i += nthreads) {
     float val = __bfloat162float(d_input[i]);
     tail_cache[n_tail++] = val;
-    sum += val * val;
+    if constexpr (NORM_SPAN == STORAGE_DIM) {
+      sum += val * val;
+    } else {
+      sum += (i < NORM_SPAN) ? val * val : 0.0f;
+    }
   }
 
 // ── Phase 2: wavefront reduction (AMD wavefront = 64 lanes) ──
@@ -173,7 +190,8 @@ __device__ __forceinline__ void rmsnorm_inline_amd(void const *input_ptr,
 template <typename T,
           int BATCH_SIZE,
           int REDUCTION_SIZE,
-          int ACTUAL_HIDDEN_DIM = REDUCTION_SIZE>
+          int ACTUAL_HIDDEN_DIM = REDUCTION_SIZE,
+          int NORM_SPAN = REDUCTION_SIZE>
 __device__ __forceinline__ void gang_rmsnorm_linear_bias_kernel(
     void const *norm_input_ptr,  // [batch, REDUCTION_SIZE]
     void const *norm_weight_ptr, // [REDUCTION_SIZE]  (zero-padded past ACTUAL)
@@ -189,8 +207,9 @@ __device__ __forceinline__ void gang_rmsnorm_linear_bias_kernel(
     int wgm,
     int tile_idx) {
   // Step 1: redundant RMSNorm.
-  gang_rmsnorm_detail::rmsnorm_inline_amd<REDUCTION_SIZE, ACTUAL_HIDDEN_DIM>(
-      norm_input_ptr, norm_weight_ptr, norm_output_ptr);
+  gang_rmsnorm_detail::
+      rmsnorm_inline_amd<REDUCTION_SIZE, ACTUAL_HIDDEN_DIM, NORM_SPAN>(
+          norm_input_ptr, norm_weight_ptr, norm_output_ptr);
 
   // Step 2: gang linear with bias, reading from norm_output_ptr.
   gang_linear_kernel<T, BATCH_SIZE, REDUCTION_SIZE>(norm_output_ptr,

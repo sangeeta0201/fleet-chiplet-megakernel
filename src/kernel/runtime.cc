@@ -388,6 +388,7 @@ void register_mugraph(
               (task_type == TASK_PAGED_ATTENTION_SPLIT_KV_MI300) ||
               (task_type == TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_MI300) ||
               (task_type == TASK_KV_CACHE_UPDATE_MI300) ||
+              (task_type == TASK_MLA_KV_CACHE_UPDATE_MI300) ||
               (task_type == TASK_PAGED_ATTENTION_CK_FMHA_SPLIT_KV_MI300) ||
               (task_type == TASK_ATTENTION_SINK_MI300) ||
               (task_type == TASK_ATTN_SM100)) {
@@ -448,7 +449,8 @@ void register_mugraph(
               task_type == TASK_GANG_OPROJ_TOPK_MOE_FUSED_MI300 ||
               task_type == TASK_GANG_FULL_LAYER_FUSED_MI300 ||
               task_type == TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300 ||
-              task_type == TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300) {
+              task_type == TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300 ||
+              task_type == TASK_GANG_MLA_DECODE_MI300) {
             auto it = graph.gang_task_tiles_per_xcd.find(op);
             assert(it != graph.gang_task_tiles_per_xcd.end() &&
                    "Gang task missing n_tiles_per_xcd");
@@ -474,7 +476,8 @@ void register_mugraph(
                        task_type ==
                            TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300 ||
                        task_type ==
-                           TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300) {
+                           TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300 ||
+                       task_type == TASK_GANG_MLA_DECODE_MI300) {
               // Encode XCD index in tile_idx so kernel can compute column
               // offset tile_idx = bid.x * tiles_per_xcd + local_t
               task.task_metadata.n_tile_start =
@@ -568,6 +571,23 @@ void register_mugraph(
         }
       }
       // assert that their is at least a single tensor shared between ops
+      if (num_shared_tensors < 1) {
+        printf("[task-chain] no shared tensor: task_type %d (variant %d) "
+               "follows task_type %d\n",
+               (int)task_type,
+               variant_id,
+               (int)std::get<2>(task_configs.find(pre_op)->second));
+        printf("  consumer inputs:");
+        for (auto const &input : input_ops) {
+          printf(" %zu", (size_t)input->dtensor.guid);
+        }
+        printf("\n  producer outputs:");
+        for (auto const &output : pre_output_ops) {
+          printf(" %zu", (size_t)output->dtensor.guid);
+        }
+        printf("\n");
+        fflush(stdout);
+      }
       assert(num_shared_tensors >= 1);
       for (int d = 0; d < mirage::config::MAX_TENSOR_DIMS; d++) {
         if (d == input_map.x) {
@@ -1552,6 +1572,8 @@ TaskGraphResult print_task_graph(
       "TASK_MOE_TOPK_SIGMOID_BIAS_MI300";
   task_type_to_name[TASK_GANG_MLA_DECODE_MI300] =
       "TASK_GANG_MLA_DECODE_MI300";
+  task_type_to_name[TASK_MLA_KV_CACHE_UPDATE_MI300] =
+      "TASK_MLA_KV_CACHE_UPDATE_MI300";
   task_type_to_name[TASK_MOE_W13_LINEAR_MI300] = "TASK_MOE_W13_LINEAR_MI300";
   task_type_to_name[TASK_MOE_W2_LINEAR_MI300] = "TASK_MOE_W2_LINEAR_MI300";
   task_type_to_name[TASK_MOE_W13_LINEAR_MXFP4_MI300] =
@@ -1692,7 +1714,8 @@ TaskGraphResult print_task_graph(
         task.first == TASK_GANG_OPROJ_TOPK_MOE_FUSED_MI300 ||
         task.first == TASK_GANG_FULL_LAYER_FUSED_MI300 ||
         task.first == TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300 ||
-        task.first == TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300) {
+        task.first == TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300 ||
+        task.first == TASK_GANG_MLA_DECODE_MI300) {
       continue;
     }
     for (size_t variant_id = 0; variant_id < task.second.size(); variant_id++) {
@@ -1752,7 +1775,8 @@ TaskGraphResult print_task_graph(
           task.first != TASK_GANG_OPROJ_TOPK_MOE_FUSED_MI300 &&
           task.first != TASK_GANG_FULL_LAYER_FUSED_MI300 &&
           task.first != TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300 &&
-          task.first != TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300) {
+          task.first != TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300 &&
+          task.first != TASK_GANG_MLA_DECODE_MI300) {
         continue;
       }
       for (size_t variant_id = 0; variant_id < task.second.size();

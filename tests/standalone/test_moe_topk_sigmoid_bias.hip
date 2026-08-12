@@ -51,7 +51,8 @@ __global__ void topk_sigmoid_bias_entry(void *input,
                                         void *output,
                                         int num_rows,
                                         void *routing_indices,
-                                        void *active_expert_ids) {
+                                        void *active_expert_ids,
+                                        int num_shared_experts) {
   kernel::topk_sigmoid_bias_mi300_task_impl<hip_bfloat16,
                                             8,
                                             NUM_EXPERTS,
@@ -67,7 +68,8 @@ __global__ void topk_sigmoid_bias_entry(void *input,
       0,
       NUM_EXPERTS,
       /*renormalize=*/true,
-      ROUTED_SCALING);
+      ROUTED_SCALING,
+      num_shared_experts);
 }
 
 // Round-trip through bf16 so the host reference sees exactly the values the
@@ -96,6 +98,14 @@ int main(int argc, char **argv) {
     fprintf(stderr, "num_rows must be in [1, 8]\n");
     return 2;
   }
+  // GLM's always-on shared expert: id NUM_EXPERTS in slot TOPK, weight 1.
+  int const num_shared = (argc > 2) ? atoi(argv[2]) : 1;
+  if (num_shared != 0 && num_shared != 1) {
+    fprintf(stderr, "num_shared must be 0 or 1\n");
+    return 2;
+  }
+  int const SLOTS = TOPK + num_shared;
+  int const TOTAL_EXPERTS = NUM_EXPERTS + num_shared;
 
   srand(1234);
   auto urand = []() { return (float)rand() / (float)RAND_MAX; };
@@ -163,18 +173,18 @@ int main(int argc, char **argv) {
   void *d_input, *d_bias, *d_output, *d_routing, *d_active;
   hipMalloc(&d_input, (size_t)num_rows * NUM_EXPERTS * 2);
   hipMalloc(&d_bias, (size_t)NUM_EXPERTS * 2);
-  hipMalloc(&d_output, (size_t)num_rows * TOPK * 4);
-  hipMalloc(&d_routing, (size_t)NUM_EXPERTS * num_rows * 4);
-  hipMalloc(&d_active, (size_t)(NUM_EXPERTS + 1) * 4);
+  hipMalloc(&d_output, (size_t)num_rows * SLOTS * 4);
+  hipMalloc(&d_routing, (size_t)TOTAL_EXPERTS * num_rows * 4);
+  hipMalloc(&d_active, (size_t)(TOTAL_EXPERTS + 1) * 4);
   hipMemcpy(d_input,
             h_input.data(),
             (size_t)num_rows * NUM_EXPERTS * 2,
             hipMemcpyHostToDevice);
   hipMemcpy(
       d_bias, h_bias.data(), (size_t)NUM_EXPERTS * 2, hipMemcpyHostToDevice);
-  hipMemset(d_output, 0, (size_t)num_rows * TOPK * 4);
-  hipMemset(d_routing, 0, (size_t)NUM_EXPERTS * num_rows * 4);
-  hipMemset(d_active, 0, (size_t)(NUM_EXPERTS + 1) * 4);
+  hipMemset(d_output, 0, (size_t)num_rows * SLOTS * 4);
+  hipMemset(d_routing, 0, (size_t)TOTAL_EXPERTS * num_rows * 4);
+  hipMemset(d_active, 0, (size_t)(TOTAL_EXPERTS + 1) * 4);
 
   hipLaunchKernelGGL(topk_sigmoid_bias_entry,
                      dim3(1),
@@ -186,25 +196,28 @@ int main(int argc, char **argv) {
                      d_output,
                      num_rows,
                      d_routing,
-                     d_active);
+                     d_active,
+                     num_shared);
   hipError_t err = hipDeviceSynchronize();
   if (err != hipSuccess) {
     fprintf(stderr, "launch failed: %s\n", hipGetErrorString(err));
     return 2;
   }
 
-  std::vector<float> out((size_t)num_rows * TOPK);
-  std::vector<int> routing((size_t)NUM_EXPERTS * num_rows);
-  std::vector<int> active(NUM_EXPERTS + 1);
-  hipMemcpy(
-      out.data(), d_output, (size_t)num_rows * TOPK * 4, hipMemcpyDeviceToHost);
+  std::vector<float> out((size_t)num_rows * SLOTS);
+  std::vector<int> routing((size_t)TOTAL_EXPERTS * num_rows);
+  std::vector<int> active(TOTAL_EXPERTS + 1);
+  hipMemcpy(out.data(),
+            d_output,
+            (size_t)num_rows * SLOTS * 4,
+            hipMemcpyDeviceToHost);
   hipMemcpy(routing.data(),
             d_routing,
-            (size_t)NUM_EXPERTS * num_rows * 4,
+            (size_t)TOTAL_EXPERTS * num_rows * 4,
             hipMemcpyDeviceToHost);
   hipMemcpy(active.data(),
             d_active,
-            (size_t)(NUM_EXPERTS + 1) * 4,
+            (size_t)(TOTAL_EXPERTS + 1) * 4,
             hipMemcpyDeviceToHost);
 
   int failures = 0;
@@ -212,7 +225,7 @@ int main(int argc, char **argv) {
 
   for (int row = 0; row < num_rows; ++row) {
     for (int j = 0; j < TOPK; ++j) {
-      float got = out[(size_t)row * TOPK + j];
+      float got = out[(size_t)row * SLOTS + j];
       float want = ref_w[(size_t)row * TOPK + j];
       float rel = fabsf(got - want) / fmaxf(fabsf(want), 1e-6f);
       max_rel = fmaxf(max_rel, rel);
@@ -228,11 +241,20 @@ int main(int argc, char **argv) {
     }
     // routing_indices[expert][row] == slot + 1 for the k selected experts, 0
     // everywhere else.
-    std::vector<int> want_routing(NUM_EXPERTS, 0);
+    std::vector<int> want_routing(TOTAL_EXPERTS, 0);
     for (int j = 0; j < TOPK; ++j) {
       want_routing[ref_ids[(size_t)row * TOPK + j]] = j + 1;
     }
-    for (int e = 0; e < NUM_EXPERTS; ++e) {
+    if (num_shared) {
+      // The shared expert is unconditionally in slot TOPK of every token.
+      want_routing[NUM_EXPERTS] = TOPK + 1;
+      float const w = out[(size_t)row * SLOTS + TOPK];
+      if (fabsf(w - 1.0f) > 1e-6f) {
+        printf("row %d shared slot: weight %.7f != 1\n", row, w);
+        ++failures;
+      }
+    }
+    for (int e = 0; e < TOTAL_EXPERTS; ++e) {
       int got = routing[(size_t)e * num_rows + row];
       if (got != want_routing[e]) {
         printf("row %d expert %d: routing_index %d != %d\n",
@@ -256,11 +278,16 @@ int main(int argc, char **argv) {
       }
     }
   }
-  if (active[NUM_EXPERTS] != TOPK) {
+  if (num_shared && active[TOPK] != NUM_EXPERTS) {
+    printf("shared slot: active_expert_id %d != %d\n", active[TOPK],
+           NUM_EXPERTS);
+    ++failures;
+  }
+  if (active[TOTAL_EXPERTS] != SLOTS) {
     printf("active_expert_ids[%d] = %d, expected %d\n",
-           NUM_EXPERTS,
-           active[NUM_EXPERTS],
-           TOPK);
+           TOTAL_EXPERTS,
+           active[TOTAL_EXPERTS],
+           SLOTS);
     ++failures;
   }
 
@@ -268,7 +295,7 @@ int main(int argc, char **argv) {
   for (int row = 0; row < num_rows; ++row) {
     float s = 0.f;
     for (int j = 0; j < TOPK; ++j) {
-      s += out[(size_t)row * TOPK + j];
+      s += out[(size_t)row * SLOTS + j];
     }
     if (fabsf(s - ROUTED_SCALING) > 1e-3f) {
       printf("row %d: weights sum to %.6f, expected %.6f\n",
@@ -286,9 +313,11 @@ int main(int argc, char **argv) {
   hipFree(d_active);
 
   if (failures == 0) {
-    printf("PASS: %d row(s), %d experts, top-%d — max weight rel err %.2e\n",
+    printf("PASS: %d row(s), %d experts (+%d shared), top-%d — max weight rel "
+           "err %.2e\n",
            num_rows,
            NUM_EXPERTS,
+           num_shared,
            TOPK,
            max_rel);
     return 0;

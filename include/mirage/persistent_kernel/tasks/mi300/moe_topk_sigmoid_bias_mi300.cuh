@@ -26,6 +26,14 @@
 // GLM-5 sets n_group = topk_group = 1, so the DeepSeek group-limited routing
 // degenerates to a plain top-k over all experts and no group masking is needed.
 //
+// GLM's always-on shared expert is emitted as one extra routing slot rather
+// than as a separate pair of GEMMs (the AITER `shared_expert_id` trick): with
+// `num_shared_experts == 1` the router appends expert id NUM_EXPERTS at slot k
+// with weight 1.0, so the routed-MoE tasks run it alongside the selected
+// experts and `moe_mul_sum_add` folds it into the same weighted sum. The
+// shared expert has exactly a routed expert's shape, so it is just row
+// NUM_EXPERTS of the stacked weights.
+//
 // Structurally a clone of moe_topk_softmax_mi300.cuh (same wave layout, same
 // branchless argmax / blanking inline asm); only the scoring function and the
 // bias/scale plumbing differ. The one extra wrinkle is that selection uses the
@@ -72,17 +80,21 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
     void *__restrict__ output_ptr, // [num_rows, k] (float weights)
     int const num_rows,
     int const k,
-    void *__restrict__ routing_indices_ptr,   // [NUM_EXPERTS, num_rows] int32
-    void *__restrict__ active_expert_ids_ptr, // [NUM_EXPERTS + 1] int32
+    void *__restrict__ routing_indices_ptr,   // [NUM_EXPERTS + S, num_rows] i32
+    void *__restrict__ active_expert_ids_ptr, // [NUM_EXPERTS + S + 1] int32
     int const start_expert,
     int const end_expert,
     bool const renormalize,
-    float const routed_scaling_factor) {
+    float const routed_scaling_factor,
+    int const num_shared_experts) {
   T *input = static_cast<T *>(input_ptr);
   T *bias = static_cast<T *>(bias_ptr);
   float *output = static_cast<float *>(output_ptr);
   int *routing_indices = static_cast<int *>(routing_indices_ptr);
   int *active_expert_ids = static_cast<int *>(active_expert_ids_ptr);
+
+  // Slot count per token: the k routed experts, plus the shared expert.
+  int const k_total = k + num_shared_experts;
 
   // Initialize routing indices to 0.
   // active_expert_ids initialization is NOT needed: we write directly to
@@ -93,6 +105,12 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
       for (int row = 0; row < num_rows; ++row) {
         routing_indices[expert * num_rows + row] = 0;
       }
+    }
+  }
+  // The shared expert takes slot k of every token, unconditionally.
+  if (num_shared_experts > 0 && routing_indices != nullptr) {
+    for (int row = threadIdx.x; row < num_rows; row += blockDim.x) {
+      routing_indices[NUM_EXPERTS * num_rows + row] = k + 1;
     }
   }
   __syncthreads();
@@ -255,7 +273,7 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
       // Weight is the UNBIASED sigmoid score, scaled by routed_scaling_factor.
       if (thread_group_idx == 0) {
         bool const node_uses = (expert >= start_expert && expert < end_expert);
-        int const out_idx = k * thread_row + k_idx;
+        int const out_idx = k_total * thread_row + k_idx;
         st_wt_u32((void *)&output[out_idx],
                   __float_as_uint(score * routed_scaling_factor));
         topk_vals[k_idx] = score;
@@ -289,22 +307,34 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
       }
     }
 
-    // Optional renormalization (write-through stores, using cached values)
+    // Optional renormalization (write-through stores, using cached values).
+    // The shared expert is outside the renormalized sum -- GLM adds it with
+    // weight 1 -- so only the k routed slots are rewritten.
     if (renormalize && thread_group_idx == 0) {
       float inv = routed_scaling_factor / row_sum_for_renorm;
       for (int k_idx = 0; k_idx < k; ++k_idx) {
-        int const out_idx = k * thread_row + k_idx;
+        int const out_idx = k_total * thread_row + k_idx;
         st_wt_u32((void *)&output[out_idx],
                   __float_as_uint(topk_vals[k_idx] * inv));
       }
     }
+
+    // Shared expert: slot k, weight 1.0, unscaled and unrenormalized.
+    if (num_shared_experts > 0 && thread_group_idx == 0) {
+      st_wt_u32((void *)&output[k_total * thread_row + k],
+                __float_as_uint(1.0f));
+    }
   }
   __syncthreads();
 
-  // Set active expert count (thread 0 only, single wavefront handles all rows
-  // for batch=1)
+  // Set the active expert list tail (thread 0 only, single wavefront handles
+  // all rows for batch=1): the shared expert id, then the slot count.
   if (active_expert_ids != nullptr && threadIdx.x == 0) {
-    st_wt_u32((void *)&active_expert_ids[NUM_EXPERTS], (unsigned)k);
+    if (num_shared_experts > 0) {
+      st_wt_u32((void *)&active_expert_ids[k], (unsigned)NUM_EXPERTS);
+    }
+    st_wt_u32((void *)&active_expert_ids[NUM_EXPERTS + num_shared_experts],
+              (unsigned)k_total);
   }
 }
 

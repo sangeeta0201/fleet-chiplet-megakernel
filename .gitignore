@@ -81,6 +81,7 @@ outputs/
 tests/standalone/test_mfma_simple
 tests/standalone/test_mfma_pipeline_hazards
 tests/standalone/test_mla_decode
+tests/standalone/test_mla_kv_cache_update
 tests/standalone/test_moe_topk_sigmoid_bias
 tests/standalone/test_rope_interleave_partial
 

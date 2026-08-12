@@ -1069,6 +1069,72 @@ class PersistentKernel:
         )
         self.kn_graph.register_task(tb_graph, "kv_cache_update_mi300", params)
 
+    def mla_kv_cache_update_layer(
+        self,
+        q_absorbed: DTensor,
+        kv_latent: DTensor,
+        kv_cache: DTensor,
+        kv_norm: DTensor,
+        cos_pos_embed: DTensor,
+        sin_pos_embed: DTensor,
+        q_workspace: DTensor,
+        grid_dim: tuple,
+        block_dim: tuple,
+        kv_offset: int = 0,
+    ):
+        """Phase A of absorbed MLA (GLM-5): latent cache append + partial RoPE.
+
+        The GQA kv_cache_update_layer splits QKV out of one fused tensor into
+        separate K and V caches. Under absorption there is one latent row per
+        token, kv_row = [c_kv | k_rope], and V is the leading kv_lora_rank dims
+        of that same row, so the two paths cannot share a task.
+
+        q_absorbed comes from q_b_proj with W_UK folded in, so each head is
+        already [q_nope @ W_UK | q_rope] and only needs RoPE on the trailing
+        slice before it lands in q_workspace. kv_latent is the raw
+        kv_a_proj_with_mqa output; kv_a_layernorm is applied here, on the write
+        side of the cache, because kv_b_proj (hence W_UK/W_UV) is linear in the
+        normalised latent.
+
+        ``kv_offset`` is the column the latent starts at within its row, for
+        callers that fuse kv_a_proj into a wider GEMM.
+        """
+        assert q_absorbed.num_dims == 2   # (num_tokens, num_q_heads * qk_dim)
+        assert kv_latent.num_dims == 2    # (num_tokens, >= kv_offset + qk_dim)
+        assert kv_cache.num_dims == 4     # (num_pages, page_size, 1, qk_dim)
+        assert q_workspace.num_dims == 2  # (num_tokens, q_workspace_stride)
+        assert kv_cache.dim(2) == 1, "MLA keeps a single shared latent head"
+
+        qk_dim = kv_cache.dim(3)
+        qk_rope_head_dim = cos_pos_embed.dim(cos_pos_embed.num_dims - 1)
+        kv_lora_rank = qk_dim - qk_rope_head_dim
+        num_qo_heads = q_workspace.dim(1) // qk_dim
+        q_workspace_stride = q_workspace.dim(1)
+        assert kv_latent.dim(1) >= kv_offset + qk_dim
+        assert kv_norm.dim(0) == kv_lora_rank
+
+        # params: num_qo_heads, kv_lora_rank, qk_rope_head_dim, max_seq_len,
+        #         page_size, q_workspace_stride, [kv_offset]
+        params = [num_qo_heads, kv_lora_rank, qk_rope_head_dim,
+                  self.max_seq_length, self.page_size, q_workspace_stride]
+        if kv_offset:
+            params.append(kv_offset)
+
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(q_absorbed, (-1, 1, -1), -1, True)
+        tb_graph.new_input(kv_latent, (-1, 1, -1), -1, True)
+        tb_graph.new_input(kv_cache, (-1, 2, -1), 1, True)
+        tb_graph.new_input(kv_norm, (-1, -1, -1), -1, True)
+        tb_graph.new_input(cos_pos_embed, (-1, -1, -1), -1, True)
+        tb_graph.new_input(sin_pos_embed, (-1, -1, -1), -1, True)
+        tb_graph.new_input(q_workspace, (-1, 1, -1), -1, True)
+        self.kn_graph.customized(
+            [q_absorbed, kv_latent, kv_cache, kv_norm,
+             cos_pos_embed, sin_pos_embed, q_workspace],
+            tb_graph,
+        )
+        self.kn_graph.register_task(tb_graph, "mla_kv_cache_update_mi300", params)
+
     def paged_attention_ck_fmha_layer(
         self,
         q_workspace: DTensor,
@@ -2439,6 +2505,7 @@ class PersistentKernel:
         output_stride: int,
         m_tiles: int = 1,
         wgm: int = 0,
+        norm_span: int = 0,
         block_dim: tuple = (256, 1, 1),
     ):
         """Fused RMSNorm + Gang Linear + Bias.
@@ -2455,6 +2522,12 @@ class PersistentKernel:
 
         ``actual_hidden_dim`` is the unpadded hidden size used for the RMS
         denominator (e.g. 2880 for GPT-OSS, with norm_input padded to 3072).
+
+        ``norm_span`` (default: the whole row) is how far the sum of squares
+        runs. It only differs from the row width when the row holds something
+        besides the normed vector and its zero padding -- GLM's q_a_layernorm
+        reads the fused ``[q_a | kv_latent]`` projection and must leave the
+        latent columns out of the denominator.
         """
         assert norm_input.num_dims == 2
         assert linear_weight.num_dims == 2
@@ -2482,10 +2555,13 @@ class PersistentKernel:
             [norm_input, norm_weight, norm_output, linear_weight, bias, output],
             tb_graph,
         )
+        params = [output_stride, tile_n, m_tiles, m_per_tile,
+                  total_tiles_per_xcd, n_tiles_per_xcd, wgm, actual_hidden_dim]
+        if norm_span:
+            assert actual_hidden_dim <= norm_span <= norm_input.dim(1)
+            params.append(norm_span)
         self.kn_graph.register_task(
-            tb_graph, "gang_rmsnorm_linear_bias_mi300",
-            [output_stride, tile_n, m_tiles, m_per_tile, total_tiles_per_xcd,
-             n_tiles_per_xcd, wgm, actual_hidden_dim]
+            tb_graph, "gang_rmsnorm_linear_bias_mi300", params
         )
 
     def gang_rmsnorm_linear_bias_topk_layer(

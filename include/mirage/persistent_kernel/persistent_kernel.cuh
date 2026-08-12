@@ -2587,9 +2587,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
         case TASK_PAGED_ATTENTION_SPLIT_KV_MI300:
         case TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_MI300:
         case TASK_KV_CACHE_UPDATE_MI300:
+        case TASK_MLA_KV_CACHE_UPDATE_MI300:
         case TASK_PAGED_ATTENTION_CK_FMHA_SPLIT_KV_MI300:
         case TASK_GANG_ATTN_SPLIT_KV_MI300:
         case TASK_GANG_ATTN_MERGE_MI300:
+        case TASK_GANG_MLA_DECODE_MI300:
           attention_cycles += task_time;
           attention_count++;
           break;

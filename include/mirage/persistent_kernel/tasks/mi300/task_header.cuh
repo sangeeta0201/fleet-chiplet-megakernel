@@ -37,6 +37,7 @@
 #include "tasks/mi300/multitoken_paged_attention_mi300.cuh"
 #include "tasks/mi300/multitoken_paged_attention_split_kv_mi300.cuh"
 #include "tasks/mi300/kv_cache_update_mi300.cuh"
+#include "tasks/mi300/mla_kv_cache_update_mi300.cuh"
 #include "tasks/mi300/attention_sink_mi300.cuh"
 #ifdef MPK_USE_CK_FMHA
 #include "tasks/mi300/paged_attention_decode_minimal_hd64_mi300.cuh"

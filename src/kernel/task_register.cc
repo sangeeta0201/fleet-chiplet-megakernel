@@ -1002,7 +1002,7 @@ int TaskRegister::register_gang_splitk_linear_res_bias_mi300_task(
 // Outputs: [linear_output]
 int TaskRegister::register_gang_rmsnorm_linear_bias_mi300_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 8);
+  assert(params.size() == 8 || params.size() == 9);
   int output_stride = params[0];
   int tile_n = params[1];
   int m_tiles = params[2];
@@ -1031,13 +1031,20 @@ int TaskRegister::register_gang_rmsnorm_linear_bias_mi300_task(
   // input[0] is norm_input [batch, reduction_size]
   assert(input_ops[0]->dtensor.num_dims == 2);
   int reduction_size = input_ops[0]->dtensor.dim[1];
+  // Optional 9th param: the leading span of the row the RMS sum runs over.
+  // Defaults to the whole row; GLM's q_a_layernorm passes the padded q_lora
+  // width because its input row is the fused [q_a | kv_latent] projection.
+  int norm_span = params.size() == 9 ? params[8] : reduction_size;
+  assert(norm_span > 0 && norm_span <= reduction_size);
+  assert(actual_hidden_dim <= norm_span);
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
-  code.e("kernel::gang_rmsnorm_linear_bias_kernel<bfloat16, $, $, $>(",
+  code.e("kernel::gang_rmsnorm_linear_bias_kernel<bfloat16, $, $, $, $>(",
          m_per_tile,
          reduction_size,
-         actual_hidden_dim);
+         actual_hidden_dim,
+         norm_span);
   code.e("    task_desc->input_ptrs[0],");  // norm_input
   code.e("    task_desc->input_ptrs[1],");  // norm_weight
   code.e("    task_desc->input_ptrs[2],");  // norm_output scratch (writable)
@@ -5401,14 +5408,21 @@ int TaskRegister::register_moe_topk_sigmoid_bias_mi300_task(
   assert(output_ops[0]->output_tensors[0].num_dims == 2);
   assert(output_ops[1]->output_tensors[0].num_dims == 2);
   assert(output_ops[2]->output_tensors[0].num_dims == 1);
-  num_experts = output_ops[1]->output_tensors[0].dim[0];
+  // The routing tables are sized for the *total* expert count. A shared
+  // expert, if any, is the one extra row past the routed experts and takes
+  // the one extra routing slot past the k selected ones.
+  int num_total_experts = output_ops[1]->output_tensors[0].dim[0];
   batch_size = output_ops[1]->output_tensors[0].dim[1];
-  num_experts_per_tok = output_ops[0]->output_tensors[0].dim[1];
-  assert(output_ops[0]->output_tensors[0].dim[0] == batch_size);
-  assert(output_ops[2]->output_tensors[0].dim[0] == num_experts + 1);
   assert(input_ops[0]->dtensor.num_dims == 2);
+  num_experts = input_ops[0]->output_tensors[0].dim[1];
+  int num_shared_experts = num_total_experts - num_experts;
+  assert(num_shared_experts == 0 || num_shared_experts == 1);
+  num_experts_per_tok =
+      output_ops[0]->output_tensors[0].dim[1] - num_shared_experts;
+  assert(num_experts_per_tok > 0);
+  assert(output_ops[0]->output_tensors[0].dim[0] == batch_size);
+  assert(output_ops[2]->output_tensors[0].dim[0] == num_total_experts + 1);
   assert(input_ops[0]->output_tensors[0].dim[0] == batch_size);
-  assert(input_ops[0]->output_tensors[0].dim[1] == num_experts);
   // e_score_correction_bias: [num_experts]
   assert(input_ops[1]->dtensor.num_dims == 1);
   assert(input_ops[1]->output_tensors[0].dim[0] == num_experts);
@@ -5429,7 +5443,8 @@ int TaskRegister::register_moe_topk_sigmoid_bias_mi300_task(
   code.e("    0,");
   code.e("    $,", num_experts);
   code.e("    $,", params[1] != 0 ? "true" : "false");
-  code.e("    $ / 1000.0f);", params[0]);
+  code.e("    $ / 1000.0f,", params[0]);
+  code.e("    $);", num_shared_experts);
   return register_task_variant(TASK_MOE_TOPK_SIGMOID_BIAS_MI300,
                                code.to_string());
 }
@@ -6317,6 +6332,80 @@ int TaskRegister::register_kv_cache_update_mi300_task(
   code.e("    1e-6f,");
   code.e("    1e-6f);");
   return register_task_variant(TASK_KV_CACHE_UPDATE_MI300, code.to_string());
+}
+
+int TaskRegister::register_mla_kv_cache_update_mi300_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: num_qo_heads (absorbed heads written to the q workspace)
+  // params[1]: kv_lora_rank
+  // params[2]: qk_rope_head_dim
+  // params[3]: max_seq_len
+  // params[4]: page_size
+  // params[5]: q_workspace_stride
+  // params[6]: kv_input_offset (column the latent starts at, optional)
+  assert(params.size() == 6 || params.size() == 7);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 6;
+  int num_outputs = 1;
+
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+
+  int num_qo_heads = params[0];
+  int kv_lora_rank = params[1];
+  int qk_rope_head_dim = params[2];
+  int max_seq_len = params[3];
+  int page_size = params[4];
+  int q_workspace_stride = params[5];
+  int q_input_stride = input_ops[0]->dtensor.dim[1];
+  int kv_input_stride = input_ops[1]->dtensor.dim[1];
+  int kv_input_offset = params.size() == 7 ? params[6] : 0;
+  assert(kv_input_offset + kv_lora_rank + qk_rope_head_dim <= kv_input_stride);
+  // Latent cache is (num_pages, page_size, 1, kv_lora_rank + qk_rope_head_dim);
+  // MLA keeps a single shared latent head, so the cache row stride is just the
+  // last dim -- unlike the GQA path, which multiplies by NUM_KV_HEADS.
+  int kv_cache_stride = input_ops[2]->output_tensors[0].dim[3];
+  assert(kv_cache_stride >= kv_lora_rank + qk_rope_head_dim);
+
+  // No LDS staging here, so unlike kv_cache_update there is nothing to cap
+  // MAX_TOKENS against; the only shared memory is the page-index table.
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::mla_kv_cache_update_impl<bfloat16, $, $, $, $, $, $, $, $, "
+         "$, $>(",
+         num_qo_heads,       /* NUM_QO_HEADS */
+         kv_lora_rank,       /* KV_LORA_RANK */
+         qk_rope_head_dim,   /* QK_ROPE_HEAD_DIM */
+         q_input_stride,     /* Q_INPUT_STRIDE */
+         kv_input_stride,    /* KV_INPUT_STRIDE */
+         kv_cache_stride,    /* KV_CACHE_STRIDE */
+         max_seq_len,        /* MAX_SEQ_LEN */
+         page_size,          /* PAGE_SIZE */
+         q_workspace_stride, /* Q_WORKSPACE_STRIDE */
+         kv_input_offset);   /* KV_INPUT_OFFSET */
+  code.e("    task_desc->input_ptrs[0],");  // q_absorbed
+  code.e("    task_desc->input_ptrs[1],");  // kv_latent
+  code.e("    task_desc->input_ptrs[2],");  // paged latent cache
+  code.e("    task_desc->output_ptrs[0],"); // q_workspace
+  code.e("    runtime_config.qo_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_indices_buffer,");
+  code.e("    runtime_config.paged_kv_last_page_len_buffer,");
+  code.e("    task_desc->task_metadata.request_id,");
+  code.e("    task_desc->input_ptrs[3],"); // kv_a_layernorm weight
+  code.e("    task_desc->input_ptrs[4],"); // cos
+  code.e("    task_desc->input_ptrs[5],"); // sin
+  code.e("    1e-6f);");
+  return register_task_variant(TASK_MLA_KV_CACHE_UPDATE_MI300,
+                               code.to_string());
 }
 
 int TaskRegister::register_paged_attention_ck_fmha_split_kv_mi300_task(
