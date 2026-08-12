@@ -29,6 +29,7 @@
 // workers_per_xcd.
 
 #pragma once
+#include "tasks/mi300/silu_mul_mi300.cuh"
 
 namespace kernel {
 
@@ -48,6 +49,28 @@ __device__ __forceinline__ int _gang_moe_get_xcd_id() {
 // Input: [batch, K=hidden_size]
 // Weight: [num_experts, N=2*intermediate, K=hidden_size]
 // Output: [batch, topk, N=2*intermediate]
+//
+// FUSE_SWIGLU folds the SiLU-mul into this epilogue, so the task writes
+// [batch, topk, intermediate] activations directly and the separate
+// moe_silu_mul task disappears along with its dispatch barrier and its
+// round trip of the 2*intermediate-wide intermediate through HBM.
+//
+// It requires the weight rows to be laid out *pairwise interleaved* --
+// row 2j is gate_j, row 2j+1 is up_j -- which is the same trick
+// gang_moe_swiglu_w2_mxfp4 relies on, just moved to the producer. The
+// reason it has to be pairwise rather than the coarse slab interleave
+// demo.py uses for the dense MLP is the epilogue register mapping: a
+// thread owns c_buf[0..3] at four *consecutive* N, so gate and its up
+// partner only meet in registers when they are adjacent columns. At
+// pairwise granularity c_buf holds [g_j, u_j, g_{j+1}, u_{j+1}] and the
+// activation falls out with no LDS traffic and no cross-lane shuffle.
+//
+// The permutation is free: rows stay whole and a tile still reads 64
+// consecutive weight rows, so the global load pattern is untouched.
+//
+// ACT_STRIDE is the row stride of the *activation* output (intermediate),
+// as distinct from OUTPUT_STRIDE which stays the weight/bias row stride
+// (2*intermediate). Ignored unless FUSE_SWIGLU.
 template <typename T,
           int BATCH_SIZE,
           int OUTPUT_SIZE,
@@ -56,7 +79,9 @@ template <typename T,
           int NUM_EXPERTS,
           int NUM_TOPK,
           int TILES_PER_EXPERT,
-          int N_TILES>
+          int N_TILES,
+          bool FUSE_SWIGLU = false,
+          int ACT_STRIDE = 0>
 __device__ __noinline__ void gang_moe_w13_linear_kernel(void const *input_ptr,
                                                         void const *weight_ptr,
                                                         void const *routing_ptr,
@@ -201,7 +226,48 @@ __device__ __noinline__ void gang_moe_w13_linear_kernel(void const *input_ptr,
     if (route_val != 0) {
       int const topk_slot = route_val - 1;
 
-      if (global_n_base + 3 < OUTPUT_SIZE) {
+      if constexpr (FUSE_SWIGLU) {
+        static_assert(2 * ACT_STRIDE == OUTPUT_STRIDE,
+                      "FUSE_SWIGLU expects a half-width activation output");
+        // global_n_base is a multiple of 4 (n_offset is a multiple of 64 and
+        // tile_col_base of 4), so the four accumulators are always a whole
+        // number of gate/up pairs starting on a pair boundary.
+        index_t const act_n_base = global_n_base >> 1;
+        bf16 *act_addr = d_output + global_m * (NUM_TOPK * ACT_STRIDE) +
+                         topk_slot * ACT_STRIDE + act_n_base;
+        bf16 const *bias_addr =
+            d_bias + expert_id * OUTPUT_STRIDE + global_n_base;
+
+        if (global_n_base + 3 < OUTPUT_SIZE) {
+          uint64_t bias_packed = *reinterpret_cast<uint64_t const *>(bias_addr);
+          bf16 const *bv = reinterpret_cast<bf16 const *>(&bias_packed);
+          float const g0 = c_buf[0] + type_convert<float>(bv[0]);
+          float const u0 = c_buf[1] + type_convert<float>(bv[1]);
+          float const g1 = c_buf[2] + type_convert<float>(bv[2]);
+          float const u1 = c_buf[3] + type_convert<float>(bv[3]);
+          uint32_t out_packed;
+          bf16 *out = reinterpret_cast<bf16 *>(&out_packed);
+          out[0] = type_convert<bf16>(fast_silu(g0) * u0);
+          out[1] = type_convert<bf16>(fast_silu(g1) * u1);
+          *reinterpret_cast<uint32_t *>(act_addr) = out_packed;
+        } else {
+#pragma unroll
+          for (index_t p = 0; p < 2; p++) {
+            index_t global_n = global_n_base + 2 * p;
+            if (global_n + 1 < OUTPUT_SIZE) {
+              float const g =
+                  c_buf[2 * p] +
+                  type_convert<float>(d_bias[expert_id * OUTPUT_STRIDE +
+                                             global_n]);
+              float const u =
+                  c_buf[2 * p + 1] +
+                  type_convert<float>(d_bias[expert_id * OUTPUT_STRIDE +
+                                             global_n + 1]);
+              act_addr[p] = type_convert<bf16>(fast_silu(g) * u);
+            }
+          }
+        }
+      } else if (global_n_base + 3 < OUTPUT_SIZE) {
         bf16 *out_addr = d_output + global_m * (NUM_TOPK * OUTPUT_STRIDE) +
                          topk_slot * OUTPUT_STRIDE + global_n_base;
         bf16 const *bias_addr =

@@ -2570,10 +2570,13 @@ int TaskRegister::register_linear_silu_mi300_task(
 // total_tiles_per_xcd]
 int TaskRegister::register_gang_moe_w13_linear_mi300_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 3);
+  // params[3]: fuse_swiglu (epilogue SiLU-mul; needs pairwise-interleaved
+  // gate/up weight rows and a half-width [batch, topk, intermediate] output)
+  assert(params.size() == 4);
   int tiles_per_expert = params[0];
   int max_experts_per_xcd = params[1];
   int total_tiles_per_xcd = params[2];
+  bool fuse_swiglu = params[3] != 0;
   (void)max_experts_per_xcd;
   (void)total_tiles_per_xcd;
 
@@ -2593,39 +2596,50 @@ int TaskRegister::register_gang_moe_w13_linear_mi300_task(
       output_ops.push_back(static_cast<tb::TBInputOp *>(op));
     }
   }
-  // Output: [batch, topk, output_size]
+  // Output: [batch, topk, output_size], or [batch, topk, output_size / 2]
+  // when the SwiGLU is fused in.
   assert(output_ops[0]->output_tensors[0].num_dims == 3);
   batch_size = output_ops[0]->output_tensors[0].dim[0];
   num_experts_per_tok = output_ops[0]->output_tensors[0].dim[1];
-  output_size = output_ops[0]->output_tensors[0].dim[2];
   // Input: [batch, reduction_size]
   assert(input_ops[0]->output_tensors[0].num_dims == 2);
   reduction_size = input_ops[0]->output_tensors[0].dim[1];
-  // Weight: [num_experts, output_size, reduction_size]
+  // Weight: [num_experts, output_size, reduction_size]. The GEMM's N comes
+  // from the weight rather than the output, since the fused epilogue emits
+  // half as many columns as it computes.
   assert(input_ops[1]->output_tensors[0].num_dims == 3);
   num_experts = input_ops[1]->output_tensors[0].dim[0];
+  output_size = input_ops[1]->output_tensors[0].dim[1];
   // Bias: [num_experts, output_stride]
   assert(input_ops[4]->output_tensors[0].num_dims == 2);
-  // Output stride
+  output_stride = input_ops[4]->output_tensors[0].dim[1];
+  // Activation row stride of the output tensor
   assert(output_ops[0]->dtensor.owner_op->op_type == type::KN_INPUT_OP);
   kn::KNInputOp *kn_input_op =
       static_cast<kn::KNInputOp *>(output_ops[0]->dtensor.owner_op);
-  output_stride = static_cast<int>(kn_input_op->input_strides[1]);
+  int act_stride = static_cast<int>(kn_input_op->input_strides[1]);
+  if (fuse_swiglu) {
+    assert(2 * act_stride == output_stride);
+  } else {
+    assert(act_stride == output_stride);
+  }
 
   int n_tiles = output_size / 64;
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
-  code.e(
-      "kernel::gang_moe_w13_linear_kernel<bfloat16, $, $, $, $, $, $, $, $>(",
-      batch_size,
-      output_size,
-      output_stride,
-      reduction_size,
-      num_experts,
-      num_experts_per_tok,
-      tiles_per_expert,
-      n_tiles);
+  code.e("kernel::gang_moe_w13_linear_kernel<bfloat16, $, $, $, $, $, $, $, "
+         "$, $, $>(",
+         batch_size,
+         output_size,
+         output_stride,
+         reduction_size,
+         num_experts,
+         num_experts_per_tok,
+         tiles_per_expert,
+         n_tiles,
+         fuse_swiglu ? "true" : "false",
+         act_stride);
   code.e("    task_desc->input_ptrs[0],");  // input activation
   code.e("    task_desc->input_ptrs[1],");  // expert weights
   code.e("    task_desc->input_ptrs[2],");  // routing indices

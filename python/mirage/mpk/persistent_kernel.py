@@ -1806,10 +1806,18 @@ class PersistentKernel:
         bias: DTensor,
         output: DTensor,
         block_dim: tuple = (256, 1, 1),
+        fuse_swiglu: bool = False,
     ):
         """Gang MoE W13 linear: 8 tasks (1/XCD), workers cooperate per expert.
         All workers on an XCD process the same expert's GEMM tiles concurrently,
         eliminating L2 thrashing from concurrent expert weight loads.
+
+        fuse_swiglu folds the SiLU-mul into the epilogue, so `output` is the
+        half-width [batch, topk, intermediate] activation and no separate
+        moe_silu_mul task is needed. It requires `weight` to carry gate and up
+        rows *pairwise* interleaved (row 2j = gate_j, row 2j+1 = up_j) -- the
+        epilogue only sees a gate/up pair in registers when they are adjacent
+        columns. Bias must be interleaved to match.
         """
         assert input.num_dims == 2   # [batch, hidden_size]
         assert weight.num_dims == 3  # [num_experts, 2*intermediate, hidden_size]
@@ -1822,6 +1830,12 @@ class PersistentKernel:
         batch_size = self.max_num_batched_tokens
         num_experts = weight.dim(0)
         output_size = weight.dim(1)
+        if fuse_swiglu:
+            assert output.dim(2) * 2 == output_size, (
+                f"fuse_swiglu output must be half the GEMM width: "
+                f"{output.dim(2)} vs {output_size}")
+        else:
+            assert output.dim(2) == output_size
         reduction_size = weight.dim(2)
         tile_n = 64
         assert output_size % tile_n == 0, f"output_size {output_size} not divisible by {tile_n}"
@@ -1847,7 +1861,7 @@ class PersistentKernel:
         )
         self.kn_graph.register_task(
             tb_graph, "gang_moe_w13_linear_mi300",
-            [tiles_per_expert, 0, total_tiles_per_xcd],
+            [tiles_per_expert, 0, total_tiles_per_xcd, 1 if fuse_swiglu else 0],
         )
 
     def gang_moe_w2_linear_layer(

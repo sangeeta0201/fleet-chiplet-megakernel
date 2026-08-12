@@ -99,17 +99,18 @@ def interleave_gate_up(w_gate: torch.Tensor, w_up: torch.Tensor,
     grid.x == 1. Grouping the rows the same way mpk.shuffle_tensors does (see
     the llama3 QKV shuffle) keeps grid.x == 8, one silu_mul task per XCD.
 
-    moe_silu_mul_layer does *not* need this: its input is 3-D and dim 2 is
-    unpartitioned, so the routed experts keep the plain concat layout.
+    The routed experts use this too, but at ``num_groups == intermediate``,
+    i.e. one row per chunk: gang_moe_w13_linear_kernel's fused SwiGLU
+    epilogue needs gate_j and up_j to land in the same thread's four
+    consecutive accumulators, which only happens when they are adjacent
+    columns.
     """
-    inter = w_gate.shape[0]
+    inter, hidden = w_gate.shape
     assert inter % num_groups == 0, (inter, num_groups)
     chunk = inter // num_groups
-    parts = []
-    for g in range(num_groups):
-        parts.append(w_gate[g * chunk:(g + 1) * chunk])
-        parts.append(w_up[g * chunk:(g + 1) * chunk])
-    return torch.cat(parts, dim=0).contiguous()
+    return torch.stack([w_gate.reshape(num_groups, chunk, hidden),
+                        w_up.reshape(num_groups, chunk, hidden)],
+                       dim=1).reshape(2 * inter, hidden).contiguous()
 
 
 def absorb_q_b(q_b_weight: torch.Tensor, w_uk: torch.Tensor,
@@ -352,6 +353,13 @@ if __name__ == "__main__":
         assert hidden_size % GANG_RED_ALIGN == 0, hidden_size
         assert (num_heads_pad * qk_dim) % GANG_OUT_ALIGN == 0
         assert (2 * moe_inter) % 64 == 0 and moe_inter % 128 == 0
+
+        # Fold the routed experts' SiLU-mul into W13's epilogue. Deletes 5
+        # tasks and one dispatch barrier per MoE layer (230 of the 238
+        # silu_mul tasks per token) and keeps the 2*moe_inter-wide gate/up
+        # intermediate in registers instead of round-tripping it through HBM.
+        # Needs the pairwise-interleaved gate/up weight layout below.
+        FUSE_MOE_SWIGLU = os.environ.get("GLM_FUSE_MOE_SWIGLU", "1") == "1"
         assert (2 * dense_inter) % GANG_OUT_ALIGN == 0
         assert dense_inter % GANG_RED_ALIGN == 0
 
@@ -386,7 +394,8 @@ if __name__ == "__main__":
         print(f"[CFG] q_heads={num_heads}->{num_heads_pad} "
               f"q_groups={num_q_groups} kv_chunks={num_kv_chunks} "
               f"latent_row={qk_dim} q_lora={q_lora}->{q_lora_pad} "
-              f"merge_dim_splits={MLA_MERGE_DIM_SPLITS}")
+              f"merge_dim_splits={MLA_MERGE_DIM_SPLITS} "
+              f"fuse_moe_swiglu={int(FUSE_MOE_SWIGLU)}")
 
         num_workers, num_schedulers = mi.get_configurations_from_gpu(rank)
 
@@ -856,12 +865,16 @@ if __name__ == "__main__":
                     torch.bfloat16).contiguous(),
                 f"layer_{i}_router_bias")
 
-            # Expert stacks, shared expert last. moe_silu_mul reads its
-            # multiplicand at a 3-D offset, so unlike the dense MLP these keep
-            # the plain [gate | up] concat layout.
+            # Expert stacks, shared expert last. With the SwiGLU fused into
+            # W13's epilogue the gate and up rows are interleaved pairwise so
+            # the pair meets in one thread's accumulators; unfused, the plain
+            # [gate | up] concat is what moe_silu_mul expects.
             experts = list(layer.mlp.experts) + [shared]
             w_moe_gu = _attach_input_keep(
                 torch.stack([
+                    interleave_gate_up(e.gate_proj.weight.data,
+                                       e.up_proj.weight.data, moe_inter)
+                    if FUSE_MOE_SWIGLU else
                     torch.cat([e.gate_proj.weight.data,
                                e.up_proj.weight.data], dim=0)
                     for e in experts
@@ -913,15 +926,17 @@ if __name__ == "__main__":
                 moe_routing_indices=moe_routing_indices,
                 moe_mask=moe_mask,
                 bias=zero_moe_bias(2 * moe_inter),
-                output=moe_mid,
+                output=moe_act if FUSE_MOE_SWIGLU else moe_mid,
+                fuse_swiglu=FUSE_MOE_SWIGLU,
                 block_dim=(256, 1, 1),
             )
-            mpk.moe_silu_mul_layer(
-                input=moe_mid,
-                output=moe_act,
-                grid_dim=(args.max_num_batched_tokens, topk_total, 1),
-                block_dim=(256, 1, 1),
-            )
+            if not FUSE_MOE_SWIGLU:
+                mpk.moe_silu_mul_layer(
+                    input=moe_mid,
+                    output=moe_act,
+                    grid_dim=(args.max_num_batched_tokens, topk_total, 1),
+                    block_dim=(256, 1, 1),
+                )
             mpk.gang_moe_w2_linear_layer(
                 input=moe_act,
                 weight=w_moe_down,

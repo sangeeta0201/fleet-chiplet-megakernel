@@ -1068,7 +1068,9 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         customized->bgraph, params);
     task_config[op] = std::make_tuple(2, 1, TASK_LINEAR_SILU_MI300, variant_id);
   } else if (name == "gang_moe_w13_linear_mi300") {
-    assert(params.size() == 3);
+    assert(params.size() == 4 &&
+           "gang_moe_w13_linear_mi300 needs [tiles_per_expert, "
+           "max_experts_per_xcd, total_tiles_per_xcd, fuse_swiglu]");
     int variant_id = task_register->register_gang_moe_w13_linear_mi300_task(
         customized->bgraph, params);
     task_config[op] =
