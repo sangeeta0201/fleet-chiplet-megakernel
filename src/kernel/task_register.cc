@@ -2862,6 +2862,76 @@ int TaskRegister::register_gang_attn_split_kv_mi300_task(
   return register_task_variant(TASK_GANG_ATTN_SPLIT_KV_MI300, code.to_string());
 }
 
+// Gang absorbed MLA decode (GLM-5): tile_idx → (request_id, q_head_group,
+// kv_chunk). MLA has a single shared latent head, so the GQA gang's
+// kv_head == xcd_id mapping is replaced by a q-head-group x sequence-chunk
+// split; see gang_mla_decode_mi300.cuh.
+// params: [num_q_heads, kv_lora_rank, qk_rope_head_dim, qk_head_dim,
+//          max_seq_len, page_size, num_kv_chunks, total_work_items_per_xcd,
+//          total_work_items, q_workspace_stride]
+int TaskRegister::register_gang_mla_decode_mi300_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 10);
+  int num_q_heads = params[0];
+  int kv_lora_rank = params[1];
+  int qk_rope_head_dim = params[2];
+  int qk_head_dim = params[3];
+  int max_seq_len = params[4];
+  int page_size = params[5];
+  int num_kv_chunks = params[6];
+  int total_work_items = params[8];
+  int q_workspace_stride = params[9];
+
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 2;  // q_workspace, kv_cache
+  int num_outputs = 2; // lse, output
+
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+
+  // Latent cache rows are [c_kv | k_rope], one shared head per token.
+  int kv_cache_stride = kv_lora_rank + qk_rope_head_dim;
+  assert(input_ops[1]->dtensor.dim[input_ops[1]->dtensor.num_dims - 1] ==
+         kv_cache_stride);
+
+  // MLA scales by the *unabsorbed* qk head dim (qk_nope + qk_rope), not the
+  // absorbed reduction width.
+  float scale_s = 1.0f / sqrtf((float)qk_head_dim) * 1.44269504088896340736f;
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::gang_mla_decode_kernel<bfloat16,");
+  code.e("    $, $, $, $, $, $, $, $>(",
+         num_q_heads,        // NUM_Q_HEADS
+         kv_lora_rank,       // KV_LORA_RANK
+         qk_rope_head_dim,   // QK_ROPE_HEAD_DIM
+         page_size,          // PAGE_SIZE
+         max_seq_len,        // MAX_SEQ_LEN
+         num_kv_chunks,      // NUM_KV_CHUNKS
+         q_workspace_stride, // Q_WORKSPACE_STRIDE
+         kv_cache_stride);   // KV_CACHE_STRIDE
+  code.e("    task_desc->input_ptrs[0],");  // q_workspace (full)
+  code.e("    task_desc->input_ptrs[1],");  // latent kv cache (full)
+  code.e("    task_desc->output_ptrs[1],"); // output (full)
+  code.e("    task_desc->output_ptrs[0],"); // lse (full)
+  code.e("    runtime_config.qo_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_indices_buffer,");
+  code.e("    runtime_config.paged_kv_last_page_len_buffer,");
+  code.e("    $,", total_work_items);
+  code.e("    tile_idx,");
+  code.e("    $f);", scale_s);
+  return register_task_variant(TASK_GANG_MLA_DECODE_MI300, code.to_string());
+}
+
 // Gang merge split-KV: 8 tasks (1 per XCD), tile_idx → (request_id, kv_head)
 // params: [num_qo_heads_per_kv, head_dim, max_seq_len, page_size,
 //          num_kv_heads, total_work_items_per_xcd, total_work_items]
@@ -5305,6 +5375,63 @@ int TaskRegister::register_moe_topk_softmax_mi300_task(
   code.e("    $,", num_experts);
   code.e("    true);");
   return register_task_variant(TASK_MOE_TOPK_SOFTMAX_MI300, code.to_string());
+}
+
+// Sigmoid + e_score_correction_bias router (`noaux_tc`), used by GLM-5.
+// Same shapes as the softmax router, plus a [num_experts] bias input.
+int TaskRegister::register_moe_topk_sigmoid_bias_mi300_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: routed_scaling_factor in 1/1000 units (GLM-5: 2500 => 2.5f)
+  // params[1]: norm_topk_prob (0/1)
+  assert(params.size() == 2);
+  int batch_size = 0, num_experts = 0, num_experts_per_tok = 0;
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 2;
+  int num_outputs = 3;
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  assert(output_ops[0]->output_tensors[0].num_dims == 2);
+  assert(output_ops[1]->output_tensors[0].num_dims == 2);
+  assert(output_ops[2]->output_tensors[0].num_dims == 1);
+  num_experts = output_ops[1]->output_tensors[0].dim[0];
+  batch_size = output_ops[1]->output_tensors[0].dim[1];
+  num_experts_per_tok = output_ops[0]->output_tensors[0].dim[1];
+  assert(output_ops[0]->output_tensors[0].dim[0] == batch_size);
+  assert(output_ops[2]->output_tensors[0].dim[0] == num_experts + 1);
+  assert(input_ops[0]->dtensor.num_dims == 2);
+  assert(input_ops[0]->output_tensors[0].dim[0] == batch_size);
+  assert(input_ops[0]->output_tensors[0].dim[1] == num_experts);
+  // e_score_correction_bias: [num_experts]
+  assert(input_ops[1]->dtensor.num_dims == 1);
+  assert(input_ops[1]->output_tensors[0].dim[0] == num_experts);
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::topk_sigmoid_bias_mi300_task_impl<hip_bfloat16, $, $, $, $>(",
+         /*VPT=*/8,
+         /*EXPERTS=*/num_experts,
+         /*WARPS_PER_CTA=*/4,
+         /*BYTES_PER_LDG=*/16);
+  code.e("    task_desc->input_ptrs[0],");
+  code.e("    task_desc->input_ptrs[1],");
+  code.e("    task_desc->output_ptrs[0],");
+  code.e("    $,", batch_size);
+  code.e("    $,", num_experts_per_tok);
+  code.e("    task_desc->output_ptrs[1],");
+  code.e("    task_desc->output_ptrs[2],");
+  code.e("    0,");
+  code.e("    $,", num_experts);
+  code.e("    $,", params[1] != 0 ? "true" : "false");
+  code.e("    $ / 1000.0f);", params[0]);
+  return register_task_variant(TASK_MOE_TOPK_SIGMOID_BIAS_MI300,
+                               code.to_string());
 }
 
 int TaskRegister::register_moe_linear_mi300_task(

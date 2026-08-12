@@ -1287,6 +1287,75 @@ class PersistentKernel:
         )
         self.kn_graph.register_task(tb_graph, "gang_attn_split_kv_mi300", params)
 
+    def gang_mla_decode_layer(
+        self,
+        q_workspace: DTensor,
+        kv_cache: DTensor,
+        lse: DTensor,
+        output: DTensor,
+        mla_params: tuple,
+        block_dim: tuple,
+    ):
+        """Gang absorbed MLA decode (GLM-5): 8 tasks (1 per XCD).
+
+        MLA has a single shared latent KV head, so unlike the GQA gang
+        attention there is no kv_head == xcd_id mapping. Each worker decodes
+        tile_idx -> (request_id, q_head_group, kv_chunk), where a q_head_group
+        is one MFMA M tile of 16 query heads.
+
+        q_workspace holds the absorbed queries [tokens, num_q_heads * (
+        kv_lora_rank + qk_rope_head_dim)]; kv_cache holds one latent row
+        [c_kv | k_rope] per token. The KV cache append is done by the
+        preceding task, so this is attention only.
+
+        With num_kv_chunks > 1 the output is float o_acc + natural-log LSE in
+        the layout paged_attention_ck_fmha_merge_layer already consumes, with
+        the q_head_group standing in for kv_head.
+        """
+        assert q_workspace.num_dims == 2
+        assert self.target_cc in (94, 95), "Gang MLA decode is MI300/MI350 only"
+
+        num_q_heads = mla_params[0]
+        kv_lora_rank = mla_params[1]
+        qk_rope_head_dim = mla_params[2]
+        qk_head_dim = mla_params[3]
+        num_kv_chunks = mla_params[4]
+
+        assert num_q_heads % 16 == 0, "num_q_heads must be a multiple of the MFMA M tile"
+        assert kv_lora_rank % 64 == 0
+        assert (kv_lora_rank + qk_rope_head_dim) % 64 == 0
+        assert kv_cache.dim(kv_cache.num_dims - 1) == kv_lora_rank + qk_rope_head_dim
+
+        q_workspace_stride = num_q_heads * (kv_lora_rank + qk_rope_head_dim)
+        assert q_workspace.dim(1) == q_workspace_stride
+
+        num_q_groups = num_q_heads // 16
+        total_work_items = (
+            self.max_num_batched_requests * num_q_groups * num_kv_chunks
+        )
+        import math
+        total_work_items_per_xcd = math.ceil(total_work_items / 8)
+
+        # params: [num_q_heads, kv_lora_rank, qk_rope_head_dim, qk_head_dim,
+        #          max_seq_len, page_size, num_kv_chunks,
+        #          total_work_items_per_xcd, total_work_items,
+        #          q_workspace_stride]
+        params = [num_q_heads, kv_lora_rank, qk_rope_head_dim, qk_head_dim,
+                  self.max_seq_length, self.page_size, num_kv_chunks,
+                  total_work_items_per_xcd, total_work_items,
+                  q_workspace_stride]
+
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        # 2 inputs: q_workspace, kv_cache
+        tb_graph.new_input(q_workspace, (-1, -1, -1), -1, True)
+        tb_graph.new_input(kv_cache, (-1, -1, -1), -1, True)
+        # 2 outputs: lse, output
+        tb_graph.new_input(lse, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output, (-1, -1, -1), -1, True)
+        self.kn_graph.customized([q_workspace, kv_cache, lse, output], tb_graph)
+        self.kn_graph.register_task(tb_graph, "gang_mla_decode_mi300", params)
+
     def gang_paged_attention_split_kv_merge_layer(
         self,
         lse: DTensor,
@@ -1371,7 +1440,48 @@ class PersistentKernel:
             self.kn_graph.register_task(tb_graph, "moe_topk_softmax_mi300")
         else:
             self.kn_graph.register_task(tb_graph, "moe_topk_softmax_sm100")
-        
+
+    def moe_topk_sigmoid_bias_routing_layer(
+        self,
+        input: DTensor,
+        bias: DTensor,
+        output: tuple[DTensor, DTensor, DTensor],
+        grid_dim: tuple,
+        block_dim: tuple,
+        routed_scaling_factor: float = 1.0,
+        norm_topk_prob: bool = True,
+    ):
+        # `noaux_tc` router (GLM-5 / DeepSeek-V3): sigmoid scoring, selection on
+        # score + e_score_correction_bias, weights taken from the unbiased score.
+        assert input.num_dims == 2  # (batch_size, num_experts)
+        assert bias.num_dims == 1  # (num_experts,)
+        assert len(output) == 3
+        moe_topk_weight, moe_routing_indices, moe_masks = output
+        assert moe_topk_weight.num_dims == 2  # (batch_size, num_experts_per_tok)
+        assert moe_routing_indices.num_dims == 2  # (num_experts, batch_size)
+        assert moe_masks.num_dims == 1  # (num_experts + 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input, (0, -1, -1), -1, True)
+        tb_graph.new_input(bias, (-1, -1, -1), -1, True)
+        tb_graph.new_input(moe_topk_weight, (0, -1, -1), -1, True)
+        tb_graph.new_input(moe_routing_indices, (-1, -1, -1), -1, True)
+        tb_graph.new_input(moe_masks, (-1, -1, -1), -1, True)
+        self.kn_graph.customized([input, bias, moe_topk_weight, moe_routing_indices, moe_masks], tb_graph)
+
+        assert self.target_cc in (94, 95), "sigmoid+bias router is MI300/MI350 only"
+        # routed_scaling_factor travels as an int (register_task takes ints only);
+        # 1/1000 units is exact for the values these configs use (GLM-5: 2.5).
+        scaling_milli = int(round(routed_scaling_factor * 1000.0))
+        assert abs(scaling_milli / 1000.0 - routed_scaling_factor) < 1e-9, (
+            f"routed_scaling_factor {routed_scaling_factor} not representable in 1/1000 units"
+        )
+        self.kn_graph.register_task(
+            tb_graph,
+            "moe_topk_sigmoid_bias_mi300",
+            [scaling_milli, 1 if norm_topk_prob else 0],
+        )
+
+
     def moe_w13_linear_layer(
         self,
         input: DTensor,

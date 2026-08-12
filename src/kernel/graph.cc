@@ -826,6 +826,13 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     task_config[op] =
         std::make_tuple(7, 3, TASK_GANG_ATTN_SPLIT_KV_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[7]; // total_work_items_per_xcd
+  } else if (name == "gang_mla_decode_mi300") {
+    assert(params.size() == 10);
+    int variant_id = task_register->register_gang_mla_decode_mi300_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(2, 2, TASK_GANG_MLA_DECODE_MI300, variant_id);
+    gang_task_tiles_per_xcd[op] = params[7]; // total_work_items_per_xcd
   } else if (name == "gang_attn_merge_mi300") {
     assert(params.size() == 7);
     int variant_id = task_register->register_gang_attn_merge_mi300_task(
@@ -988,6 +995,12 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         customized->bgraph, params);
     task_config[op] =
         std::make_tuple(1, 3, TASK_MOE_TOPK_SOFTMAX_MI300, variant_id);
+  } else if (name == "moe_topk_sigmoid_bias_mi300") {
+    assert(params.size() == 2);
+    int variant_id = task_register->register_moe_topk_sigmoid_bias_mi300_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(2, 3, TASK_MOE_TOPK_SIGMOID_BIAS_MI300, variant_id);
   } else if (name == "moe_w13_linear_mi300") {
     int variant_id = task_register->register_moe_linear_mi300_task(
         customized->bgraph, params, true /*w13_linear*/);

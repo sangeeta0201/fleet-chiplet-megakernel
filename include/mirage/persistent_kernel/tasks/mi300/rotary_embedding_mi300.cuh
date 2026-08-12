@@ -83,4 +83,80 @@ __device__ __forceinline__ void rotary_embedding(InputSmem smem_input,
   }
 }
 
+// Partial + interleaved RoPE, as used by GLM-5 (`rope_interleave: true`,
+// qk_rope_head_dim 64 of qk_head_dim 256) and DeepSeek-V3.2.
+//
+// Two differences from the half-split RoPE the GQA path uses in
+// kv_cache_update_mi300.cuh:
+//
+//   1. Partial: only the trailing ROPE_DIM dims of each head are rotated; the
+//      leading (HEAD_DIM - ROPE_DIM) "nope" dims are copied through untouched.
+//   2. Interleaved: the rotary pair for angle j is (2j, 2j+1), not
+//      (j, j + ROPE_DIM/2).
+//
+// The rotated pair is written back to (j, j + ROPE_DIM/2) rather than in
+// place. That is not a bug — it is exactly what transformers'
+// apply_rotary_pos_emb_interleave() does: it reads the even/odd slices and
+// returns `cat([even*cos - odd*sin, odd*cos + even*sin], dim=-1)`. The output
+// permutation is the same for Q and K, so the QK dot product is unchanged, and
+// matching it keeps us bit-comparable with the HF reference.
+//
+// `heads` points at NUM_HEADS heads laid out contiguously as
+// [NUM_HEADS][HEAD_DIM]. cos_ptr/sin_ptr point at this token's row of a
+// [max_seq, ROPE_DIM] table in HF layout (emb = cat(freqs, freqs)); only the
+// first ROPE_DIM/2 entries are read, the same convention the existing
+// half-split RoPE follows.
+//
+// Reads (2j, 2j+1) and writes (j, j + ROPE_DIM/2), so the read and write index
+// sets overlap across threads: the rotation is staged in registers with a
+// barrier in between.
+template <typename T,
+          int HEAD_DIM,
+          int ROPE_DIM,
+          int NUM_HEADS,
+          int BLOCK_THREADS>
+__device__ __forceinline__ void rope_interleave_partial(T *heads,
+                                                        T const *cos_ptr,
+                                                        T const *sin_ptr) {
+  static_assert(ROPE_DIM % 2 == 0, "ROPE_DIM must be even");
+  static_assert(ROPE_DIM <= HEAD_DIM, "ROPE_DIM must fit inside HEAD_DIM");
+  constexpr int HALF = ROPE_DIM / 2;
+  constexpr int NOPE_DIM = HEAD_DIM - ROPE_DIM;
+  constexpr int TOTAL = NUM_HEADS * HALF;
+  constexpr int PER_THREAD = (TOTAL + BLOCK_THREADS - 1) / BLOCK_THREADS;
+
+  float rot_even[PER_THREAD];
+  float rot_odd[PER_THREAD];
+
+#pragma unroll
+  for (int it = 0; it < PER_THREAD; ++it) {
+    int const idx = threadIdx.x + it * BLOCK_THREADS;
+    if (idx < TOTAL) {
+      int const head = idx / HALF;
+      int const j = idx % HALF;
+      T const *rot = heads + head * HEAD_DIM + NOPE_DIM;
+      float const x0 = static_cast<float>(rot[2 * j]);
+      float const x1 = static_cast<float>(rot[2 * j + 1]);
+      float const c = static_cast<float>(cos_ptr[j]);
+      float const s = static_cast<float>(sin_ptr[j]);
+      rot_even[it] = x0 * c - x1 * s;
+      rot_odd[it] = x1 * c + x0 * s;
+    }
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (int it = 0; it < PER_THREAD; ++it) {
+    int const idx = threadIdx.x + it * BLOCK_THREADS;
+    if (idx < TOTAL) {
+      int const head = idx / HALF;
+      int const j = idx % HALF;
+      T *rot = heads + head * HEAD_DIM + NOPE_DIM;
+      rot[j] = static_cast<T>(rot_even[it]);
+      rot[j + HALF] = static_cast<T>(rot_odd[it]);
+    }
+  }
+  __syncthreads();
+}
+
 } // namespace kernel

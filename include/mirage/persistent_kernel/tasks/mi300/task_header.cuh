@@ -43,6 +43,9 @@
 #include "tasks/mi300/paged_attention_ck_fmha_split_kv_mi300.cuh"
 #include "tasks/mi300/gang_attention_mi300.cuh"
 #endif
+// Absorbed MLA decode (GLM-5). Reuses the HD=64 decode's MFMA helpers but
+// pulls in no CK headers, so it lives outside the MPK_USE_CK_FMHA guard.
+#include "tasks/mi300/gang_mla_decode_mi300.cuh"
 // MoE task implementations for MI300/MI350
 #include "tasks/mi300/moe_linear_mi300.cuh"
 #include "tasks/mi300/moe_linear_mxfp4_mi300.cuh"
@@ -65,6 +68,7 @@
 #include "tasks/mi300/gang_full_layer_with_lmhead_fused_mi300.cuh"
 #include "tasks/mi300/gang_moe_swiglu_w2_mxfp4_mi300.cuh"
 #include "tasks/mi300/moe_topk_softmax_mi300.cuh"
+#include "tasks/mi300/moe_topk_sigmoid_bias_mi300.cuh"
 #include "tasks/mi300/moe_mul_sum_add_mi300.cuh"
 #include "tasks/mi300/moe_residual_add_f32_mi300.cuh"
 #include "tasks/mi300/swigluoai_mi300.cuh"

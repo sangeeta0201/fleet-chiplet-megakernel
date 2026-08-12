@@ -1548,6 +1548,10 @@ TaskGraphResult print_task_graph(
   task_type_to_name[TASK_MOE_W2_LINEAR_SM90] = "TASK_MOE_W2_LINEAR_SM90";
   task_type_to_name[TASK_MOE_TOPK_SOFTMAX_MI300] =
       "TASK_MOE_TOPK_SOFTMAX_MI300";
+  task_type_to_name[TASK_MOE_TOPK_SIGMOID_BIAS_MI300] =
+      "TASK_MOE_TOPK_SIGMOID_BIAS_MI300";
+  task_type_to_name[TASK_GANG_MLA_DECODE_MI300] =
+      "TASK_GANG_MLA_DECODE_MI300";
   task_type_to_name[TASK_MOE_W13_LINEAR_MI300] = "TASK_MOE_W13_LINEAR_MI300";
   task_type_to_name[TASK_MOE_W2_LINEAR_MI300] = "TASK_MOE_W2_LINEAR_MI300";
   task_type_to_name[TASK_MOE_W13_LINEAR_MXFP4_MI300] =

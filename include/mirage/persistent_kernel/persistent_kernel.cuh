@@ -534,7 +534,8 @@ __device__ __host__ __forceinline__ bool is_gang_task_type(TaskType t) {
          t == TASK_GANG_OPROJ_TOPK_MOE_FUSED_MI300 ||
          t == TASK_GANG_FULL_LAYER_FUSED_MI300 ||
          t == TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300 ||
-         t == TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300;
+         t == TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300 ||
+         t == TASK_GANG_MLA_DECODE_MI300;
 }
 
 __device__ __forceinline__ bool is_termination_event(size_t event_loc,
@@ -2484,6 +2485,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
         case TASK_PAGED_ATTENTION_SPLIT_KV_MI300:
         case TASK_PAGED_ATTENTION_CK_FMHA_SPLIT_KV_MI300:
         case TASK_GANG_ATTN_SPLIT_KV_MI300:
+        case TASK_GANG_MLA_DECODE_MI300:
           slot = 6;
           break;
         case TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_MI300:
@@ -2513,6 +2515,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
           slot = 10;
           break; // W2 slot (fused SwiGLU+W2 replaces SwiGLU+W2)
         case TASK_MOE_TOPK_SOFTMAX_MI300:
+        case TASK_MOE_TOPK_SIGMOID_BIAS_MI300:
           slot = 11;
           break;
         case TASK_SWIGLUOAI_MI300:

@@ -195,6 +195,9 @@ public:
                                              std::vector<int> const &params);
   int register_gang_attn_merge_mi300_task(threadblock::Graph const &bgraph,
                                           std::vector<int> const &params);
+  // MI300 gang absorbed MLA decode (GLM-5)
+  int register_gang_mla_decode_mi300_task(threadblock::Graph const &bgraph,
+                                          std::vector<int> const &params);
   // MI300 split-KV tasks
   int register_paged_attention_split_kv_mi300_task(
       threadblock::Graph const &bgraph, std::vector<int> const &params);
@@ -210,6 +213,8 @@ public:
   // MI300/MI350 MoE tasks
   int register_moe_topk_softmax_mi300_task(threadblock::Graph const &bgraph,
                                            std::vector<int> const &params);
+  int register_moe_topk_sigmoid_bias_mi300_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
   int register_moe_linear_mi300_task(threadblock::Graph const &bgraph,
                                      std::vector<int> const &params,
                                      bool w13_linear);
