@@ -900,17 +900,16 @@ oproj_barrier :
   // MI300/MI350 L2 is not coherent across XCDs.
   //
   // The producer is `st_wt_u64` (sc0 sc1), so the data bypasses L2 and lands
-  // in HBM. Plain `buffer_inv` drops vL1 only. This same worker read these
-  // same addresses one layer ago, so its L2 still holds those lines and the
-  // load is served from L2 -- returning the *previous* layer's O-proj output.
-  // Which lines survive depends on L2 eviction timing, hence run to run
-  // variation. The observable signature is exact: rows of `rmsnorm_out`
-  // differing between two runs whose `attn_proj_out` (the settled HBM content)
-  // is bit-identical -- the norm read something that is not what is in memory.
+  // in HBM. This was `buffer_inv sc1` to invalidate L2 as well as vL1; it is
+  // now plain `buffer_inv` (vL1 only). See the layer-boundary acquire at the
+  // top of gang_full_layer_fused_mi300.cuh for why that is sufficient given
+  // the Phase 9 layer barrier, and for the ablation that established it.
   //
-  // The comment this replaces already said "Invalidate L2"; the instruction
-  // simply never encoded it.
-  asm volatile("buffer_inv sc1" ::: "memory");
+  // The signature to watch for if this ever regresses is exact: rows of
+  // `rmsnorm_out` differing between two runs whose `attn_proj_out` (the
+  // settled HBM content) is bit-identical -- the norm read something that is
+  // not what is in memory.
+  asm volatile("buffer_inv" ::: "memory");
   // Drain prefetched gamma + router weight loads (issued before barrier).
   // NT loads bypass L2, unaffected by buffer_inv.
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");

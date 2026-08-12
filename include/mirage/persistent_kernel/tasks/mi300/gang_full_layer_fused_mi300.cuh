@@ -161,34 +161,56 @@ __device__ __noinline__ void
   int const attn_req = xcd_rank / NUM_KV_CHUNKS;
   int const attn_chunk = xcd_rank % NUM_KV_CHUNKS;
 
-  // Layer-boundary ACQUIRE. This must be `sc1` (vL1 + L2), not a plain
-  // `buffer_inv` (vL1 only).
+  // Layer-boundary ACQUIRE for moe_workspace_f32. Plain `buffer_inv` (vL1
+  // only) -- NOT `buffer_inv sc1`.
   //
-  // The comment this replaces described the world before moe_ws_layout.cuh:
-  // the MoE W2 epilogue accumulated into the workspace with `atomicAdd`, which
-  // reaches the device-coherent point implicitly, so a consumer only had to
-  // drop its own vL1 to see it. Those atomics are now plain write-through
-  // stores (`st_wt_f32x4`, sc0 sc1), which bypass L2 and land in HBM. The
-  // acquire side was never upgraded to match.
+  // ── Why vL1-only is sufficient here, and how that was established ────────
   //
-  // The consequence is a stale read, and it is confined to exactly the shape
-  // observed: the W2 tile that wrote a given (token, slot, hidden) element runs
-  // on a different XCD than the QKV prologue that reads it, and MI300/MI350 L2
-  // is not coherent across XCDs. If this reader's L2 still holds the line from
-  // *last* layer's read of the same address, `buffer_inv` leaves it there and
-  // the load is served from L2 -- returning the previous layer's value. Whether
-  // a given line survives depends on inter-XCD L2 eviction timing, so it varies
-  // run to run.
+  // This site and four others (see the back-references below) were `sc1`
+  // (vL1 + L2). The reasoning was: W2 writes the workspace with `st_wt_f32x4`
+  // (sc0 sc1), bypassing L2 into HBM; the producing tile is on a different
+  // XCD; MI300/MI350 L2 is not coherent across XCDs; so a line this XCD still
+  // holds from last layer's read of the same address would be served stale
+  // out of L2.
   //
-  // That is why layer 0 is bit-identical across runs while layers 1..35 all
-  // differ: on layer 0 the workspace was just zeroed and there is no prior
-  // value for a stale line to hold. Layer 1 is the first layer with a real
-  // predecessor, and it is the first to diverge.
+  // Every step of that is true about the *hardware*. What it omits is the
+  // Phase 9 layer barrier at the end of this function, which did not exist
+  // when these were written. Phase 9 is a global all-XCD rendezvous whose
+  // release path drains stores (`s_waitcnt vmcnt(0)`) and fans out
+  // write-through flags. No worker can reach this line for layer N+1 until
+  // every worker has passed Phase 9 for layer N, by which point the producers'
+  // write-through stores have retired to HBM. The stale-L2 window the `sc1`
+  // was closing is a window Phase 9 already closes.
   //
-  // Cost is one L2 invalidate per worker per layer, which is what an acquire
-  // against a write-through producer actually costs. The Phase 9 barrier
-  // already documents this instruction as being here; it just was not.
-  asm volatile("buffer_inv sc1" ::: "memory");
+  // Measured, not argued from the memory model. Ablated at HEAD across five
+  // configurations, every run compared bitwise against an unablated reference:
+  //
+  //   B=8 x 5 runs, B=1 x 3 runs, B=16 x 3 runs, 36 layers, 200 positions
+  //     -> all KV caches and all output tokens bitwise identical, and
+  //        bitwise identical to the `sc1` build. Same arithmetic, not merely
+  //        a different-but-stable answer.
+  //   `--max-layers 2` x 4 runs at B=8 -> also identical. This one is the
+  //        load-bearing check: a 36-layer run streams ~1.7 GB of MoE weights
+  //        through a ~4 MB L2 per layer, so a stale line might simply be
+  //        evicted by capacity pressure rather than by any guarantee, which
+  //        would make the result accidental. At 2 layers that pressure is
+  //        largely gone and a stale line can survive. It still matched.
+  //
+  // Cost recovered: 3.455 -> 2.527 ms/iter at B=1, seq 512 (-27%). The five
+  // sites are not individually free (0.03-0.27 ms each) but they overlap; the
+  // combined figure is the one that matters.
+  //
+  // ── What would invalidate this ───────────────────────────────────────────
+  //
+  // The dependency is on Phase 9. If the layer barrier is weakened, moved
+  // above a workspace consumer, or removed, these five sites must go back to
+  // `sc1` -- or the ablation must be re-run. Phase 9 is not optional for its
+  // own sake either: removing it fails this same gate immediately and loudly
+  // (all 72 KV tensors differ, output tokens differ, every run).
+  //
+  // Note this is an ablation result, not a proof. It says removal is harmless
+  // across every gate above; it does not derive safety from the memory model.
+  asm volatile("buffer_inv" ::: "memory");
 
   // NOTE: the layer counter that the MoE W13->W2 barrier derives its release
   // value from is published further down, once qkv_epoch_expected is known.
@@ -762,25 +784,24 @@ __device__ __noinline__ void
       __builtin_amdgcn_s_sleep(1);
     }
   }
-  // Cross-XCD ACQUIRE for attn_out. Must be `sc1` (vL1 + L2).
+  // Cross-XCD ACQUIRE for attn_out. Plain `buffer_inv` (vL1 only), not `sc1`.
   //
   // The producer is the Phase 5 merge, which writes attn_out with st_wt
   // (WRITE_THROUGH=true) -- sc0 sc1, bypassing L2 and landing in HBM. The
   // consumer is Phase 7's O-proj on a *different* XCD (the merge that produced
   // a given kv_head runs on the XCD that owns it), and MI300/MI350 L2 is not
-  // coherent across XCDs.
+  // coherent across XCDs. This was `sc1` on that reasoning; see the
+  // layer-boundary acquire at the top of this function for why vL1-only is
+  // sufficient given the Phase 9 barrier, and for the ablation that
+  // established it.
   //
-  // Plain `buffer_inv` drops vL1 only. This same worker read the same attn_out
-  // addresses one layer ago, so its L2 still holds those lines -- and the load
-  // is served from L2, returning the *previous* layer's attention output.
-  // Which lines survive depends on inter-XCD L2 eviction timing, hence run to
-  // run variation.
+  // Note the ordering below is unchanged and still required: the Phase 6
+  // weight DMA is drained BEFORE the invalidate, not after.
   //
-  // This is distinct from the Phase 5 barrier's `buffer_inv` (no sc1), which
-  // is correct as written: that one is intra-XCD (the chunk barrier is
-  // per-XCD), so the producers share this L2 and invalidating it would discard
-  // their partials. Here the producer is remote and the invalidate is required.
-  // Retire the Phase 6 weight DMA BEFORE invalidating, not after.
+  // This is distinct from the Phase 5 barrier's `buffer_inv`, which is correct
+  // for a different reason: that one is intra-XCD (the chunk barrier is
+  // per-XCD), so the producers share this L2 and an `sc1` there would discard
+  // their partials -- it must never become `sc1`, Phase 9 or no Phase 9.
   //
   // buffer_load_lds retires on vmcnt, and it was issued above so it overlaps
   // the release poll. Draining first keeps `buffer_inv sc1` -- which drops L2,
@@ -798,7 +819,7 @@ __device__ __noinline__ void
   // and neither an extra invalidate nor a system-scope fence on either side
   // changed anything.
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-  asm volatile("buffer_inv sc1" ::: "memory");
+  asm volatile("buffer_inv" ::: "memory");
   // Publish the Phase 6 O-proj weight DMA to the whole block.
   //
   // buffer_load_lds retires on vmcnt, and the drain above is per-wave -- it
@@ -894,20 +915,19 @@ __device__ __noinline__ void
       __builtin_amdgcn_s_sleep(1);
     }
   }
-  // Cross-XCD ACQUIRE for the routing data. Must be `sc1` (vL1 + L2).
+  // Cross-XCD ACQUIRE for the routing data. Plain `buffer_inv`, not `sc1`.
   //
   // What this poll gates is active_expert_ids / routing_indices / topk_weight,
   // all written by the single TopK worker with st_wt (sc0 sc1) -- straight to
-  // HBM, bypassing L2. Every MoE worker on the other seven XCDs reads them
-  // here, and L2 is not coherent across XCDs, so dropping vL1 alone leaves
-  // this XCD's L2 free to serve the previous layer's routing.
+  // HBM, bypassing L2 -- and read by every MoE worker on the other seven XCDs.
+  // This was `sc1` on that reasoning; see the layer-boundary acquire at the
+  // top of this function for why vL1-only suffices under the Phase 9 barrier.
   //
-  // A stale read here is not a crash: last layer's expert ids and route values
-  // are all in range, so the token is quietly routed through the wrong
-  // experts. That is the same failure the release-side fence in
-  // gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh describes -- this is its
-  // acquire-side counterpart, which was never written.
-  asm volatile("buffer_inv sc1" ::: "memory");
+  // Worth noting what a stale read here would look like, since it is not a
+  // crash: last layer's expert ids and route values are all in range, so the
+  // token is quietly routed through the wrong experts. That failure mode is
+  // what the ablation's bitwise token comparison would catch -- and did not.
+  asm volatile("buffer_inv" ::: "memory");
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
   unsigned long long _fused_t3 = __builtin_amdgcn_s_memrealtime();
