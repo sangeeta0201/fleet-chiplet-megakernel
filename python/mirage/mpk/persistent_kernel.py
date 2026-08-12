@@ -2098,6 +2098,151 @@ class PersistentKernel:
             [tiles_per_expert, 0, total_tiles_per_xcd, output_per_wg],
         )
 
+    def gang_moe_w13_linear_mxfp8_layer(
+        self,
+        input: DTensor,
+        weight: DTensor,
+        moe_routing_indices: DTensor,
+        moe_mask: DTensor,
+        bias: DTensor,
+        output: DTensor,
+        output_per_wg: int = 64,
+        block_dim: tuple = (256, 1, 1),
+        fuse_swiglu: bool = False,
+    ):
+        """Gang MoE W13 MXFP8 linear (gfx950): FP8 weight x FP8 activation MFMA.
+        Weight format: [E, expert_wgs, wg_bytes] (MXFP8 packed per workgroup).
+        Bias format: [E, output_stride] (2D flat).
+
+        Same fuse_swiglu contract as gang_moe_w13_linear_layer: `output` is the
+        half-width [batch, topk, intermediate] activation and the weight rows
+        must be pairwise interleaved (row 2j = gate_j, row 2j+1 = up_j).
+        """
+        assert input.num_dims == 2   # [batch, hidden_size]
+        assert weight.num_dims == 3  # [E, expert_wgs, wg_bytes]
+        assert moe_routing_indices.num_dims == 2
+        assert moe_mask.num_dims == 1
+        assert bias.num_dims == 2    # [E, output_stride]
+        assert output.num_dims == 3  # [batch, topk, output_size (/2 if fused)]
+        assert self.target_cc == 95, "Gang MoE MXFP8 requires gfx950 (MI350)"
+
+        batch_size = self.max_num_batched_tokens
+        num_experts = weight.dim(0)
+        expert_wgs = weight.dim(1)
+        output_size = expert_wgs * output_per_wg
+        assert bias.dim(1) == output_size, (
+            f"bias width {bias.dim(1)} does not match the packed weight's "
+            f"{expert_wgs} x {output_per_wg} = {output_size} rows")
+        if fuse_swiglu:
+            assert output.dim(2) * 2 == output_size, (
+                f"fuse_swiglu output must be half the GEMM width: "
+                f"{output.dim(2)} vs {output_size}")
+        else:
+            assert output.dim(2) == output_size
+        # Depth-4 MFMA pipeline: only the last slot carries a tail guard.
+        assert input.dim(1) % 512 == 0, \
+            f"MXFP8 W13 K={input.dim(1)} not divisible by 512"
+
+        tiles_per_expert = batch_size * expert_wgs
+        num_topk = output.dim(1)
+        max_activated = min(num_topk * batch_size, num_experts)
+        total_tiles_all = max_activated * tiles_per_expert
+        total_tiles_per_xcd = (total_tiles_all + 7) // 8
+        assert total_tiles_per_xcd <= 65535, \
+            f"total_tiles_per_xcd={total_tiles_per_xcd} exceeds uint16_t"
+
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input, (-1, -1, -1), 1, True)
+        tb_graph.new_input(weight, (-1, 1, -1), 2, True)
+        tb_graph.new_input(moe_routing_indices, (-1, -1, -1), -1, True)
+        tb_graph.new_input(moe_mask, (-1, -1, -1), -1, True)
+        tb_graph.new_input(bias, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output, (-1, 2, -1), -1, True)
+        self.kn_graph.customized(
+            [input, weight, moe_routing_indices, moe_mask, bias, output], tb_graph
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_moe_w13_linear_mxfp8_mi300",
+            [tiles_per_expert, 0, total_tiles_per_xcd, output_per_wg,
+             1 if fuse_swiglu else 0],
+        )
+
+    def gang_moe_w2_linear_mxfp8_layer(
+        self,
+        input: DTensor,
+        weight: DTensor,
+        moe_routing_indices: DTensor,
+        moe_mask: DTensor,
+        bias: DTensor,
+        output: DTensor,
+        output_per_wg: int = 64,
+        block_dim: tuple = (256, 1, 1),
+        routing_weight: DTensor = None,
+    ):
+        """Gang MoE W2 MXFP8 linear (gfx950): FP8 weight x FP8 activation MFMA.
+        Weight format: [E, expert_wgs, wg_bytes] (MXFP8 packed per workgroup).
+        Bias format: [E, output_stride] (2D flat).
+
+        Same fuse contract as gang_moe_w2_linear_layer: passing `routing_weight`
+        ([batch, topk] f32) folds the topk weighting and the cross-expert sum
+        into the epilogue, making `output` the [batch, hidden] f32 workspace.
+        """
+        fuse_mulsumadd = routing_weight is not None
+        assert input.num_dims == 3   # [batch, topk, intermediate]
+        assert weight.num_dims == 3  # [E, expert_wgs, wg_bytes]
+        assert moe_routing_indices.num_dims == 2
+        assert moe_mask.num_dims == 1
+        assert bias.num_dims == 2    # [E, output_stride]
+        if fuse_mulsumadd:
+            assert output.num_dims == 2          # [batch, hidden_size] f32
+            assert routing_weight.num_dims == 2  # [batch, topk] f32
+            assert routing_weight.dim(1) == input.dim(1)
+        else:
+            assert output.num_dims == 3  # [batch, topk, hidden_size]
+        assert self.target_cc == 95, "Gang MoE MXFP8 requires gfx950 (MI350)"
+
+        batch_size = self.max_num_batched_tokens
+        num_experts = weight.dim(0)
+        expert_wgs = weight.dim(1)
+        output_size = expert_wgs * output_per_wg
+        assert bias.dim(1) == output_size, (
+            f"bias width {bias.dim(1)} does not match the packed weight's "
+            f"{expert_wgs} x {output_per_wg} = {output_size} rows")
+        assert output.dim(output.num_dims - 1) == output_size
+        assert input.dim(2) % 512 == 0, \
+            f"MXFP8 W2 K={input.dim(2)} not divisible by 512"
+
+        tiles_per_expert = batch_size * expert_wgs
+        num_topk = input.dim(1)
+        max_activated = min(num_topk * batch_size, num_experts)
+        total_tiles_all = max_activated * tiles_per_expert
+        total_tiles_per_xcd = (total_tiles_all + 7) // 8
+        assert total_tiles_per_xcd <= 65535, \
+            f"total_tiles_per_xcd={total_tiles_per_xcd} exceeds uint16_t"
+
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input, (-1, -1, -1), 2, True)
+        tb_graph.new_input(weight, (-1, 1, -1), 2, True)
+        tb_graph.new_input(moe_routing_indices, (-1, -1, -1), -1, True)
+        tb_graph.new_input(moe_mask, (-1, -1, -1), -1, True)
+        tb_graph.new_input(bias, (-1, -1, -1), -1, True)
+        tensors = [input, weight, moe_routing_indices, moe_mask, bias]
+        if fuse_mulsumadd:
+            tb_graph.new_input(routing_weight, (-1, -1, -1), -1, True)
+            tensors.append(routing_weight)
+            tb_graph.new_input(output, (-1, 1, -1), -1, True)
+        else:
+            tb_graph.new_input(output, (-1, 2, -1), -1, True)
+        tensors.append(output)
+        self.kn_graph.customized(tensors, tb_graph)
+        self.kn_graph.register_task(
+            tb_graph, "gang_moe_w2_linear_mxfp8_mi300",
+            [tiles_per_expert, 0, total_tiles_per_xcd, output_per_wg,
+             1 if fuse_mulsumadd else 0],
+        )
+
     def gang_moe_fused_mxfp4_layer(
         self,
         input: DTensor,

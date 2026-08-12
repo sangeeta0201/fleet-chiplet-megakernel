@@ -153,6 +153,22 @@ def pack_mxfp8_workgroup(data: torch.Tensor, scales: torch.Tensor,
     return packed.squeeze(0) if squeeze else packed
 
 
+def pack_moe_mxfp8(stacked: torch.Tensor,
+                   output_per_wg: int = 64) -> torch.Tensor:
+    """Quantize + pack a stacked [E, out, K] bf16 expert weight into the MXFP8
+    per-workgroup layout, one expert at a time.
+
+    Quantizing all E at once would materialise an [E, out, K] fp32 intermediate
+    inside quantize_mxfp8 -- 1.6 GB for GLM's 65 x 3072 x 2048 gate/up stack,
+    on top of the bf16 stack it is being built from. Per-expert bounds that
+    transient at 1/E of it, at no cost to the result.
+    """
+    assert stacked.dim() == 3, stacked.shape
+    packed = [pack_mxfp8_workgroup(*quantize_mxfp8(stacked[e]), output_per_wg)
+              for e in range(stacked.shape[0])]
+    return torch.stack(packed).contiguous()
+
+
 def interleave_gate_up(w_gate: torch.Tensor, w_up: torch.Tensor,
                        num_groups: int) -> torch.Tensor:
     """Lay out [gate | up] as `num_groups` consecutive [gate_chunk; up_chunk]
@@ -434,6 +450,26 @@ if __name__ == "__main__":
         # also re-zeroes the workspace.
         FUSE_MOE_MULSUMADD = (
             os.environ.get("GLM_FUSE_MOE_MULSUMADD", "1") == "1")
+
+        # Store the routed experts' weights as MXFP8 (E4M3 + one E8M0 per 32
+        # contiguous K) instead of bf16. The MoE GEMMs are 47.4% of the 9.17
+        # GB/token this model streams per token, and at ~1.25 TB/s effective
+        # bandwidth the run is already bandwidth-bound, so halving the bytes
+        # is the only lever left on them. Both fused epilogues carry over
+        # unchanged. Worth 7.02 -> 6.35 ms/token, with the 50-token CI check
+        # still matching the bf16 Torch reference exactly; a WikiText-2
+        # perplexity sweep is still owed. Set GLM_MOE_MXFP8=0 for bf16.
+        MOE_MXFP8 = os.environ.get("GLM_MOE_MXFP8", "1") == "1"
+        MOE_MXFP8_OPW = 64
+        if MOE_MXFP8:
+            # Depth-4 MFMA pipeline: only the last of the four slots carries a
+            # tail guard, so a partial final group would compute k-tiles that
+            # do not exist.
+            assert hidden_size % 512 == 0, hidden_size
+            assert moe_inter % 512 == 0, moe_inter
+            assert (2 * moe_inter) % MOE_MXFP8_OPW == 0
+            assert hidden_size % MOE_MXFP8_OPW == 0
+
         assert (2 * dense_inter) % GANG_OUT_ALIGN == 0
         assert dense_inter % GANG_RED_ALIGN == 0
 
@@ -974,20 +1010,23 @@ if __name__ == "__main__":
             # the pair meets in one thread's accumulators; unfused, the plain
             # [gate | up] concat is what moe_silu_mul expects.
             experts = list(layer.mlp.experts) + [shared]
-            w_moe_gu = _attach_input_keep(
-                torch.stack([
-                    interleave_gate_up(e.gate_proj.weight.data,
-                                       e.up_proj.weight.data, moe_inter)
-                    if FUSE_MOE_SWIGLU else
-                    torch.cat([e.gate_proj.weight.data,
-                               e.up_proj.weight.data], dim=0)
-                    for e in experts
-                ]).contiguous(),
-                f"layer_{i}_moe_gate_up")
-            w_moe_down = _attach_input_keep(
-                torch.stack([e.down_proj.weight.data
-                             for e in experts]).contiguous(),
-                f"layer_{i}_moe_down")
+            gu_stack = torch.stack([
+                interleave_gate_up(e.gate_proj.weight.data,
+                                   e.up_proj.weight.data, moe_inter)
+                if FUSE_MOE_SWIGLU else
+                torch.cat([e.gate_proj.weight.data,
+                           e.up_proj.weight.data], dim=0)
+                for e in experts
+            ]).contiguous()
+            down_stack = torch.stack([e.down_proj.weight.data
+                                      for e in experts]).contiguous()
+            if MOE_MXFP8:
+                # The packer preserves row order, so the pairwise gate/up
+                # interleave above carries through untouched.
+                gu_stack = pack_moe_mxfp8(gu_stack, MOE_MXFP8_OPW)
+                down_stack = pack_moe_mxfp8(down_stack, MOE_MXFP8_OPW)
+            w_moe_gu = _attach_input_keep(gu_stack, f"layer_{i}_moe_gate_up")
+            w_moe_down = _attach_input_keep(down_stack, f"layer_{i}_moe_down")
             for e in experts:
                 _release(e.gate_proj.weight, e.up_proj.weight,
                          e.down_proj.weight)
@@ -1024,7 +1063,9 @@ if __name__ == "__main__":
                 norm_topk_prob=config.norm_topk_prob,
                 block_dim=(256, 1, 1),
             )
-            mpk.gang_moe_w13_linear_layer(
+            moe_w13_layer = (mpk.gang_moe_w13_linear_mxfp8_layer if MOE_MXFP8
+                             else mpk.gang_moe_w13_linear_layer)
+            moe_w13_layer(
                 input=rmsnorm_out_moe,
                 weight=w_moe_gu,
                 moe_routing_indices=moe_routing_indices,
@@ -1033,6 +1074,7 @@ if __name__ == "__main__":
                 output=moe_act if FUSE_MOE_SWIGLU else moe_mid,
                 fuse_swiglu=FUSE_MOE_SWIGLU,
                 block_dim=(256, 1, 1),
+                **({"output_per_wg": MOE_MXFP8_OPW} if MOE_MXFP8 else {}),
             )
             if not FUSE_MOE_SWIGLU:
                 mpk.moe_silu_mul_layer(
@@ -1041,7 +1083,9 @@ if __name__ == "__main__":
                     grid_dim=(args.max_num_batched_tokens, topk_total, 1),
                     block_dim=(256, 1, 1),
                 )
-            mpk.gang_moe_w2_linear_layer(
+            moe_w2_layer = (mpk.gang_moe_w2_linear_mxfp8_layer if MOE_MXFP8
+                            else mpk.gang_moe_w2_linear_layer)
+            moe_w2_layer(
                 input=moe_act,
                 weight=w_moe_down,
                 moe_routing_indices=moe_routing_indices,
@@ -1050,6 +1094,7 @@ if __name__ == "__main__":
                 output=moe_ws_f32 if FUSE_MOE_MULSUMADD else moe_out,
                 routing_weight=moe_topk_weight if FUSE_MOE_MULSUMADD else None,
                 block_dim=(256, 1, 1),
+                **({"output_per_wg": MOE_MXFP8_OPW} if MOE_MXFP8 else {}),
             )
             if FUSE_MOE_MULSUMADD:
                 mpk.moe_residual_add_f32_layer(

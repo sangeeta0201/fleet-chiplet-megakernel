@@ -2846,6 +2846,137 @@ int TaskRegister::register_gang_moe_linear_mxfp4_mi300_task(
   }
 }
 
+// Gang MoE MXFP8 linear: 8 tasks (1 per XCD), FP8 weight x FP8 activation MFMA.
+// params: [tiles_per_expert, max_experts_per_xcd, total_tiles_per_xcd,
+// output_per_wg, fuse_epilogue]
+//
+// Five params rather than the MXFP4 version's four: these kernels carry GLM's
+// fused epilogues (SwiGLU on W13, topk-weight + f32 atomicAdd on W2), so the
+// registrar needs the same fuse flag the bf16 pair takes.
+int TaskRegister::register_gang_moe_linear_mxfp8_mi300_task(
+    threadblock::Graph const &bgraph,
+    std::vector<int> const &params,
+    bool w13_linear) {
+  assert(params.size() == 5);
+  int tiles_per_expert = params[0];
+  int max_experts_per_xcd = params[1];
+  int total_tiles_per_xcd = params[2];
+  int output_per_wg = params[3];
+  bool fuse_epilogue = params[4] != 0;
+  (void)max_experts_per_xcd;
+  (void)total_tiles_per_xcd;
+
+  int num_experts = 0, num_experts_per_tok = 0, batch_size = 0,
+      output_stride = 0, reduction_size = 0;
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  // W2's fused epilogue reads routing_weight as input 5, exactly as the bf16
+  // path does. W13's fused epilogue needs no extra input.
+  int num_inputs = (!w13_linear && fuse_epilogue) ? 6 : 5;
+  int num_outputs = 1;
+
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  // Input: [batch, K] for W13, [batch, topk, K] for W2.
+  if (w13_linear) {
+    assert(input_ops[0]->output_tensors[0].num_dims == 2);
+    reduction_size = input_ops[0]->output_tensors[0].dim[1];
+  } else {
+    assert(input_ops[0]->output_tensors[0].num_dims == 3);
+    batch_size = input_ops[0]->output_tensors[0].dim[0];
+    num_experts_per_tok = input_ops[0]->output_tensors[0].dim[1];
+    reduction_size = input_ops[0]->output_tensors[0].dim[2];
+  }
+  // Weight: [num_experts, expert_wgs, wg_bytes]. The packing erases the logical
+  // N and K, so only num_experts survives here.
+  assert(input_ops[1]->output_tensors[0].num_dims == 3);
+  num_experts = input_ops[1]->output_tensors[0].dim[0];
+  // Bias: [num_experts, output_stride]. This is where N comes from -- the
+  // packed weight covers exactly output_stride rows per expert, so OUTPUT_SIZE
+  // and OUTPUT_STRIDE coincide and padded rows are not representable.
+  assert(input_ops[4]->output_tensors[0].num_dims == 2);
+  assert(input_ops[4]->output_tensors[0].dim[0] == num_experts);
+  output_stride = input_ops[4]->output_tensors[0].dim[1];
+  assert(output_stride % output_per_wg == 0);
+
+  // Output, and the batch/topk that W13 cannot read off its 2-D input.
+  if (w13_linear) {
+    assert(output_ops[0]->output_tensors[0].num_dims == 3);
+    batch_size = output_ops[0]->output_tensors[0].dim[0];
+    num_experts_per_tok = output_ops[0]->output_tensors[0].dim[1];
+    if (fuse_epilogue) {
+      // Half-width [batch, topk, output_stride / 2] activation.
+      assert(2 * output_ops[0]->output_tensors[0].dim[2] == output_stride);
+    } else {
+      assert(output_ops[0]->output_tensors[0].dim[2] == output_stride);
+    }
+    assert(output_ops[0]->dtensor.owner_op->op_type == type::KN_INPUT_OP);
+    kn::KNInputOp *kn_input_op =
+        static_cast<kn::KNInputOp *>(output_ops[0]->dtensor.owner_op);
+    assert(static_cast<int>(kn_input_op->input_strides[1]) ==
+           output_ops[0]->output_tensors[0].dim[2]);
+  } else if (fuse_epilogue) {
+    // Output is the f32 workspace [batch, hidden].
+    assert(output_ops[0]->output_tensors[0].num_dims == 2);
+    assert(output_ops[0]->output_tensors[0].dim[0] == batch_size);
+    assert(output_ops[0]->output_tensors[0].dim[1] == output_stride);
+    // Routing weight: [batch, topk] float32
+    assert(input_ops[5]->output_tensors[0].num_dims == 2);
+    assert(input_ops[5]->output_tensors[0].dim[1] == num_experts_per_tok);
+  } else {
+    assert(output_ops[0]->output_tensors[0].num_dims == 3);
+    assert(output_ops[0]->output_tensors[0].dim[0] == batch_size);
+    assert(output_ops[0]->output_tensors[0].dim[1] == num_experts_per_tok);
+    assert(output_ops[0]->output_tensors[0].dim[2] == output_stride);
+    assert(output_ops[0]->dtensor.owner_op->op_type == type::KN_INPUT_OP);
+    kn::KNInputOp *kn_input_op =
+        static_cast<kn::KNInputOp *>(output_ops[0]->dtensor.owner_op);
+    assert(static_cast<int>(kn_input_op->input_strides[1]) == output_stride);
+  }
+  // Tile space per expert: one tile per (token, workgroup) pair.
+  assert(tiles_per_expert == batch_size * (output_stride / output_per_wg));
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::gang_moe_$_linear_mxfp8_kernel<$, $, $, $, $, $, $, $, $>(",
+         w13_linear ? "w13" : "w2",
+         batch_size,
+         output_stride, // OUTPUT_SIZE
+         output_stride,
+         reduction_size,
+         num_experts,
+         num_experts_per_tok,
+         tiles_per_expert,
+         output_per_wg,
+         fuse_epilogue ? "true" : "false");
+  code.e("    task_desc->input_ptrs[0],");  // input activation
+  code.e("    task_desc->input_ptrs[1],");  // expert weights (MXFP8 packed)
+  code.e("    task_desc->input_ptrs[2],");  // routing indices
+  code.e("    task_desc->input_ptrs[3],");  // mask
+  code.e("    task_desc->input_ptrs[4],");  // bias
+  code.e("    task_desc->output_ptrs[0],"); // output / f32 workspace
+  if (!w13_linear && fuse_epilogue) {
+    code.e("    tile_idx,");
+    code.e("    task_desc->input_ptrs[5]);"); // routing weight
+  } else {
+    code.e("    tile_idx);");
+  }
+  if (w13_linear) {
+    return register_task_variant(TASK_GANG_MOE_W13_LINEAR_MXFP8_MI300,
+                                 code.to_string());
+  } else {
+    return register_task_variant(TASK_GANG_MOE_W2_LINEAR_MXFP8_MI300,
+                                 code.to_string());
+  }
+}
+
 // Gang fused W13+SwiGLU+W2 MXFP4 with per-expert pipelining.
 // params: [tiles_per_expert, w13_output_per_wg, total_tiles_per_xcd,
 // w2_output_per_wg]

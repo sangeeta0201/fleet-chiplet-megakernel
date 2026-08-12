@@ -187,6 +187,12 @@ public:
       threadblock::Graph const &bgraph,
       std::vector<int> const &params,
       bool w13_linear);
+  // MI300 gang MoE linear MXFP8 (gfx950; carries the fused SwiGLU / MulSumAdd
+  // epilogues the MXFP4 pair does not have)
+  int register_gang_moe_linear_mxfp8_mi300_task(
+      threadblock::Graph const &bgraph,
+      std::vector<int> const &params,
+      bool w13_linear);
   // MI300 gang MoE fused W13+SwiGLU+W2 MXFP4
   int register_gang_moe_fused_mxfp4_mi300_task(threadblock::Graph const &bgraph,
                                                std::vector<int> const &params);

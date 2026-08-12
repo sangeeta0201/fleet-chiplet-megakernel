@@ -427,6 +427,8 @@ void register_mugraph(
               task_type == TASK_GANG_MOE_W2_LINEAR_MI300 ||
               task_type == TASK_GANG_MOE_W13_LINEAR_MXFP4_MI300 ||
               task_type == TASK_GANG_MOE_W2_LINEAR_MXFP4_MI300 ||
+              task_type == TASK_GANG_MOE_W13_LINEAR_MXFP8_MI300 ||
+              task_type == TASK_GANG_MOE_W2_LINEAR_MXFP8_MI300 ||
               task_type == TASK_GANG_MOE_W13_SWIGLU_MXFP4_MI300 ||
               task_type == TASK_GANG_MOE_FUSED_MXFP4_MI300 ||
               task_type == TASK_GANG_LINEAR_BIAS_MI300 ||
@@ -1633,6 +1635,10 @@ TaskGraphResult print_task_graph(
       "TASK_GANG_MOE_W13_LINEAR_MXFP4_MI300";
   task_type_to_name[TASK_GANG_MOE_W2_LINEAR_MXFP4_MI300] =
       "TASK_GANG_MOE_W2_LINEAR_MXFP4_MI300";
+  task_type_to_name[TASK_GANG_MOE_W13_LINEAR_MXFP8_MI300] =
+      "TASK_GANG_MOE_W13_LINEAR_MXFP8_MI300";
+  task_type_to_name[TASK_GANG_MOE_W2_LINEAR_MXFP8_MI300] =
+      "TASK_GANG_MOE_W2_LINEAR_MXFP8_MI300";
   task_type_to_name[TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_MI300] =
       "TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_MI300";
   task_type_to_name[TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300] =
@@ -1693,6 +1699,8 @@ TaskGraphResult print_task_graph(
         task.first == TASK_GANG_MOE_W2_LINEAR_MI300 ||
         task.first == TASK_GANG_MOE_W13_LINEAR_MXFP4_MI300 ||
         task.first == TASK_GANG_MOE_W2_LINEAR_MXFP4_MI300 ||
+        task.first == TASK_GANG_MOE_W13_LINEAR_MXFP8_MI300 ||
+        task.first == TASK_GANG_MOE_W2_LINEAR_MXFP8_MI300 ||
         task.first == TASK_GANG_MOE_FUSED_MXFP4_MI300 ||
         task.first == TASK_GANG_MOE_SWIGLU_W2_MXFP4_MI300 ||
         task.first == TASK_GANG_MOE_W13_SWIGLU_MXFP4_MI300 ||
@@ -1754,6 +1762,8 @@ TaskGraphResult print_task_graph(
           task.first != TASK_GANG_MOE_W2_LINEAR_MI300 &&
           task.first != TASK_GANG_MOE_W13_LINEAR_MXFP4_MI300 &&
           task.first != TASK_GANG_MOE_W2_LINEAR_MXFP4_MI300 &&
+          task.first != TASK_GANG_MOE_W13_LINEAR_MXFP8_MI300 &&
+          task.first != TASK_GANG_MOE_W2_LINEAR_MXFP8_MI300 &&
           task.first != TASK_GANG_MOE_FUSED_MXFP4_MI300 &&
           task.first != TASK_GANG_MOE_SWIGLU_W2_MXFP4_MI300 &&
           task.first != TASK_GANG_MOE_W13_SWIGLU_MXFP4_MI300 &&

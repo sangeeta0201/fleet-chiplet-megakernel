@@ -515,6 +515,8 @@ __device__ __host__ __forceinline__ bool is_gang_task_type(TaskType t) {
          t == TASK_GANG_MOE_W2_LINEAR_MI300 ||
          t == TASK_GANG_MOE_W13_LINEAR_MXFP4_MI300 ||
          t == TASK_GANG_MOE_W2_LINEAR_MXFP4_MI300 ||
+         t == TASK_GANG_MOE_W13_LINEAR_MXFP8_MI300 ||
+         t == TASK_GANG_MOE_W2_LINEAR_MXFP8_MI300 ||
          t == TASK_GANG_MOE_FUSED_MXFP4_MI300 ||
          t == TASK_GANG_MOE_SWIGLU_W2_MXFP4_MI300 ||
          t == TASK_GANG_MOE_W13_SWIGLU_MXFP4_MI300 ||
@@ -2498,6 +2500,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
         case TASK_MOE_W13_LINEAR_MXFP4_CK_MI300:
         case TASK_GANG_MOE_W13_LINEAR_MI300:
         case TASK_GANG_MOE_W13_LINEAR_MXFP4_MI300:
+        case TASK_GANG_MOE_W13_LINEAR_MXFP8_MI300:
         case TASK_GANG_MOE_W13_SWIGLU_MXFP4_MI300:
           slot = 9;
           break;
@@ -2506,6 +2509,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
         case TASK_MOE_W2_LINEAR_MXFP4_CK_MI300:
         case TASK_GANG_MOE_W2_LINEAR_MI300:
         case TASK_GANG_MOE_W2_LINEAR_MXFP4_MI300:
+        case TASK_GANG_MOE_W2_LINEAR_MXFP8_MI300:
           slot = 10;
           break;
         case TASK_GANG_MOE_FUSED_MXFP4_MI300:

@@ -55,6 +55,11 @@
 #include "tasks/mi300/moe_linear_mxfp4_ck_mi300.cuh"
 #include "tasks/mi300/gang_moe_linear_mi300.cuh"
 #include "tasks/mi300/gang_moe_linear_mxfp4_mi300.cuh"
+// MXFP8 (gfx950 only). Both headers inherit _gang_moe_get_xcd_id and
+// MPK_WS_WAVE_SYNC from the includes above rather than naming them, which is
+// why they have to come after gang_moe_linear_mxfp4_mi300.cuh.
+#include "tasks/mi300/gang_linear_mxfp8_mi300.cuh"
+#include "tasks/mi300/gang_moe_linear_mxfp8_mi300.cuh"
 #include "tasks/mi300/gang_moe_pipelined_mxfp4_mi300.cuh"
 #include "tasks/mi300/gang_rmsnorm_linear_mxfp4_bias_mi300.cuh"
 #include "tasks/mi300/gang_rmsnorm_linear_mxfp4_bias_argmax_mi300.cuh"

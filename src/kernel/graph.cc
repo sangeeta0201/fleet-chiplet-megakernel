@@ -1101,6 +1101,27 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     task_config[op] =
         std::make_tuple(5, 1, TASK_GANG_MOE_W2_LINEAR_MXFP4_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[2]; // total_tiles_per_xcd
+  } else if (name == "gang_moe_w13_linear_mxfp8_mi300") {
+    assert(params.size() == 5 &&
+           "gang_moe_w13_linear_mxfp8_mi300 needs [tiles_per_expert, "
+           "max_experts_per_xcd, total_tiles_per_xcd, output_per_wg, "
+           "fuse_swiglu]");
+    int variant_id = task_register->register_gang_moe_linear_mxfp8_mi300_task(
+        customized->bgraph, params, true);
+    task_config[op] =
+        std::make_tuple(5, 1, TASK_GANG_MOE_W13_LINEAR_MXFP8_MI300, variant_id);
+    gang_task_tiles_per_xcd[op] = params[2]; // total_tiles_per_xcd
+  } else if (name == "gang_moe_w2_linear_mxfp8_mi300") {
+    assert(params.size() == 5 &&
+           "gang_moe_w2_linear_mxfp8_mi300 needs [tiles_per_expert, "
+           "max_experts_per_xcd, total_tiles_per_xcd, output_per_wg, "
+           "fuse_mulsumadd]");
+    int variant_id = task_register->register_gang_moe_linear_mxfp8_mi300_task(
+        customized->bgraph, params, false);
+    task_config[op] = std::make_tuple(
+        params[4] != 0 ? 6 : 5, 1, TASK_GANG_MOE_W2_LINEAR_MXFP8_MI300,
+        variant_id);
+    gang_task_tiles_per_xcd[op] = params[2]; // total_tiles_per_xcd
   } else if (name == "gang_moe_fused_mxfp4_mi300") {
     assert(params.size() == 4);
     int variant_id = task_register->register_gang_moe_fused_mxfp4_mi300_task(
