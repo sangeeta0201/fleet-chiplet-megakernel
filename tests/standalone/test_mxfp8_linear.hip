@@ -351,6 +351,27 @@ int main() {
          worst_res < 1.0 ? "OK" : "FAIL");
   printf("  MXFP8 format error vs bf16   : %.3e rel RMS (informational)\n",
          rms_q);
+
+  // With MXFP8_DUMP_DIR set, write the bf16 source and the device-packed
+  // bytes so check_mxfp8_pack.py can diff the demo's torch packer against
+  // them. The two have to agree byte for byte: a packer that lays rows or
+  // exponents out differently does not fault, it just quantizes the model
+  // wrong, which is indistinguishable from the format being bad.
+  if (char const *dir = getenv("MXFP8_DUMP_DIR")) {
+    std::vector<uint8_t> packed((size_t)N_WGS * WG_BYTES);
+    HIP_CHECK(hipMemcpy(
+        packed.data(), d_w, packed.size(), hipMemcpyDeviceToHost));
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/w_bf16.bin", dir);
+    FILE *f = fopen(path, "wb");
+    fwrite(h_w.data(), 2, h_w.size(), f);
+    fclose(f);
+    snprintf(path, sizeof(path), "%s/w_packed.bin", dir);
+    f = fopen(path, "wb");
+    fwrite(packed.data(), 1, packed.size(), f);
+    fclose(f);
+    printf("  dumped w_bf16.bin / w_packed.bin to %s\n", dir);
+  }
   printf("\n%s\n", ok ? "[PASS]" : "[FAIL]");
   return ok ? 0 : 1;
 }

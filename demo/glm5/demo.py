@@ -88,6 +88,71 @@ def pad_cols(w: torch.Tensor, target_cols: int) -> torch.Tensor:
     return torch.cat([w, pad], dim=1).contiguous()
 
 
+def quantize_mxfp8(w: torch.Tensor) -> tuple:
+    """Quantize a [..., out, K] bf16 weight to MXFP8: E4M3 values with one
+    E8M0 exponent per 32 contiguous K elements.
+
+    Contiguous-32 is not a free choice. The scaled MFMA takes one scale per
+    lane, and it addresses that operand by matrix position rather than by lane
+    contents -- lane 16*g+m carries row m's exponent for K block
+    [g*32, g*32+32), whatever bytes the lane's data register happens to hold.
+    Grouping any other way silently mixes exponents between element groups and
+    reads as elevated quantization noise. See
+    tests/standalone/test_mxfp8_mfma_layout.hip.
+
+    Returns (data uint8 [..., out, K], scales uint8 [..., out, K/32]).
+    """
+    K = w.shape[-1]
+    assert K % 32 == 0, f"K {K} must be a multiple of 32"
+    wf = w.float().reshape(*w.shape[:-1], K // 32, 32)
+    amax = wf.abs().amax(dim=-1)
+
+    # E8M0 exponent, matching _gang_compute_e8m0_fp8 bit for bit: take the raw
+    # exponent of amax/448 and round up whenever the mantissa is non-zero, so
+    # the block's largest value lands at or below E4M3's 448 ceiling.
+    target = (amax / 448.0).contiguous()
+    u = target.view(torch.int32)
+    raw_exp = ((u >> 23) & 0xFF) + ((u & 0x7FFFFF) != 0).to(torch.int32)
+    se = torch.where(amax == 0, torch.zeros_like(raw_exp),
+                     raw_exp.clamp(0, 255))
+
+    # se == 0 means an all-zero block; the kernel decodes that exponent as 1.0,
+    # so divide by 1.0 here too rather than by 2^-127.
+    scale = torch.where(se == 0, torch.ones_like(target),
+                        (se.to(torch.int32) << 23).view(torch.float32))
+    data = (wf / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+
+    return (data.view(torch.uint8).reshape(*w.shape[:-1], K),
+            se.to(torch.uint8))
+
+
+def pack_mxfp8_workgroup(data: torch.Tensor, scales: torch.Tensor,
+                         output_per_wg: int = 64) -> torch.Tensor:
+    """Repack quantize_mxfp8 output into the per-workgroup layout the MXFP8
+    kernels read, mirroring gpt-oss's pack_mxfp4_workgroup:
+
+        [E, wgs, OPW*K data bytes | OPW*(K/32) scale bytes]
+
+    Rows are K-major within the data half; scales are [row][k/32]. A 2-D
+    weight is treated as E == 1 and returned without the leading axis.
+    """
+    squeeze = (data.dim() == 2)
+    if squeeze:
+        data = data.unsqueeze(0)
+        scales = scales.unsqueeze(0)
+    E, out_dim, K = data.shape
+    assert scales.shape == (E, out_dim, K // 32)
+    assert out_dim % output_per_wg == 0, \
+        f"out_dim {out_dim} must be divisible by output_per_wg {output_per_wg}"
+
+    wgs = out_dim // output_per_wg
+    packed = torch.cat(
+        [data.reshape(E, wgs, output_per_wg * K),
+         scales.reshape(E, wgs, output_per_wg * (K // 32))],
+        dim=2).contiguous()
+    return packed.squeeze(0) if squeeze else packed
+
+
 def interleave_gate_up(w_gate: torch.Tensor, w_up: torch.Tensor,
                        num_groups: int) -> torch.Tensor:
     """Lay out [gate | up] as `num_groups` consecutive [gate_chunk; up_chunk]
