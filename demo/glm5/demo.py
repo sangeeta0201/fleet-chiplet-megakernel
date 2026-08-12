@@ -166,6 +166,10 @@ if __name__ == "__main__":
     parser.add_argument("--profiling", action="store_true")
     parser.add_argument("--max-seq-length", default=512, type=int)
     parser.add_argument("--model-path", type=str, default=DEFAULT_MODEL_PATH)
+    parser.add_argument(
+        "--tokenizer-path", type=str, default=None,
+        help=("Load the tokenizer from here instead of --model-path. Needed "
+              "for a config-only GLM-5 checkpoint, which ships no tokenizer."))
     parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument("--max-new-tokens", type=int, default=None)
     parser.add_argument("--prompt", type=str,
@@ -235,8 +239,12 @@ if __name__ == "__main__":
             max_num_pages=args.max_num_pages, page_size=args.page_size,
             num_layers=args.max_layers, random_weights=args.random_weights,
         ).to(dtype=torch.bfloat16, device="cuda")
+        # A partially-fetched checkpoint (config + shard index only, which is
+        # how the 744B geometry is brought up on one GPU) carries no tokenizer
+        # files. --tokenizer-path borrows one; with --random-weights the text
+        # is meaningless anyway, only the shapes matter.
         tokenizer = AutoTokenizer.from_pretrained(
-            args.model_path, trust_remote_code=True)
+            args.tokenizer_path or args.model_path, trust_remote_code=True)
 
     config = model.config
     if args.rope_interleave is not None:

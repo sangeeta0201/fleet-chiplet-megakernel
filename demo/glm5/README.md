@@ -36,12 +36,28 @@ HIP_VISIBLE_DEVICES=0 python3 demo.py --model-path /models/GLM-4.7-Flash \
 ```
 
 `--save-tokens` writes `outputs/glm5/{torch_output.json,mpk_output.json}` for
-`tests/ci-tests/test_glm5_inference_output.py`.
+`tests/ci-tests/test_glm5_inference_output.py`. The whole comparison is
+`tests/ci-tests/run_ci_tests_glm5.sh`, which runs both paths and applies the
+tolerant longest-common-block check.
+
+To exercise the real 744B kernel geometry (64 q heads, `q_lora` 2048, 6144
+hidden, 256 experts) on one GPU, truncate the layers. `--max-layers 4` is the
+smallest truncation that covers both sides of `first_k_dense_replace = 3`.
+A config-only checkpoint ships no tokenizer, so borrow one:
+
+```bash
+HIP_VISIBLE_DEVICES=0 python3 demo.py --model-path zai-org/GLM-5-FP8 \
+    --tokenizer-path zai-org/GLM-4.7-Flash \
+    --random-weights --max-layers 4 --use-mirage
+```
+
+That shape puts 4 q-head groups x 2 sequence chunks on exactly 8 XCDs.
 
 Useful flags: `--max-layers N` (truncates the Torch reference *and* the task
 graph, so the comparison stays meaningful), `--random-weights` (config +
 tokenizer only — shapes and kernels without the checkpoint),
-`--max-seq-length`, `--profiling`, `--no-rope-interleave`.
+`--max-seq-length`, `--profiling`, `--no-rope-interleave`,
+`--tokenizer-path`.
 
 Env knobs: `GLM_MLA_NUM_KV_CHUNKS` (sequence split across XCDs),
 `GANG_TILE_N`, `GANG_WGM`, `GLM_MODEL_PATH`.
