@@ -126,9 +126,8 @@ both checkpoints, so group-limited routing is a no-op.
 ### Layer schedule
 
 ```
-gang_rmsnorm_linear_bias   input_layernorm + kv_a_proj_with_mqa
-gang_linear                q_a_proj                     (same normalised hidden)
-gang_rmsnorm_linear_bias   q_a_layernorm + q_b_absorbed
+gang_rmsnorm_linear_bias   input_layernorm + [q_a_proj | kv_a_proj_with_mqa]
+gang_rmsnorm_linear_bias   q_a_layernorm (leading q_lora_pad cols) + q_b_absorbed
 mla_kv_cache_update        kv_a_layernorm + partial interleaved RoPE,
                            latent row -> paged cache, roped Q -> workspace
 gang_mla_decode            absorbed MLA, split over (q_group, kv_chunk)
@@ -153,12 +152,20 @@ tail: gang_rmsnorm_linear_bias (final norm + LM head), argmax_partial/reduce
 Two ordering constraints come from the runtime rather than the math. The task
 graph is a **linear chain**, and every op must consume at least one tensor the
 op immediately before it produced (`runtime.cc:572`) — weights don't count,
-they are graph inputs. So `kv_a_proj` is the projection fused with
-`input_layernorm`, letting `q_a_proj` follow it off the `rmsnorm_out` scratch
-and `q_b` follow `q_a` off `q_a_out`. They stay two GEMMs rather than one fused
-one for a numerical reason: `q_a_layernorm` must normalise only the `q_lora`
-columns, and a fused `[q_lora + 576]` output would drag the latent into that
-RMS denominator.
+they are graph inputs. `gang_rmsnorm_linear_bias` makes this sharper than it
+sounds: it declares its `norm_output` scratch as an *input*, so only the linear
+`output` counts as produced. A second GEMM reading that scratch shares nothing
+with the op that wrote it, which means **two sibling projections off one fused
+RMSNorm are not expressible**.
+
+So `q_a_proj` and `kv_a_proj_with_mqa` are concatenated into a single
+`[q_lora_pad | kv_lora + qk_rope]` GEMM fused with `input_layernorm`. The
+numerical objection — `q_a_layernorm` must normalise only the `q_lora` columns,
+and a fused output would drag the latent into that RMS denominator — is handled
+by a `NORM_SPAN` template parameter that bounds the sum of squares to the
+leading `q_lora_pad` columns (`if constexpr`, so the gpt-oss path is
+unchanged). `mla_kv_cache_update` then takes a `KV_INPUT_OFFSET` to find the
+latent slice inside that same row.
 
 The same rule rules out running the shared expert as its own GEMM pair — that
 makes the MoE block a diamond (shared and routed branches both hang off the
@@ -184,6 +191,7 @@ the output (so **output size % 512**), and `KPerBlock = 256` at batch ≤ 16 (so
 | q heads | 64 ✓ | 20 → **32** |
 | `q_a_proj` out | 2048 ✓ | 768 → **1024** |
 | `kv_a_proj` out | 576 → **1024** | 576 → **1024** |
+| fused `[q_a \| latent]` | **3072** | **2048** |
 | `q_b_absorbed` out | 64·576 = 36864 ✓ | 32·576 = 18432 ✓ |
 | `o_absorbed` out | 6144 ✓ | 2048 ✓ |
 | vocab | 154880 → **155136** | idem |
