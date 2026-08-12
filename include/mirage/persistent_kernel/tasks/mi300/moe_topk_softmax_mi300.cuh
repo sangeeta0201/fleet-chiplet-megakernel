@@ -22,6 +22,8 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
 
+#include "mpk_atoms.cuh" // st_wt_u16, st_wt_u32
+
 namespace kernel {
 
 static constexpr int MI300_WARP_SIZE = 64; // AMD wavefront size
@@ -82,8 +84,16 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
       // decode ballots over all BATCH_SIZE lanes, so a stale nonzero in
       // [num_rows, stride) would compact a token that does not exist into an
       // MFMA column.
+      //
+      // Write-through for the same reason as the logits reset below: the
+      // winners are published with `st_wt_u32` straight to HBM, so a plain
+      // store leaves a dirty zero line in this XCD's L2 whose writeback can
+      // land after a later layer has written the same address. Here the
+      // consequence is worse than a perturbed weight -- a dropped routing
+      // index silently removes a token from an expert's MFMA column set.
       for (int row = 0; row < routing_row_stride; ++row) {
-        routing_indices[expert * routing_row_stride + row] = 0;
+        st_wt_u32((void *)&routing_indices[expert * routing_row_stride + row],
+                  0u);
       }
     }
   }
@@ -131,13 +141,42 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
       }
     }
 
-    // Reset input buffer to 0 (for split-k gate linear compatibility)
+    // Reset input buffer to 0 (for split-k gate linear compatibility).
+    //
+    // WRITE-THROUGH, to match the producer. The 128 router workers publish
+    // each logit with `st_wt_u16` (sc0 sc1), which bypasses L2 and lands in
+    // HBM, and they sit on all 8 XCDs while this reader is on one. A plain
+    // store here leaves a *dirty* copy of the line in this XCD's L2. That line
+    // is not merely stale-on-read -- the acquire in topk_noinline drops it
+    // before the next read -- it is a pending writeback of zeros. Whenever it
+    // is evicted after the next layer's router has already written that
+    // address in HBM, the eviction overwrites a live logit with 0.
+    //
+    // A zeroed logit does not crash and does not change the ranking: 0 is far
+    // below the winners, so TopK returns the same experts in the same order
+    // and `routing_indices` / `active_expert_ids` come out bit-identical. But
+    // the softmax denominator is a sum over *all* NUM_EXPERTS logits, so the
+    // renormalized weights all shift in the low bits.
+    //
+    // Do NOT read the paragraph above as an explanation of any observed
+    // moe_topk_weight nondeterminism. It was, and it was the wrong suspect: the
+    // real cause of run-to-run moe_topk_weight divergence at batch_size >= 8
+    // was a dim-0 `input_map` on the output tensor, which made the host offset
+    // the base pointer by whole rows. See the NOTE at the `topk_weight`
+    // new_input() sites in persistent_kernel.py. The write-through reset here
+    // is still correct and still required for the L2 reason given above; it
+    // just shifts low bits, not whole rows. Define MPK_NO_LOGIT_RESET to keep
+    // the logits readable when dumping tensors for a golden reference.
+#ifndef MPK_NO_LOGIT_RESET
     for (int ldg = 0; ldg < LDG_PER_THREAD; ++ldg) {
       int src_offset = ldg * THREADS_PER_ROW * ELTS_PER_LDG;
       for (int e = 0; e < ELTS_PER_LDG; ++e) {
-        thread_read_ptr[src_offset + e] = static_cast<T>(0);
+        T zero = static_cast<T>(0);
+        st_wt_u16(&thread_read_ptr[src_offset + e],
+                  *reinterpret_cast<unsigned short *>(&zero));
       }
     }
+#endif
 
     // Max reduction within subgroup
     float thread_max = row_chunk[0];

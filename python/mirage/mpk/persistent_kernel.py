@@ -1368,7 +1368,11 @@ class PersistentKernel:
         assert moe_masks.num_dims == 1  # (num_experts + 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (0, -1, -1), -1, True)
-        tb_graph.new_input(moe_topk_weight, (0, -1, -1), -1, True)
+        # Replicated, not row-partitioned: the TopK epilogue writes every
+        # row from one block's base pointer, so a dim-0 partition would
+        # shift the whole tensor by `(batch_size // grid_dim.x) * blockIdx.x`
+        # rows. Harmless here only because callers pass grid_dim=(1,1,1).
+        tb_graph.new_input(moe_topk_weight, (-1, -1, -1), -1, True)
         tb_graph.new_input(moe_routing_indices, (-1, -1, -1), -1, True)
         tb_graph.new_input(moe_masks, (-1, -1, -1), -1, True)
         self.kn_graph.customized([input, moe_topk_weight, moe_routing_indices, moe_masks], tb_graph)
@@ -2452,7 +2456,18 @@ class PersistentKernel:
         tb_graph.new_input(logits_scratch, (1, -1, -1), 1, True)
         tb_graph.new_input(gang_counter, (-1, -1, -1), 0, True)
         # 3 outputs
-        tb_graph.new_input(topk_weight, (0, -1, -1), -1, True)
+        # topk_weight MUST be replicated (-1), never row-partitioned (0).
+        # runtime.cc:1370 offsets a partitioned tensor's base pointer by
+        # `(dim[0] // grid_dim.x) * blockIdx.x` rows, but the TopK epilogue runs
+        # on whichever single block arrives last and writes *all* batch_size
+        # rows from its own base. At grid_dim.x == 8 that floors to 0 rows for
+        # batch_size < 8 -- the only reason a dim-0 map ever appeared to work --
+        # and to blockIdx.x rows at batch_size >= 8, displacing the whole tensor
+        # by a run-varying amount and overrunning its end. Contrast
+        # logits_scratch, whose (1,-1,-1) map is deliberate: topk_noinline
+        # subtracts `xcd_id * CHUNK_N` back off
+        # (gang_rmsnorm_linear_bias_mi300.cuh:253). Nothing undoes a row offset.
+        tb_graph.new_input(topk_weight, (-1, -1, -1), -1, True)
         tb_graph.new_input(routing_indices, (-1, -1, -1), -1, True)
         tb_graph.new_input(active_expert_ids, (-1, -1, -1), -1, True)
         self.kn_graph.customized(
@@ -3140,7 +3155,9 @@ class PersistentKernel:
         # output is replicated so RMSNorm can read full hidden dim;
         # O-PROJ epilogue uses xcd_output_col_offset for correct writes
         tb_graph.new_input(output, (-1, -1, -1), -1, True)
-        tb_graph.new_input(topk_weight, (0, -1, -1), -1, True)
+        # Replicated, never row-partitioned -- see the topk_weight note in
+        # gang_rmsnorm_linear_bias_topk_layer.
+        tb_graph.new_input(topk_weight, (-1, -1, -1), -1, True)
         tb_graph.new_input(routing_indices, (-1, -1, -1), -1, True)
         tb_graph.new_input(active_expert_ids, (-1, -1, -1), -1, True)
         self.kn_graph.customized(
@@ -3280,7 +3297,9 @@ class PersistentKernel:
         tb_graph.new_input(swiglu_out, (-1, 2, -1), -1, True)       # [15] SwiGLU scratch
         # 6 outputs
         tb_graph.new_input(oproj_output, (-1, -1, -1), -1, True)    # [0] O-proj output
-        tb_graph.new_input(topk_weight, (0, -1, -1), -1, True)      # [1] topk weight
+        # Replicated, never row-partitioned -- see the topk_weight note in
+        # gang_rmsnorm_linear_bias_topk_layer.
+        tb_graph.new_input(topk_weight, (-1, -1, -1), -1, True)      # [1] topk weight
         tb_graph.new_input(routing_indices, (-1, -1, -1), -1, True)  # [2] routing indices
         tb_graph.new_input(active_expert_ids, (-1, -1, -1), -1, True)  # [3] expert mask
         tb_graph.new_input(routing_weight_moe, (-1, -1, -1), -1, True)  # [4] routing weight (MoE)
@@ -3467,7 +3486,9 @@ class PersistentKernel:
         tb_graph.new_input(q_workspace, (-1, -1, -1), -1, True)         # [3]
         tb_graph.new_input(o_acc, (-1, -1, -1), -1, True)               # [4]
         tb_graph.new_input(attn_proj_out, (-1, -1, -1), -1, True)       # [5]
-        tb_graph.new_input(topk_weight, (0, -1, -1), -1, True)          # [6]
+        # Replicated, never row-partitioned -- see the topk_weight note in
+        # gang_rmsnorm_linear_bias_topk_layer.
+        tb_graph.new_input(topk_weight, (-1, -1, -1), -1, True)          # [6]
         tb_graph.new_input(routing_indices, (-1, -1, -1), -1, True)     # [7]
         tb_graph.new_input(active_expert_ids, (-1, -1, -1), -1, True)   # [8]
         tb_graph.new_input(routing_weight_moe, (-1, -1, -1), -1, True)  # [9]
@@ -3675,7 +3696,9 @@ class PersistentKernel:
         tb_graph.new_input(q_workspace, (-1, -1, -1), -1, True)         # [3]
         tb_graph.new_input(o_acc, (-1, -1, -1), -1, True)               # [4]
         tb_graph.new_input(attn_proj_out, (-1, -1, -1), -1, True)       # [5]
-        tb_graph.new_input(topk_weight, (0, -1, -1), -1, True)          # [6]
+        # Replicated, never row-partitioned -- see the topk_weight note in
+        # gang_rmsnorm_linear_bias_topk_layer.
+        tb_graph.new_input(topk_weight, (-1, -1, -1), -1, True)          # [6]
         tb_graph.new_input(routing_indices, (-1, -1, -1), -1, True)     # [7]
         tb_graph.new_input(active_expert_ids, (-1, -1, -1), -1, True)   # [8]
         tb_graph.new_input(routing_weight_moe, (-1, -1, -1), -1, True)  # [9]

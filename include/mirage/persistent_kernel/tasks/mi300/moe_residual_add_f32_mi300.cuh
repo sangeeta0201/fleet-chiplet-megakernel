@@ -36,6 +36,7 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
 
+#include "mpk_atoms.cuh" // st_wt_zero128
 #include "moe_ws_layout.cuh"
 
 namespace kernel {
@@ -53,7 +54,25 @@ __device__ __forceinline__ void moe_residual_add_f32_mi300_impl(
   constexpr int VEC = 4;
   constexpr int BLOCK_VEC = 256 * VEC; // assumes blockDim.x == 256
 
-  float4 zero4 = {0.0f, 0.0f, 0.0f, 0.0f};
+  // ACQUIRE against the W2 producers, and it must be `sc1` (vL1 + L2).
+  //
+  // This task is the ONLY consumer of moe_workspace_f32 that is not the fused
+  // layer's QKV prologue, and it is the only one that was missing this. The
+  // prologue's acquire lives at the top of gang_full_layer_fused_mi300.cuh and
+  // its comment states the contract: W2 writes the workspace with
+  // `st_wt_f32x4` (sc0 sc1), which bypasses L2 and lands in HBM, and the
+  // producing W2 tile runs on a different XCD than this consumer. MI300/MI350
+  // L2 is not coherent across XCDs, so without this invalidate a line this XCD
+  // already holds -- from *last* iteration's read of the same address, since
+  // this task reads the identical buffer every iteration -- is served straight
+  // out of L2 and returns the previous iteration's value.
+  //
+  // A plain `buffer_inv` would not do: it drops vL1 only, and vL1 is not where
+  // the stale line lives. Which lines survive depends on inter-XCD L2 eviction
+  // timing, so the corruption is nondeterministic run to run and looks like a
+  // plausible float, never garbage -- the same signature the prologue's comment
+  // describes.
+  asm volatile("buffer_inv sc1" ::: "memory");
 
   for (int row = 0; row < BATCH_SIZE; ++row) {
     float *ws_row = d_ws + moe_ws_offset(row, 0, OUTPUT_STRIDE);
@@ -64,14 +83,22 @@ __device__ __forceinline__ void moe_residual_add_f32_mi300_impl(
     for (int off = threadIdx.x * VEC; off < OUTPUT_SIZE; off += BLOCK_VEC) {
       // Vectorized load: 4 f32 per topk slot (flat_load_dwordx4), summed in
       // fixed slot order.
+      //
+      // The zero stores are WRITE-THROUGH for the same reason W2's value
+      // stores are (see moe_ws_layout.cuh): their consumer is the *next*
+      // iteration's layer-0 QKV prologue, which runs on all 8 XCDs while this
+      // task runs on one. A plain store stops in this XCD's L2 and the other
+      // seven never see the zero -- they read layer 35's leftover MoE output
+      // and add it to the embedding, which is exactly the double-count this
+      // zero pass exists to prevent.
       float4 ws4;
       __builtin_memcpy(&ws4, ws_row + off, 16);
-      __builtin_memcpy(ws_row + off, &zero4, 16);
+      st_wt_zero128(ws_row + off);
 #pragma unroll
       for (int s = 1; s < MOE_WS_SLOTS; s++) {
         float4 slot4;
         __builtin_memcpy(&slot4, ws_row + s * OUTPUT_STRIDE + off, 16);
-        __builtin_memcpy(ws_row + s * OUTPUT_STRIDE + off, &zero4, 16);
+        st_wt_zero128(ws_row + s * OUTPUT_STRIDE + off);
         ws4.x += slot4.x;
         ws4.y += slot4.y;
         ws4.z += slot4.z;

@@ -661,6 +661,34 @@ if __name__ == "__main__":
         else:
             print(f"Chat template applied: {_lens[0]} tokens")
 
+        # --max-new-tokens on the MPK path.
+        #
+        # MPK has no runtime decode-step bound. prepare_next_batch stops on
+        # `step + num_tokens + 1 >= config.max_seq_length`
+        # (persistent_kernel.cuh:728) and on nothing else -- the only other
+        # exit, profiling_num_iters, comes from the compile-time
+        # -DMPK_PROFILING_NUM_ITERS and has no runtime setter. So the flag was
+        # silently ignored here while the Torch branch honoured it through
+        # `decode_limit`, and step counts had to be controlled by hand via
+        # --max-seq-length. Translate it into the bound MPK actually reads.
+        #
+        # Longest prompt, not request 0's: max_seq_length is a single global
+        # bound shared by every request, so sizing it off a shorter prompt
+        # would truncate the longer ones mid-generation.
+        if args.use_mirage and args.max_new_tokens is not None:
+            _needed = max(_lens) + args.max_new_tokens
+            if _needed < args.max_seq_length:
+                args.max_seq_length = _needed
+                tokens = tokens[:, :_needed].contiguous()
+                print(f"[CFG] --max-new-tokens {args.max_new_tokens} -> "
+                      f"max_seq_length={_needed} "
+                      f"(prompt {max(_lens)} + {args.max_new_tokens})")
+            else:
+                print(f"[CFG] --max-new-tokens {args.max_new_tokens} needs "
+                      f"max_seq_length {_needed}, but --max-seq-length is "
+                      f"{args.max_seq_length}; generation stops at "
+                      f"{args.max_seq_length - max(_lens)} new tokens.")
+
     # Position embeddings
     positions = torch.arange(args.max_seq_length).unsqueeze(0).to("cuda")
     position_embeddings = model.model.rotary_emb(positions)
@@ -2912,8 +2940,16 @@ if __name__ == "__main__":
                     _f.write(f"{_k} {_fp[_k]}\n")
             print(f"[FP] wrote {os.environ['MPK_FINGERPRINT']}")
             if os.environ.get("MPK_DUMP_TENSORS"):
+                # MPK_KV_ONLY_DUMP: keep only the KV caches. With MPK_KV_ALL
+                # the full dump is ~4.8GB per run at 36 layers, and comparing
+                # two runs means holding both. The KV caches are the only
+                # per-step history in the dump -- every other tensor is
+                # last-iteration scratch -- so for a multi-step divergence
+                # hunt they are the entire signal.
+                _kv_only = os.environ.get("MPK_KV_ONLY_DUMP")
                 _dump = {_k: verify_tensors[_k].detach().cpu()
-                         for _k in verify_tensors}
+                         for _k in verify_tensors
+                         if not _kv_only or "_cache" in _k}
                 # The token ids and per-request step are what make a dump
                 # interpretable: without them a row-to-row difference in
                 # embed_out cannot be told apart from "these rows embedded
