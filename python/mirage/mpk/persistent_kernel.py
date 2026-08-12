@@ -2593,6 +2593,109 @@ class PersistentKernel:
             tb_graph, "gang_rmsnorm_linear_bias_mi300", params
         )
 
+    def gang_rmsnorm_linear_bias_mla_kvupd_layer(
+        self,
+        norm_input: DTensor,
+        norm_weight: DTensor,
+        norm_output: DTensor,
+        linear_weight: DTensor,
+        bias: DTensor,
+        kv_norm: DTensor,
+        cos_pos_embed: DTensor,
+        sin_pos_embed: DTensor,
+        kv_cache: DTensor,
+        q_workspace: DTensor,
+        actual_hidden_dim: int,
+        tile_n: int,
+        output_stride: int,
+        norm_span: int,
+        reduction_size: int,
+        kv_offset: int,
+        m_tiles: int = 1,
+        wgm: int = 0,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """gang_rmsnorm_linear_bias_layer with mla_kv_cache_update_layer folded in.
+
+        Replaces the (q_a_layernorm + absorbed q_b_proj) -> MLA_KV_CACHE_UPDATE
+        pair with a single task. The old update was one workgroup that all 240
+        workers waited behind, for ~37 KB of traffic; here its Q half becomes
+        an in-place rotation by whichever worker already owns the rope columns,
+        and its latent half rides on one worker concurrently with everyone
+        else's MFMA. See the kernel header for why the tiling makes that work.
+
+        ``norm_input`` doubles as the latent source, read at ``kv_offset``:
+        GLM fuses q_a_proj and kv_a_proj_with_mqa into one GEMM, so the latent
+        is the tail of the row this task is already norming. ``q_workspace``
+        replaces the old ``q_absorbed`` buffer, which stops existing.
+
+        ``norm_span`` and ``reduction_size`` are required, unlike in the plain
+        variant -- the fused projection is the only caller and always narrows.
+        """
+        assert norm_input.num_dims == 2
+        assert linear_weight.num_dims == 2
+        assert q_workspace.num_dims == 2
+        assert kv_cache.num_dims == 4  # (num_pages, page_size, 1, qk_dim)
+        assert kv_cache.dim(2) == 1, "MLA keeps a single shared latent head"
+        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+
+        qk_dim = kv_cache.dim(3)
+        qk_rope_head_dim = cos_pos_embed.dim(cos_pos_embed.num_dims - 1)
+        kv_lora_rank = qk_dim - qk_rope_head_dim
+        assert kv_norm.dim(0) == kv_lora_rank
+        assert norm_input.dim(1) >= kv_offset + qk_dim
+        # The rope slice of a head has to be exactly one tile, or the in-place
+        # rotation would need a cross-workgroup exchange.
+        assert tile_n == qk_rope_head_dim and qk_dim % tile_n == 0, (
+            "tile_n must equal qk_rope_head_dim and divide the head width")
+
+        batch_size = self.max_num_batched_tokens
+        output_size = linear_weight.dim(0)
+        assert output_size % 8 == 0
+        chunk_n = output_size // 8
+        assert chunk_n % tile_n == 0
+        # Each XCD's column chunk must hold whole heads, so that "is this a
+        # rope tile" is a question about n_tile alone.
+        assert chunk_n % qk_dim == 0, "per-XCD chunk must hold whole heads"
+        n_tiles_per_xcd = chunk_n // tile_n
+        assert batch_size % m_tiles == 0
+        m_per_tile = batch_size // m_tiles
+        assert m_per_tile == 1, (
+            "a narrowed reduction doubles as the row stride; needs one row")
+        # +1: tile 0 is the latent cache update, which owns a dispatch slot so
+        # that it runs beside the GEMM instead of behind one worker's share of
+        # it. Only XCD 0's is live; the other seven return immediately.
+        total_tiles_per_xcd = n_tiles_per_xcd * m_tiles + 1
+        assert actual_hidden_dim <= norm_span <= reduction_size
+        assert reduction_size <= norm_input.dim(1)
+        assert reduction_size == linear_weight.dim(1), (
+            "reduction_size must match the linear weight's reduction extent")
+
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(norm_input, (-1, -1, -1), 1, True)
+        tb_graph.new_input(norm_weight, (-1, -1, -1), 0, True)
+        tb_graph.new_input(norm_output, (-1, -1, -1), 1, True)
+        tb_graph.new_input(linear_weight, (0, -1, -1), 1, True)
+        tb_graph.new_input(bias, (1, -1, -1), 1, True)
+        tb_graph.new_input(kv_norm, (-1, -1, -1), -1, True)
+        tb_graph.new_input(cos_pos_embed, (-1, -1, -1), -1, True)
+        tb_graph.new_input(sin_pos_embed, (-1, -1, -1), -1, True)
+        tb_graph.new_input(kv_cache, (-1, 2, -1), 1, True)
+        tb_graph.new_input(q_workspace, (1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [norm_input, norm_weight, norm_output, linear_weight, bias,
+             kv_norm, cos_pos_embed, sin_pos_embed, kv_cache, q_workspace],
+            tb_graph,
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_rmsnorm_linear_bias_mla_kvupd_mi300",
+            [output_stride, tile_n, m_tiles, m_per_tile, total_tiles_per_xcd,
+             n_tiles_per_xcd, wgm, actual_hidden_dim, norm_span,
+             reduction_size, kv_lora_rank, qk_rope_head_dim, kv_offset,
+             self.max_seq_length, self.page_size]
+        )
+
     def gang_rmsnorm_linear_bias_topk_layer(
         self,
         norm_input: DTensor,

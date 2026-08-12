@@ -124,6 +124,9 @@ public:
   // MI300 fused RMSNorm + gang linear + bias
   int register_gang_rmsnorm_linear_bias_mi300_task(
       threadblock::Graph const &bgraph, std::vector<int> const &params);
+  // MI300 fused RMSNorm + gang linear + bias + MLA latent KV cache update
+  int register_gang_rmsnorm_linear_bias_mla_kvupd_mi300_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
   // MI300 fused RMSNorm + gang linear + bias + TopK softmax
   int register_gang_rmsnorm_linear_bias_topk_mi300_task(
       threadblock::Graph const &bgraph, std::vector<int> const &params);

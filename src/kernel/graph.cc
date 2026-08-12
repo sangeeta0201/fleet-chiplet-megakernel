@@ -626,6 +626,17 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     task_config[op] =
         std::make_tuple(5, 1, TASK_GANG_RMSNORM_LINEAR_BIAS_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[4]; // total_tiles_per_xcd (m*n)
+  } else if (name == "gang_rmsnorm_linear_bias_mla_kvupd_mi300") {
+    assert(params.size() == 15 &&
+           "gang_rmsnorm_linear_bias_mla_kvupd_mi300 needs the 8 base params "
+           "plus [norm_span, reduction_size, kv_lora_rank, qk_rope_head_dim, "
+           "kv_input_offset, max_seq_len, page_size]");
+    int variant_id =
+        task_register->register_gang_rmsnorm_linear_bias_mla_kvupd_mi300_task(
+            customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(9, 1, TASK_GANG_RMSNORM_LINEAR_BIAS_MI300, variant_id);
+    gang_task_tiles_per_xcd[op] = params[4]; // total_tiles_per_xcd (m*n)
   } else if (name == "gang_rmsnorm_linear_bias_topk_mi300") {
     assert(params.size() == 11 &&
            "gang_rmsnorm_linear_bias_topk_mi300 needs 11 params");

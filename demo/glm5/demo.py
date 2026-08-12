@@ -488,7 +488,8 @@ if __name__ == "__main__":
         rmsnorm_out = make_tensor("rmsnorm_out", (bs, hidden_size))
         qkv_a_out = make_tensor("qkv_a_out", (bs, qkv_a_pad))
         q_a_norm_out = make_tensor("q_a_norm_out", (bs, qkv_a_pad))
-        q_absorbed = make_tensor("q_absorbed", (bs, num_heads_pad * qk_dim))
+        # The absorbed q_b_proj writes the roped Q straight into this, so the
+        # separate q_absorbed staging buffer the KV update used to read is gone.
         mla_q_ws = make_tensor("mla_q_workspace", (bs, num_heads_pad * qk_dim))
         # LSE is written unconditionally by the decode kernel; its stride is
         # num_q_groups * num_kv_chunks * 16 == num_heads_pad * num_kv_chunks.
@@ -694,34 +695,27 @@ if __name__ == "__main__":
                 block_dim=(256, 1, 1),
             )
             # 2. q_a_layernorm (leading q_lora_pad columns only) + absorbed
-            #    q_b_proj
-            mpk.gang_rmsnorm_linear_bias_layer(
+            #    q_b_proj, with the KV cache update fused into its epilogue:
+            #    the roped Q lands in mla_q_ws directly, and the latent row
+            #    (kv_a_layernorm + RoPE + paged append) rides on one worker.
+            mpk.gang_rmsnorm_linear_bias_mla_kvupd_layer(
                 norm_input=qkv_a_out,
                 norm_weight=w_q_a_norm,
                 norm_output=q_a_norm_out,
                 linear_weight=w_q_b,
                 bias=zero_bias(num_heads_pad * qk_dim),
-                output=q_absorbed,
-                actual_hidden_dim=q_lora,
-                norm_span=q_lora_pad,
-                reduction_size=q_lora_pad,
-                tile_n=GANG_TILE_N,
-                output_stride=num_heads_pad * qk_dim,
-                wgm=GANG_WGM,
-                block_dim=(256, 1, 1),
-            )
-            # 3. kv_a_layernorm + partial interleaved RoPE, append the latent
-            #    row to the paged cache, roped Q -> workspace
-            mpk.mla_kv_cache_update_layer(
-                q_absorbed=q_absorbed,
-                kv_latent=qkv_a_out,
-                kv_offset=q_lora_pad,
-                kv_cache=kv_cache,
                 kv_norm=w_kv_a_norm,
                 cos_pos_embed=cos_pos_embed,
                 sin_pos_embed=sin_pos_embed,
+                kv_cache=kv_cache,
                 q_workspace=mla_q_ws,
-                grid_dim=(args.max_num_batched_requests, 1, 1),
+                actual_hidden_dim=q_lora,
+                norm_span=q_lora_pad,
+                reduction_size=q_lora_pad,
+                kv_offset=q_lora_pad,
+                tile_n=GANG_TILE_N,
+                output_stride=num_heads_pad * qk_dim,
+                wgm=GANG_WGM,
                 block_dim=(256, 1, 1),
             )
             # 4. absorbed MLA decode, split over (q_group, kv_chunk)

@@ -41,6 +41,32 @@ using bfloat16 = type::bfloat16_t;
 //   input:  m_tile * BATCH_SIZE * REDUCTION_SIZE  (M-tile of activation)
 //   weight: n_tile * tile_n * REDUCTION_SIZE      (N-tile of weight)
 //   output: m_tile * BATCH_SIZE * o_stride + n_tile * tile_n
+
+// The 1D tile_idx -> (m_tile, n_tile) mapping, on its own so that a caller
+// wanting to run an epilogue over its own output columns can ask where those
+// columns are without re-deriving the traversal. Returns false for the
+// out-of-range tiles of a short tail window, which the caller should skip.
+__device__ __forceinline__ bool gang_linear_tile_coords(
+    int tile_idx, int m_tiles, int n_tiles, int wgm, int *m_tile, int *n_tile) {
+  // When wgm <= 0 or wgm >= m_tiles, use full M-major (W = m_tiles)
+  int W = (wgm > 0 && wgm < m_tiles) ? wgm : m_tiles;
+
+  int tid_per_group = W * n_tiles;         // tiles in one window
+  int group_id = tile_idx / tid_per_group; // which window of M-rows
+  int first_row = group_id * W;
+  int win_h = m_tiles - first_row; // remaining rows
+  if (win_h > W) {
+    win_h = W; // clamp to window height
+  }
+  int local = tile_idx % tid_per_group; // position within window
+  if (local >= win_h * n_tiles) {
+    return false; // out-of-bounds tile in tail group
+  }
+  *m_tile = first_row + (local % win_h); // fast index: sweep M within column
+  *n_tile = local / win_h; // slow index: advance N after win_h rows
+  return true;
+}
+
 template <typename T,
           int BATCH_SIZE, // = m_per_tile (rows per worker)
           int REDUCTION_SIZE>
@@ -60,24 +86,11 @@ __device__ __forceinline__ void gang_linear_kernel(
   assert(tile_idx >= 0);
 
   // HipKittens Algorithm 1, Step 2: windowed traversal
-  // When wgm <= 0 or wgm >= m_tiles, use full M-major (W = m_tiles)
-  int W = (wgm > 0 && wgm < m_tiles) ? wgm : m_tiles;
-
-  int tid_per_group = W * n_tiles;         // tiles in one window
-  int group_id = tile_idx / tid_per_group; // which window of M-rows
-  int first_row = group_id * W;
-  int win_h = m_tiles - first_row; // remaining rows
-  if (win_h > W) {
-    win_h = W; // clamp to window height
+  int m_tile, n_tile;
+  if (!gang_linear_tile_coords(tile_idx, m_tiles, n_tiles, wgm, &m_tile,
+                               &n_tile)) {
+    return; // should not happen with a correct tile count
   }
-  int local = tile_idx % tid_per_group; // position within window
-  // Handle tail group (fewer rows than W)
-  if (local >= win_h * n_tiles) {
-    return; // out-of-bounds tile in tail group — should not happen with correct
-            // tile count
-  }
-  int m_tile = first_row + (local % win_h); // fast index: sweep M within column
-  int n_tile = local / win_h; // slow index: advance N after win_h rows
 
   // Input: offset to M-tile (skip m_tile * BATCH_SIZE rows)
   T const *tile_input =

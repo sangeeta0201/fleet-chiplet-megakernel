@@ -1077,6 +1077,115 @@ int TaskRegister::register_gang_rmsnorm_linear_bias_mi300_task(
                                code.to_string());
 }
 
+// Fused RMSNorm + Gang Linear + Bias + MLA KV cache update.
+//
+// Same shape as the plain variant above -- q_a_layernorm feeding the absorbed
+// q_b_proj -- with what used to be the MLA_KV_CACHE_UPDATE task folded into
+// its epilogue. `norm_span` and the narrowed reduction are mandatory here
+// rather than optional; GLM's fused [q_a | kv_latent] projection is the only
+// caller and always supplies both.
+//
+// kv_latent is not an input of its own: the latent is the tail of the very
+// row this GEMM norms, so input_ptrs[0] serves both, read at kv_input_offset
+// against the *tensor's* full row width rather than the narrowed reduction.
+int TaskRegister::register_gang_rmsnorm_linear_bias_mla_kvupd_mi300_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 15);
+  int output_stride = params[0];
+  int tile_n = params[1];
+  int m_tiles = params[2];
+  int m_per_tile = params[3];
+  int n_tiles_per_xcd = params[5];
+  int wgm = params[6];
+  int actual_hidden_dim = params[7];
+  int norm_span = params[8];
+  int reduction_size = params[9];
+  int kv_lora_rank = params[10];
+  int qk_rope_head_dim = params[11];
+  int kv_input_offset = params[12];
+  int max_seq_len = params[13];
+  int page_size = params[14];
+
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  // norm_input, norm_weight, norm_output, linear_weight, bias,
+  // kv_a_layernorm weight, cos, sin, paged latent cache
+  int num_inputs = 9;
+  int num_outputs = 1;
+
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+
+  assert(input_ops[0]->dtensor.num_dims == 2);
+  int kv_input_stride = input_ops[0]->dtensor.dim[1];
+  assert(norm_span > 0 && norm_span <= reduction_size);
+  assert(actual_hidden_dim <= norm_span);
+  assert(reduction_size <= kv_input_stride);
+  assert(m_per_tile == 1 &&
+         "the narrowed reduction doubles as the row stride; needs one row");
+  assert(kv_input_offset + kv_lora_rank + qk_rope_head_dim <= kv_input_stride);
+  // As in the standalone task: one shared latent head, so the cache row
+  // stride is just the last dim.
+  int kv_cache_stride = input_ops[8]->output_tensors[0].dim[3];
+  assert(kv_cache_stride >= kv_lora_rank + qk_rope_head_dim);
+  // A head is (kv_lora_rank + qk_rope_head_dim) wide and its rope slice must
+  // land in exactly one tile, or the in-place rotation would straddle
+  // workgroups.
+  assert(tile_n == qk_rope_head_dim &&
+         (kv_lora_rank + qk_rope_head_dim) % tile_n == 0);
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::gang_rmsnorm_linear_bias_mla_kvupd_kernel<bfloat16, $, $, $, "
+         "$, $, $, $, $, $, $, $>(",
+         m_per_tile,        /* BATCH_SIZE */
+         reduction_size,    /* REDUCTION_SIZE */
+         actual_hidden_dim, /* ACTUAL_HIDDEN_DIM */
+         norm_span,         /* NORM_SPAN */
+         kv_lora_rank,      /* KV_LORA_RANK */
+         qk_rope_head_dim,  /* QK_ROPE_HEAD_DIM */
+         kv_input_stride,   /* KV_INPUT_STRIDE */
+         kv_cache_stride,   /* KV_CACHE_STRIDE */
+         max_seq_len,       /* MAX_SEQ_LEN */
+         page_size,         /* PAGE_SIZE */
+         kv_input_offset);  /* KV_INPUT_OFFSET */
+  code.e("    task_desc->input_ptrs[0],");  // norm_input, also kv_latent
+  code.e("    task_desc->input_ptrs[1],");  // norm_weight
+  code.e("    task_desc->input_ptrs[2],");  // norm_output scratch (writable)
+  code.e("    task_desc->input_ptrs[3],");  // linear_weight
+  code.e("    task_desc->input_ptrs[4],");  // bias
+  code.e("    task_desc->input_ptrs[0],");  // kv_latent
+  code.e("    task_desc->input_ptrs[5],");  // kv_a_layernorm weight
+  code.e("    task_desc->input_ptrs[6],");  // cos
+  code.e("    task_desc->input_ptrs[7],");  // sin
+  code.e("    task_desc->output_ptrs[0],"); // q_workspace
+  code.e("    task_desc->input_ptrs[8],");  // paged latent cache, written
+  code.e("    runtime_config.qo_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_indices_buffer,");
+  code.e("    runtime_config.paged_kv_last_page_len_buffer,");
+  code.e("    task_desc->task_metadata.request_id,");
+  code.e("    runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS],");
+  code.e("    $,", tile_n);
+  code.e("    $,", output_stride);
+  code.e("    $,", m_tiles);
+  code.e("    $,", n_tiles_per_xcd);
+  code.e("    $,", wgm);
+  code.e("    tile_idx,");
+  // Matches the standalone task's epsilon, so this stays a pure scheduling
+  // change.
+  code.e("    1e-6f);");
+  return register_task_variant(TASK_GANG_RMSNORM_LINEAR_BIAS_MI300,
+                               code.to_string());
+}
+
 // Fused RMSNorm + Gang Linear + Bias + TopK Softmax.
 // params: [output_stride, tile_n, m_tiles, m_per_tile, total_tiles_per_xcd,
 //          n_tiles_per_xcd, wgm, actual_hidden_dim, num_experts,
