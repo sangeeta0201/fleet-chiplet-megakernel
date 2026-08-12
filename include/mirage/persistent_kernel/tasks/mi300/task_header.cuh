@@ -60,6 +60,7 @@
 // why they have to come after gang_moe_linear_mxfp4_mi300.cuh.
 #include "tasks/mi300/gang_linear_mxfp8_mi300.cuh"
 #include "tasks/mi300/gang_moe_linear_mxfp8_mi300.cuh"
+#include "tasks/mi300/gang_rmsnorm_linear_mxfp8_bias_mi300.cuh"
 #include "tasks/mi300/gang_moe_pipelined_mxfp4_mi300.cuh"
 #include "tasks/mi300/gang_rmsnorm_linear_mxfp4_bias_mi300.cuh"
 #include "tasks/mi300/gang_rmsnorm_linear_mxfp4_bias_argmax_mi300.cuh"

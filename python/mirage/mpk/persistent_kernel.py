@@ -3131,6 +3131,71 @@ class PersistentKernel:
              total_tiles_per_xcd, actual_hidden_dim]
         )
 
+    def gang_rmsnorm_linear_mxfp8_bias_layer(
+        self,
+        norm_input: DTensor,
+        norm_weight: DTensor,
+        mxfp8_weight: DTensor,
+        bias: DTensor,
+        output: DTensor,
+        actual_hidden_dim: int,
+        output_per_wg: int,
+        output_stride: int,
+        norm_output: DTensor = None,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Fused RMSNorm + MXFP8 Gang Linear + Bias.
+
+        Same as gang_rmsnorm_linear_mxfp4_bias_layer but with 8-bit weights:
+        E4M3 values plus one E8M0 exponent per 32 contiguous K elements, so
+        1.03 bytes per weight against bf16's 2. Weight is packed in workgroup
+        layout: [n_wgs, wg_bytes], wg_bytes = OPW*K + OPW*(K/32).
+
+        ``actual_hidden_dim`` is the unpadded hidden size used for the RMS
+        denominator.
+
+        ``norm_output`` is bf16 scratch of the same shape as ``norm_input``;
+        every worker writes the same normalized row to it (idempotent) and
+        then reads its own tile back. It is a required buffer, not an output,
+        and defaults to ``norm_input`` only where the caller is content to
+        normalize in place -- which the GLM demo is not, so it always passes
+        one.
+        """
+        assert norm_input.num_dims == 2
+        assert mxfp8_weight.num_dims == 2
+        assert output.num_dims == 2
+        assert self.target_cc == 95, "MXFP8 MFMA is gfx950-only"
+        assert norm_output is not None, "MXFP8 rmsnorm+linear needs scratch"
+        batch_size = self.max_num_batched_tokens
+        # K must clear the depth-4 pipeline's tail: only slot 3 is guarded.
+        K = norm_input.dim(1)
+        assert K % 512 == 0, f"reduction {K} must be a multiple of 512"
+        n_wgs = mxfp8_weight.dim(0)
+        assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
+        n_wgs_per_xcd = n_wgs // 8
+        # The packed weight erases the logical N, so cross-check it against
+        # the bias, which is the only tensor that still carries it.
+        assert bias.dim(1) == n_wgs * output_per_wg, (
+            f"bias width {bias.dim(1)} != n_wgs {n_wgs} x opw {output_per_wg}")
+        total_tiles_per_xcd = batch_size * n_wgs_per_xcd
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(norm_input, (-1, -1, -1), 1, True)
+        tb_graph.new_input(norm_weight, (-1, -1, -1), 0, True)
+        tb_graph.new_input(norm_output, (-1, -1, -1), 1, True)
+        tb_graph.new_input(mxfp8_weight, (0, -1, -1), 1, True)
+        tb_graph.new_input(bias, (1, -1, -1), 1, True)
+        tb_graph.new_input(output, (1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [norm_input, norm_weight, norm_output, mxfp8_weight, bias, output],
+            tb_graph,
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_rmsnorm_linear_mxfp8_bias_mi300",
+            [output_stride, output_per_wg, n_wgs_per_xcd,
+             total_tiles_per_xcd, actual_hidden_dim]
+        )
+
     def gang_rmsnorm_linear_mxfp4_bias_argmax_layer(
         self,
         norm_input: DTensor,

@@ -669,6 +669,17 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     task_config[op] = std::make_tuple(
         5, 1, TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[3]; // total_tiles_per_xcd
+  } else if (name == "gang_rmsnorm_linear_mxfp8_bias_mi300") {
+    assert(
+        params.size() == 5 &&
+        "gang_rmsnorm_linear_mxfp8_bias_mi300 needs [o_stride, output_per_wg, "
+        "n_wgs_per_xcd, total_tiles_per_xcd, actual_hidden_dim]");
+    int variant_id =
+        task_register->register_gang_rmsnorm_linear_mxfp8_bias_mi300_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        5, 1, TASK_GANG_RMSNORM_LINEAR_MXFP8_BIAS_MI300, variant_id);
+    gang_task_tiles_per_xcd[op] = params[3]; // total_tiles_per_xcd
   } else if (name == "gang_rmsnorm_linear_mxfp4_bias_argmax_mi300") {
     assert(params.size() == 5 &&
            "gang_rmsnorm_linear_mxfp4_bias_argmax_mi300 needs [o_stride, "

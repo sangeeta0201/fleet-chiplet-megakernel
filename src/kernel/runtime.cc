@@ -436,6 +436,7 @@ void register_mugraph(
               task_type == TASK_GANG_RMSNORM_LINEAR_BIAS_MI300 ||
               task_type == TASK_GANG_RMSNORM_LINEAR_BIAS_TOPK_MI300 ||
               task_type == TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_MI300 ||
+              task_type == TASK_GANG_RMSNORM_LINEAR_MXFP8_BIAS_MI300 ||
               task_type == TASK_GANG_LINEAR_MXFP4_RES_BIAS_MI300 ||
               task_type ==
                   TASK_GANG_MULSUMRADD_RMSNORM_LINEAR_MXFP4_BIAS_MI300 ||
@@ -1641,6 +1642,8 @@ TaskGraphResult print_task_graph(
       "TASK_GANG_MOE_W2_LINEAR_MXFP8_MI300";
   task_type_to_name[TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_MI300] =
       "TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_MI300";
+  task_type_to_name[TASK_GANG_RMSNORM_LINEAR_MXFP8_BIAS_MI300] =
+      "TASK_GANG_RMSNORM_LINEAR_MXFP8_BIAS_MI300";
   task_type_to_name[TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300] =
       "TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300";
   task_type_to_name[TASK_GANG_LINEAR_MXFP4_RES_BIAS_MI300] =
@@ -1709,6 +1712,7 @@ TaskGraphResult print_task_graph(
         task.first == TASK_GANG_RMSNORM_LINEAR_BIAS_MI300 ||
         task.first == TASK_GANG_RMSNORM_LINEAR_BIAS_TOPK_MI300 ||
         task.first == TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_MI300 ||
+        task.first == TASK_GANG_RMSNORM_LINEAR_MXFP8_BIAS_MI300 ||
         task.first == TASK_GANG_LINEAR_MXFP4_RES_BIAS_MI300 ||
         task.first == TASK_GANG_MULSUMRADD_RMSNORM_LINEAR_MXFP4_BIAS_MI300 ||
         task.first == TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_KVUPD_MI300 ||
@@ -1772,6 +1776,7 @@ TaskGraphResult print_task_graph(
           task.first != TASK_GANG_RMSNORM_LINEAR_BIAS_MI300 &&
           task.first != TASK_GANG_RMSNORM_LINEAR_BIAS_TOPK_MI300 &&
           task.first != TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_MI300 &&
+          task.first != TASK_GANG_RMSNORM_LINEAR_MXFP8_BIAS_MI300 &&
           task.first != TASK_GANG_LINEAR_MXFP4_RES_BIAS_MI300 &&
           task.first != TASK_GANG_MULSUMRADD_RMSNORM_LINEAR_MXFP4_BIAS_MI300 &&
           task.first != TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_KVUPD_MI300 &&

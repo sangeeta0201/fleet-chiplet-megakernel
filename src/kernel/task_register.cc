@@ -2846,6 +2846,62 @@ int TaskRegister::register_gang_moe_linear_mxfp4_mi300_task(
   }
 }
 
+// Fused RMSNorm + MXFP8 Gang Linear + Bias. Same shape of registrar as the
+// MXFP4 one above -- only the emitted kernel name differs, because the two
+// kernels take identical parameters and differ solely in weight width.
+// params: [output_stride, output_per_wg, n_wgs_per_xcd, total_tiles_per_xcd,
+//          actual_hidden_dim]
+int TaskRegister::register_gang_rmsnorm_linear_mxfp8_bias_mi300_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 5);
+  int output_stride = params[0];
+  int output_per_wg = params[1];
+  int n_wgs_per_xcd = params[2];
+  int total_tiles_per_xcd = params[3];
+  int actual_hidden_dim = params[4];
+  (void)total_tiles_per_xcd;
+
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs =
+      5; // norm_input, norm_weight, norm_output, mxfp8_weight, bias
+  int num_outputs = 1;
+
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  // input[0] is norm_input [batch, reduction_size]
+  assert(input_ops[0]->dtensor.num_dims == 2);
+  int batch_size = input_ops[0]->dtensor.dim[0];
+  int reduction_size = input_ops[0]->dtensor.dim[1];
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::gang_rmsnorm_linear_mxfp8_bias_kernel<$, $, $, $>(",
+         batch_size,
+         output_per_wg,
+         reduction_size,
+         actual_hidden_dim);
+  code.e("    task_desc->input_ptrs[0],");  // norm_input
+  code.e("    task_desc->input_ptrs[1],");  // norm_weight
+  code.e("    task_desc->input_ptrs[2],");  // norm_output scratch
+  code.e("    task_desc->input_ptrs[3],");  // mxfp8_weight
+  code.e("    task_desc->input_ptrs[4],");  // bias
+  code.e("    task_desc->output_ptrs[0],"); // linear_output
+  code.e("    runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS],");
+  code.e("    $,", n_wgs_per_xcd);
+  code.e("    $,", output_stride);
+  code.e("    tile_idx);");
+  return register_task_variant(TASK_GANG_RMSNORM_LINEAR_MXFP8_BIAS_MI300,
+                               code.to_string());
+}
+
 // Gang MoE MXFP8 linear: 8 tasks (1 per XCD), FP8 weight x FP8 activation MFMA.
 // params: [tiles_per_expert, max_experts_per_xcd, total_tiles_per_xcd,
 // output_per_wg, fuse_epilogue]

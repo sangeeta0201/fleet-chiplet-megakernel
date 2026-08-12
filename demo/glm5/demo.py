@@ -169,6 +169,27 @@ def pack_moe_mxfp8(stacked: torch.Tensor,
     return torch.stack(packed).contiguous()
 
 
+def pack_dense_mxfp8(w: torch.Tensor, output_per_wg: int = 64,
+                     rows_per_chunk: int = 8192) -> torch.Tensor:
+    """Quantize + pack a 2-D [out, K] bf16 weight into the MXFP8 per-workgroup
+    layout, in row chunks.
+
+    Same reason as pack_moe_mxfp8: quantize_mxfp8 materialises an fp32 copy of
+    whatever it is handed, which for GLM's 155136 x 2048 LM head is 1.27 GB on
+    top of the bf16 original. Rows are independent and a workgroup is a
+    contiguous run of `output_per_wg` rows, so chunking on a multiple of that
+    and concatenating along the workgroup axis is exact.
+    """
+    assert w.dim() == 2, w.shape
+    rows = w.shape[0]
+    assert rows % output_per_wg == 0, (rows, output_per_wg)
+    step = max(output_per_wg,
+               (rows_per_chunk // output_per_wg) * output_per_wg)
+    parts = [pack_mxfp8_workgroup(*quantize_mxfp8(w[r:r + step]), output_per_wg)
+             for r in range(0, rows, step)]
+    return torch.cat(parts, dim=0).contiguous()
+
+
 def interleave_gate_up(w_gate: torch.Tensor, w_up: torch.Tensor,
                        num_groups: int) -> torch.Tensor:
     """Lay out [gate | up] as `num_groups` consecutive [gate_chunk; up_chunk]
@@ -470,6 +491,29 @@ if __name__ == "__main__":
             assert (2 * moe_inter) % MOE_MXFP8_OPW == 0
             assert hidden_size % MOE_MXFP8_OPW == 0
 
+        # Same treatment for the two dense GEMMs that hang off an RMSNorm and
+        # share one kernel: qkv_a (K=2048, N=2048, 394 MB/token) and the LM
+        # head (K=2048, N=155136, 635 MB once). 1.03 GB of the 9.17 GB budget
+        # between them. Both are already fused-RMSNorm tasks, so this is the
+        # MXFP8 twin of gang_rmsnorm_linear_mxfp4_bias, not a call to the
+        # plain dense kernel. Set GLM_DENSE_MXFP8=0 for bf16.
+        DENSE_MXFP8 = os.environ.get("GLM_DENSE_MXFP8", "1") == "1"
+        # Output rows per workgroup, and so the tile count. The LM head is
+        # 155136 rows wide and wants the widest tile it can get; qkv_a is 2048,
+        # which at 64 rows a workgroup is 4 tiles per XCD -- 32 of 240 workers.
+        # The kernel's OPW<64 branch splits K across the 4 waves instead of N,
+        # which is what un-starves it, the same trade #19 made for o_proj.
+        DENSE_MXFP8_OPW = int(os.environ.get("GLM_DENSE_MXFP8_OPW", "64"))
+        # 16 rather than 64: worth 6.30 -> 6.13 ms/token. It is the only
+        # value the K-parallel branch is correct for.
+        QKV_MXFP8_OPW = int(os.environ.get("GLM_QKV_MXFP8_OPW", "16"))
+        if DENSE_MXFP8:
+            assert hidden_size % 512 == 0, hidden_size
+            # One workgroup per 64 output rows, partitioned 8 ways across the
+            # XCDs. vocab_size is aligned to GANG_OUT_ALIGN (512) further down,
+            # which is the same constraint, so only qkv_a needs checking here.
+            assert qkv_a_pad % (8 * QKV_MXFP8_OPW) == 0, qkv_a_pad
+
         assert (2 * dense_inter) % GANG_OUT_ALIGN == 0
         assert dense_inter % GANG_RED_ALIGN == 0
 
@@ -514,7 +558,9 @@ if __name__ == "__main__":
               f"latent_row={qk_dim} q_lora={q_lora}->{q_lora_pad} "
               f"merge_dim_splits={MLA_MERGE_DIM_SPLITS} "
               f"fuse_moe_swiglu={int(FUSE_MOE_SWIGLU)} "
-              f"fuse_moe_mulsumadd={int(FUSE_MOE_MULSUMADD)}")
+              f"fuse_moe_mulsumadd={int(FUSE_MOE_MULSUMADD)} "
+              f"moe_mxfp8={int(MOE_MXFP8)} dense_mxfp8={int(DENSE_MXFP8)} "
+              f"qkv_opw={QKV_MXFP8_OPW} dense_opw={DENSE_MXFP8_OPW}")
 
         num_workers, num_schedulers = mi.get_configurations_from_gpu(rank)
 
@@ -806,11 +852,17 @@ if __name__ == "__main__":
             # What kept them apart is handled by `norm_span`: q_a_layernorm
             # sums only the leading q_lora_pad columns, leaving the latent out
             # of its RMS denominator.
-            w_qkv_a = _attach_input_keep(
-                torch.cat([pad_rows(attn.q_a_proj.weight.data, q_lora_pad),
-                           pad_rows(attn.kv_a_proj_with_mqa.weight.data,
-                                    kv_a_out_pad)], dim=0).contiguous(),
-                f"layer_{i}_qkv_a_proj")
+            qkv_a_stack = torch.cat(
+                [pad_rows(attn.q_a_proj.weight.data, q_lora_pad),
+                 pad_rows(attn.kv_a_proj_with_mqa.weight.data,
+                          kv_a_out_pad)], dim=0).contiguous()
+            if DENSE_MXFP8:
+                # The packer preserves row order, so the [q_a | latent] split
+                # the rest of the layer indexes by still lands where it did.
+                # The padded rows are exactly zero, which quantizes to an
+                # all-zero block with an E8M0 of 0 -- decoded as 1.0.
+                qkv_a_stack = pack_dense_mxfp8(qkv_a_stack, QKV_MXFP8_OPW)
+            w_qkv_a = _attach_input_keep(qkv_a_stack, f"layer_{i}_qkv_a_proj")
             # q_a_layernorm weight, zero past q_lora: the padded q_a columns
             # are exactly zero (w_qkv_a's extra rows are zero) so they cost the
             # denominator nothing, and the zeros over the latent columns keep
@@ -856,19 +908,33 @@ if __name__ == "__main__":
                 f"layer_{i}_latent_cache")
 
             # 1. input_layernorm + [q_a_proj | kv_a_proj_with_mqa]
-            mpk.gang_rmsnorm_linear_bias_layer(
-                norm_input=x,
-                norm_weight=w_norm,
-                norm_output=rmsnorm_out,
-                linear_weight=w_qkv_a,
-                bias=zero_bias(qkv_a_pad),
-                output=qkv_a_out,
-                actual_hidden_dim=hidden_size,
-                tile_n=GANG_TILE_N,
-                output_stride=qkv_a_pad,
-                wgm=GANG_WGM,
-                block_dim=(256, 1, 1),
-            )
+            if DENSE_MXFP8:
+                mpk.gang_rmsnorm_linear_mxfp8_bias_layer(
+                    norm_input=x,
+                    norm_weight=w_norm,
+                    norm_output=rmsnorm_out,
+                    mxfp8_weight=w_qkv_a,
+                    bias=zero_bias(qkv_a_pad),
+                    output=qkv_a_out,
+                    actual_hidden_dim=hidden_size,
+                    output_per_wg=QKV_MXFP8_OPW,
+                    output_stride=qkv_a_pad,
+                    block_dim=(256, 1, 1),
+                )
+            else:
+                mpk.gang_rmsnorm_linear_bias_layer(
+                    norm_input=x,
+                    norm_weight=w_norm,
+                    norm_output=rmsnorm_out,
+                    linear_weight=w_qkv_a,
+                    bias=zero_bias(qkv_a_pad),
+                    output=qkv_a_out,
+                    actual_hidden_dim=hidden_size,
+                    tile_n=GANG_TILE_N,
+                    output_stride=qkv_a_pad,
+                    wgm=GANG_WGM,
+                    block_dim=(256, 1, 1),
+                )
             # 2. q_a_layernorm (leading q_lora_pad columns only) + absorbed
             #    q_b_proj, with the KV cache update fused into its epilogue:
             #    the roped Q lands in mla_q_ws directly, and the latent row
@@ -1119,20 +1185,36 @@ if __name__ == "__main__":
         # ── Tail: final norm + LM head + argmax ──────────────────────────────
         w_final_norm = _attach_input_keep(model.model.norm.weight.data,
                                           "model_norm_weight")
-        w_lm_head = _attach_input_keep(lm_head_weight, "lm_head")
-        mpk.gang_rmsnorm_linear_bias_layer(
-            norm_input=x,
-            norm_weight=w_final_norm,
-            norm_output=rmsnorm_out,
-            linear_weight=w_lm_head,
-            bias=zero_bias(vocab_size),
-            output=argmax_in,
-            actual_hidden_dim=hidden_size,
-            tile_n=GANG_TILE_N,
-            output_stride=vocab_size,
-            wgm=GANG_WGM,
-            block_dim=(256, 1, 1),
-        )
+        w_lm_head = _attach_input_keep(
+            pack_dense_mxfp8(lm_head_weight, DENSE_MXFP8_OPW) if DENSE_MXFP8
+            else lm_head_weight, "lm_head")
+        if DENSE_MXFP8:
+            mpk.gang_rmsnorm_linear_mxfp8_bias_layer(
+                norm_input=x,
+                norm_weight=w_final_norm,
+                norm_output=rmsnorm_out,
+                mxfp8_weight=w_lm_head,
+                bias=zero_bias(vocab_size),
+                output=argmax_in,
+                actual_hidden_dim=hidden_size,
+                output_per_wg=DENSE_MXFP8_OPW,
+                output_stride=vocab_size,
+                block_dim=(256, 1, 1),
+            )
+        else:
+            mpk.gang_rmsnorm_linear_bias_layer(
+                norm_input=x,
+                norm_weight=w_final_norm,
+                norm_output=rmsnorm_out,
+                linear_weight=w_lm_head,
+                bias=zero_bias(vocab_size),
+                output=argmax_in,
+                actual_hidden_dim=hidden_size,
+                tile_n=GANG_TILE_N,
+                output_stride=vocab_size,
+                wgm=GANG_WGM,
+                block_dim=(256, 1, 1),
+            )
         mpk.argmax_partial_layer(
             input=argmax_in,
             output=(argmax_part_value, argmax_part_index),
