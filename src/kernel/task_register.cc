@@ -2656,10 +2656,14 @@ int TaskRegister::register_gang_moe_w13_linear_mi300_task(
 // total_tiles_per_xcd]
 int TaskRegister::register_gang_moe_w2_linear_mi300_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 3);
+  // params[3]: fuse_mulsumadd (epilogue topk-weight + f32 atomicAdd into a
+  // [batch, hidden] workspace, replacing the [batch, topk, hidden] slab and
+  // the moe_mul_sum_add pass over it). Adds routing_weight as input 5.
+  assert(params.size() == 4);
   int tiles_per_expert = params[0];
   int max_experts_per_xcd = params[1];
   int total_tiles_per_xcd = params[2];
+  bool fuse_mulsumadd = params[3] != 0;
   (void)max_experts_per_xcd;
   (void)total_tiles_per_xcd;
 
@@ -2667,7 +2671,7 @@ int TaskRegister::register_gang_moe_w2_linear_mi300_task(
       reduction_size = 0, output_stride = 0;
   std::vector<tb::TBInputOp *> input_ops;
   std::vector<tb::TBInputOp *> output_ops;
-  int num_inputs = 5;
+  int num_inputs = fuse_mulsumadd ? 6 : 5;
   int num_outputs = 1;
 
   assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
@@ -2679,45 +2683,66 @@ int TaskRegister::register_gang_moe_w2_linear_mi300_task(
       output_ops.push_back(static_cast<tb::TBInputOp *>(op));
     }
   }
-  // Output: [batch, topk, output_size]
-  assert(output_ops[0]->output_tensors[0].num_dims == 3);
-  batch_size = output_ops[0]->output_tensors[0].dim[0];
-  num_experts_per_tok = output_ops[0]->output_tensors[0].dim[1];
-  output_size = output_ops[0]->output_tensors[0].dim[2];
   // Input: [batch, topk, reduction_size]
   assert(input_ops[0]->output_tensors[0].num_dims == 3);
+  batch_size = input_ops[0]->output_tensors[0].dim[0];
+  num_experts_per_tok = input_ops[0]->output_tensors[0].dim[1];
   reduction_size = input_ops[0]->output_tensors[0].dim[2];
   // Weight: [num_experts, output_size, reduction_size]
   assert(input_ops[1]->output_tensors[0].num_dims == 3);
   num_experts = input_ops[1]->output_tensors[0].dim[0];
+  output_size = input_ops[1]->output_tensors[0].dim[1];
   // Bias: [num_experts, output_stride]
   assert(input_ops[4]->output_tensors[0].num_dims == 2);
-  // Output stride
-  assert(output_ops[0]->dtensor.owner_op->op_type == type::KN_INPUT_OP);
-  kn::KNInputOp *kn_input_op =
-      static_cast<kn::KNInputOp *>(output_ops[0]->dtensor.owner_op);
-  output_stride = static_cast<int>(kn_input_op->input_strides[1]);
+  output_stride = input_ops[4]->output_tensors[0].dim[1];
+  if (fuse_mulsumadd) {
+    // Output is the f32 workspace [batch, hidden]; row stride is hidden.
+    assert(output_ops[0]->output_tensors[0].num_dims == 2);
+    assert(output_ops[0]->output_tensors[0].dim[0] == batch_size);
+    assert(output_ops[0]->output_tensors[0].dim[1] == output_size);
+    assert(output_stride == output_size);
+    // Routing weight: [batch, topk] float32
+    assert(input_ops[5]->output_tensors[0].num_dims == 2);
+    assert(input_ops[5]->output_tensors[0].dim[1] == num_experts_per_tok);
+  } else {
+    // Output: [batch, topk, output_size]
+    assert(output_ops[0]->output_tensors[0].num_dims == 3);
+    assert(output_ops[0]->output_tensors[0].dim[0] == batch_size);
+    assert(output_ops[0]->output_tensors[0].dim[1] == num_experts_per_tok);
+    assert(output_ops[0]->output_tensors[0].dim[2] == output_size);
+    assert(output_ops[0]->dtensor.owner_op->op_type == type::KN_INPUT_OP);
+    kn::KNInputOp *kn_input_op =
+        static_cast<kn::KNInputOp *>(output_ops[0]->dtensor.owner_op);
+    assert(static_cast<int>(kn_input_op->input_strides[1]) == output_stride);
+  }
 
   int n_tiles = output_size / 64;
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
-  code.e("kernel::gang_moe_w2_linear_kernel<bfloat16, $, $, $, $, $, $, $, $>(",
-         batch_size,
-         output_size,
-         output_stride,
-         reduction_size,
-         num_experts,
-         num_experts_per_tok,
-         tiles_per_expert,
-         n_tiles);
+  code.e(
+      "kernel::gang_moe_w2_linear_kernel<bfloat16, $, $, $, $, $, $, $, $, $>(",
+      batch_size,
+      output_size,
+      output_stride,
+      reduction_size,
+      num_experts,
+      num_experts_per_tok,
+      tiles_per_expert,
+      n_tiles,
+      fuse_mulsumadd ? "true" : "false");
   code.e("    task_desc->input_ptrs[0],");  // input activation
   code.e("    task_desc->input_ptrs[1],");  // expert weights
   code.e("    task_desc->input_ptrs[2],");  // routing indices
   code.e("    task_desc->input_ptrs[3],");  // mask
   code.e("    task_desc->input_ptrs[4],");  // bias
-  code.e("    task_desc->output_ptrs[0],"); // output
-  code.e("    tile_idx);");
+  code.e("    task_desc->output_ptrs[0],"); // output / f32 workspace
+  if (fuse_mulsumadd) {
+    code.e("    tile_idx,");
+    code.e("    task_desc->input_ptrs[5]);"); // routing weight
+  } else {
+    code.e("    tile_idx);");
+  }
   return register_task_variant(TASK_GANG_MOE_W2_LINEAR_MI300, code.to_string());
 }
 

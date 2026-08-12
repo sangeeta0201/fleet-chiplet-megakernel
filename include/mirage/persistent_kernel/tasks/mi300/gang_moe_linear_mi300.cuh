@@ -307,6 +307,18 @@ __device__ __noinline__ void gang_moe_w13_linear_kernel(void const *input_ptr,
 // W2 processes tokens one at a time because each token has a different
 // topk_slot, so input row pointers differ per token.
 // KPerBlock=128 since K=1408 is not divisible by 256.
+//
+// FUSE_MULSUMADD folds the topk weighting and the cross-expert sum into
+// this epilogue, the way gang_moe_fused_mxfp4 does for gpt-oss: scale by
+// routing_weight[tok, slot] and float32-atomicAdd into a [batch, hidden]
+// workspace instead of writing a [batch, topk, hidden] slab that a later
+// task has to re-read and reduce. `output_ptr` is then that f32 workspace,
+// and moe_residual_add_f32 adds the residual and re-zeros it.
+//
+// The accumulation stays fp32 all the way to the residual add, where the
+// unfused path rounded each expert's contribution to bf16 first. The
+// atomics make the summation order non-deterministic, which is the same
+// trade gpt-oss already takes.
 template <typename T,
           int BATCH_SIZE,
           int OUTPUT_SIZE,
@@ -315,14 +327,17 @@ template <typename T,
           int NUM_EXPERTS,
           int NUM_TOPK,
           int TILES_PER_EXPERT,
-          int N_TILES>
-__device__ __noinline__ void gang_moe_w2_linear_kernel(void const *input_ptr,
-                                                       void const *weight_ptr,
-                                                       void const *routing_ptr,
-                                                       void const *mask_ptr,
-                                                       void const *bias_ptr,
-                                                       void *output_ptr,
-                                                       int tile_idx) {
+          int N_TILES,
+          bool FUSE_MULSUMADD = false>
+__device__ __noinline__ void
+    gang_moe_w2_linear_kernel(void const *input_ptr,
+                              void const *weight_ptr,
+                              void const *routing_ptr,
+                              void const *mask_ptr,
+                              void const *bias_ptr,
+                              void *output_ptr,
+                              int tile_idx,
+                              void const *routing_weight_ptr = nullptr) {
   using namespace ck_tile;
 
   // W2 uses KPerBlock=128 since K (e.g. 1408) may not divide 256
@@ -380,8 +395,11 @@ __device__ __noinline__ void gang_moe_w2_linear_kernel(void const *input_ptr,
   bf16 const *__restrict__ d_input = static_cast<bf16 const *>(input_ptr);
   bf16 const *__restrict__ d_weight = static_cast<bf16 const *>(weight_ptr);
   bf16 *__restrict__ d_output = static_cast<bf16 *>(output_ptr);
+  float *__restrict__ d_workspace = static_cast<float *>(output_ptr);
   int const *__restrict__ d_routing = static_cast<int const *>(routing_ptr);
   bf16 const *__restrict__ d_bias = static_cast<bf16 const *>(bias_ptr);
+  float const *__restrict__ d_routing_weight =
+      static_cast<float const *>(routing_weight_ptr);
 
   // Routing indices for this expert
   int const *expert_routing = d_routing + expert_id * BATCH_SIZE;
@@ -458,7 +476,33 @@ __device__ __noinline__ void gang_moe_w2_linear_kernel(void const *input_ptr,
 
   // Only row 0 has valid data (M=1 GEMM)
   if (tile_row == 0) {
-    if (global_n_base + 3 < OUTPUT_SIZE) {
+    if constexpr (FUSE_MULSUMADD) {
+      // The shared expert rides in routing slot NUM_TOPK-1 with weight 1.0,
+      // so it needs no special case here.
+      float const rw = d_routing_weight[w2_tok * NUM_TOPK + topk_slot];
+      float *ws_addr = d_workspace +
+                       static_cast<size_t>(w2_tok) * OUTPUT_STRIDE +
+                       global_n_base;
+      bf16 const *bias_addr =
+          d_bias + expert_id * OUTPUT_STRIDE + global_n_base;
+      if (global_n_base + 3 < OUTPUT_SIZE) {
+        uint64_t bias_packed = *reinterpret_cast<uint64_t const *>(bias_addr);
+        bf16 const *bv = reinterpret_cast<bf16 const *>(&bias_packed);
+#pragma unroll
+        for (index_t i = 0; i < 4; i++) {
+          atomicAdd(&ws_addr[i], (c_buf[i] + type_convert<float>(bv[i])) * rw);
+        }
+      } else {
+#pragma unroll
+        for (index_t i = 0; i < 4; i++) {
+          if (global_n_base + i < OUTPUT_SIZE) {
+            float const bval = type_convert<float>(
+                d_bias[expert_id * OUTPUT_STRIDE + global_n_base + i]);
+            atomicAdd(&ws_addr[i], (c_buf[i] + bval) * rw);
+          }
+        }
+      }
+    } else if (global_n_base + 3 < OUTPUT_SIZE) {
       bf16 *out_addr =
           d_output + static_cast<size_t>(w2_tok) * (NUM_TOPK * OUTPUT_STRIDE) +
           static_cast<size_t>(topk_slot) * OUTPUT_STRIDE + global_n_base;

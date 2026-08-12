@@ -1077,11 +1077,13 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         std::make_tuple(5, 1, TASK_GANG_MOE_W13_LINEAR_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[2]; // total_tiles_per_xcd
   } else if (name == "gang_moe_w2_linear_mi300") {
-    assert(params.size() == 3);
+    assert(params.size() == 4 &&
+           "gang_moe_w2_linear_mi300 needs [tiles_per_expert, "
+           "max_experts_per_xcd, total_tiles_per_xcd, fuse_mulsumadd]");
     int variant_id = task_register->register_gang_moe_w2_linear_mi300_task(
         customized->bgraph, params);
-    task_config[op] =
-        std::make_tuple(5, 1, TASK_GANG_MOE_W2_LINEAR_MI300, variant_id);
+    task_config[op] = std::make_tuple(
+        params[3] != 0 ? 6 : 5, 1, TASK_GANG_MOE_W2_LINEAR_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[2]; // total_tiles_per_xcd
   } else if (name == "gang_moe_w13_linear_mxfp4_mi300") {
     assert(params.size() == 4);

@@ -360,6 +360,15 @@ if __name__ == "__main__":
         # intermediate in registers instead of round-tripping it through HBM.
         # Needs the pairwise-interleaved gate/up weight layout below.
         FUSE_MOE_SWIGLU = os.environ.get("GLM_FUSE_MOE_SWIGLU", "1") == "1"
+
+        # Fold the topk weighting and the cross-expert sum into W2's
+        # epilogue, as gang_moe_fused_mxfp4 does for gpt-oss: scale by
+        # routing_weight and f32-atomicAdd into a [bs, hidden] workspace,
+        # instead of writing a [bs, topk_total, hidden] slab that
+        # moe_mul_sum_add then re-reads. Leaves a one-task residual add that
+        # also re-zeroes the workspace.
+        FUSE_MOE_MULSUMADD = (
+            os.environ.get("GLM_FUSE_MOE_MULSUMADD", "1") == "1")
         assert (2 * dense_inter) % GANG_OUT_ALIGN == 0
         assert dense_inter % GANG_RED_ALIGN == 0
 
@@ -395,7 +404,8 @@ if __name__ == "__main__":
               f"q_groups={num_q_groups} kv_chunks={num_kv_chunks} "
               f"latent_row={qk_dim} q_lora={q_lora}->{q_lora_pad} "
               f"merge_dim_splits={MLA_MERGE_DIM_SPLITS} "
-              f"fuse_moe_swiglu={int(FUSE_MOE_SWIGLU)}")
+              f"fuse_moe_swiglu={int(FUSE_MOE_SWIGLU)} "
+              f"fuse_moe_mulsumadd={int(FUSE_MOE_MULSUMADD)}")
 
         num_workers, num_schedulers = mi.get_configurations_from_gpu(rank)
 
@@ -585,6 +595,10 @@ if __name__ == "__main__":
         moe_mid = make_tensor("moe_mid", (bs, topk_total, 2 * moe_inter))
         moe_act = make_tensor("moe_act", (bs, topk_total, moe_inter))
         moe_out = make_tensor("moe_out", (bs, topk_total, hidden_size))
+        # atomicAdd target for the fused W2 epilogue. Zero-initialised here
+        # and re-zeroed by moe_residual_add_f32 as it consumes each layer.
+        moe_ws_f32 = make_tensor("moe_ws_f32", (bs, hidden_size),
+                                 torch_dtype=torch.float32)
 
         argmax_in = make_tensor("argmax_in", (bs, vocab_size))
         argmax_part_value = make_tensor("argmax_part_value",
@@ -943,17 +957,28 @@ if __name__ == "__main__":
                 moe_routing_indices=moe_routing_indices,
                 moe_mask=moe_mask,
                 bias=zero_moe_bias(hidden_size),
-                output=moe_out,
+                output=moe_ws_f32 if FUSE_MOE_MULSUMADD else moe_out,
+                routing_weight=moe_topk_weight if FUSE_MOE_MULSUMADD else None,
                 block_dim=(256, 1, 1),
             )
-            mpk.moe_mul_sum_add_layer(
-                input=moe_out,
-                weight=moe_topk_weight,
-                residual=attn_proj_out,
-                output=layer_out,
-                grid_dim=(args.max_num_batched_tokens, hidden_size // 256, 1),
-                block_dim=(256, 1, 1),
-            )
+            if FUSE_MOE_MULSUMADD:
+                mpk.moe_residual_add_f32_layer(
+                    workspace_f32=moe_ws_f32,
+                    residual=attn_proj_out,
+                    output=layer_out,
+                    grid_dim=(1, 1, 1),
+                    block_dim=(256, 1, 1),
+                )
+            else:
+                mpk.moe_mul_sum_add_layer(
+                    input=moe_out,
+                    weight=moe_topk_weight,
+                    residual=attn_proj_out,
+                    output=layer_out,
+                    grid_dim=(args.max_num_batched_tokens,
+                              hidden_size // 256, 1),
+                    block_dim=(256, 1, 1),
+                )
             x = layer_out
 
         # ── Tail: final norm + LM head + argmax ──────────────────────────────

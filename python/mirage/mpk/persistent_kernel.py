@@ -1873,17 +1873,30 @@ class PersistentKernel:
         bias: DTensor,
         output: DTensor,
         block_dim: tuple = (256, 1, 1),
+        routing_weight: DTensor = None,
     ):
         """Gang MoE W2 linear: 8 tasks (1/XCD), workers cooperate per expert.
         W2 processes tokens one at a time (per-token topk_slot offsets differ).
         tiles_per_expert = n_tiles * batch_size.
+
+        Passing `routing_weight` ([batch, topk] f32) fuses the topk weighting
+        and the cross-expert sum into the epilogue: it scales by the routing
+        weight and float32-atomicAdds into `output`, which is then the
+        [batch, hidden] f32 workspace that moe_residual_add_f32 consumes,
+        rather than a [batch, topk, hidden] slab.
         """
+        fuse_mulsumadd = routing_weight is not None
         assert input.num_dims == 3   # [batch, topk, intermediate]
         assert weight.num_dims == 3  # [num_experts, hidden_size, intermediate]
         assert moe_routing_indices.num_dims == 2  # [num_experts, batch_size]
         assert moe_mask.num_dims == 1  # [num_experts + 1]
         assert bias.num_dims == 2  # [num_experts, output_stride]
-        assert output.num_dims == 3  # [batch, topk, hidden_size]
+        if fuse_mulsumadd:
+            assert output.num_dims == 2       # [batch, hidden_size] f32
+            assert routing_weight.num_dims == 2  # [batch, topk] f32
+            assert routing_weight.dim(1) == input.dim(1)
+        else:
+            assert output.num_dims == 3  # [batch, topk, hidden_size]
         assert self.target_cc in (94, 95), "Gang MoE linear only supported on MI300/MI350"
 
         batch_size = self.max_num_batched_tokens
@@ -1908,13 +1921,19 @@ class PersistentKernel:
         tb_graph.new_input(moe_routing_indices, (-1, -1, -1), -1, True)
         tb_graph.new_input(moe_mask, (-1, -1, -1), -1, True)
         tb_graph.new_input(bias, (-1, -1, -1), -1, True)
-        tb_graph.new_input(output, (-1, 2, -1), -1, True)
-        self.kn_graph.customized(
-            [input, weight, moe_routing_indices, moe_mask, bias, output], tb_graph
-        )
+        tensors = [input, weight, moe_routing_indices, moe_mask, bias]
+        if fuse_mulsumadd:
+            tb_graph.new_input(routing_weight, (-1, -1, -1), -1, True)
+            tensors.append(routing_weight)
+            tb_graph.new_input(output, (-1, 1, -1), -1, True)
+        else:
+            tb_graph.new_input(output, (-1, 2, -1), -1, True)
+        tensors.append(output)
+        self.kn_graph.customized(tensors, tb_graph)
         self.kn_graph.register_task(
             tb_graph, "gang_moe_w2_linear_mi300",
-            [tiles_per_expert, 0, total_tiles_per_xcd],
+            [tiles_per_expert, 0, total_tiles_per_xcd,
+             1 if fuse_mulsumadd else 0],
         )
 
     def gang_moe_w13_linear_mxfp4_layer(
