@@ -49,6 +49,7 @@
 // pulls in no CK headers, so it lives outside the MPK_USE_CK_FMHA guard.
 #include "tasks/mi300/gang_mla_decode_mi300.cuh"
 #include "tasks/mi300/gang_gemv_mi300.cuh"
+#include "tasks/mi300/gang_gemv_mxfp8_mi300.cuh"
 // MoE task implementations for MI300/MI350
 #include "tasks/mi300/moe_linear_mi300.cuh"
 #include "tasks/mi300/moe_linear_mxfp4_mi300.cuh"

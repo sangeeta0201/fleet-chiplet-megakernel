@@ -855,7 +855,7 @@ int TaskRegister::register_gang_linear_mi300_task(
 //          n_tiles_per_xcd, wgm]
 int TaskRegister::register_gang_linear_res_mi300_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 9);
+  assert(params.size() == 10);
   int output_stride = params[0];
   int tile_n = params[1];
   int m_tiles = params[2];
@@ -871,6 +871,10 @@ int TaskRegister::register_gang_linear_res_mi300_task(
   // same op with the N>=64 tile constraint lifted, so that a hidden-width
   // projection can spread over more than 32 of the 240 workers.
   int gemv_rows = params[8];
+  // 0 = bf16 weight. 1 = MXFP8, i.e. the weight arrives workgroup-packed as
+  // [n_tiles, gemv_rows * (K + K/32)] bytes instead of [N, K] bf16. GEMV-only:
+  // the CK tile reads a plain row-major weight.
+  int mxfp8 = params[9];
 
   int reduction_size = 0;
   std::vector<tb::TBInputOp *> input_ops;
@@ -892,7 +896,19 @@ int TaskRegister::register_gang_linear_res_mi300_task(
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
-  if (gemv_rows > 0) {
+  if (gemv_rows > 0 && mxfp8) {
+    assert(gemv_rows == tile_n &&
+           "gemv_rows is the compile-time form of tile_n; they must agree");
+    // The packing erases the logical N, so the only cross-check left is the
+    // workgroup stride: data bytes plus one E8M0 per 32 K.
+    assert(input_ops[1]->dtensor.dim[1] ==
+               gemv_rows * (reduction_size + reduction_size / 32) &&
+           "MXFP8 weight is not packed at this reduction and row count");
+    code.e("kernel::gang_gemv_mxfp8_kernel<$, $, $, true>(",
+           m_per_tile,
+           reduction_size,
+           gemv_rows);
+  } else if (gemv_rows > 0) {
     assert(gemv_rows == tile_n &&
            "gemv_rows is the compile-time form of tile_n; they must agree");
     assert(input_ops[1]->dtensor.dim[1] == reduction_size &&
@@ -903,6 +919,7 @@ int TaskRegister::register_gang_linear_res_mi300_task(
            reduction_size,
            gemv_rows);
   } else {
+    assert(!mxfp8 && "MXFP8 gang linear+residual has no CK MFMA path");
     code.e("kernel::gang_linear_residual_kernel<bfloat16, $, $>(",
            m_per_tile,
            reduction_size);

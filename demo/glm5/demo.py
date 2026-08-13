@@ -511,6 +511,11 @@ if __name__ == "__main__":
         # needs a fused-kvupd kernel of its own, so being able to A/B it
         # against the bf16 twin on a single build is worth a knob.
         QB_MXFP8 = DENSE_MXFP8 and os.environ.get("GLM_QB_MXFP8", "1") == "1"
+        # o_proj likewise: it is the narrow-tile GEMV rather than an MFMA
+        # kernel, so its MXFP8 form is a separate body too, and the knob keeps
+        # the A/B on one build. Only meaningful while the GEMV is in use --
+        # there is no MXFP8 CK tile.
+        OPROJ_MXFP8 = os.environ.get("GLM_OPROJ_MXFP8", "1") == "1"
         if DENSE_MXFP8:
             assert hidden_size % 512 == 0, hidden_size
             # One workgroup per 64 output rows, partitioned 8 ways across the
@@ -697,6 +702,14 @@ if __name__ == "__main__":
         use_gemv_oproj = OPROJ_GEMV_ROWS > 0 and not (
             GANG_K_SPLITS > 1 and o_proj_red % (GANG_K_SPLITS * 256) == 0)
         oproj_tile_n = OPROJ_GEMV_ROWS if use_gemv_oproj else GANG_TILE_N
+        # 1.97 GB/token of bf16 weight, the last big one left. The packing is
+        # the same pack_dense_mxfp8 the MFMA kernels use: its data half is
+        # plain row-major, and only the MFMA *gather* wanted the split layout,
+        # so the GEMV reads it as-is. See gang_gemv_mxfp8_mi300.cuh.
+        use_mxfp8_oproj = OPROJ_MXFP8 and use_gemv_oproj
+        if use_mxfp8_oproj:
+            # 16 fp8 per lane per iteration over 256/rows lanes.
+            assert o_proj_red % ((256 // oproj_tile_n) * 16) == 0, o_proj_red
         n_tiles_xcd = hidden_size // 8 // oproj_tile_n
         # The split-K task takes a reduction_override now, so de-padding and
         # split-K compose: it reduces over the leading o_proj_red columns and
@@ -705,6 +718,7 @@ if __name__ == "__main__":
                             and o_proj_red % (GANG_K_SPLITS * 256) == 0)
         print(f"[CFG] o_proj K={o_proj_red} out={hidden_size} "
               f"tile_n={oproj_tile_n} gemv={int(use_gemv_oproj)} "
+              f"mxfp8={int(use_mxfp8_oproj)} "
               f"n_tiles/XCD={n_tiles_xcd} split-K="
               f"{GANG_K_SPLITS if use_splitk_oproj else 1} -> "
               f"{n_tiles_xcd * (GANG_K_SPLITS if use_splitk_oproj else 1) * 8}"
@@ -908,6 +922,11 @@ if __name__ == "__main__":
                 attn.o_proj.weight.data, attn._w_uv,
                 num_heads, v_head, kv_lora).to(torch.bfloat16)
             o_absorbed = pad_cols(o_absorbed, o_proj_red)
+            if use_mxfp8_oproj:
+                # One workgroup per GEMV tile, so the packing's workgroup axis
+                # *is* the tile axis: 2048 / 16 = 128 workgroups, 16 per XCD,
+                # exactly the tile count the bf16 GEMV had.
+                o_absorbed = pack_dense_mxfp8(o_absorbed, oproj_tile_n)
             w_o = _attach_input_keep(o_absorbed, f"layer_{i}_o_absorbed")
 
             attn._w_uk = None
@@ -1031,6 +1050,18 @@ if __name__ == "__main__":
                     output_stride=hidden_size,
                     k_splits=GANG_K_SPLITS,
                     reduction_size=o_proj_red,
+                    block_dim=(256, 1, 1),
+                )
+            elif use_mxfp8_oproj:
+                mpk.gang_gemv_mxfp8_with_residual_layer(
+                    input=attn_out,
+                    mxfp8_weight=w_o,
+                    residual=x,
+                    output=attn_proj_out,
+                    rows_per_wg=oproj_tile_n,
+                    output_stride=hidden_size,
+                    reduction_size=o_proj_red,
+                    wgm=GANG_WGM,
                     block_dim=(256, 1, 1),
                 )
             else:

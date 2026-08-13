@@ -2671,7 +2671,80 @@ class PersistentKernel:
         self.kn_graph.register_task(
             tb_graph, "gang_linear_res_mi300",
             [output_stride, tile_n, m_tiles, m_per_tile, total_tiles_per_xcd,
-             n_tiles_per_xcd, wgm, reduction_size, tile_n if gemv else 0]
+             n_tiles_per_xcd, wgm, reduction_size, tile_n if gemv else 0, 0]
+        )
+
+    def gang_gemv_mxfp8_with_residual_layer(
+        self,
+        input: DTensor,
+        mxfp8_weight: DTensor,
+        residual: DTensor,
+        output: DTensor,
+        rows_per_wg: int,
+        output_stride: int,
+        reduction_size: int,
+        m_tiles: int = 1,
+        wgm: int = 0,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """gang_linear_with_residual_layer(gemv=True) with an MXFP8 weight.
+
+        Same narrow-tile GEMV, same tile addressing; the weight is E4M3 plus
+        one E8M0 per 32 K instead of bf16, so it arrives workgroup-packed as
+        [n_wgs, rows_per_wg * (K + K/32)] bytes and ``rows_per_wg`` plays both
+        roles the bf16 path splits between ``tile_n`` and the weight's row
+        count. The packing erases the logical output width, so n_tiles comes
+        from the workgroup count rather than from N.
+
+        ``reduction_size`` is mandatory here rather than defaulting to the
+        input row: a packed weight cannot report its own K, and the caller
+        that wants this kernel (GLM's absorbed o_proj) is narrowing past a
+        padded tail anyway.
+        """
+        assert input.num_dims == 2
+        assert mxfp8_weight.num_dims == 2
+        assert residual.num_dims == 2
+        assert output.num_dims == 2
+        assert self.target_cc == 95, "MXFP8 dequant is gfx950-only"
+        batch_size = self.max_num_batched_tokens
+        assert rows_per_wg >= 4 and (rows_per_wg & (rows_per_wg - 1)) == 0, (
+            f"rows_per_wg must be a power of two >= 4, got {rows_per_wg}")
+        assert reduction_size > 0 and reduction_size <= input.dim(1)
+        assert reduction_size % 32 == 0
+        n_wgs = mxfp8_weight.dim(0)
+        assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
+        n_tiles_per_xcd = n_wgs // 8
+        assert mxfp8_weight.dim(1) == rows_per_wg * (
+            reduction_size + reduction_size // 32), (
+            f"weight row {mxfp8_weight.dim(1)} is not {rows_per_wg} rows "
+            f"packed at K={reduction_size}")
+        assert n_wgs * rows_per_wg == output.dim(1), (
+            f"packed weight covers {n_wgs * rows_per_wg} columns, output has "
+            f"{output.dim(1)}")
+        assert batch_size % m_tiles == 0
+        m_per_tile = batch_size // m_tiles
+        assert m_per_tile == 1, (
+            "the gemv reads the input at row stride reduction_size, which "
+            "only matches the tensor when there is one row per tile")
+        total_tiles_per_xcd = n_tiles_per_xcd * m_tiles
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input, (-1, -1, -1), 1, True)
+        # weight: partition dim 0 (workgroups) by bid.x
+        tb_graph.new_input(mxfp8_weight, (0, -1, -1), 1, True)
+        # residual and output: partition dim 1 (columns) by bid.x
+        tb_graph.new_input(residual, (1, -1, -1), 1, True)
+        tb_graph.new_input(output, (1, -1, -1), -1, True)
+        self.kn_graph.customized([input, mxfp8_weight, residual, output],
+                                 tb_graph)
+        # params: [output_stride, tile_n, m_tiles, m_per_tile,
+        #          total_tiles_per_xcd, n_tiles_per_xcd, wgm, reduction_size,
+        #          gemv_rows, mxfp8]
+        self.kn_graph.register_task(
+            tb_graph, "gang_linear_res_mi300",
+            [output_stride, rows_per_wg, m_tiles, m_per_tile,
+             total_tiles_per_xcd, n_tiles_per_xcd, wgm, reduction_size,
+             rows_per_wg, 1]
         )
 
 
