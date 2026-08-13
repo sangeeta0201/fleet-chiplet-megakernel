@@ -30,32 +30,34 @@
 // in one go, because the router's workers are already resident and holding
 // their operands.
 //
-// Where it differs from gpt-oss. There the barrier is a cheap per-XCD epoch,
-// because GQA pins kv_head == xcd_id and an XCD only ever reads what it wrote.
-// GLM's post-attention RMSNorm spans the whole 2048-wide row while each XCD
-// produced only its own 256 columns, so every worker here needs all eight
-// XCDs' output. That forces the expensive form: one global arrival counter,
-// the last arriver fanning out eight per-XCD release flags with st_wt_u32,
-// and every thread polling its own XCD's flag with ld_nt_s32. It is the
-// Mechanism C barrier from gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh,
-// unchanged.
+// The barrier. gpt-oss uses the same global form -- one arrival counter, the
+// last arriver fanning out eight per-XCD release flags with st_wt_u32, every
+// thread polling its own flag with ld_nt_s32. That is Mechanism C from
+// gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh:689, taken unchanged. It
+// is *not* a cheap per-XCD epoch there either, so nothing about GLM's geometry
+// makes this boundary more expensive to fuse than gpt-oss's.
 //
-// Result: correct, and slower. 5.44 ms against 5.34 with GLM_FUSE_OPROJ_ROUTER
-// at 0 on the same binary, 50/50 identical tokens. The +0.10 ms is not
-// compilation (that A/B is one .so), not the write-through epilogue (turning
-// it off buys 0.02 ms), and not the poll traffic (releasing the 64 workers
-// with no Phase 3 work buys nothing). Under --profiling the fusion does
-// exactly what it was built to do -- 47 dispatch gaps gone, idle 1304.6 ->
-// 1137.8 us/iter -- and still loses on the clock, so the barrier costs more
-// than the boundary. Roughly: the dispatch it replaces is ~2.5 us/layer, the
-// barrier ~4.5.
+// What the barrier does cost is a dependent stall, and the thing that pays for
+// it is prefetch. gamma and the gate row do not depend on the o_proj output,
+// so they are issued before the poll and land while it spins; only then is the
+// fusion worth as much as the dispatch it replaces. The wait therefore does
+// not happen in this wrapper -- it is handed to the router kernel under
+// OPROJ_BARRIER, which is the only place those loads can be issued from and
+// still be consumed in registers. Getting this wrong is expensive and quiet:
+// the first version of this file did the wait here and called the router as an
+// opaque __noinline__ afterwards, which measured 5.44 ms against 5.34
+// unfused. Adding the prefetch alone recovered 0.06 of that 0.10.
 //
-// The consequence is bigger than this one task. Every GLM stage boundary needs
-// the global form of the barrier, for the reason in the paragraph above, so
-// whole-layer fusion would pay this five or six times per layer to remove
-// boundaries that MPK_PRECOMPUTED_DISPATCH has already made cheap. gpt-oss
-// gets whole-layer fusion for free only because GQA lets its barriers stay
-// per-XCD. Off by default; kept as the measurement behind that conclusion.
+// Where it stands: 5.381 ms fused against 5.362 unfused, three samples each on
+// one binary, tokens identical. Parity, inside the +-0.035 run-to-run noise --
+// the 47 dispatch gaps the fusion removes (idle 1304.6 -> 1137.8 us/iter under
+// --profiling) now roughly cancel the barrier. Off by default until it wins.
+// The remaining exposed latency is Step 1 of the router: a dependent 4 KB
+// re-read of the row plus a two-__syncthreads block reduction, all after the
+// barrier, purely to get the RMSNorm sum of squares. Each o_proj workgroup
+// already holds its 16 outputs in registers, so that sum can be reduced into
+// the barrier itself and read as a single float. That is the next thing to
+// try, and it is the one that would turn parity into a win.
 //
 // Dispatch: tiles_per_xcd = max(oproj_tiles_per_xcd, router_tile_n), and
 // tile_idx is global (this task type is in runtime.cc's n_tile_start list),
@@ -110,6 +112,12 @@ __device__ __attribute__((always_inline)) void
   int const tid = threadIdx.x;
   int const xcd_id = tile_idx / tiles_per_xcd;
   int const xcd_rank = tile_idx % tiles_per_xcd;
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  // Slot 3 is OPROJ_TOPK, the same slot gpt-oss's monolith uses, and the same
+  // phase numbering: 0 = o_proj compute, 1 = barrier wait, 2 = router.
+  unsigned long long _sp_t0 = __builtin_amdgcn_s_memrealtime();
+#endif
 
   // Mechanism C barrier layout, HIER_STRIDE int32 (one cache line) per slot:
   //   [x * 16] per-XCD release flag, monotonically increasing
@@ -167,6 +175,15 @@ __device__ __attribute__((always_inline)) void
   // waiting XCD can be let through ahead of the data.
   __syncthreads();
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  {
+    unsigned long long _sp_t1 = __builtin_amdgcn_s_memrealtime();
+    if (tid == 0 && g_subphase_active) {
+      atomicAdd(&g_subphase_ns[3][0], (_sp_t1 - _sp_t0) * 10); // OProjCompute
+    }
+    _sp_t0 = _sp_t1;
+  }
+#endif
   {
     if (tid == 0) {
       int prev = atom_add_release_gpu_s32(&hier_barrier[8 * HIER_STRIDE], 1);
@@ -181,28 +198,29 @@ __device__ __attribute__((always_inline)) void
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       }
     }
-    // Only the workers that have Phase 3 work wait. The other half of each
-    // XCD's tiles are o_proj-only: once their stores are retired and their
-    // arrival is counted they have nothing left to contribute, so they return
-    // to the scheduler instead of joining the poll. That is worth doing for
-    // its own sake -- it frees 64 of the 128 workers a whole router stage
-    // early -- but mostly it halves the number of wavefronts hammering the
-    // eight release lines with non-temporal loads while the stragglers are
-    // still finishing their GEMV.
+    // Only the workers with Phase 3 work go on. The rest are o_proj-only:
+    // their stores are retired and their arrival is counted, so they return
+    // to the scheduler a whole router stage early instead of spinning.
     if (xcd_rank >= router_tile_n) {
       return;
     }
-    // Every thread polls for itself: no __syncthreads on the far side, and
-    // ld_nt from 256 threads onto one line coalesces into a single request.
-    while (ld_nt_s32(&hier_barrier[xcd_id * HIER_STRIDE]) < oproj_expected) {
-      __builtin_amdgcn_s_sleep(1);
-    }
   }
-  // Plain `buffer_inv`, no sc1: this invalidates the vL1 so the RMSNorm below
-  // re-reads the o_proj output, and deliberately leaves L2 alone -- an
-  // agent-scope acquire would throw away the lines this XCD wrote moments ago.
-  // The o_proj epilogue is write-through, so the data is already past L2.
-  asm volatile("buffer_inv" ::: "memory");
+  // The *wait* deliberately does not happen here, and neither does the
+  // acquire. Both are handed to the router kernel, which issues its gamma and
+  // gate-weight loads before polling so they are in flight while the barrier
+  // spins. Doing the wait here, with the router called as an opaque
+  // __noinline__ afterwards, exposes the full post-barrier load latency and is
+  // what made the first version of this fusion slower than the dispatch it
+  // replaced -- 5.44 ms against 5.34.
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  {
+    unsigned long long _sp_t2 = __builtin_amdgcn_s_memrealtime();
+    if (tid == 0 && g_subphase_active) {
+      atomicAdd(&g_subphase_ns[3][1], (_sp_t2 - _sp_t0) * 10); // BarrierWait
+    }
+    _sp_t0 = _sp_t2;
+  }
+#endif
 
   // ════════════════════════════════════════════════════════════════════════
   // Phase 3: RMSNorm + router GEMV + sigmoid/bias TopK
@@ -217,7 +235,8 @@ __device__ __attribute__((always_inline)) void
                                          ACTUAL_HIDDEN_DIM,
                                          NUM_EXPERTS,
                                          TOPK_K,
-                                         /*SIGMOID_BIAS=*/true>(
+                                         /*SIGMOID_BIAS=*/true,
+                                         /*OPROJ_BARRIER=*/true>(
         hidden_ptr,
         norm_weight_ptr,
         norm_output_ptr,
@@ -238,8 +257,22 @@ __device__ __attribute__((always_inline)) void
         total_router_tiles,
         renormalize,
         routed_scaling_factor,
-        num_shared_experts);
+        num_shared_experts,
+        hier_barrier,
+        xcd_id,
+        oproj_expected);
   }
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  {
+    unsigned long long _sp_t3 = __builtin_amdgcn_s_memrealtime();
+    if (tid == 0 && g_subphase_active) {
+      atomicAdd(&g_subphase_ns[3][2], (_sp_t3 - _sp_t0) * 10); // Router
+      // Only the router tiles reach here, so cnt is the divisor for phases 1
+      // and 2. Phase 0 is summed over all tiles and needs 2x this.
+      atomicAdd(&g_subphase_cnt[3], 1ULL);
+    }
+  }
+#endif
 }
 
 } // namespace kernel

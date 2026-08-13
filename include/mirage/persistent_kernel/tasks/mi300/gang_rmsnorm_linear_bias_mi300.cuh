@@ -449,7 +449,18 @@ template <typename T,
           int ACTUAL_HIDDEN_DIM,
           int NUM_EXPERTS,
           int K,
-          bool SIGMOID_BIAS = false>
+          bool SIGMOID_BIAS = false,
+          // When true the caller has just produced norm_input_ptr with a GEMM
+          // and has already counted its arrival at a cross-XCD barrier; this
+          // kernel owns the *wait*. It takes it over so that the gamma and
+          // gate-weight loads -- which do not depend on the barrier at all --
+          // can be issued before the poll and be in flight while it spins,
+          // instead of paying their full latency after it. Without this a
+          // fused caller is strictly slower than the dispatch it replaced:
+          // the barrier serialises where a task boundary would have let the
+          // next task's loads start. Lifted from
+          // gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh:716.
+          bool OPROJ_BARRIER = false>
 __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     void const *norm_input_ptr,  // input_ptrs[0]: [batch, REDUCTION_SIZE]
     void const *norm_weight_ptr, // input_ptrs[1]: [REDUCTION_SIZE]
@@ -474,7 +485,14 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     // SIGMOID_BIAS only; ignored by the softmax tail.
     bool renormalize = true,
     float routed_scaling_factor = 1.0f,
-    int num_shared_experts = 0) {
+    int num_shared_experts = 0,
+    // OPROJ_BARRIER only. Mechanism C: hier[x * 16] is XCD x's release flag,
+    // and the caller has already done the arrival and the last-arriver
+    // fan-out. `oproj_release_expected` must be read by the caller *before*
+    // it produces its output, not here -- see the fused wrapper.
+    void *oproj_hier_barrier_ptr = nullptr,
+    int oproj_xcd_id = 0,
+    int oproj_release_expected = 0) {
 
   using bf16 = __hip_bfloat16;
   bf16 const *__restrict__ d_hidden = static_cast<bf16 const *>(norm_input_ptr);
@@ -489,6 +507,47 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   int const lane = tid & 63;
   int const wave = tid >> 6;
   constexpr int NUM_WAVES = 4; // 256 threads / 64 lanes
+
+  // ═══ Step 0: prefetch across the O-proj barrier, then wait ═══
+  // gamma and this worker's gate row are data-independent of the GEMM the
+  // caller just ran, so they go out before the poll and land while it spins.
+  // `nt` keeps them out of L2, which matters: the buffer_inv that closes the
+  // barrier would otherwise throw them away again.
+  typedef int __attribute__((ext_vector_type(2))) i32x2_pf_t;
+  constexpr int H4_PF = REDUCTION_SIZE >> 2;
+  constexpr int MAX_ITERS_PF = OPROJ_BARRIER ? ((H4_PF + 255) / 256) : 1;
+  i32x2_pf_t g_pf[MAX_ITERS_PF];
+  i32x2_pf_t w_pf[MAX_ITERS_PF];
+  if constexpr (OPROJ_BARRIER) {
+    char const *g_base_pf = (char const *)norm_weight_ptr;
+    char const *w_base_pf =
+        (char const *)gate_weight_ptr + (int64_t)tile_idx * REDUCTION_SIZE * 2;
+#pragma unroll
+    for (int iter = 0; iter < MAX_ITERS_PF; iter++) {
+      int i_cur = tid + iter * 256;
+      if (i_cur >= H4_PF) {
+        break;
+      }
+      int byte_off = i_cur * 8;
+      asm volatile("global_load_dwordx2 %0, %1, off sc0 nt"
+                   : "=v"(g_pf[iter])
+                   : "v"(g_base_pf + byte_off)
+                   : "memory");
+      asm volatile("global_load_dwordx2 %0, %1, off sc0 nt"
+                   : "=v"(w_pf[iter])
+                   : "v"(w_base_pf + byte_off)
+                   : "memory");
+    }
+    int *hier = static_cast<int *>(oproj_hier_barrier_ptr);
+    while (ld_nt_s32(&hier[oproj_xcd_id * 16]) < oproj_release_expected) {
+      __builtin_amdgcn_s_sleep(1);
+    }
+    // Plain buffer_inv, no sc1: drop the vL1 so d_hidden is re-read, but
+    // leave this XCD's own L2 lines alone.
+    asm volatile("buffer_inv" ::: "memory");
+    // Drain the prefetch. nt loads bypass L2 and are unaffected by the inv.
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  }
 
   // ═══ Step 1: RMSNorm — compute irms from hidden state ═══
   // All 256 threads collaborate. Vectorized 4-wide bf16 loads.
@@ -544,7 +603,53 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   float dp = 0.0f;
   bf16 const *my_gate = d_gate_w + tile_idx * REDUCTION_SIZE;
 
-  {
+  // Every worker walks the whole row for its own gate dot product, so every
+  // worker *can* write the normed row -- and until now every worker did, all
+  // NUM_EXPERTS/8 of them per XCD, to the same global buffer. The values are
+  // identical, so all but one copy is pure store traffic on the critical path:
+  // for GLM that is 8 workers x 4 KB x 8 XCDs = 256 KB per layer where 4 KB is
+  // needed. One writer per XCD is enough (leaving the copies XCD-local, which
+  // costs nothing and keeps the store in the writer's own L2).
+  bool const write_normed = (tile_idx == 0);
+
+  if constexpr (OPROJ_BARRIER) {
+    // Same arithmetic as the branch below, but iterating over the prefetch
+    // slots so `iter` is a literal -- an array indexed by a runtime value
+    // would be spilled to scratch and the prefetch would be worthless.
+    // gamma and the gate row come from registers; only d_hidden is loaded.
+#pragma unroll
+    for (int iter = 0; iter < MAX_ITERS_PF; iter++) {
+      int i = tid + iter * 256;
+      if (i >= H4_PF) {
+        break;
+      }
+      int base = i * 4;
+      float h0 = __bfloat162float(d_hidden[base]);
+      float h1 = __bfloat162float(d_hidden[base + 1]);
+      float h2 = __bfloat162float(d_hidden[base + 2]);
+      float h3 = __bfloat162float(d_hidden[base + 3]);
+
+      bf16 const *gp = reinterpret_cast<bf16 const *>(&g_pf[iter]);
+      bf16 const *wp = reinterpret_cast<bf16 const *>(&w_pf[iter]);
+      float n0 = h0 * irms * __bfloat162float(gp[0]);
+      float n1 = h1 * irms * __bfloat162float(gp[1]);
+      float n2 = h2 * irms * __bfloat162float(gp[2]);
+      float n3 = h3 * irms * __bfloat162float(gp[3]);
+
+      if (write_normed) {
+        d_normed[base] = __float2bfloat16(n0);
+        d_normed[base + 1] = __float2bfloat16(n1);
+        d_normed[base + 2] = __float2bfloat16(n2);
+        d_normed[base + 3] = __float2bfloat16(n3);
+      }
+
+      dp += __bfloat162float(wp[0]) * n0 + __bfloat162float(wp[1]) * n1 +
+            __bfloat162float(wp[2]) * n2 + __bfloat162float(wp[3]) * n3;
+    }
+    static_assert(!OPROJ_BARRIER || (REDUCTION_SIZE % 4) == 0,
+                  "the prefetch path has no scalar tail, so K must be a "
+                  "multiple of 4");
+  } else {
     int const h4 = REDUCTION_SIZE >> 2;
     for (int i = tid; i < h4; i += (int)blockDim.x) {
       int base = i * 4;
@@ -565,10 +670,12 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
 
       // Write normed output (redundant across 128 workers, idempotent).
       // Needed by downstream MoE FP8 quant task.
-      d_normed[base] = __float2bfloat16(n0);
-      d_normed[base + 1] = __float2bfloat16(n1);
-      d_normed[base + 2] = __float2bfloat16(n2);
-      d_normed[base + 3] = __float2bfloat16(n3);
+      if (write_normed) {
+        d_normed[base] = __float2bfloat16(n0);
+        d_normed[base + 1] = __float2bfloat16(n1);
+        d_normed[base + 2] = __float2bfloat16(n2);
+        d_normed[base + 3] = __float2bfloat16(n3);
+      }
 
       // Gate GEMV: accumulate dot product
       float w0 = __bfloat162float(my_gate[base]);
@@ -582,7 +689,9 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
       float h = __bfloat162float(d_hidden[i]);
       float g = __bfloat162float(d_gamma[i]);
       float n = h * irms * g;
-      d_normed[i] = __float2bfloat16(n);
+      if (write_normed) {
+        d_normed[i] = __float2bfloat16(n);
+      }
       dp += __bfloat162float(my_gate[i]) * n;
     }
   }

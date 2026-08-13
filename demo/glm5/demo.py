@@ -506,16 +506,13 @@ if __name__ == "__main__":
         # to MoE layers on the MXFP8 GEMV path only; the dense layer keeps the
         # standalone o_proj.
         #
-        # Off by default because it is measurably slower: 5.44 ms against
-        # 5.34 for the same binary with this flag at 0, tokens identical. It
-        # is not a compilation artifact -- that A/B is on one .so -- and it is
-        # not the write-through epilogue (0.02 ms) or the barrier poll traffic
-        # (nil). Under --profiling the fusion does exactly what it was built
-        # to do: 47 dispatch gaps disappear and idle falls from 1304.6 to
-        # 1137.8 us/iter. It loses anyway, so a global cross-XCD barrier costs
-        # more than the boundary it replaces once MPK_PRECOMPUTED_DISPATCH has
-        # already made that boundary cheap. Kept, gated, as the measurement
-        # behind that conclusion -- see the kernel header.
+        #
+        # Off by default because it is at parity, not ahead: 5.381 ms fused
+        # against 5.362 unfused, three samples each on one binary, tokens
+        # identical. It was 5.44 before the router kernel took over the barrier
+        # wait so it could prefetch gamma and the gate row across it -- see the
+        # kernel header. The 47 dispatch gaps the fusion removes now roughly
+        # cancel the barrier rather than losing to it.
         FUSE_OPROJ_ROUTER = (
             os.environ.get("GLM_FUSE_OPROJ_ROUTER", "0") == "1")
         MOE_MXFP8_OPW = 64
