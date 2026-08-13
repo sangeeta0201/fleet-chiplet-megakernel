@@ -1374,6 +1374,7 @@ class PersistentKernel:
         output: DTensor,
         mla_params: tuple,
         block_dim: tuple,
+        q_workspace_slots: int = None,
     ):
         """Gang absorbed MLA decode (GLM-5): 8 tasks (1 per XCD).
 
@@ -1406,7 +1407,21 @@ class PersistentKernel:
         assert kv_cache.dim(kv_cache.num_dims - 1) == kv_lora_rank + qk_rope_head_dim
 
         q_workspace_stride = num_q_heads * (kv_lora_rank + qk_rope_head_dim)
-        assert q_workspace.dim(1) == q_workspace_stride
+        # q_workspace may be declared narrower than the kernel indexes. The
+        # producing q_b GEMM partitions its output row across the XCDs, so the
+        # declared width is what decides where its head slots land, and the
+        # caller narrows it to drop padding slots the model never fills. This
+        # task maps q_workspace replicated -- (-1, -1, -1) below -- so the
+        # declared width reaches nothing but this check: the kernel indexes
+        # head h at h * qk_head_dim off the base pointer, and always reads
+        # num_q_heads of them because a q group is one 16-row MFMA tile.
+        # q_workspace_slots is therefore an assertion that the caller has
+        # backed the declared row with a num_q_heads-wide allocation whose
+        # tail is zero, not a shape the kernel adapts to.
+        q_workspace_slots = q_workspace_slots or num_q_heads
+        assert q_workspace_slots <= num_q_heads
+        assert q_workspace.dim(1) == q_workspace_slots * (
+            kv_lora_rank + qk_rope_head_dim)
 
         num_q_groups = num_q_heads // 16
         total_work_items = (

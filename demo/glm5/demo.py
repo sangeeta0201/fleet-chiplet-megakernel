@@ -423,6 +423,26 @@ if __name__ == "__main__":
         # heads get zero q_b_absorbed rows and zero o_absorbed columns, so they
         # attend uniformly and contribute nothing.
         num_heads_pad = align_up(num_heads, 16)
+        # q_b's output does not need all of num_heads_pad.
+        #
+        # num_heads_pad is 16-aligned because MLA decode reduces 16 q heads per
+        # MFMA group. q_b has no such rule: its only constraints are that each
+        # XCD's column chunk hold whole heads (so the fused rope slice is a
+        # question about wg_idx alone) and that the row stay GANG_OUT_ALIGN
+        # aligned. Both follow from an 8-aligned slot count, because qk_dim is
+        # an odd multiple of the rope width.
+        #
+        # This matters because tile count is quantised by the worker pool, not
+        # by bytes. At 32 slots q_b is 18432/64/8 = 36 GEMM tiles + 1 latent
+        # tile = 37 per XCD against 30 workers, so it dispatches twice and the
+        # second round runs 7 tiles on 30 workers -- the stage costs two full
+        # rounds to do 1.23 rounds of work. 24 slots is 28 tiles: one round,
+        # and 25% less q_b weight traffic as a side effect.
+        #
+        # The slots past num_heads are zero either way; the only change is that
+        # slots [qb_head_slots, num_heads_pad) stop being *written* with the
+        # zeros they already hold from allocation, so MLA reads the same q.
+        qb_head_slots = align_up(num_heads, 8)
         kv_lora = config.kv_lora_rank
         qk_rope = config.qk_rope_head_dim
         qk_nope = config.qk_nope_head_dim
@@ -524,6 +544,12 @@ if __name__ == "__main__":
             assert qkv_a_pad % (8 * QKV_MXFP8_OPW) == 0, qkv_a_pad
         # q_b's OPW is forced to qk_rope by the fused rope slice, so it gets
         # no knob -- only a check that the per-XCD chunk holds whole heads.
+        qb_out_width = qb_head_slots * qk_dim
+        if not (qb_out_width % (8 * qk_rope) == 0
+                and (qb_out_width // 8) % qk_dim == 0
+                and qb_out_width % GANG_OUT_ALIGN == 0):
+            qb_out_width = num_heads_pad * qk_dim
+            qb_head_slots = num_heads_pad
         assert (num_heads_pad * qk_dim) % (8 * qk_rope) == 0
         assert ((num_heads_pad * qk_dim) // (8 * qk_rope) * qk_rope) % qk_dim == 0
 
@@ -567,6 +593,7 @@ if __name__ == "__main__":
         MLA_MERGE_WRITE_THROUGH = (
             os.environ.get("GLM_MLA_MERGE_WT", "0") == "1")
         print(f"[CFG] q_heads={num_heads}->{num_heads_pad} "
+              f"qb_slots={qb_head_slots} "
               f"q_groups={num_q_groups} kv_chunks={num_kv_chunks} "
               f"latent_row={qk_dim} q_lora={q_lora}->{q_lora_pad} "
               f"merge_dim_splits={MLA_MERGE_DIM_SPLITS} "
@@ -682,8 +709,10 @@ if __name__ == "__main__":
         # KPerBlock = 256, and the real heads occupy the leading columns, so
         # when num_heads * kv_lora is already 256-aligned we can hand it the
         # unpadded weight and stop the reduction short of the padding.
-        # The q side cannot do this: q_b's *output* must stay 512-aligned and
-        # keep the num_heads_pad * qk_dim stride that MLA decode indexes with.
+        # The q side gets the same treatment through qb_head_slots above, but
+        # by narrowing the output row rather than the reduction: q_b's output
+        # is what MLA decode indexes into, so it can only shrink in whole
+        # heads and only down to an 8-aligned slot count.
         o_proj_red = num_heads * kv_lora
         if o_proj_red % 256 != 0:
             o_proj_red = num_heads_pad * kv_lora
@@ -730,7 +759,38 @@ if __name__ == "__main__":
         q_a_norm_out = make_tensor("q_a_norm_out", (bs, qkv_a_pad))
         # The absorbed q_b_proj writes the roped Q straight into this, so the
         # separate q_absorbed staging buffer the KV update used to read is gone.
-        mla_q_ws = make_tensor("mla_q_workspace", (bs, num_heads_pad * qk_dim))
+        #
+        # The row is declared qb_out_width wide but allocated at the full
+        # num_heads_pad, and the two widths do different jobs.
+        #
+        # The declared width is what the gang partitions: it comes from the
+        # output tensor's own dim(1), not from output_stride, so it has to be
+        # qb_out_width for q_b's live heads to land contiguously from slot 0.
+        # Partitioning a 32-slot row instead would give XCD x three heads at
+        # slot 4x -- heads at {0,1,2, 4,5,6, ...}, a hole every fourth slot --
+        # and o_proj's de-padded reduction reads the leading num_heads *
+        # kv_lora columns of the attention output assuming there is no hole.
+        #
+        # The allocation stays 32 slots because MLA decode reduces 16 q heads
+        # per MFMA group and its second group loads slots 16..31 whatever the
+        # declared width says. Those tail slots read the zeros torch.zeros put
+        # there and contribute nothing, exactly as they do today; the only
+        # change is that q_b stops rewriting them with the zeros they already
+        # hold. MLA maps q_workspace replicated rather than partitioned, so
+        # the declared width never reaches its addressing.
+        #
+        # Both tasks are handed this one DTensor rather than two aliases over
+        # the same storage: the runtime derives task-graph edges from shared
+        # tensor ids (src/kernel/runtime.cc:594), so an alias drops the
+        # q_b -> MLA edge. Going through .view() rather than a 2-D slice keeps
+        # the row stride equal to the row width, which attach_input requires.
+        _q_ws_full = torch.zeros((bs, num_heads_pad * qk_dim),
+                                 dtype=torch.bfloat16, device="cuda")
+        _tensor_refs["mla_q_workspace_alloc"] = _q_ws_full
+        _q_ws_row = _q_ws_full.view(-1)[:bs * qb_out_width].view(bs, qb_out_width)
+        _tensor_refs["mla_q_workspace"] = _q_ws_row
+        mla_q_ws = mpk.attach_input(torch_tensor=_q_ws_row,
+                                    name="mla_q_workspace")
         # LSE is written unconditionally by the decode kernel; its stride is
         # num_q_groups * num_kv_chunks * 16 == num_heads_pad * num_kv_chunks.
         mla_lse = make_tensor("mla_lse", (bs, num_heads_pad * num_kv_chunks),
@@ -909,11 +969,12 @@ if __name__ == "__main__":
             # model -- [num_heads_pad * qk_dim, qkv_a_pad] is 75.5 MB/layer on
             # Flash, and every column past q_lora_pad is zero.
             q_b_absorbed = pad_cols(q_b_absorbed, q_lora_pad)
-            q_b_absorbed = pad_rows(q_b_absorbed, num_heads_pad * qk_dim)
+            q_b_absorbed = pad_rows(q_b_absorbed, qb_out_width)
             if QB_MXFP8:
                 # OPW is pinned to qk_rope_head_dim so a head's rope slice is
-                # exactly one workgroup; 18432/64/8 = 36 tiles per XCD, which
-                # is plenty of work, so there is no narrow-tile question here.
+                # exactly one workgroup. At qb_head_slots = 24 that is
+                # 13824/64/8 = 27 tiles per XCD plus the latent tile, one
+                # dispatch round on 30 workers; see qb_head_slots above.
                 q_b_absorbed = pack_dense_mxfp8(q_b_absorbed, qk_rope)
             w_q_b = _attach_input_keep(q_b_absorbed,
                                        f"layer_{i}_q_b_absorbed")
@@ -978,7 +1039,7 @@ if __name__ == "__main__":
                     norm_weight=w_q_a_norm,
                     norm_output=q_a_norm_out,
                     mxfp8_weight=w_q_b,
-                    bias=zero_bias(num_heads_pad * qk_dim),
+                    bias=zero_bias(qb_out_width),
                     kv_norm=w_kv_a_norm,
                     cos_pos_embed=cos_pos_embed,
                     sin_pos_embed=sin_pos_embed,
@@ -986,7 +1047,7 @@ if __name__ == "__main__":
                     q_workspace=mla_q_ws,
                     actual_hidden_dim=q_lora,
                     output_per_wg=qk_rope,
-                    output_stride=num_heads_pad * qk_dim,
+                    output_stride=qb_out_width,
                     reduction_size=q_lora_pad,
                     kv_offset=q_lora_pad,
                     block_dim=(256, 1, 1),
@@ -997,7 +1058,7 @@ if __name__ == "__main__":
                     norm_weight=w_q_a_norm,
                     norm_output=q_a_norm_out,
                     linear_weight=w_q_b,
-                    bias=zero_bias(num_heads_pad * qk_dim),
+                    bias=zero_bias(qb_out_width),
                     kv_norm=w_kv_a_norm,
                     cos_pos_embed=cos_pos_embed,
                     sin_pos_embed=sin_pos_embed,
@@ -1008,7 +1069,7 @@ if __name__ == "__main__":
                     reduction_size=q_lora_pad,
                     kv_offset=q_lora_pad,
                     tile_n=GANG_TILE_N,
-                    output_stride=num_heads_pad * qk_dim,
+                    output_stride=qb_out_width,
                     wgm=GANG_WGM,
                     block_dim=(256, 1, 1),
                 )
@@ -1020,6 +1081,7 @@ if __name__ == "__main__":
                 output=(mla_o_acc if num_kv_chunks > 1 else attn_out),
                 mla_params=(num_heads_pad, kv_lora, qk_rope, qk_head_dim,
                             num_kv_chunks),
+                q_workspace_slots=qb_head_slots,
                 block_dim=(256, 1, 1),
             )
             if num_kv_chunks > 1:
