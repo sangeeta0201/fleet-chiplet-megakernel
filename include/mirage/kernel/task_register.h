@@ -168,6 +168,9 @@ public:
   // MI300 fused O-PROJ+TopK+MoE (task 213+187 combined)
   int register_gang_oproj_topk_moe_fused_mi300_task(
       threadblock::Graph const &bgraph, std::vector<int> const &params);
+  // MI300 fused absorbed-o_proj + RMSNorm + sigmoid/bias router + TopK (GLM)
+  int register_gang_oproj_router_fused_mi300_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
   // MI300 fused QKV + Attention (ResAddF32+RMSNorm+QKV+KVUpdate → barrier → CK
   // FMHA)
   int register_gang_qkv_attn_fused_mi300_task(threadblock::Graph const &bgraph,

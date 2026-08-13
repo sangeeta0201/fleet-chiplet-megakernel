@@ -4003,6 +4003,136 @@ class PersistentKernel:
              total_topk_tiles, total_tiles_per_xcd]
         )
 
+    def gang_oproj_router_fused_layer(
+        self,
+        # o_proj
+        input: DTensor,
+        oproj_mxfp8_weight: DTensor,
+        residual: DTensor,
+        # router
+        norm_weight: DTensor,
+        norm_output: DTensor,
+        router_weight: DTensor,
+        router_bias: DTensor,
+        logits_scratch: DTensor,
+        router_counter: DTensor,
+        oproj_counters: DTensor,
+        # outputs
+        hidden: DTensor,
+        topk_weight: DTensor,
+        routing_indices: DTensor,
+        active_expert_ids: DTensor,
+        # parameters
+        rows_per_wg: int,
+        reduction_size: int,
+        actual_hidden_dim: int,
+        num_experts_per_tok: int = 4,
+        routed_scaling_factor: float = 1.0,
+        norm_topk_prob: bool = True,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """gang_gemv_mxfp8_with_residual_layer + the sigmoid router, fused.
+
+        The two stages either side of GLM's post-attention residual, run in one
+        gang dispatch with a cross-XCD barrier in place of the event. Both
+        halves keep their standalone semantics; see the kernel header for why
+        the barrier has to be the global kind rather than gpt-oss's per-XCD
+        epoch.
+
+        ``hidden`` is declared unpartitioned even though the o_proj half only
+        writes this XCD's columns, because the router half norms the whole row.
+        The kernel reconstructs the column slice itself. ``residual`` stays
+        partitioned -- nothing after Phase 1 reads it.
+
+        Inputs (10): input, oproj_mxfp8_weight, residual, norm_weight,
+                     norm_output, router_weight, router_bias, logits_scratch,
+                     router_counter, oproj_counters.
+        Outputs (4): hidden, topk_weight, routing_indices, active_expert_ids.
+        """
+        assert self.target_cc == 95, "MXFP8 dequant is gfx950-only"
+        assert input.num_dims == 2
+        assert oproj_mxfp8_weight.num_dims == 2
+        assert residual.num_dims == 2
+        assert hidden.num_dims == 2
+        assert router_weight.num_dims == 2
+        assert router_bias.num_dims == 1
+        assert routing_indices.num_dims == 2
+        assert active_expert_ids.num_dims == 1
+        batch_size = self.max_num_batched_tokens
+        assert batch_size == 1, (
+            "the fused o_proj GEMV reads its input at row stride "
+            "reduction_size, which only matches the tensor at one row")
+
+        # o_proj tiling, from gang_gemv_mxfp8_with_residual_layer.
+        assert rows_per_wg >= 4 and (rows_per_wg & (rows_per_wg - 1)) == 0
+        assert reduction_size > 0 and reduction_size <= input.dim(1)
+        assert reduction_size % 32 == 0
+        n_wgs = oproj_mxfp8_weight.dim(0)
+        assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
+        oproj_tiles_per_xcd = n_wgs // 8
+        assert oproj_mxfp8_weight.dim(1) == rows_per_wg * (
+            reduction_size + reduction_size // 32)
+        hidden_size = hidden.dim(1)
+        assert n_wgs * rows_per_wg == hidden_size, (
+            f"packed weight covers {n_wgs * rows_per_wg} columns, hidden has "
+            f"{hidden_size}")
+
+        # Router tiling, from gang_rmsnorm_linear_bias_topk_sigmoid_layer.
+        num_experts = router_weight.dim(0)
+        assert num_experts % 8 == 0
+        router_tile_n = num_experts // 8
+        total_router_tiles = router_tile_n * 8
+        assert router_bias.dim(0) == num_experts
+        num_shared_experts = routing_indices.dim(0) - num_experts
+        assert num_shared_experts in (0, 1)
+        assert topk_weight.dim(1) == num_experts_per_tok + num_shared_experts
+
+        tiles_per_xcd = max(oproj_tiles_per_xcd, router_tile_n)
+        assert tiles_per_xcd <= self.num_workers // 8, (
+            f"{tiles_per_xcd} tiles per XCD exceeds the "
+            f"{self.num_workers // 8} resident workers; the in-kernel barrier "
+            "deadlocks if a tile has to wait for a worker")
+        total_barrier_arrivals = tiles_per_xcd * 8
+        # 9 cache-line-strided int32 slots: 8 per-XCD release flags plus the
+        # global arrival counter. Monotonic, so it is never reset and one
+        # buffer serves every layer.
+        assert oproj_counters.dim(0) >= 9 * 16
+
+        scaling_milli = int(round(routed_scaling_factor * 1000.0))
+        assert abs(scaling_milli / 1000.0 - routed_scaling_factor) < 1e-9
+
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input, (-1, -1, -1), 1, True)
+        tb_graph.new_input(oproj_mxfp8_weight, (0, -1, -1), 1, True)
+        tb_graph.new_input(residual, (1, -1, -1), 1, True)
+        tb_graph.new_input(norm_weight, (-1, -1, -1), 0, True)
+        tb_graph.new_input(norm_output, (-1, -1, -1), 1, True)
+        tb_graph.new_input(router_weight, (0, -1, -1), 1, True)
+        tb_graph.new_input(router_bias, (-1, -1, -1), 0, True)
+        tb_graph.new_input(logits_scratch, (1, -1, -1), 1, True)
+        tb_graph.new_input(router_counter, (-1, -1, -1), 0, True)
+        tb_graph.new_input(oproj_counters, (-1, -1, -1), 0, True)
+        tb_graph.new_input(hidden, (-1, -1, -1), -1, True)
+        tb_graph.new_input(topk_weight, (0, -1, -1), -1, True)
+        tb_graph.new_input(routing_indices, (-1, -1, -1), -1, True)
+        tb_graph.new_input(active_expert_ids, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [input, oproj_mxfp8_weight, residual, norm_weight, norm_output,
+             router_weight, router_bias, logits_scratch, router_counter,
+             oproj_counters,
+             hidden, topk_weight, routing_indices, active_expert_ids],
+            tb_graph,
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_oproj_router_fused_mi300",
+            [hidden_size, rows_per_wg, oproj_tiles_per_xcd, tiles_per_xcd,
+             total_barrier_arrivals, actual_hidden_dim, num_experts,
+             num_experts_per_tok, router_tile_n, total_router_tiles,
+             reduction_size, scaling_milli, 1 if norm_topk_prob else 0,
+             batch_size]
+        )
+
     def gang_oproj_topk_moe_fused_layer(
         self,
         # O-PROJ inputs

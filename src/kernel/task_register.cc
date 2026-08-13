@@ -2137,6 +2137,109 @@ int TaskRegister::register_gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300_task(
       TASK_GANG_LINEAR_MXFP4_RES_BIAS_RMSNORM_TOPK_MI300, code.to_string());
 }
 
+// Fused absorbed-o_proj + post-attention RMSNorm + sigmoid/bias router + TopK.
+//
+// GLM's counterpart of the MXFP4 fused O-proj above, but assembled instead of
+// rewritten: the two halves stay in their own kernels and the wrapper only
+// supplies the cross-XCD barrier the dispatch used to provide. It reuses
+// TASK_GANG_OPROJ_TOPK_MOE_FUSED_MI300's task id -- variants are what
+// distinguish the two -- so nothing in runtime.cc has to learn a new type,
+// and the global tile_idx that id already carries is exactly what the
+// wrapper needs to recover its XCD.
+//
+// params: [hidden_size, oproj_rows_per_wg, oproj_tiles_per_xcd,
+//          tiles_per_xcd, total_barrier_arrivals, actual_hidden_dim,
+//          num_experts, topk_k, router_tile_n, total_router_tiles,
+//          oproj_reduction_size, scaling_milli, norm_topk_prob, batch_size]
+// Inputs (10): [attn_out, oproj_weight, residual, norm_weight, norm_output,
+//               router_weight, router_bias, logits_scratch, router_counter,
+//               oproj_counters]
+// Outputs (4): [hidden, topk_weight, routing_indices, active_expert_ids]
+int TaskRegister::register_gang_oproj_router_fused_mi300_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 14);
+  int hidden_size = params[0];
+  int oproj_rows_per_wg = params[1];
+  int oproj_tiles_per_xcd = params[2];
+  int tiles_per_xcd = params[3];
+  int total_barrier_arrivals = params[4];
+  int actual_hidden_dim = params[5];
+  int num_experts = params[6];
+  int topk_k = params[7];
+  int router_tile_n = params[8];
+  int total_router_tiles = params[9];
+  int oproj_reduction_size = params[10];
+  int scaling_milli = params[11];
+  int norm_topk_prob = params[12];
+  int batch_size = params[13];
+
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 10;
+  int num_outputs = 4;
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+
+  // The MXFP8 weight's row is the only cross-check the packing leaves: it
+  // erases the logical output width, so shape agreement has to be asserted
+  // against the byte stride instead.
+  assert(input_ops[1]->dtensor.dim[1] ==
+             oproj_rows_per_wg *
+                 (oproj_reduction_size + oproj_reduction_size / 32) &&
+         "o_proj MXFP8 weight is not packed at this reduction and row count");
+  assert(oproj_tiles_per_xcd * oproj_rows_per_wg * 8 == hidden_size &&
+         "the packed o_proj weight does not cover the hidden row exactly");
+  assert(tiles_per_xcd >= oproj_tiles_per_xcd && tiles_per_xcd >= router_tile_n);
+  assert(total_barrier_arrivals == tiles_per_xcd * 8);
+
+  // e_score_correction_bias arrives whole, as the sigmoid tail reads all of it.
+  assert(input_ops[6]->dtensor.num_dims == 1);
+  assert(input_ops[6]->output_tensors[0].dim[0] == num_experts);
+
+  int num_total_experts = output_ops[2]->output_tensors[0].dim[0];
+  int num_shared_experts = num_total_experts - num_experts;
+  assert(num_shared_experts == 0 || num_shared_experts == 1);
+  assert(output_ops[1]->output_tensors[0].dim[1] ==
+         topk_k + num_shared_experts);
+  assert(output_ops[3]->output_tensors[0].dim[0] == num_total_experts + 1);
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::gang_oproj_router_fused_kernel_mi300<$, $, $, $, $, $, $>(",
+         batch_size,
+         oproj_reduction_size,
+         oproj_rows_per_wg,
+         hidden_size,
+         actual_hidden_dim,
+         num_experts,
+         topk_k);
+  for (int i = 0; i < num_inputs; i++) {
+    code.e("    task_desc->input_ptrs[$],", i);
+  }
+  for (int i = 0; i < num_outputs; i++) {
+    code.e("    task_desc->output_ptrs[$],", i);
+  }
+  code.e("    runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS],");
+  code.e("    $,", oproj_tiles_per_xcd);
+  code.e("    $,", router_tile_n);
+  code.e("    $,", tiles_per_xcd);
+  code.e("    $,", total_barrier_arrivals);
+  code.e("    $,", total_router_tiles);
+  code.e("    $,", norm_topk_prob != 0 ? "true" : "false");
+  code.e("    $ / 1000.0f,", scaling_milli);
+  code.e("    $,", num_shared_experts);
+  code.e("    tile_idx);");
+  return register_task_variant(TASK_GANG_OPROJ_TOPK_MOE_FUSED_MI300,
+                               code.to_string());
+}
+
 // Fused O-PROJ+TopK+MoE (combines tasks 213 and 187 into one gang task).
 // params: [output_stride, output_per_wg, n_wgs_per_xcd, total_oproj_tiles,
 //          actual_hidden_dim, num_experts, topk_k, router_tile_n,

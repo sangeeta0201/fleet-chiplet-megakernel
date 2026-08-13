@@ -93,10 +93,20 @@ __device__ __forceinline__ unsigned cvt_fp8_pair(unsigned raw, float scale) {
 // n_tile indexes a workgroup rather than a row block. As in the bf16 kernel
 // the weight row stride is REDUCTION_SIZE while the *input* row stride need
 // not be, which stays correct only while BATCH_SIZE == 1.
+//
+// WRITE_THROUGH sends the epilogue store past the XCD's L2 (sc0 sc1) instead
+// of leaving it dirty there. A standalone task does not need it -- the
+// scheduler's end-of-task fence makes the result visible before any consumer
+// is dispatched -- but a *fused* caller that follows this GEMM with nothing
+// more than an in-kernel barrier does: on MI300/MI350 the L2 is per-XCD and
+// not coherent, so a plain store is invisible to the other seven XCDs no
+// matter how the barrier is ordered. Same reason the MXFP4 O-proj writes
+// st_wt_u64 and the split-KV merge takes a WRITE_THROUGH parameter.
 template <int BATCH_SIZE, // = m_per_tile
           int REDUCTION_SIZE,
           int ROWS_PER_WG,
-          bool HAS_RESIDUAL>
+          bool HAS_RESIDUAL,
+          bool WRITE_THROUGH = false>
 __device__ __noinline__ void
     gang_gemv_mxfp8_kernel(void const *input_ptr,
                            void const *weight_ptr,
@@ -249,7 +259,12 @@ __device__ __noinline__ void
       if constexpr (HAS_RESIDUAL) {
         v += b2f(R[idx]);
       }
-      O[idx] = f2b(v);
+      if constexpr (WRITE_THROUGH) {
+        unsigned short const o = f2b(v);
+        st_wt_u16(&O[idx], o);
+      } else {
+        O[idx] = f2b(v);
+      }
     }
   }
 }

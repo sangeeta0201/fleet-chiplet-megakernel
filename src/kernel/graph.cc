@@ -805,6 +805,18 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     task_config[op] = std::make_tuple(
         16, 6, TASK_GANG_OPROJ_TOPK_MOE_FUSED_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[15]; // workers_per_xcd (30)
+  } else if (name == "gang_oproj_router_fused_mi300") {
+    assert(params.size() == 14 &&
+           "gang_oproj_router_fused_mi300 needs [hidden_size, oproj_rows, "
+           "oproj_tiles_per_xcd, tiles_per_xcd, total_arrivals, "
+           "actual_hidden_dim, num_experts, topk_k, router_tile_n, "
+           "total_router_tiles, oproj_reduction, scaling_milli, "
+           "norm_topk_prob, batch_size]");
+    int variant_id = task_register->register_gang_oproj_router_fused_mi300_task(
+        customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        10, 4, TASK_GANG_OPROJ_TOPK_MOE_FUSED_MI300, variant_id);
+    gang_task_tiles_per_xcd[op] = params[3]; // tiles_per_xcd
   } else if (name == "gang_full_layer_fused_mi300") {
     assert(params.size() == 29 &&
            "gang_full_layer_fused_mi300 needs 29 params");

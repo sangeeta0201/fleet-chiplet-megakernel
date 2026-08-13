@@ -73,6 +73,7 @@
 #include "tasks/mi300/gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh"
 #include "tasks/mi300/gang_moe_fused_mxfp4_mi300.cuh"
 #include "tasks/mi300/gang_oproj_topk_moe_fused_mi300.cuh"
+#include "tasks/mi300/gang_oproj_router_fused_mi300.cuh"
 // Merge kernel needed by gang_full_layer_fused before it's included
 #include "tasks/ampere/merge_splitkv.cuh"
 #include "tasks/mi300/gang_full_layer_fused_mi300.cuh"

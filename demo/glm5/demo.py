@@ -501,6 +501,23 @@ if __name__ == "__main__":
         # still matching the bf16 Torch reference exactly; a WikiText-2
         # perplexity sweep is still owed. Set GLM_MOE_MXFP8=0 for bf16.
         MOE_MXFP8 = os.environ.get("GLM_MOE_MXFP8", "1") == "1"
+        # Fuse the absorbed o_proj into the router task, replacing one of the
+        # nine per-layer dispatch boundaries with a cross-XCD barrier. Applies
+        # to MoE layers on the MXFP8 GEMV path only; the dense layer keeps the
+        # standalone o_proj.
+        #
+        # Off by default because it is measurably slower: 5.44 ms against
+        # 5.34 for the same binary with this flag at 0, tokens identical. It
+        # is not a compilation artifact -- that A/B is on one .so -- and it is
+        # not the write-through epilogue (0.02 ms) or the barrier poll traffic
+        # (nil). Under --profiling the fusion does exactly what it was built
+        # to do: 47 dispatch gaps disappear and idle falls from 1304.6 to
+        # 1137.8 us/iter. It loses anyway, so a global cross-XCD barrier costs
+        # more than the boundary it replaces once MPK_PRECOMPUTED_DISPATCH has
+        # already made that boundary cheap. Kept, gated, as the measurement
+        # behind that conclusion -- see the kernel header.
+        FUSE_OPROJ_ROUTER = (
+            os.environ.get("GLM_FUSE_OPROJ_ROUTER", "0") == "1")
         MOE_MXFP8_OPW = 64
         if MOE_MXFP8:
             # Depth-4 MFMA pipeline: only the last of the four slots carries a
@@ -846,6 +863,11 @@ if __name__ == "__main__":
         # 0 for the next layer, so one buffer serves all of them.
         router_topk_counter = make_tensor("router_topk_counter", (1,),
                                           torch_dtype=torch.int32)
+        # Barrier slots for the fused o_proj+router task: eight per-XCD release
+        # flags plus a global arrival counter, each on its own 64-byte line.
+        # Monotonic and never reset, so all 47 layers share one buffer.
+        oproj_router_counter = make_tensor("oproj_router_counter", (9 * 16,),
+                                           torch_dtype=torch.int32)
         moe_mid = make_tensor("moe_mid", (bs, topk_total, 2 * moe_inter))
         moe_act = make_tensor("moe_act", (bs, topk_total, moe_inter))
         moe_out = make_tensor("moe_out", (bs, topk_total, hidden_size))
@@ -1101,7 +1123,12 @@ if __name__ == "__main__":
                     write_through=MLA_MERGE_WRITE_THROUGH,
                 )
             # 5. absorbed o_proj + residual
-            if use_splitk_oproj:
+            fuse_oproj_router = (FUSE_OPROJ_ROUTER and layer.is_moe
+                                 and use_mxfp8_oproj)
+            if fuse_oproj_router:
+                # Runs as Phase 1 of the fused router task below.
+                pass
+            elif use_splitk_oproj:
                 mpk.gang_splitk_linear_with_residual_layer(
                     input=attn_out,
                     weight=w_o,
@@ -1237,25 +1264,50 @@ if __name__ == "__main__":
             # row of the gate GEMV, and the last one across all 8 XCDs runs
             # the TopK tail behind an atomic-counter barrier. The redundant
             # norm is far cheaper than the barriers it replaces.
-            mpk.gang_rmsnorm_linear_bias_topk_sigmoid_layer(
-                norm_input=attn_proj_out,
-                norm_weight=w_norm_moe,
-                norm_output=rmsnorm_out_moe,
-                linear_weight=w_router,
-                bias=w_router_bias,
-                logits_scratch=moe_gate_out,
-                gang_counter=router_topk_counter,
-                topk_weight=moe_topk_weight,
-                routing_indices=moe_routing_indices,
-                active_expert_ids=moe_mask,
-                actual_hidden_dim=hidden_size,
-                tile_n=1,
-                output_stride=num_experts,
-                num_experts_per_tok=topk,
-                routed_scaling_factor=config.routed_scaling_factor,
-                norm_topk_prob=config.norm_topk_prob,
-                block_dim=(256, 1, 1),
-            )
+            if fuse_oproj_router:
+                mpk.gang_oproj_router_fused_layer(
+                    input=attn_out,
+                    oproj_mxfp8_weight=w_o,
+                    residual=x,
+                    norm_weight=w_norm_moe,
+                    norm_output=rmsnorm_out_moe,
+                    router_weight=w_router,
+                    router_bias=w_router_bias,
+                    logits_scratch=moe_gate_out,
+                    router_counter=router_topk_counter,
+                    oproj_counters=oproj_router_counter,
+                    hidden=attn_proj_out,
+                    topk_weight=moe_topk_weight,
+                    routing_indices=moe_routing_indices,
+                    active_expert_ids=moe_mask,
+                    rows_per_wg=oproj_tile_n,
+                    reduction_size=o_proj_red,
+                    actual_hidden_dim=hidden_size,
+                    num_experts_per_tok=topk,
+                    routed_scaling_factor=config.routed_scaling_factor,
+                    norm_topk_prob=config.norm_topk_prob,
+                    block_dim=(256, 1, 1),
+                )
+            else:
+                mpk.gang_rmsnorm_linear_bias_topk_sigmoid_layer(
+                    norm_input=attn_proj_out,
+                    norm_weight=w_norm_moe,
+                    norm_output=rmsnorm_out_moe,
+                    linear_weight=w_router,
+                    bias=w_router_bias,
+                    logits_scratch=moe_gate_out,
+                    gang_counter=router_topk_counter,
+                    topk_weight=moe_topk_weight,
+                    routing_indices=moe_routing_indices,
+                    active_expert_ids=moe_mask,
+                    actual_hidden_dim=hidden_size,
+                    tile_n=1,
+                    output_stride=num_experts,
+                    num_experts_per_tok=topk,
+                    routed_scaling_factor=config.routed_scaling_factor,
+                    norm_topk_prob=config.norm_topk_prob,
+                    block_dim=(256, 1, 1),
+                )
             moe_w13_layer = (mpk.gang_moe_w13_linear_mxfp8_layer if MOE_MXFP8
                              else mpk.gang_moe_w13_linear_layer)
             moe_w13_layer(
