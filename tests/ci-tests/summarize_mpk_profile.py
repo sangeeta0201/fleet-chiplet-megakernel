@@ -71,6 +71,58 @@ def paired_deltas(key_a, ts_a, key_b, ts_b):
     return common, delta
 
 
+def gap_report(common_be, d_compute, names, tpu, it, wall_ticks, t0,
+               k_b, t_b):
+    """Time when *no* task is executing anywhere, and which stage boundary it
+    sits on.
+
+    This is the number the per-task-type table cannot show. The megakernel
+    stops dead at every event: the last worker of a stage finishes, a
+    scheduler task runs, the event fires, and only then does anyone fetch the
+    next tile. Summing per-call compute therefore under-predicts the token by
+    exactly this, and it is what a fused task -- whose phase transition is an
+    in-kernel barrier rather than a dispatch -- is trying to buy back.
+
+    Read the p50 rather than the total: one enormous gap at the head of the
+    dump is the pre-graph prologue, not a stage boundary.
+    """
+    # k_b is in dump order, not sorted, so the begin timestamp of each matched
+    # pair has to come back through intersect1d rather than searchsorted.
+    _, ib, _ = np.intersect1d(k_b, common_be, return_indices=True)
+    beg = (t_b[ib].astype(np.int64) - int(t0)) % WRAP
+    end = beg + d_compute
+    tt = (common_be >> 13) & 0x1FF
+
+    # Sweep line over [begin, end): a gap is an instant where the running high
+    # water mark of end times is behind the next begin.
+    order = np.argsort(beg)
+    b, e, ty = beg[order], end[order], tt[order]
+    rows, cur_end, cur_ty = [], b[0], ty[0]
+    for i in range(len(b)):
+        if b[i] > cur_end:
+            rows.append((b[i] - cur_end, cur_ty, ty[i]))
+        if e[i] > cur_end:
+            cur_end, cur_ty = e[i], ty[i]
+    if not rows:
+        return
+    g = np.array([r[0] for r in rows], dtype=np.float64)
+    p50, p90 = np.percentile(g, [50, 90]) / tpu
+    print(f"\nidle (no task running)  : {g.sum() / tpu / it:.1f} us/iter "
+          f"({100 * g.sum() / max(wall_ticks, 1):.1f}% of the span) over "
+          f"{len(rows)} gaps, p50={p50:.2f} p90={p90:.2f} us")
+
+    agg = {}
+    for gap, a, c in rows:
+        k = (int(a), int(c))
+        v = agg.setdefault(k, [0.0, 0])
+        v[0] += gap / tpu / it
+        v[1] += 1
+    short = lambda t: names.get(int(t), f"<{t}>").replace("TASK_", "")
+    print(f"{'  idle us':>10}{'  n':>5}  stage boundary")
+    for (a, c), (tot, n) in sorted(agg.items(), key=lambda kv: -kv[1][0])[:10]:
+        print(f"{tot:>10.1f}{n:>5d}  {short(a)} -> {short(c)}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dump", help="profile_output.pt saved by demo.py --profiling")
@@ -157,10 +209,13 @@ def main():
     # Critical path: the megakernel is one long linear chain, so the useful
     # wall-clock proxy is the span from first BEGIN to last END.
     lo, hi = times.min(), times.max()
-    wall = ((int(hi) - int(lo)) % WRAP) / tpu / it
+    wall_ticks = (int(hi) - int(lo)) % WRAP
+    wall = wall_ticks / tpu / it
     print(f"\nwall-clock span in dump : {wall:.1f} us/iter")
     print(f"summed compute / wall   : {total_compute / max(wall, 1e-9):.2f}x "
           f"(mean busy workers; {num_blocks} exist)")
+
+    gap_report(common_be, d_compute, names, tpu, it, wall_ticks, lo, k_b, t_b)
     return 0
 
 
