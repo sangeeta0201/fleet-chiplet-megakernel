@@ -158,6 +158,30 @@ __device__ __forceinline__ void st_wt_zero128(void *addr) {
 #endif
 }
 
+// Write-through 128-bit store (4x dword = 16 bytes, sc0 sc1).
+// Same instruction as st_wt_zero128 but with a caller-supplied payload; the
+// address must be 16-byte aligned, as global_store_dwordx4 requires.
+__device__ __forceinline__ void st_wt_u128(void *addr,
+                                           unsigned int v0,
+                                           unsigned int v1,
+                                           unsigned int v2,
+                                           unsigned int v3) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  typedef unsigned int v4u32 __attribute__((ext_vector_type(4)));
+  v4u32 payload = {v0, v1, v2, v3};
+  asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1"
+               :
+               : "v"(addr), "v"(payload)
+               : "memory");
+#else
+  reinterpret_cast<unsigned int volatile *>(addr)[0] = v0;
+  reinterpret_cast<unsigned int volatile *>(addr)[1] = v1;
+  reinterpret_cast<unsigned int volatile *>(addr)[2] = v2;
+  reinterpret_cast<unsigned int volatile *>(addr)[3] = v3;
+#endif
+}
+
 // Write-through 32-bit store (1x float or 2x bf16)
 __device__ __forceinline__ void st_wt_u32(void *addr, unsigned int val) {
 #if defined(__HIP_DEVICE_COMPILE__) &&                                         \

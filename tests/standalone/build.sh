@@ -103,6 +103,37 @@ if [ "${GFX_ARCH:-gfx950}" = "gfx950" ]; then
         -Wno-unused-result \
         -I ../../include \
         -I ../../include/mirage/persistent_kernel
+
+    # Both of these pull in gang_gemv_mxfp8_mi300.cuh, whose WRITE_THROUGH
+    # epilogue needs st_wt_u16 out of mpk_atoms.cuh, and whose CK include chain
+    # needs the vendored composable_kernel headers.
+    echo "Building narrow-tile MXFP8 GEMV bandwidth probe..."
+    hipcc -o test_gemv_mxfp8_bw test_gemv_mxfp8_bw.hip \
+        -D__HIP_PLATFORM_AMD__ \
+        -DMIRAGE_BACKEND_USE_ROCM \
+        -DCK_TILE_FMHA_FWD_FAST_EXP2=1 \
+        --offload-arch=gfx950 \
+        -munsafe-fp-atomics \
+        -O3 \
+        -std=c++17 \
+        -Wno-unused-result \
+        -I ../../include \
+        -I ../../include/mirage/persistent_kernel \
+        -I ../../deps/composable_kernel/include
+
+    echo "Building narrow-tile MXFP8 GEMV accuracy test..."
+    hipcc -o test_gemv_mxfp8_accuracy test_gemv_mxfp8_accuracy.hip \
+        -D__HIP_PLATFORM_AMD__ \
+        -DMIRAGE_BACKEND_USE_ROCM \
+        -DCK_TILE_FMHA_FWD_FAST_EXP2=1 \
+        --offload-arch=gfx950 \
+        -munsafe-fp-atomics \
+        -O3 \
+        -std=c++17 \
+        -Wno-unused-result \
+        -I ../../include \
+        -I ../../include/mirage/persistent_kernel \
+        -I ../../deps/composable_kernel/include
 fi
 
 echo "Build complete!"
@@ -116,3 +147,5 @@ echo "          ./test_mla_kv_cache_update"
 echo "          ./test_mxfp8_mfma_layout                  # gfx950 only"
 echo "          ./test_mxfp8_linear                       # gfx950 only"
 echo "          ./test_mxfp8_moe                          # gfx950 only"
+echo "          ./test_gemv_mxfp8_bw                      # gfx950 only, ~2 min"
+echo "          ./test_gemv_mxfp8_accuracy                # gfx950 only"

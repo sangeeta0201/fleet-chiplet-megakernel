@@ -1450,6 +1450,208 @@ class PersistentKernel:
         self.kn_graph.customized([q_workspace, kv_cache, lse, output], tb_graph)
         self.kn_graph.register_task(tb_graph, "gang_mla_decode_mi300", params)
 
+    def gang_mla_attn_fused_layer(
+        self,
+        # qkv_a
+        x: DTensor,
+        pre_norm_weight: DTensor,
+        pre_norm_scratch: DTensor,
+        qkv_mxfp8_weight: DTensor,
+        qkv_bias: DTensor,
+        # q_b + latent append
+        q_a_norm_weight: DTensor,
+        q_a_norm_scratch: DTensor,
+        qb_mxfp8_weight: DTensor,
+        qb_bias: DTensor,
+        kv_norm_weight: DTensor,
+        cos_pos_embed: DTensor,
+        sin_pos_embed: DTensor,
+        kv_cache: DTensor,
+        attn_counters: DTensor,
+        # outputs
+        qkv_a_out: DTensor,
+        q_workspace: DTensor,
+        lse: DTensor,
+        o_acc: DTensor,
+        attn_out: DTensor,
+        # parameters
+        qkv_output_per_wg: int,
+        qkv_actual_hidden_dim: int,
+        qb_output_per_wg: int,
+        qb_reduction_size: int,
+        qb_actual_hidden_dim: int,
+        kv_offset: int,
+        mla_params: tuple,
+        q_workspace_slots: int = None,
+        merge_dim_splits: int = 1,
+        merge_write_through: bool = False,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """The attention half of a GLM decoder layer in one gang dispatch.
+
+        input_layernorm + [q_a_proj | kv_a_proj_with_mqa], q_a_layernorm +
+        absorbed q_b_proj + latent cache append, absorbed MLA decode, and the
+        split-KV merge, with three in-kernel barriers where the task graph
+        used to put four events. Every sub-kernel keeps its standalone
+        semantics; see the kernel header for the barrier layout and for which
+        producers have to write through.
+
+        ``qkv_a_out`` and ``q_workspace`` are declared unpartitioned even
+        though each XCD only writes its own columns, because the phases after
+        them read across XCDs. The kernel reconstructs the column slice.
+
+        ``mla_params`` is (num_q_heads, kv_lora_rank, qk_rope_head_dim,
+        qk_head_dim, num_kv_chunks), the same tuple gang_mla_decode_layer
+        takes. num_kv_chunks must be > 1 -- with a single chunk the decode
+        writes attn_out directly and there is no merge phase to fuse.
+
+        Inputs (14): x, pre_norm_weight, pre_norm_scratch, qkv_mxfp8_weight,
+                     qkv_bias, q_a_norm_weight, q_a_norm_scratch,
+                     qb_mxfp8_weight, qb_bias, kv_norm_weight, cos, sin,
+                     kv_cache, attn_counters.
+        Outputs (5): qkv_a_out, q_workspace, lse, o_acc, attn_out.
+        """
+        assert self.target_cc == 95, "MXFP8 MFMA is gfx950-only"
+        assert x.num_dims == 2
+        assert qkv_mxfp8_weight.num_dims == 2
+        assert qb_mxfp8_weight.num_dims == 2
+        assert qkv_a_out.num_dims == 2
+        assert q_workspace.num_dims == 2
+        assert attn_out.num_dims == 2
+        assert kv_cache.num_dims == 4  # (num_pages, page_size, 1, qk_dim)
+        assert kv_cache.dim(2) == 1, "MLA keeps a single shared latent head"
+        assert attn_counters.num_dims == 1
+
+        batch_size = self.max_num_batched_tokens
+        assert batch_size == 1, (
+            "a narrowed reduction doubles as the row stride in both GEMMs; "
+            "needs one row")
+
+        num_q_heads = mla_params[0]
+        kv_lora_rank = mla_params[1]
+        qk_rope_head_dim = mla_params[2]
+        qk_head_dim = mla_params[3]
+        num_kv_chunks = mla_params[4]
+        qk_dim = kv_lora_rank + qk_rope_head_dim
+        assert kv_cache.dim(3) == qk_dim
+        assert kv_norm_weight.dim(0) == kv_lora_rank
+        assert cos_pos_embed.dim(cos_pos_embed.num_dims - 1) == qk_rope_head_dim
+        assert num_kv_chunks > 1, (
+            "one chunk means no merge phase; use the unfused path")
+
+        # ── qkv_a tiling, from gang_rmsnorm_linear_mxfp8_bias_layer ──
+        qkv_reduction = x.dim(1)
+        # K must clear the depth-4 pipeline's tail: only slot 3 is guarded.
+        assert qkv_reduction % 512 == 0, qkv_reduction
+        qkv_n_wgs = qkv_mxfp8_weight.dim(0)
+        assert qkv_n_wgs % 8 == 0
+        qkv_n_wgs_per_xcd = qkv_n_wgs // 8
+        qkv_output_stride = qkv_a_out.dim(1)
+        assert qkv_n_wgs * qkv_output_per_wg == qkv_output_stride, (
+            f"packed qkv_a weight covers {qkv_n_wgs * qkv_output_per_wg} "
+            f"columns, qkv_a_out has {qkv_output_stride}")
+        assert qkv_bias.dim(1) == qkv_output_stride
+
+        # ── q_b tiling, from gang_rmsnorm_linear_mxfp8_bias_mla_kvupd_layer ──
+        assert qb_reduction_size % 512 == 0, qb_reduction_size
+        assert qb_actual_hidden_dim <= qb_reduction_size <= qkv_output_stride
+        assert kv_offset + qk_dim <= qkv_output_stride
+        assert qb_output_per_wg == qk_rope_head_dim and \
+            qk_dim % qb_output_per_wg == 0, (
+                "output_per_wg must equal qk_rope_head_dim and divide the head")
+        qb_n_wgs = qb_mxfp8_weight.dim(0)
+        assert qb_n_wgs % 8 == 0
+        qb_n_wgs_per_xcd = qb_n_wgs // 8
+        qb_output_stride = q_workspace.dim(1)
+        assert qb_n_wgs * qb_output_per_wg == qb_output_stride
+        assert qb_mxfp8_weight.dim(1) == qb_output_per_wg * (
+            qb_reduction_size + qb_reduction_size // 32)
+        assert qb_bias.dim(1) == qb_output_stride
+        assert (qb_n_wgs_per_xcd * qb_output_per_wg) % qk_dim == 0, (
+            "per-XCD chunk must hold whole heads")
+
+        # ── decode + merge tiling ──
+        assert num_q_heads % 16 == 0
+        num_q_groups = num_q_heads // 16
+        q_workspace_stride = num_q_heads * qk_dim
+        # Same contract as gang_mla_decode_layer: the declared row may be
+        # narrower than the kernel indexes, so long as the allocation behind
+        # it is num_q_heads wide with a zero tail.
+        q_workspace_slots = q_workspace_slots or num_q_heads
+        assert q_workspace_slots <= num_q_heads
+        assert qb_output_stride == q_workspace_slots * qk_dim
+        # The sub-kernels take a single request index, and a gang task has no
+        # request dimension to hang one on -- grid.x is the XCD. The registrar
+        # therefore passes a literal 0 (task_metadata.request_id aliases
+        # n_tile_start for this task type and is not readable).
+        assert self.max_num_batched_requests == 1, (
+            "gang_mla_attn_fused_layer is single-request; the standalone "
+            "decode + merge path handles batched requests")
+        mla_total_work_items = (
+            self.max_num_batched_requests * num_q_groups * num_kv_chunks)
+        import math
+        mla_tiles_per_xcd = math.ceil(mla_total_work_items / 8)
+        assert merge_dim_splits >= 1 and kv_lora_rank % merge_dim_splits == 0
+        merge_total = (self.max_num_batched_requests * num_q_groups
+                       * merge_dim_splits)
+        merge_tiles_per_xcd = math.ceil(merge_total / 8)
+
+        # The dispatch width is the widest phase. q_b is +1 for the latent
+        # tile, which owns a slot of its own on XCD 0.
+        tiles_per_xcd = max(batch_size * qkv_n_wgs_per_xcd,
+                            batch_size * qb_n_wgs_per_xcd + 1,
+                            mla_tiles_per_xcd, merge_tiles_per_xcd)
+        assert tiles_per_xcd <= self.num_workers // 8, (
+            f"{tiles_per_xcd} tiles per XCD exceeds the "
+            f"{self.num_workers // 8} resident workers; the in-kernel barrier "
+            "deadlocks if a tile has to wait for a worker")
+        # 29 cache-line-strided int32 slots: qkv_a->q_b at [0..8],
+        # q_b->decode at [10..18], decode->merge at [20..28]. All monotonic,
+        # so nothing is reset and one buffer serves every layer.
+        assert attn_counters.dim(0) >= 29 * 16
+
+        params = [batch_size, qkv_output_per_wg, qkv_actual_hidden_dim,
+                  qkv_n_wgs_per_xcd, qkv_output_stride, qb_output_per_wg,
+                  qb_reduction_size, qb_actual_hidden_dim, qb_n_wgs_per_xcd,
+                  qb_output_stride, kv_lora_rank, qk_rope_head_dim, kv_offset,
+                  self.max_seq_length, self.page_size, num_q_heads,
+                  qk_head_dim, num_kv_chunks, q_workspace_stride,
+                  mla_total_work_items, mla_tiles_per_xcd, merge_dim_splits,
+                  1 if merge_write_through else 0, merge_tiles_per_xcd,
+                  tiles_per_xcd]
+
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(x, (-1, -1, -1), 1, True)
+        tb_graph.new_input(pre_norm_weight, (-1, -1, -1), 0, True)
+        tb_graph.new_input(pre_norm_scratch, (-1, -1, -1), 1, True)
+        tb_graph.new_input(qkv_mxfp8_weight, (0, -1, -1), 1, True)
+        tb_graph.new_input(qkv_bias, (1, -1, -1), 1, True)
+        tb_graph.new_input(q_a_norm_weight, (-1, -1, -1), 0, True)
+        tb_graph.new_input(q_a_norm_scratch, (-1, -1, -1), 1, True)
+        tb_graph.new_input(qb_mxfp8_weight, (0, -1, -1), 1, True)
+        tb_graph.new_input(qb_bias, (1, -1, -1), 1, True)
+        tb_graph.new_input(kv_norm_weight, (-1, -1, -1), -1, True)
+        tb_graph.new_input(cos_pos_embed, (-1, -1, -1), -1, True)
+        tb_graph.new_input(sin_pos_embed, (-1, -1, -1), -1, True)
+        tb_graph.new_input(kv_cache, (-1, -1, -1), -1, True)
+        tb_graph.new_input(attn_counters, (-1, -1, -1), 0, True)
+        tb_graph.new_input(qkv_a_out, (-1, -1, -1), -1, True)
+        tb_graph.new_input(q_workspace, (-1, -1, -1), -1, True)
+        tb_graph.new_input(lse, (-1, -1, -1), -1, True)
+        tb_graph.new_input(o_acc, (-1, -1, -1), -1, True)
+        tb_graph.new_input(attn_out, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [x, pre_norm_weight, pre_norm_scratch, qkv_mxfp8_weight, qkv_bias,
+             q_a_norm_weight, q_a_norm_scratch, qb_mxfp8_weight, qb_bias,
+             kv_norm_weight, cos_pos_embed, sin_pos_embed, kv_cache,
+             attn_counters,
+             qkv_a_out, q_workspace, lse, o_acc, attn_out],
+            tb_graph,
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_mla_attn_fused_mi300", params)
+
     def gang_paged_attention_split_kv_merge_layer(
         self,
         lse: DTensor,

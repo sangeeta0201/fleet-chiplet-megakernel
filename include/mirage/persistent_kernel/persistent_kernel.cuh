@@ -1392,6 +1392,25 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                      : 0.0);
         }
 #endif
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+        // Same dump as the TASK_TERMINATE path below. Under precomputed
+        // dispatch a worker never fetches a TERMINATE task -- it breaks out of
+        // the iter-ready poll on precomp_terminate and returns right here --
+        // so without this copy the accumulators are silently dropped.
+        if (threadIdx.x == 0 && worker_id == 0) {
+          for (int s = 0; s < SUBPHASE_SLOTS; s++) {
+            if (g_subphase_cnt[s] == 0) {
+              continue;
+            }
+            printf("SP %d cnt %llu\n", s, g_subphase_cnt[s]);
+            for (int p = 0; p < SUBPHASE_MAX_PHASES; p++) {
+              if (g_subphase_ns[s][p] > 0) {
+                printf("SP %d %d %llu\n", s, p, g_subphase_ns[s][p]);
+              }
+            }
+          }
+        }
+#endif
         return;
       }
 

@@ -520,6 +520,13 @@ if __name__ == "__main__":
         # rides inside a wide stage's workgroup, and that needs one task.
         FUSE_OPROJ_ROUTER = (
             os.environ.get("GLM_FUSE_OPROJ_ROUTER", "1") == "1")
+        # The same treatment for the attention half: input RMSNorm + qkv_a,
+        # q_a RMSNorm + q_b + latent append, MLA decode and the split-KV merge
+        # in one gang task. Four dispatches and four events become three
+        # in-kernel barriers, and the two narrow phases -- the decode is 16 of
+        # 240 workers, the merge 32 -- stop paying for a 240-worker boundary
+        # by riding inside the q_b workgroup instead.
+        FUSE_ATTN = os.environ.get("GLM_FUSE_ATTN", "1") == "1"
         MOE_MXFP8_OPW = 64
         if MOE_MXFP8:
             # Depth-4 MFMA pipeline: only the last of the four slots carries a
@@ -588,12 +595,25 @@ if __name__ == "__main__":
         # Measured (ms/iter): 4 -> 7.127, 8 -> 7.038, 16 -> 6.995, 32 -> 7.512.
         # Past 16 the merge's own fan-out and the per-chunk prologue cost more
         # than the added parallelism returns.
+        #
+        # Re-measured (ms/token decode) once the decode and the merge moved
+        # inside the fused attention task, as (chunks x merge_dim_splits):
+        # 8x16 -> 4.987, 16x16 -> 4.902, 16x32 -> 4.912, 32x32 -> 5.457. The
+        # fused task's dispatch width is pinned at 28 tiles/XCD by the q_b
+        # phase, so the decode's ranks are resident either way and 8 chunks
+        # left 26 of 28 of them parked at the barrier; 16 is still the knee
+        # for the same reason it was before, and 32 falls off a cliff because
+        # the merge reads NUM_KV_CHUNKS dependent LSE/o_acc columns per chunk.
+        #
+        # The 64-token tile below used to floor this at 8 for the 512-token
+        # default sequence, i.e. it never reached the 16 the sweep above picked
+        # both times. 32 tokens per chunk hits 16.
         num_q_groups = num_heads_pad // 16
         _env_chunks = os.environ.get("GLM_MLA_NUM_KV_CHUNKS")
         if _env_chunks is not None:
             num_kv_chunks = int(_env_chunks)
         else:
-            _kv_tiles = max(1, (args.max_seq_length + 63) // 64)
+            _kv_tiles = max(1, (args.max_seq_length + 31) // 32)
             num_kv_chunks = max(1, min(16, _kv_tiles))
         assert num_kv_chunks >= 1
         # The merge is otherwise one task per q group -- 2 CUs of 256, each
@@ -872,6 +892,12 @@ if __name__ == "__main__":
         # and never reset, so all 47 layers share one buffer.
         oproj_router_counter = make_tensor("oproj_router_counter", (29 * 16,),
                                            torch_dtype=torch.int32)
+        # Same 29-slot layout for the fused attention task: qkv_a -> q_b at
+        # [0..8], q_b -> decode at [10..18], decode -> merge at [20..28]. A
+        # separate buffer from the MoE half's, since the two tasks are in
+        # flight against each other across the layer boundary.
+        attn_fused_counter = make_tensor("attn_fused_counter", (29 * 16,),
+                                         torch_dtype=torch.int32)
         moe_mid = make_tensor("moe_mid", (bs, topk_total, 2 * moe_inter))
         moe_act = make_tensor("moe_act", (bs, topk_total, moe_inter))
         moe_out = make_tensor("moe_out", (bs, topk_total, hidden_size))
@@ -1027,8 +1053,49 @@ if __name__ == "__main__":
                 model.model.latent_cache[i].unsqueeze(2),
                 f"layer_{i}_latent_cache")
 
+            # The whole attention half in one gang task. Needs both GEMMs
+            # on the MXFP8 path -- the fused kernel only wraps those bodies --
+            # and a real merge phase, which one KV chunk does not have.
+            fuse_attn = (FUSE_ATTN and DENSE_MXFP8 and QB_MXFP8
+                         and num_kv_chunks > 1)
+            if fuse_attn:
+                mpk.gang_mla_attn_fused_layer(
+                    x=x,
+                    pre_norm_weight=w_norm,
+                    pre_norm_scratch=rmsnorm_out,
+                    qkv_mxfp8_weight=w_qkv_a,
+                    qkv_bias=zero_bias(qkv_a_pad),
+                    q_a_norm_weight=w_q_a_norm,
+                    q_a_norm_scratch=q_a_norm_out,
+                    qb_mxfp8_weight=w_q_b,
+                    qb_bias=zero_bias(qb_out_width),
+                    kv_norm_weight=w_kv_a_norm,
+                    cos_pos_embed=cos_pos_embed,
+                    sin_pos_embed=sin_pos_embed,
+                    kv_cache=kv_cache,
+                    attn_counters=attn_fused_counter,
+                    qkv_a_out=qkv_a_out,
+                    q_workspace=mla_q_ws,
+                    lse=mla_lse,
+                    o_acc=mla_o_acc,
+                    attn_out=attn_out,
+                    qkv_output_per_wg=QKV_MXFP8_OPW,
+                    qkv_actual_hidden_dim=hidden_size,
+                    qb_output_per_wg=qk_rope,
+                    qb_reduction_size=q_lora_pad,
+                    qb_actual_hidden_dim=q_lora,
+                    kv_offset=q_lora_pad,
+                    mla_params=(num_heads_pad, kv_lora, qk_rope, qk_head_dim,
+                                num_kv_chunks),
+                    q_workspace_slots=qb_head_slots,
+                    merge_dim_splits=MLA_MERGE_DIM_SPLITS,
+                    merge_write_through=MLA_MERGE_WRITE_THROUGH,
+                    block_dim=(256, 1, 1),
+                )
             # 1. input_layernorm + [q_a_proj | kv_a_proj_with_mqa]
-            if DENSE_MXFP8:
+            if fuse_attn:
+                pass  # Phase 1 of the fused task above.
+            elif DENSE_MXFP8:
                 mpk.gang_rmsnorm_linear_mxfp8_bias_layer(
                     norm_input=x,
                     norm_weight=w_norm,
@@ -1059,7 +1126,9 @@ if __name__ == "__main__":
             #    q_b_proj, with the KV cache update fused into its epilogue:
             #    the roped Q lands in mla_q_ws directly, and the latent row
             #    (kv_a_layernorm + RoPE + paged append) rides on one worker.
-            if QB_MXFP8:
+            if fuse_attn:
+                pass  # Phase 3 of the fused task above.
+            elif QB_MXFP8:
                 mpk.gang_rmsnorm_linear_mxfp8_bias_mla_kvupd_layer(
                     norm_input=qkv_a_out,
                     norm_weight=w_q_a_norm,
@@ -1099,33 +1168,35 @@ if __name__ == "__main__":
                     wgm=GANG_WGM,
                     block_dim=(256, 1, 1),
                 )
-            # 4. absorbed MLA decode, split over (q_group, kv_chunk)
-            mpk.gang_mla_decode_layer(
-                q_workspace=mla_q_ws,
-                kv_cache=kv_cache,
-                lse=mla_lse,
-                output=(mla_o_acc if num_kv_chunks > 1 else attn_out),
-                mla_params=(num_heads_pad, kv_lora, qk_rope, qk_head_dim,
-                            num_kv_chunks),
-                q_workspace_slots=qb_head_slots,
-                block_dim=(256, 1, 1),
-            )
-            if num_kv_chunks > 1:
-                # merge_splitkv_ck_fmha treats the q groups as kv heads:
-                # merge_task_offset = bid.y (runtime.cc), so grid.y indexes the
-                # group and each task merges 16 q heads' chunks.
-                mpk.paged_attention_ck_fmha_merge_layer(
+            # 4. absorbed MLA decode, split over (q_group, kv_chunk),
+            #    then the split-KV merge. Phases 5 and 7 of the fused task.
+            if not fuse_attn:
+                mpk.gang_mla_decode_layer(
+                    q_workspace=mla_q_ws,
+                    kv_cache=kv_cache,
                     lse=mla_lse,
-                    output_tmp=mla_o_acc,
-                    output=attn_out,
-                    attention_params=(num_heads_pad, kv_lora, num_kv_chunks,
-                                      num_q_groups),
-                    grid_dim=(args.max_num_batched_requests,
-                              num_q_groups * MLA_MERGE_DIM_SPLITS, 1),
+                    output=(mla_o_acc if num_kv_chunks > 1 else attn_out),
+                    mla_params=(num_heads_pad, kv_lora, qk_rope, qk_head_dim,
+                                num_kv_chunks),
+                    q_workspace_slots=qb_head_slots,
                     block_dim=(256, 1, 1),
-                    dim_splits=MLA_MERGE_DIM_SPLITS,
-                    write_through=MLA_MERGE_WRITE_THROUGH,
                 )
+                if num_kv_chunks > 1:
+                    # merge_splitkv_ck_fmha treats the q groups as kv heads:
+                    # merge_task_offset = bid.y (runtime.cc), so grid.y indexes
+                    # the group and each task merges 16 q heads' chunks.
+                    mpk.paged_attention_ck_fmha_merge_layer(
+                        lse=mla_lse,
+                        output_tmp=mla_o_acc,
+                        output=attn_out,
+                        attention_params=(num_heads_pad, kv_lora,
+                                          num_kv_chunks, num_q_groups),
+                        grid_dim=(args.max_num_batched_requests,
+                                  num_q_groups * MLA_MERGE_DIM_SPLITS, 1),
+                        block_dim=(256, 1, 1),
+                        dim_splits=MLA_MERGE_DIM_SPLITS,
+                        write_through=MLA_MERGE_WRITE_THROUGH,
+                    )
             # 5. absorbed o_proj + residual
             # The fused task calls the MXFP8 MoE kernels with both epilogues
             # on -- SwiGLU folded into W13, mul-sum-add folded into W2 -- so

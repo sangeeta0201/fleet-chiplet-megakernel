@@ -894,6 +894,21 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     task_config[op] =
         std::make_tuple(2, 2, TASK_GANG_MLA_DECODE_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[7]; // total_work_items_per_xcd
+  } else if (name == "gang_mla_attn_fused_mi300") {
+    assert(params.size() == 25 &&
+           "gang_mla_attn_fused_mi300 needs [batch, qkv_opw, "
+           "qkv_actual_hidden, qkv_n_wgs_per_xcd, qkv_output_stride, qb_opw, "
+           "qb_reduction, qb_actual_hidden, qb_n_wgs_per_xcd, "
+           "qb_output_stride, kv_lora_rank, qk_rope_head_dim, "
+           "kv_input_offset, max_seq_len, page_size, num_q_heads, "
+           "qk_head_dim, num_kv_chunks, q_workspace_stride, "
+           "mla_total_work_items, mla_tiles_per_xcd, merge_dim_splits, "
+           "merge_write_through, merge_tiles_per_xcd, tiles_per_xcd]");
+    int variant_id = task_register->register_gang_mla_attn_fused_mi300_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(14, 5, TASK_GANG_MLA_DECODE_MI300, variant_id);
+    gang_task_tiles_per_xcd[op] = params[24]; // tiles_per_xcd
   } else if (name == "gang_attn_merge_mi300") {
     assert(params.size() == 7);
     int variant_id = task_register->register_gang_attn_merge_mi300_task(

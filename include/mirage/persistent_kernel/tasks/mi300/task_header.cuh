@@ -78,6 +78,9 @@
 #include "tasks/ampere/merge_splitkv.cuh"
 #include "tasks/mi300/gang_full_layer_fused_mi300.cuh"
 #include "tasks/mi300/gang_full_layer_with_lmhead_fused_mi300.cuh"
+// GLM's attention half, likewise after merge_splitkv.cuh: it inlines the same
+// merge as its last phase.
+#include "tasks/mi300/gang_mla_attn_fused_mi300.cuh"
 #include "tasks/mi300/gang_moe_swiglu_w2_mxfp4_mi300.cuh"
 #include "tasks/mi300/moe_topk_softmax_mi300.cuh"
 #include "tasks/mi300/moe_topk_sigmoid_bias_mi300.cuh"

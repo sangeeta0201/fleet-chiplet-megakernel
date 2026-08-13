@@ -72,13 +72,31 @@ using bf16 = __hip_bfloat16;
 // Step 2, verbatim from mla_kv_cache_update_impl minus the Q half. Kept
 // noinline so its LDS and register pressure stay off the 287 workers that
 // never call it.
+// Store one bf16 into the latent cache row.
+//
+// The default lands in this XCD's L2; the task graph's event boundary is what
+// republishes it to the other seven. A fused caller has no such boundary and
+// every XCD's MLA decode reads this row, so it asks for WRITE_THROUGH.
+template <bool WRITE_THROUGH>
+__device__ __forceinline__ void cache_store(bf16 *dst, float val) {
+  if constexpr (WRITE_THROUGH) {
+    bf16 b = static_cast<bf16>(val);
+    unsigned short raw;
+    __builtin_memcpy(&raw, &b, 2);
+    st_wt_u16((void *)dst, raw);
+  } else {
+    *dst = static_cast<bf16>(val);
+  }
+}
+
 template <int KV_LORA_RANK,
           int QK_ROPE_HEAD_DIM,
           int KV_INPUT_STRIDE,
           int KV_CACHE_STRIDE,
           int MAX_SEQ_LEN,
           int PAGE_SIZE,
-          int KV_INPUT_OFFSET>
+          int KV_INPUT_OFFSET,
+          bool WRITE_THROUGH = false>
 __device__ __attribute__((noinline)) void
     latent_to_cache(void const *kv_latent_ptr,
                     void *paged_kv_cache_ptr,
@@ -168,7 +186,7 @@ __device__ __attribute__((noinline)) void
     for (int i = tid; i < KV_LORA_RANK; i += NUM_THREADS) {
       float const val = __cvt_bf16_to_f32_mla(src[i]) * rms_rcp *
                         __cvt_bf16_to_f32_mla(kv_weight[i]);
-      dst[i] = static_cast<bf16>(val);
+      cache_store<WRITE_THROUGH>(&dst[i], val);
     }
 
     bf16 const *cos_data = d_cos + (long)pos * QK_ROPE_HEAD_DIM;
@@ -178,8 +196,9 @@ __device__ __attribute__((noinline)) void
       float const x1 = __cvt_bf16_to_f32_mla(src[KV_LORA_RANK + 2 * j + 1]);
       float const c = __cvt_bf16_to_f32_mla(cos_data[j]);
       float const s = __cvt_bf16_to_f32_mla(sin_data[j]);
-      dst[KV_LORA_RANK + j] = static_cast<bf16>(x0 * c - x1 * s);
-      dst[KV_LORA_RANK + ROPE_HALF + j] = static_cast<bf16>(x1 * c + x0 * s);
+      cache_store<WRITE_THROUGH>(&dst[KV_LORA_RANK + j], x0 * c - x1 * s);
+      cache_store<WRITE_THROUGH>(&dst[KV_LORA_RANK + ROPE_HALF + j],
+                                 x1 * c + x0 * s);
     }
     // The next token's reduction overwrites s_reduce.
     __syncthreads();
@@ -190,7 +209,7 @@ __device__ __attribute__((noinline)) void
 // Only the ROPE_HALF pairing crosses lanes, and it stays inside the tile, so
 // the read set is captured in registers and one barrier separates it from the
 // write set -- (2j, 2j+1) read, (j, j + ROPE_HALF) written.
-template <int QK_ROPE_HEAD_DIM>
+template <int QK_ROPE_HEAD_DIM, bool WRITE_THROUGH = false>
 __device__ __forceinline__ void rope_tile_inplace(bf16 *tile,
                                                   bf16 const *cos_data,
                                                   bf16 const *sin_data) {
@@ -206,8 +225,8 @@ __device__ __forceinline__ void rope_tile_inplace(bf16 *tile,
   }
   __syncthreads();
   if (tid < ROPE_HALF) {
-    tile[tid] = static_cast<bf16>(x0 * c - x1 * s);
-    tile[tid + ROPE_HALF] = static_cast<bf16>(x1 * c + x0 * s);
+    cache_store<WRITE_THROUGH>(&tile[tid], x0 * c - x1 * s);
+    cache_store<WRITE_THROUGH>(&tile[tid + ROPE_HALF], x1 * c + x0 * s);
   }
 }
 

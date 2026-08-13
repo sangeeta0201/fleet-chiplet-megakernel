@@ -62,7 +62,8 @@ template <int BATCH_SIZE,
           int KV_CACHE_STRIDE,
           int MAX_SEQ_LEN,
           int PAGE_SIZE,
-          int KV_INPUT_OFFSET>
+          int KV_INPUT_OFFSET,
+          bool WRITE_THROUGH = false>
 __device__ __attribute__((noinline)) void
     gang_rmsnorm_linear_mxfp8_bias_mla_kvupd_kernel(
         void const *norm_input_ptr,  // [batch, KV_INPUT_STRIDE] (q_a prefix)
@@ -109,7 +110,8 @@ __device__ __attribute__((noinline)) void
                                            KV_CACHE_STRIDE,
                                            MAX_SEQ_LEN,
                                            PAGE_SIZE,
-                                           KV_INPUT_OFFSET>(kv_latent_ptr,
+                                           KV_INPUT_OFFSET,
+                                           WRITE_THROUGH>(kv_latent_ptr,
                                                             paged_kv_cache_ptr,
                                                             qo_indptr,
                                                             kv_indptr,
@@ -127,7 +129,8 @@ __device__ __attribute__((noinline)) void
   gang_rmsnorm_linear_mxfp8_bias_kernel<BATCH_SIZE,
                                         OUTPUT_PER_WG,
                                         REDUCTION_SIZE,
-                                        ACTUAL_HIDDEN_DIM>(norm_input_ptr,
+                                        ACTUAL_HIDDEN_DIM,
+                                        WRITE_THROUGH>(norm_input_ptr,
                                                            norm_weight_ptr,
                                                            norm_output_ptr,
                                                            weight_ptr,
@@ -176,7 +179,7 @@ __device__ __attribute__((noinline)) void
     return;
   }
   int const pos = global_seq_len - num_tokens + (row - first_token_pos);
-  gang_mla_kvupd_detail::rope_tile_inplace<QK_ROPE_HEAD_DIM>(
+  gang_mla_kvupd_detail::rope_tile_inplace<QK_ROPE_HEAD_DIM, WRITE_THROUGH>(
       tile_base,
       d_cos + (long)pos * QK_ROPE_HEAD_DIM,
       d_sin + (long)pos * QK_ROPE_HEAD_DIM);

@@ -219,6 +219,10 @@ public:
   // MI300 gang absorbed MLA decode (GLM-5)
   int register_gang_mla_decode_mi300_task(threadblock::Graph const &bgraph,
                                           std::vector<int> const &params);
+  // MI300 fused attention half of a GLM layer (qkv_a + q_b/kvupd + MLA decode
+  // + split-KV merge), a variant of the MLA decode task type
+  int register_gang_mla_attn_fused_mi300_task(threadblock::Graph const &bgraph,
+                                              std::vector<int> const &params);
   // MI300 split-KV tasks
   int register_paged_attention_split_kv_mi300_task(
       threadblock::Graph const &bgraph, std::vector<int> const &params);

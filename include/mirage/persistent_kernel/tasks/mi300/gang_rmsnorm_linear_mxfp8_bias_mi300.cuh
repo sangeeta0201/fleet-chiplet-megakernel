@@ -157,10 +157,44 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_rmsnorm(
 //   n_wgs_per_xcd     - number of workgroups per XCD
 //   output_stride     - full output stride (for row indexing)
 //   num_active_tokens - actual number of active tokens
+// Publish four adjacent bf16 outputs.
+//
+// The default leaves them in this XCD's L2, which is all a same-XCD consumer
+// needs and is what every standalone caller wants: the task graph's event
+// boundary does the buffer_wbl2 that makes them visible elsewhere. A fused
+// caller has no event boundary, so when the consumer sits on another XCD it
+// asks for WRITE_THROUGH and the store goes past L2 to memory.
+//
+// The four columns are contiguous, so one global_store_dwordx2 carries them --
+// the same packing gang_moe_linear_mxfp8's WRITE_THROUGH epilogue does on its
+// SwiGLU pair. That needs an 8-byte-aligned destination: OUTPUT_PER_WG % 16 ==
+// 0 makes every term of the column index a multiple of 4, so the requirement
+// reduces to a 4-aligned output_stride, which the registrar asserts.
+template <bool WRITE_THROUGH>
+__device__ __forceinline__ void _rnlm8_store4(unsigned short *dst,
+                                              unsigned short v0,
+                                              unsigned short v1,
+                                              unsigned short v2,
+                                              unsigned short v3) {
+  if constexpr (WRITE_THROUGH) {
+    unsigned long long packed = (unsigned long long)v0 |
+                                ((unsigned long long)v1 << 16) |
+                                ((unsigned long long)v2 << 32) |
+                                ((unsigned long long)v3 << 48);
+    st_wt_u64((void *)dst, packed);
+  } else {
+    dst[0] = v0;
+    dst[1] = v1;
+    dst[2] = v2;
+    dst[3] = v3;
+  }
+}
+
 template <int BATCH_SIZE,
           int OUTPUT_PER_WG,
           int REDUCTION_SIZE,
-          int ACTUAL_HIDDEN_DIM = REDUCTION_SIZE>
+          int ACTUAL_HIDDEN_DIM = REDUCTION_SIZE,
+          bool WRITE_THROUGH = false>
 __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     void const *norm_input_ptr,  // [batch, REDUCTION_SIZE] bf16
     void const *norm_weight_ptr, // [REDUCTION_SIZE] bf16
@@ -355,6 +389,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
 
       // ── Step 4: Bias epilogue, write BF16 output ─────────────────────────
       if (col == 0) {
+        unsigned short packed[4];
         for (int i = 0; i < 4; i++) {
           int out_n = wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4 + i;
           float sum = acc[i];
@@ -364,9 +399,12 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
           float bv;
           __builtin_memcpy(&bv, &bt, 4);
 
-          int out_idx = tok_idx * output_stride + out_n;
-          d_output[out_idx] = _gang_float_to_bf16(sum + bv);
+          packed[i] = _gang_float_to_bf16(sum + bv);
         }
+        int out_idx = tok_idx * output_stride + wg_idx * OUTPUT_PER_WG +
+                      wave_tile * 16 + g * 4;
+        _rnlm8_store4<WRITE_THROUGH>(
+            d_output + out_idx, packed[0], packed[1], packed[2], packed[3]);
       }
     }
   } else {
@@ -470,6 +508,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
 
     // Wave 0 reduces across waves and writes output with bias
     if (warp_id == 0 && col == 0) {
+      unsigned short packed[4];
       for (int i = 0; i < 4; i++) {
         float v = 0.0f;
         for (int w = 0; w < NUM_WAVES; w++) {
@@ -482,9 +521,11 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
         float bv;
         __builtin_memcpy(&bv, &bt, 4);
 
-        int out_idx = tok_idx * output_stride + out_n;
-        d_output[out_idx] = _gang_float_to_bf16(v + bv);
+        packed[i] = _gang_float_to_bf16(v + bv);
       }
+      int out_idx = tok_idx * output_stride + wg_idx * OUTPUT_PER_WG + g * 4;
+      _rnlm8_store4<WRITE_THROUGH>(
+          d_output + out_idx, packed[0], packed[1], packed[2], packed[3]);
     }
   }
 

@@ -3701,6 +3701,183 @@ int TaskRegister::register_gang_mla_decode_mi300_task(
   return register_task_variant(TASK_GANG_MLA_DECODE_MI300, code.to_string());
 }
 
+// The attention half of a GLM decoder layer in one gang task: qkv_a, q_b +
+// latent append, MLA decode, split-KV merge. Registers as a variant of the
+// MLA decode task type, which is what puts it in runtime.cc's global-tile_idx
+// list -- the wrapper needs tile_idx = xcd_id * tiles_per_xcd + xcd_rank and
+// synthesizes each sub-kernel's own index from it.
+// params: [batch_size, qkv_opw, qkv_actual_hidden, qkv_n_wgs_per_xcd,
+//          qkv_output_stride, qb_opw, qb_reduction, qb_actual_hidden,
+//          qb_n_wgs_per_xcd, qb_output_stride, kv_lora_rank,
+//          qk_rope_head_dim, kv_input_offset, max_seq_len, page_size,
+//          num_q_heads, qk_head_dim, num_kv_chunks, q_workspace_stride,
+//          mla_total_work_items, mla_tiles_per_xcd, merge_dim_splits,
+//          merge_write_through, merge_tiles_per_xcd, tiles_per_xcd]
+int TaskRegister::register_gang_mla_attn_fused_mi300_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 25);
+  int batch_size = params[0];
+  int qkv_opw = params[1];
+  int qkv_actual_hidden = params[2];
+  int qkv_n_wgs_per_xcd = params[3];
+  int qkv_output_stride = params[4];
+  int qb_opw = params[5];
+  int qb_reduction = params[6];
+  int qb_actual_hidden = params[7];
+  int qb_n_wgs_per_xcd = params[8];
+  int qb_output_stride = params[9];
+  int kv_lora_rank = params[10];
+  int qk_rope_head_dim = params[11];
+  int kv_input_offset = params[12];
+  int max_seq_len = params[13];
+  int page_size = params[14];
+  int num_q_heads = params[15];
+  int qk_head_dim = params[16];
+  int num_kv_chunks = params[17];
+  int q_workspace_stride = params[18];
+  int mla_total_work_items = params[19];
+  int mla_tiles_per_xcd = params[20];
+  int merge_dim_splits = params[21];
+  bool merge_write_through = params[22] != 0;
+  int merge_tiles_per_xcd = params[23];
+  int tiles_per_xcd = params[24];
+
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 14;
+  int num_outputs = 5;
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+
+  // x is [batch, hidden]; the qkv_a GEMM reduces over the whole row.
+  assert(input_ops[0]->dtensor.num_dims == 2);
+  assert(input_ops[0]->dtensor.dim[0] == batch_size);
+  int qkv_reduction = input_ops[0]->dtensor.dim[1];
+  // A narrowed reduction doubles as the row stride in both GEMMs, which only
+  // matches the tensor at one row.
+  assert(batch_size == 1);
+
+  // qkv_a_out carries [q_a | latent] and is the q_b GEMM's input row.
+  assert(output_ops[0]->dtensor.num_dims == 2);
+  int kv_input_stride = output_ops[0]->dtensor.dim[1];
+  assert(qkv_output_stride == kv_input_stride);
+  assert(qkv_n_wgs_per_xcd * qkv_opw * 8 == kv_input_stride &&
+         "the packed qkv_a weight does not cover the row exactly");
+  assert(qb_actual_hidden <= qb_reduction && qb_reduction <= kv_input_stride);
+  assert(kv_input_offset + kv_lora_rank + qk_rope_head_dim <= kv_input_stride);
+
+  // The packed MXFP8 weights erase N and K, so the byte stride is the only
+  // cross-check left.
+  assert(input_ops[3]->dtensor.dim[1] ==
+             qkv_opw * (qkv_reduction + qkv_reduction / 32) &&
+         "qkv_a MXFP8 weight is not packed at this reduction and row count");
+  assert(input_ops[7]->dtensor.dim[1] ==
+             qb_opw * (qb_reduction + qb_reduction / 32) &&
+         "q_b MXFP8 weight is not packed at this reduction and row count");
+
+  // One shared latent head, so the cache row stride is just the last dim.
+  assert(input_ops[12]->dtensor.num_dims == 4);
+  assert(input_ops[12]->dtensor.dim[2] == 1);
+  int kv_cache_stride = input_ops[12]->dtensor.dim[3];
+  assert(kv_cache_stride == kv_lora_rank + qk_rope_head_dim);
+  assert(qb_opw == qk_rope_head_dim &&
+         kv_cache_stride % qb_opw == 0 &&
+         "a head's rope slice has to be exactly one q_b workgroup");
+  assert((qb_n_wgs_per_xcd * qb_opw) % kv_cache_stride == 0 &&
+         "each XCD's q_b column chunk must hold whole heads");
+  assert(qb_n_wgs_per_xcd * qb_opw * 8 == qb_output_stride);
+
+  // 29 cache-line-strided int32 slots, three monotonic barriers: qkv_a->q_b
+  // at [0..8], q_b->decode at [10..18], decode->merge at [20..28].
+  assert(input_ops[13]->dtensor.num_dims == 1);
+  assert(input_ops[13]->dtensor.dim[0] >= 29 * 16);
+
+  // Every phase has to fit inside the dispatch width, or a tile's work is
+  // silently dropped on the far side of a barrier that already released.
+  assert(batch_size * qkv_n_wgs_per_xcd <= tiles_per_xcd);
+  assert(batch_size * qb_n_wgs_per_xcd + 1 <= tiles_per_xcd);
+  assert(mla_tiles_per_xcd <= tiles_per_xcd);
+  assert(merge_tiles_per_xcd <= tiles_per_xcd);
+  assert(num_q_heads % 16 == 0);
+  int num_q_groups = num_q_heads / 16;
+  assert(mla_total_work_items == batch_size * num_q_groups * num_kv_chunks);
+  assert(merge_dim_splits >= 1 && kv_lora_rank % merge_dim_splits == 0);
+  assert(num_kv_chunks > 1 &&
+         "with one chunk the decode writes attn_out directly and there is no "
+         "merge phase; use the unfused path");
+  assert(q_workspace_stride == num_q_heads * kv_cache_stride);
+
+  // MLA scales by the *unabsorbed* qk head dim (qk_nope + qk_rope), not the
+  // absorbed reduction width. 1/sqrt(d) folded with log2(e), as the decode
+  // kernel exponentiates base 2.
+  float scale_s = 1.0f / sqrtf((float)qk_head_dim) * 1.44269504088896340736f;
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::gang_mla_attn_fused_kernel_mi300<$, $, $, $, $, $, $, $, $, "
+         "$, $, $, $, $, $, $, $, $, $>(",
+         batch_size,
+         qkv_opw,
+         qkv_reduction,
+         qkv_actual_hidden,
+         qb_opw,
+         qb_reduction,
+         qb_actual_hidden,
+         kv_lora_rank,
+         qk_rope_head_dim,
+         kv_input_stride,
+         kv_cache_stride,
+         max_seq_len,
+         page_size,
+         kv_input_offset,
+         num_q_heads,
+         num_kv_chunks,
+         q_workspace_stride,
+         merge_dim_splits,
+         merge_write_through ? "true" : "false");
+  for (int i = 0; i < num_inputs; i++) {
+    code.e("    task_desc->input_ptrs[$],", i);
+  }
+  for (int i = 0; i < num_outputs; i++) {
+    code.e("    task_desc->output_ptrs[$],", i);
+  }
+  code.e("    runtime_config.qo_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_indices_buffer,");
+  code.e("    runtime_config.paged_kv_last_page_len_buffer,");
+  // NOT task_metadata.request_id: TaskMetadata is a union, and this task is
+  // in the gang group that sets n_tile_start = bid.x * tiles_per_xcd
+  // (runtime.cc:483), which aliases request_id. Reading it back here yields
+  // 0, 28, 56, ... 196 -- one garbage index per XCD into a two-entry
+  // qo_indptr buffer, which the merge then multiplies by the output row
+  // stride. Gang tasks own the whole GPU for one request by construction (the
+  // standalone kvupd task lands on 0 only because its task type takes the
+  // n_tile_start = 0 branch), so the request index is a literal zero. The
+  // python layer asserts max_num_batched_requests == 1 to keep it honest.
+  code.e("    (int16_t)0,");
+  code.e("    runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS],");
+  code.e("    $,", qkv_n_wgs_per_xcd);
+  code.e("    $,", qkv_output_stride);
+  code.e("    $,", qb_n_wgs_per_xcd);
+  code.e("    $,", qb_output_stride);
+  code.e("    $,", mla_tiles_per_xcd);
+  code.e("    $,", mla_total_work_items);
+  code.e("    $,", merge_tiles_per_xcd);
+  code.e("    $,", tiles_per_xcd);
+  code.e("    $f,", scale_s);
+  // Matches the standalone kvupd task's epsilon.
+  code.e("    1e-6f,");
+  code.e("    tile_idx);");
+  return register_task_variant(TASK_GANG_MLA_DECODE_MI300, code.to_string());
+}
+
 // Gang merge split-KV: 8 tasks (1 per XCD), tile_idx → (request_id, kv_head)
 // params: [num_qo_heads_per_kv, head_dim, max_seq_len, page_size,
 //          num_kv_heads, total_work_items_per_xcd, total_work_items]

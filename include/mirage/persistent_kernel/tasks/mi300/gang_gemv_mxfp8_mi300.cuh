@@ -50,6 +50,36 @@
 // straight from global rather than staged through LDS; after the first touch
 // they are L1 hits, and issuing them in the same batch as the weight loads
 // keeps them off the dependency chain.
+//
+// The *activation* is the opposite case, and it was the kernel's real limit. A
+// bandwidth probe over a 4 GiB weight buffer (tests/standalone/
+// test_gemv_mxfp8_bw.hip) put a pure streaming read at 37.8 GB/s per workgroup
+// at 128 workgroups while this loop managed 14.5, so the shortfall was inside
+// the workgroup rather than in how many of them were running -- re-tiling
+// would not have touched it. The cause is that all ROWS_PER_WG rows of a
+// workgroup walk the *same* activation row, so the load below was issued once
+// per row: at the o_proj tile that is 320 KB of requests against 164 KB of
+// weight, contending for the same vmcnt queue as the loads that actually carry
+// the weight. Filling LDS with the row once and reading it from there measured
+// 18.7 GB/s/WG at 128 workgroups and 17.2 at 240, i.e. 1.30-1.32x, with the
+// fill paid per tile as it is here rather than amortized over a block's whole
+// share of them. Two variants that looked promising did not survive the probe:
+// staging the scale half as well is consistently ~6% slower, and remapping the
+// chunks so a lane's are contiguous is slower still -- the strided mapping is
+// the coalesced one.
+//
+// In the megakernel that 1.30x came out as 2.9% on the o_proj subphase and
+// nothing at all on the decode step, and the same probe explains why. Kernels
+// A-F there all run a grid-stride loop over ~184 tiles, so one tile's drain
+// overlaps the next one's ramp. gang_oproj_router_fused gives a worker exactly
+// one tile per layer and then a cross-XCD barrier, so all 128 of them ramp and
+// drain in lockstep and neither tail overlaps anything: the same kernel over
+// the same bytes costs 8.21 us/tile back to back and 11.98 us/tile one at a
+// time (kernel G). Deeper unrolling and pipelining the fill against the first
+// weight batch were both measured (kernel H) and both did nothing, which is
+// what being shape-bound rather than latency-bound looks like. So what is left
+// on this kernel is small; the factor of two is in how much consecutive work a
+// worker gets between barriers.
 
 #pragma once
 #include "tasks/mi300/gang_gemv_mi300.cuh"
@@ -58,6 +88,12 @@ namespace kernel {
 
 namespace gang_gemv_mxfp8_detail {
 typedef __bf16 __attribute__((ext_vector_type(2))) bf16x2_t;
+// A POD 16-byte vector, used instead of uint4 for anything that is loaded
+// through an addrspace(1) pointer: uint4 is HIP_vector_type, a class, so
+// dereferencing an addrspace(1) uint4* runs its copy constructor -- which
+// takes a generic `uint4 const&` -- and the cast is undone before the load
+// ever happens. The ext_vector_type is loaded directly and keeps .x/.y/.z/.w.
+typedef unsigned int __attribute__((ext_vector_type(4))) u32x4_t;
 
 // E8M0 byte to its fp32 value, 2^(e-127). e == 0 gives +0.0f rather than the
 // 1.0f the packer's comment describes, which is harmless and deliberate: a
@@ -81,6 +117,30 @@ __device__ __forceinline__ unsigned cvt_fp8_pair(unsigned raw, float scale) {
   unsigned u;
   __builtin_memcpy(&u, &v, 4);
   return u;
+}
+
+// A load that is *known* to come from device memory.
+//
+// Clang infers address spaces intraprocedurally, so a pointer that arrives as
+// an argument to a __noinline__ kernel stays generic and every dereference of
+// it is emitted as flat_load rather than global_load. On gfx9 that is not just
+// a slower addressing mode: a flat instruction increments **both** vmcnt and
+// lgkmcnt, so the `s_waitcnt lgkmcnt(0)` that retires an LDS read also waits
+// on every outstanding weight load. That is why staging the activation in LDS
+// bought only 1.08x here while the same change in a monolithic __global__
+// probe -- where the compiler does see addrspace(1) -- bought 1.30x. Casting
+// the pointer to addrspace(1) at the load restores global_load and decouples
+// the two counters again.
+//
+// Safe only because every pointer handed to this kernel is device global:
+// weights, activations, residual, bias and output all come from the
+// megakernel's workspace or from a task descriptor.
+// The cast is two-step because clang rejects a reinterpret_cast that changes
+// both the pointee type and the address space at once.
+template <typename T>
+__device__ __forceinline__ T ld_g(void const *p) {
+  T const *q = static_cast<T const *>(p);
+  return *(__attribute__((address_space(1))) T const *)q;
 }
 } // namespace gang_gemv_mxfp8_detail
 
@@ -124,6 +184,8 @@ __device__ __noinline__ void
   using gang_gemv_detail::f2b;
   using gang_gemv_mxfp8_detail::cvt_fp8_pair;
   using gang_gemv_mxfp8_detail::e8m0_to_f32;
+  using gang_gemv_mxfp8_detail::ld_g;
+  using gang_gemv_mxfp8_detail::u32x4_t;
 
   constexpr int NTHREADS = 256;
   constexpr int LANES_PER_ROW = NTHREADS / ROWS_PER_WG;
@@ -173,6 +235,33 @@ __device__ __noinline__ void
   int const row = tid / LANES_PER_ROW;
   int const lane = tid % LANES_PER_ROW;
 
+  // Dynamic LDS rather than a __shared__ array: the workers are launched with
+  // MAX_DYNAMIC_SHARED_MEMORY_SIZE and the persistent kernel runs one
+  // workgroup per CU, so this space is already paid for and costs no
+  // occupancy, whereas a static array would be added to the frame of every
+  // kernel that can reach this one. gang_moe_fused_mxfp4 stages its tokens and
+  // weights the same way. Both of this kernel's callers -- the standalone task
+  // and gang_oproj_router_fused -- have nothing live in _fused_smem here.
+  constexpr size_t A_LDS_BYTES =
+      sizeof(unsigned short) * BATCH_SIZE * REDUCTION_SIZE;
+  constexpr bool STAGE_A =
+      A_LDS_BYTES <=
+      static_cast<size_t>(mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE);
+  extern __shared__ char _fused_smem[];
+  unsigned short *s_a = reinterpret_cast<unsigned short *>(_fused_smem);
+  if constexpr (STAGE_A) {
+    // The tile coords check above is block-uniform, so every thread that
+    // reaches this __syncthreads reaches it together.
+    u32x4_t const *src = reinterpret_cast<u32x4_t const *>(tile_input);
+    u32x4_t *dst = reinterpret_cast<u32x4_t *>(s_a);
+#pragma unroll
+    for (int i = tid; i < static_cast<int>(A_LDS_BYTES / sizeof(u32x4_t));
+         i += NTHREADS) {
+      dst[i] = ld_g<u32x4_t>(src + i);
+    }
+    __syncthreads();
+  }
+
   unsigned char const *w_row = wg + static_cast<size_t>(row) * REDUCTION_SIZE;
   unsigned char const *s_row =
       wg + WG_DATA_BYTES +
@@ -197,21 +286,30 @@ __device__ __noinline__ void
 
   for (int i0 = 0; i0 < ITERS; i0 += UNROLL) {
     // Indexed only by fully unrolled loops, so these stay in VGPRs.
-    uint4 wv[UNROLL];
+    u32x4_t wv[UNROLL];
     unsigned char sv[UNROLL];
-    uint4 av[UNROLL][BATCH_SIZE][2];
+    u32x4_t av[UNROLL][BATCH_SIZE][2];
 #pragma unroll
     for (int u = 0; u < UNROLL; u++) {
       // Chunk index within the row, in units of VEC elements.
       int const c = (i0 + u) * LANES_PER_ROW + lane;
       int const k = c * VEC;
-      wv[u] = *reinterpret_cast<uint4 const *>(w_row + k);
-      sv[u] = s_row[k / SCALE_BLOCK];
+      wv[u] = ld_g<u32x4_t>(w_row + k);
+      sv[u] = ld_g<unsigned char>(s_row + k / SCALE_BLOCK);
 #pragma unroll
       for (int m = 0; m < BATCH_SIZE; m++) {
-        unsigned short const *a = tile_input + m * REDUCTION_SIZE + k;
-        av[u][m][0] = *reinterpret_cast<uint4 const *>(a);
-        av[u][m][1] = *reinterpret_cast<uint4 const *>(a + 8);
+        // if constexpr, not a ternary on the pointer: a select between an
+        // LDS-derived and a global pointer would collapse both to generic and
+        // cost flat_load where ds_read belongs.
+        if constexpr (STAGE_A) {
+          unsigned short const *a = s_a + m * REDUCTION_SIZE + k;
+          av[u][m][0] = *reinterpret_cast<u32x4_t const *>(a);
+          av[u][m][1] = *reinterpret_cast<u32x4_t const *>(a + 8);
+        } else {
+          unsigned short const *a = tile_input + m * REDUCTION_SIZE + k;
+          av[u][m][0] = ld_g<u32x4_t>(a);
+          av[u][m][1] = ld_g<u32x4_t>(a + 8);
+        }
       }
     }
 #pragma unroll
@@ -224,7 +322,7 @@ __device__ __noinline__ void
       for (int m = 0; m < BATCH_SIZE; m++) {
 #pragma unroll
         for (int h = 0; h < 4; h++) {
-          uint4 const a = av[u][m][h >> 1];
+          u32x4_t const a = av[u][m][h >> 1];
           unsigned const ax = (h & 1) ? a.z : a.x;
           unsigned const ay = (h & 1) ? a.w : a.y;
           acc[m][2 * (h & 1)] = gang_gemv_detail::fma_pair(
@@ -248,7 +346,7 @@ __device__ __noinline__ void
 
   if (lane == 0) {
     int const n_local = n_tile * ROWS_PER_WG + row;
-    float const bv = Bs ? b2f(Bs[n_local]) : 0.0f;
+    float const bv = Bs ? b2f(ld_g<unsigned short>(Bs + n_local)) : 0.0f;
 #pragma unroll
     for (int m = 0; m < BATCH_SIZE; m++) {
       if (m_tile * BATCH_SIZE + m >= num_active_tokens) {
@@ -257,7 +355,7 @@ __device__ __noinline__ void
       size_t const idx = out_off + static_cast<size_t>(m) * o_stride + row;
       float v = sum[m] + bv;
       if constexpr (HAS_RESIDUAL) {
-        v += b2f(R[idx]);
+        v += b2f(ld_g<unsigned short>(R + idx));
       }
       if constexpr (WRITE_THROUGH) {
         unsigned short const o = f2b(v);

@@ -76,7 +76,8 @@ template <typename T,
           int MAX_SEQ_LEN,
           int NUM_KV_CHUNKS,
           int Q_WORKSPACE_STRIDE,
-          int KV_CACHE_STRIDE>
+          int KV_CACHE_STRIDE,
+          bool WRITE_THROUGH = false>
 __device__ __noinline__ void
     mla_decode_absorbed(void const *q_workspace_ptr,
                         void const *paged_kv_cache_ptr,
@@ -185,7 +186,14 @@ __device__ __noinline__ void
                          static_cast<long>(query_start) * LSE_STRIDE +
                          q_head_group * NUM_KV_CHUNKS * Q_HEADS_PER_GROUP +
                          kv_chunk_idx * Q_HEADS_PER_GROUP + midx;
-        *lse_out = -1e30f;
+        if constexpr (WRITE_THROUGH) {
+          float const empty = -1e30f;
+          unsigned raw;
+          __builtin_memcpy(&raw, &empty, 4);
+          st_wt_u32((void *)lse_out, raw);
+        } else {
+          *lse_out = -1e30f;
+        }
       }
       return;
     }
@@ -420,10 +428,22 @@ __device__ __noinline__ void
                static_cast<long>(q_head_local) * KV_LORA_RANK;
 #pragma unroll
     for (int vb = 0; vb < NUM_V_BLOCKS; vb++) {
+      int dim_offset = vb * 64 + warp_id * 16 + kgrp * 4;
+      if constexpr (WRITE_THROUGH) {
+        // The four dims are contiguous and 4-aligned, so one
+        // global_store_dwordx4 carries them past L2 in a single instruction.
+        unsigned raw[4];
 #pragma unroll
-      for (int h = 0; h < 4; h++) {
-        int dim_offset = vb * 64 + warp_id * 16 + kgrp * 4 + h;
-        o[dim_offset] = o_acc[vb][h] * inv_l;
+        for (int h = 0; h < 4; h++) {
+          float v = o_acc[vb][h] * inv_l;
+          __builtin_memcpy(&raw[h], &v, 4);
+        }
+        st_wt_u128(&o[dim_offset], raw[0], raw[1], raw[2], raw[3]);
+      } else {
+#pragma unroll
+        for (int h = 0; h < 4; h++) {
+          o[dim_offset + h] = o_acc[vb][h] * inv_l;
+        }
       }
     }
   }
@@ -443,7 +463,13 @@ __device__ __noinline__ void
     float lse_val = (l_sum > 0.0f)
                         ? (m_running * 0.69314718055994530942f + logf(l_sum))
                         : -1e30f;
-    *lse_out = lse_val;
+    if constexpr (WRITE_THROUGH) {
+      unsigned raw;
+      __builtin_memcpy(&raw, &lse_val, 4);
+      st_wt_u32((void *)lse_out, raw);
+    } else {
+      *lse_out = lse_val;
+    }
   }
 }
 
@@ -467,7 +493,8 @@ template <typename T,
           int MAX_SEQ_LEN,
           int NUM_KV_CHUNKS,
           int Q_WORKSPACE_STRIDE,
-          int KV_CACHE_STRIDE>
+          int KV_CACHE_STRIDE,
+          bool WRITE_THROUGH = false>
 __device__ __noinline__ void
     gang_mla_decode_kernel(void const *q_workspace_ptr,
                            void const *paged_kv_cache_ptr,
@@ -499,7 +526,8 @@ __device__ __noinline__ void
                       MAX_SEQ_LEN,
                       NUM_KV_CHUNKS,
                       Q_WORKSPACE_STRIDE,
-                      KV_CACHE_STRIDE>(q_workspace_ptr,
+                      KV_CACHE_STRIDE,
+                      WRITE_THROUGH>(q_workspace_ptr,
                                        paged_kv_cache_ptr,
                                        output_ptr,
                                        lse_ptr,

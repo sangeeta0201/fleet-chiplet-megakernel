@@ -68,30 +68,37 @@ __device__ __forceinline__ unsigned short f2b(float f) {
 }
 
 // A packed bf16 pair lives in one 32-bit register: element 2i in the low half,
-// 2i+1 in the high half. Widening either to f32 is a single bit shuffle, so the
-// pair never has to touch memory -- which matters more than it sounds, because
-// reading the halves through a `unsigned short const *` aimed at a local uint4
-// makes LLVM materialize that uint4 in scratch and turns every iteration of the
-// k-loop into a global round trip.
-__device__ __forceinline__ float lo2f(unsigned w) {
-  unsigned u = w << 16;
-  float f;
-  __builtin_memcpy(&f, &u, 4);
-  return f;
-}
-
-__device__ __forceinline__ float hi2f(unsigned w) {
-  unsigned u = w & 0xFFFF0000u;
-  float f;
-  __builtin_memcpy(&f, &u, 4);
-  return f;
-}
+// 2i+1 in the high half. Keeping the pair in that register rather than reading
+// its halves through a `unsigned short const *` aimed at a local uint4 matters
+// more than it sounds: the pointer version makes LLVM materialize that uint4 in
+// scratch and turns every iteration of the k-loop into a global round trip.
+typedef __bf16 bf16x2_t __attribute__((ext_vector_type(2)));
 
 // acc += dot(unpack(w), unpack(a)) over the packed pair.
+//
+// v_dot2c_f32_bf16 does this in one instruction, on packed operands. The
+// obvious spelling -- widen each half to f32 with a shift and a mask, then
+// fma twice -- costs five, and that showed up plainly in the o_proj GEMV's
+// ISA: per unrolled batch of 8 chunks it emitted 144 v_lshlrev_b32 and 132
+// v_and_b32 against only 64 v_pk_fma_f32 and 64 v_cvt_scalef32_pk_bf16_fp8,
+// so 48% of the kernel's VALU was widening operands the dot product would
+// have taken as they already were.
+//
+// Instruction count matters more in this kernel than it usually would. The
+// megakernel's workers are 256 threads and the persistent kernel runs one
+// workgroup per CU, so each wave has a SIMD to itself: there is no second
+// wave to issue while this one shuffles bits, and a bandwidth probe of the
+// real one-tile-per-worker shape (tests/standalone/test_gemv_mxfp8_bw.hip,
+// kernel H) showed deeper unrolling buys nothing, which is what being
+// issue-bound rather than latency-bound looks like.
+//
+// The two-term dot is fused, so it is if anything slightly more accurate than
+// the two sequential fmaf it replaces.
 __device__ __forceinline__ float fma_pair(unsigned w, unsigned a, float acc) {
-  acc = __builtin_fmaf(lo2f(w), lo2f(a), acc);
-  acc = __builtin_fmaf(hi2f(w), hi2f(a), acc);
-  return acc;
+  bf16x2_t wv, av;
+  __builtin_memcpy(&wv, &w, 4);
+  __builtin_memcpy(&av, &a, 4);
+  return __builtin_amdgcn_fdot2_f32_bf16(wv, av, acc, /*clamp=*/false);
 }
 } // namespace gang_gemv_detail
 
