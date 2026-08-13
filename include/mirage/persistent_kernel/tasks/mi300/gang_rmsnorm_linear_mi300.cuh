@@ -71,7 +71,7 @@ __device__ __forceinline__ void
   }
   __syncthreads();
 
-  float rms_rcp = rsqrtf(red[0] / (float)HIDDEN_DIM + eps);
+  float rms_rcp = MPK_RMS_RCP(red[0], HIDDEN_DIM, eps);
 
   // All workers write the same values — writes are idempotent.
   // Use non-temporal stores to avoid L2 write amplification.

@@ -24,3 +24,21 @@
 #include <cstdint>
 #include <cstdio>
 #include <iostream>
+
+// RMSNorm reciprocal: rsqrt(sumsq/dim + eps).
+//
+// Written as a divide, `sumsq / (float)DIM + eps` costs a full IEEE-754
+// sequence (v_div_scale x2, v_rcp, Newton-Raphson refinement, v_div_fmas,
+// v_div_fixup) even though DIM is a compile-time template int -- without
+// fast-math the compiler may not fold a reciprocal that is inexact, and
+// 1/2880 is inexact. Hoisting the reciprocal to a literal collapses it to one
+// v_fmac_f32. The result differs from the divide by <=1 ulp before the rsqrt,
+// which is far below the bf16 the normalized activations are stored in.
+//
+// Set -DMPK_RMSNORM_EXACT_DIV=1 to restore the divide (A/B / bisection).
+#if defined(MPK_RMSNORM_EXACT_DIV) && MPK_RMSNORM_EXACT_DIV
+#define MPK_RMS_RCP(sumsq, DIM, eps) rsqrtf((sumsq) / (float)(DIM) + (eps))
+#else
+#define MPK_RMS_RCP(sumsq, DIM, eps)                                           \
+  rsqrtf(fmaf((sumsq), 1.0f / (float)(DIM), (eps)))
+#endif

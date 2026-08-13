@@ -118,7 +118,7 @@ __device__ __forceinline__ void rmsnorm_inline_amd(void const *input_ptr,
   }
   __syncthreads();
 
-  float rms_rcp = rsqrtf(red[0] / float(ACTUAL_HIDDEN_DIM) + eps);
+  float rms_rcp = MPK_RMS_RCP(red[0], ACTUAL_HIDDEN_DIM, eps);
 
 // ── Phase 4: apply normalization using cached input (no HBM re-read) ──
 #pragma unroll 1
@@ -390,7 +390,7 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     for (int w = 0; w < NUM_WAVES; w++) {
       tot += red[w];
     }
-    red[0] = rsqrtf(tot / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
+    red[0] = MPK_RMS_RCP(tot, ACTUAL_HIDDEN_DIM, 1e-5f);
   }
   __syncthreads();
   irms = red[0];

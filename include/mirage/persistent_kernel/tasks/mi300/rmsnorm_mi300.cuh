@@ -144,7 +144,7 @@ __device__ __forceinline__ void rms_norm_impl(void const *input_ptr,
 
   // Compute RMS reciprocal — use ACTUAL_HIDDEN_DIM for mean to match unpadded
   // computation
-  float rms_rcp = rsqrtf(reduce_smem[0] / float(ACTUAL_HIDDEN_DIM) + eps);
+  float rms_rcp = MPK_RMS_RCP(reduce_smem[0], ACTUAL_HIDDEN_DIM, eps);
 #ifdef EMBED_DEBUG
   if (threadIdx.x == 0) {
     printf(

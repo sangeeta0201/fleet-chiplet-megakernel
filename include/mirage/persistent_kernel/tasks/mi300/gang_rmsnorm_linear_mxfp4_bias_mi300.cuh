@@ -616,7 +616,7 @@ __device__ __noinline__ void gang_mulsumradd_rmsnorm_linear_mxfp4_bias_kernel(
           ssq += __shfl_xor(ssq, offset);
         }
         if (_lane_id == 0) {
-          s_red[0] = rsqrtf(ssq / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
+          s_red[0] = MPK_RMS_RCP(ssq, ACTUAL_HIDDEN_DIM, 1e-5f);
         }
       }
       __syncthreads();
@@ -1491,7 +1491,7 @@ __device__ __noinline__ void
           ssq += __shfl_xor(ssq, offset);
         }
         if (_lane_id == 0) {
-          s_red[0] = rsqrtf(ssq / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
+          s_red[0] = MPK_RMS_RCP(ssq, ACTUAL_HIDDEN_DIM, 1e-5f);
         }
       }
       __syncthreads();
@@ -1934,7 +1934,7 @@ __device__ __noinline__ void gang_resaddf32_rmsnorm_linear_mxfp4_bias_kernel(
           ssq += __shfl_xor(ssq, offset);
         }
         if (_lane_id == 0) {
-          s_red[0] = rsqrtf(ssq / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
+          s_red[0] = MPK_RMS_RCP(ssq, ACTUAL_HIDDEN_DIM, 1e-5f);
         }
       }
       __syncthreads();
@@ -2457,7 +2457,7 @@ __device__ __noinline__ void
           ssq += __shfl_xor(ssq, offset);
         }
         if (_lane_id == 0) {
-          s_red[0] = rsqrtf(ssq / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
+          s_red[0] = MPK_RMS_RCP(ssq, ACTUAL_HIDDEN_DIM, 1e-5f);
         }
       }
       __syncthreads();

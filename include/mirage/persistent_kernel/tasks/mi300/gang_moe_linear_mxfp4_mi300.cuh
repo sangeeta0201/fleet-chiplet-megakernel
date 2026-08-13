@@ -160,53 +160,116 @@ __device__ __forceinline__ void
   }
 }
 
+// ── FP8 quant sub-block sizing ────────────────────────────────────────────
+//
+// Every quantizer below splits the K axis into SUB_BLOCK-element pieces, one
+// piece per thread, and reduces the amax of the 128/SUB_BLOCK consecutive
+// lanes that share a 128-element MFMA super-block.
+//
+// SUB_BLOCK is a parallelism knob, not a layout choice: total pieces is
+// ROWS * REDUCTION_SIZE / SUB_BLOCK, and the block has 256 threads. At
+// SUB_BLOCK=32 with ROWS=1 and K=2944 that is 92 pieces -- one pass, but 164
+// of 256 threads idle while the 92 that ran each chew through 32 elements
+// serially. Halving SUB_BLOCK halves every active thread's serial work and
+// costs nothing as long as the total still fits in one pass.
+//
+// So: start at 32 and halve while the *next* step still fits in 256 threads.
+// The floor of 8 keeps the super-block group at 128/8 = 16 lanes, well inside
+// a wave. At ROWS >= 2 the 32-element form is already oversubscribed and this
+// returns 32 unchanged -- the batched paths are byte-identical.
+//
+// MEASURED: the floor is 32 (i.e. this is off by default). Dropping to 16 at
+// ROWS=1 / K=2944 -- 184 pieces over 256 threads, half the serial work per
+// thread, exactly the direction croc's f32x16 ladder went -- is a *regression*
+// here: 4 paired rounds on GPU 2 gave +15/+115/+65/+77 us. Our starting point
+// is not croc's. Their f32x2 baseline ran 6-8 blocks per wave sequentially, so
+// widening removed real serialization; ours already finishes in one pass, so
+// halving SUB_BLOCK only doubles the number of E8M0 scale derivations and
+// butterfly reductions per 128-element super-block while the loads stay the
+// same. Set to 8 or 16 to re-measure; the code paths are exercised either way.
+#ifndef MPK_FP8_QUANT_SUB_BLOCK_MIN
+#define MPK_FP8_QUANT_SUB_BLOCK_MIN 32
+#endif
+template <int REDUCTION_SIZE, int ROWS>
+constexpr int _gang_fp8_quant_sub_block() {
+  int sb = 32;
+  while (sb > MPK_FP8_QUANT_SUB_BLOCK_MIN &&
+         ROWS * (REDUCTION_SIZE / (sb / 2)) <= 256) {
+    sb /= 2;
+  }
+  return sb;
+}
+
+// Reduce `amax` across each aligned run of GROUP consecutive lanes. A butterfly
+// costs log2(GROUP) shuffles and leaves the result in every lane, versus GROUP
+// broadcast reads that leave it only where it is needed anyway.
+//
+// Only valid when whole GROUPs are active: a lane whose loop condition failed
+// never wrote `amax`, so reading it back yields garbage. Callers gate on
+// (pieces % GROUP == 0), which holds whenever REDUCTION_SIZE % 128 == 0.
+template <int GROUP>
+__device__ __forceinline__ float _gang_amax_group(float amax) {
+#pragma unroll
+  for (int off = 1; off < GROUP; off <<= 1) {
+    amax = fmaxf(amax, __shfl_xor(amax, off, GROUP));
+  }
+  return amax;
+}
+
 // Per-thread FP8 quantization mirroring FP4 structure.
-// Splits each 128-element MFMA block into 4 × 32-element sub-blocks.
-// Each thread handles one sub-block: load 32 bf16, find local amax,
-// shuffle with 3 neighbors to get 128-element block amax, compute scale,
-// pack 32 values to FP8. Single iteration for K=3072 (96 sub-blocks < 256
-// threads).
+// Splits each 128-element MFMA block into 128/SUB_BLOCK sub-blocks.
+// Each thread handles one sub-block: load SUB_BLOCK bf16, find local amax,
+// reduce with the neighbours sharing its super-block, compute scale, pack to
+// FP8. Sized by _gang_fp8_quant_sub_block so the whole K axis is one pass.
 template <int REDUCTION_SIZE>
 __device__ __forceinline__ void
     _gang_wave_parallel_fp8_quant(unsigned short const *__restrict__ src_bf16,
                                   uint8_t *__restrict__ s_tok_fp8,
                                   uint8_t *__restrict__ s_tok_scales) {
 
-  constexpr int SUB_BLOCK = 32;
-  constexpr int NSUBBLOCKS = REDUCTION_SIZE / SUB_BLOCK; // 96 for K=3072
+  constexpr int SUB_BLOCK = _gang_fp8_quant_sub_block<REDUCTION_SIZE, 1>();
+  constexpr int GROUP = 128 / SUB_BLOCK; // lanes per 128-element super-block
+  constexpr int NSUBBLOCKS = REDUCTION_SIZE / SUB_BLOCK;
+  // Whole super-blocks only: needed for the butterfly below to stay inside
+  // lanes that actually ran. REDUCTION_SIZE % 128 == 0 implies it.
+  constexpr bool ALIGNED = (NSUBBLOCKS % GROUP == 0) && (64 % GROUP == 0);
   int const tid = threadIdx.x;
   int const lane_id = tid & 63;
 
   for (int sb = tid; sb < NSUBBLOCKS; sb += blockDim.x) {
     int const base = sb * SUB_BLOCK;
-    int const super_blk = sb / 4; // which 128-element block
-    int const sub_idx = sb & 3;   // which sub-block within super-block
+    int const super_blk = sb / GROUP;    // which 128-element block
+    int const sub_idx = sb & (GROUP - 1); // which sub-block within it
 
-    // Load 32 bf16 values and find local amax (identical to FP4 quant)
-    float vals[32];
+    // Load SUB_BLOCK bf16 values and find local amax (identical to FP4 quant)
+    float vals[SUB_BLOCK];
     float amax = 0.0f;
 #pragma unroll
-    for (int j = 0; j < 32; j++) {
+    for (int j = 0; j < SUB_BLOCK; j++) {
       vals[j] = _gang_bf16_to_float(src_bf16[base + j]);
       amax = fmaxf(amax, fabsf(vals[j]));
     }
 
-    // Combine amaxes from 4 sub-blocks sharing the same 128-element
-    // super-block. Threads sb, sb+1, sb+2, sb+3 are consecutive lanes in the
-    // same wave. Use __shfl to read each neighbor's amax (4 reads, 3 fmaxf).
-    //
-    // The partner index is clamped for the same reason as in the NT variant
-    // below: NSUBBLOCKS = REDUCTION_SIZE/32 need not be a multiple of 4, so
-    // the tail super-block would otherwise reduce against lanes whose loop
-    // condition failed and whose `amax` register was never written.
-    int base_lane = lane_id & ~3; // round down to group of 4
-    int const sb_first = sb - sub_idx;
-    int const n_valid = min(4, (NSUBBLOCKS - 1) - sb_first + 1);
-    float a0 = __shfl(amax, base_lane);
-    float a1 = __shfl(amax, base_lane + min(1, n_valid - 1));
-    float a2 = __shfl(amax, base_lane + min(2, n_valid - 1));
-    float a3 = __shfl(amax, base_lane + min(3, n_valid - 1));
-    float block_amax = fmaxf(fmaxf(a0, a1), fmaxf(a2, a3));
+    // Combine amaxes across the sub-blocks sharing this 128-element
+    // super-block. They are consecutive lanes of the same wave.
+    float block_amax;
+    if constexpr (ALIGNED) {
+      block_amax = _gang_amax_group<GROUP>(amax);
+    } else {
+      // Ragged tail: NSUBBLOCKS is not a multiple of GROUP, so the last
+      // super-block would otherwise reduce against lanes whose loop condition
+      // failed and whose `amax` register was never written. Clamp the partner
+      // index to the last sub-block that actually ran.
+      int const base_lane = lane_id & ~(GROUP - 1);
+      int const sb_first = sb - sub_idx;
+      int const n_valid = min(GROUP, NSUBBLOCKS - sb_first);
+      block_amax = 0.0f;
+#pragma unroll
+      for (int p = 0; p < GROUP; p++) {
+        block_amax =
+            fmaxf(block_amax, __shfl(amax, base_lane + min(p, n_valid - 1)));
+      }
+    }
 
     // Compute E8M0 scale
     uint8_t se = _gang_compute_e8m0_fp8(block_amax);
@@ -222,9 +285,9 @@ __device__ __forceinline__ void
       scale_f = sv.f;
     }
 
-// Pack 32 values to FP8 (4 values → 4 bytes per cvt pair)
+// Pack to FP8 (4 values → 4 bytes per cvt pair)
 #pragma unroll
-    for (int j = 0; j < 32; j += 4) {
+    for (int j = 0; j < SUB_BLOCK; j += 4) {
       fp8x4_t pk = {};
       pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
           pk, vals[j], vals[j + 1], scale_f, false);
@@ -275,23 +338,29 @@ __device__ __forceinline__ void _gang_multirow_fp8_quant_impl(
     uint8_t *__restrict__ s_tok_fp8,
     uint8_t *__restrict__ s_tok_scales) {
 
-  constexpr int SUB_BLOCK = 32;
+  constexpr int SUB_BLOCK = _gang_fp8_quant_sub_block<REDUCTION_SIZE, ROWS>();
+  constexpr int GROUP = 128 / SUB_BLOCK;
   constexpr int NSUB = REDUCTION_SIZE / SUB_BLOCK;
   constexpr int TOTAL = ROWS * NSUB;
-  static_assert(NSUB % 4 == 0,
+  static_assert(NSUB % GROUP == 0,
                 "128-element super-blocks must not straddle a token row");
   static_assert(TOK_ROW_STRIDE % 16 == 0,
                 "keeps the i32x4 B-operand loads 16B-aligned");
+  // The butterfly needs each GROUP of lanes to hold one whole super-block.
+  // NSUB % GROUP == 0 keeps a super-block from straddling a row boundary, and
+  // idx = tid + n*256 preserves idx % GROUP == tid % GROUP, so a group never
+  // spans a wave boundary either.
+  static_assert(64 % GROUP == 0 && 256 % GROUP == 0,
+                "amax groups must not straddle a wavefront");
 
   int const tid = threadIdx.x;
-  int const lane_id = tid & 63;
 
   for (int idx = tid; idx < TOTAL; idx += 256) {
     int const r = ROWS == 1 ? 0 : idx / NSUB;
     int const sb = idx - r * NSUB;
     int const base = sb * SUB_BLOCK;
-    int const super_blk = sb >> 2;
-    int const sub_idx = sb & 3;
+    int const super_blk = sb / GROUP;
+    int const sub_idx = sb & (GROUP - 1);
 
     unsigned short const *row = src_bf16 + row_off(r < n_rows ? r : 0) + base;
 
@@ -318,12 +387,7 @@ __device__ __forceinline__ void _gang_multirow_fp8_quant_impl(
       }
     }
 
-    int base_lane = lane_id & ~3;
-    float a0 = __shfl(amax, base_lane);
-    float a1 = __shfl(amax, base_lane + 1);
-    float a2 = __shfl(amax, base_lane + 2);
-    float a3 = __shfl(amax, base_lane + 3);
-    float block_amax = fmaxf(fmaxf(a0, a1), fmaxf(a2, a3));
+    float block_amax = _gang_amax_group<GROUP>(amax);
 
     uint8_t se = _gang_compute_e8m0_fp8(block_amax);
     float scale_f;
@@ -412,57 +476,52 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_nt(
     uint8_t *__restrict__ s_tok_fp8,
     uint8_t *__restrict__ s_tok_scales) {
 
-  constexpr int SUB_BLOCK = 32;
-  constexpr int NSUBBLOCKS = REDUCTION_SIZE / SUB_BLOCK; // 96 for K=3072
+  constexpr int SUB_BLOCK = _gang_fp8_quant_sub_block<REDUCTION_SIZE, 1>();
+  constexpr int GROUP = 128 / SUB_BLOCK; // lanes per 128-element super-block
+  constexpr int NDW4 = SUB_BLOCK / 8;    // dwordx4 loads per sub-block
+  constexpr int NSUBBLOCKS = REDUCTION_SIZE / SUB_BLOCK;
+  constexpr bool ALIGNED = (NSUBBLOCKS % GROUP == 0) && (64 % GROUP == 0);
   int const tid = threadIdx.x;
   int const lane_id = tid & 63;
   uint32_t const *src32 = (uint32_t const *)src_bf16;
 
   for (int sb = tid; sb < NSUBBLOCKS; sb += blockDim.x) {
     int const base = sb * SUB_BLOCK;
-    int const super_blk = sb / 4;
-    int const sub_idx = sb & 3;
+    int const super_blk = sb / GROUP;
+    int const sub_idx = sb & (GROUP - 1);
     uint32_t const *base_ptr = src32 + base / 2;
 
-    // 4 wide NT loads (64 bytes = 32 bf16)
+    // NDW4 wide NT loads (16 bytes = 8 bf16 each).
     //
-    // The outputs MUST be early-clobber ("=&v"). This is one asm block with
-    // four separate instructions, so the compiler is free to allocate an
-    // output register on top of an input it believes is dead after the
-    // block -- and it does: without the '&' it emits
+    // One instruction per asm block, and the output is early-clobber ("=&v").
+    // Both matter. The original form put all four loads in a single asm block
+    // with plain "=v" outputs, so the compiler allocated the first load's
+    // destination on top of the address operands of the next three:
     //     global_load_dwordx4 v[4:7],   v[4:5],  ...
     //     global_load_dwordx4 v[8:11],  v[6:7],  ...
-    //     global_load_dwordx4 v[12:15], v[8:9],  ...
-    //     global_load_dwordx4 v[16:19], v[10:11],...
-    // where the first load's destination overwrites the address operands of
-    // the next three before they issue. Those loads then use whatever the
-    // returned data happened to be as an address. A wild address that never
-    // completes leaves the wave parked on the s_waitcnt vmcnt(0) below
-    // forever, which hangs the __syncthreads at the end of this function and
-    // through it the whole block -- the captured deadlock is exactly that:
+    // The later loads then used returned *data* as an address. A wild address
+    // that never completes leaves the wave parked on the s_waitcnt vmcnt(0)
+    // below forever, hanging the __syncthreads at the end of this function and
+    // through it the whole block -- the captured deadlock was exactly that:
     // wave 0 missing from the quant sync mask (0xe) while every wave had
-    // already cleared the W13->W2 barrier (0xf).
-    uint32_t dw[16];
-    asm volatile("global_load_dwordx4 %0, %4, off sc0 sc1 nt\n"
-                 "global_load_dwordx4 %1, %5, off sc0 sc1 nt\n"
-                 "global_load_dwordx4 %2, %6, off sc0 sc1 nt\n"
-                 "global_load_dwordx4 %3, %7, off sc0 sc1 nt"
-                 : "=&v"(*(i32x4_t *)&dw[0]),
-                   "=&v"(*(i32x4_t *)&dw[4]),
-                   "=&v"(*(i32x4_t *)&dw[8]),
-                   "=&v"(*(i32x4_t *)&dw[12])
-                 : "v"(base_ptr),
-                   "v"(base_ptr + 4),
-                   "v"(base_ptr + 8),
-                   "v"(base_ptr + 12)
-                 : "memory");
+    // already cleared the W13->W2 barrier (0xf). Splitting to one instruction
+    // per block removes the cross-load hazard; "&" keeps each load's own
+    // destination off its own address.
+    uint32_t dw[SUB_BLOCK / 2];
+#pragma unroll
+    for (int d = 0; d < NDW4; d++) {
+      asm volatile("global_load_dwordx4 %0, %1, off sc0 sc1 nt"
+                   : "=&v"(*(i32x4_t *)&dw[d * 4])
+                   : "v"(base_ptr + d * 4)
+                   : "memory");
+    }
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 
     // Convert to float and find amax
-    float vals[32];
+    float vals[SUB_BLOCK];
     float amax = 0.0f;
 #pragma unroll
-    for (int j = 0; j < 16; j++) {
+    for (int j = 0; j < SUB_BLOCK / 2; j++) {
       float lo = _gang_bf16_to_float((unsigned short)(dw[j] & 0xFFFF));
       float hi = _gang_bf16_to_float((unsigned short)(dw[j] >> 16));
       vals[j * 2] = lo;
@@ -470,24 +529,27 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_nt(
       amax = fmaxf(amax, fmaxf(fabsf(lo), fabsf(hi)));
     }
 
-    // Combine amaxes across the 4 sub-blocks of this 128-element super-block.
-    //
-    // NSUBBLOCKS is REDUCTION_SIZE/32 and is NOT guaranteed to be a multiple
-    // of 4: for the W2 path REDUCTION_SIZE = INTERMEDIATE_SIZE = 2880, giving
-    // NSUBBLOCKS = 90. The last super-block therefore has only 2 real
-    // sub-blocks (sb 88, 89), but the shuffles below still read lanes for
-    // sb 90 and 91 -- threads whose loop condition failed, so their `amax`
-    // is an uninitialized register. Clamping the partner index to the last
-    // valid sub-block makes the reduction read only lanes that ran.
-    int base_lane = lane_id & ~3;
-    int const sb_first = sb - sub_idx;  // first sb of this super-block
-    int const sb_last = NSUBBLOCKS - 1; // last sb that actually runs
-    int const n_valid = min(4, sb_last - sb_first + 1);
-    float a0 = __shfl(amax, base_lane);
-    float a1 = __shfl(amax, base_lane + min(1, n_valid - 1));
-    float a2 = __shfl(amax, base_lane + min(2, n_valid - 1));
-    float a3 = __shfl(amax, base_lane + min(3, n_valid - 1));
-    float block_amax = fmaxf(fmaxf(a0, a1), fmaxf(a2, a3));
+    // Combine amaxes across the sub-blocks of this 128-element super-block.
+    float block_amax;
+    if constexpr (ALIGNED) {
+      block_amax = _gang_amax_group<GROUP>(amax);
+    } else {
+      // NSUBBLOCKS is not guaranteed to be a multiple of GROUP. When it is
+      // not, the last super-block is short, but the shuffles would still read
+      // lanes for sub-blocks past the end -- threads whose loop condition
+      // failed, so their `amax` is an uninitialized register. Clamping the
+      // partner index to the last valid sub-block makes the reduction read
+      // only lanes that ran.
+      int const base_lane = lane_id & ~(GROUP - 1);
+      int const sb_first = sb - sub_idx;
+      int const n_valid = min(GROUP, NSUBBLOCKS - sb_first);
+      block_amax = 0.0f;
+#pragma unroll
+      for (int p = 0; p < GROUP; p++) {
+        block_amax =
+            fmaxf(block_amax, __shfl(amax, base_lane + min(p, n_valid - 1)));
+      }
+    }
 
     // Compute E8M0 scale
     uint8_t se = _gang_compute_e8m0_fp8(block_amax);
@@ -503,9 +565,9 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_nt(
       scale_f = sv.f;
     }
 
-// Pack 32 values to FP8
+// Pack SUB_BLOCK values to FP8
 #pragma unroll
-    for (int j = 0; j < 32; j += 4) {
+    for (int j = 0; j < SUB_BLOCK; j += 4) {
       fp8x4_t pk = {};
       pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
           pk, vals[j], vals[j + 1], scale_f, false);

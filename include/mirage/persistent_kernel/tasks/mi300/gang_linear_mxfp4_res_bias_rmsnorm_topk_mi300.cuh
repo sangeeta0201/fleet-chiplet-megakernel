@@ -1100,7 +1100,7 @@ oproj_barrier :
         for (int w = 0; w < NUM_WAVES; w++) {
           tot += red[w];
         }
-        red[0] = rsqrtf(tot / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
+        red[0] = MPK_RMS_RCP(tot, ACTUAL_HIDDEN_DIM, 1e-5f);
       }
       __syncthreads();
       irms = red[0];
