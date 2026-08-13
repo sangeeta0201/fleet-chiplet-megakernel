@@ -1044,10 +1044,17 @@ __device__ __noinline__ void
     // published: vmcnt is per-wave, so neither the release on the atomic nor
     // s_barrier covers the other waves. Drain, then barrier, then arrive --
     // the same ordering the other release sites in this file use.
+    //
+    // MPK_DRAIN_OVERLAP moves that drain to *after* the arrival, so the store
+    // retirement overlaps the barrier spin instead of preceding it. It is a
+    // measurement arm, not a shipping mode: see the correctness note at the
+    // post-arrival site for why it may not be enabled by default.
 #ifdef MPK_DRAIN_STATS
     unsigned long long _dr0 = __builtin_amdgcn_s_memrealtime();
 #endif
+#ifndef MPK_DRAIN_OVERLAP
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
 #ifdef MPK_DRAIN_STATS
     unsigned long long _dr1 = __builtin_amdgcn_s_memrealtime();
 #endif
@@ -1125,6 +1132,24 @@ __device__ __noinline__ void
       s_dr3 = __builtin_amdgcn_s_memrealtime();
 #endif
     }
+
+#ifdef MPK_DRAIN_OVERLAP
+    // ── Drain overlapped with the barrier spin (measurement arm) ──────────
+    //
+    // The arrival above has already been published; this retires the stores
+    // it was meant to advertise. Every thread drains, because vmcnt is
+    // per-wave and the arrival speaks for all four waves of this block.
+    //
+    // CORRECTNESS: this is deliberately weaker than the default. The arrival
+    // *is* the statement "my W2 stores are visible", so publishing it before
+    // the drain lets another XCD observe the arrival, clear the barrier, and
+    // read a moe_workspace_f32 slot whose store has not landed -- the exact
+    // race Phase 9 exists to close. It survives in practice only because the
+    // release still has to cross all 8 XCDs, which takes far longer than the
+    // drain; that is a timing accident, not a guarantee. Kept as a flag so
+    // the ceiling of the idea is a measured number rather than an argument.
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
 
 #ifdef MPK_PREFETCH_NEXT_QKV
     // ── Next layer's QKV weight DMA, issued into the barrier spin ────────
