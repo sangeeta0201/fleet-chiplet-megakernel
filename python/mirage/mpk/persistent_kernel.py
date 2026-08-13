@@ -365,6 +365,13 @@ def get_compile_command(
             flags = flags + ["-DMPK_W13_LDS_WEIGHTS"]
         if int(os.environ.get("W13_LDS_PREFETCH", "1")) == 1:
             flags = flags + ["-DMPK_W13_LDS_PREFETCH"]
+        if int(os.environ.get("MPK_PREFETCH_NEXT_QKV", "1")) == 1:
+            # Issue the next layer's QKV weight HBM->LDS DMA during the Phase 9
+            # layer-barrier spin, where the memory system is otherwise idle for
+            # ~7.7 us per worker per layer. 2.482 -> 2.456 ms/iter at B=1
+            # seq 512. Only applies to the fused-layer path; the LM-head
+            # variant is excluded because it uses input slots 24..27 itself.
+            flags = flags + ["-DMPK_PREFETCH_NEXT_QKV"]
         if int(os.environ.get("MPK_GAP_TIMING", "0")) == 1:
             flags = flags + ["-DMPK_ENABLE_GAP_TIMING"]
             flags = flags + ["-DMPK_ENABLE_DEVICE_TASK_ACCUM"]

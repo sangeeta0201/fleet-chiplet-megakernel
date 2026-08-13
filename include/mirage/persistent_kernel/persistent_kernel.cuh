@@ -2111,6 +2111,66 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                 }
                 __syncthreads();
               }
+
+#ifdef MPK_PREFETCH_NEXT_QKV
+              // Publish the NEXT layer's QKV weight pointer so the fused task
+              // can start its HBM->LDS weight DMA during the Phase 9 barrier
+              // spin instead of at the top of the next layer.
+              //
+              // Slot 24 is free for the plain fused variant: it declares 24
+              // inputs (0..23) and the tables are sized to the TaskDesc
+              // capacity of 28, so the host-side null validator already treats
+              // >= 24 as legitimately unused.
+              //
+              // It is NOT free for the LM-head variant, which really does use
+              // 24..27 -- so the whole publish is gated on the task type. That
+              // variant is dead today (an early return at the top of
+              // gang_full_layer_with_lmhead_fused_mi300.cuh) but FUSE_TAIL is
+              // meant to come back, and writing nullptr over a live input
+              // would fault rather than fail a gate. The gate costs the
+              // prefetch entirely under FUSE_TAIL, which is the right trade
+              // until someone gives that variant a slot of its own.
+              //
+              // Set outside the `ml > 0` guard above: layer 0 skips the table
+              // copy (its pointers come from the precomputed dispatch buffer),
+              // but it still needs to know layer 1's weights.
+              //
+              // Null on the last layer. The next reader would be layer 0 of
+              // the following decode iteration, and tasks that use LDS run in
+              // between (the MoE residual-add tail), so anything staged there
+              // would be clobbered before it could be read.
+              // Two slots, because the producer and the consumer need
+              // different facts at different times and neither can derive the
+              // other's:
+              //
+              //   [24] the NEXT layer's QKV weight pointer -- what Phase 9 of
+              //        *this* layer issues its DMA against. Null on the last
+              //        layer.
+              //   [25] non-null iff the PREVIOUS layer's Phase 9 staged this
+              //        layer's weights -- what Phase 1 keys its skip off. That
+              //        is exactly `ml > 0`, and the value stored is this
+              //        layer's own weight pointer so the two ends can be
+              //        checked against each other.
+              //
+              // Carrying [25] as __shared__ state across the ml loop instead
+              // would look cheaper but has no correct initial value: the very
+              // first layer of the very first iteration would read whatever
+              // was in LDS. Recomputing it host-side from `ml` is stateless.
+              if (threadIdx.x == 0 &&
+                  task_desc->task_type == TASK_GANG_FULL_LAYER_FUSED_MI300) {
+                int const next_ml = ml + 1;
+                task_desc->input_ptrs[24] =
+                    (next_ml < config.ml_num_layers)
+                        ? config.ml_input_table[(xcd_id * config.ml_num_layers +
+                                                 next_ml) *
+                                                    MAX_INPUTS_PER_TASK +
+                                                4]
+                        : nullptr;
+                task_desc->input_ptrs[25] =
+                    (ml > 0) ? task_desc->input_ptrs[4] : nullptr;
+              }
+              __syncthreads();
+#endif
 #ifdef MPK_NIL_TRIPWIRE
               // Breadcrumb: which layer this worker reached, and whether the
               // pointer set it is about to hand to the kernel contains a null.

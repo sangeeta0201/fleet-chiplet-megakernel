@@ -364,7 +364,21 @@ __device__ __noinline__ void
         qkv_n_wgs_per_xcd,
         kv_stride,
         q_ws_stride,
-        xcd_rank);
+        xcd_rank,
+#ifdef MPK_PREFETCH_NEXT_QKV
+        // Skip the DMA: the previous layer's Phase 9 already staged these
+        // exact bytes into this exact LDS region during its barrier spin.
+        // input_ptrs[25] is this layer's own weight pointer when the previous
+        // layer prefetched and null otherwise (it is null on layer 0, which
+        // has no previous layer), so this reduces to "was there a producer".
+        // The equality check is not redundant: it is the one place the two
+        // ends of the hand-off can disagree, and a mismatch here would be
+        // silent wrong numerics rather than a fault.
+        /*weights_preloaded=*/input_ptrs[25] == input_ptrs[4]
+#else
+        /*weights_preloaded=*/false
+#endif
+    );
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
     _fused_t0a = __builtin_amdgcn_s_memrealtime();
@@ -1033,6 +1047,8 @@ __device__ __noinline__ void
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     __syncthreads();
 
+    __shared__ int s_layer_rel_prev;
+
     if (tid == 0) {
       // Snapshot this XCD's release line *before* arriving. Layer L's release
       // is written only after all 240 workers arrive, this one included, so
@@ -1047,7 +1063,7 @@ __device__ __noinline__ void
       // (pc_iter is __shared__). A layer-derived target would make every
       // relaunch after a warmup wait on a value already in the past and hang
       // all 240 workers. Same reasoning as the attn_global bump above.
-      int const rel_prev = ld_nt_s32(&layer_release[xcd_id * 16]);
+      s_layer_rel_prev = ld_nt_s32(&layer_release[xcd_id * 16]);
 
       // The two arrival targets are division snapshots for the same reason,
       // and are race-free because the barrier each belongs to bounds it.
@@ -1084,8 +1100,50 @@ __device__ __noinline__ void
           asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         }
       }
+    }
 
-      while (ld_nt_s32(&layer_release[xcd_id * 16]) <= rel_prev) {
+#ifdef MPK_PREFETCH_NEXT_QKV
+    // ── Next layer's QKV weight DMA, issued into the barrier spin ────────
+    //
+    // Measured, this barrier costs mean_wait=7683 ns per worker per layer
+    // (n=4.39M): 0.277 ms of the 2.49 ms iteration spent waiting on the
+    // slowest XCD. The wait is a scheduling cost, not a bandwidth one, so
+    // weight traffic issued here is close to free -- the memory system is
+    // otherwise idle for those microseconds.
+    //
+    // Placement is load-bearing on both sides:
+    //
+    //   * AFTER the arrival block above, not before it. The last-arriving
+    //     XCD's leader executes `s_waitcnt vmcnt(0)` in its release fan-out,
+    //     which drains *all* of this wave's outstanding vector memory --
+    //     including a prefetch issued earlier. That worker is by definition
+    //     the critical path, so it would stall on its own DMA and delay the
+    //     release for all 240. Issuing after the fan-out keeps it off.
+    //
+    //   * AFTER the `__syncthreads()` that opens this block. buffer_load_lds
+    //     retires under vmcnt while MoE's ds_writes retire under lgkmcnt, so
+    //     the two are not ordered against each other; a Phase 8 LDS write
+    //     still in flight could land on top of the staged weights. The
+    //     s_barrier inside __syncthreads drains lgkmcnt first.
+    //
+    // Only Phase-1 workers stage anything: the rest have no QKV tile next
+    // layer and their LDS would just be dirtied for nothing. tile_idx there
+    // is xcd_rank, and xcd_rank is fixed for the life of the task, so this
+    // worker prefetches exactly the tile it will itself execute.
+    //
+    // input_ptrs[24] is null on the last layer of the iteration -- see the
+    // publish site in persistent_kernel.cuh for why nothing may be staged
+    // across the iteration boundary.
+    if (input_ptrs[24] != nullptr && xcd_rank < total_qkv_tiles_per_xcd) {
+      qkv_prefetch_weights_lds<QKV_BATCH_SIZE,
+                               QKV_OUTPUT_PER_WG,
+                               QKV_REDUCTION_SIZE>(
+          input_ptrs[24], qkv_n_wgs_per_xcd, xcd_rank);
+    }
+#endif
+
+    if (tid == 0) {
+      while (ld_nt_s32(&layer_release[xcd_id * 16]) <= s_layer_rel_prev) {
         __builtin_amdgcn_s_sleep(1);
       }
       __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
