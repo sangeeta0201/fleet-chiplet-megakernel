@@ -1044,10 +1044,23 @@ __device__ __noinline__ void
     // published: vmcnt is per-wave, so neither the release on the atomic nor
     // s_barrier covers the other waves. Drain, then barrier, then arrive --
     // the same ordering the other release sites in this file use.
+#ifdef MPK_DRAIN_STATS
+    unsigned long long _dr0 = __builtin_amdgcn_s_memrealtime();
+#endif
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#ifdef MPK_DRAIN_STATS
+    unsigned long long _dr1 = __builtin_amdgcn_s_memrealtime();
+#endif
     __syncthreads();
+#ifdef MPK_DRAIN_STATS
+    unsigned long long _dr2 = __builtin_amdgcn_s_memrealtime();
+#endif
 
     __shared__ int s_layer_rel_prev;
+#ifdef MPK_DRAIN_STATS
+    __shared__ unsigned long long s_dr3;
+    __shared__ bool s_was_last_local;
+#endif
 
     if (tid == 0) {
       // Snapshot this XCD's release line *before* arriving. Layer L's release
@@ -1083,12 +1096,20 @@ __device__ __noinline__ void
       int local_prev =
           atom_add_release_gpu_s32(&layer_local[xcd_id * 16], 1);
 
+#ifdef MPK_DRAIN_STATS
+      s_was_last_local = (local_prev == local_expected - 1);
+#endif
       if (local_prev == local_expected - 1) {
         // Last worker on this XCD: this XCD's MoE stores are all retired, so
         // publish one arrival on behalf of the whole die.
         int global_expected =
             (__atomic_load_n(layer_global, __ATOMIC_RELAXED) / 8 + 1) * 8;
         int global_prev = atom_add_release_gpu_s32(layer_global, 1);
+#ifdef MPK_DRAIN_STATS
+        if (global_prev == global_expected - 1) {
+          atomicAdd(&g_last_xcd[xcd_id], 1ULL);
+        }
+#endif
         if (global_prev == global_expected - 1) {
           // Last XCD overall: fan the release out with st_wt (write-through,
           // bypasses L2) so every worker polls a line it already owns.
@@ -1100,6 +1121,9 @@ __device__ __noinline__ void
           asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         }
       }
+#ifdef MPK_DRAIN_STATS
+      s_dr3 = __builtin_amdgcn_s_memrealtime();
+#endif
     }
 
 #ifdef MPK_PREFETCH_NEXT_QKV
@@ -1147,6 +1171,75 @@ __device__ __noinline__ void
         __builtin_amdgcn_s_sleep(1);
       }
       __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#ifdef MPK_DRAIN_STATS
+      unsigned long long _dr4 = __builtin_amdgcn_s_memrealtime();
+      // s_memrealtime ticks at 100 MHz -> 10 ns per tick.
+      unsigned long long drain = (_dr1 - _dr0) * 10;
+      unsigned long long sync = (_dr2 - _dr1) * 10;
+      unsigned long long arrive = (s_dr3 - _dr2) * 10;
+      unsigned long long spin = (_dr4 - s_dr3) * 10;
+      unsigned long long n = atomicAdd(&g_drain_n, 1ULL);
+      atomicAdd(&g_drain_sum, drain);
+      atomicAdd(&g_sync_sum, sync);
+      atomicAdd(&g_arrive_sum, arrive);
+      atomicAdd(&g_spin_sum, spin);
+      atomicAdd(&g_spin_xcd[xcd_id], spin);
+      atomicAdd(&g_n_xcd[xcd_id], 1ULL);
+      if (xcd_rank < 64) {
+        atomicAdd(&g_spin_rank[xcd_rank], spin);
+        atomicAdd(&g_n_rank[xcd_rank], 1ULL);
+      }
+      if (s_was_last_local) {
+        atomicAdd(&g_spin_lastlocal, spin);
+        atomicAdd(&g_n_lastlocal, 1ULL);
+      }
+      if (n % 100000 == 0 && n > 0) {
+        printf("[DRAIN] n=%llu drain=%llu sync=%llu arrive=%llu spin=%llu "
+               "tot=%llu\n",
+               n,
+               g_drain_sum / n,
+               g_sync_sum / n,
+               g_arrive_sum / n,
+               g_spin_sum / n,
+               (g_drain_sum + g_sync_sum + g_arrive_sum + g_spin_sum) / n);
+        printf("[XCDSPIN] %llu %llu %llu %llu %llu %llu %llu %llu | last "
+               "%llu %llu %llu %llu %llu %llu %llu %llu\n",
+               g_spin_xcd[0] / (g_n_xcd[0] ? g_n_xcd[0] : 1),
+               g_spin_xcd[1] / (g_n_xcd[1] ? g_n_xcd[1] : 1),
+               g_spin_xcd[2] / (g_n_xcd[2] ? g_n_xcd[2] : 1),
+               g_spin_xcd[3] / (g_n_xcd[3] ? g_n_xcd[3] : 1),
+               g_spin_xcd[4] / (g_n_xcd[4] ? g_n_xcd[4] : 1),
+               g_spin_xcd[5] / (g_n_xcd[5] ? g_n_xcd[5] : 1),
+               g_spin_xcd[6] / (g_n_xcd[6] ? g_n_xcd[6] : 1),
+               g_spin_xcd[7] / (g_n_xcd[7] ? g_n_xcd[7] : 1),
+               g_last_xcd[0],
+               g_last_xcd[1],
+               g_last_xcd[2],
+               g_last_xcd[3],
+               g_last_xcd[4],
+               g_last_xcd[5],
+               g_last_xcd[6],
+               g_last_xcd[7]);
+        printf("[INTER] lastlocal_spin=%llu n=%llu\n",
+               g_spin_lastlocal / (g_n_lastlocal ? g_n_lastlocal : 1),
+               g_n_lastlocal);
+        for (int r0 = 0; r0 < 30; r0 += 10) {
+          printf("[RANK%02d] %llu %llu %llu %llu %llu %llu %llu %llu %llu "
+                 "%llu\n",
+                 r0,
+                 g_spin_rank[r0 + 0] / (g_n_rank[r0 + 0] ? g_n_rank[r0 + 0] : 1),
+                 g_spin_rank[r0 + 1] / (g_n_rank[r0 + 1] ? g_n_rank[r0 + 1] : 1),
+                 g_spin_rank[r0 + 2] / (g_n_rank[r0 + 2] ? g_n_rank[r0 + 2] : 1),
+                 g_spin_rank[r0 + 3] / (g_n_rank[r0 + 3] ? g_n_rank[r0 + 3] : 1),
+                 g_spin_rank[r0 + 4] / (g_n_rank[r0 + 4] ? g_n_rank[r0 + 4] : 1),
+                 g_spin_rank[r0 + 5] / (g_n_rank[r0 + 5] ? g_n_rank[r0 + 5] : 1),
+                 g_spin_rank[r0 + 6] / (g_n_rank[r0 + 6] ? g_n_rank[r0 + 6] : 1),
+                 g_spin_rank[r0 + 7] / (g_n_rank[r0 + 7] ? g_n_rank[r0 + 7] : 1),
+                 g_spin_rank[r0 + 8] / (g_n_rank[r0 + 8] ? g_n_rank[r0 + 8] : 1),
+                 g_spin_rank[r0 + 9] / (g_n_rank[r0 + 9] ? g_n_rank[r0 + 9] : 1));
+        }
+      }
+#endif
     }
     __syncthreads();
     // No invalidate here: the task body re-entered for the next layer opens

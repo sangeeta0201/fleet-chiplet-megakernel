@@ -3277,6 +3277,12 @@ class PersistentKernel:
         total_w2 = max_activated * w2_tiles
         total_tiles_all = total_w13_padded + total_w2
         moe_total_tiles_per_xcd = (total_tiles_all + 7) // 8
+        import os as _os
+        if _os.environ.get("MPK_MOE_TILE_DEBUG"):
+            print(f"[MOETILE] max_activated={max_activated} n_bblk={n_bblk} "
+                  f"w13_wgs={w13_wgs} w2_wgs={w2_wgs} w13_real={total_w13_real} "
+                  f"w13_pad={total_w13_padded} w2={total_w2} all={total_tiles_all} "
+                  f"per_xcd={moe_total_tiles_per_xcd} mod30={moe_total_tiles_per_xcd%30}", flush=True)
 
         # Match standalone MoE worker count (30 = 240 workers / 8 XCDs)
         workers_per_xcd = self.num_workers // 8  # 30
@@ -3455,6 +3461,12 @@ class PersistentKernel:
         total_w2 = max_activated * w2_tiles
         total_tiles_all = total_w13_padded + total_w2
         moe_total_tiles_per_xcd = (total_tiles_all + 7) // 8
+        import os as _os
+        if _os.environ.get("MPK_MOE_TILE_DEBUG"):
+            print(f"[MOETILE2] max_activated={max_activated} n_bblk={n_bblk} "
+                  f"w13_real={total_w13_real} w13_pad={total_w13_padded} "
+                  f"w2={total_w2} all={total_tiles_all} "
+                  f"per_xcd={moe_total_tiles_per_xcd} mod30={moe_total_tiles_per_xcd%30}", flush=True)
 
         workers_per_xcd = self.num_workers // 8  # 30
 
@@ -3655,6 +3667,12 @@ class PersistentKernel:
         total_w2 = max_activated * w2_tiles
         total_tiles_all = total_w13_padded + total_w2
         moe_total_tiles_per_xcd = (total_tiles_all + 7) // 8
+        import os as _os
+        if _os.environ.get("MPK_MOE_TILE_DEBUG"):
+            print(f"[MOETILE2] max_activated={max_activated} n_bblk={n_bblk} "
+                  f"w13_real={total_w13_real} w13_pad={total_w13_padded} "
+                  f"w2={total_w2} all={total_tiles_all} "
+                  f"per_xcd={moe_total_tiles_per_xcd} mod30={moe_total_tiles_per_xcd%30}", flush=True)
 
         workers_per_xcd = self.num_workers // 8  # 30
 

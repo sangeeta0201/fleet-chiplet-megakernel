@@ -51,6 +51,29 @@ __device__ int g_subphase_active;
 __device__ unsigned long long g_subphase_scratch[8];
 #endif
 
+#ifdef MPK_DRAIN_STATS
+// Phase 9 barrier segment attribution: how much of the layer-boundary wait is
+// store drain (s_waitcnt vmcnt(0)) vs rendezvous vs spinning on other XCDs.
+__device__ unsigned long long g_drain_n;
+__device__ unsigned long long g_drain_sum;
+__device__ unsigned long long g_sync_sum;
+__device__ unsigned long long g_arrive_sum;
+__device__ unsigned long long g_spin_sum;
+// Per-XCD spin, to tell a fixed slow die from a rotating one.
+__device__ unsigned long long g_spin_xcd[8];
+__device__ unsigned long long g_n_xcd[8];
+// How often each XCD is the last one to arrive (i.e. is the critical path).
+__device__ unsigned long long g_last_xcd[8];
+// Spin of each XCD's *last local* arriver: that worker has no intra-XCD wait
+// left, so its spin is purely the inter-XCD component.
+__device__ unsigned long long g_spin_lastlocal;
+__device__ unsigned long long g_n_lastlocal;
+// Spin by xcd_rank: the intra-XCD load-imbalance map. Rank determines role
+// (QKV/attn vs MoE tiles), so this says which workers idle and which straggle.
+__device__ unsigned long long g_spin_rank[64];
+__device__ unsigned long long g_n_rank[64];
+#endif
+
 #ifdef MPK_FUSED_PHASE_TIMING
 // Fused O-proj+MoE phase timing: [0]=oproj_ns, [1]=poll_ns, [2]=moe_ns,
 // [3]=count
