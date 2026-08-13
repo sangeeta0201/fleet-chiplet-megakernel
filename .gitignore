@@ -91,3 +91,6 @@ tests/standalone/test_mfma_pipeline_hazards
 *-host-x86_64-unknown-linux-gnu.hipi
 *-host-x86_64-unknown-linux-gnu.s
 *-hip-amdgcn-amd-amdhsa.hipfb
+# -fgpu-rdc adds these
+*-hip-amdgcn-amd-amdhsa-*
+*-hip-amdgcn-amd-amdhsa.mcin

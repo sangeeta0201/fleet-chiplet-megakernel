@@ -286,11 +286,18 @@ def get_compile_command(
         rocblas_inc = os.path.join(mirage_deps_path, "rocblas", "include")
         # HIP compatibility headers directory (must come before CUTLASS includes)
         hip_compat_inc = os.path.join(mirage_inc_path, 'mirage/hip_compat')
+        # -O3 -fgpu-rdc, matching croc. The old "-O3 hangs the AMDGPU register
+        # allocator" claim no longer holds on this toolchain; -fgpu-rdc keeps
+        # the module split rather than handing the allocator one huge
+        # function. Not a speedup on its own. MPK_O2=1 reverts.
+        opt_flags = ["-O3", "-fgpu-rdc"]
+        if int(os.environ.get("MPK_O2", "0")) == 1:
+            opt_flags = ["-O2"]
         common_cmd = [
             cc,
             "-x", "hip",
             file_name,
-            "-O2",  # -O3 causes LLVM AMDGPU register allocator to hang on large fused kernels
+            *opt_flags,
             "--save-temps",  # TEMP: dump assembly for v_mov analysis
             # Omit -lineinfo for ROCm: hipcc forwards it to ld.lld which treats it as -l lineinfo
             f"-I{py_include_dir}",

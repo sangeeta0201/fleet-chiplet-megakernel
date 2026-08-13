@@ -3565,10 +3565,20 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
   }
 }
 
+// Minimum workgroups per CU. At 1 the allocator settles at 280 VGPRs
+// (1 wave/SIMD of the 512-VGPR file); =2 takes it to 200 and doubles
+// occupancy. Measured flat: +5 us over 3 paired rounds (sd 12 us). The MoE
+// inner loop feeds MFMA from LDS, not HBM, so a second resident wave adds no
+// memory-level parallelism -- it splits the same LDS bandwidth and MFMA
+// issue slots. Kept as a flag; costs nothing at the default.
+#ifndef MPK_WAVES_PER_SIMD
+#define MPK_WAVES_PER_SIMD 1
+#endif
+
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 __global__ __launch_bounds__(WORKER_NUM_THREADS,
-                             1) void persistent_kernel(RuntimeConfig config) {
+                             MPK_WAVES_PER_SIMD) void persistent_kernel(RuntimeConfig config) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
   // Dynamic role election: each block discovers its XCD, then
   // the first block on each XCD becomes the scheduler for that XCD.
@@ -3622,7 +3632,7 @@ __global__ __launch_bounds__(WORKER_NUM_THREADS,
 }
 
 __global__ __launch_bounds__(WORKER_NUM_THREADS,
-                             1) void worker_kernel(RuntimeConfig config) {
+                             MPK_WAVES_PER_SIMD) void worker_kernel(RuntimeConfig config) {
   worker_checker(config);
   execute_worker(config);
 }
