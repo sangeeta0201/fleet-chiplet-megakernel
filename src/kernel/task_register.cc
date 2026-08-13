@@ -2150,14 +2150,18 @@ int TaskRegister::register_gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300_task(
 // params: [hidden_size, oproj_rows_per_wg, oproj_tiles_per_xcd,
 //          tiles_per_xcd, total_barrier_arrivals, actual_hidden_dim,
 //          num_experts, topk_k, router_tile_n, total_router_tiles,
-//          oproj_reduction_size, scaling_milli, norm_topk_prob, batch_size]
-// Inputs (10): [attn_out, oproj_weight, residual, norm_weight, norm_output,
+//          oproj_reduction_size, scaling_milli, norm_topk_prob, batch_size,
+//          moe_intermediate, moe_w13_opw, moe_w2_opw,
+//          moe_w13_tiles_per_xcd, moe_w2_tiles_per_xcd]
+// Inputs (15): [attn_out, oproj_weight, residual, norm_weight, norm_output,
 //               router_weight, router_bias, logits_scratch, router_counter,
-//               oproj_counters]
-// Outputs (4): [hidden, topk_weight, routing_indices, active_expert_ids]
+//               oproj_counters, moe_gate_up_weight, moe_down_weight,
+//               moe_w13_bias, moe_w2_bias, moe_swiglu_out]
+// Outputs (5): [hidden, topk_weight, routing_indices, active_expert_ids,
+//               moe_workspace_f32]
 int TaskRegister::register_gang_oproj_router_fused_mi300_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 14);
+  assert(params.size() == 19);
   int hidden_size = params[0];
   int oproj_rows_per_wg = params[1];
   int oproj_tiles_per_xcd = params[2];
@@ -2172,11 +2176,16 @@ int TaskRegister::register_gang_oproj_router_fused_mi300_task(
   int scaling_milli = params[11];
   int norm_topk_prob = params[12];
   int batch_size = params[13];
+  int moe_intermediate = params[14];
+  int moe_w13_opw = params[15];
+  int moe_w2_opw = params[16];
+  int moe_w13_tiles_per_xcd = params[17];
+  int moe_w2_tiles_per_xcd = params[18];
 
   std::vector<tb::TBInputOp *> input_ops;
   std::vector<tb::TBInputOp *> output_ops;
-  int num_inputs = 10;
-  int num_outputs = 4;
+  int num_inputs = 15;
+  int num_outputs = 5;
   assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
   for (auto const &op : bgraph.operators) {
     assert(op->op_type == mirage::type::TB_INPUT_OP);
@@ -2197,7 +2206,14 @@ int TaskRegister::register_gang_oproj_router_fused_mi300_task(
   assert(oproj_tiles_per_xcd * oproj_rows_per_wg * 8 == hidden_size &&
          "the packed o_proj weight does not cover the hidden row exactly");
   assert(tiles_per_xcd >= oproj_tiles_per_xcd && tiles_per_xcd >= router_tile_n);
-  assert(total_barrier_arrivals == tiles_per_xcd * 8);
+  // The o_proj barrier is sized to the workers that actually run o_proj or the
+  // router, not to every dispatched worker. tiles_per_xcd is the MoE worker
+  // count now, and the MoE-only workers wait on `routing_ready` instead --
+  // decoupling the two barriers is the whole point of having both.
+  assert(total_barrier_arrivals ==
+         (oproj_tiles_per_xcd > router_tile_n ? oproj_tiles_per_xcd
+                                              : router_tile_n) *
+             8);
 
   // e_score_correction_bias arrives whole, as the sigmoid tail reads all of it.
   assert(input_ops[6]->dtensor.num_dims == 1);
@@ -2210,16 +2226,69 @@ int TaskRegister::register_gang_oproj_router_fused_mi300_task(
          topk_k + num_shared_experts);
   assert(output_ops[3]->output_tensors[0].dim[0] == num_total_experts + 1);
 
+  // ── MoE geometry ──
+  // The packed MXFP8 weight erases N and K, so num_experts is all it carries;
+  // the widths come from the biases, exactly as the standalone MoE registrar
+  // reads them. Both weights must agree on the expert count, and it is the
+  // routed experts plus the shared one -- the MoE tile decoder reads the
+  // activated count at active_expert_ids[MOE_NUM_EXPERTS].
+  assert(input_ops[10]->output_tensors[0].num_dims == 3);
+  assert(input_ops[11]->output_tensors[0].num_dims == 3);
+  int moe_num_experts = input_ops[10]->output_tensors[0].dim[0];
+  assert(input_ops[11]->output_tensors[0].dim[0] == moe_num_experts);
+  assert(moe_num_experts == num_experts + num_shared_experts);
+  assert(input_ops[12]->output_tensors[0].num_dims == 2);
+  assert(input_ops[12]->output_tensors[0].dim[0] == moe_num_experts);
+  assert(input_ops[12]->output_tensors[0].dim[1] == 2 * moe_intermediate);
+  assert(input_ops[13]->output_tensors[0].num_dims == 2);
+  assert(input_ops[13]->output_tensors[0].dim[0] == moe_num_experts);
+  assert(input_ops[13]->output_tensors[0].dim[1] == hidden_size);
+  // The SwiGLU activation is the half-width [batch, topk_total, intermediate]
+  // slab W13 writes and W2 reduces over.
+  assert(input_ops[14]->output_tensors[0].num_dims == 3);
+  assert(input_ops[14]->output_tensors[0].dim[0] == batch_size);
+  int moe_num_topk = input_ops[14]->output_tensors[0].dim[1];
+  assert(moe_num_topk == topk_k + num_shared_experts);
+  assert(input_ops[14]->output_tensors[0].dim[2] == moe_intermediate);
+  // Both MoE kernels index [batch, topk, stride] with a compile-time stride,
+  // so the tensor's own row stride has to be exactly that.
+  assert(input_ops[14]->dtensor.owner_op->op_type == type::KN_INPUT_OP);
+  assert(static_cast<int>(static_cast<kn::KNInputOp *>(
+             input_ops[14]->dtensor.owner_op)->input_strides[1]) ==
+         moe_intermediate);
+  // W2's fused epilogue atomically accumulates into an f32 [batch, hidden].
+  assert(output_ops[4]->output_tensors[0].num_dims == 2);
+  assert(output_ops[4]->output_tensors[0].dim[0] == batch_size);
+  assert(output_ops[4]->output_tensors[0].dim[1] == hidden_size);
+
+  assert(2 * moe_intermediate % moe_w13_opw == 0);
+  assert(hidden_size % moe_w2_opw == 0);
+  int moe_w13_tiles_per_expert = batch_size * (2 * moe_intermediate / moe_w13_opw);
+  int moe_w2_tiles_per_expert = batch_size * (hidden_size / moe_w2_opw);
+  // Every dispatched worker runs a W13 tile and arrives at the W13->W2
+  // barrier, so a tile count above the worker count would silently drop work
+  // on the far side of a barrier that has already been released.
+  assert(moe_w13_tiles_per_xcd <= tiles_per_xcd);
+  assert(moe_w2_tiles_per_xcd <= tiles_per_xcd);
+
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
-  code.e("kernel::gang_oproj_router_fused_kernel_mi300<$, $, $, $, $, $, $>(",
+  code.e("kernel::gang_oproj_router_fused_kernel_mi300<$, $, $, $, $, $, $, $, "
+         "$, $, $, $, $, $>(",
          batch_size,
          oproj_reduction_size,
          oproj_rows_per_wg,
          hidden_size,
          actual_hidden_dim,
          num_experts,
-         topk_k);
+         topk_k,
+         moe_intermediate,
+         moe_num_experts,
+         moe_num_topk,
+         moe_w13_tiles_per_expert,
+         moe_w2_tiles_per_expert,
+         moe_w13_opw,
+         moe_w2_opw);
   for (int i = 0; i < num_inputs; i++) {
     code.e("    task_desc->input_ptrs[$],", i);
   }
@@ -2235,6 +2304,8 @@ int TaskRegister::register_gang_oproj_router_fused_mi300_task(
   code.e("    $,", norm_topk_prob != 0 ? "true" : "false");
   code.e("    $ / 1000.0f,", scaling_milli);
   code.e("    $,", num_shared_experts);
+  code.e("    $,", moe_w13_tiles_per_xcd);
+  code.e("    $,", moe_w2_tiles_per_xcd);
   code.e("    tile_idx);");
   return register_task_variant(TASK_GANG_OPROJ_TOPK_MOE_FUSED_MI300,
                                code.to_string());

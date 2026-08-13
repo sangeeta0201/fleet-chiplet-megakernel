@@ -113,7 +113,16 @@ template <int BATCH_SIZE,
           int NUM_TOPK,
           int TILES_PER_EXPERT,
           int OUTPUT_PER_WG,
-          bool FUSE_SWIGLU = false>
+          bool FUSE_SWIGLU = false,
+          // Set by a fused caller that runs W2 in the same task, with only an
+          // in-kernel barrier between them. W2 for one expert reduces over
+          // that expert's whole intermediate, whose workgroups are spread
+          // across all 8 XCDs, so it reads activations this XCD produced.
+          // Per-XCD L2 is not coherent on MI300/MI350: as separate tasks the
+          // event boundary's buffer_wbl2 is what makes them visible, and a
+          // fused caller has no such boundary. Writing through costs the
+          // store's L2 residency, which nothing on this XCD wants back.
+          bool WRITE_THROUGH = false>
 __device__ __noinline__ void
     gang_moe_w13_linear_mxfp8_kernel(void const *input_ptr,
                                      void const *weight_ptr,
@@ -263,15 +272,42 @@ __device__ __noinline__ void
         unsigned short *act_addr = d_output +
                                    tok_idx * (NUM_TOPK * ACT_STRIDE) +
                                    topk_slot * ACT_STRIDE + (out_base >> 1);
+        unsigned short act[2];
+        bool act_ok[2];
 #pragma unroll
         for (int p = 0; p < 2; p++) {
           int const out_n = out_base + 2 * p;
-          if (out_n + 1 < OUTPUT_SIZE) {
+          act_ok[p] = (out_n + 1 < OUTPUT_SIZE);
+          if (act_ok[p]) {
             float const gate =
                 acc[2 * p] + _gang_bf16_to_float(bias_row[out_n]);
             float const up =
                 acc[2 * p + 1] + _gang_bf16_to_float(bias_row[out_n + 1]);
-            act_addr[p] = _gang_float_to_bf16(fast_silu(gate) * up);
+            act[p] = _gang_float_to_bf16(fast_silu(gate) * up);
+          }
+        }
+        if constexpr (WRITE_THROUGH) {
+          // The two activations are adjacent columns of the same row, and
+          // out_base is a multiple of 4, so act_addr is 4-byte aligned and the
+          // pair is one dword -- half as many write-through stores as doing
+          // them separately.
+          if (act_ok[0] && act_ok[1]) {
+            unsigned packed = (unsigned)act[0] | ((unsigned)act[1] << 16);
+            st_wt_u32((void *)act_addr, packed);
+          } else {
+#pragma unroll
+            for (int p = 0; p < 2; p++) {
+              if (act_ok[p]) {
+                st_wt_u16((void *)&act_addr[p], act[p]);
+              }
+            }
+          }
+        } else {
+#pragma unroll
+          for (int p = 0; p < 2; p++) {
+            if (act_ok[p]) {
+              act_addr[p] = act[p];
+            }
           }
         }
       } else {

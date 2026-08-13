@@ -4017,11 +4017,18 @@ class PersistentKernel:
         logits_scratch: DTensor,
         router_counter: DTensor,
         oproj_counters: DTensor,
+        # MoE
+        moe_gate_up_weight: DTensor,
+        moe_down_weight: DTensor,
+        moe_w13_bias: DTensor,
+        moe_w2_bias: DTensor,
+        moe_swiglu_out: DTensor,
         # outputs
         hidden: DTensor,
         topk_weight: DTensor,
         routing_indices: DTensor,
         active_expert_ids: DTensor,
+        moe_workspace_f32: DTensor,
         # parameters
         rows_per_wg: int,
         reduction_size: int,
@@ -4029,25 +4036,30 @@ class PersistentKernel:
         num_experts_per_tok: int = 4,
         routed_scaling_factor: float = 1.0,
         norm_topk_prob: bool = True,
+        moe_w13_output_per_wg: int = 64,
+        moe_w2_output_per_wg: int = 64,
         block_dim: tuple = (256, 1, 1),
     ):
-        """gang_gemv_mxfp8_with_residual_layer + the sigmoid router, fused.
+        """The whole tail of a GLM MoE layer in one gang dispatch.
 
-        The two stages either side of GLM's post-attention residual, run in one
-        gang dispatch with a cross-XCD barrier in place of the event. Both
-        halves keep their standalone semantics; see the kernel header for why
-        the barrier has to be the global kind rather than gpt-oss's per-XCD
-        epoch.
+        o_proj + post-attention RMSNorm + sigmoid/bias router + TopK + MoE
+        W13/SwiGLU + MoE W2/MulSumAdd, with in-kernel barriers where the task
+        graph used to put five events. Every sub-kernel keeps its standalone
+        semantics; see the kernel header for the barrier layout and for which
+        producers have to write through.
 
         ``hidden`` is declared unpartitioned even though the o_proj half only
         writes this XCD's columns, because the router half norms the whole row.
         The kernel reconstructs the column slice itself. ``residual`` stays
         partitioned -- nothing after Phase 1 reads it.
 
-        Inputs (10): input, oproj_mxfp8_weight, residual, norm_weight,
+        Inputs (15): input, oproj_mxfp8_weight, residual, norm_weight,
                      norm_output, router_weight, router_bias, logits_scratch,
-                     router_counter, oproj_counters.
-        Outputs (4): hidden, topk_weight, routing_indices, active_expert_ids.
+                     router_counter, oproj_counters, moe_gate_up_weight,
+                     moe_down_weight, moe_w13_bias, moe_w2_bias,
+                     moe_swiglu_out.
+        Outputs (5): hidden, topk_weight, routing_indices, active_expert_ids,
+                     moe_workspace_f32.
         """
         assert self.target_cc == 95, "MXFP8 dequant is gfx950-only"
         assert input.num_dims == 2
@@ -4087,16 +4099,53 @@ class PersistentKernel:
         assert num_shared_experts in (0, 1)
         assert topk_weight.dim(1) == num_experts_per_tok + num_shared_experts
 
-        tiles_per_xcd = max(oproj_tiles_per_xcd, router_tile_n)
+        # MoE tiling, from gang_moe_w{13,2}_linear_mxfp8_layer.
+        assert moe_gate_up_weight.num_dims == 3  # [E, expert_wgs, wg_bytes]
+        assert moe_down_weight.num_dims == 3
+        assert moe_w13_bias.num_dims == 2
+        assert moe_w2_bias.num_dims == 2
+        assert moe_swiglu_out.num_dims == 3      # [batch, topk_total, inter]
+        assert moe_workspace_f32.num_dims == 2
+        moe_num_experts = moe_gate_up_weight.dim(0)
+        assert moe_down_weight.dim(0) == moe_num_experts
+        assert moe_num_experts == num_experts + num_shared_experts
+        moe_w13_width = moe_gate_up_weight.dim(1) * moe_w13_output_per_wg
+        assert moe_w13_bias.dim(1) == moe_w13_width
+        assert moe_down_weight.dim(1) * moe_w2_output_per_wg == hidden_size
+        assert moe_w2_bias.dim(1) == hidden_size
+        moe_intermediate = moe_w13_width // 2
+        assert moe_swiglu_out.dim(2) == moe_intermediate
+        assert moe_swiglu_out.dim(1) == num_experts_per_tok + num_shared_experts
+        # Depth-4 MFMA pipeline: only the last slot carries a tail guard.
+        assert hidden_size % 512 == 0, \
+            f"MXFP8 W13 K={hidden_size} not divisible by 512"
+        assert moe_intermediate % 512 == 0, \
+            f"MXFP8 W2 K={moe_intermediate} not divisible by 512"
+
+        moe_topk_total = moe_swiglu_out.dim(1)
+        moe_max_activated = min(moe_topk_total * batch_size, moe_num_experts)
+        moe_w13_tiles_per_xcd = (
+            moe_max_activated * batch_size * moe_gate_up_weight.dim(1) + 7) // 8
+        moe_w2_tiles_per_xcd = (
+            moe_max_activated * batch_size * moe_down_weight.dim(1) + 7) // 8
+
+        # The o_proj barrier counts only the workers that run o_proj or the
+        # router; the MoE-only workers wait on the routing-ready epoch instead.
+        # tiles_per_xcd is therefore the MoE worker count, and it sets the
+        # dispatch width.
+        oproj_topk_tiles_per_xcd = max(oproj_tiles_per_xcd, router_tile_n)
+        total_barrier_arrivals = oproj_topk_tiles_per_xcd * 8
+        tiles_per_xcd = max(oproj_topk_tiles_per_xcd, moe_w13_tiles_per_xcd,
+                            moe_w2_tiles_per_xcd)
         assert tiles_per_xcd <= self.num_workers // 8, (
             f"{tiles_per_xcd} tiles per XCD exceeds the "
             f"{self.num_workers // 8} resident workers; the in-kernel barrier "
             "deadlocks if a tile has to wait for a worker")
-        total_barrier_arrivals = tiles_per_xcd * 8
-        # 9 cache-line-strided int32 slots: 8 per-XCD release flags plus the
-        # global arrival counter. Monotonic, so it is never reset and one
-        # buffer serves every layer.
-        assert oproj_counters.dim(0) >= 9 * 16
+        # 29 cache-line-strided int32 slots: the o_proj barrier's 8 release
+        # flags plus its counter at [0..8], the routing-ready epoch and its 8
+        # flags at [10..18], and the W13->W2 barrier at [20..28]. All monotonic,
+        # so nothing is ever reset and one buffer serves every layer.
+        assert oproj_counters.dim(0) >= 29 * 16
 
         scaling_milli = int(round(routed_scaling_factor * 1000.0))
         assert abs(scaling_milli / 1000.0 - routed_scaling_factor) < 1e-9
@@ -4113,15 +4162,23 @@ class PersistentKernel:
         tb_graph.new_input(logits_scratch, (1, -1, -1), 1, True)
         tb_graph.new_input(router_counter, (-1, -1, -1), 0, True)
         tb_graph.new_input(oproj_counters, (-1, -1, -1), 0, True)
+        tb_graph.new_input(moe_gate_up_weight, (-1, 1, -1), 2, True)
+        tb_graph.new_input(moe_down_weight, (-1, 1, -1), 2, True)
+        tb_graph.new_input(moe_w13_bias, (-1, -1, -1), -1, True)
+        tb_graph.new_input(moe_w2_bias, (-1, -1, -1), -1, True)
+        tb_graph.new_input(moe_swiglu_out, (-1, 2, -1), -1, True)
         tb_graph.new_input(hidden, (-1, -1, -1), -1, True)
         tb_graph.new_input(topk_weight, (0, -1, -1), -1, True)
         tb_graph.new_input(routing_indices, (-1, -1, -1), -1, True)
         tb_graph.new_input(active_expert_ids, (-1, -1, -1), -1, True)
+        tb_graph.new_input(moe_workspace_f32, (-1, -1, -1), -1, True)
         self.kn_graph.customized(
             [input, oproj_mxfp8_weight, residual, norm_weight, norm_output,
              router_weight, router_bias, logits_scratch, router_counter,
-             oproj_counters,
-             hidden, topk_weight, routing_indices, active_expert_ids],
+             oproj_counters, moe_gate_up_weight, moe_down_weight,
+             moe_w13_bias, moe_w2_bias, moe_swiglu_out,
+             hidden, topk_weight, routing_indices, active_expert_ids,
+             moe_workspace_f32],
             tb_graph,
         )
         self.kn_graph.register_task(
@@ -4130,7 +4187,9 @@ class PersistentKernel:
              total_barrier_arrivals, actual_hidden_dim, num_experts,
              num_experts_per_tok, router_tile_n, total_router_tiles,
              reduction_size, scaling_milli, 1 if norm_topk_prob else 0,
-             batch_size]
+             batch_size, moe_intermediate, moe_w13_output_per_wg,
+             moe_w2_output_per_wg, moe_w13_tiles_per_xcd,
+             moe_w2_tiles_per_xcd]
         )
 
     def gang_oproj_topk_moe_fused_layer(

@@ -507,14 +507,19 @@ if __name__ == "__main__":
         # standalone o_proj.
         #
         #
-        # Off by default because it is at parity, not ahead: 5.381 ms fused
-        # against 5.362 unfused, three samples each on one binary, tokens
-        # identical. It was 5.44 before the router kernel took over the barrier
-        # wait so it could prefetch gamma and the gate row across it -- see the
-        # kernel header. The 47 dispatch gaps the fusion removes now roughly
-        # cancel the barrier rather than losing to it.
+        # The whole tail of a MoE layer in one task: o_proj, post-attention
+        # RMSNorm, router, TopK, MoE W13+SwiGLU, MoE W2+MulSumAdd. Five events
+        # and five dispatches become two in-kernel barriers.
+        #
+        # Fusing only o_proj+router measured at parity (5.381 vs 5.362): the
+        # barrier costs what the dispatch cost, which is the expected result
+        # for a pairwise fusion and is not where gpt-oss's speed comes from.
+        # The profile says the cost is occupancy, not dispatch -- 85.7 of 240
+        # workers busy on average, and 3.2x more depwait than compute on MoE
+        # W13. A narrow stage only stops paying for a 240-worker barrier if it
+        # rides inside a wide stage's workgroup, and that needs one task.
         FUSE_OPROJ_ROUTER = (
-            os.environ.get("GLM_FUSE_OPROJ_ROUTER", "0") == "1")
+            os.environ.get("GLM_FUSE_OPROJ_ROUTER", "1") == "1")
         MOE_MXFP8_OPW = 64
         if MOE_MXFP8:
             # Depth-4 MFMA pipeline: only the last of the four slots carries a
@@ -860,10 +865,12 @@ if __name__ == "__main__":
         # 0 for the next layer, so one buffer serves all of them.
         router_topk_counter = make_tensor("router_topk_counter", (1,),
                                           torch_dtype=torch.int32)
-        # Barrier slots for the fused o_proj+router task: eight per-XCD release
-        # flags plus a global arrival counter, each on its own 64-byte line.
-        # Monotonic and never reset, so all 47 layers share one buffer.
-        oproj_router_counter = make_tensor("oproj_router_counter", (9 * 16,),
+        # Barrier slots for the fused o_proj+router+MoE task, each on its own
+        # 64-byte line: the o_proj->router barrier's 8 release flags plus its
+        # arrival counter at [0..8], the routing-ready epoch and its 8 per-XCD
+        # flags at [10..18], and the W13->W2 barrier at [20..28]. All monotonic
+        # and never reset, so all 47 layers share one buffer.
+        oproj_router_counter = make_tensor("oproj_router_counter", (29 * 16,),
                                            torch_dtype=torch.int32)
         moe_mid = make_tensor("moe_mid", (bs, topk_total, 2 * moe_inter))
         moe_act = make_tensor("moe_act", (bs, topk_total, moe_inter))
@@ -1120,8 +1127,13 @@ if __name__ == "__main__":
                     write_through=MLA_MERGE_WRITE_THROUGH,
                 )
             # 5. absorbed o_proj + residual
+            # The fused task calls the MXFP8 MoE kernels with both epilogues
+            # on -- SwiGLU folded into W13, mul-sum-add folded into W2 -- so
+            # the standalone silu and mul_sum_add stages have no place to run
+            # inside it.
             fuse_oproj_router = (FUSE_OPROJ_ROUTER and layer.is_moe
-                                 and use_mxfp8_oproj)
+                                 and use_mxfp8_oproj and MOE_MXFP8
+                                 and FUSE_MOE_SWIGLU and FUSE_MOE_MULSUMADD)
             if fuse_oproj_router:
                 # Runs as Phase 1 of the fused router task below.
                 pass
@@ -1273,16 +1285,24 @@ if __name__ == "__main__":
                     logits_scratch=moe_gate_out,
                     router_counter=router_topk_counter,
                     oproj_counters=oproj_router_counter,
+                    moe_gate_up_weight=w_moe_gu,
+                    moe_down_weight=w_moe_down,
+                    moe_w13_bias=zero_moe_bias(2 * moe_inter),
+                    moe_w2_bias=zero_moe_bias(hidden_size),
+                    moe_swiglu_out=moe_act,
                     hidden=attn_proj_out,
                     topk_weight=moe_topk_weight,
                     routing_indices=moe_routing_indices,
                     active_expert_ids=moe_mask,
+                    moe_workspace_f32=moe_ws_f32,
                     rows_per_wg=oproj_tile_n,
                     reduction_size=o_proj_red,
                     actual_hidden_dim=hidden_size,
                     num_experts_per_tok=topk,
                     routed_scaling_factor=config.routed_scaling_factor,
                     norm_topk_prob=config.norm_topk_prob,
+                    moe_w13_output_per_wg=MOE_MXFP8_OPW,
+                    moe_w2_output_per_wg=MOE_MXFP8_OPW,
                     block_dim=(256, 1, 1),
                 )
             else:
@@ -1305,39 +1325,44 @@ if __name__ == "__main__":
                     norm_topk_prob=config.norm_topk_prob,
                     block_dim=(256, 1, 1),
                 )
-            moe_w13_layer = (mpk.gang_moe_w13_linear_mxfp8_layer if MOE_MXFP8
-                             else mpk.gang_moe_w13_linear_layer)
-            moe_w13_layer(
-                input=rmsnorm_out_moe,
-                weight=w_moe_gu,
-                moe_routing_indices=moe_routing_indices,
-                moe_mask=moe_mask,
-                bias=zero_moe_bias(2 * moe_inter),
-                output=moe_act if FUSE_MOE_SWIGLU else moe_mid,
-                fuse_swiglu=FUSE_MOE_SWIGLU,
-                block_dim=(256, 1, 1),
-                **({"output_per_wg": MOE_MXFP8_OPW} if MOE_MXFP8 else {}),
-            )
-            if not FUSE_MOE_SWIGLU:
-                mpk.moe_silu_mul_layer(
-                    input=moe_mid,
-                    output=moe_act,
-                    grid_dim=(args.max_num_batched_tokens, topk_total, 1),
+            # W13+SwiGLU and W2+MulSumAdd ran as Phases 5 and 7 of the fused
+            # task; only the residual add is left.
+            if not fuse_oproj_router:
+                moe_w13_layer = (mpk.gang_moe_w13_linear_mxfp8_layer
+                                 if MOE_MXFP8
+                                 else mpk.gang_moe_w13_linear_layer)
+                moe_w13_layer(
+                    input=rmsnorm_out_moe,
+                    weight=w_moe_gu,
+                    moe_routing_indices=moe_routing_indices,
+                    moe_mask=moe_mask,
+                    bias=zero_moe_bias(2 * moe_inter),
+                    output=moe_act if FUSE_MOE_SWIGLU else moe_mid,
+                    fuse_swiglu=FUSE_MOE_SWIGLU,
                     block_dim=(256, 1, 1),
+                    **({"output_per_wg": MOE_MXFP8_OPW} if MOE_MXFP8 else {}),
                 )
-            moe_w2_layer = (mpk.gang_moe_w2_linear_mxfp8_layer if MOE_MXFP8
-                            else mpk.gang_moe_w2_linear_layer)
-            moe_w2_layer(
-                input=moe_act,
-                weight=w_moe_down,
-                moe_routing_indices=moe_routing_indices,
-                moe_mask=moe_mask,
-                bias=zero_moe_bias(hidden_size),
-                output=moe_ws_f32 if FUSE_MOE_MULSUMADD else moe_out,
-                routing_weight=moe_topk_weight if FUSE_MOE_MULSUMADD else None,
-                block_dim=(256, 1, 1),
-                **({"output_per_wg": MOE_MXFP8_OPW} if MOE_MXFP8 else {}),
-            )
+                if not FUSE_MOE_SWIGLU:
+                    mpk.moe_silu_mul_layer(
+                        input=moe_mid,
+                        output=moe_act,
+                        grid_dim=(args.max_num_batched_tokens, topk_total, 1),
+                        block_dim=(256, 1, 1),
+                    )
+                moe_w2_layer = (mpk.gang_moe_w2_linear_mxfp8_layer if MOE_MXFP8
+                                else mpk.gang_moe_w2_linear_layer)
+                moe_w2_layer(
+                    input=moe_act,
+                    weight=w_moe_down,
+                    moe_routing_indices=moe_routing_indices,
+                    moe_mask=moe_mask,
+                    bias=zero_moe_bias(hidden_size),
+                    output=moe_ws_f32 if FUSE_MOE_MULSUMADD else moe_out,
+                    routing_weight=(moe_topk_weight if FUSE_MOE_MULSUMADD
+                                    else None),
+                    block_dim=(256, 1, 1),
+                    **({"output_per_wg": MOE_MXFP8_OPW} if MOE_MXFP8 else {}),
+                )
             if FUSE_MOE_MULSUMADD:
                 mpk.moe_residual_add_f32_layer(
                     workspace_f32=moe_ws_f32,

@@ -398,7 +398,8 @@ __device__ __attribute__((noinline)) void
                           int num_active_tokens,
                           bool renormalize,
                           float routed_scaling_factor,
-                          int num_shared_experts) {
+                          int num_shared_experts,
+                          int *routing_ready_ptr) {
   constexpr int CHUNK_N = NUM_EXPERTS / 8;
   int xcd_id = get_xcd_id();
   void *logits_base = static_cast<T *>(logits_scratch_ptr) -
@@ -427,6 +428,33 @@ __device__ __attribute__((noinline)) void
   // Reset counter for the next layer's use.
   if (threadIdx.x == 0) {
     *static_cast<int *>(gang_counter_ptr) = 0;
+  }
+
+  // Release the MoE workers, when a fused caller has parked them on this
+  // epoch. Lifted from gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh:1070,
+  // fence and all.
+  //
+  // The fence is required, not an optimization. The consumers are MoE workers
+  // on *other* XCDs, and what they read after it is active_expert_ids and
+  // routing_indices -- written just above by all 256 threads of this block
+  // with ordinary stores. __syncthreads orders those within this block only;
+  // it says nothing about when they reach another XCD's L2. The release flags
+  // go out via st_wt, bypassing L2, so without a GPU-scope fence a flag can
+  // land in HBM ahead of the routing data it advertises.
+  //
+  // The failure is silent rather than a crash: every stale value is still in
+  // range, so a token is simply routed through the previous layer's experts.
+  if (routing_ready_ptr) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      threadfence_gpu();
+      int epoch = ld_nt_s32(routing_ready_ptr) + 1;
+      st_wt_u32((void *)routing_ready_ptr, (unsigned)epoch);
+      for (int x = 0; x < 8; x++) {
+        st_wt_u32((void *)&routing_ready_ptr[(1 + x) * 16], (unsigned)epoch);
+      }
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    }
   }
 }
 } // namespace gang_rmsnorm_topk_detail
@@ -492,7 +520,11 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     // it produces its output, not here -- see the fused wrapper.
     void *oproj_hier_barrier_ptr = nullptr,
     int oproj_xcd_id = 0,
-    int oproj_release_expected = 0) {
+    int oproj_release_expected = 0,
+    // SIGMOID_BIAS only. Non-null when a fused caller has MoE workers parked
+    // behind this router; the TopK tail fans out the release. Layout is
+    // gpt-oss's: [0] epoch, [(1 + x) * 16] XCD x's flag.
+    int *routing_ready_ptr = nullptr) {
 
   using bf16 = __hip_bfloat16;
   bf16 const *__restrict__ d_hidden = static_cast<bf16 const *>(norm_input_ptr);
@@ -750,7 +782,8 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
           num_active_tokens,
           renormalize,
           routed_scaling_factor,
-          num_shared_experts);
+          num_shared_experts,
+          routing_ready_ptr);
     } else {
       gang_rmsnorm_topk_detail::topk_noinline<T, NUM_EXPERTS, K>(
           logits_scratch_ptr,

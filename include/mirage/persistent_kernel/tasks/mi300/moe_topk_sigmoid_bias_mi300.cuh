@@ -108,9 +108,18 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
     }
   }
   // The shared expert takes slot k of every token, unconditionally.
+  //
+  // Write-through, unlike the zero fill above. The zeros are never read -- the
+  // MoE tile decoder indexes routing_indices only at experts named by
+  // active_expert_ids -- but the shared expert is always named, so this row is
+  // read by W13 workgroups on all eight XCDs. Per-XCD L2 is not coherent: as a
+  // standalone task the event boundary's buffer_wbl2 publishes it, and a fused
+  // caller has no such boundary. Failure is silent and looks like a token
+  // routed through the previous layer's shared expert.
   if (num_shared_experts > 0 && routing_indices != nullptr) {
     for (int row = threadIdx.x; row < num_rows; row += blockDim.x) {
-      routing_indices[NUM_EXPERTS * num_rows + row] = k + 1;
+      st_wt_u32((void *)&routing_indices[NUM_EXPERTS * num_rows + row],
+                (unsigned)(k + 1));
     }
   }
   __syncthreads();
