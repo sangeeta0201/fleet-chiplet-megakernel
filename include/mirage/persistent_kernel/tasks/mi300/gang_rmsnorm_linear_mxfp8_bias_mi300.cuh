@@ -229,12 +229,16 @@ __device__ __forceinline__ void _rnlm8_store4(unsigned short *dst,
 //
 // Note the workspace is not zeroed here: every gang worker reads the whole row,
 // so a worker that zeroed its slice would race the ones still reading. The
-// caller does it after the next barrier, where the arrival proves everyone is
-// done.
+// o_proj task does it up front instead, a whole task later in the event chain,
+// where its own W13->W2 barrier orders the zero against the next accumulate.
+//
+// The residual is `norm_input` itself -- under the fold that tensor is the
+// residual stream rather than an already-resolved row, so there is no second
+// pointer and nothing appears twice in the task's input list.
 template <int REDUCTION_SIZE>
 __device__ __forceinline__ float
 _rnlm8_resadd_norm_rcp(float const *__restrict__ d_ws,
-                       unsigned short const *__restrict__ d_res,
+                       unsigned short const *__restrict__ d_res, // == norm_input
                        unsigned short *__restrict__ d_x_out,
                        unsigned short *__restrict__ s_x,
                        bool store_x,
@@ -325,9 +329,10 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     int output_stride,
     int tile_idx,
     // FUSE_RESADD only. Defaulted so the twenty-odd existing call sites, none
-    // of which resolve a residual, stay as they are.
+    // of which resolve a residual, stay as they are. The residual itself is
+    // norm_input_ptr, which under the fold holds the unresolved residual
+    // stream rather than a finished row.
     void const *resadd_workspace_f32_ptr = nullptr, // [batch, REDUCTION_SIZE] f32
-    void const *resadd_residual_ptr = nullptr,      // [batch, REDUCTION_SIZE] bf16
     void *resadd_x_out_ptr = nullptr) {             // [batch, REDUCTION_SIZE] bf16
 
   static_assert(OUTPUT_PER_WG % 16 == 0,
@@ -420,22 +425,21 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
   unsigned short const *input_row;
   float rms_rcp;
   if constexpr (FUSE_RESADD) {
-    // norm_input_ptr is unused on this path: the row does not exist yet, it is
-    // workspace + residual, and this pass is what produces it.
+    // norm_input_ptr is the *residual*, not an already-resolved row: the row
+    // this pass normalizes does not exist yet, it is workspace + residual, and
+    // producing it is what this pass does.
     static_assert(ACTUAL_HIDDEN_DIM == REDUCTION_SIZE,
                   "FUSE_RESADD has no padded-row variant: the workspace and "
                   "residual buffers are exactly REDUCTION_SIZE wide");
-    (void)norm_input_ptr;
     rms_rcp = _rnlm8_resadd_norm_rcp<REDUCTION_SIZE>(
         (float const *)resadd_workspace_f32_ptr + tok_idx * REDUCTION_SIZE,
-        (unsigned short const *)resadd_residual_ptr + tok_idx * REDUCTION_SIZE,
+        (unsigned short const *)norm_input_ptr + tok_idx * REDUCTION_SIZE,
         (unsigned short *)resadd_x_out_ptr + tok_idx * REDUCTION_SIZE,
         s_x_bf16,
         /*store_x=*/wg_idx == 0);
     input_row = s_x_bf16;
   } else {
     (void)resadd_workspace_f32_ptr;
-    (void)resadd_residual_ptr;
     (void)resadd_x_out_ptr;
     input_row = (unsigned short const *)norm_input_ptr + tok_idx * REDUCTION_SIZE;
     rms_rcp =

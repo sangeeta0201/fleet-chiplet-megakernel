@@ -526,7 +526,17 @@ if __name__ == "__main__":
         # in-kernel barriers, and the two narrow phases -- the decode is 16 of
         # 240 workers, the merge 32 -- stop paying for a 240-worker boundary
         # by riding inside the q_b workgroup instead.
-        FUSE_ATTN = os.environ.get("GLM_FUSE_ATTN", "1") == "1"
+        #
+        # Off by default, because measured back to back it loses: 4.766 ms
+        # against 4.655 for the four separate tasks. Trading four scheduler
+        # boundaries for three in-kernel gang barriers is not the win it looks
+        # like, because the barriers are *wider* than the work they separate --
+        # the decode and merge phases hold every dispatched worker at a 224-way
+        # barrier to do 32 workgroups of work, whereas the task graph lets the
+        # narrow stages be narrow. See task #30; this is worth revisiting once
+        # the intra-task imbalance is fixed, since the fusion itself is sound.
+        # The residual fold is deliberately independent of this knob.
+        FUSE_ATTN = os.environ.get("GLM_FUSE_ATTN", "0") == "1"
         MOE_MXFP8_OPW = 64
         if MOE_MXFP8:
             # Depth-4 MFMA pipeline: only the last of the four slots carries a
@@ -1064,6 +1074,11 @@ if __name__ == "__main__":
             # and a real merge phase, which one KV chunk does not have.
             fuse_attn = (FUSE_ATTN and DENSE_MXFP8 and QB_MXFP8
                          and num_kv_chunks > 1)
+            # The residual fold is independent of whether the attention half is
+            # one task or four: it only needs the layer's *first* task to be an
+            # MXFP8 rmsnorm+linear, which both paths have, and the MoE W2
+            # epilogue to be accumulating into moe_ws_f32 in the first place.
+            fold_resadd = FUSE_MOE_MULSUMADD and (fuse_attn or DENSE_MXFP8)
             if fuse_attn:
                 mpk.gang_mla_attn_fused_layer(
                     x=x,
@@ -1105,6 +1120,10 @@ if __name__ == "__main__":
                 pass  # Phase 1 of the fused task above.
             elif DENSE_MXFP8:
                 mpk.gang_rmsnorm_linear_mxfp8_bias_layer(
+                    # Under the fold `x` is the unresolved residual: the
+                    # prologue adds the previous layer's MoE accumulator to it,
+                    # normalizes the sum, and publishes the resolved row to
+                    # layer_out for this layer's o_proj to add back.
                     norm_input=x,
                     norm_weight=w_norm,
                     norm_output=rmsnorm_out,
@@ -1114,6 +1133,8 @@ if __name__ == "__main__":
                     actual_hidden_dim=hidden_size,
                     output_per_wg=QKV_MXFP8_OPW,
                     output_stride=qkv_a_pad,
+                    resadd_workspace_f32=moe_ws_f32 if fold_resadd else None,
+                    resadd_x_out=layer_out if fold_resadd else None,
                     block_dim=(256, 1, 1),
                 )
             else:
@@ -1213,7 +1234,7 @@ if __name__ == "__main__":
             # layer's `x` -- is what o_proj adds back. Off it, the standalone
             # moe_residual_add_f32 at the end of each layer still produces it
             # and `x` is already the resolved row.
-            oproj_resid = layer_out if fuse_attn else x
+            oproj_resid = layer_out if fold_resadd else x
             # The fused task calls the MXFP8 MoE kernels with both epilogues
             # on -- SwiGLU folded into W13, mul-sum-add folded into W2 -- so
             # the standalone silu and mul_sum_add stages have no place to run
@@ -1294,7 +1315,7 @@ if __name__ == "__main__":
                     input=dense_mid, output=dense_act,
                     grid_dim=(8, 1, 1), block_dim=(256, 1, 1),
                 )
-                dense_out = dense_resid if fuse_attn else layer_out
+                dense_out = dense_resid if fold_resadd else layer_out
                 mpk.gang_linear_with_residual_layer(
                     input=dense_act,
                     weight=w_dense_down,
@@ -1455,8 +1476,7 @@ if __name__ == "__main__":
             # task, so it is emitted here only for the layer that has no next
             # one -- which also re-zeroes moe_ws_f32 for the next token, the
             # zero that the first layer's resolve relies on.
-            resolve_here = not (fuse_attn and FUSE_MOE_MULSUMADD
-                                and i < num_layers - 1)
+            resolve_here = not (fold_resadd and i < num_layers - 1)
             if not resolve_here:
                 x = attn_proj_out
             elif FUSE_MOE_MULSUMADD:

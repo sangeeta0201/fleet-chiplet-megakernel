@@ -218,7 +218,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
                                           QKV_ACTUAL_HIDDEN,
                                           /*WRITE_THROUGH=*/true,
                                           /*FUSE_RESADD=*/true>(
-        /*norm_input_ptr=*/nullptr, // unused under FUSE_RESADD
+        /*norm_input_ptr=*/x_ptr, // the residual, under FUSE_RESADD
         pre_norm_weight_ptr,
         pre_norm_scratch_ptr,
         qkv_weight_ptr,
@@ -229,7 +229,6 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         qkv_output_stride,
         xcd_rank,
         moe_ws_f32_ptr,
-        x_ptr,
         x_out_ptr);
   }
 
@@ -271,33 +270,9 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   __syncthreads();
   asm volatile("buffer_inv" ::: "memory");
 
-  // Zero the MoE accumulator for *this* layer's W2, which runs in the o_proj
-  // task after this one. Here rather than in Phase 1: every Phase-1 worker
-  // reads the whole row, so a worker zeroing its slice there would race the
-  // ones still reading. Past this barrier the arrival count proves all 8 XCDs
-  // finished Phase 1, so nothing is left to read.
-  //
-  // (gpt-oss zeroes in the prologue itself, gated on one workgroup per XCD,
-  // and gets away with it because the racing readers would be loading values
-  // they have already consumed. Doing it behind the barrier costs nothing and
-  // does not need that argument.)
-  //
-  // Write-through: the consumer is a device-scope atomicAdd, which is
-  // performed past the XCD's L2, so a dirty local line holding the zero could
-  // be written back over the accumulated result. One workgroup per XCD, each
-  // taking its own eighth of the row, so the 8 KB is written exactly once.
-  if (xcd_rank == 0) {
-    constexpr int WS_TOTAL = BATCH_SIZE * QKV_REDUCTION_SIZE;
-    static_assert(WS_TOTAL % (8 * 4) == 0,
-                  "the workspace has to split into eight dwordx4-aligned "
-                  "slices, one per XCD");
-    constexpr int WS_PER_XCD = WS_TOTAL / 8;
-    float *ws = const_cast<float *>(static_cast<float const *>(moe_ws_f32_ptr)) +
-                xcd_id * WS_PER_XCD;
-    for (int i = tid * 4; i < WS_PER_XCD; i += 256 * 4) {
-      st_wt_u128((void *)(ws + i), 0u, 0u, 0u, 0u);
-    }
-  }
+  // (The MoE accumulator this layer's W2 will use is zeroed by the o_proj task
+  // itself, up front, where the Phase 6 W13->W2 barrier already orders it
+  // against the first accumulate. It used to be done here.)
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   {
     unsigned long long _t = __builtin_amdgcn_s_memrealtime();

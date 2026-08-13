@@ -3464,6 +3464,8 @@ class PersistentKernel:
         output_per_wg: int,
         output_stride: int,
         norm_output: DTensor = None,
+        resadd_workspace_f32: DTensor = None,
+        resadd_x_out: DTensor = None,
         block_dim: tuple = (256, 1, 1),
     ):
         """Fused RMSNorm + MXFP8 Gang Linear + Bias.
@@ -3482,12 +3484,32 @@ class PersistentKernel:
         and defaults to ``norm_input`` only where the caller is content to
         normalize in place -- which the GLM demo is not, so it always passes
         one.
+
+        The two ``resadd_*`` arguments are all-or-nothing and turn on the
+        residual fold. Under it ``norm_input`` is reinterpreted: it is the
+        unresolved residual stream rather than a finished row, and the prologue
+        resolves ``resadd_workspace_f32 + norm_input`` -- an f32 MoE accumulator
+        plus that residual -- reduces the result in the same pass, and publishes
+        the bf16 row to ``resadd_x_out`` for this layer's o_proj to add back.
+        That replaces a standalone moe_residual_add_f32 task per layer, which is
+        what gpt-oss's gang_resaddf32_rmsnorm_linear_mxfp4_bias does.
+
+        Two obligations come with it. The caller must hand the *first* folding
+        layer a workspace that is already zero, and something must re-zero the
+        workspace between the fold and the next accumulate -- the o_proj task
+        does this up front, behind its own W13->W2 barrier. After the last
+        folding layer the caller still needs a standalone moe_residual_add_f32
+        to resolve that layer's MoE and re-zero for the next token.
         """
         assert norm_input.num_dims == 2
         assert mxfp8_weight.num_dims == 2
         assert output.num_dims == 2
         assert self.target_cc == 95, "MXFP8 MFMA is gfx950-only"
         assert norm_output is not None, "MXFP8 rmsnorm+linear needs scratch"
+        resadd = [resadd_workspace_f32, resadd_x_out]
+        fuse_resadd = any(t is not None for t in resadd)
+        assert not fuse_resadd or all(t is not None for t in resadd), (
+            "the residual fold needs both resadd_workspace_f32 and resadd_x_out")
         batch_size = self.max_num_batched_tokens
         # K must clear the depth-4 pipeline's tail: only slot 3 is guarded.
         K = norm_input.dim(1)
@@ -3499,6 +3521,16 @@ class PersistentKernel:
         # the bias, which is the only tensor that still carries it.
         assert bias.dim(1) == n_wgs * output_per_wg, (
             f"bias width {bias.dim(1)} != n_wgs {n_wgs} x opw {output_per_wg}")
+        if fuse_resadd:
+            assert actual_hidden_dim == K, (
+                "the residual fold reads workspace and residual rows of exactly "
+                f"the reduction width: {actual_hidden_dim} != {K}")
+            for name, t in zip(("resadd_workspace_f32", "resadd_x_out"),
+                               resadd):
+                assert t.num_dims == 2 and t.dim(0) == batch_size and \
+                    t.dim(1) == K, f"{name} must be ({batch_size}, {K})"
+            assert (batch_size * K) % 32 == 0, (
+                "the fold walks the row as 256 threads x float4")
         total_tiles_per_xcd = batch_size * n_wgs_per_xcd
         grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
@@ -3507,11 +3539,16 @@ class PersistentKernel:
         tb_graph.new_input(norm_output, (-1, -1, -1), 1, True)
         tb_graph.new_input(mxfp8_weight, (0, -1, -1), 1, True)
         tb_graph.new_input(bias, (1, -1, -1), 1, True)
+        io = [norm_input, norm_weight, norm_output, mxfp8_weight, bias]
+        if fuse_resadd:
+            tb_graph.new_input(resadd_workspace_f32, (-1, -1, -1), 1, True)
+            io.append(resadd_workspace_f32)
         tb_graph.new_input(output, (1, -1, -1), -1, True)
-        self.kn_graph.customized(
-            [norm_input, norm_weight, norm_output, mxfp8_weight, bias, output],
-            tb_graph,
-        )
+        io.append(output)
+        if fuse_resadd:
+            tb_graph.new_input(resadd_x_out, (-1, -1, -1), -1, True)
+            io.append(resadd_x_out)
+        self.kn_graph.customized(io, tb_graph)
         self.kn_graph.register_task(
             tb_graph, "gang_rmsnorm_linear_mxfp8_bias_mi300",
             [output_stride, output_per_wg, n_wgs_per_xcd,

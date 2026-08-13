@@ -177,6 +177,32 @@ __device__ __attribute__((always_inline)) void
   int const routing_expected = s_expected[1];
   int const w13_expected = s_expected[2];
 
+  // Zero the f32 MoE accumulator that this layer's W2 will atomicAdd into.
+  //
+  // Here, rather than in the task that reads it: the previous value is the
+  // *previous* layer's MoE output, and its only reader is this layer's RMSNorm
+  // prologue (the FUSE_RESADD fold), which is a whole task earlier in the event
+  // chain. So by the time any worker reaches this line every read of the old
+  // value has retired, and the Phase 6 W13->W2 barrier -- which every worker
+  // arrives at -- separates the zero from the first accumulate. No barrier of
+  // its own, and it serves the fused and unfused attention paths alike.
+  //
+  // Write-through: the consumer is a device-scope atomicAdd, performed past the
+  // XCD's L2, so a dirty local line holding the zero could later be written
+  // back over the accumulated result. One workgroup per XCD, each taking its
+  // own eighth of the row, so the 8 KB is written exactly once.
+  if (xcd_rank == 0) {
+    constexpr int WS_TOTAL = BATCH_SIZE * HIDDEN_SIZE;
+    static_assert(WS_TOTAL % (8 * 4) == 0,
+                  "the workspace has to split into eight dwordx4-aligned "
+                  "slices, one per XCD");
+    constexpr int WS_PER_XCD = WS_TOTAL / 8;
+    float *ws = static_cast<float *>(moe_workspace_f32_ptr) + xcd_id * WS_PER_XCD;
+    for (int i = tid * 4; i < WS_PER_XCD; i += 256 * 4) {
+      st_wt_u128((void *)(ws + i), 0u, 0u, 0u, 0u);
+    }
+  }
+
   // Workers with o_proj or router work. The rest fall straight through to the
   // routing-ready poll: they must not arrive at the o_proj barrier, whose
   // arrival count is sized to this set.

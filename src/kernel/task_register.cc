@@ -3054,9 +3054,17 @@ int TaskRegister::register_gang_rmsnorm_linear_mxfp8_bias_mi300_task(
 
   std::vector<tb::TBInputOp *> input_ops;
   std::vector<tb::TBInputOp *> output_ops;
-  int num_inputs =
-      5; // norm_input, norm_weight, norm_output, mxfp8_weight, bias
-  int num_outputs = 1;
+  // The residual fold is optional and detected from the operator count, so the
+  // plain five-input form keeps registering exactly as it did. With the fold
+  // the caller adds the previous layer's f32 MoE accumulator and the residual
+  // it belongs to, plus one output for the resolved row.
+  bool const fuse_resadd = bgraph.operators.size() == 8;
+  assert((bgraph.operators.size() == 6 || fuse_resadd) &&
+         "gang_rmsnorm_linear_mxfp8_bias takes 5 inputs + 1 output, or 6 + 2 "
+         "with the residual fold");
+  int num_inputs = fuse_resadd ? 6 : 5; // norm_input, norm_weight, norm_output,
+                                        // mxfp8_weight, bias, [resadd_ws]
+  int num_outputs = fuse_resadd ? 2 : 1;
 
   assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
   for (auto const &op : bgraph.operators) {
@@ -3072,14 +3080,28 @@ int TaskRegister::register_gang_rmsnorm_linear_mxfp8_bias_mi300_task(
   int batch_size = input_ops[0]->dtensor.dim[0];
   int reduction_size = input_ops[0]->dtensor.dim[1];
 
+  if (fuse_resadd) {
+    // The fold reads the workspace and the residual as rows of exactly the
+    // reduction width, so it has no padded-row variant.
+    assert(actual_hidden_dim == reduction_size &&
+           "the residual fold has no padded-row variant");
+    assert(input_ops[5]->dtensor.num_dims == 2);
+    assert(input_ops[5]->dtensor.dim[0] == batch_size);
+    assert(input_ops[5]->dtensor.dim[1] == reduction_size);
+    assert(output_ops[1]->dtensor.num_dims == 2);
+    assert(output_ops[1]->dtensor.dim[0] == batch_size);
+    assert(output_ops[1]->dtensor.dim[1] == reduction_size);
+  }
+
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
-  code.e("kernel::gang_rmsnorm_linear_mxfp8_bias_kernel<$, $, $, $>(",
+  code.e("kernel::gang_rmsnorm_linear_mxfp8_bias_kernel<$, $, $, $, false, $>(",
          batch_size,
          output_per_wg,
          reduction_size,
-         actual_hidden_dim);
-  code.e("    task_desc->input_ptrs[0],");  // norm_input
+         actual_hidden_dim,
+         fuse_resadd ? "true" : "false");
+  code.e("    task_desc->input_ptrs[0],");  // norm_input == residual, folding
   code.e("    task_desc->input_ptrs[1],");  // norm_weight
   code.e("    task_desc->input_ptrs[2],");  // norm_output scratch
   code.e("    task_desc->input_ptrs[3],");  // mxfp8_weight
@@ -3088,7 +3110,13 @@ int TaskRegister::register_gang_rmsnorm_linear_mxfp8_bias_mi300_task(
   code.e("    runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS],");
   code.e("    $,", n_wgs_per_xcd);
   code.e("    $,", output_stride);
-  code.e("    tile_idx);");
+  if (fuse_resadd) {
+    code.e("    tile_idx,");
+    code.e("    task_desc->input_ptrs[5],");   // previous layer's MoE f32 ws
+    code.e("    task_desc->output_ptrs[1]);"); // resolved residual stream
+  } else {
+    code.e("    tile_idx);");
+  }
   return register_task_variant(TASK_GANG_RMSNORM_LINEAR_MXFP8_BIAS_MI300,
                                code.to_string());
 }

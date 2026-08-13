@@ -678,8 +678,13 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     int variant_id =
         task_register->register_gang_rmsnorm_linear_mxfp8_bias_mi300_task(
             customized->bgraph, params);
-    task_config[op] = std::make_tuple(
-        5, 1, TASK_GANG_RMSNORM_LINEAR_MXFP8_BIAS_MI300, variant_id);
+    // 5 + 1 plain, 6 + 2 with the residual add folded into the prologue.
+    bool const fuse_resadd = customized->bgraph.operators.size() == 8;
+    task_config[op] =
+        std::make_tuple(fuse_resadd ? 6 : 5,
+                        fuse_resadd ? 2 : 1,
+                        TASK_GANG_RMSNORM_LINEAR_MXFP8_BIAS_MI300,
+                        variant_id);
     gang_task_tiles_per_xcd[op] = params[3]; // total_tiles_per_xcd
   } else if (name == "gang_rmsnorm_linear_mxfp8_bias_mla_kvupd_mi300") {
     assert(params.size() == 11 &&
