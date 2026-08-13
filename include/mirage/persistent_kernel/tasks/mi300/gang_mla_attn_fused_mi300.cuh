@@ -121,12 +121,14 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     void const *sin_ptr,             // [11]
     void *kv_cache_ptr,              // [12] paged latent cache, written
     void *attn_counters_ptr,         // [13] this task's three barriers
+    void const *moe_ws_f32_ptr,      // [14] previous layer's MoE accumulator
     // ── outputs ──
     void *qkv_a_out_ptr,   // [0] [q_a | latent], declared whole
     void *q_workspace_ptr, // [1] absorbed queries, declared whole
     void *lse_ptr,         // [2] per-chunk LSE
     void *o_acc_ptr,       // [3] per-chunk f32 partials
     void *attn_out_ptr,    // [4] merged bf16 attention output
+    void *x_out_ptr,       // [5] this layer's resolved residual stream
     // ── indptr buffers ──
     int const *qo_indptr,
     int const *kv_indptr,
@@ -185,8 +187,21 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
 #endif
 
   // ══════════════════════════════════════════════════════════════════════
-  // Phase 1: input RMSNorm + [q_a_proj | kv_a_proj_with_mqa]
+  // Phase 1: residual resolve + input RMSNorm + [q_a_proj | kv_a_proj_with_mqa]
   // ══════════════════════════════════════════════════════════════════════
+  // x_ptr is the *previous* layer's pre-MoE residual and moe_ws_f32_ptr its
+  // MoE's f32 accumulator; their sum is this layer's input, and used to be
+  // produced by a MOE_RESIDUAL_ADD_F32 task of its own -- grid_dim (1,1,1),
+  // 47 dispatches per token, 239 of 240 workers idle behind a full event
+  // boundary. FUSE_RESADD folds it into the prologue that was going to read
+  // the row anyway, which is what gpt-oss's
+  // gang_resaddf32_rmsnorm_linear_mxfp4_bias_kernel does. The resolved row
+  // still goes out to x_out_ptr, because the o_proj that follows this task
+  // adds it back as its own residual.
+  //
+  // The first layer has no MoE behind it; the demo hands it a zeroed
+  // workspace rather than a second task variant, at the cost of one 8 KB
+  // read of zeros per token.
   // The GEMM addresses its output as [wg_idx * OPW + ...] within an XCD's
   // column chunk, so it wants that chunk's base. qkv_a_out has to be declared
   // whole here -- Phase 3 norms a prefix of it that spans four XCDs, and
@@ -201,8 +216,9 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
                                           QKV_OUTPUT_PER_WG,
                                           QKV_REDUCTION_SIZE,
                                           QKV_ACTUAL_HIDDEN,
-                                          /*WRITE_THROUGH=*/true>(
-        x_ptr,
+                                          /*WRITE_THROUGH=*/true,
+                                          /*FUSE_RESADD=*/true>(
+        /*norm_input_ptr=*/nullptr, // unused under FUSE_RESADD
         pre_norm_weight_ptr,
         pre_norm_scratch_ptr,
         qkv_weight_ptr,
@@ -211,7 +227,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         num_active_tokens,
         qkv_n_wgs_per_xcd,
         qkv_output_stride,
-        xcd_rank);
+        xcd_rank,
+        moe_ws_f32_ptr,
+        x_ptr,
+        x_out_ptr);
   }
 
   // ══════════════════════════════════════════════════════════════════════
@@ -251,6 +270,34 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   }
   __syncthreads();
   asm volatile("buffer_inv" ::: "memory");
+
+  // Zero the MoE accumulator for *this* layer's W2, which runs in the o_proj
+  // task after this one. Here rather than in Phase 1: every Phase-1 worker
+  // reads the whole row, so a worker zeroing its slice there would race the
+  // ones still reading. Past this barrier the arrival count proves all 8 XCDs
+  // finished Phase 1, so nothing is left to read.
+  //
+  // (gpt-oss zeroes in the prologue itself, gated on one workgroup per XCD,
+  // and gets away with it because the racing readers would be loading values
+  // they have already consumed. Doing it behind the barrier costs nothing and
+  // does not need that argument.)
+  //
+  // Write-through: the consumer is a device-scope atomicAdd, which is
+  // performed past the XCD's L2, so a dirty local line holding the zero could
+  // be written back over the accumulated result. One workgroup per XCD, each
+  // taking its own eighth of the row, so the 8 KB is written exactly once.
+  if (xcd_rank == 0) {
+    constexpr int WS_TOTAL = BATCH_SIZE * QKV_REDUCTION_SIZE;
+    static_assert(WS_TOTAL % (8 * 4) == 0,
+                  "the workspace has to split into eight dwordx4-aligned "
+                  "slices, one per XCD");
+    constexpr int WS_PER_XCD = WS_TOTAL / 8;
+    float *ws = const_cast<float *>(static_cast<float const *>(moe_ws_f32_ptr)) +
+                xcd_id * WS_PER_XCD;
+    for (int i = tid * 4; i < WS_PER_XCD; i += 256 * 4) {
+      st_wt_u128((void *)(ws + i), 0u, 0u, 0u, 0u);
+    }
+  }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   {
     unsigned long long _t = __builtin_amdgcn_s_memrealtime();

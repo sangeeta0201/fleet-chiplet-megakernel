@@ -1468,12 +1468,14 @@ class PersistentKernel:
         sin_pos_embed: DTensor,
         kv_cache: DTensor,
         attn_counters: DTensor,
+        moe_workspace_f32: DTensor,
         # outputs
         qkv_a_out: DTensor,
         q_workspace: DTensor,
         lse: DTensor,
         o_acc: DTensor,
         attn_out: DTensor,
+        x_out: DTensor,
         # parameters
         qkv_output_per_wg: int,
         qkv_actual_hidden_dim: int,
@@ -1505,11 +1507,24 @@ class PersistentKernel:
         takes. num_kv_chunks must be > 1 -- with a single chunk the decode
         writes attn_out directly and there is no merge phase to fuse.
 
-        Inputs (14): x, pre_norm_weight, pre_norm_scratch, qkv_mxfp8_weight,
+        Phase 1 also resolves the residual stream: ``x`` is the *previous*
+        layer's pre-MoE residual and ``moe_workspace_f32`` its MoE's f32
+        accumulator, and ``x_out`` receives ``bf16(workspace + x)``, which the
+        o_proj that follows this task takes as its own residual. That add used
+        to be moe_residual_add_f32, a grid_dim (1,1,1) task run once per layer;
+        folding it into the prologue that was going to read the row anyway is
+        what gpt-oss does in gang_resaddf32_rmsnorm_linear_mxfp4_bias. The task
+        also zeroes ``moe_workspace_f32`` for this layer's own MoE, behind the
+        qkv barrier where every reader is provably done -- so the caller must
+        hand the *first* layer a workspace that is already zero, and must still
+        run a moe_residual_add_f32 after the *last* layer to resolve its MoE
+        and re-zero the buffer for the next token.
+
+        Inputs (15): x, pre_norm_weight, pre_norm_scratch, qkv_mxfp8_weight,
                      qkv_bias, q_a_norm_weight, q_a_norm_scratch,
                      qb_mxfp8_weight, qb_bias, kv_norm_weight, cos, sin,
-                     kv_cache, attn_counters.
-        Outputs (5): qkv_a_out, q_workspace, lse, o_acc, attn_out.
+                     kv_cache, attn_counters, moe_workspace_f32.
+        Outputs (6): qkv_a_out, q_workspace, lse, o_acc, attn_out, x_out.
         """
         assert self.target_cc == 95, "MXFP8 MFMA is gfx950-only"
         assert x.num_dims == 2
@@ -1610,6 +1625,21 @@ class PersistentKernel:
         # so nothing is reset and one buffer serves every layer.
         assert attn_counters.dim(0) >= 29 * 16
 
+        # The residual resolve reads and writes exactly the reduction width,
+        # so the qkv_a row cannot be padded on this path.
+        assert qkv_actual_hidden_dim == qkv_reduction, (
+            f"the fused residual resolve needs an unpadded qkv_a reduction; "
+            f"got actual_hidden_dim={qkv_actual_hidden_dim} against "
+            f"reduction={qkv_reduction}")
+        assert moe_workspace_f32.num_dims == 2
+        assert (moe_workspace_f32.dim(0), moe_workspace_f32.dim(1)) == (
+            batch_size, qkv_reduction)
+        assert x_out.num_dims == 2
+        assert (x_out.dim(0), x_out.dim(1)) == (batch_size, qkv_reduction)
+        # One workgroup per XCD zeroes its own eighth of the row with
+        # dwordx4 write-throughs.
+        assert (batch_size * qkv_reduction) % 32 == 0
+
         params = [batch_size, qkv_output_per_wg, qkv_actual_hidden_dim,
                   qkv_n_wgs_per_xcd, qkv_output_stride, qb_output_per_wg,
                   qb_reduction_size, qb_actual_hidden_dim, qb_n_wgs_per_xcd,
@@ -1636,17 +1666,19 @@ class PersistentKernel:
         tb_graph.new_input(sin_pos_embed, (-1, -1, -1), -1, True)
         tb_graph.new_input(kv_cache, (-1, -1, -1), -1, True)
         tb_graph.new_input(attn_counters, (-1, -1, -1), 0, True)
+        tb_graph.new_input(moe_workspace_f32, (-1, -1, -1), 1, True)
         tb_graph.new_input(qkv_a_out, (-1, -1, -1), -1, True)
         tb_graph.new_input(q_workspace, (-1, -1, -1), -1, True)
         tb_graph.new_input(lse, (-1, -1, -1), -1, True)
         tb_graph.new_input(o_acc, (-1, -1, -1), -1, True)
         tb_graph.new_input(attn_out, (-1, -1, -1), -1, True)
+        tb_graph.new_input(x_out, (-1, -1, -1), -1, True)
         self.kn_graph.customized(
             [x, pre_norm_weight, pre_norm_scratch, qkv_mxfp8_weight, qkv_bias,
              q_a_norm_weight, q_a_norm_scratch, qb_mxfp8_weight, qb_bias,
              kv_norm_weight, cos_pos_embed, sin_pos_embed, kv_cache,
-             attn_counters,
-             qkv_a_out, q_workspace, lse, o_acc, attn_out],
+             attn_counters, moe_workspace_f32,
+             qkv_a_out, q_workspace, lse, o_acc, attn_out, x_out],
             tb_graph,
         )
         self.kn_graph.register_task(

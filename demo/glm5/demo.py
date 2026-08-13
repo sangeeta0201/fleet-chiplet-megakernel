@@ -865,6 +865,12 @@ if __name__ == "__main__":
                                 torch_dtype=torch.float32)
         rmsnorm_out_moe = make_tensor("rmsnorm_out_moe", (bs, hidden_size))
         layer_out = make_tensor("layer_out", (bs, hidden_size))
+        # The dense prologue layer has one more residual add than a MoE layer,
+        # so it lands on the wrong side of the layer_out / attn_proj_out
+        # ping-pong that the fused residual resolve sets up. One extra row
+        # buys the parity back and keeps every MoE layer identical; see the
+        # FUSE_RESADD wiring below.
+        dense_resid = make_tensor("dense_resid", (bs, hidden_size))
 
         dense_mid = make_tensor("dense_mid", (bs, 2 * dense_inter))
         dense_act = make_tensor("dense_act", (bs, dense_inter))
@@ -1074,11 +1080,13 @@ if __name__ == "__main__":
                     sin_pos_embed=sin_pos_embed,
                     kv_cache=kv_cache,
                     attn_counters=attn_fused_counter,
+                    moe_workspace_f32=moe_ws_f32,
                     qkv_a_out=qkv_a_out,
                     q_workspace=mla_q_ws,
                     lse=mla_lse,
                     o_acc=mla_o_acc,
                     attn_out=attn_out,
+                    x_out=layer_out,
                     qkv_output_per_wg=QKV_MXFP8_OPW,
                     qkv_actual_hidden_dim=hidden_size,
                     qb_output_per_wg=qk_rope,
@@ -1198,6 +1206,14 @@ if __name__ == "__main__":
                         write_through=MLA_MERGE_WRITE_THROUGH,
                     )
             # 5. absorbed o_proj + residual
+            #
+            # On the fused path the residual stream for this layer does not
+            # exist until the attention task's Phase 1 resolves
+            # `moe_ws_f32 + x` into layer_out, so that -- not the previous
+            # layer's `x` -- is what o_proj adds back. Off it, the standalone
+            # moe_residual_add_f32 at the end of each layer still produces it
+            # and `x` is already the resolved row.
+            oproj_resid = layer_out if fuse_attn else x
             # The fused task calls the MXFP8 MoE kernels with both epilogues
             # on -- SwiGLU folded into W13, mul-sum-add folded into W2 -- so
             # the standalone silu and mul_sum_add stages have no place to run
@@ -1212,7 +1228,7 @@ if __name__ == "__main__":
                 mpk.gang_splitk_linear_with_residual_layer(
                     input=attn_out,
                     weight=w_o,
-                    residual=x,
+                    residual=oproj_resid,
                     workspace=splitk_ws,
                     output=attn_proj_out,
                     tile_n=GANG_TILE_N,
@@ -1225,7 +1241,7 @@ if __name__ == "__main__":
                 mpk.gang_gemv_mxfp8_with_residual_layer(
                     input=attn_out,
                     mxfp8_weight=w_o,
-                    residual=x,
+                    residual=oproj_resid,
                     output=attn_proj_out,
                     rows_per_wg=oproj_tile_n,
                     output_stride=hidden_size,
@@ -1237,7 +1253,7 @@ if __name__ == "__main__":
                 mpk.gang_linear_with_residual_layer(
                     input=attn_out,
                     weight=w_o,
-                    residual=x,
+                    residual=oproj_resid,
                     output=attn_proj_out,
                     tile_n=oproj_tile_n,
                     output_stride=hidden_size,
@@ -1278,17 +1294,18 @@ if __name__ == "__main__":
                     input=dense_mid, output=dense_act,
                     grid_dim=(8, 1, 1), block_dim=(256, 1, 1),
                 )
+                dense_out = dense_resid if fuse_attn else layer_out
                 mpk.gang_linear_with_residual_layer(
                     input=dense_act,
                     weight=w_dense_down,
                     residual=attn_proj_out,
-                    output=layer_out,
+                    output=dense_out,
                     tile_n=GANG_TILE_N,
                     output_stride=hidden_size,
                     wgm=GANG_WGM,
                     block_dim=(256, 1, 1),
                 )
-                x = layer_out
+                x = dense_out
                 continue
 
             # 6b. MoE layer. The shared expert is stacked as expert
@@ -1348,7 +1365,7 @@ if __name__ == "__main__":
                 mpk.gang_oproj_router_fused_layer(
                     input=attn_out,
                     oproj_mxfp8_weight=w_o,
-                    residual=x,
+                    residual=oproj_resid,
                     norm_weight=w_norm_moe,
                     norm_output=rmsnorm_out_moe,
                     router_weight=w_router,
@@ -1434,7 +1451,15 @@ if __name__ == "__main__":
                     block_dim=(256, 1, 1),
                     **({"output_per_wg": MOE_MXFP8_OPW} if MOE_MXFP8 else {}),
                 )
-            if FUSE_MOE_MULSUMADD:
+            # The residual add is Phase 1 of the *next* layer's attention
+            # task, so it is emitted here only for the layer that has no next
+            # one -- which also re-zeroes moe_ws_f32 for the next token, the
+            # zero that the first layer's resolve relies on.
+            resolve_here = not (fuse_attn and FUSE_MOE_MULSUMADD
+                                and i < num_layers - 1)
+            if not resolve_here:
+                x = attn_proj_out
+            elif FUSE_MOE_MULSUMADD:
                 mpk.moe_residual_add_f32_layer(
                     workspace_f32=moe_ws_f32,
                     residual=attn_proj_out,
@@ -1442,6 +1467,7 @@ if __name__ == "__main__":
                     grid_dim=(1, 1, 1),
                     block_dim=(256, 1, 1),
                 )
+                x = layer_out
             else:
                 mpk.moe_mul_sum_add_layer(
                     input=moe_out,
@@ -1452,7 +1478,7 @@ if __name__ == "__main__":
                               hidden_size // 256, 1),
                     block_dim=(256, 1, 1),
                 )
-            x = layer_out
+                x = layer_out
 
         # ── Tail: final norm + LM head + argmax ──────────────────────────────
         w_final_norm = _attach_input_keep(model.model.norm.weight.data,

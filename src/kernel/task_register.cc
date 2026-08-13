@@ -3744,8 +3744,8 @@ int TaskRegister::register_gang_mla_attn_fused_mi300_task(
 
   std::vector<tb::TBInputOp *> input_ops;
   std::vector<tb::TBInputOp *> output_ops;
-  int num_inputs = 14;
-  int num_outputs = 5;
+  int num_inputs = 15;
+  int num_outputs = 6;
   assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
   for (auto const &op : bgraph.operators) {
     assert(op->op_type == mirage::type::TB_INPUT_OP);
@@ -3798,6 +3798,19 @@ int TaskRegister::register_gang_mla_attn_fused_mi300_task(
   // at [0..8], q_b->decode at [10..18], decode->merge at [20..28].
   assert(input_ops[13]->dtensor.num_dims == 1);
   assert(input_ops[13]->dtensor.dim[0] >= 29 * 16);
+
+  // The MoE accumulator this task resolves into the residual stream, and the
+  // row it writes it to. Both are exactly the qkv_a reduction wide -- the
+  // fused prologue has no padded-row variant.
+  assert(input_ops[14]->dtensor.num_dims == 2);
+  assert(input_ops[14]->dtensor.dim[0] == batch_size);
+  assert(input_ops[14]->dtensor.dim[1] == qkv_reduction);
+  assert(qkv_actual_hidden == qkv_reduction &&
+         "the residual resolve reads workspace and residual rows of exactly "
+         "the reduction width, so a padded qkv_a row has no meaning here");
+  assert(output_ops[5]->dtensor.num_dims == 2);
+  assert(output_ops[5]->dtensor.dim[0] == batch_size);
+  assert(output_ops[5]->dtensor.dim[1] == qkv_reduction);
 
   // Every phase has to fit inside the dispatch width, or a tile's work is
   // silently dropped on the far side of a barrier that already released.

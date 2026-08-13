@@ -190,11 +190,129 @@ __device__ __forceinline__ void _rnlm8_store4(unsigned short *dst,
   }
 }
 
+// Resolve the residual stream out of the MoE's f32 workspace, and reduce it,
+// in one pass -- the prologue that replaces the MOE_RESIDUAL_ADD_F32 task.
+//
+// GLM's MoE W2 epilogue scales by the routing weight and atomicAdds into an
+// f32 workspace, so a layer's output is `workspace + the pre-MoE residual`.
+// That add used to be a task of its own: grid_dim (1,1,1), 47 dispatches per
+// token, one workgroup awake behind a full event boundary and 239 idle. gpt-oss
+// never had it -- gang_resaddf32_rmsnorm_linear_mxfp4_bias_kernel folds the
+// same add into the next stage's RMSNorm prologue. This is that fold, for the
+// MXFP8 path.
+//
+// Three things come out of the single pass over the row:
+//   d_x_out[h] = bf16(workspace[h] + residual[h])  -- the residual stream, which
+//                the o_proj/router task still reads as its own residual
+//   s_x[h]     = the same value, staged in LDS for the quantizer
+//   the sum of squares that Phase 4 of the norm needs
+//
+// The LDS copy is what makes this a win rather than a wash. gpt-oss keeps the
+// summed row in registers because its quantizer walks the row with the same
+// thread mapping the prologue does; GLM's maps 32 contiguous elements to one
+// thread against this pass's four strided, so a register handoff would need one
+// of the two mappings rewritten. Reading the row back from global instead would
+// race this workgroup's own stores through a write-through vL1. LDS costs two
+// bytes per element and no occupancy -- the persistent kernel already runs a
+// single workgroup per CU.
+//
+// The square is taken on the *rounded* bf16, not on the f32 sum, so the value
+// reduced here is exactly the value the quantizer will scale. That makes the
+// fold bit-identical to the two-task path it replaces.
+//
+// Every workgroup on the gang recomputes the whole row -- it has to, each needs
+// the result in its own LDS -- but only `store_x` ones publish it, since all
+// 128 of them would otherwise write the same 4 KB to the same addresses. The
+// caller sets it on one workgroup per XCD and the store is write-through, so
+// the row lands in memory once per XCD rather than as eight dirty copies in
+// eight L2s.
+//
+// Note the workspace is not zeroed here: every gang worker reads the whole row,
+// so a worker that zeroed its slice would race the ones still reading. The
+// caller does it after the next barrier, where the arrival proves everyone is
+// done.
+template <int REDUCTION_SIZE>
+__device__ __forceinline__ float
+_rnlm8_resadd_norm_rcp(float const *__restrict__ d_ws,
+                       unsigned short const *__restrict__ d_res,
+                       unsigned short *__restrict__ d_x_out,
+                       unsigned short *__restrict__ s_x,
+                       bool store_x,
+                       float eps = 1e-5f) {
+  constexpr int VEC = 4;
+  constexpr int NTHREADS = 256;
+  static_assert(REDUCTION_SIZE % (NTHREADS * VEC) == 0,
+                "FUSE_RESADD wants the row to divide evenly over 256x float4");
+  constexpr int ITERS = REDUCTION_SIZE / (NTHREADS * VEC);
+
+  int const tid = threadIdx.x;
+  float ssq = 0.0f;
+
+#pragma unroll 1
+  for (int v = 0; v < ITERS; v++) {
+    int const off = (v * NTHREADS + tid) * VEC;
+    float4 const w = *reinterpret_cast<float4 const *>(d_ws + off);
+    uint2 const r = *reinterpret_cast<uint2 const *>(d_res + off);
+
+    unsigned short const b[4] = {
+        _gang_float_to_bf16(w.x + _gang_bf16_to_float((unsigned short)r.x)),
+        _gang_float_to_bf16(w.y +
+                            _gang_bf16_to_float((unsigned short)(r.x >> 16))),
+        _gang_float_to_bf16(w.z + _gang_bf16_to_float((unsigned short)r.y)),
+        _gang_float_to_bf16(w.w +
+                            _gang_bf16_to_float((unsigned short)(r.y >> 16)))};
+    uint2 const packed = {(unsigned)b[0] | ((unsigned)b[1] << 16),
+                          (unsigned)b[2] | ((unsigned)b[3] << 16)};
+    *reinterpret_cast<uint2 *>(s_x + off) = packed;
+    if (store_x) {
+      st_wt_u64((void *)(d_x_out + off),
+                (unsigned long long)packed.x |
+                    ((unsigned long long)packed.y << 32));
+    }
+
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      float const q = _gang_bf16_to_float(b[i]);
+      ssq += q * q;
+    }
+  }
+
+  // Phase 3 of rmsnorm_rcp_amd, verbatim: wave reduce, then one cross-wave
+  // pass through LDS. The trailing __syncthreads() publishes red[0] and, here,
+  // also publishes s_x to the quantizer's different thread mapping.
+#pragma unroll
+  for (int offset = 32; offset > 0; offset >>= 1) {
+    ssq += __shfl_xor(ssq, offset);
+  }
+
+  __shared__ float red[16];
+  int const wave_id = tid >> 6;
+  int const lane_id = tid & 63;
+  int const num_waves = blockDim.x >> 6;
+  if (lane_id == 0) {
+    red[wave_id] = ssq;
+  }
+  __syncthreads();
+  if (wave_id == 0) {
+    ssq = (lane_id < num_waves) ? red[lane_id] : 0.0f;
+    for (int offset = num_waves >> 1; offset > 0; offset >>= 1) {
+      ssq += __shfl_xor(ssq, offset);
+    }
+    if (lane_id == 0) {
+      red[0] = ssq;
+    }
+  }
+  __syncthreads();
+
+  return rsqrtf(red[0] / float(REDUCTION_SIZE) + eps);
+}
+
 template <int BATCH_SIZE,
           int OUTPUT_PER_WG,
           int REDUCTION_SIZE,
           int ACTUAL_HIDDEN_DIM = REDUCTION_SIZE,
-          bool WRITE_THROUGH = false>
+          bool WRITE_THROUGH = false,
+          bool FUSE_RESADD = false>
 __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     void const *norm_input_ptr,  // [batch, REDUCTION_SIZE] bf16
     void const *norm_weight_ptr, // [REDUCTION_SIZE] bf16
@@ -205,7 +323,12 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     int num_active_tokens,
     int n_wgs_per_xcd,
     int output_stride,
-    int tile_idx) {
+    int tile_idx,
+    // FUSE_RESADD only. Defaulted so the twenty-odd existing call sites, none
+    // of which resolve a residual, stay as they are.
+    void const *resadd_workspace_f32_ptr = nullptr, // [batch, REDUCTION_SIZE] f32
+    void const *resadd_residual_ptr = nullptr,      // [batch, REDUCTION_SIZE] bf16
+    void *resadd_x_out_ptr = nullptr) {             // [batch, REDUCTION_SIZE] bf16
 
   static_assert(OUTPUT_PER_WG % 16 == 0,
                 "OUTPUT_PER_WG must be multiple of 16");
@@ -242,6 +365,14 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
   extern __shared__ char _rnlm8_smem[];
   uint8_t *s_tok_fp8 = (uint8_t *)_rnlm8_smem;
   uint8_t *s_tok_scales = s_tok_fp8 + FP8_TOK_DATA;
+  // The resadd staging buffer sits past the quantizer's, rounded up to 128 B so
+  // its uint2 traffic stays aligned. Only the K-parallel branch reuses
+  // _rnlm8_smem (as lds_reduce, from offset 0) and that is after the MFMA, by
+  // which point s_x_bf16 is dead.
+  constexpr int RESADD_SMEM_OFF =
+      ((FP8_TOK_DATA + NUM_BLOCKS_32 + 127) / 128) * 128;
+  unsigned short *s_x_bf16 =
+      (unsigned short *)(_rnlm8_smem + RESADD_SMEM_OFF);
 
   int const tid = threadIdx.x;
   int const warp_id = tid >> 6;
@@ -286,11 +417,31 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
   // The loop over batch rows goes too: it normalized every row of the batch on
   // every block and then used one. rms_rcp is this block's own token's.
   (void)norm_output_ptr;
-  unsigned short const *input_row =
-      (unsigned short const *)norm_input_ptr + tok_idx * REDUCTION_SIZE;
-  float const rms_rcp =
-      gang_rmsnorm_detail::rmsnorm_rcp_amd<REDUCTION_SIZE, ACTUAL_HIDDEN_DIM>(
-          input_row);
+  unsigned short const *input_row;
+  float rms_rcp;
+  if constexpr (FUSE_RESADD) {
+    // norm_input_ptr is unused on this path: the row does not exist yet, it is
+    // workspace + residual, and this pass is what produces it.
+    static_assert(ACTUAL_HIDDEN_DIM == REDUCTION_SIZE,
+                  "FUSE_RESADD has no padded-row variant: the workspace and "
+                  "residual buffers are exactly REDUCTION_SIZE wide");
+    (void)norm_input_ptr;
+    rms_rcp = _rnlm8_resadd_norm_rcp<REDUCTION_SIZE>(
+        (float const *)resadd_workspace_f32_ptr + tok_idx * REDUCTION_SIZE,
+        (unsigned short const *)resadd_residual_ptr + tok_idx * REDUCTION_SIZE,
+        (unsigned short *)resadd_x_out_ptr + tok_idx * REDUCTION_SIZE,
+        s_x_bf16,
+        /*store_x=*/wg_idx == 0);
+    input_row = s_x_bf16;
+  } else {
+    (void)resadd_workspace_f32_ptr;
+    (void)resadd_residual_ptr;
+    (void)resadd_x_out_ptr;
+    input_row = (unsigned short const *)norm_input_ptr + tok_idx * REDUCTION_SIZE;
+    rms_rcp =
+        gang_rmsnorm_detail::rmsnorm_rcp_amd<REDUCTION_SIZE, ACTUAL_HIDDEN_DIM>(
+            input_row);
+  }
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   if (_sp_rec) {

@@ -907,7 +907,7 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     int variant_id = task_register->register_gang_mla_attn_fused_mi300_task(
         customized->bgraph, params);
     task_config[op] =
-        std::make_tuple(14, 5, TASK_GANG_MLA_DECODE_MI300, variant_id);
+        std::make_tuple(15, 6, TASK_GANG_MLA_DECODE_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[24]; // tiles_per_xcd
   } else if (name == "gang_attn_merge_mi300") {
     assert(params.size() == 7);
