@@ -93,7 +93,10 @@ template <int BATCH_SIZE,
           int MOE_W13_TILES_PER_EXPERT,
           int MOE_W2_TILES_PER_EXPERT,
           int MOE_W13_OPW,
-          int MOE_W2_OPW>
+          int MOE_W2_OPW,
+          // Expert weights as E2M1 nibbles rather than E4M3 bytes. Only the
+          // two MoE sub-kernels see it; o_proj and the router stay MXFP8.
+          bool MOE_WEIGHT_FP4 = false>
 __device__ __attribute__((always_inline)) void
     gang_oproj_router_fused_kernel_mi300(
         // ── o_proj inputs ──
@@ -377,7 +380,8 @@ __device__ __attribute__((always_inline)) void
                                      MOE_W13_TILES_PER_EXPERT,
                                      MOE_W13_OPW,
                                      /*FUSE_SWIGLU=*/true,
-                                     /*WRITE_THROUGH=*/true>(
+                                     /*WRITE_THROUGH=*/true,
+                                     MOE_WEIGHT_FP4>(
         norm_output_ptr,
         moe_gate_up_weight_ptr,
         routing_indices_ptr,
@@ -449,7 +453,8 @@ __device__ __attribute__((always_inline)) void
                                     MOE_NUM_TOPK,
                                     MOE_W2_TILES_PER_EXPERT,
                                     MOE_W2_OPW,
-                                    /*FUSE_MULSUMADD=*/true>(
+                                    /*FUSE_MULSUMADD=*/true,
+                                    MOE_WEIGHT_FP4>(
         moe_swiglu_out_ptr,
         moe_down_weight_ptr,
         routing_indices_ptr,

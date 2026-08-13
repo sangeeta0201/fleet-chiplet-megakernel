@@ -4393,6 +4393,26 @@ class PersistentKernel:
         assert moe_intermediate % 512 == 0, \
             f"MXFP8 W2 K={moe_intermediate} not divisible by 512"
 
+        # MXFP8 or MXFP4 on the expert side. The kernel picks the width off
+        # the packed workgroup stride -- OPW*(K + K/32) against
+        # OPW*(K/2 + K/32) -- because packing erases everything else, so the
+        # only thing to establish here is that the two stacks agree.
+        def _moe_wg_bytes(opw, k, fp4):
+            return opw * ((k // 2 if fp4 else k) + k // 32)
+
+        moe_fp4 = moe_gate_up_weight.dim(2) == _moe_wg_bytes(
+            moe_w13_output_per_wg, hidden_size, True)
+        assert moe_gate_up_weight.dim(2) == _moe_wg_bytes(
+            moe_w13_output_per_wg, hidden_size, moe_fp4), (
+            f"W13 workgroup stride {moe_gate_up_weight.dim(2)} is neither the "
+            f"MXFP8 nor the MXFP4 packing of {moe_w13_output_per_wg} rows of "
+            f"K={hidden_size}")
+        assert moe_down_weight.dim(2) == _moe_wg_bytes(
+            moe_w2_output_per_wg, moe_intermediate, moe_fp4), (
+            f"W2 workgroup stride {moe_down_weight.dim(2)} disagrees with "
+            f"W13 on the element width (W13 is "
+            f"{'MXFP4' if moe_fp4 else 'MXFP8'})")
+
         moe_topk_total = moe_swiglu_out.dim(1)
         moe_max_activated = min(moe_topk_total * batch_size, moe_num_experts)
         moe_w13_tiles_per_xcd = (

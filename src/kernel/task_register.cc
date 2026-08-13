@@ -2261,6 +2261,26 @@ int TaskRegister::register_gang_oproj_router_fused_mi300_task(
   assert(output_ops[4]->output_tensors[0].dim[0] == batch_size);
   assert(output_ops[4]->output_tensors[0].dim[1] == hidden_size);
 
+  // Which element width the experts were packed at. The packed layout erases
+  // N and K, so the workgroup stride is the only place the width shows: it is
+  // OPW*(K + K/32) at MXFP8 and OPW*(K/2 + K/32) at MXFP4. The two stacks have
+  // to agree -- the kernel carries one flag for the pair -- and everything
+  // else about them, the expert count and the workgroup count, is identical
+  // between the formats, so nothing above this needed to know.
+  int const w13_fp8_bytes = moe_w13_opw * (hidden_size + hidden_size / 32);
+  int const w13_fp4_bytes = moe_w13_opw * (hidden_size / 2 + hidden_size / 32);
+  int const w2_fp8_bytes = moe_w2_opw * (moe_intermediate + moe_intermediate / 32);
+  int const w2_fp4_bytes =
+      moe_w2_opw * (moe_intermediate / 2 + moe_intermediate / 32);
+  int const w13_bytes = input_ops[10]->output_tensors[0].dim[2];
+  int const w2_bytes = input_ops[11]->output_tensors[0].dim[2];
+  bool const moe_fp4 = (w13_bytes == w13_fp4_bytes);
+  assert((moe_fp4 ? w13_fp4_bytes : w13_fp8_bytes) == w13_bytes &&
+         "the packed W13 weight matches neither the MXFP8 nor the MXFP4 "
+         "workgroup stride at this output_per_wg and hidden size");
+  assert((moe_fp4 ? w2_fp4_bytes : w2_fp8_bytes) == w2_bytes &&
+         "W13 and W2 are packed at different element widths");
+
   assert(2 * moe_intermediate % moe_w13_opw == 0);
   assert(hidden_size % moe_w2_opw == 0);
   int moe_w13_tiles_per_expert = batch_size * (2 * moe_intermediate / moe_w13_opw);
@@ -2274,7 +2294,7 @@ int TaskRegister::register_gang_oproj_router_fused_mi300_task(
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
   code.e("kernel::gang_oproj_router_fused_kernel_mi300<$, $, $, $, $, $, $, $, "
-         "$, $, $, $, $, $>(",
+         "$, $, $, $, $, $, $>(",
          batch_size,
          oproj_reduction_size,
          oproj_rows_per_wg,
@@ -2288,7 +2308,8 @@ int TaskRegister::register_gang_oproj_router_fused_mi300_task(
          moe_w13_tiles_per_expert,
          moe_w2_tiles_per_expert,
          moe_w13_opw,
-         moe_w2_opw);
+         moe_w2_opw,
+         moe_fp4 ? "true" : "false");
   for (int i = 0; i < num_inputs; i++) {
     code.e("    task_desc->input_ptrs[$],", i);
   }

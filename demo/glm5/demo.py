@@ -128,10 +128,15 @@ def quantize_mxfp8(w: torch.Tensor) -> tuple:
 
 def pack_mxfp8_workgroup(data: torch.Tensor, scales: torch.Tensor,
                          output_per_wg: int = 64) -> torch.Tensor:
-    """Repack quantize_mxfp8 output into the per-workgroup layout the MXFP8
-    kernels read, mirroring gpt-oss's pack_mxfp4_workgroup:
+    """Repack quantize_mxfp8 or quantize_mxfp4 output into the per-workgroup
+    layout the MXFP8/MXFP4 kernels read, mirroring gpt-oss's
+    pack_mxfp4_workgroup:
 
-        [E, wgs, OPW*K data bytes | OPW*(K/32) scale bytes]
+        [E, wgs, OPW*row_bytes data | OPW*(K/32) scale bytes]
+
+    row_bytes is K at MXFP8 and K/2 at MXFP4; it comes from the data tensor's
+    own last dimension, and the scale count fixes K, so one packer serves both
+    widths and the kernel reads the width back off this stride.
 
     Rows are K-major within the data half; scales are [row][k/32]. A 2-D
     weight is treated as E == 1 and returned without the leading axis.
@@ -140,17 +145,123 @@ def pack_mxfp8_workgroup(data: torch.Tensor, scales: torch.Tensor,
     if squeeze:
         data = data.unsqueeze(0)
         scales = scales.unsqueeze(0)
-    E, out_dim, K = data.shape
+    E, out_dim, row_bytes = data.shape
+    K = scales.shape[2] * 32
     assert scales.shape == (E, out_dim, K // 32)
+    assert row_bytes in (K, K // 2), \
+        f"{row_bytes} bytes per row is neither MXFP8 ({K}) nor MXFP4 {K // 2}"
     assert out_dim % output_per_wg == 0, \
         f"out_dim {out_dim} must be divisible by output_per_wg {output_per_wg}"
 
     wgs = out_dim // output_per_wg
     packed = torch.cat(
-        [data.reshape(E, wgs, output_per_wg * K),
+        [data.reshape(E, wgs, output_per_wg * row_bytes),
          scales.reshape(E, wgs, output_per_wg * (K // 32))],
         dim=2).contiguous()
     return packed.squeeze(0) if squeeze else packed
+
+
+# E2M1, the MXFP4 element format: sign + 2 exponent + 1 mantissa bits, so
+# eight magnitudes and a 6.0 ceiling against E4M3's 448.
+_E2M1_LEVELS = torch.tensor([0., 0.5, 1., 1.5, 2., 3., 4., 6.])
+
+
+def fake_quantize_mxfp4(w: torch.Tensor) -> torch.Tensor:
+    """Round a bf16 weight through MXFP4 and back, in place of quantizing to it.
+
+    This is a measurement tool, not a code path we ship. MXFP4 would cut the
+    MoE from 2.24 to 1.22 GB per token -- by far the largest single byte lever
+    left -- but GLM-4.7-Flash ships bf16, so unlike gpt-oss, whose weights were
+    trained for the format, this is a post-hoc 4-bit quantization. On layer
+    20's experts it measures 1.18e-01 relative RMS against MXFP8's 2.65e-02.
+
+    Routing the values through MXFP4 while still *packing* them as MXFP8 gives
+    the end-to-end quality answer for zero kernel work: the megakernel runs
+    unchanged and only the numbers it reads are 4-bit-accurate. If agreement
+    survives, the kernel is worth writing; if it does not, no kernel would have
+    saved it. Same block structure as quantize_mxfp8 -- one E8M0 exponent per
+    32 contiguous K -- so the comparison isolates the element format.
+    """
+    K = w.shape[-1]
+    assert K % 32 == 0, f"K {K} must be a multiple of 32"
+    wf = w.float().reshape(*w.shape[:-1], K // 32, 32)
+    amax = wf.abs().amax(dim=-1)
+    target = (amax / 6.0).contiguous()
+    u = target.view(torch.int32)
+    raw_exp = ((u >> 23) & 0xFF) + ((u & 0x7FFFFF) != 0).to(torch.int32)
+    se = torch.where(amax == 0, torch.zeros_like(raw_exp), raw_exp.clamp(0, 255))
+    scale = torch.where(se == 0, torch.ones_like(target),
+                        (se.to(torch.int32) << 23).view(torch.float32))
+    n = wf / scale.unsqueeze(-1)
+    levels = _E2M1_LEVELS.to(n.device)
+    q = levels[(n.abs().unsqueeze(-1) - levels).abs().argmin(-1)] * n.sign()
+    return (q * scale.unsqueeze(-1)).reshape(w.shape).to(w.dtype)
+
+
+# Narrow the routed experts from MXFP8 to MXFP4. The MoE weights are 2.238 GB
+# of the 4.537 GB this model streams per token, so this is the single largest
+# byte lever left and, together with de-padding and un-absorbing attention, the
+# arithmetic path to 2 ms -- 4.54 -> 2.67 GB at 1.44 TB/s is 1.86.
+#
+# GLM-4.7-Flash ships bf16, so unlike gpt-oss this is post-hoc 4-bit
+# quantization of weights never trained for it, and the format error is 4x
+# MXFP8's: 1.18e-01 relative RMS against 2.65e-02 on layer 20's experts. What
+# licences it is the end-to-end probe -- fake_quantize_mxfp4 below, which routes
+# expert values through E2M1 while still packing MXFP8, so the megakernel runs
+# untouched -- which reproduced the MXFP8 baseline's token agreement exactly.
+# A WikiText-2 perplexity sweep is still owed, as it is for MXFP8.
+#
+# Measured back to back: 4.634 -> 4.467 ms/token, with the 50-token CI check
+# giving the same 22-token longest common block and 18-token exact prefix as
+# MXFP8. Note how small that is against the byte arithmetic -- 1.02 GB removed
+# would be ~1.0 ms if the MoE were bandwidth-bound, and it bought 0.17. The
+# stage runs at roughly 1 TB/s of the 5.4 the part can stream, so bytes are no
+# longer what binds it; see task #30. MXFP4 still earns its place, both for the
+# 0.17 and because the byte budget has to come down anyway before utilization
+# work can cash out. Set GLM_MOE_MXFP4=0 for MXFP8.
+MOE_MXFP4 = os.environ.get("GLM_MOE_MXFP4", "1") == "1"
+
+
+def quantize_mxfp4(w: torch.Tensor) -> tuple:
+    """Quantize a [..., out, K] bf16 weight to MXFP4: E2M1 nibbles with one
+    E8M0 exponent per 32 contiguous K elements.
+
+    Same block structure and the same scale arithmetic as quantize_mxfp8 -- the
+    MFMA addresses its scale operand by matrix position either way, so the
+    contiguous-32 grouping is no more optional here than there -- with 6.0 in
+    place of 448.0 as the ceiling the exponent has to bring the block under.
+
+    The rounding is gpt-oss's quantize_bf16_to_mxfp4, thresholds and all: the
+    midpoints between the eight E2M1 magnitudes, applied as a ladder of
+    comparisons rather than a nearest-level search, with the sign in bit 3.
+    Nibble order within a byte is element 2b low, 2b+1 high, matching what
+    __builtin_amdgcn_cvt_scalef32_pk_fp4_f32 writes on the activation side.
+
+    Returns (data uint8 [..., out, K/2], scales uint8 [..., out, K/32]).
+    """
+    K = w.shape[-1]
+    assert K % 32 == 0, f"K {K} must be a multiple of 32"
+    wf = w.float().reshape(*w.shape[:-1], K // 32, 32)
+    amax = wf.abs().amax(dim=-1)
+
+    target = (amax / 6.0).contiguous()
+    u = target.view(torch.int32)
+    raw_exp = ((u >> 23) & 0xFF) + ((u & 0x7FFFFF) != 0).to(torch.int32)
+    se = torch.where(amax == 0, torch.zeros_like(raw_exp),
+                     raw_exp.clamp(0, 255))
+    scale = torch.where(se == 0, torch.ones_like(target),
+                        (se.to(torch.int32) << 23).view(torch.float32))
+
+    n = wf / scale.unsqueeze(-1)
+    a = n.abs()
+    nib = torch.zeros_like(a, dtype=torch.uint8)
+    for thr, code in ((0.25, 1), (0.75, 2), (1.25, 3), (1.75, 4),
+                      (2.50, 5), (3.50, 6), (5.00, 7)):
+        nib[a >= thr] = code
+    nib[n < 0] |= 8
+
+    packed = nib[..., 0::2] | (nib[..., 1::2] << 4)
+    return (packed.reshape(*w.shape[:-1], K // 2), se.to(torch.uint8))
 
 
 def pack_moe_mxfp8(stacked: torch.Tensor,
@@ -164,7 +275,13 @@ def pack_moe_mxfp8(stacked: torch.Tensor,
     transient at 1/E of it, at no cost to the result.
     """
     assert stacked.dim() == 3, stacked.shape
-    packed = [pack_mxfp8_workgroup(*quantize_mxfp8(stacked[e]), output_per_wg)
+    if MOE_MXFP4:
+        quant = quantize_mxfp4
+    elif os.environ.get("GLM_FAKE_MXFP4_EXPERTS", "0") == "1":
+        quant = lambda w: quantize_mxfp8(fake_quantize_mxfp4(w))
+    else:
+        quant = quantize_mxfp8
+    packed = [pack_mxfp8_workgroup(*quant(stacked[e]), output_per_wg)
               for e in range(stacked.shape[0])]
     return torch.stack(packed).contiguous()
 
@@ -538,6 +655,14 @@ if __name__ == "__main__":
         # The residual fold is deliberately independent of this knob.
         FUSE_ATTN = os.environ.get("GLM_FUSE_ATTN", "0") == "1"
         MOE_MXFP8_OPW = 64
+        assert not MOE_MXFP4 or MOE_MXFP8, \
+            "GLM_MOE_MXFP4 narrows the MXFP8 expert path; it is not a bf16 mode"
+        # Only the fused tail carries the width through to the kernel. The
+        # standalone gang_moe_w{13,2}_linear_mxfp8 layers still hard-code the
+        # MXFP8 stride and would mis-address a nibble-packed weight, so they
+        # are refused rather than silently wrong.
+        assert not MOE_MXFP4 or FUSE_OPROJ_ROUTER, \
+            "GLM_MOE_MXFP4 needs GLM_FUSE_OPROJ_ROUTER=1"
         if MOE_MXFP8:
             # Depth-4 MFMA pipeline: only the last of the four slots carries a
             # tail guard, so a partial final group would compute k-tiles that

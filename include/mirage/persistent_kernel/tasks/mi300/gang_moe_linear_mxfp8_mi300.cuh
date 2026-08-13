@@ -44,6 +44,16 @@
 // Weight format, per workgroup of OUTPUT_PER_WG rows of one expert:
 //   [FP8 E4M3 data: OPW * K bytes][E8M0 scales: OPW * (K/32) bytes]
 // Experts are contiguous: expert e starts at e * EXPERT_WGS * WG_BYTES.
+//
+// WEIGHT_FP4 narrows that data half to OPW * (K/2) bytes of E2M1 nibbles and
+// nothing else. The scales are already E8M0-per-32 in both formats, the tile
+// decode, the LDS activation and both epilogues are format-blind, and the MFMA
+// is the same v_mfma_scale_f32_16x16x128_f8f6f4 with cbsz switched from FP8 to
+// FP4 -- so the two paths differ in exactly three expressions (the row stride,
+// the A-operand load, and cbsz) and are one template rather than two files.
+// The activation stays FP8: this is W4A8, and quantizing the token to 4 bits
+// as gpt-oss's f4xf4 path does would spend the quality budget twice over for
+// no bandwidth, since the token is 2 KB against the weight's 48 MB.
 
 #pragma once
 // Inherits the same include ordering as gang_linear_mxfp8_mi300.cuh; see the
@@ -54,6 +64,30 @@
 #include "tasks/mi300/silu_mul_mi300.cuh"
 
 namespace kernel {
+
+// The weight operand at whichever width it is packed. FP4 fills only the lower
+// 128 bits of the i32x8 and is contiguous there, so it is one 16-byte load
+// against FP8's split gather of two.
+template <bool FP4>
+__device__ __forceinline__ i32x8_t _gang_load_w_mfma_a(uint8_t const *row,
+                                                       int kt,
+                                                       int g) {
+  if constexpr (FP4) {
+    return _gang_load_fp4_mfma_b(row, kt, g);
+  } else {
+    return _gang_load_fp8_mfma_b(row, kt, g);
+  }
+}
+
+template <bool FP4>
+__device__ __forceinline__ f32x4_t _gang_mfma_w_x_f8(
+    i32x8_t a, i32x8_t b, f32x4_t c, int scale_a, int scale_b) {
+  if constexpr (FP4) {
+    return _gang_mfma_f4xf8(a, b, c, scale_a, scale_b);
+  } else {
+    return _gang_mfma_f8xf8(a, b, c, scale_a, scale_b);
+  }
+}
 
 // Resolve a gang tile index to (expert_id, token, workgroup).
 //
@@ -122,7 +156,10 @@ template <int BATCH_SIZE,
           // event boundary's buffer_wbl2 is what makes them visible, and a
           // fused caller has no such boundary. Writing through costs the
           // store's L2 residency, which nothing on this XCD wants back.
-          bool WRITE_THROUGH = false>
+          bool WRITE_THROUGH = false,
+          // E2M1 nibbles instead of E4M3 bytes on the weight side only; see
+          // the note at the top of the file.
+          bool WEIGHT_FP4 = false>
 __device__ __noinline__ void
     gang_moe_w13_linear_mxfp8_kernel(void const *input_ptr,
                                      void const *weight_ptr,
@@ -137,7 +174,8 @@ __device__ __noinline__ void
                 "K must be a multiple of 128 for FP8 MFMA");
 
   constexpr int NUM_BLOCKS_32 = REDUCTION_SIZE / 32;
-  constexpr int WG_DATA_BYTES = OUTPUT_PER_WG * REDUCTION_SIZE;
+  constexpr int W_ROW_BYTES = WEIGHT_FP4 ? REDUCTION_SIZE / 2 : REDUCTION_SIZE;
+  constexpr int WG_DATA_BYTES = OUTPUT_PER_WG * W_ROW_BYTES;
   constexpr int WG_SCALE_BYTES = OUTPUT_PER_WG * NUM_BLOCKS_32;
   constexpr int WG_BYTES = WG_DATA_BYTES + WG_SCALE_BYTES;
   constexpr int EXPERT_WGS = OUTPUT_STRIDE / OUTPUT_PER_WG;
@@ -199,18 +237,18 @@ __device__ __noinline__ void
     int const wave_tile = warp_id + tile_iter * NUM_WAVES;
     int const w_row = wave_tile * 16 + col;
     uint8_t const *w_data_row =
-        wg_data + static_cast<size_t>(w_row) * REDUCTION_SIZE;
+        wg_data + static_cast<size_t>(w_row) * W_ROW_BYTES;
     int const row_scale_base = w_row * NUM_BLOCKS_32;
 
     f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    i32x8_t a0 = _gang_load_fp8_mfma_b(w_data_row, 0 * K_PER_MFMA, g);
+    i32x8_t a0 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 0 * K_PER_MFMA, g);
     int sa0 = (int)wg_scales[row_scale_base + 0 * 4 + g];
-    i32x8_t a1 = _gang_load_fp8_mfma_b(w_data_row, 1 * K_PER_MFMA, g);
+    i32x8_t a1 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 1 * K_PER_MFMA, g);
     int sa1 = (int)wg_scales[row_scale_base + 1 * 4 + g];
-    i32x8_t a2 = _gang_load_fp8_mfma_b(w_data_row, 2 * K_PER_MFMA, g);
+    i32x8_t a2 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 2 * K_PER_MFMA, g);
     int sa2 = (int)wg_scales[row_scale_base + 2 * 4 + g];
-    i32x8_t a3 = _gang_load_fp8_mfma_b(w_data_row, 3 * K_PER_MFMA, g);
+    i32x8_t a3 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 3 * K_PER_MFMA, g);
     int sa3 = (int)wg_scales[row_scale_base + 3 * 4 + g];
 
 // IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation.
@@ -218,41 +256,45 @@ __device__ __noinline__ void
     for (int ki = 0; ki < MFMA_ITERS; ki += 4) {
       {
         i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
-        acc = _gang_mfma_f8xf8(a0, b, acc, sa0, (int)s_tok_scales[ki]);
+        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a0, b, acc, sa0,
+                                            (int)s_tok_scales[ki]);
       }
       if (ki + 4 < MFMA_ITERS) {
         int kt4 = (ki + 4) * K_PER_MFMA;
-        a0 = _gang_load_fp8_mfma_b(w_data_row, kt4, g);
+        a0 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt4, g);
         sa0 = (int)wg_scales[row_scale_base + kt4 / 32 + g];
       }
 
       {
         i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 1) * K_PER_MFMA, g);
-        acc = _gang_mfma_f8xf8(a1, b, acc, sa1, (int)s_tok_scales[ki + 1]);
+        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a1, b, acc, sa1,
+                                            (int)s_tok_scales[ki + 1]);
       }
       if (ki + 5 < MFMA_ITERS) {
         int kt5 = (ki + 5) * K_PER_MFMA;
-        a1 = _gang_load_fp8_mfma_b(w_data_row, kt5, g);
+        a1 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt5, g);
         sa1 = (int)wg_scales[row_scale_base + kt5 / 32 + g];
       }
 
       {
         i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 2) * K_PER_MFMA, g);
-        acc = _gang_mfma_f8xf8(a2, b, acc, sa2, (int)s_tok_scales[ki + 2]);
+        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a2, b, acc, sa2,
+                                            (int)s_tok_scales[ki + 2]);
       }
       if (ki + 6 < MFMA_ITERS) {
         int kt6 = (ki + 6) * K_PER_MFMA;
-        a2 = _gang_load_fp8_mfma_b(w_data_row, kt6, g);
+        a2 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt6, g);
         sa2 = (int)wg_scales[row_scale_base + kt6 / 32 + g];
       }
 
       if (ki + 3 < MFMA_ITERS) {
         i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 3) * K_PER_MFMA, g);
-        acc = _gang_mfma_f8xf8(a3, b, acc, sa3, (int)s_tok_scales[ki + 3]);
+        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a3, b, acc, sa3,
+                                            (int)s_tok_scales[ki + 3]);
       }
       if (ki + 7 < MFMA_ITERS) {
         int kt7 = (ki + 7) * K_PER_MFMA;
-        a3 = _gang_load_fp8_mfma_b(w_data_row, kt7, g);
+        a3 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt7, g);
         sa3 = (int)wg_scales[row_scale_base + kt7 / 32 + g];
       }
     }
@@ -354,7 +396,8 @@ template <int BATCH_SIZE,
           int NUM_TOPK,
           int TILES_PER_EXPERT,
           int OUTPUT_PER_WG,
-          bool FUSE_MULSUMADD = false>
+          bool FUSE_MULSUMADD = false,
+          bool WEIGHT_FP4 = false>
 __device__ __noinline__ void
     gang_moe_w2_linear_mxfp8_kernel(void const *input_ptr,
                                     void const *weight_ptr,
@@ -370,7 +413,8 @@ __device__ __noinline__ void
                 "K must be a multiple of 128 for FP8 MFMA");
 
   constexpr int NUM_BLOCKS_32 = REDUCTION_SIZE / 32;
-  constexpr int WG_DATA_BYTES = OUTPUT_PER_WG * REDUCTION_SIZE;
+  constexpr int W_ROW_BYTES = WEIGHT_FP4 ? REDUCTION_SIZE / 2 : REDUCTION_SIZE;
+  constexpr int WG_DATA_BYTES = OUTPUT_PER_WG * W_ROW_BYTES;
   constexpr int WG_SCALE_BYTES = OUTPUT_PER_WG * NUM_BLOCKS_32;
   constexpr int WG_BYTES = WG_DATA_BYTES + WG_SCALE_BYTES;
   constexpr int EXPERT_WGS = OUTPUT_STRIDE / OUTPUT_PER_WG;
@@ -435,18 +479,18 @@ __device__ __noinline__ void
     int const wave_tile = warp_id + tile_iter * NUM_WAVES;
     int const w_row = wave_tile * 16 + col;
     uint8_t const *w_data_row =
-        wg_data + static_cast<size_t>(w_row) * REDUCTION_SIZE;
+        wg_data + static_cast<size_t>(w_row) * W_ROW_BYTES;
     int const row_scale_base = w_row * NUM_BLOCKS_32;
 
     f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    i32x8_t a0 = _gang_load_fp8_mfma_b(w_data_row, 0 * K_PER_MFMA, g);
+    i32x8_t a0 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 0 * K_PER_MFMA, g);
     int sa0 = (int)wg_scales[row_scale_base + 0 * 4 + g];
-    i32x8_t a1 = _gang_load_fp8_mfma_b(w_data_row, 1 * K_PER_MFMA, g);
+    i32x8_t a1 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 1 * K_PER_MFMA, g);
     int sa1 = (int)wg_scales[row_scale_base + 1 * 4 + g];
-    i32x8_t a2 = _gang_load_fp8_mfma_b(w_data_row, 2 * K_PER_MFMA, g);
+    i32x8_t a2 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 2 * K_PER_MFMA, g);
     int sa2 = (int)wg_scales[row_scale_base + 2 * 4 + g];
-    i32x8_t a3 = _gang_load_fp8_mfma_b(w_data_row, 3 * K_PER_MFMA, g);
+    i32x8_t a3 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 3 * K_PER_MFMA, g);
     int sa3 = (int)wg_scales[row_scale_base + 3 * 4 + g];
 
 // IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation.
@@ -454,41 +498,45 @@ __device__ __noinline__ void
     for (int ki = 0; ki < MFMA_ITERS; ki += 4) {
       {
         i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
-        acc = _gang_mfma_f8xf8(a0, b, acc, sa0, (int)s_tok_scales[ki]);
+        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a0, b, acc, sa0,
+                                            (int)s_tok_scales[ki]);
       }
       if (ki + 4 < MFMA_ITERS) {
         int kt4 = (ki + 4) * K_PER_MFMA;
-        a0 = _gang_load_fp8_mfma_b(w_data_row, kt4, g);
+        a0 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt4, g);
         sa0 = (int)wg_scales[row_scale_base + kt4 / 32 + g];
       }
 
       {
         i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 1) * K_PER_MFMA, g);
-        acc = _gang_mfma_f8xf8(a1, b, acc, sa1, (int)s_tok_scales[ki + 1]);
+        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a1, b, acc, sa1,
+                                            (int)s_tok_scales[ki + 1]);
       }
       if (ki + 5 < MFMA_ITERS) {
         int kt5 = (ki + 5) * K_PER_MFMA;
-        a1 = _gang_load_fp8_mfma_b(w_data_row, kt5, g);
+        a1 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt5, g);
         sa1 = (int)wg_scales[row_scale_base + kt5 / 32 + g];
       }
 
       {
         i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 2) * K_PER_MFMA, g);
-        acc = _gang_mfma_f8xf8(a2, b, acc, sa2, (int)s_tok_scales[ki + 2]);
+        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a2, b, acc, sa2,
+                                            (int)s_tok_scales[ki + 2]);
       }
       if (ki + 6 < MFMA_ITERS) {
         int kt6 = (ki + 6) * K_PER_MFMA;
-        a2 = _gang_load_fp8_mfma_b(w_data_row, kt6, g);
+        a2 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt6, g);
         sa2 = (int)wg_scales[row_scale_base + kt6 / 32 + g];
       }
 
       if (ki + 3 < MFMA_ITERS) {
         i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 3) * K_PER_MFMA, g);
-        acc = _gang_mfma_f8xf8(a3, b, acc, sa3, (int)s_tok_scales[ki + 3]);
+        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a3, b, acc, sa3,
+                                            (int)s_tok_scales[ki + 3]);
       }
       if (ki + 7 < MFMA_ITERS) {
         int kt7 = (ki + 7) * K_PER_MFMA;
-        a3 = _gang_load_fp8_mfma_b(w_data_row, kt7, g);
+        a3 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt7, g);
         sa3 = (int)wg_scales[row_scale_base + kt7 / 32 + g];
       }
     }
