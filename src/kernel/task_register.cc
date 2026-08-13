@@ -2902,6 +2902,101 @@ int TaskRegister::register_gang_rmsnorm_linear_mxfp8_bias_mi300_task(
                                code.to_string());
 }
 
+// Fused q_a_layernorm + MXFP8 absorbed q_b_proj + MLA KV cache update.
+// Registers as a variant of the plain MXFP8 rmsnorm+linear task type, exactly
+// as the bf16 kvupd task is a variant of its own bf16 base -- the runtime
+// bookkeeping is identical and only the emitted body differs.
+// params: [output_stride, output_per_wg, n_wgs_per_xcd, total_tiles_per_xcd,
+//          actual_hidden_dim, reduction_size, kv_lora_rank, qk_rope_head_dim,
+//          kv_input_offset, max_seq_len, page_size]
+int TaskRegister::register_gang_rmsnorm_linear_mxfp8_bias_mla_kvupd_mi300_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 11);
+  int output_stride = params[0];
+  int output_per_wg = params[1];
+  int n_wgs_per_xcd = params[2];
+  int total_tiles_per_xcd = params[3];
+  int actual_hidden_dim = params[4];
+  int reduction_size = params[5];
+  int kv_lora_rank = params[6];
+  int qk_rope_head_dim = params[7];
+  int kv_input_offset = params[8];
+  int max_seq_len = params[9];
+  int page_size = params[10];
+  (void)total_tiles_per_xcd;
+
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  // norm_input, norm_weight, norm_output, mxfp8_weight, bias,
+  // kv_a_layernorm weight, cos, sin, paged latent cache
+  int num_inputs = 9;
+  int num_outputs = 1;
+
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+
+  assert(input_ops[0]->dtensor.num_dims == 2);
+  int batch_size = input_ops[0]->dtensor.dim[0];
+  int kv_input_stride = input_ops[0]->dtensor.dim[1];
+  assert(actual_hidden_dim <= reduction_size);
+  assert(reduction_size <= kv_input_stride);
+  assert(batch_size == 1 &&
+         "the narrowed reduction doubles as the row stride; needs one row");
+  assert(kv_input_offset + kv_lora_rank + qk_rope_head_dim <= kv_input_stride);
+  // One shared latent head, so the cache row stride is just the last dim.
+  int kv_cache_stride = input_ops[8]->output_tensors[0].dim[3];
+  assert(kv_cache_stride >= kv_lora_rank + qk_rope_head_dim);
+  assert(output_per_wg == qk_rope_head_dim &&
+         (kv_lora_rank + qk_rope_head_dim) % output_per_wg == 0);
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::gang_rmsnorm_linear_mxfp8_bias_mla_kvupd_kernel<$, $, $, $, "
+         "$, $, $, $, $, $, $>(",
+         batch_size,        /* BATCH_SIZE */
+         output_per_wg,     /* OUTPUT_PER_WG */
+         reduction_size,    /* REDUCTION_SIZE */
+         actual_hidden_dim, /* ACTUAL_HIDDEN_DIM */
+         kv_lora_rank,      /* KV_LORA_RANK */
+         qk_rope_head_dim,  /* QK_ROPE_HEAD_DIM */
+         kv_input_stride,   /* KV_INPUT_STRIDE */
+         kv_cache_stride,   /* KV_CACHE_STRIDE */
+         max_seq_len,       /* MAX_SEQ_LEN */
+         page_size,         /* PAGE_SIZE */
+         kv_input_offset);  /* KV_INPUT_OFFSET */
+  code.e("    task_desc->input_ptrs[0],");  // norm_input, also kv_latent
+  code.e("    task_desc->input_ptrs[1],");  // norm_weight
+  code.e("    task_desc->input_ptrs[2],");  // norm_output scratch (writable)
+  code.e("    task_desc->input_ptrs[3],");  // mxfp8_weight
+  code.e("    task_desc->input_ptrs[4],");  // bias
+  code.e("    task_desc->input_ptrs[0],");  // kv_latent
+  code.e("    task_desc->input_ptrs[5],");  // kv_a_layernorm weight
+  code.e("    task_desc->input_ptrs[6],");  // cos
+  code.e("    task_desc->input_ptrs[7],");  // sin
+  code.e("    task_desc->output_ptrs[0],"); // q_workspace
+  code.e("    task_desc->input_ptrs[8],");  // paged latent cache, written
+  code.e("    runtime_config.qo_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_indices_buffer,");
+  code.e("    runtime_config.paged_kv_last_page_len_buffer,");
+  code.e("    task_desc->task_metadata.request_id,");
+  code.e("    runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS],");
+  code.e("    $,", n_wgs_per_xcd);
+  code.e("    $,", output_stride);
+  code.e("    tile_idx,");
+  // Matches the standalone task's epsilon, as the bf16 variant does.
+  code.e("    1e-6f);");
+  return register_task_variant(TASK_GANG_RMSNORM_LINEAR_MXFP8_BIAS_MI300,
+                               code.to_string());
+}
+
 // Gang MoE MXFP8 linear: 8 tasks (1 per XCD), FP8 weight x FP8 activation MFMA.
 // params: [tiles_per_expert, max_experts_per_xcd, total_tiles_per_xcd,
 // output_per_wg, fuse_epilogue]

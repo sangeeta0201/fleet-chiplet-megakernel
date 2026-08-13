@@ -3196,6 +3196,103 @@ class PersistentKernel:
              total_tiles_per_xcd, actual_hidden_dim]
         )
 
+    def gang_rmsnorm_linear_mxfp8_bias_mla_kvupd_layer(
+        self,
+        norm_input: DTensor,
+        norm_weight: DTensor,
+        norm_output: DTensor,
+        mxfp8_weight: DTensor,
+        bias: DTensor,
+        kv_norm: DTensor,
+        cos_pos_embed: DTensor,
+        sin_pos_embed: DTensor,
+        kv_cache: DTensor,
+        q_workspace: DTensor,
+        actual_hidden_dim: int,
+        output_per_wg: int,
+        output_stride: int,
+        reduction_size: int,
+        kv_offset: int,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """gang_rmsnorm_linear_bias_mla_kvupd_layer with an MXFP8 weight.
+
+        Same fusion, same tile-0-owns-the-latent-row dispatch; the GEMM half
+        is the MXFP8 kernel instead of the bf16 one, so the weight arrives
+        workgroup-packed as [n_wgs, wg_bytes] and ``output_per_wg`` replaces
+        ``tile_n``. There is no separate ``norm_span``: the MXFP8 kernel norms
+        exactly the ``reduction_size`` columns it multiplies, which is what
+        the bf16 caller asked for anyway.
+        """
+        assert norm_input.num_dims == 2
+        assert mxfp8_weight.num_dims == 2
+        assert q_workspace.num_dims == 2
+        assert kv_cache.num_dims == 4  # (num_pages, page_size, 1, qk_dim)
+        assert kv_cache.dim(2) == 1, "MLA keeps a single shared latent head"
+        assert self.target_cc == 95, "MXFP8 MFMA is gfx950-only"
+
+        qk_dim = kv_cache.dim(3)
+        qk_rope_head_dim = cos_pos_embed.dim(cos_pos_embed.num_dims - 1)
+        kv_lora_rank = qk_dim - qk_rope_head_dim
+        assert kv_norm.dim(0) == kv_lora_rank
+        assert norm_input.dim(1) >= kv_offset + qk_dim
+        # The rope slice of a head has to be exactly one workgroup, or the
+        # in-place rotation would straddle two of them.
+        assert output_per_wg == qk_rope_head_dim and qk_dim % output_per_wg == 0, (
+            "output_per_wg must equal qk_rope_head_dim and divide the head")
+
+        batch_size = self.max_num_batched_tokens
+        assert batch_size == 1, (
+            "a narrowed reduction doubles as the row stride; needs one row")
+        # K must clear the depth-4 pipeline's tail: only slot 3 is guarded.
+        assert reduction_size % 512 == 0, reduction_size
+        assert actual_hidden_dim <= reduction_size <= norm_input.dim(1)
+        n_wgs = mxfp8_weight.dim(0)
+        assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
+        n_wgs_per_xcd = n_wgs // 8
+        # The packed weight erases both N and K, so recover K from the row
+        # width and cross-check N against the bias -- the only tensor that
+        # still carries it.
+        assert mxfp8_weight.dim(1) == output_per_wg * (
+            reduction_size + reduction_size // 32), (
+            f"wg_bytes {mxfp8_weight.dim(1)} does not match opw "
+            f"{output_per_wg} x K {reduction_size}")
+        assert bias.dim(1) == n_wgs * output_per_wg, (
+            f"bias width {bias.dim(1)} != n_wgs {n_wgs} x opw {output_per_wg}")
+        # Each XCD's column chunk must hold whole heads, so that "does this
+        # worker own a rope slice" is a question about wg_idx alone.
+        assert (n_wgs_per_xcd * output_per_wg) % qk_dim == 0, (
+            "per-XCD chunk must hold whole heads")
+        # +1: tile 0 is the latent cache update, which owns a dispatch slot so
+        # that it runs beside the GEMM instead of behind one worker's share of
+        # it. Only XCD 0's is live; the other seven return immediately.
+        total_tiles_per_xcd = batch_size * n_wgs_per_xcd + 1
+
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(norm_input, (-1, -1, -1), 1, True)
+        tb_graph.new_input(norm_weight, (-1, -1, -1), 0, True)
+        tb_graph.new_input(norm_output, (-1, -1, -1), 1, True)
+        tb_graph.new_input(mxfp8_weight, (0, -1, -1), 1, True)
+        tb_graph.new_input(bias, (1, -1, -1), 1, True)
+        tb_graph.new_input(kv_norm, (-1, -1, -1), -1, True)
+        tb_graph.new_input(cos_pos_embed, (-1, -1, -1), -1, True)
+        tb_graph.new_input(sin_pos_embed, (-1, -1, -1), -1, True)
+        tb_graph.new_input(kv_cache, (-1, 2, -1), 1, True)
+        tb_graph.new_input(q_workspace, (1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [norm_input, norm_weight, norm_output, mxfp8_weight, bias,
+             kv_norm, cos_pos_embed, sin_pos_embed, kv_cache, q_workspace],
+            tb_graph,
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_rmsnorm_linear_mxfp8_bias_mla_kvupd_mi300",
+            [output_stride, output_per_wg, n_wgs_per_xcd,
+             total_tiles_per_xcd, actual_hidden_dim, reduction_size,
+             kv_lora_rank, qk_rope_head_dim, kv_offset,
+             self.max_seq_length, self.page_size]
+        )
+
     def gang_rmsnorm_linear_mxfp4_bias_argmax_layer(
         self,
         norm_input: DTensor,

@@ -507,12 +507,20 @@ if __name__ == "__main__":
         # 16 rather than 64: worth 6.30 -> 6.13 ms/token. It is the only
         # value the K-parallel branch is correct for.
         QKV_MXFP8_OPW = int(os.environ.get("GLM_QKV_MXFP8_OPW", "16"))
+        # q_b gets its own switch: it is the one dense GEMM whose MXFP8 form
+        # needs a fused-kvupd kernel of its own, so being able to A/B it
+        # against the bf16 twin on a single build is worth a knob.
+        QB_MXFP8 = DENSE_MXFP8 and os.environ.get("GLM_QB_MXFP8", "1") == "1"
         if DENSE_MXFP8:
             assert hidden_size % 512 == 0, hidden_size
             # One workgroup per 64 output rows, partitioned 8 ways across the
             # XCDs. vocab_size is aligned to GANG_OUT_ALIGN (512) further down,
             # which is the same constraint, so only qkv_a needs checking here.
             assert qkv_a_pad % (8 * QKV_MXFP8_OPW) == 0, qkv_a_pad
+        # q_b's OPW is forced to qk_rope by the fused rope slice, so it gets
+        # no knob -- only a check that the per-XCD chunk holds whole heads.
+        assert (num_heads_pad * qk_dim) % (8 * qk_rope) == 0
+        assert ((num_heads_pad * qk_dim) // (8 * qk_rope) * qk_rope) % qk_dim == 0
 
         assert (2 * dense_inter) % GANG_OUT_ALIGN == 0
         assert dense_inter % GANG_RED_ALIGN == 0
@@ -560,6 +568,7 @@ if __name__ == "__main__":
               f"fuse_moe_swiglu={int(FUSE_MOE_SWIGLU)} "
               f"fuse_moe_mulsumadd={int(FUSE_MOE_MULSUMADD)} "
               f"moe_mxfp8={int(MOE_MXFP8)} dense_mxfp8={int(DENSE_MXFP8)} "
+              f"qb_mxfp8={int(QB_MXFP8)} "
               f"qkv_opw={QKV_MXFP8_OPW} dense_opw={DENSE_MXFP8_OPW}")
 
         num_workers, num_schedulers = mi.get_configurations_from_gpu(rank)
@@ -887,6 +896,11 @@ if __name__ == "__main__":
             # Flash, and every column past q_lora_pad is zero.
             q_b_absorbed = pad_cols(q_b_absorbed, q_lora_pad)
             q_b_absorbed = pad_rows(q_b_absorbed, num_heads_pad * qk_dim)
+            if QB_MXFP8:
+                # OPW is pinned to qk_rope_head_dim so a head's rope slice is
+                # exactly one workgroup; 18432/64/8 = 36 tiles per XCD, which
+                # is plenty of work, so there is no narrow-tile question here.
+                q_b_absorbed = pack_dense_mxfp8(q_b_absorbed, qk_rope)
             w_q_b = _attach_input_keep(q_b_absorbed,
                                        f"layer_{i}_q_b_absorbed")
 
@@ -939,26 +953,46 @@ if __name__ == "__main__":
             #    q_b_proj, with the KV cache update fused into its epilogue:
             #    the roped Q lands in mla_q_ws directly, and the latent row
             #    (kv_a_layernorm + RoPE + paged append) rides on one worker.
-            mpk.gang_rmsnorm_linear_bias_mla_kvupd_layer(
-                norm_input=qkv_a_out,
-                norm_weight=w_q_a_norm,
-                norm_output=q_a_norm_out,
-                linear_weight=w_q_b,
-                bias=zero_bias(num_heads_pad * qk_dim),
-                kv_norm=w_kv_a_norm,
-                cos_pos_embed=cos_pos_embed,
-                sin_pos_embed=sin_pos_embed,
-                kv_cache=kv_cache,
-                q_workspace=mla_q_ws,
-                actual_hidden_dim=q_lora,
-                norm_span=q_lora_pad,
-                reduction_size=q_lora_pad,
-                kv_offset=q_lora_pad,
-                tile_n=GANG_TILE_N,
-                output_stride=num_heads_pad * qk_dim,
-                wgm=GANG_WGM,
-                block_dim=(256, 1, 1),
-            )
+            if QB_MXFP8:
+                mpk.gang_rmsnorm_linear_mxfp8_bias_mla_kvupd_layer(
+                    norm_input=qkv_a_out,
+                    norm_weight=w_q_a_norm,
+                    norm_output=q_a_norm_out,
+                    mxfp8_weight=w_q_b,
+                    bias=zero_bias(num_heads_pad * qk_dim),
+                    kv_norm=w_kv_a_norm,
+                    cos_pos_embed=cos_pos_embed,
+                    sin_pos_embed=sin_pos_embed,
+                    kv_cache=kv_cache,
+                    q_workspace=mla_q_ws,
+                    actual_hidden_dim=q_lora,
+                    output_per_wg=qk_rope,
+                    output_stride=num_heads_pad * qk_dim,
+                    reduction_size=q_lora_pad,
+                    kv_offset=q_lora_pad,
+                    block_dim=(256, 1, 1),
+                )
+            else:
+                mpk.gang_rmsnorm_linear_bias_mla_kvupd_layer(
+                    norm_input=qkv_a_out,
+                    norm_weight=w_q_a_norm,
+                    norm_output=q_a_norm_out,
+                    linear_weight=w_q_b,
+                    bias=zero_bias(num_heads_pad * qk_dim),
+                    kv_norm=w_kv_a_norm,
+                    cos_pos_embed=cos_pos_embed,
+                    sin_pos_embed=sin_pos_embed,
+                    kv_cache=kv_cache,
+                    q_workspace=mla_q_ws,
+                    actual_hidden_dim=q_lora,
+                    norm_span=q_lora_pad,
+                    reduction_size=q_lora_pad,
+                    kv_offset=q_lora_pad,
+                    tile_n=GANG_TILE_N,
+                    output_stride=num_heads_pad * qk_dim,
+                    wgm=GANG_WGM,
+                    block_dim=(256, 1, 1),
+                )
             # 4. absorbed MLA decode, split over (q_group, kv_chunk)
             mpk.gang_mla_decode_layer(
                 q_workspace=mla_q_ws,
