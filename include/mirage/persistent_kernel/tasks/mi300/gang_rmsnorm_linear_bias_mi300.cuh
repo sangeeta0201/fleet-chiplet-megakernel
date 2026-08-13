@@ -43,6 +43,89 @@ using bf16 = __hip_bfloat16;
 // whole row is still normalized-and-scaled on the way out, so the trailing
 // columns come out zero (the norm weight is zero there) and the downstream
 // GEMM's matching weight columns are zero too.
+// The sum-of-squares half of rmsnorm_inline_amd, returning 1/rms and writing
+// nothing.
+//
+// It exists for the consumers that do not want the normalized row in memory.
+// A fused RMSNorm + quantized GEMM writes the row to global only so that its
+// own quantizer can read it straight back -- a 4 KB store and a 4 KB load per
+// block, on the dependency path, for a value that never leaves the workgroup.
+// Handing the caller `rms_rcp` instead lets it apply `* rms_rcp * weight[i]`
+// at the point of use, where the input is still L1-hot from Phase 1 below.
+//
+// Phases 1-3 are rmsnorm_inline_amd's, minus the register cache: nothing here
+// revisits the input, so caching it would only hold VGPRs. Phase 4 is the
+// caller's. The trailing __syncthreads() is the one that publishes red[0], so
+// the returned value is uniform and the LDS is free on return.
+template <int STORAGE_DIM, int ACTUAL_HIDDEN_DIM, int NORM_SPAN = STORAGE_DIM>
+__device__ __forceinline__ float rmsnorm_rcp_amd(void const *input_ptr,
+                                                 float eps = 1e-5f) {
+  bf16 const *__restrict__ d_input = static_cast<bf16 const *>(input_ptr);
+
+  constexpr int VEC_SIZE = 8;
+  constexpr int NTHREADS = 256;
+  int const tid = threadIdx.x;
+  int const nthreads = blockDim.x;
+  constexpr int VEC_ITERS = STORAGE_DIM / (NTHREADS * VEC_SIZE);
+  constexpr int VEC_END = VEC_ITERS * NTHREADS * VEC_SIZE;
+  float sum = 0.0f;
+
+#pragma unroll 1
+  for (int v = 0; v < VEC_ITERS; v++) {
+    int offset = (v * nthreads + tid) * VEC_SIZE;
+    uint64_t in_lo = *reinterpret_cast<uint64_t const *>(&d_input[offset]);
+    uint64_t in_hi = *reinterpret_cast<uint64_t const *>(&d_input[offset + 4]);
+    bf16 const *lo = reinterpret_cast<bf16 const *>(&in_lo);
+    bf16 const *hi = reinterpret_cast<bf16 const *>(&in_hi);
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      float vlo = __bfloat162float(lo[i]);
+      float vhi = __bfloat162float(hi[i]);
+      if constexpr (NORM_SPAN == STORAGE_DIM) {
+        sum += vlo * vlo;
+        sum += vhi * vhi;
+      } else {
+        sum += (offset + i < NORM_SPAN) ? vlo * vlo : 0.0f;
+        sum += (offset + 4 + i < NORM_SPAN) ? vhi * vhi : 0.0f;
+      }
+    }
+  }
+  for (int i = VEC_END + tid; i < STORAGE_DIM; i += nthreads) {
+    float val = __bfloat162float(d_input[i]);
+    if constexpr (NORM_SPAN == STORAGE_DIM) {
+      sum += val * val;
+    } else {
+      sum += (i < NORM_SPAN) ? val * val : 0.0f;
+    }
+  }
+
+#pragma unroll
+  for (int offset = 32; offset > 0; offset >>= 1) {
+    sum += __shfl_xor(sum, offset);
+  }
+
+  __shared__ float red[16];
+  int wave_id = tid >> 6;
+  int lane_id = tid & 63;
+  int num_waves = nthreads >> 6;
+  if (lane_id == 0) {
+    red[wave_id] = sum;
+  }
+  __syncthreads();
+  if (wave_id == 0) {
+    sum = (lane_id < num_waves) ? red[lane_id] : 0.0f;
+    for (int offset = num_waves >> 1; offset > 0; offset >>= 1) {
+      sum += __shfl_xor(sum, offset);
+    }
+    if (lane_id == 0) {
+      red[0] = sum;
+    }
+  }
+  __syncthreads();
+
+  return rsqrtf(red[0] / float(ACTUAL_HIDDEN_DIM) + eps);
+}
+
 template <int STORAGE_DIM, int ACTUAL_HIDDEN_DIM, int NORM_SPAN = STORAGE_DIM>
 __device__ __forceinline__ void rmsnorm_inline_amd(void const *input_ptr,
                                                    void const *weight_ptr,

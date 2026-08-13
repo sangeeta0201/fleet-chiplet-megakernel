@@ -58,6 +58,92 @@
 
 namespace kernel {
 
+// _gang_wave_parallel_fp8_quant with the RMSNorm's Phase 4 folded in.
+//
+// The stock quantizer reads an already-normalized bf16 row. Producing that row
+// costs a 4 KB global store and a 4 KB global load per block, and the value
+// never leaves the workgroup -- see rmsnorm_rcp_amd. This variant reads the
+// *raw* row instead and applies `* rms_rcp * norm_weight[i]` on the way into
+// the E4M3 pack, so the bf16 intermediate never exists in any memory space.
+//
+// The re-read is not new traffic. Phase 1 of the norm just walked this row on
+// this block, so it is L1-resident, and the norm weight was going to be read
+// by Phase 4 anyway -- the same 4 KB, moved rather than added. What changes is
+// the width of the thread mapping: the norm scales 8 elements per thread over
+// 256 threads, the quantizer 32 over the 64 threads that own a sub-block, so
+// the same multiplies land on a quarter of the lanes. Thirty-two v_fma's
+// against a global round trip is not a close trade.
+//
+// Everything else -- the sub-block split, the clamped __shfl partner index,
+// the E8M0 derivation, the packing order -- is _gang_wave_parallel_fp8_quant's
+// and is kept identical on purpose.
+template <int REDUCTION_SIZE>
+__device__ __forceinline__ void _gang_wave_parallel_fp8_quant_rmsnorm(
+    unsigned short const *__restrict__ src_bf16,
+    unsigned short const *__restrict__ norm_weight,
+    float rms_rcp,
+    uint8_t *__restrict__ s_tok_fp8,
+    uint8_t *__restrict__ s_tok_scales) {
+
+  constexpr int SUB_BLOCK = 32;
+  constexpr int NSUBBLOCKS = REDUCTION_SIZE / SUB_BLOCK;
+  int const tid = threadIdx.x;
+  int const lane_id = tid & 63;
+
+  for (int sb = tid; sb < NSUBBLOCKS; sb += blockDim.x) {
+    int const base = sb * SUB_BLOCK;
+    int const super_blk = sb / 4;
+    int const sub_idx = sb & 3;
+
+    float vals[32];
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 32; j++) {
+      float v = _gang_bf16_to_float(src_bf16[base + j]) * rms_rcp *
+                _gang_bf16_to_float(norm_weight[base + j]);
+      vals[j] = v;
+      amax = fmaxf(amax, fabsf(v));
+    }
+
+    int base_lane = lane_id & ~3;
+    int const sb_first = sb - sub_idx;
+    int const n_valid = min(4, (NSUBBLOCKS - 1) - sb_first + 1);
+    float a0 = __shfl(amax, base_lane);
+    float a1 = __shfl(amax, base_lane + min(1, n_valid - 1));
+    float a2 = __shfl(amax, base_lane + min(2, n_valid - 1));
+    float a3 = __shfl(amax, base_lane + min(3, n_valid - 1));
+    float block_amax = fmaxf(fmaxf(a0, a1), fmaxf(a2, a3));
+
+    uint8_t se = _gang_compute_e8m0_fp8(block_amax);
+    float scale_f;
+    if (se == 0) {
+      scale_f = 1.0f;
+    } else {
+      union {
+        float f;
+        uint32_t u;
+      } sv;
+      sv.u = (uint32_t)se << 23;
+      scale_f = sv.f;
+    }
+
+#pragma unroll
+    for (int j = 0; j < 32; j += 4) {
+      fp8x4_t pk = {};
+      pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
+          pk, vals[j], vals[j + 1], scale_f, false);
+      pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
+          pk, vals[j + 2], vals[j + 3], scale_f, true);
+      *(int *)(s_tok_fp8 + base + j) = *(int const *)&pk;
+    }
+
+    if (sub_idx == 0) {
+      s_tok_scales[super_blk] = se;
+    }
+  }
+  __syncthreads();
+}
+
 // Fused RMSNorm + MXFP8 Gang Linear + Bias.
 //
 // Template params:
@@ -78,7 +164,7 @@ template <int BATCH_SIZE,
 __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     void const *norm_input_ptr,  // [batch, REDUCTION_SIZE] bf16
     void const *norm_weight_ptr, // [REDUCTION_SIZE] bf16
-    void *norm_output_ptr,       // [batch, REDUCTION_SIZE] bf16 scratch
+    void *norm_output_ptr,       // unused: see the note at Step 1+2
     void const *weight_ptr,      // [n_wgs_per_xcd, wg_bytes] packed MXFP8
     void const *bias_ptr,        // [1, output_size_per_xcd] bf16 (partitioned)
     void *output_ptr,            // [batch, output_stride] bf16 (partitioned)
@@ -136,25 +222,11 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     _sp_t0 = __builtin_amdgcn_s_memrealtime();
   }
 #endif
-  // ── Step 1: Redundant RMSNorm ───────────────────────────────────────────
-  // All workers compute the same RMSNorm and write to norm_output_ptr.
+  // ── Tile dispatch ──────────────────────────────────────────────
+  // tile_idx is block-uniform, so this early exit is too, and it is safe to
+  // take it in front of the __syncthreads() inside the norm below.
   int batch_count =
       (num_active_tokens < BATCH_SIZE) ? num_active_tokens : BATCH_SIZE;
-  for (int b = 0; b < batch_count; b++) {
-    unsigned short const *row_in =
-        (unsigned short const *)norm_input_ptr + b * REDUCTION_SIZE;
-    unsigned short *row_out =
-        (unsigned short *)norm_output_ptr + b * REDUCTION_SIZE;
-    gang_rmsnorm_detail::rmsnorm_inline_amd<REDUCTION_SIZE, ACTUAL_HIDDEN_DIM>(
-        row_in, norm_weight_ptr, row_out);
-  }
-
-#ifdef MPK_ENABLE_SUBPHASE_TIMING
-  if (_sp_rec) {
-    _sp_t1 = __builtin_amdgcn_s_memrealtime();
-  }
-#endif
-  // ── Tile dispatch ───────────────────────────────────────────────────────
   int tok_idx = tile_idx / n_wgs_per_xcd;
   int wg_idx = tile_idx % n_wgs_per_xcd;
 
@@ -166,12 +238,37 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
   uint8_t const *wg_data = W + static_cast<int64_t>(wg_idx) * WG_BYTES;
   uint8_t const *wg_scales = wg_data + WG_DATA_BYTES;
 
-  // ── Step 2: Quantize BF16 normalized input -> FP8 in LDS ────────────────
+  // ── Step 1+2: RMSNorm and quantize, with no bf16 round trip ─────────────
+  //
+  // norm_output_ptr is not written. It used to carry the normalized row from
+  // the norm to the quantizer -- 4 KB out to global and 4 KB back, per block,
+  // on the dependency path, for a value no other task reads. (In demo/glm5
+  // this task's norm_output is `rmsnorm_out`, shared scratch for qkv_a and the
+  // LM head, and nothing takes it as an input.) The row now goes norm ->
+  // quantizer in registers; the parameter stays only because the task
+  // signature is generated. A consumer that actually wants the normalized row
+  // needs a store added back here, not a silent read.
+  //
+  // The loop over batch rows goes too: it normalized every row of the batch on
+  // every block and then used one. rms_rcp is this block's own token's.
+  (void)norm_output_ptr;
   unsigned short const *input_row =
-      (unsigned short const *)norm_output_ptr + tok_idx * REDUCTION_SIZE;
+      (unsigned short const *)norm_input_ptr + tok_idx * REDUCTION_SIZE;
+  float const rms_rcp =
+      gang_rmsnorm_detail::rmsnorm_rcp_amd<REDUCTION_SIZE, ACTUAL_HIDDEN_DIM>(
+          input_row);
 
-  _gang_wave_parallel_fp8_quant<REDUCTION_SIZE>(
-      input_row, s_tok_fp8, s_tok_scales);
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  if (_sp_rec) {
+    _sp_t1 = __builtin_amdgcn_s_memrealtime();
+  }
+#endif
+  _gang_wave_parallel_fp8_quant_rmsnorm<REDUCTION_SIZE>(
+      input_row,
+      (unsigned short const *)norm_weight_ptr,
+      rms_rcp,
+      s_tok_fp8,
+      s_tok_scales);
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   if (_sp_rec) {
