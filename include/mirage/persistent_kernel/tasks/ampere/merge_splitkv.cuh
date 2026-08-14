@@ -286,19 +286,52 @@ __device__ __forceinline__ void
 
     // Write output: either write-through (st_wt) or regular global store
     if constexpr (WRITE_THROUGH) {
-      // Pack pairs of bf16 into uint32 and write-through to HBM
       static_assert(VAL_PER_THREAD % 2 == 0 || VAL_PER_THREAD == 1,
                     "WRITE_THROUGH requires even VAL_PER_THREAD or 1");
+      if constexpr (VAL_PER_THREAD == 1) {
+        // One dim per thread -- DIM_SPLITS == HEAD_DIM / THREADS_PER_TOKEN,
+        // the finest split the merge supports. The paired loop below cannot
+        // run here: it would read out_vals[1] out of bounds and store two
+        // elements, the second garbage, over the next thread's dim. That is
+        // a silent corruption of half of attn_out, invisible unless
+        // WRITE_THROUGH is on, which is why it survived until whole-layer
+        // fusion forced the flag and DIM_SPLITS=32 started emitting nonsense.
+        //
+        // The obvious repair -- st_wt_u16 -- is correct but slow: a 2-byte
+        // write-through is a partial-line write and the memory side turns it
+        // into a read-modify-write. Measured 4.408 ms against 4.002 for the
+        // (wrong) dword version, so the store width, not the merge, was
+        // carrying that difference.
+        //
+        // So pair the threads instead. thread_in_group t and t+1 own
+        // contiguous dims of the same head -- out_offset_base is
+        // ... + thread_in_group * 1 -- and THREADS_PER_TOKEN divides 64, so a
+        // group never straddles a wave and shfl_down(1) from an even lane
+        // always lands on its own partner. Even lanes do one dword store,
+        // odd lanes none.
+        float const partner = __shfl_down(out_vals[0], 1, THREADS_PER_TOKEN);
+        if ((thread_in_group & 1) == 0) {
+          __hip_bfloat16 v0 = (__hip_bfloat16)out_vals[0];
+          __hip_bfloat16 v1 = (__hip_bfloat16)partner;
+          uint16_t lo, hi;
+          memcpy(&lo, &v0, 2);
+          memcpy(&hi, &v1, 2);
+          st_wt_u32((void *)&output_ptr[out_offset_base],
+                    lo | ((uint32_t)hi << 16));
+        }
+      } else {
+        // Pack pairs of bf16 into uint32 and write-through to HBM
 #pragma unroll
-      for (int i = 0; i < VAL_PER_THREAD; i += 2) {
-        __hip_bfloat16 v0 = (__hip_bfloat16)out_vals[i];
-        __hip_bfloat16 v1 = (__hip_bfloat16)out_vals[i + 1];
-        uint32_t packed;
-        uint16_t lo, hi;
-        memcpy(&lo, &v0, 2);
-        memcpy(&hi, &v1, 2);
-        packed = lo | ((uint32_t)hi << 16);
-        st_wt_u32((void *)&output_ptr[out_offset_base + i], packed);
+        for (int i = 0; i < VAL_PER_THREAD; i += 2) {
+          __hip_bfloat16 v0 = (__hip_bfloat16)out_vals[i];
+          __hip_bfloat16 v1 = (__hip_bfloat16)out_vals[i + 1];
+          uint32_t packed;
+          uint16_t lo, hi;
+          memcpy(&lo, &v0, 2);
+          memcpy(&hi, &v1, 2);
+          packed = lo | ((uint32_t)hi << 16);
+          st_wt_u32((void *)&output_ptr[out_offset_base + i], packed);
+        }
       }
     } else {
 #pragma unroll

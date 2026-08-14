@@ -766,8 +766,20 @@ if __name__ == "__main__":
         # thread carrying kv_lora/16 = 32 unrolled softmax chains. Slice the
         # 512-wide latent so the merge fans out instead. 8 slices puts
         # kv_lora/8/16 = 4 dims on each thread across 16 tasks.
+        # 32 under whole-layer fusion, 16 otherwise. Fusion puts the merge on
+        # the Phase 8 barrier's critical path with 26 of 30 workers per XCD
+        # parked behind it, so doubling merge_tiles_per_xcd from 4 to 8 pays
+        # here in a way it never did when the merge was its own task: measured
+        # 4.486 -> 4.115 ms fused, against 4.465 -> 4.493 unfused.
+        #
+        # 32 is the finest split the merge supports -- kv_lora / 32 / 16 = 1
+        # dim per thread -- and getting there needed two fixes in
+        # merge_splitkv_ck_fmha's write-through epilogue, see the comments
+        # there. Without them this configuration silently corrupted half of
+        # attn_out.
         MLA_MERGE_DIM_SPLITS = int(
-            os.environ.get("GLM_MLA_MERGE_DIM_SPLITS", "16"))
+            os.environ.get("GLM_MLA_MERGE_DIM_SPLITS",
+                           "32" if FUSE_FULL_LAYER else "16"))
         assert kv_lora % (MLA_MERGE_DIM_SPLITS * 16) == 0
         # Off by default: measured a dead heat (8.025 vs 8.026 ms). The win it
         # buys gpt-oss is deleting a separate readback+flush pass inside the
