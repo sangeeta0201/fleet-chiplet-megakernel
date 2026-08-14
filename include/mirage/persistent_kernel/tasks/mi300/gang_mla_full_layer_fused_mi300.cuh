@@ -331,9 +331,22 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     // visibility of stores issued by the 255 threads that are not tid 0. The
     // release atomic below has to be ordered after all of them.
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+    // Phase 8 is the largest line in the profile by a wide margin, and "all
+    // 240 workers wait 20 us" has two very different explanations: a straggler
+    // the barrier is legitimately waiting for, or the barrier mechanism itself
+    // costing that much. Split it four ways so the answer is read off rather
+    // than argued about. Every arrival hits ONE address with a device-scope
+    // atomic, so _b_atomic is where 240-way same-line contention would show.
+    unsigned long long _b_t0 = 0, _b_t1 = 0, _b_t2 = 0, _b_t3 = 0;
+    _b_t0 = __builtin_amdgcn_s_memrealtime();
+#endif
     if (tid == 0) {
       int const prev =
           atom_add_release_gpu_s32(&attn_release[8 * HIER_STRIDE], 1);
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+      _b_t1 = __builtin_amdgcn_s_memrealtime();
+#endif
       if ((prev % arrivals) == arrivals - 1) {
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         for (int x = 0; x < 8; x++) {
@@ -342,6 +355,9 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
         }
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       }
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+      _b_t2 = __builtin_amdgcn_s_memrealtime();
+#endif
     }
     // ── o_proj weight DMA, issued before the poll ────────────────────────
     // gpt-oss does exactly this at the equivalent barrier
@@ -399,12 +415,20 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
         auto *pf_dst =
             (__attribute__((address_space(3)))
              uint32_t *)(_fused_smem + PF_LDS_OFF + (tid >> 6) * 1024);
+        // One incrementing voffset register, not PF_LPT independent ones.
+        // The loads are deliberately issued back to back, so an expression
+        // that depends on j keeps all PF_LPT of them live at once -- 42 VGPRs
+        // here. That is what pushed worker_kernel past its register budget
+        // when the same idiom was added a second time for the shared expert
+        // (332 VGPRs / 0 spills -> 349 / 8, and 4.115 -> 4.762 ms). The tail
+        // is clamped on the register instead of per load, since PF_N16 is not
+        // a multiple of 256 and the last round would run off the slab.
+        int pf_voff = static_cast<int>(pf_wg_voff) + tid * 16;
+        int const pf_last = static_cast<int>(pf_wg_voff) + (PF_N16 - 1) * 16;
 #pragma unroll
         for (int j = 0; j < PF_LPT; j++) {
-          int const idx = tid + j * 256;
-          int const clamped = idx < PF_N16 ? idx : PF_N16 - 1;
-          uint32_t const voff =
-              pf_wg_voff + static_cast<uint32_t>(clamped) * 16;
+          int const voff = pf_voff < pf_last ? pf_voff : pf_last;
+          pf_voff += 4096;
           // aux = sc0, deliberately without gpt-oss's `nt`. gpt-oss passes 3
           // (sc0|nt); nt marks the line evict-first in L2, which is right
           // when the DMA's only purpose is to reach LDS. Here the point is
@@ -429,17 +453,56 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
           // both sides in the same proportion, so this is about the best the
           // idiom can do here; the remaining 27 us of Phase 8 spin is a
           // load-balance problem, not a latency-hiding one. See task #30.
-          __llvm_amdgcn_raw_buffer_load_lds(
-              pf_rsrc, pf_dst, 16, static_cast<int>(voff), 0, 0, 1);
+          __llvm_amdgcn_raw_buffer_load_lds(pf_rsrc, pf_dst, 16, voff, 0, 0, 1);
+          // Opaque to the optimizer, and load-bearing twice over. Without
+          // it LLVM reassociates the PF_LPT offsets into PF_LPT
+          // simultaneously-live VGPRs -- 42 here, 17 for the shared-expert
+          // prefetch -- which together took worker_kernel from 332 VGPRs /
+          // 0 spills to 349 / 8 and cost 4.115 -> 4.762 ms. Rolling the
+          // loop up with #pragma unroll 1 fixes the registers but sinks
+          // the m0 setup into the loop body, and then the DMA no longer
+          // finishes under the spin: o_proj went 18.5 -> 33.5 s, worse
+          // than not prefetching at all. This keeps both properties --
+          // back-to-back loads, one offset register.
+          asm volatile("" : "+v"(pf_voff) : : "memory");
         }
       }
     }
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+    _b_t3 = __builtin_amdgcn_s_memrealtime();
+#endif
     if (tid == 0) {
       int *const my_flag = &attn_release[xcd_id * HIER_STRIDE];
       while (ld_nt_s32(my_flag) < attn_release_expected) {
         __builtin_amdgcn_s_sleep(1);
       }
     }
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+    if (tid == 0 && g_subphase_active) {
+      unsigned long long _b_t4 = __builtin_amdgcn_s_memrealtime();
+      atomicAdd(&g_subphase_ns[5][1], (_b_t1 - _b_t0) * 10); // arrival atomic
+      atomicAdd(&g_subphase_ns[5][2], (_b_t2 - _b_t1) * 10); // release fan-out
+      atomicAdd(&g_subphase_ns[5][3], (_b_t3 - _b_t2) * 10); // prefetch issue
+      atomicAdd(&g_subphase_ns[5][4], (_b_t4 - _b_t3) * 10); // spin on flag
+      // Split the spin by population. Phase 7's merge runs on the
+      // merge_tiles_per_xcd ranks only; if those are the stragglers this
+      // barrier waits for, their own spin is ~0 and everyone else's is the
+      // full wait. If BOTH populations spin the same, the straggler is
+      // somewhere else entirely and widening the merge would buy nothing.
+      if (xcd_rank < merge_tiles_per_xcd) {
+        atomicAdd(&g_subphase_ns[5][5], (_b_t4 - _b_t3) * 10); // merge ranks
+      } else {
+        atomicAdd(&g_subphase_ns[5][6], (_b_t4 - _b_t3) * 10); // idle ranks
+      }
+      // The merge ranks arrive ~23 us after everyone else but Phase 7's merge
+      // compute is only ~2.4 us, so the time is in the entry region: the
+      // __syncthreads plus the s_waitcnt vmcnt(0) that drains Phase 7's
+      // write-through attn_out stores. Attribute it to confirm.
+      if (xcd_rank < merge_tiles_per_xcd) {
+        atomicAdd(&g_subphase_ns[5][7], (_b_t0 - _fl_t0) * 10);
+      }
+    }
+#endif
     __syncthreads();
     // Plain buffer_inv, not an agent-scope acquire fence. The fence would
     // emit `buffer_inv sc1`, which also invalidates L2 and would throw away
