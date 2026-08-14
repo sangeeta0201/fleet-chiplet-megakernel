@@ -1191,7 +1191,90 @@ __device__ __noinline__ void
     }
 #endif
 
-    if (tid == 0) {
+    // ── Only the readers wait ────────────────────────────────────────────
+    //
+    // Every worker ARRIVES above; the release fan-out is unchanged and still
+    // requires all 240. What is narrowed is the WAIT.
+    //
+    // The dependency this barrier exists for is not all-to-all. It is complete
+    // bipartite between two unequal sets:
+    //
+    //   writers: all 240 -- every worker runs MoE tiles (the grid-stride loop
+    //            in Phase 8).
+    //   readers: the Phase 1 ResAddF32 prologue, guarded by
+    //            `xcd_rank < total_qkv_tiles_per_xcd` -- 10 of 30 per XCD.
+    //
+    // Every edge really is present: the prologue is an RMSNorm, so each reader
+    // consumes the whole hidden row (all MOE_WS_SLOTS slots) and reduces it to
+    // one SSQ before it can produce anything, and those elements are written
+    // by W2 tiles on all 8 XCDs. So a reader genuinely needs every writer, and
+    // that wait is irreducible here. The other 20 workers per XCD read nothing
+    // this barrier protects.
+    //
+    // ── Why the 20 non-readers are still ordered, with no barrier ──────────
+    //
+    // Skipping the wait does not let them run free; it defers their gate to
+    // one they already execute. A non-reader's path into layer N+1 is:
+    //
+    //   top-of-function `buffer_inv`  ->  Phase 1 skipped (not a QKV tile)
+    //   ->  Phase 2 skipped (xcd_rank >= qkv_epoch_participants at B=1)
+    //   ->  Phases 3-5 skipped (not an attention participant)
+    //   ->  Phase 6: O-proj weight DMA, then the attn_release poll.
+    //
+    // Between the two it touches exactly two things, neither of which layer N
+    // produced: the invalidate (whose data it does not read -- it skips the
+    // prologue), and a DMA of O-proj *weights*, which are static.
+    //
+    // Then it blocks. The attn_release poll below Phase 6 is unguarded -- all
+    // 240 execute it -- and its target is `layer_counter + 1`, a pure function
+    // of the layer index. Layer N+1's attn_release is published by that
+    // layer's merges, run by attention participants, who are readers
+    // (ATTN_PARTICIPANTS <= total_qkv_tiles_per_xcd at B=1) and therefore did
+    // wait here. So layer N+1's flag cannot appear until every one of the 240
+    // arrived for layer N. The non-reader is ordered behind the full barrier
+    // transitively, one phase later, at a poll it was going to pay anyway.
+    //
+    // At B>1 where ATTN_PARTICIPANTS may exceed total_qkv_tiles_per_xcd, an
+    // attention worker can fall outside the wait set. It is still ordered: it
+    // is a qkv_epoch participant (that set is the max of the two), and
+    // qkv_epoch's own release requires all of its participants to arrive for
+    // layer N+1, which requires the QKV workers -- readers -- to have cleared
+    // this barrier for layer N.
+    //
+    // Three invariants were checked against this, not assumed:
+    //
+    //   * The division snapshots stay in range. `local_expected` needs
+    //     v in [30L, 30(L+1)). A non-reader cannot arrive for layer L+1 before
+    //     all layer-L arrivals, because reaching layer L+1's Phase 9 means
+    //     passing layer L+1's attn_release, which needs layer L's release,
+    //     which needs this very arrival. Unchanged, and for the same reason.
+    //
+    //   * The five vL1-only acquires from 981e124 still hold. Their premise is
+    //     "no worker reaches layer N+1 until all 240 passed Phase 9 for layer
+    //     N". For readers nothing changed. For non-readers the only one of the
+    //     five reached before the attn_release poll is the top-of-function
+    //     acquire, and it guards moe_workspace_f32, which they do not read.
+    //     routing_ready's `buffer_inv` sits after two layer-derived polls.
+    //
+    //   * The MoE straddle window does not widen. A non-reader reaches layer
+    //     N+1's MoE only through routing_ready, hence TopK, hence every O-proj
+    //     tile, hence attn_release -- so still strictly after all 240 arrived
+    //     for layer N, which is after their layer-N MoE.
+    //
+    // Measured at B=1, seq 512, paired A/B on one GPU, 5 rounds:
+    // 2.4090 -> 2.3560 ms/iter, -51.0 us, 95% CI [-60.0, -42.0], 5/0/0.
+    // Full removal (MPK_NO_LAYER_BARRIER, incorrect) is -240 us, so this
+    // recovers the false-dependency share and leaves the 189 us the readers
+    // genuinely spend waiting on the slowest writer. That remainder is MoE
+    // tile imbalance, not barrier cost.
+    //
+    // MPK_SYM_LAYER_BARRIER restores the all-240 wait for bisection.
+#ifdef MPK_SYM_LAYER_BARRIER
+    bool const _lb_waits = true;
+#else
+    bool const _lb_waits = (xcd_rank < total_qkv_tiles_per_xcd);
+#endif
+    if (tid == 0 && _lb_waits) {
       while (ld_nt_s32(&layer_release[xcd_id * 16]) <= s_layer_rel_prev) {
         __builtin_amdgcn_s_sleep(1);
       }
