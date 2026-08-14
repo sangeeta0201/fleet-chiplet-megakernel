@@ -223,6 +223,10 @@ public:
   // + split-KV merge), a variant of the MLA decode task type
   int register_gang_mla_attn_fused_mi300_task(threadblock::Graph const &bgraph,
                                               std::vector<int> const &params);
+  // MI300 whole-layer fused GLM task: the attention half and the MoE half of
+  // one decoder layer in a single gang dispatch
+  int register_gang_mla_full_layer_fused_mi300_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
   // MI300 split-KV tasks
   int register_paged_attention_split_kv_mi300_task(
       threadblock::Graph const &bgraph, std::vector<int> const &params);

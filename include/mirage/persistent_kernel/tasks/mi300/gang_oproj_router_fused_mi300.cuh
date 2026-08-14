@@ -136,7 +136,17 @@ __device__ __attribute__((always_inline)) void
         int num_shared_experts,
         int moe_w13_tiles_per_xcd,
         int moe_w2_tiles_per_xcd,
-        int tile_idx) {
+        int tile_idx,
+        // Release values supplied by a caller that has already snapshotted
+        // them. Negative means "snapshot them yourself", which is what the
+        // standalone dispatch of this task does. The fused whole-layer task
+        // passes real values because inlined there this body no longer sits
+        // directly behind the previous layer's event boundary, and the
+        // argument in the comment below stops holding for routing_ready --
+        // see gang_mla_full_layer_fused_mi300.cuh.
+        int oproj_expected_in = -1,
+        int routing_expected_in = -1,
+        int w13_expected_in = -1) {
 
   int const tid = threadIdx.x;
   int const xcd_id = tile_idx / tiles_per_xcd;
@@ -170,15 +180,22 @@ __device__ __attribute__((always_inline)) void
   // earliest possible publication is a whole o_proj GEMM after the latest
   // possible arrival here.
   __shared__ int s_expected[3];
-  if (tid == 0) {
-    s_expected[0] = ld_nt_s32(&hier_barrier[xcd_id * HIER_STRIDE]) + 1;
-    s_expected[1] = ld_nt_s32(routing_ready) + 1;
-    s_expected[2] = ld_nt_s32(&w13_barrier[xcd_id * HIER_STRIDE]) + 1;
+  if (oproj_expected_in < 0) {
+    if (tid == 0) {
+      s_expected[0] = ld_nt_s32(&hier_barrier[xcd_id * HIER_STRIDE]) + 1;
+      s_expected[1] = ld_nt_s32(routing_ready) + 1;
+      s_expected[2] = ld_nt_s32(&w13_barrier[xcd_id * HIER_STRIDE]) + 1;
+    }
+    __syncthreads();
   }
-  __syncthreads();
-  int const oproj_expected = s_expected[0];
-  int const routing_expected = s_expected[1];
-  int const w13_expected = s_expected[2];
+  // The override is a kernel argument, so the branch above is block-uniform
+  // and the __syncthreads inside it is safe.
+  int const oproj_expected =
+      oproj_expected_in < 0 ? s_expected[0] : oproj_expected_in;
+  int const routing_expected =
+      routing_expected_in < 0 ? s_expected[1] : routing_expected_in;
+  int const w13_expected =
+      w13_expected_in < 0 ? s_expected[2] : w13_expected_in;
 
   // Zero the f32 MoE accumulator that this layer's W2 will atomicAdd into.
   //

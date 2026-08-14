@@ -147,7 +147,16 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     int tiles_per_xcd,
     float scale_s,
     float kv_eps,
-    int tile_idx) {
+    int tile_idx,
+    // Release values supplied by a caller that has already snapshotted them.
+    // Negative means "snapshot them yourself", which is what the standalone
+    // dispatch of this task does. The fused whole-layer task passes real
+    // values because by the time this body runs, seven phases deep, the
+    // snapshot is no longer behind the previous layer's event boundary -- see
+    // gang_mla_full_layer_fused_mi300.cuh.
+    int qkv_expected_in = -1,
+    int qb_expected_in = -1,
+    int decode_expected_in = -1) {
 
   int const tid = threadIdx.x;
   int const xcd_id = tile_idx / tiles_per_xcd;
@@ -170,15 +179,20 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // arriving block: a straggler wave there can observe its own thread 0's
   // bump, compute expected = published + 1, and spin forever.
   __shared__ int s_expected[3];
-  if (tid == 0) {
-    s_expected[0] = ld_nt_s32(&qkv_barrier[xcd_id * HIER_STRIDE]) + 1;
-    s_expected[1] = ld_nt_s32(&qb_barrier[xcd_id * HIER_STRIDE]) + 1;
-    s_expected[2] = ld_nt_s32(&decode_barrier[xcd_id * HIER_STRIDE]) + 1;
+  if (qkv_expected_in < 0) {
+    if (tid == 0) {
+      s_expected[0] = ld_nt_s32(&qkv_barrier[xcd_id * HIER_STRIDE]) + 1;
+      s_expected[1] = ld_nt_s32(&qb_barrier[xcd_id * HIER_STRIDE]) + 1;
+      s_expected[2] = ld_nt_s32(&decode_barrier[xcd_id * HIER_STRIDE]) + 1;
+    }
+    __syncthreads();
   }
-  __syncthreads();
-  int const qkv_expected = s_expected[0];
-  int const qb_expected = s_expected[1];
-  int const decode_expected = s_expected[2];
+  // The override is a kernel argument, so the branch above is block-uniform
+  // and the __syncthreads inside it is safe.
+  int const qkv_expected = qkv_expected_in < 0 ? s_expected[0] : qkv_expected_in;
+  int const qb_expected = qb_expected_in < 0 ? s_expected[1] : qb_expected_in;
+  int const decode_expected =
+      decode_expected_in < 0 ? s_expected[2] : decode_expected_in;
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   // Slot 4 is ATTN: [0]=qkv_a [1]=qkv barrier [2]=q_b+kvupd [3]=q_b barrier

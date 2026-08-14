@@ -914,6 +914,21 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     task_config[op] =
         std::make_tuple(15, 6, TASK_GANG_MLA_DECODE_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[24]; // tiles_per_xcd
+  } else if (name == "gang_mla_full_layer_fused_mi300") {
+    assert(params.size() == 42 &&
+           "gang_mla_full_layer_fused_mi300 takes the 25 attention params "
+           "of gang_mla_attn_fused_mi300 followed by the 17 MoE params of "
+           "gang_oproj_router_fused_mi300 that are not already among them");
+    int variant_id =
+        task_register->register_gang_mla_full_layer_fused_mi300_task(
+            customized->bgraph, params);
+    // Registered as a variant of the MLA decode task type: it is already in
+    // runtime.cc's gang group and takes the n_tile_start = bid.x *
+    // tiles_per_xcd branch the fused halves need, so no enum entry and no
+    // runtime.cc change.
+    task_config[op] =
+        std::make_tuple(27, 11, TASK_GANG_MLA_DECODE_MI300, variant_id);
+    gang_task_tiles_per_xcd[op] = params[24]; // tiles_per_xcd
   } else if (name == "gang_attn_merge_mi300") {
     assert(params.size() == 7);
     int variant_id = task_register->register_gang_attn_merge_mi300_task(

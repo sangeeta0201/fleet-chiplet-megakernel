@@ -3940,6 +3940,306 @@ int TaskRegister::register_gang_mla_attn_fused_mi300_task(
   return register_task_variant(TASK_GANG_MLA_DECODE_MI300, code.to_string());
 }
 
+// Whole-layer fused GLM task: the attention half and the MoE half of one
+// decoder layer in a single gang dispatch, with an in-kernel cross-XCD
+// barrier where the task graph used to put an event. Six dispatches per layer
+// become one.
+//
+// This is the union of register_gang_mla_attn_fused_mi300_task and
+// register_gang_oproj_router_fused_mi300_task; the assertions below are those
+// two sets, re-indexed onto the merged pointer map and with the checks that
+// only the fusion can make added. Kept as one registrar rather than two calls
+// because the two halves disagree about tiles_per_xcd -- the fused dispatch
+// width is the max over every phase in the layer, and both halves have to be
+// told the same one or xcd_id = tile_idx / tiles_per_xcd decodes differently
+// on either side of Phase 8.
+//
+// Inputs (27):  0 x, 1 pre_norm_weight, 2 pre_norm_scratch, 3 qkv_weight,
+//               4 qkv_bias, 5 q_a_norm_weight, 6 q_a_norm_scratch,
+//               7 qb_weight, 8 qb_bias, 9 kv_norm_weight, 10 cos, 11 sin,
+//               12 kv_cache, 13 moe_workspace_f32 (read), 14 counters,
+//               15 oproj_weight, 16 residual, 17 post_norm_weight,
+//               18 post_norm_output, 19 router_weight, 20 router_bias,
+//               21 logits_scratch, 22 moe_gate_up_weight,
+//               23 moe_down_weight, 24 moe_w13_bias, 25 moe_w2_bias,
+//               26 moe_swiglu_out
+// Outputs (11): 0 qkv_a_out, 1 q_workspace, 2 lse, 3 o_acc, 4 attn_out,
+//               5 x_out, 6 hidden, 7 topk_weight, 8 routing_indices,
+//               9 active_expert_ids, 10 moe_workspace_f32 (written)
+int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 42);
+  // ── attention half ──
+  int batch_size = params[0];
+  int qkv_opw = params[1];
+  int qkv_actual_hidden = params[2];
+  int qkv_n_wgs_per_xcd = params[3];
+  int qkv_output_stride = params[4];
+  int qb_opw = params[5];
+  int qb_reduction = params[6];
+  int qb_actual_hidden = params[7];
+  int qb_n_wgs_per_xcd = params[8];
+  int qb_output_stride = params[9];
+  int kv_lora_rank = params[10];
+  int qk_rope_head_dim = params[11];
+  int kv_input_offset = params[12];
+  int max_seq_len = params[13];
+  int page_size = params[14];
+  int num_q_heads = params[15];
+  int qk_head_dim = params[16];
+  int num_kv_chunks = params[17];
+  int q_workspace_stride = params[18];
+  int mla_total_work_items = params[19];
+  int mla_tiles_per_xcd = params[20];
+  int merge_dim_splits = params[21];
+  bool merge_write_through = params[22] != 0;
+  int merge_tiles_per_xcd = params[23];
+  int tiles_per_xcd = params[24];
+  // ── MoE half ──
+  int hidden_size = params[25];
+  int oproj_rows_per_wg = params[26];
+  int oproj_tiles_per_xcd = params[27];
+  int total_barrier_arrivals = params[28];
+  int actual_hidden_dim = params[29];
+  int num_experts = params[30];
+  int topk_k = params[31];
+  int router_tile_n = params[32];
+  int total_router_tiles = params[33];
+  int oproj_reduction_size = params[34];
+  int scaling_milli = params[35];
+  int norm_topk_prob = params[36];
+  int moe_intermediate = params[37];
+  int moe_w13_opw = params[38];
+  int moe_w2_opw = params[39];
+  int moe_w13_tiles_per_xcd = params[40];
+  int moe_w2_tiles_per_xcd = params[41];
+
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 27;
+  int num_outputs = 11;
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+
+  // ══ attention geometry ══
+  assert(input_ops[0]->dtensor.num_dims == 2);
+  assert(input_ops[0]->dtensor.dim[0] == batch_size);
+  int qkv_reduction = input_ops[0]->dtensor.dim[1];
+  assert(batch_size == 1);
+  assert(output_ops[0]->dtensor.num_dims == 2);
+  int kv_input_stride = output_ops[0]->dtensor.dim[1];
+  assert(qkv_output_stride == kv_input_stride);
+  assert(qkv_n_wgs_per_xcd * qkv_opw * 8 == kv_input_stride &&
+         "the packed qkv_a weight does not cover the row exactly");
+  assert(qb_actual_hidden <= qb_reduction && qb_reduction <= kv_input_stride);
+  assert(kv_input_offset + kv_lora_rank + qk_rope_head_dim <= kv_input_stride);
+  assert(input_ops[3]->dtensor.dim[1] ==
+             qkv_opw * (qkv_reduction + qkv_reduction / 32) &&
+         "qkv_a MXFP8 weight is not packed at this reduction and row count");
+  assert(input_ops[7]->dtensor.dim[1] ==
+             qb_opw * (qb_reduction + qb_reduction / 32) &&
+         "q_b MXFP8 weight is not packed at this reduction and row count");
+  assert(input_ops[12]->dtensor.num_dims == 4);
+  assert(input_ops[12]->dtensor.dim[2] == 1);
+  int kv_cache_stride = input_ops[12]->dtensor.dim[3];
+  assert(kv_cache_stride == kv_lora_rank + qk_rope_head_dim);
+  assert(qb_opw == qk_rope_head_dim && kv_cache_stride % qb_opw == 0 &&
+         "a head's rope slice has to be exactly one q_b workgroup");
+  assert((qb_n_wgs_per_xcd * qb_opw) % kv_cache_stride == 0 &&
+         "each XCD's q_b column chunk must hold whole heads");
+  assert(qb_n_wgs_per_xcd * qb_opw * 8 == qb_output_stride);
+  assert(num_q_heads % 16 == 0);
+  int num_q_groups = num_q_heads / 16;
+  assert(mla_total_work_items == batch_size * num_q_groups * num_kv_chunks);
+  assert(merge_dim_splits >= 1 && kv_lora_rank % merge_dim_splits == 0);
+  assert(num_kv_chunks > 1 &&
+         "with one chunk the decode writes attn_out directly and there is no "
+         "merge phase; the fused layer has no such variant");
+  assert(q_workspace_stride == num_q_heads * kv_cache_stride);
+  // The merge's consumer is now Phase 9's o_proj, on the other side of an
+  // in-kernel barrier rather than an event, and it reduces over the whole row
+  // while each XCD writes only its own tiles. A plain store would sit in the
+  // producing XCD's L2 where the consumer's buffer_inv cannot reach it.
+  assert(merge_write_through &&
+         "the fused layer requires MERGE_WRITE_THROUGH; see the header");
+
+  // The residual resolve reads and writes exactly the reduction width.
+  assert(input_ops[13]->dtensor.num_dims == 2);
+  assert(input_ops[13]->dtensor.dim[0] == batch_size);
+  assert(input_ops[13]->dtensor.dim[1] == qkv_reduction);
+  assert(qkv_actual_hidden == qkv_reduction &&
+         "the residual resolve has no padded-row variant");
+  assert(output_ops[5]->dtensor.num_dims == 2);
+  assert(output_ops[5]->dtensor.dim[0] == batch_size);
+  assert(output_ops[5]->dtensor.dim[1] == qkv_reduction);
+
+  // ══ the merged counter buffer ══
+  // 71 cache-line-strided int32 slots; see the kernel header for the map.
+  assert(input_ops[14]->dtensor.num_dims == 1);
+  assert(input_ops[14]->dtensor.dim[0] >= 71 * 16);
+
+  // ══ MoE geometry ══
+  assert(input_ops[15]->dtensor.dim[1] ==
+             oproj_rows_per_wg *
+                 (oproj_reduction_size + oproj_reduction_size / 32) &&
+         "o_proj MXFP8 weight is not packed at this reduction and row count");
+  assert(oproj_tiles_per_xcd * oproj_rows_per_wg * 8 == hidden_size &&
+         "the packed o_proj weight does not cover the hidden row exactly");
+  assert(hidden_size == qkv_reduction &&
+         "o_proj's N is the next layer's qkv_a K; they are one row");
+  assert(total_barrier_arrivals ==
+         (oproj_tiles_per_xcd > router_tile_n ? oproj_tiles_per_xcd
+                                              : router_tile_n) *
+             8);
+  assert(input_ops[20]->dtensor.num_dims == 1);
+  assert(input_ops[20]->output_tensors[0].dim[0] == num_experts);
+
+  int num_total_experts = output_ops[8]->output_tensors[0].dim[0];
+  int num_shared_experts = num_total_experts - num_experts;
+  assert(num_shared_experts == 0 || num_shared_experts == 1);
+  assert(output_ops[7]->output_tensors[0].dim[1] ==
+         topk_k + num_shared_experts);
+  assert(output_ops[9]->output_tensors[0].dim[0] == num_total_experts + 1);
+
+  assert(input_ops[22]->output_tensors[0].num_dims == 3);
+  assert(input_ops[23]->output_tensors[0].num_dims == 3);
+  int moe_num_experts = input_ops[22]->output_tensors[0].dim[0];
+  assert(input_ops[23]->output_tensors[0].dim[0] == moe_num_experts);
+  assert(moe_num_experts == num_experts + num_shared_experts);
+  assert(input_ops[24]->output_tensors[0].num_dims == 2);
+  assert(input_ops[24]->output_tensors[0].dim[0] == moe_num_experts);
+  assert(input_ops[24]->output_tensors[0].dim[1] == 2 * moe_intermediate);
+  assert(input_ops[25]->output_tensors[0].num_dims == 2);
+  assert(input_ops[25]->output_tensors[0].dim[0] == moe_num_experts);
+  assert(input_ops[25]->output_tensors[0].dim[1] == hidden_size);
+  assert(input_ops[26]->output_tensors[0].num_dims == 3);
+  assert(input_ops[26]->output_tensors[0].dim[0] == batch_size);
+  int moe_num_topk = input_ops[26]->output_tensors[0].dim[1];
+  assert(moe_num_topk == topk_k + num_shared_experts);
+  assert(input_ops[26]->output_tensors[0].dim[2] == moe_intermediate);
+  assert(input_ops[26]->dtensor.owner_op->op_type == type::KN_INPUT_OP);
+  assert(static_cast<int>(
+             static_cast<kn::KNInputOp *>(input_ops[26]->dtensor.owner_op)
+                 ->input_strides[1]) == moe_intermediate);
+  assert(output_ops[10]->output_tensors[0].num_dims == 2);
+  assert(output_ops[10]->output_tensors[0].dim[0] == batch_size);
+  assert(output_ops[10]->output_tensors[0].dim[1] == hidden_size);
+
+  // Expert element width, read off the packed workgroup stride: the packing
+  // erases N and K, so OPW*(K + K/32) against OPW*(K/2 + K/32) is the only
+  // place MXFP8 and MXFP4 differ.
+  int const w13_fp8_bytes = moe_w13_opw * (hidden_size + hidden_size / 32);
+  int const w13_fp4_bytes = moe_w13_opw * (hidden_size / 2 + hidden_size / 32);
+  int const w2_fp8_bytes =
+      moe_w2_opw * (moe_intermediate + moe_intermediate / 32);
+  int const w2_fp4_bytes =
+      moe_w2_opw * (moe_intermediate / 2 + moe_intermediate / 32);
+  int const w13_bytes = input_ops[22]->output_tensors[0].dim[2];
+  int const w2_bytes = input_ops[23]->output_tensors[0].dim[2];
+  bool const moe_fp4 = (w13_bytes == w13_fp4_bytes);
+  assert((moe_fp4 ? w13_fp4_bytes : w13_fp8_bytes) == w13_bytes &&
+         "the packed W13 weight matches neither the MXFP8 nor the MXFP4 "
+         "workgroup stride at this output_per_wg and hidden size");
+  assert((moe_fp4 ? w2_fp4_bytes : w2_fp8_bytes) == w2_bytes &&
+         "W13 and W2 are packed at different element widths");
+
+  assert(2 * moe_intermediate % moe_w13_opw == 0);
+  assert(hidden_size % moe_w2_opw == 0);
+  int moe_w13_tiles_per_expert =
+      batch_size * (2 * moe_intermediate / moe_w13_opw);
+  int moe_w2_tiles_per_expert = batch_size * (hidden_size / moe_w2_opw);
+
+  // ══ every phase in the layer has to fit inside the one dispatch width ══
+  // Both halves decode xcd_id from tile_idx / tiles_per_xcd, so this is the
+  // single number they must agree on, and a phase wider than it would drop
+  // work on the far side of a barrier that has already released.
+  assert(batch_size * qkv_n_wgs_per_xcd <= tiles_per_xcd);
+  assert(batch_size * qb_n_wgs_per_xcd + 1 <= tiles_per_xcd);
+  assert(mla_tiles_per_xcd <= tiles_per_xcd);
+  assert(merge_tiles_per_xcd <= tiles_per_xcd);
+  assert(oproj_tiles_per_xcd <= tiles_per_xcd);
+  assert(router_tile_n <= tiles_per_xcd);
+  assert(moe_w13_tiles_per_xcd <= tiles_per_xcd);
+  assert(moe_w2_tiles_per_xcd <= tiles_per_xcd);
+
+  float scale_s = 1.0f / sqrtf((float)qk_head_dim) * 1.44269504088896340736f;
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::gang_mla_full_layer_fused_kernel_mi300<$, $, $, $, $, $, $, "
+         "$, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, "
+         "$, $, $, $>(",
+         batch_size,
+         qkv_opw,
+         qkv_reduction,
+         qkv_actual_hidden,
+         qb_opw,
+         qb_reduction,
+         qb_actual_hidden,
+         kv_lora_rank,
+         qk_rope_head_dim,
+         kv_input_stride,
+         kv_cache_stride,
+         max_seq_len,
+         page_size,
+         kv_input_offset,
+         num_q_heads,
+         num_kv_chunks,
+         q_workspace_stride,
+         merge_dim_splits,
+         merge_write_through ? "true" : "false",
+         oproj_reduction_size,
+         oproj_rows_per_wg,
+         hidden_size,
+         actual_hidden_dim,
+         num_experts,
+         topk_k,
+         moe_intermediate,
+         moe_num_experts,
+         moe_num_topk,
+         moe_w13_tiles_per_expert,
+         moe_w2_tiles_per_expert,
+         moe_w13_opw,
+         moe_w2_opw,
+         moe_fp4 ? "true" : "false");
+  code.e("    task_desc->input_ptrs,");
+  code.e("    task_desc->output_ptrs,");
+  code.e("    runtime_config.qo_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_indices_buffer,");
+  code.e("    runtime_config.paged_kv_last_page_len_buffer,");
+  code.e("    runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS],");
+  code.e("    $,", qkv_n_wgs_per_xcd);
+  code.e("    $,", qkv_output_stride);
+  code.e("    $,", qb_n_wgs_per_xcd);
+  code.e("    $,", qb_output_stride);
+  code.e("    $,", mla_tiles_per_xcd);
+  code.e("    $,", mla_total_work_items);
+  code.e("    $,", merge_tiles_per_xcd);
+  code.e("    $f,", scale_s);
+  // Matches the standalone kvupd task's epsilon.
+  code.e("    1e-6f,");
+  code.e("    $,", oproj_tiles_per_xcd);
+  code.e("    $,", router_tile_n);
+  code.e("    $,", total_barrier_arrivals);
+  code.e("    $,", total_router_tiles);
+  code.e("    $,", norm_topk_prob != 0 ? "true" : "false");
+  code.e("    $ / 1000.0f,", scaling_milli);
+  code.e("    $,", num_shared_experts);
+  code.e("    $,", moe_w13_tiles_per_xcd);
+  code.e("    $,", moe_w2_tiles_per_xcd);
+  code.e("    $,", tiles_per_xcd);
+  code.e("    tile_idx);");
+  return register_task_variant(TASK_GANG_MLA_DECODE_MI300, code.to_string());
+}
+
 // Gang merge split-KV: 8 tasks (1 per XCD), tile_idx → (request_id, kv_head)
 // params: [num_qo_heads_per_kv, head_dim, max_seq_len, page_size,
 //          num_kv_heads, total_work_items_per_xcd, total_work_items]

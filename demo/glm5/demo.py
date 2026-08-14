@@ -654,6 +654,17 @@ if __name__ == "__main__":
         # the intra-task imbalance is fixed, since the fusion itself is sound.
         # The residual fold is deliberately independent of this knob.
         FUSE_ATTN = os.environ.get("GLM_FUSE_ATTN", "0") == "1"
+        # And both halves together: the whole decoder layer as one gang task.
+        # Six dispatches per layer become one, and the attention->o_proj event
+        # becomes the fifteen-phase task's Phase 8 in-kernel barrier.
+        #
+        # This subsumes GLM_FUSE_ATTN and GLM_FUSE_OPROJ_ROUTER on MoE layers:
+        # it needs everything they need (MXFP8 on both dense GEMMs and on the
+        # experts, both MoE epilogues folded, more than one KV chunk so there
+        # is a merge phase) plus a write-through merge, which it forces below
+        # because attn_out now crosses a barrier instead of an event.
+        FUSE_FULL_LAYER = (
+            os.environ.get("GLM_FUSE_FULL_LAYER", "0") == "1")
         MOE_MXFP8_OPW = 64
         assert not MOE_MXFP4 or MOE_MXFP8, \
             "GLM_MOE_MXFP4 narrows the MXFP8 expert path; it is not a bf16 mode"
@@ -764,8 +775,12 @@ if __name__ == "__main__":
         # still its own task. At dim_splits=16 each thread writes 2 bf16 and
         # the store path is not the bottleneck either way. Kept plumbed for
         # when the merge moves inside a fused MLA layer.
+        # Forced on under whole-layer fusion: the merge writes only this
+        # XCD's tiles of attn_out and o_proj reduces over the whole row, and
+        # an in-kernel barrier -- unlike an event -- does not flush the
+        # producing XCD's L2. The kernel static_asserts it.
         MLA_MERGE_WRITE_THROUGH = (
-            os.environ.get("GLM_MLA_MERGE_WT", "0") == "1")
+            os.environ.get("GLM_MLA_MERGE_WT", "0") == "1" or FUSE_FULL_LAYER)
         print(f"[CFG] q_heads={num_heads}->{num_heads_pad} "
               f"qb_slots={qb_head_slots} "
               f"q_groups={num_q_groups} kv_chunks={num_kv_chunks} "
@@ -1039,6 +1054,15 @@ if __name__ == "__main__":
         # flight against each other across the layer boundary.
         attn_fused_counter = make_tensor("attn_fused_counter", (29 * 16,),
                                          torch_dtype=torch.int32)
+        # Whole-layer fusion collapses those three buffers into one, not for
+        # tidiness but because the merged input list is 27 slots against a
+        # MAX_INPUTS_PER_TASK of 28. Slot map (each on its own 64-byte line):
+        # attention qkv_a->q_b [0..9], q_b->decode [10..19],
+        # decode->merge [20..29], attention->o_proj [30..39],
+        # o_proj->router [40..49], routing-ready epoch [50..59],
+        # W13->W2 [60..69], and the router's own TopK arrival counter at [70].
+        full_layer_counter = make_tensor("full_layer_counter", (71 * 16,),
+                                         torch_dtype=torch.int32)
         moe_mid = make_tensor("moe_mid", (bs, topk_total, 2 * moe_inter))
         moe_act = make_tensor("moe_act", (bs, topk_total, moe_inter))
         moe_out = make_tensor("moe_out", (bs, topk_total, hidden_size))
@@ -1199,12 +1223,23 @@ if __name__ == "__main__":
             # and a real merge phase, which one KV chunk does not have.
             fuse_attn = (FUSE_ATTN and DENSE_MXFP8 and QB_MXFP8
                          and num_kv_chunks > 1)
+            # Whole-layer fusion is the union of both halves' preconditions,
+            # and it is emitted at the MoE call site further down because the
+            # expert weights it needs are not built until then. Here it only
+            # has to switch every attention stage off.
+            fuse_full_layer = (FUSE_FULL_LAYER and layer.is_moe
+                               and DENSE_MXFP8 and QB_MXFP8
+                               and num_kv_chunks > 1
+                               and use_mxfp8_oproj and MOE_MXFP8
+                               and FUSE_MOE_SWIGLU and FUSE_MOE_MULSUMADD)
+            if fuse_full_layer:
+                fuse_attn = True
             # The residual fold is independent of whether the attention half is
             # one task or four: it only needs the layer's *first* task to be an
             # MXFP8 rmsnorm+linear, which both paths have, and the MoE W2
             # epilogue to be accumulating into moe_ws_f32 in the first place.
             fold_resadd = FUSE_MOE_MULSUMADD and (fuse_attn or DENSE_MXFP8)
-            if fuse_attn:
+            if fuse_attn and not fuse_full_layer:
                 mpk.gang_mla_attn_fused_layer(
                     x=x,
                     pre_norm_weight=w_norm,
@@ -1367,6 +1402,8 @@ if __name__ == "__main__":
             fuse_oproj_router = (FUSE_OPROJ_ROUTER and layer.is_moe
                                  and use_mxfp8_oproj and MOE_MXFP8
                                  and FUSE_MOE_SWIGLU and FUSE_MOE_MULSUMADD)
+            if fuse_full_layer:
+                fuse_oproj_router = True
             if fuse_oproj_router:
                 # Runs as Phase 1 of the fused router task below.
                 pass
@@ -1507,7 +1544,76 @@ if __name__ == "__main__":
             # row of the gate GEMV, and the last one across all 8 XCDs runs
             # the TopK tail behind an atomic-counter barrier. The redundant
             # norm is far cheaper than the barriers it replaces.
-            if fuse_oproj_router:
+            if fuse_full_layer:
+                # The whole layer. Everything from the input RMSNorm to the
+                # MoE W2 accumulation, in one dispatch.
+                #
+                # `oproj_resid` and `x_out` are the same tensor by
+                # construction: Phase 1 resolves the residual stream into
+                # layer_out and Phase 9 adds it back. That is the same
+                # producer/consumer pair the two-task form had, only now
+                # inside one task -- and the resolve already writes through
+                # (st_wt_u64 in _rnlm8_resadd_norm_rcp), so it survives the
+                # Phase 8 barrier without an event.
+                mpk.gang_mla_full_layer_fused_layer(
+                    x=x,
+                    pre_norm_weight=w_norm,
+                    pre_norm_scratch=rmsnorm_out,
+                    qkv_mxfp8_weight=w_qkv_a,
+                    qkv_bias=zero_bias(qkv_a_pad),
+                    q_a_norm_weight=w_q_a_norm,
+                    q_a_norm_scratch=q_a_norm_out,
+                    qb_mxfp8_weight=w_q_b,
+                    qb_bias=zero_bias(qb_out_width),
+                    kv_norm_weight=w_kv_a_norm,
+                    cos_pos_embed=cos_pos_embed,
+                    sin_pos_embed=sin_pos_embed,
+                    kv_cache=kv_cache,
+                    moe_workspace_f32=moe_ws_f32,
+                    counters=full_layer_counter,
+                    oproj_mxfp8_weight=w_o,
+                    residual=oproj_resid,
+                    post_norm_weight=w_norm_moe,
+                    post_norm_output=rmsnorm_out_moe,
+                    router_weight=w_router,
+                    router_bias=w_router_bias,
+                    logits_scratch=moe_gate_out,
+                    moe_gate_up_weight=w_moe_gu,
+                    moe_down_weight=w_moe_down,
+                    moe_w13_bias=zero_moe_bias(2 * moe_inter),
+                    moe_w2_bias=zero_moe_bias(hidden_size),
+                    moe_swiglu_out=moe_act,
+                    qkv_a_out=qkv_a_out,
+                    q_workspace=mla_q_ws,
+                    lse=mla_lse,
+                    o_acc=mla_o_acc,
+                    attn_out=attn_out,
+                    x_out=layer_out,
+                    hidden=attn_proj_out,
+                    topk_weight=moe_topk_weight,
+                    routing_indices=moe_routing_indices,
+                    active_expert_ids=moe_mask,
+                    qkv_output_per_wg=QKV_MXFP8_OPW,
+                    qkv_actual_hidden_dim=hidden_size,
+                    qb_output_per_wg=qk_rope,
+                    qb_reduction_size=q_lora_pad,
+                    qb_actual_hidden_dim=q_lora,
+                    kv_offset=q_lora_pad,
+                    mla_params=(num_heads_pad, kv_lora, qk_rope, qk_head_dim,
+                                num_kv_chunks),
+                    q_workspace_slots=qb_head_slots,
+                    merge_dim_splits=MLA_MERGE_DIM_SPLITS,
+                    oproj_rows_per_wg=oproj_tile_n,
+                    oproj_reduction_size=o_proj_red,
+                    actual_hidden_dim=hidden_size,
+                    num_experts_per_tok=topk,
+                    routed_scaling_factor=config.routed_scaling_factor,
+                    norm_topk_prob=config.norm_topk_prob,
+                    moe_w13_output_per_wg=MOE_MXFP8_OPW,
+                    moe_w2_output_per_wg=MOE_MXFP8_OPW,
+                    block_dim=(256, 1, 1),
+                )
+            elif fuse_oproj_router:
                 mpk.gang_oproj_router_fused_layer(
                     input=attn_out,
                     oproj_mxfp8_weight=w_o,

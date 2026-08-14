@@ -1684,6 +1684,371 @@ class PersistentKernel:
         self.kn_graph.register_task(
             tb_graph, "gang_mla_attn_fused_mi300", params)
 
+    def gang_mla_full_layer_fused_layer(
+        self,
+        # ── attention half ──
+        x: DTensor,
+        pre_norm_weight: DTensor,
+        pre_norm_scratch: DTensor,
+        qkv_mxfp8_weight: DTensor,
+        qkv_bias: DTensor,
+        q_a_norm_weight: DTensor,
+        q_a_norm_scratch: DTensor,
+        qb_mxfp8_weight: DTensor,
+        qb_bias: DTensor,
+        kv_norm_weight: DTensor,
+        cos_pos_embed: DTensor,
+        sin_pos_embed: DTensor,
+        kv_cache: DTensor,
+        moe_workspace_f32: DTensor,
+        # ── the one counter buffer both halves share ──
+        counters: DTensor,
+        # ── MoE half ──
+        oproj_mxfp8_weight: DTensor,
+        residual: DTensor,
+        post_norm_weight: DTensor,
+        post_norm_output: DTensor,
+        router_weight: DTensor,
+        router_bias: DTensor,
+        logits_scratch: DTensor,
+        moe_gate_up_weight: DTensor,
+        moe_down_weight: DTensor,
+        moe_w13_bias: DTensor,
+        moe_w2_bias: DTensor,
+        moe_swiglu_out: DTensor,
+        # ── outputs ──
+        qkv_a_out: DTensor,
+        q_workspace: DTensor,
+        lse: DTensor,
+        o_acc: DTensor,
+        attn_out: DTensor,
+        x_out: DTensor,
+        hidden: DTensor,
+        topk_weight: DTensor,
+        routing_indices: DTensor,
+        active_expert_ids: DTensor,
+        # ── attention parameters ──
+        qkv_output_per_wg: int,
+        qkv_actual_hidden_dim: int,
+        qb_output_per_wg: int,
+        qb_reduction_size: int,
+        qb_actual_hidden_dim: int,
+        kv_offset: int,
+        mla_params: tuple,
+        q_workspace_slots: int = None,
+        merge_dim_splits: int = 1,
+        # ── MoE parameters ──
+        oproj_rows_per_wg: int = 16,
+        oproj_reduction_size: int = 0,
+        actual_hidden_dim: int = 0,
+        num_experts_per_tok: int = 4,
+        routed_scaling_factor: float = 1.0,
+        norm_topk_prob: bool = True,
+        moe_w13_output_per_wg: int = 64,
+        moe_w2_output_per_wg: int = 64,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """A whole GLM decoder layer in one gang dispatch.
+
+        The union of ``gang_mla_attn_fused_layer`` and
+        ``gang_oproj_router_fused_layer``, with an in-kernel cross-XCD barrier
+        between them where the task graph used to put an event. Six dispatched
+        tasks per layer become one.
+
+        Three things differ from calling the two halves back to back, and all
+        three are forced rather than optional:
+
+        * ``merge_write_through`` is not a parameter. The split-KV merge writes
+          only this XCD's tiles of ``attn_out`` and o_proj reduces over the
+          whole row, so with an in-kernel barrier in place of an event the
+          store has to go past the producing XCD's L2. The registrar asserts
+          it.
+        * The three counter buffers the halves used become one ``counters``
+          tensor of at least ``71 * 16`` int32. Not for tidiness -- the merged
+          input list is 27 slots against a ``MAX_INPUTS_PER_TASK`` of 28, and
+          three separate buffers would not fit. See the kernel header for the
+          slot map.
+        * ``tiles_per_xcd`` is the max over every phase in the *layer*, and
+          both halves are given that one number. They each decode
+          ``xcd_id = tile_idx / tiles_per_xcd``, so a disagreement across the
+          Phase 8 barrier would put the two halves on different XCDs.
+
+        ``attn_out`` is declared once, as an output; the MoE half reads it from
+        there. ``moe_workspace_f32`` is declared twice, as the input the
+        residual resolve reads (the previous layer's accumulator) and as the
+        output W2 accumulates into -- the same buffer in both roles, which is
+        what the two-task form did across a layer boundary.
+
+        Inputs (27), outputs (11): see the registrar's comment for the map.
+        """
+        assert x.num_dims == 2
+        assert qkv_mxfp8_weight.num_dims == 2
+        assert qb_mxfp8_weight.num_dims == 2
+        assert qkv_a_out.num_dims == 2
+        assert q_workspace.num_dims == 2
+        assert attn_out.num_dims == 2
+        assert kv_cache.num_dims == 4  # (num_pages, page_size, 1, qk_dim)
+        assert kv_cache.dim(2) == 1, "MLA keeps a single shared latent head"
+        assert counters.num_dims == 1
+        assert oproj_mxfp8_weight.num_dims == 2
+        assert residual.num_dims == 2
+        assert hidden.num_dims == 2
+        assert router_weight.num_dims == 2
+        assert router_bias.num_dims == 1
+        assert routing_indices.num_dims == 2
+        assert active_expert_ids.num_dims == 1
+
+        batch_size = self.max_num_batched_tokens
+        assert batch_size == 1, (
+            "a narrowed reduction doubles as the row stride in three of this "
+            "layer's GEMMs; needs one row")
+        assert self.max_num_batched_requests == 1, (
+            "the fused layer is single-request; the registrar passes a "
+            "literal request index of 0")
+
+        # ══ attention geometry, from gang_mla_attn_fused_layer ══
+        num_q_heads = mla_params[0]
+        kv_lora_rank = mla_params[1]
+        qk_rope_head_dim = mla_params[2]
+        qk_head_dim = mla_params[3]
+        num_kv_chunks = mla_params[4]
+        qk_dim = kv_lora_rank + qk_rope_head_dim
+        assert kv_cache.dim(3) == qk_dim
+        assert kv_norm_weight.dim(0) == kv_lora_rank
+        assert cos_pos_embed.dim(cos_pos_embed.num_dims - 1) == qk_rope_head_dim
+        assert num_kv_chunks > 1, (
+            "one chunk means no merge phase; the fused layer has no such "
+            "variant")
+
+        qkv_reduction = x.dim(1)
+        assert qkv_reduction % 512 == 0, qkv_reduction
+        qkv_n_wgs = qkv_mxfp8_weight.dim(0)
+        assert qkv_n_wgs % 8 == 0
+        qkv_n_wgs_per_xcd = qkv_n_wgs // 8
+        qkv_output_stride = qkv_a_out.dim(1)
+        assert qkv_n_wgs * qkv_output_per_wg == qkv_output_stride, (
+            f"packed qkv_a weight covers {qkv_n_wgs * qkv_output_per_wg} "
+            f"columns, qkv_a_out has {qkv_output_stride}")
+        assert qkv_bias.dim(1) == qkv_output_stride
+
+        assert qb_reduction_size % 512 == 0, qb_reduction_size
+        assert qb_actual_hidden_dim <= qb_reduction_size <= qkv_output_stride
+        assert kv_offset + qk_dim <= qkv_output_stride
+        assert qb_output_per_wg == qk_rope_head_dim and \
+            qk_dim % qb_output_per_wg == 0, (
+                "output_per_wg must equal qk_rope_head_dim and divide the head")
+        qb_n_wgs = qb_mxfp8_weight.dim(0)
+        assert qb_n_wgs % 8 == 0
+        qb_n_wgs_per_xcd = qb_n_wgs // 8
+        qb_output_stride = q_workspace.dim(1)
+        assert qb_n_wgs * qb_output_per_wg == qb_output_stride
+        assert qb_mxfp8_weight.dim(1) == qb_output_per_wg * (
+            qb_reduction_size + qb_reduction_size // 32)
+        assert qb_bias.dim(1) == qb_output_stride
+        assert (qb_n_wgs_per_xcd * qb_output_per_wg) % qk_dim == 0, (
+            "per-XCD chunk must hold whole heads")
+
+        assert num_q_heads % 16 == 0
+        num_q_groups = num_q_heads // 16
+        q_workspace_stride = num_q_heads * qk_dim
+        q_workspace_slots = q_workspace_slots or num_q_heads
+        assert q_workspace_slots <= num_q_heads
+        assert qb_output_stride == q_workspace_slots * qk_dim
+        mla_total_work_items = (
+            self.max_num_batched_requests * num_q_groups * num_kv_chunks)
+        import math
+        mla_tiles_per_xcd = math.ceil(mla_total_work_items / 8)
+        assert merge_dim_splits >= 1 and kv_lora_rank % merge_dim_splits == 0
+        merge_total = (self.max_num_batched_requests * num_q_groups
+                       * merge_dim_splits)
+        merge_tiles_per_xcd = math.ceil(merge_total / 8)
+
+        assert qkv_actual_hidden_dim == qkv_reduction, (
+            f"the fused residual resolve needs an unpadded qkv_a reduction; "
+            f"got actual_hidden_dim={qkv_actual_hidden_dim} against "
+            f"reduction={qkv_reduction}")
+        assert moe_workspace_f32.num_dims == 2
+        assert (moe_workspace_f32.dim(0), moe_workspace_f32.dim(1)) == (
+            batch_size, qkv_reduction)
+        assert x_out.num_dims == 2
+        assert (x_out.dim(0), x_out.dim(1)) == (batch_size, qkv_reduction)
+        assert (batch_size * qkv_reduction) % 32 == 0
+
+        # ══ MoE geometry, from gang_oproj_router_fused_layer ══
+        assert oproj_rows_per_wg >= 4 and \
+            (oproj_rows_per_wg & (oproj_rows_per_wg - 1)) == 0
+        assert 0 < oproj_reduction_size <= attn_out.dim(1)
+        assert oproj_reduction_size % 32 == 0
+        n_wgs = oproj_mxfp8_weight.dim(0)
+        assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
+        oproj_tiles_per_xcd = n_wgs // 8
+        assert oproj_mxfp8_weight.dim(1) == oproj_rows_per_wg * (
+            oproj_reduction_size + oproj_reduction_size // 32)
+        hidden_size = hidden.dim(1)
+        assert n_wgs * oproj_rows_per_wg == hidden_size, (
+            f"packed weight covers {n_wgs * oproj_rows_per_wg} columns, "
+            f"hidden has {hidden_size}")
+        assert hidden_size == qkv_reduction, (
+            "o_proj's N is the next layer's qkv_a K; they are one row")
+
+        num_experts = router_weight.dim(0)
+        assert num_experts % 8 == 0
+        router_tile_n = num_experts // 8
+        total_router_tiles = router_tile_n * 8
+        assert router_bias.dim(0) == num_experts
+        num_shared_experts = routing_indices.dim(0) - num_experts
+        assert num_shared_experts in (0, 1)
+        assert topk_weight.dim(1) == num_experts_per_tok + num_shared_experts
+
+        assert moe_gate_up_weight.num_dims == 3  # [E, expert_wgs, wg_bytes]
+        assert moe_down_weight.num_dims == 3
+        assert moe_w13_bias.num_dims == 2
+        assert moe_w2_bias.num_dims == 2
+        assert moe_swiglu_out.num_dims == 3      # [batch, topk_total, inter]
+        moe_num_experts = moe_gate_up_weight.dim(0)
+        assert moe_down_weight.dim(0) == moe_num_experts
+        assert moe_num_experts == num_experts + num_shared_experts
+        moe_w13_width = moe_gate_up_weight.dim(1) * moe_w13_output_per_wg
+        assert moe_w13_bias.dim(1) == moe_w13_width
+        assert moe_down_weight.dim(1) * moe_w2_output_per_wg == hidden_size
+        assert moe_w2_bias.dim(1) == hidden_size
+        moe_intermediate = moe_w13_width // 2
+        assert moe_swiglu_out.dim(2) == moe_intermediate
+        assert moe_swiglu_out.dim(1) == num_experts_per_tok + num_shared_experts
+        assert hidden_size % 512 == 0, \
+            f"MXFP8 W13 K={hidden_size} not divisible by 512"
+        assert moe_intermediate % 512 == 0, \
+            f"MXFP8 W2 K={moe_intermediate} not divisible by 512"
+
+        def _moe_wg_bytes(opw, k, fp4):
+            return opw * ((k // 2 if fp4 else k) + k // 32)
+
+        moe_fp4 = moe_gate_up_weight.dim(2) == _moe_wg_bytes(
+            moe_w13_output_per_wg, hidden_size, True)
+        assert moe_gate_up_weight.dim(2) == _moe_wg_bytes(
+            moe_w13_output_per_wg, hidden_size, moe_fp4), (
+            f"W13 workgroup stride {moe_gate_up_weight.dim(2)} is neither the "
+            f"MXFP8 nor the MXFP4 packing of {moe_w13_output_per_wg} rows of "
+            f"K={hidden_size}")
+        assert moe_down_weight.dim(2) == _moe_wg_bytes(
+            moe_w2_output_per_wg, moe_intermediate, moe_fp4), (
+            f"W2 workgroup stride {moe_down_weight.dim(2)} disagrees with "
+            f"W13 on the element width (W13 is "
+            f"{'MXFP4' if moe_fp4 else 'MXFP8'})")
+
+        moe_topk_total = moe_swiglu_out.dim(1)
+        moe_max_activated = min(moe_topk_total * batch_size, moe_num_experts)
+        moe_w13_tiles_per_xcd = (
+            moe_max_activated * batch_size * moe_gate_up_weight.dim(1) + 7) // 8
+        moe_w2_tiles_per_xcd = (
+            moe_max_activated * batch_size * moe_down_weight.dim(1) + 7) // 8
+
+        oproj_topk_tiles_per_xcd = max(oproj_tiles_per_xcd, router_tile_n)
+        total_barrier_arrivals = oproj_topk_tiles_per_xcd * 8
+
+        # ══ the one dispatch width ══
+        # Every phase of the layer, both halves. Whichever is widest sets the
+        # worker count, and every barrier in the task is sized against it.
+        tiles_per_xcd = max(batch_size * qkv_n_wgs_per_xcd,
+                            batch_size * qb_n_wgs_per_xcd + 1,
+                            mla_tiles_per_xcd, merge_tiles_per_xcd,
+                            oproj_topk_tiles_per_xcd,
+                            moe_w13_tiles_per_xcd, moe_w2_tiles_per_xcd)
+        assert tiles_per_xcd <= self.num_workers // 8, (
+            f"{tiles_per_xcd} tiles per XCD exceeds the "
+            f"{self.num_workers // 8} resident workers; the in-kernel barrier "
+            "deadlocks if a tile has to wait for a worker")
+
+        # 71 cache-line-strided int32 slots. See the kernel header for the map;
+        # all eight barriers are monotonic, so nothing is reset and one buffer
+        # serves every layer of every iteration.
+        assert counters.dim(0) >= 71 * 16, (
+            f"the fused layer needs {71 * 16} int32 of counters, got "
+            f"{counters.dim(0)}")
+
+        scaling_milli = int(round(routed_scaling_factor * 1000.0))
+        assert abs(scaling_milli / 1000.0 - routed_scaling_factor) < 1e-9
+
+        params = [
+            # attention half (25)
+            batch_size, qkv_output_per_wg, qkv_actual_hidden_dim,
+            qkv_n_wgs_per_xcd, qkv_output_stride, qb_output_per_wg,
+            qb_reduction_size, qb_actual_hidden_dim, qb_n_wgs_per_xcd,
+            qb_output_stride, kv_lora_rank, qk_rope_head_dim, kv_offset,
+            self.max_seq_length, self.page_size, num_q_heads, qk_head_dim,
+            num_kv_chunks, q_workspace_stride, mla_total_work_items,
+            mla_tiles_per_xcd, merge_dim_splits,
+            1,  # merge_write_through, forced -- see the docstring
+            merge_tiles_per_xcd, tiles_per_xcd,
+            # MoE half (17)
+            hidden_size, oproj_rows_per_wg, oproj_tiles_per_xcd,
+            total_barrier_arrivals, actual_hidden_dim, num_experts,
+            num_experts_per_tok, router_tile_n, total_router_tiles,
+            oproj_reduction_size, scaling_milli, 1 if norm_topk_prob else 0,
+            moe_intermediate, moe_w13_output_per_wg, moe_w2_output_per_wg,
+            moe_w13_tiles_per_xcd, moe_w2_tiles_per_xcd,
+        ]
+        assert len(params) == 42
+
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        # Partition maps are each half's, unchanged: the weights split by
+        # column across the XCDs, the shared rows do not.
+        tb_graph.new_input(x, (-1, -1, -1), 1, True)
+        tb_graph.new_input(pre_norm_weight, (-1, -1, -1), 0, True)
+        tb_graph.new_input(pre_norm_scratch, (-1, -1, -1), 1, True)
+        tb_graph.new_input(qkv_mxfp8_weight, (0, -1, -1), 1, True)
+        tb_graph.new_input(qkv_bias, (1, -1, -1), 1, True)
+        tb_graph.new_input(q_a_norm_weight, (-1, -1, -1), 0, True)
+        tb_graph.new_input(q_a_norm_scratch, (-1, -1, -1), 1, True)
+        tb_graph.new_input(qb_mxfp8_weight, (0, -1, -1), 1, True)
+        tb_graph.new_input(qb_bias, (1, -1, -1), 1, True)
+        tb_graph.new_input(kv_norm_weight, (-1, -1, -1), -1, True)
+        tb_graph.new_input(cos_pos_embed, (-1, -1, -1), -1, True)
+        tb_graph.new_input(sin_pos_embed, (-1, -1, -1), -1, True)
+        tb_graph.new_input(kv_cache, (-1, -1, -1), -1, True)
+        tb_graph.new_input(moe_workspace_f32, (-1, -1, -1), 1, True)
+        tb_graph.new_input(counters, (-1, -1, -1), 0, True)
+        tb_graph.new_input(oproj_mxfp8_weight, (0, -1, -1), 1, True)
+        tb_graph.new_input(residual, (1, -1, -1), 1, True)
+        tb_graph.new_input(post_norm_weight, (-1, -1, -1), 0, True)
+        tb_graph.new_input(post_norm_output, (-1, -1, -1), 1, True)
+        tb_graph.new_input(router_weight, (0, -1, -1), 1, True)
+        tb_graph.new_input(router_bias, (-1, -1, -1), 0, True)
+        tb_graph.new_input(logits_scratch, (1, -1, -1), 1, True)
+        tb_graph.new_input(moe_gate_up_weight, (-1, 1, -1), 2, True)
+        tb_graph.new_input(moe_down_weight, (-1, 1, -1), 2, True)
+        tb_graph.new_input(moe_w13_bias, (-1, -1, -1), -1, True)
+        tb_graph.new_input(moe_w2_bias, (-1, -1, -1), -1, True)
+        tb_graph.new_input(moe_swiglu_out, (-1, 2, -1), -1, True)
+        tb_graph.new_input(qkv_a_out, (-1, -1, -1), -1, True)
+        tb_graph.new_input(q_workspace, (-1, -1, -1), -1, True)
+        tb_graph.new_input(lse, (-1, -1, -1), -1, True)
+        tb_graph.new_input(o_acc, (-1, -1, -1), -1, True)
+        tb_graph.new_input(attn_out, (-1, -1, -1), -1, True)
+        tb_graph.new_input(x_out, (-1, -1, -1), -1, True)
+        tb_graph.new_input(hidden, (-1, -1, -1), -1, True)
+        tb_graph.new_input(topk_weight, (0, -1, -1), -1, True)
+        tb_graph.new_input(routing_indices, (-1, -1, -1), -1, True)
+        tb_graph.new_input(active_expert_ids, (-1, -1, -1), -1, True)
+        tb_graph.new_input(moe_workspace_f32, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [x, pre_norm_weight, pre_norm_scratch, qkv_mxfp8_weight, qkv_bias,
+             q_a_norm_weight, q_a_norm_scratch, qb_mxfp8_weight, qb_bias,
+             kv_norm_weight, cos_pos_embed, sin_pos_embed, kv_cache,
+             moe_workspace_f32, counters,
+             oproj_mxfp8_weight, residual, post_norm_weight, post_norm_output,
+             router_weight, router_bias, logits_scratch,
+             moe_gate_up_weight, moe_down_weight, moe_w13_bias, moe_w2_bias,
+             moe_swiglu_out,
+             qkv_a_out, q_workspace, lse, o_acc, attn_out, x_out,
+             hidden, topk_weight, routing_indices, active_expert_ids,
+             moe_workspace_f32],
+            tb_graph,
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_mla_full_layer_fused_mi300", params)
+
     def gang_paged_attention_split_kv_merge_layer(
         self,
         lse: DTensor,
