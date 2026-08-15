@@ -77,13 +77,34 @@ namespace kernel {
 // Everything else -- the sub-block split, the clamped __shfl partner index,
 // the E8M0 derivation, the packing order -- is _gang_wave_parallel_fp8_quant's
 // and is kept identical on purpose.
-template <int REDUCTION_SIZE>
+//
+// SRC_IS_GLOBAL says which address space src_bf16 lives in. The two callers
+// differ: the plain path hands over the raw row in device global, the
+// FUSE_RESADD path hands over s_x_bf16, which is LDS. It matters because the
+// global case is read through an addrspace(1) cast -- otherwise clang, which
+// cannot see through the __noinline__ task boundary, emits flat_load, and a
+// flat instruction bumps lgkmcnt as well as vmcnt on gfx9. This function ends
+// in ds_write, so that lgkmcnt would be waited on with the row still in
+// flight. norm_weight is device global in both cases and is always cast.
+// Pointing the global path at LDS would be UB; the template argument is the
+// only thing keeping the two apart.
+template <int REDUCTION_SIZE, bool SRC_IS_GLOBAL>
 __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_rmsnorm(
     unsigned short const *__restrict__ src_bf16,
     unsigned short const *__restrict__ norm_weight,
     float rms_rcp,
     uint8_t *__restrict__ s_tok_fp8,
     uint8_t *__restrict__ s_tok_scales) {
+
+  using gu16 = __attribute__((address_space(1))) unsigned short const *;
+  gu16 g_nw = (gu16)norm_weight;
+  auto ld_src = [&](int i) -> unsigned short {
+    if constexpr (SRC_IS_GLOBAL) {
+      return ((gu16)src_bf16)[i];
+    } else {
+      return src_bf16[i];
+    }
+  };
 
   constexpr int SUB_BLOCK = 32;
   constexpr int NSUBBLOCKS = REDUCTION_SIZE / SUB_BLOCK;
@@ -99,8 +120,8 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_rmsnorm(
     float amax = 0.0f;
 #pragma unroll
     for (int j = 0; j < 32; j++) {
-      float v = _gang_bf16_to_float(src_bf16[base + j]) * rms_rcp *
-                _gang_bf16_to_float(norm_weight[base + j]);
+      float v = _gang_bf16_to_float(ld_src(base + j)) * rms_rcp *
+                _gang_bf16_to_float(g_nw[base + j]);
       vals[j] = v;
       amax = fmaxf(amax, fabsf(v));
     }
@@ -357,6 +378,26 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
                 "Depth-4 pipeline requires REDUCTION_SIZE % 512 == 0");
 
   // ── Wave tiling ─────────────────────────────────────────────────────────
+  // Above this many k-tiles the A operand no longer fits in registers
+  // (8 VGPRs each), so the N-parallel branch falls back to the rotating
+  // depth-4 pipeline. See the note at the branch.
+  //
+  // Currently 0, i.e. the straight-line branch is off. It is correct in
+  // principle and its asm is clean, but at MFMA_ITERS=8 it puts the function
+  // at 248 VGPRs, and the allocator responds by spilling the last B tile into
+  // the accumulator file and then coalescing the final MFMA's destination
+  // onto it -- `v_mfma a[0:3], v[128:135], a[0:7], a[8:11]`, a destination
+  // overlapping srcB, which MAI forbids. It is 2 of the 664 v_mfma in the
+  // whole translation unit and both are this kernel; nothing else in the
+  // megakernel comes close enough to the register ceiling to trip it.
+  //
+  // More to the point it bought nothing: 3.853 and 3.854 ms against a
+  // 3.855 ms baseline. The timing is valid even though those runs decoded
+  // garbage -- the same loads and MFMAs issue either way. q_b is 240 workers
+  // wide and the barrier after it is 32 wide, so finishing early only makes
+  // the 240 wait longer. See the note in memory: the layer is barrier-bound,
+  // not bandwidth-bound. Re-enable only alongside a fix to the barrier shape.
+  constexpr int FULL_PRELOAD_ITERS = 0;
   constexpr int NUM_WAVES = 4;
   constexpr int TILES_PER_WAVE = OUTPUT_PER_WG / 16 / NUM_WAVES;
 
@@ -452,7 +493,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     _sp_t1 = __builtin_amdgcn_s_memrealtime();
   }
 #endif
-  _gang_wave_parallel_fp8_quant_rmsnorm<REDUCTION_SIZE>(
+  _gang_wave_parallel_fp8_quant_rmsnorm<REDUCTION_SIZE, !FUSE_RESADD>(
       input_row,
       (unsigned short const *)norm_weight_ptr,
       rms_rcp,
@@ -477,70 +518,160 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
 
       f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
 
-      // Pre-fill: load k-tiles 0..3 into pipeline slots
-      i32x8_t a0 = _gang_load_fp8_mfma_b(w_data_row, 0 * K_PER_MFMA, g);
-      int sa0 = (int)wg_scales[row_scale_base + 0 * 4 + g];
-      i32x8_t a1 = _gang_load_fp8_mfma_b(w_data_row, 1 * K_PER_MFMA, g);
-      int sa1 = (int)wg_scales[row_scale_base + 1 * 4 + g];
-      i32x8_t a2 = _gang_load_fp8_mfma_b(w_data_row, 2 * K_PER_MFMA, g);
-      int sa2 = (int)wg_scales[row_scale_base + 2 * 4 + g];
-      i32x8_t a3 = _gang_load_fp8_mfma_b(w_data_row, 3 * K_PER_MFMA, g);
-      int sa3 = (int)wg_scales[row_scale_base + 3 * 4 + g];
+      if constexpr (MFMA_ITERS <= FULL_PRELOAD_ITERS) {
+        // ── Straight-line: the whole K reduction fits in registers ──────────
+        //
+        // At K=1024 (q_b) MFMA_ITERS is 8, so the rotating depth-4 pipeline
+        // below runs exactly two iterations -- and pays for the privilege
+        // twice over. `#pragma unroll 1` forbids the unroll that would let the
+        // compiler rotate registers, so instead it emits ~35 v_mov at the loop
+        // bottom to shuffle the refilled tiles into the slot registers, and a
+        // `s_waitcnt vmcnt(0)` in front of them to make the copies legal. That
+        // drains every prefetch at the end of each iteration.
+        //
+        // Two iterations of a pipeline is not a pipeline. Issue all
+        // MFMA_ITERS tiles up front instead: 2*MFMA_ITERS global_load_dwordx4
+        // in flight before the first MFMA, no rotation, no copies, and each
+        // MFMA waits on a *decreasing* vmcnt rather than zero. 8 tiles is 64
+        // VGPRs of A operand, which is what the depth-4 version already peaked
+        // at (4 held + 4 in flight), so this costs no occupancy.
+        //
+        // The bound is register pressure: MFMA_ITERS=16 (K=2048, the dense
+        // MLP) would need 128 VGPRs of A and spill, so that shape keeps the
+        // rotating pipeline.
+        i32x8_t a[MFMA_ITERS];
+        int sa[MFMA_ITERS];
+#pragma unroll
+        for (int ki = 0; ki < MFMA_ITERS; ki++) {
+          a[ki] = _gang_load_fp8_mfma_b_g(w_data_row, ki * K_PER_MFMA, g);
+          sa[ki] =
+              (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + ki * 4 + g);
+        }
+        // The B operands come out of LDS and have to be preloaded too, into
+        // their own registers -- this is hazard 1 from
+        // tests/standalone/test_mfma_pipeline_hazards.hip.
+        //
+        // Left to itself the allocator hands every b the *same* bank, so the
+        // asm reads
+        //     v_mfma  a[0:3], v[14:21], v[144:151], ...
+        //     ds_read_b128 v[14:17], v2 offset:128
+        // -- an LDS write into v[14:21] while the MFMA immediately above is
+        // still sampling it. lgkmcnt tracks when LDS data reaches the VGPR,
+        // not when the MFMA has finished reading its sources, so the next
+        // MFMA sees mixed operands. The hazard test calls this intermittent
+        // at ~20% of launches; here it fires on seven of the eight MFMAs
+        // because a single bank is recycled for all of them, and the model
+        // decodes fluent nonsense.
+        //
+        // Holding all MFMA_ITERS b values live forces disjoint banks, which
+        // is the ping-pong fix taken to its limit: no register is ever both a
+        // live MFMA source and an in-flight LDS destination.
+        i32x8_t b[MFMA_ITERS];
+#pragma unroll
+        for (int ki = 0; ki < MFMA_ITERS; ki++) {
+          b[ki] = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
+        }
+        // Nail every load down on this side of the MFMAs.
+        //
+        // Without this the machine scheduler sinks all but two tiles back
+        // below the first MFMA -- its register-pressure heuristic targets an
+        // occupancy this kernel does not have (the megakernel runs one wave
+        // per SIMD at 248 VGPRs) and it happily trades 16 loads in flight for
+        // a smaller live set. The result is `s_waitcnt vmcnt(0)` in front of
+        // six of the eight MFMAs, i.e. the same fully-exposed latency the
+        // rotating pipeline had, just spelled differently -- and it is also
+        // what re-introduces the WAR hazard above.
+        __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+        for (int ki = 0; ki < MFMA_ITERS; ki++) {
+          acc = _gang_mfma_f8xf8(a[ki], b[ki], acc, sa[ki],
+                                 (int)s_tok_scales[ki]);
+        }
+        // This is what "prevents ROCm miscompilation" below actually means,
+        // and it is worth naming because it is not a codegen bug.
+        //
+        // `acc` is read only under `if (col == 0)` in the epilogue. Given
+        // straight-line MFMAs, LLVM happily sinks the whole chain into that
+        // block -- the asm shows `s_and_b64 exec, exec, vcc` landing *above*
+        // the first v_mfma. But MFMA gathers its A and B operands across all
+        // 64 lanes of the wave, so running it under a 1-in-16 EXEC mask
+        // silently computes on 4 lanes' worth of data. The model still decodes;
+        // it just emits garbage.
+        //
+        // The `#pragma unroll 1` loop in the branch below blocks the sink as a
+        // side effect (LLVM will not sink a loop into a conditional), which is
+        // why nobody had to name the hazard. Straight-line code has no such
+        // accident, so pin `acc` here with a volatile asm the sinker cannot
+        // move: same "+v" optimization-barrier idiom as
+        // gang_mla_full_layer_fused_mi300.cuh:467.
+        asm volatile("" : "+v"(acc));
+      } else {
+        // Pre-fill: load k-tiles 0..3 into pipeline slots
+        i32x8_t a0 = _gang_load_fp8_mfma_b_g(w_data_row, 0 * K_PER_MFMA, g);
+        int sa0 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + 0 * 4 + g);
+        i32x8_t a1 = _gang_load_fp8_mfma_b_g(w_data_row, 1 * K_PER_MFMA, g);
+        int sa1 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + 1 * 4 + g);
+        i32x8_t a2 = _gang_load_fp8_mfma_b_g(w_data_row, 2 * K_PER_MFMA, g);
+        int sa2 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + 2 * 4 + g);
+        i32x8_t a3 = _gang_load_fp8_mfma_b_g(w_data_row, 3 * K_PER_MFMA, g);
+        int sa3 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + 3 * 4 + g);
 
-// IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation.
+        // IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation -- see the
+        // EXEC-mask note in the branch above for what that actually is.
 #pragma unroll 1
-      for (int ki = 0; ki < MFMA_ITERS; ki += 4) {
-        // Slot 0: compute k-tile ki, prefetch ki+4
-        {
-          i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
-          int sb = (int)s_tok_scales[ki];
-          acc = _gang_mfma_f8xf8(a0, b, acc, sa0, sb);
-        }
-        if (ki + 4 < MFMA_ITERS) {
-          int kt4 = (ki + 4) * K_PER_MFMA;
-          a0 = _gang_load_fp8_mfma_b(w_data_row, kt4, g);
-          sa0 = (int)wg_scales[row_scale_base + kt4 / 32 + g];
-        }
+        for (int ki = 0; ki < MFMA_ITERS; ki += 4) {
+          // Slot 0: compute k-tile ki, prefetch ki+4
+          {
+            i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
+            int sb = (int)s_tok_scales[ki];
+            acc = _gang_mfma_f8xf8(a0, b, acc, sa0, sb);
+          }
+          if (ki + 4 < MFMA_ITERS) {
+            int kt4 = (ki + 4) * K_PER_MFMA;
+            a0 = _gang_load_fp8_mfma_b_g(w_data_row, kt4, g);
+            sa0 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + kt4 / 32 + g);
+          }
 
-        // Slot 1: compute k-tile ki+1, prefetch ki+5
-        {
-          i32x8_t b =
-              _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 1) * K_PER_MFMA, g);
-          int sb = (int)s_tok_scales[ki + 1];
-          acc = _gang_mfma_f8xf8(a1, b, acc, sa1, sb);
-        }
-        if (ki + 5 < MFMA_ITERS) {
-          int kt5 = (ki + 5) * K_PER_MFMA;
-          a1 = _gang_load_fp8_mfma_b(w_data_row, kt5, g);
-          sa1 = (int)wg_scales[row_scale_base + kt5 / 32 + g];
-        }
+          // Slot 1: compute k-tile ki+1, prefetch ki+5
+          {
+            i32x8_t b =
+                _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 1) * K_PER_MFMA, g);
+            int sb = (int)s_tok_scales[ki + 1];
+            acc = _gang_mfma_f8xf8(a1, b, acc, sa1, sb);
+          }
+          if (ki + 5 < MFMA_ITERS) {
+            int kt5 = (ki + 5) * K_PER_MFMA;
+            a1 = _gang_load_fp8_mfma_b_g(w_data_row, kt5, g);
+            sa1 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + kt5 / 32 + g);
+          }
 
-        // Slot 2: compute k-tile ki+2, prefetch ki+6
-        {
-          i32x8_t b =
-              _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 2) * K_PER_MFMA, g);
-          int sb = (int)s_tok_scales[ki + 2];
-          acc = _gang_mfma_f8xf8(a2, b, acc, sa2, sb);
-        }
-        if (ki + 6 < MFMA_ITERS) {
-          int kt6 = (ki + 6) * K_PER_MFMA;
-          a2 = _gang_load_fp8_mfma_b(w_data_row, kt6, g);
-          sa2 = (int)wg_scales[row_scale_base + kt6 / 32 + g];
-        }
+          // Slot 2: compute k-tile ki+2, prefetch ki+6
+          {
+            i32x8_t b =
+                _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 2) * K_PER_MFMA, g);
+            int sb = (int)s_tok_scales[ki + 2];
+            acc = _gang_mfma_f8xf8(a2, b, acc, sa2, sb);
+          }
+          if (ki + 6 < MFMA_ITERS) {
+            int kt6 = (ki + 6) * K_PER_MFMA;
+            a2 = _gang_load_fp8_mfma_b_g(w_data_row, kt6, g);
+            sa2 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + kt6 / 32 + g);
+          }
 
-        // Slot 3: compute k-tile ki+3, prefetch ki+7
-        if (ki + 3 < MFMA_ITERS) {
-          i32x8_t b =
-              _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 3) * K_PER_MFMA, g);
-          int sb = (int)s_tok_scales[ki + 3];
-          acc = _gang_mfma_f8xf8(a3, b, acc, sa3, sb);
+          // Slot 3: compute k-tile ki+3, prefetch ki+7
+          if (ki + 3 < MFMA_ITERS) {
+            i32x8_t b =
+                _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 3) * K_PER_MFMA, g);
+            int sb = (int)s_tok_scales[ki + 3];
+            acc = _gang_mfma_f8xf8(a3, b, acc, sa3, sb);
+          }
+          if (ki + 7 < MFMA_ITERS) {
+            int kt7 = (ki + 7) * K_PER_MFMA;
+            a3 = _gang_load_fp8_mfma_b_g(w_data_row, kt7, g);
+            sa3 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + kt7 / 32 + g);
+          }
         }
-        if (ki + 7 < MFMA_ITERS) {
-          int kt7 = (ki + 7) * K_PER_MFMA;
-          a3 = _gang_load_fp8_mfma_b(w_data_row, kt7, g);
-          sa3 = (int)wg_scales[row_scale_base + kt7 / 32 + g];
-        }
-      }
+      } // MFMA_ITERS > FULL_PRELOAD_ITERS
 
       // ── Step 4: Bias epilogue, write BF16 output ─────────────────────────
       if (col == 0) {
@@ -588,17 +719,17 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
 
     // Pre-fill: load k-tiles 0..3 into pipeline slots
-    i32x8_t a0 = _gang_load_fp8_mfma_b(w_data_row, ki_start * K_PER_MFMA, g);
-    int sa0 = (int)wg_scales[row_scale_base + ki_start * 4 + g];
-    i32x8_t a1 =
-        _gang_load_fp8_mfma_b(w_data_row, (ki_start + 1) * K_PER_MFMA, g);
-    int sa1 = (int)wg_scales[row_scale_base + (ki_start + 1) * 4 + g];
-    i32x8_t a2 =
-        _gang_load_fp8_mfma_b(w_data_row, (ki_start + 2) * K_PER_MFMA, g);
-    int sa2 = (int)wg_scales[row_scale_base + (ki_start + 2) * 4 + g];
-    i32x8_t a3 =
-        _gang_load_fp8_mfma_b(w_data_row, (ki_start + 3) * K_PER_MFMA, g);
-    int sa3 = (int)wg_scales[row_scale_base + (ki_start + 3) * 4 + g];
+    i32x8_t a0 = _gang_load_fp8_mfma_b_g(w_data_row, ki_start * K_PER_MFMA, g);
+    int sa0 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + ki_start * 4 + g);
+    i32x8_t a1 = _gang_load_fp8_mfma_b_g(
+        w_data_row, (ki_start + 1) * K_PER_MFMA, g);
+    int sa1 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + (ki_start + 1) * 4 + g);
+    i32x8_t a2 = _gang_load_fp8_mfma_b_g(
+        w_data_row, (ki_start + 2) * K_PER_MFMA, g);
+    int sa2 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + (ki_start + 2) * 4 + g);
+    i32x8_t a3 = _gang_load_fp8_mfma_b_g(
+        w_data_row, (ki_start + 3) * K_PER_MFMA, g);
+    int sa3 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + (ki_start + 3) * 4 + g);
 
 // IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation.
 #pragma unroll 1
@@ -611,8 +742,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
       }
       if (ki + 4 < ki_end) {
         int kt4 = (ki + 4) * K_PER_MFMA;
-        a0 = _gang_load_fp8_mfma_b(w_data_row, kt4, g);
-        sa0 = (int)wg_scales[row_scale_base + kt4 / 32 + g];
+        a0 = _gang_load_fp8_mfma_b_g(w_data_row, kt4, g);
+        sa0 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + kt4 / 32 + g);
       }
 
       // Slot 1: compute k-tile ki+1, prefetch ki+5
@@ -623,8 +754,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
       }
       if (ki + 5 < ki_end) {
         int kt5 = (ki + 5) * K_PER_MFMA;
-        a1 = _gang_load_fp8_mfma_b(w_data_row, kt5, g);
-        sa1 = (int)wg_scales[row_scale_base + kt5 / 32 + g];
+        a1 = _gang_load_fp8_mfma_b_g(w_data_row, kt5, g);
+        sa1 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + kt5 / 32 + g);
       }
 
       // Slot 2: compute k-tile ki+2, prefetch ki+6
@@ -635,8 +766,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
       }
       if (ki + 6 < ki_end) {
         int kt6 = (ki + 6) * K_PER_MFMA;
-        a2 = _gang_load_fp8_mfma_b(w_data_row, kt6, g);
-        sa2 = (int)wg_scales[row_scale_base + kt6 / 32 + g];
+        a2 = _gang_load_fp8_mfma_b_g(w_data_row, kt6, g);
+        sa2 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + kt6 / 32 + g);
       }
 
       // Slot 3: compute k-tile ki+3, prefetch ki+7
@@ -647,8 +778,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
       }
       if (ki + 7 < ki_end) {
         int kt7 = (ki + 7) * K_PER_MFMA;
-        a3 = _gang_load_fp8_mfma_b(w_data_row, kt7, g);
-        sa3 = (int)wg_scales[row_scale_base + kt7 / 32 + g];
+        a3 = _gang_load_fp8_mfma_b_g(w_data_row, kt7, g);
+        sa3 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + kt7 / 32 + g);
       }
     }
 

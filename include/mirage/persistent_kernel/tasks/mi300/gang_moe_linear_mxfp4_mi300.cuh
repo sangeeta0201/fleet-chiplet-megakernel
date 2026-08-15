@@ -381,6 +381,36 @@ __device__ __forceinline__ f32x4_t _gang_mfma_f4xf8(
       scale_b);
 }
 
+// A load that is *known* to come from device *global* memory.
+//
+// Clang infers address spaces intraprocedurally, so a pointer that arrives as
+// an argument to a __noinline__ task kernel stays generic and every deref of
+// it is emitted as flat_load rather than global_load. On gfx9 that is not
+// merely a slower addressing mode: a flat instruction increments **both**
+// vmcnt and lgkmcnt, so the `s_waitcnt lgkmcnt(0)` that retires an LDS read
+// also waits on every outstanding weight load. In an MFMA loop that reads its
+// A operand from global and its B operand from LDS -- which is every GEMM in
+// this directory -- that single waitcnt sits directly in front of the MFMAs
+// and drains the software pipeline, so the prefetch buys nothing at all.
+//
+// Casting at the load restores global_load and decouples the two counters.
+// Safe only because every pointer handed to these kernels is device global:
+// weights, scales, activations, residual, bias and output all come from the
+// megakernel workspace or from a task descriptor. Never point this at LDS.
+//
+// The cast is two-step because clang rejects a reinterpret_cast that changes
+// both the pointee type and the address space at once. T must be a POD or an
+// ext_vector_type -- a HIP_vector_type class (uint2, uint4, ...) has a copy
+// constructor taking a generic reference, which silently undoes the cast.
+//
+// Same idiom as gang_gemv_mxfp8_detail::ld_g; kept here so every consumer of
+// _gang_load_fp8_mfma_b can reach it.
+template <typename T>
+__device__ __forceinline__ T _gang_ld_g(void const *p) {
+  T const *q = static_cast<T const *>(p);
+  return *(__attribute__((address_space(1))) T const *)q;
+}
+
 // Load FP8 B-operand for 16x16x128 MFMA.
 // FP8 layout requires two 16-byte chunks at K offsets [g*16..g*16+15]
 // and [g*16+64..g*16+79] within the 128-element tile.
@@ -389,6 +419,28 @@ __device__ __forceinline__ i32x8_t _gang_load_fp8_mfma_b(uint8_t const *data,
                                                          int g) {
   i32x4_t lo = *(i32x4_t const *)(data + kt + g * 16);
   i32x4_t hi = *(i32x4_t const *)(data + kt + g * 16 + 64);
+  i32x8_t r;
+  r[0] = lo[0];
+  r[1] = lo[1];
+  r[2] = lo[2];
+  r[3] = lo[3];
+  r[4] = hi[0];
+  r[5] = hi[1];
+  r[6] = hi[2];
+  r[7] = hi[3];
+  return r;
+}
+
+// Global-memory twin of _gang_load_fp8_mfma_b, for the weight (A) operand.
+// Identical addressing; the only difference is that the two 16-byte gathers
+// go through _gang_ld_g so they emit global_load_dwordx4 and stay out of
+// lgkmcnt. Use this one for anything read out of the weight buffer and the
+// plain one for anything read out of LDS.
+__device__ __forceinline__ i32x8_t _gang_load_fp8_mfma_b_g(uint8_t const *data,
+                                                           int kt,
+                                                           int g) {
+  i32x4_t lo = _gang_ld_g<i32x4_t>(data + kt + g * 16);
+  i32x4_t hi = _gang_ld_g<i32x4_t>(data + kt + g * 16 + 64);
   i32x8_t r;
   r[0] = lo[0];
   r[1] = lo[1];

@@ -62,8 +62,15 @@ __device__ __forceinline__ float rmsnorm_rcp_amd(void const *input_ptr,
                                                  float eps = 1e-5f) {
   bf16 const *__restrict__ d_input = static_cast<bf16 const *>(input_ptr);
 
-  constexpr int VEC_SIZE = 8;
+  // 8 bf16 per thread needs STORAGE_DIM to be a multiple of 256*8. At
+  // STORAGE_DIM=1024 -- q_b, whose input is the 768-wide q_lora row padded to
+  // 1024 -- it is not, so VEC_ITERS came out 0, the whole vectorized loop was
+  // dead, and the row was read by the scalar tail below: four separate 2-byte
+  // global loads per thread where one 8-byte load would do. Drop to 4 bf16 per
+  // thread for those shapes. STORAGE_DIM=2048 is unaffected and still takes
+  // the 8-wide path.
   constexpr int NTHREADS = 256;
+  constexpr int VEC_SIZE = (STORAGE_DIM % (NTHREADS * 8) == 0) ? 8 : 4;
   int const tid = threadIdx.x;
   int const nthreads = blockDim.x;
   constexpr int VEC_ITERS = STORAGE_DIM / (NTHREADS * VEC_SIZE);
@@ -73,20 +80,40 @@ __device__ __forceinline__ float rmsnorm_rcp_amd(void const *input_ptr,
 #pragma unroll 1
   for (int v = 0; v < VEC_ITERS; v++) {
     int offset = (v * nthreads + tid) * VEC_SIZE;
-    uint64_t in_lo = *reinterpret_cast<uint64_t const *>(&d_input[offset]);
-    uint64_t in_hi = *reinterpret_cast<uint64_t const *>(&d_input[offset + 4]);
+    // addrspace(1) so this is global_load, not flat_load. A flat instruction
+    // increments both vmcnt and lgkmcnt on gfx9, so the lgkmcnt(0) that
+    // retires the cross-wave reduction's LDS traffic below would also wait on
+    // this row. Same two-step cast as gang_gemv_mxfp8_detail::ld_g; d_input is
+    // always device global here (the LDS-staged caller uses
+    // _rnlm8_resadd_norm_rcp instead, which never reaches this function).
+    uint64_t const *in_lo_p =
+        reinterpret_cast<uint64_t const *>(&d_input[offset]);
+    uint64_t in_lo =
+        *(__attribute__((address_space(1))) uint64_t const *)in_lo_p;
     bf16 const *lo = reinterpret_cast<bf16 const *>(&in_lo);
-    bf16 const *hi = reinterpret_cast<bf16 const *>(&in_hi);
 #pragma unroll
     for (int i = 0; i < 4; i++) {
       float vlo = __bfloat162float(lo[i]);
-      float vhi = __bfloat162float(hi[i]);
       if constexpr (NORM_SPAN == STORAGE_DIM) {
         sum += vlo * vlo;
-        sum += vhi * vhi;
       } else {
         sum += (offset + i < NORM_SPAN) ? vlo * vlo : 0.0f;
-        sum += (offset + 4 + i < NORM_SPAN) ? vhi * vhi : 0.0f;
+      }
+    }
+    if constexpr (VEC_SIZE == 8) {
+      uint64_t const *in_hi_p =
+          reinterpret_cast<uint64_t const *>(&d_input[offset + 4]);
+      uint64_t in_hi =
+          *(__attribute__((address_space(1))) uint64_t const *)in_hi_p;
+      bf16 const *hi = reinterpret_cast<bf16 const *>(&in_hi);
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        float vhi = __bfloat162float(hi[i]);
+        if constexpr (NORM_SPAN == STORAGE_DIM) {
+          sum += vhi * vhi;
+        } else {
+          sum += (offset + 4 + i < NORM_SPAN) ? vhi * vhi : 0.0f;
+        }
       }
     }
   }
