@@ -1,0 +1,38 @@
+diff --git a/src/ipc/context_ipc_device.cpp b/src/ipc/context_ipc_device.cpp
+index e9ff4ad..83aed7e 100644
+--- a/src/ipc/context_ipc_device.cpp
++++ b/src/ipc/context_ipc_device.cpp
+@@ -105,8 +105,31 @@ __device__ void IPCContext::quiet() {
+ }
+ 
+ __device__ void *IPCContext::shmem_ptr(const void *dest, int pe) {
+-  void *ret = nullptr;
+-  return ret;
++  // Upstream returns nullptr here unconditionally -- shmem_ptr was only ever
++  // implemented for the reverse-offload backend (ROContext::shmem_ptr). But
++  // the IPC backend already has everything the translation needs: putmem
++  // directly below computes ipc_bases[pe] + (dest - ipc_bases[my_pe]) on every
++  // call. shmem_ptr is that same arithmetic without the copy, so returning
++  // null here is a gap, not a statement that the mapping is unavailable.
++  //
++  // This matters because null is indistinguishable from "no peer mapping" at
++  // the call site: callers that offer a direct-store fast path silently take
++  // their staged fallback forever, and nothing reports it.
++  //
++  // Guarded on ipc_bases rather than isIpcAvailable(): IPCContext's ctor
++  // copies ipc_bases and shm_size from the backend but not pes_with_ipc_avail,
++  // so isIpcAvailable() would report false on a context where putmem works
++  // fine. Indexing by global pe matches what putmem/getmem do here.
++  if (ipcImpl_.ipc_bases == nullptr) {
++    return nullptr;
++  }
++  char *my_base = ipcImpl_.ipc_bases[my_pe];
++  char *peer_base = ipcImpl_.ipc_bases[pe];
++  if (my_base == nullptr || peer_base == nullptr) {
++    return nullptr;
++  }
++  uint64_t L_offset = reinterpret_cast<const char *>(dest) - my_base;
++  return peer_base + L_offset;
+ }
+ 
+ __device__ void IPCContext::putmem_wg(void *dest, const void *source,

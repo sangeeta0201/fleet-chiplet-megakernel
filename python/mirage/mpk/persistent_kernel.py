@@ -98,12 +98,41 @@ static PyObject *set_rope_tables_func(PyObject *self, PyObject *args) {
   Py_RETURN_NONE;
 }
 
+static PyObject *read_shmem_alloc_func(PyObject *self, PyObject *args) {
+  int index;
+  PyObject *py_dst;
+  unsigned long long nbytes;
+  if (!PyArg_ParseTuple(args, "iOK", &index, &py_dst, &nbytes)) {
+    PyErr_SetString(PyExc_TypeError, "Expected (index, dst_ptr, nbytes)");
+    return NULL;
+  }
+  void *dst = PyLong_AsVoidPtr(py_dst);
+  int rc = mpk_read_shmem_alloc(index, dst, (size_t)nbytes);
+  return PyLong_FromLong((long)rc);
+}
+
+static PyObject *num_shmem_allocs_func(PyObject *self, PyObject *args) {
+  return PyLong_FromLong((long)mpk_num_shmem_allocs());
+}
+
+static PyObject *shmem_alloc_size_func(PyObject *self, PyObject *args) {
+  int index;
+  if (!PyArg_ParseTuple(args, "i", &index)) {
+    PyErr_SetString(PyExc_TypeError, "Expected (index)");
+    return NULL;
+  }
+  return PyLong_FromUnsignedLongLong(mpk_shmem_alloc_size(index));
+}
+
 static PyMethodDef ModuleMethods[] = {
   {"init_func", init_func, METH_VARARGS, "initialize persistent kernel"},
   {"init_request_func", init_request_func, METH_VARARGS, "initialize request resources"},
   {"launch_func", launch_func, METH_VARARGS, "launch persistent kernel"},
   {"finalize_func", finalize_func, METH_VARARGS, "finalize persistent kernel"},
   {"set_rope_tables_func", set_rope_tables_func, METH_VARARGS, "set RoPE cos/sin tables"},
+  {"read_shmem_alloc_func", read_shmem_alloc_func, METH_VARARGS, "snapshot symmetric-heap alloc into device buffer"},
+  {"num_shmem_allocs_func", num_shmem_allocs_func, METH_VARARGS, "number of recorded symmetric-heap allocs"},
+  {"shmem_alloc_size_func", shmem_alloc_size_func, METH_VARARGS, "byte size of a recorded symmetric-heap alloc"},
   {NULL, NULL, 0, NULL} // sentinel
 };
 
@@ -147,6 +176,9 @@ def get_compile_command(
     py_so_path,
     profiling,
     use_nvshmem,
+    use_rocshmem=False,
+    rocshmem_inc_path=None,
+    rocshmem_lib_path=None,
     num_workers=None,
     num_local_schedulers=None,
     num_remote_schedulers=None,
@@ -229,6 +261,44 @@ def get_compile_command(
         flags = flags + ["-DMPK_W13_LDS_WEIGHTS"]
     if int(os.environ.get("W13_LDS_PREFETCH", "1")) == 1:
         flags = flags + ["-DMPK_W13_LDS_PREFETCH"]
+    if int(os.environ.get("W13_QFIRST", "0")) == 1:
+        flags = flags + ["-DMPK_W13_QFIRST"]
+    if int(os.environ.get("W13_ILV", "0")) == 1:
+        flags = flags + ["-DMPK_W13_ILV"]
+    if int(os.environ.get("W13_BIASPRE", "0")) == 1:
+        flags = flags + ["-DMPK_W13_BIASPRE"]
+    if int(os.environ.get("QKV_RMSPRE", "0")) == 1:
+        flags = flags + ["-DMPK_QKV_RMSPRE"]
+    if int(os.environ.get("TK_DEFER", "0")) == 1:
+        # Hoist TopK's three st_wt stores out of the k=4 loop. The loop
+        # alternates them with `asm volatile` blanking blocks, and LLVM's
+        # waitcnt pass cannot see into inline asm, so each iteration drains
+        # write-through stores to HBM. CORRECT output: nothing in the loop
+        # reads what it stores, and the `output` store it removed was dead
+        # (renormalize is literally true, so the renorm pass overwrote it).
+        flags = flags + ["-DMPK_TK_DEFER"]
+    if int(os.environ.get("TK_NOELOAD", "0")) == 1:
+        # TopK's completer read the routing_ready epoch back with an uncached
+        # ld_nt_s32 before publishing epoch+1. The consumer never reads it --
+        # it derives layer_counter + 1 -- so the producer takes the same value
+        # as an argument. CORRECT output: same value, one fewer HBM round trip
+        # on the serial path 239 workers wait behind.
+        flags = flags + ["-DMPK_TK_NOELOAD"]
+    if int(os.environ.get("EP9_DIRECT", "0")) == 1:
+        # Phase 9a's release flags removed: the 8 folding workgroups poll the
+        # GPU-wide arrival counter (ep_moe_done >= 8 * (layer_idx + 1))
+        # instead of a flag the closer publishes after observing it. Drops the
+        # closer's 8 write-through stores and their drain from the span
+        # between the last W2 tile and the first byte of folding. CORRECT
+        # output: same predicate, same instant; ordering was never carried by
+        # the flag (it is each worker's own vmcnt drain before its arrival
+        # atomic, plus the folder's buffer_inv).
+        #
+        # MEASURED NULL: 2.219 vs 2.138 baseline, +2.25 us/layer. The 8 `nt`
+        # spin loops contend with the 8 XCD leaders' RMWs on that same line;
+        # the separate release lines were what kept poll traffic off the
+        # critical atomic. See the long note at MPK_EP9_DIRECT.
+        flags = flags + ["-DMPK_EP9_DIRECT=1"]
     # Use when debugging
     # flags = flags + [f"-DMPK_ENABLE_VERBOSE"]
     if int(os.environ.get("PRECOMPUTED_DISPATCH", "1")) == 1:
@@ -291,7 +361,10 @@ def get_compile_command(
             "-x", "hip",
             file_name,
             "-O2",  # -O3 causes LLVM AMDGPU register allocator to hang on large fused kernels
-            "--save-temps",  # TEMP: dump assembly for v_mov analysis
+            # NOTE: do NOT add --save-temps here. Under multi-GPU SPMD both ranks
+            # share a cwd and compile an input named test.cu, so --save-temps
+            # dumps colliding intermediate object files (test-hip-amdgcn-*.o),
+            # corrupting the device link (undefined __hip_gpubin_handle).
             # Omit -lineinfo for ROCm: hipcc forwards it to ld.lld which treats it as -l lineinfo
             f"-I{py_include_dir}",
             f"-I{mirage_inc_path}",
@@ -363,6 +436,25 @@ def get_compile_command(
             flags = flags + ["-DMPK_W13_LDS_WEIGHTS"]
         if int(os.environ.get("W13_LDS_PREFETCH", "1")) == 1:
             flags = flags + ["-DMPK_W13_LDS_PREFETCH"]
+        if int(os.environ.get("W13_QFIRST", "0")) == 1:
+            flags = flags + ["-DMPK_W13_QFIRST"]
+        if int(os.environ.get("W13_ILV", "0")) == 1:
+            flags = flags + ["-DMPK_W13_ILV"]
+        if int(os.environ.get("W13_BIASPRE", "0")) == 1:
+            flags = flags + ["-DMPK_W13_BIASPRE"]
+        if int(os.environ.get("QKV_RMSPRE", "0")) == 1:
+            # QKV pass 1's loads issued ABOVE the weight buffer_load_lds block.
+            # MEASURED NULL: p1 1.76 -> 1.53 and drain 0.70 -> 0.50, but pre
+            # 1.44 -> 2.02 -- issue backpressure just relocates the stall into
+            # the issue block. 2.150/2.123 vs 2.116 baseline. Kept because the
+            # negative result is what rules the approach out.
+            flags = flags + ["-DMPK_QKV_RMSPRE"]
+        if int(os.environ.get("TK_DEFER", "0")) == 1:
+            flags = flags + ["-DMPK_TK_DEFER"]
+        if int(os.environ.get("TK_NOELOAD", "0")) == 1:
+            flags = flags + ["-DMPK_TK_NOELOAD"]
+        if int(os.environ.get("EP9_DIRECT", "0")) == 1:
+            flags = flags + ["-DMPK_EP9_DIRECT=1"]
         if int(os.environ.get("MPK_GAP_TIMING", "0")) == 1:
             flags = flags + ["-DMPK_ENABLE_GAP_TIMING"]
             flags = flags + ["-DMPK_ENABLE_DEVICE_TASK_ACCUM"]
@@ -374,7 +466,103 @@ def get_compile_command(
             flags = flags + ["-DMPK_FUSED_TAIL_TIMING"]
         if int(os.environ.get("MPK_K2944_DEBUG", "0")) == 1:
             flags = flags + ["-DMPK_K2944_DEBUG"]
-        if int(os.environ.get("PRECOMPUTED_DISPATCH", "1")) == 1:
+        if int(os.environ.get("MPK_EP9_ONLY", "0")) == 1:
+            # Phase 9 breakdown only: keeps the accumulate-and-dump-once EP9
+            # report and compiles out the per-layer FUSED_PHASE printf, which
+            # on its own takes the iteration from 2.5 ms to ~440 ms.
+            flags = flags + ["-DMPK_EP9_ONLY", "-DMPK_ENABLE_DEVICE_TASK_TIMING"]
+        if int(os.environ.get("MPK_EP_WAIT_AT_USE", "0")) == 1:
+            # Moves Phase 9d's cross-GPU peer wait to its point of use in the
+            # next layer's QKV prologue. Both placements are CORRECT -- the
+            # gather buffers are per-layer, so deferring the wait exposes no
+            # WAR hazard -- so unlike MPK_EP_ABLATE this is a scheduling knob
+            # and its output must still pass the correctness suite.
+            flags = flags + ["-DMPK_EP_WAIT_AT_USE=1"]
+        if int(os.environ.get("MPK_MOE_NOPAD", "0")) == 1:
+            # Drops the 240-tile W13 padding when W13 already fits in one
+            # round, so the freed slots carry real W2 tiles that can overlap
+            # their weight prefetch with the W13 phase. EP-only in practice
+            # (1-GPU W13 overflows the round and keeps the padding). CORRECT
+            # output: it reorders which worker runs which tile, not what any
+            # tile computes.
+            flags = flags + ["-DMPK_MOE_NOPAD"]
+        _w13_early = int(os.environ.get("MPK_W13_EARLY_REL", "0"))
+        if _w13_early:
+            # Fire the W13->W2 release at _w13_early/16 of the W13 arrivals.
+            # WRONG OUTPUT by construction -- prices the ceiling of any
+            # dependency-narrowing scheme (MoK-style indexed counters, W2
+            # split-K with a half-width required_count) before building one.
+            # If 8/16 does not move the token, the W2 wait is W13's DURATION,
+            # not its arrival count, and narrowing the count cannot help.
+            flags = flags + [f"-DMPK_W13_EARLY_REL={_w13_early}"]
+        _perf_iter = int(os.environ.get("MPK_PERFETTO", "0"))
+        if _perf_iter:
+            # Capture raw per-worker phase spans for ONE decode iteration and
+            # dump them as [PERF] CSV lines; perf_to_perfetto.py turns those
+            # into a Perfetto trace. Correct output -- this only stores
+            # timestamps the fused task already takes. Implies device timing,
+            # which is where those timestamps come from, and EP9_ONLY to
+            # suppress the per-layer printf storm that would otherwise
+            # dominate the very timeline being captured.
+            flags = flags + [
+                "-DMPK_PERFETTO",
+                f"-DMPK_PERFETTO_ITER={_perf_iter}",
+                "-DMPK_ENABLE_DEVICE_TASK_TIMING",
+                "-DMPK_EP9_ONLY",
+            ]
+        for _nq in ("MPK_W13_NOQUANT", "MPK_W2_NOQUANT"):
+            if int(os.environ.get(_nq, "0")) == 1:
+                # Skip the per-tile FP8 token quant. WRONG OUTPUT by
+                # construction -- prices the ceiling of hoisting the quant,
+                # which is redundant across every tile of an expert (all 92 W13
+                # / 45 W2 workgroups quantize the same vector). The quant also
+                # hides the weight-prefetch latency, so the measured delta is
+                # the NET win a real hoist could deliver, not the gross 1.51 us.
+                flags = flags + [f"-D{_nq}"]
+        if int(os.environ.get("MPK_W2_HALFK", "0")) == 1:
+            # Halves W2's MFMA iteration count to price a K-split of W2 against
+            # the W13 -> barrier -> W2 chain that sets Phase 8's length. See the
+            # W2_MFMA_ITERS definition in gang_moe_fused_mxfp4_mi300.cuh.
+            # WRONG OUTPUT: latency attribution only.
+            flags = flags + ["-DMPK_W2_HALFK"]
+        if int(os.environ.get("MPK_W2_SPLITK", "0")) == 1:
+            # Splits W2's K in two, doubling the W2 tile count so each worker
+            # loads half the weight bytes. Under EP a rank owns 2 experts, so
+            # W2 is 92 tiles on 240 workers (38% occupancy); the split takes it
+            # to 184. Both halves atomicAdd into moe_workspace_f32, so no new
+            # combine is needed. CORRECT output: it redistributes the reduction
+            # rather than dropping it (unlike MPK_W2_HALFK above).
+            flags = flags + ["-DMPK_W2_SPLITK"]
+        if int(os.environ.get("MPK_EP_SKEW_PROBE", "0")) == 1:
+            # Measures how much earlier a column slice's W2 tiles finish than
+            # the last W2 tile on the GPU -- i.e. the headroom a per-slice
+            # "send as you go" release could claim over the current GPU-wide
+            # Phase 9 barrier. One timestamp per W2 tile, so cheap, but it
+            # still perturbs; do not quote latency from a probe run.
+            flags = flags + ["-DMPK_EP_SKEW_PROBE"]
+        # Inline-EP combine ablation. 1 = keep every barrier but drop the
+        # cross-GPU put/wait; 2 = drop Phase 9 entirely but keep the 64/64
+        # expert slicing. BOTH PRODUCE WRONG OUTPUT -- they exist to price the
+        # collective's parts against the DP baseline, nothing else.
+        _ep_ablate = int(os.environ.get("MPK_EP_ABLATE", "0"))
+        if _ep_ablate:
+            flags = flags + [f"-DMPK_EP_ABLATE={_ep_ablate}"]
+        if int(os.environ.get("MPK_EP_SIG_DBG", "0")) == 1:
+            # EP collective diagnostics: prints, once per rank, which of the
+            # two Phase 9 publication paths is actually live. Cheap enough to
+            # leave reachable, and the one thing worth checking first whenever
+            # an EP latency number looks unexplained -- see the [EPPATH] probe
+            # in gang_full_layer_fused_mi300.cuh.
+            flags = flags + ["-DMPK_EP_SIG_DBG"]
+        # The precomputed worker-dispatch template is baked from single-GPU task
+        # timing. Under multi-GPU (rocSHMEM) the cross-GPU put+signal waits
+        # perturb that timing and the fixed template deadlocks: a worker parks
+        # on a task it must itself produce, the ranks drift apart, and the run
+        # hangs. Force the dynamic scheduler-dispatch path for multi-GPU;
+        # single-GPU keeps the precomputed fast path. An explicit
+        # PRECOMPUTED_DISPATCH=0 still disables it everywhere.
+        precomputed_default = "0" if use_rocshmem else "1"
+        if int(os.environ.get("PRECOMPUTED_DISPATCH", precomputed_default)) == 1:
             flags = flags + ["-DMPK_PRECOMPUTED_DISPATCH"]
             flags = flags + ["-DMPK_FUSED_LAYER_BATCHING"]
         if int(os.environ.get("MPK_NIL_TRIPWIRE", "0")) == 1:
@@ -400,6 +588,10 @@ def get_compile_command(
             # Force seqlen_q=1: uses merge path only (faster decode, slower prefill)
             flags = flags + ["-DMPK_MAX_TOKENS_PER_REQUEST=1"]
         amdgpu_target = os.environ.get("AMDGPU_TARGETS", "gfx950")
+        if use_rocshmem:
+            # rocSHMEM's IPC backend requires an xnack-off code object on gfx950.
+            if ":" not in amdgpu_target:
+                amdgpu_target = f"{amdgpu_target}:xnack-"
         specific_cmd = [
             f"--offload-arch={amdgpu_target}",
             f"-L{rocm_lib}",
@@ -408,6 +600,31 @@ def get_compile_command(
             "-lrocblas",
             "-lhipblas",
         ]
+        if use_rocshmem:
+            # Device-initiated one-sided communication (rocSHMEM), the AMD
+            # analog of NVSHMEM. -fgpu-rdc + --hip-link are the HIP equivalents
+            # of nvcc's -rdc=true device link, required so the megakernel can
+            # call rocSHMEM device functions across translation units.
+            rocshmem_lib_archive = os.path.join(rocshmem_lib_path, "librocshmem.a")
+            common_cmd = common_cmd + [
+                f"-I{rocshmem_inc_path}",
+                f"-I{mpi_inc_path}",
+            ]
+            flags = flags + [
+                "-DUSE_ROCSHMEM",
+                "-fgpu-rdc",
+                "--hip-link",
+            ]
+            specific_cmd = specific_cmd + [
+                # Reset the input language ("-x hip" is still active from
+                # common_cmd) so the driver treats the rocSHMEM archive as a
+                # link input rather than compiling it as HIP source.
+                "-x", "none",
+                rocshmem_lib_archive,
+                f"-L{mpi_lib_path}",
+                "-lmpi",
+                "-lhsa-runtime64",
+            ]
         return common_cmd + specific_cmd + flags
 
     if profiling:
@@ -459,7 +676,10 @@ class PersistentKernel:
         self.meta_tensors = meta_tensors
         self.profiler_tensor = profiler_tensor
         self.trace_name = trace_name
-        self.use_nvshmem = True if world_size > 1 else False
+        # Multi-GPU comm backend: NVSHMEM on CUDA, rocSHMEM on ROCm.
+        _is_rocm = bool(getattr(torch.version, "hip", None))
+        self.use_nvshmem = (world_size > 1) and not _is_rocm
+        self.use_rocshmem = (world_size > 1) and _is_rocm
         self.spec_decode_config = spec_decode_config
         self._spec_decode_handlers = {
             "promptlookup": self.prompt_lookup_spec_handler,
@@ -2873,6 +3093,7 @@ class PersistentKernel:
         w13_output_per_wg: int = 128,
         w2_output_per_wg: int = 64,
         block_dim: tuple = (256, 1, 1),
+        num_experts_global: int = None,
     ):
         """Fused W13+SwiGLU+W2 MoE gang kernel with per-expert pipelining.
         Single gang task replaces separate W13 and W2 tasks. Phase-ordered
@@ -2900,7 +3121,20 @@ class PersistentKernel:
         assert self.target_cc in (94, 95), "Fused MoE MXFP4 only supported on MI300/MI350"
 
         batch_size = self.max_num_batched_tokens
-        num_experts = gate_up_weight.dim(0)
+        # Expert-parallel: gate_up_weight is sliced to this rank's local experts.
+        # The routing/mask/tile space stays GLOBAL, so tile/pad/dispatch math uses
+        # num_experts_global; only the weight storage is local (num_local_experts).
+        num_local_experts = gate_up_weight.dim(0)
+        if num_experts_global is None:
+            num_experts_global = num_local_experts
+        num_experts = num_experts_global
+        # Only shard the expert range when weights are actually sliced per rank
+        # (expert-parallel). When replicated (num_local_experts == global), every
+        # rank owns the full [0, num_experts) range.
+        if num_local_experts < num_experts_global:
+            expert_base = self.mpi_rank * num_local_experts
+        else:
+            expert_base = 0
         w13_wgs = gate_up_weight.dim(1)  # 2*intermediate/W13_OPW
         w2_wgs = down_weight.dim(1)      # hidden/W2_OPW
 
@@ -2946,7 +3180,8 @@ class PersistentKernel:
         )
         self.kn_graph.register_task(
             tb_graph, "gang_moe_fused_mxfp4_mi300",
-            [tiles_per_expert, w13_output_per_wg, total_tiles_per_xcd, w2_output_per_wg],
+            [tiles_per_expert, w13_output_per_wg, total_tiles_per_xcd, w2_output_per_wg,
+             expert_base, num_local_experts],
         )
 
     def gang_moe_swiglu_w2_mxfp4_layer(
@@ -4928,9 +5163,24 @@ class PersistentKernel:
 
         w13_tiles = batch_size * w13_wgs
         w2_tiles = batch_size * w2_wgs
-        total_w13_real = max_activated * w13_tiles
+        # Slot-parallel EP builds the tile space over the experts this rank
+        # OWNS, so the loop bound must shrink to match; the device-side decode
+        # in gang_moe_fused_mxfp4_mi300.cuh does the same arithmetic. Sizing
+        # this for the full activated list would not be wrong -- the extra
+        # trips decode past total_tiles and return -- but it costs a poll per
+        # worker per layer for nothing.
+        _ep_ws = 1
+        _ep_me = 0
+        _owned = ((max_activated - _ep_me + _ep_ws - 1) // _ep_ws
+                  if _ep_ws > 1 else max_activated)
+        total_w13_real = _owned * w13_tiles
         total_w13_padded = ((total_w13_real + PAD_MULTIPLE - 1) // PAD_MULTIPLE) * PAD_MULTIPLE
-        total_w2 = max_activated * w2_tiles
+        # MPK_W2_SPLITK doubles the W2 tile space on the device (each tile
+        # covers half of K), so the host loop bound has to double too --
+        # otherwise the un-dispatched half never arrives and the W13->W2
+        # per-expert barrier hangs.
+        _w2_splitk = 2 if int(os.environ.get("MPK_W2_SPLITK", "0")) == 1 else 1
+        total_w2 = _owned * w2_tiles * _w2_splitk
         total_tiles_all = total_w13_padded + total_w2
         moe_total_tiles_per_xcd = (total_tiles_all + 7) // 8
 
@@ -5043,11 +5293,49 @@ class PersistentKernel:
         sliding_window: int = 0,
         w13_output_per_wg: int = 128,
         w2_output_per_wg: int = 64,
+        expert_base: int = 0,
+        num_local_experts: int = None,
+        # Inline expert-parallel combine (Phase 9)
+        ep_gather: DTensor = None,
+        ep_signal: DTensor = None,
+        ep_combined: DTensor = None,
+        ep_fold_rank: int = 0,
+        # The EP reduce, dissolved into this layer's QKV prologue. Pass the
+        # PREVIOUS layer's ep_gather and the prologue sums its per-rank slots
+        # in the pass it already makes over that vector, instead of reading a
+        # combined residual that a separate reduce + exit barrier had to
+        # produce. None on layer 0 (its residual is the embedding) and on every
+        # non-EP config.
+        ep_prev_gather: DTensor = None,
+        # True only on the layer whose consumer is a separate task -- the last
+        # one, read by the tail. That layer still materializes the sum into
+        # ep_combined and still pays the exit barrier; the other 35 do not.
+        ep_write_combined: bool = False,
+        # Slot-parallel expert split. When ep_slot_ws > 1 the rank owns the
+        # activated-list slots congruent to ep_slot_me, and gate_up/down must
+        # be the FULL replicated weights (expert_base=0,
+        # num_local_experts=num_experts).
+        ep_slot_ws: int = 1,
+        ep_slot_me: int = 0,
         block_dim: tuple = (256, 1, 1),
     ):
         """Full-layer fused gang task: QKV+Attn+O-proj+TopK+MoE.
         Combines task 214 and 215 into one gang task per layer.
-        24 inputs, 11 outputs.
+        24 inputs, 11 outputs (26/12 with the inline EP combine).
+
+        Under expert parallelism the caller passes sliced gate_up/down weights
+        and biases plus the ownership window [expert_base, expert_base +
+        num_local_experts). Routing, mask and barrier stay replicated global
+        and keyed by global expert id; only weight storage is local. Defaults
+        reproduce the single-GPU identity mapping.
+
+        Passing ep_gather/ep_signal/ep_combined additionally fuses the MoE
+        cross-rank combine into the task, replacing the three dispatched tasks
+        (moe_residual_add_f32 -> identity -> allreduce) that used to follow it.
+        ep_gather and ep_signal must be symmetric-heap tensors
+        (io_category="nvshmem_tensor"); ep_combined carries the layer output
+        and is read by the next layer as its residual. Omitting them keeps the
+        single-GPU / replicated-MoE behaviour exactly as before.
         """
         assert residual.num_dims == 2
         assert qkv_weight.num_dims == 2
@@ -5055,6 +5343,28 @@ class PersistentKernel:
         assert gate_up_weight.num_dims == 3
         assert down_weight.num_dims == 3
         assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+
+        ep_inline = ep_gather is not None
+        if ep_inline:
+            assert ep_signal is not None and ep_combined is not None, \
+                "inline EP combine needs ep_gather, ep_signal and ep_combined"
+            assert self.world_size > 1, \
+                "inline EP combine requires world_size > 1"
+            assert ep_gather.num_dims == 3  # (world_size, batch, hidden)
+            assert ep_gather.dim(0) == self.world_size
+            assert ep_combined.num_dims == 2
+            if ep_prev_gather is not None:
+                assert ep_prev_gather.num_dims == 3
+                assert ep_prev_gather.dim(0) == self.world_size
+            # One 64-byte line per PE so a peer's SIGNAL_ADD never shares a
+            # line with another's (FULL_LAYER_EP_SIGNAL_STRIDE in the kernel).
+            # 64 bytes (one cache line) of signal space per PE. Declared in
+            # int32 units because mi.uint64 has no get_datatype_size() entry;
+            # the kernel reinterprets the pointer as uint64*.
+            assert ep_signal.dim(0) >= self.world_size * 16
+        else:
+            assert ep_prev_gather is None, \
+                "ep_prev_gather only means anything with the inline EP combine"
 
         batch_size = self.max_num_batched_tokens
 
@@ -5083,20 +5393,42 @@ class PersistentKernel:
         total_oproj_tiles = max(oproj_tiles_per_xcd, router_tile_n) * 8
 
         # MoE tiling (from type 187/215)
-        moe_num_experts = gate_up_weight.dim(0)
+        # gate_up_weight.dim(0) is the LOCAL expert count under expert
+        # parallelism, but the tile space must cover every GLOBALLY activated
+        # expert: tiles are decoded against the replicated global mask and
+        # non-owned experts early-return inside the kernel. Sizing the tile
+        # space with the local count would drop the tiles of experts owned by
+        # higher ranks.
+        if num_local_experts is None:
+            num_local_experts = gate_up_weight.dim(0)
         w13_wgs = gate_up_weight.dim(1)
         w2_wgs = down_weight.dim(1)
         num_topk = swiglu_out.dim(1)
-        max_activated = min(num_topk * batch_size, moe_num_experts)
+        max_activated = min(num_topk * batch_size, num_experts)
         PAD_MULTIPLE = 240
 
         intermediate_size = swiglu_out.dim(2)
 
         w13_tiles = batch_size * w13_wgs
         w2_tiles = batch_size * w2_wgs
-        total_w13_real = max_activated * w13_tiles
+        # Slot-parallel EP builds the tile space over the experts this rank
+        # OWNS, so the loop bound must shrink to match; the device-side decode
+        # in gang_moe_fused_mxfp4_mi300.cuh does the same arithmetic. Sizing
+        # this for the full activated list would not be wrong -- the extra
+        # trips decode past total_tiles and return -- but it costs a poll per
+        # worker per layer for nothing.
+        _ep_ws = ep_slot_ws
+        _ep_me = ep_slot_me
+        _owned = ((max_activated - _ep_me + _ep_ws - 1) // _ep_ws
+                  if _ep_ws > 1 else max_activated)
+        total_w13_real = _owned * w13_tiles
         total_w13_padded = ((total_w13_real + PAD_MULTIPLE - 1) // PAD_MULTIPLE) * PAD_MULTIPLE
-        total_w2 = max_activated * w2_tiles
+        # MPK_W2_SPLITK doubles the W2 tile space on the device (each tile
+        # covers half of K), so the host loop bound has to double too --
+        # otherwise the un-dispatched half never arrives and the W13->W2
+        # per-expert barrier hangs.
+        _w2_splitk = 2 if int(os.environ.get("MPK_W2_SPLITK", "0")) == 1 else 1
+        total_w2 = _owned * w2_tiles * _w2_splitk
         total_tiles_all = total_w13_padded + total_w2
         moe_total_tiles_per_xcd = (total_tiles_all + 7) // 8
 
@@ -5130,6 +5462,15 @@ class PersistentKernel:
         tb_graph.new_input(moe_barrier, (-1, -1, -1), -1, True)         # [21]
         tb_graph.new_input(swiglu_out, (-1, 2, -1), -1, True)           # [22]
         tb_graph.new_input(o_acc_f32, (-1, -1, -1), -1, True)           # [23]
+        # Inline-EP inputs. The runtime splits this flat operator list at the
+        # registered num_inputs, so these must sit BETWEEN the inputs and the
+        # outputs -- appending them at the end would reclassify x_output and
+        # k_cache as inputs and shift every output index the kernel hard-codes.
+        if ep_inline:
+            tb_graph.new_input(ep_gather, (-1, -1, -1), -1, True)       # [24]
+            tb_graph.new_input(ep_signal, (-1, -1, -1), -1, True)       # [25]
+            if ep_prev_gather is not None:
+                tb_graph.new_input(ep_prev_gather, (-1, -1, -1), -1, True)  # [26]
         # 11 outputs
         tb_graph.new_input(x_output, (-1, -1, -1), -1, True)            # [0]
         tb_graph.new_input(k_cache, (-1, -1, -1), -1, True)             # [1]
@@ -5143,16 +5484,25 @@ class PersistentKernel:
         tb_graph.new_input(routing_weight_moe, (-1, -1, -1), -1, True)  # [9]
         tb_graph.new_input(moe_workspace_f32, (-1, -1, -1), -1, True)   # [10]
 
+        # 12th output, EP only.
+        if ep_inline:
+            tb_graph.new_input(ep_combined, (-1, -1, -1), -1, True)     # [11]
+
+        # Must mirror the tb_graph operator order exactly.
         self.kn_graph.customized(
             [workspace_f32, residual, norm_weight_pre, norm_scratch_pre,
              qkv_weight, qkv_bias, sinks_or_placeholder, qkv_barrier, lse_acc,
              oproj_weight, oproj_bias, norm_weight_post, norm_scratch_post,
              router_weight, router_bias, logits_scratch, oproj_counters,
              gate_up_weight, down_weight, w13_bias, w2_bias,
-             moe_barrier, swiglu_out, o_acc_f32,
-             x_output, k_cache, v_cache, q_workspace, o_acc,
-             attn_proj_out, topk_weight, routing_indices,
-             active_expert_ids, routing_weight_moe, moe_workspace_f32],
+             moe_barrier, swiglu_out, o_acc_f32]
+            + ([ep_gather, ep_signal] if ep_inline else [])
+            + ([ep_prev_gather] if ep_inline and ep_prev_gather is not None
+               else [])
+            + [x_output, k_cache, v_cache, q_workspace, o_acc,
+               attn_proj_out, topk_weight, routing_indices,
+               active_expert_ids, routing_weight_moe, moe_workspace_f32]
+            + ([ep_combined] if ep_inline else []),
             tb_graph,
         )
         self.kn_graph.register_task(
@@ -5166,7 +5516,15 @@ class PersistentKernel:
              num_experts, topk_k, router_tile_n, total_topk_tiles,
              oproj_tiles_per_xcd, moe_total_tiles_per_xcd,
              w13_output_per_wg, w2_output_per_wg,
-             intermediate_size, workers_per_xcd]
+             intermediate_size, workers_per_xcd,
+             expert_base, num_local_experts,
+             self.world_size if ep_inline else 1,
+             self.mpi_rank if ep_inline else 0,
+             ep_fold_rank,
+             ep_slot_ws, ep_slot_me,
+             (self.world_size
+              if (ep_inline and ep_prev_gather is not None) else 1),
+             1 if (ep_inline and ep_write_combined) else 0]
         )
 
     def gang_full_layer_with_lmhead_fused_layer(
@@ -5281,9 +5639,24 @@ class PersistentKernel:
 
         w13_tiles = batch_size * w13_wgs
         w2_tiles = batch_size * w2_wgs
-        total_w13_real = max_activated * w13_tiles
+        # Slot-parallel EP builds the tile space over the experts this rank
+        # OWNS, so the loop bound must shrink to match; the device-side decode
+        # in gang_moe_fused_mxfp4_mi300.cuh does the same arithmetic. Sizing
+        # this for the full activated list would not be wrong -- the extra
+        # trips decode past total_tiles and return -- but it costs a poll per
+        # worker per layer for nothing.
+        _ep_ws = 1
+        _ep_me = 0
+        _owned = ((max_activated - _ep_me + _ep_ws - 1) // _ep_ws
+                  if _ep_ws > 1 else max_activated)
+        total_w13_real = _owned * w13_tiles
         total_w13_padded = ((total_w13_real + PAD_MULTIPLE - 1) // PAD_MULTIPLE) * PAD_MULTIPLE
-        total_w2 = max_activated * w2_tiles
+        # MPK_W2_SPLITK doubles the W2 tile space on the device (each tile
+        # covers half of K), so the host loop bound has to double too --
+        # otherwise the un-dispatched half never arrives and the W13->W2
+        # per-expert barrier hangs.
+        _w2_splitk = 2 if int(os.environ.get("MPK_W2_SPLITK", "0")) == 1 else 1
+        total_w2 = _owned * w2_tiles * _w2_splitk
         total_tiles_all = total_w13_padded + total_w2
         moe_total_tiles_per_xcd = (total_tiles_all + 7) // 8
 
@@ -6013,13 +6386,22 @@ class PersistentKernel:
         output_dir = kwargs.get("output_dir", None)
 
         MIRAGE_ROOT, INCLUDE_PATH, DEPS_PATH = get_key_paths()
+        # Each rank bakes its own (process-local) torch device pointers into the
+        # generated test.cu, so multi-GPU SPMD runs MUST NOT share an output
+        # directory; otherwise the ranks race on the same file/.so and one rank
+        # compiles the other rank's pointers (-> cudaMemcpy DtoD "invalid
+        # argument"). Give each rank its own directory when world_size > 1.
+        if self.world_size > 1:
+            base_output_dir = f"./permanent_output_dir_rank{self.mpi_rank}/"
+        else:
+            base_output_dir = "./permanent_output_dir/"
         if self.mode == "online_notoken" or self.mode == "online" or self.mode == "multi_turn":
             # We will init for multiple times so the output directory should be permanent
-            tempdir = "./permanent_output_dir/"
+            tempdir = base_output_dir
         else:
             tempdir_obj = tempfile.TemporaryDirectory()
             #tempdir = tempdir_obj.name
-            tempdir = "./permanent_output_dir/"
+            tempdir = base_output_dir
         os.makedirs(tempdir, exist_ok=True)
         results = self.kn_graph.generate_task_graph(num_gpus=self.world_size, my_gpu_id=self.mpi_rank)
 
@@ -6088,6 +6470,8 @@ class PersistentKernel:
 
         NVSHMEM_INC_PATH = None
         NVSHMEM_LIB_PATH = None
+        ROCSHMEM_INC_PATH = None
+        ROCSHMEM_LIB_PATH = None
         MPI_INC_PATH = None
         MPI_LIB_PATH = None
         if self.use_nvshmem:
@@ -6152,6 +6536,58 @@ class PersistentKernel:
                         f"Cannot find libmpi.so, please set environment variable MPI_LIB_PATH"
                     )
 
+        if self.use_rocshmem:
+            # find rocSHMEM include folder
+            if "ROCSHMEM_INC_PATH" in os.environ:
+                ROCSHMEM_INC_PATH = os.environ.get("ROCSHMEM_INC_PATH")
+            else:
+                ROCSHMEM_INC_PATH = os.path.join(
+                    os.path.expanduser("~"), "rocshmem", "include"
+                )
+            header_file_path = os.path.join(
+                ROCSHMEM_INC_PATH, "rocshmem", "rocshmem.hpp"
+            )
+            if not os.path.exists(header_file_path):
+                raise RuntimeError(
+                    f"Cannot find rocshmem/rocshmem.hpp at {header_file_path}, "
+                    "please set environment variable ROCSHMEM_INC_PATH"
+                )
+            # find rocSHMEM static library (librocshmem.a)
+            if "ROCSHMEM_LIB_PATH" in os.environ:
+                ROCSHMEM_LIB_PATH = os.environ.get("ROCSHMEM_LIB_PATH")
+            else:
+                ROCSHMEM_LIB_PATH = os.path.join(
+                    os.path.expanduser("~"), "rocshmem", "lib"
+                )
+            lib_file_path = os.path.join(ROCSHMEM_LIB_PATH, "librocshmem.a")
+            if not os.path.exists(lib_file_path):
+                raise RuntimeError(
+                    f"Cannot find librocshmem.a at {lib_file_path}, "
+                    "please set environment variable ROCSHMEM_LIB_PATH"
+                )
+            # find mpi include folder (rocSHMEM bootstraps through MPI)
+            if "MPI_INC_PATH" in os.environ:
+                MPI_INC_PATH = os.environ.get("MPI_INC_PATH")
+            else:
+                MPI_INC_PATH = "/usr/lib/x86_64-linux-gnu/openmpi/include"
+            header_file_path = os.path.join(MPI_INC_PATH, "mpi.h")
+            if not os.path.exists(header_file_path):
+                raise RuntimeError(
+                    f"Cannot find mpi.h at {header_file_path}, "
+                    "please set environment variable MPI_INC_PATH"
+                )
+            # find mpi shared library
+            if "MPI_LIB_PATH" in os.environ:
+                MPI_LIB_PATH = os.environ.get("MPI_LIB_PATH")
+            else:
+                MPI_LIB_PATH = "/usr/lib/x86_64-linux-gnu/openmpi/lib"
+            lib_file_path = os.path.join(MPI_LIB_PATH, "libmpi.so")
+            if not os.path.exists(lib_file_path):
+                raise RuntimeError(
+                    f"Cannot find libmpi.so at {lib_file_path}, "
+                    "please set environment variable MPI_LIB_PATH"
+                )
+
         cc_cmd = get_compile_command(
             mpk=self,
             target_cc=self.target_cc,
@@ -6168,6 +6604,9 @@ class PersistentKernel:
             py_so_path=so_path,
             profiling=True if self.profiler_tensor is not None else False,
             use_nvshmem=self.use_nvshmem,
+            use_rocshmem=self.use_rocshmem,
+            rocshmem_inc_path=ROCSHMEM_INC_PATH,
+            rocshmem_lib_path=ROCSHMEM_LIB_PATH,
             num_workers=self.num_workers,
             num_local_schedulers=self.num_local_schedulers, 
             num_remote_schedulers=self.num_remote_schedulers,
@@ -6187,6 +6626,9 @@ class PersistentKernel:
         self.init_request_func = getattr(mod, "init_request_func")
         self.finalize_func = getattr(mod, "finalize_func")
         self._set_rope_tables_func = getattr(mod, "set_rope_tables_func", None)
+        self._read_shmem_alloc_func = getattr(mod, "read_shmem_alloc_func", None)
+        self._num_shmem_allocs_func = getattr(mod, "num_shmem_allocs_func", None)
+        self._shmem_alloc_size_func = getattr(mod, "shmem_alloc_size_func", None)
         print("Finished megakernel compilation...")
 
         #meta_tensors_ptr = [tensor.data_ptr() for tensor in self.meta_tensors]
@@ -6227,6 +6669,25 @@ class PersistentKernel:
         assert self._is_compiled, "Must call compile() before set_rope_tables()"
         assert self._set_rope_tables_func is not None
         self._set_rope_tables_func(cos_tensor.data_ptr(), sin_tensor.data_ptr())
+
+    def num_shmem_allocs(self) -> int:
+        """Number of recorded symmetric-heap (nvshmem/rocshmem) allocations."""
+        assert self._num_shmem_allocs_func is not None
+        return int(self._num_shmem_allocs_func())
+
+    def shmem_alloc_size(self, index: int) -> int:
+        """Byte size of the index-th symmetric-heap allocation (0 if invalid)."""
+        assert self._shmem_alloc_size_func is not None
+        return int(self._shmem_alloc_size_func(index))
+
+    def read_shmem_alloc(self, index: int, dst_tensor: "torch.Tensor") -> int:
+        """Snapshot the index-th symmetric-heap allocation into dst_tensor
+        (a CUDA tensor). Returns 0 on success, -1 on bad index/size."""
+        assert self._read_shmem_alloc_func is not None
+        nbytes = dst_tensor.numel() * dst_tensor.element_size()
+        return int(
+            self._read_shmem_alloc_func(index, dst_tensor.data_ptr(), nbytes)
+        )
 
     def __call__(self, **kwargs):
         stream = kwargs.get("default_stream", None)

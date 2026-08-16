@@ -241,6 +241,106 @@ __device__ __forceinline__ void
   __syncthreads();
 }
 
+// ── Split form of the quant above, for interleaving with weight-load issue ──
+//
+// Issuing a buffer_load is not free on gfx950: a wave cannot push loads into
+// the memory system faster than it retires them, so the 24-load W13 prefetch
+// spends ~1.5 us stalled at the issue point (measured; and NOT the s_mov m0
+// hazard -- 24 s_mov vs 1 s_mov is 0.873 vs 0.871 us). That stall is fillable
+// with VALU, which is what the split buys: front() ends with the token in
+// registers and nothing outstanding, then the caller alternates issue blocks
+// with back_range() calls that touch registers and LDS only.
+//
+// The order matters for a second reason. LLVM's waitcnt pass cannot see inside
+// an inline asm block, so it cannot wait on the token load alone -- consuming
+// any pre-asm VMEM value emits s_waitcnt vmcnt(0), which covers every
+// in-flight weight load. front() must therefore run before the first issue
+// block, or the quant blocks on the whole 98 KB weight stream.
+template <int REDUCTION_SIZE>
+struct _gang_fp8_quant_state {
+  float vals[32];
+  float scale_f;
+  int base;
+  int super_blk;
+  int sub_idx;
+  bool active;
+};
+
+template <int REDUCTION_SIZE>
+__device__ __forceinline__ _gang_fp8_quant_state<REDUCTION_SIZE>
+    _gang_fp8_quant_front(unsigned short const *__restrict__ src_bf16,
+                          uint8_t *__restrict__ s_tok_scales) {
+  constexpr int SUB_BLOCK = 32;
+  constexpr int NSUBBLOCKS = REDUCTION_SIZE / SUB_BLOCK;
+  static_assert(NSUBBLOCKS <= 256,
+                "split quant assumes one sub-block per thread (no loop)");
+
+  int const tid = threadIdx.x;
+  int const lane_id = tid & 63;
+  _gang_fp8_quant_state<REDUCTION_SIZE> st;
+  st.active = tid < NSUBBLOCKS;
+
+  int const sb = st.active ? tid : NSUBBLOCKS - 1;
+  st.base = sb * SUB_BLOCK;
+  st.super_blk = sb / 4;
+  st.sub_idx = sb & 3;
+
+  float amax = 0.0f;
+#pragma unroll
+  for (int j = 0; j < 32; j++) {
+    st.vals[j] = _gang_bf16_to_float(src_bf16[st.base + j]);
+    amax = fmaxf(amax, fabsf(st.vals[j]));
+  }
+
+  // Same clamped partner indexing as the unsplit version: NSUBBLOCKS need not
+  // be a multiple of 4, so the tail super-block would otherwise reduce against
+  // lanes whose `amax` was never written.
+  int base_lane = lane_id & ~3;
+  int const sb_first = sb - st.sub_idx;
+  int const n_valid = min(4, (NSUBBLOCKS - 1) - sb_first + 1);
+  float a0 = __shfl(amax, base_lane);
+  float a1 = __shfl(amax, base_lane + min(1, n_valid - 1));
+  float a2 = __shfl(amax, base_lane + min(2, n_valid - 1));
+  float a3 = __shfl(amax, base_lane + min(3, n_valid - 1));
+  float block_amax = fmaxf(fmaxf(a0, a1), fmaxf(a2, a3));
+
+  uint8_t se = _gang_compute_e8m0_fp8(block_amax);
+  if (se == 0) {
+    st.scale_f = 1.0f;
+  } else {
+    union {
+      float f;
+      uint32_t u;
+    } sv;
+    sv.u = (uint32_t)se << 23;
+    st.scale_f = sv.f;
+  }
+  if (st.active && st.sub_idx == 0) {
+    s_tok_scales[st.super_blk] = se;
+  }
+  return st;
+}
+
+// Packs elements [LO, HI) of this thread's sub-block. Register + LDS only, so
+// it can sit between weight-load issue blocks without forcing a waitcnt.
+template <int REDUCTION_SIZE, int LO, int HI>
+__device__ __forceinline__ void
+    _gang_fp8_quant_back_range(_gang_fp8_quant_state<REDUCTION_SIZE> const &st,
+                               uint8_t *__restrict__ s_tok_fp8) {
+  if (!st.active) {
+    return;
+  }
+#pragma unroll
+  for (int j = LO; j < HI; j += 4) {
+    fp8x4_t pk = {};
+    pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
+        pk, st.vals[j], st.vals[j + 1], st.scale_f, false);
+    pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
+        pk, st.vals[j + 2], st.vals[j + 3], st.scale_f, true);
+    *(int *)(s_tok_fp8 + st.base + j) = *(int const *)&pk;
+  }
+}
+
 // NT-load variant of per-thread FP8 quantization for W2 cross-XCD reads.
 // Same sub-block structure as non-NT variant but uses dwordx4 NT loads.
 template <int REDUCTION_SIZE>

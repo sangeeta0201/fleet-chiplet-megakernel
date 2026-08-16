@@ -2461,7 +2461,7 @@ int TaskRegister::register_gang_oproj_topk_moe_fused_mi300_task(
 //                active_expert_ids, moe_routing_weight, moe_workspace_f32]
 int TaskRegister::register_gang_full_layer_fused_mi300_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 29);
+  assert(params.size() == 38);
   int qkv_output_per_wg = params[0];
   int qkv_n_wgs_per_xcd = params[1];
   int total_qkv_tiles_per_xcd = params[2];
@@ -2491,11 +2491,34 @@ int TaskRegister::register_gang_full_layer_fused_mi300_task(
   int w2_output_per_wg = params[26];
   int moe_intermediate_size = params[27];
   int workers_per_xcd = params[28];
+  // Expert-parallel: this rank owns experts
+  // [moe_expert_base, moe_expert_base + moe_num_local_experts). Single-GPU and
+  // replicated-MoE pass 0 / num_experts, which the kernel treats as identity.
+  int moe_expert_base = params[29];
+  int moe_num_local_experts = params[30];
+  // Inline EP combine (Phase 9). ep_world_size == 1 compiles the phase out and
+  // the task keeps its 24/11 tensor arity; > 1 adds the gather buffer, the
+  // signal array, and the combined output.
+  int ep_world_size = params[31];
+  int ep_my_pe = params[32];
+  int ep_fold_pe = params[33];
+  bool ep_inline = ep_world_size > 1;
+  // Slot-parallel expert split: own activated-list slots congruent to
+  // ep_slot_me mod ep_slot_ws rather than an id range. 1/0 = disabled.
+  int ep_slot_ws = params[34];
+  int ep_slot_me = params[35];
+  // The EP reduce, dissolved into this layer's QKV prologue: > 1 means
+  // input[26] is the PREVIOUS layer's gather buffer and Phase 1 sums its slots
+  // instead of reading a combined residual. ep_write_combined marks the one
+  // layer (the last) whose consumer is a separate task and therefore still
+  // needs the sum materialized into output[11].
+  int ep_prev_slots = params[36];
+  bool ep_write_combined = params[37] != 0;
 
   std::vector<tb::TBInputOp *> input_ops;
   std::vector<tb::TBInputOp *> output_ops;
-  int num_inputs = 24;
-  int num_outputs = 11;
+  int num_inputs = ep_inline ? (ep_prev_slots > 1 ? 27 : 26) : 24;
+  int num_outputs = ep_inline ? 12 : 11;
 
   assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
   for (auto const &op : bgraph.operators) {
@@ -2522,9 +2545,11 @@ int TaskRegister::register_gang_full_layer_fused_mi300_task(
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
   // 22 template parameters + DECODE_ONLY=true (compile out prefill attention
-  // path)
+  // path) + the 2 expert-parallel ownership bounds + the 3 inline-combine ones
+  // + the 2 slot-split ones + the 2 dissolved-reduce ones
   code.e("kernel::gang_full_layer_fused_kernel_mi300<$, $, $, $, $, $, $, $, "
-         "$, $, $, $, $, $, $, $, $, $, $, $, $, $, true>(",
+         "$, $, $, $, $, $, $, $, $, $, $, $, $, $, true, $, $, $, $, $, $, "
+         "$, $, $>(",
          batch_size,
          qkv_output_per_wg,
          qkv_reduction_size,
@@ -2546,7 +2571,16 @@ int TaskRegister::register_gang_full_layer_fused_mi300_task(
          moe_intermediate_size,
          moe_hidden_size,
          w13_output_per_wg,
-         w2_output_per_wg);
+         w2_output_per_wg,
+         moe_expert_base,
+         moe_num_local_experts,
+         ep_world_size,
+         ep_my_pe,
+         ep_fold_pe,
+         ep_slot_ws,
+         ep_slot_me,
+         ep_prev_slots,
+         ep_write_combined);
   // Pass input/output pointer arrays directly (2 params instead of 34)
   code.e("    task_desc->input_ptrs,");
   code.e("    task_desc->output_ptrs,");
@@ -3373,11 +3407,16 @@ int TaskRegister::register_gang_moe_linear_mxfp8_mi300_task(
 // w2_output_per_wg]
 int TaskRegister::register_gang_moe_fused_mxfp4_mi300_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 4);
+  assert(params.size() == 6);
   int tiles_per_expert = params[0];
   int w13_output_per_wg = params[1];
   int total_tiles_per_xcd = params[2];
   int w2_output_per_wg = params[3];
+  // Expert-parallel: rank owns experts [expert_base, expert_base +
+  // num_local_experts). For single-GPU these are 0 and the global expert
+  // count, so the kernel's ownership test is a no-op.
+  int expert_base = params[4];
+  int num_local_experts = params[5];
   (void)tiles_per_expert;
   (void)total_tiles_per_xcd;
 
@@ -3404,9 +3443,18 @@ int TaskRegister::register_gang_moe_fused_mxfp4_mi300_task(
   int batch_size = input_ops[0]->dtensor.dim[0];
   int hidden_size = input_ops[0]->dtensor.dim[1];
 
-  // input[1]: gate_up weights [E, expert_wgs, wg_bytes]
+  // input[1]: gate_up weights [E_local, expert_wgs, wg_bytes]
+  // Under expert-parallel this is the *local* expert count (sliced per rank);
+  // single-GPU it equals the global count.
   assert(input_ops[1]->dtensor.num_dims == 3);
-  int num_experts = input_ops[1]->dtensor.dim[0];
+  int num_local_experts_weight = input_ops[1]->dtensor.dim[0];
+  (void)num_local_experts_weight;
+
+  // input[3]: routing [E_global, batch] -- routing/mask/barrier stay
+  // replicated global structures, so the kernel's NUM_EXPERTS must be the
+  // global count, not the sliced weight count.
+  assert(input_ops[3]->dtensor.num_dims == 2);
+  int num_experts = input_ops[3]->dtensor.dim[0];
 
   // output[0]: swiglu_out [batch, topk, intermediate_size]
   assert(output_ops[0]->dtensor.num_dims == 3);
@@ -3415,14 +3463,17 @@ int TaskRegister::register_gang_moe_fused_mxfp4_mi300_task(
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
-  code.e("kernel::gang_moe_fused_mxfp4_kernel_mi300<$, $, $, $, $, $, $>(",
+  code.e("kernel::gang_moe_fused_mxfp4_kernel_mi300<$, $, $, $, $, $, $, $, "
+         "$>(",
          batch_size,
          intermediate_size,
          hidden_size,
          num_experts,
          num_topk,
          w13_output_per_wg,
-         w2_output_per_wg);
+         w2_output_per_wg,
+         expert_base,
+         num_local_experts);
   code.e("    task_desc->input_ptrs[0],"); // input [batch, hidden]
   code.e("    task_desc->input_ptrs[1],"); // gate_up weights [E, W13_WGS,
                                            // wg_bytes]
@@ -4548,18 +4599,18 @@ int TaskRegister::register_reduce_task(threadblock::Graph const &bgraph,
   c.e("assert(gpu_id < runtime_config.num_gpus);");
   c.e("assert(gpu_id != runtime_config.my_gpu_id);");
   c.e("for (int i = 0; i < $; i++) {", batch_size);
-  c.e("  nvshmemx_putmem_signal_block(");
+  c.e("  mpk_putmem_signal_block(");
   c.e("      reinterpret_cast<char*>(task_desc->output_ptrs[0]) + i * $ * "
       "sizeof(bfloat16),",
       input_stride);
   c.e("      reinterpret_cast<char*>(task_desc->input_ptrs[0]) + i * $ * "
       "sizeof(bfloat16),",
       output_stride);
-  c.e("      task_desc->xfer_size_in_bytes / $,", batch_size);
+  c.e("      task_desc->task_metadata.xfer_size_in_bytes / $,", batch_size);
   c.e("      reinterpret_cast<uint64_t "
       "*>(&runtime_config.all_event_counters[event_index]),");
   c.e("      1 /*signal*/,");
-  c.e("      NVSHMEM_SIGNAL_ADD,");
+  c.e("      MPK_SIGNAL_ADD,");
   c.e("      gpu_id);");
   c.e("}");
   register_task_variant(TASK_NVSHMEM_COPY, c.to_string());

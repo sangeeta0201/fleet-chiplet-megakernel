@@ -88,13 +88,46 @@ constexpr int MOE_BAR_COUNTER_SLOT = 8; // line index of the arrival counter
 constexpr int MOE_BAR_SLOTS = 10;       // lines reserved per expert
 constexpr int MOE_BAR_STRIDE = MOE_BAR_SLOTS * MOE_BAR_LINE; // ints per expert
 
+// The flat single-counter arrival below is NOT worth turning into a two-level
+// tree, measured 2026-08-12. All 92 W13 tiles of an expert atomicAdd one
+// address, which is the same shape Phase 9's 9a tree replaced for a real gain,
+// so it looks like the same win -- it is not. Built it (per-XCD arrival lines
+// keyed by phase_tile % 8, then 8 leaders on the global counter, depth ~12 + 8
+// instead of 92): 2.187 vs 2.177 baseline, and W2's measured barrier wait was
+// 1.30 us against 1.26 before. The wait did not move because it is not atomic
+// contention -- it is W13 arrival SPREAD. The release already fires within
+// noise of the last W13 tile retiring; what a W2 tile waits for is that last
+// tile, and no barrier shape changes when it lands. 9a differed because its
+// 240 arrivals were genuinely serialized ahead of a closer that then had work
+// to do. Do not rebuild this without first shrinking the W13 tail itself.
+
 template <int BATCH_SIZE,
           int INTERMEDIATE_SIZE,
           int HIDDEN_SIZE,
           int NUM_EXPERTS,
           int NUM_TOPK,
           int W13_OUTPUT_PER_WG,
-          int W2_OUTPUT_PER_WG>
+          int W2_OUTPUT_PER_WG,
+          int EXPERT_BASE = 0,
+          int NUM_LOCAL_EXPERTS = NUM_EXPERTS,
+          // Slot-parallel expert assignment. Instead of owning a contiguous
+          // *id* range, a rank owns the activated-list SLOTS congruent to
+          // EP_SLOT_ME mod EP_SLOT_WS. Weights must be replicated (all
+          // NUM_EXPERTS present locally), which costs nothing here: 63.7 GB
+          // of MXFP4 experts against 252 GB of HBM.
+          //
+          // Why this is better balanced than the id split: active_expert_ids
+          // holds exactly k=4 entries, so slots split 2/2 every time. An id
+          // range splits by *parity of whichever ids won*, which is 3-1 half
+          // the time and 4-0 an eighth of the time -- expected 2.75 experts
+          // on the critical rank instead of 2.0, and that straggler is what
+          // Phase 9's GPU-wide barrier waits for.
+          //
+          // Both ranks read the same replicated, score-ordered
+          // active_expert_ids, so the partition agrees across ranks with no
+          // communication. EP_SLOT_WS == 1 disables it.
+          int EP_SLOT_WS = 1,
+          int EP_SLOT_ME = 0>
 __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     void const *input_ptr,          // [batch, hidden] BF16
     void const *gate_up_weight_ptr, // [E, W13_WGS, wg_bytes] MXFP4 (interleaved
@@ -134,7 +167,57 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   constexpr int W2_WGS = W2_OUTPUT_SIZE / W2_OUTPUT_PER_WG;
   constexpr int64_t W2_EXPERT_BYTES =
       static_cast<int64_t>(W2_WGS) * W2_WG_BYTES;
-  constexpr int W2_MFMA_ITERS = W2_K / 128;
+  // MPK_W2_HALFK: run half the K-loop and keep everything else identical.
+  // This is the price tag for a K-split of W2, measured before writing one.
+  //
+  // The chain that sets Phase 8's length is W13 -> per-expert barrier -> W2 on
+  // the 12 workers per XCD that draw a W2 tile (see the MOEOCC dump: 17.5 us
+  // busy against 1.0 for the 6 that draw only padding). Splitting W2's K would
+  // halve its share of that chain and hand the second half to workers that are
+  // idle today; the partial sums need no new combine because the epilogue
+  // already atomicAdds into moe_workspace_f32. Whether that is worth the index
+  // surgery depends entirely on how much of the 5.7 us W2 compute is the MFMA
+  // loop rather than the weight load and quant around it, and halving the
+  // iteration count answers exactly that.
+  //
+  // WRONG OUTPUT: half the reduction is simply dropped, not redistributed.
+  //
+  // MPK_W2_SPLITK is the real thing the comment above priced: split W2's K in
+  // two and give each half its own tile, so the tile count doubles and every
+  // worker loads half the weight bytes. Under EP (2 owned experts) W2 is only
+  // W2_WGS * 2 = 92 tiles against 240 workers -- 38% occupancy -- and a
+  // constant-total-bytes microbenchmark of exactly this access pattern reads
+  // 2114 GB/s at 92 workgroups against 2885 at 184. Both halves atomicAdd into
+  // moe_workspace_f32, so no new combine step is needed; the bias is gated to
+  // half 0 so it is counted once.
+//
+  // The split is in units of whole MFMA iterations, not raw K. W2_K is 2944 =
+  // 23 * 128 and 23 is prime, so there is no even 2-way split: the halves are
+  // 12 and 11 iterations. That makes the iteration count and every row stride
+  // a RUNTIME value under split-K, which is why the constants below are sized
+  // for the larger half and the actual extents are recomputed per tile.
+#ifdef MPK_W2_SPLITK
+  constexpr int W2_SPLITK = 2;
+#else
+  constexpr int W2_SPLITK = 1;
+#endif
+  static_assert(W2_K % 128 == 0, "W2_K must be a whole number of MFMA steps");
+  constexpr int W2_TOTAL_ITERS = W2_K / 128; // 23
+  constexpr int W2_ITERS_MAX =
+      (W2_TOTAL_ITERS + W2_SPLITK - 1) / W2_SPLITK; // 12 split, 23 not
+  // One MFMA iteration covers 128 K-elements = 64 packed-FP4 bytes and 4
+  // scale bytes per output row.
+  constexpr int W2_ROW_H = W2_ITERS_MAX * 64;   // data bytes/row, larger half
+  constexpr int W2_BLK32_H = W2_ITERS_MAX * 4;  // scale bytes/row, larger half
+#ifdef MPK_W2_HALFK
+  constexpr int W2_MFMA_ITERS = W2_TOTAL_ITERS / 2;
+#else
+  constexpr int W2_MFMA_ITERS = W2_TOTAL_ITERS;
+#endif
+  // s_tok_fp8 always holds the FULL K (the quant is unsplit), so the LDS
+  // weight base must clear W2_K + all W2_K/128 token scales -- not
+  // W2_MFMA_ITERS, which is halved under split-K.
+  constexpr int W2_TOK_SCALES = W2_K / 128;
   constexpr int W2_TILES = BATCH_SIZE * W2_WGS;
 
   // Common constants
@@ -185,10 +268,59 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #endif
 
   int global_tile = tile_idx * 8 + xcd_id;
-  int total_w13_real = num_activated_experts * W13_TILES;
+  // Under slot-parallel EP the tile space is built over the experts THIS rank
+  // owns, not over the whole activated list. Sizing it for all of them and
+  // then early-returning the non-owned tiles looks free -- the skipped tile
+  // costs nothing -- but it is not, because the tile index is what maps work
+  // to workers. Owned tiles come in runs of W13_TILES/W2_TILES, and a run
+  // against the stride-30 worker map aliases: measured 1 or 2 real tiles per
+  // worker where 182 tiles over 240 workers should never exceed 1, with the
+  // 2-tile workers taking 12.8 us against 1.0 for the idle ones. That spread
+  // is what Phase 9's barrier then waits out.
+  //
+  // Compacting is exact, not approximate: ownership is expert_idx % WS == ME,
+  // so the owned experts are a strided subsequence of the activated list and
+  // compact slot c maps back to activated index c * WS + ME. Both ranks
+  // compute the same split from the same replicated routing.
+  int const ep_owned_experts =
+      (EP_SLOT_WS > 1)
+          ? ((num_activated_experts - EP_SLOT_ME + EP_SLOT_WS - 1) / EP_SLOT_WS)
+          : num_activated_experts;
+  int total_w13_real = ep_owned_experts * W13_TILES;
+  // Padding earns its keep only when W13 overflows round 0. On the 1-GPU path
+  // it does: 4 activated experts * W13_TILES = 384 real tiles against 240
+  // workers, so W13 spills into round 1 and without padding the round-1 W2
+  // tiles would be interleaved with W13 tiles that still gate them.
+  //
+  // Under EP the picture inverts. 2 owned experts = 192 real W13 tiles, which
+  // fit in round 0 with 48 slots to spare, and padding fills those 48 slots
+  // with no-ops. The workers holding them (r=24-29) finish in ~1 us and idle,
+  // while all 96 W2 tiles land in round 1 on r=0-11 -- workers that just spent
+  // ~10 us on a real W13 tile. That placement forfeits the W2 weight prefetch:
+  // the buffer_load_lds below is deliberately issued BEFORE the W13 barrier
+  // poll so its ~3 us of HBM latency hides behind the wait, but a worker that
+  // is still computing W13 does not reach the prefetch until the wait is
+  // already over.
+  //
+  // MPK_MOE_NOPAD drops the padding when W13 fits in one round, so those 48
+  // slots carry real W2 tiles instead. W13's completion time is unchanged --
+  // every real W13 tile is still in round 0 -- and 48 of the 96 W2 tiles now
+  // issue their weight loads at t~0 and overlap the entire W13 phase.
+  //
+  // The guard is what keeps the 1-GPU behaviour intact: at 384 real tiles the
+  // condition is false and the padding stays exactly as before.
+  bool const w13_fits_one_round = (total_w13_real <= PAD_MULTIPLE);
+#ifdef MPK_MOE_NOPAD
+  int total_w13 =
+      w13_fits_one_round
+          ? total_w13_real
+          : ((total_w13_real + PAD_MULTIPLE - 1) / PAD_MULTIPLE) * PAD_MULTIPLE;
+#else
+  (void)w13_fits_one_round;
   int total_w13 =
       ((total_w13_real + PAD_MULTIPLE - 1) / PAD_MULTIPLE) * PAD_MULTIPLE;
-  int total_w2 = num_activated_experts * W2_TILES;
+#endif
+  int total_w2 = ep_owned_experts * W2_TILES * W2_SPLITK;
   int total_tiles = total_w13 + total_w2;
   if (global_tile >= total_tiles) {
     MPK_WS_MARK(8100, global_tile); // exit: past end of tile range
@@ -197,18 +329,39 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 
   bool is_w2 = (global_tile >= total_w13);
   int expert_idx, phase_tile;
+  int k_half = 0;
   if (!is_w2) {
     expert_idx = global_tile / W13_TILES;
     phase_tile = global_tile % W13_TILES;
-    // Padding tile: expert_idx beyond activated range → skip
-    if (expert_idx >= num_activated_experts) {
+    // Padding tile: beyond the OWNED range → skip. (Without EP, owned ==
+    // activated and this is the same test as before.)
+    if (expert_idx >= ep_owned_experts) {
       MPK_WS_MARK(8101, global_tile); // exit: W13 padding tile
       return;
     }
   } else {
     int w2_tile = global_tile - total_w13;
+    if constexpr (W2_SPLITK > 1) {
+      // k_half is the FAST index: the two halves of one output tile land on
+      // adjacent tile slots, so each wg's placement neighbourhood (and hence
+      // its XCD/column relationship) is what it was before the split.
+      k_half = w2_tile % W2_SPLITK;
+      w2_tile /= W2_SPLITK;
+    }
+    (void)k_half;
     expert_idx = w2_tile / W2_TILES;
     phase_tile = w2_tile % W2_TILES;
+  }
+  // Compact slot -> activated-list index. Everything downstream (d_mask, the
+  // per-expert barrier, the routing table) is keyed by the activated index on
+  // BOTH ranks, so the expansion has to happen here, before any of them are
+  // touched. Identity when EP_SLOT_WS == 1.
+  if constexpr (EP_SLOT_WS > 1) {
+    expert_idx = expert_idx * EP_SLOT_WS + EP_SLOT_ME;
+    if (expert_idx >= num_activated_experts) {
+      MPK_WS_MARK(8101, global_tile); // exit: past activated list
+      return;
+    }
   }
 
   int n_wgs = is_w2 ? W2_WGS : W13_WGS;
@@ -225,6 +378,27 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
           (((unsigned long long)(unsigned char)num_activated_experts) << 32) |
           (((unsigned long long)(is_w2 ? 1 : 0)) << 40));
   int expert_id = d_mask[expert_idx];
+  // Expert-parallel ownership: this rank only computes experts it owns.
+  // Routing/mask/barrier are replicated global structures keyed by expert_id;
+  // only weight/bias storage is local (indexed by local_eid). Skipping both the
+  // W13 (producer) and W2 (consumer) tiles of a non-owned expert means that
+  // expert's per-expert barrier is never used on this rank -> no deadlock.
+  // For single-GPU EXPERT_BASE=0 and NUM_LOCAL_EXPERTS=NUM_EXPERTS, so the
+  // test is always false and local_eid == expert_id.
+  if constexpr (EP_SLOT_WS > 1) {
+    // Ownership is already established: the tile space is built over owned
+    // experts only and expert_idx was expanded from a compact slot, so
+    // expert_idx % EP_SLOT_WS == EP_SLOT_ME holds by construction. The filter
+    // that used to live here ran AFTER a full-size tile space had been laid
+    // out, which is what made the work distribution lumpy.
+  } else if (expert_id < EXPERT_BASE ||
+             expert_id >= EXPERT_BASE + NUM_LOCAL_EXPERTS) {
+    MPK_WS_MARK(8104, global_tile); // exit: expert not owned by this rank
+    return;
+  }
+  // Slot-parallel replicates the weights, so the local index is the global
+  // one; the id split packs its owned range down to [0, NUM_LOCAL_EXPERTS).
+  int local_eid = (EP_SLOT_WS > 1) ? expert_id : (expert_id - EXPERT_BASE);
   int const *expert_routing = d_routing + expert_id * BATCH_SIZE;
 
   if (tok_idx >= BATCH_SIZE) {
@@ -246,6 +420,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // ══════════════════════════════════════════════════════════════════════════
   // PHASE 0: W13 + SwiGLU → write BF16 to swiglu_out
   // ══════════════════════════════════════════════════════════════════════════
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+  unsigned long long _mt_tile0 = __builtin_amdgcn_s_memrealtime();
+#endif
   if (!is_w2) {
     MOE_DBG_SUBPHASE(2000);
     MPK_WS_MARK(8200, global_tile); // W13 compute
@@ -255,12 +432,60 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 
     // Weight pointers
     uint8_t const *expert_weight =
-        W_gate_up + static_cast<int64_t>(expert_id) * W13_EXPERT_BYTES;
+        W_gate_up + static_cast<int64_t>(local_eid) * W13_EXPERT_BYTES;
     uint8_t const *wg_data =
         expert_weight + static_cast<int64_t>(wg_idx) * W13_WG_BYTES;
     uint8_t const *wg_scales = wg_data + W13_WG_DATA;
 
     unsigned short const *input_base = A + tok_idx * W13_K;
+
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+    // Splits the "pre" term: address setup (t0v/t0m, 24 readfirstlane) vs. the
+    // 24-load asm block itself. Measured addr=0.33, issue=1.50. The issue side
+    // is NOT the s_mov_b32 m0 hazard (24 s_mov vs 1 s_mov microbenchmarks
+    // identically, 0.873 vs 0.871 us) -- it is issue backpressure. A wave
+    // cannot push loads into the memory system faster than it retires them, so
+    // the weight stream is paid at the issue point, not at the drain.
+    unsigned long long _w13_cpi = _mt_tile0;
+    unsigned long long _w13_cpq = _mt_tile0;
+    unsigned long long _w13_cpm = _mt_tile0;
+    unsigned long long _w13_cps = _mt_tile0;
+#endif
+
+#ifdef MPK_W13_QFIRST
+    // Quantize the token BEFORE issuing any weight load.
+    //
+    // The order used to be the reverse, on the theory that the weight loads
+    // would fly during the quant. They do not, and worse, the reverse order
+    // makes the quant WAIT for them: LLVM's waitcnt pass cannot see inside an
+    // inline asm block, so it has no way to wait on the token load alone. Any
+    // consumption of a value loaded before the asm forces s_waitcnt vmcnt(0),
+    // which covers all 24 in-flight weight loads. Verified on the isolated
+    // case -- a token global_load followed by 4 asm buffer_load...lds emits a
+    // single vmcnt(0) in front of the token's first use. So the quant's first
+    // fmaxf was blocking on the whole 98 KB weight stream, which is why the
+    // old split read quant=1.64 for ~0.2 us of actual VALU work and why the
+    // drain that followed it was only 0.52 us -- there was nothing left.
+    //
+    // Quantizing first costs the token load's own latency (5760 B, L2-hot:
+    // every one of the 92 workgroups of an expert reads the same vector) and
+    // removes the false dependency entirely.
+    _gang_wave_parallel_fp8_quant<W13_K>(input_base, s_tok_fp8, s_tok_scales);
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+    _w13_cpq = __builtin_amdgcn_s_memrealtime();
+#endif
+#endif
+
+#ifdef MPK_W13_ILV
+    // Load the token and reduce to its E8M0 scales here, before any weight
+    // load is issued (see the waitcnt note on _gang_fp8_quant_front). The
+    // pack half is deferred into the issue blocks below.
+    _gang_fp8_quant_state<W13_K> _qst =
+        _gang_fp8_quant_front<W13_K>(input_base, s_tok_scales);
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+    _w13_cpq = __builtin_amdgcn_s_memrealtime();
+#endif
+#endif
 
 #ifdef MPK_W13_LDS_PREFETCH
     // ── Phase A: Issue tile_iter=0 HBM weight loads BEFORE quant ──────────
@@ -305,6 +530,136 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
               lds_base_off + t * W13_TILE_BYTES + j * 4096);
         }
       }
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+      // Address setup done, nothing issued yet.
+      _w13_cpi = __builtin_amdgcn_s_memrealtime();
+#endif
+#ifdef MPK_W13_ILV
+      // Interleaved issue: 6 loads, then 1/4 of the FP8 pack, x4. The pack
+      // touches registers and LDS only, so it costs no waitcnt and runs inside
+      // the issue backpressure stall instead of after it. Microbenchmarked at
+      // this exact shape (24 lds loads + ~1.8 us of VALU, 184 WGs): 12.34 us
+      // issue-all-then-ALU vs 9.68 us interleaved.
+      {
+        asm volatile(
+                     "s_mov_b32 m0, %[m0]\n buffer_load_dwordx4 %[v0], "
+                     "%[rsrc], 0 offen sc0 nt lds\n"
+                     "s_mov_b32 m0, %[m1]\n buffer_load_dwordx4 %[v1], "
+                     "%[rsrc], 0 offen sc0 nt lds\n"
+                     "s_mov_b32 m0, %[m2]\n buffer_load_dwordx4 %[v2], "
+                     "%[rsrc], 0 offen sc0 nt lds\n"
+                     "s_mov_b32 m0, %[m3]\n buffer_load_dwordx4 %[v3], "
+                     "%[rsrc], 0 offen sc0 nt lds\n"
+                     "s_mov_b32 m0, %[m4]\n buffer_load_dwordx4 %[v4], "
+                     "%[rsrc], 0 offen sc0 nt lds\n"
+                     "s_mov_b32 m0, %[m5]\n buffer_load_dwordx4 %[v5], "
+                     "%[rsrc], 0 offen sc0 nt lds\n"
+                     :
+                     : [rsrc] "s"(w13_rsrc),
+                       [v0] "v"(t0v[0]),
+                       [v1] "v"(t0v[1]),
+                       [v2] "v"(t0v[2]),
+                       [v3] "v"(t0v[3]),
+                       [v4] "v"(t0v[4]),
+                       [v5] "v"(t0v[5]),
+                       [m0] "s"(t0m[0]),
+                       [m1] "s"(t0m[1]),
+                       [m2] "s"(t0m[2]),
+                       [m3] "s"(t0m[3]),
+                       [m4] "s"(t0m[4]),
+                       [m5] "s"(t0m[5])
+                     : "memory", "m0");
+        _gang_fp8_quant_back_range<W13_K, 0, 8>(_qst, s_tok_fp8);
+        asm volatile(
+                     "s_mov_b32 m0, %[m6]\n buffer_load_dwordx4 %[v6], "
+                     "%[rsrc], 0 offen sc0 nt lds\n"
+                     "s_mov_b32 m0, %[m7]\n buffer_load_dwordx4 %[v7], "
+                     "%[rsrc], 0 offen sc0 nt lds\n"
+                     "s_mov_b32 m0, %[m8]\n buffer_load_dwordx4 %[v8], "
+                     "%[rsrc], 0 offen sc0 nt lds\n"
+                     "s_mov_b32 m0, %[m9]\n buffer_load_dwordx4 %[v9], "
+                     "%[rsrc], 0 offen sc0 nt lds\n"
+                     "s_mov_b32 m0, %[m10]\n buffer_load_dwordx4 %[v10], "
+                     "%[rsrc], 0 offen sc0 nt lds\n"
+                     "s_mov_b32 m0, %[m11]\n buffer_load_dwordx4 %[v11], "
+                     "%[rsrc], 0 offen sc0 nt lds\n"
+                     :
+                     : [rsrc] "s"(w13_rsrc),
+                       [v6] "v"(t0v[6]),
+                       [v7] "v"(t0v[7]),
+                       [v8] "v"(t0v[8]),
+                       [v9] "v"(t0v[9]),
+                       [v10] "v"(t0v[10]),
+                       [v11] "v"(t0v[11]),
+                       [m6] "s"(t0m[6]),
+                       [m7] "s"(t0m[7]),
+                       [m8] "s"(t0m[8]),
+                       [m9] "s"(t0m[9]),
+                       [m10] "s"(t0m[10]),
+                       [m11] "s"(t0m[11])
+                     : "memory", "m0");
+        _gang_fp8_quant_back_range<W13_K, 8, 16>(_qst, s_tok_fp8);
+        asm volatile(
+                     "s_mov_b32 m0, %[m12]\n buffer_load_dwordx4 %[v12], "
+                     "%[rsrc], 0 offen sc0 nt lds\n"
+                     "s_mov_b32 m0, %[m13]\n buffer_load_dwordx4 %[v13], "
+                     "%[rsrc], 0 offen sc0 nt lds\n"
+                     "s_mov_b32 m0, %[m14]\n buffer_load_dwordx4 %[v14], "
+                     "%[rsrc], 0 offen sc0 nt lds\n"
+                     "s_mov_b32 m0, %[m15]\n buffer_load_dwordx4 %[v15], "
+                     "%[rsrc], 0 offen sc0 nt lds\n"
+                     "s_mov_b32 m0, %[m16]\n buffer_load_dwordx4 %[v16], "
+                     "%[rsrc], 0 offen sc0 nt lds\n"
+                     "s_mov_b32 m0, %[m17]\n buffer_load_dwordx4 %[v17], "
+                     "%[rsrc], 0 offen sc0 nt lds\n"
+                     :
+                     : [rsrc] "s"(w13_rsrc),
+                       [v12] "v"(t0v[12]),
+                       [v13] "v"(t0v[13]),
+                       [v14] "v"(t0v[14]),
+                       [v15] "v"(t0v[15]),
+                       [v16] "v"(t0v[16]),
+                       [v17] "v"(t0v[17]),
+                       [m12] "s"(t0m[12]),
+                       [m13] "s"(t0m[13]),
+                       [m14] "s"(t0m[14]),
+                       [m15] "s"(t0m[15]),
+                       [m16] "s"(t0m[16]),
+                       [m17] "s"(t0m[17])
+                     : "memory", "m0");
+        _gang_fp8_quant_back_range<W13_K, 16, 24>(_qst, s_tok_fp8);
+        asm volatile(
+                     "s_mov_b32 m0, %[m18]\n buffer_load_dwordx4 %[v18], "
+                     "%[rsrc], 0 offen sc0 nt lds\n"
+                     "s_mov_b32 m0, %[m19]\n buffer_load_dwordx4 %[v19], "
+                     "%[rsrc], 0 offen sc0 nt lds\n"
+                     "s_mov_b32 m0, %[m20]\n buffer_load_dwordx4 %[v20], "
+                     "%[rsrc], 0 offen sc0 nt lds\n"
+                     "s_mov_b32 m0, %[m21]\n buffer_load_dwordx4 %[v21], "
+                     "%[rsrc], 0 offen sc0 nt lds\n"
+                     "s_mov_b32 m0, %[m22]\n buffer_load_dwordx4 %[v22], "
+                     "%[rsrc], 0 offen sc0 nt lds\n"
+                     "s_mov_b32 m0, %[m23]\n buffer_load_dwordx4 %[v23], "
+                     "%[rsrc], 0 offen sc0 nt lds\n"
+                     :
+                     : [rsrc] "s"(w13_rsrc),
+                       [v18] "v"(t0v[18]),
+                       [v19] "v"(t0v[19]),
+                       [v20] "v"(t0v[20]),
+                       [v21] "v"(t0v[21]),
+                       [v22] "v"(t0v[22]),
+                       [v23] "v"(t0v[23]),
+                       [m18] "s"(t0m[18]),
+                       [m19] "s"(t0m[19]),
+                       [m20] "s"(t0m[20]),
+                       [m21] "s"(t0m[21]),
+                       [m22] "s"(t0m[22]),
+                       [m23] "s"(t0m[23])
+                     : "memory", "m0");
+        _gang_fp8_quant_back_range<W13_K, 24, 32>(_qst, s_tok_fp8);
+        __syncthreads();
+      }
+#else
       asm volatile("s_mov_b32 m0, %[m0]\n  buffer_load_dwordx4 %[v0],  "
                    "%[rsrc], 0 offen sc0 nt lds\n"
                    "s_mov_b32 m0, %[m1]\n  buffer_load_dwordx4 %[v1],  "
@@ -404,13 +759,46 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                      [m22] "s"(t0m[22]),
                      [m23] "s"(t0m[23])
                    : "memory", "m0");
+#endif
     }
 #endif // MPK_W13_LDS_PREFETCH — 24 dwordx4 loads in flight
 
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+    // Checkpoint 0: tile setup + the 24 dwordx4 buffer_load_lds issued above,
+    // but NOT the quant. The first breakdown lumped these together and called
+    // the sum "quant" -- it is not, the prefetch issue is in front of it, and
+    // the quant's own loads queue behind ~98 KB of already-issued traffic.
+    unsigned long long _w13_cp0 = __builtin_amdgcn_s_memrealtime();
+#endif
+
+#if !defined(MPK_W13_QFIRST) && !defined(MPK_W13_ILV)
+    // MPK_W13_NOQUANT: skip the token quant entirely. WRONG OUTPUT by
+    // construction (s_tok_fp8/s_tok_scales are left uninitialized) -- this
+    // prices the CEILING of hoisting the quant out of the tile, since all 92
+    // W13 workgroups of an expert quantize the IDENTICAL token vector (see the
+    // QFIRST note above: "every one of the 92 workgroups of an expert reads the
+    // same vector"). Measured [W13SPLIT] quant=1.51 us of a 7.09 us tile.
+    //
+    // Note this probe also DELETES the latency-hiding the quant provides: the
+    // 24 dwordx4 buffer_load_lds issued just above are meant to fly behind it.
+    // So the delta measured here is the NET ceiling (quant removed minus drain
+    // lengthened), which is what a real hoist would actually deliver -- not the
+    // 1.51 us gross.
+#ifndef MPK_W13_NOQUANT
     _gang_wave_parallel_fp8_quant<W13_K>(input_base, s_tok_fp8, s_tok_scales);
+#endif
+#endif
 
 #ifdef MPK_ENABLE_MOE_SUBPHASE
     g_subphase_scratch[1] = __builtin_amdgcn_s_memrealtime();
+#endif
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+    // W13 breakdown checkpoint A: token quant done. The weight loads issued
+    // above are still in flight; the point of quantizing here is to give them
+    // something to fly behind. cpb is set inside the drain block below, which
+    // is a nested scope, so it is declared here.
+    unsigned long long _w13_cpa = __builtin_amdgcn_s_memrealtime();
+    unsigned long long _w13_cpb = _w13_cpa;
 #endif
 
 #ifdef MPK_W13_LDS_PREFETCH
@@ -438,6 +826,13 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       // Drain ALL: buffer_load_lds (Phase A) + scale loads
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+      // Checkpoint B: the whole tile's weights are resident. Everything from
+      // here to the barrier is compute. If THIS is where the 3.0 us sits, the
+      // loads are not hidden and a K-chunked ping-pong is the fix; if it is
+      // near zero, they already are and double-buffering is pointless.
+      _w13_cpb = __builtin_amdgcn_s_memrealtime();
+#endif
       {
 #pragma unroll
         for (int j = 0; j < W13_SC_LPT; j++) {
@@ -466,6 +861,44 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 
         int wave_tile_0 = warp_id;
         f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
+
+#ifdef MPK_W13_BIASPRE
+        // Bias for this lane's 4 outputs, issued BEFORE the MFMA so its HBM
+        // latency hides behind the 1.57 us GEMM instead of being paid in the
+        // epilogue. Measured: the epilogue spends 1.10 us on the issue side
+        // against 0.35 us of store drain, and these two loads are the only
+        // HBM traffic in it -- everything else is registers and LDS.
+        //
+        // Safe to consume after the MFMA asm block: the load is issued before
+        // it, and LLVM places the s_waitcnt at the USE, which is after. The
+        // addresses depend only on local_eid/wg_idx/wave_tile/g, all known
+        // here.
+        // Issued through inline asm with NO "memory" clobber and no waitcnt,
+        // so LLVM cannot sink a s_waitcnt in front of the MFMA block for it:
+        // it does not model these loads at all. The single vmcnt(0) that the
+        // epilogue's own stores already need is what retires them.
+        //
+        // A plain C load here does NOT work -- LLVM hoists its s_waitcnt above
+        // the MFMA asm (it cannot prove the asm does not alias), which moved
+        // 0.9 us out of the epilogue and straight into mfma: 1.57 -> 2.27 with
+        // epi 1.10 -> 0.20 and no net change.
+        // ONE register pair, extracted with shifts. An array read through a
+        // pointer cast forces it to scratch, and the asm writes registers --
+        // that mismatch produced a kernel that generated zero tokens.
+        unsigned long long _bias_pre = 0;
+        {
+          int out_n0 = wg_idx * W13_OUTPUT_PER_WG + wave_tile_0 * 16 + g * 4;
+          // 4 contiguous bf16 = 8 bytes; out_n0 is a multiple of 4 so the
+          // address is 8-byte aligned. Issued by every lane, not just col==0:
+          // the wait below is uniform, so the load must be too.
+          unsigned short const *bp =
+              d_w13_bias + local_eid * W13_OUTPUT_SIZE +
+              (out_n0 + 3 < W13_OUTPUT_SIZE ? out_n0 : W13_OUTPUT_SIZE - 4);
+          asm volatile("global_load_dwordx2 %0, %1, off\n"
+                       : "=v"(_bias_pre)
+                       : "v"(bp));
+        }
+#endif
 
         // Depth-2 pipelined FP8 MFMA loop (full asm, single-buffer).
         //
@@ -625,6 +1058,15 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                 "a3");
         }
 
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+        // Checkpoint M: the MFMA asm block has retired its accumulator, but
+        // the SwiGLU epilogue and its write-through stores have not run. The
+        // 2.97 us "mfma_swiglu" is the two together against a 0.66 us MFMA
+        // issue floor (23 iters x ~30 ns), so which half holds the gap decides
+        // whether to attack the GEMM or the epilogue's 4 st_wt_u16 per lane.
+        _w13_cpm = __builtin_amdgcn_s_memrealtime();
+#endif
+
         // ── Issue tile_iter=1 per-wave HBM→LDS loads BEFORE SwiGLU ──
         // Each wave loads only its own tile slot. The buffer_load_lds
         // writes go to [warp_id * W13_TILE_BYTES + s*1024 + j*4096]
@@ -753,6 +1195,15 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                        : "memory", "m0");
         }
 
+#ifdef MPK_W13_BIASPRE
+        // LLVM does not model the asm bias load, so it emits no wait for it.
+        // This is that wait, unconditional so every lane that issued the load
+        // also retires it -- the earlier version put it under `if (i == 0)`
+        // inside two divergent ifs and the kernel produced zero tokens. Nearly
+        // free: the load was issued before a 1.57 us MFMA.
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
+
         // tile_iter=0 SwiGLU epilogue (tile_iter=1 HBM loads fly in background)
         if (col == 0) {
           constexpr int ACT_STRIDE = W13_OUTPUT_SIZE / 2;
@@ -760,12 +1211,19 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             int out_n =
                 wg_idx * W13_OUTPUT_PER_WG + wave_tile_0 * 16 + g * 4 + i;
             if (out_n + 1 < W13_OUTPUT_SIZE) {
+#ifdef MPK_W13_BIASPRE
               unsigned bt_g =
-                  (unsigned)d_w13_bias[expert_id * W13_OUTPUT_SIZE + out_n]
+                  (unsigned)((_bias_pre >> (i * 16)) & 0xFFFFu) << 16;
+              unsigned bt_u =
+                  (unsigned)((_bias_pre >> ((i + 1) * 16)) & 0xFFFFu) << 16;
+#else
+              unsigned bt_g =
+                  (unsigned)d_w13_bias[local_eid * W13_OUTPUT_SIZE + out_n]
                   << 16;
               unsigned bt_u =
-                  (unsigned)d_w13_bias[expert_id * W13_OUTPUT_SIZE + out_n + 1]
+                  (unsigned)d_w13_bias[local_eid * W13_OUTPUT_SIZE + out_n + 1]
                   << 16;
+#endif
               float bias_g;
               __builtin_memcpy(&bias_g, &bt_g, 4);
               float bias_u;
@@ -983,11 +1441,11 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                   wg_idx * W13_OUTPUT_PER_WG + wave_tile_1 * 16 + g * 4 + i;
               if (out_n + 1 < W13_OUTPUT_SIZE) {
                 unsigned bt_g =
-                    (unsigned)d_w13_bias[expert_id * W13_OUTPUT_SIZE + out_n]
+                    (unsigned)d_w13_bias[local_eid * W13_OUTPUT_SIZE + out_n]
                     << 16;
                 unsigned bt_u =
                     (unsigned)
-                        d_w13_bias[expert_id * W13_OUTPUT_SIZE + out_n + 1]
+                        d_w13_bias[local_eid * W13_OUTPUT_SIZE + out_n + 1]
                     << 16;
                 float bias_g;
                 __builtin_memcpy(&bias_g, &bt_g, 4);
@@ -1202,9 +1660,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
           int out_n = wg_idx * W13_OUTPUT_PER_WG + wave_tile * 16 + g * 4 + i;
           if (out_n + 1 < W13_OUTPUT_SIZE) {
             unsigned bt_g =
-                (unsigned)d_w13_bias[expert_id * W13_OUTPUT_SIZE + out_n] << 16;
+                (unsigned)d_w13_bias[local_eid * W13_OUTPUT_SIZE + out_n] << 16;
             unsigned bt_u =
-                (unsigned)d_w13_bias[expert_id * W13_OUTPUT_SIZE + out_n + 1]
+                (unsigned)d_w13_bias[local_eid * W13_OUTPUT_SIZE + out_n + 1]
                 << 16;
             float bias_g;
             __builtin_memcpy(&bias_g, &bt_g, 4);
@@ -1228,8 +1686,22 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     g_subphase_scratch[4] = __builtin_amdgcn_s_memrealtime();
 #endif
 
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+    // Checkpoint S: SwiGLU math + the write-through stores are ISSUED, but not
+    // drained. Splits epi so a wide-store rewrite is only attempted if the
+    // issue side, not the drain, holds the 1.4 us.
+    _w13_cps = __builtin_amdgcn_s_memrealtime();
+#endif
+
     __asm__ __volatile__("s_waitcnt vmcnt(0)" ::: "memory");
     __syncthreads();
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+    // Checkpoint C: MFMA + SwiGLU + the swiglu_out stores are done and
+    // drained. Taken after the drain and syncthreads on purpose -- those are
+    // part of producing the output, and putting them in the arrival term
+    // would credit the barrier with work the compute owes.
+    unsigned long long _w13_cpc = __builtin_amdgcn_s_memrealtime();
+#endif
 
     // ── Mechanism C W13 signal (producer side)
     // ──────────────────────────────── Uses layer index from shared memory for
@@ -1251,9 +1723,43 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       // the per-XCD slots of one expert held *different* epochs, which is
       // impossible if the eight stores from one producer all survived.
       // COUNTER_OFF puts the counter on the next line.
+      // Flat, and deliberately so -- see the note on MOE_BAR_STRIDE above for
+      // the two-level version that was built and measured neutral.
       int prev_global = atom_add_release_gpu_s32(
           &d_barrier[base + MOE_BAR_COUNTER_SLOT * MOE_BAR_LINE], 1);
+      // MPK_W13_EARLY_REL: fire the release at FRAC/16 of the arrivals instead
+      // of all W13_TILES. WRONG OUTPUT by construction -- W2 reads swiglu
+      // columns whose producers have not run. It exists to price the ceiling
+      // of every "narrow the dependency" scheme (MoK-style per-column-range
+      // counters, W2 split-K with a half-width required_count) BEFORE paying
+      // for the index surgery: if releasing at half the arrivals does not move
+      // the token, then the W2 barrier wait is W13's DURATION, not its arrival
+      // count, and no narrowing of the count can help.
+      //
+      // MEASURED 2026-08-14, world 4 + MPK_MOE_NOPAD, GPUs 4-7: FRAC=8
+      // (release at 46 of 92) gives 2.098 vs 2.122 baseline. **0.024 ms is
+      // the whole ceiling**, barely above run-to-run spread, against a
+      // measured 7.4 us/tile W2 barrier wait ([MOETILE] bar=7.38..7.61). This
+      // retires the narrowing family without building it -- and the probe
+      // cheats harder than any correct scheme could, since it releases on ANY
+      // 46 arrivals while split-K's half-0 needs the SPECIFIC first-half
+      // tiles, whose max lands later than the 46th order statistic.
+      //
+      // Why it does not pay here and does for MoK (cursor/mixture-of-kittens,
+      // grouped_gemm.cuh:125): their hidden_row_block_ready is indexed per
+      // ROW BLOCK of a 4096-token minibatch, so producers arrive SUCCESSIVELY
+      // over time and waiting on 1/8 of them genuinely starts a consumer
+      // earlier. Under NOPAD at world 4 we run 137 tiles on 240 workers, so
+      // all 92 W13 tiles are concurrent and retire together at ~7.2 us. Same
+      // counter mechanism, opposite producer schedule. The lever is W13's
+      // 7.2 us tile itself, not what waits on it.
+#ifdef MPK_W13_EARLY_REL
+      constexpr int _early_n = (W13_TILES * MPK_W13_EARLY_REL) / 16;
+      constexpr int _rel_at = (_early_n < 1) ? 1 : _early_n;
+      if ((prev_global % W13_TILES) == _rel_at - 1) {
+#else
       if ((prev_global % W13_TILES) == W13_TILES - 1) {
+#endif
         // Last W13 arrival: write per-XCD release = layer_idx + 1
         constexpr int LAYER_IDX_SMEM_OFF =
             mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
@@ -1274,6 +1780,34 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     // Raw timestamps in scratch[0..4] — deltas computed by scheduler
 #endif
 
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+    // W13's tile cost, accumulated HERE rather than at the shared epilogue at
+    // the end of the function: a W13 tile returns from this point, so it never
+    // reaches that site and [MOETILE] reported w13 n=0 for as long as the
+    // counter has existed. That is why Phase 8's 46% of the layer had a
+    // measured W2 half and an unmeasured W13 half.
+    if (tid == 0) {
+      unsigned long long _w13_end = __builtin_amdgcn_s_memrealtime();
+      atomicAdd(&g_moe_w13_ns, _w13_end - _mt_tile0);
+      atomicAdd(&g_moe_w13_n, 1ull);
+      // The five terms of the tile, in order and non-overlapping, so they sum
+      // to the total above.
+      // The quant sits before the prefetch under MPK_W13_QFIRST and after it
+      // otherwise, so it contributes one of two disjoint intervals; the other
+      // is zero. Written this way the five terms still sum to the tile total
+      // in both configurations.
+      atomicAdd(&g_w13_addr_ns, _w13_cpi - _w13_cpq);
+      atomicAdd(&g_w13_pre_ns, _w13_cp0 - _w13_cpi);
+      atomicAdd(&g_w13_quant_ns,
+                (_w13_cpq - _mt_tile0) + (_w13_cpa - _w13_cp0));
+      atomicAdd(&g_w13_drain_ns, _w13_cpb - _w13_cpa);
+      atomicAdd(&g_w13_mfma_ns, _w13_cpm - _w13_cpb);
+      atomicAdd(&g_w13_epi_ns, _w13_cps - _w13_cpm);
+      atomicAdd(&g_w13_stdrain_ns, _w13_cpc - _w13_cps);
+      atomicAdd(&g_w13_arrive_ns, _w13_end - _w13_cpc);
+    }
+#endif
+
     return;
   }
 
@@ -1290,18 +1824,26 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   MPK_WS_MARK(8300, global_tile); // W2 entry
   // Weight pointers — depend only on expert_id/wg_idx, available before barrier
   uint8_t const *expert_weight =
-      W_down + static_cast<int64_t>(expert_id) * W2_EXPERT_BYTES;
+      W_down + static_cast<int64_t>(local_eid) * W2_EXPERT_BYTES;
   uint8_t const *wg_data =
       expert_weight + static_cast<int64_t>(wg_idx) * W2_WG_BYTES;
   uint8_t const *wg_scales = wg_data + W2_WG_DATA;
 
   constexpr int W2_TILE_ROWS = 16;
-  constexpr int W2_TILE_DATA = W2_TILE_ROWS * (W2_K / 2);
-  constexpr int W2_TILE_SCALE = W2_TILE_ROWS * W2_NUM_BLK32;
+  // Under split-K a tile covers 16 rows x W2_ROW_H bytes (half a row each),
+  // so both the LDS footprint and the load count halve. W2_ROW_H == W2_K/2
+  // and these reduce to the original values when W2_SPLITK == 1.
+  constexpr int W2_TILE_DATA = W2_TILE_ROWS * W2_ROW_H;
+  constexpr int W2_TILE_SCALE = W2_TILE_ROWS * W2_BLK32_H;
   constexpr int w2_n16_data = W2_TILE_DATA / 16;
   constexpr int W2_LPT = (w2_n16_data + 255) / 256;
   constexpr int W2_TILE_DATA_PADDED = W2_LPT * 256 * 16;
   constexpr int W2_TILE_BYTES = W2_TILE_DATA_PADDED + W2_TILE_SCALE;
+  // 16-byte units per row-half, for the row-strided source addressing below.
+  constexpr int W2_U16_PER_ROW = W2_ROW_H / 16;
+  static_assert(W2_SPLITK == 1 || W2_TILES_PER_WAVE == 1,
+                "W2 split-K assumes a single tile per wave (W2_OPW == 64); "
+                "the tile_iter=1 reload path is not split-K aware");
 
   // ── W2 weight prefetch + barrier wait overlap ────────────────────────────
   // Strategy: issue buffer_load_lds for W2 weights BEFORE barrier poll so
@@ -1313,9 +1855,26 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // barrier)
   i32x4_t w2_rsrc =
       make_w_buffer_rsrc(expert_weight, static_cast<uint32_t>(W2_EXPERT_BYTES));
-  uint32_t w2_wg_voff_base = static_cast<uint32_t>(wg_idx) * W2_WG_BYTES;
+  // Split-K iteration window. 23 iterations split 2 ways is 12 + 11, so half 1
+  // would be a short block. Rather than make the load count vary, half 1 backs
+  // its window up to start at iteration 23-12=11 and loads a full 12: it then
+  // runs all 12 while half 0 runs only the first 11, so together they cover
+  // [0,11) + [11,23) = every iteration exactly once. The loads stay uniform
+  // and no bounds check is needed. w2_iter_lo is the FIRST iteration this tile
+  // loads; w2_iters is how many it actually multiplies.
+  int const w2_iter_lo =
+      (W2_SPLITK > 1) ? (k_half ? (W2_TOTAL_ITERS - W2_ITERS_MAX) : 0) : 0;
+  int const w2_iters =
+      (W2_SPLITK > 1)
+          ? (k_half ? W2_ITERS_MAX : (W2_TOTAL_ITERS - W2_ITERS_MAX))
+          : W2_MFMA_ITERS;
+  // Byte offset of the window inside a weight row / scale row.
+  int const w2_row_off = w2_iter_lo * 64;
+  int const w2_sc_off = w2_iter_lo * 4;
+  uint32_t w2_wg_voff_base = static_cast<uint32_t>(wg_idx) * W2_WG_BYTES +
+                             static_cast<uint32_t>(w2_row_off);
 
-  constexpr int LDS_W2_OFF = ((W2_K + W2_MFMA_ITERS + 15) / 16) * 16;
+  constexpr int LDS_W2_OFF = ((W2_K + W2_TOK_SCALES + 15) / 16) * 16;
   static_assert(LDS_W2_OFF + W2_TILE_BYTES * NUM_WAVES <= 155 * 1024,
                 "W2 LDS weight tiles exceed MI350X LDS budget");
   uint8_t *lds_w2_base = (uint8_t *)_fused_smem + LDS_W2_OFF;
@@ -1339,19 +1898,40 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   {
     unsigned lds_w2_off = (unsigned)(uintptr_t)(lds_w2_base + warp_id * 1024);
     unsigned w2v[24], w2m[24];
+    // The asm below is hardwired to 24 loads, which is exactly
+    // NUM_WAVES * W2_LPT at W2_LPT == 6 (the unsplit tile). Split-K halves the
+    // tile so W2_LPT is 3 and only 12 slots are real; the rest must still hold
+    // a defined address. Point them at slot 0 -- the same bytes to the same LDS
+    // offset, so the replay is idempotent rather than merely harmless.
+#pragma unroll
+    for (int s = 0; s < 24; s++) {
+      w2v[s] = 0;
+      w2m[s] = 0;
+    }
 #pragma unroll
     for (int t = 0; t < NUM_WAVES; t++) {
 #pragma unroll
       for (int j = 0; j < W2_LPT; j++) {
         int idx = tid + j * 256;
         int clamped = idx < w2_n16_data ? idx : w2_n16_data - 1;
+        // A tile row is only W2_ROW_H bytes but HBM rows are W2_K/2 apart, so
+        // the 16-byte unit index has to be split into (row, offset). Identity
+        // when W2_SPLITK == 1: W2_U16_PER_ROW is then W2_K/32 and this is
+        // exactly clamped * 16.
+        int w2_row = clamped / W2_U16_PER_ROW;
+        int w2_off = clamped % W2_U16_PER_ROW;
         w2v[t * W2_LPT + j] =
             w2_wg_voff_base +
             static_cast<uint32_t>(t * W2_TILE_ROWS * (W2_K / 2)) +
-            static_cast<uint32_t>(clamped * 16);
+            static_cast<uint32_t>(w2_row * (W2_K / 2) + w2_off * 16);
         w2m[t * W2_LPT + j] = __builtin_amdgcn_readfirstlane(
             lds_w2_off + t * W2_TILE_BYTES + j * 4096);
       }
+    }
+#pragma unroll
+    for (int s = NUM_WAVES * W2_LPT; s < 24; s++) {
+      w2v[s] = w2v[0];
+      w2m[s] = w2m[0];
     }
     asm volatile("s_mov_b32 m0, %[m0]\n  buffer_load_dwordx4 %[v0],  %[rsrc], "
                  "0 offen sc0 nt lds\n"
@@ -1457,8 +2037,34 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // Issue scale loads concurrently with buffer_load_lds
   constexpr int W2_TOTAL_SC_DW4 = (W2_TILE_SCALE * NUM_WAVES) / 16;
   constexpr int W2_SC_LPT = (W2_TOTAL_SC_DW4 + 255) / 256;
+  // Split-K reads scales a DWORD at a time, not a dwordx4. The unsplit path
+  // can use 16-byte loads because a wg's scales are one contiguous run, but a
+  // K-window is a strided slice: rows are W2_NUM_BLK32 = 92 bytes apart and
+  // half 1 starts 44 bytes in. Neither is 16-byte aligned; both are 4-byte
+  // aligned (92 = 4*23, 44 = 4*11), so dwords are the largest legal unit.
+  constexpr int W2_TOTAL_SC_DW = W2_TILE_SCALE * NUM_WAVES / 4;
+  constexpr int W2_SC_LPT_DW = (W2_TOTAL_SC_DW + 255) / 256;
+  constexpr int W2_SC_DW_PER_ROW = W2_BLK32_H / 4;
+  constexpr int W2_SC_DW_PER_TILE = W2_TILE_SCALE / 4;
   i32x4_t w2_sc_buf[W2_SC_LPT];
-  {
+  unsigned w2_sc_dw[W2_SC_LPT_DW];
+  if constexpr (W2_SPLITK > 1) {
+    uint8_t const *sc_src8 = wg_scales + w2_sc_off;
+#pragma unroll
+    for (int j = 0; j < W2_SC_LPT_DW; j++) {
+      int idx = tid + j * 256;
+      if (idx < W2_TOTAL_SC_DW) {
+        int sc_tile = idx / W2_SC_DW_PER_TILE;
+        int sc_off = idx % W2_SC_DW_PER_TILE;
+        int sc_row = sc_off / W2_SC_DW_PER_ROW;
+        int sc_boff = sc_off % W2_SC_DW_PER_ROW;
+        w2_sc_dw[j] = *(unsigned const *)(sc_src8 +
+                                          (sc_tile * W2_TILE_ROWS + sc_row) *
+                                              W2_NUM_BLK32 +
+                                          sc_boff * 4);
+      }
+    }
+  } else {
     i32x4_t const *sc_src = (i32x4_t const *)wg_scales;
 #pragma unroll
     for (int j = 0; j < W2_SC_LPT; j++) {
@@ -1469,6 +2075,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     }
   }
 
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+  unsigned long long _mt_bar0 = __builtin_amdgcn_s_memrealtime();
+#endif
   // All threads poll per-XCD release flag independently.
   // Eliminates tid==0 + __syncthreads — each thread confirms barrier itself.
   {
@@ -1520,6 +2129,12 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     // block can be split across the barrier.
     MPK_WS_WAVE_EXIT(warp_id);
   }
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+  if (tid == 0) {
+    atomicAdd(&g_moe_w2bar_ns,
+              __builtin_amdgcn_s_memrealtime() - _mt_bar0);
+  }
+#endif
   MOE_DBG_SUBPHASE(3002);
   MPK_WS_MARK(8302, global_tile); // W2: cleared W13->W2 barrier
 
@@ -1533,8 +2148,12 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     unsigned short const *w2_input_base =
         d_swiglu_out + tok_idx * (NUM_TOPK * INTERMEDIATE_SIZE) +
         topk_slot * INTERMEDIATE_SIZE;
+    // MPK_W2_NOQUANT: same probe as MPK_W13_NOQUANT, for W2's side. All 45 W2
+    // tiles of an expert quantize the identical SwiGLU vector. WRONG OUTPUT.
+#ifndef MPK_W2_NOQUANT
     _gang_wave_parallel_fp8_quant_nt<W2_K>(
         w2_input_base, s_tok_fp8, s_tok_scales);
+#endif
   }
 
   // Drain ALL pending HBM loads: buffer_load_lds (weight) + scale loads
@@ -1543,7 +2162,19 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   MPK_WS_MARK(8304, global_tile); // W2: drain HBM loads
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
   asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
-  {
+  if constexpr (W2_SPLITK > 1) {
+#pragma unroll
+    for (int j = 0; j < W2_SC_LPT_DW; j++) {
+      int idx = tid + j * 256;
+      if (idx < W2_TOTAL_SC_DW) {
+        int tile = idx / W2_SC_DW_PER_TILE;
+        int off = idx % W2_SC_DW_PER_TILE;
+        unsigned *dst_sc = (unsigned *)(lds_w2_base + tile * W2_TILE_BYTES +
+                                        W2_TILE_DATA_PADDED);
+        dst_sc[off] = w2_sc_dw[j];
+      }
+    }
+  } else {
     constexpr int W2_SC_DW4_PER_TILE = W2_TILE_SCALE / 16;
 #pragma unroll
     for (int j = 0; j < W2_SC_LPT; j++) {
@@ -1574,13 +2205,13 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // same LDS slots before its MFMA loop — matching the W13 dual-tile pattern.
   {
     constexpr int W2_TILE_ROWS_L = 16;
-    constexpr int W2_TILE_DATA_L = W2_TILE_ROWS_L * (W2_K / 2);
-    constexpr int W2_TILE_SCALE_L = W2_TILE_ROWS_L * W2_NUM_BLK32;
+    constexpr int W2_TILE_DATA_L = W2_TILE_ROWS_L * W2_ROW_H;
+    constexpr int W2_TILE_SCALE_L = W2_TILE_ROWS_L * W2_BLK32_H;
     constexpr int w2_n16_L = W2_TILE_DATA_L / 16;
     constexpr int W2_LPT_L = (w2_n16_L + 255) / 256;
     constexpr int W2_TILE_DATA_PADDED_L = W2_LPT_L * 256 * 16;
     constexpr int W2_TILE_BYTES_L = W2_TILE_DATA_PADDED_L + W2_TILE_SCALE_L;
-    constexpr int LDS_W2_OFF_L = ((W2_K + W2_MFMA_ITERS + 15) / 16) * 16;
+    constexpr int LDS_W2_OFF_L = ((W2_K + W2_TOK_SCALES + 15) / 16) * 16;
     uint8_t *lds_w2_base_l = (uint8_t *)_fused_smem + LDS_W2_OFF_L;
 
     // ── tile_iter=0: weights already in LDS from pre-load ──────────────
@@ -1591,8 +2222,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       uint8_t *lds_w2_scales = lds_w2_data + W2_TILE_DATA_PADDED_L;
 
       int w_row_local = col;
-      int const row_data_base = w_row_local * (W2_K / 2);
-      int const row_scale_base = w_row_local * W2_NUM_BLK32;
+      // LDS holds this half packed densely, so rows stride by the half size.
+      int const row_data_base = w_row_local * W2_ROW_H;
+      int const row_scale_base = w_row_local * W2_BLK32_H;
 
       // Prefetch epilogue data before MFMA loop so loads fly during compute.
       int out_n_base = wg_idx * W2_OUTPUT_PER_WG + wave_tile_0 * 16 + g * 4;
@@ -1601,7 +2233,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       if (col == 0 && out_n_base < W2_OUTPUT_SIZE) {
         float const *rw_ptr = &d_routing_weight[tok_idx * NUM_TOPK + topk_slot];
         unsigned short const *bias_ptr =
-            &d_w2_bias[expert_id * W2_OUTPUT_SIZE + out_n_base];
+            &d_w2_bias[local_eid * W2_OUTPUT_SIZE + out_n_base];
         asm volatile("global_load_dword %0, %2, off\n"
                      "global_load_dwordx2 %1, %3, off"
                      : "=&v"(pf_rw), "=&v"(pf_bias)
@@ -1622,8 +2254,15 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             (unsigned)(uintptr_t)(lds_w2_data + row_data_base + g * 16);
         unsigned w2_ws_addr =
             (unsigned)(uintptr_t)(lds_w2_scales + row_scale_base + g);
-        unsigned w2_t_addr = (unsigned)(uintptr_t)(s_tok_fp8 + g * 16);
-        unsigned w2_ts_addr = (unsigned)(uintptr_t)(s_tok_scales);
+        // The FP8 quant covers the full K in every tile, so this tile's slice
+        // of the token vector starts at its window's first iteration:
+        // 128 fp8 bytes per iteration for the data, 1 scale byte per
+        // iteration. The asm walks scales as tsa + s13, so offsetting the
+        // base is sufficient.
+        unsigned w2_t_addr =
+            (unsigned)(uintptr_t)(s_tok_fp8 + w2_iter_lo * 128 + g * 16);
+        unsigned w2_ts_addr =
+            (unsigned)(uintptr_t)(s_tok_scales + w2_iter_lo);
         asm volatile(
             // Zero accumulator
             // ── Two disjoint operand banks ──
@@ -1670,7 +2309,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             "ds_read_b128 v[36:39], %[ta] offset:64\n"
             "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], "
             "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
-            "s_cmpk_lt_i32 s13, %[iters_m1]\n"
+            // s_cmp, not s_cmpk: the trip count is an SGPR under split-K (23
+            // iterations split 12/11), and s_cmpk only takes a literal.
+            "s_cmp_lt_i32 s13, %[iters_m1]\n"
             "s_cbranch_scc0 W2_T0_TAIL_B1_%=\n"
 
             // ---- consume bank 1, prefetch into bank 0 ----
@@ -1687,7 +2328,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             "ds_read_b128 v[12:15], %[ta] offset:64\n"
             "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], "
             "a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
-            "s_cmpk_lt_i32 s13, %[iters_m1]\n"
+            "s_cmp_lt_i32 s13, %[iters_m1]\n"
             "s_cbranch_scc1 PIPELINED_W2_T0_%=\n"
 
             // ── Final MFMA ──
@@ -1724,7 +2365,12 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
               [wa] "+v"(w2_w_addr),
               [wsa] "+v"(w2_ws_addr),
               [ta] "+v"(w2_t_addr)
-            : [tsa] "v"(w2_ts_addr), [iters_m1] "n"(W2_MFMA_ITERS - 1)
+            // readfirstlane: w2_iters is uniform across the block (it derives
+            // from the tile index) but the compiler only knows it came from a
+            // thread-varying computation, so without this it lands in a VGPR
+            // and s_cmp rejects it.
+            : [tsa] "v"(w2_ts_addr),
+              [iters_m1] "s"(__builtin_amdgcn_readfirstlane(w2_iters - 1))
             : "memory",
               "s13",
               "v7",
@@ -1775,6 +2421,14 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         __builtin_memcpy(&bv1, &bt1, 4);
         __builtin_memcpy(&bv2, &bt2, 4);
         __builtin_memcpy(&bv3, &bt3, 4);
+        // Split-K: the two halves both atomicAdd into the same accumulator,
+        // so the bias must be added by exactly one of them.
+        if (k_half != 0) {
+          bv0 = 0.0f;
+          bv1 = 0.0f;
+          bv2 = 0.0f;
+          bv3 = 0.0f;
+        }
         int ws_base = tok_idx * HIDDEN_SIZE + out_n_base;
         atomicAdd(&d_workspace_f32[ws_base + 0], (acc[0] + bv0) * pf_rw);
         atomicAdd(&d_workspace_f32[ws_base + 1], (acc[1] + bv1) * pf_rw);
@@ -1972,7 +2626,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
           float const *rw_ptr =
               &d_routing_weight[tok_idx * NUM_TOPK + topk_slot];
           unsigned short const *bias_ptr =
-              &d_w2_bias[expert_id * W2_OUTPUT_SIZE + out_n_base];
+              &d_w2_bias[local_eid * W2_OUTPUT_SIZE + out_n_base];
           asm volatile("global_load_dword %0, %2, off\n"
                        "global_load_dwordx2 %1, %3, off"
                        : "=&v"(pf_rw), "=&v"(pf_bias)
@@ -2023,6 +2677,51 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   }
 
   __syncthreads();
+
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+  // End of the tile, both kinds. w13 total covers compute; w2 total covers the
+  // barrier poll AND compute, so w2 minus w2bar is W2's own work.
+  if (tid == 0) {
+    unsigned long long _dt = __builtin_amdgcn_s_memrealtime() - _mt_tile0;
+    if (is_w2) {
+      atomicAdd(&g_moe_w2_ns, _dt);
+      atomicAdd(&g_moe_w2_n, 1ull);
+    } else {
+      atomicAdd(&g_moe_w13_ns, _dt);
+      atomicAdd(&g_moe_w13_n, 1ull);
+    }
+  }
+#endif
+#ifdef MPK_EP_SKEW_PROBE
+  // EP skew probe. One timestamp per W2 tile, taken after its atomicAdds have
+  // retired, recorded as a max into the column slice that tile wrote and into
+  // the GPU-wide maximum. Phase 9 then reports (gpu_last - slice_last) per
+  // slice: the time a per-slice release could have shipped that slice early.
+  //
+  // Keyed by the SAME slice arithmetic Phase 9 folds with -- EP_FOLD_CHUNK is
+  // ceil(QKV_REDUCTION_SIZE/8) rounded up to even -- so a slice here is exactly
+  // the columns one XCD's fold reads. Anything else would compare two different
+  // partitions and the answer would be meaningless.
+  if (is_w2 && tid == 0) {
+    unsigned long long t = __builtin_amdgcn_s_memrealtime();
+    // wg_idx covers columns [wg_idx*W2_OUTPUT_PER_WG, +W2_OUTPUT_PER_WG).
+    // QKV_REDUCTION_SIZE is the PADDED hidden size and HIDDEN_SIZE is not, but
+    // the fold's chunk is derived from the padded one; recompute it the same
+    // way rather than assuming the two partitions coincide.
+    constexpr int SKEW_PAD = ((HIDDEN_SIZE + 63) / 64) * 64;
+    constexpr int SKEW_CHUNK = ((SKEW_PAD + 7) / 8 + 1) & ~1;
+    int c_lo = wg_idx * W2_OUTPUT_PER_WG;
+    int c_hi = c_lo + W2_OUTPUT_PER_WG - 1;
+    int s_lo = c_lo / SKEW_CHUNK;
+    int s_hi = c_hi / SKEW_CHUNK;
+    // A W2 workgroup's output span can straddle two fold slices; both are
+    // gated on it, so both take the timestamp.
+    for (int s = s_lo; s <= s_hi && s < EP_SKEW_SLICES; s++) {
+      atomicMax(&g_ep_slice_last[s], t);
+    }
+    atomicMax(&g_ep_gpu_last, t);
+  }
+#endif
 
 #if 0 // W2 reporting disabled — timestamps not captured
     {

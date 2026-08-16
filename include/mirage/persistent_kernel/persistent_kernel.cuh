@@ -20,11 +20,11 @@
 #endif
 #include "mpk_atoms.cuh"
 #include "runtime_header.h"
-#ifdef USE_NVSHMEM
-#include <mpi.h>
-#include <nvshmem.h>
-#include <nvshmemx.h>
-#endif
+// Backend-agnostic SHMEM comm shim (NVSHMEM / rocSHMEM / single-PE no-op).
+// Provides mpk_putmem_signal_block, MPK_SIGNAL_ADD, and the host mpk_shmem_*
+// wrappers to both the megakernel host code and the emitted allreduce tasks.
+#include "comm/mpk_comm.cuh"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -55,6 +55,259 @@ __device__ unsigned long long g_subphase_scratch[8];
 // Fused O-proj+MoE phase timing: [0]=oproj_ns, [1]=poll_ns, [2]=moe_ns,
 // [3]=count
 __device__ unsigned long long g_fused_phase_ns[4];
+#endif
+
+// ── EP skew probe ──────────────────────────────────────────────────────────
+//
+// Phase 9 waits for ALL 240 workers before folding, but a given column of the
+// residual is only written by the W2 tiles whose output slice covers it --
+// ~2 tiles per rank at top_k=4, not 240. If those tiles finish much earlier
+// than the last worker on the GPU, the barrier is buying nothing for that
+// column and a per-slice release could ship it early. If they finish at
+// roughly the same time, there is nothing to overlap and the whole
+// send-as-you-go idea is dead regardless of how it is implemented.
+//
+// This measures exactly that gap, and nothing else:
+//   g_ep_slice_last[x] = timestamp of the last W2 atomicAdd into XCD x's
+//                        column slice (max over contributing tiles)
+//   g_ep_gpu_last      = timestamp of the last W2 tile anywhere on the GPU
+// The difference, per slice, is the headroom a per-slice release could claim.
+//
+// Written with plain atomics on device globals from the W2 epilogue only
+// (one per tile, not per element), so the probe does not perturb the compute
+// it is measuring. Off unless MPK_EP_SKEW_PROBE is defined.
+#ifdef MPK_EP_SKEW_PROBE
+#define EP_SKEW_SLICES 8
+#define EP_SKEW_HIST 64
+__device__ unsigned long long g_ep_slice_last[EP_SKEW_SLICES];
+__device__ unsigned long long g_ep_gpu_last;
+__device__ unsigned long long g_ep_layer_t0;
+// Per-layer samples of (gpu_last - slice_last), in units of s_memrealtime
+// ticks (100 MHz => 10 ns/tick). Ring of the most recent EP_SKEW_HIST layers.
+__device__ unsigned long long g_ep_skew_hist[EP_SKEW_HIST][EP_SKEW_SLICES];
+__device__ unsigned long long g_ep_skew_span[EP_SKEW_HIST];
+__device__ int g_ep_skew_n;
+#endif
+
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+// Phase 9 breakdown accumulators, in s_memrealtime ticks (10 ns).
+// [role][9a, 9bc, 9d, 9e]; role 0 = folder (xcd_rank 0), 1 = follower.
+// Accumulated rather than printed per layer -- see the dump site in
+// gang_full_layer_fused_mi300.cuh for why.
+__device__ unsigned long long g_ep9_ns[2][4];
+__device__ unsigned long long g_ep9_cnt[2];
+// Phases 1-8 breakdown, same accumulate-and-dump-once treatment as g_ep9_ns
+// and for the same reason: the per-layer [FUSED_PHASE] printf takes the
+// iteration from 2.5 ms to ~440 ms, so its numbers describe the printf.
+// Slots: [0] qkv_gemm  [1] qkv_barrier  [2] attn  [3] merge+flush
+//        [4] wait_others (to the cross-XCD barrier)  [5] Phase 6 xcd_barrier
+//        [6] Phase 7 oproj+topk  [7] Phase 8 MoE
+//        [8] Phase 7 split: oproj+router compute only (so [6] - [8] is the
+//            Phase 7b routing_ready wait)
+__device__ unsigned long long g_fp_ns[9];
+__device__ unsigned long long g_fp_cnt;
+// Inside Phase 7's compute half, which is the only part a row-shard of o_proj
+// could halve. [0] o_proj MFMA, [1] the GPU-wide o_proj barrier, [2] RMSNorm +
+// router GEMV. Only [0] is shardable: RMSNorm and the router read the whole
+// hidden vector by definition, so they stay replicated on both ranks.
+__device__ unsigned long long g_op3_ns[3];
+__device__ unsigned long long g_op3_cnt;
+// Worker ARRIVAL spread at 9a: min/max over all 240 workgroups of the instant
+// they reach Phase 9, reset each layer. The W2-tile skew probe says tile
+// completion spreads only 0.48 us, but a worker's last act is not necessarily a
+// W2 tile, so tile spread does not bound worker spread. This measures the thing
+// the barrier actually waits on.
+// Initialized to ~0 so the first atomicMin takes; the closer resets it to ~0
+// again at the end of every layer.
+__device__ unsigned long long g_ep9_arr_min = ~0ull;
+__device__ unsigned long long g_ep9_arr_max;
+__device__ unsigned long long g_ep9_arr_span_sum;
+__device__ unsigned long long g_ep9_arr_span_max;
+__device__ unsigned long long g_ep9_arr_n;
+// Same, for entry into Phase 8 (MoE). Comparing the two spreads says whether
+// MoE creates the skew or inherits it.
+__device__ unsigned long long g_ep8_arr_min = ~0ull;
+__device__ unsigned long long g_ep8_arr_max;
+__device__ unsigned long long g_ep8_arr_span_sum;
+__device__ unsigned long long g_ep8_arr_span_max;
+// Per-worker MoE occupancy, indexed by worker (xcd*30 + xcd_rank).
+// g_moe_busy_ns is the time each worker spends between entering Phase 8 and
+// reaching 9a; g_moe_tiles is how many tiles it was handed. If busy time is
+// flat the barrier is waiting on something other than MoE work; if it tracks
+// the tile count, the tile->worker map is the problem.
+#define MOE_OCC_WORKERS 240
+__device__ unsigned long long g_moe_busy_ns[MOE_OCC_WORKERS];
+__device__ unsigned long long g_moe_tiles[MOE_OCC_WORKERS];
+__device__ unsigned long long g_moe_occ_iters;
+
+// ── MPK_PERFETTO: raw per-worker phase spans, for a Perfetto timeline ──────
+// Everything above reduces timestamps into atomicAdd accumulators, which is
+// why the 20x max/min worker spread in [MOEOCC] cannot be attributed: a mean
+// says nothing about WHICH worker was slow or what it was doing. This keeps
+// the raw pairs instead.
+//
+// One row per (worker, layer, phase): 6 phase boundaries the fused task
+// already timestamps (_fused_t0/t0a/t0b/t1/t2/t3, _ep_t0.._ep_t4). We store
+// entry+exit as raw s_memrealtime ticks (100 MHz, 10 ns) and let the host do
+// the arithmetic, so no information is lost to a reduction.
+//
+// Sized for ONE layer-sweep of one decode iteration: 240 workers x 36 layers
+// x PERF_NPHASE. At 8 phases x 2 u32 that is 240*36*8*2*4 B = 553 KB of device
+// global -- fine. Writes are plain stores to device memory (NOT the pinned
+// host buffer MPK_WS_MARK uses, which costs a PCIe write per mark and was
+// measured at 2.3x when done four times per tile).
+#define PERF_NPHASE 8
+#define PERF_NLAYER 36
+#define PERF_SLOTS (MOE_OCC_WORKERS * PERF_NLAYER * PERF_NPHASE)
+// [slot][0] = entry tick, [slot][1] = exit tick, relative to g_perf_t0.
+__device__ unsigned int g_perf_span[PERF_SLOTS][2];
+// Kernel-wide time origin, so the u32 deltas cannot overflow: at 100 MHz a
+// u32 covers 43 s, and one decode iteration is ~2 ms.
+__device__ unsigned long long g_perf_t0;
+// Set to 1 by the first worker to reach the capture iteration; the dump
+// reads it to know the buffer is populated. Capturing every iteration would
+// just overwrite, so the gate picks a single steady-state one.
+__device__ int g_perf_armed;
+__device__ __forceinline__ void mpk_perf_span(int worker,
+                                              int layer,
+                                              int phase,
+                                              unsigned long long t_in,
+                                              unsigned long long t_out) {
+  if (worker >= MOE_OCC_WORKERS || layer >= PERF_NLAYER ||
+      phase >= PERF_NPHASE) {
+    return;
+  }
+  // g_perf_armed guards the origin: worker 0 of layer 0 publishes g_perf_t0,
+  // and every other worker records its spans at the END of its layer, so the
+  // origin is set long before it is read. The check makes that ordering
+  // explicit rather than assumed -- an unarmed read would see t0 == 0 and
+  // turn the subtraction into a full 64-bit tick count, overflowing the u32.
+  if (!g_perf_armed) {
+    return;
+  }
+  unsigned long long const t0 = g_perf_t0;
+  if (t_in < t0 || t_out < t_in) {
+    return;
+  }
+  int const slot = (worker * PERF_NLAYER + layer) * PERF_NPHASE + phase;
+  g_perf_span[slot][0] = (unsigned int)(t_in - t0);
+  g_perf_span[slot][1] = (unsigned int)(t_out - t0);
+}
+// Where a MoE worker's time actually goes: w13 compute, the W13->W2 per-expert
+// barrier poll, and W2 compute. The occupancy probe shows workers holding at
+// most 2 tiles yet spanning 1-12 us, so the cost is inside a tile, not in the
+// number of them. These three say which part.
+__device__ unsigned long long g_moe_w13_ns;
+__device__ unsigned long long g_moe_w2bar_ns;
+__device__ unsigned long long g_moe_w2_ns;
+__device__ unsigned long long g_moe_w13_n;
+__device__ unsigned long long g_moe_w2_n;
+// W13's 7.4 us/tile against a 4.4 us HBM-stream floor for the same bytes: the
+// four terms that 7.4 splits into, so the 3.0 us gap can be attributed before
+// anything is restructured. Double-buffering the K loop only pays if the MFMA
+// term is large enough to hide loads behind; if the gap is in the load drain
+// or the SwiGLU epilogue instead, it buys nothing.
+//   p: entry -> the 24 dwordx4 buffer_load_lds prefetch is ISSUED
+//   a: that -> post FP8 quant of the token
+//   b: post-quant -> weight/scale loads drained (s_waitcnt vmcnt(0))
+//   c: drain -> MFMA + SwiGLU + swiglu_out store complete
+//   d: that -> barrier arrival done (tile exit)
+// The first cut folded p into a and reported 3.46 us of "quant". It is not
+// quant: the prefetch issue sits in front of it and the quant's own loads
+// queue behind ~98 KB of in-flight weight traffic, so p+a+b was measuring the
+// HBM stream (4.42 us floor for these bytes at nt=256) more than the ALU.
+// pre splits again into addr (t0v/t0m setup, 24 readfirstlane) and issue (the
+// 24-load asm block), because the block is supposed to cost ~75 ns and the
+// s_mov_b32 m0 in front of every load is the reason to doubt that.
+__device__ unsigned long long g_w13_addr_ns;
+__device__ unsigned long long g_w13_pre_ns;
+__device__ unsigned long long g_w13_quant_ns;
+__device__ unsigned long long g_w13_drain_ns;
+__device__ unsigned long long g_w13_mfma_ns;
+__device__ unsigned long long g_w13_epi_ns;
+__device__ unsigned long long g_w13_stdrain_ns;
+__device__ unsigned long long g_w13_arrive_ns;
+
+// Phase 1 (QKV GEMM) tile split, same accumulate-and-dump-once treatment as
+// the W13 split above. QKV moves 7.8 MB of MXFP4 per rank and the phase takes
+// 8.9 us, but dividing those gives 0.9 TB/s and that ratio is meaningless --
+// the split below shows the weight stream is only pre+drain = 2.14 us, i.e.
+// 3.6 TB/s against a measured 6.59 TB/s peak, with drain at 0.70 us meaning
+// the prefetch is already well hidden. The time is elsewhere. The existing
+// MPK_ENABLE_SUBPHASE_TIMING slots cannot say where: _sp_t3b in the kvupd
+// kernel is declared and never assigned, so its [3]/[4] terms are garbage.
+//
+// MEASURED (n=288080, both ranks): pre 1.44, rms 3.27, quant 0.65, drain 0.70,
+// mfma 1.40, epi 1.12. RMSNorm is 38% of the tile for 23 KB of traffic, and
+// all 80 QKV workgroups norm the SAME 2880-element vector.
+//
+// Terms, in execution order, non-overlapping and summing to the tile total:
+//   pre     Phase A buffer_load_lds issue (4 waves x QKV_LPT loads)
+//   rms     ResAddF32 + RMSNorm over the hidden vector
+//   quant   FP8 activation quant into LDS
+//   drain   s_waitcnt on the Phase A loads + scale scatter
+//   mfma    the asm MFMA loop
+//   epi     KV_UPD / RoPE epilogue + workspace zeroing
+__device__ unsigned long long g_qkv_pre_ns;
+__device__ unsigned long long g_qkv_rms_ns;
+__device__ unsigned long long g_qkv_quant_ns;
+__device__ unsigned long long g_qkv_drain_ns;
+__device__ unsigned long long g_qkv_mfma_ns;
+__device__ unsigned long long g_qkv_epi_ns;
+__device__ unsigned long long g_qkv_n;
+// rms split three ways: p1 is the resadd + sum-of-squares pass (2 or 3 HBM
+// streams: the f32 workspace, the residual, and under EP the peer's gather
+// slot), red is the cross-wave ssq reduction (two __syncthreads), p2 is the
+// norm-weight apply. p1 and p2 are separated by a full block barrier, so if
+// the cost is HBM latency rather than bytes it shows up as p1 >> p2.
+__device__ unsigned long long g_qkv_rp1_ns;
+__device__ unsigned long long g_qkv_rred_ns;
+__device__ unsigned long long g_qkv_rp2_ns;
+
+// Phase 7b's routing_ready wait, 5.4 us/layer, split by CAUSE. The two
+// possibilities need opposite fixes, so the split decides which to build:
+//
+//   arr   time from the LAST router tile arriving at the top-k barrier back to
+//         when the FIRST one did -- i.e. arrival spread. If this dominates,
+//         the wait is inherited skew and parallelizing top-k buys nothing.
+//   tk    top-k compute itself: one workgroup, 128 logits, plus the 8-flag
+//         st_wt fanout. If THIS dominates, it is a genuine serial critical
+//         path at bs=1 and worth restructuring.
+//
+// arr is measured on the top-k completer via a min-timestamp every router tile
+// atomicMins as it arrives; tk is that completer's own compute span. Both are
+// per-layer, reset by the completer after it reads them.
+__device__ unsigned long long g_tk_arr_ns;
+__device__ unsigned long long g_tk_tk_ns;
+__device__ unsigned long long g_tk_fan_ns;
+__device__ unsigned long long g_tk_n;
+__device__ unsigned long long g_tk_first = ~0ull;
+// MEASURED: arr 5.4-5.7, tk 3.0, fan 1.3-1.8 us. Arrival spread is the larger
+// term, so the wait is mostly inherited skew -- but tk+fan = 4.4 us is a
+// genuinely serial span with 239 workers parked, and that part is attackable.
+// Second-level split of those two, since the fixes differ:
+//
+//   fence   threadfence_gpu() alone. On gfx950 this is `buffer_wbl2 sc1`, a
+//           writeback of the WHOLE L2. Every store it must publish is already
+//           st_wt EXCEPT routing_indices' zero-init (moe_topk_softmax_mi300
+//           :68, a plain store), so the same argument that killed the Phase 9
+//           fence in 57422b1 may apply here.
+//   flags   the 9 st_wt_u32 epoch publishes + their s_waitcnt.
+//   zinit   the 128-expert routing_indices zero-init loop and its syncthreads,
+//           run by the single completer block before it touches any logit.
+//   sfmx    buffer_inv + the load/softmax/top-k/blank body.
+__device__ unsigned long long g_tk_fence_ns;
+__device__ unsigned long long g_tk_eload_ns;
+__device__ unsigned long long g_tk_flags_ns;
+__device__ unsigned long long g_tk_zinit_ns;
+__device__ unsigned long long g_tk_sfmx_ns;
+//   inv     the buffer_inv that opens topk_noinline -- a WHOLE-L2 invalidate on
+//           the completer's XCD, taken to see the logits the 128 router tiles
+//           wrote past L2 with st_wt.
+//   lload   the 128-bf16 logit read itself, which is a cold HBM hit by
+//           construction and is what the inv is paid for.
+__device__ unsigned long long g_tk_inv_ns;
+__device__ unsigned long long g_tk_lload_ns;
 #endif
 
 #ifdef MPK_ENABLE_SPAN_TIMING
@@ -1580,13 +1833,17 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
         }
 #endif
         if (is_nvshmem_event(event_id)) {
-#ifdef USE_NVSHMEM
-          nvshmem_signal_wait_until(
+          // Cross-GPU dependency: a remote PE increments this symmetric event
+          // counter via put+signal (SIGNAL_ADD). Wait through the backend's
+          // signal primitive so the remote write is observed past the local
+          // cache hierarchy. Under USE_ROCSHMEM this was previously compiled
+          // out entirely, which let the consumer run before the remote slice
+          // landed. GE (not EQ): the counter is a monotonic atomic-add, so a
+          // fast peer can push it past the threshold before we sample it.
+          mpk_shmem_signal_wait_ge(
               reinterpret_cast<uint64_t *>(
                   &config.all_event_counters[event_index]),
-              NVSHMEM_CMP_EQ,
               needed_counts);
-#endif
         } else {
 #ifdef MPK_ENABLE_TIMING
           unsigned long long dep_start = clock64();
@@ -1898,6 +2155,46 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                  (double)poll / 1000.0 / n_iters,
                  (double)moe / 1000.0 / n_iters,
                  n_iters);
+        }
+      }
+#endif
+#ifdef MPK_EP_SKEW_PROBE
+      if (threadIdx.x == 0 && worker_id == 0) {
+        int n = g_ep_skew_n;
+        int have = (n < EP_SKEW_HIST) ? n : EP_SKEW_HIST;
+        if (have > 0) {
+          // s_memrealtime is the 100 MHz constant clock: 1 tick = 10 ns.
+          // Report the mean and the max over the retained layers; the max is
+          // what matters, because a per-slice release only helps if the slice
+          // is reliably early, not occasionally early.
+          printf("[EPSKEW] layers=%d (ring holds %d) unit=us\n", n, have);
+          for (int s = 0; s < EP_SKEW_SLICES; s++) {
+            unsigned long long sum = 0, mx = 0;
+            for (int i = 0; i < have; i++) {
+              unsigned long long v = g_ep_skew_hist[i][s];
+              sum += v;
+              if (v > mx) {
+                mx = v;
+              }
+            }
+            printf("[EPSKEW] slice%d mean=%.3f max=%.3f\n",
+                   s,
+                   (double)sum / have / 100.0,
+                   (double)mx / 100.0);
+          }
+          unsigned long long ssum = 0, smx = 0;
+          for (int i = 0; i < have; i++) {
+            unsigned long long v = g_ep_skew_span[i];
+            ssum += v;
+            if (v > smx) {
+              smx = v;
+            }
+          }
+          // span = gpu_last - earliest slice_last: the total W2 tail spread.
+          // No per-slice scheme can claim more than this.
+          printf("[EPSKEW] span mean=%.3f max=%.3f\n",
+                 (double)ssum / have / 100.0,
+                 (double)smx / 100.0);
         }
       }
 #endif
@@ -2275,6 +2572,22 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               int n_tile_start = (int)task_desc->task_metadata.n_tile_start;
               int n_tile_count = (int)task_desc->task_metadata.n_tile_count;
               int my_tiles = 0;
+
+              // Rebase the host-stamped layer index onto the run-monotonic
+              // counter the fused kernel's barriers require -- the same value
+              // the replay loop computes, (iter-1)*num_layers + layer. The
+              // barrier counters are never reset, so a per-iteration index
+              // would satisfy every layer's release from iteration 1 onward.
+              // task_desc points at a reused shared-memory slot, so the store
+              // must be visible block-wide before any worker enters the task.
+              if (threadIdx.x == 0 && config.ml_scanned_layers > 0) {
+                int stamped_layer = task_desc->task_metadata._linear_reserved;
+                task_desc->task_metadata._linear_reserved =
+                    (int32_t)((pc_iter - 1) * config.ml_scanned_layers +
+                              stamped_layer);
+              }
+              __syncthreads();
+
               for (int t = block_xcd_local_rank; t < n_tile_count;
                    t += block_workers_on_xcd) {
                 _execute_gang_task(task_desc, config, n_tile_start + t);
@@ -3557,8 +3870,15 @@ __global__ void scheduler_kernel(RuntimeConfig config) {
 template <typename DT>
 DT *gpu_malloc(size_t size) {
   void *dst_ptr;
-#ifdef USE_NVSHMEM
+#if defined(USE_NVSHMEM)
   dst_ptr = nvshmem_malloc(size);
+#elif defined(USE_ROCSHMEM)
+  // Multi-GPU: buffers reached by a cross-PE put+signal (notably
+  // all_event_counters, the inter-GPU event-trigger counters) MUST live in the
+  // symmetric heap so a remote PE's signal lands at the matching offset. A
+  // plain hipMalloc here would make those addresses non-symmetric and corrupt
+  // the remote signal, silently yielding wrong allreduce results.
+  dst_ptr = mpk_shmem_malloc(size);
 #else
   (void)cudaMalloc(&dst_ptr, size);
 #endif
@@ -3566,8 +3886,10 @@ DT *gpu_malloc(size_t size) {
 }
 
 void gpu_free(void *ptr) {
-#ifdef USE_NVSHMEM
+#if defined(USE_NVSHMEM)
   nvshmem_free(ptr);
+#elif defined(USE_ROCSHMEM)
+  mpk_shmem_free(ptr);
 #else
   (void)cudaFree(ptr);
 #endif
@@ -3753,6 +4075,38 @@ extern "C" void set_rope_tables(void *cos_ptr, void *sin_ptr) {
   global_runtime_config.rope_sin_ptr = sin_ptr;
 }
 
+// Diagnostic: copy `nbytes` from the `index`-th symmetric-heap allocation
+// (allocation order recorded in mpk_shmem_alloc_registry) into device buffer
+// `dst`. Returns 0 on success, -1 on bad index / size. Used by --verify to
+// snapshot the post-allreduce mlp_final tensor -- a symmetric-heap tensor with
+// no torch backing, so the Python side cannot otherwise read it.
+extern "C" int mpk_read_shmem_alloc(int index, void *dst, size_t nbytes) {
+  auto &reg = mpk_shmem_alloc_registry();
+  if (index < 0 || index >= (int)reg.size()) {
+    return -1;
+  }
+  if (nbytes > reg[index].second || reg[index].first == nullptr) {
+    return -1;
+  }
+  (void)cudaMemcpy(dst, reg[index].first, nbytes, cudaMemcpyDeviceToDevice);
+  (void)cudaDeviceSynchronize();
+  return 0;
+}
+
+// Diagnostic: number of recorded symmetric-heap allocations.
+extern "C" int mpk_num_shmem_allocs() {
+  return (int)mpk_shmem_alloc_registry().size();
+}
+
+// Diagnostic: byte size of the index-th symmetric-heap allocation, or 0.
+extern "C" unsigned long long mpk_shmem_alloc_size(int index) {
+  auto &reg = mpk_shmem_alloc_registry();
+  if (index < 0 || index >= (int)reg.size()) {
+    return 0ULL;
+  }
+  return (unsigned long long)reg[index].second;
+}
+
 extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
                                        void *profiler_buffer,
                                        int my_rank,
@@ -3801,6 +4155,19 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   int npes = nvshmem_n_pes();
   int mype_node = nvshmem_team_my_pe(NVSHMEMX_TEAM_NODE);
   printf("mype(%d) npes(%d) mype_node(%d)\n", mype, npes, mype_node);
+#elif defined(USE_ROCSHMEM)
+  // rocSHMEM bootstraps MPI internally; the target device must already be
+  // selected (the cudaSetDevice above) before rocshmem_init().
+  rocshmem::rocshmem_init();
+  rocshmem::rocshmem_barrier_all();
+  int mype = rocshmem::rocshmem_my_pe();
+  int npes = rocshmem::rocshmem_n_pes();
+  printf("mype(%d) npes(%d)\n", mype, npes);
+  // rocSHMEM's IPC init (symmetric-heap reservation + peer-access enable) can
+  // leave the current HIP device != my_rank, unlike NVSHMEM which preserves it.
+  // Re-assert it so the subsequent device-to-device weight staging (which reads
+  // this rank's torch tensors on device my_rank) runs on the right device.
+  (void)cudaSetDevice(my_rank);
 #else
   int mype = 0;
   int npes = 1;
@@ -3832,6 +4199,24 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   std::vector<EventDesc> all_events;
   std::vector<TaskId> first_tasks;
   _init_persistent_kernel(all_fulltasks, all_events, first_tasks, npes, mype);
+
+  // Sample the symmetric-heap peer deltas now that _init_persistent_kernel has
+  // done every mpk_shmem_malloc. This is what lets the EP combine translate a
+  // local symmetric address to its peer with an add instead of a call into
+  // rocshmem_ptr on the hot path -- see mpk_comm.cuh. Any recorded symmetric
+  // allocation serves as the probe; the delta is heap-wide, not per-object.
+  {
+    auto &reg = mpk_shmem_alloc_registry();
+    void *probe = nullptr;
+    for (auto const &a : reg) {
+      if (a.first != nullptr) {
+        probe = a.first;
+        break;
+      }
+    }
+    mpk_shmem_init_peer_deltas(probe);
+  }
+
   std::vector<TaskDesc> all_tasks;
   for (auto const &ft : all_fulltasks) {
     TaskDesc task_desc(ft);
@@ -3959,6 +4344,62 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
            n_tasks_pre,
            n_events_pre);
     fflush(stdout);
+
+    // Multi-layer replay is only legal when the fused layers are back-to-back.
+    // The replay loop runs all 36 layers inside ONE task without returning to
+    // the scheduler, so it cannot execute anything the graph placed *between*
+    // layers. Compaction then deletes layers 1..35, and whatever sat between
+    // them keeps its dependent events -- events nothing triggers any more. The
+    // graph stalls with N-1 dead events and no error.
+    //
+    // This is exactly what expert-parallel MoE does: it inserts a
+    // residual-fold + allreduce after every layer's combine. Detect the gap
+    // and fall back to per-layer dispatch (slower, but the graph runs).
+    // Stamp each fused task with its layer index.
+    //
+    // The fused kernel derives every barrier release value from
+    // task_layer_idx == task_metadata._linear_reserved (see the layer-counter
+    // discussion in gang_full_layer_fused_mi300.cuh). Until now the ONLY
+    // writer of that field was the replay loop, so on the per-layer dispatch
+    // path the kernel read whatever the host happened to leave in the union --
+    // and waited on epoch values no producer would ever reach. Stamping here
+    // makes the field meaningful on both paths; replay overwrites it with the
+    // same number.
+    global_runtime_config.ml_scanned_layers = ml_layers;
+    for (int L = 0; L < ml_layers; L++) {
+      for (int xcd = 0; xcd < NUM_XCDS_ML; xcd++) {
+        all_tasks[fused_layer_positions[L] + xcd]
+            .task_metadata._linear_reserved = L;
+      }
+    }
+
+    // MPK_ML_REPLAY=0 forces the fallback on a graph that would otherwise
+    // qualify. This is the only way to run the per-layer fused dispatch path
+    // on a config where replay is legal, which is what isolates a bug in that
+    // path from a bug in whatever made replay illegal.
+    {
+      char const *rep = getenv("MPK_ML_REPLAY");
+      if (rep && atoi(rep) == 0 && ml_layers > 1) {
+        printf("[MPK] Multi-layer table: DISABLED by MPK_ML_REPLAY=0\n");
+        fflush(stdout);
+        ml_layers = 1;
+      }
+    }
+
+    int inter_layer_gap = 0;
+    for (int L = 1; L < ml_layers; L++) {
+      size_t gap = fused_layer_positions[L] -
+                   (fused_layer_positions[L - 1] + NUM_XCDS_ML);
+      inter_layer_gap += (int)gap;
+    }
+    if (ml_layers > 1 && inter_layer_gap > 0) {
+      printf("[MPK] Multi-layer table: DISABLED -- %d task(s) sit between "
+             "fused layers (per-layer collectives?). Replay would delete "
+             "them; falling back to per-layer dispatch.\n",
+             inter_layer_gap);
+      fflush(stdout);
+      ml_layers = 1; // skip compaction below
+    }
 
     if (ml_layers > 1) {
       // Build per-XCD pointer tables from all layers BEFORE compaction
@@ -4257,6 +4698,7 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   }
 #else
   global_runtime_config.ml_num_layers = 0;
+  global_runtime_config.ml_scanned_layers = 0;
 #endif // MPK_FUSED_LAYER_BATCHING
 
   // =========================================================================
@@ -4383,6 +4825,31 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
           h_gang_dispatch_count[tev_idx] += dispatch_count;
         }
       }
+    }
+
+    // Sort each worker's queue into task-index order.
+    //
+    // Workers execute their queue strictly front-to-back and block on each
+    // task's dependency event, so a queue whose order disagrees with the
+    // graph's topological order deadlocks: the worker parks on a late task
+    // while an earlier one -- which some other worker is waiting on -- sits
+    // behind it, unreachable.
+    //
+    // The queues are built by iterating event groups, and event index order is
+    // NOT topological with respect to task index. On the single-fused-layer
+    // graphs this never showed, because compaction left one event group per
+    // stage and the orders coincided. Under expert parallelism there are ~100
+    // groups per layer and they do not: 8 workers (one per XCD) were observed
+    // parked on a layer-4 collective while 97 others spun in layer 4's
+    // monolith barriers short_by=1, waiting on exactly those 8.
+    //
+    // dfs_create_events_add_tasks assigns task indices in dependency order, so
+    // ascending task index is a valid topological order and sorting is enough.
+    // begin_task_graph (position 1) and the orphans are already ahead of the
+    // main range by index, so this does not disturb them.
+    for (int i = 0; i < total_template_entries; i++) {
+      size_t *q = h_tmpl.data() + (size_t)i * max_tpw;
+      std::sort(q, q + h_tmpl_len[i]);
     }
 
     int gang_barrier_events = 0;
@@ -4861,9 +5328,9 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
                                  cudaEventDisableTiming);
 
   init_request_resources();
-#ifdef USE_NVSHMEM
+#if defined(USE_NVSHMEM) || defined(USE_ROCSHMEM)
   // Add a global barrier for all init_kernel to complete
-  nvshmem_barrier_all();
+  mpk_shmem_barrier_all();
 #endif
 }
 
@@ -4881,8 +5348,8 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                                        end_of_task_graph_event_pos);
     (void)cudaEventRecord(global_runtime_config.prepare_done_event,
                           default_stream);
-#ifdef USE_NVSHMEM
-    nvshmem_barrier_all();
+#if defined(USE_NVSHMEM) || defined(USE_ROCSHMEM)
+    mpk_shmem_barrier_all();
 #endif
   }
   int num_schedulers = global_runtime_config.num_local_schedulers +
@@ -5275,6 +5742,25 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                       break;
                     case 90:
                       pn = "P9-layer-done";
+                      break;
+                    // Phase 9's sub-stages. A hang here is a collective hang,
+                    // and which stage it is decides where to look: 9a is the
+                    // GPU-wide MoE arrival, 9b/9c the fold + peer store, 9d
+                    // the self/peer signal wait, 9e the last-layer exit.
+                    case 91:
+                      pn = "P9a-moe-arrive";
+                      break;
+                    case 92:
+                      pn = "P9bc-fold-release";
+                      break;
+                    case 93:
+                      pn = "P9bc-folding";
+                      break;
+                    case 94:
+                      pn = "P9d-sig-wait";
+                      break;
+                    case 95:
+                      pn = "P9e-exit";
                       break;
                   }
                 }
@@ -5734,9 +6220,9 @@ extern "C" void finalize_persistent_kernel() {
   }
   gpu_free(global_runtime_config.sched_queues);
   gpu_free(global_runtime_config.first_tasks);
-#ifdef USE_NVSHMEM
-  nvshmem_barrier_all();
-  nvshmem_finalize();
+#if defined(USE_NVSHMEM) || defined(USE_ROCSHMEM)
+  mpk_shmem_barrier_all();
+  mpk_shmem_finalize();
 #endif
   // Free worker and scheduler streams
   (void)cudaEventDestroy(global_runtime_config.prepare_done_event);

@@ -22,18 +22,25 @@
 //   signal Phase 6: Cross-XCD barrier — all 30 workers poll attn_global Phase
 //   7: O-proj + RMSNorm + Router + TopK Phase 8: MoE (W13+SwiGLU+W2)
 //
+//   Phase 9: EP combine       — expert-parallel only; see below
+//
 // Counter buffer slot map (extends type 215's layout):
 //   oproj_counters_ptr + 0..18*16-1  : type 215's counters
 //   oproj_counters_ptr + 19*16       : attn_global_counter (cross-XCD sync)
 //   oproj_counters_ptr + 20*16       : qkv_epoch[0..7] per-XCD epoch flags
 //   oproj_counters_ptr + 28*16       : chunk_barrier[0..7] per-XCD chunk
 //   arrival
+//   oproj_counters_ptr + 36*16       : attn_xcd_release[0..7]
+//   oproj_counters_ptr + 768         : ep_moe_done   (EP: global MoE arrival)
+//   oproj_counters_ptr + 784 (+4 ea) : ep_combine_release[0..7] (EP)
+//   oproj_counters_ptr + 816 (+4 ea) : ep_fold_done[0..7]       (EP)
 //
 // Stack-frame optimization: input/output pointers are NOT unpacked into
 // local variables. Instead, input_ptrs[N] and output_ptrs[N] are accessed
 // directly, saving ~272 bytes of stack frame per thread.
 
 #pragma once
+#include "comm/mpk_comm.cuh"
 #include "tasks/mi300/gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh"
 #include "tasks/mi300/gang_moe_fused_mxfp4_mi300.cuh"
 #include "tasks/mi300/gang_rmsnorm_linear_mxfp4_bias_mi300.cuh"
@@ -45,6 +52,325 @@ static constexpr int FULL_LAYER_ATTN_GLOBAL_COUNTER_SLOT = 19 * 16;
 static constexpr int FULL_LAYER_QKV_EPOCH_SLOT = 20 * 16;
 static constexpr int FULL_LAYER_CHUNK_BARRIER_SLOT = 28 * 16;
 static constexpr int FULL_LAYER_ATTN_XCD_RELEASE_SLOT = 36 * 16;
+// Phase 9 (expert-parallel combine) barrier slots. Same 16-int (64-byte)
+// per-XCD spacing as every other barrier here, so no two XCDs share a line.
+// These push the counter buffer past the 832 ints the non-EP path allocates;
+// demo.py sizes it to EP_COUNTER_SIZE when the inline combine is on.
+static constexpr int FULL_LAYER_EP_MOE_DONE_SLOT = 48 * 16;      // 768
+static constexpr int FULL_LAYER_EP_RELEASE_SLOT = 49 * 16;       // 784..896
+static constexpr int FULL_LAYER_EP_FOLD_DONE_SLOT = 58 * 16;     // 928..1040
+// Nine lines, not eight: [0] is the accumulator the 8 slice-reducers count into
+// and [1+x] is XCD x's release flag. The reduce is sliced across XCDs, so an
+// XCD's own completion no longer means the residual is whole.
+static constexpr int FULL_LAYER_EP_COMBINE_DONE_SLOT = 67 * 16;  // 1072..1216
+// Per-XCD MoE arrival counters for the two-level 9a tree. One 64-byte line per
+// XCD, so the 30 workers of an XCD contend only with each other.
+static constexpr int FULL_LAYER_EP_XCD_ARRIVE_SLOT = 77 * 16;    // 1232..1344
+static constexpr int FULL_LAYER_EP_XCD_STRIDE = 16;
+// Highest int the EP phase touches, + one slot of headroom. Kept next to the
+// slots so the two cannot drift apart; demo.py asserts against it indirectly
+// by allocating this many ints.
+static constexpr int FULL_LAYER_EP_COUNTER_SIZE = 86 * 16;       // 1376
+// Stride between per-PE signal slots, in uint64. One 64-byte line each so a
+// peer's SIGNAL_ADD never shares a line with another peer's.
+static constexpr int FULL_LAYER_EP_SIGNAL_STRIDE = 8;
+
+// Hoisted from the Phase 9 block: MPK_EP_WAIT_AT_USE's wait sits in Phase 1,
+// upstream of where this used to be defined, and must not compile in under an
+// ablation that suppresses the peer signal it waits on.
+#ifndef MPK_EP_ABLATE
+#define MPK_EP_ABLATE 0
+#endif
+
+// Move Phase 9d's peer wait to its point of use in the next layer's QKV
+// prologue. Both placements are correct -- see the long comment at the Phase 1
+// site -- so this is a pure scheduling knob, not an ablation. Forced off under
+// any ablation that drops the peer store (1, 5) or Phase 9 as a whole (2):
+// with nothing signalling, a deferred wait would spin forever.
+#ifndef MPK_EP_WAIT_AT_USE
+#define MPK_EP_WAIT_AT_USE 0
+#endif
+#if MPK_EP_ABLATE != 0
+#undef MPK_EP_WAIT_AT_USE
+#define MPK_EP_WAIT_AT_USE 0
+#endif
+
+// 9a's release hop, removed: the 8 folding workgroups poll the GPU-wide
+// arrival counter directly instead of a flag the closer publishes.
+//
+// Today the span between the last W2 tile on the GPU and the first byte of
+// folding is four serialized round trips: the last worker's per-XCD atomic,
+// its XCD leader's global atomic, the closer's 8 write-through release stores
+// plus their vmcnt drain, and the poller's load of the flag. The middle two
+// exist only to convert "the counter reached 8N" into "a flag says so" -- and
+// the counter is already a device-scope location every XCD can read.
+//
+// So the closer publishes nothing and each XCD's workgroup 0 spins on
+// ep_moe_done >= 8 * ep_expected. Same predicate, same instant, two fewer
+// hops. This is the transferable half of Kog's sentinel-polling result (poll
+// the thing itself, not a flag about it); the literal form does not apply
+// here, because 9a's payload is an f32 workspace accumulated by atomicAdd and
+// no value in it distinguishes "complete" from "partially summed".
+//
+// Correctness is unchanged and does not rest on the flag. What orders the W2
+// atomicAdds ahead of the fold is each worker's own s_waitcnt vmcnt(0) before
+// its arrival atomic (retires its stores to the coherence point) and the
+// buffer_inv the folder issues before reading the workspace. The flag never
+// carried data; it only carried the count, which is what is now read directly.
+//
+// The failure mode if the counter is NOT visible off-XCD is a hang, not a
+// wrong answer -- the poll simply never satisfies. Forced off under any
+// ablation: MPK_EP_ABLATE=3 drops the cross-XCD atomic entirely, so the
+// counter never reaches the threshold and the poll would spin forever.
+//
+// MEASURED NULL, and a large one: 2.219 vs 2.138 ms/token on the same day,
+// +2.25 us per layer -- the opposite sign and four times the size of the two
+// hops it removes. The reason is the thing the comment above got wrong. The
+// 8 pollers do not just read the line, they read it in a spin loop with
+// `nt` (uncached, so every trip is a fresh coherence request) while the 8 XCD
+// leaders are trying to land read-modify-writes on it. A load is not a
+// coherence transaction, but a continuous stream of uncached loads to the
+// line an atomic is queued on absolutely does delay that atomic. Separate
+// release lines were never redundant with the arrival line; the separation is
+// what keeps the poll traffic off the critical RMW.
+//
+// This also prices the general shape: any "poll the thing itself" rewrite on
+// this hardware has to check that the thing is not also an atomic target.
+// Kog's sentinel result holds for data buffers, where the producer's stores
+// are plain writes and the poll contends with nothing.
+//
+// Kept, default off, because the negative result is what rules it out.
+#ifndef MPK_EP9_DIRECT
+#define MPK_EP9_DIRECT 0
+#endif
+#if MPK_EP_ABLATE != 0
+#undef MPK_EP9_DIRECT
+#define MPK_EP9_DIRECT 0
+#endif
+
+// Fold this rank's MoE partial out of the f32 workspace into bf16, optionally
+// adding the residual, and zero the workspace.
+//
+// This is moe_residual_add_f32_mi300_impl's job, but that kernel always adds a
+// residual, so the non-folding ranks would need a zero buffer plumbed through
+// the graph purely to be added to nothing. FOLD is a template parameter here
+// instead, so the add compiles away on the ranks that must not perform it and
+// no zero_residual tensor is needed.
+//
+// Zeroing is not incidental: the next layer's QKV prologue computes
+// x = workspace_f32 + residual, and under EP the complete sum is handed to it
+// as `residual`. The workspace must therefore read as zero, or this layer's
+// partial would be counted twice.
+// peer_out, when non-null, is this same slot's address in the PEER's address
+// space (mpk_shmem_peer_ptr). Each thread stores the value it just computed to
+// both places, so the cross-GPU transfer is the fold's own epilogue: no staging
+// buffer to re-read, no DMA descriptor, no separate transfer step to wait on.
+// The remote store is write-through (sc0 sc1) because the peer must observe it
+// without a flush of this rank's L2 -- the same reason every cross-XCD release
+// flag here is st_wt_u32.
+// col_lo/col_hi restrict the fold to a column slice, so the 8 XCD workgroups
+// that are awake anyway can each take 1/8 of the work instead of one workgroup
+// doing all of it while 239 workers idle. The slices are disjoint, so no
+// coordination is needed between them beyond the arrival count that follows.
+// NPEER is the number of remote copies to publish to, i.e. EP_WORLD_SIZE - 1.
+// At NPEER == 1 this is byte-for-byte the two-GPU path it generalizes; the
+// loops below all collapse under #pragma unroll at that count.
+//
+// Why a wider world does not need a wider mechanism: the transfer is the
+// fold's epilogue, so an extra peer is an extra st_wt_u32 issued from the same
+// thread in the same iteration, on an address that differs only by that peer's
+// heap delta. Those stores are fire-and-forget writes to distinct XGMI links
+// and they pipeline -- the wave issues all NPEER of them and drains once. That
+// is the whole reason a direct path scales where the staged one does not: a
+// staged putmem_signal is a work-group collective, so N-1 peers cost N-1
+// sequential collectives, while N-1 direct stores cost one drain.
+template <int BATCH_SIZE,
+          int OUTPUT_SIZE,
+          int OUTPUT_STRIDE,
+          bool FOLD,
+          int NPEER = 1>
+__device__ __forceinline__ void _full_layer_ep_fold_partial(
+    void *workspace_f32_ptr, void const *residual_ptr, void *output_ptr,
+    void *const *peer_out_ptrs = nullptr, int col_lo = 0,
+    int col_hi = OUTPUT_SIZE) {
+  float *__restrict__ d_ws = static_cast<float *>(workspace_f32_ptr);
+  unsigned short const *__restrict__ d_res =
+      static_cast<unsigned short const *>(residual_ptr);
+  unsigned short *__restrict__ d_out =
+      static_cast<unsigned short *>(output_ptr);
+  unsigned short *d_peer[NPEER];
+#pragma unroll
+  for (int q = 0; q < NPEER; ++q) {
+    d_peer[q] = peer_out_ptrs
+                    ? static_cast<unsigned short *>(peer_out_ptrs[q])
+                    : nullptr;
+  }
+
+  for (int row = 0; row < BATCH_SIZE; ++row) {
+    float *ws_row = d_ws + row * OUTPUT_STRIDE;
+    unsigned short const *res_row = d_res + row * OUTPUT_STRIDE;
+    unsigned short *out_row = d_out + row * OUTPUT_STRIDE;
+    unsigned short *peer_row[NPEER];
+#pragma unroll
+    for (int q = 0; q < NPEER; ++q) {
+      peer_row[q] = d_peer[q] ? d_peer[q] + row * OUTPUT_STRIDE : nullptr;
+    }
+    // Two bf16 per thread per step, so the remote store is a 32-bit write
+    // rather than two 16-bit ones. A 2-byte store still occupies a full XGMI
+    // transaction, so the narrow form would double the packet count for the
+    // same payload. OUTPUT_SIZE is the padded hidden dim (even); the odd tail
+    // below exists only so the helper stays correct for any width.
+    int const pair_lo = col_lo >> 1;
+    int const pair_hi = col_hi >> 1;
+    for (int p = pair_lo + threadIdx.x; p < pair_hi; p += blockDim.x) {
+      int off = p << 1;
+      unsigned packed = 0;
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        float v = ws_row[off + j];
+        if constexpr (FOLD) {
+          unsigned rbits = (unsigned)res_row[off + j] << 16;
+          float rv;
+          __builtin_memcpy(&rv, &rbits, 4);
+          v += rv;
+        }
+        unsigned u;
+        __builtin_memcpy(&u, &v, 4);
+        unsigned rounding_bias = ((u >> 16) & 1) + 0x7FFFu;
+        unsigned short bf = (unsigned short)((u + rounding_bias) >> 16);
+        packed |= ((unsigned)bf) << (16 * j);
+      }
+      // The LOCAL slot is written write-through too, as one 32-bit store rather
+      // than two 16-bit ones -- `packed` is already assembled for the peer.
+      //
+      // The point is not the store width, it is what write-through lets the
+      // caller drop. This slot's consumer is the next layer's QKV prologue on
+      // every XCD, so a plain store needs an agent-scope release to become
+      // visible, and threadfence_gpu() on gfx950 is `buffer_wbl2 sc1` -- an
+      // L2->HBM writeback of the WHOLE cache, run by all 8 folding workgroups
+      // on all 36 layers. st_wt puts these bytes past L2 on the store itself,
+      // which is the only data the fence was there to publish (the workspace
+      // zeroing below is read back by this same XCD's Phase 8 atomicAdds, and
+      // those go through L2 anyway).
+      st_wt_u32((void *)&out_row[off], packed);
+      // The zeroing has to be write-through for the same reason, and it is the
+      // one that makes dropping the fence sound. Its consumer is the next
+      // layer's Phase 8 atomicAdd, and a W2 tile writing these columns can land
+      // on ANY XCD -- the tile->column map is by wg_idx, not by XCD -- so a
+      // plain store into this XCD's L2 is not enough. Two floats, one 8-byte
+      // store, the same pair the fold just read.
+      st_wt_u64((void *)&ws_row[off], 0ull);
+      // All NPEER remote copies issued back to back, then one drain at the
+      // call site. Distinct peers are distinct XGMI links, so these overlap.
+#pragma unroll
+      for (int q = 0; q < NPEER; ++q) {
+        if (peer_row[q]) {
+          st_wt_u32((void *)&peer_row[q][off], packed);
+        }
+      }
+    }
+    if ((OUTPUT_SIZE & 1) && threadIdx.x == 0 && col_hi == OUTPUT_SIZE) {
+      int off = OUTPUT_SIZE - 1;
+      float v = ws_row[off];
+      if constexpr (FOLD) {
+        unsigned rbits = (unsigned)res_row[off] << 16;
+        float rv;
+        __builtin_memcpy(&rv, &rbits, 4);
+        v += rv;
+      }
+      unsigned u;
+      __builtin_memcpy(&u, &v, 4);
+      unsigned rounding_bias = ((u >> 16) & 1) + 0x7FFFu;
+      unsigned short bf = (unsigned short)((u + rounding_bias) >> 16);
+      st_wt_u16((void *)&out_row[off], bf);
+      st_wt_u32((void *)&ws_row[off], 0u);
+#pragma unroll
+      for (int q = 0; q < NPEER; ++q) {
+        if (peer_row[q]) {
+          st_wt_u16((void *)&peer_row[q][off], bf);
+        }
+      }
+    }
+  }
+}
+
+// Wait until every OTHER PE's slot of the symmetric gather buffer has landed
+// for this layer. Single-threaded; the caller decides which thread runs it.
+//
+// At world size 2 this is one plain non-temporal load in a loop rather than a
+// call into rocSHMEM: the direct peer store and rocSHMEM's SIGNAL_ADD land at
+// the same symmetric address, and ld_nt_u64 observes it past the local cache
+// hierarchy either way, which was the only reason the backend primitive was
+// needed. Wider worlds keep the staged path.
+//
+// Many workers may poll the same address concurrently and that is fine: a load
+// is not a coherence transaction the way an atomic is, and the line is
+// read-only until its one writer touches it once per layer. The 240-deep
+// arrival tree in 9a exists because atomicAdds to one address serialize; reads
+// to one address do not.
+// ep_direct selects the poll shape, not the world size. Under direct peer
+// stores every peer writes its own signal line with st_wt_u64 and this is a
+// plain load either way; the staged path needs the backend primitive because
+// its signal arrives as a SIGNAL_ADD through rocSHMEM.
+template <int EP_WORLD_SIZE, int EP_MY_PE>
+__device__ __forceinline__ void
+    _full_layer_ep_wait_peers(uint64_t *ep_signal, uint64_t ep_sig_expected,
+                              bool ep_direct = false) {
+  if constexpr (EP_WORLD_SIZE == 2) {
+    uint64_t *peer_sig =
+        ep_signal + (size_t)(1 - EP_MY_PE) * FULL_LAYER_EP_SIGNAL_STRIDE;
+    while (ld_nt_u64(reinterpret_cast<unsigned long long *>(peer_sig)) <
+           (unsigned long long)ep_sig_expected) {
+      __builtin_amdgcn_s_sleep(1);
+    }
+  } else if (ep_direct) {
+    // Wait on all peers CONCURRENTLY, not one after another.
+    //
+    // The sequential form below is correct but it serializes the wait: peer 1
+    // is not even looked at until peer 0 has landed, so the observed cost is
+    // the sum of the per-peer detection latencies rather than the max. The
+    // peers are independent producers writing independent lines -- nothing
+    // orders them -- so the right shape is one pass over all lines per poll
+    // round, exiting when the slowest is in.
+    //
+    // Correctness is the same predicate: this returns only when every peer's
+    // line has reached the threshold. `remaining` is a bitmask rather than a
+    // counter so a line that satisfies early is not re-read on later rounds.
+    unsigned remaining = 0;
+#pragma unroll
+    for (int p = 0; p < EP_WORLD_SIZE; p++) {
+      if (p != EP_MY_PE) {
+        remaining |= (1u << p);
+      }
+    }
+    while (remaining) {
+#pragma unroll
+      for (int p = 0; p < EP_WORLD_SIZE; p++) {
+        if (remaining & (1u << p)) {
+          uint64_t *sp = ep_signal + (size_t)p * FULL_LAYER_EP_SIGNAL_STRIDE;
+          if (ld_nt_u64(reinterpret_cast<unsigned long long *>(sp)) >=
+              (unsigned long long)ep_sig_expected) {
+            remaining &= ~(1u << p);
+          }
+        }
+      }
+      if (remaining) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+  } else {
+    // Staged fallback: one transfer per peer carries the whole slot and
+    // signals slot 0 of p's line, so every waiter watches that one slot.
+    for (int p = 0; p < EP_WORLD_SIZE; p++) {
+      if (p == EP_MY_PE) {
+        continue;
+      }
+      mpk_shmem_signal_wait_ge(
+          ep_signal + (size_t)p * FULL_LAYER_EP_SIGNAL_STRIDE,
+          ep_sig_expected);
+    }
+  }
+}
 
 template <int QKV_BATCH_SIZE,
           int QKV_OUTPUT_PER_WG,
@@ -68,7 +394,45 @@ template <int QKV_BATCH_SIZE,
           int MOE_HIDDEN_SIZE,
           int MOE_W13_OUTPUT_PER_WG,
           int MOE_W2_OUTPUT_PER_WG,
-          bool DECODE_ONLY = false>
+          bool DECODE_ONLY = false,
+          // Expert-parallel ownership. This rank computes only experts in
+          // [MOE_EXPERT_BASE, MOE_EXPERT_BASE + MOE_NUM_LOCAL_EXPERTS) and its
+          // weight/bias arrays hold only those, indexed by local id. Defaults
+          // are the single-GPU / replicated-MoE identity, so every existing
+          // instantiation is unchanged.
+          int MOE_EXPERT_BASE = 0,
+          int MOE_NUM_LOCAL_EXPERTS = NUM_EXPERTS,
+          // Inline expert-parallel combine (Phase 9). EP_WORLD_SIZE == 1 is
+          // the single-GPU / replicated-MoE identity: Phase 9 compiles away
+          // entirely, so every existing instantiation is unchanged and pays
+          // nothing. EP_MY_PE is this rank; EP_FOLD_PE is the one rank that
+          // folds the real residual into its partial, so that after the SUM
+          // the residual appears exactly once.
+          int EP_WORLD_SIZE = 1,
+          int EP_MY_PE = 0,
+          int EP_FOLD_PE = 0,
+          // Slot-parallel expert split (see gang_moe_fused_mxfp4_mi300.cuh).
+          // Replaces the id-range split when > 1; requires replicated weights.
+          int EP_SLOT_WS = 1,
+          int EP_SLOT_ME = 0,
+          // The EP reduction, dissolved into this layer's QKV prologue.
+          //
+          // > 1 means input_ptrs[26] is the PREVIOUS layer's symmetric gather
+          // buffer -- [EP_PREV_SLOTS, batch, QKV_REDUCTION_SIZE], one slot per
+          // rank holding that rank's partial -- and Phase 1 reads it in place
+          // of input_ptrs[1], summing the slots in the same pass it already
+          // makes over that vector to compute the sum of squares. There is no
+          // separate reduce and no barrier around one.
+          //
+          // Layer 0 has no predecessor and so passes 1: its residual is the
+          // embedding, an ordinary 2-D tensor in input_ptrs[1].
+          int EP_PREV_SLOTS = 1,
+          // Whether this layer's Phase 9 also materializes the sum into
+          // output_ptrs[11]. Only the LAST layer needs it, because the tail
+          // (final RMSNorm + LM head) is a separate task that reads a plain 2-D
+          // tensor and has no slot-summing prologue to fold the reduce into.
+          // Every other layer leaves the exchange as the last thing it does.
+          bool EP_WRITE_COMBINED = false>
 __device__ __noinline__ void
     gang_full_layer_fused_kernel_mi300(void *const *input_ptrs,
                                        void *const *output_ptrs,
@@ -104,12 +468,15 @@ __device__ __noinline__ void
   //  [15] logits_scratch   [16] oproj_counters   [17] moe_gate_up_weight
   //  [18] moe_down_weight  [19] moe_w13_bias     [20] moe_w2_bias
   //  [21] moe_barrier      [22] moe_swiglu_out   [23] o_acc_f32
+  //  [24] ep_gather        [25] ep_signal   (EP_WORLD_SIZE > 1 only; both are
+  //                                          symmetric-heap allocations)
   //
   // output_ptrs layout:
   //  [0] x_output         [1] k_cache           [2] v_cache
   //  [3] q_workspace      [4] o_acc             [5] attn_proj_out
   //  [6] topk_weight      [7] routing_indices   [8] active_expert_ids
   //  [9] moe_routing_weight [10] moe_workspace_f32
+  //  [11] ep_combined     (EP_WORLD_SIZE > 1 only)
 
   int xcd_id;
   asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)" : "=s"(xcd_id));
@@ -130,6 +497,13 @@ __device__ __noinline__ void
   unsigned long long _fused_t0 = __builtin_amdgcn_s_memrealtime();
   unsigned long long _fused_t0a = 0, _fused_t0b = 0, _fused_t0c = 0,
                      _fused_t0d = 0, _merge_done = 0;
+  // Phase 9 (inline EP combine) sub-timestamps. Taken on a CORRECT run --
+  // this is what prices the collective without the ablations' routing drift.
+  //   _ep_t0 entry (MoE done, this worker)  _ep_t1 after 9a GPU-wide barrier
+  //   _ep_t2 after 9b/9c fold+put           _ep_t3 after 9d wait+reduce
+  //   _ep_t4 after 9e exit barrier
+  unsigned long long _ep_t0 = 0, _ep_t1 = 0, _ep_t2 = 0, _ep_t3 = 0,
+                     _ep_t4 = 0;
 #endif
 
 #ifdef MPK_ENABLE_MOE_SUBPHASE
@@ -194,6 +568,24 @@ __device__ __noinline__ void
   // Because they are all the same per-layer count, all three expected values
   // are the same number.
   int const layer_counter = task_layer_idx;
+#ifdef MPK_PERFETTO
+  // task_layer_idx counts (iteration * num_layers + layer) monotonically, so
+  // it yields both the layer and the iteration to capture. MPK_PERFETTO_ITER
+  // picks a steady-state decode iteration (default 100 -- past warmup, and the
+  // [EP9ARR] dump above uses the same 36*100 point, so the two agree).
+  int const _perf_layer = task_layer_idx % PERF_NLAYER;
+  int const _perf_iter = task_layer_idx / PERF_NLAYER;
+  bool const _perf_cap = (_perf_iter == MPK_PERFETTO_ITER);
+  int const _perf_wid = xcd_id * workers_per_xcd + xcd_rank;
+  if (_perf_cap && tid == 0 && _perf_wid == 0 && _perf_layer == 0) {
+    // First worker of the capture iteration sets the time origin. Other
+    // workers of layer 0 may read it a few hundred ns later; mpk_perf_span
+    // drops any span that starts before it rather than underflowing.
+    g_perf_t0 = _fused_t0;
+    __threadfence();
+    g_perf_armed = 1;
+  }
+#endif
   int const routing_expected = layer_counter + 1;
   int const attn_release_expected = layer_counter + 1;
   int const qkv_epoch_expected = layer_counter + 1;
@@ -242,15 +634,77 @@ __device__ __noinline__ void
   // ══════════════════════════════════════════════════════════════════
   MPK_TW_SUB(10, xcd_rank);
   if (xcd_rank < total_qkv_tiles_per_xcd) {
+    // Under EP the "residual" this prologue reads is the PREVIOUS layer's
+    // symmetric gather buffer, and the prologue performs the cross-rank SUM
+    // itself as part of the pass it already makes over that vector. See
+    // EP_PEER_SLOTS in gang_rmsnorm_linear_mxfp4_bias_mi300.cuh: it is what
+    // lets Phase 9 end at the exchange instead of running a reduce and an exit
+    // barrier after it. Slot 0 of the gather buffer sits exactly where an
+    // ordinary residual would, so the pointer arithmetic is identical and
+    // EP_PREV_SLOTS == 1 (layer 0, or no EP at all) reads it as one.
+    void const *qkv_residual =
+        (EP_PREV_SLOTS > 1) ? input_ptrs[26] : input_ptrs[1];
+
+    // The peer's slot is NOT waited on here by default, even though these 8
+    // workers are its only readers and this is the first instruction that
+    // needs it.
+    //
+    // Moving the wait here was the obvious "dependency at the point of use"
+    // play and it measured slower: 2.542 vs 2.528 ms/token. The reason is
+    // where each placement sits relative to the rest of the layer. At the end
+    // of the previous layer the wait trails everything -- the peer is running
+    // the same layer on the same schedule, so its store has effectively
+    // already landed by the time anyone looks. Here it sits UPSTREAM of the
+    // Phase 2 QKV barrier, which gates all of attention, so any residual
+    // latency serializes with the whole layer instead of overlapping the
+    // layer boundary.
+    //
+    // MPK_EP_WAIT_AT_USE=1 re-tests that placement. The original measurement
+    // was taken at a ~2.53 ms operating point, before the write-through fold
+    // and the two L2-writeback removals; the peer wait is a much larger share
+    // of what remains now, so the balance may have moved. What makes the move
+    // legal at all is that the gather buffers are per-layer (ep_gather_{li} in
+    // demo.py) -- layer i's slot is written only in layer i and read only in
+    // layer i+1, so deferring the wait cannot expose a WAR hazard. The
+    // threshold is layer_counter, not layer_counter + 1: what is awaited is
+    // the PREVIOUS layer's signal, and that layer published (its own
+    // layer_counter) + 1 == this layer's layer_counter.
+    //
+    // Only the local self-wait stays in 9d under this flag. It is not about
+    // the peer at all -- it covers two purely local WAR hazards (the fold
+    // reads attn_proj_out, which the next layer's Phase 7 overwrites, and it
+    // zeroes moe_workspace_f32, which the next layer's Phase 8 atomicAdds
+    // into), so it cannot move to a consumer that touches neither.
+#if MPK_EP_WAIT_AT_USE
+    if constexpr (EP_PREV_SLOTS > 1 && EP_WORLD_SIZE > 1) {
+      if (tid == 0) {
+        uint64_t *_prev_peer_sig = reinterpret_cast<uint64_t *>(input_ptrs[25]) +
+                                   (size_t)(1 - EP_MY_PE) *
+                                       FULL_LAYER_EP_SIGNAL_STRIDE;
+        while (ld_nt_u64(reinterpret_cast<unsigned long long *>(
+                   _prev_peer_sig)) < (unsigned long long)layer_counter) {
+          __builtin_amdgcn_s_sleep(1);
+        }
+      }
+      __syncthreads();
+      // The peer's bytes arrived by write-through store, so they are in HBM,
+      // not in this XCD's L2 -- but a stale line for those addresses may still
+      // sit in this workgroup's vL1 from the previous layer's read of the same
+      // per-layer buffer's neighbours. Plain buffer_inv (no sc1) is the right
+      // scope: vL1 only, leaving L2 alone.
+      asm volatile("buffer_inv" ::: "memory");
+    }
+#endif
     gang_resaddf32_rmsnorm_linear_mxfp4_bias_kvupd_kernel<QKV_BATCH_SIZE,
                                                           QKV_OUTPUT_PER_WG,
                                                           QKV_REDUCTION_SIZE,
                                                           ACTUAL_HIDDEN_DIM,
                                                           HEAD_DIM,
                                                           NUM_Q_PER_KV,
-                                                          PAGE_SIZE>(
+                                                          PAGE_SIZE,
+                                                          EP_PREV_SLOTS>(
         input_ptrs[0],
-        input_ptrs[1],
+        qkv_residual,
         input_ptrs[2],
         input_ptrs[3],
         input_ptrs[4],
@@ -666,9 +1120,21 @@ __device__ __noinline__ void
           // below derives every number from _fused_t0.._fused_t4, which are
           // taken in this function. This used to name a _ts_base that was
           // never declared, so MPK_DEVICE_TIMING=1 did not compile.
-          nullptr);
+          nullptr,
+          // epoch_hint: the same value this function's own Phase 7b poll waits
+          // for. Handing it to the producer lets it skip an uncached read-back
+          // of a counter both sides can derive from the layer index.
+          routing_expected);
     }
   }
+
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+  // Splits Phase 7's [FP18] number into o_proj+router COMPUTE and the Phase 7b
+  // routing_ready WAIT. The two have opposite implications: only the compute
+  // half is replicated work that row-sharding o_proj across EP ranks could
+  // remove, while the wait half would just turn into a longer wait.
+  unsigned long long _fused_t2b = __builtin_amdgcn_s_memrealtime();
+#endif
 
   // ══════════════════════════════════════════════════════════════════
   // Phase 7b: wait for TopK (XCD-local release flag)
@@ -694,11 +1160,33 @@ __device__ __noinline__ void
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
   unsigned long long _fused_t3 = __builtin_amdgcn_s_memrealtime();
+  // Entry spread into Phase 8, measured the same way as the 9a arrival spread.
+  // 9a's spread is 19.4 us; the question this answers is whether MoE CREATES
+  // that skew (entry spread small, exit spread large -> tile imbalance, fix the
+  // partition) or merely INHERITS it (both large -> the skew predates MoE and
+  // no MoE-side balancing helps). Reset by the same closer that reads it.
+  if (threadIdx.x == 0) {
+    atomicMin(&g_ep8_arr_min, _fused_t3);
+    atomicMax(&g_ep8_arr_max, _fused_t3);
+  }
 #endif
 
   // ══════════════════════════════════════════════════════════════════
   // Phase 8: MoE (W13+SwiGLU+W2)
   // ══════════════════════════════════════════════════════════════════
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+  {
+    int _wid = xcd_id * workers_per_xcd + xcd_rank;
+    if (threadIdx.x == 0 && _wid < MOE_OCC_WORKERS) {
+      unsigned long long _n = 0;
+      for (int _t = xcd_rank; _t < moe_total_tiles_per_xcd;
+           _t += workers_per_xcd) {
+        _n++;
+      }
+      atomicAdd(&g_moe_tiles[_wid], _n);
+    }
+  }
+#endif
   for (int moe_t = xcd_rank; moe_t < moe_total_tiles_per_xcd;
        moe_t += workers_per_xcd) {
     MPK_TW_SUB(80, moe_t);
@@ -709,7 +1197,11 @@ __device__ __noinline__ void
                                       NUM_EXPERTS,
                                       TOPK_K,
                                       MOE_W13_OUTPUT_PER_WG,
-                                      MOE_W2_OUTPUT_PER_WG>(input_ptrs[12],
+                                      MOE_W2_OUTPUT_PER_WG,
+                                      MOE_EXPERT_BASE,
+                                      MOE_NUM_LOCAL_EXPERTS,
+                                      EP_SLOT_WS,
+                                      EP_SLOT_ME>(input_ptrs[12],
                                                             input_ptrs[17],
                                                             input_ptrs[18],
                                                             output_ptrs[7],
@@ -723,8 +1215,1017 @@ __device__ __noinline__ void
                                                             moe_t);
   }
 
+  // ══════════════════════════════════════════════════════════════════
+  // Phase 9: inline expert-parallel combine
+  //
+  // Under EP each rank owns MOE_NUM_LOCAL_EXPERTS of the NUM_EXPERTS experts,
+  // so what Phase 8 leaves in moe_workspace_f32 is a PARTIAL weighted sum.
+  // The complete value is the sum across ranks, and the layer's residual must
+  // be added to it exactly once.
+  //
+  // This used to be three dispatched tasks after the monolith --
+  // moe_residual_add_f32 -> identity -> allreduce. That cost two scheduler
+  // round-trips per layer and, worse, put a SECOND gang group between
+  // consecutive monolith dispatches: workers blocked in the collective's gang
+  // barrier while other workers blocked in the next layer's Phase 6 barrier,
+  // each group waiting on the other. It deadlocked. Doing the exchange here
+  // removes the second gang group along with the round-trips: one dispatch
+  // per layer, and the scheduler is not involved in the collective at all.
+  //
+  //   9a  every worker on every XCD arrives -- the partial is only complete
+  //       once the last W2 atomicAdd anywhere on this GPU has landed
+  //   9b  one workgroup folds f32 partial (+ residual on EP_FOLD_PE) to bf16
+  //       into this rank's slot of the symmetric gather buffer, and zeroes
+  //       the workspace for the next layer
+  //   9c  that workgroup puts its slot to every peer and signals
+  //   9d  wait for all peers' slots to arrive AND for 9b's local fold, then
+  //       every XCD's workgroup 0 reduces the gather buffer into the output
+  //   9e  every other worker waits for its XCD's combine before leaving the
+  //       layer -- without this the layer has no exit fence at all
+  //
+  // For EP_WORLD_SIZE == 1 (single GPU, or multi-GPU with replicated MoE) the
+  // whole block compiles away and the next layer's QKV prologue closes out the
+  // workspace exactly as before.
+  // ══════════════════════════════════════════════════════════════════
+  // ── Ablation knobs (MPK_EP_ABLATE, off by default) ──────────────────
+  //
+  // Phase 9 bundles four costs that the end-to-end number cannot separate:
+  // the GPU-wide barrier (9a), the fold, the cross-GPU transfer (9c/9d), and
+  // the exit barrier (9e). These strip them one at a time so each can be
+  // priced. BOTH SETTINGS PRODUCE WRONG OUTPUT -- they exist only to
+  // attribute latency, and every run using them must be reported as such.
+  //
+  //   MPK_EP_ABLATE=1  skip the put and the peer signal-wait. All barriers,
+  //                    the fold and the local reduce stay. The reduce then
+  //                    sums this rank's slot with a stale peer slot, so the
+  //                    answer is garbage but the intra-GPU control flow and
+  //                    every memory access is byte-for-byte the real one.
+  //                    Difference vs. full = cost of the network round trip.
+  //   MPK_EP_ABLATE=2  skip Phase 9 entirely. Experts are still sliced 64/64,
+  //                    so this prices the expert-work SAVING against the DP
+  //                    baseline with none of the combine's cost. Output is a
+  //                    partial sum -- garbage, and the next layer's prologue
+  //                    reads the un-zeroed workspace too.
+  //   MPK_EP_ABLATE=6  keep 9a, the fold and the peer put, but let the 232
+  //                    workers that do NOT fold leave without waiting in 9d.
+  //                    The folding workgroups (xcd_rank == 0) still take the
+  //                    full wait, so the transfer is still ordered; what goes
+  //                    away is 232 workers sitting on a signal for work they
+  //                    never read. Prices the ceiling of ping-pong buffering
+  //                    attn_proj_out / moe_workspace_f32, which is what would
+  //                    make this legal -- both hazards 9d covers are WAR
+  //                    against the NEXT layer's reuse of those two buffers.
+  //                    WRONG OUTPUT as written: with one buffer a fast worker
+  //                    does clobber them.
+#ifndef MPK_EP_ABLATE
+#define MPK_EP_ABLATE 0
+#endif
+  if constexpr (EP_WORLD_SIZE > 1 && MPK_EP_ABLATE != 2) {
+    int *ep_moe_done = oproj_counters_base + FULL_LAYER_EP_MOE_DONE_SLOT;
+    int *ep_release = oproj_counters_base + FULL_LAYER_EP_RELEASE_SLOT;
+    int *ep_fold_done = oproj_counters_base + FULL_LAYER_EP_FOLD_DONE_SLOT;
+    int *ep_combine_done =
+        oproj_counters_base + FULL_LAYER_EP_COMBINE_DONE_SLOT;
+    int *ep_xcd_arrive = oproj_counters_base + FULL_LAYER_EP_XCD_ARRIVE_SLOT;
+    // input_ptrs[24]: [EP_WORLD_SIZE, batch, QKV_REDUCTION_SIZE] bf16
+    // symmetric gather buffer. Slot p holds rank p's folded partial.
+    // input_ptrs[25]: [EP_WORLD_SIZE * 8] uint64 symmetric signal counters.
+    //
+    // QKV_REDUCTION_SIZE, not OPROJ_REDUCTION_SIZE: what is exchanged is a
+    // residual-stream vector (padded hidden), whereas OPROJ_REDUCTION_SIZE is
+    // o_proj's *input* width (num_heads * head_dim).
+    __hip_bfloat16 *ep_gather =
+        reinterpret_cast<__hip_bfloat16 *>(input_ptrs[24]);
+    uint64_t *ep_signal = reinterpret_cast<uint64_t *>(input_ptrs[25]);
+    constexpr size_t EP_SLOT_ELEMS =
+        (size_t)QKV_BATCH_SIZE * QKV_REDUCTION_SIZE;
+    constexpr size_t EP_SLOT_BYTES = EP_SLOT_ELEMS * sizeof(__hip_bfloat16);
+
+    // The release/signal thresholds ride the same run-monotonic layer counter
+    // every other barrier here uses, so nothing is reset between layers and no
+    // worker has to observe a shared value to agree on the target.
+    int const ep_expected = layer_counter + 1;
+    // One signal line per producing PE, and the consumer waits on each line
+    // separately, so a line's threshold is just the layer count -- one arrival
+    // per layer from its one writer. This used to be (EP_WORLD_SIZE - 1) *
+    // ep_expected, which is the same thing at world size 2 and too high at any
+    // larger size: a line would never reach it and the wait would hang.
+    uint64_t const ep_sig_expected = (uint64_t)ep_expected;
+
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+    _ep_t0 = __builtin_amdgcn_s_memrealtime();
+#endif
+
+    MPK_WS_PHASE(91, qkv_epoch_expected, xcd_id);
+    // ── 9a: GPU-wide MoE barrier, as a two-level tree ───────────────────
+    // Every worker, not just this XCD's: W2 tiles for an expert can be
+    // executed by any XCD, so the partial is not complete until all 240 have
+    // finished. vmcnt(0) retires this block's atomicAdds to L2 before the
+    // arrival is visible.
+    //
+    // The arrival used to be a single atomicAdd to ep_moe_done from all 240
+    // workers. Every one of those is a far atomic serialized at the same
+    // coherence point, so the barrier cost scaled with the full worker count
+    // -- 240 deep, and it measured like it (9a p50 5.4 us, p90 22.2 us, for a
+    // barrier whose actual work is zero). Every other barrier in this file
+    // already avoids that by fanning out over 8 per-XCD lines; 9a was the one
+    // that did not.
+    //
+    // Two levels: 30 workers contend per XCD line (8 lines in parallel), then
+    // the 8 XCD leaders contend on the single global line. Depth 30 + 8
+    // instead of 240, with identical semantics -- the global counter still
+    // only reaches its target once every worker on the GPU has arrived.
+    __syncthreads();
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    bool is_last_on_gpu = false;
+    if (tid == 0) {
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+      // Arrival instant of THIS workgroup, before it touches the counter.
+      // min/max over the 240 give the spread the barrier is absorbing.
+      {
+        unsigned long long _a = _ep_t0;
+        atomicMin(&g_ep9_arr_min, _a);
+        atomicMax(&g_ep9_arr_max, _a);
+        // Phase 8 occupancy for THIS worker: entry (_fused_t3) to arrival.
+        int _wid = xcd_id * workers_per_xcd + xcd_rank;
+        if (_wid < MOE_OCC_WORKERS && _a >= _fused_t3) {
+          atomicAdd(&g_moe_busy_ns[_wid], _a - _fused_t3);
+        }
+      }
+#endif
+      int prev_x = atom_add_release_gpu_s32(
+          &ep_xcd_arrive[xcd_id * FULL_LAYER_EP_XCD_STRIDE], 1);
+      if (prev_x % workers_per_xcd == workers_per_xcd - 1) {
+        // Leader of this XCD: one arrival on behalf of all 30.
+#if MPK_EP_ABLATE == 3
+        // Ablation: drop the CROSS-XCD level. Each XCD's leader acts as if it
+        // closed the whole GPU, so the rendezvous never spans XCDs. Prices the
+        // GPU-wide-ness of 9a against its arrival depth -- the two levels cost
+        // very different things and the end-to-end number cannot separate them.
+        // 8 workgroups then fold concurrently and every XCD reduces against a
+        // partial that may still be growing: WRONG OUTPUT, latency only.
+        is_last_on_gpu = true;
+#else
+        int prev = atom_add_release_gpu_s32(ep_moe_done, 1);
+        if (prev % 8 == 7) {
+          is_last_on_gpu = true;
+        }
+#endif
+      }
+    }
+
+    MPK_WS_PHASE(92, qkv_epoch_expected, xcd_id);
+    // ── 9b/9c: fold + stream, run BY the worker that closed the barrier ──
+    //
+    // This used to be a separate step: 9a released 8 flags, XCD 0's workgroup 0
+    // woke up, folded, released 8 more flags, and only then could 9d proceed.
+    // Two full flag round-trips to hand 0.1 us of folding from one workgroup to
+    // another. The worker that closes 9a already knows the GPU is done -- it is
+    // the one that observed the last arrival -- so it just does the fold itself
+    // and publishes once. One release chain per layer instead of three.
+    //
+    // No threadfence_gpu() for the closer either. It is a release fence, and
+    // between its arrival atomic and here it has written nothing to release:
+    // the ep_release flags below are st_wt_u32 and the fold's stores are all
+    // write-through now. The acquire it actually needs -- seeing the W2
+    // atomicAdds other XCDs made into the workspace -- is the buffer_inv before
+    // the fold, which is a different instruction and still there. This one is
+    // left over from when 9a's job was to release flags to a separate folding
+    // workgroup, and it costs a whole-L2 writeback on the single worker every
+    // other worker on the GPU is waiting for.
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+    // Read the arrival spread from the closer: it has just observed the 240th
+    // arrival, so min/max are final for this layer and no one has started the
+    // next. Reset here for the same reason.
+    if (is_last_on_gpu && tid == 0) {
+      unsigned long long lo = g_ep9_arr_min, hi = g_ep9_arr_max;
+      unsigned long long span = (hi >= lo) ? (hi - lo) : 0;
+      atomicAdd(&g_ep9_arr_span_sum, span);
+      atomicMax(&g_ep9_arr_span_max, span);
+      unsigned long long lo8 = g_ep8_arr_min, hi8 = g_ep8_arr_max;
+      unsigned long long span8 = (hi8 >= lo8) ? (hi8 - lo8) : 0;
+      atomicAdd(&g_ep8_arr_span_sum, span8);
+      atomicMax(&g_ep8_arr_span_max, span8);
+      unsigned long long an = atomicAdd(&g_ep9_arr_n, 1ull);
+      g_ep9_arr_min = ~0ull;
+      g_ep9_arr_max = 0ull;
+      g_ep8_arr_min = ~0ull;
+      g_ep8_arr_max = 0ull;
+#ifdef MPK_PERFETTO
+      // Dump the captured iteration once, as CSV lines the host converts to
+      // Perfetto JSON. Fires one iteration AFTER the capture so every worker
+      // has written its spans. ~240*36*8 = 69k lines at worst, but only on a
+      // run that is already instrumented and not being timed.
+      if (an == (unsigned long long)(MPK_PERFETTO_ITER + 1) * 36ull) {
+        for (int w = 0; w < MOE_OCC_WORKERS; w++) {
+          for (int L = 0; L < PERF_NLAYER; L++) {
+            for (int p = 0; p < PERF_NPHASE; p++) {
+              int const slot = (w * PERF_NLAYER + L) * PERF_NPHASE + p;
+              unsigned int const a = g_perf_span[slot][0];
+              unsigned int const b = g_perf_span[slot][1];
+              if (b > a) {
+                printf("[PERF] %d %d %d %u %u\n", w, L, p, a, b);
+              }
+            }
+          }
+        }
+        printf("[PERFEND]\n");
+      }
+#endif
+      if (an == 36ull * 100ull) {
+        printf("[EP9ARR] n=%llu p8_entry_spread_us mean=%.3f max=%.3f | "
+               "p9_entry_spread_us mean=%.3f max=%.3f\n",
+               an,
+               (double)g_ep8_arr_span_sum / an / 100.0,
+               (double)g_ep8_arr_span_max / 100.0,
+               (double)g_ep9_arr_span_sum / an / 100.0,
+               (double)g_ep9_arr_span_max / 100.0);
+        // Per-worker MoE occupancy, one line per XCD to keep the printf
+        // count trivial. Values are per layer-instance: busy_us is Phase 8
+        // entry -> 9a arrival, tiles is loop trips handed to that worker.
+        for (int x = 0; x < 8; x++) {
+          double bmin = 1e30, bmax = 0.0, bsum = 0.0;
+          unsigned long long tmin = ~0ull, tmax = 0;
+          for (int r = 0; r < 30; r++) {
+            int w = x * 30 + r;
+            // One sample per worker per layer, and `an` counts layers, so this
+            // is already per-layer; ticks -> us is /100.
+            double b = (double)g_moe_busy_ns[w] / an / 100.0;
+            unsigned long long t = g_moe_tiles[w];
+            bsum += b;
+            if (b < bmin) {
+              bmin = b;
+            }
+            if (b > bmax) {
+              bmax = b;
+            }
+            if (t < tmin) {
+              tmin = t;
+            }
+            if (t > tmax) {
+              tmax = t;
+            }
+          }
+          printf("[MOEOCC] xcd=%d busy_us min=%.2f mean=%.2f max=%.2f | "
+                 "tiles min=%llu max=%llu\n",
+                 x,
+                 bmin,
+                 bsum / 30.0,
+                 bmax,
+                 tmin,
+                 tmax);
+        }
+        // Per-TILE cost, averaged over every tile executed on this rank.
+        // w2_bar is the W13->W2 per-expert barrier poll, which is included in
+        // w2_tot; w2_tot - w2_bar is W2's own compute.
+        printf("[MOETILE] w13 n=%llu us=%.2f | w2 n=%llu tot=%.2f bar=%.2f "
+               "compute=%.2f\n",
+               g_moe_w13_n,
+               g_moe_w13_n ? (double)g_moe_w13_ns / g_moe_w13_n / 100.0 : 0.0,
+               g_moe_w2_n,
+               g_moe_w2_n ? (double)g_moe_w2_ns / g_moe_w2_n / 100.0 : 0.0,
+               g_moe_w2_n ? (double)g_moe_w2bar_ns / g_moe_w2_n / 100.0 : 0.0,
+               g_moe_w2_n ? (double)(g_moe_w2_ns - g_moe_w2bar_ns) /
+                                g_moe_w2_n / 100.0
+                          : 0.0);
+        // W13's tile split five ways. These sum to the w13 us above; whichever
+        // holds the gap against the 4.4 us HBM-stream floor for the same bytes
+        // is the one worth restructuring. pre is the prefetch issue, split out
+        // of quant because the first cut charged it to the quant.
+        if (g_moe_w13_n) {
+          double _n = (double)g_moe_w13_n * 100.0;
+          printf("[W13SPLIT] addr=%.2f pre=%.2f quant=%.2f drain=%.2f "
+                 "mfma=%.2f epi=%.2f stdrain=%.2f arrive=%.2f\n",
+                 (double)g_w13_addr_ns / _n,
+                 (double)g_w13_pre_ns / _n,
+                 (double)g_w13_quant_ns / _n,
+                 (double)g_w13_drain_ns / _n,
+                 (double)g_w13_mfma_ns / _n,
+                 (double)g_w13_epi_ns / _n,
+                 (double)g_w13_stdrain_ns / _n,
+                 (double)g_w13_arrive_ns / _n);
+        }
+        // Phase 1's tile split, same terms in execution order. These sum to
+        // the QKV tile cost, which [FP18] reports as qkv_gemm. QKV moves
+        // 7.4 MB/rank at 0.83 TB/s against a 6.59 TB/s peak; W13 by contrast
+        // is AT peak, so the term holding that 8x gap is the one to attack.
+        if (g_qkv_n) {
+          double _qn = (double)g_qkv_n * 100.0;
+          printf("[QKVSPLIT] n=%llu pre=%.2f rms=%.2f (p1=%.2f red=%.2f "
+                 "p2=%.2f) quant=%.2f drain=%.2f mfma=%.2f epi=%.2f\n",
+                 g_qkv_n,
+                 (double)g_qkv_pre_ns / _qn,
+                 (double)g_qkv_rms_ns / _qn,
+                 (double)g_qkv_rp1_ns / _qn,
+                 (double)g_qkv_rred_ns / _qn,
+                 (double)g_qkv_rp2_ns / _qn,
+                 (double)g_qkv_quant_ns / _qn,
+                 (double)g_qkv_drain_ns / _qn,
+                 (double)g_qkv_mfma_ns / _qn,
+                 (double)g_qkv_epi_ns / _qn);
+        }
+        // Phase 7b's 5.4 us routing wait, split by cause. arr is the router
+        // tiles' arrival spread (inherited skew -- parallelizing top-k would
+        // not touch it); tk + fan is the completer's own serial span (top-k
+        // over 128 logits, then the 8-flag publish).
+        if (g_tk_n) {
+          double _tn = (double)g_tk_n * 100.0;
+          printf("[TKSPLIT] n=%llu arr=%.2f tk=%.2f (inv=%.2f zinit=%.2f "
+                 "lload=%.2f rest=%.2f) "
+                 "fan=%.2f (fence=%.2f eload=%.2f flags=%.2f)\n",
+                 g_tk_n,
+                 (double)g_tk_arr_ns / _tn,
+                 (double)g_tk_tk_ns / _tn,
+                 (double)g_tk_inv_ns / _tn,
+                 (double)g_tk_zinit_ns / _tn,
+                 (double)g_tk_lload_ns / _tn,
+                 (double)(g_tk_tk_ns - g_tk_inv_ns - g_tk_zinit_ns -
+                          g_tk_lload_ns) /
+                     _tn,
+                 (double)g_tk_fan_ns / _tn,
+                 (double)g_tk_fence_ns / _tn,
+                 (double)g_tk_eload_ns / _tn,
+                 (double)g_tk_flags_ns / _tn);
+        }
+      }
+    }
+#endif
+    // The closer releases every XCD immediately, before folding anything. The
+    // fold is then done by all 8 XCD workgroups in parallel, each on its own
+    // column slice, rather than by this one workgroup while 239 workers idle.
+    //
+    // Measured: the bare rendezvous costs 0.29 ms/token (MPK_EP_ABLATE=5) and
+    // adding the single-workgroup fold + reduce took it to 0.59 -- the fold was
+    // as expensive as the barrier that gated it, because 11.8 KB of f32 reads
+    // and 5.8 KB of XGMI stores were running at 1/240 of the machine. Slicing
+    // it 8 ways puts that work on hardware that is already awake and waiting.
+#ifdef MPK_EP_SKEW_PROBE
+    // Read the probe from the ONE worker that has just observed every W2 tile
+    // on the GPU. At this instant g_ep_slice_last[] and g_ep_gpu_last are final
+    // for this layer and nothing has started the next one, so the sample needs
+    // no barrier of its own. Reset here too, for the same reason.
+    if (is_last_on_gpu) {
+      unsigned long long gpu_last = g_ep_gpu_last;
+      int slot = g_ep_skew_n % EP_SKEW_HIST;
+      unsigned long long span_min = ~0ull;
+      for (int s = 0; s < EP_SKEW_SLICES; s++) {
+        unsigned long long sl = g_ep_slice_last[s];
+        // Headroom for slice s: how long it sat complete while the barrier
+        // waited for the rest of the GPU.
+        g_ep_skew_hist[slot][s] = (sl > 0 && gpu_last >= sl) ? (gpu_last - sl) : 0;
+        if (sl > 0 && sl < span_min) {
+          span_min = sl;
+        }
+        g_ep_slice_last[s] = 0;
+      }
+      // Span = last tile anywhere minus the FIRST slice to complete: the total
+      // spread of W2 completion, i.e. the most any scheme could overlap.
+      g_ep_skew_span[slot] = (span_min != ~0ull) ? (gpu_last - span_min) : 0;
+      g_ep_gpu_last = 0;
+      g_ep_skew_n = g_ep_skew_n + 1;
+      // Dump from here rather than the TERMINATE path: this block is on the
+      // hot path and certain to run, and at n=3600 we are well past prefill
+      // (72 iters x 36 layers = 2592) and into decode steady state. One
+      // worker, once, so the printf does not perturb the measurement.
+      if (g_ep_skew_n == 3600) {
+        printf("[EPSKEW] n=%d window=%d unit=us (1 tick = 10ns)\n",
+               g_ep_skew_n,
+               EP_SKEW_HIST);
+        for (int s = 0; s < EP_SKEW_SLICES; s++) {
+          unsigned long long sum = 0, mx = 0;
+          for (int i = 0; i < EP_SKEW_HIST; i++) {
+            unsigned long long v = g_ep_skew_hist[i][s];
+            sum += v;
+            if (v > mx) {
+              mx = v;
+            }
+          }
+          printf("[EPSKEW] slice%d mean=%.3f max=%.3f\n",
+                 s,
+                 (double)sum / EP_SKEW_HIST / 100.0,
+                 (double)mx / 100.0);
+        }
+        unsigned long long ssum = 0, smx = 0;
+        for (int i = 0; i < EP_SKEW_HIST; i++) {
+          unsigned long long v = g_ep_skew_span[i];
+          ssum += v;
+          if (v > smx) {
+            smx = v;
+          }
+        }
+        printf("[EPSKEW] span mean=%.3f max=%.3f\n",
+               (double)ssum / EP_SKEW_HIST / 100.0,
+               (double)smx / 100.0);
+      }
+    }
+#endif
+#if !MPK_EP9_DIRECT
+    if (is_last_on_gpu) {
+      for (int x = 0; x < 8; x++) {
+        st_wt_u32((void *)&ep_release[x * FULL_LAYER_EP_XCD_STRIDE],
+                  (unsigned)ep_expected);
+      }
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    }
+#endif
+
+    // Every XCD's workgroup 0 waits for the release, then folds its slice.
+    __shared__ int s_ep_closer;
+    if (tid == 0) {
+      s_ep_closer = 0;
+      if (xcd_rank == 0) {
+#if MPK_EP9_DIRECT
+        // Poll the arrival counter itself. 8 XCD leaders arrive per layer and
+        // the counter is run-monotonic (never reset), so the target is
+        // 8 * ep_expected -- derived, not observed, exactly like every other
+        // threshold in this file.
+        //
+        // 8 pollers on one line is fine where 240 arrivals on one line was
+        // not: a load is not a coherence transaction, and this line's only
+        // writers are the 8 leaders that touch it once each per layer. That
+        // asymmetry is the whole reason 9a fans its ARRIVALS out over 8 lines
+        // but can afford to fan its RELEASE in to one.
+        int const ep9_target = 8 * ep_expected;
+        while (ld_nt_s32(ep_moe_done) < ep9_target) {
+          __builtin_amdgcn_s_sleep(1);
+        }
+#else
+        int _obs;
+        while ((_obs = ld_nt_s32(
+                    &ep_release[xcd_id * FULL_LAYER_EP_XCD_STRIDE])) <
+               ep_expected) {
+          __builtin_amdgcn_s_sleep(1);
+        }
+#endif
+        s_ep_closer = 1;
+      }
+    }
+    __syncthreads();
+
+    // Is every peer directly mapped? Hoisted out of the fold block below,
+    // which is entered only by the folding work-groups, because the 9d peer
+    // wait further down runs on EVERY worker and needs the same answer to
+    // choose its poll shape. Pure function of the init-time delta table --
+    // same value on every thread, recomputed rather than communicated.
+    bool ep_any_direct = (EP_WORLD_SIZE > 1);
+#if MPK_EP_ABLATE == 1
+    ep_any_direct = false;
+#else
+    if constexpr (EP_WORLD_SIZE > 1) {
+      for (int q = 0; q < EP_WORLD_SIZE - 1; q++) {
+        int64_t _d = 0;
+        if (!mpk_shmem_peer_delta((q < EP_MY_PE) ? q : (q + 1), &_d)) {
+          ep_any_direct = false;
+        }
+      }
+    }
+#endif
+
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+    // 9a ends HERE, not after the fold. The old placement folded the two
+    // together and reported 9bc as 0, which is how the fold's cost stayed
+    // hidden inside the "barrier" number.
+    _ep_t1 = __builtin_amdgcn_s_memrealtime();
+#endif
+
+    // Column slice for this XCD. Rounded to an even boundary so the packed
+    // 32-bit peer stores never straddle two slices.
+    constexpr int EP_FOLD_COLS = QKV_REDUCTION_SIZE;
+    constexpr int EP_FOLD_CHUNK = ((EP_FOLD_COLS + 7) / 8 + 1) & ~1;
+    int const ep_col_lo = xcd_id * EP_FOLD_CHUNK;
+    int const ep_col_hi = (ep_col_lo + EP_FOLD_CHUNK) < EP_FOLD_COLS
+                              ? (ep_col_lo + EP_FOLD_CHUNK)
+                              : EP_FOLD_COLS;
+
+    // MPK_EP_ABLATE=5 keeps the 9a rendezvous and the 9e exit fence but drops
+    // everything in between: no fold, no transfer, no reduce. The barrier
+    // structure alone. This is the one measurement that separates "the GPU-wide
+    // rendezvous is inherently expensive" from "the work it gates is". WRONG
+    // OUTPUT: nothing writes ep_combined and the workspace is never zeroed.
+#if MPK_EP_ABLATE == 5
+    if (s_ep_closer && tid == 0) {
+      for (int x = 0; x < 8; x++) {
+        st_wt_u32((void *)&ep_release[x * FULL_LAYER_EP_XCD_STRIDE],
+                  (unsigned)ep_expected);
+      }
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    }
+    if (false) {
+#else
+    if (s_ep_closer) {
+#endif
+      MPK_WS_PHASE(93, qkv_epoch_expected, xcd_id);
+      asm volatile("buffer_inv" ::: "memory");
+      //
+      // REQUIRES patches/rocshmem-ipc-shmem-ptr.patch. Stock rocSHMEM stubs
+      // out IPCContext::shmem_ptr to return nullptr, so ep_direct is false and
+      // every layer silently takes the staged putmem_signal fallback below --
+      // which is what all EP numbers before 2026-08-09 were measuring. With
+      // the patch: 2.378 -> 2.229 ms/iter, 4/4 correctness.
+      //
+      // The failure mode is silent by construction, because nullptr is also
+      // the legitimate "no peer mapping" answer. Confirm the direct path is
+      // live with MPK_EP_SIG_DBG=1 and read the [EPPATH] line; ep_direct=1 on
+      // both ranks is the only evidence that these comments describe the code
+      // that actually runs. The patch is still required after the peer-delta
+      // change below: init samples the mapping through rocshmem_ptr once, so a
+      // stub there yields no valid delta and every peer stays unmapped.
+      //
+      // Fold straight into every peer's gather slot as well as my own.
+      // peer_slot[q] is this rank's slot in peer q's copy of the symmetric
+      // buffer, so after the fold every GPU holds my partial and nothing
+      // further has to be transferred.
+      //
+      // This used to be gated on EP_WORLD_SIZE == 2, which meant a 4-GPU run
+      // silently took the staged putmem_signal path for all 36 layers -- the
+      // pre-optimization path, whose own measured cost is recorded above as
+      // 2.378 vs 2.229 for ONE peer. The gate was never a correctness
+      // requirement; it was written when only the 2-PE delta was plumbed.
+      // mpk_shmem_peer_delta is per-PE and valid for up to MPK_MAX_PES, so
+      // the general form is the same code in a loop.
+      //
+      // One delta, two addresses, per peer. The gather slot and the signal
+      // line are both symmetric-heap objects and the local->peer offset is
+      // heap-wide (see mpk_comm.cuh), so translating the signal below costs an
+      // add and no second lookup. Resolving them here also means the per-layer
+      // cost of the translation is that add, not a walk down the rocSHMEM
+      // context.
+      constexpr int EP_NPEER =
+          (EP_WORLD_SIZE > 1) ? (EP_WORLD_SIZE - 1) : 1;
+      void *peer_slot[EP_NPEER];
+      int64_t ep_peer_delta[EP_NPEER];
+      int ep_peer_pe[EP_NPEER];
+      bool ep_all_mapped = (EP_WORLD_SIZE > 1);
+#pragma unroll
+      for (int q = 0; q < EP_NPEER; q++) {
+        peer_slot[q] = nullptr;
+        ep_peer_delta[q] = 0;
+        // Peers in rank order, skipping self: q -> the q'th other PE.
+        ep_peer_pe[q] = (q < EP_MY_PE) ? q : (q + 1);
+      }
+#if MPK_EP_ABLATE != 1
+      if constexpr (EP_WORLD_SIZE > 1) {
+#pragma unroll
+        for (int q = 0; q < EP_NPEER; q++) {
+          if (mpk_shmem_peer_delta(ep_peer_pe[q], &ep_peer_delta[q])) {
+            peer_slot[q] = reinterpret_cast<void *>(
+                reinterpret_cast<char *>(ep_gather + EP_MY_PE * EP_SLOT_ELEMS) +
+                ep_peer_delta[q]);
+          } else {
+            // One unmapped peer disqualifies the direct path for the whole
+            // work-group: the staged fallback is a collective that sends to
+            // every peer, so it cannot be run for a subset.
+            ep_all_mapped = false;
+          }
+        }
+      }
+#endif
+      // Whether the direct path is live has to be a work-group-wide decision,
+      // not a per-thread one: the staged fallback below is a work-group
+      // collective and every thread must agree on whether to enter it.
+      bool const ep_direct = ep_all_mapped;
+#ifdef MPK_EP_SIG_DBG
+      // Which of the two publication paths is actually live. The direct one
+      // needs mpk_shmem_peer_ptr to hand back a usable mapping of the peer's
+      // symmetric allocation; if it returns null every layer silently goes
+      // through the staged putmem_signal instead, and no amount of tuning the
+      // direct path changes anything.
+      if (tid == 0 && xcd_id == 0 && layer_counter == 0) {
+        printf("[EPPATH] pe=%d world=%d npeer=%d ep_direct=%d peer_slot0=%p\n",
+               EP_MY_PE, EP_WORLD_SIZE, EP_NPEER, (int)ep_direct,
+               peer_slot[0]);
+      }
+#endif
+      // This XCD's slice only. All 8 run concurrently on disjoint columns.
+      _full_layer_ep_fold_partial<QKV_BATCH_SIZE,
+                                  QKV_REDUCTION_SIZE,
+                                  QKV_REDUCTION_SIZE,
+                                  (EP_MY_PE == EP_FOLD_PE),
+                                  EP_NPEER>(
+          output_ptrs[10],                      // moe_workspace_f32
+          output_ptrs[5],                       // attn_proj_out (residual)
+          ep_gather + EP_MY_PE * EP_SLOT_ELEMS, // my slot
+          peer_slot,                            // every peer's copy of my slot
+          ep_col_lo,
+          ep_col_hi);
+      __syncthreads();
+      // No threadfence_gpu() here. Every store the fold makes -- the local slot,
+      // the peer's slot, and the workspace zeroing -- is now write-through, so
+      // there is nothing sitting in this XCD's L2 for an agent-scope release to
+      // publish. What remains is the part that was always load-bearing:
+      // s_waitcnt vmcnt(0) retires all 256 threads' stores before tid 0's
+      // arrival atomic below, so a consumer that observes the count observes
+      // the bytes.
+      //
+      // The fence was `buffer_wbl2 sc1` on gfx950, an L2->HBM writeback of the
+      // whole cache paid by all 8 folding workgroups on all 36 layers -- the
+      // same cost the Phase 4/5 chunk barrier removed for the same reason (see
+      // the note on db48239 above).
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+
+#if MPK_EP_ABLATE != 1
+      if (ep_direct) {
+        // My slice is in the peer's memory, ordered ahead of the arrival by the
+        // fence above. Count the slice in; the 8th one to land tells the peer.
+        //
+        // The signal is a store of the run-monotonic count rather than an
+        // accumulate, so it stays idempotent and the consumer's threshold is
+        // unchanged from the staged path -- but it must be issued only once the
+        // whole payload is there, hence the local count first.
+        //
+        // One signal per PE, not one per (PE, XCD). Splitting it so each XCD
+        // pair handshakes privately is the obvious next move -- the consumer
+        // below reads only its own columns -- and it deadlocks. Left as one
+        // signal until that is understood; see the note on the consumer.
+        if (tid == 0) {
+          int prev_f = atom_add_release_gpu_s32(ep_fold_done, 1);
+          if (prev_f % 8 == 7) {
+            // Same heap-wide deltas resolved above; ep_direct being true is
+            // what makes them valid. One store per peer, all issued before the
+            // single drain below -- so N-1 peers cost one drain, not N-1
+            // round trips. This is the signal analogue of the fold's
+            // multi-peer store loop.
+#pragma unroll
+            for (int q = 0; q < EP_NPEER; q++) {
+              uint64_t *peer_sig = reinterpret_cast<uint64_t *>(
+                  reinterpret_cast<char *>(ep_signal +
+                                           (size_t)EP_MY_PE *
+                                               FULL_LAYER_EP_SIGNAL_STRIDE) +
+                  ep_peer_delta[q]);
+              st_wt_u64((void *)peer_sig, (unsigned long long)ep_sig_expected);
+            }
+            // Same store, local copy: this thread has just observed all 8
+            // local slices, which is precisely what a worker leaving this
+            // layer needs to know about its OWN rank's slot. Publishing it on
+            // the local signal line rather than a separate flag means the
+            // consumer's wait is two loads in one loop instead of two
+            // rendezvous -- and it is written by the thread that already knew
+            // the answer, so it adds no hop.
+            st_wt_u64((void *)(ep_signal + (size_t)EP_MY_PE *
+                                               FULL_LAYER_EP_SIGNAL_STRIDE),
+                      (unsigned long long)ep_sig_expected);
+            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          }
+        }
+      } else {
+        // No direct mapping (or world > 2): stage it. putmem_signal is a
+        // work-group collective and sends the whole slot, so only one XCD may
+        // issue it, and only after every slice has been folded locally.
+        __shared__ int s_ep_put;
+        if (tid == 0) {
+          int prev_f = atom_add_release_gpu_s32(ep_fold_done, 1);
+          s_ep_put = (prev_f % 8 == 7) ? 1 : 0;
+        }
+        __syncthreads();
+        if (s_ep_put && tid == 0) {
+          st_wt_u64((void *)(ep_signal +
+                             (size_t)EP_MY_PE * FULL_LAYER_EP_SIGNAL_STRIDE),
+                    (unsigned long long)ep_sig_expected);
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        }
+        if (s_ep_put) {
+          asm volatile("buffer_inv" ::: "memory");
+          for (int p = 0; p < EP_WORLD_SIZE; p++) {
+            if (p == EP_MY_PE) {
+              continue;
+            }
+            mpk_putmem_signal_block(
+                ep_gather + EP_MY_PE * EP_SLOT_ELEMS,
+                ep_gather + EP_MY_PE * EP_SLOT_ELEMS,
+                EP_SLOT_BYTES,
+                ep_signal + (size_t)EP_MY_PE * FULL_LAYER_EP_SIGNAL_STRIDE,
+                1,
+                MPK_SIGNAL_ADD,
+                p);
+          }
+        }
+      }
+#else
+      (void)ep_direct;
+      if (tid == 0) {
+        atom_add_release_gpu_s32(ep_fold_done, 1);
+      }
+#endif
+    }
+
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+    _ep_t2 = __builtin_amdgcn_s_memrealtime();
+#endif
+
+    MPK_WS_PHASE(94, qkv_epoch_expected, xcd_id);
+    // ── 9d: wait for THIS rank's slot to be complete. No reduce. ────────
+    //
+    // There is no reduce pass here any more and no exit barrier after it. The
+    // next layer's QKV prologue reads the gather buffer directly and sums the
+    // slots as part of the pass it already makes over that vector
+    // (EP_PEER_SLOTS in gang_rmsnorm_linear_mxfp4_bias_mi300.cuh).
+    //
+    // What that removes is a hop, not just work. The old shape was
+    // peer -> combiner (9d) -> everyone (9e): the release could not start
+    // until a reduce it gated had finished, so every worker paid the peer
+    // latency plus a reduce plus a second GPU-internal round trip. Now the
+    // reduce lives in a consumer that was already loading those bytes and
+    // there is nothing to release.
+    //
+    // The PEER's slot is not waited on here. Its only reader is the next
+    // layer's QKV prologue, which is 8 of 240 workers, so that wait belongs at
+    // the point of use (Phase 1, gated on EP_PREV_SLOTS) rather than at the
+    // layer boundary where it stalls 232 workers that never touch those bytes.
+    // Per-layer gather buffers are what make that safe: layer i's buffer is
+    // written only in layer i and read only in layer i+1, so a worker running
+    // ahead cannot clobber a slot the peer has yet to fill.
+    //
+    // Every worker, not workgroup 0: with no combiner there is no one to
+    // release the others, and nothing to release them for.
+    {
+      if (tid == 0) {
+        // This rank's OWN slot: its 8 column slices are written by 8 different
+        // XCDs, so a worker cannot know the local half is complete from its own
+        // store alone. The gate is published on this rank's signal line by the
+        // same thread that observed the 8th local fold, so it costs a load and
+        // no extra rendezvous -- and unlike the peer's line it is purely
+        // on-GPU, no XGMI round trip in the critical path.
+        //
+        // It also covers the two WAR hazards the old exit barrier covered: the
+        // fold reads attn_proj_out (which the next layer's Phase 7 overwrites)
+        // and zeroes moe_workspace_f32 (which the next layer's Phase 8
+        // atomicAdds into). Both are ordered behind this signal, and both are
+        // strictly local -- another reason the peer's line does not belong
+        // here.
+#if MPK_EP_ABLATE != 1 && MPK_EP_ABLATE != 5
+#if MPK_EP_ABLATE == 6
+        // Only the folding workgroups wait. See the knob comment above.
+        if (xcd_rank == 0) {
+#endif
+        uint64_t *self_sig =
+            ep_signal + (size_t)EP_MY_PE * FULL_LAYER_EP_SIGNAL_STRIDE;
+        while (ld_nt_u64(reinterpret_cast<unsigned long long *>(self_sig)) <
+               (unsigned long long)ep_sig_expected) {
+          __builtin_amdgcn_s_sleep(1);
+        }
+        // The peer's slot, waited on here rather than at its point of use in
+        // the next layer's QKV prologue. Both ranks run the same layer on the
+        // same schedule, so by the time a worker reaches this line the peer's
+        // store has effectively already landed and the poll is free; pushing
+        // it into Phase 1 instead puts it upstream of the QKV barrier that
+        // gates all of attention, and measured 2.542 vs 2.528 ms/token.
+        //
+        // MPK_EP_WAIT_AT_USE=1 moves it to Phase 1 anyway, to re-price that
+        // measurement now that the fold is write-through and the two L2
+        // writebacks are gone. The last layer is the exception: its consumer
+        // is the tail task, not a QKV prologue, so there is nowhere downstream
+        // to move the wait to and EP_WRITE_COMBINED reads all slots right
+        // below. It keeps the wait here under either setting.
+#if !MPK_EP_WAIT_AT_USE
+        _full_layer_ep_wait_peers<EP_WORLD_SIZE, EP_MY_PE>(
+            ep_signal, ep_sig_expected, ep_any_direct);
+#else
+        if constexpr (EP_WRITE_COMBINED) {
+          _full_layer_ep_wait_peers<EP_WORLD_SIZE, EP_MY_PE>(
+              ep_signal, ep_sig_expected, ep_any_direct);
+        }
+#endif
+#if MPK_EP_ABLATE == 6
+        }
+#endif
+#else
+        (void)ep_signal;
+        (void)ep_sig_expected;
+#endif
+      }
+      __syncthreads();
+      asm volatile("buffer_inv" ::: "memory");
+      // For every layer but the last, nothing else happens here. There used to
+      // be a reduce writing output_ptrs[11], then a release flag, then an exit
+      // barrier every worker waited on; all three are gone, because the sum is
+      // produced by the NEXT layer's QKV prologue straight out of the gather
+      // buffer (EP_PEER_SLOTS) -- so there is no combined vector to publish and
+      // no window between publishing and consuming for a barrier to protect.
+      //
+      // The last layer is the exception: its consumer is the tail (final
+      // RMSNorm + LM head), a separate task with a plain 2-D input and no
+      // slot-summing prologue to fold into. So exactly one layer out of 36
+      // still materializes the sum and still needs the exit barrier that makes
+      // it visible. 1/36 of the old cost.
+      if constexpr (EP_WRITE_COMBINED) {
+        __hip_bfloat16 *ep_out =
+            reinterpret_cast<__hip_bfloat16 *>(output_ptrs[11]);
+        // EXACTLY the columns this XCD folded, on every row. That identity is
+        // what lets the wait above be a per-slot poll rather than a full
+        // cross-XCD rendezvous: this workgroup consumes only its own local
+        // store and the matching remote slice.
+        for (int row = 0; row < QKV_BATCH_SIZE; ++row) {
+          size_t const row_base = (size_t)row * QKV_REDUCTION_SIZE;
+          for (int c = ep_col_lo + tid; c < ep_col_hi; c += blockDim.x) {
+            size_t idx = row_base + c;
+            float acc = 0.0f;
+            for (int p = 0; p < EP_WORLD_SIZE; p++) {
+              acc += (float)ep_gather[(size_t)p * EP_SLOT_ELEMS + idx];
+            }
+            __hip_bfloat16 v = (__hip_bfloat16)acc;
+            unsigned short bits;
+            __builtin_memcpy(&bits, &v, 2);
+            st_wt_u16((void *)&ep_out[idx], bits);
+          }
+        }
+        __syncthreads();
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        threadfence_gpu();
+        if (tid == 0) {
+          int prev_c = atom_add_release_gpu_s32(ep_combine_done, 1);
+          if (prev_c % 8 == 7) {
+            for (int x = 0; x < 8; x++) {
+              st_wt_u32(
+                  (void *)&ep_combine_done[(1 + x) * FULL_LAYER_EP_XCD_STRIDE],
+                  (unsigned)ep_expected);
+            }
+            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          }
+        }
+      }
+    }
+
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+    _ep_t3 = __builtin_amdgcn_s_memrealtime();
+#endif
+
+    MPK_WS_PHASE(95, qkv_epoch_expected, xcd_id);
+    // ── 9e: exit barrier, last layer only. ───────────────────────────────
+    //
+    // This used to run on every layer: the combiner published a per-XCD release
+    // flag once its slice of the reduce had landed and all 240 workers polled
+    // it. It existed because the reduce was a distinct step producing a
+    // distinct buffer (output_ptrs[11]) that the next layer read, so the layer
+    // needed an exit fence between "combined" and "consumed".
+    //
+    // With the reduce dissolved into the next layer's QKV prologue there is no
+    // such buffer and no such window. Everything a worker must establish before
+    // leaving -- both slots of the gather buffer complete, hence the fold's
+    // reads of attn_proj_out and its zeroing of moe_workspace_f32 done -- is
+    // established by the two-slot wait in 9d, which every worker takes. The
+    // release chain went from
+    //   peer -> combiner -> everyone  (two sequential hops)
+    // to
+    //   peer -> everyone              (one, polled in parallel by all 240).
+    //
+    // It survives only on the last layer, where output_ptrs[11] IS written and
+    // a separate tail task reads it.
+    if constexpr (EP_WRITE_COMBINED) {
+      if (tid == 0) {
+        while (ld_nt_s32(&ep_combine_done[(1 + xcd_id) *
+                                          FULL_LAYER_EP_XCD_STRIDE]) <
+               ep_expected) {
+          __builtin_amdgcn_s_sleep(1);
+        }
+      }
+      __syncthreads();
+    }
+    asm volatile("buffer_inv" ::: "memory");
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+    _ep_t4 = __builtin_amdgcn_s_memrealtime();
+#endif
+  }
+
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
   __syncthreads();
+  // Phase 9 breakdown. Still printed from two roles: xcd_rank==0 also FOLDS
+  // (9b/9c) while every other rank only waits, so their 9bc/9d split differs
+  // even though both now take the same 9d wait. 9e is gone and reads ~0.
+  if constexpr (EP_WORLD_SIZE > 1) {
+    // Accumulate, do NOT print per layer. Printing here fires 36 layers x 16
+    // reporting workgroups x 126 iters = ~146k printfs and takes the iteration
+    // from 2.5 ms to 441 ms -- the breakdown then describes the printf, not the
+    // collective. Accumulate into globals and dump once, from the hot path,
+    // deep enough into decode that prefill is out of the average.
+#ifdef MPK_PERFETTO
+    // Raw spans for the timeline, one worker-track per (rank, xcd, worker).
+    // Emitted here because every phase timestamp is still in scope. Phases
+    // 0..3 come from the QKV/attn worker path (_fused_t0a/b/c are 0 on workers
+    // that did not run those), 4..7 are the ones every worker executes.
+    if (tid == 0 && _perf_cap) {
+      int const w = _perf_wid;
+      int const L = _perf_layer;
+      if (_fused_t0a > 0) {
+        mpk_perf_span(w, L, 0, _fused_t0, _fused_t0a); // qkv gemm
+      }
+      if (_fused_t0a > 0 && _fused_t0b > 0) {
+        mpk_perf_span(w, L, 1, _fused_t0a, _fused_t0b); // qkv barrier
+      }
+      if (_fused_t0b > 0 && _fused_t0c > 0) {
+        mpk_perf_span(w, L, 2, _fused_t0b, _fused_t0c); // attn
+      }
+      mpk_perf_span(w, L, 3, _fused_t1, _fused_t2); // xcd barrier
+      mpk_perf_span(w, L, 4, _fused_t2, _fused_t3); // oproj+topk
+      if (_ep_t0 > 0) {
+        mpk_perf_span(w, L, 5, _fused_t3, _ep_t0); // MoE (phase 8)
+        mpk_perf_span(w, L, 6, _ep_t0, _ep_t1);    // 9a barrier
+        mpk_perf_span(w, L, 7, _ep_t1, _ep_t4);    // 9b-9e combine
+      }
+    }
+#endif
+    if (tid == 0 && (xcd_rank == 0 || xcd_rank == 1) && _ep_t0 > 0) {
+      int r = (xcd_rank == 0) ? 0 : 1;
+      atomicAdd(&g_ep9_ns[r][0], (unsigned long long)(_ep_t1 - _ep_t0));
+      atomicAdd(&g_ep9_ns[r][1], (unsigned long long)(_ep_t2 - _ep_t1));
+      atomicAdd(&g_ep9_ns[r][2], (unsigned long long)(_ep_t3 - _ep_t2));
+      atomicAdd(&g_ep9_ns[r][3], (unsigned long long)(_ep_t4 - _ep_t3));
+      unsigned long long n = atomicAdd(&g_ep9_cnt[r], 1ull);
+      // 8 workgroups per role per layer x 36 layers = 288 per iteration.
+      // Dump at iteration ~100, well past the 72 prefill tokens.
+      if (r == 0 && n == 288ull * 100ull) {
+        for (int rr = 0; rr < 2; rr++) {
+          unsigned long long c = g_ep9_cnt[rr];
+          if (c == 0) {
+            continue;
+          }
+          // Ticks -> us per layer-instance: 1 tick = 10 ns.
+          printf("[EP9] role=%s n=%llu per_layer_us 9a=%.3f 9bc=%.3f "
+                 "9d=%.3f 9e=%.3f tot=%.3f | x36 ms=%.3f\n",
+                 rr == 0 ? "folder" : "follower",
+                 c,
+                 (double)g_ep9_ns[rr][0] / c / 100.0,
+                 (double)g_ep9_ns[rr][1] / c / 100.0,
+                 (double)g_ep9_ns[rr][2] / c / 100.0,
+                 (double)g_ep9_ns[rr][3] / c / 100.0,
+                 (double)(g_ep9_ns[rr][0] + g_ep9_ns[rr][1] + g_ep9_ns[rr][2] +
+                          g_ep9_ns[rr][3]) /
+                     c / 100.0,
+                 (double)(g_ep9_ns[rr][0] + g_ep9_ns[rr][1] + g_ep9_ns[rr][2] +
+                          g_ep9_ns[rr][3]) /
+                     c / 100.0 * 36.0 / 1000.0);
+        }
+      }
+    }
+  }
+  // Phases 1-8, accumulated and dumped once -- the same treatment as the EP9
+  // block above and for the same reason. This is the breakdown for the 1.923 ms
+  // that Phase 9 does NOT explain: until now the only per-phase numbers came
+  // from the per-layer [FUSED_PHASE] printf below, which perturbs the iteration
+  // by ~200x and so cannot be read even relatively.
+  //
+  // One reporting workgroup per XCD (xcd_rank == 0), which is the same worker
+  // the printf below uses, so the two describe the same thing at very different
+  // cost. That worker holds a real W13 tile in Phase 8, so its p8 is the
+  // W13 -> barrier -> W2 chain rather than a padding tile's early exit.
+  {
+    unsigned long long _fp_t4 = __builtin_amdgcn_s_memrealtime();
+    if (tid == 0 && xcd_rank == 0 && _fused_t0a > 0 && _fused_t0b > 0) {
+      atomicAdd(&g_fp_ns[0], (unsigned long long)(_fused_t0a - _fused_t0));
+      atomicAdd(&g_fp_ns[1], (unsigned long long)(_fused_t0b - _fused_t0a));
+      // attn / merge only exist on workers that ran an attention chunk.
+      if (_fused_t0c > 0) {
+        atomicAdd(&g_fp_ns[2], (unsigned long long)(_fused_t0c - _fused_t0b));
+        if (_fused_t0d > 0) {
+          atomicAdd(&g_fp_ns[3], (unsigned long long)(_fused_t0d - _fused_t0c));
+          atomicAdd(&g_fp_ns[4], (unsigned long long)(_fused_t1 - _fused_t0d));
+        } else {
+          atomicAdd(&g_fp_ns[4], (unsigned long long)(_fused_t1 - _fused_t0c));
+        }
+      }
+      atomicAdd(&g_fp_ns[5], (unsigned long long)(_fused_t2 - _fused_t1));
+      atomicAdd(&g_fp_ns[6], (unsigned long long)(_fused_t3 - _fused_t2));
+      atomicAdd(&g_fp_ns[7], (unsigned long long)(_fp_t4 - _fused_t3));
+      atomicAdd(&g_fp_ns[8], (unsigned long long)(_fused_t2b - _fused_t2));
+      unsigned long long fn = atomicAdd(&g_fp_cnt, 1ull);
+      // 8 XCDs x 36 layers = 288 per iteration; dump at ~iteration 100, past
+      // the 72 prefill tokens. Same cadence as the EP9 dump.
+      if (fn == 288ull * 100ull) {
+        double c = (double)g_fp_cnt;
+        // Ticks -> us per layer-instance: 1 tick = 10 ns, so /100.
+        double v[9];
+        for (int k = 0; k < 9; k++) {
+          v[k] = (double)g_fp_ns[k] / c / 100.0;
+        }
+        // v[8] is a SUBDIVISION of v[6], not another phase -- excluded from
+        // the total, reported as oproj_cmp / oproj_wait.
+        double tot = 0;
+        for (int k = 0; k < 8; k++) {
+          tot += v[k];
+        }
+        printf("[FP18] n=%.0f per_layer_us qkv_gemm=%.3f qkv_bar=%.3f "
+               "attn=%.3f merge=%.3f wait=%.3f xcd_bar=%.3f oproj_topk=%.3f "
+               "(cmp=%.3f wait=%.3f) moe=%.3f | tot=%.3f x36ms=%.3f\n",
+               c,
+               v[0],
+               v[1],
+               v[2],
+               v[3],
+               v[4],
+               v[5],
+               v[6],
+               v[8],
+               v[6] - v[8],
+               v[7],
+               tot,
+               tot * 36.0 / 1000.0);
+      }
+    }
+  }
+
+  // MPK_EP9_ONLY suppresses the per-layer full-phase dump so the Phase 9
+  // accumulators above can be read from a run that still executes at ~2.5 ms.
+  // With both live the printf volume alone costs 440 ms/iter.
+#ifndef MPK_EP9_ONLY
   if (tid == 0 && xcd_rank == 0) {
     unsigned long long _fused_t4 = __builtin_amdgcn_s_memrealtime();
     double p1_5 = (double)(_fused_t1 - _fused_t0) * 10.0 / 1000.0;
@@ -773,6 +2274,7 @@ __device__ __noinline__ void
            flush_sig,
            wait_others);
   }
+#endif // MPK_EP9_ONLY
 #endif
   MPK_TW_SUB(90, tile_idx);
   MPK_WS_PHASE(90, qkv_epoch_expected, xcd_id);

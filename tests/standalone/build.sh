@@ -136,6 +136,15 @@ if [ "${GFX_ARCH:-gfx950}" = "gfx950" ]; then
         -I ../../deps/composable_kernel/include
 fi
 
+# Needs two peer-capable GPUs at run time, but builds anywhere.
+echo "Building EP collective floor benchmark..."
+hipcc -o test_ep_collective test_ep_collective.hip \
+    -D__HIP_PLATFORM_AMD__ \
+    --offload-arch=gfx950 \
+    -munsafe-fp-atomics \
+    -O3 \
+    -std=c++17
+
 echo "Build complete!"
 echo ""
 echo "Run with: ./test_mfma_simple"
@@ -149,3 +158,4 @@ echo "          ./test_mxfp8_linear                       # gfx950 only"
 echo "          ./test_mxfp8_moe                          # gfx950 only"
 echo "          ./test_gemv_mxfp8_bw                      # gfx950 only, ~2 min"
 echo "          ./test_gemv_mxfp8_accuracy                # gfx950 only"
+echo "          HIP_VISIBLE_DEVICES=6,7 ./test_ep_collective [iters]"

@@ -91,7 +91,11 @@ __device__ __attribute__((noinline)) void
         // Optional: per-worker timestamp ring buffer pointer (g_fused_ts).
         // When non-null, writes slots 9 (oproj_done), 10 (barrier_done),
         // 11 (rmsnorm_router_done) for sub-phase breakdown.
-        unsigned long long *ts_base = nullptr) {
+        unsigned long long *ts_base = nullptr,
+        // Optional: the epoch value to publish into routing_ready. When >= 0
+        // the completer skips the uncached read-back of the current epoch.
+        // Callers that track a layer counter should pass layer_idx + 1.
+        int epoch_hint = -1) {
 
   static_assert(OUTPUT_PER_WG % 16 == 0,
                 "OUTPUT_PER_WG must be multiple of 16");
@@ -147,6 +151,12 @@ __device__ __attribute__((noinline)) void
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   unsigned long long _sp_t0 = __builtin_amdgcn_s_memrealtime();
+#endif
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+  // See the [OP3] dump below. Taken unconditionally rather than under
+  // `ts_base`, which the fused wrapper passes as nullptr.
+  unsigned long long _op3_t0 = __builtin_amdgcn_s_memrealtime();
+  unsigned long long _op3_t1 = 0, _op3_t2 = 0;
 #endif
 
   int batch_count =
@@ -706,6 +716,7 @@ oproj_barrier :
   if (tid == 0 && ts_base) {
     ts_base[9] = __builtin_amdgcn_s_memrealtime(); // slot 9: oproj_mfma_done
   }
+  _op3_t1 = __builtin_amdgcn_s_memrealtime();
 #endif
   __syncthreads();
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
@@ -796,6 +807,7 @@ oproj_barrier :
     ts_base[10] =
         __builtin_amdgcn_s_memrealtime(); // slot 10: oproj_barrier_done
   }
+  _op3_t2 = __builtin_amdgcn_s_memrealtime();
 #endif
 
   // ════════════════════════════════════════════════════════════════════════
@@ -1031,12 +1043,41 @@ topk_barrier :
     ts_base[11] =
         __builtin_amdgcn_s_memrealtime(); // slot 11: rmsnorm_router_done
   }
+  // Accumulated split of Phase 7's compute half, independent of ts_base (the
+  // fused wrapper passes nullptr there). Sizes the o_proj row-shard: only
+  // _op3_mfma is replicated work a shard removes, and it has to beat the
+  // ~2.2 us mid-layer exchange the shard would add before the router.
+  if (tid == 0 && _op3_t0 > 0) {
+    unsigned long long _op3_t3 = __builtin_amdgcn_s_memrealtime();
+    atomicAdd(&g_op3_ns[0], (unsigned long long)(_op3_t1 - _op3_t0));
+    atomicAdd(&g_op3_ns[1], (unsigned long long)(_op3_t2 - _op3_t1));
+    atomicAdd(&g_op3_ns[2], (unsigned long long)(_op3_t3 - _op3_t2));
+    unsigned long long _on = atomicAdd(&g_op3_cnt, 1ull);
+    // Router tiles per layer x 36 layers; dump once, deep into decode. The
+    // exact per-iteration count varies with router_tile_n, so key off a round
+    // number large enough to be past prefill rather than an exact multiple.
+    if (_on == 200000ull) {
+      double c = (double)g_op3_cnt;
+      printf("[OP3] n=%.0f per_layer_us oproj_mfma=%.3f oproj_bar=%.3f "
+             "rmsnorm_router=%.3f\n",
+             c,
+             (double)g_op3_ns[0] / c / 100.0,
+             (double)g_op3_ns[1] / c / 100.0,
+             (double)g_op3_ns[2] / c / 100.0);
+    }
+  }
 #endif
   __syncthreads();
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 
   __shared__ int s_topk_done;
   if (tid == 0) {
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+    // Every router tile stamps its arrival; the completer reads the min. The
+    // difference is the arrival spread the Phase 7b wait inherits, as opposed
+    // to the top-k compute it causes.
+    atomicMin(&g_tk_first, __builtin_amdgcn_s_memrealtime());
+#endif
     s_topk_done = atomicAdd(topk_counter, 1) + 1;
   }
   __syncthreads();
@@ -1047,6 +1088,8 @@ topk_barrier :
       ts_base[14] =
           __builtin_amdgcn_s_memrealtime(); // slot 14: topk_compute_start
     }
+    unsigned long long _tk_t0 = __builtin_amdgcn_s_memrealtime();
+    unsigned long long _tk_t1 = _tk_t0;
 #endif
     gang_rmsnorm_topk_detail::topk_noinline<__hip_bfloat16, NUM_EXPERTS, K>(
         logits_scratch_ptr,
@@ -1092,15 +1135,70 @@ topk_barrier :
       // gang_oproj_topk_moe_fused_mi300.cuh, "TopK worker wrote per-XCD flags
       // via st_wt after threadfence_gpu". The comment above was written for a
       // fence that was never actually here.
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+      // After the top-k stores and the fence, before the flag fanout: splits
+      // the completer's span into compute and publish.
+      _tk_t1 = __builtin_amdgcn_s_memrealtime();
+#endif
       threadfence_gpu();
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+      // The fence alone. buffer_wbl2 sc1 has no return value to depend on, so
+      // s_memrealtime could be hoisted above it -- s_waitcnt keeps it below.
+      asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)" ::: "memory");
+      unsigned long long _tk_tf = __builtin_amdgcn_s_memrealtime();
+#endif
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+      unsigned long long _tk_tl = _tk_tf;
+#endif
       if (routing_ready_ptr) {
+#ifdef MPK_TK_NOELOAD
+        // The epoch is a pure function of the layer index, so read nothing.
+        //
+        // ld_nt_s32 here is an UNCACHED HBM load, and every store below depends
+        // on it, so it is a serial round trip (measured 0.30-0.44 us) taken by
+        // the one worker 239 others are waiting on. The consumer side already
+        // derives the same number without reading -- see routing_expected =
+        // layer_counter + 1 in gang_full_layer_fused_mi300.cuh, and the comment
+        // there explaining why the counters are never read: they start at 0,
+        // bump once per layer, and are never reset.
+        //
+        // Passing epoch_hint < 0 keeps the old read for the call sites that do
+        // not have a layer index to hand.
+        int epoch = (epoch_hint >= 0) ? epoch_hint : (ld_nt_s32(routing_ready_ptr) + 1);
+#else
         int epoch = ld_nt_s32(routing_ready_ptr) + 1;
+#endif
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+        // The epoch read is an uncached HBM round trip that every store below
+        // depends on. `epoch * 0` keeps it in the dependence chain so the
+        // timestamp cannot be hoisted above the load's s_waitcnt.
+        _tk_tl = __builtin_amdgcn_s_memrealtime() + (unsigned long long)(epoch * 0);
+#endif
         st_wt_u32((void *)routing_ready_ptr, (unsigned)epoch);
         for (int x = 0; x < 8; x++) {
           st_wt_u32((void *)&routing_ready_ptr[(1 + x) * 16], (unsigned)epoch);
         }
       }
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+      {
+        unsigned long long _tk_t2 = __builtin_amdgcn_s_memrealtime();
+        // g_tk_first is the EARLIEST arrival at the top-k barrier; _tk_t0 is
+        // this (last) tile's. Their difference is the spread. Reset for the
+        // next layer -- this worker is the only one past the barrier, so the
+        // reset cannot race an arrival.
+        unsigned long long _f = g_tk_first;
+        atomicAdd(&g_tk_arr_ns, (_tk_t0 > _f) ? (_tk_t0 - _f) : 0ull);
+        atomicAdd(&g_tk_tk_ns, _tk_t1 - _tk_t0);
+        atomicAdd(&g_tk_fan_ns, _tk_t2 - _tk_t1);
+        // fence + eload + flags sum to fan.
+        atomicAdd(&g_tk_fence_ns, _tk_tf - _tk_t1);
+        atomicAdd(&g_tk_eload_ns, _tk_tl - _tk_tf);
+        atomicAdd(&g_tk_flags_ns, _tk_t2 - _tk_tl);
+        atomicAdd(&g_tk_n, 1ull);
+        g_tk_first = ~0ull;
+      }
+#endif
     }
   }
 
