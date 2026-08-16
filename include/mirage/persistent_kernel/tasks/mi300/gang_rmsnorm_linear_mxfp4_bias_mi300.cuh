@@ -2125,6 +2125,21 @@ __device__ __noinline__ void
     _sp_t0 = __builtin_amdgcn_s_memrealtime();
   }
 #endif
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+  // QKV tile split. Taken by tid 0 of every QKV tile, not just tile 0, so the
+  // numbers are a per-tile average over the whole rank rather than one
+  // worker's. Initialized to the tile start so a tile that returns early
+  // (tok_idx >= batch_count) contributes zeros to the later terms instead of
+  // wrapping.
+  unsigned long long _qkv_t0 = __builtin_amdgcn_s_memrealtime();
+  unsigned long long _qkv_tp = _qkv_t0;
+  unsigned long long _qkv_tr = _qkv_t0;
+  unsigned long long _qkv_tq = _qkv_t0;
+  unsigned long long _qkv_td = _qkv_t0;
+  unsigned long long _qkv_tm = _qkv_t0;
+  unsigned long long _qkv_r1 = _qkv_t0;
+  unsigned long long _qkv_r2 = _qkv_t0;
+#endif
   int batch_count =
       (num_active_tokens < BATCH_SIZE) ? num_active_tokens : BATCH_SIZE;
 
@@ -2148,6 +2163,54 @@ __device__ __noinline__ void
   static_assert(QKV_LDS_OFF_A + QKV_TILE_BYTES * NUM_WAVES <= 155 * 1024,
                 "QKV LDS weights exceed MI350X LDS budget");
   uint8_t *qkv_lds_w = (uint8_t *)_rnlm_smem + QKV_LDS_OFF_A;
+
+#ifdef MPK_QKV_RMSPRE
+  // Pass 1 of RMSNorm is 1.8 us to move 23 KB -- ~3.5 ns worth of bandwidth,
+  // so it is latency, not bytes. Hoisting its loads within pass 1 changed
+  // nothing (measured: p1 1.76 both ways), because LLVM already batched them.
+  // What actually serializes them is the weight buffer_load_lds block BELOW:
+  // it saturates the memory system first, and pass 1's loads then queue behind
+  // the whole 7.8 MB stream. Same issue-backpressure effect as the W13 tile.
+  //
+  // So issue pass 1's loads HERE, ahead of the weight DMA. vmcnt is a counter,
+  // not a flag: consuming these after the weight block waits vmcnt(<weight
+  // loads still in flight>), not vmcnt(0), so the weight stream is not drained
+  // early. Only b == 0 is prefetched -- at decode BATCH_SIZE is 1, and the
+  // b > 0 path below still does its own loads.
+  constexpr int _RP_VEC = 4;
+  constexpr int _RP_BLOCK_VEC = 256 * _RP_VEC;
+  constexpr int _RP_NI =
+      (REDUCTION_SIZE + _RP_BLOCK_VEC - 1) / _RP_BLOCK_VEC;
+  constexpr int _RP_NPEER = (EP_PEER_SLOTS > 1) ? (EP_PEER_SLOTS - 1) : 1;
+  float4 pf_ws[_RP_NI];
+  uint2 pf_res[_RP_NI];
+  uint2 pf_peer[_RP_NI][_RP_NPEER];
+  bool pf_act[_RP_NI];
+  {
+    float const *rp_ws_base = (float const *)workspace_f32_ptr;
+    unsigned short const *rp_res_base =
+        (unsigned short const *)residual_ptr;
+#pragma unroll
+    for (int i = 0; i < _RP_NI; i++) {
+      int o = tid * _RP_VEC + i * _RP_BLOCK_VEC;
+      pf_act[i] = (o < REDUCTION_SIZE);
+      // Inactive lanes clamp to 0 rather than skipping: the load stays
+      // uniform and in range, and its value is never used.
+      int co = pf_act[i] ? o : 0;
+      __builtin_memcpy(&pf_ws[i], rp_ws_base + co, 16);
+      __builtin_memcpy(&pf_res[i], rp_res_base + co, 8);
+      if constexpr (EP_PEER_SLOTS > 1) {
+#pragma unroll
+        for (int p = 1; p < EP_PEER_SLOTS; p++) {
+          __builtin_memcpy(
+              &pf_peer[i][p - 1],
+              rp_res_base + (size_t)p * BATCH_SIZE * REDUCTION_SIZE + co,
+              8);
+        }
+      }
+    }
+  }
+#endif
 
   {
     i32x4_t qkv_rsrc = make_w_buffer_rsrc(W, qkv_buf_range);
@@ -2174,6 +2237,10 @@ __device__ __noinline__ void
     }
   }
 
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+  _qkv_tp = __builtin_amdgcn_s_memrealtime();
+#endif
+
   // ── Step 0+1 FUSED: ResAddF32 + RMSNorm ───────────────────────────────
   {
     float *d_ws = (float *)workspace_f32_ptr;
@@ -2198,12 +2265,33 @@ __device__ __noinline__ void
         unsigned short const *res_base = d_residual + b * REDUCTION_SIZE;
         unsigned short *xout_base = d_x_out + b * REDUCTION_SIZE;
 
+#ifdef MPK_QKV_RMSPRE
+        // Consumes the loads issued above the weight DMA. b > 0 is not
+        // prefetched (BATCH_SIZE is 1 at decode), so it loads inline.
+        static_assert(_MAX_ITERS == _RP_NI, "prefetch iteration count drift");
+#pragma unroll
+        for (int i = 0; i < _RP_NI; i++) {
+          if (!pf_act[i]) {
+            continue;
+          }
+          int off = tid * VEC + i * BLOCK_VEC;
+          float4 ws4;
+          uint2 res_packed;
+          if (b == 0) {
+            ws4 = pf_ws[i];
+            res_packed = pf_res[i];
+          } else {
+            __builtin_memcpy(&ws4, ws_base + off, 16);
+            __builtin_memcpy(&res_packed, res_base + off, 8);
+          }
+#else
 #pragma unroll
         for (int off = tid * VEC; off < REDUCTION_SIZE; off += BLOCK_VEC) {
           float4 ws4;
           __builtin_memcpy(&ws4, ws_base + off, 16);
           uint2 res_packed;
           __builtin_memcpy(&res_packed, res_base + off, 8);
+#endif
 
           unsigned r0 = (res_packed.x & 0xFFFFu) << 16;
           unsigned r1 = res_packed.x & 0xFFFF0000u;
@@ -2221,11 +2309,23 @@ __device__ __noinline__ void
           if constexpr (EP_PEER_SLOTS > 1) {
 #pragma unroll
             for (int p = 1; p < EP_PEER_SLOTS; p++) {
+#ifdef MPK_QKV_RMSPRE
+              uint2 pk;
+              if (b == 0) {
+                pk = pf_peer[i][p - 1];
+              } else {
+                __builtin_memcpy(
+                    &pk,
+                    res_base + (size_t)p * BATCH_SIZE * REDUCTION_SIZE + off,
+                    8);
+              }
+#else
               uint2 pk;
               __builtin_memcpy(
                   &pk,
                   res_base + (size_t)p * BATCH_SIZE * REDUCTION_SIZE + off,
                   8);
+#endif
               unsigned p0 = (pk.x & 0xFFFFu) << 16;
               unsigned p1 = pk.x & 0xFFFF0000u;
               unsigned p2 = (pk.y & 0xFFFFu) << 16;
@@ -2270,6 +2370,12 @@ __device__ __noinline__ void
         }
       }
 
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+      // Reading ssq into the timestamp's dependence chain is what keeps this
+      // after pass 1 rather than scheduled into it.
+      _qkv_r1 = __builtin_amdgcn_s_memrealtime() + (unsigned long long)(ssq * 0.0f);
+#endif
+
 #pragma unroll
       for (int offset = 32; offset > 0; offset >>= 1) {
         ssq += __shfl_xor(ssq, offset);
@@ -2296,6 +2402,10 @@ __device__ __noinline__ void
       }
       __syncthreads();
       rms_rcp = s_red[0];
+
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+      _qkv_r2 = __builtin_amdgcn_s_memrealtime();
+#endif
 
       // Pass 2: Apply norm weight using CACHED sums (no re-read of x_out)
       {
@@ -2331,12 +2441,20 @@ __device__ __noinline__ void
   }
 #endif
 
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+  _qkv_tr = __builtin_amdgcn_s_memrealtime();
+#endif
+
   // ── Step 2: Prepare activation in LDS ──────────────────────────────────
 
   unsigned short const *input_row =
       (unsigned short const *)norm_scratch_ptr + tok_idx * REDUCTION_SIZE;
   _gang_wave_parallel_fp8_quant<REDUCTION_SIZE>(
       input_row, s_tok_fp8, s_tok_scales);
+
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+  _qkv_tq = __builtin_amdgcn_s_memrealtime();
+#endif
 
   // ── Phase B: Drain buffer_load_lds, scatter scales to LDS ──
   {
@@ -2377,6 +2495,12 @@ __device__ __noinline__ void
     __syncthreads();
   }
 
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+  _qkv_td = __builtin_amdgcn_s_memrealtime();
+#endif
+
+  // Tiles past the batch return here and never reach the accumulate below, so
+  // they are absent from the average rather than contributing a short tile.
   if (tok_idx >= batch_count) {
     return;
   }
@@ -2575,6 +2699,12 @@ __device__ __noinline__ void
       acc[2] = qa2;
       acc[3] = qa3;
 
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+      // Reading acc forces the accumulator to have retired, so this lands
+      // after the MFMA rather than being scheduled into it.
+      _qkv_tm = __builtin_amdgcn_s_memrealtime();
+#endif
+
       // ── Fused KV_UPD epilogue ──────────────────────────────────────────
       int kv_head = _kvupd_get_xcd_id();
       int request_id = 0;
@@ -2694,6 +2824,23 @@ __device__ __noinline__ void
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
   }
+
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+  if (tid == 0) {
+    unsigned long long _qkv_te = __builtin_amdgcn_s_memrealtime();
+    atomicAdd(&g_qkv_pre_ns, _qkv_tp - _qkv_t0);
+    atomicAdd(&g_qkv_rms_ns, _qkv_tr - _qkv_tp);
+    atomicAdd(&g_qkv_quant_ns, _qkv_tq - _qkv_tr);
+    atomicAdd(&g_qkv_drain_ns, _qkv_td - _qkv_tq);
+    atomicAdd(&g_qkv_mfma_ns, _qkv_tm - _qkv_td);
+    atomicAdd(&g_qkv_epi_ns, _qkv_te - _qkv_tm);
+    // Subdivision of rms; these three sum to it, not to the tile.
+    atomicAdd(&g_qkv_rp1_ns, _qkv_r1 - _qkv_tp);
+    atomicAdd(&g_qkv_rred_ns, _qkv_r2 - _qkv_r1);
+    atomicAdd(&g_qkv_rp2_ns, _qkv_tr - _qkv_r2);
+    atomicAdd(&g_qkv_n, 1ull);
+  }
+#endif
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   if (_sp_rec) {

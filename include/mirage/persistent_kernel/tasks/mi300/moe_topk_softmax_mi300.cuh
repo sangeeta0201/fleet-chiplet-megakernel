@@ -58,6 +58,10 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
   int *routing_indices = static_cast<int *>(routing_indices_ptr);
   int *active_expert_ids = static_cast<int *>(active_expert_ids_ptr);
 
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+  unsigned long long _tks_t0 = __builtin_amdgcn_s_memrealtime();
+#endif
+
   // Initialize routing indices to 0.
   // active_expert_ids initialization is NOT needed: we write directly to
   // active_expert_ids[0..k-1] during TopK and set the count after.
@@ -70,6 +74,15 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
     }
   }
   __syncthreads();
+
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+  // Split the completer's 3.0 us: everything before this point is the
+  // 128-expert zero-init, everything after is the actual routing math.
+  unsigned long long _tks_t1_l = __builtin_amdgcn_s_memrealtime();
+  if (threadIdx.x == 0) {
+    atomicAdd(&g_tk_zinit_ns, _tks_t1_l - _tks_t0);
+  }
+#endif
 
   // Compile-time constants
   static constexpr int ELTS_PER_LDG = BYTES_PER_LDG / sizeof(T);
@@ -110,6 +123,17 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
       }
     }
 
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+    // The logit load is 128 bf16 that every one of the 128 router tiles just
+    // pushed past L2 with st_wt, so this is a cold HBM read no matter what.
+    // row_chunk[0]*0 keeps the timestamp below the load's s_waitcnt.
+    if (threadIdx.x == 0) {
+      atomicAdd(&g_tk_lload_ns,
+                __builtin_amdgcn_s_memrealtime() +
+                    (unsigned long long)(row_chunk[0] * 0.0f) - _tks_t1_l);
+    }
+#endif
+
     // Reset input buffer to 0 (for split-k gate linear compatibility)
     for (int ldg = 0; ldg < LDG_PER_THREAD; ++ldg) {
       int src_offset = ldg * THREADS_PER_ROW * ELTS_PER_LDG;
@@ -149,6 +173,9 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
     static constexpr int COLS_PER_GROUP_LDG = ELTS_PER_LDG * THREADS_PER_ROW;
     float row_sum_for_renorm = 0.f;
     float topk_vals[8];
+#ifdef MPK_TK_DEFER
+    int topk_experts[8];
+#endif
 
     // Precompute expert column indices for branchless local argmax.
     int col[VPT];
@@ -218,6 +245,15 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
       }
 
       // ── Step 3: Write top-k result ──
+#ifdef MPK_TK_DEFER
+      // Record only; every store moves below the loop. See the block after it
+      // for why this is the same bytes in the same places.
+      if (thread_group_idx == 0) {
+        topk_experts[k_idx] = expert;
+        topk_vals[k_idx] = max_val;
+        row_sum_for_renorm += max_val;
+      }
+#else
       if (thread_group_idx == 0) {
         bool const node_uses = (expert >= start_expert && expert < end_expert);
         int const out_idx = k * thread_row + k_idx;
@@ -235,6 +271,7 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
           }
         }
       }
+#endif
 
       // ── Step 4: Branchless blanking of winner ──
       // expert == col[i] matches exactly one thread + one element.
@@ -251,6 +288,48 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
       }
     }
 
+#ifdef MPK_TK_DEFER
+    // All of Step 3, hoisted out of the k-loop.
+    //
+    // Why this is worth doing: the loop body alternates st_wt_u32 with
+    // `asm volatile` blocks (Step 4's branchless blanking). LLVM's waitcnt
+    // pass cannot see inside inline asm, so it must conservatively drain
+    // outstanding VMEM before each asm block -- every iteration pays an
+    // s_waitcnt vmcnt(0) on write-through stores that went past L2 to HBM.
+    // With k=4 that is up to 4 serialized HBM store round trips inside what
+    // should be pure register math, and this is the single completer
+    // workgroup with 239 other workers parked on its release flag.
+    //
+    // Why it is the same result: nothing in the loop READS output,
+    // routing_indices, or active_expert_ids -- the winners are already kept in
+    // topk_vals/topk_experts for the renorm pass, and Step 4 blanks
+    // row_chunk in registers. Store order among these three arrays is not
+    // observable either: the consumers are gated on the routing_ready flag,
+    // published after a threadfence_gpu in the caller.
+    //
+    // The `output` store in the loop was also dead outright: renormalize is
+    // passed literally true at the only two call sites, so the renorm block
+    // below unconditionally overwrote it.
+    if (thread_group_idx == 0) {
+      float inv = renormalize ? (1.f / row_sum_for_renorm) : 1.f;
+      for (int k_idx = 0; k_idx < k; ++k_idx) {
+        int const out_idx = k * thread_row + k_idx;
+        st_wt_u32((void *)&output[out_idx],
+                  __float_as_uint(topk_vals[k_idx] * inv));
+        int const expert = topk_experts[k_idx];
+        bool const node_uses = (expert >= start_expert && expert < end_expert);
+        if (node_uses && routing_indices != nullptr) {
+          int const local_expert = expert - start_expert;
+          st_wt_u32(
+              (void *)&routing_indices[local_expert * num_rows + thread_row],
+              (unsigned)(k_idx + 1));
+          if (active_expert_ids != nullptr) {
+            st_wt_u32((void *)&active_expert_ids[k_idx], (unsigned)expert);
+          }
+        }
+      }
+    }
+#else
     // Optional renormalization (write-through stores, using cached values)
     if (renormalize && thread_group_idx == 0) {
       float inv = 1.f / row_sum_for_renorm;
@@ -260,6 +339,7 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
                   __float_as_uint(topk_vals[k_idx] * inv));
       }
     }
+#endif
   }
   __syncthreads();
 

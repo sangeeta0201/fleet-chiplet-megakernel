@@ -261,6 +261,44 @@ def get_compile_command(
         flags = flags + ["-DMPK_W13_LDS_WEIGHTS"]
     if int(os.environ.get("W13_LDS_PREFETCH", "1")) == 1:
         flags = flags + ["-DMPK_W13_LDS_PREFETCH"]
+    if int(os.environ.get("W13_QFIRST", "0")) == 1:
+        flags = flags + ["-DMPK_W13_QFIRST"]
+    if int(os.environ.get("W13_ILV", "0")) == 1:
+        flags = flags + ["-DMPK_W13_ILV"]
+    if int(os.environ.get("W13_BIASPRE", "0")) == 1:
+        flags = flags + ["-DMPK_W13_BIASPRE"]
+    if int(os.environ.get("QKV_RMSPRE", "0")) == 1:
+        flags = flags + ["-DMPK_QKV_RMSPRE"]
+    if int(os.environ.get("TK_DEFER", "0")) == 1:
+        # Hoist TopK's three st_wt stores out of the k=4 loop. The loop
+        # alternates them with `asm volatile` blanking blocks, and LLVM's
+        # waitcnt pass cannot see into inline asm, so each iteration drains
+        # write-through stores to HBM. CORRECT output: nothing in the loop
+        # reads what it stores, and the `output` store it removed was dead
+        # (renormalize is literally true, so the renorm pass overwrote it).
+        flags = flags + ["-DMPK_TK_DEFER"]
+    if int(os.environ.get("TK_NOELOAD", "0")) == 1:
+        # TopK's completer read the routing_ready epoch back with an uncached
+        # ld_nt_s32 before publishing epoch+1. The consumer never reads it --
+        # it derives layer_counter + 1 -- so the producer takes the same value
+        # as an argument. CORRECT output: same value, one fewer HBM round trip
+        # on the serial path 239 workers wait behind.
+        flags = flags + ["-DMPK_TK_NOELOAD"]
+    if int(os.environ.get("EP9_DIRECT", "0")) == 1:
+        # Phase 9a's release flags removed: the 8 folding workgroups poll the
+        # GPU-wide arrival counter (ep_moe_done >= 8 * (layer_idx + 1))
+        # instead of a flag the closer publishes after observing it. Drops the
+        # closer's 8 write-through stores and their drain from the span
+        # between the last W2 tile and the first byte of folding. CORRECT
+        # output: same predicate, same instant; ordering was never carried by
+        # the flag (it is each worker's own vmcnt drain before its arrival
+        # atomic, plus the folder's buffer_inv).
+        #
+        # MEASURED NULL: 2.219 vs 2.138 baseline, +2.25 us/layer. The 8 `nt`
+        # spin loops contend with the 8 XCD leaders' RMWs on that same line;
+        # the separate release lines were what kept poll traffic off the
+        # critical atomic. See the long note at MPK_EP9_DIRECT.
+        flags = flags + ["-DMPK_EP9_DIRECT=1"]
     # Use when debugging
     # flags = flags + [f"-DMPK_ENABLE_VERBOSE"]
     if int(os.environ.get("PRECOMPUTED_DISPATCH", "1")) == 1:
@@ -398,6 +436,25 @@ def get_compile_command(
             flags = flags + ["-DMPK_W13_LDS_WEIGHTS"]
         if int(os.environ.get("W13_LDS_PREFETCH", "1")) == 1:
             flags = flags + ["-DMPK_W13_LDS_PREFETCH"]
+        if int(os.environ.get("W13_QFIRST", "0")) == 1:
+            flags = flags + ["-DMPK_W13_QFIRST"]
+        if int(os.environ.get("W13_ILV", "0")) == 1:
+            flags = flags + ["-DMPK_W13_ILV"]
+        if int(os.environ.get("W13_BIASPRE", "0")) == 1:
+            flags = flags + ["-DMPK_W13_BIASPRE"]
+        if int(os.environ.get("QKV_RMSPRE", "0")) == 1:
+            # QKV pass 1's loads issued ABOVE the weight buffer_load_lds block.
+            # MEASURED NULL: p1 1.76 -> 1.53 and drain 0.70 -> 0.50, but pre
+            # 1.44 -> 2.02 -- issue backpressure just relocates the stall into
+            # the issue block. 2.150/2.123 vs 2.116 baseline. Kept because the
+            # negative result is what rules the approach out.
+            flags = flags + ["-DMPK_QKV_RMSPRE"]
+        if int(os.environ.get("TK_DEFER", "0")) == 1:
+            flags = flags + ["-DMPK_TK_DEFER"]
+        if int(os.environ.get("TK_NOELOAD", "0")) == 1:
+            flags = flags + ["-DMPK_TK_NOELOAD"]
+        if int(os.environ.get("EP9_DIRECT", "0")) == 1:
+            flags = flags + ["-DMPK_EP9_DIRECT=1"]
         if int(os.environ.get("MPK_GAP_TIMING", "0")) == 1:
             flags = flags + ["-DMPK_ENABLE_GAP_TIMING"]
             flags = flags + ["-DMPK_ENABLE_DEVICE_TASK_ACCUM"]
@@ -429,6 +486,39 @@ def get_compile_command(
             # output: it reorders which worker runs which tile, not what any
             # tile computes.
             flags = flags + ["-DMPK_MOE_NOPAD"]
+        _w13_early = int(os.environ.get("MPK_W13_EARLY_REL", "0"))
+        if _w13_early:
+            # Fire the W13->W2 release at _w13_early/16 of the W13 arrivals.
+            # WRONG OUTPUT by construction -- prices the ceiling of any
+            # dependency-narrowing scheme (MoK-style indexed counters, W2
+            # split-K with a half-width required_count) before building one.
+            # If 8/16 does not move the token, the W2 wait is W13's DURATION,
+            # not its arrival count, and narrowing the count cannot help.
+            flags = flags + [f"-DMPK_W13_EARLY_REL={_w13_early}"]
+        _perf_iter = int(os.environ.get("MPK_PERFETTO", "0"))
+        if _perf_iter:
+            # Capture raw per-worker phase spans for ONE decode iteration and
+            # dump them as [PERF] CSV lines; perf_to_perfetto.py turns those
+            # into a Perfetto trace. Correct output -- this only stores
+            # timestamps the fused task already takes. Implies device timing,
+            # which is where those timestamps come from, and EP9_ONLY to
+            # suppress the per-layer printf storm that would otherwise
+            # dominate the very timeline being captured.
+            flags = flags + [
+                "-DMPK_PERFETTO",
+                f"-DMPK_PERFETTO_ITER={_perf_iter}",
+                "-DMPK_ENABLE_DEVICE_TASK_TIMING",
+                "-DMPK_EP9_ONLY",
+            ]
+        for _nq in ("MPK_W13_NOQUANT", "MPK_W2_NOQUANT"):
+            if int(os.environ.get(_nq, "0")) == 1:
+                # Skip the per-tile FP8 token quant. WRONG OUTPUT by
+                # construction -- prices the ceiling of hoisting the quant,
+                # which is redundant across every tile of an expert (all 92 W13
+                # / 45 W2 workgroups quantize the same vector). The quant also
+                # hides the weight-prefetch latency, so the measured delta is
+                # the NET win a real hoist could deliver, not the gross 1.51 us.
+                flags = flags + [f"-D{_nq}"]
         if int(os.environ.get("MPK_W2_HALFK", "0")) == 1:
             # Halves W2's MFMA iteration count to price a K-split of W2 against
             # the W13 -> barrier -> W2 chain that sets Phase 8's length. See the

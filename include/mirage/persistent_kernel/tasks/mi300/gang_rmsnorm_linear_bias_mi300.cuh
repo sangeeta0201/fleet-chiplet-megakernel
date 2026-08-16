@@ -254,7 +254,21 @@ __device__ __attribute__((noinline)) void
   // all 128 workers bypassed L2 → HBM. buffer_inv ensures the reader's L2
   // fetches fresh data from HBM (zeroing stores from previous iteration may
   // have populated L2 with stale zeros).
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+  unsigned long long _tki_t0 = __builtin_amdgcn_s_memrealtime();
+#endif
   asm volatile("buffer_inv" ::: "memory");
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+  // buffer_inv invalidates this XCD's ENTIRE L2, not just the 256-byte logit
+  // line, so it costs the completer both the invalidate itself and every
+  // subsequent miss on data it had cached. Timed separately from the softmax
+  // body because the fix differs: the invalidate can be narrowed (the logits
+  // are st_wt, so a plain load with sc0 sc1 reads past L2 without nuking it),
+  // whereas the body would need restructuring.
+  if (threadIdx.x == 0) {
+    atomicAdd(&g_tk_inv_ns, __builtin_amdgcn_s_memrealtime() - _tki_t0);
+  }
+#endif
 
   topk_softmax_mi300_task_impl<T,
                                /*VPT=*/8,
