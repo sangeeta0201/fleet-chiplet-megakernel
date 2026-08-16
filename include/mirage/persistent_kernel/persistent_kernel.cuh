@@ -139,6 +139,60 @@ __device__ unsigned long long g_ep8_arr_span_max;
 __device__ unsigned long long g_moe_busy_ns[MOE_OCC_WORKERS];
 __device__ unsigned long long g_moe_tiles[MOE_OCC_WORKERS];
 __device__ unsigned long long g_moe_occ_iters;
+
+// ── MPK_PERFETTO: raw per-worker phase spans, for a Perfetto timeline ──────
+// Everything above reduces timestamps into atomicAdd accumulators, which is
+// why the 20x max/min worker spread in [MOEOCC] cannot be attributed: a mean
+// says nothing about WHICH worker was slow or what it was doing. This keeps
+// the raw pairs instead.
+//
+// One row per (worker, layer, phase): 6 phase boundaries the fused task
+// already timestamps (_fused_t0/t0a/t0b/t1/t2/t3, _ep_t0.._ep_t4). We store
+// entry+exit as raw s_memrealtime ticks (100 MHz, 10 ns) and let the host do
+// the arithmetic, so no information is lost to a reduction.
+//
+// Sized for ONE layer-sweep of one decode iteration: 240 workers x 36 layers
+// x PERF_NPHASE. At 8 phases x 2 u32 that is 240*36*8*2*4 B = 553 KB of device
+// global -- fine. Writes are plain stores to device memory (NOT the pinned
+// host buffer MPK_WS_MARK uses, which costs a PCIe write per mark and was
+// measured at 2.3x when done four times per tile).
+#define PERF_NPHASE 8
+#define PERF_NLAYER 36
+#define PERF_SLOTS (MOE_OCC_WORKERS * PERF_NLAYER * PERF_NPHASE)
+// [slot][0] = entry tick, [slot][1] = exit tick, relative to g_perf_t0.
+__device__ unsigned int g_perf_span[PERF_SLOTS][2];
+// Kernel-wide time origin, so the u32 deltas cannot overflow: at 100 MHz a
+// u32 covers 43 s, and one decode iteration is ~2 ms.
+__device__ unsigned long long g_perf_t0;
+// Set to 1 by the first worker to reach the capture iteration; the dump
+// reads it to know the buffer is populated. Capturing every iteration would
+// just overwrite, so the gate picks a single steady-state one.
+__device__ int g_perf_armed;
+__device__ __forceinline__ void mpk_perf_span(int worker,
+                                              int layer,
+                                              int phase,
+                                              unsigned long long t_in,
+                                              unsigned long long t_out) {
+  if (worker >= MOE_OCC_WORKERS || layer >= PERF_NLAYER ||
+      phase >= PERF_NPHASE) {
+    return;
+  }
+  // g_perf_armed guards the origin: worker 0 of layer 0 publishes g_perf_t0,
+  // and every other worker records its spans at the END of its layer, so the
+  // origin is set long before it is read. The check makes that ordering
+  // explicit rather than assumed -- an unarmed read would see t0 == 0 and
+  // turn the subtraction into a full 64-bit tick count, overflowing the u32.
+  if (!g_perf_armed) {
+    return;
+  }
+  unsigned long long const t0 = g_perf_t0;
+  if (t_in < t0 || t_out < t_in) {
+    return;
+  }
+  int const slot = (worker * PERF_NLAYER + layer) * PERF_NPHASE + phase;
+  g_perf_span[slot][0] = (unsigned int)(t_in - t0);
+  g_perf_span[slot][1] = (unsigned int)(t_out - t0);
+}
 // Where a MoE worker's time actually goes: w13 compute, the W13->W2 per-expert
 // barrier poll, and W2 compute. The occupancy probe shows workers holding at
 // most 2 tiles yet spanning 1-12 us, so the cost is inside a tile, not in the
@@ -148,6 +202,112 @@ __device__ unsigned long long g_moe_w2bar_ns;
 __device__ unsigned long long g_moe_w2_ns;
 __device__ unsigned long long g_moe_w13_n;
 __device__ unsigned long long g_moe_w2_n;
+// W13's 7.4 us/tile against a 4.4 us HBM-stream floor for the same bytes: the
+// four terms that 7.4 splits into, so the 3.0 us gap can be attributed before
+// anything is restructured. Double-buffering the K loop only pays if the MFMA
+// term is large enough to hide loads behind; if the gap is in the load drain
+// or the SwiGLU epilogue instead, it buys nothing.
+//   p: entry -> the 24 dwordx4 buffer_load_lds prefetch is ISSUED
+//   a: that -> post FP8 quant of the token
+//   b: post-quant -> weight/scale loads drained (s_waitcnt vmcnt(0))
+//   c: drain -> MFMA + SwiGLU + swiglu_out store complete
+//   d: that -> barrier arrival done (tile exit)
+// The first cut folded p into a and reported 3.46 us of "quant". It is not
+// quant: the prefetch issue sits in front of it and the quant's own loads
+// queue behind ~98 KB of in-flight weight traffic, so p+a+b was measuring the
+// HBM stream (4.42 us floor for these bytes at nt=256) more than the ALU.
+// pre splits again into addr (t0v/t0m setup, 24 readfirstlane) and issue (the
+// 24-load asm block), because the block is supposed to cost ~75 ns and the
+// s_mov_b32 m0 in front of every load is the reason to doubt that.
+__device__ unsigned long long g_w13_addr_ns;
+__device__ unsigned long long g_w13_pre_ns;
+__device__ unsigned long long g_w13_quant_ns;
+__device__ unsigned long long g_w13_drain_ns;
+__device__ unsigned long long g_w13_mfma_ns;
+__device__ unsigned long long g_w13_epi_ns;
+__device__ unsigned long long g_w13_stdrain_ns;
+__device__ unsigned long long g_w13_arrive_ns;
+
+// Phase 1 (QKV GEMM) tile split, same accumulate-and-dump-once treatment as
+// the W13 split above. QKV moves 7.8 MB of MXFP4 per rank and the phase takes
+// 8.9 us, but dividing those gives 0.9 TB/s and that ratio is meaningless --
+// the split below shows the weight stream is only pre+drain = 2.14 us, i.e.
+// 3.6 TB/s against a measured 6.59 TB/s peak, with drain at 0.70 us meaning
+// the prefetch is already well hidden. The time is elsewhere. The existing
+// MPK_ENABLE_SUBPHASE_TIMING slots cannot say where: _sp_t3b in the kvupd
+// kernel is declared and never assigned, so its [3]/[4] terms are garbage.
+//
+// MEASURED (n=288080, both ranks): pre 1.44, rms 3.27, quant 0.65, drain 0.70,
+// mfma 1.40, epi 1.12. RMSNorm is 38% of the tile for 23 KB of traffic, and
+// all 80 QKV workgroups norm the SAME 2880-element vector.
+//
+// Terms, in execution order, non-overlapping and summing to the tile total:
+//   pre     Phase A buffer_load_lds issue (4 waves x QKV_LPT loads)
+//   rms     ResAddF32 + RMSNorm over the hidden vector
+//   quant   FP8 activation quant into LDS
+//   drain   s_waitcnt on the Phase A loads + scale scatter
+//   mfma    the asm MFMA loop
+//   epi     KV_UPD / RoPE epilogue + workspace zeroing
+__device__ unsigned long long g_qkv_pre_ns;
+__device__ unsigned long long g_qkv_rms_ns;
+__device__ unsigned long long g_qkv_quant_ns;
+__device__ unsigned long long g_qkv_drain_ns;
+__device__ unsigned long long g_qkv_mfma_ns;
+__device__ unsigned long long g_qkv_epi_ns;
+__device__ unsigned long long g_qkv_n;
+// rms split three ways: p1 is the resadd + sum-of-squares pass (2 or 3 HBM
+// streams: the f32 workspace, the residual, and under EP the peer's gather
+// slot), red is the cross-wave ssq reduction (two __syncthreads), p2 is the
+// norm-weight apply. p1 and p2 are separated by a full block barrier, so if
+// the cost is HBM latency rather than bytes it shows up as p1 >> p2.
+__device__ unsigned long long g_qkv_rp1_ns;
+__device__ unsigned long long g_qkv_rred_ns;
+__device__ unsigned long long g_qkv_rp2_ns;
+
+// Phase 7b's routing_ready wait, 5.4 us/layer, split by CAUSE. The two
+// possibilities need opposite fixes, so the split decides which to build:
+//
+//   arr   time from the LAST router tile arriving at the top-k barrier back to
+//         when the FIRST one did -- i.e. arrival spread. If this dominates,
+//         the wait is inherited skew and parallelizing top-k buys nothing.
+//   tk    top-k compute itself: one workgroup, 128 logits, plus the 8-flag
+//         st_wt fanout. If THIS dominates, it is a genuine serial critical
+//         path at bs=1 and worth restructuring.
+//
+// arr is measured on the top-k completer via a min-timestamp every router tile
+// atomicMins as it arrives; tk is that completer's own compute span. Both are
+// per-layer, reset by the completer after it reads them.
+__device__ unsigned long long g_tk_arr_ns;
+__device__ unsigned long long g_tk_tk_ns;
+__device__ unsigned long long g_tk_fan_ns;
+__device__ unsigned long long g_tk_n;
+__device__ unsigned long long g_tk_first = ~0ull;
+// MEASURED: arr 5.4-5.7, tk 3.0, fan 1.3-1.8 us. Arrival spread is the larger
+// term, so the wait is mostly inherited skew -- but tk+fan = 4.4 us is a
+// genuinely serial span with 239 workers parked, and that part is attackable.
+// Second-level split of those two, since the fixes differ:
+//
+//   fence   threadfence_gpu() alone. On gfx950 this is `buffer_wbl2 sc1`, a
+//           writeback of the WHOLE L2. Every store it must publish is already
+//           st_wt EXCEPT routing_indices' zero-init (moe_topk_softmax_mi300
+//           :68, a plain store), so the same argument that killed the Phase 9
+//           fence in 57422b1 may apply here.
+//   flags   the 9 st_wt_u32 epoch publishes + their s_waitcnt.
+//   zinit   the 128-expert routing_indices zero-init loop and its syncthreads,
+//           run by the single completer block before it touches any logit.
+//   sfmx    buffer_inv + the load/softmax/top-k/blank body.
+__device__ unsigned long long g_tk_fence_ns;
+__device__ unsigned long long g_tk_eload_ns;
+__device__ unsigned long long g_tk_flags_ns;
+__device__ unsigned long long g_tk_zinit_ns;
+__device__ unsigned long long g_tk_sfmx_ns;
+//   inv     the buffer_inv that opens topk_noinline -- a WHOLE-L2 invalidate on
+//           the completer's XCD, taken to see the logits the 128 router tiles
+//           wrote past L2 with st_wt.
+//   lload   the 128-bf16 logit read itself, which is a cold HBM hit by
+//           construction and is what the inv is paid for.
+__device__ unsigned long long g_tk_inv_ns;
+__device__ unsigned long long g_tk_lload_ns;
 #endif
 
 #ifdef MPK_ENABLE_SPAN_TIMING

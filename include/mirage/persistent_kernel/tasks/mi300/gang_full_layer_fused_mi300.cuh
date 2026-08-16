@@ -95,6 +95,59 @@ static constexpr int FULL_LAYER_EP_SIGNAL_STRIDE = 8;
 #define MPK_EP_WAIT_AT_USE 0
 #endif
 
+// 9a's release hop, removed: the 8 folding workgroups poll the GPU-wide
+// arrival counter directly instead of a flag the closer publishes.
+//
+// Today the span between the last W2 tile on the GPU and the first byte of
+// folding is four serialized round trips: the last worker's per-XCD atomic,
+// its XCD leader's global atomic, the closer's 8 write-through release stores
+// plus their vmcnt drain, and the poller's load of the flag. The middle two
+// exist only to convert "the counter reached 8N" into "a flag says so" -- and
+// the counter is already a device-scope location every XCD can read.
+//
+// So the closer publishes nothing and each XCD's workgroup 0 spins on
+// ep_moe_done >= 8 * ep_expected. Same predicate, same instant, two fewer
+// hops. This is the transferable half of Kog's sentinel-polling result (poll
+// the thing itself, not a flag about it); the literal form does not apply
+// here, because 9a's payload is an f32 workspace accumulated by atomicAdd and
+// no value in it distinguishes "complete" from "partially summed".
+//
+// Correctness is unchanged and does not rest on the flag. What orders the W2
+// atomicAdds ahead of the fold is each worker's own s_waitcnt vmcnt(0) before
+// its arrival atomic (retires its stores to the coherence point) and the
+// buffer_inv the folder issues before reading the workspace. The flag never
+// carried data; it only carried the count, which is what is now read directly.
+//
+// The failure mode if the counter is NOT visible off-XCD is a hang, not a
+// wrong answer -- the poll simply never satisfies. Forced off under any
+// ablation: MPK_EP_ABLATE=3 drops the cross-XCD atomic entirely, so the
+// counter never reaches the threshold and the poll would spin forever.
+//
+// MEASURED NULL, and a large one: 2.219 vs 2.138 ms/token on the same day,
+// +2.25 us per layer -- the opposite sign and four times the size of the two
+// hops it removes. The reason is the thing the comment above got wrong. The
+// 8 pollers do not just read the line, they read it in a spin loop with
+// `nt` (uncached, so every trip is a fresh coherence request) while the 8 XCD
+// leaders are trying to land read-modify-writes on it. A load is not a
+// coherence transaction, but a continuous stream of uncached loads to the
+// line an atomic is queued on absolutely does delay that atomic. Separate
+// release lines were never redundant with the arrival line; the separation is
+// what keeps the poll traffic off the critical RMW.
+//
+// This also prices the general shape: any "poll the thing itself" rewrite on
+// this hardware has to check that the thing is not also an atomic target.
+// Kog's sentinel result holds for data buffers, where the producer's stores
+// are plain writes and the poll contends with nothing.
+//
+// Kept, default off, because the negative result is what rules it out.
+#ifndef MPK_EP9_DIRECT
+#define MPK_EP9_DIRECT 0
+#endif
+#if MPK_EP_ABLATE != 0
+#undef MPK_EP9_DIRECT
+#define MPK_EP9_DIRECT 0
+#endif
+
 // Fold this rank's MoE partial out of the f32 workspace into bf16, optionally
 // adding the residual, and zero the workspace.
 //
@@ -119,22 +172,49 @@ static constexpr int FULL_LAYER_EP_SIGNAL_STRIDE = 8;
 // that are awake anyway can each take 1/8 of the work instead of one workgroup
 // doing all of it while 239 workers idle. The slices are disjoint, so no
 // coordination is needed between them beyond the arrival count that follows.
-template <int BATCH_SIZE, int OUTPUT_SIZE, int OUTPUT_STRIDE, bool FOLD>
+// NPEER is the number of remote copies to publish to, i.e. EP_WORLD_SIZE - 1.
+// At NPEER == 1 this is byte-for-byte the two-GPU path it generalizes; the
+// loops below all collapse under #pragma unroll at that count.
+//
+// Why a wider world does not need a wider mechanism: the transfer is the
+// fold's epilogue, so an extra peer is an extra st_wt_u32 issued from the same
+// thread in the same iteration, on an address that differs only by that peer's
+// heap delta. Those stores are fire-and-forget writes to distinct XGMI links
+// and they pipeline -- the wave issues all NPEER of them and drains once. That
+// is the whole reason a direct path scales where the staged one does not: a
+// staged putmem_signal is a work-group collective, so N-1 peers cost N-1
+// sequential collectives, while N-1 direct stores cost one drain.
+template <int BATCH_SIZE,
+          int OUTPUT_SIZE,
+          int OUTPUT_STRIDE,
+          bool FOLD,
+          int NPEER = 1>
 __device__ __forceinline__ void _full_layer_ep_fold_partial(
     void *workspace_f32_ptr, void const *residual_ptr, void *output_ptr,
-    void *peer_out_ptr = nullptr, int col_lo = 0, int col_hi = OUTPUT_SIZE) {
+    void *const *peer_out_ptrs = nullptr, int col_lo = 0,
+    int col_hi = OUTPUT_SIZE) {
   float *__restrict__ d_ws = static_cast<float *>(workspace_f32_ptr);
   unsigned short const *__restrict__ d_res =
       static_cast<unsigned short const *>(residual_ptr);
   unsigned short *__restrict__ d_out =
       static_cast<unsigned short *>(output_ptr);
-  unsigned short *d_peer = static_cast<unsigned short *>(peer_out_ptr);
+  unsigned short *d_peer[NPEER];
+#pragma unroll
+  for (int q = 0; q < NPEER; ++q) {
+    d_peer[q] = peer_out_ptrs
+                    ? static_cast<unsigned short *>(peer_out_ptrs[q])
+                    : nullptr;
+  }
 
   for (int row = 0; row < BATCH_SIZE; ++row) {
     float *ws_row = d_ws + row * OUTPUT_STRIDE;
     unsigned short const *res_row = d_res + row * OUTPUT_STRIDE;
     unsigned short *out_row = d_out + row * OUTPUT_STRIDE;
-    unsigned short *peer_row = d_peer ? d_peer + row * OUTPUT_STRIDE : nullptr;
+    unsigned short *peer_row[NPEER];
+#pragma unroll
+    for (int q = 0; q < NPEER; ++q) {
+      peer_row[q] = d_peer[q] ? d_peer[q] + row * OUTPUT_STRIDE : nullptr;
+    }
     // Two bf16 per thread per step, so the remote store is a 32-bit write
     // rather than two 16-bit ones. A 2-byte store still occupies a full XGMI
     // transaction, so the narrow form would double the packet count for the
@@ -180,8 +260,13 @@ __device__ __forceinline__ void _full_layer_ep_fold_partial(
       // plain store into this XCD's L2 is not enough. Two floats, one 8-byte
       // store, the same pair the fold just read.
       st_wt_u64((void *)&ws_row[off], 0ull);
-      if (peer_row) {
-        st_wt_u32((void *)&peer_row[off], packed);
+      // All NPEER remote copies issued back to back, then one drain at the
+      // call site. Distinct peers are distinct XGMI links, so these overlap.
+#pragma unroll
+      for (int q = 0; q < NPEER; ++q) {
+        if (peer_row[q]) {
+          st_wt_u32((void *)&peer_row[q][off], packed);
+        }
       }
     }
     if ((OUTPUT_SIZE & 1) && threadIdx.x == 0 && col_hi == OUTPUT_SIZE) {
@@ -199,8 +284,11 @@ __device__ __forceinline__ void _full_layer_ep_fold_partial(
       unsigned short bf = (unsigned short)((u + rounding_bias) >> 16);
       st_wt_u16((void *)&out_row[off], bf);
       st_wt_u32((void *)&ws_row[off], 0u);
-      if (peer_row) {
-        st_wt_u16((void *)&peer_row[off], bf);
+#pragma unroll
+      for (int q = 0; q < NPEER; ++q) {
+        if (peer_row[q]) {
+          st_wt_u16((void *)&peer_row[q][off], bf);
+        }
       }
     }
   }
@@ -220,15 +308,55 @@ __device__ __forceinline__ void _full_layer_ep_fold_partial(
 // read-only until its one writer touches it once per layer. The 240-deep
 // arrival tree in 9a exists because atomicAdds to one address serialize; reads
 // to one address do not.
+// ep_direct selects the poll shape, not the world size. Under direct peer
+// stores every peer writes its own signal line with st_wt_u64 and this is a
+// plain load either way; the staged path needs the backend primitive because
+// its signal arrives as a SIGNAL_ADD through rocSHMEM.
 template <int EP_WORLD_SIZE, int EP_MY_PE>
 __device__ __forceinline__ void
-    _full_layer_ep_wait_peers(uint64_t *ep_signal, uint64_t ep_sig_expected) {
+    _full_layer_ep_wait_peers(uint64_t *ep_signal, uint64_t ep_sig_expected,
+                              bool ep_direct = false) {
   if constexpr (EP_WORLD_SIZE == 2) {
     uint64_t *peer_sig =
         ep_signal + (size_t)(1 - EP_MY_PE) * FULL_LAYER_EP_SIGNAL_STRIDE;
     while (ld_nt_u64(reinterpret_cast<unsigned long long *>(peer_sig)) <
            (unsigned long long)ep_sig_expected) {
       __builtin_amdgcn_s_sleep(1);
+    }
+  } else if (ep_direct) {
+    // Wait on all peers CONCURRENTLY, not one after another.
+    //
+    // The sequential form below is correct but it serializes the wait: peer 1
+    // is not even looked at until peer 0 has landed, so the observed cost is
+    // the sum of the per-peer detection latencies rather than the max. The
+    // peers are independent producers writing independent lines -- nothing
+    // orders them -- so the right shape is one pass over all lines per poll
+    // round, exiting when the slowest is in.
+    //
+    // Correctness is the same predicate: this returns only when every peer's
+    // line has reached the threshold. `remaining` is a bitmask rather than a
+    // counter so a line that satisfies early is not re-read on later rounds.
+    unsigned remaining = 0;
+#pragma unroll
+    for (int p = 0; p < EP_WORLD_SIZE; p++) {
+      if (p != EP_MY_PE) {
+        remaining |= (1u << p);
+      }
+    }
+    while (remaining) {
+#pragma unroll
+      for (int p = 0; p < EP_WORLD_SIZE; p++) {
+        if (remaining & (1u << p)) {
+          uint64_t *sp = ep_signal + (size_t)p * FULL_LAYER_EP_SIGNAL_STRIDE;
+          if (ld_nt_u64(reinterpret_cast<unsigned long long *>(sp)) >=
+              (unsigned long long)ep_sig_expected) {
+            remaining &= ~(1u << p);
+          }
+        }
+      }
+      if (remaining) {
+        __builtin_amdgcn_s_sleep(1);
+      }
     }
   } else {
     // Staged fallback: one transfer per peer carries the whole slot and
@@ -440,6 +568,24 @@ __device__ __noinline__ void
   // Because they are all the same per-layer count, all three expected values
   // are the same number.
   int const layer_counter = task_layer_idx;
+#ifdef MPK_PERFETTO
+  // task_layer_idx counts (iteration * num_layers + layer) monotonically, so
+  // it yields both the layer and the iteration to capture. MPK_PERFETTO_ITER
+  // picks a steady-state decode iteration (default 100 -- past warmup, and the
+  // [EP9ARR] dump above uses the same 36*100 point, so the two agree).
+  int const _perf_layer = task_layer_idx % PERF_NLAYER;
+  int const _perf_iter = task_layer_idx / PERF_NLAYER;
+  bool const _perf_cap = (_perf_iter == MPK_PERFETTO_ITER);
+  int const _perf_wid = xcd_id * workers_per_xcd + xcd_rank;
+  if (_perf_cap && tid == 0 && _perf_wid == 0 && _perf_layer == 0) {
+    // First worker of the capture iteration sets the time origin. Other
+    // workers of layer 0 may read it a few hundred ns later; mpk_perf_span
+    // drops any span that starts before it rather than underflowing.
+    g_perf_t0 = _fused_t0;
+    __threadfence();
+    g_perf_armed = 1;
+  }
+#endif
   int const routing_expected = layer_counter + 1;
   int const attn_release_expected = layer_counter + 1;
   int const qkv_epoch_expected = layer_counter + 1;
@@ -974,7 +1120,11 @@ __device__ __noinline__ void
           // below derives every number from _fused_t0.._fused_t4, which are
           // taken in this function. This used to name a _ts_base that was
           // never declared, so MPK_DEVICE_TIMING=1 did not compile.
-          nullptr);
+          nullptr,
+          // epoch_hint: the same value this function's own Phase 7b poll waits
+          // for. Handing it to the producer lets it skip an uncached read-back
+          // of a counter both sides can derive from the layer index.
+          routing_expected);
     }
   }
 
@@ -1261,6 +1411,27 @@ __device__ __noinline__ void
       g_ep9_arr_max = 0ull;
       g_ep8_arr_min = ~0ull;
       g_ep8_arr_max = 0ull;
+#ifdef MPK_PERFETTO
+      // Dump the captured iteration once, as CSV lines the host converts to
+      // Perfetto JSON. Fires one iteration AFTER the capture so every worker
+      // has written its spans. ~240*36*8 = 69k lines at worst, but only on a
+      // run that is already instrumented and not being timed.
+      if (an == (unsigned long long)(MPK_PERFETTO_ITER + 1) * 36ull) {
+        for (int w = 0; w < MOE_OCC_WORKERS; w++) {
+          for (int L = 0; L < PERF_NLAYER; L++) {
+            for (int p = 0; p < PERF_NPHASE; p++) {
+              int const slot = (w * PERF_NLAYER + L) * PERF_NPHASE + p;
+              unsigned int const a = g_perf_span[slot][0];
+              unsigned int const b = g_perf_span[slot][1];
+              if (b > a) {
+                printf("[PERF] %d %d %d %u %u\n", w, L, p, a, b);
+              }
+            }
+          }
+        }
+        printf("[PERFEND]\n");
+      }
+#endif
       if (an == 36ull * 100ull) {
         printf("[EP9ARR] n=%llu p8_entry_spread_us mean=%.3f max=%.3f | "
                "p9_entry_spread_us mean=%.3f max=%.3f\n",
@@ -1317,6 +1488,65 @@ __device__ __noinline__ void
                g_moe_w2_n ? (double)(g_moe_w2_ns - g_moe_w2bar_ns) /
                                 g_moe_w2_n / 100.0
                           : 0.0);
+        // W13's tile split five ways. These sum to the w13 us above; whichever
+        // holds the gap against the 4.4 us HBM-stream floor for the same bytes
+        // is the one worth restructuring. pre is the prefetch issue, split out
+        // of quant because the first cut charged it to the quant.
+        if (g_moe_w13_n) {
+          double _n = (double)g_moe_w13_n * 100.0;
+          printf("[W13SPLIT] addr=%.2f pre=%.2f quant=%.2f drain=%.2f "
+                 "mfma=%.2f epi=%.2f stdrain=%.2f arrive=%.2f\n",
+                 (double)g_w13_addr_ns / _n,
+                 (double)g_w13_pre_ns / _n,
+                 (double)g_w13_quant_ns / _n,
+                 (double)g_w13_drain_ns / _n,
+                 (double)g_w13_mfma_ns / _n,
+                 (double)g_w13_epi_ns / _n,
+                 (double)g_w13_stdrain_ns / _n,
+                 (double)g_w13_arrive_ns / _n);
+        }
+        // Phase 1's tile split, same terms in execution order. These sum to
+        // the QKV tile cost, which [FP18] reports as qkv_gemm. QKV moves
+        // 7.4 MB/rank at 0.83 TB/s against a 6.59 TB/s peak; W13 by contrast
+        // is AT peak, so the term holding that 8x gap is the one to attack.
+        if (g_qkv_n) {
+          double _qn = (double)g_qkv_n * 100.0;
+          printf("[QKVSPLIT] n=%llu pre=%.2f rms=%.2f (p1=%.2f red=%.2f "
+                 "p2=%.2f) quant=%.2f drain=%.2f mfma=%.2f epi=%.2f\n",
+                 g_qkv_n,
+                 (double)g_qkv_pre_ns / _qn,
+                 (double)g_qkv_rms_ns / _qn,
+                 (double)g_qkv_rp1_ns / _qn,
+                 (double)g_qkv_rred_ns / _qn,
+                 (double)g_qkv_rp2_ns / _qn,
+                 (double)g_qkv_quant_ns / _qn,
+                 (double)g_qkv_drain_ns / _qn,
+                 (double)g_qkv_mfma_ns / _qn,
+                 (double)g_qkv_epi_ns / _qn);
+        }
+        // Phase 7b's 5.4 us routing wait, split by cause. arr is the router
+        // tiles' arrival spread (inherited skew -- parallelizing top-k would
+        // not touch it); tk + fan is the completer's own serial span (top-k
+        // over 128 logits, then the 8-flag publish).
+        if (g_tk_n) {
+          double _tn = (double)g_tk_n * 100.0;
+          printf("[TKSPLIT] n=%llu arr=%.2f tk=%.2f (inv=%.2f zinit=%.2f "
+                 "lload=%.2f rest=%.2f) "
+                 "fan=%.2f (fence=%.2f eload=%.2f flags=%.2f)\n",
+                 g_tk_n,
+                 (double)g_tk_arr_ns / _tn,
+                 (double)g_tk_tk_ns / _tn,
+                 (double)g_tk_inv_ns / _tn,
+                 (double)g_tk_zinit_ns / _tn,
+                 (double)g_tk_lload_ns / _tn,
+                 (double)(g_tk_tk_ns - g_tk_inv_ns - g_tk_zinit_ns -
+                          g_tk_lload_ns) /
+                     _tn,
+                 (double)g_tk_fan_ns / _tn,
+                 (double)g_tk_fence_ns / _tn,
+                 (double)g_tk_eload_ns / _tn,
+                 (double)g_tk_flags_ns / _tn);
+        }
       }
     }
 #endif
@@ -1389,6 +1619,7 @@ __device__ __noinline__ void
       }
     }
 #endif
+#if !MPK_EP9_DIRECT
     if (is_last_on_gpu) {
       for (int x = 0; x < 8; x++) {
         st_wt_u32((void *)&ep_release[x * FULL_LAYER_EP_XCD_STRIDE],
@@ -1396,22 +1627,59 @@ __device__ __noinline__ void
       }
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
+#endif
 
     // Every XCD's workgroup 0 waits for the release, then folds its slice.
     __shared__ int s_ep_closer;
     if (tid == 0) {
       s_ep_closer = 0;
       if (xcd_rank == 0) {
+#if MPK_EP9_DIRECT
+        // Poll the arrival counter itself. 8 XCD leaders arrive per layer and
+        // the counter is run-monotonic (never reset), so the target is
+        // 8 * ep_expected -- derived, not observed, exactly like every other
+        // threshold in this file.
+        //
+        // 8 pollers on one line is fine where 240 arrivals on one line was
+        // not: a load is not a coherence transaction, and this line's only
+        // writers are the 8 leaders that touch it once each per layer. That
+        // asymmetry is the whole reason 9a fans its ARRIVALS out over 8 lines
+        // but can afford to fan its RELEASE in to one.
+        int const ep9_target = 8 * ep_expected;
+        while (ld_nt_s32(ep_moe_done) < ep9_target) {
+          __builtin_amdgcn_s_sleep(1);
+        }
+#else
         int _obs;
         while ((_obs = ld_nt_s32(
                     &ep_release[xcd_id * FULL_LAYER_EP_XCD_STRIDE])) <
                ep_expected) {
           __builtin_amdgcn_s_sleep(1);
         }
+#endif
         s_ep_closer = 1;
       }
     }
     __syncthreads();
+
+    // Is every peer directly mapped? Hoisted out of the fold block below,
+    // which is entered only by the folding work-groups, because the 9d peer
+    // wait further down runs on EVERY worker and needs the same answer to
+    // choose its poll shape. Pure function of the init-time delta table --
+    // same value on every thread, recomputed rather than communicated.
+    bool ep_any_direct = (EP_WORLD_SIZE > 1);
+#if MPK_EP_ABLATE == 1
+    ep_any_direct = false;
+#else
+    if constexpr (EP_WORLD_SIZE > 1) {
+      for (int q = 0; q < EP_WORLD_SIZE - 1; q++) {
+        int64_t _d = 0;
+        if (!mpk_shmem_peer_delta((q < EP_MY_PE) ? q : (q + 1), &_d)) {
+          ep_any_direct = false;
+        }
+      }
+    }
+#endif
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
     // 9a ends HERE, not after the fold. The old placement folded the two
@@ -1463,33 +1731,59 @@ __device__ __noinline__ void
       // change below: init samples the mapping through rocshmem_ptr once, so a
       // stub there yields no valid delta and every peer stays unmapped.
       //
-      // Fold straight into the peer's gather slot as well as my own. peer_slot
-      // is this rank's slot in the PEER's copy of the symmetric buffer, so
-      // after the fold both GPUs hold my partial and nothing further has to be
-      // transferred. For EP_WORLD_SIZE == 2 there is exactly one peer, which is
-      // the configuration this path serves; wider worlds fall back to the
-      // staged put below.
+      // Fold straight into every peer's gather slot as well as my own.
+      // peer_slot[q] is this rank's slot in peer q's copy of the symmetric
+      // buffer, so after the fold every GPU holds my partial and nothing
+      // further has to be transferred.
       //
-      // One delta, two addresses. The gather slot and the signal line are both
-      // symmetric-heap objects and the local->peer offset is heap-wide (see
-      // mpk_comm.cuh), so translating the signal below costs an add and no
-      // second lookup. Resolving both here also means the per-layer cost of the
-      // translation is that add, not a walk down the rocSHMEM context.
-      __hip_bfloat16 *peer_slot = nullptr;
-      int64_t ep_peer_delta = 0;
+      // This used to be gated on EP_WORLD_SIZE == 2, which meant a 4-GPU run
+      // silently took the staged putmem_signal path for all 36 layers -- the
+      // pre-optimization path, whose own measured cost is recorded above as
+      // 2.378 vs 2.229 for ONE peer. The gate was never a correctness
+      // requirement; it was written when only the 2-PE delta was plumbed.
+      // mpk_shmem_peer_delta is per-PE and valid for up to MPK_MAX_PES, so
+      // the general form is the same code in a loop.
+      //
+      // One delta, two addresses, per peer. The gather slot and the signal
+      // line are both symmetric-heap objects and the local->peer offset is
+      // heap-wide (see mpk_comm.cuh), so translating the signal below costs an
+      // add and no second lookup. Resolving them here also means the per-layer
+      // cost of the translation is that add, not a walk down the rocSHMEM
+      // context.
+      constexpr int EP_NPEER =
+          (EP_WORLD_SIZE > 1) ? (EP_WORLD_SIZE - 1) : 1;
+      void *peer_slot[EP_NPEER];
+      int64_t ep_peer_delta[EP_NPEER];
+      int ep_peer_pe[EP_NPEER];
+      bool ep_all_mapped = (EP_WORLD_SIZE > 1);
+#pragma unroll
+      for (int q = 0; q < EP_NPEER; q++) {
+        peer_slot[q] = nullptr;
+        ep_peer_delta[q] = 0;
+        // Peers in rank order, skipping self: q -> the q'th other PE.
+        ep_peer_pe[q] = (q < EP_MY_PE) ? q : (q + 1);
+      }
 #if MPK_EP_ABLATE != 1
-      if constexpr (EP_WORLD_SIZE == 2) {
-        if (mpk_shmem_peer_delta(1 - EP_MY_PE, &ep_peer_delta)) {
-          peer_slot = reinterpret_cast<__hip_bfloat16 *>(
-              reinterpret_cast<char *>(ep_gather + EP_MY_PE * EP_SLOT_ELEMS) +
-              ep_peer_delta);
+      if constexpr (EP_WORLD_SIZE > 1) {
+#pragma unroll
+        for (int q = 0; q < EP_NPEER; q++) {
+          if (mpk_shmem_peer_delta(ep_peer_pe[q], &ep_peer_delta[q])) {
+            peer_slot[q] = reinterpret_cast<void *>(
+                reinterpret_cast<char *>(ep_gather + EP_MY_PE * EP_SLOT_ELEMS) +
+                ep_peer_delta[q]);
+          } else {
+            // One unmapped peer disqualifies the direct path for the whole
+            // work-group: the staged fallback is a collective that sends to
+            // every peer, so it cannot be run for a subset.
+            ep_all_mapped = false;
+          }
         }
       }
 #endif
       // Whether the direct path is live has to be a work-group-wide decision,
       // not a per-thread one: the staged fallback below is a work-group
       // collective and every thread must agree on whether to enter it.
-      bool const ep_direct = (peer_slot != nullptr);
+      bool const ep_direct = ep_all_mapped;
 #ifdef MPK_EP_SIG_DBG
       // Which of the two publication paths is actually live. The direct one
       // needs mpk_shmem_peer_ptr to hand back a usable mapping of the peer's
@@ -1497,19 +1791,21 @@ __device__ __noinline__ void
       // through the staged putmem_signal instead, and no amount of tuning the
       // direct path changes anything.
       if (tid == 0 && xcd_id == 0 && layer_counter == 0) {
-        printf("[EPPATH] pe=%d ep_direct=%d peer_slot=%p\n",
-               EP_MY_PE, (int)ep_direct, (void *)peer_slot);
+        printf("[EPPATH] pe=%d world=%d npeer=%d ep_direct=%d peer_slot0=%p\n",
+               EP_MY_PE, EP_WORLD_SIZE, EP_NPEER, (int)ep_direct,
+               peer_slot[0]);
       }
 #endif
       // This XCD's slice only. All 8 run concurrently on disjoint columns.
       _full_layer_ep_fold_partial<QKV_BATCH_SIZE,
                                   QKV_REDUCTION_SIZE,
                                   QKV_REDUCTION_SIZE,
-                                  (EP_MY_PE == EP_FOLD_PE)>(
+                                  (EP_MY_PE == EP_FOLD_PE),
+                                  EP_NPEER>(
           output_ptrs[10],                      // moe_workspace_f32
           output_ptrs[5],                       // attn_proj_out (residual)
           ep_gather + EP_MY_PE * EP_SLOT_ELEMS, // my slot
-          peer_slot,                            // peer's copy of my slot
+          peer_slot,                            // every peer's copy of my slot
           ep_col_lo,
           ep_col_hi);
       __syncthreads();
@@ -1544,14 +1840,20 @@ __device__ __noinline__ void
         if (tid == 0) {
           int prev_f = atom_add_release_gpu_s32(ep_fold_done, 1);
           if (prev_f % 8 == 7) {
-            // Same heap-wide delta resolved above; ep_direct being true is
-            // what makes it valid.
-            uint64_t *peer_sig = reinterpret_cast<uint64_t *>(
-                reinterpret_cast<char *>(ep_signal +
-                                         (size_t)EP_MY_PE *
-                                             FULL_LAYER_EP_SIGNAL_STRIDE) +
-                ep_peer_delta);
-            st_wt_u64((void *)peer_sig, (unsigned long long)ep_sig_expected);
+            // Same heap-wide deltas resolved above; ep_direct being true is
+            // what makes them valid. One store per peer, all issued before the
+            // single drain below -- so N-1 peers cost one drain, not N-1
+            // round trips. This is the signal analogue of the fold's
+            // multi-peer store loop.
+#pragma unroll
+            for (int q = 0; q < EP_NPEER; q++) {
+              uint64_t *peer_sig = reinterpret_cast<uint64_t *>(
+                  reinterpret_cast<char *>(ep_signal +
+                                           (size_t)EP_MY_PE *
+                                               FULL_LAYER_EP_SIGNAL_STRIDE) +
+                  ep_peer_delta[q]);
+              st_wt_u64((void *)peer_sig, (unsigned long long)ep_sig_expected);
+            }
             // Same store, local copy: this thread has just observed all 8
             // local slices, which is precisely what a worker leaving this
             // layer needs to know about its OWN rank's slot. Publishing it on
@@ -1675,12 +1977,12 @@ __device__ __noinline__ void
         // to move the wait to and EP_WRITE_COMBINED reads all slots right
         // below. It keeps the wait here under either setting.
 #if !MPK_EP_WAIT_AT_USE
-        _full_layer_ep_wait_peers<EP_WORLD_SIZE, EP_MY_PE>(ep_signal,
-                                                           ep_sig_expected);
+        _full_layer_ep_wait_peers<EP_WORLD_SIZE, EP_MY_PE>(
+            ep_signal, ep_sig_expected, ep_any_direct);
 #else
         if constexpr (EP_WRITE_COMBINED) {
-          _full_layer_ep_wait_peers<EP_WORLD_SIZE, EP_MY_PE>(ep_signal,
-                                                             ep_sig_expected);
+          _full_layer_ep_wait_peers<EP_WORLD_SIZE, EP_MY_PE>(
+              ep_signal, ep_sig_expected, ep_any_direct);
         }
 #endif
 #if MPK_EP_ABLATE == 6
@@ -1795,6 +2097,32 @@ __device__ __noinline__ void
     // from 2.5 ms to 441 ms -- the breakdown then describes the printf, not the
     // collective. Accumulate into globals and dump once, from the hot path,
     // deep enough into decode that prefill is out of the average.
+#ifdef MPK_PERFETTO
+    // Raw spans for the timeline, one worker-track per (rank, xcd, worker).
+    // Emitted here because every phase timestamp is still in scope. Phases
+    // 0..3 come from the QKV/attn worker path (_fused_t0a/b/c are 0 on workers
+    // that did not run those), 4..7 are the ones every worker executes.
+    if (tid == 0 && _perf_cap) {
+      int const w = _perf_wid;
+      int const L = _perf_layer;
+      if (_fused_t0a > 0) {
+        mpk_perf_span(w, L, 0, _fused_t0, _fused_t0a); // qkv gemm
+      }
+      if (_fused_t0a > 0 && _fused_t0b > 0) {
+        mpk_perf_span(w, L, 1, _fused_t0a, _fused_t0b); // qkv barrier
+      }
+      if (_fused_t0b > 0 && _fused_t0c > 0) {
+        mpk_perf_span(w, L, 2, _fused_t0b, _fused_t0c); // attn
+      }
+      mpk_perf_span(w, L, 3, _fused_t1, _fused_t2); // xcd barrier
+      mpk_perf_span(w, L, 4, _fused_t2, _fused_t3); // oproj+topk
+      if (_ep_t0 > 0) {
+        mpk_perf_span(w, L, 5, _fused_t3, _ep_t0); // MoE (phase 8)
+        mpk_perf_span(w, L, 6, _ep_t0, _ep_t1);    // 9a barrier
+        mpk_perf_span(w, L, 7, _ep_t1, _ep_t4);    // 9b-9e combine
+      }
+    }
+#endif
     if (tid == 0 && (xcd_rank == 0 || xcd_rank == 1) && _ep_t0 > 0) {
       int r = (xcd_rank == 0) ? 0 : 1;
       atomicAdd(&g_ep9_ns[r][0], (unsigned long long)(_ep_t1 - _ep_t0));
