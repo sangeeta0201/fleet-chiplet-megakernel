@@ -4236,8 +4236,22 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
   code.e("    $,", moe_w13_tiles_per_xcd);
   code.e("    $,", moe_w2_tiles_per_xcd);
   code.e("    $,", tiles_per_xcd);
-  code.e("    tile_idx);");
-  return register_task_variant(TASK_GANG_MLA_DECODE_MI300, code.to_string());
+  code.e("    tile_idx,");
+  // Multi-layer mode (task #14). ml_num_layers is 0 whenever the scheduler is
+  // dispatching one task per layer, which is what the kernel's snapshot path
+  // keys off; _linear_reserved carries the monotonic layer index the batched
+  // loop publishes before each layer. Both live behind MPK_PRECOMPUTED_DISPATCH
+  // -- RuntimeConfig does not declare ml_num_layers without it -- so the
+  // fallback has to be a literal.
+  code.e("#if defined(MPK_PRECOMPUTED_DISPATCH) && "
+         "defined(MPK_FUSED_LAYER_BATCHING)");
+  code.e("    runtime_config.ml_num_layers,");
+  code.e("#else");
+  code.e("    0,");
+  code.e("#endif");
+  code.e("    (int)task_desc->task_metadata._linear_reserved);");
+  return register_task_variant(TASK_GANG_MLA_FULL_LAYER_FUSED_MI300,
+                               code.to_string());
 }
 
 // Gang merge split-KV: 8 tasks (1 per XCD), tile_idx → (request_id, kv_head)

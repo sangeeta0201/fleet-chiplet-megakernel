@@ -538,7 +538,8 @@ __device__ __host__ __forceinline__ bool is_gang_task_type(TaskType t) {
          t == TASK_GANG_FULL_LAYER_FUSED_MI300 ||
          t == TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300 ||
          t == TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300 ||
-         t == TASK_GANG_MLA_DECODE_MI300;
+         t == TASK_GANG_MLA_DECODE_MI300 ||
+         t == TASK_GANG_MLA_FULL_LAYER_FUSED_MI300;
 }
 
 __device__ __forceinline__ bool is_termination_event(size_t event_loc,
@@ -2099,7 +2100,8 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
         // ===== Fused-layer batching fast path =====
         if (task_desc->task_type == TASK_GANG_FULL_LAYER_FUSED_MI300 ||
             task_desc->task_type ==
-                TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300) {
+                TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300 ||
+            task_desc->task_type == TASK_GANG_MLA_FULL_LAYER_FUSED_MI300) {
 
           if (config.ml_num_layers > 0) {
             // ===== Multi-layer all-fused: one task executes all layers =====
@@ -2347,7 +2349,9 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               TaskDesc *next_td = task_descs + next_qp;
               if (next_td->task_type != TASK_GANG_FULL_LAYER_FUSED_MI300 &&
                   next_td->task_type !=
-                      TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300) {
+                      TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300 &&
+                  next_td->task_type !=
+                      TASK_GANG_MLA_FULL_LAYER_FUSED_MI300) {
                 break;
               }
 
@@ -2510,6 +2514,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
         case TASK_PAGED_ATTENTION_CK_FMHA_SPLIT_KV_MI300:
         case TASK_GANG_ATTN_SPLIT_KV_MI300:
         case TASK_GANG_MLA_DECODE_MI300:
+        case TASK_GANG_MLA_FULL_LAYER_FUSED_MI300:
           slot = 6;
           break;
         case TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_MI300:
@@ -2619,6 +2624,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
         case TASK_GANG_ATTN_SPLIT_KV_MI300:
         case TASK_GANG_ATTN_MERGE_MI300:
         case TASK_GANG_MLA_DECODE_MI300:
+        case TASK_GANG_MLA_FULL_LAYER_FUSED_MI300:
           attention_cycles += task_time;
           attention_count++;
           break;
@@ -3934,7 +3940,9 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
         if (is_gang_task_type(all_tasks[t].task_type) &&
             (all_tasks[t].task_type == TASK_GANG_FULL_LAYER_FUSED_MI300 ||
              all_tasks[t].task_type ==
-                 TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300) &&
+                 TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300 ||
+             all_tasks[t].task_type ==
+                 TASK_GANG_MLA_FULL_LAYER_FUSED_MI300) &&
             t + NUM_XCDS_ML <= all_tasks.size()) {
           fused_layer_positions.push_back(t);
           t += NUM_XCDS_ML;
@@ -3996,9 +4004,13 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
       {
         int null_in = 0, null_out = 0, unused_in = 0, unused_out = 0;
         for (int L = 0; L < ml_layers; L++) {
-          bool is_lmhead = all_tasks[fused_layer_positions[L]].task_type ==
-                           TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300;
-          int used_in = is_lmhead ? 28 : 24;
+          TaskType lt = all_tasks[fused_layer_positions[L]].task_type;
+          bool is_lmhead = lt == TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300;
+          // GLM's fused layer declares 27 inputs / 11 outputs; gpt-oss's plain
+          // variant 24 / 11 and its LM-head variant 28 / 13.
+          int used_in =
+              is_lmhead ? 28 : (lt == TASK_GANG_MLA_FULL_LAYER_FUSED_MI300 ? 27
+                                                                          : 24);
           int used_out = is_lmhead ? 13 : 11;
           for (int xcd = 0; xcd < NUM_XCDS_ML; xcd++) {
             int base = (xcd * ml_layers + L) * ML_N_IN;

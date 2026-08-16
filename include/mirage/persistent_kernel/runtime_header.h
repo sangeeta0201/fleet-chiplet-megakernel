@@ -193,6 +193,12 @@ enum TaskType {
   TASK_GANG_MOE_W13_LINEAR_MXFP8_MI300 = 222,
   TASK_GANG_MOE_W2_LINEAR_MXFP8_MI300 = 223,
   TASK_GANG_RMSNORM_LINEAR_MXFP8_BIAS_MI300 = 224,
+  // GLM whole-layer fusion. Its own type rather than a variant of
+  // TASK_GANG_MLA_DECODE_MI300, which is what it used to register as: the
+  // multi-layer scan in persistent_kernel.cuh identifies fused layers by task
+  // type, and sharing a type with the plain MLA decode task would have made
+  // layer 0's unfused decode look like a fused layer.
+  TASK_GANG_MLA_FULL_LAYER_FUSED_MI300 = 225,
   // Hopper Tasks
   TASK_HOPPER_TASK_BEGIN = 150, // Hopper start placeholder, not a real task
   TASK_LINEAR_WITH_RESIDUAL_HOPPER = 151,

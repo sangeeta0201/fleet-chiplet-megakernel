@@ -922,12 +922,13 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     int variant_id =
         task_register->register_gang_mla_full_layer_fused_mi300_task(
             customized->bgraph, params);
-    // Registered as a variant of the MLA decode task type: it is already in
-    // runtime.cc's gang group and takes the n_tile_start = bid.x *
-    // tiles_per_xcd branch the fused halves need, so no enum entry and no
-    // runtime.cc change.
-    task_config[op] =
-        std::make_tuple(27, 11, TASK_GANG_MLA_DECODE_MI300, variant_id);
+    // Its own task type rather than a variant of TASK_GANG_MLA_DECODE_MI300.
+    // The multi-layer scan in persistent_kernel.cuh identifies fused layers by
+    // task type, so sharing a type with the plain MLA decode task would make
+    // layer 0's unfused decode look like a fused layer. runtime.cc lists the
+    // new type everywhere the decode type appears.
+    task_config[op] = std::make_tuple(
+        27, 11, TASK_GANG_MLA_FULL_LAYER_FUSED_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[24]; // tiles_per_xcd
   } else if (name == "gang_attn_merge_mi300") {
     assert(params.size() == 7);

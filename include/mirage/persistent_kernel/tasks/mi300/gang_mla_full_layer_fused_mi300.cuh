@@ -122,7 +122,10 @@ static constexpr int FULL_LAYER_ATTN_SLOT = 0;
 static constexpr int FULL_LAYER_ATTN_RELEASE_SLOT = 30;
 static constexpr int FULL_LAYER_OPROJ_SLOT = 40;
 static constexpr int FULL_LAYER_ROUTER_COUNTER_SLOT = 70;
-static constexpr int FULL_LAYER_COUNTER_SLOTS = 71;
+// Layer-entry barrier, used only in multi-layer mode. Mechanism C like the
+// rest: per-XCD release flags at [71..78], global arrival counter at [79].
+static constexpr int FULL_LAYER_ENTRY_SLOT = 71;
+static constexpr int FULL_LAYER_COUNTER_SLOTS = 80;
 
 template <
     // ── shared ──
@@ -196,7 +199,15 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     int moe_w2_tiles_per_xcd,
     // ── shared parameters ──
     int tiles_per_xcd,
-    int tile_idx) {
+    int tile_idx,
+    // Multi-layer mode (task #14). `ml_num_layers` is runtime_config's, and is
+    // 0 whenever the scheduler is dispatching one task per layer -- which is
+    // the only case where the snapshot below is safe. `task_layer_idx` is the
+    // monotonic (iteration * num_layers + layer) counter the scheduler writes
+    // into task_metadata._linear_reserved before each layer of the batched
+    // loop; it is meaningless when ml_num_layers is 0.
+    int ml_num_layers,
+    int task_layer_idx) {
 
   static_assert(MERGE_WRITE_THROUGH,
                 "the fused layer reads attn_out across an in-kernel barrier "
@@ -220,23 +231,97 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
   int *const oproj_counters = counters + FULL_LAYER_OPROJ_SLOT * HIER_STRIDE;
   int *const router_counter =
       counters + FULL_LAYER_ROUTER_COUNTER_SLOT * HIER_STRIDE;
+  int *const entry_bar = counters + FULL_LAYER_ENTRY_SLOT * HIER_STRIDE;
 
-  // All six release values, plus this task's own, read before Phase 1. See
-  // the header: this is the only point in the fused body that is still
-  // behind the previous layer's event, and the two halves' own snapshots are
-  // suppressed by passing these down.
+  // Multi-layer mode: the scheduler is running every layer inside one task,
+  // so the per-layer event boundary the snapshot below depends on is gone.
+  bool const ml_mode = ml_num_layers > 0;
+
+  // ── layer-entry barrier (multi-layer mode only) ──────────────────────────
+  // Phase 1 resolves the residual stream, which the *previous* layer's MoE W2
+  // wrote. With one dispatch per layer that ordering came free: the scheduler
+  // would not dispatch this task until every worker had retired the last one.
+  // Inside the batched loop nothing separates them -- the loop body is a bare
+  // threadfence plus a __syncthreads, which orders one workgroup's 256 threads
+  // and nothing else. A worker that finishes its W2 tiles early would walk
+  // straight into the next layer's residual resolve and read a row other
+  // workers have not finished accumulating into, and the resolve zeroes
+  // moe_ws_f32 as it consumes it, so the loser's atomicAdd would land in an
+  // already-drained accumulator.
+  //
+  // gpt-oss's fused layer has the same shape and does not do this. Its comment
+  // reasons about visibility (threadfence, buffer_inv) rather than arrival,
+  // which is a different property: the last barrier before its layer boundary
+  // is the per-expert W13->W2 one, so its race window is one W2 tile wide and
+  // evidently narrow enough not to fire. That is not an argument for leaving
+  // it open here.
+  //
+  // Mechanism C, identical to Phase 8 below: bump a global counter, let the
+  // last arriver fan a write-through release out to all eight per-XCD flags,
+  // poll your own XCD's flag. Costs one all-XCD barrier per layer, which is
+  // what the removed event boundary was anyway; what multi-layer mode buys is
+  // the scheduler round trip on either side of it, not the sync itself.
+  if (ml_mode) {
+    int const entry_expected = task_layer_idx + 1;
+    int const arrivals = tiles_per_xcd * 8;
+    __syncthreads();
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    if (tid == 0) {
+      int const prev = atom_add_release_gpu_s32(&entry_bar[8 * HIER_STRIDE], 1);
+      if ((prev % arrivals) == arrivals - 1) {
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        for (int x = 0; x < 8; x++) {
+          st_wt_u32((void *)&entry_bar[x * HIER_STRIDE],
+                    (unsigned)entry_expected);
+        }
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      }
+      int *const my_flag = &entry_bar[xcd_id * HIER_STRIDE];
+      while (ld_nt_s32(my_flag) < entry_expected) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+    __syncthreads();
+    // Same reasoning as Phase 8: plain buffer_inv, not an agent-scope acquire.
+    asm volatile("buffer_inv" ::: "memory");
+  }
+
+  // All six release values, plus this task's own.
+  //
+  // One dispatch per layer: read them here, before Phase 1. See the header --
+  // this is the only point in the fused body that is still behind the previous
+  // layer's event, and the two halves' own snapshots are suppressed by passing
+  // these down.
+  //
+  // Multi-layer mode: there is no such point, so the snapshot is replaced by
+  // the deterministic layer counter, exactly as gpt-oss's full-layer task does
+  // (see the layer_counter comment in gang_full_layer_fused_mi300.cuh). Every
+  // one of these counters is monotonic, never reset, and bumped exactly once
+  // per fused layer -- five are release flags written with the very value
+  // being computed here, and routing_ready's epoch is read-modify-written once
+  // by the single TopK completer -- so after fused layer L each of them holds
+  // L + 1. Deriving that from the layer index instead of from a load means
+  // every worker on every XCD agrees with no ordering requirement at all,
+  // which is strictly stronger than the snapshot it replaces.
   __shared__ int s_exp[7];
   if (tid == 0) {
-    s_exp[0] = ld_nt_s32(&attn_counters[xcd_id * HIER_STRIDE]) + 1;
-    s_exp[1] = ld_nt_s32(&attn_counters[(10 + xcd_id) * HIER_STRIDE]) + 1;
-    s_exp[2] = ld_nt_s32(&attn_counters[(20 + xcd_id) * HIER_STRIDE]) + 1;
-    s_exp[3] = ld_nt_s32(&attn_release[xcd_id * HIER_STRIDE]) + 1;
-    s_exp[4] = ld_nt_s32(&oproj_counters[xcd_id * HIER_STRIDE]) + 1;
-    // routing_ready's global epoch lives at its slot 0; the per-XCD release
-    // flags are at [(1 + xcd) * HIER_STRIDE]. That asymmetry is the MoE
-    // half's, reproduced here because it is the half that reads it back.
-    s_exp[5] = ld_nt_s32(&oproj_counters[10 * HIER_STRIDE]) + 1;
-    s_exp[6] = ld_nt_s32(&oproj_counters[(20 + xcd_id) * HIER_STRIDE]) + 1;
+    if (ml_mode) {
+#pragma unroll
+      for (int i = 0; i < 7; i++) {
+        s_exp[i] = task_layer_idx + 1;
+      }
+    } else {
+      s_exp[0] = ld_nt_s32(&attn_counters[xcd_id * HIER_STRIDE]) + 1;
+      s_exp[1] = ld_nt_s32(&attn_counters[(10 + xcd_id) * HIER_STRIDE]) + 1;
+      s_exp[2] = ld_nt_s32(&attn_counters[(20 + xcd_id) * HIER_STRIDE]) + 1;
+      s_exp[3] = ld_nt_s32(&attn_release[xcd_id * HIER_STRIDE]) + 1;
+      s_exp[4] = ld_nt_s32(&oproj_counters[xcd_id * HIER_STRIDE]) + 1;
+      // routing_ready's global epoch lives at its slot 0; the per-XCD release
+      // flags are at [(1 + xcd) * HIER_STRIDE]. That asymmetry is the MoE
+      // half's, reproduced here because it is the half that reads it back.
+      s_exp[5] = ld_nt_s32(&oproj_counters[10 * HIER_STRIDE]) + 1;
+      s_exp[6] = ld_nt_s32(&oproj_counters[(20 + xcd_id) * HIER_STRIDE]) + 1;
+    }
   }
   __syncthreads();
   int const attn_release_expected = s_exp[3];

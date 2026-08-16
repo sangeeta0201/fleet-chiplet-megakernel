@@ -453,7 +453,8 @@ void register_mugraph(
               task_type == TASK_GANG_FULL_LAYER_FUSED_MI300 ||
               task_type == TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300 ||
               task_type == TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300 ||
-              task_type == TASK_GANG_MLA_DECODE_MI300) {
+              task_type == TASK_GANG_MLA_DECODE_MI300 ||
+              task_type == TASK_GANG_MLA_FULL_LAYER_FUSED_MI300) {
             auto it = graph.gang_task_tiles_per_xcd.find(op);
             assert(it != graph.gang_task_tiles_per_xcd.end() &&
                    "Gang task missing n_tiles_per_xcd");
@@ -480,7 +481,8 @@ void register_mugraph(
                            TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300 ||
                        task_type ==
                            TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300 ||
-                       task_type == TASK_GANG_MLA_DECODE_MI300) {
+                       task_type == TASK_GANG_MLA_DECODE_MI300 ||
+                       task_type == TASK_GANG_MLA_FULL_LAYER_FUSED_MI300) {
               // Encode XCD index in tile_idx so kernel can compute column
               // offset tile_idx = bid.x * tiles_per_xcd + local_t
               task.task_metadata.n_tile_start =
@@ -1575,6 +1577,8 @@ TaskGraphResult print_task_graph(
       "TASK_MOE_TOPK_SIGMOID_BIAS_MI300";
   task_type_to_name[TASK_GANG_MLA_DECODE_MI300] =
       "TASK_GANG_MLA_DECODE_MI300";
+  task_type_to_name[TASK_GANG_MLA_FULL_LAYER_FUSED_MI300] =
+      "TASK_GANG_MLA_FULL_LAYER_FUSED_MI300";
   task_type_to_name[TASK_MLA_KV_CACHE_UPDATE_MI300] =
       "TASK_MLA_KV_CACHE_UPDATE_MI300";
   task_type_to_name[TASK_MOE_W13_LINEAR_MI300] = "TASK_MOE_W13_LINEAR_MI300";
@@ -1727,7 +1731,8 @@ TaskGraphResult print_task_graph(
         task.first == TASK_GANG_FULL_LAYER_FUSED_MI300 ||
         task.first == TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300 ||
         task.first == TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300 ||
-        task.first == TASK_GANG_MLA_DECODE_MI300) {
+        task.first == TASK_GANG_MLA_DECODE_MI300 ||
+        task.first == TASK_GANG_MLA_FULL_LAYER_FUSED_MI300) {
       continue;
     }
     for (size_t variant_id = 0; variant_id < task.second.size(); variant_id++) {
@@ -1791,7 +1796,8 @@ TaskGraphResult print_task_graph(
           task.first != TASK_GANG_FULL_LAYER_FUSED_MI300 &&
           task.first != TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300 &&
           task.first != TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300 &&
-          task.first != TASK_GANG_MLA_DECODE_MI300) {
+          task.first != TASK_GANG_MLA_DECODE_MI300 &&
+          task.first != TASK_GANG_MLA_FULL_LAYER_FUSED_MI300) {
         continue;
       }
       for (size_t variant_id = 0; variant_id < task.second.size();
