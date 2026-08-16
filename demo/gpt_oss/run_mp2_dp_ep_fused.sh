@@ -49,7 +49,7 @@ source ./env_common.sh
 
 export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-6,7}"
 export ROCSHMEM_MAX_NUM_CONTEXTS="${ROCSHMEM_MAX_NUM_CONTEXTS:-2}"
-export ATTN_DP=1
+export ATTN_DP="${ATTN_DP:-1}"
 export MOE_EP=1
 # Slot-parallel expert ownership (activated-list position, weights replicated)
 # rather than an expert-id window. Splits 2/2 on every token instead of 3-1 half
