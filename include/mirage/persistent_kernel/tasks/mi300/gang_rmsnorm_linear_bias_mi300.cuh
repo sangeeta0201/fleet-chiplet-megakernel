@@ -22,6 +22,14 @@
 
 namespace kernel {
 
+// Self-heal gate for the Mechanism-C flag polls. Same value and same
+// reasoning as the copy in gang_mla_full_layer_fused_mi300.cuh, which carries
+// the full note; duplicated under #ifndef because the monoliths land in this
+// translation unit in include order and any one of them may be first.
+#ifndef MPK_FL_REPUBLISH_SPINS
+#define MPK_FL_REPUBLISH_SPINS 1024
+#endif
+
 namespace gang_rmsnorm_detail {
 using bf16 = __hip_bfloat16;
 
@@ -636,8 +644,30 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
                    : "memory");
     }
     int *hier = static_cast<int *>(oproj_hier_barrier_ptr);
-    while (ld_nt_s32(&hier[oproj_xcd_id * 16]) < oproj_release_expected) {
-      __builtin_amdgcn_s_sleep(1);
+    // Self-heal, see MPK_FL_REPUBLISH_SPINS in
+    // gang_mla_full_layer_fused_mi300.cuh. The release is eight independent
+    // write-through stores from one elected thread, issued once, never
+    // retried; lose the one addressed to this XCD and every worker on it
+    // spins here for the rest of the run. The arrival count is not plumbed
+    // down to this kernel, but the other seven flags are just as conclusive:
+    // all eight are written by the same thread in the same loop, so any peer
+    // at or past the epoch proves the release fired and this line is simply
+    // short. Republishing it is idempotent -- same monotonic absolute value.
+    {
+      int _spins = 0;
+      while (ld_nt_s32(&hier[oproj_xcd_id * 16]) < oproj_release_expected) {
+        if ((++_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
+          for (int x = 0; x < 8; x++) {
+            if (ld_nt_s32(&hier[x * 16]) >= oproj_release_expected) {
+              st_wt_u32((void *)&hier[oproj_xcd_id * 16],
+                        (unsigned)oproj_release_expected);
+              asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+              break;
+            }
+          }
+        }
+        __builtin_amdgcn_s_sleep(1);
+      }
     }
     // Plain buffer_inv, no sc1: drop the vL1 so d_hidden is re-read, but
     // leave this XCD's own L2 lines alone.

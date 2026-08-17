@@ -183,6 +183,34 @@ static constexpr int FULL_LAYER_MLA_EP_RELEASE_SLOT = 80;
 static constexpr int FULL_LAYER_MLA_EP_FOLD_DONE_SLOT = 88;
 static constexpr int FULL_LAYER_COUNTER_SLOTS = 96;
 
+// Self-heal gate for the Mechanism-C flag polls.
+//
+// Mechanism C splits "everyone arrived" into two separate facts: a global
+// arrival counter, which is atomic and unambiguous, and eight per-XCD release
+// flags, which are eight independent write-through stores issued by whichever
+// worker happened to win a modular test on that counter. The counter is the
+// truth; the flags are a cache of it, published once, by one thread, with no
+// retry. Anything that costs one of those eight stores -- a lost store on one
+// XCD's path, or an election that fires for the wrong layer once the workers
+// straddle two of them -- wedges every worker on that XCD forever, while the
+// other seven XCDs sail on. That is exactly the shape of the NP=8 hang: 170 of
+// 240 workers spinning on `obs=26 exp=27` while 70 are already a layer ahead.
+//
+// So a waiter that has spun this long stops trusting the flag and consults the
+// counter itself. The counter advances by exactly `arrivals` per fused layer,
+// so `counter >= arrivals * expected` means every producer for this layer has
+// arrived and the release is owed; the waiter then publishes its own XCD's
+// flag. The store is the same monotonic absolute value the elected worker
+// would have written, so re-issuing it is idempotent by construction -- the
+// same argument MPK_EP_REPUBLISH_SPINS rests on in the gpt-oss monolith.
+//
+// Cost in a healthy run is zero: the gate is a spin count a satisfied poll
+// never reaches. This barrier's tail is ~20 us and a spin round is ~0.4 us, so
+// a normal wait clears in tens of rounds; 1024 rounds is ~400 us.
+#ifndef MPK_FL_REPUBLISH_SPINS
+#define MPK_FL_REPUBLISH_SPINS 1024
+#endif
+
 template <
     // ── shared ──
     int BATCH_SIZE,
@@ -364,7 +392,23 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       }
       int *const my_flag = &entry_bar[xcd_id * HIER_STRIDE];
-      while (ld_nt_s32(my_flag) < entry_expected) {
+      MPK_WS_WAIT_BEGIN(761, entry_expected);
+      int _spins = 0;
+      int _obs;
+      while ((_obs = ld_nt_s32(my_flag)) < entry_expected) {
+        ++_spins;
+        MPK_WS_WAIT_TICK(_obs, _spins);
+        // Self-heal, see MPK_FL_REPUBLISH_SPINS. Same one-shot fan-out as
+        // Phase 8 and the same failure mode, so the same escape: the arrival
+        // counter is monotonic at `arrivals` per layer, and once it is at or
+        // past arrivals * entry_expected the release is owed.
+        if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
+          if (ld_nt_s32(&entry_bar[8 * HIER_STRIDE]) >=
+              arrivals * entry_expected) {
+            st_wt_u32((void *)my_flag, (unsigned)entry_expected);
+            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          }
+        }
         __builtin_amdgcn_s_sleep(1);
       }
     }
@@ -732,6 +776,17 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
             MPK_WS_WAIT_TICK(_ep_obs, _ep_spins);
             MPK_WS_WAIT_AUX(ld_nt_s32(ep_fold_done), _ep_obs, 0, 0);
           }
+          // Self-heal, see MPK_FL_REPUBLISH_SPINS. ep_fold_done is the
+          // unambiguous count here: eight folding work-groups per layer, so
+          // 8 * ep_expected means every column slice landed and the release
+          // is owed regardless of whether the elected leader's store to this
+          // XCD's line survived.
+          if ((_ep_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
+            if (ld_nt_s32(ep_fold_done) >= 8 * ep_expected) {
+              st_wt_u32((void *)my_flag, (unsigned)ep_expected);
+              asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+            }
+          }
 #if MPK_EP_WAIT_TIMEOUT
           // Bounded for the same reason as the peer wait -- see
           // MPK_EP_WAIT_TIMEOUT in gang_full_layer_fused_mi300.cuh. Without
@@ -1085,11 +1140,20 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       // fired, and a stuck waiter is then a visibility fault on its own flag
       // rather than a missing producer. a1 is the XCD, since the release is a
       // fan-out to eight separate lines and only one of them may be short.
-      MPK_WS_WAIT_BEGIN(860, attn_release_expected);
+      // 760, not 860: the dump decoder reads any id in [800,900) as the MoE
+      // W13->W2 barrier for expert (id-800), so 860 came out as two
+      // contradictory decodings of the same aux pair and the counter it
+      // printed could not be trusted. Keep this one out of that range.
+      MPK_WS_WAIT_BEGIN(760, attn_release_expected);
       int _spins = 0;
       int _obs = 0;
       while ((_obs = ld_nt_s32(my_flag)) < attn_release_expected) {
-        MPK_WS_WAIT_TICK(_obs, ++_spins);
+        // Incremented outside the macro on purpose: MPK_WS_WAIT_TICK expands
+        // to ((void)0) in the ship build, so `++_spins` inside it would never
+        // be evaluated there and the republish gate below would fire on every
+        // round instead of every MPK_FL_REPUBLISH_SPINS.
+        ++_spins;
+        MPK_WS_WAIT_TICK(_obs, _spins);
 #ifdef MPK_WORKER_STATE
         // Guarded: MPK_WS_WAIT_AUX is unconditional, so an unguarded argument
         // would put this extra load in the ship build's hottest barrier.
@@ -1100,6 +1164,16 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
                           0);
         }
 #endif
+        // Self-heal: see MPK_FL_REPUBLISH_SPINS. The counter is the truth, the
+        // flag is a one-shot cache of it; if the cache is short and the
+        // counter is not, publish the flag ourselves.
+        if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
+          if (ld_nt_s32(&attn_release[8 * HIER_STRIDE]) >=
+              arrivals * attn_release_expected) {
+            st_wt_u32((void *)my_flag, (unsigned)attn_release_expected);
+            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          }
+        }
         __builtin_amdgcn_s_sleep(1);
       }
     }

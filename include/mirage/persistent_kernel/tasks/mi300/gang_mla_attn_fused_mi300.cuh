@@ -83,6 +83,14 @@
 
 namespace kernel {
 
+// Self-heal gate for the Mechanism-C flag polls. Same value and same
+// reasoning as the copy in gang_mla_full_layer_fused_mi300.cuh, which carries
+// the full note; duplicated under #ifndef because the two monoliths land in
+// this translation unit in include order and either one may be first.
+#ifndef MPK_FL_REPUBLISH_SPINS
+#define MPK_FL_REPUBLISH_SPINS 1024
+#endif
+
 template <int BATCH_SIZE,
           // ── qkv_a: input_layernorm + [q_a_proj | kv_a_proj_with_mqa] ──
           int QKV_OUTPUT_PER_WG,
@@ -286,7 +294,25 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
       }
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
-    while (ld_nt_s32(&qkv_barrier[xcd_id * HIER_STRIDE]) < qkv_expected) {
+    // Self-heal, see MPK_FL_REPUBLISH_SPINS: the fan-out above is one
+    // write-through store per XCD, issued once, by one thread, with no retry.
+    // Lose one and every worker on that XCD spins here forever. The arrival
+    // counter is the truth -- monotonic at `arrivals` per layer -- so a waiter
+    // that has spun past the gate consults it and publishes its own flag.
+    int *const _qkv_flag = &qkv_barrier[xcd_id * HIER_STRIDE];
+    MPK_WS_WAIT_BEGIN(762, qkv_expected);
+    int _spins = 0;
+    int _obs;
+    while ((_obs = ld_nt_s32(_qkv_flag)) < qkv_expected) {
+      ++_spins;
+      MPK_WS_WAIT_TICK(_obs, _spins);
+      if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
+        if (ld_nt_s32(&qkv_barrier[8 * HIER_STRIDE]) >=
+            arrivals * qkv_expected) {
+          st_wt_u32((void *)_qkv_flag, (unsigned)qkv_expected);
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        }
+      }
       __builtin_amdgcn_s_sleep(1);
     }
   }
@@ -381,7 +407,21 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // against the merge.
   if (xcd_rank < mla_tiles_per_xcd) {
     if (tid == 0) {
-      while (ld_nt_s32(&qb_barrier[xcd_id * HIER_STRIDE]) < qb_expected) {
+      // Self-heal, see MPK_FL_REPUBLISH_SPINS.
+      int *const _qb_flag = &qb_barrier[xcd_id * HIER_STRIDE];
+      MPK_WS_WAIT_BEGIN(763, qb_expected);
+      int _spins = 0;
+      int _obs;
+      while ((_obs = ld_nt_s32(_qb_flag)) < qb_expected) {
+        ++_spins;
+        MPK_WS_WAIT_TICK(_obs, _spins);
+        if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
+          if (ld_nt_s32(&qb_barrier[8 * HIER_STRIDE]) >=
+              arrivals * qb_expected) {
+            st_wt_u32((void *)_qb_flag, (unsigned)qb_expected);
+            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          }
+        }
         __builtin_amdgcn_s_sleep(1);
       }
     }
@@ -461,7 +501,23 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     return;
   }
   if (tid == 0) {
-    while (ld_nt_s32(&decode_barrier[xcd_id * HIER_STRIDE]) < decode_expected) {
+    // Self-heal, see MPK_FL_REPUBLISH_SPINS. Note the arrival above is
+    // unconditional but this wait is merge-ranks-only, so the counter still
+    // advances by the full `arrivals` per layer and the quota test holds.
+    int *const _dec_flag = &decode_barrier[xcd_id * HIER_STRIDE];
+    MPK_WS_WAIT_BEGIN(764, decode_expected);
+    int _spins = 0;
+    int _obs;
+    while ((_obs = ld_nt_s32(_dec_flag)) < decode_expected) {
+      ++_spins;
+      MPK_WS_WAIT_TICK(_obs, _spins);
+      if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
+        if (ld_nt_s32(&decode_barrier[8 * HIER_STRIDE]) >=
+            arrivals * decode_expected) {
+          st_wt_u32((void *)_dec_flag, (unsigned)decode_expected);
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        }
+      }
       __builtin_amdgcn_s_sleep(1);
     }
   }

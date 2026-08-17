@@ -2218,6 +2218,17 @@ if __name__ == "__main__":
                   f"(avg {_decode_total / _decode_count:.3f}ms/iter)")
             print(f"  Decode per-iter range: min={min(_decode_samples):.3f}ms "
                   f"max={max(_decode_samples):.3f}ms")
+            # Which iterations stalled, and where in the decode run. A single
+            # multi-second outlier is a liveness bug, not a latency number, and
+            # its position (first decode iter vs. random) says which.
+            _outliers = sorted(
+                ((_t, _it - 1) for _it, _t in _fwd_times.items()
+                 if prefill_iterations < _it - 1 <= total_iterations
+                 and _t > 10.0 * min(_decode_samples)),
+                reverse=True)
+            if _outliers:
+                print("  Decode outliers (>10x min): " + ", ".join(
+                    f"iter {_i} = {_t:.1f}ms" for _t, _i in _outliers[:8]))
         if _fwd_dropped > 0:
             print(f"  NOTE: device per-iter ring overflowed -- {_fwd_dropped} "
                   f"of {_fwd_total_iters} samples dropped; all-iteration "

@@ -6065,7 +6065,7 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                           a0 % 46,
                           a1);
                 }
-                // 860 is the attention -> o_proj cross-XCD barrier (phase 8 of
+                // 760 is the attention -> o_proj cross-XCD barrier (phase 8 of
                 // the MLA monolith). a0 is the raw global arrival counter,
                 // monotonic at `arrivals` per fused layer, and a1 is the XCD
                 // whose release flag this worker polls. The counter is what
@@ -6074,7 +6074,7 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                 // waiter still short is not missing a producer -- it is not
                 // seeing a store that was made. Short of it, a producer really
                 // is missing and the count says how many.
-                if (spins > 0 && bid == 860) {
+                if (spins > 0 && bid == 760) {
                   // arrivals is not carried in the dump; derive it from the
                   // counter itself, which is an exact multiple of it at every
                   // quiescent point. 240 = tiles_per_xcd(30) * 8 for GLM.
@@ -6269,6 +6269,20 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                   bn = "P2-qkv-epoch";
                 } else if (bid == 60) {
                   bn = "P6-attn-xcd";
+                } else if (bid == 760) {
+                  bn = "attn->o_proj xcd flag";
+                } else if (bid == 761) {
+                  bn = "layer-entry xcd flag";
+                } else if (bid == 762) {
+                  bn = "qkv_a->q_b xcd flag";
+                } else if (bid == 763) {
+                  bn = "q_b->decode xcd flag";
+                } else if (bid == 764) {
+                  bn = "decode->merge xcd flag";
+                } else if (bid == 765) {
+                  bn = "routing-ready xcd flag";
+                } else if (bid == 766) {
+                  bn = "GLM MoE W13->W2 xcd flag";
                 } else if (bid == 75) {
                   bn = "P7b-routing";
                 }

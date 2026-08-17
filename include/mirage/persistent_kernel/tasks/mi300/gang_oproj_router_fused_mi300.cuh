@@ -80,6 +80,14 @@
 
 namespace kernel {
 
+// Self-heal gate for the Mechanism-C flag polls. Same value and same
+// reasoning as the copy in gang_mla_full_layer_fused_mi300.cuh, which carries
+// the full note; duplicated under #ifndef because the monoliths land in this
+// translation unit in include order and any one of them may be first.
+#ifndef MPK_FL_REPUBLISH_SPINS
+#define MPK_FL_REPUBLISH_SPINS 1024
+#endif
+
 template <int BATCH_SIZE,
           int OPROJ_REDUCTION_SIZE, // absorbed o_proj K (10240 for GLM)
           int OPROJ_ROWS_PER_WG,    // output columns per workgroup
@@ -378,7 +386,24 @@ __device__ __attribute__((always_inline)) void
   // there, still have something to wait on.
   if (tid == 0) {
     int *my_flag = &routing_ready[(1 + xcd_id) * HIER_STRIDE];
-    while (ld_nt_s32(my_flag) < routing_expected) {
+    // Self-heal, see MPK_FL_REPUBLISH_SPINS in
+    // gang_mla_full_layer_fused_mi300.cuh. Unlike the barriers there this one
+    // has no arrival counter -- but it does not need one. The TopK tail
+    // (gang_rmsnorm_linear_bias_mi300.cuh) publishes slot 0 and then the eight
+    // per-XCD lines from the same thread in the same loop, so slot 0 at the
+    // epoch proves the release fired and this XCD's line is merely short.
+    MPK_WS_WAIT_BEGIN(765, routing_expected);
+    int _spins = 0;
+    int _obs;
+    while ((_obs = ld_nt_s32(my_flag)) < routing_expected) {
+      ++_spins;
+      MPK_WS_WAIT_TICK(_obs, _spins);
+      if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
+        if (ld_nt_s32(routing_ready) >= routing_expected) {
+          st_wt_u32((void *)my_flag, (unsigned)routing_expected);
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        }
+      }
       __builtin_amdgcn_s_sleep(1);
     }
   }
@@ -459,7 +484,24 @@ __device__ __attribute__((always_inline)) void
   }
   if (tid == 0) {
     int *my_flag = &w13_barrier[xcd_id * HIER_STRIDE];
-    while (ld_nt_s32(my_flag) < w13_expected) {
+    // Self-heal, see MPK_FL_REPUBLISH_SPINS in
+    // gang_mla_full_layer_fused_mi300.cuh. The counter just above is the
+    // truth and advances by exactly `arrivals` per layer, so at or past
+    // arrivals * w13_expected the release is owed and republishing this XCD's
+    // line is idempotent -- same monotonic absolute value.
+    int const arrivals = tiles_per_xcd * 8;
+    MPK_WS_WAIT_BEGIN(766, w13_expected);
+    int _spins = 0;
+    int _obs;
+    while ((_obs = ld_nt_s32(my_flag)) < w13_expected) {
+      ++_spins;
+      MPK_WS_WAIT_TICK(_obs, _spins);
+      if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
+        if (ld_nt_s32(&w13_barrier[8 * HIER_STRIDE]) >= arrivals * w13_expected) {
+          st_wt_u32((void *)my_flag, (unsigned)w13_expected);
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        }
+      }
       __builtin_amdgcn_s_sleep(1);
     }
   }
