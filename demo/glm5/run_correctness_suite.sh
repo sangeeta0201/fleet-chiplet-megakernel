@@ -43,13 +43,35 @@ PROMPTS=(
   "Explain the difference between a stack and a queue in computer science."
 )
 
+# The megakernel does not depend on the prompt, so build once and reuse:
+# 4 prompts x a full rebuild is ~an hour, against ~3 min per run on a warm
+# build. Clear it here rather than trusting the caller's KEEP_BUILD, so the
+# first run of the sweep is always against freshly generated code.
+rm -rf permanent_output_dir permanent_output_dir_rank*
+export KEEP_BUILD=1
+
+# Bound each run. The megakernel has an intermittent single-rank livelock (see
+# task #46) that pins one GPU indefinitely; without a bound one bad prompt eats
+# the sweep and the remaining prompts never run.
+RUN_TIMEOUT="${RUN_TIMEOUT:-1200}"
+
 for i in "${!PROMPTS[@]}"; do
   p="${PROMPTS[$i]}"
   dst="$OUT_DIR/${TAG}_p${i}.json"
   log="$OUT_DIR/${TAG}_p${i}.log"
+  # Fresh rendezvous port per prompt: a killed run leaves the listener bound
+  # or in TIME_WAIT, and the next launch dies with EADDRINUSE before it builds.
+  export MASTER_PORT=$(( ${MASTER_PORT_BASE:-29950} + i ))
   echo "=== [$TAG] prompt $i: $p"
-  ./"$LAUNCHER" --prompt "$p" --save-tokens "$dst" > "$log" 2>&1
+  timeout "$RUN_TIMEOUT" ./"$LAUNCHER" --prompt "$p" --save-tokens "$dst" \
+    > "$log" 2>&1
   rc=$?
+  if [ "$rc" -eq 124 ]; then
+    # A timed-out mpirun leaves the ranks behind, and the next launch then
+    # contends with eight live processes for the same eight GPUs.
+    pkill -9 -f "demo.py" 2>/dev/null; sleep 5
+    pkill -9 -f "mpirun -np" 2>/dev/null; sleep 3
+  fi
   # The multi-rank case writes <stem>_rank<r>.json and never <stem>.json, so
   # test for either shape rather than for the literal path handed to demo.py.
   n=$(ls "$OUT_DIR/${TAG}_p${i}".json "$OUT_DIR/${TAG}_p${i}"_rank*.json \
