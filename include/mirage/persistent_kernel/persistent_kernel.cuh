@@ -373,6 +373,14 @@ __device__ __forceinline__ void
 // telling those apart is exactly what identifies the blocking worker.
 __device__ int *g_ws_dev;
 
+// Sentinel the host pre-stamps into every worker's phase slot before the
+// launch. Zero is a legal phase and `in_task` is `wphase >= 0`, so a slot the
+// device never wrote is otherwise indistinguishable from a worker parked at
+// phase 0 -- which is how a whole rank of never-started workers once read as
+// "240 workers IN TASK". Negative, so it decodes as "idle at the scheduler"
+// rather than as a task, and far from -1 so the dump can count it separately.
+#define MPK_WS_UNWRITTEN (-0x40000000)
+
 __device__ __forceinline__ void
     mpk_ws_phase(int phase, int layer, int xcd, int tid) {
   if (tid == 0 && g_ws_dev != nullptr) {
@@ -4959,14 +4967,36 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
           // MPK_WS_WAIT_BEGIN / MPK_WS_WAIT_TICK, and
           // [num_workers*8, num_workers*12) is the per-barrier aux written by
           // MPK_WS_WAIT_AUX.
+          //
+          // Coherent, NOT NonCoherent. This used to pass
+          // hipHostMallocNonCoherent, which maps the pages MTYPE_NC on the
+          // device side: a store lands in this XCD's L2 and stays there until
+          // something evicts it or a system-scope release flushes it. Every
+          // writer here (mpk_ws_phase, MPK_WS_WAIT_*) is a plain
+          // __atomic_store_n(..., __ATOMIC_RELAXED) at default agent scope, so
+          // nothing ever forces that flush. On a hang the kernel never returns
+          // either, so there is no end-of-kernel writeback to save us. The
+          // result is a debug buffer the host reads as all-zeros for an
+          // arbitrary subset of ranks -- and since `in_task` is
+          // `wphase >= 0`, an unwritten slot decodes as "IN TASK: phase=0",
+          // i.e. the instrument manufactures a rank whose workers appear to be
+          // wedged in a task they never entered. /tmp/probe3.log's "rank 3
+          // never dispatched a task" was exactly that artifact.
+          //
+          // hipHostMallocCoherent maps the pages MTYPE_UC, so the relaxed
+          // store goes to host memory directly. Slower per store, which is
+          // fine: this whole allocation only exists under MPK_WORKER_STATE.
           size_t ws_bytes = (size_t)num_workers * 12 * sizeof(int);
           int *ws_host = nullptr;
           if (hipHostMalloc(reinterpret_cast<void **>(&ws_host),
                             ws_bytes,
-                            hipHostMallocMapped | hipHostMallocNonCoherent) ==
+                            hipHostMallocMapped | hipHostMallocCoherent) ==
                   hipSuccess &&
               ws_host != nullptr) {
             memset(ws_host, 0, ws_bytes);
+            for (int w = 0; w < num_workers; w++) {
+              ws_host[w * 4 + 3] = MPK_WS_UNWRITTEN;
+            }
             int *ws_dev = nullptr;
             if (hipHostGetDevicePointer(reinterpret_cast<void **>(&ws_dev),
                                         ws_host,
@@ -5519,6 +5549,12 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
           int dep_hist[256] = {};
           int phase_gang_stuck = 0;
           int phase_gang_entry = 0;
+          // Workers whose phase slot still holds the pre-launch sentinel, i.e.
+          // that have never executed a single MPK_WS write. In a healthy run
+          // this drops to 0 within the first tick; if it stays at
+          // g_dbg_num_workers, this rank's megakernel is not running at all,
+          // which is a completely different failure from any barrier stall.
+          int ws_unwritten = 0;
           int moe_sub[8] = {};  // 0=w13(2000) 1=w13sig(2001) 2=w2entry(3000)
                                 // 3=w2poll(3001) 4=w2polldone(3002)
                                 // 5=w2quant(3003) 6=w2lds(3004) 7=w2mfma(3005)
@@ -5560,6 +5596,10 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
             int dep = __atomic_load_n(&ws[1], __ATOMIC_RELAXED);
             int done = __atomic_load_n(&ws[2], __ATOMIC_RELAXED);
             int phase = __atomic_load_n(&ws[3], __ATOMIC_RELAXED);
+            if (phase == MPK_WS_UNWRITTEN) {
+              ws_unwritten++;
+              continue;
+            }
             int sc = phase / 100000;
             int moe_xcd = (phase / 10000) % 10;
             int moe_tile = phase % 10000;
@@ -5646,6 +5686,18 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                     break;
                   case 60:
                     pn = "P6-attn-xcd-barrier";
+                    break;
+                  case 61:
+                    pn = "P6a-arrived";
+                    break;
+                  case 62:
+                    pn = "P6b-flag-poll";
+                    break;
+                  case 63:
+                    pn = "P6c-flag-cleared";
+                    break;
+                  case 64:
+                    pn = "P6d-post-inv";
                     break;
                   case 70:
                     pn = "P7-oproj";
@@ -5756,6 +5808,16 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                     stall_ticks >= 2 ? "   *** STALLED: no worker has advanced "
                                        "for 3+ ticks ***"
                                      : "");
+          }
+          if (ws_unwritten > 0) {
+            fprintf(stderr,
+                    "  ws-unwritten: %d/%d workers have never written a phase"
+                    "%s\n",
+                    ws_unwritten,
+                    g_dbg_num_workers,
+                    ws_unwritten == g_dbg_num_workers
+                        ? "   *** this rank's megakernel is not running ***"
+                        : "");
           }
           // Barrier watch. Only meaningful once the run is actually wedged --
           // in a healthy run these slots hold whatever barrier each worker
@@ -5871,6 +5933,18 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                       break;
                     case 60:
                       pn = "P6-attn-xcd-barrier";
+                      break;
+                    case 61:
+                      pn = "P6a-arrived";
+                      break;
+                    case 62:
+                      pn = "P6b-flag-poll";
+                      break;
+                    case 63:
+                      pn = "P6c-flag-cleared";
+                      break;
+                    case 64:
+                      pn = "P6d-post-inv";
                       break;
                     case 70:
                       pn = "P7-oproj";
@@ -5990,6 +6064,35 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                           a0,
                           a0 % 46,
                           a1);
+                }
+                // 860 is the attention -> o_proj cross-XCD barrier (phase 8 of
+                // the MLA monolith). a0 is the raw global arrival counter,
+                // monotonic at `arrivals` per fused layer, and a1 is the XCD
+                // whose release flag this worker polls. The counter is what
+                // decides the case: at or past arrivals * expected every
+                // worker arrived and the last one fanned the release out, so a
+                // waiter still short is not missing a producer -- it is not
+                // seeing a store that was made. Short of it, a producer really
+                // is missing and the count says how many.
+                if (spins > 0 && bid == 860) {
+                  // arrivals is not carried in the dump; derive it from the
+                  // counter itself, which is an exact multiple of it at every
+                  // quiescent point. 240 = tiles_per_xcd(30) * 8 for GLM.
+                  int const arrivals = 240;
+                  int want_ctr = arrivals * exp_;
+                  fprintf(stderr,
+                          "        attn-xcd barrier: xcd=%d obs=%d want=%d "
+                          "counter=%d (need %d, short %d) %s\n",
+                          a1,
+                          obs,
+                          exp_,
+                          a0,
+                          want_ctr,
+                          want_ctr - a0,
+                          a0 >= want_ctr
+                              ? "<== all arrived, release fired: THIS FLAG IS "
+                                "NOT VISIBLE TO THIS WORKER"
+                              : "<== producers missing, blame the arrivals");
                 }
                 // 899 is the EP self-signal wait, 900 the peer wait -- the two
                 // halves of one rendezvous. Decoded here rather than left as
@@ -6270,6 +6373,18 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                     break;
                   case 60:
                     pn = "P6-attn-xcd-barrier";
+                    break;
+                  case 61:
+                    pn = "P6a-arrived";
+                    break;
+                  case 62:
+                    pn = "P6b-flag-poll";
+                    break;
+                  case 63:
+                    pn = "P6c-flag-cleared";
+                    break;
+                  case 64:
+                    pn = "P6d-post-inv";
                     break;
                   case 70:
                     pn = "P7-oproj";

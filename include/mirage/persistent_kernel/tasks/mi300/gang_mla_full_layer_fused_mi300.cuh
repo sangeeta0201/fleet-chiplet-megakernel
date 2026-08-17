@@ -957,6 +957,13 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       _b_t2 = __builtin_amdgcn_s_memrealtime();
 #endif
     }
+    // Phase 60's marker covers everything from the top of this barrier to the
+    // MoE call, which is three very different places to be wedged: before the
+    // arrival atomic, spinning on the flag, or parked in the trailing
+    // __syncthreads while another wave of the same block is still behind.
+    // 61/62/63/64 split them, because a capture with four workers "at the
+    // barrier" cannot be read without knowing which.
+    MPK_WS_PHASE(61, task_layer_idx, xcd_id);
     // ── o_proj weight DMA, issued before the poll ────────────────────────
     // gpt-oss does exactly this at the equivalent barrier
     // (gang_full_layer_fused_mi300.cuh, Phase 6): 42 buffer_load_dwordx4-to-
@@ -1069,12 +1076,34 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     _b_t3 = __builtin_amdgcn_s_memrealtime();
 #endif
+    MPK_WS_PHASE(62, task_layer_idx, xcd_id);
     if (tid == 0) {
       int *const my_flag = &attn_release[xcd_id * HIER_STRIDE];
-      while (ld_nt_s32(my_flag) < attn_release_expected) {
+      // Watch this poll. a0 is the raw global arrival counter: it is
+      // monotonic at `arrivals` per fused layer, so a0 >= arrivals *
+      // attn_release_expected proves every worker arrived and the release
+      // fired, and a stuck waiter is then a visibility fault on its own flag
+      // rather than a missing producer. a1 is the XCD, since the release is a
+      // fan-out to eight separate lines and only one of them may be short.
+      MPK_WS_WAIT_BEGIN(860, attn_release_expected);
+      int _spins = 0;
+      int _obs = 0;
+      while ((_obs = ld_nt_s32(my_flag)) < attn_release_expected) {
+        MPK_WS_WAIT_TICK(_obs, ++_spins);
+#ifdef MPK_WORKER_STATE
+        // Guarded: MPK_WS_WAIT_AUX is unconditional, so an unguarded argument
+        // would put this extra load in the ship build's hottest barrier.
+        if ((_spins & (MPK_WS_WAIT_REFRESH - 1)) == 0) {
+          MPK_WS_WAIT_AUX(ld_nt_s32(&attn_release[8 * HIER_STRIDE]),
+                          xcd_id,
+                          0,
+                          0);
+        }
+#endif
         __builtin_amdgcn_s_sleep(1);
       }
     }
+    MPK_WS_PHASE(63, task_layer_idx, xcd_id);
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     if (tid == 0 && g_subphase_active) {
       unsigned long long _b_t4 = __builtin_amdgcn_s_memrealtime();
@@ -1111,6 +1140,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     // from 9 on reuses that memory, so the loads have to have landed before
     // one of them writes there.
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    MPK_WS_PHASE(64, task_layer_idx, xcd_id);
   }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   {

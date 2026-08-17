@@ -358,6 +358,29 @@ __device__ __forceinline__ void _full_layer_ep_fold_partial(
 // L2-resident release flag with no memory traffic to lose. It is not a fix and
 // must not be cited as one. Not applied to the staged fallback: rocSHMEM's
 // wait_until owns its own coherence there.
+//
+// LATER, and it revises the conclusion above without contradicting it. Reading
+// /tmp/probe1.log turned up a real, separate defect in the intra-device
+// Mechanism-C barriers: ld_nt_s32 was `global_load_dword ... nt` with no scope
+// bits at all. `nt` is a temporal hint, so that poll could be answered from a
+// vL1 line the producer's write-through store never invalidated, and later
+// from a stale XCD-local L2 line. It is now `off sc0 sc1 nt`; see the scope
+// table at the top of mpk_atoms.cuh, and note that `sc0` alone -- the first
+// attempt -- is workgroup scope and was one scope short. The paragraph above
+// stands as written either way: buffer_inv sc1 on THIS poll was never going to
+// reach an intra-device barrier.
+//
+// LATER STILL, correcting the sentence this comment used to open with. That
+// fix is worth keeping but it is NOT the cause of the NP=8 hang: the hang
+// reproduces identically at 512/256 with `sc0 nt` and with `sc0 sc1 nt`. Nor
+// was the probe1 reading sound. The MPK_WORKER_STATE buffer was allocated
+// hipHostMallocNonCoherent while every writer is a relaxed agent-scope store,
+// so slots the device had written could sit unflushed in L2 and slots it had
+// never written decoded as "IN TASK: phase=0" -- the instrument invented both
+// the four wedged workers here and, in probe3, an entire rank of them. The
+// allocation is hipHostMallocCoherent now and unwritten slots carry
+// MPK_WS_UNWRITTEN. Any localization from probe1-3 needs re-taking before it
+// is trusted.
 #if defined(__HIP_DEVICE_COMPILE__) &&                                         \
     (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
 #define MPK_EP_POLL_INV() asm volatile("buffer_inv sc1" ::: "memory")

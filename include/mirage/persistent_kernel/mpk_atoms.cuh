@@ -39,18 +39,37 @@
 // Non-Temporal (NT) Load/Store for MI300X
 // =============================================================================
 //
-// NT loads/stores bypass both L1 and L2 caches, reading/writing directly
-// to HBM memory. This avoids relying on cache coherence protocol.
+// CORRECTION -- the paragraph that used to sit here claimed "NT loads/stores
+// bypass both L1 and L2 caches, reading/writing directly to HBM memory. This
+// avoids relying on cache coherence protocol." That is false on gfx942/gfx950,
+// and believing it cost this branch a long intermittent-hang hunt. `nt` is a
+// *temporal* hint: it marks the line evict-first (MISS_EVICT / HIT_STREAM in
+// the cache-policy tables) so it does not pollute the cache for reuse. It does
+// not change the access's *scope*, so an `nt` load still hits whatever is
+// already resident in the CU's vector L1 and in this XCD's L2.
 //
-// Assembly flags:
-//   global_load_dwordx2 %0, %1, off nt
-//   global_store_dwordx2 %0, %1, off nt
+// Scope is `sc0`/`sc1`, and it is orthogonal to `nt`. What each bit actually
+// means, taken from what hipcc emits for __hip_atomic_load/store on gfx950
+// rather than from the ISA table:
 //
-// On MI300X (gfx942), the 'nt' (non-temporal) flag sets:
-//   - L1: sc1=1 or NT=1 → MISS EVICT (bypasses L1)
-//   - L2: sc0=1 or NT=1 → HIT STREAM / Cache Bypass
+//   load  sc0      -- WORKGROUP scope. Misses vL1; answered by this XCD's L2.
+//   load  sc1      -- AGENT scope. Pairs with `buffer_inv sc1` as the acquire.
+//   load  sc0 sc1  -- SYSTEM scope. Misses vL1 and L2, goes to memory.
+//   store sc1      -- agent release; compiler prefixes `buffer_wbl2 sc1`.
+//   store sc0 sc1  -- write through past vL1 and L2.
+//   buffer_inv     -- invalidate vL1 only        (workgroup-scope acquire)
+//   buffer_inv sc1 -- invalidate vL1 and L2      (agent-scope acquire)
 //
-// Why fence is still needed with NT:
+// The trap is that `sc0` reads like "the cache bit" and is in fact the WEAKEST
+// one. On MI300/MI350 the L2 is per-XCD and not snooped, so an `sc0` load is
+// answered from a possibly-stale line whenever the producer sat on a different
+// XCD. Two consequences bit this branch in sequence: a plain `nt` poll can be
+// answered from the CU's own vL1, which a peer's write-through store never
+// invalidates; and an `sc0 nt` poll can be answered from a stale XCD-local L2
+// line. Anything used as a cross-XCD barrier poll needs `sc1` at minimum --
+// see ld_nt_s32 below.
+//
+// Why fence is still needed:
 //   NT provides cache bypass but NOT memory ordering. Without fence:
 //   1. Hardware can reorder NT loads (read data before flag)
 //   2. Compiler can reorder code (asm volatile helps but isn't enough)
@@ -85,12 +104,44 @@ __device__ __forceinline__ unsigned long long int
 #endif
 }
 
-// Non-temporal 32-bit load (bypasses cache, reads from memory)
+// 32-bit barrier-poll load. Every Mechanism-C barrier poll in the gang tasks is
+// built on this, so its coherence is the coherence of every barrier in the
+// megakernel: 45 call sites, 33 of them inside a `while`.
+//
+// It used to be `off nt` and nothing else, on the belief -- stated in the
+// section header above, now corrected -- that `nt` bypasses cache. It does not;
+// `nt` is a temporal hint and scope is a separate axis. Fixing that to `sc0 nt`
+// was still wrong, one scope short, and the NP=8 hang survived it unchanged.
+//
+// The scope encoding on gfx950, straight out of the compiler rather than
+// inferred (hipcc -S, __hip_atomic_load on gfx950):
+//
+//   workgroup acquire : global_load_dword ... sc0
+//   agent     acquire : global_load_dword ... sc1   + buffer_inv sc1
+//   agent     release : buffer_wbl2 sc1 + global_store_dword ... sc1
+//
+// So `sc0` is WORKGROUP scope, not agent. An `sc0` load misses the CU's vector
+// L1 and is then answered by this XCD's L2 -- and on MI300/MI350 the L2 is
+// per-XCD and not snooped, so a line this XCD cached before the release is
+// still there and still stale. Only `sc1` reaches agent scope.
+//
+// `sc0 sc1` here, i.e. bypass both, which is system scope and strictly stronger
+// than needed. The alternative -- `sc1` plus a `buffer_inv sc1` inside every
+// poll loop, which is what the compiler emits -- would invalidate the whole L2
+// on every spin iteration for 240 workers, throwing away the weight lines the
+// prefetch-across-barrier work exists to keep resident. Bypassing on the one
+// flag load is the cheaper half of that trade. Same encoding as ld_sys_u64,
+// which is the one poll primitive on this branch that never hung.
+//
+// Cost note: the poll now goes to MALL/HBM instead of L2. It is one dword per
+// spin per waiter behind an s_sleep(1), against a barrier whose flag line is
+// read-shared -- but if the barrier tail regresses, this is the first thing to
+// re-measure.
 __device__ __forceinline__ int ld_nt_s32(int *addr) {
 #if defined(__HIP_DEVICE_COMPILE__) &&                                         \
     (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
   int val;
-  asm volatile("global_load_dword %0, %1, off nt\n"
+  asm volatile("global_load_dword %0, %1, off sc0 sc1 nt\n"
                "s_waitcnt vmcnt(0)"
                : "=v"(val)
                : "v"(addr)

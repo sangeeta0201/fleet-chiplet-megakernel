@@ -123,9 +123,15 @@ mpk_shmem_signal_wait_ge(uint64_t *sig_addr, uint64_t val) {
   // actually does that matters is Context::test -> uncached_load, which on
   // gfx942/gfx950 is `global_load_dwordx2 ... sc0 sc1` + `s_waitcnt vmcnt(0)`
   // -- a load that misses the local cache hierarchy so a peer's store is
-  // observed. ld_nt_u64 is the same load with `nt` instead of `sc0 sc1`;
-  // both bypass L2 on this part, and the `nt` form is what the 2-PE peer wait
-  // in gang_full_layer_fused_mi300.cuh already polls with.
+  // observed. Use ld_sys_u64, which is exactly that encoding.
+  //
+  // This used to call ld_nt_u64 (`nt` and nothing else) on the claim that
+  // "both bypass L2 on this part". They do not. `nt` is a temporal hint that
+  // marks the line evict-first; it does not change the scope of the access, so
+  // the load still hits vL1 and this XCD's L2, and a peer's store over XGMI is
+  // not guaranteed to be observed at all. Same defect ld_nt_s32 had; see the
+  // scope table at the top of mpk_atoms.cuh, and note in particular that `sc0`
+  // alone would NOT have been enough here either -- it is workgroup scope.
   //
   // The s_sleep is an addition, not a translation: rocSHMEM's loop is a bare
   // `while (!test(...))`, which issues back-to-back uncached loads at full
@@ -134,7 +140,7 @@ mpk_shmem_signal_wait_ge(uint64_t *sig_addr, uint64_t val) {
   {
     unsigned long long *p = reinterpret_cast<unsigned long long *>(sig_addr);
     unsigned long long const want = static_cast<unsigned long long>(val);
-    while (ld_nt_u64(p) < want) {
+    while (ld_sys_u64(p) < want) {
       __builtin_amdgcn_s_sleep(1);
     }
   }
