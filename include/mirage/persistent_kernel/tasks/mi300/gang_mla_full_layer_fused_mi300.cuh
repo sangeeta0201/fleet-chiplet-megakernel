@@ -776,13 +776,48 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
             MPK_WS_WAIT_TICK(_ep_obs, _ep_spins);
             MPK_WS_WAIT_AUX(ld_nt_s32(ep_fold_done), _ep_obs, 0, 0);
           }
-          // Self-heal, see MPK_FL_REPUBLISH_SPINS. ep_fold_done is the
-          // unambiguous count here: eight folding work-groups per layer, so
-          // 8 * ep_expected means every column slice landed and the release
-          // is owed regardless of whether the elected leader's store to this
-          // XCD's line survived.
-          if ((_ep_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
-            if (ld_nt_s32(ep_fold_done) >= 8 * ep_expected) {
+          // Self-heal, see MPK_FL_REPUBLISH_SPINS. The release is owed only
+          // when BOTH halves of what the leader attests to hold: eight local
+          // column slices folded (ep_fold_done == 8 * ep_expected, eight
+          // folding work-groups per layer) AND every peer's signal in.
+          //
+          // The local half alone is NOT the predicate, though it reads like
+          // the obvious one and was what this tested first. ep_fold_done
+          // reaches 8 * ep_expected the instant this rank finishes its own
+          // fold -- which is exactly when the leader ENTERS the peer wait, not
+          // when it leaves. So a heal on the local half fires ~1024 spins into
+          // every layer whose peers are even slightly late, and releases 239
+          // workers into the next layer's QKV prologue, the one place that
+          // sums the gather slots, before the peers have written them. Two
+          // faults, and both were observed at NP=8:
+          //
+          //   correctness -- one rank's residual stream built from the
+          //                  previous layer's peer slots, silently;
+          //   liveness    -- those 239 hit the next layer's qkv barrier
+          //                  without their leader, so that round sits one
+          //                  arrival short (240*L - 1 on the counter) until
+          //                  the leader escapes, and the whole rank parks.
+          //
+          // One healer per XCD, not 239 per rank. The peer read is
+          // EP_WORLD_SIZE - 1 ld_sys_u64s, whose sc0 sc1 bypasses L1 and L2,
+          // and the flag it would republish is per-XCD -- so 30 of the 30
+          // workers on an XCD issuing it buys nothing that the first one does
+          // not. xcd_rank 1 is already this file's designated one-per-XCD
+          // reporter (see the [EPREL] print below); reusing it keeps the
+          // uncached load rate at 8 x (EP_WORLD_SIZE - 1) per rank per 1024
+          // spins instead of 239 x that.
+          if (xcd_rank == 1 &&
+              (_ep_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
+            // Under MPK_EP_ABLATE the peers never signal, so the peer half is
+            // vacuous and testing it would turn the backstop off entirely.
+#if MPK_EP_ABLATE == 0
+            bool const _ep_peers_in =
+                _full_layer_ep_peers_ready<EP_WORLD_SIZE, EP_MY_PE>(
+                    ep_signal, ep_sig_expected);
+#else
+            bool const _ep_peers_in = true;
+#endif
+            if (ld_nt_s32(ep_fold_done) >= 8 * ep_expected && _ep_peers_in) {
               st_wt_u32((void *)my_flag, (unsigned)ep_expected);
               asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
             }

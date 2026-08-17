@@ -458,6 +458,42 @@ __device__ __forceinline__ void
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 }
 
+// Every peer's pushed signal at or past the threshold -- the peer half of what
+// the elected leader's release attests to.
+//
+// A self-healing waiter on the per-XCD release flag (barrier id 901) must test
+// this, not just the local fold count. The release the leader publishes carries
+// TWO facts: eight local column slices folded, and every peer's signal in. A
+// heal predicated on the local half alone republishes the flag while the leader
+// is still parked in the peer wait, which drops 239 workers into the next
+// layer's QKV prologue -- the one place that reads the gather slots -- ahead of
+// the peers whose bytes it is about to sum. That is a correctness hole first
+// (a rank's residual stream built from stale peer slots) and a liveness one
+// second: those 239 arrive at the next layer's qkv barrier without their
+// leader, so its round sits one arrival short until the leader escapes, and
+// every arrival after it is permanently off by one XCD's worth of skew.
+//
+// Same predicate as _full_layer_ep_wait_peers' direct path, minus the state
+// the wait carries across rounds -- this is called once every
+// MPK_FL_REPUBLISH_SPINS, so one pass over EP_WORLD_SIZE - 1 lines is the whole
+// cost, and it only runs when the flag is already late.
+template <int EP_WORLD_SIZE, int EP_MY_PE>
+__device__ __forceinline__ bool
+    _full_layer_ep_peers_ready(uint64_t *ep_signal, uint64_t ep_sig_expected) {
+#pragma unroll
+  for (int p = 0; p < EP_WORLD_SIZE; p++) {
+    if (p == EP_MY_PE) {
+      continue;
+    }
+    uint64_t *const sp = ep_signal + (size_t)p * FULL_LAYER_EP_SIGNAL_STRIDE;
+    if (ld_sys_u64(reinterpret_cast<unsigned long long *>(sp)) <
+        (unsigned long long)ep_sig_expected) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // The peer's OWN copy of its signal, read out of the peer's memory.
 //
 // The wait polls `ep_signal[p]` in MY buffer -- the copy peer p PUSHED to me.

@@ -307,8 +307,16 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
       ++_spins;
       MPK_WS_WAIT_TICK(_obs, _spins);
       if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
-        if (ld_nt_s32(&qkv_barrier[8 * HIER_STRIDE]) >=
-            arrivals * qkv_expected) {
+        int const _cnt = ld_nt_s32(&qkv_barrier[8 * HIER_STRIDE]);
+        // A worker parked here with its spin counter frozen across every host
+        // dump is either not executing at all or looping with the heal
+        // permanently declined; the two need different fixes and observed/
+        // expected cannot tell them apart. aux[0] is the live arrival counter
+        // and aux[1] the number of heal rounds this waiter has run, both
+        // written from inside the heal, so a frozen aux[1] means the wave
+        // stopped and a growing one means the quota test below keeps failing.
+        MPK_WS_WAIT_AUX(_cnt, _spins / MPK_FL_REPUBLISH_SPINS, 0, 0);
+        if (_cnt >= arrivals * qkv_expected) {
           st_wt_u32((void *)_qkv_flag, (unsigned)qkv_expected);
           asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         }

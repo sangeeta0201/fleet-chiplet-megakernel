@@ -1,3 +1,4 @@
+import os
 import torch
 
 # This function returns the shared memory limit (in bytes)
@@ -62,6 +63,15 @@ def get_configurations_from_gpu(rank):
             # MI350: 256 CUs, 8 XCDs (32 CUs/XCD)
             num_xcds = 8
             worker = 240  # Same as MI300X for compatibility
+            # 240 workers + 8 schedulers = 248 blocks on 256 CUs, i.e. 31 of
+            # the 32 CUs on every XCD. At NP=8 the last work-group on each XCD
+            # (xcd_rank 29) has been observed to stop executing mid-spin, which
+            # wedges the whole rank; MPK_NUM_WORKERS exists to test whether
+            # leaving more CUs idle makes that go away. Rounded down to a
+            # multiple of 8 so every XCD still gets the same number.
+            _w_env = os.environ.get("MPK_NUM_WORKERS")
+            if _w_env:
+                worker = max(num_xcds, (int(_w_env) // num_xcds) * num_xcds)
             scheduler = num_xcds
             worker = min(worker, MAX_NUM_WORKERS)
             print(f"AMD MI350 config: workers={worker}, schedulers={scheduler}, "

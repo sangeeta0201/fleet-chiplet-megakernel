@@ -381,6 +381,32 @@ __device__ int *g_ws_dev;
 // rather than as a task, and far from -1 so the dump can count it separately.
 #define MPK_WS_UNWRITTEN (-0x40000000)
 
+// Second sentinel, written by each worker block as the first thing it does
+// after the launch and before it joins the XCD-ready count. It separates the
+// two failures that both present as "ws-unwritten: 240/240":
+//
+//   all UNWRITTEN  -> the worker kernel is not on the GPU at all
+//   N ENTERED, few
+//   UNWRITTEN      -> the kernel launched but some blocks never became
+//                     resident, so `worker_xcd_ready_count` never reaches
+//                     num_workers and every scheduler is still parked in its
+//                     bootstrap wait. Nothing is ever dispatched, so no worker
+//                     writes a phase -- including the 239 that ARE resident.
+//   all ENTERED    -> everyone is resident and the schedulers are the problem.
+//
+// A persistent kernel assumes every block is co-resident; 240 workers + 8
+// schedulers on 256 CUs leaves no slack for a single misplaced block. This is
+// the cheapest way to see that happen: one relaxed store per block, once.
+#define MPK_WS_ENTERED (-0x3F000000)
+
+// Scheduler slots live past the three per-worker regions (phase, barrier
+// watch, wave mask), 4 ints each. 16 covers every configuration here (8
+// schedulers on MI350, one per XCD).
+#define MPK_WS_SCHED_SLOTS 16
+// Scheduler phase codes, written to slot [+3].
+#define MPK_WS_SCHED_ENTERED (-0x3E000000)
+#define MPK_WS_SCHED_XCD_READY (-0x3D000000)
+
 __device__ __forceinline__ void
     mpk_ws_phase(int phase, int layer, int xcd, int tid) {
   if (tid == 0 && g_ws_dev != nullptr) {
@@ -1421,6 +1447,14 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
     g_ws_dev = config.precomp_dbg_worker_state;
     // Stride to the barrier-watch half of the buffer (see MPK_WS_WAIT_BEGIN).
     g_ws_nworkers = config.num_workers;
+    // Residency mark. Must be before the worker_xcd_ready_count atomicAdd
+    // below: the schedulers block until that count reaches num_workers, so if
+    // one block is not resident every OTHER block parks at the scheduler with
+    // no task and no phase. See MPK_WS_ENTERED.
+    if (g_ws_dev != nullptr) {
+      __atomic_store_n(
+          &g_ws_dev[blockIdx.x * 4 + 3], MPK_WS_ENTERED, __ATOMIC_RELAXED);
+    }
   }
   __syncthreads();
 #endif
@@ -3244,6 +3278,22 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
     int sched_queue_ids[2];
     sched_queues[0] = config.sched_queues[sched_id];
     sched_queue_ids[0] = sched_id;
+#ifdef MPK_WORKER_STATE
+    // Scheduler residency + liveness, in the slots past the three per-worker
+    // regions. Without this a stalled bootstrap is invisible: the schedulers
+    // write nothing, so "no task was ever dispatched" and "no scheduler is
+    // resident" read identically off the worker slots.
+    int *const _ws_sched =
+        (config.precomp_dbg_worker_state != nullptr && sched_id >= 0 &&
+         sched_id < MPK_WS_SCHED_SLOTS)
+            ? config.precomp_dbg_worker_state + config.num_workers * 12 +
+                  sched_id * 4
+            : nullptr;
+    if (_ws_sched != nullptr) {
+      __atomic_store_n(&_ws_sched[0], (int)blockIdx.x, __ATOMIC_RELAXED);
+      __atomic_store_n(&_ws_sched[3], MPK_WS_SCHED_ENTERED, __ATOMIC_RELAXED);
+    }
+#endif
 
     // Build worker list for this scheduler (all workers on this XCD)
     int my_workers[MAX_WORKER_PER_SCHEDULER];
@@ -3260,8 +3310,19 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
       // Wait for all workers to report their XCD IDs
       if (config.worker_xcd_map != nullptr) {
-        while (atomicAdd(config.worker_xcd_ready_count, 0) <
-               config.num_workers) {
+        while (true) {
+          int const _rdy = atomicAdd(config.worker_xcd_ready_count, 0);
+#ifdef MPK_WORKER_STATE
+          // The count itself, live. `239` here names the failure outright:
+          // one worker block never became resident, and every scheduler is
+          // therefore still in this loop rather than dispatching.
+          if (_ws_sched != nullptr) {
+            __atomic_store_n(&_ws_sched[1], _rdy, __ATOMIC_RELAXED);
+          }
+#endif
+          if (_rdy >= config.num_workers) {
+            break;
+          }
           __nanosleep(100);
         }
         // Fence ensures we see all worker_xcd_map writes
@@ -3273,6 +3334,17 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
             my_workers[my_num_workers++] = w;
           }
         }
+        // Device printf never reaches the log on a hang -- the buffer is
+        // flushed at kernel exit and the kernel does not exit -- so the same
+        // two facts also go to the pinned worker-state buffer.
+#ifdef MPK_WORKER_STATE
+        if (_ws_sched != nullptr) {
+          __atomic_store_n(&_ws_sched[2], my_xcd * 1000 + my_num_workers,
+                           __ATOMIC_RELAXED);
+          __atomic_store_n(
+              &_ws_sched[3], MPK_WS_SCHED_XCD_READY, __ATOMIC_RELAXED);
+        }
+#endif
         printf("[SCHED_XCD] sched_id=%d xcd=%d workers_on_xcd=%d block=%d\n",
                sched_id,
                my_xcd,
@@ -3313,6 +3385,15 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
 #endif
 
     while (true) {
+#ifdef MPK_WORKER_STATE
+      // Liveness once the bootstrap wait has cleared: with [3] at
+      // MPK_WS_SCHED_XCD_READY, [1] is this scheduler's event-loop iteration
+      // count. Frozen across host dumps means the scheduler itself is stuck,
+      // which no worker slot can show.
+      if (_ws_sched != nullptr) {
+        __atomic_store_n(&_ws_sched[1], (int)iteration_num, __ATOMIC_RELAXED);
+      }
+#endif
       int poll_count = 0;
       while (cur_event_pos[queue_idx] == last_event_pos[queue_idx]) {
         // queue_idx 0 = own scheduler queue (XCD-local), 1 = broadcast
@@ -4986,7 +5067,10 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
           // hipHostMallocCoherent maps the pages MTYPE_UC, so the relaxed
           // store goes to host memory directly. Slower per store, which is
           // fine: this whole allocation only exists under MPK_WORKER_STATE.
-          size_t ws_bytes = (size_t)num_workers * 12 * sizeof(int);
+          // Three per-worker regions of 4 ints, then MPK_WS_SCHED_SLOTS
+          // scheduler slots of 4 (see MPK_WS_SCHED_ENTERED).
+          size_t ws_bytes =
+              (size_t)(num_workers * 12 + MPK_WS_SCHED_SLOTS * 4) * sizeof(int);
           int *ws_host = nullptr;
           if (hipHostMalloc(reinterpret_cast<void **>(&ws_host),
                             ws_bytes,
@@ -4996,6 +5080,9 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
             memset(ws_host, 0, ws_bytes);
             for (int w = 0; w < num_workers; w++) {
               ws_host[w * 4 + 3] = MPK_WS_UNWRITTEN;
+            }
+            for (int s = 0; s < MPK_WS_SCHED_SLOTS; s++) {
+              ws_host[num_workers * 12 + s * 4 + 3] = MPK_WS_UNWRITTEN;
             }
             int *ws_dev = nullptr;
             if (hipHostGetDevicePointer(reinterpret_cast<void **>(&ws_dev),
@@ -5555,6 +5642,8 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
           // g_dbg_num_workers, this rank's megakernel is not running at all,
           // which is a completely different failure from any barrier stall.
           int ws_unwritten = 0;
+          // Resident but never dispatched a task (see MPK_WS_ENTERED).
+          int ws_entered = 0;
           int moe_sub[8] = {};  // 0=w13(2000) 1=w13sig(2001) 2=w2entry(3000)
                                 // 3=w2poll(3001) 4=w2polldone(3002)
                                 // 5=w2quant(3003) 6=w2lds(3004) 7=w2mfma(3005)
@@ -5598,6 +5687,10 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
             int phase = __atomic_load_n(&ws[3], __ATOMIC_RELAXED);
             if (phase == MPK_WS_UNWRITTEN) {
               ws_unwritten++;
+              continue;
+            }
+            if (phase == MPK_WS_ENTERED) {
+              ws_entered++;
               continue;
             }
             int sc = phase / 100000;
@@ -5818,6 +5911,48 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                     ws_unwritten == g_dbg_num_workers
                         ? "   *** this rank's megakernel is not running ***"
                         : "");
+          }
+          // Residency and bootstrap. Printed whenever anything is still short
+          // of its first task, because that window is the whole failure: the
+          // schedulers block until every worker has registered its XCD, so one
+          // non-resident block leaves all 240 idle and all 8 schedulers spinning
+          // in the bootstrap wait, with not a single phase written anywhere.
+          if (ws_entered > 0 || ws_unwritten > 0) {
+            int const nsched = global_runtime_config.num_local_schedulers +
+                               global_runtime_config.num_remote_schedulers;
+            fprintf(stderr,
+                    "  ws-residency: entered-no-task=%d unwritten=%d of %d"
+                    "%s\n",
+                    ws_entered,
+                    ws_unwritten,
+                    g_dbg_num_workers,
+                    (ws_unwritten > 0 && ws_entered > 0)
+                        ? "   *** some worker blocks are NOT RESIDENT; the "
+                          "schedulers can never leave the XCD-ready wait ***"
+                        : "");
+            for (int s = 0; s < nsched && s < MPK_WS_SCHED_SLOTS; s++) {
+              int *sl = g_dbg_h_worker_state + g_dbg_num_workers * 12 + s * 4;
+              int sblk = __atomic_load_n(&sl[0], __ATOMIC_RELAXED);
+              int sv1 = __atomic_load_n(&sl[1], __ATOMIC_RELAXED);
+              int sv2 = __atomic_load_n(&sl[2], __ATOMIC_RELAXED);
+              int sph = __atomic_load_n(&sl[3], __ATOMIC_RELAXED);
+              char const *sn = "?";
+              if (sph == MPK_WS_UNWRITTEN) {
+                sn = "NOT-RESIDENT";
+              } else if (sph == MPK_WS_SCHED_ENTERED) {
+                sn = "in-xcd-ready-wait";
+              } else if (sph == MPK_WS_SCHED_XCD_READY) {
+                sn = "dispatching";
+              }
+              fprintf(stderr,
+                      "    sched%d: %s block=%d %s=%d xcd/workers=%d\n",
+                      s,
+                      sn,
+                      sblk,
+                      sph == MPK_WS_SCHED_XCD_READY ? "iters" : "ready_count",
+                      sv1,
+                      sv2);
+            }
           }
           // Barrier watch. Only meaningful once the run is actually wedged --
           // in a healthy run these slots hold whatever barrier each worker
