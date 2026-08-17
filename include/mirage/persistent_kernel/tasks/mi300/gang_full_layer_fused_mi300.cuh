@@ -370,12 +370,20 @@ __device__ __forceinline__ void _full_layer_ep_fold_partial(
 // Bounded peer wait, for diagnosing a hang that only exists in an
 // uninstrumented build.
 //
-// The NP=8 EP hang is inside this wait, and every instrument that could read
-// it out perturbs it away: MPK_WORKER_STATE completes, the host debug poll
-// completes, MPK_EP_ABLATE=2 completes. Device printf is not an escape either
-// on its own -- the megakernel's printf buffer flushes at kernel exit, and a
-// hung kernel never exits, so the one channel that could report the state is
-// the one the hang suppresses.
+// The NP=8 EP hang is inside this wait, and device printf is not an escape on
+// its own -- the megakernel's printf buffer flushes at kernel exit, and a hung
+// kernel never exits, so the one channel that could report the state is the
+// one the hang suppresses.
+//
+// This comment used to also say the hang was a Heisenbug: that
+// MPK_WORKER_STATE, the host debug poll and MPK_EP_ABLATE=2 each made it
+// complete. That reading was wrong, and it cost several build cycles. The hang
+// is INTERMITTENT -- a clean ship-config NP=8 MOE_EP=1 build ran 3.919 and
+// 3.904 ms/iter with correct text on all eight ranks twice, then hung on the
+// third run of the same binary. At a hang rate near 1 in 3, a single passing
+// run under an instrument is not evidence that the instrument suppressed
+// anything, and every entry in that "perturbation set" was a single passing
+// run. Only a repeated run tells you anything here. Budget for it.
 //
 // So: give the spin a ceiling. After MPK_EP_WAIT_TIMEOUT rounds, print every
 // peer's observed signal value, the expected threshold and the surviving
@@ -395,6 +403,22 @@ __device__ __forceinline__ void _full_layer_ep_fold_partial(
 // behavior, so this compiles away entirely unless asked for.
 #ifndef MPK_EP_WAIT_TIMEOUT
 #define MPK_EP_WAIT_TIMEOUT 0
+#endif
+
+// How many layers of timeout reports to print, counted on the run-monotonic
+// signal threshold. Once the wait is bounded, every later layer times out too
+// (the fold consumed garbage, so nothing downstream is meaningful), and 46
+// layers x 8 peers x 8 ranks x N decode steps of printf floods the buffer and
+// buries the first report -- which is the only one describing the real
+// failure. So this is a ceiling, not a filter.
+//
+// Set it to the fused layer count to cover exactly the first decode iteration,
+// which is where every failure seen so far has landed. It is a layer count and
+// not a bool because the failing layer moves: the first localized hang was at
+// threshold 2, but with an intermittent bug there is no reason for it to stay
+// there.
+#ifndef MPK_EP_TMO_PRINT_LAYERS
+#define MPK_EP_TMO_PRINT_LAYERS 2
 #endif
 
 template <int EP_WORLD_SIZE, int EP_MY_PE>
@@ -479,12 +503,7 @@ __device__ __forceinline__ void
         }
 #if MPK_EP_WAIT_TIMEOUT
         if (_spins > MPK_EP_WAIT_TIMEOUT) {
-          // Print only the first two layers. Once the wait is bounded every
-          // later layer times out too (the fold consumed garbage, so nothing
-          // downstream is meaningful), and 46 layers x 8 peers x 8 ranks x N
-          // decode steps of printf floods the buffer and buries layer 0 --
-          // which is the only report that describes the real failure.
-          if (ep_sig_expected <= 2) {
+          if (ep_sig_expected <= MPK_EP_TMO_PRINT_LAYERS) {
             // One line per peer, not a summary: the question this run exists
             // to answer is whether NO peer ever lands (transport dead) or SOME
             // peer lands and one straggles (a publish-side ordering bug on one

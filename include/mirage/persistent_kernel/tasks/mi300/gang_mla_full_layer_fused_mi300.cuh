@@ -147,6 +147,9 @@
 #ifndef MPK_EP_ABLATE
 #define MPK_EP_ABLATE 0
 #endif
+#ifndef MPK_EP_TMO_PRINT_LAYERS
+#define MPK_EP_TMO_PRINT_LAYERS 2
+#endif
 
 namespace kernel {
 
@@ -573,7 +576,13 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
           // forever -- which is the NP=8 signature (peers see p7 stuck one
           // layer behind while p0..p6 advance). Only the first two layers, and
           // only one line per work-group: 8 ranks x 8 XCDs x 2 layers.
-          if (task_layer_idx <= 1) {
+          // Bounded by the same knob as [EPTMO] so the two reports cover the
+          // same window. task_layer_idx is run-monotonic across decode
+          // iterations, so a limit of ml_num_layers covers exactly the first
+          // iteration -- which is where every failure localized so far has
+          // landed, and 8 folders x 8 ranks x 47 layers of printf is a size
+          // the buffer survives.
+          if (task_layer_idx < MPK_EP_TMO_PRINT_LAYERS) {
             printf("[EPFOLD] pe=%d xcd=%d layer=%d prev_f=%d leader=%d\n",
                    EP_MY_PE, xcd_id, task_layer_idx, prev_f, (int)ep_leader);
           }
@@ -748,7 +757,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
           // always escapes first and releases, so these waiters fire ONLY when
           // no leader was elected -- which is the case worth naming.
           if (_ep_spins > MPK_EP_WAIT_TIMEOUT * 256) {
-            if (xcd_rank == 1 && task_layer_idx <= 2) {
+            if (xcd_rank == 1 && task_layer_idx < MPK_EP_TMO_PRINT_LAYERS) {
               printf("[EPREL] pe=%d xcd=%d layer=%d TIMEOUT obs=%d exp=%d "
                      "fold_done=%d (want %d)\n",
                      EP_MY_PE, xcd_id, task_layer_idx, _ep_obs, ep_expected,

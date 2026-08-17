@@ -554,6 +554,12 @@ def get_compile_command(
         _ep_wait_tmo = int(os.environ.get("MPK_EP_WAIT_TIMEOUT", "0"))
         if _ep_wait_tmo:
             flags = flags + [f"-DMPK_EP_WAIT_TIMEOUT={_ep_wait_tmo}"]
+        # How many layers of [EPTMO]/[EPFOLD]/[EPREL] to print, on the
+        # run-monotonic layer counter. Default 2; set it to the fused layer
+        # count to cover the whole first decode iteration.
+        _ep_tmo_layers = int(os.environ.get("MPK_EP_TMO_PRINT_LAYERS", "0"))
+        if _ep_tmo_layers:
+            flags = flags + [f"-DMPK_EP_TMO_PRINT_LAYERS={_ep_tmo_layers}"]
         if int(os.environ.get("MPK_EP_SIG_DBG", "0")) == 1:
             # EP collective diagnostics: prints, once per rank, which of the
             # two Phase 9 publication paths is actually live. Cheap enough to
