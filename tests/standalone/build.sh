@@ -104,6 +104,23 @@ if [ "${GFX_ARCH:-gfx950}" = "gfx950" ]; then
         -I ../../include \
         -I ../../include/mirage/persistent_kernel
 
+    # gang_rmsnorm_linear_mxfp8_bias_mi300.cuh includes the bf16 RMSNorm-linear
+    # header for its norm prologue, and that one reaches CK, so this needs the
+    # vendored composable_kernel headers like the GEMV probes below.
+    echo "Building EP prologue cross-rank sum test..."
+    hipcc -o test_ep_prologue_sum test_ep_prologue_sum.hip \
+        -D__HIP_PLATFORM_AMD__ \
+        -DMIRAGE_BACKEND_USE_ROCM \
+        -DCK_TILE_FMHA_FWD_FAST_EXP2=1 \
+        --offload-arch=gfx950 \
+        -munsafe-fp-atomics \
+        -O3 \
+        -std=c++17 \
+        -Wno-unused-result \
+        -I ../../include \
+        -I ../../include/mirage/persistent_kernel \
+        -I ../../deps/composable_kernel/include
+
     # Both of these pull in gang_gemv_mxfp8_mi300.cuh, whose WRITE_THROUGH
     # epilogue needs st_wt_u16 out of mpk_atoms.cuh, and whose CK include chain
     # needs the vendored composable_kernel headers.

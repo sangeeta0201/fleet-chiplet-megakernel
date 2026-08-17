@@ -256,7 +256,29 @@ __device__ __forceinline__ void _rnlm8_store4(unsigned short *dst,
 // The residual is `norm_input` itself -- under the fold that tensor is the
 // residual stream rather than an already-resolved row, so there is no second
 // pointer and nothing appears twice in the task's input list.
-template <int REDUCTION_SIZE>
+//
+// ── expert parallelism ───────────────────────────────────────────────────
+// EP_PEER_SLOTS > 1 makes this pass the cross-rank reduction as well.
+// `d_res` then points at the symmetric gather buffer -- EP_PEER_SLOTS
+// consecutive [batch, REDUCTION_SIZE] bf16 planes, EP_SLOT_ELEMS apart, one
+// per rank -- and the row is the sum of all of them.
+//
+// This is gpt-oss's EP_PEER_SLOTS in gang_rmsnorm_linear_mxfp4_bias_mi300.cuh,
+// and the reason is the same one: the previous owner of these adds was a
+// separate reduce pass at the end of the layer, and that pass needed an exit
+// barrier behind it so nobody entered the next layer before the combined row
+// was whole. Making the consumer BE the reduction leaves no window between
+// "combined" and "consumed" for a barrier to protect.
+//
+// One deliberate divergence from gpt-oss: `d_ws` is not read at all under EP.
+// gpt-oss still adds its f32 workspace because its fold zeroes the workspace
+// as it folds, so the term is a known zero. GLM does not zero there -- the
+// o_proj stage does it, a phase later (see the note above, and the zeroing
+// block in gang_oproj_router_fused_mi300.cuh) -- so at this point the
+// workspace still holds this rank's partial, which the fold has already
+// written into this rank's gather slot. Adding it would count the local
+// contribution twice. Skipping it also drops 8 KB of loads per layer.
+template <int REDUCTION_SIZE, int EP_PEER_SLOTS = 0, int EP_SLOT_ELEMS = 0>
 __device__ __forceinline__ float
 _rnlm8_resadd_norm_rcp(float const *__restrict__ d_ws,
                        unsigned short const *__restrict__ d_res, // == norm_input
@@ -270,22 +292,54 @@ _rnlm8_resadd_norm_rcp(float const *__restrict__ d_ws,
                 "FUSE_RESADD wants the row to divide evenly over 256x float4");
   constexpr int ITERS = REDUCTION_SIZE / (NTHREADS * VEC);
 
+  constexpr bool EP = (EP_PEER_SLOTS > 1);
+  static_assert(!EP || EP_SLOT_ELEMS >= REDUCTION_SIZE,
+                "the EP gather slot stride must span at least one row");
+  // The peers other than slot 0, which is read as the plain `d_res` above.
+  // Sized to 1 rather than 0 off the EP path so the array is never zero-length.
+  constexpr int NEXTRA = EP ? (EP_PEER_SLOTS - 1) : 1;
+
   int const tid = threadIdx.x;
   float ssq = 0.0f;
 
 #pragma unroll 1
   for (int v = 0; v < ITERS; v++) {
     int const off = (v * NTHREADS + tid) * VEC;
-    float4 const w = *reinterpret_cast<float4 const *>(d_ws + off);
     uint2 const r = *reinterpret_cast<uint2 const *>(d_res + off);
 
+    float f[4];
+    if constexpr (EP) {
+      // All NEXTRA slot loads issued before any is consumed: they are
+      // independent addresses on distinct pages, so the extra ranks cost
+      // bandwidth (2 KB per peer at REDUCTION_SIZE 2048) and not latency.
+      uint2 pk[NEXTRA];
+#pragma unroll
+      for (int p = 0; p < NEXTRA; p++) {
+        pk[p] = *reinterpret_cast<uint2 const *>(
+            d_res + (size_t)(p + 1) * EP_SLOT_ELEMS + off);
+      }
+      f[0] = _gang_bf16_to_float((unsigned short)r.x);
+      f[1] = _gang_bf16_to_float((unsigned short)(r.x >> 16));
+      f[2] = _gang_bf16_to_float((unsigned short)r.y);
+      f[3] = _gang_bf16_to_float((unsigned short)(r.y >> 16));
+#pragma unroll
+      for (int p = 0; p < NEXTRA; p++) {
+        f[0] += _gang_bf16_to_float((unsigned short)pk[p].x);
+        f[1] += _gang_bf16_to_float((unsigned short)(pk[p].x >> 16));
+        f[2] += _gang_bf16_to_float((unsigned short)pk[p].y);
+        f[3] += _gang_bf16_to_float((unsigned short)(pk[p].y >> 16));
+      }
+    } else {
+      float4 const w = *reinterpret_cast<float4 const *>(d_ws + off);
+      f[0] = w.x + _gang_bf16_to_float((unsigned short)r.x);
+      f[1] = w.y + _gang_bf16_to_float((unsigned short)(r.x >> 16));
+      f[2] = w.z + _gang_bf16_to_float((unsigned short)r.y);
+      f[3] = w.w + _gang_bf16_to_float((unsigned short)(r.y >> 16));
+    }
+
     unsigned short const b[4] = {
-        _gang_float_to_bf16(w.x + _gang_bf16_to_float((unsigned short)r.x)),
-        _gang_float_to_bf16(w.y +
-                            _gang_bf16_to_float((unsigned short)(r.x >> 16))),
-        _gang_float_to_bf16(w.z + _gang_bf16_to_float((unsigned short)r.y)),
-        _gang_float_to_bf16(w.w +
-                            _gang_bf16_to_float((unsigned short)(r.y >> 16)))};
+        _gang_float_to_bf16(f[0]), _gang_float_to_bf16(f[1]),
+        _gang_float_to_bf16(f[2]), _gang_float_to_bf16(f[3])};
     uint2 const packed = {(unsigned)b[0] | ((unsigned)b[1] << 16),
                           (unsigned)b[2] | ((unsigned)b[3] << 16)};
     *reinterpret_cast<uint2 *>(s_x + off) = packed;
@@ -337,7 +391,11 @@ template <int BATCH_SIZE,
           int REDUCTION_SIZE,
           int ACTUAL_HIDDEN_DIM = REDUCTION_SIZE,
           bool WRITE_THROUGH = false,
-          bool FUSE_RESADD = false>
+          bool FUSE_RESADD = false,
+          // Expert parallelism: > 1 makes the FUSE_RESADD prologue the
+          // cross-rank reduction, reading `norm_input_ptr` as the symmetric
+          // gather buffer. See _rnlm8_resadd_norm_rcp.
+          int EP_PEER_SLOTS = 0>
 __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     void const *norm_input_ptr,  // [batch, REDUCTION_SIZE] bf16
     void const *norm_weight_ptr, // [REDUCTION_SIZE] bf16
@@ -472,7 +530,13 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     static_assert(ACTUAL_HIDDEN_DIM == REDUCTION_SIZE,
                   "FUSE_RESADD has no padded-row variant: the workspace and "
                   "residual buffers are exactly REDUCTION_SIZE wide");
-    rms_rcp = _rnlm8_resadd_norm_rcp<REDUCTION_SIZE>(
+    // Under EP the slot stride is the whole [batch, REDUCTION_SIZE] plane, so
+    // slot p of token `tok_idx` sits at p * BATCH_SIZE * REDUCTION_SIZE +
+    // tok_idx * REDUCTION_SIZE -- the base pointer below is unchanged and the
+    // helper adds the slot term itself.
+    rms_rcp = _rnlm8_resadd_norm_rcp<REDUCTION_SIZE,
+                                     EP_PEER_SLOTS,
+                                     BATCH_SIZE * REDUCTION_SIZE>(
         (float const *)resadd_workspace_f32_ptr + tok_idx * REDUCTION_SIZE,
         (unsigned short const *)norm_input_ptr + tok_idx * REDUCTION_SIZE,
         (unsigned short *)resadd_x_out_ptr + tok_idx * REDUCTION_SIZE,

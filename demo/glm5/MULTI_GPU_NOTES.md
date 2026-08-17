@@ -13,10 +13,10 @@ record for the mechanism. This file covers only what is *different* for GLM.
 | `MAX_INPUTS_PER_TASK` raised 28 -> 32 | done |
 | EP counter slots + template params in the monolith | done (inert at `EP_WORLD_SIZE == 1`) |
 | EP fold/exchange body in the monolith | **not started** |
-| `ep_prev_gather` sum inside GLM's Phase 1 | **not started — the hard part, see below** |
+| `ep_prev_gather` sum inside GLM's Phase 1 | done — `test_ep_prologue_sum` passes |
 | demo.py EP plumbing + expert slicing | **not started** |
 | `run_mp8_dp_ep_fused.sh` | **not started** |
-| GLM-5.2 weights on this box | **blocked, see below** |
+| GLM-5.2 weights on this box | needs a streaming loader, see below |
 
 ## The transport floor, measured here
 
@@ -62,6 +62,35 @@ So the change is inside a fused three-way helper, not at a call site. That is
 the one place where "use as much code as possible from gpt-oss" does not
 directly apply — the surrounding mechanism ports verbatim, this pass does not.
 
+**Done.** `_rnlm8_resadd_norm_rcp` now takes `EP_PEER_SLOTS` / `EP_SLOT_ELEMS`,
+plumbed up through `gang_rmsnorm_linear_mxfp8_bias_kernel`,
+`gang_mla_attn_fused_kernel_mi300` and the monolith, which selects
+`input_ptrs[29]` (`ep_prev_gather`) over `input_ptrs[0]` when
+`EP_WORLD_SIZE > 1`. At world size 1 every template argument defaults away and
+the emitted code is unchanged.
+
+One divergence from gpt-oss, deliberate: GLM does **not** read the f32
+workspace under EP. gpt-oss can, because its fold zeroes the workspace as it
+folds, so the term is a known zero. GLM zeroes it a phase later, in
+`gang_oproj_router_fused_mi300.cuh`, so at Phase 1 it still holds this rank's
+partial — which the fold has already published into this rank's gather slot.
+Adding it would double-count. Skipping it also drops 8 KB of loads per layer.
+
+`tests/standalone/test_ep_prologue_sum` measures both halves, world 8,
+hidden 2048:
+
+| check | result |
+|---|---|
+| EP sum vs a CPU replay of the same bf16 sum | bit-identical, 2048/2048 |
+| EP vs the single-GPU f32-workspace path | rel L2 3.0e-3, max abs 7.8e-3 |
+| `rms_rcp`, EP vs single-GPU | rel 9.7e-5 |
+
+The second row is not a bug and cannot be driven to zero: EP rounds each
+rank's partial to bf16 *before* the sum, the single-GPU path rounds once
+*after*. Eight bf16 roundings in quadrature is ~1.1e-2 of the partial
+magnitude, and the partials are ~1/8 of the row. This is the numerical price
+of the design, and it is charged once per layer.
+
 ## Counter slot map (GLM monolith)
 
 `FULL_LAYER_COUNTER_SLOTS = 96`, each slot a 64-byte line:
@@ -94,26 +123,28 @@ adds a *second* collective per layer, and at the measured ~21 us/sync that is
 Both are dominated by sync count, not by bytes, which is the same conclusion
 gpt-oss reached: "a faster EP needs FEWER syncs, not a cheaper one."
 
-## Blocker: GLM-5.2 weights do not fit
+## GLM-5.2 weights: a staging problem, not a capacity one
 
-| | |
-|---|---|
-| free on `/` | 658 GB |
-| GLM-5.2 FP8, 692 B params @ 1 B/param | ~692 GB |
-| GLM-5.2 BF16 | ~1.4 TB |
+**GPU memory is not the constraint.** 8 x 270.6 GB = 2.16 TB of HBM, ~298 MB
+used per GPU. GLM-5.2 FP8 at ~692 GB is ~86 GB/GPU under EP8, against 252 GiB
+each. That matches the "resident 99 GB" row in the byte budget below.
 
-3.5 TB total, 2.7 TB used, and most of that used space is not visible from
-inside the container. `models--zai-org--GLM-5-FP8` in the HF cache is 11 MB:
-config and shard index only. gpt-oss-120b is likewise absent (32 KB), which is
-why the transport was validated with the standalone benchmark rather than
-end to end.
+The one real constraint is **disk**: 658 GB free on `/` against ~692 GB of
+shards. 3.5 TB total, 2.7 TB used, most of it not visible from inside the
+container. `models--zai-org--GLM-5-FP8` in the HF cache is 11 MB -- config and
+shard index only.
 
-What is local: GLM-4.7-Flash, 59 GB, real weights.
+That constraint is soft, because nothing requires the checkpoint to be
+resident on disk all at once. Download shard -> load to GPU -> delete shard
+makes peak disk one shard, ~5 GB against 142 of them. The costs are one extra
+network pass and a load that cannot resume without re-downloading. This is the
+plan of record; stream-requantizing FP8 -> MXFP4 was considered and is not
+needed, since it gives up FP8 fidelity to solve a problem that goes away.
 
-Options: free space outside the container; stream-requantize FP8 -> MXFP4
-shard by shard, deleting each source shard (~350 GB peak, gives up FP8
-fidelity); or bring EP up on GLM-4.7-Flash and on `--random-weights` GLM-5.2
-geometry first and swap real weights in later.
+gpt-oss-120b is likewise absent (32 KB), which is why the transport was
+validated with the standalone benchmark rather than end to end. What is local:
+GLM-4.7-Flash, 59 GB, real weights -- so EP comes up on Flash and on
+`--random-weights` GLM-5.2 geometry first either way.
 
 ## Byte budget, GLM-5.2, fp8, per token
 

@@ -372,8 +372,20 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
                                    NUM_KV_CHUNKS,
                                    Q_WORKSPACE_STRIDE,
                                    MERGE_DIM_SPLITS,
-                                   MERGE_WRITE_THROUGH>(
-      /*x=*/input_ptrs[0],
+                                   MERGE_WRITE_THROUGH,
+                                   /*EP_PEER_SLOTS=*/EP_WORLD_SIZE>(
+      // Under EP the residual stream this prologue resolves is the PREVIOUS
+      // layer's symmetric gather buffer -- EP_WORLD_SIZE bf16 slots -- and the
+      // prologue sums them itself, as part of the pass it already makes over
+      // the row. gpt-oss does the same thing with input_ptrs[26]; see the
+      // EP_PEER_SLOTS note in gang_rmsnorm_linear_mxfp8_bias_mi300.cuh for why
+      // the reduction lives at the consumer rather than behind an exit barrier
+      // at the producer.
+      //
+      // Slot 0 sits exactly where an ordinary residual would, so at
+      // EP_WORLD_SIZE == 1 this is input_ptrs[0] and the pointer arithmetic is
+      // unchanged.
+      /*x=*/(EP_WORLD_SIZE > 1) ? input_ptrs[29] : input_ptrs[0],
       /*pre_norm_weight=*/input_ptrs[1],
       /*pre_norm_scratch=*/input_ptrs[2],
       /*qkv_weight=*/input_ptrs[3],

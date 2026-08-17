@@ -104,7 +104,13 @@ template <int BATCH_SIZE,
           int NUM_KV_CHUNKS,
           int Q_WORKSPACE_STRIDE,
           int MERGE_DIM_SPLITS,
-          bool MERGE_WRITE_THROUGH>
+          bool MERGE_WRITE_THROUGH,
+          // ── expert parallelism ──
+          // > 1 turns Phase 1's residual resolve into the cross-rank sum:
+          // x_ptr is then the previous layer's symmetric gather buffer,
+          // EP_PEER_SLOTS bf16 planes of [batch, QKV_REDUCTION_SIZE], and
+          // moe_ws_f32_ptr goes unread. See _rnlm8_resadd_norm_rcp.
+          int EP_PEER_SLOTS = 0>
 __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     // ── inputs ──
     void const *x_ptr,               // [0]  residual stream
@@ -231,7 +237,8 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
                                           QKV_REDUCTION_SIZE,
                                           QKV_ACTUAL_HIDDEN,
                                           /*WRITE_THROUGH=*/true,
-                                          /*FUSE_RESADD=*/true>(
+                                          /*FUSE_RESADD=*/true,
+                                          EP_PEER_SLOTS>(
         /*norm_input_ptr=*/x_ptr, // the residual, under FUSE_RESADD
         pre_norm_weight_ptr,
         pre_norm_scratch_ptr,
