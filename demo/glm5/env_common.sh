@@ -53,6 +53,20 @@ else
   export LD_LIBRARY_PATH="$MPI_LIB_PATH:/opt/rocm/lib:${LD_LIBRARY_PATH:-}"
 fi
 
+# Host thread oversubscription. torch and OpenMP both default to one thread per
+# core -- 256 on this box -- and mpirun starts NP copies of that, so an 8-rank
+# run puts ~2048 runnable threads on 256 cores. The megakernel is persistent and
+# the host thread's only job between iterations is to bump the step counter, so
+# losing that thread to the scheduler idles the whole GPU. Divide the cores.
+if [ -z "${OMP_NUM_THREADS:-}" ]; then
+  _mpk_cores=$(nproc 2>/dev/null || echo 8)
+  _mpk_np="${NP:-1}"
+  export OMP_NUM_THREADS=$(( _mpk_cores / _mpk_np ))
+  [ "$OMP_NUM_THREADS" -lt 1 ] && export OMP_NUM_THREADS=1
+  unset _mpk_cores _mpk_np
+fi
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-$OMP_NUM_THREADS}"
+
 # Every knob the GLM path reads, forwarded to all ranks by mpirun. Listing them
 # unconditionally is deliberate: -x on an unset variable is a no-op, so a knob
 # set in the caller's shell reaches every rank without editing this list.
@@ -61,6 +75,7 @@ MPK_FORWARD_VARS=(
   HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES
   ROCSHMEM_INC_PATH ROCSHMEM_LIB_PATH MPI_INC_PATH MPI_LIB_PATH
   LD_LIBRARY_PATH PATH
+  OMP_NUM_THREADS MKL_NUM_THREADS
   ROCSHMEM_MAX_NUM_CONTEXTS MASTER_PORT
   ATTN_DP MOE_EP EP_FOLD_RANK
   PRECOMPUTED_DISPATCH MPK_ML_REPLAY

@@ -21,6 +21,8 @@
 # it, hence the extra EP_TAIL_ONLY task demo.py appends before the LM head.
 set -u
 cd "$(dirname "${BASH_SOURCE[0]}")"
+# Before env_common.sh: it divides the core count by NP to size OMP_NUM_THREADS.
+NP="${NP:-8}"
 source ./env_common.sh
 
 export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
@@ -38,8 +40,6 @@ export EP_FOLD_RANK="${EP_FOLD_RANK:-0}"
 export GLM_FUSE_FULL_LAYER="${GLM_FUSE_FULL_LAYER:-1}"
 export PRECOMPUTED_DISPATCH="${PRECOMPUTED_DISPATCH:-1}"
 export MPK_ML_REPLAY="${MPK_ML_REPLAY:-1}"
-
-NP="${NP:-8}"
 
 if [ "${KEEP_BUILD:-0}" != "1" ]; then
   rm -rf permanent_output_dir permanent_output_dir_rank*
