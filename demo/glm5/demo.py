@@ -31,7 +31,10 @@ DEFAULT_MODEL_PATH = os.environ.get("GLM_MODEL_PATH", "zai-org/GLM-4.7-Flash")
 # CI correctness-dump defaults. Torch vs Mirage token dumps land here for
 # tests/ci-tests/test_glm5_inference_output.py.
 DEFAULT_SAVE_DIR = os.path.join("outputs", "glm5")
-MAX_SAVE_TOKENS = 100
+# The dump is truncated to this many generated tokens. Overridable because the
+# multi-prompt sweep generates 256: leave it at 100 and a divergence past token
+# 100 never reaches the JSON, so the comparison silently passes.
+MAX_SAVE_TOKENS = int(os.environ.get("MAX_SAVE_TOKENS", "100"))
 
 
 # ── Shape helpers ────────────────────────────────────────────────────────────
@@ -422,7 +425,6 @@ if __name__ == "__main__":
             save_path = os.path.join(DEFAULT_SAVE_DIR, fn)
         else:
             save_path = args.save_tokens
-        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
     else:
         save_path = None
 
@@ -444,6 +446,19 @@ if __name__ == "__main__":
     except ImportError:
         world_size = 1
         rank = 0
+
+    # Rank-suffix the token dump. Under DP attention every rank decodes the
+    # same prompt and must produce the same answer, so the per-rank dumps are
+    # the correctness gate for the EP fold -- a fold that drops one peer's
+    # experts corrupts that rank's residual stream and nobody else's. Without
+    # the suffix all eight ranks race on one path and the file that survives
+    # is whichever rank closed last, which is exactly the rank you do not get
+    # to choose.
+    if save_path is not None:
+        if world_size > 1:
+            _stem, _ext = os.path.splitext(save_path)
+            save_path = f"{_stem}_rank{rank}{_ext}"
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
 
     if world_size > 1:
         dist.init_process_group(backend="nccl", init_method="env://")
@@ -2068,7 +2083,9 @@ if __name__ == "__main__":
         print("Prompt length {}, generate length {}, per-token latency {} ms"
               .format(prompt_len, cur_pos - prompt_len,
                       run_time / max(1, cur_pos - prompt_len)))
-        if save_path and rank == 0:
+        # Every rank writes (to its own suffixed path) -- see the save_path
+        # resolution above.
+        if save_path:
             slice_end = min(end_idx, prompt_len + MAX_SAVE_TOKENS)
             out = {
                 "token_ids": tokens[0, prompt_len:slice_end].tolist(),
@@ -2076,6 +2093,7 @@ if __name__ == "__main__":
                                          skip_special_tokens=True),
                 "generate_length": max(0, end_idx - prompt_len),
                 "mode": "torch",
+                "rank": rank,
             }
             with open(save_path, "w") as f:
                 json.dump(out, f, indent=2)
@@ -2135,7 +2153,7 @@ if __name__ == "__main__":
             valid_ids = generated_ids[generated_ids >= 0]
             print(tokenizer.decode(valid_ids, skip_special_tokens=True))
 
-        if save_path and rank == 0:
+        if save_path:
             gen0 = tokens[0, : step[0].item() + 1]
             gen0 = gen0[gen0 >= 0]
             pl0 = prompt_lengths[0].item()
@@ -2147,6 +2165,7 @@ if __name__ == "__main__":
                                          skip_special_tokens=True),
                 "generate_length": max(0, end0 - pl0),
                 "mode": "mpk",
+                "rank": rank,
             }
             with open(save_path, "w") as f:
                 json.dump(out, f, indent=2)
