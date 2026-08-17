@@ -12,8 +12,8 @@ record for the mechanism. This file covers only what is *different* for GLM.
 | peer transport works on this box | done — all 8 GPUs mutually peer-accessible |
 | `MAX_INPUTS_PER_TASK` raised 28 -> 32 | done |
 | EP counter slots + template params in the monolith | done (inert at `EP_WORLD_SIZE == 1`) |
-| EP fold/exchange body in the monolith | **not started** |
-| `ep_prev_gather` sum inside GLM's Phase 1 | done — `test_ep_prologue_sum` passes |
+| EP fold/exchange body in the monolith | done — compiles at world 8, inert at world 1 |
+| `ep_gather` sum inside GLM's Phase 1 | done — `test_ep_prologue_sum` passes |
 | demo.py EP plumbing + expert slicing | **not started** |
 | `run_mp8_dp_ep_fused.sh` | **not started** |
 | GLM-5.2 weights on this box | needs a streaming loader, see below |
@@ -44,8 +44,32 @@ fold, because a W2 tile for any expert can execute on any XCD. GLM's
 multi-layer path *already* pays exactly that barrier — the layer-entry barrier
 at `FULL_LAYER_ENTRY_SLOT`, added for task #14 because Phase 1 zeroes
 `moe_ws_f32` as it consumes it. Same guarantee, same arrival count
-(`tiles_per_xcd * 8`). The EP fold can sit directly behind it instead of
-introducing a second all-XCD sync.
+(`tiles_per_xcd * 8`).
+
+Collecting it means moving the fold from the **tail** of layer L, where
+gpt-oss puts it, to the **head** of layer L+1, directly behind that barrier.
+That is the one structural difference between the two ports, and it is done.
+EP costs GLM one rendezvous per layer (the fold-done wait) where it costs
+gpt-oss two.
+
+Two consequences worth writing down, because both read as bugs otherwise:
+
+- `input_ptrs[27]` is both the fold's destination and Phase 1's source *in the
+  same layer*. It still has to be one buffer per fused layer: after the peer
+  wait, a peer may run ahead and fold layer L+1 while this rank is still in
+  layer L's Phase 1 reading the row. 46 × 8 × 4 KB for GLM-4.7-Flash.
+- The fold reads `moe_ws_f32` at the layer head, so the *first* fused layer
+  reads whatever the last fused layer of the previous token left there. Layer 1
+  needs a permanently-zeroed `moe_ws_f32` in the multi-layer input table —
+  a demo.py concern (#43), and the reason layer 0 being dense costs nothing:
+  with a zero workspace the fold publishes `residual` on `EP_FOLD_PE` and zero
+  everywhere else, and the cross-rank sum is the residual.
+
+The thresholds ride `task_layer_idx`, which is only meaningful inside the
+batched loop, so **EP requires precomputed dispatch**. There is nothing safe to
+snapshot on the single-dispatch path: the local signal line is written
+asynchronously by peers. demo.py must refuse the combination rather than make
+it work.
 
 **Not free: the residual fold.** This is the real work.
 
@@ -65,7 +89,7 @@ directly apply — the surrounding mechanism ports verbatim, this pass does not.
 **Done.** `_rnlm8_resadd_norm_rcp` now takes `EP_PEER_SLOTS` / `EP_SLOT_ELEMS`,
 plumbed up through `gang_rmsnorm_linear_mxfp8_bias_kernel`,
 `gang_mla_attn_fused_kernel_mi300` and the monolith, which selects
-`input_ptrs[29]` (`ep_prev_gather`) over `input_ptrs[0]` when
+`input_ptrs[27]` (`ep_gather`) over `input_ptrs[0]` when
 `EP_WORLD_SIZE > 1`. At world size 1 every template argument defaults away and
 the emitted code is unchanged.
 
@@ -101,8 +125,14 @@ of the design, and it is charged once per layer.
 [20..29] decode -> merge               [60..69] MoE W13 -> W2
 [30..39] attention -> o_proj           [70]     router TopK arrivals
 [71..78] layer-entry release flags     [79]     layer-entry arrivals
-[80..87] EP exit release flags         [88]     EP fold arrivals
+[80..87] reserved, unused              [88]     EP fold arrivals
 ```
+
+`[80..87]` was reserved for a Mechanism-C exit barrier after the fold. It is
+not used: the thread that observes the 8th local column slice publishes that
+fact on this rank's own signal line, so every worker's gate is a load in the
+loop it already runs rather than a second rendezvous. That is gpt-oss's
+current design too — the exit barrier was in its *first* version.
 
 The EP slots are allocated unconditionally. Undersizing a counter buffer does
 not fail loudly, it corrupts whatever torch allocated next — gpt-oss lost time
