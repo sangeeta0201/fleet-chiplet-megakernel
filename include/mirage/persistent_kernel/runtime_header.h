@@ -92,7 +92,18 @@ unsigned long long int const EVENT_NVSHMEM_TAG = 0x1e00000000000000;
 unsigned long long int const EVENT_INVALID_ID = 0x7ffffffffffffffe;
 typedef unsigned long long int EventCounter;
 
-int const MAX_INPUTS_PER_TASK = 28;
+// 28 was exactly gpt-oss's LM-head monolith. GLM's fused layer already
+// declares 27, and expert parallelism adds three more inputs to it --
+// ep_gather, ep_signal, ep_prev_gather -- so the old ceiling was one short.
+// 32 leaves headroom for the DSA indexer's tensors rather than making this a
+// recurring edit.
+//
+// These are pure sizing constants: they set the width of TaskDesc's descriptor
+// arrays and of the multi-layer pointer tables, which a task indexes by slot.
+// Raising them costs 8 XCDs * layers * 4 extra pointers -- ~12 KB at GLM's 46
+// layers -- and changes no semantics. Slots past a task's declared arity are
+// legitimately null; see the null-table diagnostic in persistent_kernel.cuh.
+int const MAX_INPUTS_PER_TASK = 32;
 int const MAX_OUTPUTS_PER_TASK = 13;
 
 // Nil-address tripwire buffer geometry (see MPK_NIL_TRIPWIRE).

@@ -125,7 +125,21 @@ static constexpr int FULL_LAYER_ROUTER_COUNTER_SLOT = 70;
 // Layer-entry barrier, used only in multi-layer mode. Mechanism C like the
 // rest: per-XCD release flags at [71..78], global arrival counter at [79].
 static constexpr int FULL_LAYER_ENTRY_SLOT = 71;
-static constexpr int FULL_LAYER_COUNTER_SLOTS = 80;
+// ── expert parallelism (EP_WORLD_SIZE > 1 only) ──────────────────────────
+// Per-XCD release flags for the EP exit barrier at [80..87], and the arrival
+// counter the eight folding work-groups bump at [88].
+//
+// The exit barrier is not optional bookkeeping. MULTI_GPU_NOTES.md records it
+// as *the* bug that made gpt-oss's EP emit garbage: without it a worker leaves
+// the layer while another XCD's column slice is still being folded, and the
+// next layer's residual resolve reads a half-written row.
+//
+// MLA_ prefix, not the bare FULL_LAYER_EP_* gpt-oss uses: both monoliths are
+// included into the same translation unit and share this namespace, and its
+// slot map is its own (its EP barriers live at [48..85] of a 1216-int buffer).
+static constexpr int FULL_LAYER_MLA_EP_RELEASE_SLOT = 80;
+static constexpr int FULL_LAYER_MLA_EP_FOLD_DONE_SLOT = 88;
+static constexpr int FULL_LAYER_COUNTER_SLOTS = 96;
 
 template <
     // ── shared ──
@@ -163,7 +177,15 @@ template <
     int MOE_W2_TILES_PER_EXPERT,
     int MOE_W13_OPW,
     int MOE_W2_OPW,
-    bool MOE_WEIGHT_FP4 = false>
+    bool MOE_WEIGHT_FP4 = false,
+    // ── expert parallelism ──
+    // 1 / 0 / 0 compiles the whole EP block out, so the single-GPU kernel is
+    // byte-for-byte what it was before EP existed.
+    int EP_WORLD_SIZE = 1,
+    int EP_MY_PE = 0,
+    // The one rank that folds the real residual into its MoE partial, so the
+    // residual appears exactly once after the cross-rank sum.
+    int EP_FOLD_PE = 0>
 __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     // Pointer arrays are passed whole rather than unpacked into 38 named
     // parameters, which is what gpt-oss's full-layer task does and for the

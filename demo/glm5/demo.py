@@ -1068,15 +1068,25 @@ if __name__ == "__main__":
                                          torch_dtype=torch.int32)
         # Whole-layer fusion collapses those three buffers into one, not for
         # tidiness but because the merged input list is 27 slots against a
-        # MAX_INPUTS_PER_TASK of 28. Slot map (each on its own 64-byte line):
+        # MAX_INPUTS_PER_TASK of 32 (28 before EP needed three more slots).
+        # Slot map (each on its own 64-byte line):
         # attention qkv_a->q_b [0..9], q_b->decode [10..19],
         # decode->merge [20..29], attention->o_proj [30..39],
         # o_proj->router [40..49], routing-ready epoch [50..59],
         # W13->W2 [60..69], the router's own TopK arrival counter at [70],
         # and the multi-layer layer-entry barrier at [71..79] (per-XCD release
-        # flags at [71..78], arrival counter at [79]). Must match
-        # FULL_LAYER_COUNTER_SLOTS in gang_mla_full_layer_fused_mi300.cuh.
-        full_layer_counter = make_tensor("full_layer_counter", (80 * 16,),
+        # flags at [71..78], arrival counter at [79]).
+        #
+        # Expert parallelism adds the EP exit barrier: per-XCD release flags at
+        # [80..87] and the folding work-groups' arrival counter at [88]. Those
+        # slots are allocated unconditionally -- 256 bytes of int32 is not worth
+        # a conditional, and undersizing a counter buffer corrupts whatever
+        # torch allocated next rather than failing loudly (gpt-oss lost time to
+        # exactly that; see MULTI_GPU_NOTES.md §3c, counter buffer 832 -> 1216).
+        #
+        # Must match FULL_LAYER_COUNTER_SLOTS in
+        # gang_mla_full_layer_fused_mi300.cuh.
+        full_layer_counter = make_tensor("full_layer_counter", (96 * 16,),
                                          torch_dtype=torch.int32)
         moe_mid = make_tensor("moe_mid", (bs, topk_total, 2 * moe_inter))
         moe_act = make_tensor("moe_act", (bs, topk_total, moe_inter))
