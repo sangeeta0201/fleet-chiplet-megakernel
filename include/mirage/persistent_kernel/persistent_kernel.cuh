@@ -6016,20 +6016,38 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                 // 900: a0 is the bitmask of peers whose line is still short.
                 // One bit is a straggler and the fault is on that rank; all
                 // bits is a transport or address fault and the fault is here.
-                // a1 is the lowest missing peer's observed value -- exp_ - 1
-                // means that peer is exactly one layer behind, i.e. parked in
-                // this same wait.
+                // a1 packs two views of the LOWEST missing peer's signal: low
+                // 16 bits the copy that peer pushed into this rank's line
+                // (what the wait actually tests), high 16 bits the same value
+                // read out of that peer's OWN memory through its peer delta.
+                // pushed == exp_ - 1 alone only says "that peer is one layer
+                // behind"; it is the two together that name the fault.
+                //
+                //   home > pushed  : the peer really did advance and its store
+                //                    into this line is not landing -- and the
+                //                    re-publish retry in the wait means it did
+                //                    not land on ~15k attempts, so it is the
+                //                    mapping or the link, not a dropped store.
+                //   home == pushed : the peer never advanced its signal, and
+                //                    its own higher threshold came from a
+                //                    counter that drifted between ranks. A
+                //                    software bug; fix the counter.
                 if (spins > 0 && bid == 900) {
                   int nmiss = __builtin_popcount((unsigned)a0);
+                  int pushed = a1 & 0xffff;
+                  int home = (a1 >> 16) & 0xffff;
                   fprintf(stderr,
                           "        EP peer-wait: missing=0x%02x (%d peers) "
-                          "lowest_obs=%d want=%d %s\n",
+                          "pushed=%d home=%d want=%d %s%s\n",
                           a0,
                           nmiss,
-                          a1,
+                          pushed,
+                          home,
                           exp_,
                           nmiss == 1 ? "<== single straggler, blame that rank"
-                                     : "<== broad, blame transport/address");
+                                     : "<== broad, blame transport/address",
+                          home == pushed ? " [counter drift]"
+                                         : " [PUSH NOT LANDING]");
                 }
                 if (false) {
                   // a0 = raw arrival counter. If a0 is an exact multiple of

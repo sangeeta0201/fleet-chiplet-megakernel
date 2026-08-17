@@ -367,6 +367,118 @@ __device__ __forceinline__ void _full_layer_ep_fold_partial(
   } while (0)
 #endif
 
+// Re-publish this rank's signal to its peers from inside the peer wait.
+//
+// WHY, and the evidence is specific. An NP=8 MOE_EP=1 hang captured with
+// MPK_WORKER_STATE + MPK_HOST_DBG_POLL gave, at one instant:
+//
+//   rank 0 : bid 900, remaining=0x08, obs=1918, exp=1919
+//   rank 1-7: bid 900, remaining=0x01, obs=1919, exp=1920
+//
+// Read that literally. Ranks 1-7 are at epoch 1920 and see rank 0 at 1919 --
+// they are waiting on rank 0, correctly, because rank 0 has not passed 1919.
+// Rank 0 is waiting on rank 3 to reach 1919. But rank 3 is itself at 1920,
+// which it could only reach by publishing 1919 and then 1920 to every peer
+// before each wait. So rank 3 issued two stores of a monotonically increasing
+// value into rank 0's line, and rank 0's line still reads 1918. Every other
+// rank observed rank 3's 1919 -- that is what let them advance. Exactly one
+// directed edge, r3 -> r0, dropped two consecutive 8-byte stores.
+//
+// That rules out the static explanations, all of which fail at layer 0 rather
+// than at layer 1919: a wrong peer delta, an unmapped peer, a leader that was
+// never elected ([EPFOLD] shows all 8 folders arriving and a leader on every
+// rank at every layer), a non-monotonic threshold. It also rules out reader
+// staleness, which MPK_EP_POLL_INV already covers and which the comment above
+// records as tested and not the mechanism. What is left is a store that was
+// issued, drained to vmcnt(0), and never landed on one XGMI edge.
+//
+// The repair is to stop treating the publish as a one-shot. The store is a
+// monotonic absolute value, not an accumulate -- the fold code says so and
+// relies on it -- so re-issuing it is idempotent by construction, and it
+// carries no new data: the gather-slot bytes it releases were written and
+// drained long before the first publish. So a waiter that is not satisfied
+// re-publishes its own current value every MPK_EP_REPUBLISH_SPINS rounds.
+//
+// Why that breaks the specific cycle above: the rank that lost a store to me
+// is necessarily at an epoch >= the one I am waiting for, because losing it is
+// what let that rank advance past me. Its re-publish therefore carries a value
+// that satisfies my threshold, not merely the one I missed. Here rank 3
+// re-publishes 1920, rank 0 needs 1919, and rank 0 goes. Sent to all peers
+// rather than to `remaining`, because the rank that dropped my line need not
+// be one I am waiting on.
+//
+// Cost in a healthy run is zero: the gate is a spin count that a satisfied
+// wait never reaches, and only the one leader thread per rank runs this loop
+// at all. The deltas are recomputed from the init-time table rather than
+// plumbed down, exactly as ep_any_direct is at the call site.
+#ifndef MPK_EP_REPUBLISH_SPINS
+#define MPK_EP_REPUBLISH_SPINS 65536
+#endif
+
+template <int EP_WORLD_SIZE, int EP_MY_PE>
+__device__ __forceinline__ void
+    _full_layer_ep_republish(uint64_t *ep_signal, uint64_t ep_sig_expected) {
+  uint64_t *const my_line =
+      ep_signal + (size_t)EP_MY_PE * FULL_LAYER_EP_SIGNAL_STRIDE;
+#pragma unroll
+  for (int p = 0; p < EP_WORLD_SIZE; p++) {
+    if (p == EP_MY_PE) {
+      continue;
+    }
+    int64_t d = 0;
+    if (mpk_shmem_peer_delta(p, &d)) {
+      st_wt_u64((void *)(reinterpret_cast<char *>(my_line) + d),
+                (unsigned long long)ep_sig_expected);
+    }
+  }
+  st_wt_u64((void *)my_line, (unsigned long long)ep_sig_expected);
+  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+}
+
+// The peer's OWN copy of its signal, read out of the peer's memory.
+//
+// The wait polls `ep_signal[p]` in MY buffer -- the copy peer p PUSHED to me.
+// The publisher also writes the identical value to `ep_signal[p]` in its OWN
+// buffer (see the "Same store, local copy" store in the fold), and the peer
+// delta translates one symmetric address to the other. So this reads the
+// authoritative copy of exactly the value the wait is testing, over the same
+// XGMI mapping the push travels, and the two can be compared.
+//
+// That comparison is the whole point, and it is the one measurement that
+// separates the two surviving explanations of the NP=8 hang. Retrying the push
+// 15,000 times (MPK_EP_REPUBLISH_SPINS below) did not heal it, and the reader
+// already invalidates with buffer_inv sc1 on every round, so repetition has
+// exonerated both ends of the pushed path. Either:
+//
+//   home > pushed -- the publisher really is at the later epoch and its store
+//                    into my line is not landing, however many times issued;
+//   home == pushed -- the publisher never advanced its signal at all, and its
+//                    own higher `ep_sig_expected` came from a counter that
+//                    drifted between ranks. A software bug, not a transport
+//                    one, and the fix is in the counter.
+//
+// Diagnostic only: it does NOT clear the peer's bit. Clearing on the home copy
+// would let the wait proceed on a peer whose gather-slot bytes may have been
+// dropped by the same path that dropped the signal, turning a hang into silent
+// corruption of one rank's residual stream. Read it, report it, keep waiting.
+template <int EP_WORLD_SIZE, int EP_MY_PE>
+__device__ __forceinline__ unsigned long long
+    _full_layer_ep_peer_home(uint64_t *ep_signal, unsigned remaining) {
+  if (!remaining) {
+    return 0ull;
+  }
+  int const p = (int)__builtin_ctz(remaining);
+  int64_t d = 0;
+  if (!mpk_shmem_peer_delta(p, &d)) {
+    return ~0ull;
+  }
+  uint64_t *const home = reinterpret_cast<uint64_t *>(
+      reinterpret_cast<char *>(ep_signal +
+                               (size_t)p * FULL_LAYER_EP_SIGNAL_STRIDE) +
+      d);
+  return ld_sys_u64(reinterpret_cast<unsigned long long *>(home));
+}
+
 // Bounded peer wait, for diagnosing a hang that only exists in an
 // uninstrumented build.
 //
@@ -447,6 +559,10 @@ __device__ __forceinline__ void
         break;
       }
 #endif
+      if ((_spins & (MPK_EP_REPUBLISH_SPINS - 1)) == 0) {
+        _full_layer_ep_republish<EP_WORLD_SIZE, EP_MY_PE>(ep_signal,
+                                                          ep_sig_expected);
+      }
       MPK_EP_POLL_INV();
       __builtin_amdgcn_s_sleep(1);
     }
@@ -472,6 +588,11 @@ __device__ __forceinline__ void
     }
     int _spins = 0;
     int _obs_low = 0;
+    // Only read under MPK_WORKER_STATE -- it is an XGMI round trip, and
+    // nothing but the dump consumes it. Declared unconditionally so the aux
+    // call below has one shape.
+    unsigned long long _home_low = 0ull;
+    (void)_home_low;
     while (remaining) {
 #pragma unroll
       for (int p = 0; p < EP_WORLD_SIZE; p++) {
@@ -489,17 +610,32 @@ __device__ __forceinline__ void
       if (remaining) {
         if ((++_spins & (MPK_WS_WAIT_REFRESH - 1)) == 0) {
           MPK_WS_WAIT_TICK(_obs_low, _spins);
-          // aux2 is MY OWN line, read back through the same ld_sys_u64 the
-          // peer lines go through. The waiter is the rank's publisher, so if
-          // its own absolute store is not observable here then the failure is
-          // the store, not the peer transport -- and that distinction is not
-          // recoverable from `remaining` alone, which only ever describes
-          // other ranks.
-          MPK_WS_WAIT_AUX(
-              (int)remaining, _obs_low,
-              (int)ld_sys_u64(reinterpret_cast<unsigned long long *>(
-                  ep_signal + (size_t)EP_MY_PE * FULL_LAYER_EP_SIGNAL_STRIDE)),
-              0);
+          // a1 carries BOTH copies of the lowest missing peer's signal:
+          // low 16 bits the value that peer pushed into my line, high 16 the
+          // value in that peer's own memory, read through its delta. Packed
+          // rather than split across a1/a2 because a2 does not reach the dump.
+          // 16 bits each is enough -- the threshold is a layer count and the
+          // hangs land near 2000. See _full_layer_ep_peer_home for why this
+          // one comparison decides between a lost push and a drifted counter.
+#ifdef MPK_WORKER_STATE
+          _home_low =
+              _full_layer_ep_peer_home<EP_WORLD_SIZE, EP_MY_PE>(ep_signal,
+                                                                remaining);
+#endif
+          // Only a0 and a1 reach the dump. mpk_ws_wait_aux stores a0/a1 and
+          // does `(void)a2; (void)a3;` -- slots b[2] and b[3] belong to the
+          // per-wave exit mask. An earlier version of this call passed MY OWN
+          // line here, read back through the same ld_sys_u64 the peer lines go
+          // through, with a comment claiming the dump distinguished "my store
+          // is not observable even locally" from "the peer transport dropped
+          // it". It never did: what printed in aux2 was the wave mask, 0xf,
+          // and reading it as a signal value costs real time in a hang triage.
+          // Do not put a value in a2/a3 expecting to see it.
+          MPK_WS_WAIT_AUX((int)remaining,
+                          (int)((_obs_low & 0xffff) |
+                                (int)((_home_low & 0xffffull) << 16)),
+                          0,
+                          0);
         }
 #if MPK_EP_WAIT_TIMEOUT
         if (_spins > MPK_EP_WAIT_TIMEOUT) {
@@ -519,6 +655,10 @@ __device__ __forceinline__ void
           break;
         }
 #endif
+        if ((_spins & (MPK_EP_REPUBLISH_SPINS - 1)) == 0) {
+          _full_layer_ep_republish<EP_WORLD_SIZE, EP_MY_PE>(ep_signal,
+                                                            ep_sig_expected);
+        }
         MPK_EP_POLL_INV();
         __builtin_amdgcn_s_sleep(1);
       }
