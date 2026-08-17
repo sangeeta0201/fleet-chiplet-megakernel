@@ -5557,8 +5557,66 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                 int fl = (phase - 50000000) % 1000;
                 char const *pn = "?";
                 switch (fp) {
+                  case 11:
+                    pn = "EP-fold-begin";
+                    break;
+                  case 12:
+                    pn = "EP-arrival-done";
+                    break;
+                  case 13:
+                    pn = "EP-self-wait-done";
+                    break;
+                  case 14:
+                    pn = "EP-peer-wait-done";
+                    break;
                   case 20:
                     pn = "P2-qkv-epoch";
+                    break;
+                  // GLM's MLA attention half, one per phase. gpt-oss reuses
+                  // 20/30/... for its own coarser split; these are the
+                  // intra-attention breakdown the MLA monolith needs.
+                  case 21:
+                    pn = "MLA-P1-resolve-norm-qkva";
+                    break;
+                  case 22:
+                    pn = "MLA-P2-qkva-qb-barrier";
+                    break;
+                  case 23:
+                    pn = "MLA-P3-qb-kvappend";
+                    break;
+                  case 24:
+                    pn = "MLA-P4-qb-decode-barrier";
+                    break;
+                  case 25:
+                    pn = "MLA-P5-decode";
+                    break;
+                  case 26:
+                    pn = "MLA-P6-decode-merge-barrier";
+                    break;
+                  case 27:
+                    pn = "MLA-P7-merge";
+                    break;
+                  // GLM's MoE half, phases 9-15 of the monolith.
+                  case 71:
+                    pn = "MOE-P9-oproj";
+                    break;
+                  case 72:
+                    pn = "MOE-P10-oproj-router-barrier";
+                    break;
+                  case 73:
+                    pn = "MOE-P11-norm-router-topk";
+                    break;
+                  case 74:
+                    pn = "MOE-P12-routing-wait";
+                    break;
+                  case 76:
+                    pn = "MOE-P13-w13";
+                    break;
+                  case 77:
+                    pn = "MOE-P14-w13-w2-barrier";
+                    break;
+                  case 78:
+                    pn = "MOE-P15-w2";
                     break;
                   case 30:
                     pn = "P3-attn-chunk";
@@ -5726,6 +5784,64 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                   switch (fp) {
                     case 20:
                       pn = "P2-qkv-epoch";
+                      break;
+                    // GLM's MLA monolith markers: 11-14 the EP fold, 21-27 the
+                    // attention half, 71-78 the MoE half. Kept in step with the
+                    // per-worker switch above -- the same marker has to decode the
+                    // same way in the histogram or the two disagree.
+                    case 11:
+                      pn = "EP-fold-begin";
+                      break;
+                    case 12:
+                      pn = "EP-arrival-done";
+                      break;
+                    case 13:
+                      pn = "EP-self-wait-done";
+                      break;
+                    case 14:
+                      pn = "EP-peer-wait-done";
+                      break;
+                    case 21:
+                      pn = "MLA-P1-resolve-norm-qkva";
+                      break;
+                    case 22:
+                      pn = "MLA-P2-qkva-qb-barrier";
+                      break;
+                    case 23:
+                      pn = "MLA-P3-qb-kvappend";
+                      break;
+                    case 24:
+                      pn = "MLA-P4-qb-decode-barrier";
+                      break;
+                    case 25:
+                      pn = "MLA-P5-decode";
+                      break;
+                    case 26:
+                      pn = "MLA-P6-decode-merge-barrier";
+                      break;
+                    case 27:
+                      pn = "MLA-P7-merge";
+                      break;
+                    case 71:
+                      pn = "MOE-P9-oproj";
+                      break;
+                    case 72:
+                      pn = "MOE-P10-oproj-router-barrier";
+                      break;
+                    case 73:
+                      pn = "MOE-P11-norm-router-topk";
+                      break;
+                    case 74:
+                      pn = "MOE-P12-routing-wait";
+                      break;
+                    case 76:
+                      pn = "MOE-P13-w13";
+                      break;
+                    case 77:
+                      pn = "MOE-P14-w13-w2-barrier";
+                      break;
+                    case 78:
+                      pn = "MOE-P15-w2";
                       break;
                     case 30:
                       pn = "P3-attn-chunk";
@@ -5997,6 +6113,64 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                 switch (kv.first) {
                   case 20:
                     pn = "P2-qkv-epoch";
+                    break;
+                  // GLM's MLA monolith markers: 11-14 the EP fold, 21-27 the
+                  // attention half, 71-78 the MoE half. Kept in step with the
+                  // per-worker switch above -- the same marker has to decode the
+                  // same way in the histogram or the two disagree.
+                  case 11:
+                    pn = "EP-fold-begin";
+                    break;
+                  case 12:
+                    pn = "EP-arrival-done";
+                    break;
+                  case 13:
+                    pn = "EP-self-wait-done";
+                    break;
+                  case 14:
+                    pn = "EP-peer-wait-done";
+                    break;
+                  case 21:
+                    pn = "MLA-P1-resolve-norm-qkva";
+                    break;
+                  case 22:
+                    pn = "MLA-P2-qkva-qb-barrier";
+                    break;
+                  case 23:
+                    pn = "MLA-P3-qb-kvappend";
+                    break;
+                  case 24:
+                    pn = "MLA-P4-qb-decode-barrier";
+                    break;
+                  case 25:
+                    pn = "MLA-P5-decode";
+                    break;
+                  case 26:
+                    pn = "MLA-P6-decode-merge-barrier";
+                    break;
+                  case 27:
+                    pn = "MLA-P7-merge";
+                    break;
+                  case 71:
+                    pn = "MOE-P9-oproj";
+                    break;
+                  case 72:
+                    pn = "MOE-P10-oproj-router-barrier";
+                    break;
+                  case 73:
+                    pn = "MOE-P11-norm-router-topk";
+                    break;
+                  case 74:
+                    pn = "MOE-P12-routing-wait";
+                    break;
+                  case 76:
+                    pn = "MOE-P13-w13";
+                    break;
+                  case 77:
+                    pn = "MOE-P14-w13-w2-barrier";
+                    break;
+                  case 78:
+                    pn = "MOE-P15-w2";
                     break;
                   case 30:
                     pn = "P3-attn-chunk";

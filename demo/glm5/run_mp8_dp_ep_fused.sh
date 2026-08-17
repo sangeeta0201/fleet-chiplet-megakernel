@@ -30,7 +30,10 @@ export ROCSHMEM_MAX_NUM_CONTEXTS="${ROCSHMEM_MAX_NUM_CONTEXTS:-8}"
 # and slicing 20 q heads eight ways is not a shape the decode kernel has.
 # demo.py asserts attn_dp under MOE_EP.
 export ATTN_DP="${ATTN_DP:-1}"
-export MOE_EP=1
+# Overridable only as an ablation: MOE_EP=0 at world > 1 replicates the whole
+# model per rank and leaves no collective in the step at all, which is the
+# isolation test for "is this the EP fold or is this multi-GPU launch".
+export MOE_EP="${MOE_EP:-1}"
 export EP_FOLD_RANK="${EP_FOLD_RANK:-0}"
 export GLM_FUSE_FULL_LAYER="${GLM_FUSE_FULL_LAYER:-1}"
 export PRECOMPUTED_DISPATCH="${PRECOMPUTED_DISPATCH:-1}"

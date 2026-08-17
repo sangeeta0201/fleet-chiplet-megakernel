@@ -206,6 +206,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   unsigned long long _sp_t0 = __builtin_amdgcn_s_memrealtime();
 #endif
 
+  MPK_WS_PHASE(21, qkv_expected, xcd_id);
   // ══════════════════════════════════════════════════════════════════════
   // Phase 1: residual resolve + input RMSNorm + [q_a_proj | kv_a_proj_with_mqa]
   // ══════════════════════════════════════════════════════════════════════
@@ -253,6 +254,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         x_out_ptr);
   }
 
+  MPK_WS_PHASE(22, qkv_expected, xcd_id);
   // ══════════════════════════════════════════════════════════════════════
   // Phase 2: qkv_a -> q_b barrier
   // ══════════════════════════════════════════════════════════════════════
@@ -304,6 +306,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   }
 #endif
 
+  MPK_WS_PHASE(23, qkv_expected, xcd_id);
   // ══════════════════════════════════════════════════════════════════════
   // Phase 3: q_a RMSNorm + absorbed q_b + latent KV-cache append
   // ══════════════════════════════════════════════════════════════════════
@@ -349,6 +352,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         kv_eps);
   }
 
+  MPK_WS_PHASE(24, qkv_expected, xcd_id);
   // ══════════════════════════════════════════════════════════════════════
   // Phase 4: q_b -> decode barrier
   // ══════════════════════════════════════════════════════════════════════
@@ -393,6 +397,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     }
 #endif
 
+    MPK_WS_PHASE(25, qkv_expected, xcd_id);
     // ════════════════════════════════════════════════════════════════════
     // Phase 5: absorbed MLA decode, split over (q_head_group, kv_chunk)
     // ════════════════════════════════════════════════════════════════════
@@ -433,6 +438,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
 #endif
   }
 
+  MPK_WS_PHASE(26, qkv_expected, xcd_id);
   // ══════════════════════════════════════════════════════════════════════
   // Phase 6: decode -> merge barrier
   // ══════════════════════════════════════════════════════════════════════
@@ -471,6 +477,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   }
 #endif
 
+  MPK_WS_PHASE(27, qkv_expected, xcd_id);
   // ══════════════════════════════════════════════════════════════════════
   // Phase 7: split-KV merge
   // ══════════════════════════════════════════════════════════════════════

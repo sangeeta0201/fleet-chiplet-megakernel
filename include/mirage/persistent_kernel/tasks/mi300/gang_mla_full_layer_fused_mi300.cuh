@@ -381,6 +381,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
   // asynchronously by peers. demo.py refuses to build an EP configuration
   // without precomputed dispatch rather than making that work.
   if constexpr (EP_WORLD_SIZE > 1) {
+    MPK_WS_PHASE(11, task_layer_idx, xcd_id);
     int *const ep_fold_done =
         counters + FULL_LAYER_MLA_EP_FOLD_DONE_SLOT * HIER_STRIDE;
     // input_ptrs[27]: [EP_WORLD_SIZE, BATCH_SIZE, QKV_REDUCTION_SIZE] bf16
@@ -575,15 +576,18 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     // the reason generalizes: pushing it into Phase 1 puts it upstream of the
     // qkv_a -> q_b barrier that gates all of attention, so one late peer
     // stalls the whole XCD instead of one worker.
+    MPK_WS_PHASE(12, task_layer_idx, xcd_id);
     if (tid == 0) {
       uint64_t *const self_sig =
           ep_signal + (size_t)EP_MY_PE * FULL_LAYER_EP_SIGNAL_STRIDE;
-      while (ld_nt_u64(reinterpret_cast<unsigned long long *>(self_sig)) <
+      while (ld_sys_u64(reinterpret_cast<unsigned long long *>(self_sig)) <
              (unsigned long long)ep_sig_expected) {
         __builtin_amdgcn_s_sleep(1);
       }
+      MPK_WS_PHASE(13, task_layer_idx, xcd_id);
       _full_layer_ep_wait_peers<EP_WORLD_SIZE, EP_MY_PE>(
           ep_signal, ep_sig_expected, ep_any_direct);
+      MPK_WS_PHASE(14, task_layer_idx, xcd_id);
     }
     __syncthreads();
     asm volatile("buffer_inv" ::: "memory");
@@ -645,6 +649,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
   // Workers past merge_tiles_per_xcd return out of this call early, from its
   // Phase 7 guard. They land on the Phase 8 barrier below with nothing to do
   // -- which is exactly where the o_proj weight prefetch is issued from.
+  MPK_WS_PHASE(20, task_layer_idx, xcd_id);
   gang_mla_attn_fused_kernel_mi300<BATCH_SIZE,
                                    QKV_OUTPUT_PER_WG,
                                    QKV_REDUCTION_SIZE,
@@ -718,6 +723,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       /*qb_expected_in=*/s_exp[1],
       /*decode_expected_in=*/s_exp[2]);
 
+  MPK_WS_PHASE(60, task_layer_idx, xcd_id);
   // ══════════════════════════════════════════════════════════════════════
   // Phase 8: attention -> o_proj cross-XCD barrier
   // ══════════════════════════════════════════════════════════════════════
@@ -940,6 +946,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
   // attn_out is output_ptrs[4] here rather than an input of its own: the two
   // halves declared it identically (unpartitioned) so one slot serves both,
   // and the input list has no room for a second.
+  MPK_WS_PHASE(70, task_layer_idx, xcd_id);
   gang_oproj_router_fused_kernel_mi300<BATCH_SIZE,
                                        OPROJ_REDUCTION_SIZE,
                                        OPROJ_ROWS_PER_WG,
@@ -999,6 +1006,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       /*oproj_expected_in=*/s_exp[4],
       /*routing_expected_in=*/s_exp[5],
       /*w13_expected_in=*/s_exp[6]);
+  MPK_WS_PHASE(90, task_layer_idx, xcd_id);
 }
 
 } // namespace kernel

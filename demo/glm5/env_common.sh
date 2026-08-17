@@ -20,8 +20,28 @@ export MODEL_PATH="${MODEL_PATH:-zai-org/GLM-4.7-Flash}"
 
 # rocSHMEM + the MPI it was built against. rocSHMEM's IPC backend only needs
 # MPI for bootstrap (rank exchange), not for the data path.
-export ROCSHMEM_INC_PATH="${ROCSHMEM_INC_PATH:-/home/claudeuser/rocshmem/include}"
-export ROCSHMEM_LIB_PATH="${ROCSHMEM_LIB_PATH:-/home/claudeuser/rocshmem/lib}"
+#
+# The path is probed rather than hardcoded: gpt_oss/env_common.sh names
+# /home/claudeuser/rocshmem, which does not exist on this box -- the install
+# is /home/claudeuser/rocshmem_install (the source tree is /home/claudeuser/
+# rocSHMEM and has headers but no librocshmem.a). Getting this wrong fails
+# late and unhelpfully, at codegen, on every rank at once.
+if [ -z "${ROCSHMEM_INC_PATH:-}" ]; then
+  for d in /home/claudeuser/rocshmem_install /home/claudeuser/rocshmem \
+           /opt/rocshmem /usr/local/rocshmem; do
+    if [ -f "$d/include/rocshmem/rocshmem.hpp" ] && \
+       [ -f "$d/lib/librocshmem.a" ]; then
+      export ROCSHMEM_INC_PATH="$d/include"
+      export ROCSHMEM_LIB_PATH="${ROCSHMEM_LIB_PATH:-$d/lib}"
+      break
+    fi
+  done
+fi
+if [ -z "${ROCSHMEM_INC_PATH:-}" ]; then
+  echo "env_common.sh: no rocSHMEM install found; set ROCSHMEM_INC_PATH" >&2
+fi
+export ROCSHMEM_INC_PATH="${ROCSHMEM_INC_PATH:-}"
+export ROCSHMEM_LIB_PATH="${ROCSHMEM_LIB_PATH:-}"
 if [ -d /home/claudeuser/ompi/lib ]; then
   export MPI_INC_PATH="${MPI_INC_PATH:-/home/claudeuser/ompi/include}"
   export MPI_LIB_PATH="${MPI_LIB_PATH:-/home/claudeuser/ompi/lib}"
@@ -41,7 +61,7 @@ MPK_FORWARD_VARS=(
   HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES
   ROCSHMEM_INC_PATH ROCSHMEM_LIB_PATH MPI_INC_PATH MPI_LIB_PATH
   LD_LIBRARY_PATH PATH
-  ROCSHMEM_MAX_NUM_CONTEXTS
+  ROCSHMEM_MAX_NUM_CONTEXTS MASTER_PORT
   ATTN_DP MOE_EP EP_FOLD_RANK
   PRECOMPUTED_DISPATCH MPK_ML_REPLAY
   GLM_FUSE_FULL_LAYER GLM_FUSE_ATTN GLM_FUSE_OPROJ_ROUTER

@@ -437,7 +437,10 @@ if __name__ == "__main__":
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
         os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = "12355"
+        # Overridable: a killed run leaves the listener in TIME_WAIT (or, if
+        # it hung, still bound), and the next launch dies with EADDRINUSE
+        # before it has even built. Debugging a livelock means killing runs.
+        os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "12355")
     except ImportError:
         world_size = 1
         rank = 0
@@ -1241,7 +1244,11 @@ if __name__ == "__main__":
 
         def zero_moe_bias(size):
             if size not in _moe_bias_cache:
-                t = torch.zeros(num_experts_total, size,
+                # Rows are LOCAL experts, not global: the bias is a weight
+                # tensor, indexed by the same local_eid as gate_up/down, and
+                # the registrar asserts dim[0] == the weight tensor's dim[0].
+                # Off EP the two counts coincide.
+                t = torch.zeros(ep_local + num_shared, size,
                                 dtype=torch.bfloat16, device="cuda")
                 _tensor_refs[f"zero_moe_bias_{size}"] = t
                 _moe_bias_cache[size] = mpk.attach_input(

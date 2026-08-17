@@ -238,6 +238,7 @@ __device__ __attribute__((always_inline)) void
       oproj_tiles_per_xcd > router_tile_n ? oproj_tiles_per_xcd : router_tile_n;
 
   if (xcd_rank < oproj_topk_tiles_per_xcd) {
+    MPK_WS_PHASE(71, routing_expected, xcd_id);
     // ══════════════════════════════════════════════════════════════════════
     // Phase 1: absorbed o_proj (MXFP8 GEMV + residual)
     // ══════════════════════════════════════════════════════════════════════
@@ -266,6 +267,7 @@ __device__ __attribute__((always_inline)) void
                                                      xcd_rank);
     }
 
+    MPK_WS_PHASE(72, routing_expected, xcd_id);
     // ══════════════════════════════════════════════════════════════════════
     // Phase 2: o_proj -> router barrier (arrival only)
     // ══════════════════════════════════════════════════════════════════════
@@ -310,6 +312,7 @@ __device__ __attribute__((always_inline)) void
     }
 #endif
 
+    MPK_WS_PHASE(73, routing_expected, xcd_id);
     // ══════════════════════════════════════════════════════════════════════
     // Phase 3: RMSNorm + router GEMV + sigmoid/bias TopK
     // ══════════════════════════════════════════════════════════════════════
@@ -350,7 +353,8 @@ __device__ __attribute__((always_inline)) void
           hier_barrier,
           xcd_id,
           oproj_expected,
-          routing_ready);
+          routing_ready,
+          /*routing_epoch_hint=*/routing_expected);
     }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     {
@@ -364,6 +368,7 @@ __device__ __attribute__((always_inline)) void
 #endif
   }
 
+  MPK_WS_PHASE(74, routing_expected, xcd_id);
   // ════════════════════════════════════════════════════════════════════════
   // Phase 4: wait for routing
   // ════════════════════════════════════════════════════════════════════════
@@ -392,6 +397,7 @@ __device__ __attribute__((always_inline)) void
   }
 #endif
 
+  MPK_WS_PHASE(76, routing_expected, xcd_id);
   // ════════════════════════════════════════════════════════════════════════
   // Phase 5: MoE W13 (gate+up) with the SwiGLU folded into the epilogue
   // ════════════════════════════════════════════════════════════════════════
@@ -429,6 +435,7 @@ __device__ __attribute__((always_inline)) void
   }
 #endif
 
+  MPK_WS_PHASE(77, routing_expected, xcd_id);
   // ════════════════════════════════════════════════════════════════════════
   // Phase 6: W13 -> W2 barrier
   // ════════════════════════════════════════════════════════════════════════
@@ -468,6 +475,7 @@ __device__ __attribute__((always_inline)) void
   }
 #endif
 
+  MPK_WS_PHASE(78, routing_expected, xcd_id);
   // ════════════════════════════════════════════════════════════════════════
   // Phase 7: MoE W2 (down) with the routing-weight mul-sum-add folded in
   // ════════════════════════════════════════════════════════════════════════

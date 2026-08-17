@@ -101,6 +101,40 @@ __device__ __forceinline__ int ld_nt_s32(int *addr) {
 #endif
 }
 
+// System-scope 64-bit load: sc0 sc1, so it misses L1 AND the device L2 every
+// time and goes to the fabric.
+//
+// `nt` on its own is only a replacement-policy hint -- an NT load still HITS a
+// resident line. That is survivable for the intra-GPU barrier flags, whose
+// pollers overwhelmingly arrive after the flag has moved, so their first load
+// misses and fetches the new value. It is not survivable for a peer GPU's
+// signal line, where a poller routinely arrives BEFORE the remote store lands:
+// its first load pulls the stale value into this XCD's L2, and every later
+// iteration of the spin hits that line. The store side is already sc0 sc1, so
+// the value does reach the fabric -- the reader simply never looks. Nothing in
+// the spin loop evicts the line either, so it clears only when unrelated
+// traffic or a host-side DMA happens to flush L2, which is why the failure
+// looks like ~17 s per layer of "progress" clocked by the 1 Hz debug poll
+// rather than like a deadlock.
+//
+// Pay sc0 sc1 only where a remote agent is the writer; the intra-GPU flags
+// keep ld_nt_s32.
+__device__ __forceinline__ unsigned long long int
+    ld_sys_u64(unsigned long long int *addr) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  unsigned long long int val;
+  asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1 nt\n"
+               "s_waitcnt vmcnt(0)"
+               : "=v"(val)
+               : "v"(addr)
+               : "memory");
+  return val;
+#else
+  return *reinterpret_cast<unsigned long long int volatile *>(addr);
+#endif
+}
+
 // Non-temporal store (bypasses cache, writes to memory)
 __device__ __forceinline__ void st_nt_u64(unsigned long long int *addr,
                                           unsigned long long int val) {

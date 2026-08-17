@@ -440,7 +440,8 @@ __device__ __attribute__((noinline)) void
                           bool renormalize,
                           float routed_scaling_factor,
                           int num_shared_experts,
-                          int *routing_ready_ptr) {
+                          int *routing_ready_ptr,
+                          int epoch_hint) {
   constexpr int CHUNK_N = NUM_EXPERTS / 8;
   int xcd_id = get_xcd_id();
   void *logits_base = static_cast<T *>(logits_scratch_ptr) -
@@ -489,7 +490,26 @@ __device__ __attribute__((noinline)) void
     __syncthreads();
     if (threadIdx.x == 0) {
       threadfence_gpu();
-      int epoch = ld_nt_s32(routing_ready_ptr) + 1;
+      // Publish the epoch the consumers will actually wait for.
+      //
+      // The read-modify-write below is only equivalent to that when the
+      // publication count and the consumer's layer index advance in lockstep,
+      // and under EP they do not: the EP_TAIL_ONLY layer folds the last real
+      // layer's MoE output and returns before the router ever runs, so it
+      // consumes an `ml` slot -- hence a `task_layer_idx` -- without
+      // publishing. One skipped bump per decode iteration, and the fused
+      // caller's `routing_expected = task_layer_idx + 1` runs permanently
+      // ahead of this counter. The first symptom is a hard hang at the Phase 4
+      // routing poll of pc_iter 2, layer 0, with all 240 workers parked.
+      //
+      // Storing the caller's value instead of incrementing makes writer and
+      // reader agree by construction, exactly as every Mechanism C barrier
+      // flag in this file already does. It also drops an uncached HBM round
+      // trip (0.30-0.44 us measured in gpt-oss) from the serial TopK tail that
+      // 239 workers are blocked on. epoch_hint < 0 keeps the old read for
+      // callers with no layer index to hand.
+      int epoch =
+          (epoch_hint >= 0) ? epoch_hint : (ld_nt_s32(routing_ready_ptr) + 1);
       st_wt_u32((void *)routing_ready_ptr, (unsigned)epoch);
       for (int x = 0; x < 8; x++) {
         st_wt_u32((void *)&routing_ready_ptr[(1 + x) * 16], (unsigned)epoch);
@@ -565,7 +585,11 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     // SIGMOID_BIAS only. Non-null when a fused caller has MoE workers parked
     // behind this router; the TopK tail fans out the release. Layout is
     // gpt-oss's: [0] epoch, [(1 + x) * 16] XCD x's flag.
-    int *routing_ready_ptr = nullptr) {
+    int *routing_ready_ptr = nullptr,
+    // SIGMOID_BIAS only. The epoch value the TopK tail publishes into
+    // routing_ready. Pass the same number the caller's consumers wait on;
+    // < 0 falls back to incrementing whatever is there.
+    int routing_epoch_hint = -1) {
 
   using bf16 = __hip_bfloat16;
   bf16 const *__restrict__ d_hidden = static_cast<bf16 const *>(norm_input_ptr);
@@ -824,7 +848,8 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
           renormalize,
           routed_scaling_factor,
           num_shared_experts,
-          routing_ready_ptr);
+          routing_ready_ptr,
+          routing_epoch_hint);
     } else {
       gang_rmsnorm_topk_detail::topk_noinline<T, NUM_EXPERTS, K>(
           logits_scratch_ptr,

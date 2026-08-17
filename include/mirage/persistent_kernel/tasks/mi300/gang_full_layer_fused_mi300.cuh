@@ -299,9 +299,13 @@ __device__ __forceinline__ void _full_layer_ep_fold_partial(
 //
 // At world size 2 this is one plain non-temporal load in a loop rather than a
 // call into rocSHMEM: the direct peer store and rocSHMEM's SIGNAL_ADD land at
-// the same symmetric address, and ld_nt_u64 observes it past the local cache
+// the same symmetric address, and ld_sys_u64 observes it past the local cache
 // hierarchy either way, which was the only reason the backend primitive was
 // needed. Wider worlds keep the staged path.
+//
+// sc0 sc1, not nt: nt is a replacement hint and still hits a resident line,
+// so a worker that starts polling before the remote store lands spins on the
+// stale copy it just pulled in. See ld_sys_u64 in mpk_atoms.cuh.
 //
 // Many workers may poll the same address concurrently and that is fine: a load
 // is not a coherence transaction the way an atomic is, and the line is
@@ -319,7 +323,7 @@ __device__ __forceinline__ void
   if constexpr (EP_WORLD_SIZE == 2) {
     uint64_t *peer_sig =
         ep_signal + (size_t)(1 - EP_MY_PE) * FULL_LAYER_EP_SIGNAL_STRIDE;
-    while (ld_nt_u64(reinterpret_cast<unsigned long long *>(peer_sig)) <
+    while (ld_sys_u64(reinterpret_cast<unsigned long long *>(peer_sig)) <
            (unsigned long long)ep_sig_expected) {
       __builtin_amdgcn_s_sleep(1);
     }
@@ -348,7 +352,7 @@ __device__ __forceinline__ void
       for (int p = 0; p < EP_WORLD_SIZE; p++) {
         if (remaining & (1u << p)) {
           uint64_t *sp = ep_signal + (size_t)p * FULL_LAYER_EP_SIGNAL_STRIDE;
-          if (ld_nt_u64(reinterpret_cast<unsigned long long *>(sp)) >=
+          if (ld_sys_u64(reinterpret_cast<unsigned long long *>(sp)) >=
               (unsigned long long)ep_sig_expected) {
             remaining &= ~(1u << p);
           }
@@ -681,7 +685,7 @@ __device__ __noinline__ void
         uint64_t *_prev_peer_sig = reinterpret_cast<uint64_t *>(input_ptrs[25]) +
                                    (size_t)(1 - EP_MY_PE) *
                                        FULL_LAYER_EP_SIGNAL_STRIDE;
-        while (ld_nt_u64(reinterpret_cast<unsigned long long *>(
+        while (ld_sys_u64(reinterpret_cast<unsigned long long *>(
                    _prev_peer_sig)) < (unsigned long long)layer_counter) {
           __builtin_amdgcn_s_sleep(1);
         }
@@ -1959,7 +1963,7 @@ __device__ __noinline__ void
 #endif
         uint64_t *self_sig =
             ep_signal + (size_t)EP_MY_PE * FULL_LAYER_EP_SIGNAL_STRIDE;
-        while (ld_nt_u64(reinterpret_cast<unsigned long long *>(self_sig)) <
+        while (ld_sys_u64(reinterpret_cast<unsigned long long *>(self_sig)) <
                (unsigned long long)ep_sig_expected) {
           __builtin_amdgcn_s_sleep(1);
         }
