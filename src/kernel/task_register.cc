@@ -3099,12 +3099,16 @@ int TaskRegister::register_gang_moe_linear_mxfp4_mi300_task(
 //          actual_hidden_dim]
 int TaskRegister::register_gang_rmsnorm_linear_mxfp8_bias_mi300_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 5);
+  assert(params.size() == 6);
   int output_stride = params[0];
   int output_per_wg = params[1];
   int n_wgs_per_xcd = params[2];
   int total_tiles_per_xcd = params[3];
   int actual_hidden_dim = params[4];
+  // Expert parallelism. 0 or 1 is the single-GPU identity. > 1 makes the
+  // residual fold the cross-rank sum as well, and re-reads input[0] as a
+  // symmetric gather buffer of ep_peer_slots [batch, reduction] planes.
+  int ep_peer_slots = params[5];
   (void)total_tiles_per_xcd;
 
   std::vector<tb::TBInputOp *> input_ops;
@@ -3130,10 +3134,22 @@ int TaskRegister::register_gang_rmsnorm_linear_mxfp8_bias_mi300_task(
       output_ops.push_back(static_cast<tb::TBInputOp *>(op));
     }
   }
-  // input[0] is norm_input [batch, reduction_size]
-  assert(input_ops[0]->dtensor.num_dims == 2);
-  int batch_size = input_ops[0]->dtensor.dim[0];
-  int reduction_size = input_ops[0]->dtensor.dim[1];
+  // input[0] is norm_input [batch, reduction_size], or the symmetric gather
+  // buffer [ep_peer_slots, batch, reduction_size] under EP.
+  int batch_size, reduction_size;
+  if (ep_peer_slots > 1) {
+    assert(fuse_resadd &&
+           "EP reduces inside the residual fold; there is nowhere else to "
+           "put it");
+    assert(input_ops[0]->dtensor.num_dims == 3);
+    assert(input_ops[0]->dtensor.dim[0] == ep_peer_slots);
+    batch_size = input_ops[0]->dtensor.dim[1];
+    reduction_size = input_ops[0]->dtensor.dim[2];
+  } else {
+    assert(input_ops[0]->dtensor.num_dims == 2);
+    batch_size = input_ops[0]->dtensor.dim[0];
+    reduction_size = input_ops[0]->dtensor.dim[1];
+  }
 
   if (fuse_resadd) {
     // The fold reads the workspace and the residual as rows of exactly the
@@ -3150,12 +3166,14 @@ int TaskRegister::register_gang_rmsnorm_linear_mxfp8_bias_mi300_task(
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
-  code.e("kernel::gang_rmsnorm_linear_mxfp8_bias_kernel<$, $, $, $, false, $>(",
+  code.e("kernel::gang_rmsnorm_linear_mxfp8_bias_kernel<$, $, $, $, false, $, "
+         "$>(",
          batch_size,
          output_per_wg,
          reduction_size,
          actual_hidden_dim,
-         fuse_resadd ? "true" : "false");
+         fuse_resadd ? "true" : "false",
+         ep_peer_slots);
   code.e("    task_desc->input_ptrs[0],");  // norm_input == residual, folding
   code.e("    task_desc->input_ptrs[1],");  // norm_weight
   code.e("    task_desc->input_ptrs[2],");  // norm_output scratch
@@ -4019,7 +4037,7 @@ int TaskRegister::register_gang_mla_attn_fused_mi300_task(
 //               9 active_expert_ids, 10 moe_workspace_f32 (written)
 int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 42);
+  assert(params.size() == 46);
   // ── attention half ──
   int batch_size = params[0];
   int qkv_opw = params[1];
@@ -4064,10 +4082,19 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
   int moe_w2_opw = params[39];
   int moe_w13_tiles_per_xcd = params[40];
   int moe_w2_tiles_per_xcd = params[41];
+  // Expert parallelism. 1 / 0 / 0 / 0 is the single-GPU identity and compiles
+  // the whole EP block, the tail variant and the expert remap out; > 1 adds
+  // the symmetric gather buffer and the signal array as inputs [27] and [28].
+  int ep_world_size = params[42];
+  int ep_my_pe = params[43];
+  int ep_fold_pe = params[44];
+  bool ep_tail_only = params[45] != 0;
+  bool ep_inline = ep_world_size > 1;
+  assert(!ep_tail_only || ep_inline);
 
   std::vector<tb::TBInputOp *> input_ops;
   std::vector<tb::TBInputOp *> output_ops;
-  int num_inputs = 27;
+  int num_inputs = ep_inline ? 29 : 27;
   int num_outputs = 11;
   assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
   for (auto const &op : bgraph.operators) {
@@ -4161,14 +4188,25 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
 
   assert(input_ops[22]->output_tensors[0].num_dims == 3);
   assert(input_ops[23]->output_tensors[0].num_dims == 3);
-  int moe_num_experts = input_ops[22]->output_tensors[0].dim[0];
-  assert(input_ops[23]->output_tensors[0].dim[0] == moe_num_experts);
-  assert(moe_num_experts == num_experts + num_shared_experts);
+  // What the WEIGHT tensors hold, which under EP is a slice: this rank's
+  // num_experts / world_size routed experts, then the shared expert, which
+  // every rank stores and exactly one computes. What the KERNEL is templated
+  // on is the GLOBAL count, because the activated list and the routing table
+  // are replicated and keyed by the global expert id -- d_mask[MOE_NUM_EXPERTS]
+  // is the activated-slot count and would read past the list at the local one.
+  int moe_num_local_experts = input_ops[22]->output_tensors[0].dim[0];
+  int moe_num_experts = num_experts + num_shared_experts;
+  assert(num_experts % ep_world_size == 0 &&
+         "ep_slice needs the routed expert count to divide by the world size");
+  assert(moe_num_local_experts ==
+             num_experts / ep_world_size + num_shared_experts &&
+         "the expert weight tensor is not this rank's ep_slice");
+  assert(input_ops[23]->output_tensors[0].dim[0] == moe_num_local_experts);
   assert(input_ops[24]->output_tensors[0].num_dims == 2);
-  assert(input_ops[24]->output_tensors[0].dim[0] == moe_num_experts);
+  assert(input_ops[24]->output_tensors[0].dim[0] == moe_num_local_experts);
   assert(input_ops[24]->output_tensors[0].dim[1] == 2 * moe_intermediate);
   assert(input_ops[25]->output_tensors[0].num_dims == 2);
-  assert(input_ops[25]->output_tensors[0].dim[0] == moe_num_experts);
+  assert(input_ops[25]->output_tensors[0].dim[0] == moe_num_local_experts);
   assert(input_ops[25]->output_tensors[0].dim[1] == hidden_size);
   assert(input_ops[26]->output_tensors[0].num_dims == 3);
   assert(input_ops[26]->output_tensors[0].dim[0] == batch_size);
@@ -4226,7 +4264,7 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
   code.inc_indent();
   code.e("kernel::gang_mla_full_layer_fused_kernel_mi300<$, $, $, $, $, $, $, "
          "$, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, "
-         "$, $, $, $>(",
+         "$, $, $, $, $, $, $, $>(",
          batch_size,
          qkv_opw,
          qkv_reduction,
@@ -4259,7 +4297,11 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
          moe_w2_tiles_per_expert,
          moe_w13_opw,
          moe_w2_opw,
-         moe_fp4 ? "true" : "false");
+         moe_fp4 ? "true" : "false",
+         ep_world_size,
+         ep_my_pe,
+         ep_fold_pe,
+         ep_tail_only ? "true" : "false");
   code.e("    task_desc->input_ptrs,");
   code.e("    task_desc->output_ptrs,");
   code.e("    runtime_config.qo_indptr_buffer,");

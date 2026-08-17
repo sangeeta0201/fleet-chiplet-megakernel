@@ -97,20 +97,84 @@ __device__ __forceinline__ f32x4_t _gang_mfma_w_x_f8(
 //
 // Returns false when this worker has no tile, has run past the activated
 // experts, or the token does not route to this expert.
-template <int BATCH_SIZE, int NUM_EXPERTS, int TILES_PER_EXPERT, int WGS>
+//
+// ── expert parallelism ────────────────────────────────────────────────────
+// Under EP each rank stores and computes only EP_NUM_ROUTED / EP_WORLD_SIZE of
+// the routed experts (the id split gpt-oss calls `ep_slice`; GLM cannot use its
+// slot split, because top-4 does not span 8 ranks). Routing, the mask and the
+// activated list stay REPLICATED and keyed by the global expert id -- only the
+// weight and bias tensors are local, so only their index is remapped, to
+// *local_eid.
+//
+// The shared expert has no id range to fall in: it is id EP_NUM_ROUTED, every
+// token routes to it, and it must be computed exactly once across the whole
+// world or the cross-rank sum would count it EP_WORLD_SIZE times. One rank
+// (EP_SHARED_PE) owns it; the others store a copy they never read, which is
+// 36 MB of dead weight per rank at GLM-5.2 dims and not worth a ragged tensor
+// shape to avoid.
+//
+// The tile space is built over the OWNED subsequence of the activated list,
+// not over the whole list with the non-owned tiles early-returning. gpt-oss
+// measured why: owned tiles come in runs of TILES_PER_EXPERT, and a run
+// against the stride-N worker map aliases into 2 real tiles on one worker
+// where the tile count should never exceed 1 -- and that straggler is exactly
+// what the next barrier waits out. Compacting costs two scans of the activated
+// list (at most TOPK_K + 1 loads, hoisted uniformly across the workgroup) per
+// tile, against a tile that is a whole GEMV.
+template <int BATCH_SIZE,
+          int NUM_EXPERTS,
+          int TILES_PER_EXPERT,
+          int WGS,
+          int EP_WORLD_SIZE = 1,
+          int EP_MY_PE = 0,
+          // Routed experts only; the shared expert is id EP_NUM_ROUTED.
+          int EP_NUM_ROUTED = NUM_EXPERTS,
+          int EP_SHARED_PE = 0>
 __device__ __forceinline__ bool _gang_moe_mxfp8_tile(int tile_idx,
                                                      int const *d_mask,
                                                      int const *d_routing,
                                                      int *expert_id,
+                                                     int *local_eid,
                                                      int *tok_idx,
                                                      int *wg_idx,
                                                      int *topk_slot) {
   int const num_activated_experts = d_mask[NUM_EXPERTS];
   int global_tile = tile_idx * 8 + _gang_moe_get_xcd_id();
-  if (global_tile >= num_activated_experts * TILES_PER_EXPERT) {
-    return false;
+  int e, leid;
+  if constexpr (EP_WORLD_SIZE > 1) {
+    static_assert(EP_NUM_ROUTED % EP_WORLD_SIZE == 0,
+                  "ep_slice needs the routed expert count to divide by the "
+                  "world size");
+    constexpr int EP_LOCAL_ROUTED = EP_NUM_ROUTED / EP_WORLD_SIZE;
+    constexpr int EP_BASE = EP_MY_PE * EP_LOCAL_ROUTED;
+    int const owned_rank = global_tile / TILES_PER_EXPERT;
+    int seen = -1;
+    e = -1;
+    for (int i = 0; i < num_activated_experts; i++) {
+      int const cand = d_mask[i];
+      bool const owned =
+          (cand >= EP_NUM_ROUTED)
+              ? (EP_MY_PE == EP_SHARED_PE)
+              : (cand >= EP_BASE && cand < EP_BASE + EP_LOCAL_ROUTED);
+      if (owned && ++seen == owned_rank) {
+        e = cand;
+        break;
+      }
+    }
+    if (e < 0) {
+      return false;
+    }
+    // Local weight layout: the owned routed range packed down to
+    // [0, EP_LOCAL_ROUTED), then the shared expert.
+    leid = (e >= EP_NUM_ROUTED) ? (EP_LOCAL_ROUTED + (e - EP_NUM_ROUTED))
+                                : (e - EP_BASE);
+  } else {
+    if (global_tile >= num_activated_experts * TILES_PER_EXPERT) {
+      return false;
+    }
+    e = d_mask[global_tile / TILES_PER_EXPERT];
+    leid = e;
   }
-  int const e = d_mask[global_tile / TILES_PER_EXPERT];
   int const within = global_tile % TILES_PER_EXPERT;
   int const tok = within / WGS;
   if (tok >= BATCH_SIZE) {
@@ -121,6 +185,7 @@ __device__ __forceinline__ bool _gang_moe_mxfp8_tile(int tile_idx,
     return false;
   }
   *expert_id = e;
+  *local_eid = leid;
   *tok_idx = tok;
   *wg_idx = within % WGS;
   *topk_slot = route_val - 1;
@@ -159,7 +224,13 @@ template <int BATCH_SIZE,
           bool WRITE_THROUGH = false,
           // E2M1 nibbles instead of E4M3 bytes on the weight side only; see
           // the note at the top of the file.
-          bool WEIGHT_FP4 = false>
+          bool WEIGHT_FP4 = false,
+          // Expert parallelism; see the note on _gang_moe_mxfp8_tile. 1/0
+          // compiles the remap out and local_eid == expert_id.
+          int EP_WORLD_SIZE = 1,
+          int EP_MY_PE = 0,
+          int EP_NUM_ROUTED = NUM_EXPERTS,
+          int EP_SHARED_PE = 0>
 __device__ __noinline__ void
     gang_moe_w13_linear_mxfp8_kernel(void const *input_ptr,
                                      void const *weight_ptr,
@@ -198,21 +269,26 @@ __device__ __noinline__ void
   unsigned short const *d_bias = (unsigned short const *)bias_ptr;
   unsigned short *d_output = (unsigned short *)output_ptr;
 
-  int expert_id, tok_idx, wg_idx, topk_slot;
+  int expert_id, local_eid, tok_idx, wg_idx, topk_slot;
   if (!_gang_moe_mxfp8_tile<BATCH_SIZE,
                             NUM_EXPERTS,
                             TILES_PER_EXPERT,
-                            EXPERT_WGS>(tile_idx,
-                                        (int const *)mask_ptr,
-                                        (int const *)routing_ptr,
-                                        &expert_id,
-                                        &tok_idx,
-                                        &wg_idx,
-                                        &topk_slot)) {
+                            EXPERT_WGS,
+                            EP_WORLD_SIZE,
+                            EP_MY_PE,
+                            EP_NUM_ROUTED,
+                            EP_SHARED_PE>(tile_idx,
+                                          (int const *)mask_ptr,
+                                          (int const *)routing_ptr,
+                                          &expert_id,
+                                          &local_eid,
+                                          &tok_idx,
+                                          &wg_idx,
+                                          &topk_slot)) {
     return;
   }
 
-  uint8_t const *wg_data = W + static_cast<int64_t>(expert_id) * EXPERT_BYTES +
+  uint8_t const *wg_data = W + static_cast<int64_t>(local_eid) * EXPERT_BYTES +
                            static_cast<int64_t>(wg_idx) * WG_BYTES;
   uint8_t const *wg_scales = wg_data + WG_DATA_BYTES;
 
@@ -303,7 +379,7 @@ __device__ __noinline__ void
     // a result.
     if (col == 0) {
       int const out_base = wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4;
-      unsigned short const *bias_row = d_bias + expert_id * OUTPUT_STRIDE;
+      unsigned short const *bias_row = d_bias + local_eid * OUTPUT_STRIDE;
 
       if constexpr (FUSE_SWIGLU) {
         constexpr int ACT_STRIDE = OUTPUT_STRIDE / 2;
@@ -397,7 +473,13 @@ template <int BATCH_SIZE,
           int TILES_PER_EXPERT,
           int OUTPUT_PER_WG,
           bool FUSE_MULSUMADD = false,
-          bool WEIGHT_FP4 = false>
+          bool WEIGHT_FP4 = false,
+          // Expert parallelism; see the note on _gang_moe_mxfp8_tile. 1/0
+          // compiles the remap out and local_eid == expert_id.
+          int EP_WORLD_SIZE = 1,
+          int EP_MY_PE = 0,
+          int EP_NUM_ROUTED = NUM_EXPERTS,
+          int EP_SHARED_PE = 0>
 __device__ __noinline__ void
     gang_moe_w2_linear_mxfp8_kernel(void const *input_ptr,
                                     void const *weight_ptr,
@@ -436,21 +518,26 @@ __device__ __noinline__ void
   float *d_workspace = (float *)output_ptr;
   float const *d_routing_weight = (float const *)routing_weight_ptr;
 
-  int expert_id, tok_idx, wg_idx, topk_slot;
+  int expert_id, local_eid, tok_idx, wg_idx, topk_slot;
   if (!_gang_moe_mxfp8_tile<BATCH_SIZE,
                             NUM_EXPERTS,
                             TILES_PER_EXPERT,
-                            EXPERT_WGS>(tile_idx,
-                                        (int const *)mask_ptr,
-                                        (int const *)routing_ptr,
-                                        &expert_id,
-                                        &tok_idx,
-                                        &wg_idx,
-                                        &topk_slot)) {
+                            EXPERT_WGS,
+                            EP_WORLD_SIZE,
+                            EP_MY_PE,
+                            EP_NUM_ROUTED,
+                            EP_SHARED_PE>(tile_idx,
+                                          (int const *)mask_ptr,
+                                          (int const *)routing_ptr,
+                                          &expert_id,
+                                          &local_eid,
+                                          &tok_idx,
+                                          &wg_idx,
+                                          &topk_slot)) {
     return;
   }
 
-  uint8_t const *wg_data = W + static_cast<int64_t>(expert_id) * EXPERT_BYTES +
+  uint8_t const *wg_data = W + static_cast<int64_t>(local_eid) * EXPERT_BYTES +
                            static_cast<int64_t>(wg_idx) * WG_BYTES;
   uint8_t const *wg_scales = wg_data + WG_DATA_BYTES;
 
@@ -543,7 +630,7 @@ __device__ __noinline__ void
 
     if (col == 0) {
       int const out_base = wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4;
-      unsigned short const *bias_row = d_bias + expert_id * OUTPUT_STRIDE;
+      unsigned short const *bias_row = d_bias + local_eid * OUTPUT_STRIDE;
 
       if constexpr (FUSE_MULSUMADD) {
         // The shared expert rides in routing slot NUM_TOPK-1 with weight 1.0,

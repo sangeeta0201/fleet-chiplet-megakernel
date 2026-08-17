@@ -1966,6 +1966,25 @@ class PersistentKernel:
         norm_topk_prob: bool = True,
         moe_w13_output_per_wg: int = 64,
         moe_w2_output_per_wg: int = 64,
+        # -- expert parallelism --
+        # Symmetric-heap tensors (io_category="nvshmem_tensor"). Passing them
+        # turns on the head-of-layer fold: this rank's f32 MoE partial plus
+        # (on ep_fold_rank only) the residual is rounded to bf16 into slot
+        # my_pe of ep_gather, exchanged with every peer, and Phase 1 sums all
+        # world_size slots instead of reading (moe_workspace_f32, residual).
+        #
+        # ep_gather must be a DISTINCT buffer per fused layer -- after the peer
+        # wait a peer may fold layer L+1 while this rank is still reading
+        # layer L's row. ep_signal can be one buffer for the whole model: its
+        # thresholds ride the monotonic layer counter.
+        ep_gather: DTensor = None,
+        ep_signal: DTensor = None,
+        ep_fold_rank: int = 0,
+        # The tail variant: run the entry barrier, the fold, the exchange and
+        # the peer wait, then return before Phase 1. demo.py emits exactly one
+        # of these, immediately after the last real layer, because the fold
+        # sits at the HEAD of a layer and the last layer has no successor.
+        ep_tail_only: bool = False,
         block_dim: tuple = (256, 1, 1),
     ):
         """A whole GLM decoder layer in one gang dispatch.
@@ -2017,6 +2036,23 @@ class PersistentKernel:
         assert router_bias.num_dims == 1
         assert routing_indices.num_dims == 2
         assert active_expert_ids.num_dims == 1
+
+        ep_inline = ep_gather is not None
+        if ep_inline:
+            assert ep_signal is not None, \
+                "the EP fold needs both ep_gather and ep_signal"
+            assert self.world_size > 1, "the EP fold needs world_size > 1"
+            assert ep_gather.num_dims == 3   # (world_size, batch, hidden)
+            assert ep_gather.dim(0) == self.world_size
+            assert 0 <= ep_fold_rank < self.world_size
+            # One 64-byte line per PE, so a peer's signal store never shares a
+            # line with another's. int32 units because mi.uint64 has no
+            # get_datatype_size() entry; the kernel reinterprets the pointer
+            # as uint64*.
+            assert ep_signal.dim(0) >= self.world_size * 16
+        else:
+            assert ep_signal is None and not ep_tail_only, \
+                "ep_signal / ep_tail_only only mean anything with ep_gather"
 
         batch_size = self.max_num_batched_tokens
         assert batch_size == 1, (
@@ -2125,9 +2161,21 @@ class PersistentKernel:
         assert moe_w13_bias.num_dims == 2
         assert moe_w2_bias.num_dims == 2
         assert moe_swiglu_out.num_dims == 3      # [batch, topk_total, inter]
-        moe_num_experts = moe_gate_up_weight.dim(0)
-        assert moe_down_weight.dim(0) == moe_num_experts
-        assert moe_num_experts == num_experts + num_shared_experts
+        # The WEIGHT tensors hold this rank's slice; the router, the routing
+        # table and the activated list stay replicated over all num_experts,
+        # which is what the kernel is templated on.
+        moe_num_local_experts = moe_gate_up_weight.dim(0)
+        moe_num_experts = num_experts + num_shared_experts
+        ep_ws = self.world_size if ep_inline else 1
+        assert num_experts % ep_ws == 0, (
+            f"ep_slice needs {num_experts} routed experts to divide by "
+            f"world_size {ep_ws}")
+        assert moe_down_weight.dim(0) == moe_num_local_experts
+        assert moe_num_local_experts == \
+            num_experts // ep_ws + num_shared_experts, (
+                f"expert weights hold {moe_num_local_experts} experts; this "
+                f"rank's ep_slice is {num_experts // ep_ws} routed + "
+                f"{num_shared_experts} shared")
         moe_w13_width = moe_gate_up_weight.dim(1) * moe_w13_output_per_wg
         assert moe_w13_bias.dim(1) == moe_w13_width
         assert moe_down_weight.dim(1) * moe_w2_output_per_wg == hidden_size
@@ -2179,12 +2227,19 @@ class PersistentKernel:
             f"{self.num_workers // 8} resident workers; the in-kernel barrier "
             "deadlocks if a tile has to wait for a worker")
 
-        # 71 cache-line-strided int32 slots. See the kernel header for the map;
-        # all eight barriers are monotonic, so nothing is reset and one buffer
-        # serves every layer of every iteration.
-        assert counters.dim(0) >= 71 * 16, (
-            f"the fused layer needs {71 * 16} int32 of counters, got "
-            f"{counters.dim(0)}")
+        # 80 cache-line-strided int32 slots, or 96 under EP. See the kernel
+        # header for the map; every barrier is monotonic, so nothing is reset
+        # and one buffer serves every layer of every iteration.
+        #
+        # 80, not 71: FULL_LAYER_ENTRY_SLOT is 71 and the layer-entry barrier
+        # spans nine lines from there (eight per-XCD release flags plus the
+        # arrival counter at [79]). Under EP add the fold counter at [88].
+        # Undersizing this does not fail loudly, it corrupts whatever torch
+        # allocated next -- demo.py already asks for 96 either way.
+        counter_slots = 96 if ep_inline else 80
+        assert counters.dim(0) >= counter_slots * 16, (
+            f"the fused layer needs {counter_slots * 16} int32 of counters, "
+            f"got {counters.dim(0)}")
 
         scaling_milli = int(round(routed_scaling_factor * 1000.0))
         assert abs(scaling_milli / 1000.0 - routed_scaling_factor) < 1e-9
@@ -2207,8 +2262,13 @@ class PersistentKernel:
             oproj_reduction_size, scaling_milli, 1 if norm_topk_prob else 0,
             moe_intermediate, moe_w13_output_per_wg, moe_w2_output_per_wg,
             moe_w13_tiles_per_xcd, moe_w2_tiles_per_xcd,
+            # expert parallelism (4)
+            self.world_size if ep_inline else 1,
+            self.mpi_rank if ep_inline else 0,
+            ep_fold_rank if ep_inline else 0,
+            1 if ep_tail_only else 0,
         ]
-        assert len(params) == 42
+        assert len(params) == 46
 
         grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
@@ -2241,6 +2301,9 @@ class PersistentKernel:
         tb_graph.new_input(moe_w13_bias, (-1, -1, -1), -1, True)
         tb_graph.new_input(moe_w2_bias, (-1, -1, -1), -1, True)
         tb_graph.new_input(moe_swiglu_out, (-1, 2, -1), -1, True)
+        if ep_inline:
+            tb_graph.new_input(ep_gather, (-1, -1, -1), -1, True)   # [27]
+            tb_graph.new_input(ep_signal, (-1, -1, -1), -1, True)   # [28]
         tb_graph.new_input(qkv_a_out, (-1, -1, -1), -1, True)
         tb_graph.new_input(q_workspace, (-1, -1, -1), -1, True)
         tb_graph.new_input(lse, (-1, -1, -1), -1, True)
@@ -2260,8 +2323,9 @@ class PersistentKernel:
              oproj_mxfp8_weight, residual, post_norm_weight, post_norm_output,
              router_weight, router_bias, logits_scratch,
              moe_gate_up_weight, moe_down_weight, moe_w13_bias, moe_w2_bias,
-             moe_swiglu_out,
-             qkv_a_out, q_workspace, lse, o_acc, attn_out, x_out,
+             moe_swiglu_out]
+            + ([ep_gather, ep_signal] if ep_inline else [])
+            + [qkv_a_out, q_workspace, lse, o_acc, attn_out, x_out,
              hidden, topk_weight, routing_indices, active_expert_ids,
              moe_workspace_f32],
             tb_graph,
@@ -4066,6 +4130,11 @@ class PersistentKernel:
         norm_output: DTensor = None,
         resadd_workspace_f32: DTensor = None,
         resadd_x_out: DTensor = None,
+        # Expert parallelism. > 1 re-reads ``norm_input`` as a symmetric
+        # gather buffer of this many [batch, K] bf16 planes and makes the
+        # residual fold the cross-rank sum. Used by the LM head, which under
+        # EP is the consumer of the tail layer's exchange.
+        ep_peer_slots: int = 0,
         block_dim: tuple = (256, 1, 1),
     ):
         """Fused RMSNorm + MXFP8 Gang Linear + Bias.
@@ -4101,7 +4170,10 @@ class PersistentKernel:
         folding layer the caller still needs a standalone moe_residual_add_f32
         to resolve that layer's MoE and re-zero for the next token.
         """
-        assert norm_input.num_dims == 2
+        ep = ep_peer_slots > 1
+        assert not ep or norm_input.num_dims == 3, \
+            "under EP norm_input is the gather buffer (slots, batch, K)"
+        assert ep or norm_input.num_dims == 2
         assert mxfp8_weight.num_dims == 2
         assert output.num_dims == 2
         assert self.target_cc == 95, "MXFP8 MFMA is gfx950-only"
@@ -4110,9 +4182,14 @@ class PersistentKernel:
         fuse_resadd = any(t is not None for t in resadd)
         assert not fuse_resadd or all(t is not None for t in resadd), (
             "the residual fold needs both resadd_workspace_f32 and resadd_x_out")
+        assert not ep or fuse_resadd, \
+            "the EP sum rides inside the residual fold"
+        assert not ep or ep_peer_slots == self.world_size, \
+            f"ep_peer_slots {ep_peer_slots} != world_size {self.world_size}"
+        assert not ep or norm_input.dim(0) == ep_peer_slots
         batch_size = self.max_num_batched_tokens
         # K must clear the depth-4 pipeline's tail: only slot 3 is guarded.
-        K = norm_input.dim(1)
+        K = norm_input.dim(2) if ep else norm_input.dim(1)
         assert K % 512 == 0, f"reduction {K} must be a multiple of 512"
         n_wgs = mxfp8_weight.dim(0)
         assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
@@ -4152,7 +4229,7 @@ class PersistentKernel:
         self.kn_graph.register_task(
             tb_graph, "gang_rmsnorm_linear_mxfp8_bias_mi300",
             [output_stride, output_per_wg, n_wgs_per_xcd,
-             total_tiles_per_xcd, actual_hidden_dim]
+             total_tiles_per_xcd, actual_hidden_dim, ep_peer_slots]
         )
 
     def gang_rmsnorm_linear_mxfp8_bias_mla_kvupd_layer(

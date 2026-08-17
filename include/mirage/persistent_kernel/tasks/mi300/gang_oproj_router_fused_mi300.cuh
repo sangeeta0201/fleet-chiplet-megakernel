@@ -96,7 +96,15 @@ template <int BATCH_SIZE,
           int MOE_W2_OPW,
           // Expert weights as E2M1 nibbles rather than E4M3 bytes. Only the
           // two MoE sub-kernels see it; o_proj and the router stay MXFP8.
-          bool MOE_WEIGHT_FP4 = false>
+          bool MOE_WEIGHT_FP4 = false,
+          // Expert parallelism. Only the two MoE sub-kernels see it: o_proj,
+          // the RMSNorm and the router are replicated on every rank, because
+          // the router has to produce the SAME activated list everywhere or
+          // the ranks would disagree about who owns what. 1/0 compiles the
+          // whole remap out.
+          int EP_WORLD_SIZE = 1,
+          int EP_MY_PE = 0,
+          int EP_SHARED_PE = 0>
 __device__ __attribute__((always_inline)) void
     gang_oproj_router_fused_kernel_mi300(
         // ── o_proj inputs ──
@@ -398,7 +406,11 @@ __device__ __attribute__((always_inline)) void
                                      MOE_W13_OPW,
                                      /*FUSE_SWIGLU=*/true,
                                      /*WRITE_THROUGH=*/true,
-                                     MOE_WEIGHT_FP4>(
+                                     MOE_WEIGHT_FP4,
+                                     EP_WORLD_SIZE,
+                                     EP_MY_PE,
+                                     /*EP_NUM_ROUTED=*/NUM_EXPERTS,
+                                     EP_SHARED_PE>(
         norm_output_ptr,
         moe_gate_up_weight_ptr,
         routing_indices_ptr,
@@ -471,7 +483,11 @@ __device__ __attribute__((always_inline)) void
                                     MOE_W2_TILES_PER_EXPERT,
                                     MOE_W2_OPW,
                                     /*FUSE_MULSUMADD=*/true,
-                                    MOE_WEIGHT_FP4>(
+                                    MOE_WEIGHT_FP4,
+                                    EP_WORLD_SIZE,
+                                    EP_MY_PE,
+                                    /*EP_NUM_ROUTED=*/NUM_EXPERTS,
+                                    EP_SHARED_PE>(
         moe_swiglu_out_ptr,
         moe_down_weight_ptr,
         routing_indices_ptr,

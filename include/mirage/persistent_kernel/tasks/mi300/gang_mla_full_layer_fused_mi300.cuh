@@ -192,7 +192,28 @@ template <
     int EP_MY_PE = 0,
     // The one rank that folds the real residual into its MoE partial, so the
     // residual appears exactly once after the cross-rank sum.
-    int EP_FOLD_PE = 0>
+    int EP_FOLD_PE = 0,
+    // ── the EP tail ──────────────────────────────────────────────────────
+    // Because the fold sits at the HEAD of the layer, the LAST fused layer's
+    // MoE output is never folded by anyone: there is no layer L+1 to do it.
+    // gpt-oss does not have this problem -- it folds at the tail, so its last
+    // layer's own fold is the last thing it does (its EP_WRITE_COMBINED
+    // variant).
+    //
+    // The fix is a variant that runs the layer-entry barrier, the fold, the
+    // exchange and the peer wait, and then returns before Phase 1. demo.py
+    // emits it as one extra gang_mla_full_layer_fused_layer call immediately
+    // after the last real layer, with nothing between the two -- which is what
+    // gets it picked up by the multi-layer scan in persistent_kernel.cuh (it
+    // groups *consecutive* runs of this task type, and swaps variant_id per
+    // layer out of ml_variant_ids, so a different instantiation per fused
+    // layer is exactly what that table is for). Joining the batch is not
+    // cosmetic: task_layer_idx has to keep counting, or the tail's signal-line
+    // threshold would not agree across ranks.
+    //
+    // The LM head then reads the gather buffer directly through EP_PEER_SLOTS,
+    // so no separate combine pass is needed.
+    bool EP_TAIL_ONLY = false>
 __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     // Pointer arrays are passed whole rather than unpacked into 38 named
     // parameters, which is what gpt-oss's full-layer task does and for the
@@ -568,6 +589,16 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     asm volatile("buffer_inv" ::: "memory");
   }
 
+  // The tail variant's whole job is the block above: fold the last real
+  // layer's MoE output and publish it, so the LM head has something to sum.
+  // Everything below would run a 47th attention/MoE layer on weights demo.py
+  // did not bind.
+  static_assert(!EP_TAIL_ONLY || EP_WORLD_SIZE > 1,
+                "EP_TAIL_ONLY is meaningless without expert parallelism");
+  if constexpr (EP_TAIL_ONLY) {
+    return;
+  }
+
   // All six release values, plus this task's own.
   //
   // One dispatch per layer: read them here, before Phase 1. See the header --
@@ -923,7 +954,16 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
                                        MOE_W2_TILES_PER_EXPERT,
                                        MOE_W13_OPW,
                                        MOE_W2_OPW,
-                                       MOE_WEIGHT_FP4>(
+                                       MOE_WEIGHT_FP4,
+                                       EP_WORLD_SIZE,
+                                       EP_MY_PE,
+                                       // The shared expert must be computed
+                                       // exactly once across the world, and
+                                       // the rank that already folds the
+                                       // residual is the natural place to put
+                                       // it: it is the one rank whose slot is
+                                       // guaranteed non-trivial anyway.
+                                       /*EP_SHARED_PE=*/EP_FOLD_PE>(
       /*oproj_input=*/output_ptrs[4],
       /*oproj_weight=*/input_ptrs[15],
       /*oproj_residual=*/input_ptrs[16],

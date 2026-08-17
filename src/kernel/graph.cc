@@ -672,9 +672,10 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     gang_task_tiles_per_xcd[op] = params[3]; // total_tiles_per_xcd
   } else if (name == "gang_rmsnorm_linear_mxfp8_bias_mi300") {
     assert(
-        params.size() == 5 &&
+        params.size() == 6 &&
         "gang_rmsnorm_linear_mxfp8_bias_mi300 needs [o_stride, output_per_wg, "
-        "n_wgs_per_xcd, total_tiles_per_xcd, actual_hidden_dim]");
+        "n_wgs_per_xcd, total_tiles_per_xcd, actual_hidden_dim, "
+        "ep_peer_slots]");
     int variant_id =
         task_register->register_gang_rmsnorm_linear_mxfp8_bias_mi300_task(
             customized->bgraph, params);
@@ -926,10 +927,11 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         std::make_tuple(15, 6, TASK_GANG_MLA_DECODE_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[24]; // tiles_per_xcd
   } else if (name == "gang_mla_full_layer_fused_mi300") {
-    assert(params.size() == 42 &&
+    assert(params.size() == 46 &&
            "gang_mla_full_layer_fused_mi300 takes the 25 attention params "
-           "of gang_mla_attn_fused_mi300 followed by the 17 MoE params of "
-           "gang_oproj_router_fused_mi300 that are not already among them");
+           "of gang_mla_attn_fused_mi300, the 17 MoE params of "
+           "gang_oproj_router_fused_mi300 that are not already among them, "
+           "then [ep_world_size, ep_my_pe, ep_fold_pe, ep_tail_only]");
     int variant_id =
         task_register->register_gang_mla_full_layer_fused_mi300_task(
             customized->bgraph, params);
@@ -938,8 +940,13 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     // task type, so sharing a type with the plain MLA decode task would make
     // layer 0's unfused decode look like a fused layer. runtime.cc lists the
     // new type everywhere the decode type appears.
-    task_config[op] = std::make_tuple(
-        27, 11, TASK_GANG_MLA_FULL_LAYER_FUSED_MI300, variant_id);
+    // Under EP the task grows two inputs: the symmetric gather buffer and the
+    // signal array. Same shape as gpt-oss's fused layer, which likewise varies
+    // its declared arity with ep_world_size rather than declaring null slots.
+    task_config[op] = std::make_tuple(params[42] > 1 ? 29 : 27,
+                                      11,
+                                      TASK_GANG_MLA_FULL_LAYER_FUSED_MI300,
+                                      variant_id);
     gang_task_tiles_per_xcd[op] = params[24]; // tiles_per_xcd
   } else if (name == "gang_attn_merge_mi300") {
     assert(params.size() == 7);

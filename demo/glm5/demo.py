@@ -448,14 +448,33 @@ if __name__ == "__main__":
     if rank != 0:
         print = lambda *_, **__: None
 
+    # ── data-parallel attention ──────────────────────────────────────────
+    # MLA keeps ONE shared latent head, so the gpt-oss `kv_head == xcd_id`
+    # split has no analogue and slicing the q heads eight ways leaves 8 heads
+    # per rank -- a shape the decode kernel's 16-head MFMA group does not
+    # have. At batch 1 replicating attention is nearly free: every rank keeps
+    # all heads and the whole latent cache, runs the identical attention on
+    # the identical token, and the result is already complete per rank. That
+    # deletes the attention all-reduce outright and leaves the MoE fold as the
+    # only collective in the step.
+    #
+    # attn_ws is what from_pretrained is handed, and it is the whole switch:
+    # GlmMLA divides num_heads by it and inserts a dist.all_reduce in o_proj,
+    # neither of which DP may have.
+    attn_dp = world_size > 1 and os.environ.get("ATTN_DP", "1") == "1"
+    attn_ws = 1 if attn_dp else world_size
+
     print("Input arguments:", args)
     print(f"world_size({world_size}) rank({rank})")
+    if attn_dp:
+        print("[ATTN_DP] attention replicated per rank; "
+              "no attention all-reduce")
     torch.set_default_dtype(torch.bfloat16)
     torch.cuda.set_device(rank)
 
     with torch.device("cuda"):
         model = GlmMoeDsaForCausalLM.from_pretrained(
-            args.model_path, world_size=world_size,
+            args.model_path, world_size=attn_ws,
             max_num_pages=args.max_num_pages, page_size=args.page_size,
             num_layers=args.max_layers, random_weights=args.random_weights,
         ).to(dtype=torch.bfloat16, device="cuda")
@@ -665,6 +684,64 @@ if __name__ == "__main__":
         # because attn_out now crosses a barrier instead of an event.
         FUSE_FULL_LAYER = (
             os.environ.get("GLM_FUSE_FULL_LAYER", "0") == "1")
+
+        # ── expert parallelism ───────────────────────────────────────────
+        # The routed experts split by ID across the ranks -- gpt-oss's
+        # `ep_slice`. Its other split, EP_SLOT, partitions the ACTIVATED list
+        # instead and is the better-balanced of the two, but a top-4 list
+        # cannot span 8 ranks, so GLM does not get to use it.
+        #
+        # What is local is only the weight tensors. The router, the routing
+        # table, the activated list, both RMSNorms and o_proj stay REPLICATED
+        # and keyed by the global expert id -- every rank has to derive the
+        # same activated list or they would disagree about who owns what.
+        #
+        # The shared expert has no id range to fall in: it is id
+        # `num_experts`, every token routes to it, and it must be computed by
+        # exactly ONE rank or the cross-rank sum would count it world_size
+        # times. The kernel gives it to EP_SHARED_PE == EP_FOLD_PE; every rank
+        # still stores a replica it never reads, which is cheaper than a
+        # ragged weight shape.
+        moe_ep = world_size > 1 and os.environ.get("MOE_EP", "1") == "1"
+        if moe_ep:
+            assert num_experts % world_size == 0, (
+                f"ep_slice needs {num_experts} routed experts to divide by "
+                f"world_size {world_size}")
+            ep_local = num_experts // world_size
+            ep_base = rank * ep_local
+        else:
+            ep_local = num_experts
+            ep_base = 0
+        # The single rank that folds the real residual into its MoE partial,
+        # so the residual survives the cross-rank sum exactly once. The kernel
+        # gives the same rank the shared expert, for the same reason.
+        ep_fold_rank = int(os.environ.get("EP_FOLD_RANK", "0"))
+        assert 0 <= ep_fold_rank < world_size
+        if moe_ep:
+            # The fold is Phase 0 of the fused layer, not a task of its own,
+            # so EP and whole-layer fusion are one switch.
+            assert FUSE_FULL_LAYER, (
+                "MOE_EP needs GLM_FUSE_FULL_LAYER=1: the fold, the exchange "
+                "and the peer wait are the head of the fused layer and there "
+                "is no unfused path for them")
+            assert attn_dp, (
+                "MOE_EP assumes DP attention; TP attention would need an "
+                "all-reduce of its own, which this branch does not have")
+            # Every EP threshold is a function of task_layer_idx, which only
+            # exists inside the multi-layer batched loop. persistent_kernel.py
+            # defaults PRECOMPUTED_DISPATCH to 0 whenever rocSHMEM is on, so
+            # this has to be set explicitly -- and refused rather than run as
+            # a hang.
+            assert os.environ.get("PRECOMPUTED_DISPATCH") == "1", (
+                "MOE_EP needs PRECOMPUTED_DISPATCH=1, whose default is 0 "
+                "under rocSHMEM: the fold's signal thresholds ride the "
+                "multi-layer layer counter")
+            assert os.environ.get("MPK_ML_REPLAY", "1") == "1", (
+                "MOE_EP needs the multi-layer replay path (MPK_ML_REPLAY=1)")
+            print(f"[MOE_EP] rank {rank} owns routed experts "
+                  f"[{ep_base}, {ep_base + ep_local}) of {num_experts}; "
+                  f"shared expert and residual fold on rank {ep_fold_rank}")
+
         MOE_MXFP8_OPW = 64
         assert not MOE_MXFP4 or MOE_MXFP8, \
             "GLM_MOE_MXFP4 narrows the MXFP8 expert path; it is not a bf16 mode"
@@ -1088,6 +1165,47 @@ if __name__ == "__main__":
         # gang_mla_full_layer_fused_mi300.cuh.
         full_layer_counter = make_tensor("full_layer_counter", (96 * 16,),
                                          torch_dtype=torch.int32)
+        # ── the EP exchange buffers ──────────────────────────────────────
+        # One gather buffer PER FUSED LAYER, plus one for the tail. The fold
+        # is at the head of layer L+1 and Phase 1 reads the same buffer in
+        # the same layer, which reads oddly until you notice the ordering: a
+        # peer that has cleared the wait is free to run ahead and fold layer
+        # L+1 while this rank is still reading layer L's row, and nothing
+        # orders those two. One buffer per layer is what removes the hazard.
+        # 8 x 2048 bf16 is 32 KB a layer on Flash.
+        #
+        # The signal array is SHARED by every layer and must be: its
+        # thresholds ride the run-monotonic layer counter, so it accumulates
+        # exactly one store per (peer, layer) and there is nothing to reset. A
+        # per-layer array would only ever reach 1 while layer 1 waited for 2.
+        #
+        # Both live in the symmetric heap: the fold addresses a peer by heap
+        # delta, so a plain torch allocation would land the write somewhere
+        # unrelated on the remote rank.
+        ep_gather_list = []
+        ep_signal = None
+        if moe_ep:
+            ep_gather_list = [
+                mpk.new_tensor(
+                    dims=(world_size, bs, hidden_size),
+                    dtype=mi.bfloat16,
+                    name=f"ep_gather_{li}",
+                    io_category="nvshmem_tensor",
+                )
+                # num_layers buffers for the fused layers (the dense prologue
+                # layers never use theirs) and one more for the tail.
+                for li in range(num_layers + 1)
+            ]
+            # uint64 counters, one 64-byte line per PE so two peers' stores
+            # never share a line. Declared int32 because that is what
+            # get_datatype_size() supports; only the byte count matters and
+            # the kernel reinterprets the base pointer as uint64*.
+            ep_signal = mpk.new_tensor(
+                dims=(world_size * 16,),
+                dtype=mi.int32,
+                name="ep_signal",
+                io_category="nvshmem_tensor",
+            )
         moe_mid = make_tensor("moe_mid", (bs, topk_total, 2 * moe_inter))
         moe_act = make_tensor("moe_act", (bs, topk_total, moe_inter))
         moe_out = make_tensor("moe_out", (bs, topk_total, hidden_size))
@@ -1162,6 +1280,9 @@ if __name__ == "__main__":
         )
         x = y
 
+        # The last fused layer's argument bundle, reused verbatim by the EP
+        # tail task below.
+        last_fl_kwargs = None
         for i, layer in enumerate(model.model.layers):
             attn = layer.self_attn
             attn._absorb()
@@ -1534,7 +1655,13 @@ if __name__ == "__main__":
             # W13's epilogue the gate and up rows are interleaved pairwise so
             # the pair meets in one thread's accumulators; unfused, the plain
             # [gate | up] concat is what moe_silu_mul expects.
-            experts = list(layer.mlp.experts) + [shared]
+            # Under EP this rank stores only its id slice of the routed
+            # experts, packed down to [0, ep_local), then the shared expert
+            # at ep_local -- which is exactly the local_eid the MoE tile
+            # helper computes. Every rank stores the shared replica; only
+            # ep_fold_rank ever reads it.
+            routed = list(layer.mlp.experts)
+            experts = routed[ep_base:ep_base + ep_local] + [shared]
             gu_stack = torch.stack([
                 interleave_gate_up(e.gate_proj.weight.data,
                                    e.up_proj.weight.data, moe_inter)
@@ -1552,7 +1679,9 @@ if __name__ == "__main__":
                 down_stack = pack_moe_mxfp8(down_stack, MOE_MXFP8_OPW)
             w_moe_gu = _attach_input_keep(gu_stack, f"layer_{i}_moe_gate_up")
             w_moe_down = _attach_input_keep(down_stack, f"layer_{i}_moe_down")
-            for e in experts:
+            # Release the FULL list, not the owned slice: the non-owned
+            # experts were loaded and are now dead weight.
+            for e in routed + [shared]:
                 _release(e.gate_proj.weight, e.up_proj.weight,
                          e.down_proj.weight)
 
@@ -1580,7 +1709,11 @@ if __name__ == "__main__":
                 # inside one task -- and the resolve already writes through
                 # (st_wt_u64 in _rnlm8_resadd_norm_rcp), so it survives the
                 # Phase 8 barrier without an event.
-                mpk.gang_mla_full_layer_fused_layer(
+                # Built as a dict rather than passed inline so the EP tail
+                # task below can rebind the last layer's weights verbatim --
+                # it is the same task type on the same layer, differing only
+                # in its gather buffer and the ep_tail_only variant flag.
+                fl_kwargs = dict(
                     x=x,
                     pre_norm_weight=w_norm,
                     pre_norm_scratch=rmsnorm_out,
@@ -1638,6 +1771,15 @@ if __name__ == "__main__":
                     moe_w2_output_per_wg=MOE_MXFP8_OPW,
                     block_dim=(256, 1, 1),
                 )
+                if moe_ep:
+                    # The fold at the head of this layer publishes the
+                    # PREVIOUS layer's partial, so the buffer is keyed by the
+                    # layer doing the reading -- one per fused layer.
+                    fl_kwargs.update(ep_gather=ep_gather_list[i],
+                                     ep_signal=ep_signal,
+                                     ep_fold_rank=ep_fold_rank)
+                mpk.gang_mla_full_layer_fused_layer(**fl_kwargs)
+                last_fl_kwargs = fl_kwargs
             elif fuse_oproj_router:
                 mpk.gang_oproj_router_fused_layer(
                     input=attn_out,
@@ -1732,7 +1874,13 @@ if __name__ == "__main__":
             # task, so it is emitted here only for the layer that has no next
             # one -- which also re-zeroes moe_ws_f32 for the next token, the
             # zero that the first layer's resolve relies on.
-            resolve_here = not (fold_resadd and i < num_layers - 1)
+            # Under EP nobody resolves here at all: the last layer's MoE
+            # partial is folded and published by the tail task below, which
+            # re-zeroes moe_ws_f32 as it reads it, and the LM head's prologue
+            # does the cross-rank sum. The standalone moe_residual_add_f32
+            # would double-count this rank's contribution.
+            resolve_here = not (fold_resadd
+                                and (moe_ep or i < num_layers - 1))
             if not resolve_here:
                 x = attn_proj_out
             elif FUSE_MOE_MULSUMADD:
@@ -1756,15 +1904,63 @@ if __name__ == "__main__":
                 )
                 x = layer_out
 
+        # ── The EP tail ──────────────────────────────────────────────────
+        # GLM folds at the HEAD of a layer, which buys it one rendezvous per
+        # layer where gpt-oss pays two -- and costs it this: the LAST fused
+        # layer's MoE output is never folded, because there is no layer L+1
+        # to do it. So emit one more of the same task, in the variant that
+        # runs the layer-entry barrier, the fold, the exchange and the peer
+        # wait and then returns before Phase 1.
+        #
+        # It must be IMMEDIATELY after the last real layer with nothing in
+        # between. The multi-layer scan in persistent_kernel.cuh groups
+        # *consecutive* runs of this task type and swaps variant_id per layer
+        # out of ml_variant_ids, so a different instantiation for the tail is
+        # exactly what that table is for -- but anything wedged between the
+        # two would break the run and disable replay for the whole model.
+        # Joining the batch is not cosmetic either: task_layer_idx has to
+        # keep counting, or the tail's signal threshold would not agree
+        # across ranks.
+        if moe_ep:
+            assert last_fl_kwargs is not None, \
+                "MOE_EP found no fused layer to tail"
+            mpk.gang_mla_full_layer_fused_layer(**dict(
+                last_fl_kwargs,
+                # The residual stream the fold adds to moe_ws_f32. `x` is the
+                # last layer's `hidden`, which is what the next layer's fold
+                # would have read.
+                x=x,
+                ep_gather=ep_gather_list[num_layers],
+                ep_tail_only=True,
+            ))
+
         # ── Tail: final norm + LM head + argmax ──────────────────────────────
         w_final_norm = _attach_input_keep(model.model.norm.weight.data,
                                           "model_norm_weight")
         w_lm_head = _attach_input_keep(
             pack_dense_mxfp8(lm_head_weight, DENSE_MXFP8_OPW) if DENSE_MXFP8
             else lm_head_weight, "lm_head")
+        assert not moe_ep or DENSE_MXFP8, \
+            "MOE_EP needs the MXFP8 LM head: it is the cross-rank combine"
         if DENSE_MXFP8:
+            # Under EP the LM head IS the combine. Its residual fold already
+            # walks the whole row, so summing world_size gather slots rides
+            # inside a pass it was making anyway -- which is what lets the
+            # tail exchange have no exit barrier behind it: there is no window
+            # between "combined" and "consumed" for one to protect.
+            #
+            # resadd_workspace_f32 is handed moe_ws_f32 but never read: the
+            # fold already zeroed it, and this rank's partial is in its own
+            # gather slot. It is passed for the task-graph edge -- moe_ws_f32
+            # is an output of the tail task, and it is the only tensor that
+            # orders the LM head after it (ep_gather is an input to both).
+            ep_lm_kwargs = dict(
+                norm_input=ep_gather_list[num_layers],
+                resadd_workspace_f32=moe_ws_f32,
+                resadd_x_out=layer_out,
+                ep_peer_slots=world_size,
+            ) if moe_ep else dict(norm_input=x)
             mpk.gang_rmsnorm_linear_mxfp8_bias_layer(
-                norm_input=x,
                 norm_weight=w_final_norm,
                 norm_output=rmsnorm_out,
                 mxfp8_weight=w_lm_head,
@@ -1774,6 +1970,7 @@ if __name__ == "__main__":
                 output_per_wg=DENSE_MXFP8_OPW,
                 output_stride=vocab_size,
                 block_dim=(256, 1, 1),
+                **ep_lm_kwargs,
             )
         else:
             mpk.gang_rmsnorm_linear_bias_layer(

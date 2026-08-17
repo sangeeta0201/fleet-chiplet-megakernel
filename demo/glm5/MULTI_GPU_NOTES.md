@@ -14,8 +14,9 @@ record for the mechanism. This file covers only what is *different* for GLM.
 | EP counter slots + template params in the monolith | done (inert at `EP_WORLD_SIZE == 1`) |
 | EP fold/exchange body in the monolith | done — compiles at world 8, inert at world 1 |
 | `ep_gather` sum inside GLM's Phase 1 | done — `test_ep_prologue_sum` passes |
-| demo.py EP plumbing + expert slicing | **not started** |
-| `run_mp8_dp_ep_fused.sh` | **not started** |
+| demo.py EP plumbing + expert slicing | done — single-GPU unaffected, 3.73 ms, "Paris", 46 fused layers |
+| `run_mp8_dp_ep_fused.sh` + `env_common.sh` | done |
+| 8-GPU EP run on GLM-4.7-Flash | **not started** |
 | GLM-5.2 weights on this box | needs a streaming loader, see below |
 
 ## The transport floor, measured here
@@ -201,4 +202,27 @@ checkout, on branch `amd-multi-gpu-rocshmem`, with no GLM code. Runs from
 `demo/glm5` silently exercise the wrong tree and fail with
 `'PersistentKernel' object has no attribute 'gang_rmsnorm_linear_mxfp8_bias_layer'`.
 Both `PYTHONPATH` and `MIRAGE_HOME` must be pinned to this tree, exactly as
-`demo/gpt_oss/env_common.sh` already documents. glm5 has no such script yet.
+`demo/gpt_oss/env_common.sh` already documents. `demo/glm5/env_common.sh` now
+does the same, and `run_mp8_dp_ep_fused.sh` sources it.
+
+## What demo.py does under `MOE_EP=1` (#43)
+
+Eight edits, all mirroring `demo/gpt_oss/demo.py` except where noted.
+
+| edit | what |
+|---|---|
+| DP attention | `attn_ws = 1` is handed to `from_pretrained`, so `GlmMLA` neither divides `num_heads` nor inserts the o_proj all-reduce. That deletes the attention collective outright; the MoE fold is the only one left in the step. |
+| EP config | `ep_local = num_experts // world_size`, `ep_base = rank * ep_local`; asserts divisibility, `GLM_FUSE_FULL_LAYER`, `ATTN_DP`, `PRECOMPUTED_DISPATCH=1`, `MPK_ML_REPLAY=1`. |
+| symmetric heap | `ep_gather_{0..num_layers}` (one per fused layer **plus one for the tail**), each `(world_size, bs, hidden)`, and one `ep_signal` of `world_size * 16` ints. |
+| expert slicing | `experts = routed[ep_base:ep_base+ep_local] + [shared]`. The shared expert is replicated on every rank and read by `EP_SHARED_PE == EP_FOLD_PE` only. The **full** routed list is released, not the owned slice — the other 56 were loaded and are now dead. |
+| fused-layer call | built as a dict so the tail can reuse it verbatim; `ep_gather=ep_gather_list[i]` is keyed by the layer doing the *reading*, since the fold at the head of layer L publishes layer L-1's partial. |
+| EP tail | one extra `gang_mla_full_layer_fused_layer(..., ep_tail_only=True)`. The last fused layer has no layer L+1 to fold it. This task also re-zeroes `moe_ws_f32` (the fold's `st_wt_u64(..., 0)` does both), which is why the standalone last-layer `moe_residual_add_f32_layer` is dropped under EP — `resolve_here` becomes `not (fold_resadd and (moe_ep or i < num_layers - 1))`. |
+| LM head | is the cross-rank combine: `norm_input=ep_gather_tail`, `ep_peer_slots=world_size`. Requires `GLM_DENSE_MXFP8`. |
+
+One non-obvious edge: **the LM head and the EP tail task both take
+`ep_gather_tail` as an input**, and task-graph edges come from shared DTensor
+ids in producer→consumer position, so two consumers of the same tensor are not
+ordered. The edge is created by also passing `resadd_workspace_f32=moe_ws_f32`
+— an *output* of the tail task. The kernel never dereferences it under EP
+(`_rnlm8_resadd_norm_rcp` skips the f32 workspace when `EP_PEER_SLOTS > 1`);
+it exists purely to order the two tasks.

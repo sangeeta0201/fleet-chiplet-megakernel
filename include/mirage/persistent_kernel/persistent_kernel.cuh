@@ -4447,11 +4447,19 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
         for (int L = 0; L < ml_layers; L++) {
           TaskType lt = all_tasks[fused_layer_positions[L]].task_type;
           bool is_lmhead = lt == TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300;
-          // GLM's fused layer declares 27 inputs / 11 outputs; gpt-oss's plain
-          // variant 24 / 11 and its LM-head variant 28 / 13.
+          // GLM's fused layer declares 27 inputs / 11 outputs, or 29 / 11
+          // under EP; gpt-oss's plain variant 24 / 11 and its LM-head variant
+          // 28 / 13. The EP arity is detected rather than passed: slot [28] is
+          // the signal array, which only an EP graph binds, and a graph that
+          // binds it binds it on every fused layer.
           int used_in =
-              is_lmhead ? 28 : (lt == TASK_GANG_MLA_FULL_LAYER_FUSED_MI300 ? 27
-                                                                          : 24);
+              is_lmhead
+                  ? 28
+                  : (lt == TASK_GANG_MLA_FULL_LAYER_FUSED_MI300
+                         ? (all_tasks[fused_layer_positions[L]].input_ptrs[28]
+                                ? 29
+                                : 27)
+                         : 24);
           int used_out = is_lmhead ? 13 : 11;
           for (int xcd = 0; xcd < NUM_XCDS_ML; xcd++) {
             int base = (xcd * ml_layers + L) * ML_N_IN;

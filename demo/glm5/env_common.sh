@@ -1,0 +1,61 @@
+#!/bin/bash
+# Shared environment for the GLM megakernel runs.
+# Sourced by run_mp8_dp_ep_fused.sh -- not run directly.
+#
+# Deliberately parallel to demo/gpt_oss/env_common.sh; the only GLM-specific
+# parts are MODEL_PATH and the GLM_* knob names in MPK_FORWARD_VARS.
+
+FLEET_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# MIRAGE_HOME decides which tree the megakernel compiles against, and
+# PYTHONPATH decides which one `import mirage` resolves to. A stale editable
+# install (~/.local/.../__editable__.mirage_project*.pth) points at a
+# *different* checkout -- /home/claudeuser/mirage, branch
+# amd-multi-gpu-rocshmem, which has no GLM code -- so both must be pinned or
+# the run silently exercises the wrong codebase.
+export MIRAGE_HOME="$FLEET_HOME"
+export PYTHONPATH="$FLEET_HOME/python:${PYTHONPATH:-}"
+
+export MODEL_PATH="${MODEL_PATH:-zai-org/GLM-4.7-Flash}"
+
+# rocSHMEM + the MPI it was built against. rocSHMEM's IPC backend only needs
+# MPI for bootstrap (rank exchange), not for the data path.
+export ROCSHMEM_INC_PATH="${ROCSHMEM_INC_PATH:-/home/claudeuser/rocshmem/include}"
+export ROCSHMEM_LIB_PATH="${ROCSHMEM_LIB_PATH:-/home/claudeuser/rocshmem/lib}"
+if [ -d /home/claudeuser/ompi/lib ]; then
+  export MPI_INC_PATH="${MPI_INC_PATH:-/home/claudeuser/ompi/include}"
+  export MPI_LIB_PATH="${MPI_LIB_PATH:-/home/claudeuser/ompi/lib}"
+  export PATH="/home/claudeuser/ompi/bin:$PATH"
+  export LD_LIBRARY_PATH="/home/claudeuser/ompi/lib:/home/claudeuser/ucx/lib:/opt/rocm/lib:${LD_LIBRARY_PATH:-}"
+else
+  export MPI_INC_PATH="${MPI_INC_PATH:-/usr/lib/x86_64-linux-gnu/openmpi/include}"
+  export MPI_LIB_PATH="${MPI_LIB_PATH:-/usr/lib/x86_64-linux-gnu/openmpi/lib}"
+  export LD_LIBRARY_PATH="$MPI_LIB_PATH:/opt/rocm/lib:${LD_LIBRARY_PATH:-}"
+fi
+
+# Every knob the GLM path reads, forwarded to all ranks by mpirun. Listing them
+# unconditionally is deliberate: -x on an unset variable is a no-op, so a knob
+# set in the caller's shell reaches every rank without editing this list.
+MPK_FORWARD_VARS=(
+  MIRAGE_HOME PYTHONPATH MODEL_PATH GLM_MODEL_PATH
+  HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES
+  ROCSHMEM_INC_PATH ROCSHMEM_LIB_PATH MPI_INC_PATH MPI_LIB_PATH
+  LD_LIBRARY_PATH PATH
+  ROCSHMEM_MAX_NUM_CONTEXTS
+  ATTN_DP MOE_EP EP_FOLD_RANK
+  PRECOMPUTED_DISPATCH MPK_ML_REPLAY
+  GLM_FUSE_FULL_LAYER GLM_FUSE_ATTN GLM_FUSE_OPROJ_ROUTER
+  GLM_FUSE_MOE_SWIGLU GLM_FUSE_MOE_MULSUMADD
+  GLM_MOE_MXFP4 GLM_MOE_MXFP8 GLM_FAKE_MXFP4_EXPERTS
+  GLM_DENSE_MXFP8 GLM_DENSE_MXFP8_OPW GLM_OPROJ_MXFP8 GLM_QB_MXFP8
+  GLM_QKV_MXFP8_OPW GLM_OPROJ_GEMV_ROWS
+  GLM_MLA_NUM_KV_CHUNKS GLM_MLA_MERGE_DIM_SPLITS GLM_MLA_MERGE_WT
+  GANG_TILE_N GANG_WGM GANG_K_SPLITS
+  MPK_SPAN_TIMING MPK_SUBPHASE_TIMING MPK_DEVICE_TIMING MPK_WORKER_STATE
+  MAX_SAVE_TOKENS
+)
+
+mpk_x_args() {
+  local v
+  for v in "${MPK_FORWARD_VARS[@]}"; do printf -- '-x %s ' "$v"; done
+}
