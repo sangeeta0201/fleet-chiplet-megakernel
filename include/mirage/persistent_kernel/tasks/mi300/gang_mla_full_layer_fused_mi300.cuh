@@ -670,6 +670,18 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     // speed. This barrier amplifies that fault, it does not cause it, and
     // changing its shape cannot fix it. See task #43.
     //
+    // LATER, and it revises the paragraph above rather than replacing it: a
+    // NP=8 MOE_EP=1 run with MPK_EP_WAIT_TIMEOUT=50000 and MPK_EP_SIG_DBG=1
+    // came in at 4.002 ms/iter uniform across all eight ranks (range
+    // 3.942-4.050), with correct generated text on every rank, and with
+    // NEITHER bound ever firing -- no [EPTMO], no [EPREL]. So the ~350x
+    // straggler is not a permanent property of eight concurrent replicas on
+    // this box; it is intermittent, and when it does not happen the EP path is
+    // 4.002 against 3.634-3.667 for the MOE_EP=0 replica baseline. That number
+    // is NOT quotable as a ship figure -- it came off a build with both
+    // diagnostic knobs compiled in, and the knobs are still the leading
+    // suspect for why that run did not hang.
+    //
     // What the release carries is strictly stronger than what the two waits it
     // replaces carried: the leader observed all eight local fold slices (it
     // was the eighth) *and* every peer's signal. The local half of that is the
@@ -721,7 +733,21 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
           // ep_fold_done is the payload: at layer L it must read 8L+8 once
           // every folding work-group has arrived. Anything less names how many
           // are missing. One line per XCD, not per worker.
-          if (_ep_spins > MPK_EP_WAIT_TIMEOUT) {
+          //
+          // x256, and the factor is load-bearing rather than a fudge. A spin
+          // here is one ld_nt_s32 off an L2-resident flag; a spin in the peer
+          // wait is EP_WORLD_SIZE-1 ld_sys_u64s that miss L1 and L2 and go to
+          // the fabric. At an equal spin budget these waiters give up orders of
+          // magnitude sooner in wall time than the leader they are waiting for,
+          // so the first run with this instrument had every rank time out at
+          // layer 0 with fold_done=8 -- the leader was fine and simply had not
+          // escaped its own bound yet. That reports nothing and, worse, drops
+          // 240 workers through a barrier and corrupts the rest of the run.
+          //
+          // The ordering this factor buys is the whole diagnostic: the leader
+          // always escapes first and releases, so these waiters fire ONLY when
+          // no leader was elected -- which is the case worth naming.
+          if (_ep_spins > MPK_EP_WAIT_TIMEOUT * 256) {
             if (xcd_rank == 1 && task_layer_idx <= 2) {
               printf("[EPREL] pe=%d xcd=%d layer=%d TIMEOUT obs=%d exp=%d "
                      "fold_done=%d (want %d)\n",

@@ -341,9 +341,17 @@ __device__ __forceinline__ void _full_layer_ep_fold_partial(
 // IT DID NOT FIX THE HANG. A clean NP=8 build with buffer_inv sc1 on every
 // poll round still never completes. So reader-side staleness is NOT the
 // mechanism, and neither is the peer-delta table (a walk of all 49 symmetric
-// allocations reports 0 mismatches on 8 ranks x 8 PEs) nor the publish side
-// (MPK_EP_ABLATE=2 -- store, no wait -- completes at NP=8). Whatever the host
-// DMA and the worker-state stores are perturbing, it is not this.
+// allocations reports 0 mismatches on 8 ranks x 8 PEs). Whatever the host DMA
+// and the worker-state stores are perturbing, it is not this.
+//
+// An earlier version of this comment also cited "MPK_EP_ABLATE=2 completes at
+// NP=8" as evidence that the publish side is sound. That was a misreading:
+// ABLATE=2 skips Phase 9 ENTIRELY (see the guard at the Phase 9 entry), so it
+// exercises neither the fold nor the store nor the wait, and proves nothing
+// about any of them. The publish side is instead cleared by [EPFOLD], which
+// shows all 8 folding work-groups arriving and a leader elected on every rank
+// at every layer, and by tests/standalone/test_ep_signal_np8.hip, which passes
+// the whole rendezvous at 8 PEs.
 //
 // The macro is kept because it is defensively correct and free: one thread per
 // rank runs it once per layer, and the other 239 workers are spinning on an
