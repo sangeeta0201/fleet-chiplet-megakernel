@@ -602,6 +602,65 @@ __device__ __attribute__((noinline)) void
     acc = _gang_mfma_f4xf4(a, b, acc, sa, sb);                                 \
   } while (0)
 
+#ifdef MPK_OPROJ_W_REGS
+      // ── Register-pressure probe: hoist the weight slices into registers ──
+      //
+      // Question this answers: can O-proj weights live in registers at all?
+      // The per-lane slice is already in MFMA operand layout -- each lane
+      // reads 16 B at a lane-derived address straight into a[0..3] -- so no
+      // cross-lane permute is needed, and at KP_BASE=8 iters/wave the whole
+      // slice is 8 * 16 B = 128 B/lane = 32 VGPRs.
+      //
+      // This holds them only across the MFMA loop, which is a far shorter
+      // live range than the cross-layer version would need. If even this
+      // spills, the cross-barrier variant cannot work; if it is free, the
+      // live range is the open question rather than the capacity.
+      {
+        i32x4_t _wreg[8];
+        int _sreg[8];
+#pragma unroll
+        for (int _j = 0; _j < 8; _j++) {
+          int _ki = kp_ki_start + _j;
+          int _kic = (_ki < kp_ki_end) ? _ki : kp_ki_end - 1;
+          __builtin_memcpy(&_wreg[_j],
+                           lds_w_data + lds_row_data_base +
+                               _kic * (K_PER_MFMA / 2) + g * 16,
+                           16);
+          _sreg[_j] = (int)lds_w_scales[lds_row_scale_base + _kic * 4 + g];
+        }
+#define DO_MFMA_REG_FP8(J)                                                     \
+  do {                                                                         \
+    i32x8_t a;                                                                 \
+    a[0] = _wreg[J][0];                                                        \
+    a[1] = _wreg[J][1];                                                        \
+    a[2] = _wreg[J][2];                                                        \
+    a[3] = _wreg[J][3];                                                        \
+    a[4] = 0;                                                                  \
+    a[5] = 0;                                                                  \
+    a[6] = 0;                                                                  \
+    a[7] = 0;                                                                  \
+    i32x8_t b =                                                                \
+        _gang_load_fp8_mfma_b(b_tok, (kp_ki_start + (J)) * K_PER_MFMA, g);     \
+    int sb = (int)b_scl[kp_ki_start + (J)];                                    \
+    acc = _gang_mfma_f4xf8(a, b, acc, _sreg[J], sb);                           \
+  } while (0)
+        DO_MFMA_REG_FP8(0);
+        DO_MFMA_REG_FP8(1);
+        DO_MFMA_REG_FP8(2);
+        DO_MFMA_REG_FP8(3);
+        DO_MFMA_REG_FP8(4);
+        if (kp_ki_start + 5 < kp_ki_end) {
+          DO_MFMA_REG_FP8(5);
+        }
+        if (kp_ki_start + 6 < kp_ki_end) {
+          DO_MFMA_REG_FP8(6);
+        }
+        if (kp_ki_start + 7 < kp_ki_end) {
+          DO_MFMA_REG_FP8(7);
+        }
+#undef DO_MFMA_REG_FP8
+      }
+#else
       DO_MFMA_LDS_FP8(kp_ki_start + 0);
       DO_MFMA_LDS_FP8(kp_ki_start + 1);
       DO_MFMA_LDS_FP8(kp_ki_start + 2);
@@ -616,6 +675,7 @@ __device__ __attribute__((noinline)) void
       if (kp_ki_start + 7 < kp_ki_end) {
         DO_MFMA_LDS_FP8(kp_ki_start + 7);
       }
+#endif
 #undef DO_MFMA_LDS_FP8
 #undef DO_MFMA_LDS_FP4
 
