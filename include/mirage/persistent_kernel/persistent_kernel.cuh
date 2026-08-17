@@ -5396,8 +5396,25 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
 
 #ifdef MPK_PRECOMPUTED_DISPATCH
     // Debug: poll device memory via async memcpy on a separate stream
-    fprintf(stderr, "[HOST_DBG] Starting poll loop...\n");
-    if (global_runtime_config.precomp_iter_ready &&
+    // Opt-in, and the default matters. The block below is described further
+    // down as running "only under MPK_WORKER_STATE debug builds"; it never
+    // did. Its only guard is #ifdef MPK_PRECOMPUTED_DISPATCH, which GLM sets
+    // unconditionally (every EP threshold is a function of task_layer_idx, so
+    // demo.py asserts on it), so this ran on every GLM run including the
+    // timed ones.
+    //
+    // It is not an instrumentation-only path. It spawns a detached thread
+    // that issues hipMemcpyAsync D2H plus hipStreamSynchronize on a private
+    // stream against a GPU whose 256 CUs are entirely occupied by the
+    // persistent kernel. A small D2H is a blit kernel on ROCm, and a blit
+    // kernel that cannot find a free CU is exactly the case the hardware
+    // scheduler resolves by preempting the resident kernel.
+    char const *dbg_poll_env = getenv("MPK_HOST_DBG_POLL");
+    bool const dbg_poll_on = dbg_poll_env && atoi(dbg_poll_env) == 1;
+    if (dbg_poll_on) {
+      fprintf(stderr, "[HOST_DBG] Starting poll loop...\n");
+    }
+    if (dbg_poll_on && global_runtime_config.precomp_iter_ready &&
         global_runtime_config.precomp_terminate) {
       hipStream_t dbg_stream;
       (void)hipStreamCreate(&dbg_stream);
@@ -5962,6 +5979,46 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                           a0 % 46,
                           a1);
                 }
+                // 899 is the EP self-signal wait, 900 the peer wait -- the two
+                // halves of one rendezvous. Decoded here rather than left as
+                // raw aux ints because which half is stuck decides whether the
+                // fault is local (fold arrivals) or remote (publish/transport).
+                //
+                // 899: a0 is the raw ep_fold_done counter, run-monotonic with
+                // exactly 8 arrivals per layer. a0 % 8 != 0 while the folding
+                // work-groups are parked means the arrivals themselves are
+                // being lost, before any peer is involved.
+                if (spins > 0 && bid == 899) {
+                  fprintf(stderr,
+                          "        EP self-wait: ep_fold_done=%d (%%8=%d, "
+                          "layers=%d) sig=%d want=%d %s\n",
+                          a0,
+                          a0 % 8,
+                          a0 / 8,
+                          a1,
+                          exp_,
+                          a0 % 8 != 0
+                              ? "<== local fold arrivals LOST"
+                              : "<== arrivals complete, publish did not land");
+                }
+                // 900: a0 is the bitmask of peers whose line is still short.
+                // One bit is a straggler and the fault is on that rank; all
+                // bits is a transport or address fault and the fault is here.
+                // a1 is the lowest missing peer's observed value -- exp_ - 1
+                // means that peer is exactly one layer behind, i.e. parked in
+                // this same wait.
+                if (spins > 0 && bid == 900) {
+                  int nmiss = __builtin_popcount((unsigned)a0);
+                  fprintf(stderr,
+                          "        EP peer-wait: missing=0x%02x (%d peers) "
+                          "lowest_obs=%d want=%d %s\n",
+                          a0,
+                          nmiss,
+                          a1,
+                          exp_,
+                          nmiss == 1 ? "<== single straggler, blame that rank"
+                                     : "<== broad, blame transport/address");
+                }
                 if (false) {
                   // a0 = raw arrival counter. If a0 is an exact multiple of
                   // W13_TILES every producer arrived and the release fired.
@@ -6316,7 +6373,7 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
       // Deliberately leaking dbg_stream: the poll thread is detached and may
       // still be blocked inside HIP on it. Destroying the stream out from
       // under it would turn a diagnosable hang into a use-after-free. This
-      // path only runs under MPK_WORKER_STATE debug builds.
+      // path only runs under MPK_HOST_DBG_POLL=1.
     }
 #endif
     (void)cudaStreamSynchronize(global_runtime_config.worker_stream);

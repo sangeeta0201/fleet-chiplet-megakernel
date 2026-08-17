@@ -554,6 +554,13 @@ def get_compile_command(
             # an EP latency number looks unexplained -- see the [EPPATH] probe
             # in gang_full_layer_fused_mi300.cuh.
             flags = flags + ["-DMPK_EP_SIG_DBG"]
+        if int(os.environ.get("MPK_EP_FORCE_STAGED", "0")) == 1:
+            # Force the staged rocSHMEM publication even where every peer is
+            # directly mapped. Both paths write the same value to the same
+            # symmetric address, so this bisects "the direct peer store is not
+            # becoming visible" against everything else in the layer. Slower by
+            # construction -- a diagnostic, not a configuration.
+            flags = flags + ["-DMPK_EP_FORCE_STAGED"]
         # The precomputed worker-dispatch template is baked from single-GPU task
         # timing. Under multi-GPU (rocSHMEM) the cross-GPU put+signal waits
         # perturb that timing and the fixed template deadlocks: a worker parks

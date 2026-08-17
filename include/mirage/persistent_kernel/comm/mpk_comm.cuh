@@ -268,6 +268,15 @@ __global__ void mpk_init_peer_deltas_kernel(void *probe, int my_pe, int n_pes) {
     }
     mpk_peer_heap_delta_d[pe] = delta;
     valid |= (1u << pe);
+#ifdef MPK_EP_SIG_DBG
+    // Printed from init, which runs before demo.py redirects fd 1 into the
+    // deferred device log, so these are visible while a run is still going.
+    // Two peers sharing a delta means the peer stores alias: every rank would
+    // then be publishing into one peer's line and the others would never see
+    // the signal advance.
+    printf("[EPDELTA] my_pe=%d pe=%d probe=%p peer=%p delta=%lld\n",
+           my_pe, pe, probe, p, (long long)delta);
+#endif
   }
   (void)my_pe;
   mpk_peer_heap_valid_d = valid;

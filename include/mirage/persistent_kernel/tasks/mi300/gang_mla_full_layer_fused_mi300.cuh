@@ -118,6 +118,29 @@
 #include "tasks/mi300/gang_moe_linear_mxfp4_mi300.cuh"
 #include "tasks/mi300/gang_oproj_router_fused_mi300.cuh"
 
+// Inline-EP ablation. EVERY non-zero setting PRODUCES WRONG OUTPUT -- each
+// rank folds against whatever happens to be in its gather slots -- so no
+// latency from one of these is an EP number. They exist to split the layer's
+// cross-GPU cost into its two halves, which the aggregate cannot do:
+//
+//   0  full EP: peer signal store + peer wait.
+//   1  neither. Prices the whole cross-GPU rendezvous against the MOE_EP=0
+//      replica baseline. Measured NP=8 GLM-4.7-Flash: 4.768 ms/iter decode vs
+//      3.637 for MOE_EP=0, so EP's compute reshape is ~1.1 ms and everything
+//      else the full path costs is in the rendezvous.
+//   2  store, no wait. The difference between 1 and 2 is what the seven
+//      st_wt_u64s cost; the difference between 2 and 0 is what waiting for
+//      them to become visible costs. Splitting these matters because the fold
+//      already writes each peer's gather slot over the same links and that
+//      transport is inside the 4.768, so a slow signal is a visibility
+//      problem, not a bandwidth one.
+//
+// Same knob and same meaning as gang_full_layer_fused's. The two monoliths
+// share a translation unit, so the guard is #ifndef, not a redefinition.
+#ifndef MPK_EP_ABLATE
+#define MPK_EP_ABLATE 0
+#endif
+
 namespace kernel {
 
 // Slot bases into the single counter buffer, in HIER_STRIDE units.
@@ -129,15 +152,17 @@ static constexpr int FULL_LAYER_ROUTER_COUNTER_SLOT = 70;
 // rest: per-XCD release flags at [71..78], global arrival counter at [79].
 static constexpr int FULL_LAYER_ENTRY_SLOT = 71;
 // ── expert parallelism (EP_WORLD_SIZE > 1 only) ──────────────────────────
-// [80..87] were reserved for a Mechanism-C exit barrier and are unused. The
-// hazard they were reserved for is real -- MULTI_GPU_NOTES.md records it as
-// *the* bug that made gpt-oss's EP emit garbage: a worker leaves the layer
-// while another XCD's column slice is still being folded, and the residual
-// resolve reads a half-written row -- but the self-signal wait in the EP
-// block covers it for a load instead of a rendezvous, since the thread that
-// observes the 8th local fold publishes that fact on this rank's own signal
-// line. Kept allocated: the buffer is sized from FULL_LAYER_COUNTER_SLOTS and
-// shrinking it buys nothing.
+// [80..87] are the eight per-XCD release flags for the EP rendezvous. They
+// were reserved for a Mechanism-C exit barrier, went unused while every worker
+// polled the signal lines directly, and are now load-bearing: the poll has to
+// be ld_sys_u64 (L2-bypassing) and 240 workers doing that against seven remote
+// lines is what made NP=8 unusable. One thread waits, these eight flags carry
+// the result. The hazard they were originally reserved for -- MULTI_GPU_NOTES.md
+// records it as *the* bug that made gpt-oss's EP emit garbage: a worker leaves
+// the layer while another XCD's column slice is still being folded, and the
+// residual resolve reads a half-written row -- is covered by the same release,
+// since the thread that fans it out is the one that counted the eighth local
+// fold slice in.
 //
 // [88] is the arrival counter the eight folding work-groups bump.
 //
@@ -419,6 +444,13 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
         ep_any_direct = false;
       }
     }
+#ifdef MPK_EP_FORCE_STAGED
+    // Bisection knob, not a tuning one. The direct path and the staged
+    // rocSHMEM path publish the same value at the same symmetric address, so
+    // forcing the staged one isolates "is the peer store landing" from
+    // everything else in the layer. Correct but slower; never leave it on.
+    ep_any_direct = false;
+#endif
 
     // Column slice for this XCD. Rounded to an even boundary so the packed
     // 32-bit peer stores never straddle two slices.
@@ -428,6 +460,14 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     int const ep_col_hi = (ep_col_lo + EP_FOLD_CHUNK) < EP_FOLD_COLS
                               ? (ep_col_lo + EP_FOLD_CHUNK)
                               : EP_FOLD_COLS;
+
+    // Set on the one thread, rank-wide, that counts the eighth local slice in.
+    // That thread is the one that publishes, so it is also the one that waits;
+    // every other worker polls a local flag instead. See the Mechanism C note
+    // at the wait below for why that indirection is not optional at NP=8.
+    bool ep_leader = false;
+    int *const ep_release =
+        counters + FULL_LAYER_MLA_EP_RELEASE_SLOT * HIER_STRIDE;
 
     // One folding work-group per XCD, eight in total, on disjoint columns.
     // xcd_rank 0 is the same rank that leads every other per-XCD job here.
@@ -463,7 +503,24 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       }
       // Work-group-wide decision, not per-thread: the staged fallback is a
       // work-group collective and every thread must agree on entering it.
+      bool const ep_mapped_raw = ep_all_mapped;
+#ifdef MPK_EP_FORCE_STAGED
+      ep_all_mapped = false;
+#endif
       bool const ep_direct = ep_all_mapped;
+#ifdef MPK_EP_SIG_DBG
+      // Which of the two publication paths is actually live. If
+      // mpk_shmem_peer_delta hands back nothing usable, every layer silently
+      // goes through the staged putmem_signal and no amount of reasoning about
+      // st_wt_u64 explains anything.
+      if (tid == 0 && xcd_id == 0 && task_layer_idx == 0) {
+        printf("[EPPATH] pe=%d world=%d npeer=%d mapped_raw=%d ep_direct=%d "
+               "any_direct=%d peer_slot0=%p delta0=%lld\n",
+               EP_MY_PE, EP_WORLD_SIZE, EP_NPEER, (int)ep_mapped_raw,
+               (int)ep_direct, (int)ep_any_direct, peer_slot[0],
+               (long long)ep_peer_delta[0]);
+      }
+#endif
 
       // Note what this does NOT need to be templated on: the fold also zeroes
       // moe_ws_f32 as it reads it, which is redundant with the zeroing
@@ -500,7 +557,9 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
         // an accumulate, so it stays idempotent.
         if (tid == 0) {
           int const prev_f = atom_add_release_gpu_s32(ep_fold_done, 1);
+          ep_leader = (prev_f % 8 == 7);
           if (prev_f % 8 == 7) {
+#if MPK_EP_ABLATE != 1
             // All EP_NPEER stores issued back to back, then a single drain:
             // distinct peers are distinct XGMI links and these pipeline, so
             // N-1 peers cost one drain rather than N-1 round trips.
@@ -513,6 +572,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
                   ep_peer_delta[q]);
               st_wt_u64((void *)peer_sig, (unsigned long long)ep_sig_expected);
             }
+#endif
             // Same store, local copy. This thread has just observed all eight
             // local slices, which is exactly what a worker entering Phase 1
             // needs to know about its OWN rank's slot; publishing it on the
@@ -532,6 +592,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
         if (tid == 0) {
           int const prev_f = atom_add_release_gpu_s32(ep_fold_done, 1);
           s_ep_put = (prev_f % 8 == 7) ? 1 : 0;
+          ep_leader = (prev_f % 8 == 7);
         }
         __syncthreads();
         if (s_ep_put && tid == 0) {
@@ -540,6 +601,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
                     (unsigned long long)ep_sig_expected);
           asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         }
+#if MPK_EP_ABLATE != 1
         if (s_ep_put) {
           asm volatile("buffer_inv" ::: "memory");
           for (int p = 0; p < EP_WORLD_SIZE; p++) {
@@ -556,37 +618,82 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
                 p);
           }
         }
+#endif
       }
     }
 
     // ── wait: this rank's slot complete, then every peer's ────────────────
-    // No exit barrier and no reduce pass. FULL_LAYER_MLA_EP_RELEASE_SLOT was
-    // reserved for one and is not used: the self-signal wait subsumes it.
+    // Mechanism C. Exactly one thread on the rank waits -- the same thread
+    // that published, which by construction counted the eighth local slice in
+    // and therefore needs no self-signal wait at all -- and it fans a
+    // write-through release out to eight per-XCD flags. Everyone else polls
+    // its own XCD's flag with ld_nt_s32, which is L2-resident and local.
     //
-    // The self wait is the one that is not optional. This rank's slot is
-    // written by eight different XCDs, so a worker cannot know the local row
-    // is whole from its own store. It also covers the two local WAR hazards
-    // the exit barrier used to: the fold reads input_ptrs[0] (which Phase 9
-    // of this layer overwrites via `hidden`) and zeroes moe_ws_f32 (which
-    // Phase 15 atomicAdds into). Both are now ordered behind this signal, and
-    // both are strictly on-GPU -- no XGMI in that part of the path.
+    // The shape this replaced had every worker's tid 0 poll the EP_WORLD_SIZE
+    // signal lines itself. That is a genuinely bad shape -- the poll has to be
+    // ld_sys_u64, whose sc0 sc1 bypasses L1 *and* L2, so 240 workers x
+    // (EP_WORLD_SIZE - 1) lines separated by nothing but s_sleep(1) aims
+    // billions of uncached 8-byte reads per second at a handful of cache
+    // lines -- and it is why this is written the house way. But do not read
+    // the NP=8 history as evidence for it:
     //
-    // The peer wait sits here rather than at its point of use in Phase 1.
-    // gpt-oss measured both placements (2.528 ms here vs 2.542 ms at use) and
-    // the reason generalizes: pushing it into Phase 1 puts it upstream of the
-    // qkv_a -> q_b barrier that gates all of attention, so one late peer
-    // stalls the whole XCD instead of one worker.
+    //   all-workers poll, NP=8 : 375.9 ms/iter (correct output)
+    //   Mechanism C,     NP=8 : no measurable improvement
+    //
+    // The 375.9 is not this barrier's doing. MPK_EP_ABLATE=1 (no peer store,
+    // no peer wait) still costs 4.768 ms/iter against 3.637 for the MOE_EP=0
+    // replica baseline, and MOE_EP=0 at NP=8 -- no collective anywhere in the
+    // kernel -- itself produced a 3.595 to 1347 ms/iter spread across the
+    // eight ranks, with the slow ranks reshuffling run to run. Something makes
+    // a random subset of concurrent GLM replicas ~350x slow on this box; a
+    // per-layer rendezvous then makes every rank run at the slowest one's
+    // speed. This barrier amplifies that fault, it does not cause it, and
+    // changing its shape cannot fix it. See task #43.
+    //
+    // What the release carries is strictly stronger than what the two waits it
+    // replaces carried: the leader observed all eight local fold slices (it
+    // was the eighth) *and* every peer's signal. The local half of that is the
+    // part that is not optional -- it covers the two WAR hazards the removed
+    // exit barrier used to, the fold reading input_ptrs[0] which Phase 9
+    // overwrites via `hidden`, and the fold zeroing moe_ws_f32 which Phase 15
+    // atomicAdds into.
+    //
+    // The peer wait stays here rather than moving to its point of use in
+    // Phase 1. gpt-oss measured both placements (2.528 ms here vs 2.542 ms at
+    // use) and the reason generalizes: pushing it into Phase 1 puts it
+    // upstream of the qkv_a -> q_b barrier that gates all of attention, so one
+    // late peer stalls the whole XCD instead of one worker.
     MPK_WS_PHASE(12, task_layer_idx, xcd_id);
     if (tid == 0) {
-      uint64_t *const self_sig =
-          ep_signal + (size_t)EP_MY_PE * FULL_LAYER_EP_SIGNAL_STRIDE;
-      while (ld_sys_u64(reinterpret_cast<unsigned long long *>(self_sig)) <
-             (unsigned long long)ep_sig_expected) {
-        __builtin_amdgcn_s_sleep(1);
+      if (ep_leader) {
+#if MPK_EP_ABLATE == 0
+        MPK_WS_PHASE(13, task_layer_idx, xcd_id);
+        _full_layer_ep_wait_peers<EP_WORLD_SIZE, EP_MY_PE>(
+            ep_signal, ep_sig_expected, ep_any_direct, tid);
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
+        for (int x = 0; x < 8; x++) {
+          st_wt_u32((void *)&ep_release[x * HIER_STRIDE],
+                    (unsigned)ep_expected);
+        }
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      } else {
+        // Barrier id 901: the per-XCD EP release. aux0 is the raw
+        // ep_fold_done counter, so a stall here still distinguishes "the
+        // leader never got its eighth local slice" from "the leader is stuck
+        // on a peer" -- for the latter, look for bid 900 on one worker.
+        int *const my_flag = &ep_release[xcd_id * HIER_STRIDE];
+        MPK_WS_WAIT_BEGIN(901, ep_expected);
+        int _ep_spins = 0;
+        int _ep_obs;
+        while ((_ep_obs = ld_nt_s32(my_flag)) < ep_expected) {
+          if ((++_ep_spins & (MPK_WS_WAIT_REFRESH - 1)) == 0) {
+            MPK_WS_WAIT_TICK(_ep_obs, _ep_spins);
+            MPK_WS_WAIT_AUX(ld_nt_s32(ep_fold_done), _ep_obs, 0, 0);
+          }
+          __builtin_amdgcn_s_sleep(1);
+        }
       }
-      MPK_WS_PHASE(13, task_layer_idx, xcd_id);
-      _full_layer_ep_wait_peers<EP_WORLD_SIZE, EP_MY_PE>(
-          ep_signal, ep_sig_expected, ep_any_direct);
       MPK_WS_PHASE(14, task_layer_idx, xcd_id);
     }
     __syncthreads();

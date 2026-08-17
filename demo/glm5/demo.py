@@ -448,8 +448,17 @@ if __name__ == "__main__":
     if world_size > 1:
         dist.init_process_group(backend="nccl", init_method="env://")
     global print
-    if rank != 0:
+    # Silencing the other ranks keeps a normal run readable, but it also hides
+    # the one thing an 8-rank latency investigation needs: the per-rank decode
+    # summary. [FWD_PASS_TOTAL] is printed by every rank and is not a
+    # substitute -- it averages prefill in, and prefill is where startup skew
+    # lands, so a rank that is 8x on FWD_PASS_TOTAL may be identical in decode.
+    if rank != 0 and os.environ.get("MPK_PRINT_ALL_RANKS", "0") != "1":
         print = lambda *_, **__: None
+    elif rank != 0:
+        _rank_tag = f"[r{rank}] "
+        _real_print = print
+        print = lambda *a, **k: _real_print(_rank_tag, *a, **k)
 
     # ── data-parallel attention ──────────────────────────────────────────
     # MLA keeps ONE shared latent head, so the gpt-oss `kv_head == xcd_id`

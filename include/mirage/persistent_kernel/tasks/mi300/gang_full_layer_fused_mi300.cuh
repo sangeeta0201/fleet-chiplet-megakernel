@@ -316,15 +316,28 @@ __device__ __forceinline__ void _full_layer_ep_fold_partial(
 // stores every peer writes its own signal line with st_wt_u64 and this is a
 // plain load either way; the staged path needs the backend primitive because
 // its signal arrives as a SIGNAL_ADD through rocSHMEM.
+// `tid` is a parameter rather than threadIdx.x because the MPK_WS_WAIT_* macros
+// take it by name and the caller has already narrowed to one thread; passing it
+// keeps the barrier watch a no-op expansion when MPK_WORKER_STATE is off.
+// Barrier id 900: the peer wait. aux0 carries the `remaining` bitmask, which is
+// what distinguishes "one straggling peer" from "no peer ever landed".
 template <int EP_WORLD_SIZE, int EP_MY_PE>
 __device__ __forceinline__ void
     _full_layer_ep_wait_peers(uint64_t *ep_signal, uint64_t ep_sig_expected,
-                              bool ep_direct = false) {
+                              bool ep_direct = false, int tid = 0) {
+  MPK_WS_WAIT_BEGIN(900, (int)ep_sig_expected);
   if constexpr (EP_WORLD_SIZE == 2) {
     uint64_t *peer_sig =
         ep_signal + (size_t)(1 - EP_MY_PE) * FULL_LAYER_EP_SIGNAL_STRIDE;
-    while (ld_sys_u64(reinterpret_cast<unsigned long long *>(peer_sig)) <
+    int _spins = 0;
+    unsigned long long _obs;
+    while ((_obs = ld_sys_u64(
+                reinterpret_cast<unsigned long long *>(peer_sig))) <
            (unsigned long long)ep_sig_expected) {
+      if ((++_spins & (MPK_WS_WAIT_REFRESH - 1)) == 0) {
+        MPK_WS_WAIT_TICK((int)_obs, _spins);
+        MPK_WS_WAIT_AUX((int)(1u << (1 - EP_MY_PE)), (int)_obs, 0, 0);
+      }
       __builtin_amdgcn_s_sleep(1);
     }
   } else if (ep_direct) {
@@ -347,18 +360,27 @@ __device__ __forceinline__ void
         remaining |= (1u << p);
       }
     }
+    int _spins = 0;
+    int _obs_low = 0;
     while (remaining) {
 #pragma unroll
       for (int p = 0; p < EP_WORLD_SIZE; p++) {
         if (remaining & (1u << p)) {
           uint64_t *sp = ep_signal + (size_t)p * FULL_LAYER_EP_SIGNAL_STRIDE;
-          if (ld_sys_u64(reinterpret_cast<unsigned long long *>(sp)) >=
-              (unsigned long long)ep_sig_expected) {
+          unsigned long long _v =
+              ld_sys_u64(reinterpret_cast<unsigned long long *>(sp));
+          if (_v >= (unsigned long long)ep_sig_expected) {
             remaining &= ~(1u << p);
+          } else if (p == (int)(__builtin_ctz(remaining))) {
+            _obs_low = (int)_v;
           }
         }
       }
       if (remaining) {
+        if ((++_spins & (MPK_WS_WAIT_REFRESH - 1)) == 0) {
+          MPK_WS_WAIT_TICK(_obs_low, _spins);
+          MPK_WS_WAIT_AUX((int)remaining, _obs_low, 0, 0);
+        }
         __builtin_amdgcn_s_sleep(1);
       }
     }
