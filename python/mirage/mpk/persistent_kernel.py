@@ -547,6 +547,13 @@ def get_compile_command(
         _ep_ablate = int(os.environ.get("MPK_EP_ABLATE", "0"))
         if _ep_ablate:
             flags = flags + [f"-DMPK_EP_ABLATE={_ep_ablate}"]
+        # Bound the Phase 9 peer wait so a hung run still reaches kernel exit
+        # and flushes its device printf buffer. See MPK_EP_WAIT_TIMEOUT in
+        # gang_full_layer_fused_mi300.cuh. ALSO PRODUCES WRONG OUTPUT when it
+        # fires -- falling through consumes peer slots that were never written.
+        _ep_wait_tmo = int(os.environ.get("MPK_EP_WAIT_TIMEOUT", "0"))
+        if _ep_wait_tmo:
+            flags = flags + [f"-DMPK_EP_WAIT_TIMEOUT={_ep_wait_tmo}"]
         if int(os.environ.get("MPK_EP_SIG_DBG", "0")) == 1:
             # EP collective diagnostics: prints, once per rank, which of the
             # two Phase 9 publication paths is actually live. Cheap enough to

@@ -242,7 +242,8 @@ __device__ __forceinline__ void *mpk_shmem_peer_ptr(void const *dest, int pe) {
 // is not a constant offset, which would mean the single-base assumption above
 // is wrong on this backend) is left invalid, so mpk_shmem_peer_ptr returns
 // nullptr for it and callers take their staged fallback exactly as before.
-__global__ void mpk_init_peer_deltas_kernel(void *probe, int my_pe, int n_pes) {
+__global__ void mpk_init_peer_deltas_kernel(void *probe, int my_pe, int n_pes,
+                                            void **allocs, int n_allocs) {
   if (threadIdx.x != 0 || blockIdx.x != 0) {
     return;
   }
@@ -256,14 +257,38 @@ __global__ void mpk_init_peer_deltas_kernel(void *probe, int my_pe, int n_pes) {
     // Cross-check on a second address in the same heap. If the backend ever
     // stops being a single flat mapping this catches it here, at init, rather
     // than as silent corruption 36 layers deep.
-    void *probe2 = reinterpret_cast<char *>(probe) + 64;
-    void *p2 = rocshmem::rocshmem_ptr(probe2, pe);
-    if (p2 == nullptr ||
-        (reinterpret_cast<char *>(p2) - reinterpret_cast<char *>(probe2)) !=
-            delta) {
-      printf("[MPK] peer delta for pe=%d is not heap-wide constant; "
-             "direct peer stores disabled for that peer\n",
-             pe);
+    //
+    // `probe + 64` alone did NOT do that. `probe` is the FIRST recorded
+    // symmetric allocation, so probe+64 is still inside that same object: it
+    // proves the mapping is constant across 64 bytes, which no allocator was
+    // ever going to fail. Every real hazard here is inter-object -- the heap
+    // spilling into a second segment, a differently-aligned tail allocation --
+    // and those live at the far end, in the objects this never looked at. The
+    // EP signal array is the LAST of 49 allocations and the only one addressed
+    // by delta from the first, which is precisely the pair the old check
+    // skipped. So walk every recorded allocation.
+    bool flat = true;
+    for (int a = 0; a < n_allocs; a++) {
+      if (allocs[a] == nullptr) {
+        continue;
+      }
+      void *pa = rocshmem::rocshmem_ptr(allocs[a], pe);
+      if (pa == nullptr ||
+          (reinterpret_cast<char *>(pa) - reinterpret_cast<char *>(allocs[a])) !=
+              delta) {
+        printf("[MPK] peer delta for pe=%d differs at alloc %d (%p -> %p, "
+               "delta %lld, expected %lld); direct peer stores disabled for "
+               "that peer\n",
+               pe, a, allocs[a], pa,
+               (long long)(pa ? (reinterpret_cast<char *>(pa) -
+                                 reinterpret_cast<char *>(allocs[a]))
+                              : 0),
+               (long long)delta);
+        flat = false;
+        break;
+      }
+    }
+    if (!flat) {
       continue;
     }
     mpk_peer_heap_delta_d[pe] = delta;
@@ -283,6 +308,10 @@ __global__ void mpk_init_peer_deltas_kernel(void *probe, int my_pe, int n_pes) {
 }
 #endif
 
+// Defined below, next to mpk_shmem_malloc which populates it. Declared here
+// because the delta init needs the full allocation list to cross-check.
+inline std::vector<std::pair<void *, size_t>> &mpk_shmem_alloc_registry();
+
 // Host entry: call once after the symmetric heap has been allocated and before
 // the megakernel launches. `probe` is any symmetric-heap pointer.
 __host__ inline void mpk_shmem_init_peer_deltas(void *probe) {
@@ -295,9 +324,31 @@ __host__ inline void mpk_shmem_init_peer_deltas(void *probe) {
   }
   int my_pe = rocshmem::rocshmem_my_pe();
   int n_pes = rocshmem::rocshmem_n_pes();
+  // Stage the allocation list where the kernel can read it. rocshmem_ptr is
+  // device-only, so the walk has to happen on the GPU.
+  auto &reg = mpk_shmem_alloc_registry();
+  int n_allocs = (int)reg.size();
+  void **allocs_d = nullptr;
+  if (n_allocs > 0) {
+    std::vector<void *> host_allocs;
+    host_allocs.reserve(n_allocs);
+    for (auto const &a : reg) {
+      host_allocs.push_back(a.first);
+    }
+    if (hipMalloc(&allocs_d, sizeof(void *) * n_allocs) != hipSuccess) {
+      allocs_d = nullptr;
+      n_allocs = 0;
+    } else {
+      (void)hipMemcpy(allocs_d, host_allocs.data(), sizeof(void *) * n_allocs,
+                      hipMemcpyHostToDevice);
+    }
+  }
   hipLaunchKernelGGL(mpk_init_peer_deltas_kernel, dim3(1), dim3(1), 0, 0, probe,
-                     my_pe, n_pes);
+                     my_pe, n_pes, allocs_d, n_allocs);
   (void)hipDeviceSynchronize();
+  if (allocs_d) {
+    (void)hipFree(allocs_d);
+  }
 #else
   (void)probe;
 #endif

@@ -137,6 +137,13 @@
 //
 // Same knob and same meaning as gang_full_layer_fused's. The two monoliths
 // share a translation unit, so the guard is #ifndef, not a redefinition.
+// Same default as gang_full_layer_fused_mi300.cuh, repeated because this
+// header does not include that one and the two are only guaranteed to share a
+// translation unit, not an order. Both guards are #ifndef, so a -D on the
+// compile line still wins whichever is seen first.
+#ifndef MPK_EP_WAIT_TIMEOUT
+#define MPK_EP_WAIT_TIMEOUT 0
+#endif
 #ifndef MPK_EP_ABLATE
 #define MPK_EP_ABLATE 0
 #endif
@@ -558,6 +565,19 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
         if (tid == 0) {
           int const prev_f = atom_add_release_gpu_s32(ep_fold_done, 1);
           ep_leader = (prev_f % 8 == 7);
+#ifdef MPK_EP_SIG_DBG
+          // Which of the eight folding work-groups actually arrived, and in
+          // what order. Leader election is `prev_f % 8 == 7` on a counter that
+          // is never reset, so ONE missing arrival on one rank silently means
+          // no leader, no publish, and every other rank waiting on that rank
+          // forever -- which is the NP=8 signature (peers see p7 stuck one
+          // layer behind while p0..p6 advance). Only the first two layers, and
+          // only one line per work-group: 8 ranks x 8 XCDs x 2 layers.
+          if (task_layer_idx <= 1) {
+            printf("[EPFOLD] pe=%d xcd=%d layer=%d prev_f=%d leader=%d\n",
+                   EP_MY_PE, xcd_id, task_layer_idx, prev_f, (int)ep_leader);
+          }
+#endif
           if (prev_f % 8 == 7) {
 #if MPK_EP_ABLATE != 1
             // All EP_NPEER stores issued back to back, then a single drain:
@@ -691,6 +711,26 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
             MPK_WS_WAIT_TICK(_ep_obs, _ep_spins);
             MPK_WS_WAIT_AUX(ld_nt_s32(ep_fold_done), _ep_obs, 0, 0);
           }
+#if MPK_EP_WAIT_TIMEOUT
+          // Bounded for the same reason as the peer wait -- see
+          // MPK_EP_WAIT_TIMEOUT in gang_full_layer_fused_mi300.cuh. Without
+          // this the rank whose leader was never elected is precisely the rank
+          // that can never exit, so its printf buffer never flushes and the
+          // only rank that knows why is the only one that cannot say.
+          //
+          // ep_fold_done is the payload: at layer L it must read 8L+8 once
+          // every folding work-group has arrived. Anything less names how many
+          // are missing. One line per XCD, not per worker.
+          if (_ep_spins > MPK_EP_WAIT_TIMEOUT) {
+            if (xcd_rank == 1 && task_layer_idx <= 2) {
+              printf("[EPREL] pe=%d xcd=%d layer=%d TIMEOUT obs=%d exp=%d "
+                     "fold_done=%d (want %d)\n",
+                     EP_MY_PE, xcd_id, task_layer_idx, _ep_obs, ep_expected,
+                     ld_nt_s32(ep_fold_done), 8 * (task_layer_idx + 1));
+            }
+            break;
+          }
+#endif
           __builtin_amdgcn_s_sleep(1);
         }
       }

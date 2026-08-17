@@ -5910,9 +5910,17 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                 int a1 = __atomic_load_n(&a[1], __ATOMIC_RELAXED);
                 int a2 = __atomic_load_n(&a[2], __ATOMIC_RELAXED);
                 int a3 = __atomic_load_n(&a[3], __ATOMIC_RELAXED);
+                // aux is printed unconditionally. It used to be read here and
+                // then only consumed by the fp == 80 branch below, which meant
+                // the one field that distinguishes "one straggling peer" from
+                // "no peer ever landed" -- bid 900's aux0, the `remaining`
+                // bitmask -- was collected on the device, copied to the host,
+                // and thrown away. Four extra ints on a line that is only
+                // emitted under MPK_WORKER_STATE costs nothing.
                 fprintf(stderr,
                         "    >>> w%d IN TASK: phase=%d (%s xcd=%d epoch=%d) "
-                        "watch[bid=%d obs=%d exp=%d spins=%d]\n",
+                        "watch[bid=%d obs=%d exp=%d spins=%d] "
+                        "aux[%d %d %d %d]\n",
                         w,
                         wphase,
                         pn,
@@ -5921,7 +5929,11 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                         bid,
                         obs,
                         exp_,
-                        spins);
+                        spins,
+                        a0,
+                        a1,
+                        a2,
+                        a3);
                 // Per-wave exit mask for the MoE W13->W2 poll. That poll is
                 // thread-divergent by construction (each thread tests the
                 // release flag on its own, no __syncthreads), so waves of one

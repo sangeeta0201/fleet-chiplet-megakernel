@@ -321,6 +321,74 @@ __device__ __forceinline__ void _full_layer_ep_fold_partial(
 // keeps the barrier watch a no-op expansion when MPK_WORKER_STATE is off.
 // Barrier id 900: the peer wait. aux0 carries the `remaining` bitmask, which is
 // what distinguishes "one straggling peer" from "no peer ever landed".
+// Drop this XCD's L2 between poll rounds, so the next ld_sys_u64 on a peer's
+// signal line cannot be answered from a resident line.
+//
+// HISTORY, because the obvious reading of this macro is wrong. It was added to
+// fix the NP=8 hang, on the theory that ld_sys_u64's `nt` is only a
+// replacement hint and its `sc0 sc1` was not actually reaching the fabric on
+// gfx950. The theory fit every observation available at the time:
+//
+//   NP=8, MOE_EP=1, host debug poll ON  : 375.9 ms/iter, completes
+//   NP=8, MOE_EP=1, host debug poll OFF : never completes
+//
+// The poll thread was a 1 Hz hipMemcpyAsync D2H that did nothing for the
+// algorithm but flushed L2 as a side effect -- exactly the "unrelated traffic
+// happens to flush L2" escape a stale-line bug would need. An
+// MPK_WORKER_STATE build also completes, and its per-tick stores are traffic
+// too.
+//
+// IT DID NOT FIX THE HANG. A clean NP=8 build with buffer_inv sc1 on every
+// poll round still never completes. So reader-side staleness is NOT the
+// mechanism, and neither is the peer-delta table (a walk of all 49 symmetric
+// allocations reports 0 mismatches on 8 ranks x 8 PEs) nor the publish side
+// (MPK_EP_ABLATE=2 -- store, no wait -- completes at NP=8). Whatever the host
+// DMA and the worker-state stores are perturbing, it is not this.
+//
+// The macro is kept because it is defensively correct and free: one thread per
+// rank runs it once per layer, and the other 239 workers are spinning on an
+// L2-resident release flag with no memory traffic to lose. It is not a fix and
+// must not be cited as one. Not applied to the staged fallback: rocSHMEM's
+// wait_until owns its own coherence there.
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#define MPK_EP_POLL_INV() asm volatile("buffer_inv sc1" ::: "memory")
+#else
+#define MPK_EP_POLL_INV()                                                      \
+  do {                                                                         \
+  } while (0)
+#endif
+
+// Bounded peer wait, for diagnosing a hang that only exists in an
+// uninstrumented build.
+//
+// The NP=8 EP hang is inside this wait, and every instrument that could read
+// it out perturbs it away: MPK_WORKER_STATE completes, the host debug poll
+// completes, MPK_EP_ABLATE=2 completes. Device printf is not an escape either
+// on its own -- the megakernel's printf buffer flushes at kernel exit, and a
+// hung kernel never exits, so the one channel that could report the state is
+// the one the hang suppresses.
+//
+// So: give the spin a ceiling. After MPK_EP_WAIT_TIMEOUT rounds, print every
+// peer's observed signal value, the expected threshold and the surviving
+// `remaining` bitmask, then FALL THROUGH as if the wait had been satisfied.
+// The kernel then runs to completion, exits, and flushes the buffer.
+//
+// This adds one register-resident counter and one compare per round to the
+// poll loop -- no stores, no extra memory traffic -- which is the smallest
+// perturbation of the loop found that still yields a report. Whether that is
+// small enough to preserve the bug is itself part of what the run measures: if
+// the timeout never fires, the counter perturbed it away too, and that is a
+// datum about the mechanism rather than a failed experiment.
+//
+// Output is WRONG when this fires: falling through means consuming peer slots
+// that were never written. No latency or token check from a build with
+// MPK_EP_WAIT_TIMEOUT != 0 means anything. Default 0 = unbounded = ship
+// behavior, so this compiles away entirely unless asked for.
+#ifndef MPK_EP_WAIT_TIMEOUT
+#define MPK_EP_WAIT_TIMEOUT 0
+#endif
+
 template <int EP_WORLD_SIZE, int EP_MY_PE>
 __device__ __forceinline__ void
     _full_layer_ep_wait_peers(uint64_t *ep_signal, uint64_t ep_sig_expected,
@@ -338,6 +406,16 @@ __device__ __forceinline__ void
         MPK_WS_WAIT_TICK((int)_obs, _spins);
         MPK_WS_WAIT_AUX((int)(1u << (1 - EP_MY_PE)), (int)_obs, 0, 0);
       }
+#if MPK_EP_WAIT_TIMEOUT
+      if (_spins > MPK_EP_WAIT_TIMEOUT) {
+        printf("[EPTMO] pe=%d exp=%llu TIMEOUT peer=%llu self=%llu\n", EP_MY_PE,
+               (unsigned long long)ep_sig_expected, _obs,
+               ld_sys_u64(reinterpret_cast<unsigned long long *>(
+                   ep_signal + (size_t)EP_MY_PE * FULL_LAYER_EP_SIGNAL_STRIDE)));
+        break;
+      }
+#endif
+      MPK_EP_POLL_INV();
       __builtin_amdgcn_s_sleep(1);
     }
   } else if (ep_direct) {
@@ -379,8 +457,42 @@ __device__ __forceinline__ void
       if (remaining) {
         if ((++_spins & (MPK_WS_WAIT_REFRESH - 1)) == 0) {
           MPK_WS_WAIT_TICK(_obs_low, _spins);
-          MPK_WS_WAIT_AUX((int)remaining, _obs_low, 0, 0);
+          // aux2 is MY OWN line, read back through the same ld_sys_u64 the
+          // peer lines go through. The waiter is the rank's publisher, so if
+          // its own absolute store is not observable here then the failure is
+          // the store, not the peer transport -- and that distinction is not
+          // recoverable from `remaining` alone, which only ever describes
+          // other ranks.
+          MPK_WS_WAIT_AUX(
+              (int)remaining, _obs_low,
+              (int)ld_sys_u64(reinterpret_cast<unsigned long long *>(
+                  ep_signal + (size_t)EP_MY_PE * FULL_LAYER_EP_SIGNAL_STRIDE)),
+              0);
         }
+#if MPK_EP_WAIT_TIMEOUT
+        if (_spins > MPK_EP_WAIT_TIMEOUT) {
+          // Print only the first two layers. Once the wait is bounded every
+          // later layer times out too (the fold consumed garbage, so nothing
+          // downstream is meaningful), and 46 layers x 8 peers x 8 ranks x N
+          // decode steps of printf floods the buffer and buries layer 0 --
+          // which is the only report that describes the real failure.
+          if (ep_sig_expected <= 2) {
+            // One line per peer, not a summary: the question this run exists
+            // to answer is whether NO peer ever lands (transport dead) or SOME
+            // peer lands and one straggles (a publish-side ordering bug on one
+            // rank), and only the per-peer values separate those.
+            for (int p = 0; p < EP_WORLD_SIZE; p++) {
+              printf("[EPTMO] pe=%d exp=%llu TIMEOUT rem=0x%x p%d=%llu\n",
+                     EP_MY_PE, (unsigned long long)ep_sig_expected, remaining,
+                     p,
+                     ld_sys_u64(reinterpret_cast<unsigned long long *>(
+                         ep_signal + (size_t)p * FULL_LAYER_EP_SIGNAL_STRIDE)));
+            }
+          }
+          break;
+        }
+#endif
+        MPK_EP_POLL_INV();
         __builtin_amdgcn_s_sleep(1);
       }
     }
