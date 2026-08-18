@@ -78,17 +78,30 @@ namespace kernel {
 // the E8M0 derivation, the packing order -- is _gang_wave_parallel_fp8_quant's
 // and is kept identical on purpose.
 //
-// SRC_IS_GLOBAL says which address space src_bf16 lives in. The two callers
-// differ: the plain path hands over the raw row in device global, the
-// FUSE_RESADD path hands over s_x_bf16, which is LDS. It matters because the
-// global case is read through an addrspace(1) cast -- otherwise clang, which
-// cannot see through the __noinline__ task boundary, emits flat_load, and a
-// flat instruction bumps lgkmcnt as well as vmcnt on gfx9. This function ends
-// in ds_write, so that lgkmcnt would be waited on with the row still in
-// flight. norm_weight is device global in both cases and is always cast.
-// Pointing the global path at LDS would be UB; the template argument is the
-// only thing keeping the two apart.
-template <int REDUCTION_SIZE, bool SRC_IS_GLOBAL>
+// SRC_IS_GLOBAL and NW_IS_LDS say which address space each input lives in.
+// The callers differ: the plain path used to hand over the raw row in device
+// global, the FUSE_RESADD path hands over s_x_bf16, which is LDS. It matters
+// because the global case is read through an addrspace(1) cast -- otherwise
+// clang, which cannot see through the __noinline__ task boundary, emits
+// flat_load, and a flat instruction bumps lgkmcnt as well as vmcnt on gfx9.
+// This function ends in ds_write, so that lgkmcnt would be waited on with the
+// row still in flight. Pointing a global read at LDS would be UB; the template
+// arguments are the only thing keeping the cases apart.
+//
+// NW_IS_LDS exists for the same reason the row staging does, one level up:
+// with both operands in LDS this function issues no vmem at all, so the
+// caller's hoisted A-tile prefetch can stay in flight across it. See the
+// LDS_PROLOGUE block in the kernel.
+//
+// BARRIER_LDS_ONLY is the other half of that. The trailing __syncthreads()
+// publishes s_tok_fp8 and s_tok_scales, which is LDS traffic, but HIP lowers
+// it to `s_waitcnt vmcnt(0) lgkmcnt(0)` -- and vmcnt(0) would retire exactly
+// the prefetch we are trying to keep outstanding. The barrier is split into
+// its LDS-only parts when the caller has vmem in flight it wants to keep.
+template <int REDUCTION_SIZE,
+          bool SRC_IS_GLOBAL,
+          bool NW_IS_LDS = false,
+          bool BARRIER_LDS_ONLY = false>
 __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_rmsnorm(
     unsigned short const *__restrict__ src_bf16,
     unsigned short const *__restrict__ norm_weight,
@@ -97,12 +110,18 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_rmsnorm(
     uint8_t *__restrict__ s_tok_scales) {
 
   using gu16 = __attribute__((address_space(1))) unsigned short const *;
-  gu16 g_nw = (gu16)norm_weight;
   auto ld_src = [&](int i) -> unsigned short {
     if constexpr (SRC_IS_GLOBAL) {
       return ((gu16)src_bf16)[i];
     } else {
       return src_bf16[i];
+    }
+  };
+  auto ld_nw = [&](int i) -> unsigned short {
+    if constexpr (NW_IS_LDS) {
+      return norm_weight[i];
+    } else {
+      return ((gu16)norm_weight)[i];
     }
   };
 
@@ -121,7 +140,7 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_rmsnorm(
 #pragma unroll
     for (int j = 0; j < 32; j++) {
       float v = _gang_bf16_to_float(ld_src(base + j)) * rms_rcp *
-                _gang_bf16_to_float(g_nw[base + j]);
+                _gang_bf16_to_float(ld_nw(base + j));
       vals[j] = v;
       amax = fmaxf(amax, fabsf(v));
     }
@@ -162,7 +181,12 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_rmsnorm(
       s_tok_scales[super_blk] = se;
     }
   }
-  __syncthreads();
+  if constexpr (BARRIER_LDS_ONLY) {
+    asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+    __builtin_amdgcn_s_barrier();
+  } else {
+    __syncthreads();
+  }
 }
 
 // Fused RMSNorm + MXFP8 Gang Linear + Bias.
@@ -278,14 +302,26 @@ __device__ __forceinline__ void _rnlm8_store4(unsigned short *dst,
 // workspace still holds this rank's partial, which the fold has already
 // written into this rank's gather slot. Adding it would count the local
 // contribution twice. Skipping it also drops 8 KB of loads per layer.
-template <int REDUCTION_SIZE, int EP_PEER_SLOTS = 0, int EP_SLOT_ELEMS = 0>
+//
+// STAGE_NW additionally copies the norm weight into LDS on the same pass. It
+// is a separate row, so the two loads are independent and cost latency only
+// once; doing it in a loop of its own would need its own s_waitcnt in front of
+// its own ds_write. The point of having it in LDS at all is that the quantizer
+// then reads no global memory, which is what lets the caller keep an A-tile
+// prefetch in flight across it.
+template <int REDUCTION_SIZE,
+          int EP_PEER_SLOTS = 0,
+          int EP_SLOT_ELEMS = 0,
+          bool STAGE_NW = false>
 __device__ __forceinline__ float
 _rnlm8_resadd_norm_rcp(float const *__restrict__ d_ws,
                        unsigned short const *__restrict__ d_res, // == norm_input
                        unsigned short *__restrict__ d_x_out,
                        unsigned short *__restrict__ s_x,
                        bool store_x,
-                       float eps = 1e-5f) {
+                       float eps = 1e-5f,
+                       unsigned short const *__restrict__ d_nw = nullptr,
+                       unsigned short *__restrict__ s_nw = nullptr) {
   constexpr int VEC = 4;
   constexpr int NTHREADS = 256;
   static_assert(REDUCTION_SIZE % (NTHREADS * VEC) == 0,
@@ -306,6 +342,15 @@ _rnlm8_resadd_norm_rcp(float const *__restrict__ d_ws,
   for (int v = 0; v < ITERS; v++) {
     int const off = (v * NTHREADS + tid) * VEC;
     uint2 const r = *reinterpret_cast<uint2 const *>(d_res + off);
+    if constexpr (STAGE_NW) {
+      // Four bf16 is eight bytes, and `off` is a multiple of four elements, so
+      // this is one aligned dwordx2 each way. Two-step addrspace(1) cast for
+      // the same reason rmsnorm_rcp_amd uses one: a flat_load would bump
+      // lgkmcnt and be waited on by the ds_write right below it.
+      uint64_t const *nwp = reinterpret_cast<uint64_t const *>(d_nw + off);
+      *reinterpret_cast<uint64_t *>(s_nw + off) =
+          *(__attribute__((address_space(1))) uint64_t const *)nwp;
+    }
 
     float f[4];
     if constexpr (EP) {
@@ -384,6 +429,114 @@ _rnlm8_resadd_norm_rcp(float const *__restrict__ d_ws,
   __syncthreads();
 
   return rsqrtf(red[0] / float(REDUCTION_SIZE) + eps);
+}
+
+// _rnlm8_resadd_norm_rcp without the residual: the plain path's
+// rmsnorm_rcp_amd, plus the LDS staging of the row and the norm weight.
+//
+// rmsnorm_rcp_amd deliberately does *not* cache the row -- "nothing here
+// revisits the input, so caching it would only hold VGPRs" -- which was true
+// when the quantizer re-read the row from a still-L1-hot global address. It is
+// the re-read that is the problem now, not its cost: it is vmem issued between
+// the caller's A-tile prefetch and the MFMAs that consume it, and vmcnt is
+// in-order on gfx9, so waiting for the re-read also waits for the prefetch.
+// Staging both operands here turns the entire quantizer into LDS traffic.
+//
+// The row is walked once instead of twice, so this is not extra work; the LDS
+// costs 2 bytes per element and no occupancy, since the persistent kernel
+// already runs one workgroup per CU.
+//
+// ACTUAL_HIDDEN_DIM is the RMS divisor, as in rmsnorm_rcp_amd. There is no
+// NORM_SPAN parameter because this kernel's only caller never used one: q_a,
+// the shape that needs a narrowed span, gets it from a narrowed REDUCTION_SIZE
+// instead (see gang_rmsnorm_linear_mxfp8_bias_mla_kvupd_mi300.cuh).
+template <int REDUCTION_SIZE, int ACTUAL_HIDDEN_DIM>
+__device__ __forceinline__ float
+_rnlm8_stage_norm_rcp(unsigned short const *__restrict__ d_in,
+                      unsigned short const *__restrict__ d_nw,
+                      unsigned short *__restrict__ s_x,
+                      unsigned short *__restrict__ s_nw,
+                      float eps = 1e-5f) {
+  // The traversal is rmsnorm_rcp_amd's, element for element and in the same
+  // order, so `ssq` accumulates the same partial sums into the same lanes and
+  // the returned rms_rcp is bit-identical to the function this replaces. Only
+  // the two ds_writes are new.
+  constexpr int NTHREADS = 256;
+  constexpr int VEC_SIZE = (REDUCTION_SIZE % (NTHREADS * 8) == 0) ? 8 : 4;
+  constexpr int VEC_ITERS = REDUCTION_SIZE / (NTHREADS * VEC_SIZE);
+  constexpr int VEC_END = VEC_ITERS * NTHREADS * VEC_SIZE;
+  using gu16 = __attribute__((address_space(1))) unsigned short const *;
+  using gu64 = __attribute__((address_space(1))) uint64_t const *;
+
+  int const tid = threadIdx.x;
+  int const nthreads = blockDim.x;
+  float ssq = 0.0f;
+
+  auto stage4 = [&](int off) -> uint64_t {
+    uint64_t const x = *(gu64)reinterpret_cast<uint64_t const *>(d_in + off);
+    uint64_t const w = *(gu64)reinterpret_cast<uint64_t const *>(d_nw + off);
+    *reinterpret_cast<uint64_t *>(s_x + off) = x;
+    *reinterpret_cast<uint64_t *>(s_nw + off) = w;
+    return x;
+  };
+
+#pragma unroll 1
+  for (int v = 0; v < VEC_ITERS; v++) {
+    int const off = (v * nthreads + tid) * VEC_SIZE;
+    uint64_t const lo = stage4(off);
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      float const q =
+          _gang_bf16_to_float((unsigned short)((lo >> (16 * i)) & 0xFFFFu));
+      ssq += q * q;
+    }
+    if constexpr (VEC_SIZE == 8) {
+      uint64_t const hi = stage4(off + 4);
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        float const q =
+            _gang_bf16_to_float((unsigned short)((hi >> (16 * i)) & 0xFFFFu));
+        ssq += q * q;
+      }
+    }
+  }
+  // Dead at every shape this kernel is instantiated at (REDUCTION_SIZE is 2048
+  // or 6144, both a whole number of 256x8 passes); kept because
+  // REDUCTION_SIZE % 128 == 0 is the only thing the kernel actually asserts.
+  for (int i = VEC_END + tid; i < REDUCTION_SIZE; i += nthreads) {
+    unsigned short const x = ((gu16)d_in)[i];
+    s_x[i] = x;
+    s_nw[i] = ((gu16)d_nw)[i];
+    float const q = _gang_bf16_to_float(x);
+    ssq += q * q;
+  }
+
+  // Phase 3 of rmsnorm_rcp_amd, verbatim.
+#pragma unroll
+  for (int offset = 32; offset > 0; offset >>= 1) {
+    ssq += __shfl_xor(ssq, offset);
+  }
+
+  __shared__ float red[16];
+  int const wave_id = tid >> 6;
+  int const lane_id = tid & 63;
+  int const num_waves = blockDim.x >> 6;
+  if (lane_id == 0) {
+    red[wave_id] = ssq;
+  }
+  __syncthreads();
+  if (wave_id == 0) {
+    ssq = (lane_id < num_waves) ? red[lane_id] : 0.0f;
+    for (int offset = num_waves >> 1; offset > 0; offset >>= 1) {
+      ssq += __shfl_xor(ssq, offset);
+    }
+    if (lane_id == 0) {
+      red[0] = ssq;
+    }
+  }
+  __syncthreads();
+
+  return rsqrtf(red[0] / float(ACTUAL_HIDDEN_DIM) + eps);
 }
 
 template <int BATCH_SIZE,
@@ -466,6 +619,48 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
   unsigned short const *d_bias = (unsigned short const *)bias_ptr;
   unsigned short *d_output = (unsigned short *)output_ptr;
 
+  // ── LDS prologue ────────────────────────────────────────────────────────
+  // Stage the row and the norm weight in LDS so the quantizer issues no vmem,
+  // and hoist the first four A-tiles above it so their latency runs underneath.
+  //
+  // The two halves are one change, not two. vmcnt is in-order on gfx9: hoisting
+  // the prefetch on its own just moves the exposed weight latency from after
+  // the quantizer to before it, because the quantizer's own global reads are
+  // younger and waiting on them drains the prefetch with them. The prologue has
+  // to touch no global memory at all for the hoist to buy anything.
+  //
+  // GLM_PROLOGUE_PREFETCH=0 is the ablation; it restores the previous code
+  // exactly, including the LDS footprint. It is an ablation and not a
+  // correctness fallback: rms_rcp is bit-identical either way (the staging
+  // traversal is rmsnorm_rcp_amd's, element for element), and the quantizer
+  // reads the same values, only out of LDS instead of global.
+  //
+  // Measured, GLM-5 744B, NP=8 EP, 78 layers, MPK_SUBPHASE_TIMING=1, SP4
+  // (gang_mla_attn_fused), aggregate worker-seconds over cnt 1219200:
+  //
+  //   SP4 slot           off      on      delta
+  //   [0] qkv_a        26.657  24.859   -1.80  (-6.7%)
+  //   [1] qkv barrier  12.532  11.570   -0.96
+  //   [2] q_b + kvupd  63.827  51.678  -12.15  (-19.0%)
+  //   [3] q_b barrier   1.399   1.284   -0.12
+  //   [4] MLA decode    1.109   1.119   +0.01
+  //   [5] dec barrier  16.466  17.575   +1.11
+  //   [6] merge         2.214   2.191   -0.02
+  //   SP4 total       124.20  110.28   -13.93 (-11.2%)
+  //
+  // Uninstrumented end-to-end decode, three runs each:
+  //   off 17.993 / 18.220 / 18.227 ms   (mean 18.147)
+  //   on  17.284 / 17.550 / 17.412 ms   (mean 17.415, -0.73 ms, -4.0%)
+  //
+  // The two GEMM stages give up 14 worker-s and the decode barrier takes back
+  // 1.1 of it -- these workers now arrive early and wait -- so most of it
+  // translates. Zero spills at all four instantiations.
+#ifdef MPK_GLM_PROLOGUE_PREFETCH_OFF
+  constexpr bool LDS_PROLOGUE = false;
+#else
+  constexpr bool LDS_PROLOGUE = true;
+#endif
+
   extern __shared__ char _rnlm8_smem[];
   uint8_t *s_tok_fp8 = (uint8_t *)_rnlm8_smem;
   uint8_t *s_tok_scales = s_tok_fp8 + FP8_TOK_DATA;
@@ -477,6 +672,20 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
       ((FP8_TOK_DATA + NUM_BLOCKS_32 + 127) / 128) * 128;
   unsigned short *s_x_bf16 =
       (unsigned short *)(_rnlm8_smem + RESADD_SMEM_OFF);
+  // The norm weight follows it. REDUCTION_SIZE is a multiple of 128, so the
+  // row is a multiple of 256 B and this stays 128 B-aligned without padding.
+  // Worst case here is REDUCTION_SIZE 6144 (qkv_a): 6 KB quantizer + 12 KB row
+  // + 12 KB weight is 30 KB of the 155 KB the gfx950 worker is launched with,
+  // and the persistent kernel runs one workgroup per CU regardless, so none of
+  // it costs occupancy.
+  constexpr int NW_SMEM_OFF =
+      RESADD_SMEM_OFF + (LDS_PROLOGUE ? REDUCTION_SIZE * 2 : 0);
+  unsigned short *s_nw_bf16 =
+      (unsigned short *)(_rnlm8_smem + NW_SMEM_OFF);
+  static_assert(!LDS_PROLOGUE ||
+                    NW_SMEM_OFF + REDUCTION_SIZE * 2 <=
+                        mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE,
+                "the LDS prologue does not fit in the worker's dynamic LDS");
 
   int const tid = threadIdx.x;
   int const warp_id = tid >> 6;
@@ -536,20 +745,67 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     // helper adds the slot term itself.
     rms_rcp = _rnlm8_resadd_norm_rcp<REDUCTION_SIZE,
                                      EP_PEER_SLOTS,
-                                     BATCH_SIZE * REDUCTION_SIZE>(
+                                     BATCH_SIZE * REDUCTION_SIZE,
+                                     /*STAGE_NW=*/LDS_PROLOGUE>(
         (float const *)resadd_workspace_f32_ptr + tok_idx * REDUCTION_SIZE,
         (unsigned short const *)norm_input_ptr + tok_idx * REDUCTION_SIZE,
         (unsigned short *)resadd_x_out_ptr + tok_idx * REDUCTION_SIZE,
         s_x_bf16,
-        /*store_x=*/wg_idx == 0);
+        /*store_x=*/wg_idx == 0,
+        /*eps=*/1e-5f,
+        (unsigned short const *)norm_weight_ptr,
+        s_nw_bf16);
     input_row = s_x_bf16;
   } else {
     (void)resadd_workspace_f32_ptr;
     (void)resadd_x_out_ptr;
-    input_row = (unsigned short const *)norm_input_ptr + tok_idx * REDUCTION_SIZE;
-    rms_rcp =
-        gang_rmsnorm_detail::rmsnorm_rcp_amd<REDUCTION_SIZE, ACTUAL_HIDDEN_DIM>(
-            input_row);
+    unsigned short const *raw_row =
+        (unsigned short const *)norm_input_ptr + tok_idx * REDUCTION_SIZE;
+    if constexpr (LDS_PROLOGUE) {
+      rms_rcp = _rnlm8_stage_norm_rcp<REDUCTION_SIZE, ACTUAL_HIDDEN_DIM>(
+          raw_row, (unsigned short const *)norm_weight_ptr, s_x_bf16,
+          s_nw_bf16);
+      input_row = s_x_bf16;
+    } else {
+      input_row = raw_row;
+      rms_rcp = gang_rmsnorm_detail::rmsnorm_rcp_amd<REDUCTION_SIZE,
+                                                     ACTUAL_HIDDEN_DIM>(
+          input_row);
+    }
+  }
+
+  // ── The hoisted A-tile prefetch ─────────────────────────────────────────
+  // Both MFMA branches below open by filling the depth-4 pipeline's four
+  // slots, and both do it after the quantizer. Issue that fill here instead:
+  // it depends only on wg_idx, warp_id and the lane, all of which are known on
+  // entry, and the quantizer that follows is now pure LDS, so the loads stay
+  // outstanding across it and the first MFMA waits on a counter that has
+  // already had the whole quantizer to drain.
+  //
+  // Only the first group is hoisted, and only when it is the *only* group of
+  // its wave -- the two GLM shapes that matter are QB_OUTPUT_PER_WG 64
+  // (N-parallel, TILES_PER_WAVE 1) and QKV_OUTPUT_PER_WG 16 (K-parallel, one
+  // fill per wave). A wider OUTPUT_PER_WG would hold these 32 VGPRs live
+  // across every later tile_iter for no benefit, so it keeps the old form.
+  constexpr bool HOIST_PREFILL =
+      LDS_PROLOGUE && (OUTPUT_PER_WG >= 64 ? (TILES_PER_WAVE == 1) : true);
+  i32x8_t ph_a[HOIST_PREFILL ? 4 : 1];
+  int ph_sa[HOIST_PREFILL ? 4 : 1];
+  if constexpr (HOIST_PREFILL) {
+    // N-parallel gives each wave its own 16 rows starting at k-tile 0;
+    // K-parallel gives all four waves the same 16 rows and splits K.
+    int const h_row = (OUTPUT_PER_WG >= 64) ? (warp_id * 16 + col) : col;
+    int const h_ki0 =
+        (OUTPUT_PER_WG >= 64) ? 0 : (warp_id * (MFMA_ITERS / NUM_WAVES));
+    uint8_t const *h_data = wg_data + static_cast<int64_t>(h_row) * REDUCTION_SIZE;
+    int const h_scale_base = h_row * NUM_BLOCKS_32;
+#pragma unroll
+    for (int ki = 0; ki < 4; ki++) {
+      ph_a[ki] =
+          _gang_load_fp8_mfma_b_g(h_data, (h_ki0 + ki) * K_PER_MFMA, g);
+      ph_sa[ki] = (int)_gang_ld_g<uint8_t>(wg_scales + h_scale_base +
+                                           (h_ki0 + ki) * 4 + g);
+    }
   }
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
@@ -557,9 +813,13 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     _sp_t1 = __builtin_amdgcn_s_memrealtime();
   }
 #endif
-  _gang_wave_parallel_fp8_quant_rmsnorm<REDUCTION_SIZE, !FUSE_RESADD>(
+  _gang_wave_parallel_fp8_quant_rmsnorm<REDUCTION_SIZE,
+                                        /*SRC_IS_GLOBAL=*/!FUSE_RESADD &&
+                                            !LDS_PROLOGUE,
+                                        /*NW_IS_LDS=*/LDS_PROLOGUE,
+                                        /*BARRIER_LDS_ONLY=*/HOIST_PREFILL>(
       input_row,
-      (unsigned short const *)norm_weight_ptr,
+      LDS_PROLOGUE ? s_nw_bf16 : (unsigned short const *)norm_weight_ptr,
       rms_rcp,
       s_tok_fp8,
       s_tok_scales);
@@ -670,15 +930,28 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
         // gang_mla_full_layer_fused_mi300.cuh:467.
         asm volatile("" : "+v"(acc));
       } else {
-        // Pre-fill: load k-tiles 0..3 into pipeline slots
-        i32x8_t a0 = _gang_load_fp8_mfma_b_g(w_data_row, 0 * K_PER_MFMA, g);
-        int sa0 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + 0 * 4 + g);
-        i32x8_t a1 = _gang_load_fp8_mfma_b_g(w_data_row, 1 * K_PER_MFMA, g);
-        int sa1 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + 1 * 4 + g);
-        i32x8_t a2 = _gang_load_fp8_mfma_b_g(w_data_row, 2 * K_PER_MFMA, g);
-        int sa2 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + 2 * 4 + g);
-        i32x8_t a3 = _gang_load_fp8_mfma_b_g(w_data_row, 3 * K_PER_MFMA, g);
-        int sa3 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + 3 * 4 + g);
+        // Pre-fill: load k-tiles 0..3 into pipeline slots. Under HOIST_PREFILL
+        // this wave's only fill was already issued above the quantizer, so the
+        // slots start from those registers instead; w_row there is
+        // warp_id * 16 + col, which is this loop's w_row at tile_iter 0, and
+        // TILES_PER_WAVE == 1 is what makes that the only iteration.
+        i32x8_t a0, a1, a2, a3;
+        int sa0, sa1, sa2, sa3;
+        if constexpr (HOIST_PREFILL) {
+          a0 = ph_a[0]; sa0 = ph_sa[0];
+          a1 = ph_a[1]; sa1 = ph_sa[1];
+          a2 = ph_a[2]; sa2 = ph_sa[2];
+          a3 = ph_a[3]; sa3 = ph_sa[3];
+        } else {
+          a0 = _gang_load_fp8_mfma_b_g(w_data_row, 0 * K_PER_MFMA, g);
+          sa0 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + 0 * 4 + g);
+          a1 = _gang_load_fp8_mfma_b_g(w_data_row, 1 * K_PER_MFMA, g);
+          sa1 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + 1 * 4 + g);
+          a2 = _gang_load_fp8_mfma_b_g(w_data_row, 2 * K_PER_MFMA, g);
+          sa2 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + 2 * 4 + g);
+          a3 = _gang_load_fp8_mfma_b_g(w_data_row, 3 * K_PER_MFMA, g);
+          sa3 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + 3 * 4 + g);
+        }
 
         // IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation -- see the
         // EXEC-mask note in the branch above for what that actually is.
@@ -782,18 +1055,26 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
 
     f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    // Pre-fill: load k-tiles 0..3 into pipeline slots
-    i32x8_t a0 = _gang_load_fp8_mfma_b_g(w_data_row, ki_start * K_PER_MFMA, g);
-    int sa0 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + ki_start * 4 + g);
-    i32x8_t a1 = _gang_load_fp8_mfma_b_g(
-        w_data_row, (ki_start + 1) * K_PER_MFMA, g);
-    int sa1 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + (ki_start + 1) * 4 + g);
-    i32x8_t a2 = _gang_load_fp8_mfma_b_g(
-        w_data_row, (ki_start + 2) * K_PER_MFMA, g);
-    int sa2 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + (ki_start + 2) * 4 + g);
-    i32x8_t a3 = _gang_load_fp8_mfma_b_g(
-        w_data_row, (ki_start + 3) * K_PER_MFMA, g);
-    int sa3 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + (ki_start + 3) * 4 + g);
+    // Pre-fill: load k-tiles 0..3 into pipeline slots. Under HOIST_PREFILL
+    // these were issued above the quantizer; the hoist used w_row = col and
+    // ki0 = warp_id * ITERS_PER_WAVE, which is exactly (w_row, ki_start) here.
+    i32x8_t a0, a1, a2, a3;
+    int sa0, sa1, sa2, sa3;
+    if constexpr (HOIST_PREFILL) {
+      a0 = ph_a[0]; sa0 = ph_sa[0];
+      a1 = ph_a[1]; sa1 = ph_sa[1];
+      a2 = ph_a[2]; sa2 = ph_sa[2];
+      a3 = ph_a[3]; sa3 = ph_sa[3];
+    } else {
+      a0 = _gang_load_fp8_mfma_b_g(w_data_row, ki_start * K_PER_MFMA, g);
+      sa0 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + ki_start * 4 + g);
+      a1 = _gang_load_fp8_mfma_b_g(w_data_row, (ki_start + 1) * K_PER_MFMA, g);
+      sa1 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + (ki_start + 1) * 4 + g);
+      a2 = _gang_load_fp8_mfma_b_g(w_data_row, (ki_start + 2) * K_PER_MFMA, g);
+      sa2 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + (ki_start + 2) * 4 + g);
+      a3 = _gang_load_fp8_mfma_b_g(w_data_row, (ki_start + 3) * K_PER_MFMA, g);
+      sa3 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + (ki_start + 3) * 4 + g);
+    }
 
 // IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation.
 #pragma unroll 1

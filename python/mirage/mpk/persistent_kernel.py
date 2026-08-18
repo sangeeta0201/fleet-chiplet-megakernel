@@ -431,6 +431,13 @@ def get_compile_command(
         # against 4 MB of L2. See gang_mla_full_layer_fused_mi300.cuh.
         if int(os.environ.get("GLM_OPROJ_PREFETCH", "1")) == 0:
             flags = flags + ["-DMPK_GLM_OPROJ_PREFETCH_OFF"]
+        # Ablation for the LDS prologue + hoisted A-tile prefetch in
+        # gang_rmsnorm_linear_mxfp8_bias_kernel (the qkv_a and q_b GEMMs).
+        # Unlike the o_proj knob above this one does change what is computed --
+        # the row and the norm weight are read once into LDS instead of twice
+        # from global -- so the ablation is also the correctness fallback.
+        if int(os.environ.get("GLM_PROLOGUE_PREFETCH", "1")) == 0:
+            flags = flags + ["-DMPK_GLM_PROLOGUE_PREFETCH_OFF"]
         if int(os.environ.get("MPK_MOE_SUBPHASE", "0")) == 1:
             flags = flags + ["-DMPK_ENABLE_MOE_SUBPHASE"]
         if int(os.environ.get("MPK_FUSED_PHASE_TIMING", "0")) == 1:
