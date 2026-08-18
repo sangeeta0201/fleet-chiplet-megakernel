@@ -356,6 +356,37 @@ class GlmMLP(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
+# The eight E2M1 magnitudes, sign in bit 3 -- the exact inverse of the ladder
+# of thresholds demo.py's quantize_mxfp4 encodes with.
+_E2M1_LUT = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6.,
+                          -0., -.5, -1., -1.5, -2., -3., -4., -6.])
+
+
+def dequantize_mxfp4(blocks: torch.Tensor, scales: torch.Tensor,
+                     out_dtype=torch.bfloat16) -> torch.Tensor:
+    """MXFP4 [out, K/2] nibbles + [out, K/32] E8M0 exponents -> [out, K].
+
+    The inverse of demo.py's ``quantize_mxfp4``, and it has to agree with it
+    on both conventions the packing chose: nibble order within a byte is
+    element 2b low / 2b+1 high, and a zero exponent means a scale of 1.0
+    rather than 2^-127 (quantize_mxfp4 emits se == 0 for an all-zero block).
+
+    This exists so GLM-5 has a Torch reference at all. The checkpoint only
+    ever lands on disk as MXFP4 -- the bf16 form is 1488 GB -- so without a
+    dequantiser the megakernel's output has nothing to be compared against.
+    """
+    lut = _E2M1_LUT.to(blocks.device)
+    lo, hi = (blocks & 0x0F).long(), (blocks >> 4).long()
+    vals = torch.stack([lut[lo], lut[hi]], dim=-1).reshape(
+        *blocks.shape[:-1], blocks.shape[-1] * 2)
+    K = vals.shape[-1]
+    sf = torch.where(scales == 0,
+                     torch.ones_like(scales, dtype=torch.float32),
+                     (scales.to(torch.int32) << 23).view(torch.float32))
+    return (vals.reshape(*vals.shape[:-1], K // 32, 32)
+            * sf.unsqueeze(-1)).reshape(*blocks.shape[:-1], K).to(out_dtype)
+
+
 class GlmTopkRouter(nn.Module):
     """``noaux_tc``: sigmoid gating, bias-corrected selection, renormalised
     weights, then a constant rescale.
@@ -458,14 +489,30 @@ class GlmMoE(nn.Module):
             config.hidden_size,
             config.moe_intermediate_size * config.n_shared_experts)
 
+    def _mxfp4_expert(self, e, x):
+        """SwiGLU for one MXFP4 expert, dequantised on the fly.
+
+        Not cached: the full bf16 form of one layer's 256 experts is 9.6 GB,
+        and top-8 of 256 means a decode step touches 8. Dequantising the three
+        projections costs ~38M elements, which is nothing next to loading them
+        would be. This is the reference leg -- it is allowed to be slow, it is
+        not allowed to hold a second copy of the model.
+        """
+        w = self.expert_mxfp4[e - self.ep_base]
+        g, u, d = (dequantize_mxfp4(*w[p], out_dtype=x.dtype)
+                   for p in ("gate_proj", "up_proj", "down_proj"))
+        return F.linear(F.silu(F.linear(x, g)) * F.linear(x, u), d)
+
     def forward(self, hidden_states):
-        if self.experts is None or self.ep_local != self.config.n_routed_experts:
+        if self.ep_local != self.config.n_routed_experts:
             raise NotImplementedError(
                 "the Torch reference MoE needs every expert resident; this "
                 "module holds only rank-local "
                 f"{'MXFP4' if self.mxfp4_experts else 'bf16'} experts "
                 f"[{self.ep_base}, {self.ep_base + self.ep_local}). Use the "
                 "megakernel path (--use-mirage) for the sharded model.")
+        expert = (self._mxfp4_expert if self.experts is None
+                  else lambda e, x: self.experts[e](x))
         residuals = hidden_states
         orig_shape = hidden_states.shape
         topk_indices, topk_weights, router_logits = self.gate(hidden_states)
@@ -475,7 +522,7 @@ class GlmMoE(nn.Module):
         for tok in range(flat.shape[0]):
             for slot in range(topk_indices.shape[1]):
                 e = int(topk_indices[tok, slot])
-                out[tok] += (self.experts[e](flat[tok:tok + 1]).float()
+                out[tok] += (expert(e, flat[tok:tok + 1]).float()
                              * float(topk_weights[tok, slot]))[0]
         out = out.to(hidden_states.dtype).view(*orig_shape)
         # The shared expert runs on every token and is added unweighted.
