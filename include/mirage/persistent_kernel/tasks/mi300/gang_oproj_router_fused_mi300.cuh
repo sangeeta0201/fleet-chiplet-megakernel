@@ -258,6 +258,37 @@ __device__ __attribute__((always_inline)) void
     // against 30 resident workers, and the dispatch width is capped at the
     // worker count because a tile that has to wait for a worker deadlocks the
     // barrier below. Where the count fits the loop runs once.
+    //
+    // m_tiles is 1, so every pass round this loop has the same `tile_input`
+    // and the GEMV's 64 KB LDS staging of it is identical work. Stage on the
+    // first pass only. Nothing between the passes writes _fused_smem: the GEMV
+    // itself only reads s_a after the staging block, and the router below runs
+    // after the barrier.
+    //
+    // GLM_OPROJ_RESTAGE=1 is the ablation: it re-stages on every pass, i.e.
+    // the previous behaviour.
+    //
+    // Measured, GLM-5 744B, NP=8 EP, 78 layers, MPK_SUBPHASE_TIMING=1, rank 0,
+    // aggregate worker-seconds over SP3 cnt 2209800:
+    //
+    //   SP3 slot          restage  stage-once  delta
+    //   [0] OProjCompute   123.71      120.65  -3.06  (-2.5%)
+    //   [2] Router          55.35       52.94  -2.41
+    //   others                     within +-1.0 (noise)
+    //   SP4 (control)      110.89      110.87   0.00
+    //
+    // End-to-end is flat: SP3[0] is 25% of ~495 worker-s, so -2.5% there is
+    // ~0.1 ms, under the run-to-run spread. Three uninstrumented runs, decode
+    // device clock: 17.474 / 17.496 / 17.229 ms (mean 17.400) vs 17.284 /
+    // 17.550 / 17.412 (mean 17.415). Kept anyway -- it is a strict removal of
+    // 128 KB of traffic per second pass with bit-identical output, and it gets
+    // less hidden as the barrier waits come down.
+#ifdef MPK_GLM_OPROJ_RESTAGE
+    constexpr bool RESTAGE = true;
+#else
+    constexpr bool RESTAGE = false;
+#endif
+    bool stage_a = true;
     for (int t = xcd_rank; t < oproj_tiles_per_xcd; t += tiles_per_xcd) {
       unsigned short *xcd_out =
           static_cast<unsigned short *>(hidden_ptr) +
@@ -276,7 +307,10 @@ __device__ __attribute__((always_inline)) void
                                                      /*m_tiles=*/1,
                                                      oproj_tiles_per_xcd,
                                                      /*wgm=*/0,
-                                                     t);
+                                                     t,
+                                                     /*bias_ptr=*/nullptr,
+                                                     stage_a);
+      stage_a = RESTAGE;
     }
 
     MPK_WS_PHASE(72, routing_expected, xcd_id);

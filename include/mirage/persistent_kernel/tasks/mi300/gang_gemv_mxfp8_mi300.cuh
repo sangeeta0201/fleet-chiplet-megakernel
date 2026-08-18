@@ -179,7 +179,8 @@ __device__ __noinline__ void
                            int n_tiles,
                            int wgm,
                            int tile_idx,
-                           void const *bias_ptr = nullptr) {
+                           void const *bias_ptr = nullptr,
+                           bool stage_a = true) {
   using gang_gemv_detail::b2f;
   using gang_gemv_detail::f2b;
   using gang_gemv_mxfp8_detail::cvt_fp8_pair;
@@ -242,6 +243,15 @@ __device__ __noinline__ void
   // kernel that can reach this one. gang_moe_fused_mxfp4 stages its tokens and
   // weights the same way. Both of this kernel's callers -- the standalone task
   // and gang_oproj_router_fused -- have nothing live in _fused_smem here.
+  //
+  // `stage_a` lets a caller that calls this kernel more than once for the same
+  // activation row skip the copy after the first. o_proj is that caller: at
+  // GLM-5's hidden 6144 it runs 48 tiles per XCD over ~29 workers, so 19
+  // workers go round the grid-stride loop twice, and with m_tiles == 1 the
+  // second tile's `tile_input` is the first tile's -- 64 KB of global reads and
+  // 64 KB of ds_writes to rebuild a buffer that is already correct. The caller
+  // owns the invariant: pass false only when this block already staged the same
+  // `tile_input` and nothing has written _fused_smem since.
   constexpr size_t A_LDS_BYTES =
       sizeof(unsigned short) * BATCH_SIZE * REDUCTION_SIZE;
   constexpr bool STAGE_A =
@@ -251,15 +261,17 @@ __device__ __noinline__ void
   unsigned short *s_a = reinterpret_cast<unsigned short *>(_fused_smem);
   if constexpr (STAGE_A) {
     // The tile coords check above is block-uniform, so every thread that
-    // reaches this __syncthreads reaches it together.
-    u32x4_t const *src = reinterpret_cast<u32x4_t const *>(tile_input);
-    u32x4_t *dst = reinterpret_cast<u32x4_t *>(s_a);
+    // reaches this __syncthreads reaches it together, and so is `stage_a`.
+    if (stage_a) {
+      u32x4_t const *src = reinterpret_cast<u32x4_t const *>(tile_input);
+      u32x4_t *dst = reinterpret_cast<u32x4_t *>(s_a);
 #pragma unroll
-    for (int i = tid; i < static_cast<int>(A_LDS_BYTES / sizeof(u32x4_t));
-         i += NTHREADS) {
-      dst[i] = ld_g<u32x4_t>(src + i);
+      for (int i = tid; i < static_cast<int>(A_LDS_BYTES / sizeof(u32x4_t));
+           i += NTHREADS) {
+        dst[i] = ld_g<u32x4_t>(src + i);
+      }
+      __syncthreads();
     }
-    __syncthreads();
   }
 
   unsigned char const *w_row = wg + static_cast<size_t>(row) * REDUCTION_SIZE;

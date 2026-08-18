@@ -438,6 +438,11 @@ def get_compile_command(
         # from global -- so the ablation is also the correctness fallback.
         if int(os.environ.get("GLM_PROLOGUE_PREFETCH", "1")) == 0:
             flags = flags + ["-DMPK_GLM_PROLOGUE_PREFETCH_OFF"]
+        # Ablation for skipping the o_proj GEMV's activation re-stage on the
+        # second grid-stride pass. m_tiles is 1 there, so the two passes stage
+        # the same 64 KB row; =1 restores the redundant copy.
+        if int(os.environ.get("GLM_OPROJ_RESTAGE", "0")) == 1:
+            flags = flags + ["-DMPK_GLM_OPROJ_RESTAGE"]
         if int(os.environ.get("MPK_MOE_SUBPHASE", "0")) == 1:
             flags = flags + ["-DMPK_ENABLE_MOE_SUBPHASE"]
         if int(os.environ.get("MPK_FUSED_PHASE_TIMING", "0")) == 1:
