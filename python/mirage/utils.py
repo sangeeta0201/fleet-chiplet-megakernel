@@ -64,11 +64,25 @@ def get_configurations_from_gpu(rank):
             num_xcds = 8
             worker = 240  # Same as MI300X for compatibility
             # 240 workers + 8 schedulers = 248 blocks on 256 CUs, i.e. 31 of
-            # the 32 CUs on every XCD. At NP=8 the last work-group on each XCD
-            # (xcd_rank 29) has been observed to stop executing mid-spin, which
-            # wedges the whole rank; MPK_NUM_WORKERS exists to test whether
-            # leaving more CUs idle makes that go away. Rounded down to a
-            # multiple of 8 so every XCD still gets the same number.
+            # the 32 CUs on every XCD. The megakernel needs every block
+            # co-resident, so this margin is load-bearing.
+            #
+            # At NP=8 it is not enough. The last worker on an XCD (xcd_rank 29)
+            # never becomes resident at all -- worker-state slot still at
+            # MPK_WS_UNWRITTEN, worker_xcd_ready_count stuck at 239 of 240, and
+            # all eight schedulers parked in the bootstrap wait having never
+            # dispatched a task. An earlier reading of this as "stops executing
+            # mid-spin" was wrong: the block never ran. Workers and schedulers
+            # are separate kernels on separate streams and are round-robined
+            # onto XCDs independently, so nothing puts the 8 scheduler blocks
+            # one per XCD, and an XCD drawing two of them needs 33 slots for 32.
+            #
+            # MPK_NUM_WORKERS buys the headroom. demo/glm5/run_mp8_dp_ep_fused.sh
+            # sets 232 (29/XCD), which is what makes the full 78-layer NP=8 run
+            # complete; see the measurements there. The default stays 240 so
+            # gpt-oss and single-GPU runs keep the config their recorded
+            # latencies were measured against. Rounded down to a multiple of 8
+            # so every XCD still gets the same number.
             _w_env = os.environ.get("MPK_NUM_WORKERS")
             if _w_env:
                 worker = max(num_xcds, (int(_w_env) // num_xcds) * num_xcds)

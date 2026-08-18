@@ -45,7 +45,61 @@ if [ "${KEEP_BUILD:-0}" != "1" ]; then
   rm -rf permanent_output_dir permanent_output_dir_rank*
 fi
 
+# Leave two CUs per XCD idle. This is a liveness fix, not a tuning knob, and
+# it is what makes the full 78-layer NP=8 run complete at all.
+#
+# The default (utils.py) is 240 workers + 8 schedulers = 248 blocks on 256 CUs,
+# i.e. 31 of the 32 CUs on every XCD. The megakernel requires every block to be
+# co-resident -- a worker that never gets a CU never reports into
+# worker_xcd_ready_count, and all eight schedulers then spin in the bootstrap
+# wait forever without dispatching a single task. Workers and schedulers are
+# two separate kernels on two separate streams, so their blocks are round-robined
+# onto XCDs independently; nothing guarantees the 8 scheduler blocks land one
+# per XCD, and any XCD that draws two of them needs 33 slots for 32 CUs.
+#
+# Measured, full 78 layers, NP=8, both runs with the NUMA binding below:
+#
+#   240 workers : hang at layer 0. Rank 3's worker 237 -- XCD 237%8 = 5,
+#                 xcd_rank 237/8 = 29, i.e. the last worker on its XCD -- sat at
+#                 MPK_WS_UNWRITTEN, never resident. Its 8 schedulers were all at
+#                 MPK_WS_SCHED_ENTERED with worker_xcd_ready_count = 239 of 240.
+#                 The other 7 ranks were healthy and merely blocked behind it:
+#                 0,1,2,4 waiting on peer 3 at exp=1 with rank 3's own signal
+#                 copy reading 0 (never published, not a lost push), and 5,6,7
+#                 one layer further waiting on rank 1.
+#   232 workers : completes. 18.110 ms/iter decode, no [EPTMO]/[EPREL], correct
+#                 text ("...Paris. ...Berlin. ...Warsaw. ...Rome.").
+#
+# Scoped to this script on purpose. gpt-oss and single-GPU GLM have run at 240
+# workers for a long time; the co-residency margin is the same there in
+# principle, but the failure has only ever been observed at NP=8, and changing
+# their worker count would silently move every latency number already recorded
+# against them.
+export MPK_NUM_WORKERS="${MPK_NUM_WORKERS:-232}"
+
+# Pin each rank to the NUMA node its GPU hangs off.
+#
+# OpenMPI 4.1.2 with no binding flags maps round-robin BY SOCKET, so ranks
+# 0,2,4,6 land on socket 0 and 1,3,5,7 on socket 1, while HIP_VISIBLE_DEVICES
+# hands rank i GPU i -- and GPUs 0-3 sit on NUMA 0, GPUs 4-7 on NUMA 1
+# (/sys/.../numa_node: 05,15,65,75 -> 0; 85,95,e5,f5 -> 1). Six of the eight
+# ranks therefore drive a GPU across the socket link. `ppr:4:numa` fills node 0
+# with ranks 0-3 and node 1 with ranks 4-7, the rank->GPU->NUMA identity this
+# demo wants.
+#
+# This was added while chasing the hang above, on the theory that the straggler
+# set tracked socket 1. It did not: the laggards moved from {1,3,5,7} to {4,6,7}
+# when the binding changed, the collapse point moved with them (fold 6454 vs
+# 347), and the actual cause turned out to be the co-residency race. XGMI here
+# is fully connected at uniform weight, so there is no GPU-side asymmetry for a
+# socket to explain. Keep it because rank->GPU->NUMA identity is right on its
+# own terms; do NOT credit it with fixing anything.
+#
+# Override with MPK_MPI_BIND="--bind-to none" to isolate a binding regression.
+MPK_MPI_BIND="${MPK_MPI_BIND:---map-by ppr:$((NP / 2)):numa --bind-to numa}"
+
 mpirun -np "$NP" --tag-output --allow-run-as-root \
+  $MPK_MPI_BIND \
   $(mpk_x_args) \
   stdbuf -oL -eL python3 demo.py --use-mirage \
     --max-seq-length "${MAX_SEQ_LENGTH:-128}" \
