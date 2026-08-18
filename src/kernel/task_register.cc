@@ -4205,8 +4205,17 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
              oproj_rows_per_wg *
                  (oproj_reduction_size + oproj_reduction_size / 32) &&
          "o_proj MXFP8 weight is not packed at this reduction and row count");
-  assert(oproj_tiles_per_xcd * oproj_rows_per_wg * 8 == hidden_size &&
-         "the packed o_proj weight does not cover the hidden row exactly");
+  // Either the whole row, or this rank's 1/world-th of it under output-wise
+  // sharded o_proj followed by the in-kernel all-gather. The kernel detects
+  // the shard off exactly this ratio -- there is no flag -- so nothing between
+  // the two is legal, and hidden_size stays the FULL row either way: it is the
+  // router's K and the all-gather's target width.
+  assert((oproj_tiles_per_xcd * oproj_rows_per_wg * 8 == hidden_size ||
+          (ep_inline &&
+           oproj_tiles_per_xcd * oproj_rows_per_wg * 8 * ep_world_size ==
+               hidden_size)) &&
+         "the packed o_proj weight covers neither the hidden row nor this "
+         "rank's 1/world-th of it");
   // ── W_UV, un-absorbed kv_b_v only ──
   // A block-diagonal GEMV over num_q_heads independent [kv_lora, v_head]
   // blocks, packed as one [num_q_heads * v_head, kv_lora] MXFP8 stack, so the

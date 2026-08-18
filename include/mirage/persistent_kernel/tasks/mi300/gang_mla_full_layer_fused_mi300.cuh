@@ -1447,7 +1447,16 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       /*v_out=*/output_ptrs[11],
       wuv_tiles_per_xcd,
       /*wuv_expected_in=*/s_exp[7],
-      /*wuv_counters=*/wuv_counters);
+      /*wuv_counters=*/wuv_counters,
+      // Only under EP, and only in ml_mode: the all-gather's release value is
+      // oproj_expected, which is task_layer_idx + 1 there and a load off a
+      // counter otherwise -- and a value read from a local counter is not the
+      // value a peer would publish. input_ptrs[28] is the same signal array
+      // Phase 9 uses; see OPROJ_EP_SIGNAL_SLOT for how the line is split.
+      /*ep_signal=*/(EP_WORLD_SIZE > 1 && ml_mode) ? input_ptrs[28] : nullptr);
+  static_assert(OPROJ_EP_SIGNAL_STRIDE == FULL_LAYER_EP_SIGNAL_STRIDE,
+                "the o_proj all-gather shares the EP fold's signal array, so "
+                "the two must agree on its per-PE stride");
   MPK_WS_PHASE(90, task_layer_idx, xcd_id);
 }
 

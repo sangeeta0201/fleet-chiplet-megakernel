@@ -2281,9 +2281,17 @@ class PersistentKernel:
                 and qk_nope_head_dim == 0
             wuk_tiles_per_xcd = 0
         hidden_size = hidden.dim(1)
-        assert n_wgs * oproj_rows_per_wg == hidden_size, (
-            f"packed weight covers {n_wgs * oproj_rows_per_wg} columns, "
-            f"hidden has {hidden_size}")
+        # Either the whole row, or this rank's 1/world-th of it under
+        # output-wise sharded o_proj. The kernel reads the shard off exactly
+        # this ratio -- there is no flag -- so nothing between the two is
+        # legal, and hidden_size stays the FULL row either way: it is the
+        # RMSNorm's and the router's K, and the all-gather's target width.
+        oproj_cols = n_wgs * oproj_rows_per_wg
+        assert oproj_cols == hidden_size or (
+            ep_inline and oproj_cols * self.world_size == hidden_size), (
+                f"packed weight covers {oproj_cols} columns; hidden has "
+                f"{hidden_size} and world is "
+                f"{self.world_size if ep_inline else 1}")
         assert hidden_size == qkv_reduction, (
             "o_proj's N is the next layer's qkv_a K; they are one row")
 

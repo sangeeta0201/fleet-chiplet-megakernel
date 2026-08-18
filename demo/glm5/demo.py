@@ -1149,6 +1149,27 @@ if __name__ == "__main__":
         if UNABSORB_V and not use_mxfp8_oproj:
             # Phase 8b only exists inside the MXFP8 GEMV o_proj.
             UNABSORB_V = False
+        # ── rank-sharded o_proj ───────────────────────────────────────────
+        # o_proj is the largest replicated weight in the layer: 103.8 MB per
+        # rank per layer at GLM-5's shape, read identically on all 8 ranks
+        # because attention is data-parallel at batch 1. Output-wise sharding
+        # gives rank p rows [p * hidden/EP, +that) and therefore exactly those
+        # columns of the hidden row; the columns are disjoint, so the row is
+        # completed by an all-gather rather than a reduction, and the residual
+        # add stays inside the one rank that owns each column.
+        #
+        # There is no kernel flag: the task detects the shard from its own tile
+        # count (see oproj_tp in gang_oproj_router_fused_mi300.cuh), so this
+        # slice is the entire switch. It needs the fused whole-layer task,
+        # which is the only path with the symmetric signal array to rendezvous
+        # on, and per-XCD tiles that stay whole.
+        oproj_tp = (int(os.environ.get("GLM_OPROJ_TP", "1")) == 1
+                    and moe_ep and world_size > 1
+                    and FUSE_FULL_LAYER and use_mxfp8_oproj
+                    and hidden_size % (world_size * 8 * oproj_tile_n) == 0)
+        oproj_tp_cols = hidden_size // world_size if oproj_tp else hidden_size
+        print(f"[CFG] o_proj tp={int(oproj_tp)} cols_per_rank={oproj_tp_cols} "
+              f"tiles_per_xcd={oproj_tp_cols // 8 // oproj_tile_n}")
         n_tiles_xcd = hidden_size // 8 // oproj_tile_n
         # The split-K task takes a reduction_override now, so de-padding and
         # split-K compose: it reduces over the leading o_proj_red columns and
@@ -1229,7 +1250,27 @@ if __name__ == "__main__":
         # of q_b workgroups, which is what makes the rope slice one workgroup.
         mla_q_nope = (make_tensor("mla_q_nope", (bs, qb_nope_width))
                       if UNABSORB_K else None)
-        attn_proj_out = make_tensor("attn_proj_out", (bs, hidden_size))
+        if oproj_tp:
+            # Under rank-sharded o_proj every rank computes a disjoint 1/EP-th
+            # of this row and pushes it straight into the peers' copies, so it
+            # has to live on the symmetric heap -- a plain cudaMalloc would put
+            # the peer store at an unrelated address on the remote rank.
+            #
+            # One buffer for all layers, not one per layer as ep_gather needs.
+            # The hazard ep_gather guards against -- a peer running ahead and
+            # overwriting layer L's row while this rank still reads it -- is
+            # closed here by the MoE fold: a peer cannot reach layer L+1's
+            # o_proj until it has seen this rank's layer-L partial, which this
+            # rank publishes at the head of layer L+1, i.e. after its own
+            # layer-L router and MoE have finished reading the row.
+            attn_proj_out = mpk.new_tensor(
+                dims=(bs, hidden_size),
+                dtype=mi.bfloat16,
+                name="attn_proj_out",
+                io_category="nvshmem_tensor",
+            )
+        else:
+            attn_proj_out = make_tensor("attn_proj_out", (bs, hidden_size))
         # Split-K accumulator for the absorbed o_proj. Absorption widens that
         # GEMM's reduction to num_heads_pad * kv_lora (16384 on Flash) while
         # its output stays at hidden_size, and gang GEMMs only split the
@@ -1566,6 +1607,15 @@ if __name__ == "__main__":
                     attn.o_proj.weight.data, attn._w_uv,
                     num_heads, v_head, kv_lora).to(torch.bfloat16)
                 o_w = pad_cols(o_w, layer_o_proj_red)
+            if oproj_tp and fuse_full_layer:
+                # Keep only the output rows this rank owns. Everything
+                # downstream follows from dim 0: oproj_tiles_per_xcd is
+                # oproj_weight.dim(0) // 8, so the tile count drops from 48 to
+                # 6 per XCD with no other change, and that ratio is what the
+                # kernel reads the shard off. Only the fused whole-layer task
+                # -- the dense prologue keeps the replicated weight.
+                o_w = o_w[rank * oproj_tp_cols:(rank + 1) * oproj_tp_cols, :]
+                o_w = o_w.contiguous()
             if use_mxfp8_oproj:
                 # One workgroup per GEMV tile, so the packing's workgroup axis
                 # *is* the tile axis: 2048 / 16 = 128 workgroups, 16 per XCD,

@@ -91,6 +91,18 @@ namespace kernel {
 #define MPK_FL_REPUBLISH_SPINS 1024
 #endif
 
+// Layout of the symmetric EP signal array, in uint64 units. Duplicated from
+// FULL_LAYER_EP_SIGNAL_STRIDE in gang_full_layer_fused_mi300.cuh rather than
+// read from it -- the monoliths land in this translation unit in include order
+// and either may be first. gang_mla_full_layer_fused_mi300.cuh static_asserts
+// the two agree, from a point where both are in scope.
+//
+// One 64-byte line per PE, written only by that PE (on every peer's copy), so
+// two independent per-layer signals can share it with no false sharing: slot 0
+// is Phase 9's MoE fold, slot 1 is this task's o_proj all-gather.
+static constexpr int OPROJ_EP_SIGNAL_STRIDE = 8;
+static constexpr int OPROJ_EP_SIGNAL_SLOT = 1;
+
 template <int BATCH_SIZE,
           int OPROJ_REDUCTION_SIZE, // absorbed o_proj K (10240 for GLM)
           int OPROJ_ROWS_PER_WG,    // output columns per workgroup
@@ -189,7 +201,14 @@ __device__ __attribute__((always_inline)) void
         // where the standalone dispatch puts them. The whole-layer task passes
         // an explicit base instead: its merged buffer gives this task only
         // slots [40 .. 69], and 0/10/20 already fill them.
-        void *wuv_counters_ptr = nullptr) {
+        void *wuv_counters_ptr = nullptr,
+        // Symmetric [EP_WORLD_SIZE * 8] uint64 signal array, the same object
+        // the Phase-9 EP fold uses. Slot 0 of a PE's 64-byte line is the
+        // fold's; slot 1 is this task's o_proj all-gather. Sharing the line is
+        // safe because both are written only by that PE, on every peer, and
+        // both carry the same run-monotonic layer count. Null on the
+        // standalone dispatch, and null is also what disables the all-gather.
+        void *ep_signal_ptr = nullptr) {
 
   int const tid = threadIdx.x;
   int const xcd_id = tile_idx / tiles_per_xcd;
@@ -479,23 +498,60 @@ __device__ __attribute__((always_inline)) void
     constexpr bool RESTAGE = false;
 #endif
     bool stage_a = true;
+    // ── rank-sharded o_proj (OPROJ_TP) ────────────────────────────────────
+    // With ATTN_DP at batch 1 every rank holds the same attn_out and computes
+    // the same o_proj from the same 103.8 MB of weight -- 8x the bytes for one
+    // copy of the answer, and the single largest replicated item in the layer
+    // (see the profile note above: o_proj is 26.7% of this task and runs at
+    // 76% of HBM peak, so the only lever left on it is bytes).
+    //
+    // Sharding it output-wise: rank p keeps rows [p * HIDDEN_SIZE/EP, +that)
+    // of the weight and computes exactly those columns of the hidden row,
+    // residual included. The columns are disjoint across ranks, so completing
+    // the row is an all-gather and not a reduction, and every rank's slice is
+    // already final -- nothing is added to it afterwards.
+    //
+    // It is detected, not plumbed. demo.py slices the weight and
+    // oproj_tiles_per_xcd falls out of its dim 0, so "my tiles cover a
+    // 1/EP-th of the row" is the whole condition, and A/B is a demo.py env
+    // flag with no template argument, no new task input and no arity change.
+    constexpr int OPROJ_TP_COLS = HIDDEN_SIZE / EP_WORLD_SIZE;
+    bool const oproj_tp =
+        (EP_WORLD_SIZE > 1) && (ep_signal_ptr != nullptr) &&
+        (oproj_tiles_per_xcd * OPROJ_ROWS_PER_WG * 8 == OPROJ_TP_COLS);
     // The output columns and the residual columns are the SAME columns, so both
-    // are derived here from one base instead of the output being offset by the
-    // kernel and the residual by the input partition map. Today the two agree
-    // -- o_proj covers the whole row, so xcd_id * oproj_tiles_per_xcd *
-    // OPROJ_ROWS_PER_WG is exactly the xcd_id * HIDDEN_SIZE/8 slice the map
-    // handed over -- and this is a pure refactor. It exists because the map
-    // cannot express the next step: under rank-sharded o_proj the base is
-    // my_pe * (HIDDEN_SIZE / EP_WORLD_SIZE) + xcd_id * (that / 8), and a
-    // partition map has no rank axis. Keep the two pointers derived together so
-    // they cannot drift apart when that base changes.
+    // are derived here from one base rather than the output being offset by the
+    // kernel and the residual by the input partition map -- which has no rank
+    // axis and so cannot express the sharded base at all.
     size_t const oproj_col_base =
+        (oproj_tp ? (size_t)EP_MY_PE * OPROJ_TP_COLS : (size_t)0) +
         static_cast<size_t>(xcd_id) * oproj_tiles_per_xcd * OPROJ_ROWS_PER_WG;
     unsigned short *const xcd_out =
         static_cast<unsigned short *>(hidden_ptr) + oproj_col_base;
     unsigned short const *const xcd_res =
         static_cast<unsigned short const *>(oproj_residual_ptr) +
         oproj_col_base;
+    // One delta per peer, resolved once. Both the hidden row and the signal
+    // array are symmetric-heap objects, so the same heap-wide delta addresses
+    // either; that is the property the Phase-9 fold relies on too.
+    constexpr int OPROJ_NPEER = (EP_WORLD_SIZE > 1) ? (EP_WORLD_SIZE - 1) : 1;
+    int64_t oproj_peer_delta[OPROJ_NPEER];
+    bool oproj_all_mapped = oproj_tp;
+    if (oproj_tp) {
+#pragma unroll
+      for (int q = 0; q < OPROJ_NPEER; q++) {
+        oproj_peer_delta[q] = 0;
+        if (!mpk_shmem_peer_delta((q < EP_MY_PE) ? q : (q + 1),
+                                  &oproj_peer_delta[q])) {
+          // No direct mapping means no place to push to. Fall back to the
+          // replicated form for this run rather than to a staged collective:
+          // the weight is already sliced by then, so the row would simply be
+          // wrong. This is a fail-loud configuration error, not a fast path.
+          oproj_all_mapped = false;
+        }
+      }
+    }
+    bool const oproj_push = oproj_tp && oproj_all_mapped;
     for (int t = xcd_rank; t < oproj_tiles_per_xcd; t += tiles_per_xcd) {
       gang_gemv_mxfp8_kernel<BATCH_SIZE,
                              OPROJ_REDUCTION_SIZE,
@@ -518,6 +574,44 @@ __device__ __attribute__((always_inline)) void
                                                      /*bias_ptr=*/nullptr,
                                                      stage_a);
       stage_a = RESTAGE;
+      // Push the tile straight into every peer's copy of the hidden row, at
+      // the identical offset -- the slices are disjoint, so the all-gather is
+      // EP_NPEER stores of the bytes this workgroup just produced and no
+      // staging buffer at all. Per worker per layer that is
+      // OPROJ_ROWS_PER_WG/2 dwords x 7 links = 56 stores at GLM-5's shape.
+      //
+      // Pushed here rather than by the elected barrier leader on the whole
+      // 1/EP-th row: the leader is one workgroup and would serialize 1.5 KB
+      // x 7 behind the last arrival, whereas here the links are loaded by all
+      // eight XCDs while the o_proj tiles are still finishing, and the leader
+      // is left with nothing to do but the signal and the wait.
+      //
+      // The read-back has to bypass L1: the GEMV's epilogue is WRITE_THROUGH,
+      // i.e. sc0 sc1, so the bytes are in memory but this CU's vL1 may hold
+      // the line these lanes read before it. ld_nt_s32 is the sc0 sc1 load,
+      // and it carries its own vmcnt drain.
+      if (oproj_push) {
+        static_assert((OPROJ_ROWS_PER_WG % 2) == 0,
+                      "peer stores are packed 32-bit, so a tile must be an "
+                      "even number of bf16");
+        constexpr int OPROJ_TILE_W32 = OPROJ_ROWS_PER_WG / 2;
+        __syncthreads();
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        unsigned int *const src32 = reinterpret_cast<unsigned int *>(
+            xcd_out + (size_t)t * OPROJ_ROWS_PER_WG);
+        for (int w = tid; w < OPROJ_TILE_W32; w += (int)blockDim.x) {
+          unsigned int const v =
+              (unsigned int)ld_nt_s32(reinterpret_cast<int *>(src32 + w));
+          // Unrolled over peers so oproj_peer_delta stays in registers: a
+          // runtime index into a per-thread array is a scratch spill.
+#pragma unroll
+          for (int q = 0; q < OPROJ_NPEER; q++) {
+            st_wt_u32((void *)(reinterpret_cast<char *>(src32 + w) +
+                               oproj_peer_delta[q]),
+                      v);
+          }
+        }
+      }
     }
 
     MPK_WS_PHASE(72, routing_expected, xcd_id);
@@ -544,6 +638,60 @@ __device__ __attribute__((always_inline)) void
       // whole run, so there is no window in which a fast worker from the next
       // layer can observe a zeroed counter.
       if ((prev % total_barrier_arrivals) == total_barrier_arrivals - 1) {
+        // ── the all-gather's rendezvous rides this barrier ────────────────
+        // Under OPROJ_TP the row is not complete when the local arrivals are
+        // in; it is complete when every peer's slice has landed too. This
+        // thread is the one the modular test elected, so it is the one that
+        // has observed all eight local XCDs -- which is exactly the condition
+        // for telling the peers, and it is already the thread that fans the
+        // release out. Folding the peer wait in here means ONE thread on the
+        // rank polls the remote lines (which must be sc0 sc1, L2-bypassing --
+        // see ld_sys_u64) and the other 231 workers keep polling a local flag
+        // that is now simply published later. No second barrier, no change to
+        // the router-side wait, and the router's self-heal stays sound: it
+        // republishes only from a flag that some other XCD already holds, and
+        // all eight are written below, after this wait.
+        if (oproj_push) {
+          unsigned long long *const ep_sig =
+              static_cast<unsigned long long *>(ep_signal_ptr);
+          unsigned long long *const my_line =
+              ep_sig + (size_t)EP_MY_PE * OPROJ_EP_SIGNAL_STRIDE +
+              OPROJ_EP_SIGNAL_SLOT;
+          // All EP_NPEER stores back to back, then one drain: distinct peers
+          // are distinct XGMI links and pipeline.
+#pragma unroll
+          for (int q = 0; q < OPROJ_NPEER; q++) {
+            st_wt_u64((void *)(reinterpret_cast<char *>(my_line) +
+                               oproj_peer_delta[q]),
+                      (unsigned long long)oproj_expected);
+          }
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          // Poll all peers concurrently off one bitmask rather than in rank
+          // order, so a slow link costs its own latency and not the sum.
+          unsigned remaining = (1u << OPROJ_NPEER) - 1u;
+          while (remaining) {
+#pragma unroll
+            for (int q = 0; q < OPROJ_NPEER; q++) {
+              if (remaining & (1u << q)) {
+                int const p = (q < EP_MY_PE) ? q : (q + 1);
+                if (ld_sys_u64(ep_sig + (size_t)p * OPROJ_EP_SIGNAL_STRIDE +
+                               OPROJ_EP_SIGNAL_SLOT) >=
+                    (unsigned long long)oproj_expected) {
+                  remaining &= ~(1u << q);
+                }
+              }
+            }
+            if (remaining) {
+              __builtin_amdgcn_s_sleep(1);
+            }
+          }
+          // The peer slices arrived as sc0 sc1 stores, so they are in memory
+          // and not in any cache this rank can see stale. Drop vL1 anyway
+          // before the release: the router re-reads the whole row and its own
+          // buffer_inv is downstream of a flag this thread has not written
+          // yet, which is the wrong order to rely on.
+          asm volatile("buffer_inv" ::: "memory");
+        }
         for (int x = 0; x < 8; x++) {
           st_wt_u32((void *)&hier_barrier[x * HIER_STRIDE],
                     (unsigned)oproj_expected);
