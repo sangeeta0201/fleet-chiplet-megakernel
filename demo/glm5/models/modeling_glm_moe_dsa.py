@@ -703,6 +703,22 @@ class GlmMoeDsaForCausalLM(GlmPreTrainedModel):
                       flush=True)
         mxfp4_experts = bool(mxfp4_experts)
 
+        # Sharding the expert list at construction time is what makes GLM-5
+        # constructible at all -- 256 experts x 76 layers in bf16 is 1488 GB.
+        # A bf16 checkpoint is a different case: it is GLM-4.7-Flash, it fits
+        # on one GPU whole, and demo.py already takes this rank's slice when it
+        # packs the megakernel weights (`ep_slice_base`, keyed off whether the
+        # module came back sharded). Sharding it here as well would need
+        # load_state_dict to remap global expert index to local, which nothing
+        # needs -- so build it unsharded and let the packer do the split.
+        if ep_world > 1 and not mxfp4_experts:
+            if verbose:
+                print(f"[load] bf16 experts: building all "
+                      f"{config.n_routed_experts} per rank; the EP slice is "
+                      f"taken when the megakernel weights are packed",
+                      flush=True)
+            ep_rank, ep_world = 0, 1
+
         model = cls(config, world_size=world_size, max_num_pages=max_num_pages,
                     page_size=page_size, num_layers=num_layers,
                     ep_rank=ep_rank, ep_world=ep_world,
