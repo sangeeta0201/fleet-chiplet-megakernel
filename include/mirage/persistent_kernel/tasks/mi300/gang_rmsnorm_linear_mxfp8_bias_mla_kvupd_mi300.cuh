@@ -41,6 +41,22 @@
 // slice is the last QK_ROPE_HEAD_DIM of them, and with OUTPUT_PER_WG equal to
 // the rope width that slice is one workgroup. GLM: 512 + 64 against 64 gives
 // 9 workgroups a head, and every ninth owns a rope slice alone.
+//
+// ── QK_NOPE_HEAD_DIM > 0: q_b with W_UK left out of it ──────────────────
+//
+// Absorbing W_UK widens q_b's output from qk_nope + qk_rope to kv_lora +
+// qk_rope per head -- 256 to 576 on GLM-5 -- and the weight is [rows, q_lora],
+// so the absorbed form costs 77.9 MB a layer against 34.6 MB plus 6.5 MB for
+// the W_UK stack. Same bytes-for-ops trade as the o_proj/W_UV side, and the
+// same exactness argument: MLA's QK product is linear in the cached latent.
+//
+// The only thing that changes in here is where the output goes. A head is
+// four workgroups instead of nine, the first three carry nope rows and land
+// contiguously in a [num_heads, qk_nope + qk_rope] scratch that the W_UK GEMV
+// reduces over, and the fourth is still the rope slice alone -- rotated out of
+// that scratch and into the 576-wide query row at head * QK_DIM +
+// KV_LORA_RANK, where MLA decode expects it. The scratch's own rope columns
+// keep the un-rotated values and are never read.
 
 #pragma once
 
@@ -63,7 +79,11 @@ template <int BATCH_SIZE,
           int MAX_SEQ_LEN,
           int PAGE_SIZE,
           int KV_INPUT_OFFSET,
-          bool WRITE_THROUGH = false>
+          bool WRITE_THROUGH = false,
+          // > 0 un-absorbs W_UK: q_b's output row is per head
+          // QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM wide instead of QK_DIM, and
+          // q_workspace_ptr addresses that scratch rather than the query row.
+          int QK_NOPE_HEAD_DIM = 0>
 __device__ __attribute__((noinline)) void
     gang_rmsnorm_linear_mxfp8_bias_mla_kvupd_kernel(
         void const *norm_input_ptr,  // [batch, KV_INPUT_STRIDE] (q_a prefix)
@@ -86,15 +106,21 @@ __device__ __attribute__((noinline)) void
         int n_wgs_per_xcd,
         int o_stride,
         int tile_idx,
-        float kv_eps) {
+        float kv_eps,
+        // Un-absorbed only: the 576-wide query row MLA decode reads, whole
+        // rather than this XCD's slice, since the head index below is global.
+        void *q_rope_out_ptr = nullptr) {
   using bf16 = __hip_bfloat16;
   constexpr int QK_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM;
+  constexpr bool UNABSORB_K = QK_NOPE_HEAD_DIM > 0;
+  constexpr int HEAD_SPAN =
+      UNABSORB_K ? (QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM) : QK_DIM;
 
   // A head's rope slice has to be exactly one workgroup, or the in-place
   // rotation would straddle two of them.
   static_assert(OUTPUT_PER_WG == QK_ROPE_HEAD_DIM,
                 "OUTPUT_PER_WG must equal the rope width");
-  static_assert(QK_DIM % OUTPUT_PER_WG == 0,
+  static_assert(HEAD_SPAN % OUTPUT_PER_WG == 0,
                 "a head must be a whole number of workgroups");
 
   // Tile 0 carries the latent row and nothing else; the GEMM's tiles are
@@ -145,7 +171,7 @@ __device__ __attribute__((noinline)) void
   // which XCD we are on, because QK_DIM divides the per-XCD chunk.
   int const tok_idx = gemm_tile_idx / n_wgs_per_xcd;
   int const wg_idx = gemm_tile_idx % n_wgs_per_xcd;
-  constexpr int WGS_PER_HEAD = QK_DIM / OUTPUT_PER_WG;
+  constexpr int WGS_PER_HEAD = HEAD_SPAN / OUTPUT_PER_WG;
   if (wg_idx % WGS_PER_HEAD != WGS_PER_HEAD - 1) {
     return;
   }
@@ -179,10 +205,32 @@ __device__ __attribute__((noinline)) void
     return;
   }
   int const pos = global_seq_len - num_tokens + (row - first_token_pos);
+
+  // Absorbed: the rope slice is already sitting in the query row, so it is
+  // rotated where it is. Un-absorbed: it is sitting in the [nope | rope]
+  // scratch instead, and the query row is 576 wide with the roped 64 last, so
+  // the rotation writes across. The head index has to be global for that --
+  // q_workspace_ptr is this XCD's slice of the scratch, but q_rope_out_ptr is
+  // the whole query row.
+  bf16 *rope_out = nullptr;
+  if constexpr (UNABSORB_K) {
+    static_assert(BATCH_SIZE == 1,
+                  "the query row's stride is not plumbed through here, so the "
+                  "cross-write is only addressable at one token");
+    static_assert(QK_NOPE_HEAD_DIM % OUTPUT_PER_WG == 0,
+                  "the nope rows must fill whole workgroups, or a head's rope "
+                  "workgroup would not be its last");
+    int const xcd_id = gang_rmsnorm_topk_detail::get_xcd_id();
+    int const head = xcd_id * (n_wgs_per_xcd / WGS_PER_HEAD) +
+                     wg_idx / WGS_PER_HEAD;
+    rope_out = reinterpret_cast<bf16 *>(q_rope_out_ptr) +
+               (long)head * QK_DIM + KV_LORA_RANK;
+  }
   gang_mla_kvupd_detail::rope_tile_inplace<QK_ROPE_HEAD_DIM, WRITE_THROUGH>(
       tile_base,
       d_cos + (long)pos * QK_ROPE_HEAD_DIM,
-      d_sin + (long)pos * QK_ROPE_HEAD_DIM);
+      d_sin + (long)pos * QK_ROPE_HEAD_DIM,
+      rope_out);
 }
 
 } // namespace kernel

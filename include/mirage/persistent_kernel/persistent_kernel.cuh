@@ -4595,27 +4595,31 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
           TaskType lt = all_tasks[fused_layer_positions[L]].task_type;
           bool is_lmhead = lt == TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300;
           // GLM's fused layer declares 27 inputs / 11 outputs, +2 inputs under
-          // EP and +1 in / +1 out when kv_b_v is un-absorbed (the packed W_UV
-          // weight and its V workspace); gpt-oss's plain variant 24 / 11 and
-          // its LM-head variant 28 / 13. The arity is detected rather than
-          // passed: each of those trailing slots is bound only by the graph
-          // that uses it, and on every fused layer if at all.
+          // EP, +1 in / +1 out when kv_b_v is un-absorbed (the packed W_UV
+          // weight and its V workspace) and +1 in / +1 out again when kv_b_k
+          // is (the W_UK weight and the nope scratch); gpt-oss's plain variant
+          // 24 / 11 and its LM-head variant 28 / 13. The arity is detected
+          // rather than passed: each of those trailing slots is bound only by
+          // the graph that uses it, and on every fused layer if at all.
           TaskDesc const &lt_td = all_tasks[fused_layer_positions[L]];
           int used_in =
               is_lmhead
                   ? 28
                   : (lt == TASK_GANG_MLA_FULL_LAYER_FUSED_MI300
-                         ? (lt_td.input_ptrs[29]   ? 30
+                         ? (lt_td.input_ptrs[30]   ? 31
+                            : lt_td.input_ptrs[29] ? 30
                             : lt_td.input_ptrs[28] ? 29
                             : lt_td.input_ptrs[27] ? 28
                                                    : 27)
                          : 24);
           int used_out =
-              is_lmhead ? 13
-                        : ((lt == TASK_GANG_MLA_FULL_LAYER_FUSED_MI300 &&
-                            lt_td.output_ptrs[11])
-                               ? 12
-                               : 11);
+              is_lmhead
+                  ? 13
+                  : (lt == TASK_GANG_MLA_FULL_LAYER_FUSED_MI300
+                         ? (lt_td.output_ptrs[12]   ? 13
+                            : lt_td.output_ptrs[11] ? 12
+                                                    : 11)
+                         : 11);
           for (int xcd = 0; xcd < NUM_XCDS_ML; xcd++) {
             int base = (xcd * ml_layers + L) * ML_N_IN;
             for (int i = 0; i < ML_N_IN; i++) {

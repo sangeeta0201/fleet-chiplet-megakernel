@@ -4042,7 +4042,7 @@ int TaskRegister::register_gang_mla_attn_fused_mi300_task(
 //               11 v_out (un-absorbed kv_b_v only)
 int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 49);
+  assert(params.size() == 52);
   // ── attention half ──
   int batch_size = params[0];
   int qkv_opw = params[1];
@@ -4103,6 +4103,15 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
   int wuv_v_head_dim = params[47];
   int wuv_tiles_per_xcd = params[48];
   bool const unabsorb_v = wuv_rows_per_wg > 0;
+  // ── un-absorbed kv_b_k ──
+  // Same trade on the Q side: q_b's per-head output narrows from
+  // kv_lora_rank + qk_rope to qk_nope + qk_rope, and Phase 3b's block-diagonal
+  // GEMV applies W_UK. qb_output_stride then addresses the nope scratch, not
+  // the query row, so the head-span assertions below have to follow.
+  int qk_nope_head_dim = params[49];
+  int wuk_rows_per_wg = params[50];
+  int wuk_tiles_per_xcd = params[51];
+  bool const unabsorb_k = wuk_rows_per_wg > 0;
   bool ep_inline = ep_world_size > 1;
   assert(!ep_tail_only || ep_inline);
 
@@ -4113,8 +4122,9 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
   // unconditionally -- both are inside the fixed task_desc arrays, and the
   // kernel discards them under `if constexpr` -- so the absorbed build passes
   // an unread pointer rather than needing a dummy tensor.
-  int num_inputs = (ep_inline ? 29 : 27) + (unabsorb_v ? 1 : 0);
-  int num_outputs = 11 + (unabsorb_v ? 1 : 0);
+  int num_inputs =
+      (ep_inline ? 29 : 27) + (unabsorb_v ? 1 : 0) + (unabsorb_k ? 1 : 0);
+  int num_outputs = 11 + (unabsorb_v ? 1 : 0) + (unabsorb_k ? 1 : 0);
   assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
   for (auto const &op : bgraph.operators) {
     assert(op->op_type == mirage::type::TB_INPUT_OP);
@@ -4147,9 +4157,15 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
   assert(input_ops[12]->dtensor.dim[2] == 1);
   int kv_cache_stride = input_ops[12]->dtensor.dim[3];
   assert(kv_cache_stride == kv_lora_rank + qk_rope_head_dim);
-  assert(qb_opw == qk_rope_head_dim && kv_cache_stride % qb_opw == 0 &&
+  // q_b's per-head output span: the query row itself when W_UK is absorbed,
+  // the [nope | rope] scratch when it is not. Everything below is stated
+  // against that span rather than against kv_cache_stride, because the two
+  // stop coinciding under un-absorption.
+  int const qb_head_span =
+      unabsorb_k ? (qk_nope_head_dim + qk_rope_head_dim) : kv_cache_stride;
+  assert(qb_opw == qk_rope_head_dim && qb_head_span % qb_opw == 0 &&
          "a head's rope slice has to be exactly one q_b workgroup");
-  assert((qb_n_wgs_per_xcd * qb_opw) % kv_cache_stride == 0 &&
+  assert((qb_n_wgs_per_xcd * qb_opw) % qb_head_span == 0 &&
          "each XCD's q_b column chunk must hold whole heads");
   assert(qb_n_wgs_per_xcd * qb_opw * 8 == qb_output_stride);
   assert(num_q_heads % 16 == 0);
@@ -4178,10 +4194,11 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
   assert(output_ops[5]->dtensor.dim[1] == qkv_reduction);
 
   // ══ the merged counter buffer ══
-  // 71 cache-line-strided int32 slots, or 106 once Phase 8b's barrier is live;
-  // see the kernel header for the map.
+  // 71 cache-line-strided int32 slots, 106 once Phase 8b's barrier is live,
+  // 114 once Phase 3b's is too; see the kernel header for the map.
   assert(input_ops[14]->dtensor.num_dims == 1);
-  assert(input_ops[14]->dtensor.dim[0] >= (unabsorb_v ? 106 : 71) * 16);
+  assert(input_ops[14]->dtensor.dim[0] >=
+         (unabsorb_k ? 114 : unabsorb_v ? 106 : 71) * 16);
 
   // ══ MoE geometry ══
   assert(input_ops[15]->dtensor.dim[1] ==
@@ -4213,6 +4230,37 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
     assert(wuv_tiles_per_xcd == 0 && wuv_v_head_dim == 0);
     assert(oproj_reduction_size == num_q_heads * kv_lora_rank &&
            "absorbed o_proj reduces over num_q_heads * kv_lora_rank");
+  }
+  // ── W_UK, un-absorbed kv_b_k only ──
+  // The mirror image of the block above: num_q_heads independent
+  // [qk_nope, kv_lora] blocks packed as one [num_q_heads * kv_lora, qk_nope]
+  // MXFP8 stack, reducing over qk_nope into the query row's latent columns.
+  if (unabsorb_k) {
+    int const wuk_in = (ep_inline ? 29 : 27) + (unabsorb_v ? 1 : 0);
+    int const qnope_out = 11 + (unabsorb_v ? 1 : 0);
+    assert(kv_lora_rank % wuk_rows_per_wg == 0 &&
+           "a head's absorbed rows must fill whole W_UK workgroups");
+    assert(input_ops[wuk_in]->dtensor.dim[1] ==
+               wuk_rows_per_wg * (qk_nope_head_dim + qk_nope_head_dim / 32) &&
+           "W_UK MXFP8 weight is not packed at qk_nope_head_dim and this row "
+           "count");
+    assert(wuk_tiles_per_xcd * wuk_rows_per_wg * 8 ==
+               num_q_heads * kv_lora_rank &&
+           "the packed W_UK weight does not cover the query row's latent "
+           "columns exactly");
+    // Phase 3b's barrier is XCD-local because the producer and the consumer
+    // land on the same heads: q_b's per-XCD chunk and W_UK's per-XCD tile run
+    // must describe the same head count.
+    assert(wuk_tiles_per_xcd / (kv_lora_rank / wuk_rows_per_wg) ==
+               (qb_n_wgs_per_xcd * qb_opw) / qb_head_span &&
+           "q_b and W_UK disagree on how many heads live on an XCD");
+    assert(output_ops[qnope_out]->dtensor.num_dims == 2);
+    assert(output_ops[qnope_out]->dtensor.dim[0] == batch_size);
+    assert(output_ops[qnope_out]->dtensor.dim[1] == num_q_heads * qb_head_span);
+    assert(qb_output_stride == num_q_heads * qb_head_span &&
+           "un-absorbed q_b writes the nope scratch, not the query row");
+  } else {
+    assert(wuk_tiles_per_xcd == 0 && qk_nope_head_dim == 0);
   }
   assert(hidden_size == qkv_reduction &&
          "o_proj's N is the next layer's qkv_a K; they are one row");
@@ -4308,7 +4356,7 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
   code.inc_indent();
   code.e("kernel::gang_mla_full_layer_fused_kernel_mi300<$, $, $, $, $, $, $, "
          "$, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, "
-         "$, $, $, $, $, $, $, $, $, $>(",
+         "$, $, $, $, $, $, $, $, $, $, $, $>(",
          batch_size,
          qkv_opw,
          qkv_reduction,
@@ -4347,7 +4395,9 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
          ep_fold_pe,
          ep_tail_only ? "true" : "false",
          wuv_rows_per_wg,
-         wuv_v_head_dim);
+         wuv_v_head_dim,
+         qk_nope_head_dim,
+         wuk_rows_per_wg);
   code.e("    task_desc->input_ptrs,");
   code.e("    task_desc->output_ptrs,");
   code.e("    runtime_config.qo_indptr_buffer,");
@@ -4375,6 +4425,7 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
   code.e("    $,", moe_w13_tiles_per_xcd);
   code.e("    $,", moe_w2_tiles_per_xcd);
   code.e("    $,", wuv_tiles_per_xcd);
+  code.e("    $,", wuk_tiles_per_xcd);
   code.e("    $,", tiles_per_xcd);
   code.e("    tile_idx,");
   // Multi-layer mode (task #14). ml_num_layers is 0 whenever the scheduler is

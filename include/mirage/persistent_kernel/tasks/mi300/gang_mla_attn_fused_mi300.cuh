@@ -76,8 +76,18 @@
 // index, which is synthesized from (xcd_id, xcd_rank) against their own
 // per-XCD width rather than the dispatch width.
 
+// A fourth barrier appears when W_UK is un-absorbed from q_b (Phase 3b), and
+// it is the only XCD-local one in either monolith. q_b's workgroups and the
+// W_UK GEMV's tiles are both head-aligned onto the same eight heads per XCD --
+// 32 workgroups of four and 64 tiles of eight, at GLM-5's 64 heads -- so the
+// producer and the consumer of the nope scratch are always on one chiplet and
+// the release never has to wait on another. Its counters live in a region of
+// their own: for XCD x, the flag at [x * 16] and the arrival counter at
+// [x * 16 + 8].
+//
 #pragma once
 #include "tasks/ampere/merge_splitkv.cuh"
+#include "tasks/mi300/gang_gemv_mxfp8_mi300.cuh"
 #include "tasks/mi300/gang_mla_decode_mi300.cuh"
 #include "tasks/mi300/gang_rmsnorm_linear_mxfp8_bias_mla_kvupd_mi300.cuh"
 
@@ -118,7 +128,14 @@ template <int BATCH_SIZE,
           // x_ptr is then the previous layer's symmetric gather buffer,
           // EP_PEER_SLOTS bf16 planes of [batch, QKV_REDUCTION_SIZE], and
           // moe_ws_f32_ptr goes unread. See _rnlm8_resadd_norm_rcp.
-          int EP_PEER_SLOTS = 0>
+          int EP_PEER_SLOTS = 0,
+          // ── un-absorbed W_UK ──
+          // Both > 0 turn on Phase 3b: q_b emits qk_nope + qk_rope per head
+          // instead of kv_lora + qk_rope, and a block-diagonal GEMV applies
+          // W_UK afterwards. 0 keeps the absorbed q_b, which is what the
+          // dense prologue layers and the standalone dispatch use.
+          int QK_NOPE_HEAD_DIM = 0,
+          int WUK_ROWS_PER_WG = 0>
 __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     // ── inputs ──
     void const *x_ptr,               // [0]  residual stream
@@ -170,7 +187,13 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     // gang_mla_full_layer_fused_mi300.cuh.
     int qkv_expected_in = -1,
     int qb_expected_in = -1,
-    int decode_expected_in = -1) {
+    int decode_expected_in = -1,
+    // ── un-absorbed W_UK, Phase 3b; all unused when QK_NOPE_HEAD_DIM == 0 ──
+    void const *wuk_weight_ptr = nullptr, // packed MXFP8, this XCD's slice
+    void *q_nope_ptr = nullptr,           // [batch, H * (nope + rope)] scratch
+    int wuk_tiles_per_xcd = 0,
+    int wuk_expected_in = 0,
+    void *wuk_counters_ptr = nullptr) {
 
   int const tid = threadIdx.x;
   int const xcd_id = tile_idx / tiles_per_xcd;
@@ -186,6 +209,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   int *qb_barrier = qkv_barrier + 10 * HIER_STRIDE;
   int *decode_barrier = qkv_barrier + 20 * HIER_STRIDE;
   int const arrivals = tiles_per_xcd * 8;
+  constexpr bool UNABSORB_K = QK_NOPE_HEAD_DIM > 0 && WUK_ROWS_PER_WG > 0;
+  // Only dereferenced under UNABSORB_K; the caller owns the region and the
+  // standalone dispatch does not allocate one.
+  int *wuk_barrier = static_cast<int *>(wuk_counters_ptr);
 
   // Release values are read once, up front, before anything in this layer has
   // run -- the same argument as the MoE task's s_expected block. Reading a
@@ -210,7 +237,8 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   // Slot 4 is ATTN: [0]=qkv_a [1]=qkv barrier [2]=q_b+kvupd [3]=q_b barrier
-  // [4]=MLA decode [5]=decode barrier [6]=merge.
+  // [4]=MLA decode [5]=decode barrier [6]=merge [7]=W_UK + its XCD-local
+  // barrier, un-absorbed only.
   unsigned long long _sp_t0 = __builtin_amdgcn_s_memrealtime();
 #endif
 
@@ -355,8 +383,12 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // the GEMM tiles are shifted up by one inside the kernel. Handing it
   // xcd_rank reproduces the standalone dispatch exactly.
   for (int t = xcd_rank; t < qb_tiles_per_xcd; t += tiles_per_xcd) {
+    // Un-absorbed, the GEMM's output row is the nope scratch instead of the
+    // query row; the rope workgroup crosses back into the query row itself,
+    // which is why that one is handed over whole and un-biased.
     unsigned short *xcd_q_ws =
-        static_cast<unsigned short *>(q_workspace_ptr) +
+        static_cast<unsigned short *>(UNABSORB_K ? q_nope_ptr
+                                                 : q_workspace_ptr) +
         static_cast<size_t>(xcd_id) * qb_n_wgs_per_xcd * QB_OUTPUT_PER_WG;
     gang_rmsnorm_linear_mxfp8_bias_mla_kvupd_kernel<BATCH_SIZE,
                                                     QB_OUTPUT_PER_WG,
@@ -369,7 +401,8 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
                                                     MAX_SEQ_LEN,
                                                     PAGE_SIZE,
                                                     KV_INPUT_OFFSET,
-                                                    /*WRITE_THROUGH=*/true>(
+                                                    /*WRITE_THROUGH=*/true,
+                                                    QK_NOPE_HEAD_DIM>(
         qkv_a_out_ptr,
         q_a_norm_weight_ptr,
         q_a_norm_scratch_ptr,
@@ -390,7 +423,104 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         qb_n_wgs_per_xcd,
         qb_output_stride,
         t,
-        kv_eps);
+        kv_eps,
+        /*q_rope_out_ptr=*/q_workspace_ptr);
+  }
+
+  // ══════════════════════════════════════════════════════════════════════
+  // Phase 3b: W_UK, un-absorbed -- q_nope[h] * W_UK[h] -> the query row
+  // ══════════════════════════════════════════════════════════════════════
+  // Block-diagonal GEMV, KV_LORA_RANK rows per head over a QK_NOPE_HEAD_DIM
+  // reduction, exactly the shape the W_UV side runs before o_proj. The
+  // barrier ahead of it is XCD-local: see the header note.
+  if constexpr (UNABSORB_K) {
+    static_assert(KV_LORA_RANK % WUK_ROWS_PER_WG == 0,
+                  "a head's absorbed rows must fill whole GEMV tiles");
+    constexpr int TILES_PER_HEAD = KV_LORA_RANK / WUK_ROWS_PER_WG;
+    constexpr int QK_DIM_ = KV_LORA_RANK + QK_ROPE_HEAD_DIM;
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+    // Close [2] here so it stays "q_b" and [7] is "W_UK + its barrier". Phase
+    // 4 still adds to [2] below; with this path on, what it adds is the
+    // handful of instructions between the end of this block and its own
+    // __syncthreads.
+    {
+      unsigned long long _t = __builtin_amdgcn_s_memrealtime();
+      if (tid == 0 && g_subphase_active) {
+        atomicAdd(&g_subphase_ns[4][2], (_t - _sp_t0) * 10);
+      }
+      _sp_t0 = _t;
+    }
+#endif
+
+    __syncthreads();
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    if (tid == 0) {
+      int *const _cnt = &wuk_barrier[xcd_id * HIER_STRIDE + 8];
+      int *const _flag = &wuk_barrier[xcd_id * HIER_STRIDE];
+      int prev = atom_add_release_gpu_s32(_cnt, 1);
+      if ((prev % tiles_per_xcd) == tiles_per_xcd - 1) {
+        st_wt_u32((void *)_flag, (unsigned)wuk_expected_in);
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      }
+      // Self-heal, see MPK_FL_REPUBLISH_SPINS. The predicate is the whole
+      // release condition here, not half of it: this barrier publishes one
+      // flag and protects one XCD's writes, so its own counter reaching
+      // tiles_per_xcd * expected is exactly what the flag stands for.
+      MPK_WS_WAIT_BEGIN(768, wuk_expected_in);
+      int _spins = 0;
+      int _obs;
+      while ((_obs = ld_nt_s32(_flag)) < wuk_expected_in) {
+        ++_spins;
+        MPK_WS_WAIT_TICK(_obs, _spins);
+        if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
+          if (ld_nt_s32(_cnt) >= tiles_per_xcd * wuk_expected_in) {
+            st_wt_u32((void *)_flag, (unsigned)wuk_expected_in);
+            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          }
+        }
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+    __syncthreads();
+    asm volatile("buffer_inv" ::: "memory");
+
+    // The weight is dim-0 partitioned per XCD, so `wuk_weight_ptr` is already
+    // this XCD's slice and the GEMV gets the *local* tile index against
+    // wuk_tiles_per_xcd. Only the head lookup needs the global index, and the
+    // output column is biased into the pointer -- the same shape as Phase 8b
+    // on the W_UV side, except that the query row's per-head span (QK_DIM) is
+    // wider than the rows a head writes (KV_LORA_RANK), so the bias carries a
+    // per-head skip as well.
+    for (int t = xcd_rank; t < wuk_tiles_per_xcd; t += tiles_per_xcd) {
+      int const heads_per_xcd = wuk_tiles_per_xcd / TILES_PER_HEAD;
+      int const head = xcd_id * heads_per_xcd + t / TILES_PER_HEAD;
+      unsigned short const *head_in =
+          static_cast<unsigned short const *>(q_nope_ptr) +
+          static_cast<size_t>(head) *
+              (QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM);
+      // out[t] wants head * QK_DIM + (t % TPH) * ROWS, and the kernel adds
+      // t * ROWS, so the difference is the base -- monotonic in t, never
+      // stepping below q_workspace_ptr.
+      unsigned short *tile_out =
+          static_cast<unsigned short *>(q_workspace_ptr) +
+          static_cast<size_t>(xcd_id) * heads_per_xcd * QK_DIM_ +
+          static_cast<size_t>(t / TILES_PER_HEAD) * QK_ROPE_HEAD_DIM;
+      gang_gemv_mxfp8_kernel<BATCH_SIZE, QK_NOPE_HEAD_DIM, WUK_ROWS_PER_WG,
+                             /*HAS_RESIDUAL=*/false, /*WRITE_THROUGH=*/true>(
+          head_in, wuk_weight_ptr, /*residual=*/nullptr, tile_out,
+          num_active_tokens, WUK_ROWS_PER_WG, qb_output_stride,
+          /*m_tiles=*/1, wuk_tiles_per_xcd, /*wgm=*/0, t);
+    }
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+    {
+      unsigned long long _t = __builtin_amdgcn_s_memrealtime();
+      if (tid == 0 && g_subphase_active) {
+        atomicAdd(&g_subphase_ns[4][7], (_t - _sp_t0) * 10);
+      }
+      _sp_t0 = _t;
+    }
+#endif
   }
 
   MPK_WS_PHASE(24, qkv_expected, xcd_id);

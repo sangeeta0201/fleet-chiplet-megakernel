@@ -2024,6 +2024,23 @@ class PersistentKernel:
         v_out: DTensor = None,
         wuv_rows_per_wg: int = 0,
         wuv_v_head_dim: int = 0,
+        # -- un-absorbed kv_b_k --
+        # The Q-side mirror. Passing wuk_mxfp8_weight moves W_UK back out of
+        # q_b: q_b's per-head output narrows from kv_lora_rank + qk_rope to
+        # qk_nope_head_dim + qk_rope and lands in q_nope, then a
+        # block-diagonal GEMV
+        #   q[h * qk_dim + c] = sum_j q_nope[h * (nope + rope) + j] * W_UK[h][j][c]
+        # writes the query row's latent columns. q_b's rope workgroup still
+        # rotates straight into the query row, so q_nope's own rope columns
+        # are written and never read. 77.9 MB -> 34.6 + 6.5 per layer.
+        #
+        # The weight is packed [num_q_heads * kv_lora_rank, qk_nope_head_dim]
+        # at wuk_rows_per_wg, and q_workspace stays the 576-wide query row --
+        # it is q_nope that q_b's output stride now describes.
+        wuk_mxfp8_weight: DTensor = None,
+        q_nope: DTensor = None,
+        wuk_rows_per_wg: int = 0,
+        qk_nope_head_dim: int = 0,
         # -- expert parallelism --
         # Symmetric-heap tensors (io_category="nvshmem_tensor"). Passing them
         # turns on the head-of-layer fold: this rank's f32 MoE partial plus
@@ -2148,18 +2165,26 @@ class PersistentKernel:
         assert qb_reduction_size % 512 == 0, qb_reduction_size
         assert qb_actual_hidden_dim <= qb_reduction_size <= qkv_output_stride
         assert kv_offset + qk_dim <= qkv_output_stride
+        # q_b's per-head output span, and the row it writes: the query row
+        # itself when W_UK is absorbed, the [nope | rope] scratch when it is
+        # not. Everything about q_b's shape is stated against these two rather
+        # than against qk_dim / q_workspace, since the pairs stop coinciding.
+        unabsorb_k = wuk_mxfp8_weight is not None
+        qb_head_span = (qk_nope_head_dim + qk_rope_head_dim) if unabsorb_k \
+            else qk_dim
+        qb_out_tensor = q_nope if unabsorb_k else q_workspace
         assert qb_output_per_wg == qk_rope_head_dim and \
-            qk_dim % qb_output_per_wg == 0, (
+            qb_head_span % qb_output_per_wg == 0, (
                 "output_per_wg must equal qk_rope_head_dim and divide the head")
         qb_n_wgs = qb_mxfp8_weight.dim(0)
         assert qb_n_wgs % 8 == 0
         qb_n_wgs_per_xcd = qb_n_wgs // 8
-        qb_output_stride = q_workspace.dim(1)
+        qb_output_stride = qb_out_tensor.dim(1)
         assert qb_n_wgs * qb_output_per_wg == qb_output_stride
         assert qb_mxfp8_weight.dim(1) == qb_output_per_wg * (
             qb_reduction_size + qb_reduction_size // 32)
         assert qb_bias.dim(1) == qb_output_stride
-        assert (qb_n_wgs_per_xcd * qb_output_per_wg) % qk_dim == 0, (
+        assert (qb_n_wgs_per_xcd * qb_output_per_wg) % qb_head_span == 0, (
             "per-XCD chunk must hold whole heads")
 
         assert num_q_heads % 16 == 0
@@ -2167,7 +2192,7 @@ class PersistentKernel:
         q_workspace_stride = num_q_heads * qk_dim
         q_workspace_slots = q_workspace_slots or num_q_heads
         assert q_workspace_slots <= num_q_heads
-        assert qb_output_stride == q_workspace_slots * qk_dim
+        assert qb_output_stride == q_workspace_slots * qb_head_span
         mla_total_work_items = (
             self.max_num_batched_requests * num_q_groups * num_kv_chunks)
         import math
@@ -2226,6 +2251,35 @@ class PersistentKernel:
                 f"absorbed o_proj reduces over num_q_heads * kv_lora_rank = "
                 f"{num_q_heads * kv_lora_rank}, got {oproj_reduction_size}")
             wuv_tiles_per_xcd = 0
+        if unabsorb_k:
+            assert q_nope is not None and wuk_rows_per_wg > 0 \
+                and qk_nope_head_dim > 0, \
+                "un-absorbing kv_b_k needs q_nope, wuk_rows_per_wg and " \
+                "qk_nope_head_dim as well as the weight"
+            assert q_workspace.dim(1) == num_q_heads * qk_dim, (
+                "un-absorbed, q_b writes q_nope and Phase 3b writes the whole "
+                "query row, so q_workspace cannot be a slot subset")
+            assert q_nope.num_dims == 2
+            assert (q_nope.dim(0), q_nope.dim(1)) == (
+                batch_size, num_q_heads * qb_head_span)
+            assert kv_lora_rank % wuk_rows_per_wg == 0
+            wuk_n_wgs = wuk_mxfp8_weight.dim(0)
+            assert wuk_n_wgs % 8 == 0
+            wuk_tiles_per_xcd = wuk_n_wgs // 8
+            assert wuk_n_wgs * wuk_rows_per_wg == num_q_heads * kv_lora_rank, (
+                f"packed W_UK covers {wuk_n_wgs * wuk_rows_per_wg} rows, the "
+                f"query row's latent columns are {num_q_heads * kv_lora_rank}")
+            assert wuk_mxfp8_weight.dim(1) == wuk_rows_per_wg * (
+                qk_nope_head_dim + qk_nope_head_dim // 32)
+            # Phase 3b's barrier is XCD-local, which is only legal because the
+            # producer and the consumer sit on the same heads.
+            assert wuk_tiles_per_xcd // (kv_lora_rank // wuk_rows_per_wg) == \
+                (qb_n_wgs_per_xcd * qb_output_per_wg) // qb_head_span, \
+                "q_b and W_UK disagree on how many heads live on an XCD"
+        else:
+            assert q_nope is None and wuk_rows_per_wg == 0 \
+                and qk_nope_head_dim == 0
+            wuk_tiles_per_xcd = 0
         hidden_size = hidden.dim(1)
         assert n_wgs * oproj_rows_per_wg == hidden_size, (
             f"packed weight covers {n_wgs * oproj_rows_per_wg} columns, "
@@ -2312,7 +2366,7 @@ class PersistentKernel:
                                 batch_size * qb_n_wgs_per_xcd + 1,
                                 mla_tiles_per_xcd, merge_tiles_per_xcd,
                                 oproj_topk_tiles_per_xcd,
-                                wuv_tiles_per_xcd,
+                                wuv_tiles_per_xcd, wuk_tiles_per_xcd,
                                 moe_w13_tiles_per_xcd, moe_w2_tiles_per_xcd),
                             self.num_workers // 8)
         total_barrier_arrivals = min(oproj_topk_tiles_per_xcd,
@@ -2331,6 +2385,10 @@ class PersistentKernel:
         counter_slots = (96 if ep_inline else 80)
         if unabsorb_v:
             counter_slots = 106
+        # Phase 3b's XCD-local barrier adds [106 .. 113]; it sits past W_UV's
+        # region whether or not that one is live, so the map never renumbers.
+        if unabsorb_k:
+            counter_slots = 114
         assert counters.dim(0) >= counter_slots * 16, (
             f"the fused layer needs {counter_slots * 16} int32 of counters, "
             f"got {counters.dim(0)}")
@@ -2363,8 +2421,10 @@ class PersistentKernel:
             1 if ep_tail_only else 0,
             # un-absorbed kv_b_v (3)
             wuv_rows_per_wg, wuv_v_head_dim, wuv_tiles_per_xcd,
+            # un-absorbed kv_b_k (3)
+            qk_nope_head_dim, wuk_rows_per_wg, wuk_tiles_per_xcd,
         ]
-        assert len(params) == 49
+        assert len(params) == 52
 
         grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
@@ -2403,6 +2463,11 @@ class PersistentKernel:
         if unabsorb_v:
             # Last input, so that the EP pair keeps 27/28 either way.
             tb_graph.new_input(wuv_mxfp8_weight, (0, -1, -1), 1, True)
+        if unabsorb_k:
+            # And after that one, in a fixed W_UV-then-W_UK order so either
+            # can be on alone. Dim-0 partitioned like every other GEMV weight:
+            # the kernel gets this XCD's slice and indexes it locally.
+            tb_graph.new_input(wuk_mxfp8_weight, (0, -1, -1), 1, True)
         tb_graph.new_input(qkv_a_out, (-1, -1, -1), -1, True)
         tb_graph.new_input(q_workspace, (-1, -1, -1), -1, True)
         tb_graph.new_input(lse, (-1, -1, -1), -1, True)
@@ -2416,6 +2481,8 @@ class PersistentKernel:
         tb_graph.new_input(moe_workspace_f32, (-1, -1, -1), -1, True)
         if unabsorb_v:
             tb_graph.new_input(v_out, (-1, -1, -1), -1, True)   # output [11]
+        if unabsorb_k:
+            tb_graph.new_input(q_nope, (-1, -1, -1), -1, True)  # output [12]
         self.kn_graph.customized(
             [x, pre_norm_weight, pre_norm_scratch, qkv_mxfp8_weight, qkv_bias,
              q_a_norm_weight, q_a_norm_scratch, qb_mxfp8_weight, qb_bias,
@@ -2427,10 +2494,12 @@ class PersistentKernel:
              moe_swiglu_out]
             + ([ep_gather, ep_signal] if ep_inline else [])
             + ([wuv_mxfp8_weight] if unabsorb_v else [])
+            + ([wuk_mxfp8_weight] if unabsorb_k else [])
             + [qkv_a_out, q_workspace, lse, o_acc, attn_out, x_out,
              hidden, topk_weight, routing_indices, active_expert_ids,
              moe_workspace_f32]
-            + ([v_out] if unabsorb_v else []),
+            + ([v_out] if unabsorb_v else [])
+            + ([q_nope] if unabsorb_k else []),
             tb_graph,
         )
         self.kn_graph.register_task(

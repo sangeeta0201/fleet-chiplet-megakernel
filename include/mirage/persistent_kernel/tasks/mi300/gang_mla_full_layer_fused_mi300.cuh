@@ -185,7 +185,11 @@ static constexpr int FULL_LAYER_MLA_EP_FOLD_DONE_SLOT = 88;
 // flags at [96 .. 103], arrival counter at [104]. Past the EP slots rather
 // than inside the MoE half's [40 .. 69] region, which 0/10/20 already fill.
 static constexpr int FULL_LAYER_MLA_WUV_SLOT = 96;
-static constexpr int FULL_LAYER_COUNTER_SLOTS = 106;
+// Phase 3b's q_b -> W_UK barrier, un-absorbed kv_b_k only. XCD-local, so it
+// has no global counter: XCD x owns the flag at [106 + x] and the arrival
+// counter eight ints into that same stride.
+static constexpr int FULL_LAYER_MLA_WUK_SLOT = 106;
+static constexpr int FULL_LAYER_COUNTER_SLOTS = 114;
 
 // Self-heal gate for the Mechanism-C flag polls.
 //
@@ -289,7 +293,15 @@ template <
     // GLM-5 on 8 ranks the absorbed o_proj is 60% of the token's bytes.
     // Adds input [29] (EP) / [27] (no EP) and output [11].
     int WUV_ROWS_PER_WG = 0,
-    int WUV_V_HEAD_DIM = 0>
+    int WUV_V_HEAD_DIM = 0,
+    // ── un-absorbed kv_b_k ────────────────────────────────────────────────
+    // The q side of the same trade. 0 keeps W_UK folded into q_b, whose
+    // output is then KV_LORA_RANK + QK_ROPE_HEAD_DIM per head; non-zero
+    // narrows it to QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM and adds Phase 3b.
+    // 77.9 MB a layer becomes 34.6 plus 6.5 for the W_UK stack.
+    // Adds input [30] (EP) / [28] (no EP) and output [12].
+    int QK_NOPE_HEAD_DIM = 0,
+    int WUK_ROWS_PER_WG = 0>
 __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     // Pointer arrays are passed whole rather than unpacked into 38 named
     // parameters, which is what gpt-oss's full-layer task does and for the
@@ -327,6 +339,8 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     int moe_w2_tiles_per_xcd,
     // Phase 8b's tile count, per XCD. 0 whenever WUV_ROWS_PER_WG is 0.
     int wuv_tiles_per_xcd,
+    // Phase 3b's, likewise 0 whenever WUK_ROWS_PER_WG is 0.
+    int wuk_tiles_per_xcd,
     // ── shared parameters ──
     int tiles_per_xcd,
     int tile_idx,
@@ -366,11 +380,20 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
   // EP pair so that turning EP on or off renumbers nothing: the input list is
   // 0..26 always, 27/28 under EP, and this last.
   constexpr int FL_WUV_WEIGHT_IN = (EP_WORLD_SIZE > 1) ? 29 : 27;
+  // W_UK's, appended after it in a fixed order (W_UV then W_UK) and closing
+  // the gap when W_UV is absorbed, so either can be on alone.
+  constexpr int FL_WUK_WEIGHT_IN =
+      FL_WUV_WEIGHT_IN + ((WUV_ROWS_PER_WG > 0) ? 1 : 0);
+  constexpr int FL_QNOPE_OUT = (WUV_ROWS_PER_WG > 0) ? 12 : 11;
   // Phase 8b's W_UV -> o_proj barrier. The MoE half's own [30 .. 38] would
   // land on top of the router counter here, so it gets its own base past the
   // EP slots and is handed down explicitly.
   int *const wuv_counters =
       counters + FULL_LAYER_MLA_WUV_SLOT * HIER_STRIDE;
+  // Phase 3b's q_b -> W_UK barrier, XCD-local: per XCD a flag at [x * 16] and
+  // an arrival counter at [x * 16 + 8], eight slots in all.
+  int *const wuk_counters =
+      counters + FULL_LAYER_MLA_WUK_SLOT * HIER_STRIDE;
 
   // Multi-layer mode: the scheduler is running every layer inside one task,
   // so the per-layer event boundary the snapshot below depends on is gone.
@@ -916,11 +939,11 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
   // L + 1. Deriving that from the layer index instead of from a load means
   // every worker on every XCD agrees with no ordering requirement at all,
   // which is strictly stronger than the snapshot it replaces.
-  __shared__ int s_exp[8];
+  __shared__ int s_exp[9];
   if (tid == 0) {
     if (ml_mode) {
 #pragma unroll
-      for (int i = 0; i < 8; i++) {
+      for (int i = 0; i < 9; i++) {
         s_exp[i] = task_layer_idx + 1;
       }
     } else {
@@ -938,6 +961,9 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       // 96 slots and [96 + xcd_id] is off the end.
       s_exp[7] = (WUV_ROWS_PER_WG > 0)
                      ? ld_nt_s32(&wuv_counters[xcd_id * HIER_STRIDE]) + 1
+                     : 0;
+      s_exp[8] = (WUK_ROWS_PER_WG > 0)
+                     ? ld_nt_s32(&wuk_counters[xcd_id * HIER_STRIDE]) + 1
                      : 0;
     }
   }
@@ -970,7 +996,9 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
                                    Q_WORKSPACE_STRIDE,
                                    MERGE_DIM_SPLITS,
                                    MERGE_WRITE_THROUGH,
-                                   /*EP_PEER_SLOTS=*/EP_WORLD_SIZE>(
+                                   /*EP_PEER_SLOTS=*/EP_WORLD_SIZE,
+                                   QK_NOPE_HEAD_DIM,
+                                   WUK_ROWS_PER_WG>(
       // Under EP the residual stream this prologue resolves is the symmetric
       // gather buffer the EP block above just folded into -- EP_WORLD_SIZE
       // bf16 slots holding the PREVIOUS layer's per-rank partials -- and the
@@ -1022,7 +1050,12 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       tile_idx,
       /*qkv_expected_in=*/s_exp[0],
       /*qb_expected_in=*/s_exp[1],
-      /*decode_expected_in=*/s_exp[2]);
+      /*decode_expected_in=*/s_exp[2],
+      /*wuk_weight=*/input_ptrs[FL_WUK_WEIGHT_IN],
+      /*q_nope=*/output_ptrs[FL_QNOPE_OUT],
+      wuk_tiles_per_xcd,
+      /*wuk_expected_in=*/s_exp[8],
+      /*wuk_counters=*/wuk_counters);
 
   MPK_WS_PHASE(60, task_layer_idx, xcd_id);
   // ══════════════════════════════════════════════════════════════════════

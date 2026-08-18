@@ -858,6 +858,41 @@ if __name__ == "__main__":
         assert (num_heads_pad * qk_dim) % (8 * qk_rope) == 0
         assert ((num_heads_pad * qk_dim) // (8 * qk_rope) * qk_rope) % qk_dim == 0
 
+        # ── un-absorbing W_UK from q_b, the Q-side mirror of W_UV ────────
+        # Absorption widens q_b's per-head output from qk_nope + qk_rope to
+        # kv_lora + qk_rope -- 256 to 576 on GLM-5 -- so [H*576, q_lora_pad] is
+        # 77.9 MB of MXFP8 a layer against 34.6 for the plain weight plus 6.5
+        # for the W_UK stack. Exact for the same reason the V side is: MLA's
+        # QK product is linear in the cached latent.
+        #
+        # Only the whole-layer fused task has a Phase 3b to apply it in, so the
+        # dense prologue layers keep the absorbed q_b. num_heads must be
+        # unpadded and 8-aligned: q_b's per-XCD column chunk and W_UK's per-XCD
+        # tile run have to land on the same eight heads, which is what lets
+        # Phase 3b's barrier stay XCD-local.
+        UNABSORB_K = (int(os.environ.get("GLM_UNABSORB_QB", "1")) == 1
+                      and QB_MXFP8
+                      and qk_nope < kv_lora
+                      and num_heads == num_heads_pad
+                      and num_heads % 8 == 0
+                      and (num_heads * (qk_nope + qk_rope)) % GANG_OUT_ALIGN == 0)
+        # Same lane arithmetic as W_UV: 256/ROWS lanes per row at 16 fp8 each,
+        # so qk_nope % (256/ROWS * 16) == 0. At qk_nope = 192 that allows 64
+        # (4 lanes, 64 elements a lane) and 128 (2 lanes, 32); 64 gives 512
+        # tiles, 64 per XCD, eight per head.
+        # 128 measured better than 64: 512 tiles -> 256, so each XCD's 29
+        # workers make 2 grid-stride rounds instead of 3, and the GEMV inner
+        # loop unrolls 2x. Worth 4.3 s of aggregate worker time in SP4[7].
+        WUK_GEMV_ROWS = int(os.environ.get("GLM_WUK_GEMV_ROWS", "128"))
+        # q_b's output row when W_UK is left out of it: the [nope | rope]
+        # scratch Phase 3b reduces over, not the query row.
+        qb_nope_span = qk_nope + qk_rope
+        qb_nope_width = num_heads * qb_nope_span
+        if UNABSORB_K:
+            assert kv_lora % WUK_GEMV_ROWS == 0
+            assert qk_nope % ((256 // WUK_GEMV_ROWS) * 16) == 0
+            assert (qb_nope_width // 8) % qb_nope_span == 0
+
         assert (2 * dense_inter) % GANG_OUT_ALIGN == 0
         assert dense_inter % GANG_RED_ALIGN == 0
 
@@ -1187,6 +1222,13 @@ if __name__ == "__main__":
         # num_heads_pad * kv_lora.
         mla_v_out = (make_tensor("mla_v_out", (bs, o_proj_red_unabsorbed))
                      if UNABSORB_V else None)
+        # Phase 3's output and Phase 3b's input when W_UK is un-absorbed: the
+        # per-head [nope | rope] row. The rope columns are written (that is
+        # where the GEMM puts them) and never read -- the rotation lands in
+        # the query row instead -- but they keep the head span a whole number
+        # of q_b workgroups, which is what makes the rope slice one workgroup.
+        mla_q_nope = (make_tensor("mla_q_nope", (bs, qb_nope_width))
+                      if UNABSORB_K else None)
         attn_proj_out = make_tensor("attn_proj_out", (bs, hidden_size))
         # Split-K accumulator for the absorbed o_proj. Absorption widens that
         # GEMM's reduction to num_heads_pad * kv_lora (16384 on Flash) while
@@ -1270,9 +1312,12 @@ if __name__ == "__main__":
         # Must match FULL_LAYER_COUNTER_SLOTS in
         # gang_mla_full_layer_fused_mi300.cuh.
         # Un-absorbed kv_b_v adds Phase 8b's barrier: per-XCD release flags at
-        # [96..103] and the arrival counter at [104].
+        # [96..103] and the arrival counter at [104]. Un-absorbed kv_b_k adds
+        # Phase 3b's, which is XCD-local: for XCD x the flag at [106 + x] and
+        # its arrival counter eight lines further on, i.e. [106..113].
         full_layer_counter = make_tensor(
-            "full_layer_counter", ((106 if UNABSORB_V else 96) * 16,),
+            "full_layer_counter",
+            ((114 if UNABSORB_K else 106 if UNABSORB_V else 96) * 16,),
             torch_dtype=torch.int32)
         # ── the EP exchange buffers ──────────────────────────────────────
         # One gather buffer PER FUSED LAYER, plus one for the tail. The fold
@@ -1435,26 +1480,6 @@ if __name__ == "__main__":
                 attn.kv_a_layernorm.weight.data.contiguous(),
                 f"layer_{i}_kv_a_layernorm")
 
-            q_b_absorbed = absorb_q_b(
-                attn.q_b_proj.weight.data, attn._w_uk,
-                num_heads, qk_nope, qk_rope, q_lora).to(torch.bfloat16)
-            # q_b only wants the q_a half of the fused [q_a | latent] row, so
-            # it reduces over q_lora_pad rather than the full qkv_a_pad. Both
-            # are legal reductions (256-aligned) and the q_a half leads the
-            # row, but stopping at q_lora_pad halves the widest weight in the
-            # model -- [num_heads_pad * qk_dim, qkv_a_pad] is 75.5 MB/layer on
-            # Flash, and every column past q_lora_pad is zero.
-            q_b_absorbed = pad_cols(q_b_absorbed, q_lora_pad)
-            q_b_absorbed = pad_rows(q_b_absorbed, qb_out_width)
-            if QB_MXFP8:
-                # OPW is pinned to qk_rope_head_dim so a head's rope slice is
-                # exactly one workgroup. At qb_head_slots = 24 that is
-                # 13824/64/8 = 27 tiles per XCD plus the latent tile, one
-                # dispatch round on 30 workers; see qb_head_slots above.
-                q_b_absorbed = pack_dense_mxfp8(q_b_absorbed, qk_rope)
-            w_q_b = _attach_input_keep(q_b_absorbed,
-                                       f"layer_{i}_q_b_absorbed")
-
             # The whole attention half in one gang task. Needs both GEMMs
             # on the MXFP8 path -- the fused kernel only wraps those bodies --
             # and a real merge phase, which one KV chunk does not have.
@@ -1471,6 +1496,49 @@ if __name__ == "__main__":
                                and FUSE_MOE_SWIGLU and FUSE_MOE_MULSUMADD)
             if fuse_full_layer:
                 fuse_attn = True
+
+            # ── q_b, absorbed or not ─────────────────────────────────────
+            # Only the whole-layer fused task has a Phase 3b to apply W_UK in,
+            # so the dense prologue layers keep the absorbed weight. q_b only
+            # wants the q_a half of the fused [q_a | latent] row either way, so
+            # it reduces over q_lora_pad rather than the full qkv_a_pad: both
+            # are legal reductions (256-aligned) and the q_a half leads the
+            # row, but stopping at q_lora_pad halves the widest weight in the
+            # model -- [num_heads_pad * qk_dim, qkv_a_pad] is 75.5 MB/layer on
+            # Flash, and every column past q_lora_pad is zero.
+            unabsorb_k_this = UNABSORB_K and fuse_full_layer
+            if unabsorb_k_this:
+                # The checkpoint's own q_b, [H * (nope + rope), q_lora]; no
+                # row padding, because UNABSORB_K already requires the head
+                # count to be unpadded.
+                q_b_w = attn.q_b_proj.weight.data.to(torch.bfloat16)
+                assert q_b_w.shape[0] == qb_nope_width, (
+                    q_b_w.shape, qb_nope_width)
+                q_b_w = pad_cols(q_b_w, q_lora_pad)
+                # W_UK is [H, qk_nope, kv_lora]: for head h,
+                #   q[h][c] = sum_j q_nope[h][j] * W_UK[h][j][c]
+                # so the GEMV's [rows, reduction] is that transposed, with the
+                # head axis flattened into the rows.
+                w_uk_rows = attn._w_uk.transpose(1, 2).reshape(
+                    num_heads * kv_lora, qk_nope).to(torch.bfloat16
+                                                     ).contiguous()
+                w_wuk = _attach_input_keep(
+                    pack_dense_mxfp8(w_uk_rows, WUK_GEMV_ROWS),
+                    f"layer_{i}_w_uk")
+            else:
+                q_b_w = absorb_q_b(
+                    attn.q_b_proj.weight.data, attn._w_uk,
+                    num_heads, qk_nope, qk_rope, q_lora).to(torch.bfloat16)
+                q_b_w = pad_cols(q_b_w, q_lora_pad)
+                q_b_w = pad_rows(q_b_w, qb_out_width)
+                w_wuk = None
+            if QB_MXFP8:
+                # OPW is pinned to qk_rope_head_dim so a head's rope slice is
+                # exactly one workgroup. At qb_head_slots = 24 that is
+                # 13824/64/8 = 27 tiles per XCD plus the latent tile, one
+                # dispatch round on 30 workers; see qb_head_slots above.
+                q_b_w = pack_dense_mxfp8(q_b_w, qk_rope)
+            w_q_b = _attach_input_keep(q_b_w, f"layer_{i}_q_b_absorbed")
 
             # ── o_proj, absorbed or not ──────────────────────────────────
             # Only the whole-layer fused task has a Phase 8b to apply W_UV in,
@@ -1909,7 +1977,8 @@ if __name__ == "__main__":
                     q_a_norm_weight=w_q_a_norm,
                     q_a_norm_scratch=q_a_norm_out,
                     qb_mxfp8_weight=w_q_b,
-                    qb_bias=zero_bias(qb_out_width),
+                    qb_bias=zero_bias(
+                        qb_nope_width if unabsorb_k_this else qb_out_width),
                     kv_norm_weight=w_kv_a_norm,
                     cos_pos_embed=cos_pos_embed,
                     sin_pos_embed=sin_pos_embed,
@@ -1946,7 +2015,11 @@ if __name__ == "__main__":
                     kv_offset=q_lora_pad,
                     mla_params=(num_heads_pad, kv_lora, qk_rope, qk_head_dim,
                                 num_kv_chunks),
-                    q_workspace_slots=qb_head_slots,
+                    # Un-absorbed, q_b's output row is q_nope and Phase 3b
+                    # writes the whole query row, so there is no slot subset
+                    # to take -- the "slots" here are q_nope's, all of them.
+                    q_workspace_slots=(num_heads if unabsorb_k_this
+                                       else qb_head_slots),
                     merge_dim_splits=MLA_MERGE_DIM_SPLITS,
                     oproj_rows_per_wg=oproj_tile_n,
                     oproj_reduction_size=layer_o_proj_red,
@@ -1954,6 +2027,10 @@ if __name__ == "__main__":
                     v_out=mla_v_out if unabsorb_this else None,
                     wuv_rows_per_wg=WUV_GEMV_ROWS if unabsorb_this else 0,
                     wuv_v_head_dim=v_head if unabsorb_this else 0,
+                    wuk_mxfp8_weight=w_wuk,
+                    q_nope=mla_q_nope if unabsorb_k_this else None,
+                    wuk_rows_per_wg=WUK_GEMV_ROWS if unabsorb_k_this else 0,
+                    qk_nope_head_dim=qk_nope if unabsorb_k_this else 0,
                     actual_hidden_dim=hidden_size,
                     num_experts_per_tok=topk,
                     routed_scaling_factor=config.routed_scaling_factor,

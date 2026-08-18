@@ -209,10 +209,17 @@ __device__ __attribute__((noinline)) void
 // Only the ROPE_HALF pairing crosses lanes, and it stays inside the tile, so
 // the read set is captured in registers and one barrier separates it from the
 // write set -- (2j, 2j+1) read, (j, j + ROPE_HALF) written.
+//
+// `out` lands the rotated tile somewhere other than where it was read from,
+// which is what the un-absorbed q_b needs: there the GEMM's output row is the
+// 256-wide [nope | rope] scratch W_UK reduces over, while MLA decode wants the
+// roped 64 in the 576-wide query row. Since the read set is already in
+// registers before the barrier, redirecting the write costs nothing.
 template <int QK_ROPE_HEAD_DIM, bool WRITE_THROUGH = false>
 __device__ __forceinline__ void rope_tile_inplace(bf16 *tile,
                                                   bf16 const *cos_data,
-                                                  bf16 const *sin_data) {
+                                                  bf16 const *sin_data,
+                                                  bf16 *out = nullptr) {
   constexpr int ROPE_HALF = QK_ROPE_HEAD_DIM / 2;
   int const tid = threadIdx.x;
 
@@ -224,9 +231,10 @@ __device__ __forceinline__ void rope_tile_inplace(bf16 *tile,
     s = __cvt_bf16_to_f32_mla(sin_data[tid]);
   }
   __syncthreads();
+  bf16 *dst = out ? out : tile;
   if (tid < ROPE_HALF) {
-    cache_store<WRITE_THROUGH>(&tile[tid], x0 * c - x1 * s);
-    cache_store<WRITE_THROUGH>(&tile[tid + ROPE_HALF], x1 * c + x0 * s);
+    cache_store<WRITE_THROUGH>(&dst[tid], x0 * c - x1 * s);
+    cache_store<WRITE_THROUGH>(&dst[tid + ROPE_HALF], x1 * c + x0 * s);
   }
 }
 
