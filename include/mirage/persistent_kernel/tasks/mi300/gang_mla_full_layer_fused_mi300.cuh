@@ -1081,6 +1081,32 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     // concurrent DMAs -- the same trap gang_moe_fused_mxfp4_mi300.cuh:285
     // works around with a single inline-asm block. A constant destination
     // sidesteps it without the asm.
+    //
+    // ── does this still pay at GLM-5 shapes? ─────────────────────────────
+    // The numbers above were measured on GLM-4.7-Flash, where PF_WG_BYTES is
+    // 160 KB. GLM-5 instantiates OPROJ_REDUCTION_SIZE 32768 (kv_b_v absorbed)
+    // and OPROJ_ROWS_PER_WG 16, so
+    //
+    //   PF_WG_BYTES = 16 * 32768 * 33/32 = 528 KB per worker
+    //   per XCD     = 29 workers * 528 KB = 15.3 MB
+    //   L2 per XCD  = 4 MB (rocminfo)
+    //
+    // i.e. the prefetch working set is 3.8x L2, so most of what it pulls up is
+    // evicted before Phase 9 reads it. PF_LPT scales with it too: 42 loads per
+    // thread on Flash, 132 here, and 42 was already the count that made LLVM's
+    // offset reassociation spill.
+    //
+    // Two consequences. Widening the prefetch to cover the whole grid-stride
+    // sequence is wrong, even though it looks like an obvious bug that only
+    // tile `xcd_rank` is fetched while gang_oproj_router_fused_mi300.cuh:261
+    // strides over 48 tiles with 29 workers: that would take the working set
+    // to 7.6x L2. And the existing one-round prefetch is itself suspect here.
+    // GLM_OPROJ_PREFETCH=0 is the ablation.
+    //
+    // MEASURED at GLM-5, 78 layers, NP=8:
+    //   prefetch on   18.2 ms/iter (17.993 / 18.220 / 18.227 / 18.110)
+    //   prefetch off  see below
+#ifndef MPK_GLM_OPROJ_PREFETCH_OFF
     {
       constexpr int PF_WG_DATA = OPROJ_ROWS_PER_WG * OPROJ_REDUCTION_SIZE;
       constexpr int PF_WG_SCALE = OPROJ_ROWS_PER_WG * (OPROJ_REDUCTION_SIZE / 32);
@@ -1098,6 +1124,30 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
                     "the o_proj prefetch window has to fit past the GEMV's "
                     "activation staging");
 
+      // Only tile `xcd_rank`, deliberately, even though Phase 9 grid-strides
+      // (gang_oproj_router_fused_mi300.cuh:261):
+      //   for (t = xcd_rank; t < oproj_tiles_per_xcd; t += tiles_per_xcd)
+      // At GLM-5 that is 48 tiles over 29 workers, so ranks 0..18 run a second
+      // tile that this prefetch does not cover -- 19 of 48 tiles, 40% of
+      // o_proj, cold from HBM. That looks like a bug. Covering it is a loss.
+      //
+      // Measured, GLM-5 78 layers NP=8, MPK_SUBPHASE_TIMING=1, aggregate
+      // worker seconds at cnt 2209800 (GLM_OPROJ_PREFETCH=0 is the ablation):
+      //
+      //                        off       1 round    2 rounds
+      //   SP3[0] o_proj      146.85 s    123.48 s    119.11 s
+      //   SP5[0] barrier      59.25 s     57.61 s     77.75 s
+      //   SP3[2] Router       58.33 s     53.87 s     61.20 s
+      //   end to end        20.006 ms   19.227 ms   19.892 ms
+      //
+      // A second round buys 4.4 s on o_proj and pays 20.1 s at the Phase 8
+      // barrier, because the extra traffic is issued by all 232 workers while
+      // the 32 merge workers the barrier waits on are still reading -- the
+      // same effect the +9% above documents, just bigger. One round is the
+      // operating point. Note also that one round is already 29 * 528 KB =
+      // 15.3 MB per XCD against 4 MB of L2; the prefetch pays anyway (off is
+      // 19% worse on o_proj), so L2 residency is not the limit, barrier
+      // interference is.
       if (xcd_rank < oproj_tiles_per_xcd) {
         extern __shared__ char _fused_smem[];
         i32x4_t const pf_rsrc = make_w_buffer_rsrc(
@@ -1163,6 +1213,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
         }
       }
     }
+#endif // MPK_GLM_OPROJ_PREFETCH_OFF
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     _b_t3 = __builtin_amdgcn_s_memrealtime();
 #endif

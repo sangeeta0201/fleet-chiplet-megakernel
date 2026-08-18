@@ -422,6 +422,15 @@ def get_compile_command(
             flags = flags + ["-DMPK_ENABLE_DEVICE_TASK_ACCUM"]
         if int(os.environ.get("MPK_SUBPHASE_TIMING", "0")) == 1:
             flags = flags + ["-DMPK_ENABLE_SUBPHASE_TIMING"]
+        # Ablation for the o_proj weight prefetch in the fused MLA layer.
+        # It is a pure L2 warm-up -- the LDS copy is never read -- so turning
+        # it off is safe by construction and changes only bandwidth timing.
+        # Worth an ablation because the working set scales with the model:
+        # PF_WG_BYTES = OPROJ_ROWS_PER_WG * OPROJ_REDUCTION_SIZE * 33/32, which
+        # is 160 KB at GLM-4.7-Flash but 528 KB at GLM-5, i.e. 15.3 MB per XCD
+        # against 4 MB of L2. See gang_mla_full_layer_fused_mi300.cuh.
+        if int(os.environ.get("GLM_OPROJ_PREFETCH", "1")) == 0:
+            flags = flags + ["-DMPK_GLM_OPROJ_PREFETCH_OFF"]
         if int(os.environ.get("MPK_MOE_SUBPHASE", "0")) == 1:
             flags = flags + ["-DMPK_ENABLE_MOE_SUBPHASE"]
         if int(os.environ.get("MPK_FUSED_PHASE_TIMING", "0")) == 1:
