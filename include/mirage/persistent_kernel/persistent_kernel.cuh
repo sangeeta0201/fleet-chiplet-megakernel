@@ -1631,6 +1631,30 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
           }
           __builtin_amdgcn_s_sleep(1);
         }
+        // Terminate is checked INSIDE the wait loop only, and that is not
+        // enough: the scheduler's shutdown path sets terminate and then bumps
+        // iter_ready (see the END_OF_TASK_GRAPH handler). A worker that
+        // samples iter_ready after that bump never enters the loop at all, so
+        // it falls through and starts an iteration the scheduler will never
+        // produce. Its first task with a dependent event then waits on a
+        // counter that is one arrival short forever, while every worker that
+        // did take the break returns -- one resident workgroup, 100% GPU, no
+        // progress, and the host blocked in hipStreamSynchronize.
+        //
+        // Observed at NP=8 EP on GLM-5: 7 of 8 ranks reached
+        // finalize_persistent_kernel while rank 5 held exactly one workgroup
+        // (block 234) spinning in the dep wait at needed=128 actual=127.
+        // This is task #47's ~40%-of-runs cold-start hang, and it is not
+        // EP-specific -- EP only makes it reliable by coupling the ranks.
+        //
+        // The re-check is safe on every normal iteration boundary: terminate
+        // is set exactly once, on the final END_OF_TASK_GRAPH, and the bump
+        // that accompanies it is the only one that outruns a real iteration.
+        // A worker at a boundary always has pc_iter greater than the last
+        // completed iteration, so bailing here can never skip real work.
+        if (__atomic_load_n(config.precomp_terminate, __ATOMIC_RELAXED)) {
+          pc_terminated = 1;
+        }
       }
       __syncthreads();
       if (pc_terminated) {
@@ -1914,11 +1938,34 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                                __ATOMIC_RELAXED);
             }
 #endif
+#ifdef MPK_PRECOMPUTED_DISPATCH
+            // Backstop for the shutdown race closed at the iteration gate
+            // above. That fix keeps a worker from entering a phantom
+            // iteration; this one gets a worker out if it is already parked
+            // on an arrival that will never come. Without it the only exit
+            // from this loop is the counter, so a single wedged workgroup
+            // holds the whole rank -- and at NP=8 the peer wait then holds
+            // every other rank with it.
+            //
+            // Polled every 1024 spins, not every spin: this is the barrier
+            // wait, it is the hottest loop in the kernel, and precomp_terminate
+            // is a system-scoped line that 240 workers would otherwise hammer.
+            // A 1024-spin granularity is ~50us of extra shutdown latency once
+            // per run, against zero steady-state cost.
+            int _term_poll = 0;
+#endif
             while (actual_counts < needed_counts) {
               actual_counts =
                   __atomic_load_n(reinterpret_cast<unsigned long long *>(
                                       &config.all_event_counters[event_index]),
                                   __ATOMIC_RELAXED);
+#ifdef MPK_PRECOMPUTED_DISPATCH
+              if ((++_term_poll & 1023) == 0 &&
+                  __atomic_load_n(config.precomp_terminate, __ATOMIC_RELAXED)) {
+                pc_terminated = 1;
+                break;
+              }
+#endif
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
               __builtin_amdgcn_s_sleep(1);
 #endif
@@ -1946,6 +1993,17 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #endif
     }
     __syncthreads();
+
+#ifdef MPK_PRECOMPUTED_DISPATCH
+    // The dep-wait backstop above bailed out of a wait that will never be
+    // satisfied. Rides the __syncthreads() that is already here, so this
+    // costs one shared-memory read per task and no extra barrier. The
+    // accumulator dumps are skipped deliberately: this path only runs when
+    // the run is already being torn down.
+    if (pc_terminated) {
+      return;
+    }
+#endif
 
 #ifdef MPK_ENABLE_PROFILING
     if (task_desc->task_type != TASK_TERMINATE) {

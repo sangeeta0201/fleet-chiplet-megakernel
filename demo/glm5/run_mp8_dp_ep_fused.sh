@@ -47,7 +47,7 @@ fi
 
 mpirun -np "$NP" --tag-output --allow-run-as-root \
   $(mpk_x_args) \
-  python3 demo.py --use-mirage \
+  stdbuf -oL -eL python3 demo.py --use-mirage \
     --max-seq-length "${MAX_SEQ_LENGTH:-128}" \
     --max-new-tokens "${MAX_NEW_TOKENS:-16}" \
     --model-path "$MODEL_PATH" "$@"
