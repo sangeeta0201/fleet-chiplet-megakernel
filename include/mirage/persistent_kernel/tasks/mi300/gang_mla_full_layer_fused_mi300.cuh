@@ -181,7 +181,11 @@ static constexpr int FULL_LAYER_ENTRY_SLOT = 71;
 // slot map is its own (its EP barriers live at [48..85] of a 1216-int buffer).
 static constexpr int FULL_LAYER_MLA_EP_RELEASE_SLOT = 80;
 static constexpr int FULL_LAYER_MLA_EP_FOLD_DONE_SLOT = 88;
-static constexpr int FULL_LAYER_COUNTER_SLOTS = 96;
+// Phase 8b's W_UV -> o_proj barrier, un-absorbed kv_b_v only: per-XCD release
+// flags at [96 .. 103], arrival counter at [104]. Past the EP slots rather
+// than inside the MoE half's [40 .. 69] region, which 0/10/20 already fill.
+static constexpr int FULL_LAYER_MLA_WUV_SLOT = 96;
+static constexpr int FULL_LAYER_COUNTER_SLOTS = 106;
 
 // Self-heal gate for the Mechanism-C flag polls.
 //
@@ -276,7 +280,16 @@ template <
     //
     // The LM head then reads the gather buffer directly through EP_PEER_SLOTS,
     // so no separate combine pass is needed.
-    bool EP_TAIL_ONLY = false>
+    bool EP_TAIL_ONLY = false,
+    // ── un-absorbed kv_b_v ────────────────────────────────────────────────
+    // 0 keeps W_UV folded into o_proj. Non-zero adds Phase 8b, the
+    // block-diagonal GEMV that applies it to the merged attention output, and
+    // makes OPROJ_REDUCTION_SIZE the narrower NUM_Q_HEADS * WUV_V_HEAD_DIM.
+    // See the Phase 0 comment in gang_oproj_router_fused_mi300.cuh -- at
+    // GLM-5 on 8 ranks the absorbed o_proj is 60% of the token's bytes.
+    // Adds input [29] (EP) / [27] (no EP) and output [11].
+    int WUV_ROWS_PER_WG = 0,
+    int WUV_V_HEAD_DIM = 0>
 __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     // Pointer arrays are passed whole rather than unpacked into 38 named
     // parameters, which is what gpt-oss's full-layer task does and for the
@@ -312,6 +325,8 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     int num_shared_experts,
     int moe_w13_tiles_per_xcd,
     int moe_w2_tiles_per_xcd,
+    // Phase 8b's tile count, per XCD. 0 whenever WUV_ROWS_PER_WG is 0.
+    int wuv_tiles_per_xcd,
     // ── shared parameters ──
     int tiles_per_xcd,
     int tile_idx,
@@ -347,6 +362,15 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
   int *const router_counter =
       counters + FULL_LAYER_ROUTER_COUNTER_SLOT * HIER_STRIDE;
   int *const entry_bar = counters + FULL_LAYER_ENTRY_SLOT * HIER_STRIDE;
+  // W_UV's packed MXFP8 weight, un-absorbed kv_b_v only. Appended after the
+  // EP pair so that turning EP on or off renumbers nothing: the input list is
+  // 0..26 always, 27/28 under EP, and this last.
+  constexpr int FL_WUV_WEIGHT_IN = (EP_WORLD_SIZE > 1) ? 29 : 27;
+  // Phase 8b's W_UV -> o_proj barrier. The MoE half's own [30 .. 38] would
+  // land on top of the router counter here, so it gets its own base past the
+  // EP slots and is handed down explicitly.
+  int *const wuv_counters =
+      counters + FULL_LAYER_MLA_WUV_SLOT * HIER_STRIDE;
 
   // Multi-layer mode: the scheduler is running every layer inside one task,
   // so the per-layer event boundary the snapshot below depends on is gone.
@@ -892,11 +916,11 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
   // L + 1. Deriving that from the layer index instead of from a load means
   // every worker on every XCD agrees with no ordering requirement at all,
   // which is strictly stronger than the snapshot it replaces.
-  __shared__ int s_exp[7];
+  __shared__ int s_exp[8];
   if (tid == 0) {
     if (ml_mode) {
 #pragma unroll
-      for (int i = 0; i < 7; i++) {
+      for (int i = 0; i < 8; i++) {
         s_exp[i] = task_layer_idx + 1;
       }
     } else {
@@ -910,6 +934,11 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       // half's, reproduced here because it is the half that reads it back.
       s_exp[5] = ld_nt_s32(&oproj_counters[10 * HIER_STRIDE]) + 1;
       s_exp[6] = ld_nt_s32(&oproj_counters[(20 + xcd_id) * HIER_STRIDE]) + 1;
+      // Guarded: with W_UV absorbed the caller sizes the counter tensor at
+      // 96 slots and [96 + xcd_id] is off the end.
+      s_exp[7] = (WUV_ROWS_PER_WG > 0)
+                     ? ld_nt_s32(&wuv_counters[xcd_id * HIER_STRIDE]) + 1
+                     : 0;
     }
   }
   __syncthreads();
@@ -1342,7 +1371,10 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
                                        // residual is the natural place to put
                                        // it: it is the one rank whose slot is
                                        // guaranteed non-trivial anyway.
-                                       /*EP_SHARED_PE=*/EP_FOLD_PE>(
+                                       /*EP_SHARED_PE=*/EP_FOLD_PE,
+                                       WUV_ROWS_PER_WG,
+                                       /*WUV_REDUCTION=*/KV_LORA_RANK,
+                                       WUV_V_HEAD_DIM>(
       /*oproj_input=*/output_ptrs[4],
       /*oproj_weight=*/input_ptrs[15],
       /*oproj_residual=*/input_ptrs[16],
@@ -1377,7 +1409,12 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       tile_idx,
       /*oproj_expected_in=*/s_exp[4],
       /*routing_expected_in=*/s_exp[5],
-      /*w13_expected_in=*/s_exp[6]);
+      /*w13_expected_in=*/s_exp[6],
+      /*wuv_weight=*/input_ptrs[FL_WUV_WEIGHT_IN],
+      /*v_out=*/output_ptrs[11],
+      wuv_tiles_per_xcd,
+      /*wuv_expected_in=*/s_exp[7],
+      /*wuv_counters=*/wuv_counters);
   MPK_WS_PHASE(90, task_layer_idx, xcd_id);
 }
 

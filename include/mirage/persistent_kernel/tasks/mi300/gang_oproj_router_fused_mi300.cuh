@@ -35,7 +35,7 @@
 // happens if the stages share a task.
 //
 // Barrier structure. Two independent barriers, exactly as gpt-oss splits them,
-// in one counter tensor of 29 * 16 int32:
+// in one counter tensor of 39 * 16 int32:
 //
 //   [0 .. 8]      o_proj -> router. Mechanism C: per-XCD release flags at
 //                 [x * 16], global arrival counter at [8 * 16]. Arrivals are
@@ -49,6 +49,9 @@
 //   [20 .. 28]    W13 -> W2. Mechanism C again, flags at [(20 + x) * 16],
 //                 counter at [28 * 16], workers_per_xcd * 8 arrivals -- every
 //                 worker runs a W13 tile, so every worker arrives.
+//   [30 .. 38]    W_UV -> o_proj, WUV_ROWS_PER_WG > 0 only. Mechanism C,
+//                 workers_per_xcd * 8 arrivals, arrive and wait in the same
+//                 place. Unused slots when kv_b_v stays absorbed.
 //
 // Prefetch across the o_proj barrier is load-bearing and is why the *wait* for
 // barrier 1 does not happen in this wrapper: it is handed to the router
@@ -112,7 +115,19 @@ template <int BATCH_SIZE,
           // whole remap out.
           int EP_WORLD_SIZE = 1,
           int EP_MY_PE = 0,
-          int EP_SHARED_PE = 0>
+          int EP_SHARED_PE = 0,
+          // ── un-absorbed kv_b_v ────────────────────────────────────────
+          // 0 keeps the absorbed o_proj: OPROJ_REDUCTION_SIZE is
+          // NUM_Q_HEADS * KV_LORA_RANK and W_UV is already folded into the
+          // weight. Non-zero makes OPROJ_REDUCTION_SIZE NUM_Q_HEADS *
+          // WUV_V_HEAD_DIM and adds Phase 0, a block-diagonal GEMV
+          //
+          //   v[h * V_HEAD + j] = sum_c attn_out[h * KV_LORA + c] * W_UV[h][c][j]
+          //
+          // ahead of it. See the byte argument in the Phase 0 comment.
+          int WUV_ROWS_PER_WG = 0,
+          int WUV_REDUCTION = 0,  // == KV_LORA_RANK
+          int WUV_V_HEAD_DIM = 0> // == v_head_dim
 __device__ __attribute__((always_inline)) void
     gang_oproj_router_fused_kernel_mi300(
         // ── o_proj inputs ──
@@ -162,7 +177,19 @@ __device__ __attribute__((always_inline)) void
         // see gang_mla_full_layer_fused_mi300.cuh.
         int oproj_expected_in = -1,
         int routing_expected_in = -1,
-        int w13_expected_in = -1) {
+        int w13_expected_in = -1,
+        // ── un-absorbed kv_b_v, WUV_ROWS_PER_WG > 0 only ──
+        // Trailing rather than grouped with the o_proj inputs so that adding
+        // them renumbers neither the input nor the output list.
+        void const *wuv_weight_ptr = nullptr, // MXFP8 [H * V_HEAD, KV_LORA]
+        void *v_out_ptr = nullptr,            // [b, H * V_HEAD], o_proj's input
+        int wuv_tiles_per_xcd = 0,
+        int wuv_expected_in = -1,
+        // Null means "slots [30 .. 38] of my own counter tensor", which is
+        // where the standalone dispatch puts them. The whole-layer task passes
+        // an explicit base instead: its merged buffer gives this task only
+        // slots [40 .. 69], and 0/10/20 already fill them.
+        void *wuv_counters_ptr = nullptr) {
 
   int const tid = threadIdx.x;
   int const xcd_id = tile_idx / tiles_per_xcd;
@@ -180,6 +207,12 @@ __device__ __attribute__((always_inline)) void
   int *hier_barrier = static_cast<int *>(oproj_counters_ptr);
   int *routing_ready = hier_barrier + 10 * HIER_STRIDE;
   int *w13_barrier = hier_barrier + 20 * HIER_STRIDE;
+  // Phase 0's W_UV -> o_proj barrier. The full-layer caller hands down its own
+  // base (its [30] is the attention release); standalone falls back to [30].
+  // Only ever dereferenced under `WUV_ROWS_PER_WG > 0` -- with W_UV absorbed
+  // the standalone counter tensor is 29 slots and [30] is off the end.
+  int *wuv_barrier = wuv_counters_ptr ? static_cast<int *>(wuv_counters_ptr)
+                                      : hier_barrier + 30 * HIER_STRIDE;
 
   // Read the release values this layer will publish *before* Phase 1, not
   // after. Reading next to the arrival atomic is the natural place and is what
@@ -195,12 +228,18 @@ __device__ __attribute__((always_inline)) void
   // start on any worker until the previous layer's event has fired, so the
   // earliest possible publication is a whole o_proj GEMM after the latest
   // possible arrival here.
-  __shared__ int s_expected[3];
+  __shared__ int s_expected[4];
   if (oproj_expected_in < 0) {
     if (tid == 0) {
       s_expected[0] = ld_nt_s32(&hier_barrier[xcd_id * HIER_STRIDE]) + 1;
       s_expected[1] = ld_nt_s32(routing_ready) + 1;
       s_expected[2] = ld_nt_s32(&w13_barrier[xcd_id * HIER_STRIDE]) + 1;
+      // Guarded: with W_UV absorbed the standalone counter tensor is 29
+      // slots and [30 + xcd_id] is off the end. The snapshot below the
+      // branch stays branch-free either way.
+      s_expected[3] = (WUV_ROWS_PER_WG > 0)
+                          ? ld_nt_s32(&wuv_barrier[xcd_id * HIER_STRIDE]) + 1
+                          : 0;
     }
     __syncthreads();
   }
@@ -212,6 +251,8 @@ __device__ __attribute__((always_inline)) void
       routing_expected_in < 0 ? s_expected[1] : routing_expected_in;
   int const w13_expected =
       w13_expected_in < 0 ? s_expected[2] : w13_expected_in;
+  int const wuv_expected =
+      wuv_expected_in < 0 ? s_expected[3] : wuv_expected_in;
 
   // Zero the f32 MoE accumulator that this layer's W2 will atomicAdd into.
   //
@@ -238,6 +279,155 @@ __device__ __attribute__((always_inline)) void
       st_wt_u128((void *)(ws + i), 0u, 0u, 0u, 0u);
     }
   }
+
+  constexpr bool UNABSORB_V = WUV_ROWS_PER_WG > 0;
+  // ════════════════════════════════════════════════════════════════════════
+  // Phase 0: un-absorbed kv_b_v (W_UV), a block-diagonal GEMV
+  // ════════════════════════════════════════════════════════════════════════
+  // Why undo an absorption that was put in deliberately. Absorption is a
+  // FLOP-for-bytes trade, and at GLM-5 on 8 GPUs the bytes are all that
+  // matter. Attention is replicated on every rank (DP attention, EP MoE), so
+  // each rank streams the whole of it per token, and per layer that is
+  //
+  //   qkv_a       6144 x 2624   =  16.1 M
+  //   q_b         2048 x 36864  =  75.5 M   (W_UK absorbed)
+  //   o_proj      6144 x 32768  = 201.3 M   (W_UV absorbed)
+  //                             = 292.9 M weights, 302 MB at MXFP8
+  //
+  // against ~40 MB/layer for the MoE half at EP=8 and top-8 of 256. o_proj
+  // alone is 60% of the token's bytes. Un-absorbed it is 6144 x 16384 =
+  // 100.7 M, and W_UV is 64 x 512 x 256 = 8.4 M: 201.3 -> 109.1 M, i.e.
+  // -95 MB per layer, -7.4 GB per token over 78 layers.
+  //
+  // What makes it exact at decode is that the PV accumulation is linear in
+  // the cached latent. The decode's per-head output is sum_t a_t * c_t over
+  // the KV_LORA-wide latent rows, so applying W_UV[h] to that sum is the same
+  // as having applied it to every c_t -- which is what absorbing it into
+  // o_proj did. It costs one 512x256 matvec per head, 8.4 M MACs on a single
+  // token, i.e. nothing but its own weight bytes.
+  //
+  // Shape. The GEMV is the same gang_gemv_mxfp8_kernel o_proj runs; only the
+  // activation pointer moves per tile. Output row n belongs to head
+  // n / V_HEAD_DIM and reduces over that head's KV_LORA latent slice, so
+  // WUV_ROWS_PER_WG has to divide V_HEAD_DIM for a workgroup's rows to share
+  // one head. The packed weight is W_UV.transpose(1, 2) flattened to
+  // [H * V_HEAD_DIM, KV_LORA_RANK], so a global tile index addresses it the
+  // same way it addresses any other workgroup-packed weight.
+  //
+  // The barrier. Phase 1 reduces over the whole v row, so W_UV has to be
+  // complete on every XCD before o_proj starts -- one more cross-XCD barrier
+  // than the absorbed form needs. It should be a cheap one: unlike the
+  // attention->o_proj barrier, which waits on a merge that only four ranks per
+  // XCD run, every worker here gets one or two equal tiles, so they arrive
+  // together.
+  //
+  // MEASURED, GLM-5 744B, NP=8 EP, 78 layers, rank 0. GLM_UNABSORB_OPROJ=0 is
+  // the ablation. Aggregate worker-seconds, MPK_SUBPHASE_TIMING=1, SP3 cnt
+  // 2209800:
+  //
+  //   SP3 slot            absorbed   un-absorbed   delta
+  //   [0] OProjCompute     120.65        58.86     -61.79
+  //   [7] Wuv                  --        30.02     +30.02
+  //   [2] Router            52.94        33.41     -19.53
+  //   SP5[0] Phase-8 bar    56.71        50.73      -5.98
+  //   SP4 (control)        110.87       108.81      -2.06
+  //
+  // Three uninstrumented runs each, decode host clock:
+  //   absorbed     17.441 / 17.134 / 17.254  mean 17.28 ms
+  //   un-absorbed  14.779 / 15.055 / 14.706  mean 14.85 ms   -14.1%
+  //
+  // o_proj halves because its K halves, and Router falls with it -- the 95 MB
+  // per layer this stops reading is 95 MB the router's own weights no longer
+  // contend with. The Wuv phase costs back 8.4 MB of weight plus a barrier.
+  //
+  // Accuracy: demo/glm5/run_correctness_suite.sh, 4 prompts, NP=8. Both forms
+  // agree with the torch reference to exactly the same prefix (0/90, 28/256,
+  // 13/256, 0/256) and all 8 ranks are identical in both. The two forms
+  // diverge from each other at token 14-51, as expected -- un-absorbed
+  // quantizes W_UV to MXFP8 on its own and rounds v to bf16, where the
+  // absorbed form quantized the product.
+  if constexpr (UNABSORB_V) {
+    static_assert(WUV_V_HEAD_DIM % WUV_ROWS_PER_WG == 0,
+                  "a workgroup's rows must sit inside one head, or its "
+                  "activation slice would not be contiguous");
+    static_assert(OPROJ_REDUCTION_SIZE % WUV_V_HEAD_DIM == 0,
+                  "o_proj's K is the whole v row, H * V_HEAD_DIM");
+    constexpr int TILES_PER_HEAD = WUV_V_HEAD_DIM / WUV_ROWS_PER_WG;
+    // `wuv_weight_ptr` is this XCD's dim-0 slice of the packed weight, the
+    // same partitioning o_proj's input [15] gets, so the GEMV is handed the
+    // *local* tile index against wuv_tiles_per_xcd n_tiles. Only the head
+    // lookup and the output column need the global index -- and the column is
+    // biased into the pointer, exactly like Phase 1's xcd_out.
+    unsigned short *xcd_v_out =
+        static_cast<unsigned short *>(v_out_ptr) +
+        static_cast<size_t>(xcd_id) * wuv_tiles_per_xcd * WUV_ROWS_PER_WG;
+    for (int t = xcd_rank; t < wuv_tiles_per_xcd; t += tiles_per_xcd) {
+      int const g = xcd_id * wuv_tiles_per_xcd + t;
+      unsigned short const *head_in =
+          static_cast<unsigned short const *>(oproj_input_ptr) +
+          static_cast<size_t>(g / TILES_PER_HEAD) * WUV_REDUCTION;
+      gang_gemv_mxfp8_kernel<BATCH_SIZE,
+                             WUV_REDUCTION,
+                             WUV_ROWS_PER_WG,
+                             /*HAS_RESIDUAL=*/false,
+                             /*WRITE_THROUGH=*/true>(head_in,
+                                                     wuv_weight_ptr,
+                                                     /*residual=*/nullptr,
+                                                     xcd_v_out,
+                                                     num_active_tokens,
+                                                     WUV_ROWS_PER_WG,
+                                                     OPROJ_REDUCTION_SIZE,
+                                                     /*m_tiles=*/1,
+                                                     wuv_tiles_per_xcd,
+                                                     /*wgm=*/0,
+                                                     t);
+    }
+    // Mechanism C, arrive and wait, the same shape as Phase 6's W13 -> W2.
+    // Every worker arrives and every worker waits: Phase 1's participant set
+    // is narrower, but a worker that skipped the wait would fall through to
+    // the routing-ready poll and could reach Phase 4 -- which reads the normed
+    // row derived from o_proj -- before o_proj had a correct v to read.
+    __syncthreads();
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    int const wuv_arrivals = tiles_per_xcd * 8;
+    if (tid == 0) {
+      int prev = atom_add_release_gpu_s32(&wuv_barrier[8 * HIER_STRIDE], 1);
+      if ((prev % wuv_arrivals) == wuv_arrivals - 1) {
+        for (int x = 0; x < 8; x++) {
+          st_wt_u32((void *)&wuv_barrier[x * HIER_STRIDE],
+                    (unsigned)wuv_expected);
+        }
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      }
+      int *my_flag = &wuv_barrier[xcd_id * HIER_STRIDE];
+      MPK_WS_WAIT_BEGIN(767, wuv_expected);
+      int _spins = 0;
+      int _obs;
+      while ((_obs = ld_nt_s32(my_flag)) < wuv_expected) {
+        ++_spins;
+        MPK_WS_WAIT_TICK(_obs, _spins);
+        if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
+          if (ld_nt_s32(&wuv_barrier[8 * HIER_STRIDE]) >=
+              wuv_arrivals * wuv_expected) {
+            st_wt_u32((void *)my_flag, (unsigned)wuv_expected);
+            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          }
+        }
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+    __syncthreads();
+    asm volatile("buffer_inv" ::: "memory");
+  }
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  {
+    unsigned long long _sp_tv = __builtin_amdgcn_s_memrealtime();
+    if (tid == 0 && g_subphase_active) {
+      atomicAdd(&g_subphase_ns[3][7], (_sp_tv - _sp_t0) * 10); // Wuv
+    }
+    _sp_t0 = _sp_tv;
+  }
+#endif
 
   // Workers with o_proj or router work. The rest fall straight through to the
   // routing-ready poll: they must not arrive at the o_proj barrier, whose
@@ -297,7 +487,10 @@ __device__ __attribute__((always_inline)) void
                              OPROJ_REDUCTION_SIZE,
                              OPROJ_ROWS_PER_WG,
                              /*HAS_RESIDUAL=*/true,
-                             /*WRITE_THROUGH=*/true>(oproj_input_ptr,
+                             /*WRITE_THROUGH=*/true>(UNABSORB_V
+                                                         ? (void const *)
+                                                               v_out_ptr
+                                                         : oproj_input_ptr,
                                                      oproj_weight_ptr,
                                                      oproj_residual_ptr,
                                                      xcd_out,

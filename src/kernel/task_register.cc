@@ -4033,12 +4033,16 @@ int TaskRegister::register_gang_mla_attn_fused_mi300_task(
 //               21 logits_scratch, 22 moe_gate_up_weight,
 //               23 moe_down_weight, 24 moe_w13_bias, 25 moe_w2_bias,
 //               26 moe_swiglu_out
-// Outputs (11): 0 qkv_a_out, 1 q_workspace, 2 lse, 3 o_acc, 4 attn_out,
+//               [27, 28 under EP: ep_gather, ep_signal]
+//               last: wuv_weight, un-absorbed kv_b_v only (index 29 under EP,
+//               27 otherwise; absent when absorbed)
+// Outputs (12): 0 qkv_a_out, 1 q_workspace, 2 lse, 3 o_acc, 4 attn_out,
 //               5 x_out, 6 hidden, 7 topk_weight, 8 routing_indices,
-//               9 active_expert_ids, 10 moe_workspace_f32 (written)
+//               9 active_expert_ids, 10 moe_workspace_f32 (written),
+//               11 v_out (un-absorbed kv_b_v only)
 int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 46);
+  assert(params.size() == 49);
   // ── attention half ──
   int batch_size = params[0];
   int qkv_opw = params[1];
@@ -4090,13 +4094,27 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
   int ep_my_pe = params[43];
   int ep_fold_pe = params[44];
   bool ep_tail_only = params[45] != 0;
+  // ── un-absorbed kv_b_v ──
+  // 0 keeps W_UV folded into o_proj, which is the shape every assertion below
+  // already describes. Non-zero narrows oproj_reduction_size from
+  // num_q_heads * kv_lora_rank to num_q_heads * wuv_v_head_dim and adds the
+  // block-diagonal GEMV that produces o_proj's input.
+  int wuv_rows_per_wg = params[46];
+  int wuv_v_head_dim = params[47];
+  int wuv_tiles_per_xcd = params[48];
+  bool const unabsorb_v = wuv_rows_per_wg > 0;
   bool ep_inline = ep_world_size > 1;
   assert(!ep_tail_only || ep_inline);
 
   std::vector<tb::TBInputOp *> input_ops;
   std::vector<tb::TBInputOp *> output_ops;
-  int num_inputs = ep_inline ? 29 : 27;
-  int num_outputs = 11;
+  // W_UV's weight and the V row it produces exist only when kv_b_v is
+  // un-absorbed. The codegen still emits input_ptrs[29] / output_ptrs[11]
+  // unconditionally -- both are inside the fixed task_desc arrays, and the
+  // kernel discards them under `if constexpr` -- so the absorbed build passes
+  // an unread pointer rather than needing a dummy tensor.
+  int num_inputs = (ep_inline ? 29 : 27) + (unabsorb_v ? 1 : 0);
+  int num_outputs = 11 + (unabsorb_v ? 1 : 0);
   assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
   for (auto const &op : bgraph.operators) {
     assert(op->op_type == mirage::type::TB_INPUT_OP);
@@ -4160,9 +4178,10 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
   assert(output_ops[5]->dtensor.dim[1] == qkv_reduction);
 
   // ══ the merged counter buffer ══
-  // 71 cache-line-strided int32 slots; see the kernel header for the map.
+  // 71 cache-line-strided int32 slots, or 106 once Phase 8b's barrier is live;
+  // see the kernel header for the map.
   assert(input_ops[14]->dtensor.num_dims == 1);
-  assert(input_ops[14]->dtensor.dim[0] >= 71 * 16);
+  assert(input_ops[14]->dtensor.dim[0] >= (unabsorb_v ? 106 : 71) * 16);
 
   // ══ MoE geometry ══
   assert(input_ops[15]->dtensor.dim[1] ==
@@ -4171,6 +4190,30 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
          "o_proj MXFP8 weight is not packed at this reduction and row count");
   assert(oproj_tiles_per_xcd * oproj_rows_per_wg * 8 == hidden_size &&
          "the packed o_proj weight does not cover the hidden row exactly");
+  // ── W_UV, un-absorbed kv_b_v only ──
+  // A block-diagonal GEMV over num_q_heads independent [kv_lora, v_head]
+  // blocks, packed as one [num_q_heads * v_head, kv_lora] MXFP8 stack, so the
+  // reduction is kv_lora_rank and the output row is oproj_reduction_size.
+  if (unabsorb_v) {
+    int const wuv_in = ep_inline ? 29 : 27;
+    assert(oproj_reduction_size == num_q_heads * wuv_v_head_dim &&
+           "un-absorbed o_proj reduces over num_q_heads * v_head_dim");
+    assert(wuv_v_head_dim % wuv_rows_per_wg == 0 &&
+           "a head's V slice must be a whole number of W_UV workgroups");
+    assert(input_ops[wuv_in]->dtensor.dim[1] ==
+               wuv_rows_per_wg * (kv_lora_rank + kv_lora_rank / 32) &&
+           "W_UV MXFP8 weight is not packed at kv_lora_rank and this row "
+           "count");
+    assert(wuv_tiles_per_xcd * wuv_rows_per_wg * 8 == oproj_reduction_size &&
+           "the packed W_UV weight does not cover the V row exactly");
+    assert(output_ops[11]->dtensor.num_dims == 2);
+    assert(output_ops[11]->dtensor.dim[0] == batch_size);
+    assert(output_ops[11]->dtensor.dim[1] == oproj_reduction_size);
+  } else {
+    assert(wuv_tiles_per_xcd == 0 && wuv_v_head_dim == 0);
+    assert(oproj_reduction_size == num_q_heads * kv_lora_rank &&
+           "absorbed o_proj reduces over num_q_heads * kv_lora_rank");
+  }
   assert(hidden_size == qkv_reduction &&
          "o_proj's N is the next layer's qkv_a K; they are one row");
   {
@@ -4265,7 +4308,7 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
   code.inc_indent();
   code.e("kernel::gang_mla_full_layer_fused_kernel_mi300<$, $, $, $, $, $, $, "
          "$, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, "
-         "$, $, $, $, $, $, $, $>(",
+         "$, $, $, $, $, $, $, $, $, $>(",
          batch_size,
          qkv_opw,
          qkv_reduction,
@@ -4302,7 +4345,9 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
          ep_world_size,
          ep_my_pe,
          ep_fold_pe,
-         ep_tail_only ? "true" : "false");
+         ep_tail_only ? "true" : "false",
+         wuv_rows_per_wg,
+         wuv_v_head_dim);
   code.e("    task_desc->input_ptrs,");
   code.e("    task_desc->output_ptrs,");
   code.e("    runtime_config.qo_indptr_buffer,");
@@ -4329,6 +4374,7 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
   code.e("    $,", num_shared_experts);
   code.e("    $,", moe_w13_tiles_per_xcd);
   code.e("    $,", moe_w2_tiles_per_xcd);
+  code.e("    $,", wuv_tiles_per_xcd);
   code.e("    $,", tiles_per_xcd);
   code.e("    tile_idx,");
   // Multi-layer mode (task #14). ml_num_layers is 0 whenever the scheduler is

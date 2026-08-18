@@ -2007,6 +2007,23 @@ class PersistentKernel:
         norm_topk_prob: bool = True,
         moe_w13_output_per_wg: int = 64,
         moe_w2_output_per_wg: int = 64,
+        # -- un-absorbed kv_b_v --
+        # Passing wuv_mxfp8_weight moves W_UV back out of o_proj: the layer
+        # gains a block-diagonal GEMV
+        #   v[h * v_head + j] = sum_c attn_out[h * kv_lora + c] * W_UV[h][c][j]
+        # writing v_out, and o_proj reduces over that narrower row instead of
+        # over the latent. At GLM-5 that is 6144 x 32768 -> 6144 x 16384 plus
+        # a 64 x 512 x 256 stack, i.e. 201 MB -> 109 MB of MXFP8 per layer per
+        # rank, against one extra cross-XCD barrier.
+        #
+        # The weight is packed like every other GEMV weight in this file:
+        # [num_q_heads * v_head_dim, kv_lora_rank] rows, pack_dense_mxfp8 at
+        # wuv_rows_per_wg. oproj_reduction_size must then be
+        # num_q_heads * v_head_dim, and oproj_mxfp8_weight packed at it.
+        wuv_mxfp8_weight: DTensor = None,
+        v_out: DTensor = None,
+        wuv_rows_per_wg: int = 0,
+        wuv_v_head_dim: int = 0,
         # -- expert parallelism --
         # Symmetric-heap tensors (io_category="nvshmem_tensor"). Passing them
         # turns on the head-of-layer fold: this rank's f32 MoE partial plus
@@ -2181,6 +2198,34 @@ class PersistentKernel:
         oproj_tiles_per_xcd = n_wgs // 8
         assert oproj_mxfp8_weight.dim(1) == oproj_rows_per_wg * (
             oproj_reduction_size + oproj_reduction_size // 32)
+        unabsorb_v = wuv_mxfp8_weight is not None
+        if unabsorb_v:
+            assert v_out is not None and wuv_rows_per_wg > 0 \
+                and wuv_v_head_dim > 0, \
+                "un-absorbing kv_b_v needs v_out, wuv_rows_per_wg and " \
+                "wuv_v_head_dim as well as the weight"
+            assert oproj_reduction_size == num_q_heads * wuv_v_head_dim, (
+                f"un-absorbed o_proj reduces over num_q_heads * v_head_dim = "
+                f"{num_q_heads * wuv_v_head_dim}, got {oproj_reduction_size}")
+            assert wuv_v_head_dim % wuv_rows_per_wg == 0
+            wuv_n_wgs = wuv_mxfp8_weight.dim(0)
+            assert wuv_n_wgs % 8 == 0
+            wuv_tiles_per_xcd = wuv_n_wgs // 8
+            assert wuv_n_wgs * wuv_rows_per_wg == oproj_reduction_size, (
+                f"packed W_UV covers {wuv_n_wgs * wuv_rows_per_wg} columns, "
+                f"the V row is {oproj_reduction_size}")
+            assert wuv_mxfp8_weight.dim(1) == wuv_rows_per_wg * (
+                kv_lora_rank + kv_lora_rank // 32)
+            assert v_out.num_dims == 2
+            assert (v_out.dim(0), v_out.dim(1)) == (
+                batch_size, oproj_reduction_size)
+        else:
+            assert v_out is None and wuv_rows_per_wg == 0 \
+                and wuv_v_head_dim == 0
+            assert oproj_reduction_size == num_q_heads * kv_lora_rank, (
+                f"absorbed o_proj reduces over num_q_heads * kv_lora_rank = "
+                f"{num_q_heads * kv_lora_rank}, got {oproj_reduction_size}")
+            wuv_tiles_per_xcd = 0
         hidden_size = hidden.dim(1)
         assert n_wgs * oproj_rows_per_wg == hidden_size, (
             f"packed weight covers {n_wgs * oproj_rows_per_wg} columns, "
@@ -2267,6 +2312,7 @@ class PersistentKernel:
                                 batch_size * qb_n_wgs_per_xcd + 1,
                                 mla_tiles_per_xcd, merge_tiles_per_xcd,
                                 oproj_topk_tiles_per_xcd,
+                                wuv_tiles_per_xcd,
                                 moe_w13_tiles_per_xcd, moe_w2_tiles_per_xcd),
                             self.num_workers // 8)
         total_barrier_arrivals = min(oproj_topk_tiles_per_xcd,
@@ -2281,7 +2327,10 @@ class PersistentKernel:
         # arrival counter at [79]). Under EP add the fold counter at [88].
         # Undersizing this does not fail loudly, it corrupts whatever torch
         # allocated next -- demo.py already asks for 96 either way.
-        counter_slots = 96 if ep_inline else 80
+        # Un-absorbed kv_b_v adds Phase 8b's barrier at [96 .. 104].
+        counter_slots = (96 if ep_inline else 80)
+        if unabsorb_v:
+            counter_slots = 106
         assert counters.dim(0) >= counter_slots * 16, (
             f"the fused layer needs {counter_slots * 16} int32 of counters, "
             f"got {counters.dim(0)}")
@@ -2312,8 +2361,10 @@ class PersistentKernel:
             self.mpi_rank if ep_inline else 0,
             ep_fold_rank if ep_inline else 0,
             1 if ep_tail_only else 0,
+            # un-absorbed kv_b_v (3)
+            wuv_rows_per_wg, wuv_v_head_dim, wuv_tiles_per_xcd,
         ]
-        assert len(params) == 46
+        assert len(params) == 49
 
         grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
@@ -2349,6 +2400,9 @@ class PersistentKernel:
         if ep_inline:
             tb_graph.new_input(ep_gather, (-1, -1, -1), -1, True)   # [27]
             tb_graph.new_input(ep_signal, (-1, -1, -1), -1, True)   # [28]
+        if unabsorb_v:
+            # Last input, so that the EP pair keeps 27/28 either way.
+            tb_graph.new_input(wuv_mxfp8_weight, (0, -1, -1), 1, True)
         tb_graph.new_input(qkv_a_out, (-1, -1, -1), -1, True)
         tb_graph.new_input(q_workspace, (-1, -1, -1), -1, True)
         tb_graph.new_input(lse, (-1, -1, -1), -1, True)
@@ -2360,6 +2414,8 @@ class PersistentKernel:
         tb_graph.new_input(routing_indices, (-1, -1, -1), -1, True)
         tb_graph.new_input(active_expert_ids, (-1, -1, -1), -1, True)
         tb_graph.new_input(moe_workspace_f32, (-1, -1, -1), -1, True)
+        if unabsorb_v:
+            tb_graph.new_input(v_out, (-1, -1, -1), -1, True)   # output [11]
         self.kn_graph.customized(
             [x, pre_norm_weight, pre_norm_scratch, qkv_mxfp8_weight, qkv_bias,
              q_a_norm_weight, q_a_norm_scratch, qb_mxfp8_weight, qb_bias,
@@ -2370,9 +2426,11 @@ class PersistentKernel:
              moe_gate_up_weight, moe_down_weight, moe_w13_bias, moe_w2_bias,
              moe_swiglu_out]
             + ([ep_gather, ep_signal] if ep_inline else [])
+            + ([wuv_mxfp8_weight] if unabsorb_v else [])
             + [qkv_a_out, q_workspace, lse, o_acc, attn_out, x_out,
              hidden, topk_weight, routing_indices, active_expert_ids,
-             moe_workspace_f32],
+             moe_workspace_f32]
+            + ([v_out] if unabsorb_v else []),
             tb_graph,
         )
         self.kn_graph.register_task(

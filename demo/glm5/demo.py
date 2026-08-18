@@ -1050,6 +1050,39 @@ if __name__ == "__main__":
         o_proj_red = num_heads * kv_lora
         if o_proj_red % 256 != 0:
             o_proj_red = num_heads_pad * kv_lora
+        # ── or: don't absorb W_UV at all ──────────────────────────────────
+        # Absorption trades bytes for ops, and at GLM-5 on 8 ranks the layer
+        # is bytes. Per layer per GPU, MXFP8: qkv_a 16.1 M, q_b 75.5 M,
+        # o_proj 201.3 M -- 302 MB of attention weight against ~40 MB of
+        # EP-sliced expert weight, so o_proj alone is 60% of the token. Its
+        # reduction is num_heads * kv_lora only *because* W_UV is folded in;
+        # un-folded it is num_heads * v_head, and GLM-5's v_head (256) is half
+        # its kv_lora (512). 201.3 M -> 100.7 M, plus 8.4 M for the W_UV stack
+        # itself: -95 MB a layer, -7.4 GB a token over 78 layers.
+        #
+        # What it costs is a block-diagonal GEMV
+        #   v[h * v_head + j] = sum_c attn_out[h * kv_lora + c] * W_UV[h][j][c]
+        # ahead of o_proj, and one cross-XCD barrier between the two. Only the
+        # whole-layer fused task implements it (Phase 8b); the dense prologue
+        # layers keep the absorbed weight, which is why both widths are built.
+        #
+        # Exact, not an approximation: MLA's PV accumulation is linear in the
+        # cached latent, so applying W_UV before o_proj and folding it into
+        # o_proj differ only in rounding.
+        o_proj_red_absorbed = o_proj_red
+        o_proj_red_unabsorbed = num_heads * v_head
+        UNABSORB_V = (int(os.environ.get("GLM_UNABSORB_OPROJ", "1")) == 1
+                      and v_head < kv_lora
+                      and o_proj_red_unabsorbed % 256 == 0
+                      # Phase 8b walks attn_out head by head at a stride of
+                      # kv_lora, so a padded head count would need the V row
+                      # padded to match. GLM-5's 64 heads need neither.
+                      and num_heads == num_heads_pad)
+        # 256/ROWS lanes per row and 16 fp8 each, so ROWS >= 4 and
+        # kv_lora % (256/ROWS * 16) == 0; 64 is the widest legal tile and the
+        # one that keeps the tile count off the grid-stride cliff (16384/64/8
+        # = 32 per XCD against 29 workers).
+        WUV_GEMV_ROWS = int(os.environ.get("GLM_WUV_GEMV_ROWS", "64"))
         # The other way to un-starve o_proj, and the one that works: keep the
         # op output-parallel but make the tiles narrower. The 64-column floor
         # came from the 16x64x256 MFMA tile, and at batch 1 that tile was
@@ -1073,12 +1106,24 @@ if __name__ == "__main__":
         if use_mxfp8_oproj:
             # 16 fp8 per lane per iteration over 256/rows lanes.
             assert o_proj_red % ((256 // oproj_tile_n) * 16) == 0, o_proj_red
+            if UNABSORB_V:
+                assert o_proj_red_unabsorbed % (
+                    (256 // oproj_tile_n) * 16) == 0, o_proj_red_unabsorbed
+                assert v_head % WUV_GEMV_ROWS == 0
+                assert kv_lora % ((256 // WUV_GEMV_ROWS) * 16) == 0
+        if UNABSORB_V and not use_mxfp8_oproj:
+            # Phase 8b only exists inside the MXFP8 GEMV o_proj.
+            UNABSORB_V = False
         n_tiles_xcd = hidden_size // 8 // oproj_tile_n
         # The split-K task takes a reduction_override now, so de-padding and
         # split-K compose: it reduces over the leading o_proj_red columns and
         # splits *those* k_splits ways.
         use_splitk_oproj = (GANG_K_SPLITS > 1
                             and o_proj_red % (GANG_K_SPLITS * 256) == 0)
+        print(f"[CFG] o_proj unabsorb_v={int(UNABSORB_V)} "
+              f"K_absorbed={o_proj_red_absorbed} "
+              f"K_unabsorbed={o_proj_red_unabsorbed} "
+              f"wuv_rows={WUV_GEMV_ROWS}")
         print(f"[CFG] o_proj K={o_proj_red} out={hidden_size} "
               f"tile_n={oproj_tile_n} gemv={int(use_gemv_oproj)} "
               f"mxfp8={int(use_mxfp8_oproj)} "
@@ -1137,6 +1182,11 @@ if __name__ == "__main__":
                 torch_dtype=torch.float32)
         else:
             mla_o_acc = None
+        # Phase 8b's output and o_proj's input when W_UV is un-absorbed: the
+        # per-head V slice, num_heads * v_head wide against attn_out's
+        # num_heads_pad * kv_lora.
+        mla_v_out = (make_tensor("mla_v_out", (bs, o_proj_red_unabsorbed))
+                     if UNABSORB_V else None)
         attn_proj_out = make_tensor("attn_proj_out", (bs, hidden_size))
         # Split-K accumulator for the absorbed o_proj. Absorption widens that
         # GEMM's reduction to num_heads_pad * kv_lora (16384 on Flash) while
@@ -1219,8 +1269,11 @@ if __name__ == "__main__":
         #
         # Must match FULL_LAYER_COUNTER_SLOTS in
         # gang_mla_full_layer_fused_mi300.cuh.
-        full_layer_counter = make_tensor("full_layer_counter", (96 * 16,),
-                                         torch_dtype=torch.int32)
+        # Un-absorbed kv_b_v adds Phase 8b's barrier: per-XCD release flags at
+        # [96..103] and the arrival counter at [104].
+        full_layer_counter = make_tensor(
+            "full_layer_counter", ((106 if UNABSORB_V else 96) * 16,),
+            torch_dtype=torch.int32)
         # ── the EP exchange buffers ──────────────────────────────────────
         # One gather buffer PER FUSED LAYER, plus one for the tail. The fold
         # is at the head of layer L+1 and Phase 1 reads the same buffer in
@@ -1402,28 +1455,6 @@ if __name__ == "__main__":
             w_q_b = _attach_input_keep(q_b_absorbed,
                                        f"layer_{i}_q_b_absorbed")
 
-            o_absorbed = absorb_o_proj(
-                attn.o_proj.weight.data, attn._w_uv,
-                num_heads, v_head, kv_lora).to(torch.bfloat16)
-            o_absorbed = pad_cols(o_absorbed, o_proj_red)
-            if use_mxfp8_oproj:
-                # One workgroup per GEMV tile, so the packing's workgroup axis
-                # *is* the tile axis: 2048 / 16 = 128 workgroups, 16 per XCD,
-                # exactly the tile count the bf16 GEMV had.
-                o_absorbed = pack_dense_mxfp8(o_absorbed, oproj_tile_n)
-            w_o = _attach_input_keep(o_absorbed, f"layer_{i}_o_absorbed")
-
-            attn._w_uk = None
-            attn._w_uv = None
-            _release(attn.q_b_proj.weight, attn.kv_b_proj.weight,
-                     attn.o_proj.weight)
-
-            # latent_cache[i] is [pages, page_size, 576]; the kernels want a
-            # 4-D [pages, page_size, 1, 576]. unsqueeze is a contiguous view.
-            kv_cache = _attach_input_keep(
-                model.model.latent_cache[i].unsqueeze(2),
-                f"layer_{i}_latent_cache")
-
             # The whole attention half in one gang task. Needs both GEMMs
             # on the MXFP8 path -- the fused kernel only wraps those bodies --
             # and a real merge phase, which one KV chunk does not have.
@@ -1440,6 +1471,51 @@ if __name__ == "__main__":
                                and FUSE_MOE_SWIGLU and FUSE_MOE_MULSUMADD)
             if fuse_full_layer:
                 fuse_attn = True
+
+            # ── o_proj, absorbed or not ──────────────────────────────────
+            # Only the whole-layer fused task has a Phase 8b to apply W_UV in,
+            # so the dense prologue layers keep the absorbed weight and the
+            # MoE layers get the narrow one plus the W_UV stack. Both are
+            # legal for the same checkpoint; see the byte argument above.
+            unabsorb_this = UNABSORB_V and fuse_full_layer
+            if unabsorb_this:
+                layer_o_proj_red = o_proj_red_unabsorbed
+                o_w = pad_cols(attn.o_proj.weight.data.to(torch.bfloat16),
+                               layer_o_proj_red)
+                # W_UV is [H, v_head, kv_lora] -- exactly the GEMV's
+                # [rows, reduction] once the head axis is flattened into the
+                # rows, since row h * v_head + j reduces over that head's
+                # kv_lora slice of attn_out.
+                w_uv_rows = attn._w_uv.reshape(
+                    num_heads * v_head, kv_lora).to(torch.bfloat16).contiguous()
+                w_wuv = _attach_input_keep(
+                    pack_dense_mxfp8(w_uv_rows, WUV_GEMV_ROWS),
+                    f"layer_{i}_w_uv")
+            else:
+                layer_o_proj_red = o_proj_red
+                w_wuv = None
+                o_w = absorb_o_proj(
+                    attn.o_proj.weight.data, attn._w_uv,
+                    num_heads, v_head, kv_lora).to(torch.bfloat16)
+                o_w = pad_cols(o_w, layer_o_proj_red)
+            if use_mxfp8_oproj:
+                # One workgroup per GEMV tile, so the packing's workgroup axis
+                # *is* the tile axis: 2048 / 16 = 128 workgroups, 16 per XCD,
+                # exactly the tile count the bf16 GEMV had.
+                o_w = pack_dense_mxfp8(o_w, oproj_tile_n)
+            w_o = _attach_input_keep(o_w, f"layer_{i}_o_absorbed")
+
+            attn._w_uk = None
+            attn._w_uv = None
+            _release(attn.q_b_proj.weight, attn.kv_b_proj.weight,
+                     attn.o_proj.weight)
+
+            # latent_cache[i] is [pages, page_size, 576]; the kernels want a
+            # 4-D [pages, page_size, 1, 576]. unsqueeze is a contiguous view.
+            kv_cache = _attach_input_keep(
+                model.model.latent_cache[i].unsqueeze(2),
+                f"layer_{i}_latent_cache")
+
             # The residual fold is independent of whether the attention half is
             # one task or four: it only needs the layer's *first* task to be an
             # MXFP8 rmsnorm+linear, which both paths have, and the MoE W2
@@ -1623,7 +1699,7 @@ if __name__ == "__main__":
                     tile_n=GANG_TILE_N,
                     output_stride=hidden_size,
                     k_splits=GANG_K_SPLITS,
-                    reduction_size=o_proj_red,
+                    reduction_size=layer_o_proj_red,
                     block_dim=(256, 1, 1),
                 )
             elif use_mxfp8_oproj:
@@ -1634,7 +1710,7 @@ if __name__ == "__main__":
                     output=attn_proj_out,
                     rows_per_wg=oproj_tile_n,
                     output_stride=hidden_size,
-                    reduction_size=o_proj_red,
+                    reduction_size=layer_o_proj_red,
                     wgm=GANG_WGM,
                     block_dim=(256, 1, 1),
                 )
@@ -1647,7 +1723,7 @@ if __name__ == "__main__":
                     tile_n=oproj_tile_n,
                     output_stride=hidden_size,
                     wgm=GANG_WGM,
-                    reduction_size=o_proj_red,
+                    reduction_size=layer_o_proj_red,
                     gemv=use_gemv_oproj,
                     block_dim=(256, 1, 1),
                 )
@@ -1873,7 +1949,11 @@ if __name__ == "__main__":
                     q_workspace_slots=qb_head_slots,
                     merge_dim_splits=MLA_MERGE_DIM_SPLITS,
                     oproj_rows_per_wg=oproj_tile_n,
-                    oproj_reduction_size=o_proj_red,
+                    oproj_reduction_size=layer_o_proj_red,
+                    wuv_mxfp8_weight=w_wuv,
+                    v_out=mla_v_out if unabsorb_this else None,
+                    wuv_rows_per_wg=WUV_GEMV_ROWS if unabsorb_this else 0,
+                    wuv_v_head_dim=v_head if unabsorb_this else 0,
                     actual_hidden_dim=hidden_size,
                     num_experts_per_tok=topk,
                     routed_scaling_factor=config.routed_scaling_factor,
@@ -1914,7 +1994,7 @@ if __name__ == "__main__":
                     active_expert_ids=moe_mask,
                     moe_workspace_f32=moe_ws_f32,
                     rows_per_wg=oproj_tile_n,
-                    reduction_size=o_proj_red,
+                    reduction_size=layer_o_proj_red,
                     actual_hidden_dim=hidden_size,
                     num_experts_per_tok=topk,
                     routed_scaling_factor=config.routed_scaling_factor,
