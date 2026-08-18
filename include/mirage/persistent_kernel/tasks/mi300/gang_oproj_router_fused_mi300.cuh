@@ -479,10 +479,24 @@ __device__ __attribute__((always_inline)) void
     constexpr bool RESTAGE = false;
 #endif
     bool stage_a = true;
+    // The output columns and the residual columns are the SAME columns, so both
+    // are derived here from one base instead of the output being offset by the
+    // kernel and the residual by the input partition map. Today the two agree
+    // -- o_proj covers the whole row, so xcd_id * oproj_tiles_per_xcd *
+    // OPROJ_ROWS_PER_WG is exactly the xcd_id * HIDDEN_SIZE/8 slice the map
+    // handed over -- and this is a pure refactor. It exists because the map
+    // cannot express the next step: under rank-sharded o_proj the base is
+    // my_pe * (HIDDEN_SIZE / EP_WORLD_SIZE) + xcd_id * (that / 8), and a
+    // partition map has no rank axis. Keep the two pointers derived together so
+    // they cannot drift apart when that base changes.
+    size_t const oproj_col_base =
+        static_cast<size_t>(xcd_id) * oproj_tiles_per_xcd * OPROJ_ROWS_PER_WG;
+    unsigned short *const xcd_out =
+        static_cast<unsigned short *>(hidden_ptr) + oproj_col_base;
+    unsigned short const *const xcd_res =
+        static_cast<unsigned short const *>(oproj_residual_ptr) +
+        oproj_col_base;
     for (int t = xcd_rank; t < oproj_tiles_per_xcd; t += tiles_per_xcd) {
-      unsigned short *xcd_out =
-          static_cast<unsigned short *>(hidden_ptr) +
-          static_cast<size_t>(xcd_id) * oproj_tiles_per_xcd * OPROJ_ROWS_PER_WG;
       gang_gemv_mxfp8_kernel<BATCH_SIZE,
                              OPROJ_REDUCTION_SIZE,
                              OPROJ_ROWS_PER_WG,
@@ -492,7 +506,7 @@ __device__ __attribute__((always_inline)) void
                                                                v_out_ptr
                                                          : oproj_input_ptr,
                                                      oproj_weight_ptr,
-                                                     oproj_residual_ptr,
+                                                     xcd_res,
                                                      xcd_out,
                                                      num_active_tokens,
                                                      OPROJ_ROWS_PER_WG,

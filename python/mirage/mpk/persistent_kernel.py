@@ -2446,7 +2446,9 @@ class PersistentKernel:
         tb_graph.new_input(moe_workspace_f32, (-1, -1, -1), 1, True)
         tb_graph.new_input(counters, (-1, -1, -1), 0, True)
         tb_graph.new_input(oproj_mxfp8_weight, (0, -1, -1), 1, True)
-        tb_graph.new_input(residual, (1, -1, -1), 1, True)
+        # Unpartitioned; see the note on the same input in
+        # gang_oproj_router_fused_layer. Was (1, -1, -1), same arithmetic.
+        tb_graph.new_input(residual, (-1, -1, -1), 1, True)
         tb_graph.new_input(post_norm_weight, (-1, -1, -1), 0, True)
         tb_graph.new_input(post_norm_output, (-1, -1, -1), 1, True)
         tb_graph.new_input(router_weight, (0, -1, -1), 1, True)
@@ -5300,7 +5302,12 @@ class PersistentKernel:
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, -1, -1), 1, True)
         tb_graph.new_input(oproj_mxfp8_weight, (0, -1, -1), 1, True)
-        tb_graph.new_input(residual, (1, -1, -1), 1, True)
+        # Unpartitioned: the kernel now derives the residual's XCD column slice
+        # from the same base as the output's, so that the two cannot drift and
+        # so the base can become rank-dependent under sharded o_proj, which a
+        # partition map has no axis for. See gang_oproj_router_fused_mi300.cuh's
+        # oproj_col_base. Was (1, -1, -1); the arithmetic is identical.
+        tb_graph.new_input(residual, (-1, -1, -1), 1, True)
         tb_graph.new_input(norm_weight, (-1, -1, -1), 0, True)
         tb_graph.new_input(norm_output, (-1, -1, -1), 1, True)
         tb_graph.new_input(router_weight, (0, -1, -1), 1, True)
