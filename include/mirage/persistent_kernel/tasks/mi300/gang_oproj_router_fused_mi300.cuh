@@ -254,7 +254,11 @@ __device__ __attribute__((always_inline)) void
     // XCD's slice, so it wants the XCD's base pointer. `hidden_ptr` is the
     // whole row here -- it has to be, since Phase 3 norms all of it -- so the
     // slice is reconstructed rather than handed over by the partition map.
-    if (xcd_rank < oproj_tiles_per_xcd) {
+    // Grid-stride: at GLM-5's hidden 6144 o_proj wants 48 tiles per XCD
+    // against 30 resident workers, and the dispatch width is capped at the
+    // worker count because a tile that has to wait for a worker deadlocks the
+    // barrier below. Where the count fits the loop runs once.
+    for (int t = xcd_rank; t < oproj_tiles_per_xcd; t += tiles_per_xcd) {
       unsigned short *xcd_out =
           static_cast<unsigned short *>(hidden_ptr) +
           static_cast<size_t>(xcd_id) * oproj_tiles_per_xcd * OPROJ_ROWS_PER_WG;
@@ -272,7 +276,7 @@ __device__ __attribute__((always_inline)) void
                                                      /*m_tiles=*/1,
                                                      oproj_tiles_per_xcd,
                                                      /*wgm=*/0,
-                                                     xcd_rank);
+                                                     t);
     }
 
     MPK_WS_PHASE(72, routing_expected, xcd_id);
@@ -328,7 +332,14 @@ __device__ __attribute__((always_inline)) void
     // own atomic counter picks the last of the 64 to run the TopK tail.
     // Workers past router_tile_n must not enter, or that counter would
     // over-count. That tail publishes `routing_ready` for the MoE phases.
-    if (xcd_rank < router_tile_n) {
+    // Grid-stride over experts. One worker per expert is the shape this was
+    // written for, but 256 experts is 32 per XCD against 30 workers, so at
+    // GLM-5 two ranks per XCD carry a second expert. The second call re-runs
+    // the redundant RMSNorm and re-clears the o_proj barrier -- both are
+    // idempotent, and the gang counter still sees exactly total_router_tiles
+    // arrivals per layer however they are distributed, so the TopK tail still
+    // fires exactly once.
+    for (int t = xcd_rank; t < router_tile_n; t += tiles_per_xcd) {
       gang_rmsnorm_linear_bias_topk_kernel<__hip_bfloat16,
                                            BATCH_SIZE,
                                            HIDDEN_SIZE,
@@ -353,7 +364,7 @@ __device__ __attribute__((always_inline)) void
           /*m_tiles=*/1,
           router_tile_n,
           /*wgm=*/0,
-          xcd_rank,
+          t,
           total_router_tiles,
           renormalize,
           routed_scaling_factor,

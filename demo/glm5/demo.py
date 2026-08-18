@@ -409,6 +409,14 @@ if __name__ == "__main__":
     parser.add_argument("--random-weights", action="store_true",
                         help="Skip the checkpoint; exercise shapes only")
     parser.add_argument(
+        "--mxfp4-checkpoint", dest="mxfp4_checkpoint", action="store_true",
+        default=None,
+        help="Read routed experts as pre-quantised MXFP4 blocks/scales "
+             "(the stream_quant_glm5.py output) instead of bf16. Default is "
+             "auto: on iff the checkpoint index advertises .mxfp4_blocks.")
+    parser.add_argument("--no-mxfp4-checkpoint", dest="mxfp4_checkpoint",
+                        action="store_false")
+    parser.add_argument(
         "--rope-interleave", dest="rope_interleave", action="store_true",
         default=None,
         help="Force interleaved RoPE pairs (2j, 2j+1). GLM-5 sets this in "
@@ -491,6 +499,15 @@ if __name__ == "__main__":
     attn_dp = world_size > 1 and os.environ.get("ATTN_DP", "1") == "1"
     attn_ws = 1 if attn_dp else world_size
 
+    # Expert parallelism has to be decided BEFORE the weights are loaded, not
+    # just before they are packed. At GLM-4.7-Flash's 64 experts every rank can
+    # afford to load all of them and throw away the seven eighths it does not
+    # own; at GLM-5's 256 experts x 76 layers it cannot -- the full bf16 MoE is
+    # 1488 GB against 288 GB of HBM. So the rank's slice is pushed down into
+    # model construction, and `ep_base` below becomes an offset into a list
+    # that already starts at this rank's first expert.
+    moe_ep = world_size > 1 and os.environ.get("MOE_EP", "1") == "1"
+
     print("Input arguments:", args)
     print(f"world_size({world_size}) rank({rank})")
     if attn_dp:
@@ -504,6 +521,9 @@ if __name__ == "__main__":
             args.model_path, world_size=attn_ws,
             max_num_pages=args.max_num_pages, page_size=args.page_size,
             num_layers=args.max_layers, random_weights=args.random_weights,
+            ep_rank=(rank if moe_ep else 0),
+            ep_world=(world_size if moe_ep else 1),
+            mxfp4_experts=args.mxfp4_checkpoint,
         ).to(dtype=torch.bfloat16, device="cuda")
         # A partially-fetched checkpoint (config + shard index only, which is
         # how the 744B geometry is brought up on one GPU) carries no tokenizer
@@ -729,7 +749,7 @@ if __name__ == "__main__":
         # times. The kernel gives it to EP_SHARED_PE == EP_FOLD_PE; every rank
         # still stores a replica it never reads, which is cheaper than a
         # ragged weight shape.
-        moe_ep = world_size > 1 and os.environ.get("MOE_EP", "1") == "1"
+        # moe_ep was decided before the load, above.
         if moe_ep:
             assert num_experts % world_size == 0, (
                 f"ep_slice needs {num_experts} routed experts to divide by "
@@ -739,6 +759,15 @@ if __name__ == "__main__":
         else:
             ep_local = num_experts
             ep_base = 0
+
+        # Where this rank's slice starts *in the list the model holds*. When
+        # construction was already EP-aware the list begins at ep_base, so the
+        # offset is zero; `ep_base` itself stays the global id and is what the
+        # log and the kernel's expert-id arithmetic mean.
+        model_ep_sharded = any(
+            getattr(l.mlp, "ep_local", num_experts) != num_experts
+            for l in model.model.layers if l.is_moe)
+        ep_slice_base = 0 if model_ep_sharded else ep_base
         # The single rank that folds the real residual into its MoE partial,
         # so the residual survives the cross-rank sum exactly once. The kernel
         # gives the same rank the shared expert, for the same reason.
@@ -1691,30 +1720,81 @@ if __name__ == "__main__":
             # at ep_local -- which is exactly the local_eid the MoE tile
             # helper computes. Every rank stores the shared replica; only
             # ep_fold_rank ever reads it.
-            routed = list(layer.mlp.experts)
-            experts = routed[ep_base:ep_base + ep_local] + [shared]
-            gu_stack = torch.stack([
-                interleave_gate_up(e.gate_proj.weight.data,
-                                   e.up_proj.weight.data, moe_inter)
-                if FUSE_MOE_SWIGLU else
-                torch.cat([e.gate_proj.weight.data,
-                           e.up_proj.weight.data], dim=0)
-                for e in experts
-            ]).contiguous()
-            down_stack = torch.stack([e.down_proj.weight.data
-                                      for e in experts]).contiguous()
-            if MOE_MXFP8:
-                # The packer preserves row order, so the pairwise gate/up
-                # interleave above carries through untouched.
-                gu_stack = pack_moe_mxfp8(gu_stack, MOE_MXFP8_OPW)
-                down_stack = pack_moe_mxfp8(down_stack, MOE_MXFP8_OPW)
+            if layer.mlp.mxfp4_experts:
+                # The routed experts arrived from disk already in MXFP4, so the
+                # only work left is the row permutation and the per-workgroup
+                # pack -- both of which are pure reshuffles of the quantised
+                # rows. interleave_gate_up is width-agnostic (it only ever
+                # reshapes dim 0), so the same call serves the K/2-wide blocks
+                # and the K/32-wide scales, and it commutes with quantisation
+                # exactly because MXFP4 blocks never cross a row.
+                #
+                # The shared expert is not pre-quantised: it is 1/256th of the
+                # bytes, the streamer leaves it bf16, and quantising it here
+                # keeps it on the identical code path as GLM-4.7-Flash.
+                assert MOE_MXFP8 and MOE_MXFP4, (
+                    "an MXFP4 checkpoint needs the MXFP4 expert kernel "
+                    "(GLM_MOE_MXFP4=1); there is no bf16 path for it")
+
+                def _pair(d, key):
+                    b, s = d[key]
+                    return b, s
+
+                def _pack_one(gb, gs, ub, us, db, ds):
+                    if FUSE_MOE_SWIGLU:
+                        gu_b = interleave_gate_up(gb, ub, moe_inter)
+                        gu_s = interleave_gate_up(gs, us, moe_inter)
+                    else:
+                        gu_b = torch.cat([gb, ub], dim=0)
+                        gu_s = torch.cat([gs, us], dim=0)
+                    return (pack_mxfp8_workgroup(gu_b, gu_s, MOE_MXFP8_OPW),
+                            pack_mxfp8_workgroup(db, ds, MOE_MXFP8_OPW))
+
+                gu_parts, down_parts = [], []
+                for d in layer.mlp.expert_mxfp4:
+                    gb, gs = _pair(d, "gate_proj")
+                    ub, us = _pair(d, "up_proj")
+                    db, ds = _pair(d, "down_proj")
+                    gu, dn = _pack_one(gb, gs, ub, us, db, ds)
+                    gu_parts.append(gu)
+                    down_parts.append(dn)
+                sg, sgs = quantize_mxfp4(shared.gate_proj.weight.data)
+                su, sus = quantize_mxfp4(shared.up_proj.weight.data)
+                sd, sds = quantize_mxfp4(shared.down_proj.weight.data)
+                gu, dn = _pack_one(sg, sgs, su, sus, sd, sds)
+                gu_parts.append(gu)
+                down_parts.append(dn)
+                gu_stack = torch.stack(gu_parts).contiguous()
+                down_stack = torch.stack(down_parts).contiguous()
+                layer.mlp.expert_mxfp4 = None   # drop the unpacked references
+                _release(shared.gate_proj.weight, shared.up_proj.weight,
+                         shared.down_proj.weight)
+            else:
+                routed = list(layer.mlp.experts)
+                experts = (routed[ep_slice_base:ep_slice_base + ep_local]
+                           + [shared])
+                gu_stack = torch.stack([
+                    interleave_gate_up(e.gate_proj.weight.data,
+                                       e.up_proj.weight.data, moe_inter)
+                    if FUSE_MOE_SWIGLU else
+                    torch.cat([e.gate_proj.weight.data,
+                               e.up_proj.weight.data], dim=0)
+                    for e in experts
+                ]).contiguous()
+                down_stack = torch.stack([e.down_proj.weight.data
+                                          for e in experts]).contiguous()
+                if MOE_MXFP8:
+                    # The packer preserves row order, so the pairwise gate/up
+                    # interleave above carries through untouched.
+                    gu_stack = pack_moe_mxfp8(gu_stack, MOE_MXFP8_OPW)
+                    down_stack = pack_moe_mxfp8(down_stack, MOE_MXFP8_OPW)
+                # Release the FULL list, not the owned slice: the non-owned
+                # experts were loaded and are now dead weight.
+                for e in routed + [shared]:
+                    _release(e.gate_proj.weight, e.up_proj.weight,
+                             e.down_proj.weight)
             w_moe_gu = _attach_input_keep(gu_stack, f"layer_{i}_moe_gate_up")
             w_moe_down = _attach_input_keep(down_stack, f"layer_{i}_moe_down")
-            # Release the FULL list, not the owned slice: the non-owned
-            # experts were loaded and are now dead weight.
-            for e in routed + [shared]:
-                _release(e.gate_proj.weight, e.up_proj.weight,
-                         e.down_proj.weight)
 
             # post_attention_layernorm + router GEMV + routing, fused.
             #

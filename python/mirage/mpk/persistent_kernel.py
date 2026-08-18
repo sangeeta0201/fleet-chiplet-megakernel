@@ -1851,15 +1851,15 @@ class PersistentKernel:
                        * merge_dim_splits)
         merge_tiles_per_xcd = math.ceil(merge_total / 8)
 
-        # The dispatch width is the widest phase. q_b is +1 for the latent
-        # tile, which owns a slot of its own on XCD 0.
-        tiles_per_xcd = max(batch_size * qkv_n_wgs_per_xcd,
-                            batch_size * qb_n_wgs_per_xcd + 1,
-                            mla_tiles_per_xcd, merge_tiles_per_xcd)
-        assert tiles_per_xcd <= self.num_workers // 8, (
-            f"{tiles_per_xcd} tiles per XCD exceeds the "
-            f"{self.num_workers // 8} resident workers; the in-kernel barrier "
-            "deadlocks if a tile has to wait for a worker")
+        # The dispatch width is the widest phase, clamped to the resident
+        # workers -- the phases grid-stride past that, and the in-kernel
+        # barriers are sized in dispatched workers, so a tile parked behind a
+        # busy worker would deadlock them. q_b is +1 for the latent tile,
+        # which owns a slot of its own on XCD 0.
+        tiles_per_xcd = min(max(batch_size * qkv_n_wgs_per_xcd,
+                                batch_size * qb_n_wgs_per_xcd + 1,
+                                mla_tiles_per_xcd, merge_tiles_per_xcd),
+                            self.num_workers // 8)
         # 29 cache-line-strided int32 slots: qkv_a->q_b at [0..8],
         # q_b->decode at [10..18], decode->merge at [20..28]. All monotonic,
         # so nothing is reset and one buffer serves every layer.
@@ -2232,20 +2232,24 @@ class PersistentKernel:
             moe_max_activated * batch_size * moe_down_weight.dim(1) + 7) // 8
 
         oproj_topk_tiles_per_xcd = max(oproj_tiles_per_xcd, router_tile_n)
-        total_barrier_arrivals = oproj_topk_tiles_per_xcd * 8
 
         # ══ the one dispatch width ══
         # Every phase of the layer, both halves. Whichever is widest sets the
-        # worker count, and every barrier in the task is sized against it.
-        tiles_per_xcd = max(batch_size * qkv_n_wgs_per_xcd,
-                            batch_size * qb_n_wgs_per_xcd + 1,
-                            mla_tiles_per_xcd, merge_tiles_per_xcd,
-                            oproj_topk_tiles_per_xcd,
-                            moe_w13_tiles_per_xcd, moe_w2_tiles_per_xcd)
-        assert tiles_per_xcd <= self.num_workers // 8, (
-            f"{tiles_per_xcd} tiles per XCD exceeds the "
-            f"{self.num_workers // 8} resident workers; the in-kernel barrier "
-            "deadlocks if a tile has to wait for a worker")
+        # worker count, and every barrier in the task is sized against it --
+        # but only up to the resident workers, because the barriers count
+        # *dispatched* workers and a tile parked behind a busy one deadlocks
+        # them. Past that point the phases grid-stride: GLM-5 wants 108 W2
+        # tiles, 72 W13, 48 o_proj, 33 q_b and 32 router tiles per XCD against
+        # 30 workers, so those phases take 2-4 rounds each. GLM-4.7-Flash fits
+        # in one round everywhere and is unaffected.
+        tiles_per_xcd = min(max(batch_size * qkv_n_wgs_per_xcd,
+                                batch_size * qb_n_wgs_per_xcd + 1,
+                                mla_tiles_per_xcd, merge_tiles_per_xcd,
+                                oproj_topk_tiles_per_xcd,
+                                moe_w13_tiles_per_xcd, moe_w2_tiles_per_xcd),
+                            self.num_workers // 8)
+        total_barrier_arrivals = min(oproj_topk_tiles_per_xcd,
+                                     tiles_per_xcd) * 8
 
         # 80 cache-line-strided int32 slots, or 96 under EP. See the kernel
         # header for the map; every barrier is monotonic, so nothing is reset
@@ -5119,16 +5123,22 @@ class PersistentKernel:
 
         # The o_proj barrier counts only the workers that run o_proj or the
         # router; the MoE-only workers wait on the routing-ready epoch instead.
-        # tiles_per_xcd is therefore the MoE worker count, and it sets the
-        # dispatch width.
         oproj_topk_tiles_per_xcd = max(oproj_tiles_per_xcd, router_tile_n)
-        total_barrier_arrivals = oproj_topk_tiles_per_xcd * 8
-        tiles_per_xcd = max(oproj_topk_tiles_per_xcd, moe_w13_tiles_per_xcd,
-                            moe_w2_tiles_per_xcd)
-        assert tiles_per_xcd <= self.num_workers // 8, (
-            f"{tiles_per_xcd} tiles per XCD exceeds the "
-            f"{self.num_workers // 8} resident workers; the in-kernel barrier "
-            "deadlocks if a tile has to wait for a worker")
+
+        # The dispatch width, clamped to the resident workers. Every phase in
+        # the task grid-strides by it, so a phase with more tiles than workers
+        # takes more rounds instead of asking for a worker that does not
+        # exist. The clamp is not a tuning choice: the in-kernel barriers are
+        # sized in *dispatched* workers, and a tile parked behind a busy
+        # worker would deadlock them. GLM-5 needs it -- 108 W2 tiles per XCD
+        # against 30 workers -- and GLM-4.7-Flash never reaches it.
+        tiles_per_xcd = min(max(oproj_topk_tiles_per_xcd,
+                                moe_w13_tiles_per_xcd, moe_w2_tiles_per_xcd),
+                            self.num_workers // 8)
+        # ...and the o_proj barrier's arrival count is the participating set
+        # after the clamp, not before it.
+        total_barrier_arrivals = min(oproj_topk_tiles_per_xcd,
+                                     tiles_per_xcd) * 8
         # 29 cache-line-strided int32 slots: the o_proj barrier's 8 release
         # flags plus its counter at [0..8], the routing-ready epoch and its 8
         # flags at [10..18], and the W13->W2 barrier at [20..28]. All monotonic,

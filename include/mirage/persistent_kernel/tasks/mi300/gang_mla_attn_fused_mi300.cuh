@@ -237,7 +237,14 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // reads a latent slice that spans two more -- so the slice the partition
   // map used to supply is reconstructed instead, exactly as the MoE task
   // reconstructs o_proj's.
-  if (xcd_rank < qkv_tiles_per_xcd) {
+  // Grid-stride, not one tile per worker: at GLM-5's widths a phase can want
+  // more tiles per XCD than there are resident workers (o_proj 48, the router
+  // 32, W2 108 against 30), and the dispatch width is capped at the worker
+  // count because a tile that has to wait for a worker deadlocks the in-kernel
+  // barriers. Every phase therefore strides by tiles_per_xcd. Where the count
+  // fits -- which is all of them at GLM-4.7-Flash -- the loop runs once and
+  // the generated code is what it was.
+  for (int t = xcd_rank; t < qkv_tiles_per_xcd; t += tiles_per_xcd) {
     unsigned short *xcd_out =
         static_cast<unsigned short *>(qkv_a_out_ptr) +
         static_cast<size_t>(xcd_id) * qkv_n_wgs_per_xcd * QKV_OUTPUT_PER_WG;
@@ -257,7 +264,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         num_active_tokens,
         qkv_n_wgs_per_xcd,
         qkv_output_stride,
-        xcd_rank,
+        t,
         moe_ws_f32_ptr,
         x_out_ptr);
   }
@@ -347,7 +354,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // tile_idx 0 is the latent row and returns immediately on every XCD but 0;
   // the GEMM tiles are shifted up by one inside the kernel. Handing it
   // xcd_rank reproduces the standalone dispatch exactly.
-  if (xcd_rank < qb_tiles_per_xcd) {
+  for (int t = xcd_rank; t < qb_tiles_per_xcd; t += tiles_per_xcd) {
     unsigned short *xcd_q_ws =
         static_cast<unsigned short *>(q_workspace_ptr) +
         static_cast<size_t>(xcd_id) * qb_n_wgs_per_xcd * QB_OUTPUT_PER_WG;
@@ -382,7 +389,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         num_active_tokens,
         qb_n_wgs_per_xcd,
         qb_output_stride,
-        xcd_rank,
+        t,
         kv_eps);
   }
 
@@ -454,27 +461,29 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     // against mla_tiles_per_xcd rather than tiles_per_xcd reproduces the
     // standalone task's mapping, where the gang dispatch width was the
     // decode's own.
-    gang_mla_decode_kernel<bfloat16,
-                           NUM_Q_HEADS,
-                           KV_LORA_RANK,
-                           QK_ROPE_HEAD_DIM,
-                           PAGE_SIZE,
-                           MAX_SEQ_LEN,
-                           NUM_KV_CHUNKS,
-                           Q_WORKSPACE_STRIDE,
-                           KV_CACHE_STRIDE,
-                           /*WRITE_THROUGH=*/true>(
-        q_workspace_ptr,
-        kv_cache_ptr,
-        o_acc_ptr,
-        lse_ptr,
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        kv_last_page_len,
-        mla_total_work_items,
-        xcd_id * mla_tiles_per_xcd + xcd_rank,
-        scale_s);
+    for (int t = xcd_rank; t < mla_tiles_per_xcd; t += tiles_per_xcd) {
+      gang_mla_decode_kernel<bfloat16,
+                             NUM_Q_HEADS,
+                             KV_LORA_RANK,
+                             QK_ROPE_HEAD_DIM,
+                             PAGE_SIZE,
+                             MAX_SEQ_LEN,
+                             NUM_KV_CHUNKS,
+                             Q_WORKSPACE_STRIDE,
+                             KV_CACHE_STRIDE,
+                             /*WRITE_THROUGH=*/true>(
+          q_workspace_ptr,
+          kv_cache_ptr,
+          o_acc_ptr,
+          lse_ptr,
+          qo_indptr,
+          kv_indptr,
+          kv_indices,
+          kv_last_page_len,
+          mla_total_work_items,
+          xcd_id * mla_tiles_per_xcd + t,
+          scale_s);
+    }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     {
       unsigned long long _t = __builtin_amdgcn_s_memrealtime();
@@ -551,23 +560,25 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // bid.y of a (requests, 32, 1) grid -- there is no bid.y in a gang task, so
   // it comes from the worker's own coordinates instead.
   constexpr int NUM_Q_GROUPS = NUM_Q_HEADS / 16;
-  merge_splitkv_ck_fmha<bfloat16,
-                        /*NUM_QO_HEADS_PER_KV=*/16,
-                        NUM_Q_GROUPS,
-                        /*HEAD_DIM=*/KV_LORA_RANK,
-                        NUM_KV_CHUNKS,
-                        /*KV_CHUNK_SIZE=*/128,
-                        PAGE_SIZE,
-                        MERGE_WRITE_THROUGH,
-                        MERGE_DIM_SPLITS>(
-      reinterpret_cast<float const *>(lse_ptr),
-      reinterpret_cast<float const *>(o_acc_ptr),
-      qo_indptr,
-      kv_indptr,
-      kv_last_page_len,
-      request_id,
-      reinterpret_cast<bfloat16 *>(attn_out_ptr),
-      xcd_id * merge_tiles_per_xcd + xcd_rank);
+  for (int t = xcd_rank; t < merge_tiles_per_xcd; t += tiles_per_xcd) {
+    merge_splitkv_ck_fmha<bfloat16,
+                          /*NUM_QO_HEADS_PER_KV=*/16,
+                          NUM_Q_GROUPS,
+                          /*HEAD_DIM=*/KV_LORA_RANK,
+                          NUM_KV_CHUNKS,
+                          /*KV_CHUNK_SIZE=*/128,
+                          PAGE_SIZE,
+                          MERGE_WRITE_THROUGH,
+                          MERGE_DIM_SPLITS>(
+        reinterpret_cast<float const *>(lse_ptr),
+        reinterpret_cast<float const *>(o_acc_ptr),
+        qo_indptr,
+        kv_indptr,
+        kv_last_page_len,
+        request_id,
+        reinterpret_cast<bfloat16 *>(attn_out_ptr),
+        xcd_id * merge_tiles_per_xcd + t);
+  }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   {
     unsigned long long _t = __builtin_amdgcn_s_memrealtime();

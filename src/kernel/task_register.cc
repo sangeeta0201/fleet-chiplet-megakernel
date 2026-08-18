@@ -2205,15 +2205,19 @@ int TaskRegister::register_gang_oproj_router_fused_mi300_task(
          "o_proj MXFP8 weight is not packed at this reduction and row count");
   assert(oproj_tiles_per_xcd * oproj_rows_per_wg * 8 == hidden_size &&
          "the packed o_proj weight does not cover the hidden row exactly");
-  assert(tiles_per_xcd >= oproj_tiles_per_xcd && tiles_per_xcd >= router_tile_n);
   // The o_proj barrier is sized to the workers that actually run o_proj or the
-  // router, not to every dispatched worker. tiles_per_xcd is the MoE worker
-  // count now, and the MoE-only workers wait on `routing_ready` instead --
-  // decoupling the two barriers is the whole point of having both.
-  assert(total_barrier_arrivals ==
-         (oproj_tiles_per_xcd > router_tile_n ? oproj_tiles_per_xcd
-                                              : router_tile_n) *
-             8);
+  // router, not to every dispatched worker: the MoE-only workers wait on
+  // `routing_ready` instead, and decoupling the two barriers is the whole
+  // point of having both. Clipped by the dispatch width, because a phase with
+  // more tiles than workers grid-strides -- the extra tiles are extra rounds
+  // on the same workers, not extra arrivals.
+  {
+    int const participants = oproj_tiles_per_xcd > router_tile_n
+                                 ? oproj_tiles_per_xcd
+                                 : router_tile_n;
+    assert(total_barrier_arrivals ==
+           (participants < tiles_per_xcd ? participants : tiles_per_xcd) * 8);
+  }
 
   // e_score_correction_bias arrives whole, as the sigmoid tail reads all of it.
   assert(input_ops[6]->dtensor.num_dims == 1);
@@ -2285,11 +2289,11 @@ int TaskRegister::register_gang_oproj_router_fused_mi300_task(
   assert(hidden_size % moe_w2_opw == 0);
   int moe_w13_tiles_per_expert = batch_size * (2 * moe_intermediate / moe_w13_opw);
   int moe_w2_tiles_per_expert = batch_size * (hidden_size / moe_w2_opw);
-  // Every dispatched worker runs a W13 tile and arrives at the W13->W2
-  // barrier, so a tile count above the worker count would silently drop work
-  // on the far side of a barrier that has already been released.
-  assert(moe_w13_tiles_per_xcd <= tiles_per_xcd);
-  assert(moe_w2_tiles_per_xcd <= tiles_per_xcd);
+  // Both MoE phases grid-stride by tiles_per_xcd, so a tile count above the
+  // worker count costs extra rounds rather than dropping work. Every
+  // dispatched worker still arrives at the W13->W2 barrier exactly once,
+  // whichever side of the width the tile count falls on.
+  assert(moe_w13_tiles_per_xcd > 0 && moe_w2_tiles_per_xcd > 0);
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
@@ -3930,12 +3934,9 @@ int TaskRegister::register_gang_mla_attn_fused_mi300_task(
   assert(output_ops[5]->dtensor.dim[0] == batch_size);
   assert(output_ops[5]->dtensor.dim[1] == qkv_reduction);
 
-  // Every phase has to fit inside the dispatch width, or a tile's work is
-  // silently dropped on the far side of a barrier that already released.
-  assert(batch_size * qkv_n_wgs_per_xcd <= tiles_per_xcd);
-  assert(batch_size * qb_n_wgs_per_xcd + 1 <= tiles_per_xcd);
-  assert(mla_tiles_per_xcd <= tiles_per_xcd);
-  assert(merge_tiles_per_xcd <= tiles_per_xcd);
+  // Phases wider than the dispatch width grid-stride by it; the width itself
+  // is the caller's clamp against the resident worker count.
+  assert(tiles_per_xcd > 0);
   assert(num_q_heads % 16 == 0);
   int num_q_groups = num_q_heads / 16;
   assert(mla_total_work_items == batch_size * num_q_groups * num_kv_chunks);
@@ -4172,10 +4173,13 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
          "the packed o_proj weight does not cover the hidden row exactly");
   assert(hidden_size == qkv_reduction &&
          "o_proj's N is the next layer's qkv_a K; they are one row");
-  assert(total_barrier_arrivals ==
-         (oproj_tiles_per_xcd > router_tile_n ? oproj_tiles_per_xcd
-                                              : router_tile_n) *
-             8);
+  {
+    int const participants = oproj_tiles_per_xcd > router_tile_n
+                                 ? oproj_tiles_per_xcd
+                                 : router_tile_n;
+    assert(total_barrier_arrivals ==
+           (participants < tiles_per_xcd ? participants : tiles_per_xcd) * 8);
+  }
   assert(input_ops[20]->dtensor.num_dims == 1);
   assert(input_ops[20]->output_tensors[0].dim[0] == num_experts);
 
@@ -4245,18 +4249,15 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
       batch_size * (2 * moe_intermediate / moe_w13_opw);
   int moe_w2_tiles_per_expert = batch_size * (hidden_size / moe_w2_opw);
 
-  // ══ every phase in the layer has to fit inside the one dispatch width ══
+  // ══ the one dispatch width ══
   // Both halves decode xcd_id from tile_idx / tiles_per_xcd, so this is the
-  // single number they must agree on, and a phase wider than it would drop
-  // work on the far side of a barrier that has already released.
-  assert(batch_size * qkv_n_wgs_per_xcd <= tiles_per_xcd);
-  assert(batch_size * qb_n_wgs_per_xcd + 1 <= tiles_per_xcd);
-  assert(mla_tiles_per_xcd <= tiles_per_xcd);
-  assert(merge_tiles_per_xcd <= tiles_per_xcd);
-  assert(oproj_tiles_per_xcd <= tiles_per_xcd);
-  assert(router_tile_n <= tiles_per_xcd);
-  assert(moe_w13_tiles_per_xcd <= tiles_per_xcd);
-  assert(moe_w2_tiles_per_xcd <= tiles_per_xcd);
+  // single number they must agree on. A phase wider than it is not an error:
+  // every phase grid-strides by tiles_per_xcd and simply takes more rounds,
+  // which is how GLM-5 runs 108 W2 tiles per XCD on 30 workers. What would be
+  // an error is a width above the resident worker count, since the barriers
+  // count dispatched workers -- but that is the caller's clamp to enforce,
+  // and it is not visible from here.
+  assert(tiles_per_xcd > 0);
 
   float scale_s = 1.0f / sqrtf((float)qk_head_dim) * 1.44269504088896340736f;
 

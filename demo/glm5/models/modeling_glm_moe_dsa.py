@@ -415,19 +415,57 @@ class GlmTopkRouter(nn.Module):
 
 
 class GlmMoE(nn.Module):
-    def __init__(self, config: GlmMoeDsaConfig):
+    """Routed experts + one shared expert, optionally expert-parallel.
+
+    ``ep_world > 1`` allocates only this rank's ``n_routed_experts //
+    ep_world`` experts. That is not an optimisation at GLM-5's scale, it is
+    what makes the model constructible: 256 experts x 76 layers in bf16 is
+    1488 GB, against 288 GB of HBM per GPU.
+
+    ``mxfp4_experts`` goes further and never materialises the bf16 form at
+    all. One rank's 32-expert slice is 183 GB as bf16 and 46 GB as MXFP4, and
+    the megakernel only ever reads the MXFP4 packing, so the bf16 is pure
+    transient. The quantised experts are deliberately NOT nn.Modules --
+    load_state_dict has no notion of a blocks/scales pair -- and are filled by
+    ``GlmMoeDsaForCausalLM.from_pretrained`` into ``expert_mxfp4``.
+    """
+
+    def __init__(self, config: GlmMoeDsaConfig, ep_rank: int = 0,
+                 ep_world: int = 1, mxfp4_experts: bool = False):
         super().__init__()
         self.config = config
-        self.experts = nn.ModuleList([
-            GlmMLP(config.hidden_size, config.moe_intermediate_size)
-            for _ in range(config.n_routed_experts)
-        ])
+        assert config.n_routed_experts % ep_world == 0, (
+            f"{config.n_routed_experts} routed experts must divide by "
+            f"ep_world {ep_world}")
+        self.ep_local = config.n_routed_experts // ep_world
+        self.ep_base = ep_rank * self.ep_local
+        self.mxfp4_experts = mxfp4_experts
+        if mxfp4_experts:
+            self.experts = None
+            # [{"gate_proj": (blocks, scales), "up_proj": ..., "down_proj": ...}]
+            self.expert_mxfp4 = [dict() for _ in range(self.ep_local)]
+        else:
+            # Sharding the bf16 path too would need load_state_dict to remap
+            # global expert index to local, which nothing needs: bf16 is the
+            # GLM-4.7-Flash reference path and it runs unsharded.
+            assert ep_world == 1, "bf16 experts do not support ep_world > 1"
+            self.experts = nn.ModuleList([
+                GlmMLP(config.hidden_size, config.moe_intermediate_size)
+                for _ in range(self.ep_local)
+            ])
         self.gate = GlmTopkRouter(config)
         self.shared_experts = GlmMLP(
             config.hidden_size,
             config.moe_intermediate_size * config.n_shared_experts)
 
     def forward(self, hidden_states):
+        if self.experts is None or self.ep_local != self.config.n_routed_experts:
+            raise NotImplementedError(
+                "the Torch reference MoE needs every expert resident; this "
+                "module holds only rank-local "
+                f"{'MXFP4' if self.mxfp4_experts else 'bf16'} experts "
+                f"[{self.ep_base}, {self.ep_base + self.ep_local}). Use the "
+                "megakernel path (--use-mirage) for the sharded model.")
         residuals = hidden_states
         orig_shape = hidden_states.shape
         topk_indices, topk_weights, router_logits = self.gate(hidden_states)
@@ -446,7 +484,8 @@ class GlmMoE(nn.Module):
 
 class GlmDecoderLayer(nn.Module):
     def __init__(self, config: GlmMoeDsaConfig, latent_cache, layer_idx: int,
-                 world_size: int):
+                 world_size: int, ep_rank: int = 0, ep_world: int = 1,
+                 mxfp4_experts: bool = False):
         super().__init__()
         self.layer_idx = layer_idx
         self.self_attn = GlmMLA(config, latent_cache, layer_idx, world_size)
@@ -458,7 +497,8 @@ class GlmDecoderLayer(nn.Module):
         # `intermediate_size`; everything after is MoE.
         self.is_moe = layer_idx >= config.first_k_dense_replace
         if self.is_moe:
-            self.mlp = GlmMoE(config)
+            self.mlp = GlmMoE(config, ep_rank=ep_rank, ep_world=ep_world,
+                              mxfp4_experts=mxfp4_experts)
         else:
             self.mlp = GlmMLP(config.hidden_size, config.intermediate_size)
 
@@ -501,7 +541,9 @@ class GlmPreTrainedModel(PreTrainedModel):
 
 class GlmMoeDsaModel(GlmPreTrainedModel):
     def __init__(self, config: GlmMoeDsaConfig, world_size: int,
-                 max_num_pages: int, page_size: int, num_layers: int = None):
+                 max_num_pages: int, page_size: int, num_layers: int = None,
+                 ep_rank: int = 0, ep_world: int = 1,
+                 mxfp4_experts: bool = False):
         super().__init__(config)
         self.config = config
         n = num_layers if num_layers is not None else config.num_hidden_layers
@@ -516,7 +558,9 @@ class GlmMoeDsaModel(GlmPreTrainedModel):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([
-            GlmDecoderLayer(config, self.latent_cache, i, world_size)
+            GlmDecoderLayer(config, self.latent_cache, i, world_size,
+                            ep_rank=ep_rank, ep_world=ep_world,
+                            mxfp4_experts=mxfp4_experts)
             for i in range(n)
         ])
         self.norm = GlmRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -559,10 +603,13 @@ def dequantize_fp8_blockscale(weight: torch.Tensor, scale_inv: torch.Tensor,
 class GlmMoeDsaForCausalLM(GlmPreTrainedModel):
     def __init__(self, config: GlmMoeDsaConfig, world_size: int = 1,
                  max_num_pages: int = 16, page_size: int = 4096,
-                 num_layers: int = None):
+                 num_layers: int = None, ep_rank: int = 0, ep_world: int = 1,
+                 mxfp4_experts: bool = False):
         super().__init__(config)
         self.model = GlmMoeDsaModel(config, world_size, max_num_pages,
-                                    page_size, num_layers=num_layers)
+                                    page_size, num_layers=num_layers,
+                                    ep_rank=ep_rank, ep_world=ep_world,
+                                    mxfp4_experts=mxfp4_experts)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size,
                                  bias=False)
@@ -571,9 +618,11 @@ class GlmMoeDsaForCausalLM(GlmPreTrainedModel):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, world_size=1,
                         max_num_pages=16, page_size=4096, num_layers=None,
-                        random_weights=False, **kwargs):
+                        random_weights=False, ep_rank=0, ep_world=1,
+                        mxfp4_experts=False, verbose=True, **kwargs):
         import glob
-        from safetensors.torch import load_file
+
+        from safetensors import safe_open
 
         if os.path.isdir(pretrained_model_name_or_path):
             model_path = pretrained_model_name_or_path
@@ -588,8 +637,29 @@ class GlmMoeDsaForCausalLM(GlmPreTrainedModel):
                                            allow_patterns=allow)
 
         config = GlmMoeDsaConfig.from_model_path(model_path)
+
+        # Auto-detect the expert format from the index rather than making the
+        # caller assert it: getting this wrong is not a clean failure. Claiming
+        # MXFP4 over a bf16 checkpoint leaves every expert slot empty, and the
+        # reverse loads uint8 nibbles as if they were weights.
+        if mxfp4_experts is None and not random_weights:
+            idx_f = os.path.join(model_path, "model.safetensors.index.json")
+            mxfp4_experts = False
+            if os.path.exists(idx_f):
+                with open(idx_f) as fh:
+                    mxfp4_experts = any(
+                        k.endswith(".mxfp4_blocks")
+                        for k in json.load(fh)["weight_map"])
+            if verbose:
+                print(f"[load] expert format: "
+                      f"{'MXFP4 (pre-quantised)' if mxfp4_experts else 'bf16'}",
+                      flush=True)
+        mxfp4_experts = bool(mxfp4_experts)
+
         model = cls(config, world_size=world_size, max_num_pages=max_num_pages,
-                    page_size=page_size, num_layers=num_layers)
+                    page_size=page_size, num_layers=num_layers,
+                    ep_rank=ep_rank, ep_world=ep_world,
+                    mxfp4_experts=mxfp4_experts)
         if random_weights:
             print("Using randomly initialised weights (--random-weights): "
                   "shapes and kernels are exercised, output text is not "
@@ -602,37 +672,74 @@ class GlmMoeDsaForCausalLM(GlmPreTrainedModel):
         if not files:
             raise FileNotFoundError(f"No safetensors found in {model_path}")
 
+        ep_local = config.n_routed_experts // ep_world
+        ep_base = ep_rank * ep_local
+
         # Pair `weight` with `weight_scale_inv` before assigning; they can land
         # in the same shard but nothing guarantees it.
         fp8_pending = {}
         loaded = set()
+        n_expert_t = 0
 
         def commit(mapped):
-            missing, unexpected = model.load_state_dict(mapped, strict=False)
+            model.load_state_dict(mapped, strict=False)
             loaded.update(mapped.keys())
 
-        for f in files:
-            sd = load_file(f, device="cpu")
-            mapped = {}
-            for name, tensor in sd.items():
-                # Drop the MTP layer, the DSA indexer, and anything past
-                # --max-layers. `model.layers.N.` is the only place a layer
-                # index appears.
-                if name.startswith("model.layers."):
-                    idx = int(name.split(".")[2])
-                    if idx >= n_layers:
+        def route_expert(name, fh):
+            """Place one `...mlp.experts.<e>.<proj>.weight.mxfp4_{blocks,scales}`
+            into its layer's expert_mxfp4 slot, or skip it.
+
+            Returns True if the name was an expert tensor -- consumed or
+            skipped -- so the caller does not also hand it to load_state_dict.
+            Skipping is the point: at ep_world=8 seven of every eight experts
+            are never read off disk at all, which is what keeps the load to
+            46 GB per rank instead of 390.
+            """
+            for suffix, slot in ((".mxfp4_blocks", 0), (".mxfp4_scales", 1)):
+                if not name.endswith(suffix):
+                    continue
+                base = name[:-len(suffix)]
+                parts = base.split(".")          # model layers L mlp experts E proj weight
+                if len(parts) < 7 or parts[4] != "experts":
+                    return False
+                layer_i, glob_e, proj = int(parts[2]), int(parts[5]), parts[6]
+                if layer_i >= n_layers:
+                    return True
+                if not (ep_base <= glob_e < ep_base + ep_local):
+                    return True                  # another rank owns it
+                store = model.model.layers[layer_i].mlp.expert_mxfp4
+                pair = store[glob_e - ep_base].setdefault(proj, [None, None])
+                pair[slot] = fh.get_tensor(name).cuda(non_blocking=True)
+                return True
+            return False
+
+        for fi, f in enumerate(files):
+            with safe_open(f, framework="pt", device="cpu") as fh:
+                mapped = {}
+                for name in fh.keys():
+                    # Drop the MTP layer, the DSA indexer, and anything past
+                    # --max-layers. `model.layers.N.` is the only place a layer
+                    # index appears.
+                    if name.startswith("model.layers."):
+                        idx = int(name.split(".")[2])
+                        if idx >= n_layers:
+                            continue
+                    if (".indexer." in name
+                            or name.endswith("indexers_proj.weight")):
                         continue
-                if ".indexer." in name or name.endswith("indexers_proj.weight"):
-                    continue
-                if name.endswith(".weight_scale_inv"):
-                    fp8_pending.setdefault(name[:-len("_scale_inv")], {})[
-                        "scale"] = tensor
-                    continue
-                if tensor.dtype == torch.float8_e4m3fn:
-                    fp8_pending.setdefault(name, {})["weight"] = tensor
-                    continue
-                mapped[name] = tensor
-            commit(mapped)
+                    if mxfp4_experts and route_expert(name, fh):
+                        n_expert_t += 1
+                        continue
+                    if name.endswith(".weight_scale_inv"):
+                        fp8_pending.setdefault(name[:-len("_scale_inv")], {})[
+                            "scale"] = fh.get_tensor(name)
+                        continue
+                    tensor = fh.get_tensor(name)
+                    if tensor.dtype == torch.float8_e4m3fn:
+                        fp8_pending.setdefault(name, {})["weight"] = tensor
+                        continue
+                    mapped[name] = tensor
+                commit(mapped)
             # Dequantise whatever is now complete and release it.
             ready = {k: v for k, v in fp8_pending.items()
                      if "weight" in v and "scale" in v}
@@ -641,6 +748,10 @@ class GlmMoeDsaForCausalLM(GlmPreTrainedModel):
                         for k, v in ready.items()})
                 for k in ready:
                     del fp8_pending[k]
+            if verbose and (fi % 10 == 0 or fi == len(files) - 1):
+                print(f"[load] shard {fi + 1}/{len(files)} "
+                      f"{torch.cuda.memory_allocated() / 2**30:.1f} GiB "
+                      f"resident", flush=True)
 
         leftover = [k for k, v in fp8_pending.items()
                     if "weight" in v and "scale" not in v]
@@ -648,6 +759,27 @@ class GlmMoeDsaForCausalLM(GlmPreTrainedModel):
             raise RuntimeError(
                 f"{len(leftover)} FP8 weights had no weight_scale_inv, "
                 f"e.g. {leftover[:3]}")
+
+        if mxfp4_experts:
+            # Every local expert must have all three projections, each with
+            # both halves of the pair. A silently half-loaded expert would show
+            # up much later as garbage text from one rank's slice only.
+            n_moe = sum(1 for l in model.model.layers if l.is_moe)
+            want = {"gate_proj", "up_proj", "down_proj"}
+            for l in model.model.layers:
+                if not l.is_moe:
+                    continue
+                for e, d in enumerate(l.mlp.expert_mxfp4):
+                    assert set(d) == want and all(
+                        p[0] is not None and p[1] is not None
+                        for p in d.values()), (
+                        f"layer {l.layer_idx} local expert {e} "
+                        f"(global {ep_base + e}) incomplete: "
+                        f"{ {k: [x is not None for x in v] for k, v in d.items()} }")
+            if verbose:
+                print(f"[load] {n_expert_t} MXFP4 expert tensors -> "
+                      f"{n_moe} MoE layers x {ep_local} experts, "
+                      f"global [{ep_base}, {ep_base + ep_local})", flush=True)
 
         expected = set(model.state_dict().keys())
         never = sorted(expected - loaded)
