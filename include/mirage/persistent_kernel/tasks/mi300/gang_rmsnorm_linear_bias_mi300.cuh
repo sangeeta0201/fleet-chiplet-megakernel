@@ -422,7 +422,10 @@ __device__ __attribute__((noinline)) void
                                                      NUM_EXPERTS,
                                                      true);
 
-  // Reset counter for the next layer's use.
+  // Reset counter for the next layer's use. Ordinary store: the buffer_wbl2 in
+  // the release fence below retires it before any consumer runs. It must stay
+  // ordinary -- st_wt here is part of the measured-negative change described at
+  // that fence.
   if (threadIdx.x == 0) {
     *static_cast<int *>(gang_counter_ptr) = 0;
   }
@@ -475,7 +478,10 @@ __device__ __attribute__((noinline)) void
       routed_scaling_factor,
       num_shared_experts);
 
-  // Reset counter for the next layer's use.
+  // Reset counter for the next layer's use. Ordinary store: the buffer_wbl2 in
+  // the release fence below retires it before any consumer runs. It must stay
+  // ordinary -- st_wt here is part of the measured-negative change described at
+  // that fence.
   if (threadIdx.x == 0) {
     *static_cast<int *>(gang_counter_ptr) = 0;
   }
@@ -486,14 +492,23 @@ __device__ __attribute__((noinline)) void
   //
   // The fence is required, not an optimization. The consumers are MoE workers
   // on *other* XCDs, and what they read after it is active_expert_ids and
-  // routing_indices -- written just above by all 256 threads of this block
-  // with ordinary stores. __syncthreads orders those within this block only;
-  // it says nothing about when they reach another XCD's L2. The release flags
-  // go out via st_wt, bypassing L2, so without a GPU-scope fence a flag can
-  // land in HBM ahead of the routing data it advertises.
+  // routing_indices, written just above by all 256 threads of this block.
+  // __syncthreads orders those within this block only; it says nothing about
+  // when they reach another XCD's L2. The release flags go out via st_wt,
+  // bypassing L2, so without a GPU-scope fence a flag can land in HBM ahead of
+  // the routing data it advertises.
   //
   // The failure is silent rather than a crash: every stale value is still in
   // range, so a token is simply routed through the previous layer's experts.
+  //
+  // MEASURED, do not re-attempt: converting the tail's last two ordinary
+  // stores to st_wt and downgrading this to `s_waitcnt vmcnt(0)` is a 2.2%
+  // regression (12.897 vs 12.615 ms, two matched repeats each, 2026-08-19) and
+  // leaves SP6[4] -- this tail's own cost -- unchanged at 0.58 s aggregate.
+  // The 7.6 us tail is the TopK compute, not this fence. The likely reason
+  // removing it costs: buffer_wbl2 drains this XCD's dirty L2 during the one
+  // window where 231 workers are parked anyway; defer it and the writeback
+  // lands on the MoE critical path instead.
   if (routing_ready_ptr) {
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -698,6 +713,16 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
   }
 
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  // SP6[0] is the o_proj barrier spin above. [1]..[4] split what is left of
+  // this kernel, so SP3[2] "Router" decomposes without a second run:
+  //   [1] Step 1 RMSNorm   [2] Step 2 gate dot + normed write
+  //   [3] Step 3 logit store + arrival atomic   [4] Step 4 TopK tail
+  // Every one is guarded `tid == 0 && g_subphase_active`, exactly as SP6[0]
+  // and SP3[2] are, so all six are directly comparable.
+  unsigned long long _rt_t0 = __builtin_amdgcn_s_memrealtime();
+#endif
+
   // ═══ Step 1: RMSNorm — compute irms from hidden state ═══
   // All 256 threads collaborate. Vectorized 4-wide bf16 loads.
   //
@@ -755,6 +780,13 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
       *irms_cache = irms;
     }
   }
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  unsigned long long _rt_t1 = __builtin_amdgcn_s_memrealtime();
+  if (tid == 0 && g_subphase_active) {
+    atomicAdd(&g_subphase_ns[6][1], (_rt_t1 - _rt_t0) * 10); // Step 1 norm
+  }
+#endif
 
   // ═══ Step 2: Fused Gate GEMV + norm write ═══
   // One expert per worker. Each thread handles REDUCTION_SIZE/blockDim.x
@@ -887,6 +919,13 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     st_wt_u16(&d_logits[tile_idx], *reinterpret_cast<unsigned short *>(&bval));
   }
 
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  unsigned long long _rt_t2 = __builtin_amdgcn_s_memrealtime();
+  if (tid == 0 && g_subphase_active) {
+    atomicAdd(&g_subphase_ns[6][2], (_rt_t2 - _rt_t1) * 10); // Step 2 gate dot
+  }
+#endif
+
   // ═══ Step 3: Cross-XCD barrier via atomic counter ═══
   // Write-through stores (sc0 sc1) bypass L2 → HBM. s_waitcnt ensures
   // stores are globally visible before incrementing counter.
@@ -899,6 +938,13 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   }
   __syncthreads();
   int completed = s_completed;
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  unsigned long long _rt_t3 = __builtin_amdgcn_s_memrealtime();
+  if (tid == 0 && g_subphase_active) {
+    atomicAdd(&g_subphase_ns[6][3], (_rt_t3 - _rt_t2) * 10); // Step 3 arrival
+  }
+#endif
 
   // ═══ Step 4: Last worker runs TopK ═══
   if (completed == total_gang_tiles) {
@@ -925,6 +971,17 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
           gang_counter_ptr,
           num_active_tokens);
     }
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+    // Only the elected block reaches here, so SP6[4] is the serial TopK tail
+    // itself -- one sample per layer, not per worker. g_subphase_cnt only has
+    // SUBPHASE_SLOTS entries and slot 6 already counts router-kernel calls, so
+    // SP6[5] carries this tail's own event count instead (a raw count, not ns).
+    if (tid == 0 && g_subphase_active) {
+      atomicAdd(&g_subphase_ns[6][4],
+                (__builtin_amdgcn_s_memrealtime() - _rt_t3) * 10);
+      atomicAdd(&g_subphase_ns[6][5], 1ULL);
+    }
+#endif
   }
 }
 
