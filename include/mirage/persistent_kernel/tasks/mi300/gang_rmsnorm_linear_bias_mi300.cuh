@@ -956,6 +956,26 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   __syncthreads();
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 
+  // MEASURED, do not re-attempt: splitting this into a two-level counter --
+  // one 64-byte line per XCD at [(1 + x) * 16] closed by that XCD's 32nd
+  // arrival, then eight arrivals on [0] -- is a 6.0% regression (decode
+  // 13.031 / 12.863 ms against 12.281 / 12.150 for this line, four runs
+  // interleaved in one session, 2026-08-19). The premise was that 256
+  // device-scope atomicAdds on one word serialise at the memory-side atomic
+  // unit; SP6[3]'s 2.10 us mean is arrival *skew*, not that contention, so
+  // there is nothing to win and the second, dependent atomic that the electing
+  // block has to issue before the TopK tail can start is pure added latency on
+  // the path all 232 workers' RoutingWait hangs off.
+  //
+  // Two further traps if it is ever revisited anyway. The nine-word variant
+  // must not be reset by the tail: zeroing nine words instead of one widens the
+  // window in which a worker already into the next layer reads a half-cleared
+  // counter, and that deadlocked at iteration 0 in three runs out of three. Run
+  // the words monotonic with a modular test instead, the way the o_proj barrier
+  // in gang_oproj_router_fused_mi300.cuh does -- that ran, it was merely slow.
+  // And the split is only sound because the router is entered by all eight XCDs
+  // or by none; the dense prefix layers and the EP_TAIL_ONLY variant return
+  // before Phase 3 uniformly, so no XCD's line drifts out of step.
   __shared__ int s_completed;
   if (tid == 0) {
     s_completed = atomicAdd(static_cast<int *>(gang_counter_ptr), 1) + 1;
