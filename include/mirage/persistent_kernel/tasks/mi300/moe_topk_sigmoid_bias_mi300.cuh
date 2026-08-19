@@ -233,6 +233,7 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
     int const start_col = first_elt;
     float row_sum_for_renorm = 0.f;
     float topk_vals[8];
+    int topk_experts[8];
 
     // Precompute expert column indices for branchless local argmax.
     int col[VPT];
@@ -332,25 +333,17 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
                      : "vcc");
       }
 
-      // ── Step 3: Write top-k result ──
-      // Weight is the UNBIASED sigmoid score, scaled by routed_scaling_factor.
+      // ── Step 3: Record the winner ──
+      // Registers only. Publishing here instead would put three st_wt_u32 in
+      // the loop body, and each of those is an `asm volatile ... : "memory"`,
+      // which is a full compiler barrier: 24 of them across the eight passes
+      // pin the shuffle reduce, the blanking and the address arithmetic into
+      // strict program order and leave the scheduler nothing to overlap. The
+      // stores go out in one burst below.
       if (thread_group_idx == 0) {
-        bool const node_uses = (expert >= start_expert && expert < end_expert);
-        int const out_idx = k_total * thread_row + k_idx;
-        st_wt_u32((void *)&output[out_idx],
-                  __float_as_uint(score * routed_scaling_factor));
         topk_vals[k_idx] = score;
+        topk_experts[k_idx] = expert;
         row_sum_for_renorm += score;
-
-        if (node_uses && routing_indices != nullptr) {
-          int const local_expert = expert - start_expert;
-          st_wt_u32(
-              (void *)&routing_indices[local_expert * num_rows + thread_row],
-              (unsigned)(k_idx + 1));
-          if (active_expert_ids != nullptr) {
-            st_wt_u32((void *)&active_expert_ids[k_idx], (unsigned)expert);
-          }
-        }
       }
 
       // ── Step 4: Branchless blanking of winner ──
@@ -379,19 +372,35 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
     }
 #endif
 
-    // Optional renormalization (write-through stores, using cached values).
-    // The shared expert is outside the renormalized sum -- GLM adds it with
-    // weight 1 -- so only the k routed slots are rewritten.
-    if (renormalize && thread_group_idx == 0) {
-      float inv = routed_scaling_factor / row_sum_for_renorm;
+    // Publish all k slots in one burst, folding the renormalisation in.
+    //
+    // The weight is the UNBIASED sigmoid score. The shared expert sits outside
+    // the renormalised sum -- GLM adds it with weight 1 -- so only the k routed
+    // slots are written here. Previously the loop stored score *
+    // routed_scaling_factor for every slot and this block immediately
+    // overwrote all k of them; that store was dead on the renormalising path,
+    // which is every GLM call.
+    if (thread_group_idx == 0) {
+      float const inv = renormalize ? (routed_scaling_factor /
+                                       row_sum_for_renorm)
+                                    : routed_scaling_factor;
 #pragma unroll
       for (int k_idx = 0; k_idx < K_UNROLL; ++k_idx) {
         if (k_idx >= k) {
           break;
         }
-        int const out_idx = k_total * thread_row + k_idx;
-        st_wt_u32((void *)&output[out_idx],
+        int const expert = topk_experts[k_idx];
+        st_wt_u32((void *)&output[k_total * thread_row + k_idx],
                   __float_as_uint(topk_vals[k_idx] * inv));
+        if (expert >= start_expert && expert < end_expert &&
+            routing_indices != nullptr) {
+          st_wt_u32((void *)&routing_indices[(expert - start_expert) * num_rows +
+                                             thread_row],
+                    (unsigned)(k_idx + 1));
+          if (active_expert_ids != nullptr) {
+            st_wt_u32((void *)&active_expert_ids[k_idx], (unsigned)expert);
+          }
+        }
       }
     }
 
