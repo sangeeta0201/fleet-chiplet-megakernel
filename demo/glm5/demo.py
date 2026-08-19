@@ -888,10 +888,37 @@ if __name__ == "__main__":
         # scratch Phase 3b reduces over, not the query row.
         qb_nope_span = qk_nope + qk_rope
         qb_nope_width = num_heads * qb_nope_span
+        # q_b's GEMM tile width. It used to be pinned to qk_rope because a
+        # head's rope slice had to be exactly one workgroup; the kernel now only
+        # needs the slice to be the *tail* of one, so any divisor of the head
+        # span that is at least the rope width works.
+        #
+        # 64 is measured best, and NOT for the reason the makespan model
+        # predicts. 8 heads/XCD * 256 / OPW tiles (plus the latent tile) clear
+        # 29 workers in ceil(tiles/29) grid-stride rounds, and 128 is the only
+        # legal width that fits in one round -- 17 tiles instead of 33. Costing
+        # a tile as (per-tile RMSNorm+quant prologue) + (bytes/14.5 GB/s per WG)
+        # made that look like 17.3 us against 21.8.
+        #
+        # It measured the other way: 12.884 ms/iter at 128 against 12.261 at 64,
+        # NP=8, same build, output correct in both. So a tile's cost is
+        # markedly superlinear in OPW -- more than the ~2 us of lost overlap
+        # from HOIST_PREFILL switching off at TILES_PER_WAVE == 2, so most
+        # likely accumulator VGPR pressure on the N-parallel MFMA path. The
+        # extra round is cheaper than the wider tile, and the makespan argument
+        # does not survive contact.
+        #
+        # Absorbed q_b has a 576-wide head span, which only 64 divides, so this
+        # knob only reaches the un-absorbed path either way.
+        QB_GEMM_OPW = int(os.environ.get("GLM_QB_OPW", "64"))
         if UNABSORB_K:
             assert kv_lora % WUK_GEMV_ROWS == 0
             assert qk_nope % ((256 // WUK_GEMV_ROWS) * 16) == 0
             assert (qb_nope_width // 8) % qb_nope_span == 0
+            assert QB_GEMM_OPW >= qk_rope and QB_GEMM_OPW % 16 == 0
+            assert qb_nope_span % QB_GEMM_OPW == 0, (
+                f"GLM_QB_OPW={QB_GEMM_OPW} must divide the {qb_nope_span}-wide "
+                "head span")
 
         assert (2 * dense_inter) % GANG_OUT_ALIGN == 0
         assert dense_inter % GANG_RED_ALIGN == 0
@@ -962,7 +989,7 @@ if __name__ == "__main__":
         MLA_MERGE_WRITE_THROUGH = (
             os.environ.get("GLM_MLA_MERGE_WT", "0") == "1" or FUSE_FULL_LAYER)
         print(f"[CFG] q_heads={num_heads}->{num_heads_pad} "
-              f"qb_slots={qb_head_slots} "
+              f"qb_slots={qb_head_slots} qb_opw={QB_GEMM_OPW} "
               f"q_groups={num_q_groups} kv_chunks={num_kv_chunks} "
               f"latent_row={qk_dim} q_lora={q_lora}->{q_lora_pad} "
               f"merge_dim_splits={MLA_MERGE_DIM_SPLITS} "
@@ -1587,12 +1614,15 @@ if __name__ == "__main__":
                 q_b_w = pad_cols(q_b_w, q_lora_pad)
                 q_b_w = pad_rows(q_b_w, qb_out_width)
                 w_wuk = None
+            # Absorbed q_b's 576-wide head span is only divisible by the rope
+            # width, so only the un-absorbed layers get the wider tile. See
+            # QB_GEMM_OPW.
+            qb_opw_this = QB_GEMM_OPW if unabsorb_k_this else qk_rope
             if QB_MXFP8:
-                # OPW is pinned to qk_rope_head_dim so a head's rope slice is
-                # exactly one workgroup. At qb_head_slots = 24 that is
-                # 13824/64/8 = 27 tiles per XCD plus the latent tile, one
-                # dispatch round on 30 workers; see qb_head_slots above.
-                q_b_w = pack_dense_mxfp8(q_b_w, qk_rope)
+                # The weight is packed per workgroup of qb_opw_this columns, so
+                # the pack width and the kernel's OUTPUT_PER_WG are the same
+                # number and have to be chosen together.
+                q_b_w = pack_dense_mxfp8(q_b_w, qb_opw_this)
             w_q_b = _attach_input_keep(q_b_w, f"layer_{i}_q_b_absorbed")
 
             # ── o_proj, absorbed or not ──────────────────────────────────
@@ -1678,7 +1708,7 @@ if __name__ == "__main__":
                     x_out=layer_out,
                     qkv_output_per_wg=QKV_MXFP8_OPW,
                     qkv_actual_hidden_dim=hidden_size,
-                    qb_output_per_wg=qk_rope,
+                    qb_output_per_wg=qb_opw_this,
                     qb_reduction_size=q_lora_pad,
                     qb_actual_hidden_dim=q_lora,
                     kv_offset=q_lora_pad,
@@ -2073,7 +2103,7 @@ if __name__ == "__main__":
                     active_expert_ids=moe_mask,
                     qkv_output_per_wg=QKV_MXFP8_OPW,
                     qkv_actual_hidden_dim=hidden_size,
-                    qb_output_per_wg=qk_rope,
+                    qb_output_per_wg=qb_opw_this,
                     qb_reduction_size=q_lora_pad,
                     qb_actual_hidden_dim=q_lora,
                     kv_offset=q_lora_pad,

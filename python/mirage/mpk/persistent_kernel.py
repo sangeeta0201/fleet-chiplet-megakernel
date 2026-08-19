@@ -1832,9 +1832,13 @@ class PersistentKernel:
         assert qb_reduction_size % 512 == 0, qb_reduction_size
         assert qb_actual_hidden_dim <= qb_reduction_size <= qkv_output_stride
         assert kv_offset + qk_dim <= qkv_output_stride
-        assert qb_output_per_wg == qk_rope_head_dim and \
+        # See the same assert in gang_mla_full_layer_fused_layer: the rope slice
+        # only has to fit inside one workgroup, not fill it. This path is always
+        # absorbed, so qk_dim is 576 and only 64 divides it anyway.
+        assert qb_output_per_wg >= qk_rope_head_dim and \
             qk_dim % qb_output_per_wg == 0, (
-                "output_per_wg must equal qk_rope_head_dim and divide the head")
+                "output_per_wg must be at least qk_rope_head_dim and divide "
+                "the head span")
         qb_n_wgs = qb_mxfp8_weight.dim(0)
         assert qb_n_wgs % 8 == 0
         qb_n_wgs_per_xcd = qb_n_wgs // 8
@@ -2173,9 +2177,14 @@ class PersistentKernel:
         qb_head_span = (qk_nope_head_dim + qk_rope_head_dim) if unabsorb_k \
             else qk_dim
         qb_out_tensor = q_nope if unabsorb_k else q_workspace
-        assert qb_output_per_wg == qk_rope_head_dim and \
+        # The rope slice has to fit inside one workgroup so the rotation is not
+        # split across two workers, and it is the tail of a head, so a wider
+        # workgroup is fine as long as heads still divide evenly. The kernel
+        # offsets its rope pointer by (output_per_wg - qk_rope_head_dim).
+        assert qb_output_per_wg >= qk_rope_head_dim and \
             qb_head_span % qb_output_per_wg == 0, (
-                "output_per_wg must equal qk_rope_head_dim and divide the head")
+                "output_per_wg must be at least qk_rope_head_dim and divide "
+                "the head span")
         qb_n_wgs = qb_mxfp8_weight.dim(0)
         assert qb_n_wgs % 8 == 0
         qb_n_wgs_per_xcd = qb_n_wgs // 8

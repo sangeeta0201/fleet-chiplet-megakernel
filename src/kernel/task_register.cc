@@ -3909,9 +3909,9 @@ int TaskRegister::register_gang_mla_attn_fused_mi300_task(
   assert(input_ops[12]->dtensor.dim[2] == 1);
   int kv_cache_stride = input_ops[12]->dtensor.dim[3];
   assert(kv_cache_stride == kv_lora_rank + qk_rope_head_dim);
-  assert(qb_opw == qk_rope_head_dim &&
+  assert(qb_opw >= qk_rope_head_dim &&
          kv_cache_stride % qb_opw == 0 &&
-         "a head's rope slice has to be exactly one q_b workgroup");
+         "a head's rope slice has to fit inside one q_b workgroup");
   assert((qb_n_wgs_per_xcd * qb_opw) % kv_cache_stride == 0 &&
          "each XCD's q_b column chunk must hold whole heads");
   assert(qb_n_wgs_per_xcd * qb_opw * 8 == qb_output_stride);
@@ -4163,8 +4163,11 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
   // stop coinciding under un-absorption.
   int const qb_head_span =
       unabsorb_k ? (qk_nope_head_dim + qk_rope_head_dim) : kv_cache_stride;
-  assert(qb_opw == qk_rope_head_dim && qb_head_span % qb_opw == 0 &&
-         "a head's rope slice has to be exactly one q_b workgroup");
+  // Only inside one, not equal to it: the slice is the tail of a head's span,
+  // so the kernel offsets by (qb_opw - qk_rope_head_dim). Lets q_b size its
+  // tile for the grid-stride makespan instead of inheriting the rope width.
+  assert(qb_opw >= qk_rope_head_dim && qb_head_span % qb_opw == 0 &&
+         "a head's rope slice has to fit inside one q_b workgroup");
   assert((qb_n_wgs_per_xcd * qb_opw) % qb_head_span == 0 &&
          "each XCD's q_b column chunk must hold whole heads");
   assert(qb_n_wgs_per_xcd * qb_opw * 8 == qb_output_stride);

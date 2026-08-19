@@ -107,7 +107,7 @@ template <int BATCH_SIZE,
           int QKV_REDUCTION_SIZE, // == hidden_size
           int QKV_ACTUAL_HIDDEN,  // RMSNorm divisor, <= QKV_REDUCTION_SIZE
           // ── q_b: q_a_layernorm + absorbed q_b_proj + latent append ──
-          int QB_OUTPUT_PER_WG,  // == QK_ROPE_HEAD_DIM
+          int QB_OUTPUT_PER_WG,  // >= QK_ROPE_HEAD_DIM, divides the head span
           int QB_REDUCTION_SIZE, // == q_lora_pad
           int QB_ACTUAL_HIDDEN,  // == q_lora
           int KV_LORA_RANK,

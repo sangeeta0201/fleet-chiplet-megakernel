@@ -38,9 +38,12 @@
 // MXFP8 weight is packed per workgroup of OUTPUT_PER_WG columns, so a flat
 // tile resolves to (tok_idx, wg_idx) instead of (m_tile, n_tile), and wg_idx
 // plays exactly the role n_tile did: a head spans QK_DIM columns, its rope
-// slice is the last QK_ROPE_HEAD_DIM of them, and with OUTPUT_PER_WG equal to
-// the rope width that slice is one workgroup. GLM: 512 + 64 against 64 gives
-// 9 workgroups a head, and every ninth owns a rope slice alone.
+// slice is the last QK_ROPE_HEAD_DIM of them, so it lands in the head's last
+// workgroup whenever OUTPUT_PER_WG is at least the rope width. GLM absorbed:
+// 512 + 64 against 64 gives 9 workgroups a head, and every ninth owns a rope
+// slice that fills it exactly. GLM un-absorbed at OUTPUT_PER_WG 128: 192 + 64
+// against 128 gives 2 workgroups a head, and the second owns the rope slice as
+// its trailing half.
 //
 // ── QK_NOPE_HEAD_DIM > 0: q_b with W_UK left out of it ──────────────────
 //
@@ -116,10 +119,22 @@ __device__ __attribute__((noinline)) void
   constexpr int HEAD_SPAN =
       UNABSORB_K ? (QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM) : QK_DIM;
 
-  // A head's rope slice has to be exactly one workgroup, or the in-place
-  // rotation would straddle two of them.
-  static_assert(OUTPUT_PER_WG == QK_ROPE_HEAD_DIM,
-                "OUTPUT_PER_WG must equal the rope width");
+  // A head's rope slice has to sit inside ONE workgroup: the rotation reads
+  // (2j, 2j+1) and writes (j, j + ROPE_HALF) across the whole slice, so a
+  // slice split over two workers -- which have no barrier between them --
+  // would read half of it before the other half was written.
+  //
+  // It does not have to *be* the workgroup, which is what this used to
+  // require. The slice is the tail of a head's span, so whenever the span
+  // divides into whole workgroups and a workgroup is at least as wide as the
+  // slice, the head's last workgroup contains it outright. Decoupling the two
+  // is what lets q_b pick its tile width on scheduling grounds instead of
+  // inheriting the rope's: at GLM-5's 8 heads per XCD and a 256-wide head
+  // span, OUTPUT_PER_WG 64 gives 32 tiles against 29 workers -- two
+  // grid-stride rounds for four of them and one for the rest -- while 128
+  // gives 16 and clears in a single round.
+  static_assert(OUTPUT_PER_WG >= QK_ROPE_HEAD_DIM,
+                "a head's rope slice must fit inside one workgroup");
   static_assert(HEAD_SPAN % OUTPUT_PER_WG == 0,
                 "a head must be a whole number of workgroups");
 
@@ -195,9 +210,12 @@ __device__ __attribute__((noinline)) void
 
   bf16 const *d_cos = reinterpret_cast<bf16 const *>(cos_ptr);
   bf16 const *d_sin = reinterpret_cast<bf16 const *>(sin_ptr);
+  // The rope slice is the *tail* of this workgroup's columns, not all of them,
+  // whenever OUTPUT_PER_WG is wider than the rope.
   bf16 *tile_base = reinterpret_cast<bf16 *>(q_workspace_ptr) +
                     (long)tok_idx * o_stride +
-                    (long)wg_idx * OUTPUT_PER_WG;
+                    (long)wg_idx * OUTPUT_PER_WG +
+                    (OUTPUT_PER_WG - QK_ROPE_HEAD_DIM);
 
   int const row = tok_idx;
   if (row < first_token_pos || row >= first_token_pos + num_tokens ||
@@ -217,9 +235,12 @@ __device__ __attribute__((noinline)) void
     static_assert(BATCH_SIZE == 1,
                   "the query row's stride is not plumbed through here, so the "
                   "cross-write is only addressable at one token");
-    static_assert(QK_NOPE_HEAD_DIM % OUTPUT_PER_WG == 0,
-                  "the nope rows must fill whole workgroups, or a head's rope "
-                  "workgroup would not be its last");
+    // The nope rows do NOT have to fill whole workgroups. At OUTPUT_PER_WG 128
+    // the head's second workgroup straddles nope[128:192] and the rope slice,
+    // and that is harmless in exactly this branch: `out` is non-null, so the
+    // rotation writes to the query row and leaves the scratch's rope columns
+    // holding their un-roped values -- which W_UK never reads, since it
+    // reduces over head_in[0:QK_NOPE_HEAD_DIM] only.
     int const xcd_id = gang_rmsnorm_topk_detail::get_xcd_id();
     int const head = xcd_id * (n_wgs_per_xcd / WGS_PER_HEAD) +
                      wg_idx / WGS_PER_HEAD;
