@@ -458,6 +458,16 @@ __device__ __attribute__((noinline)) void
   void *logits_base = static_cast<T *>(logits_scratch_ptr) -
                       static_cast<int64_t>(xcd_id) * CHUNK_N;
 
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  // Split SP6[4] (the 7.6 us serial tail) into its two halves, so the next
+  // attempt on it is aimed rather than guessed:
+  //   SP6[6] = buffer_inv + the selection itself
+  //   SP6[7] = counter reset + syncthreads + release fence + epoch publish
+  // Only the elected block runs any of this, so these are wall microseconds
+  // per MoE layer, not worker-seconds. SP6[5] already carries the event count.
+  unsigned long long _tk_t0 = __builtin_amdgcn_s_memrealtime();
+#endif
+
   asm volatile("buffer_inv" ::: "memory");
 
   topk_sigmoid_bias_mi300_task_impl<T,
@@ -477,6 +487,13 @@ __device__ __attribute__((noinline)) void
       renormalize,
       routed_scaling_factor,
       num_shared_experts);
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  unsigned long long _tk_t1 = __builtin_amdgcn_s_memrealtime();
+  if (threadIdx.x == 0 && g_subphase_active) {
+    atomicAdd(&g_subphase_ns[6][6], (_tk_t1 - _tk_t0) * 10); // selection
+  }
+#endif
 
   // Reset counter for the next layer's use. Ordinary store: the buffer_wbl2 in
   // the release fence below retires it before any consumer runs. It must stay
@@ -540,6 +557,13 @@ __device__ __attribute__((noinline)) void
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
   }
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  if (threadIdx.x == 0 && g_subphase_active) {
+    atomicAdd(&g_subphase_ns[6][7],
+              (__builtin_amdgcn_s_memrealtime() - _tk_t1) * 10); // release
+  }
+#endif
 }
 } // namespace gang_rmsnorm_topk_detail
 
