@@ -43,7 +43,10 @@
 // router kernel (so the gamma/gate prefetch covers it), which charges it to
 // slot 3 phase 2 along with the norm and the gate GEMV. [0] is the spin
 // alone; subtract it from SP3[2] for the router's real compute.
-#define SUBPHASE_SLOTS 7
+// 7=TOPK_SPLIT, GLM only: the inside of the noaux_tc TopK tail, which SP6[6]
+// measures whole. One sample per layer -- only the elected block runs it -- so
+// aggregate / ranks / iters is already the wall.
+#define SUBPHASE_SLOTS 8
 #define SUBPHASE_MAX_PHASES 8
 __device__ unsigned long long g_subphase_ns[SUBPHASE_SLOTS]
                                            [SUBPHASE_MAX_PHASES];

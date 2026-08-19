@@ -96,6 +96,16 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
   // Slot count per token: the k routed experts, plus the shared expert.
   int const k_total = k + num_shared_experts;
 
+  // SP7 splits SP6[6] -- the 5.78 us selection half of the router's serial
+  // tail -- five ways, so the next attempt at it aims at the right microsecond.
+  // No s_waitcnt is inserted at the boundaries, deliberately: the stores here
+  // are fire-and-forget and the drain is the release fence's (SP6[7]), so a
+  // SP7 sum well short of SP6[6] localises the cost to that drain rather than
+  // to any of these five.
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  unsigned long long _tk_a0 = __builtin_amdgcn_s_memrealtime();
+#endif
+
   // Initialize routing indices to 0.
   // active_expert_ids initialization is NOT needed: we write directly to
   // active_expert_ids[0..k-1] during TopK and set the count after.
@@ -123,6 +133,13 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
     }
   }
   __syncthreads();
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  unsigned long long _tk_a1 = __builtin_amdgcn_s_memrealtime();
+  if (threadIdx.x == 0 && g_subphase_active) {
+    atomicAdd(&g_subphase_ns[7][0], (_tk_a1 - _tk_a0) * 10); // zero fill
+  }
+#endif
 
   // Compile-time constants
   static constexpr int ELTS_PER_LDG = BYTES_PER_LDG / sizeof(T);
@@ -172,6 +189,17 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
       }
     }
 
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+    unsigned long long _tk_a2 = __builtin_amdgcn_s_memrealtime();
+    if (threadIdx.x == 0 && g_subphase_active) {
+      // The sigmoid consumes each loaded value, so the compiler's waitcnt is
+      // inside the loop and this does capture the logit + bias fetch. Both
+      // rows were published with sc0 sc1 stores by 256 blocks on eight XCDs,
+      // so they are a cold 512 + 512 B read from HBM, not from this XCD's L2.
+      atomicAdd(&g_subphase_ns[7][1], (_tk_a2 - _tk_a1) * 10); // logit+bias ld
+    }
+#endif
+
     // Reset input buffer to 0 (for split-k gate linear compatibility)
     for (int ldg = 0; ldg < LDG_PER_THREAD; ++ldg) {
       int src_offset = ldg * THREADS_PER_ROW * ELTS_PER_LDG;
@@ -179,6 +207,13 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
         thread_read_ptr[src_offset + e] = static_cast<T>(0);
       }
     }
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+    unsigned long long _tk_a3 = __builtin_amdgcn_s_memrealtime();
+    if (threadIdx.x == 0 && g_subphase_active) {
+      atomicAdd(&g_subphase_ns[7][2], (_tk_a3 - _tk_a2) * 10); // logit clear
+    }
+#endif
 
     // No max/sum reduction here: sigmoid is elementwise, unlike softmax.
 
@@ -316,6 +351,15 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
       }
     }
 
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+    unsigned long long _tk_a4 = __builtin_amdgcn_s_memrealtime();
+    if (threadIdx.x == 0 && g_subphase_active) {
+      // The k dependent argmax passes: eight rounds of an 8-wide branchless
+      // local argmax plus a five-step shfl_xor reduce over THREADS_PER_ROW=32.
+      atomicAdd(&g_subphase_ns[7][3], (_tk_a4 - _tk_a3) * 10); // k-loop select
+    }
+#endif
+
     // Optional renormalization (write-through stores, using cached values).
     // The shared expert is outside the renormalized sum -- GLM adds it with
     // weight 1 -- so only the k routed slots are rewritten.
@@ -345,6 +389,23 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
     st_wt_u32((void *)&active_expert_ids[NUM_EXPERTS + num_shared_experts],
               (unsigned)k_total);
   }
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  if (threadIdx.x == 0 && g_subphase_active) {
+    // Whole-impl total, not a fifth segment: the renorm/shared-slot/tail
+    // piece is [4] - ([0] + [1] + [2] + [3]). Measured from _tk_a0 because the
+    // three inner timestamps are scoped to the `thread_row < num_rows` block.
+    // [4] against SP6[6] also says how much of the selection half is the
+    // buffer_inv and the noinline wrapper rather than this function.
+    atomicAdd(&g_subphase_ns[7][4],
+              (__builtin_amdgcn_s_memrealtime() - _tk_a0) * 10);
+    // Must be g_subphase_cnt, not another g_subphase_ns phase: the dump loop
+    // in persistent_kernel.cuh skips a whole slot on `g_subphase_cnt[s] == 0`
+    // before it ever looks at the phases, so a slot that only writes ns is
+    // silently dropped.
+    atomicAdd(&g_subphase_cnt[7], 1ULL); // tail event count
+  }
+#endif
 }
 
 } // namespace kernel
