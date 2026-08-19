@@ -69,11 +69,22 @@ __device__ __forceinline__ float fast_sigmoid(float x) {
 //   NUM_EXPERTS - total number of experts (power of 2)
 //   WARPS_PER_CTA - number of wavefronts per CTA (typically 4)
 //   BYTES_PER_LDG - bytes per vectorized load (8 or 16)
+//   K_STATIC      - top-k when the caller knows it at compile time, else 0.
+//
+// K_STATIC is a performance parameter, not a functional one: `k` is still
+// honoured either way. It exists because `topk_vals[k_idx]` is indexed by the
+// selection loop's induction variable, and with a runtime bound the loop can
+// not unroll, so the index stays dynamic and AMDGCN backs the array with
+// scratch -- private memory, which is HBM. That turns eight register writes
+// plus the renormalisation loop's eight reads into sixteen ~400-cycle round
+// trips sitting on the router's serial critical path. Passing the bound as a
+// constant unrolls both loops and keeps the array in VGPRs.
 template <typename T,
           int VPT,
           int NUM_EXPERTS,
           int WARPS_PER_CTA,
-          int BYTES_PER_LDG>
+          int BYTES_PER_LDG,
+          int K_STATIC = 0>
 __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
     void *__restrict__ input_ptr, // [num_rows, NUM_EXPERTS]
     void *__restrict__ bias_ptr,  // [NUM_EXPERTS] e_score_correction_bias
@@ -230,7 +241,15 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
       col[i] = start_col + i;
     }
 
-    for (int k_idx = 0; k_idx < k; ++k_idx) {
+    // topk_vals is 8 wide, so k has always been capped at 8 here; the unroll
+    // bound just makes that cap explicit. The `break` is dead code whenever
+    // K_STATIC == k, and it is what keeps the runtime-k callers correct.
+    constexpr int K_UNROLL = (K_STATIC > 0) ? K_STATIC : 8;
+#pragma unroll
+    for (int k_idx = 0; k_idx < K_UNROLL; ++k_idx) {
+      if (k_idx >= k) {
+        break;
+      }
       // ── Step 1: Branchless local argmax over VPT=8 elements ──
       // Carries three registers: the biased max (compare key), the expert id,
       // and the unbiased score (the value we ultimately emit).
@@ -365,7 +384,11 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
     // weight 1 -- so only the k routed slots are rewritten.
     if (renormalize && thread_group_idx == 0) {
       float inv = routed_scaling_factor / row_sum_for_renorm;
-      for (int k_idx = 0; k_idx < k; ++k_idx) {
+#pragma unroll
+      for (int k_idx = 0; k_idx < K_UNROLL; ++k_idx) {
+        if (k_idx >= k) {
+          break;
+        }
         int const out_idx = k_total * thread_row + k_idx;
         st_wt_u32((void *)&output[out_idx],
                   __float_as_uint(topk_vals[k_idx] * inv));

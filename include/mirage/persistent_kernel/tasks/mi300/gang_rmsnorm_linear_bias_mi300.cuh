@@ -474,7 +474,8 @@ __device__ __attribute__((noinline)) void
                                     /*VPT=*/8,
                                     NUM_EXPERTS,
                                     /*WARPS_PER_CTA=*/4,
-                                    /*BYTES_PER_LDG=*/16>(
+                                    /*BYTES_PER_LDG=*/16,
+                                    /*K_STATIC=*/K>(
       logits_base,
       bias_ptr,
       topk_weight_ptr,
