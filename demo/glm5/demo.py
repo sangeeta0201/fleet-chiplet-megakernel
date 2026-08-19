@@ -1114,10 +1114,12 @@ if __name__ == "__main__":
                       # padded to match. GLM-5's 64 heads need neither.
                       and num_heads == num_heads_pad)
         # 256/ROWS lanes per row and 16 fp8 each, so ROWS >= 4 and
-        # kv_lora % (256/ROWS * 16) == 0; 64 is the widest legal tile and the
-        # one that keeps the tile count off the grid-stride cliff (16384/64/8
-        # = 32 per XCD against 29 workers).
-        WUV_GEMV_ROWS = int(os.environ.get("GLM_WUV_GEMV_ROWS", "64"))
+        # kv_lora % (256/ROWS * 16) == 0. Retuned after o_proj was sharded
+        # (ms/iter, everything else at the tuned point): 64 -> 12.533,
+        # 128 -> 12.231, 256 -> 12.881. 128 is 16384/128/8 = 16 tiles per XCD,
+        # half a round of 29 workers; 256 halves that again and the phase goes
+        # latency-bound.
+        WUV_GEMV_ROWS = int(os.environ.get("GLM_WUV_GEMV_ROWS", "128"))
         # The other way to un-starve o_proj, and the one that works: keep the
         # op output-parallel but make the tiles narrower. The 64-column floor
         # came from the 16x64x256 MFMA tile, and at batch 1 that tile was
@@ -1129,9 +1131,23 @@ if __name__ == "__main__":
         # monotonic, because tile count has to land well on 30 workers/XCD: 16
         # gives 16 tiles and one clean round, 8 gives 32 tiles and spends a
         # whole second round on two of them. 0 restores the CK path.
-        OPROJ_GEMV_ROWS = int(os.environ.get("GLM_OPROJ_GEMV_ROWS", "16"))
+        _oproj_rows_env = os.environ.get("GLM_OPROJ_GEMV_ROWS")
+        OPROJ_GEMV_ROWS = int(_oproj_rows_env) if _oproj_rows_env else 16
         use_gemv_oproj = OPROJ_GEMV_ROWS > 0 and not (
             GANG_K_SPLITS > 1 and o_proj_red % (GANG_K_SPLITS * 256) == 0)
+        # Everything the tp predicate below tests except the divisibility,
+        # which needs the tile width that this decides. Sharding cuts the
+        # columns by world_size, so at an unchanged tile width it cuts the tile
+        # count by the same factor and leaves most of the XCD idle: at GLM-5
+        # tile_n=16 gives 6 tiles against 29 workers. Give the factor back to
+        # the tile, down to the 4-row floor (256/ROWS lanes at 16 fp8 each).
+        # Measured, sharded, ms/iter: 16 -> 13.057, 8 -> 12.598, 4 -> 12.533.
+        oproj_tp_eligible = (int(os.environ.get("GLM_OPROJ_TP", "1")) == 1
+                             and moe_ep and world_size > 1
+                             and FUSE_FULL_LAYER and OPROJ_MXFP8
+                             and use_gemv_oproj)
+        if oproj_tp_eligible and _oproj_rows_env is None:
+            OPROJ_GEMV_ROWS = max(4, OPROJ_GEMV_ROWS // world_size)
         oproj_tile_n = OPROJ_GEMV_ROWS if use_gemv_oproj else GANG_TILE_N
         # 1.97 GB/token of bf16 weight, the last big one left. The packing is
         # the same pack_dense_mxfp8 the MFMA kernels use: its data half is
@@ -1163,9 +1179,7 @@ if __name__ == "__main__":
         # slice is the entire switch. It needs the fused whole-layer task,
         # which is the only path with the symmetric signal array to rendezvous
         # on, and per-XCD tiles that stay whole.
-        oproj_tp = (int(os.environ.get("GLM_OPROJ_TP", "1")) == 1
-                    and moe_ep and world_size > 1
-                    and FUSE_FULL_LAYER and use_mxfp8_oproj
+        oproj_tp = (oproj_tp_eligible and use_mxfp8_oproj
                     and hidden_size % (world_size * 8 * oproj_tile_n) == 0)
         oproj_tp_cols = hidden_size // world_size if oproj_tp else hidden_size
         print(f"[CFG] o_proj tp={int(oproj_tp)} cols_per_rank={oproj_tp_cols} "
