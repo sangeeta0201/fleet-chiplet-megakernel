@@ -86,7 +86,15 @@ template <int BATCH_SIZE,
           // > 0 un-absorbs W_UK: q_b's output row is per head
           // QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM wide instead of QK_DIM, and
           // q_workspace_ptr addresses that scratch rather than the query row.
-          int QK_NOPE_HEAD_DIM = 0>
+          int QK_NOPE_HEAD_DIM = 0,
+          // Hand the rotation to the caller instead of doing it here. The
+          // only reason the rope has a say in OUTPUT_PER_WG is that the slice
+          // must not be split across workgroups with no barrier between them;
+          // a caller that already runs a barrier after this GEMM -- the
+          // un-absorbed path's XCD-local W_UK release -- can rotate on the far
+          // side of it and free the tile width entirely. See the note on the
+          // static_assert below.
+          bool DEFER_ROPE = false>
 __device__ __attribute__((noinline)) void
     gang_rmsnorm_linear_mxfp8_bias_mla_kvupd_kernel(
         void const *norm_input_ptr,  // [batch, KV_INPUT_STRIDE] (q_a prefix)
@@ -133,8 +141,19 @@ __device__ __attribute__((noinline)) void
   // span, OUTPUT_PER_WG 64 gives 32 tiles against 29 workers -- two
   // grid-stride rounds for four of them and one for the rest -- while 128
   // gives 16 and clears in a single round.
-  static_assert(OUTPUT_PER_WG >= QK_ROPE_HEAD_DIM,
+  //
+  // DEFER_ROPE drops even that. Under the EP head shard q_b covers one head
+  // per XCD, so at OUTPUT_PER_WG 64 the whole phase is four tiles against 29
+  // workers and its makespan is one 135 KB tile -- 25 workers idle through
+  // 11 us. The only thing standing between that and a 16-wide tile is this
+  // assert, and the caller that wants it already has the barrier the rotation
+  // needs. So it rotates there, and this kernel just leaves the un-roped
+  // columns in the scratch.
+  static_assert(DEFER_ROPE || OUTPUT_PER_WG >= QK_ROPE_HEAD_DIM,
                 "a head's rope slice must fit inside one workgroup");
+  static_assert(!DEFER_ROPE || UNABSORB_K,
+                "only the un-absorbed path has a barrier after this GEMM and "
+                "a separate scratch to leave the un-roped columns in");
   static_assert(HEAD_SPAN % OUTPUT_PER_WG == 0,
                 "a head must be a whole number of workgroups");
 
@@ -181,6 +200,14 @@ __device__ __attribute__((noinline)) void
                                                            n_wgs_per_xcd,
                                                            o_stride,
                                                            gemm_tile_idx);
+
+  if constexpr (DEFER_ROPE) {
+    // The caller rotates, after its own barrier. Nothing below this point --
+    // the rope-slice test, the position arithmetic, the cos/sin loads -- has
+    // any other purpose, so the whole tail goes away and the tile is a plain
+    // GEMM again.
+    return;
+  }
 
   // Does this worker own a rope slice? Positional, and needs no knowledge of
   // which XCD we are on, because QK_DIM divides the per-XCD chunk.

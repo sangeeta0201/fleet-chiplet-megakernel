@@ -932,12 +932,28 @@ if __name__ == "__main__":
         #
         # Absorbed q_b has a 576-wide head span, which only 64 divides, so this
         # knob only reaches the un-absorbed path either way.
-        QB_GEMM_OPW = int(os.environ.get("GLM_QB_OPW", "64"))
+        #
+        # MEASURED 2026-08-19, after the head shard and the deferred rope: 16 is
+        # best, 11.500 ms/iter against 11.805 at 64, same build, 4/4 on the
+        # correctness suite. Sharded, an XCD owns one head, so 64 is four tiles
+        # against 29 workers and the makespan is one whole 135 KB tile -- the
+        # superlinearity that beat the makespan model above only bites when the
+        # tiles outnumber the workers. 32 is not legal: the MXFP8 GEMM's
+        # K-parallel branch (OPW < 64) emits exactly 16 rows per workgroup, so
+        # the ladder is 16, then 64.
+        QB_GEMM_OPW = int(os.environ.get("GLM_QB_OPW", "16"))
         if UNABSORB_K:
             assert kv_lora % WUK_GEMV_ROWS == 0
             assert qk_nope % ((256 // WUK_GEMV_ROWS) * 16) == 0
             assert (qb_nope_width // 8) % qb_nope_span == 0
-            assert QB_GEMM_OPW >= qk_rope and QB_GEMM_OPW % 16 == 0
+            # The >= qk_rope floor was the rope's, not the GEMM's: the rotation
+            # reads (2j, 2j+1) and writes (j, j + rope/2) across a head's whole
+            # rope slice, so the slice could not straddle two workgroups with
+            # no barrier between them. Un-absorbed, it no longer runs in this
+            # GEMM at all -- the kernel defers it past Phase 3b's XCD-local
+            # W_UK release -- so the only remaining constraint is the tile
+            # width the MFMA path wants.
+            assert QB_GEMM_OPW % 16 == 0
             assert qb_nope_span % QB_GEMM_OPW == 0, (
                 f"GLM_QB_OPW={QB_GEMM_OPW} must divide the {qb_nope_span}-wide "
                 "head span")

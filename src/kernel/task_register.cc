@@ -4166,7 +4166,13 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
   // Only inside one, not equal to it: the slice is the tail of a head's span,
   // so the kernel offsets by (qb_opw - qk_rope_head_dim). Lets q_b size its
   // tile for the grid-stride makespan instead of inheriting the rope width.
-  assert(qb_opw >= qk_rope_head_dim && qb_head_span % qb_opw == 0 &&
+  //
+  // Un-absorbed the floor lifts entirely -- the kernel defers the rotation to
+  // the far side of Phase 3b's XCD-local W_UK release, which is the barrier a
+  // split slice needs, and that switch is compile-time off exactly this
+  // comparison (QB_DEFER_ROPE), so the two sides cannot disagree.
+  assert((unabsorb_k || qb_opw >= qk_rope_head_dim) &&
+         qb_head_span % qb_opw == 0 &&
          "a head's rope slice has to fit inside one q_b workgroup");
   assert((qb_n_wgs_per_xcd * qb_opw) % qb_head_span == 0 &&
          "each XCD's q_b column chunk must hold whole heads");

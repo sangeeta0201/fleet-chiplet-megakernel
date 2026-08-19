@@ -2193,10 +2193,16 @@ class PersistentKernel:
         # split across two workers, and it is the tail of a head, so a wider
         # workgroup is fine as long as heads still divide evenly. The kernel
         # offsets its rope pointer by (output_per_wg - qk_rope_head_dim).
-        assert qb_output_per_wg >= qk_rope_head_dim and \
+        #
+        # Un-absorbed, that floor is gone: the kernel defers the rotation past
+        # Phase 3b's XCD-local W_UK release, which is the barrier the split
+        # slice needed, and runs it on the last W_UK tile of each head. The
+        # switch is compile-time off exactly this comparison, so the two sides
+        # cannot disagree.
+        assert (unabsorb_k or qb_output_per_wg >= qk_rope_head_dim) and \
             qb_head_span % qb_output_per_wg == 0, (
-                "output_per_wg must be at least qk_rope_head_dim and divide "
-                "the head span")
+                "output_per_wg must be at least qk_rope_head_dim (absorbed "
+                "only) and divide the head span")
         qb_n_wgs = qb_mxfp8_weight.dim(0)
         assert qb_n_wgs % 8 == 0
         qb_n_wgs_per_xcd = qb_n_wgs // 8

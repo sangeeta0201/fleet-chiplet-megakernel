@@ -318,6 +318,19 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // per-XCD offset the replicated form already used.
   int const qb_head_base = qb_tp ? EP_MY_PE * QB_TP_HEADS : 0;
 
+  // ── deferred rope ───────────────────────────────────────────────────────
+  // Sharded, q_b's makespan is one tile: four of them per XCD against 29
+  // workers. Narrowing the tile is the whole remaining lever there, and the
+  // only thing that pinned OPW at >= QK_ROPE_HEAD_DIM was that the rotation
+  // reads (2j, 2j+1) and writes (j, j + ROPE_HALF) across a head's whole rope
+  // slice, so the slice could not straddle two workgroups with no barrier
+  // between them. Phase 3b's XCD-local W_UK release *is* such a barrier, so
+  // below that width the kvupd kernel leaves the columns un-roped and the
+  // last W_UK tile of each head rotates them -- the same workgroup that
+  // already carries the head's rope tail into the peers.
+  constexpr bool QB_DEFER_ROPE =
+      UNABSORB_K && (QB_OUTPUT_PER_WG < QK_ROPE_HEAD_DIM);
+
   // Release values are read once, up front, before anything in this layer has
   // run -- the same argument as the MoE task's s_expected block. Reading a
   // release value beside its own arrival atomic races within the last
@@ -519,7 +532,8 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
                                                     PAGE_SIZE,
                                                     KV_INPUT_OFFSET,
                                                     /*WRITE_THROUGH=*/true,
-                                                    QK_NOPE_HEAD_DIM>(
+                                                    QK_NOPE_HEAD_DIM,
+                                                    QB_DEFER_ROPE>(
         qkv_a_out_ptr,
         q_a_norm_weight_ptr,
         q_a_norm_scratch_ptr,
@@ -680,6 +694,24 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     }
     bool const qb_push = qb_tp && qb_all_mapped;
 
+    // Deferred rope: the position arithmetic the kvupd kernel used to do, at
+    // BATCH_SIZE 1 where the token row is 0. Hoisted out of the tile loop
+    // because it is four scalar loads and does not depend on the tile.
+    int rope_pos = 0;
+    if constexpr (QB_DEFER_ROPE) {
+      int const req = request_id;
+      int const first_token_pos = qo_indptr[req];
+      int const num_tokens = qo_indptr[req + 1] - first_token_pos;
+      int const first_page_pos = kv_indptr[req];
+      int const global_seq_len =
+          (kv_indptr[req + 1] - first_page_pos - 1) * PAGE_SIZE +
+          kv_last_page_len[req];
+      rope_pos = global_seq_len - num_tokens;
+      static_assert(BATCH_SIZE == 1,
+                    "the deferred rotation reads token row 0 only, like the "
+                    "cross-write in the kvupd kernel it replaces");
+    }
+
     for (int t = xcd_rank; t < wuk_tiles_per_xcd; t += tiles_per_xcd) {
       int const heads_per_xcd = wuk_tiles_per_xcd / TILES_PER_HEAD;
       int const head = qb_head_base + xcd_id * heads_per_xcd +
@@ -717,6 +749,32 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
       // ld_nt_s32 is the sc0 sc1 load: the GEMV epilogue and the rope tile are
       // both write-through, so the bytes are in memory but this CU's vL1 may
       // hold the line these lanes read before them.
+      // Deferred rotation. The kvupd kernel left this head's rope columns
+      // un-roped in the nope scratch because the tile was too narrow to hold
+      // the slice; the XCD-local barrier above is the ordering the rotation
+      // needed, so it happens here, on the last W_UK tile of the head -- the
+      // same workgroup that widens the push below to carry the rope tail.
+      // Gated on QB_DEFER_ROPE alone, not on qb_push: a single-rank narrow-OPW
+      // build has no push and still needs the query row roped.
+      //
+      // rope_tile_inplace has a __syncthreads in it, so the guard has to be
+      // block-uniform; t and TILES_PER_HEAD both are.
+      if constexpr (QB_DEFER_ROPE) {
+        if ((t % TILES_PER_HEAD) == TILES_PER_HEAD - 1) {
+          using rope_bf16 = gang_mla_kvupd_detail::bf16;
+          gang_mla_kvupd_detail::rope_tile_inplace<QK_ROPE_HEAD_DIM,
+                                                   /*WRITE_THROUGH=*/true>(
+              reinterpret_cast<rope_bf16 *>(q_nope_ptr) +
+                  static_cast<size_t>(head) * QB_HEAD_SPAN +
+                  QK_NOPE_HEAD_DIM,
+              reinterpret_cast<rope_bf16 const *>(cos_ptr) +
+                  static_cast<size_t>(rope_pos) * QK_ROPE_HEAD_DIM,
+              reinterpret_cast<rope_bf16 const *>(sin_ptr) +
+                  static_cast<size_t>(rope_pos) * QK_ROPE_HEAD_DIM,
+              reinterpret_cast<rope_bf16 *>(q_workspace_ptr) +
+                  static_cast<size_t>(head) * QK_DIM_ + KV_LORA_RANK);
+        }
+      }
       if (qb_push) {
         static_assert((WUK_ROWS_PER_WG % 2) == 0 &&
                           (QK_ROPE_HEAD_DIM % 2) == 0,
