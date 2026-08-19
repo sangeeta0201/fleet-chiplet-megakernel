@@ -2057,6 +2057,15 @@ class PersistentKernel:
         q_nope: DTensor = None,
         wuk_rows_per_wg: int = 0,
         qk_nope_head_dim: int = 0,
+        # -- router tile width --
+        # Experts per router call. 1 is one worker per expert, which at
+        # GLM-5's 256 experts is 32 tiles per XCD against 29 workers: two
+        # rounds for a mean of 1.10, and the second round re-pays the o_proj
+        # barrier spin, the redundant RMSNorm, two block reductions and the
+        # arrival atomic to add one dot product. 2 makes it 16 tiles and one
+        # round; the row is read once and both gate rows ride the same
+        # prefetch across the barrier.
+        router_experts_per_tile: int = 1,
         # -- expert parallelism --
         # Symmetric-heap tensors (io_category="nvshmem_tensor"). Passing them
         # turns on the head-of-layer fold: this rank's f32 MoE partial plus
@@ -2345,7 +2354,15 @@ class PersistentKernel:
 
         num_experts = router_weight.dim(0)
         assert num_experts % 8 == 0
-        router_tile_n = num_experts // 8
+        # router_tile_n is the TILE count per XCD, not the expert count: each
+        # tile carries router_experts_per_tile experts off one pass over the
+        # row. total_router_tiles is what the gang counter's TopK tail elects
+        # on, so it follows.
+        assert router_experts_per_tile >= 1
+        assert num_experts % (8 * router_experts_per_tile) == 0, (
+            f"{num_experts} experts do not split into 8 XCDs of "
+            f"{router_experts_per_tile}-expert tiles")
+        router_tile_n = num_experts // 8 // router_experts_per_tile
         total_router_tiles = router_tile_n * 8
         assert router_bias.dim(0) == num_experts
         num_shared_experts = routing_indices.dim(0) - num_experts
@@ -2479,8 +2496,10 @@ class PersistentKernel:
             wuv_rows_per_wg, wuv_v_head_dim, wuv_tiles_per_xcd,
             # un-absorbed kv_b_k (3)
             qk_nope_head_dim, wuk_rows_per_wg, wuk_tiles_per_xcd,
+            # router tile width (1) -- appended last so nothing renumbers
+            router_experts_per_tile,
         ]
-        assert len(params) == 52
+        assert len(params) == 53
 
         grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))

@@ -139,7 +139,12 @@ template <int BATCH_SIZE,
           // ahead of it. See the byte argument in the Phase 0 comment.
           int WUV_ROWS_PER_WG = 0,
           int WUV_REDUCTION = 0,  // == KV_LORA_RANK
-          int WUV_V_HEAD_DIM = 0> // == v_head_dim
+          int WUV_V_HEAD_DIM = 0, // == v_head_dim
+          // Experts per router tile. See Phase 3. 1 is one worker per expert,
+          // which at GLM-5's 256 experts is 32 tiles per XCD against 29
+          // workers -- two rounds for a mean of 1.10. `router_tile_n` is the
+          // TILE count, so the caller divides by this.
+          int ROUTER_EXPERTS_PER_TILE = 1>
 __device__ __attribute__((always_inline)) void
     gang_oproj_router_fused_kernel_mi300(
         // ── o_proj inputs ──
@@ -747,21 +752,23 @@ __device__ __attribute__((always_inline)) void
     // own atomic counter picks the last of the 64 to run the TopK tail.
     // Workers past router_tile_n must not enter, or that counter would
     // over-count. That tail publishes `routing_ready` for the MoE phases.
-    // Grid-stride over experts. One worker per expert is the shape this was
-    // written for, but 256 experts is 32 per XCD against 30 workers, so at
-    // GLM-5 two ranks per XCD carry a second expert. The second call re-runs
-    // the redundant RMSNorm and re-clears the o_proj barrier -- both are
-    // idempotent, and the gang counter still sees exactly total_router_tiles
-    // arrivals per layer however they are distributed, so the TopK tail still
-    // fires exactly once.
+    // Grid-stride over router TILES, each carrying ROUTER_EXPERTS_PER_TILE
+    // experts. One worker per expert (EPT 1) is the shape this was written
+    // for, but 256 experts is 32 per XCD against 29 workers, so a second round
+    // ran for a mean of 1.10 -- and that second call re-paid the barrier spin,
+    // the redundant RMSNorm, two block-wide reductions and the arrival atomic
+    // to add one dot product. At EPT 2 the tiles are 16 per XCD and the round
+    // count is one; the gang counter sees exactly total_router_tiles arrivals
+    // per layer however they are distributed, so the TopK tail still fires
+    // exactly once either way.
     //
-    // The re-norm is idempotent but not free, and it lands on exactly the
-    // workers that are already the stragglers: 32 experts over 29 workers
-    // makes the makespan two calls where the mean is 1.10, and every worker
-    // past the first call also loses the barrier spin that was hiding its
-    // gate-row prefetch. `irms` does not depend on the expert, so cache it in
-    // LDS across the calls -- bit-identical, so the logits do not move.
+    // The LDS irms cache below is what made EPT 1's second round survivable
+    // and is kept: it costs nothing at EPT 2 (one call, one norm) and still
+    // covers any geometry where the tiles outnumber the workers.
     // Reset per layer: `hidden` is a different row each time.
+    static_assert(NUM_EXPERTS % (8 * ROUTER_EXPERTS_PER_TILE) == 0,
+                  "the router's experts split evenly over the XCDs and then "
+                  "over a tile; router_tile_n is that quotient");
     __shared__ float s_router_irms;
     if (tid == 0) {
       s_router_irms = -1.0f;
@@ -775,7 +782,8 @@ __device__ __attribute__((always_inline)) void
                                            NUM_EXPERTS,
                                            TOPK_K,
                                            /*SIGMOID_BIAS=*/true,
-                                           /*OPROJ_BARRIER=*/true>(
+                                           /*OPROJ_BARRIER=*/true,
+                                           ROUTER_EXPERTS_PER_TILE>(
           hidden_ptr,
           norm_weight_ptr,
           norm_output_ptr,

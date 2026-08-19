@@ -4042,7 +4042,7 @@ int TaskRegister::register_gang_mla_attn_fused_mi300_task(
 //               11 v_out (un-absorbed kv_b_v only)
 int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 52);
+  assert(params.size() == 53);
   // ── attention half ──
   int batch_size = params[0];
   int qkv_opw = params[1];
@@ -4112,6 +4112,15 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
   int wuk_rows_per_wg = params[50];
   int wuk_tiles_per_xcd = params[51];
   bool const unabsorb_k = wuk_rows_per_wg > 0;
+  // ── router tile width ──
+  // Experts per router call. router_tile_n above is the TILE count, so the
+  // two multiply back to num_experts / 8. Appended last so the 52 indices
+  // above keep their numbering.
+  int router_experts_per_tile = params[52];
+  assert(router_experts_per_tile >= 1);
+  assert(router_tile_n * router_experts_per_tile * 8 == num_experts &&
+         "router_tile_n counts tiles, not experts");
+  assert(total_router_tiles == router_tile_n * 8);
   bool ep_inline = ep_world_size > 1;
   assert(!ep_tail_only || ep_inline);
 
@@ -4390,7 +4399,7 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
   code.inc_indent();
   code.e("kernel::gang_mla_full_layer_fused_kernel_mi300<$, $, $, $, $, $, $, "
          "$, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, "
-         "$, $, $, $, $, $, $, $, $, $, $, $>(",
+         "$, $, $, $, $, $, $, $, $, $, $, $, $>(",
          batch_size,
          qkv_opw,
          qkv_reduction,
@@ -4431,7 +4440,8 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
          wuv_rows_per_wg,
          wuv_v_head_dim,
          qk_nope_head_dim,
-         wuk_rows_per_wg);
+         wuk_rows_per_wg,
+         router_experts_per_tile);
   code.e("    task_desc->input_ptrs,");
   code.e("    task_desc->output_ptrs,");
   code.e("    runtime_config.qo_indptr_buffer,");

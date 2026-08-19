@@ -811,6 +811,23 @@ if __name__ == "__main__":
         # Separate knobs so the two stages can move one at a time.
         MOE_W13_OPW = int(os.environ.get("GLM_MOE_W13_OPW", "64"))
         MOE_W2_OPW = int(os.environ.get("GLM_MOE_W2_OPW", "64"))
+        # Experts per router call. The router is one worker per expert, so
+        # GLM-5's 256 experts are 32 tiles per XCD against 29 workers: two
+        # grid-stride rounds for a mean of 1.10 calls, and the second round
+        # re-pays the o_proj barrier spin, the redundant RMSNorm, two block
+        # reductions and the arrival atomic just to add one dot product.
+        # Measured at the post-deferred-rope operating point (subphase
+        # counters, 15.106 ms/iter instrumented): SP3[2] Router 1.415 +
+        # SP3[3] RoutingWait 1.010 = 16% of wall, and SP6/SP3 call counts
+        # gave the 1.1035 ratio directly. 2 makes it 16 tiles and one round.
+        #
+        # MEASURED 2026-08-19, same build, one variable: 11.721 ms/iter at 1
+        # against 10.990 at 2, -6.2%. (The 1 here is the refactored kernel and
+        # is 0.22 ms slower than the 11.500 recorded before it -- the dp[] and
+        # red[] indexing is not free at one expert. It goes away at 2.)
+        # 4 is legal -- 8 tiles per XCD -- but doubles the prefetch register
+        # array again on top of a kernel already at ~332 VGPRs.
+        ROUTER_EPT = int(os.environ.get("GLM_ROUTER_EPT", "2"))
         assert not MOE_MXFP4 or MOE_MXFP8, \
             "GLM_MOE_MXFP4 narrows the MXFP8 expert path; it is not a bf16 mode"
         # Only the fused tail carries the width through to the kernel. The
@@ -2243,6 +2260,7 @@ if __name__ == "__main__":
                     norm_topk_prob=config.norm_topk_prob,
                     moe_w13_output_per_wg=MOE_W13_OPW,
                     moe_w2_output_per_wg=MOE_W2_OPW,
+                    router_experts_per_tile=ROUTER_EPT,
                     block_dim=(256, 1, 1),
                 )
                 if moe_ep:

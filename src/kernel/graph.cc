@@ -927,13 +927,14 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         std::make_tuple(15, 6, TASK_GANG_MLA_DECODE_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[24]; // tiles_per_xcd
   } else if (name == "gang_mla_full_layer_fused_mi300") {
-    assert(params.size() == 52 &&
+    assert(params.size() == 53 &&
            "gang_mla_full_layer_fused_mi300 takes the 25 attention params "
            "of gang_mla_attn_fused_mi300, the 17 MoE params of "
            "gang_oproj_router_fused_mi300 that are not already among them, "
            "then [ep_world_size, ep_my_pe, ep_fold_pe, ep_tail_only], "
-           "[wuv_rows_per_wg, wuv_v_head_dim, wuv_tiles_per_xcd] and "
-           "[qk_nope_head_dim, wuk_rows_per_wg, wuk_tiles_per_xcd]");
+           "[wuv_rows_per_wg, wuv_v_head_dim, wuv_tiles_per_xcd], "
+           "[qk_nope_head_dim, wuk_rows_per_wg, wuk_tiles_per_xcd] and "
+           "[router_experts_per_tile]");
     int variant_id =
         task_register->register_gang_mla_full_layer_fused_mi300_task(
             customized->bgraph, params);

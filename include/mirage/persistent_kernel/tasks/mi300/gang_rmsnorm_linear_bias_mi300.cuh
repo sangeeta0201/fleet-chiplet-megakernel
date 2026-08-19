@@ -597,7 +597,18 @@ template <typename T,
           // the barrier serialises where a task boundary would have let the
           // next task's loads start. Lifted from
           // gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh:716.
-          bool OPROJ_BARRIER = false>
+          bool OPROJ_BARRIER = false,
+          // Experts per call. 1 is the shape this was written for -- one
+          // worker per expert -- and is bit-identical to the code before this
+          // parameter existed. Above 1 the call walks the row once and emits
+          // EXPERTS_PER_TILE logits from it, which is the only lever on the
+          // *round count*: GLM-5's 256 experts are 32 tiles per XCD against 29
+          // workers, so at 1 the makespan is two calls where the mean is 1.10,
+          // and the second call re-pays the barrier spin, the two block-wide
+          // reductions and the arrival atomic to add one dot product. The row
+          // read, the RMSNorm and the normed write are all shared across a
+          // tile's experts; only the gate row and the accumulator are not.
+          int EXPERTS_PER_TILE = 1>
 __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     void const *norm_input_ptr,  // input_ptrs[0]: [batch, REDUCTION_SIZE]
     void const *norm_weight_ptr, // input_ptrs[1]: [REDUCTION_SIZE]
@@ -660,6 +671,12 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   int const wave = tid >> 6;
   constexpr int NUM_WAVES = 4; // 256 threads / 64 lanes
 
+  // This tile's first expert, in the caller's index space -- XCD-local for the
+  // fused router, where gate_weight_ptr and logits_scratch_ptr are already
+  // this XCD's slice. At EXPERTS_PER_TILE 1 this is `tile_idx` and every
+  // expression below reduces to what it was.
+  int const first_expert = tile_idx * EXPERTS_PER_TILE;
+
   // ═══ Step 0: prefetch across the O-proj barrier, then wait ═══
   // gamma and this worker's gate row are data-independent of the GEMM the
   // caller just ran, so they go out before the poll and land while it spins.
@@ -669,11 +686,11 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   constexpr int H4_PF = REDUCTION_SIZE >> 2;
   constexpr int MAX_ITERS_PF = OPROJ_BARRIER ? ((H4_PF + 255) / 256) : 1;
   i32x2_pf_t g_pf[MAX_ITERS_PF];
-  i32x2_pf_t w_pf[MAX_ITERS_PF];
+  i32x2_pf_t w_pf[EXPERTS_PER_TILE][MAX_ITERS_PF];
   if constexpr (OPROJ_BARRIER) {
     char const *g_base_pf = (char const *)norm_weight_ptr;
-    char const *w_base_pf =
-        (char const *)gate_weight_ptr + (int64_t)tile_idx * REDUCTION_SIZE * 2;
+    char const *w_base_pf = (char const *)gate_weight_ptr +
+                            (int64_t)first_expert * REDUCTION_SIZE * 2;
 #pragma unroll
     for (int iter = 0; iter < MAX_ITERS_PF; iter++) {
       int i_cur = tid + iter * 256;
@@ -685,10 +702,19 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
                    : "=v"(g_pf[iter])
                    : "v"(g_base_pf + byte_off)
                    : "memory");
-      asm volatile("global_load_dwordx2 %0, %1, off sc0 nt"
-                   : "=v"(w_pf[iter])
-                   : "v"(w_base_pf + byte_off)
-                   : "memory");
+      // Every expert in the tile, so all EXPERTS_PER_TILE gate rows are in
+      // flight across the barrier rather than one across it and the rest
+      // behind it. Costs EXPERTS_PER_TILE * MAX_ITERS_PF * 2 live VGPRs; see
+      // the note on the asm barrier below, which is what keeps the *address*
+      // arithmetic from costing as many again.
+#pragma unroll
+      for (int e = 0; e < EXPERTS_PER_TILE; e++) {
+        asm volatile("global_load_dwordx2 %0, %1, off sc0 nt"
+                     : "=v"(w_pf[e][iter])
+                     : "v"(w_base_pf + (int64_t)e * REDUCTION_SIZE * 2 +
+                           byte_off)
+                     : "memory");
+      }
     }
     int *hier = static_cast<int *>(oproj_hier_barrier_ptr);
     // Self-heal, see MPK_FL_REPUBLISH_SPINS in
@@ -820,8 +846,12 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   //
   // Gate weight layout: [chunk_N, REDUCTION_SIZE] bf16, row-major.
   // tile_idx = expert index within this XCD (0..chunk_N-1).
-  float dp = 0.0f;
-  bf16 const *my_gate = d_gate_w + tile_idx * REDUCTION_SIZE;
+  float dp[EXPERTS_PER_TILE];
+#pragma unroll
+  for (int e = 0; e < EXPERTS_PER_TILE; e++) {
+    dp[e] = 0.0f;
+  }
+  bf16 const *my_gate = d_gate_w + (int64_t)first_expert * REDUCTION_SIZE;
 
   // Every worker walks the whole row for its own gate dot product, so every
   // worker *can* write the normed row -- and until now every worker did, all
@@ -830,7 +860,7 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   // for GLM that is 8 workers x 4 KB x 8 XCDs = 256 KB per layer where 4 KB is
   // needed. One writer per XCD is enough (leaving the copies XCD-local, which
   // costs nothing and keeps the store in the writer's own L2).
-  bool const write_normed = (tile_idx == 0);
+  bool const write_normed = (first_expert == 0);
 
   if constexpr (OPROJ_BARRIER) {
     // Same arithmetic as the branch below, but iterating over the prefetch
@@ -850,7 +880,6 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
       float h3 = __bfloat162float(d_hidden[base + 3]);
 
       bf16 const *gp = reinterpret_cast<bf16 const *>(&g_pf[iter]);
-      bf16 const *wp = reinterpret_cast<bf16 const *>(&w_pf[iter]);
       float n0 = h0 * irms * __bfloat162float(gp[0]);
       float n1 = h1 * irms * __bfloat162float(gp[1]);
       float n2 = h2 * irms * __bfloat162float(gp[2]);
@@ -863,8 +892,12 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
         d_normed[base + 3] = __float2bfloat16(n3);
       }
 
-      dp += __bfloat162float(wp[0]) * n0 + __bfloat162float(wp[1]) * n1 +
-            __bfloat162float(wp[2]) * n2 + __bfloat162float(wp[3]) * n3;
+#pragma unroll
+      for (int e = 0; e < EXPERTS_PER_TILE; e++) {
+        bf16 const *wp = reinterpret_cast<bf16 const *>(&w_pf[e][iter]);
+        dp[e] += __bfloat162float(wp[0]) * n0 + __bfloat162float(wp[1]) * n1 +
+                 __bfloat162float(wp[2]) * n2 + __bfloat162float(wp[3]) * n3;
+      }
     }
     static_assert(!OPROJ_BARRIER || (REDUCTION_SIZE % 4) == 0,
                   "the prefetch path has no scalar tail, so K must be a "
@@ -898,11 +931,15 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
       }
 
       // Gate GEMV: accumulate dot product
-      float w0 = __bfloat162float(my_gate[base]);
-      float w1 = __bfloat162float(my_gate[base + 1]);
-      float w2 = __bfloat162float(my_gate[base + 2]);
-      float w3 = __bfloat162float(my_gate[base + 3]);
-      dp += w0 * n0 + w1 * n1 + w2 * n2 + w3 * n3;
+#pragma unroll
+      for (int e = 0; e < EXPERTS_PER_TILE; e++) {
+        bf16 const *ge = my_gate + (int64_t)e * REDUCTION_SIZE;
+        float w0 = __bfloat162float(ge[base]);
+        float w1 = __bfloat162float(ge[base + 1]);
+        float w2 = __bfloat162float(ge[base + 2]);
+        float w3 = __bfloat162float(ge[base + 3]);
+        dp[e] += w0 * n0 + w1 * n1 + w2 * n2 + w3 * n3;
+      }
     }
     // Scalar tail
     for (int i = (h4 << 2) + tid; i < REDUCTION_SIZE; i += (int)blockDim.x) {
@@ -912,36 +949,49 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
       if (write_normed) {
         d_normed[i] = __float2bfloat16(n);
       }
-      dp += __bfloat162float(my_gate[i]) * n;
+#pragma unroll
+      for (int e = 0; e < EXPERTS_PER_TILE; e++) {
+        dp[e] += __bfloat162float(my_gate[(int64_t)e * REDUCTION_SIZE + i]) * n;
+      }
     }
   }
 
-// Wave-level reduction for dp
+  // Wave-level reduction, then one LDS slot per (wave, expert). `red` is 16
+  // floats, so EXPERTS_PER_TILE * NUM_WAVES has to fit -- 4 experts at four
+  // waves is the ceiling, and nothing here wants to go that wide.
+  static_assert(EXPERTS_PER_TILE * NUM_WAVES <= 16,
+                "red[] holds NUM_WAVES partial sums per expert");
 #pragma unroll
-  for (int off = 32; off > 0; off >>= 1) {
-    dp += __shfl_xor(dp, off);
-  }
-
-  // Cross-wave LDS reduce
-  if (lane == 0) {
-    red[wave] = dp;
+  for (int e = 0; e < EXPERTS_PER_TILE; e++) {
+#pragma unroll
+    for (int off = 32; off > 0; off >>= 1) {
+      dp[e] += __shfl_xor(dp[e], off);
+    }
+    if (lane == 0) {
+      red[e * NUM_WAVES + wave] = dp[e];
+    }
   }
   __syncthreads();
 
   // tid==0 writes logit + bias via write-through store
   if (tid == 0) {
-    float s = 0.0f;
-    for (int w = 0; w < NUM_WAVES; w++) {
-      s += red[w];
+#pragma unroll
+    for (int e = 0; e < EXPERTS_PER_TILE; e++) {
+      float s = 0.0f;
+      for (int w = 0; w < NUM_WAVES; w++) {
+        s += red[e * NUM_WAVES + w];
+      }
+      // `noaux_tc` keeps its bias out of the logit -- it only steers
+      // selection, and the weight that gets emitted comes from the unbiased
+      // sigmoid. The tail applies it. Everyone else folds it in here as an
+      // ordinary GEMV bias.
+      if (!SIGMOID_BIAS && d_bias) {
+        s += __bfloat162float(d_bias[first_expert + e]);
+      }
+      bf16 bval = __float2bfloat16(s);
+      st_wt_u16(&d_logits[first_expert + e],
+                *reinterpret_cast<unsigned short *>(&bval));
     }
-    // `noaux_tc` keeps its bias out of the logit -- it only steers selection,
-    // and the weight that gets emitted comes from the unbiased sigmoid. The
-    // tail applies it. Everyone else folds it in here as an ordinary GEMV bias.
-    if (!SIGMOID_BIAS && d_bias) {
-      s += __bfloat162float(d_bias[tile_idx]);
-    }
-    bf16 bval = __float2bfloat16(s);
-    st_wt_u16(&d_logits[tile_idx], *reinterpret_cast<unsigned short *>(&bval));
   }
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING

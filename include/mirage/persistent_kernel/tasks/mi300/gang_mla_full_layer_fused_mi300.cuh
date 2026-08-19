@@ -301,7 +301,10 @@ template <
     // 77.9 MB a layer becomes 34.6 plus 6.5 for the W_UK stack.
     // Adds input [30] (EP) / [28] (no EP) and output [12].
     int QK_NOPE_HEAD_DIM = 0,
-    int WUK_ROWS_PER_WG = 0>
+    int WUK_ROWS_PER_WG = 0,
+    // Experts per router tile; `router_tile_n` below is the tile count, not
+    // the expert count. See Phase 3 in gang_oproj_router_fused_mi300.cuh.
+    int ROUTER_EXPERTS_PER_TILE = 1>
 __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     // Pointer arrays are passed whole rather than unpacked into 38 named
     // parameters, which is what gpt-oss's full-layer task does and for the
@@ -1416,7 +1419,8 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
                                        /*EP_SHARED_PE=*/EP_FOLD_PE,
                                        WUV_ROWS_PER_WG,
                                        /*WUV_REDUCTION=*/KV_LORA_RANK,
-                                       WUV_V_HEAD_DIM>(
+                                       WUV_V_HEAD_DIM,
+                                       ROUTER_EXPERTS_PER_TILE>(
       /*oproj_input=*/output_ptrs[4],
       /*oproj_weight=*/input_ptrs[15],
       /*oproj_residual=*/input_ptrs[16],
