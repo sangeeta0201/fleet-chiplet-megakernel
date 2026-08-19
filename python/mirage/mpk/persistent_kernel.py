@@ -438,6 +438,18 @@ def get_compile_command(
         # from global -- so the ablation is also the correctness fallback.
         if int(os.environ.get("GLM_PROLOGUE_PREFETCH", "1")) == 0:
             flags = flags + ["-DMPK_GLM_PROLOGUE_PREFETCH_OFF"]
+        # Pair-local decode -> merge rendezvous in the fused MLA attention
+        # task: re-cut the decode work map so XCD pair (2k, 2k+1) owns every
+        # kv chunk of q_group k, which is what the merge map already assumes,
+        # and shrink Phase 6's barrier from 8 XCDs to 2. This is the gpt-oss
+        # CROC chunk-barrier idiom, adapted -- GLM's merge is 128 tiles, far
+        # too big for gpt-oss's "last arriver runs it inline", so the barrier
+        # is narrowed rather than deleted. Needs 8 % NUM_Q_GROUPS == 0 and
+        # (8 / NUM_Q_GROUPS) | NUM_KV_CHUNKS; the kernel falls back to the
+        # global barrier when either fails. See
+        # gang_mla_attn_fused_mi300.cuh.
+        if int(os.environ.get("GLM_MLA_PAIR_MERGE", "0")) == 1:
+            flags = flags + ["-DMPK_GLM_MLA_PAIR_MERGE"]
         # Ablation for skipping the o_proj GEMV's activation re-stage on the
         # second grid-stride pass. m_tiles is 1 there, so the two passes stage
         # the same 64 KB row; =1 restores the redundant copy.

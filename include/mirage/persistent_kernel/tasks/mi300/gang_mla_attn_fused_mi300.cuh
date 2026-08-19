@@ -209,6 +209,53 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   int *qb_barrier = qkv_barrier + 10 * HIER_STRIDE;
   int *decode_barrier = qkv_barrier + 20 * HIER_STRIDE;
   int const arrivals = tiles_per_xcd * 8;
+
+  // ── pair-local decode -> merge (the gpt-oss CROC port) ──────────────────
+  // gpt-oss's chunk barrier is per-XCD because it maps kv_head == xcd_id, so
+  // one chiplet owns a head's whole chunk set and the last chunk to arrive
+  // just runs the merge inline. MLA has a single latent head, so the default
+  // decode map -- item = xcd_id * mla_tiles_per_xcd + t, decomposed by the
+  // decode kernel as q_group = item % NUM_Q_GROUPS -- scatters a q_group's
+  // NUM_KV_CHUNKS chunks across every XCD, and Phase 6 has to rendezvous
+  // GPU-wide. Measured 13.23 us/worker/layer of spin on the 128 merge ranks.
+  //
+  // The *merge* map is already pair-aligned and nobody noticed: its offset is
+  // xcd_id * merge_tiles_per_xcd + t, and merge_tiles_per_xcd is
+  // NUM_Q_GROUPS * MERGE_DIM_SPLITS / 8, so offset / MERGE_DIM_SPLITS --
+  // which is what the merge kernel reads as its q_group -- collapses to
+  // xcd_id * NUM_Q_GROUPS / 8. At GLM-5's four q_groups that is xcd_id / 2:
+  // XCDs 2k and 2k+1 both merge q_group k already. Only the decode disagrees.
+  //
+  // So re-cut the decode instead: XCD pair (2k, 2k+1) computes every chunk of
+  // q_group k, half the chunks each. The merge's reads then never leave the
+  // pair, and the rendezvous drops from 8 XCDs to 2. Nothing else moves --
+  // o_acc and lse are indexed by the decode kernel from its own decomposed
+  // (q_group, chunk), so permuting which XCD runs which item is invisible.
+  constexpr int NUM_Q_GROUPS = NUM_Q_HEADS / 16;
+  constexpr int XCDS_PER_GROUP =
+      (NUM_Q_GROUPS > 0 && (8 % NUM_Q_GROUPS) == 0) ? 8 / NUM_Q_GROUPS : 1;
+#ifdef MPK_GLM_MLA_PAIR_MERGE
+  // Needs 8 % NUM_Q_GROUPS == 0 for the pairing to exist at all, and
+  // XCDS_PER_GROUP | NUM_KV_CHUNKS so each half of a pair gets a whole number
+  // of chunks. Both hold at GLM-5 (4 groups, 4 chunks); neither is checked at
+  // runtime because a false one silently drops decode items.
+  constexpr bool PAIR_MERGE = (8 % NUM_Q_GROUPS) == 0 &&
+                              (NUM_KV_CHUNKS % XCDS_PER_GROUP) == 0;
+#else
+  constexpr bool PAIR_MERGE = false;
+#endif
+  int const pair_id = xcd_id / XCDS_PER_GROUP;
+  int const pair_half = xcd_id % XCDS_PER_GROUP;
+  // Slot 8's line carries the single global arrival counter at offset 0 in
+  // the default mode and nothing else, so in pair mode the per-pair counters
+  // ride in the same line at 4-int spacing. A run is one mode or the other,
+  // and pair 0 reuses the old address. Four atomics on one line is no worse
+  // than the one address all 232 workers hit today, and it costs no slot --
+  // the standalone dispatch only allocates decode_barrier[0..8].
+  int *const _dec_cnt =
+      &decode_barrier[8 * HIER_STRIDE + (PAIR_MERGE ? 4 * pair_id : 0)];
+  int const dec_arrivals =
+      PAIR_MERGE ? tiles_per_xcd * XCDS_PER_GROUP : arrivals;
   constexpr bool UNABSORB_K = QK_NOPE_HEAD_DIM > 0 && WUK_ROWS_PER_WG > 0;
   // Only dereferenced under UNABSORB_K; the caller owns the region and the
   // standalone dispatch does not allocate one.
@@ -592,6 +639,14 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     // standalone task's mapping, where the gang dispatch width was the
     // decode's own.
     for (int t = xcd_rank; t < mla_tiles_per_xcd; t += tiles_per_xcd) {
+      // Under PAIR_MERGE this XCD owns chunks [pair_half * mla_tiles_per_xcd,
+      // +mla_tiles_per_xcd) of q_group pair_id, and the decode kernel wants
+      // chunk * NUM_Q_GROUPS + q_group. Still a bijection onto
+      // [0, NUM_Q_GROUPS * NUM_KV_CHUNKS), just a different one.
+      int const decode_item =
+          PAIR_MERGE
+              ? (pair_half * mla_tiles_per_xcd + t) * NUM_Q_GROUPS + pair_id
+              : xcd_id * mla_tiles_per_xcd + t;
       gang_mla_decode_kernel<bfloat16,
                              NUM_Q_HEADS,
                              KV_LORA_RANK,
@@ -611,7 +666,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
           kv_indices,
           kv_last_page_len,
           mla_total_work_items,
-          xcd_id * mla_tiles_per_xcd + t,
+          decode_item,
           scale_s);
     }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
@@ -635,11 +690,22 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   __syncthreads();
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
   if (tid == 0) {
-    int prev = atom_add_release_gpu_s32(&decode_barrier[8 * HIER_STRIDE], 1);
-    if ((prev % arrivals) == arrivals - 1) {
-      for (int x = 0; x < 8; x++) {
-        st_wt_u32((void *)&decode_barrier[x * HIER_STRIDE],
-                  (unsigned)decode_expected);
+    int prev = atom_add_release_gpu_s32(_dec_cnt, 1);
+    if ((prev % dec_arrivals) == dec_arrivals - 1) {
+      if constexpr (PAIR_MERGE) {
+        // Release only this pair. The other three pairs are computing chunks
+        // this pair's merge never reads.
+        for (int h = 0; h < XCDS_PER_GROUP; h++) {
+          st_wt_u32(
+              (void *)&decode_barrier[(pair_id * XCDS_PER_GROUP + h) *
+                                      HIER_STRIDE],
+              (unsigned)decode_expected);
+        }
+      } else {
+        for (int x = 0; x < 8; x++) {
+          st_wt_u32((void *)&decode_barrier[x * HIER_STRIDE],
+                    (unsigned)decode_expected);
+        }
       }
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
@@ -650,7 +716,11 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   if (tid == 0) {
     // Self-heal, see MPK_FL_REPUBLISH_SPINS. Note the arrival above is
     // unconditional but this wait is merge-ranks-only, so the counter still
-    // advances by the full `arrivals` per layer and the quota test holds.
+    // advances by the full `dec_arrivals` per layer and the quota test holds.
+    // Under PAIR_MERGE the counter is the pair's, and the pair's quota is the
+    // *whole* predicate this flag stands for -- everything this XCD's merge
+    // reads was written by the pair. Healing on a partial predicate is what
+    // broke the NP=8 EP barrier; there is no partial one to heal on here.
     int *const _dec_flag = &decode_barrier[xcd_id * HIER_STRIDE];
     MPK_WS_WAIT_BEGIN(764, decode_expected);
     int _spins = 0;
@@ -659,8 +729,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
       ++_spins;
       MPK_WS_WAIT_TICK(_obs, _spins);
       if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
-        if (ld_nt_s32(&decode_barrier[8 * HIER_STRIDE]) >=
-            arrivals * decode_expected) {
+        if (ld_nt_s32(_dec_cnt) >= dec_arrivals * decode_expected) {
           st_wt_u32((void *)_dec_flag, (unsigned)decode_expected);
           asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         }
@@ -688,8 +757,8 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // kernel decomposes itself; all this has to supply is a bijection onto
   // [0, NUM_Q_GROUPS * MERGE_DIM_SPLITS). The standalone task got it from
   // bid.y of a (requests, 32, 1) grid -- there is no bid.y in a gang task, so
-  // it comes from the worker's own coordinates instead.
-  constexpr int NUM_Q_GROUPS = NUM_Q_HEADS / 16;
+  // it comes from the worker's own coordinates instead. NUM_Q_GROUPS is
+  // declared up with the pair-merge block, which needs it far earlier.
   for (int t = xcd_rank; t < merge_tiles_per_xcd; t += tiles_per_xcd) {
     merge_splitkv_ck_fmha<bfloat16,
                           /*NUM_QO_HEADS_PER_KV=*/16,
