@@ -728,6 +728,19 @@ __device__ __attribute__((always_inline)) void
     // idempotent, and the gang counter still sees exactly total_router_tiles
     // arrivals per layer however they are distributed, so the TopK tail still
     // fires exactly once.
+    //
+    // The re-norm is idempotent but not free, and it lands on exactly the
+    // workers that are already the stragglers: 32 experts over 29 workers
+    // makes the makespan two calls where the mean is 1.10, and every worker
+    // past the first call also loses the barrier spin that was hiding its
+    // gate-row prefetch. `irms` does not depend on the expert, so cache it in
+    // LDS across the calls -- bit-identical, so the logits do not move.
+    // Reset per layer: `hidden` is a different row each time.
+    __shared__ float s_router_irms;
+    if (tid == 0) {
+      s_router_irms = -1.0f;
+    }
+    __syncthreads();
     for (int t = xcd_rank; t < router_tile_n; t += tiles_per_xcd) {
       gang_rmsnorm_linear_bias_topk_kernel<__hip_bfloat16,
                                            BATCH_SIZE,
@@ -762,7 +775,8 @@ __device__ __attribute__((always_inline)) void
           xcd_id,
           oproj_expected,
           routing_ready,
-          /*routing_epoch_hint=*/routing_expected);
+          /*routing_epoch_hint=*/routing_expected,
+          /*irms_cache=*/&s_router_irms);
     }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     {

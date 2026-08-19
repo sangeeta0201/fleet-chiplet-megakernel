@@ -39,7 +39,11 @@
 // Must be declared before task_header.cuh so gang task kernels can see them.
 #if defined(MPK_ENABLE_SUBPHASE_TIMING) || defined(MPK_ENABLE_MOE_SUBPHASE)
 // Slots: 0=QKV 1=QKV_KVUPD 2=OPROJ 3=OPROJ_TOPK 4=MOE_W13 5=MOE_W2
-#define SUBPHASE_SLOTS 6
+// 6=ROUTER_SPLIT, GLM only: the o_proj barrier wait is served inside the
+// router kernel (so the gamma/gate prefetch covers it), which charges it to
+// slot 3 phase 2 along with the norm and the gate GEMV. [0] is the spin
+// alone; subtract it from SP3[2] for the router's real compute.
+#define SUBPHASE_SLOTS 7
 #define SUBPHASE_MAX_PHASES 8
 __device__ unsigned long long g_subphase_ns[SUBPHASE_SLOTS]
                                            [SUBPHASE_MAX_PHASES];

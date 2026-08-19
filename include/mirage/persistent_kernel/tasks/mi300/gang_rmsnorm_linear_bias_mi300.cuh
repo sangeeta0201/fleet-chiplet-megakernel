@@ -597,7 +597,14 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     // SIGMOID_BIAS only. The epoch value the TopK tail publishes into
     // routing_ready. Pass the same number the caller's consumers wait on;
     // < 0 falls back to incrementing whatever is there.
-    int routing_epoch_hint = -1) {
+    int routing_epoch_hint = -1,
+    // Optional LDS scratch letting one worker amortise Step 1 over several
+    // experts. Every worker re-norms the whole row to get a scalar that does
+    // not depend on which expert it is doing, so a worker holding two experts
+    // computes the same `irms` twice, bit for bit. Point this at a __shared__
+    // float, set it negative once per layer, and the second call skips Step 1
+    // entirely. Null keeps the old behaviour.
+    float *irms_cache = nullptr) {
 
   using bf16 = __hip_bfloat16;
   bf16 const *__restrict__ d_hidden = static_cast<bf16 const *>(norm_input_ptr);
@@ -654,6 +661,9 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     // at or past the epoch proves the release fired and this line is simply
     // short. Republishing it is idempotent -- same monotonic absolute value.
     {
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+      unsigned long long _sp_spin0 = __builtin_amdgcn_s_memrealtime();
+#endif
       int _spins = 0;
       while (ld_nt_s32(&hier[oproj_xcd_id * 16]) < oproj_release_expected) {
         if ((++_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
@@ -668,6 +678,18 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
         }
         __builtin_amdgcn_s_sleep(1);
       }
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+      // The caller charges this whole kernel to SP3[2] "Router", so without
+      // this the spin and the router's actual work are one number. Guarded
+      // exactly as SP3[2] is -- every worker's thread 0, both calls when a
+      // worker carries two experts -- so the two are directly comparable and
+      // SP3[2] minus this is the router's real compute.
+      if (tid == 0 && g_subphase_active) {
+        atomicAdd(&g_subphase_ns[6][0],
+                  (__builtin_amdgcn_s_memrealtime() - _sp_spin0) * 10);
+        atomicAdd(&g_subphase_cnt[6], 1ULL);
+      }
+#endif
     }
     // Plain buffer_inv, no sc1: drop the vL1 so d_hidden is re-read, but
     // leave this XCD's own L2 lines alone.
@@ -678,8 +700,15 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
 
   // ═══ Step 1: RMSNorm — compute irms from hidden state ═══
   // All 256 threads collaborate. Vectorized 4-wide bf16 loads.
+  //
+  // Skipped outright when a previous call on this block already computed it
+  // for the same row. The cache is LDS written by tid 0 and read by all 256,
+  // which is safe without a fence of its own: the producing call ends in
+  // __syncthreads (Step 3) and this read is the next call's first LDS access.
+  __shared__ float red[16];
+  bool const irms_cached = (irms_cache != nullptr) && (*irms_cache > 0.0f);
   float ssq = 0.0f;
-  {
+  if (!irms_cached) {
     int const h4 = REDUCTION_SIZE >> 2;
     for (int i = tid; i < h4; i += (int)blockDim.x) {
       int base = i * 4;
@@ -696,29 +725,36 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     }
   }
 
+  float irms;
+  if (irms_cached) {
+    irms = *irms_cache;
+  } else {
 // Wave-level reduction (64 lanes)
 #pragma unroll
-  for (int off = 32; off > 0; off >>= 1) {
-    ssq += __shfl_xor(ssq, off);
-  }
-
-  // Cross-wave reduction via LDS
-  __shared__ float red[16];
-  if (lane == 0) {
-    red[wave] = ssq;
-  }
-  __syncthreads();
-
-  float irms;
-  if (tid == 0) {
-    float tot = 0.0f;
-    for (int w = 0; w < NUM_WAVES; w++) {
-      tot += red[w];
+    for (int off = 32; off > 0; off >>= 1) {
+      ssq += __shfl_xor(ssq, off);
     }
-    red[0] = rsqrtf(tot / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
+
+    // Cross-wave reduction via LDS
+    if (lane == 0) {
+      red[wave] = ssq;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+      float tot = 0.0f;
+      for (int w = 0; w < NUM_WAVES; w++) {
+        tot += red[w];
+      }
+      red[0] = rsqrtf(tot / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
+    }
+    __syncthreads();
+    irms = red[0];
+    // `red` is reused by the dp reduction below, so the cache cannot alias it.
+    if (irms_cache != nullptr && tid == 0) {
+      *irms_cache = irms;
+    }
   }
-  __syncthreads();
-  irms = red[0];
 
   // ═══ Step 2: Fused Gate GEMV + norm write ═══
   // One expert per worker. Each thread handles REDUCTION_SIZE/blockDim.x
