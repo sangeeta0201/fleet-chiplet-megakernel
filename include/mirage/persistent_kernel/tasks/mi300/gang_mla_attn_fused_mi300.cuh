@@ -101,6 +101,19 @@ namespace kernel {
 #define MPK_FL_REPUBLISH_SPINS 1024
 #endif
 
+// Layout of the symmetric EP signal array, in uint64 units. Duplicated from
+// FULL_LAYER_EP_SIGNAL_STRIDE rather than read from it, for the same reason
+// OPROJ_EP_SIGNAL_STRIDE is: the monoliths land in this translation unit in
+// include order and any of them may be first. gang_mla_full_layer_fused_mi300
+// static_asserts that all three agree, from a point where all are in scope.
+//
+// One 64-byte line per PE, written only by that PE (on every peer's copy), so
+// three independent per-layer signals share it with no false sharing: slot 0
+// is Phase 9's MoE fold, slot 1 the o_proj all-gather, slot 2 this task's
+// head-sharded q_b/W_UK all-gather.
+static constexpr int QB_EP_SIGNAL_STRIDE = 8;
+static constexpr int QB_EP_SIGNAL_SLOT = 2;
+
 template <int BATCH_SIZE,
           // ── qkv_a: input_layernorm + [q_a_proj | kv_a_proj_with_mqa] ──
           int QKV_OUTPUT_PER_WG,
@@ -135,7 +148,14 @@ template <int BATCH_SIZE,
           // W_UK afterwards. 0 keeps the absorbed q_b, which is what the
           // dense prologue layers and the standalone dispatch use.
           int QK_NOPE_HEAD_DIM = 0,
-          int WUK_ROWS_PER_WG = 0>
+          int WUK_ROWS_PER_WG = 0,
+          // ── head-sharded q_b + W_UK ──
+          // Only used to derive this rank's head base and to address peers;
+          // the shard itself is detected from the tile count, exactly as the
+          // o_proj one is. Defaulted so the standalone dispatch and every
+          // single-rank build are untouched.
+          int EP_MY_PE = 0,
+          int EP_WORLD_SIZE = 1>
 __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     // ── inputs ──
     void const *x_ptr,               // [0]  residual stream
@@ -193,7 +213,12 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     void *q_nope_ptr = nullptr,           // [batch, H * (nope + rope)] scratch
     int wuk_tiles_per_xcd = 0,
     int wuk_expected_in = 0,
-    void *wuk_counters_ptr = nullptr) {
+    void *wuk_counters_ptr = nullptr,
+    // Symmetric [EP_WORLD_SIZE * 8] uint64 signal array -- the same object the
+    // Phase-9 EP fold and the o_proj all-gather use, at slot 2 of this PE's
+    // 64-byte line. Null on the standalone dispatch, and null is also what
+    // disables the head shard.
+    void *ep_signal_ptr = nullptr) {
 
   int const tid = threadIdx.x;
   int const xcd_id = tile_idx / tiles_per_xcd;
@@ -260,6 +285,38 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // Only dereferenced under UNABSORB_K; the caller owns the region and the
   // standalone dispatch does not allocate one.
   int *wuk_barrier = static_cast<int *>(wuk_counters_ptr);
+
+  // ── head-sharded q_b + W_UK (QB_TP) ─────────────────────────────────────
+  // With ATTN_DP at batch 1 every rank runs the same 64 heads from the same
+  // weights: q_b is 34.6 MB of MXFP8 per rank per layer and W_UK another 6.6,
+  // eight copies of one answer. Sharding is head-wise -- rank p owns heads
+  // [p * NUM_Q_HEADS/EP, +that) -- because a head is the unit both stages are
+  // already blocked on, and because that keeps Phase 3b's barrier XCD-local:
+  // one head per XCD instead of eight, producer and consumer still paired.
+  //
+  // What it actually buys is not bytes but makespan. Replicated, q_b hands an
+  // XCD 33 tiles against 29 workers, so 25 of 29 idle a whole 10.28 us tile in
+  // the round-two straggler (see the Phase 3b note below), and the tile count
+  // is locked by the shape: OPW must divide the 256-wide head span, so per XCD
+  // it is 32, 16, 8 or 4 and never 29. Sharded, an XCD owns one head -- four
+  // GEMM tiles plus the latent -- and the second round disappears.
+  //
+  // Detected, not plumbed, exactly like the o_proj shard: "my per-XCD chunk
+  // covers a 1/EP-th of the nope row" is unambiguous, since nothing between
+  // the whole row and exactly 1/world is a legal packing.
+  constexpr int QB_HEAD_SPAN = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM;
+  constexpr int QB_QK_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM;
+  constexpr int QB_TP_HEADS =
+      (EP_WORLD_SIZE > 1) ? (NUM_Q_HEADS / EP_WORLD_SIZE) : NUM_Q_HEADS;
+  constexpr int QB_NPEER = (EP_WORLD_SIZE > 1) ? (EP_WORLD_SIZE - 1) : 1;
+  bool const qb_tp = UNABSORB_K && (EP_WORLD_SIZE > 1) &&
+                     (ep_signal_ptr != nullptr) &&
+                     (qb_n_wgs_per_xcd * QB_OUTPUT_PER_WG * 8 ==
+                      QB_TP_HEADS * QB_HEAD_SPAN);
+  // Both scratch rows stay declared at the full 64 heads; only the weights are
+  // sliced, so every offset this rank touches is its own head base plus the
+  // per-XCD offset the replicated form already used.
+  int const qb_head_base = qb_tp ? EP_MY_PE * QB_TP_HEADS : 0;
 
   // Release values are read once, up front, before anything in this layer has
   // run -- the same argument as the MoE task's s_expected block. Reading a
@@ -441,9 +498,14 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     // Un-absorbed, the GEMM's output row is the nope scratch instead of the
     // query row; the rope workgroup crosses back into the query row itself,
     // which is why that one is handed over whole and un-biased.
+    //
+    // Under QB_TP the base carries this rank's head slice as well. The nope
+    // scratch is declared whole on every rank, so rank p's XCD x writes the
+    // columns of global head p * QB_TP_HEADS + x and nothing else ever does.
     unsigned short *xcd_q_ws =
         static_cast<unsigned short *>(UNABSORB_K ? q_nope_ptr
                                                  : q_workspace_ptr) +
+        static_cast<size_t>(qb_head_base) * QB_HEAD_SPAN +
         static_cast<size_t>(xcd_id) * qb_n_wgs_per_xcd * QB_OUTPUT_PER_WG;
     gang_rmsnorm_linear_mxfp8_bias_mla_kvupd_kernel<BATCH_SIZE,
                                                     QB_OUTPUT_PER_WG,
@@ -479,7 +541,12 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         qb_output_stride,
         t,
         kv_eps,
-        /*q_rope_out_ptr=*/q_workspace_ptr);
+        // The kvupd kernel derives the head from xcd_id and its own per-XCD
+        // workgroup count, which under QB_TP is a *rank-local* head index.
+        // Biasing the pointer by this rank's head base is what makes it land
+        // on the global head, and costs the kernel nothing.
+        /*q_rope_out_ptr=*/static_cast<unsigned short *>(q_workspace_ptr) +
+            static_cast<size_t>(qb_head_base) * QB_QK_DIM);
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     if (tid == 0 && g_subphase_active) {
       unsigned long long _d =
@@ -593,9 +660,30 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     // on the W_UV side, except that the query row's per-head span (QK_DIM) is
     // wider than the rows a head writes (KV_LORA_RANK), so the bias carries a
     // per-head skip as well.
+    // One delta per peer under QB_TP, resolved once for the whole loop. Kept
+    // inside this scope rather than at function scope so the seven int64 do
+    // not sit live across the decode, which is the register-hungriest phase.
+    int64_t qb_peer_delta[QB_NPEER];
+    bool qb_all_mapped = qb_tp;
+    if (qb_tp) {
+#pragma unroll
+      for (int q = 0; q < QB_NPEER; q++) {
+        qb_peer_delta[q] = 0;
+        if (!mpk_shmem_peer_delta((q < EP_MY_PE) ? q : (q + 1),
+                                  &qb_peer_delta[q])) {
+          // No direct mapping is a fail-loud configuration error, not a slow
+          // path: the weights are already sliced, so falling back would just
+          // leave seven eighths of the query row stale.
+          qb_all_mapped = false;
+        }
+      }
+    }
+    bool const qb_push = qb_tp && qb_all_mapped;
+
     for (int t = xcd_rank; t < wuk_tiles_per_xcd; t += tiles_per_xcd) {
       int const heads_per_xcd = wuk_tiles_per_xcd / TILES_PER_HEAD;
-      int const head = xcd_id * heads_per_xcd + t / TILES_PER_HEAD;
+      int const head = qb_head_base + xcd_id * heads_per_xcd +
+                       t / TILES_PER_HEAD;
       unsigned short const *head_in =
           static_cast<unsigned short const *>(q_nope_ptr) +
           static_cast<size_t>(head) *
@@ -605,6 +693,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
       // stepping below q_workspace_ptr.
       unsigned short *tile_out =
           static_cast<unsigned short *>(q_workspace_ptr) +
+          static_cast<size_t>(qb_head_base) * QK_DIM_ +
           static_cast<size_t>(xcd_id) * heads_per_xcd * QK_DIM_ +
           static_cast<size_t>(t / TILES_PER_HEAD) * QK_ROPE_HEAD_DIM;
       gang_gemv_mxfp8_kernel<BATCH_SIZE, QK_NOPE_HEAD_DIM, WUK_ROWS_PER_WG,
@@ -612,6 +701,49 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
           head_in, wuk_weight_ptr, /*residual=*/nullptr, tile_out,
           num_active_tokens, WUK_ROWS_PER_WG, qb_output_stride,
           /*m_tiles=*/1, wuk_tiles_per_xcd, /*wgm=*/0, t);
+      // Push the rows this workgroup just produced straight into every peer's
+      // copy of the query row, at the identical offset. The head slices are
+      // disjoint across ranks, so the all-gather is QB_NPEER stores of those
+      // bytes and needs no staging buffer -- the same shape as the o_proj
+      // gather, and pushed here rather than by the barrier leader so all eight
+      // XCDs drive the links while W_UK is still running.
+      //
+      // The last tile of a head carries QK_ROPE_HEAD_DIM more: the roped
+      // columns sit immediately after the head's latent rows in the query row,
+      // and they were written back in Phase 3 by this same XCD -- which the
+      // XCD-local barrier above has already ordered. Contiguous, so it is a
+      // wider push and not a second one.
+      //
+      // ld_nt_s32 is the sc0 sc1 load: the GEMV epilogue and the rope tile are
+      // both write-through, so the bytes are in memory but this CU's vL1 may
+      // hold the line these lanes read before them.
+      if (qb_push) {
+        static_assert((WUK_ROWS_PER_WG % 2) == 0 &&
+                          (QK_ROPE_HEAD_DIM % 2) == 0,
+                      "peer stores are packed 32-bit, so both the tile and the "
+                      "rope tail must be an even number of bf16");
+        int const push_w32 =
+            (((t % TILES_PER_HEAD) == TILES_PER_HEAD - 1)
+                 ? (WUK_ROWS_PER_WG + QK_ROPE_HEAD_DIM)
+                 : WUK_ROWS_PER_WG) /
+            2;
+        __syncthreads();
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        unsigned int *const src32 = reinterpret_cast<unsigned int *>(
+            tile_out + (size_t)t * WUK_ROWS_PER_WG);
+        for (int w = tid; w < push_w32; w += (int)blockDim.x) {
+          unsigned int const v =
+              (unsigned int)ld_nt_s32(reinterpret_cast<int *>(src32 + w));
+          // Unrolled over peers so qb_peer_delta stays in registers: a runtime
+          // index into a per-thread array is a scratch spill.
+#pragma unroll
+          for (int q = 0; q < QB_NPEER; q++) {
+            st_wt_u32((void *)(reinterpret_cast<char *>(src32 + w) +
+                               qb_peer_delta[q]),
+                      v);
+          }
+        }
+      }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
       ++_wuk_tiles;
 #endif
@@ -650,6 +782,66 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   if (tid == 0) {
     int prev = atom_add_release_gpu_s32(&qb_barrier[8 * HIER_STRIDE], 1);
     if ((prev % arrivals) == arrivals - 1) {
+      // ── the head shard's rendezvous rides this barrier ──────────────────
+      // Under QB_TP the query row is not complete when the local arrivals are
+      // in; it is complete when every peer's eight heads have landed too. This
+      // thread is the one the modular test elected, so it has observed all
+      // eight local XCDs -- exactly the condition for telling the peers -- and
+      // it is already the thread that fans the release out. One thread on the
+      // rank polls the remote lines and the other 231 workers keep polling a
+      // local flag that is simply published later. No second barrier.
+      if (qb_tp) {
+        int64_t d[QB_NPEER];
+        bool mapped = true;
+#pragma unroll
+        for (int q = 0; q < QB_NPEER; q++) {
+          d[q] = 0;
+          if (!mpk_shmem_peer_delta((q < EP_MY_PE) ? q : (q + 1), &d[q])) {
+            mapped = false;
+          }
+        }
+        if (mapped) {
+          unsigned long long *const ep_sig =
+              static_cast<unsigned long long *>(ep_signal_ptr);
+          unsigned long long *const my_line =
+              ep_sig + (size_t)EP_MY_PE * QB_EP_SIGNAL_STRIDE +
+              QB_EP_SIGNAL_SLOT;
+          // All QB_NPEER stores back to back, then one drain: distinct peers
+          // are distinct XGMI links and pipeline.
+#pragma unroll
+          for (int q = 0; q < QB_NPEER; q++) {
+            st_wt_u64(
+                (void *)(reinterpret_cast<char *>(my_line) + d[q]),
+                (unsigned long long)qb_expected);
+          }
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          // Poll all peers off one bitmask rather than in rank order, so a
+          // slow link costs its own latency and not the sum.
+          unsigned remaining = (1u << QB_NPEER) - 1u;
+          while (remaining) {
+#pragma unroll
+            for (int q = 0; q < QB_NPEER; q++) {
+              if (remaining & (1u << q)) {
+                int const p = (q < EP_MY_PE) ? q : (q + 1);
+                if (ld_sys_u64(ep_sig + (size_t)p * QB_EP_SIGNAL_STRIDE +
+                               QB_EP_SIGNAL_SLOT) >=
+                    (unsigned long long)qb_expected) {
+                  remaining &= ~(1u << q);
+                }
+              }
+            }
+            if (remaining) {
+              __builtin_amdgcn_s_sleep(1);
+            }
+          }
+          // The peer heads arrived as sc0 sc1 stores, so they are in memory.
+          // Drop this CU's vL1 anyway before the release: the decode re-reads
+          // the whole query row and its own buffer_inv is downstream of a flag
+          // this thread has not written yet, which is the wrong order to rely
+          // on.
+          asm volatile("buffer_inv" ::: "memory");
+        }
+      }
       for (int x = 0; x < 8; x++) {
         st_wt_u32((void *)&qb_barrier[x * HIER_STRIDE], (unsigned)qb_expected);
       }
@@ -670,8 +862,28 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         ++_spins;
         MPK_WS_WAIT_TICK(_obs, _spins);
         if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
-          if (ld_nt_s32(&qb_barrier[8 * HIER_STRIDE]) >=
-              arrivals * qb_expected) {
+          // Under QB_TP the local arrival count is only HALF the release
+          // condition -- the peer heads must have landed too, and only the
+          // elected leader has waited for them. Healing off the counter would
+          // do exactly what the barrier-901 bug did: let workers past a
+          // rendezvous whose remote half has not happened. Heal off another
+          // XCD's flag instead, which the leader writes after the peer wait,
+          // so observing it implies the whole predicate.
+          bool _heal;
+          if (qb_tp) {
+            _heal = false;
+            for (int x = 0; x < 8; x++) {
+              if (x != xcd_id &&
+                  ld_nt_s32(&qb_barrier[x * HIER_STRIDE]) >= qb_expected) {
+                _heal = true;
+                break;
+              }
+            }
+          } else {
+            _heal =
+                ld_nt_s32(&qb_barrier[8 * HIER_STRIDE]) >= arrivals * qb_expected;
+          }
+          if (_heal) {
             st_wt_u32((void *)_qb_flag, (unsigned)qb_expected);
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
           }

@@ -1233,6 +1233,44 @@ if __name__ == "__main__":
         oproj_tp_cols = hidden_size // world_size if oproj_tp else hidden_size
         print(f"[CFG] o_proj tp={int(oproj_tp)} cols_per_rank={oproj_tp_cols} "
               f"tiles_per_xcd={oproj_tp_cols // 8 // oproj_tile_n}")
+        # ── rank-sharded q_b + W_UK ───────────────────────────────────────
+        # The same trade as o_proj, on the second-largest replicated weight:
+        # q_b is 34.6 MB and W_UK 6.6 MB per rank per layer, both read
+        # identically on all 8 ranks because attention is data-parallel.
+        # Here the motive is makespan rather than bytes. q_b dispatches 33
+        # tiles per XCD (32 GEMM at 10.28 us plus tile 0's latent append)
+        # against 29 workers, so 25 of 29 idle a whole tile -- 8.9 of the
+        # 12.4 us mean spin at the W_UK barrier. The tile count is locked by
+        # shape: OPW must divide the 256-wide head span and be >= qk_rope, so
+        # the legal per-XCD counts are 32/16/8/4 and never 29, and narrowing
+        # loses because the tile is already at 67% of the per-CU HBM roof.
+        # Only fewer heads per XCD removes the second round.
+        #
+        # Rank p owns heads [p * H/EP, +that), one head per (rank, XCD). Both
+        # scratch rows stay declared at the full head count on every rank;
+        # only the weights are sliced, and the kernel pushes each W_UK output
+        # tile into the peers' copy of q_workspace as it lands, then folds the
+        # all-gather rendezvous into the existing Phase-4 barrier. As with
+        # o_proj there is no kernel flag -- the task reads the shard off its
+        # own tile ratio -- so this slice plus the symmetric q_workspace is
+        # the entire switch.
+        #
+        # Not extended to the MLA decode: NUM_Q_GROUPS = heads/16 would go to
+        # 0 at 8 heads. Phase 5 onwards still sees all 64.
+        qb_tp = (int(os.environ.get("GLM_QB_TP", "1")) == 1
+                 and moe_ep and world_size > 1
+                 and FUSE_FULL_LAYER and UNABSORB_K
+                 # One whole head per (rank, XCD), at minimum.
+                 and num_heads % (world_size * 8) == 0
+                 and (num_heads // world_size) * qb_nope_span
+                 % GANG_OUT_ALIGN == 0
+                 # W_UK's tiles have to stay a whole number per XCD too.
+                 and ((num_heads // world_size) * kv_lora
+                      // WUK_GEMV_ROWS) % 8 == 0)
+        qb_tp_heads = (num_heads // world_size) if qb_tp else num_heads
+        print(f"[CFG] q_b/W_UK tp={int(qb_tp)} heads_per_rank={qb_tp_heads} "
+              f"qb_tiles_per_xcd={qb_tp_heads * qb_nope_span // 8 // QB_GEMM_OPW}"
+              f" wuk_tiles_per_xcd={qb_tp_heads * kv_lora // 8 // WUK_GEMV_ROWS}")
         n_tiles_xcd = hidden_size // 8 // oproj_tile_n
         # The split-K task takes a reduction_override now, so de-padding and
         # split-K compose: it reduces over the leading o_proj_red columns and
@@ -1282,13 +1320,36 @@ if __name__ == "__main__":
         # tensor ids (src/kernel/runtime.cc:594), so an alias drops the
         # q_b -> MLA edge. Going through .view() rather than a 2-D slice keeps
         # the row stride equal to the row width, which attach_input requires.
-        _q_ws_full = torch.zeros((bs, num_heads_pad * qk_dim),
-                                 dtype=torch.bfloat16, device="cuda")
-        _tensor_refs["mla_q_workspace_alloc"] = _q_ws_full
-        _q_ws_row = _q_ws_full.view(-1)[:bs * qb_out_width].view(bs, qb_out_width)
-        _tensor_refs["mla_q_workspace"] = _q_ws_row
-        mla_q_ws = mpk.attach_input(torch_tensor=_q_ws_row,
-                                    name="mla_q_workspace")
+        if qb_tp:
+            # Under the head shard each rank fills only its own 1/EP-th of
+            # this row and pushes those columns into the peers' copies, so it
+            # has to sit on the symmetric heap for the peer store to land at
+            # the same address. One buffer for all layers, safe for the same
+            # reason attn_proj_out's is: a peer cannot reach layer L+1's
+            # Phase 3b without passing the layer-L MoE fold, which needs this
+            # rank's layer-L MoE output, which needs this rank's layer-L
+            # decode to have read the row.
+            #
+            # Declared at the full width -- UNABSORB_K already forces
+            # num_heads == num_heads_pad, so qb_out_width is the whole row and
+            # the padded/unpadded distinction below does not arise.
+            assert qb_out_width == num_heads_pad * qk_dim, (
+                qb_out_width, num_heads_pad * qk_dim)
+            mla_q_ws = mpk.new_tensor(
+                dims=(bs, qb_out_width),
+                dtype=mi.bfloat16,
+                name="mla_q_workspace",
+                io_category="nvshmem_tensor",
+            )
+        else:
+            _q_ws_full = torch.zeros((bs, num_heads_pad * qk_dim),
+                                     dtype=torch.bfloat16, device="cuda")
+            _tensor_refs["mla_q_workspace_alloc"] = _q_ws_full
+            _q_ws_row = _q_ws_full.view(-1)[:bs * qb_out_width].view(
+                bs, qb_out_width)
+            _tensor_refs["mla_q_workspace"] = _q_ws_row
+            mla_q_ws = mpk.attach_input(torch_tensor=_q_ws_row,
+                                        name="mla_q_workspace")
         # LSE is written unconditionally by the decode kernel; its stride is
         # num_q_groups * num_kv_chunks * 16 == num_heads_pad * num_kv_chunks.
         mla_lse = make_tensor("mla_lse", (bs, num_heads_pad * num_kv_chunks),
@@ -1626,6 +1687,19 @@ if __name__ == "__main__":
                 w_uk_rows = attn._w_uk.transpose(1, 2).reshape(
                     num_heads * kv_lora, qk_nope).to(torch.bfloat16
                                                      ).contiguous()
+                if qb_tp:
+                    # Keep only this rank's heads. Both weights are row-major
+                    # in the head axis -- q_b's rows are head-major over the
+                    # [nope | rope] span, W_UK's over the latent columns -- so
+                    # the slice is one contiguous block in each, and the tile
+                    # counts drop by world_size with nothing else changed.
+                    # That ratio is what the kernel reads the shard off.
+                    q_b_w = q_b_w[rank * qb_tp_heads * qb_nope_span:
+                                  (rank + 1) * qb_tp_heads * qb_nope_span,
+                                  :].contiguous()
+                    w_uk_rows = w_uk_rows[rank * qb_tp_heads * kv_lora:
+                                          (rank + 1) * qb_tp_heads * kv_lora,
+                                          :].contiguous()
                 w_wuk = _attach_input_keep(
                     pack_dense_mxfp8(w_uk_rows, WUK_GEMV_ROWS),
                     f"layer_{i}_w_uk")

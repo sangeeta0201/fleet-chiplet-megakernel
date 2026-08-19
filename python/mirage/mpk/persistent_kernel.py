@@ -2201,10 +2201,24 @@ class PersistentKernel:
         assert qb_n_wgs % 8 == 0
         qb_n_wgs_per_xcd = qb_n_wgs // 8
         qb_output_stride = qb_out_tensor.dim(1)
-        assert qb_n_wgs * qb_output_per_wg == qb_output_stride
+        # Either the whole nope row, or this rank's 1/world-th of it under the
+        # head-sharded q_b. The kernel reads the shard off exactly this ratio
+        # -- there is no flag -- so nothing between the two is legal, and
+        # qb_output_stride stays the FULL row either way: it is the scratch's
+        # declared width, which every rank allocates whole and only writes its
+        # own head slice of.
+        qb_cols = qb_n_wgs * qb_output_per_wg
+        assert qb_cols == qb_output_stride or (
+            ep_inline and qb_cols * self.world_size == qb_output_stride), (
+                f"packed q_b covers {qb_cols} columns; the nope row is "
+                f"{qb_output_stride} and world is "
+                f"{self.world_size if ep_inline else 1}")
         assert qb_mxfp8_weight.dim(1) == qb_output_per_wg * (
             qb_reduction_size + qb_reduction_size // 32)
-        assert qb_bias.dim(1) == qb_output_stride
+        # The sharded form may keep the bias at the full row -- it is indexed
+        # by a column offset that never leaves this rank's slice, so a whole
+        # row is in bounds and one fewer tensor changes shape.
+        assert qb_bias.dim(1) in (qb_cols, qb_output_stride)
         assert (qb_n_wgs_per_xcd * qb_output_per_wg) % qb_head_span == 0, (
             "per-XCD chunk must hold whole heads")
 
@@ -2287,9 +2301,16 @@ class PersistentKernel:
             wuk_n_wgs = wuk_mxfp8_weight.dim(0)
             assert wuk_n_wgs % 8 == 0
             wuk_tiles_per_xcd = wuk_n_wgs // 8
-            assert wuk_n_wgs * wuk_rows_per_wg == num_q_heads * kv_lora_rank, (
-                f"packed W_UK covers {wuk_n_wgs * wuk_rows_per_wg} rows, the "
-                f"query row's latent columns are {num_q_heads * kv_lora_rank}")
+            # Whole query row, or this rank's 1/world-th of it under the head
+            # shard. W_UK follows q_b head for head; the XCD-local-barrier
+            # assert below re-checks that they agree.
+            wuk_rows = wuk_n_wgs * wuk_rows_per_wg
+            assert wuk_rows == num_q_heads * kv_lora_rank or (
+                ep_inline
+                and wuk_rows * self.world_size == num_q_heads * kv_lora_rank), (
+                    f"packed W_UK covers {wuk_rows} rows, the query row's "
+                    f"latent columns are {num_q_heads * kv_lora_rank} and "
+                    f"world is {self.world_size if ep_inline else 1}")
             assert wuk_mxfp8_weight.dim(1) == wuk_rows_per_wg * (
                 qk_nope_head_dim + qk_nope_head_dim // 32)
             # Phase 3b's barrier is XCD-local, which is only legal because the

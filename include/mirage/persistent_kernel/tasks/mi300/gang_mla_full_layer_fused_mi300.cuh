@@ -998,7 +998,9 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
                                    MERGE_WRITE_THROUGH,
                                    /*EP_PEER_SLOTS=*/EP_WORLD_SIZE,
                                    QK_NOPE_HEAD_DIM,
-                                   WUK_ROWS_PER_WG>(
+                                   WUK_ROWS_PER_WG,
+                                   EP_MY_PE,
+                                   EP_WORLD_SIZE>(
       // Under EP the residual stream this prologue resolves is the symmetric
       // gather buffer the EP block above just folded into -- EP_WORLD_SIZE
       // bf16 slots holding the PREVIOUS layer's per-rank partials -- and the
@@ -1055,7 +1057,14 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       /*q_nope=*/output_ptrs[FL_QNOPE_OUT],
       wuk_tiles_per_xcd,
       /*wuk_expected_in=*/s_exp[8],
-      /*wuk_counters=*/wuk_counters);
+      /*wuk_counters=*/wuk_counters,
+      // Same object, same reasoning, as the o_proj all-gather's below: only
+      // under EP and only in ml_mode, because the head shard's release value
+      // is qb_expected, which is task_layer_idx + 1 there and a load off a
+      // local counter otherwise -- and a local counter's value is not the
+      // value a peer would publish. Slot 2 of the per-PE line; see
+      // QB_EP_SIGNAL_SLOT in gang_mla_attn_fused_mi300.cuh.
+      /*ep_signal=*/(EP_WORLD_SIZE > 1 && ml_mode) ? input_ptrs[28] : nullptr);
 
   MPK_WS_PHASE(60, task_layer_idx, xcd_id);
   // ══════════════════════════════════════════════════════════════════════
@@ -1454,9 +1463,15 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       // value a peer would publish. input_ptrs[28] is the same signal array
       // Phase 9 uses; see OPROJ_EP_SIGNAL_SLOT for how the line is split.
       /*ep_signal=*/(EP_WORLD_SIZE > 1 && ml_mode) ? input_ptrs[28] : nullptr);
-  static_assert(OPROJ_EP_SIGNAL_STRIDE == FULL_LAYER_EP_SIGNAL_STRIDE,
-                "the o_proj all-gather shares the EP fold's signal array, so "
-                "the two must agree on its per-PE stride");
+  static_assert(OPROJ_EP_SIGNAL_STRIDE == FULL_LAYER_EP_SIGNAL_STRIDE &&
+                    QB_EP_SIGNAL_STRIDE == FULL_LAYER_EP_SIGNAL_STRIDE,
+                "the o_proj and q_b all-gathers share the EP fold's signal "
+                "array, so all three must agree on its per-PE stride");
+  static_assert(QB_EP_SIGNAL_SLOT != OPROJ_EP_SIGNAL_SLOT &&
+                    QB_EP_SIGNAL_SLOT != 0 && OPROJ_EP_SIGNAL_SLOT != 0 &&
+                    QB_EP_SIGNAL_SLOT < FULL_LAYER_EP_SIGNAL_STRIDE,
+                "the three signals must occupy distinct slots of the line, "
+                "and slot 0 belongs to the Phase-9 fold");
   MPK_WS_PHASE(90, task_layer_idx, xcd_id);
 }
 

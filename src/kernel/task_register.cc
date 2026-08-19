@@ -4170,7 +4170,16 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
          "a head's rope slice has to fit inside one q_b workgroup");
   assert((qb_n_wgs_per_xcd * qb_opw) % qb_head_span == 0 &&
          "each XCD's q_b column chunk must hold whole heads");
-  assert(qb_n_wgs_per_xcd * qb_opw * 8 == qb_output_stride);
+  // Either the whole nope row, or this rank's 1/world-th of it under the
+  // head-sharded q_b. The kernel reads the shard off exactly this ratio -- see
+  // qb_tp in gang_mla_attn_fused_mi300.cuh -- so nothing between the two is
+  // legal, and qb_output_stride stays the FULL row either way: it is the
+  // scratch's declared width, which every rank allocates whole.
+  assert((qb_n_wgs_per_xcd * qb_opw * 8 == qb_output_stride ||
+          (ep_inline && qb_n_wgs_per_xcd * qb_opw * 8 * ep_world_size ==
+                            qb_output_stride)) &&
+         "the packed q_b weight covers neither the nope row nor this rank's "
+         "1/world-th of it");
   assert(num_q_heads % 16 == 0);
   int num_q_groups = num_q_heads / 16;
   assert(mla_total_work_items == batch_size * num_q_groups * num_kv_chunks);
@@ -4256,10 +4265,17 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
                wuk_rows_per_wg * (qk_nope_head_dim + qk_nope_head_dim / 32) &&
            "W_UK MXFP8 weight is not packed at qk_nope_head_dim and this row "
            "count");
-    assert(wuk_tiles_per_xcd * wuk_rows_per_wg * 8 ==
-               num_q_heads * kv_lora_rank &&
-           "the packed W_UK weight does not cover the query row's latent "
-           "columns exactly");
+    // Either every head's latent columns, or this rank's 1/world-th of them
+    // under the head shard. The kernel detects the shard off q_b's ratio
+    // below -- there is no flag -- and W_UK follows q_b head for head, which
+    // the XCD-local-barrier assert further down re-checks.
+    assert((wuk_tiles_per_xcd * wuk_rows_per_wg * 8 ==
+                num_q_heads * kv_lora_rank ||
+            (ep_inline && wuk_tiles_per_xcd * wuk_rows_per_wg * 8 *
+                                  ep_world_size ==
+                              num_q_heads * kv_lora_rank)) &&
+           "the packed W_UK weight covers neither the query row's latent "
+           "columns nor this rank's 1/world-th of them");
     // Phase 3b's barrier is XCD-local because the producer and the consumer
     // land on the same heads: q_b's per-XCD chunk and W_UK's per-XCD tile run
     // must describe the same head count.
