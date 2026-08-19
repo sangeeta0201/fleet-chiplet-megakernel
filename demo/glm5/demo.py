@@ -798,7 +798,19 @@ if __name__ == "__main__":
                   f"[{ep_base}, {ep_base + ep_local}) of {num_experts}; "
                   f"shared expert and residual fold on rank {ep_fold_rank}")
 
-        MOE_MXFP8_OPW = 64
+        # Output rows per MoE workgroup, and so the tile count. The default is
+        # the N-parallel width; 16 selects the kernel's K-parallel branch, all
+        # four waves on the same 16 rows with the reduction split between them.
+        #
+        # This is the same starvation qkv_a had (see GLM_QKV_MXFP8_OPW below)
+        # and expert parallelism makes it much worse. _gang_moe_mxfp8_tile
+        # builds the tile space over the OWNED activated experts, and at EP=8 a
+        # rank owns about one of the eight routed experts, so at OPW=64 a whole
+        # layer's W13 is 2*2048/64 = 64 tiles and W2 is 6144/64 = 96 -- 8 and
+        # 12 per XCD against 29 workers. At 16 both are 4x that.
+        # Separate knobs so the two stages can move one at a time.
+        MOE_W13_OPW = int(os.environ.get("GLM_MOE_W13_OPW", "64"))
+        MOE_W2_OPW = int(os.environ.get("GLM_MOE_W2_OPW", "64"))
         assert not MOE_MXFP4 or MOE_MXFP8, \
             "GLM_MOE_MXFP4 narrows the MXFP8 expert path; it is not a bf16 mode"
         # Only the fused tail carries the width through to the kernel. The
@@ -813,8 +825,18 @@ if __name__ == "__main__":
             # do not exist.
             assert hidden_size % 512 == 0, hidden_size
             assert moe_inter % 512 == 0, moe_inter
-            assert (2 * moe_inter) % MOE_MXFP8_OPW == 0
-            assert hidden_size % MOE_MXFP8_OPW == 0
+            assert (2 * moe_inter) % MOE_W13_OPW == 0
+            assert hidden_size % MOE_W2_OPW == 0
+            # The K-parallel branch emits exactly 16 rows per workgroup and
+            # splits MFMA_ITERS four ways, one group of four k-tiles minimum.
+            for _nm, _opw, _k in (("W13", MOE_W13_OPW, hidden_size),
+                                  ("W2", MOE_W2_OPW, moe_inter)):
+                assert _opw % 64 == 0 or _opw == 16, \
+                    f"MoE {_nm} OPW {_opw} is neither N- nor K-parallel"
+                if _opw == 16:
+                    assert (_k // 128) % 16 == 0, \
+                        (f"MoE {_nm} K={_k} gives {_k // 128} MFMA iters, "
+                         f"which does not split into 4 waves x a multiple of 4")
 
         # Same treatment for the two dense GEMMs that hang off an RMSNorm and
         # share one kernel: qkv_a (K=2048, N=2048, 394 MB/token) and the LM
@@ -1985,8 +2007,8 @@ if __name__ == "__main__":
                     else:
                         gu_b = torch.cat([gb, ub], dim=0)
                         gu_s = torch.cat([gs, us], dim=0)
-                    return (pack_mxfp8_workgroup(gu_b, gu_s, MOE_MXFP8_OPW),
-                            pack_mxfp8_workgroup(db, ds, MOE_MXFP8_OPW))
+                    return (pack_mxfp8_workgroup(gu_b, gu_s, MOE_W13_OPW),
+                            pack_mxfp8_workgroup(db, ds, MOE_W2_OPW))
 
                 gu_parts, down_parts = [], []
                 for d in layer.mlp.expert_mxfp4:
@@ -2024,8 +2046,8 @@ if __name__ == "__main__":
                 if MOE_MXFP8:
                     # The packer preserves row order, so the pairwise gate/up
                     # interleave above carries through untouched.
-                    gu_stack = pack_moe_mxfp8(gu_stack, MOE_MXFP8_OPW)
-                    down_stack = pack_moe_mxfp8(down_stack, MOE_MXFP8_OPW)
+                    gu_stack = pack_moe_mxfp8(gu_stack, MOE_W13_OPW)
+                    down_stack = pack_moe_mxfp8(down_stack, MOE_W2_OPW)
                 # Release the FULL list, not the owned slice: the non-owned
                 # experts were loaded and are now dead weight.
                 for e in routed + [shared]:
@@ -2129,8 +2151,8 @@ if __name__ == "__main__":
                     num_experts_per_tok=topk,
                     routed_scaling_factor=config.routed_scaling_factor,
                     norm_topk_prob=config.norm_topk_prob,
-                    moe_w13_output_per_wg=MOE_MXFP8_OPW,
-                    moe_w2_output_per_wg=MOE_MXFP8_OPW,
+                    moe_w13_output_per_wg=MOE_W13_OPW,
+                    moe_w2_output_per_wg=MOE_W2_OPW,
                     block_dim=(256, 1, 1),
                 )
                 if moe_ep:
@@ -2170,8 +2192,8 @@ if __name__ == "__main__":
                     num_experts_per_tok=topk,
                     routed_scaling_factor=config.routed_scaling_factor,
                     norm_topk_prob=config.norm_topk_prob,
-                    moe_w13_output_per_wg=MOE_MXFP8_OPW,
-                    moe_w2_output_per_wg=MOE_MXFP8_OPW,
+                    moe_w13_output_per_wg=MOE_W13_OPW,
+                    moe_w2_output_per_wg=MOE_W2_OPW,
                     block_dim=(256, 1, 1),
                 )
             else:
@@ -2209,7 +2231,7 @@ if __name__ == "__main__":
                     output=moe_act if FUSE_MOE_SWIGLU else moe_mid,
                     fuse_swiglu=FUSE_MOE_SWIGLU,
                     block_dim=(256, 1, 1),
-                    **({"output_per_wg": MOE_MXFP8_OPW} if MOE_MXFP8 else {}),
+                    **({"output_per_wg": MOE_W13_OPW} if MOE_MXFP8 else {}),
                 )
                 if not FUSE_MOE_SWIGLU:
                     mpk.moe_silu_mul_layer(
@@ -2230,7 +2252,7 @@ if __name__ == "__main__":
                     routing_weight=(moe_topk_weight if FUSE_MOE_MULSUMADD
                                     else None),
                     block_dim=(256, 1, 1),
-                    **({"output_per_wg": MOE_MXFP8_OPW} if MOE_MXFP8 else {}),
+                    **({"output_per_wg": MOE_W2_OPW} if MOE_MXFP8 else {}),
                 )
             # The residual add is Phase 1 of the *next* layer's attention
             # task, so it is emitted here only for the layer that has no next

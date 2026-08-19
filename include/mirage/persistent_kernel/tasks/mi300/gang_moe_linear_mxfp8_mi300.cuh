@@ -239,8 +239,9 @@ __device__ __noinline__ void
                                      void const *bias_ptr,
                                      void *output_ptr,
                                      int tile_idx) {
-  static_assert(OUTPUT_PER_WG % 64 == 0,
-                "OUTPUT_PER_WG must be a multiple of 64 (4 waves x 16 rows)");
+  static_assert(OUTPUT_PER_WG % 64 == 0 || OUTPUT_PER_WG == 16,
+                "OUTPUT_PER_WG is either N-parallel (a multiple of 64 = 4 "
+                "waves x 16 rows) or the K-parallel width, 16");
   static_assert(REDUCTION_SIZE % 128 == 0,
                 "K must be a multiple of 128 for FP8 MFMA");
 
@@ -261,7 +262,12 @@ __device__ __noinline__ void
                 "Depth-4 pipeline requires REDUCTION_SIZE % 512 == 0");
 
   constexpr int NUM_WAVES = 4;
-  constexpr int TILES_PER_WAVE = OUTPUT_PER_WG / 16 / NUM_WAVES;
+  // N-parallel splits the workgroup's rows across the waves; K-parallel gives
+  // every wave the same 16 rows and splits the reduction, so it has exactly
+  // one tile. See the branch below.
+  constexpr bool K_PARALLEL = (OUTPUT_PER_WG < 64);
+  constexpr int TILES_PER_WAVE =
+      K_PARALLEL ? 1 : (OUTPUT_PER_WG / 16 / NUM_WAVES);
   constexpr int FP8_TOK_DATA = REDUCTION_SIZE;
 
   unsigned short const *A = (unsigned short const *)input_ptr;
@@ -296,19 +302,138 @@ __device__ __noinline__ void
   uint8_t *s_tok_fp8 = (uint8_t *)_gang_moe_mxfp8_smem;
   uint8_t *s_tok_scales = s_tok_fp8 + FP8_TOK_DATA;
 
+  // K-parallel reduces four waves' partial sums through LDS. Placed AFTER the
+  // token scratch rather than aliased over it, which is what the dense MXFP8
+  // kernel does: a wave that reaches the reduction while wave 0 is still
+  // consuming the low end of s_tok_fp8 would otherwise overwrite k-tiles wave
+  // 0 has not read. 256 bytes against a 6.3 KB allocation is not worth the
+  // race.
+  float *s_reduce =
+      (float *)(((uintptr_t)(s_tok_scales + NUM_BLOCKS_32) + 15u) &
+                ~(uintptr_t)15);
+
   int const tid = threadIdx.x;
   int const warp_id = tid >> 6;
   int const lane_id = tid & 63;
   int const col = lane_id & 15; // weight row within the 16x16 MFMA tile
   int const g = lane_id >> 4;   // K-group (0..3)
 
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  // Slot 1 is otherwise unused. [0]/[1] split this tile into the token-quant
+  // prologue and everything after it, [6] counts tiles, so ns/count is a
+  // per-tile microsecond figure without needing a worker/layer divisor.
+  unsigned long long _sp_q0 = __builtin_amdgcn_s_memrealtime();
+#endif
   // Phase 1: quantize this token's activation to FP8 E4M3 in LDS.
   _gang_wave_parallel_fp8_quant<REDUCTION_SIZE>(
       A + static_cast<size_t>(tok_idx) * REDUCTION_SIZE,
       s_tok_fp8,
       s_tok_scales);
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  unsigned long long _sp_q1 = __builtin_amdgcn_s_memrealtime();
+  if (tid == 0 && g_subphase_active) {
+    atomicAdd(&g_subphase_ns[1][0], (_sp_q1 - _sp_q0) * 10);
+    atomicAdd(&g_subphase_ns[1][6], 1ULL);
+    atomicAdd(&g_subphase_cnt[1], 1ULL);
+  }
+#endif
+
+  // Phase 2 epilogue, hoisted out of both parallelization branches. `acc`
+  // holds one lane's four output columns, starting at out_base; at one token
+  // per tile only col 0 carries a result, so every caller guards on that.
+  auto emit = [&](f32x4_t const &acc, int const out_base) {
+    unsigned short const *bias_row = d_bias + local_eid * OUTPUT_STRIDE;
+
+    if constexpr (FUSE_SWIGLU) {
+      constexpr int ACT_STRIDE = OUTPUT_STRIDE / 2;
+      static_assert(2 * ACT_STRIDE == OUTPUT_STRIDE,
+                    "FUSE_SWIGLU expects a half-width activation output");
+      // out_base is a multiple of 4, so the four accumulators are always
+      // two whole gate/up pairs starting on a pair boundary.
+      unsigned short *act_addr = d_output +
+                                 tok_idx * (NUM_TOPK * ACT_STRIDE) +
+                                 topk_slot * ACT_STRIDE + (out_base >> 1);
+      unsigned short act[2];
+      bool act_ok[2];
+#pragma unroll
+      for (int p = 0; p < 2; p++) {
+        int const out_n = out_base + 2 * p;
+        act_ok[p] = (out_n + 1 < OUTPUT_SIZE);
+        if (act_ok[p]) {
+          float const gate = acc[2 * p] + _gang_bf16_to_float(bias_row[out_n]);
+          float const up =
+              acc[2 * p + 1] + _gang_bf16_to_float(bias_row[out_n + 1]);
+          act[p] = _gang_float_to_bf16(fast_silu(gate) * up);
+        }
+      }
+      if constexpr (WRITE_THROUGH) {
+        // The two activations are adjacent columns of the same row, and
+        // out_base is a multiple of 4, so act_addr is 4-byte aligned and the
+        // pair is one dword -- half as many write-through stores as doing
+        // them separately.
+        if (act_ok[0] && act_ok[1]) {
+          unsigned packed = (unsigned)act[0] | ((unsigned)act[1] << 16);
+          st_wt_u32((void *)act_addr, packed);
+        } else {
+#pragma unroll
+          for (int p = 0; p < 2; p++) {
+            if (act_ok[p]) {
+              st_wt_u16((void *)&act_addr[p], act[p]);
+            }
+          }
+        }
+      } else {
+#pragma unroll
+        for (int p = 0; p < 2; p++) {
+          if (act_ok[p]) {
+            act_addr[p] = act[p];
+          }
+        }
+      }
+    } else {
+      unsigned short *out_addr = d_output +
+                                 tok_idx * (NUM_TOPK * OUTPUT_STRIDE) +
+                                 topk_slot * OUTPUT_STRIDE + out_base;
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        int const out_n = out_base + i;
+        if (out_n < OUTPUT_SIZE) {
+          out_addr[i] = _gang_float_to_bf16(
+              acc[i] + _gang_bf16_to_float(bias_row[out_n]));
+        }
+      }
+    }
+  };
 
   // Phase 2: depth-4 pipelined FP8(weight) x FP8(token) MFMA.
+  //
+  // Two parallelizations, chosen by OUTPUT_PER_WG. N-parallel is the wide
+  // form: the workgroup's rows are dealt out across the four waves. It wants
+  // OUTPUT_PER_WG >= 64 and gives the largest tile, which is right when there
+  // are more tiles than workers.
+  //
+  // Under expert parallelism there are not. _gang_moe_mxfp8_tile builds the
+  // tile space over the OWNED activated experts, and at EP=8 a rank owns ~2
+  // activated experts (one routed of eight, plus the shared expert on
+  // EP_SHARED_PE), so a GLM-5 layer has 127 live W13 tiles at
+  // OUTPUT_PER_WG=64 -- 15.9 per XCD against 29 workers. K-parallel is the
+  // narrow form that was supposed to fix it: all four waves take the same 16
+  // rows and split the reduction, so the tile count goes up 4x and each tile
+  // was expected to cost a quarter as much. Same trade the dense MXFP8 kernel
+  // makes for qkv_a at QKV_MXFP8_OPW=16, and #19 for o_proj.
+  //
+  // MEASURED NEGATIVE, keep the branch but do not default to it. GLM-5,
+  // NP=8 EP, GLM_MOE_W13_OPW=16 vs 64: 13.539 vs 12.196 ms/iter, and
+  // SP3[4] MoeW13 2.008 vs 0.923 ms/iter. Per-tile subphase slot 1 says why.
+  // The N-parallel OPW=64 tile is 0.86 us of token quant + 13.9 us of body
+  // for 208 KB of weight, i.e. 15.0 GB/s against the 20.2 GB/s per-CU share
+  // of HBM -- already 74% of roof. The K-parallel tile moves a quarter of
+  // those bytes and still costs 12.2 us, 4.0 GB/s. A 12-iteration k-loop
+  // cannot keep enough loads in flight to reach the roof, so the split buys
+  // 4x the tiles at 4x the cost per byte and the makespan gets worse, not
+  // better. The prologue is NOT the fixed cost that would have made
+  // subdivision pay: at 0.86 us it is 6% of the tile.
+  if constexpr (!K_PARALLEL) {
   for (int tile_iter = 0; tile_iter < TILES_PER_WAVE; tile_iter++) {
     int const wave_tile = warp_id + tile_iter * NUM_WAVES;
     int const w_row = wave_tile * 16 + col;
@@ -378,73 +503,121 @@ __device__ __noinline__ void
     // Epilogue. acc[i] = C[g*4+i][col]; at one token per tile only col 0 holds
     // a result.
     if (col == 0) {
-      int const out_base = wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4;
-      unsigned short const *bias_row = d_bias + local_eid * OUTPUT_STRIDE;
+      emit(acc, wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4);
+    }
+  }
+  } else {
+    // K-parallel: all four waves take the same 16 output rows and split the
+    // reduction between them, then reduce through LDS.
+    static_assert(OUTPUT_PER_WG == 16,
+                  "the K-parallel branch covers 16 output rows per workgroup");
+    constexpr int ITERS_PER_WAVE = MFMA_ITERS / NUM_WAVES;
+    static_assert(MFMA_ITERS % NUM_WAVES == 0,
+                  "MFMA_ITERS must be divisible by NUM_WAVES for K-parallel");
+    // Same reason the N-parallel loop needs MFMA_ITERS % 4 == 0: only slot 3
+    // carries a tail guard, so a partial final group would let slots 1 and 2
+    // compute k-tiles outside this wave's range.
+    static_assert(ITERS_PER_WAVE >= 4 && ITERS_PER_WAVE % 4 == 0,
+                  "Depth-4 K-parallel requires ITERS_PER_WAVE a multiple of 4");
 
-      if constexpr (FUSE_SWIGLU) {
-        constexpr int ACT_STRIDE = OUTPUT_STRIDE / 2;
-        static_assert(2 * ACT_STRIDE == OUTPUT_STRIDE,
-                      "FUSE_SWIGLU expects a half-width activation output");
-        // out_base is a multiple of 4, so the four accumulators are always
-        // two whole gate/up pairs starting on a pair boundary.
-        unsigned short *act_addr = d_output +
-                                   tok_idx * (NUM_TOPK * ACT_STRIDE) +
-                                   topk_slot * ACT_STRIDE + (out_base >> 1);
-        unsigned short act[2];
-        bool act_ok[2];
+    int const ki_start = warp_id * ITERS_PER_WAVE;
+    int const ki_end = ki_start + ITERS_PER_WAVE;
+    int const w_row = col; // all four waves, same 16 rows
+    uint8_t const *w_data_row =
+        wg_data + static_cast<size_t>(w_row) * W_ROW_BYTES;
+    int const row_scale_base = w_row * NUM_BLOCKS_32;
+
+    f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    i32x8_t a0 =
+        _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, ki_start * K_PER_MFMA, g);
+    int sa0 = (int)wg_scales[row_scale_base + ki_start * 4 + g];
+    i32x8_t a1 = _gang_load_w_mfma_a<WEIGHT_FP4>(
+        w_data_row, (ki_start + 1) * K_PER_MFMA, g);
+    int sa1 = (int)wg_scales[row_scale_base + (ki_start + 1) * 4 + g];
+    i32x8_t a2 = _gang_load_w_mfma_a<WEIGHT_FP4>(
+        w_data_row, (ki_start + 2) * K_PER_MFMA, g);
+    int sa2 = (int)wg_scales[row_scale_base + (ki_start + 2) * 4 + g];
+    i32x8_t a3 = _gang_load_w_mfma_a<WEIGHT_FP4>(
+        w_data_row, (ki_start + 3) * K_PER_MFMA, g);
+    int sa3 = (int)wg_scales[row_scale_base + (ki_start + 3) * 4 + g];
+
+// IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation.
+#pragma unroll 1
+    for (int ki = ki_start; ki < ki_end; ki += 4) {
+      {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
+        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a0, b, acc, sa0,
+                                            (int)s_tok_scales[ki]);
+      }
+      if (ki + 4 < ki_end) {
+        int kt4 = (ki + 4) * K_PER_MFMA;
+        a0 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt4, g);
+        sa0 = (int)wg_scales[row_scale_base + kt4 / 32 + g];
+      }
+
+      {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 1) * K_PER_MFMA, g);
+        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a1, b, acc, sa1,
+                                            (int)s_tok_scales[ki + 1]);
+      }
+      if (ki + 5 < ki_end) {
+        int kt5 = (ki + 5) * K_PER_MFMA;
+        a1 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt5, g);
+        sa1 = (int)wg_scales[row_scale_base + kt5 / 32 + g];
+      }
+
+      {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 2) * K_PER_MFMA, g);
+        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a2, b, acc, sa2,
+                                            (int)s_tok_scales[ki + 2]);
+      }
+      if (ki + 6 < ki_end) {
+        int kt6 = (ki + 6) * K_PER_MFMA;
+        a2 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt6, g);
+        sa2 = (int)wg_scales[row_scale_base + kt6 / 32 + g];
+      }
+
+      if (ki + 3 < ki_end) {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 3) * K_PER_MFMA, g);
+        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a3, b, acc, sa3,
+                                            (int)s_tok_scales[ki + 3]);
+      }
+      if (ki + 7 < ki_end) {
+        int kt7 = (ki + 7) * K_PER_MFMA;
+        a3 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt7, g);
+        sa3 = (int)wg_scales[row_scale_base + kt7 / 32 + g];
+      }
+    }
+
+    if (col == 0) {
 #pragma unroll
-        for (int p = 0; p < 2; p++) {
-          int const out_n = out_base + 2 * p;
-          act_ok[p] = (out_n + 1 < OUTPUT_SIZE);
-          if (act_ok[p]) {
-            float const gate =
-                acc[2 * p] + _gang_bf16_to_float(bias_row[out_n]);
-            float const up =
-                acc[2 * p + 1] + _gang_bf16_to_float(bias_row[out_n + 1]);
-            act[p] = _gang_float_to_bf16(fast_silu(gate) * up);
-          }
-        }
-        if constexpr (WRITE_THROUGH) {
-          // The two activations are adjacent columns of the same row, and
-          // out_base is a multiple of 4, so act_addr is 4-byte aligned and the
-          // pair is one dword -- half as many write-through stores as doing
-          // them separately.
-          if (act_ok[0] && act_ok[1]) {
-            unsigned packed = (unsigned)act[0] | ((unsigned)act[1] << 16);
-            st_wt_u32((void *)act_addr, packed);
-          } else {
+      for (int i = 0; i < 4; i++) {
+        s_reduce[warp_id * OUTPUT_PER_WG + g * 4 + i] = acc[i];
+      }
+    }
+    __syncthreads();
+
+    if (warp_id == 0 && col == 0) {
+      f32x4_t sum = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
-            for (int p = 0; p < 2; p++) {
-              if (act_ok[p]) {
-                st_wt_u16((void *)&act_addr[p], act[p]);
-              }
-            }
-          }
-        } else {
-#pragma unroll
-          for (int p = 0; p < 2; p++) {
-            if (act_ok[p]) {
-              act_addr[p] = act[p];
-            }
-          }
-        }
-      } else {
-        unsigned short *out_addr = d_output +
-                                   tok_idx * (NUM_TOPK * OUTPUT_STRIDE) +
-                                   topk_slot * OUTPUT_STRIDE + out_base;
+      for (int w = 0; w < NUM_WAVES; w++) {
 #pragma unroll
         for (int i = 0; i < 4; i++) {
-          int const out_n = out_base + i;
-          if (out_n < OUTPUT_SIZE) {
-            out_addr[i] = _gang_float_to_bf16(
-                acc[i] + _gang_bf16_to_float(bias_row[out_n]));
-          }
+          sum[i] += s_reduce[w * OUTPUT_PER_WG + g * 4 + i];
         }
       }
+      emit(sum, wg_idx * OUTPUT_PER_WG + g * 4);
     }
   }
 
   __syncthreads();
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  if (tid == 0 && g_subphase_active) {
+    atomicAdd(&g_subphase_ns[1][1],
+              (__builtin_amdgcn_s_memrealtime() - _sp_q1) * 10);
+  }
+#endif
 }
 
 // Gang MoE W2 (down projection) with MXFP8 weights.
@@ -489,8 +662,9 @@ __device__ __noinline__ void
                                     void *output_ptr,
                                     int tile_idx,
                                     void const *routing_weight_ptr = nullptr) {
-  static_assert(OUTPUT_PER_WG % 64 == 0,
-                "OUTPUT_PER_WG must be a multiple of 64 (4 waves x 16 rows)");
+  static_assert(OUTPUT_PER_WG % 64 == 0 || OUTPUT_PER_WG == 16,
+                "OUTPUT_PER_WG is either N-parallel (a multiple of 64 = 4 "
+                "waves x 16 rows) or the K-parallel width, 16");
   static_assert(REDUCTION_SIZE % 128 == 0,
                 "K must be a multiple of 128 for FP8 MFMA");
 
@@ -508,7 +682,12 @@ __device__ __noinline__ void
                 "Depth-4 pipeline requires REDUCTION_SIZE % 512 == 0");
 
   constexpr int NUM_WAVES = 4;
-  constexpr int TILES_PER_WAVE = OUTPUT_PER_WG / 16 / NUM_WAVES;
+  // See the note on the W13 kernel's branch: K_PARALLEL is the narrow-tile
+  // form that keeps all 29 workers per XCD fed when expert parallelism has
+  // left the layer with only one owned expert's worth of tiles.
+  constexpr bool K_PARALLEL = (OUTPUT_PER_WG < 64);
+  constexpr int TILES_PER_WAVE =
+      K_PARALLEL ? 1 : (OUTPUT_PER_WG / 16 / NUM_WAVES);
   constexpr int FP8_TOK_DATA = REDUCTION_SIZE;
 
   unsigned short const *A = (unsigned short const *)input_ptr;
@@ -545,23 +724,70 @@ __device__ __noinline__ void
   uint8_t *s_tok_fp8 = (uint8_t *)_gang_moe_mxfp8_smem;
   uint8_t *s_tok_scales = s_tok_fp8 + FP8_TOK_DATA;
 
+  // See the W13 kernel: after the token scratch, not aliased over it.
+  float *s_reduce =
+      (float *)(((uintptr_t)(s_tok_scales + NUM_BLOCKS_32) + 15u) &
+                ~(uintptr_t)15);
+
   int const tid = threadIdx.x;
   int const warp_id = tid >> 6;
   int const lane_id = tid & 63;
   int const col = lane_id & 15;
   int const g = lane_id >> 4;
 
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  unsigned long long _sp_q0 = __builtin_amdgcn_s_memrealtime();
+#endif
   _gang_wave_parallel_fp8_quant_nt<REDUCTION_SIZE>(
       A + static_cast<size_t>(tok_idx) * (NUM_TOPK * REDUCTION_SIZE) +
           static_cast<size_t>(topk_slot) * REDUCTION_SIZE,
       s_tok_fp8,
       s_tok_scales);
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  unsigned long long _sp_q1 = __builtin_amdgcn_s_memrealtime();
+  if (tid == 0 && g_subphase_active) {
+    atomicAdd(&g_subphase_ns[1][2], (_sp_q1 - _sp_q0) * 10);
+    atomicAdd(&g_subphase_ns[1][7], 1ULL);
+  }
+#endif
 
   float rw = 0.0f;
   if constexpr (FUSE_MULSUMADD) {
     rw = d_routing_weight[tok_idx * NUM_TOPK + topk_slot];
   }
 
+  // Epilogue, hoisted out of both parallelization branches; see W13.
+  auto emit = [&](f32x4_t const &acc, int const out_base) {
+    unsigned short const *bias_row = d_bias + local_eid * OUTPUT_STRIDE;
+
+    if constexpr (FUSE_MULSUMADD) {
+      // The shared expert rides in routing slot NUM_TOPK-1 with weight 1.0,
+      // so it needs no special case here.
+      float *ws_addr = d_workspace +
+                       static_cast<size_t>(tok_idx) * OUTPUT_STRIDE + out_base;
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        if (out_base + i < OUTPUT_SIZE) {
+          atomicAdd(&ws_addr[i],
+                    (acc[i] + _gang_bf16_to_float(bias_row[out_base + i])) *
+                        rw);
+        }
+      }
+    } else {
+      unsigned short *out_addr =
+          d_output + static_cast<size_t>(tok_idx) * (NUM_TOPK * OUTPUT_STRIDE) +
+          static_cast<size_t>(topk_slot) * OUTPUT_STRIDE + out_base;
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        if (out_base + i < OUTPUT_SIZE) {
+          out_addr[i] = _gang_float_to_bf16(
+              acc[i] + _gang_bf16_to_float(bias_row[out_base + i]));
+        }
+      }
+    }
+  };
+
+  if constexpr (!K_PARALLEL) {
   for (int tile_iter = 0; tile_iter < TILES_PER_WAVE; tile_iter++) {
     int const wave_tile = warp_id + tile_iter * NUM_WAVES;
     int const w_row = wave_tile * 16 + col;
@@ -629,40 +855,117 @@ __device__ __noinline__ void
     }
 
     if (col == 0) {
-      int const out_base = wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4;
-      unsigned short const *bias_row = d_bias + local_eid * OUTPUT_STRIDE;
+      emit(acc, wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4);
+    }
+  }
+  } else {
+    // K-parallel; see the W13 kernel for the shape argument.
+    static_assert(OUTPUT_PER_WG == 16,
+                  "the K-parallel branch covers 16 output rows per workgroup");
+    constexpr int ITERS_PER_WAVE = MFMA_ITERS / NUM_WAVES;
+    static_assert(MFMA_ITERS % NUM_WAVES == 0,
+                  "MFMA_ITERS must be divisible by NUM_WAVES for K-parallel");
+    static_assert(ITERS_PER_WAVE >= 4 && ITERS_PER_WAVE % 4 == 0,
+                  "Depth-4 K-parallel requires ITERS_PER_WAVE a multiple of 4");
 
-      if constexpr (FUSE_MULSUMADD) {
-        // The shared expert rides in routing slot NUM_TOPK-1 with weight 1.0,
-        // so it needs no special case here.
-        float *ws_addr =
-            d_workspace + static_cast<size_t>(tok_idx) * OUTPUT_STRIDE +
-            out_base;
+    int const ki_start = warp_id * ITERS_PER_WAVE;
+    int const ki_end = ki_start + ITERS_PER_WAVE;
+    int const w_row = col;
+    uint8_t const *w_data_row =
+        wg_data + static_cast<size_t>(w_row) * W_ROW_BYTES;
+    int const row_scale_base = w_row * NUM_BLOCKS_32;
+
+    f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    i32x8_t a0 =
+        _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, ki_start * K_PER_MFMA, g);
+    int sa0 = (int)wg_scales[row_scale_base + ki_start * 4 + g];
+    i32x8_t a1 = _gang_load_w_mfma_a<WEIGHT_FP4>(
+        w_data_row, (ki_start + 1) * K_PER_MFMA, g);
+    int sa1 = (int)wg_scales[row_scale_base + (ki_start + 1) * 4 + g];
+    i32x8_t a2 = _gang_load_w_mfma_a<WEIGHT_FP4>(
+        w_data_row, (ki_start + 2) * K_PER_MFMA, g);
+    int sa2 = (int)wg_scales[row_scale_base + (ki_start + 2) * 4 + g];
+    i32x8_t a3 = _gang_load_w_mfma_a<WEIGHT_FP4>(
+        w_data_row, (ki_start + 3) * K_PER_MFMA, g);
+    int sa3 = (int)wg_scales[row_scale_base + (ki_start + 3) * 4 + g];
+
+// IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation.
+#pragma unroll 1
+    for (int ki = ki_start; ki < ki_end; ki += 4) {
+      {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
+        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a0, b, acc, sa0,
+                                            (int)s_tok_scales[ki]);
+      }
+      if (ki + 4 < ki_end) {
+        int kt4 = (ki + 4) * K_PER_MFMA;
+        a0 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt4, g);
+        sa0 = (int)wg_scales[row_scale_base + kt4 / 32 + g];
+      }
+
+      {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 1) * K_PER_MFMA, g);
+        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a1, b, acc, sa1,
+                                            (int)s_tok_scales[ki + 1]);
+      }
+      if (ki + 5 < ki_end) {
+        int kt5 = (ki + 5) * K_PER_MFMA;
+        a1 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt5, g);
+        sa1 = (int)wg_scales[row_scale_base + kt5 / 32 + g];
+      }
+
+      {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 2) * K_PER_MFMA, g);
+        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a2, b, acc, sa2,
+                                            (int)s_tok_scales[ki + 2]);
+      }
+      if (ki + 6 < ki_end) {
+        int kt6 = (ki + 6) * K_PER_MFMA;
+        a2 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt6, g);
+        sa2 = (int)wg_scales[row_scale_base + kt6 / 32 + g];
+      }
+
+      if (ki + 3 < ki_end) {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 3) * K_PER_MFMA, g);
+        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a3, b, acc, sa3,
+                                            (int)s_tok_scales[ki + 3]);
+      }
+      if (ki + 7 < ki_end) {
+        int kt7 = (ki + 7) * K_PER_MFMA;
+        a3 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt7, g);
+        sa3 = (int)wg_scales[row_scale_base + kt7 / 32 + g];
+      }
+    }
+
+    if (col == 0) {
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        s_reduce[warp_id * OUTPUT_PER_WG + g * 4 + i] = acc[i];
+      }
+    }
+    __syncthreads();
+
+    if (warp_id == 0 && col == 0) {
+      f32x4_t sum = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+      for (int w = 0; w < NUM_WAVES; w++) {
 #pragma unroll
         for (int i = 0; i < 4; i++) {
-          if (out_base + i < OUTPUT_SIZE) {
-            atomicAdd(&ws_addr[i],
-                      (acc[i] + _gang_bf16_to_float(bias_row[out_base + i])) *
-                          rw);
-          }
-        }
-      } else {
-        unsigned short *out_addr =
-            d_output +
-            static_cast<size_t>(tok_idx) * (NUM_TOPK * OUTPUT_STRIDE) +
-            static_cast<size_t>(topk_slot) * OUTPUT_STRIDE + out_base;
-#pragma unroll
-        for (int i = 0; i < 4; i++) {
-          if (out_base + i < OUTPUT_SIZE) {
-            out_addr[i] = _gang_float_to_bf16(
-                acc[i] + _gang_bf16_to_float(bias_row[out_base + i]));
-          }
+          sum[i] += s_reduce[w * OUTPUT_PER_WG + g * 4 + i];
         }
       }
+      emit(sum, wg_idx * OUTPUT_PER_WG + g * 4);
     }
   }
 
   __syncthreads();
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  if (tid == 0 && g_subphase_active) {
+    atomicAdd(&g_subphase_ns[1][3],
+              (__builtin_amdgcn_s_memrealtime() - _sp_q1) * 10);
+  }
+#endif
 }
 
 } // namespace kernel
