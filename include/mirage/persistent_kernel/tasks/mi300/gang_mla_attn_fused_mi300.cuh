@@ -430,6 +430,14 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // the GEMM tiles are shifted up by one inside the kernel. Handing it
   // xcd_rank reproduces the standalone dispatch exactly.
   for (int t = xcd_rank; t < qb_tiles_per_xcd; t += tiles_per_xcd) {
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+    // The W_UK barrier at [0][4] charges 10.6 us/layer of spin, and q_b's own
+    // 33-tiles-on-29-workers straggler only accounts for ~5 of it. Time the
+    // tiles here to tell a fat tile from arrival skew: [7][6]/[7][7] are the
+    // GEMM tiles and their count, [2][0] is tile 0 -- the latent row and the
+    // KV-cache append, which is real work on XCD 0 and a no-op elsewhere.
+    unsigned long long _sp_qb0 = __builtin_amdgcn_s_memrealtime();
+#endif
     // Un-absorbed, the GEMM's output row is the nope scratch instead of the
     // query row; the rope workgroup crosses back into the query row itself,
     // which is why that one is handed over whole and un-biased.
@@ -472,6 +480,18 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         t,
         kv_eps,
         /*q_rope_out_ptr=*/q_workspace_ptr);
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+    if (tid == 0 && g_subphase_active) {
+      unsigned long long _d =
+          (__builtin_amdgcn_s_memrealtime() - _sp_qb0) * 10;
+      if (t == 0) {
+        atomicAdd(&g_subphase_ns[2][0], _d);
+      } else {
+        atomicAdd(&g_subphase_ns[7][6], _d);
+        atomicAdd(&g_subphase_ns[7][7], 1ULL);
+      }
+    }
+#endif
   }
 
   // ══════════════════════════════════════════════════════════════════════
@@ -480,6 +500,28 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // Block-diagonal GEMV, KV_LORA_RANK rows per head over a QK_NOPE_HEAD_DIM
   // reduction, exactly the shape the W_UV side runs before o_proj. The
   // barrier ahead of it is XCD-local: see the header note.
+  //
+  // MEASURED 2026-08-19, GLM-5 NP=8 EP, subphase slot 0. This phase's slot
+  // [4][7] is 1.045 ms/iter and reads like a slow GEMV; it is not. Split, it
+  // is 0.829 of barrier and 0.216 of GEMV -- a tile is 2.52 us and a worker
+  // runs 1.06 of them per layer. The spin is q_b's, not W_UK's: q_b dispatches
+  // 33 tiles per XCD (32 GEMM of 10.28 us, plus tile 0's latent append at
+  // 2.09) against 29 workers, so 25 of 29 finish a round early and wait
+  // 10.3 us. 25/29 * 10.28 = 8.9 of the 12.4 us mean spin; the rest is skew.
+  //
+  // The tile count is locked by the shape, not by tuning. Per XCD q_b covers
+  // 8 heads * 256 columns and QB_OUTPUT_PER_WG must divide the 256-wide head
+  // span, so the legal tile counts per XCD are 32, 16, 8, 4 -- never 29. The
+  // OPW sweep found 64 best and cannot reach one round. Narrowing loses for
+  // the same reason it lost in the MoE (see that header): the tile is already
+  // 67% of the 20.2 GB/s per-CU HBM share, so a quarter-width tile costs far
+  // more than a quarter. What removes the second round is fewer heads per
+  // XCD, i.e. sharding heads across the EP ranks.
+  //
+  // Merging this phase into q_b's pool with a per-head release instead of the
+  // barrier is worth much less than the 12.4 us suggests: heads 0-6 are ready
+  // after round 1, but head 7 is produced by tiles 29-32, which are exactly
+  // the round-2 tiles, so the makespan floor stays 20.6 + 2.52.
   if constexpr (UNABSORB_K) {
     static_assert(KV_LORA_RANK % WUK_ROWS_PER_WG == 0,
                   "a head's absorbed rows must fill whole GEMV tiles");
@@ -532,6 +574,18 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     __syncthreads();
     asm volatile("buffer_inv" ::: "memory");
 
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+    // [7] above is "W_UK + its barrier", which is not enough to tell an
+    // issue-starved GEMV from a straggler on the XCD-local release. Slot 0's
+    // spare entries split it: [4] the barrier, [5] the grid-stride GEMV loop,
+    // [6] the tiles this worker actually ran, so [5]/[6] is a per-tile figure.
+    unsigned long long _sp_wuk = __builtin_amdgcn_s_memrealtime();
+    if (tid == 0 && g_subphase_active) {
+      atomicAdd(&g_subphase_ns[0][4], (_sp_wuk - _sp_t0) * 10);
+    }
+    int _wuk_tiles = 0;
+#endif
+
     // The weight is dim-0 partitioned per XCD, so `wuk_weight_ptr` is already
     // this XCD's slice and the GEMV gets the *local* tile index against
     // wuk_tiles_per_xcd. Only the head lookup needs the global index, and the
@@ -558,12 +612,20 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
           head_in, wuk_weight_ptr, /*residual=*/nullptr, tile_out,
           num_active_tokens, WUK_ROWS_PER_WG, qb_output_stride,
           /*m_tiles=*/1, wuk_tiles_per_xcd, /*wgm=*/0, t);
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+      ++_wuk_tiles;
+#endif
     }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     {
       unsigned long long _t = __builtin_amdgcn_s_memrealtime();
       if (tid == 0 && g_subphase_active) {
         atomicAdd(&g_subphase_ns[4][7], (_t - _sp_t0) * 10);
+        atomicAdd(&g_subphase_ns[0][5], (_t - _sp_wuk) * 10);
+        atomicAdd(&g_subphase_ns[0][6], (unsigned long long)_wuk_tiles);
+        // Both dump sites skip a slot whose count is zero, and nothing on the
+        // GLM path writes g_subphase_cnt[0] -- qkv_a reports into [4][0].
+        atomicAdd(&g_subphase_cnt[0], 1ULL);
       }
       _sp_t0 = _t;
     }

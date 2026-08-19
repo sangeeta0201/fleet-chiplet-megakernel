@@ -380,6 +380,13 @@ __device__ __attribute__((always_inline)) void
     unsigned short *xcd_v_out =
         static_cast<unsigned short *>(v_out_ptr) +
         static_cast<size_t>(xcd_id) * wuv_tiles_per_xcd * WUV_ROWS_PER_WG;
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+    // [3][7] below is "W_UV + its GPU-wide barrier". Slot 0's spare entry [7]
+    // is the GEMV loop alone and [2][7] the barrier, so the two can be told
+    // apart; the tile count comes from the W_UK counter's twin at [7][5].
+    unsigned long long _sp_wuv = __builtin_amdgcn_s_memrealtime();
+    int _wuv_tiles = 0;
+#endif
     for (int t = xcd_rank; t < wuv_tiles_per_xcd; t += tiles_per_xcd) {
       int const g = xcd_id * wuv_tiles_per_xcd + t;
       unsigned short const *head_in =
@@ -400,7 +407,20 @@ __device__ __attribute__((always_inline)) void
                                                      wuv_tiles_per_xcd,
                                                      /*wgm=*/0,
                                                      t);
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+      ++_wuv_tiles;
+#endif
     }
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+    {
+      unsigned long long _t = __builtin_amdgcn_s_memrealtime();
+      if (tid == 0 && g_subphase_active) {
+        atomicAdd(&g_subphase_ns[0][7], (_t - _sp_wuv) * 10);
+        atomicAdd(&g_subphase_ns[7][5], (unsigned long long)_wuv_tiles);
+      }
+      _sp_wuv = _t;
+    }
+#endif
     // Mechanism C, arrive and wait, the same shape as Phase 6's W13 -> W2.
     // Every worker arrives and every worker waits: Phase 1's participant set
     // is narrower, but a worker that skipped the wait would fall through to
@@ -437,6 +457,12 @@ __device__ __attribute__((always_inline)) void
     }
     __syncthreads();
     asm volatile("buffer_inv" ::: "memory");
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+    if (tid == 0 && g_subphase_active) {
+      atomicAdd(&g_subphase_ns[2][7],
+                (__builtin_amdgcn_s_memrealtime() - _sp_wuv) * 10);
+    }
+#endif
   }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   {
