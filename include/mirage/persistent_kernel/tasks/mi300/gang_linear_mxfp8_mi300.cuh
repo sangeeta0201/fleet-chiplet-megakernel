@@ -95,8 +95,16 @@ __device__ __forceinline__ bool _gang_mxfp8_tile_coords(
 // 256 threads / 4 waves. Each wave handles 16 output rows (N-parallel).
 // K=128 per MFMA via __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4.
 // Input is quantized on the fly from bf16 to FP8 E4M3 in shared memory.
-template <int BATCH_SIZE,     // = m_per_tile (rows per M-tile)
-          int REDUCTION_SIZE> // K dimension
+//
+// WRITE_THROUGH sends the epilogue store past the XCD's L2 (sc0 sc1), for the
+// same reason gang_gemv_mxfp8_kernel takes the flag: a *fused* caller that
+// follows this GEMM with nothing more than an in-kernel barrier needs the
+// result visible to the other seven XCDs, and on MI300/MI350 the L2 is per-XCD
+// and not coherent, so a plain store is not. A standalone task does not need it
+// -- the scheduler's end-of-task fence covers it -- hence the default.
+template <int BATCH_SIZE,      // = m_per_tile (rows per M-tile)
+          int REDUCTION_SIZE,  // K dimension
+          bool WRITE_THROUGH = false>
 __device__ __noinline__ void gang_linear_mxfp8_kernel(
     void const *input_ptr,  // [batch, REDUCTION_SIZE] bf16
     void const *weight_ptr, // [1, n_wgs, wg_bytes] MXFP8 packed
@@ -253,7 +261,11 @@ __device__ __noinline__ void gang_linear_mxfp8_kernel(
             sum += _gang_bf16_to_float(d_bias[out_n]);
           }
           int out_idx = wave_tile * 16 + g * 4 + i;
-          out_base[out_idx] = _gang_float_to_bf16(sum);
+          if constexpr (WRITE_THROUGH) {
+            st_wt_u16(&out_base[out_idx], _gang_float_to_bf16(sum));
+          } else {
+            out_base[out_idx] = _gang_float_to_bf16(sum);
+          }
         }
       }
     }

@@ -396,6 +396,22 @@ __device__ __attribute__((always_inline)) void
     static_assert(OPROJ_REDUCTION_SIZE % WUV_V_HEAD_DIM == 0,
                   "o_proj's K is the whole v row, H * V_HEAD_DIM");
     constexpr int TILES_PER_HEAD = WUV_V_HEAD_DIM / WUV_ROWS_PER_WG;
+    // W_UV is the only one of the three bf16-activation GEMVs whose shape the
+    // FP8 MFMA can take. o_proj wants 4-row tiles at the NP=8 shard (96
+    // columns per XCD, 24 tiles against 29 workers) where the MFMA's unit is
+    // 64; and W_UK reduces over QK_NOPE_HEAD_DIM = 192, which is not even a
+    // multiple of the 128-wide k-tile, let alone the depth-4 pipeline's 512.
+    // Padding 192 -> 512 would be 2.7x the bytes on a memory-bound stage.
+    // The row width is not a free choice under MPK_WUV_MFMA -- the MFMA
+    // kernel's OUTPUT_PER_WG is a hardcoded 4 waves x 16 rows -- so the demo
+    // pins GLM_WUV_GEMV_ROWS to 64 when it sets the flag, and this falls back
+    // rather than mis-tiling if some other width reaches here.
+#if defined(MPK_WUV_MFMA)
+    constexpr bool WUV_USE_MFMA =
+        (WUV_ROWS_PER_WG == 64) && (WUV_REDUCTION % 512 == 0);
+#else
+    constexpr bool WUV_USE_MFMA = false;
+#endif
     // `wuv_weight_ptr` is this XCD's dim-0 slice of the packed weight, the
     // same partitioning o_proj's input [15] gets, so the GEMV is handed the
     // *local* tile index against wuv_tiles_per_xcd n_tiles. Only the head
@@ -416,21 +432,63 @@ __device__ __attribute__((always_inline)) void
       unsigned short const *head_in =
           static_cast<unsigned short const *>(oproj_input_ptr) +
           static_cast<size_t>(g / TILES_PER_HEAD) * WUV_REDUCTION;
-      gang_gemv_mxfp8_kernel<BATCH_SIZE,
-                             WUV_REDUCTION,
-                             WUV_ROWS_PER_WG,
-                             /*HAS_RESIDUAL=*/false,
-                             /*WRITE_THROUGH=*/true>(head_in,
-                                                     wuv_weight_ptr,
-                                                     /*residual=*/nullptr,
-                                                     xcd_v_out,
-                                                     num_active_tokens,
-                                                     WUV_ROWS_PER_WG,
-                                                     OPROJ_REDUCTION_SIZE,
-                                                     /*m_tiles=*/1,
-                                                     wuv_tiles_per_xcd,
-                                                     /*wgm=*/0,
-                                                     t);
+      if constexpr (WUV_USE_MFMA) {
+        // FP8 activation. The GEMV expands the weight to bf16 a pair at a time
+        // (v_cvt_scalef32_pk_bf16_fp8) and accumulates with v_dot2c_f32_bf16,
+        // ~82 VALU ops per 128 B of weight per lane; this quantizes the
+        // activation to FP8 as well and lets the MFMA's scale operands do the
+        // dequant in hardware. There is no third option on gfx950 -- the fp8
+        // VALU dots (v_dot4_f32_fp8_fp8 and friends) need target feature
+        // dot11-insts, which gfx942 has and gfx950 does not, so an fp8
+        // activation means v_mfma_scale_f32_16x16x128_f8f6f4 or nothing.
+        //
+        // The packed weight is byte-identical: pack_dense_mxfp8 lays a
+        // workgroup out as [OPW][K] E4M3 then [OPW][K/32] E8M0, and both
+        // kernels compute the same WG_BYTES from it. Only the gather differs.
+        //
+        // Measured over a 4 GiB HBM-resident weight buffer at K=10240
+        // (tests/standalone/test_fp8_act_mfma_bw.hip), GB/s per workgroup:
+        //
+        //   blocks   streaming roof   GEMV (LDS act)   this
+        //      128           37.44             18.7    21.02
+        //      240           22.37             17.2    19.30
+        //
+        // +12%, taking the stage from 77% to 86% of the achievable streaming
+        // rate. Not the 4x the instruction count suggests: the loop was never
+        // VALU-throughput-bound, the VALU was crowding load issue, and only
+        // part of that recovers.
+        gang_linear_mxfp8_kernel<BATCH_SIZE,
+                                 WUV_REDUCTION,
+                                 /*WRITE_THROUGH=*/true>(head_in,
+                                                         wuv_weight_ptr,
+                                                         xcd_v_out,
+                                                         num_active_tokens,
+                                                         WUV_ROWS_PER_WG,
+                                                         OPROJ_REDUCTION_SIZE,
+                                                         /*output_size=*/
+                                                         OPROJ_REDUCTION_SIZE,
+                                                         /*m_tiles=*/1,
+                                                         wuv_tiles_per_xcd,
+                                                         /*wgm=*/0,
+                                                         t,
+                                                         /*bias_ptr=*/nullptr);
+      } else {
+        gang_gemv_mxfp8_kernel<BATCH_SIZE,
+                               WUV_REDUCTION,
+                               WUV_ROWS_PER_WG,
+                               /*HAS_RESIDUAL=*/false,
+                               /*WRITE_THROUGH=*/true>(head_in,
+                                                       wuv_weight_ptr,
+                                                       /*residual=*/nullptr,
+                                                       xcd_v_out,
+                                                       num_active_tokens,
+                                                       WUV_ROWS_PER_WG,
+                                                       OPROJ_REDUCTION_SIZE,
+                                                       /*m_tiles=*/1,
+                                                       wuv_tiles_per_xcd,
+                                                       /*wgm=*/0,
+                                                       t);
+      }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
       ++_wuv_tiles;
 #endif

@@ -1237,6 +1237,47 @@ if __name__ == "__main__":
         # half a round of 29 workers; 256 halves that again and the phase goes
         # latency-bound.
         WUV_GEMV_ROWS = int(os.environ.get("GLM_WUV_GEMV_ROWS", "128"))
+        # WUV_MFMA=1 takes W_UV off the bf16-dot GEMV and onto
+        # v_mfma_scale_f32_16x16x128_f8f6f4 with an FP8 activation, which on
+        # gfx950 is the only fp8-activation instruction there is (the VALU fp8
+        # dots need dot11-insts, which gfx942 has and gfx950 dropped).
+        #
+        # Off by default: it is a measured regression, and the standalone probe
+        # that predicted a win was run in the wrong regime.
+        #
+        # A/B at a fixed 64 rows (so the tile count is not the variable), rank
+        # 0, MPK_SUBPHASE_TIMING=1, ms/iter:
+        #
+        #   counter          GEMV     MFMA     delta
+        #   SP0[7] loop      0.367    0.463    +26.3%
+        #   SP2[7] barrier   0.480    0.601    +25.4%
+        #   SP3[7] both      0.870    1.087    +24.9%
+        #   decode wall     14.255   14.524    +1.9%
+        #
+        # tests/standalone/test_fp8_act_mfma_bw.hip measured +12% for the same
+        # kernel swap -- at K=10240, i.e. MFMA_ITERS=80. W_UV reduces over
+        # K=512, which is MFMA_ITERS=4, and the kernel's software pipeline is
+        # depth 4 (static_assert MFMA_ITERS >= 4 && % 4 == 0). So W_UV sits at
+        # the exact minimum: every iteration is pipeline fill, none is steady
+        # state, and the FP8 activation's amax reduction is a fixed prologue
+        # cost with only 33.8 KB of weight per WG to amortize it over. The
+        # streaming rate the probe measured is a property of the steady state
+        # this shape never reaches.
+        #
+        # It also costs the tuned row width. gang_linear_mxfp8_kernel's
+        # OUTPUT_PER_WG is a hardcoded 4 waves x 16 rows, so this pins 64, and
+        # 64 is the width the sweep above rejected (32 tiles per XCD against 29
+        # workers is two grid-stride rounds where 128's 16 tiles is one) -- a
+        # further -0.30 ms on top of the numbers above, which were taken at 64
+        # on both sides.
+        #
+        # Turning this back on needs a shallow-K pipeline variant, not a knob.
+        if int(os.environ.get("WUV_MFMA", "0")) == 1:
+            if os.environ.get("GLM_WUV_GEMV_ROWS") is None:
+                WUV_GEMV_ROWS = 64
+            assert WUV_GEMV_ROWS == 64, (
+                "WUV_MFMA needs GLM_WUV_GEMV_ROWS=64; got "
+                f"{WUV_GEMV_ROWS}")
         # The other way to un-starve o_proj, and the one that works: keep the
         # op output-parallel but make the tiles narrower. The 64-column floor
         # came from the 16x64x256 MFMA tile, and at batch 1 that tile was

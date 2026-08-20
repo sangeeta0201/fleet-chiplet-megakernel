@@ -261,6 +261,15 @@ def get_compile_command(
         flags = flags + ["-DMPK_W13_LDS_WEIGHTS"]
     if int(os.environ.get("W13_LDS_PREFETCH", "1")) == 1:
         flags = flags + ["-DMPK_W13_LDS_PREFETCH"]
+    # W_UV takes an FP8 activation through v_mfma_scale_f32_16x16x128_f8f6f4
+    # instead of dequantizing the weight to bf16 for v_dot2c_f32_bf16. Needs
+    # GLM_WUV_GEMV_ROWS=64, which demo/glm5/demo.py pins when this is set.
+    #
+    # Off by default: measured a 26% regression on the stage. See the note in
+    # demo/glm5/demo.py -- W_UV's K=512 is exactly the MFMA kernel's minimum
+    # pipeline depth, so the swap is all fill and no steady state.
+    if int(os.environ.get("WUV_MFMA", "0")) == 1:
+        flags = flags + ["-DMPK_WUV_MFMA"]
     if int(os.environ.get("W13_QFIRST", "0")) == 1:
         flags = flags + ["-DMPK_W13_QFIRST"]
     if int(os.environ.get("W13_ILV", "0")) == 1:
@@ -469,6 +478,8 @@ def get_compile_command(
             flags = flags + ["-DMPK_W13_LDS_WEIGHTS"]
         if int(os.environ.get("W13_LDS_PREFETCH", "1")) == 1:
             flags = flags + ["-DMPK_W13_LDS_PREFETCH"]
+        if int(os.environ.get("WUV_MFMA", "0")) == 1:
+            flags = flags + ["-DMPK_WUV_MFMA"]
         if int(os.environ.get("W13_QFIRST", "0")) == 1:
             flags = flags + ["-DMPK_W13_QFIRST"]
         if int(os.environ.get("W13_ILV", "0")) == 1:
