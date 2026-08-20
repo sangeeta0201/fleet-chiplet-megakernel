@@ -1039,12 +1039,25 @@ if __name__ == "__main__":
         # The 64-token tile below used to floor this at 8 for the 512-token
         # default sequence, i.e. it never reached the 16 the sweep above picked
         # both times. 32 tokens per chunk hits 16.
+        #
+        # 32 tokens per chunk is the wrong granularity at short sequences: at
+        # max_seq_length=128 it yields 4 chunks, so decode runs on
+        # q_groups*chunks = 16 tiles = 2/XCD, 7% of the 29 workers, and the
+        # other 216 spin through it twice (decode->merge, then the Phase 8
+        # barrier). MPK_MLA_SKIP_DECODE prices that whole complex at 3.40 ms of
+        # the 14.189 baseline, and only ~0.5 ms of it is decode's own work.
+        # Measured at max_seq_length=128, one variable, output verified:
+        #   chunks=4  (32 tok/chunk, old default) -> 14.189 ms
+        #   chunks=16 ( 8 tok/chunk)              -> 11.464 ms  (-2.73, -19.2%)
+        # So occupancy dominates chunk granularity -- 8-token chunks are fine.
+        # Cutting to 8 tokens per chunk reaches the 16 cap at any sequence >=
+        # 128, which is where the older 16x32 sweep landed anyway.
         num_q_groups = num_heads_pad // 16
         _env_chunks = os.environ.get("GLM_MLA_NUM_KV_CHUNKS")
         if _env_chunks is not None:
             num_kv_chunks = int(_env_chunks)
         else:
-            _kv_tiles = max(1, (args.max_seq_length + 31) // 32)
+            _kv_tiles = max(1, (args.max_seq_length + 7) // 8)
             num_kv_chunks = max(1, min(16, _kv_tiles))
         assert num_kv_chunks >= 1
         # The merge is otherwise one task per q group -- 2 CUs of 256, each
