@@ -970,6 +970,16 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     // against mla_tiles_per_xcd rather than tiles_per_xcd reproduces the
     // standalone task's mapping, where the gang dispatch width was the
     // decode's own.
+    // MPK_MLA_SKIP_DECODE: run every barrier and every other phase, but do no
+    // decode work at all. WRONG OUTPUT by construction -- o_acc/lse keep the
+    // previous layer's values. Same purpose as MPK_W13_EARLY_REL in
+    // gang_oproj_router_fused_mi300.cuh: price the ceiling before building.
+    // The comment in gang_mla_full_layer_fused_mi300.cuh:1391 attributes
+    // 1.88 ms/iter of makespan to 232 workers waiting on the 16 that run this
+    // loop. If deleting the loop entirely does not move the wall, that
+    // attribution is wrong the same way the W13->W2 barrier's was, and
+    // widening the decode (more kv chunks, more q groups) cannot pay.
+#ifndef MPK_MLA_SKIP_DECODE
     for (int t = xcd_rank; t < mla_tiles_per_xcd; t += tiles_per_xcd) {
       // Under PAIR_MERGE this XCD owns chunks [pair_half * mla_tiles_per_xcd,
       // +mla_tiles_per_xcd) of q_group pair_id, and the decode kernel wants
@@ -1001,6 +1011,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
           decode_item,
           scale_s);
     }
+#endif
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     {
       unsigned long long _t = __builtin_amdgcn_s_memrealtime();

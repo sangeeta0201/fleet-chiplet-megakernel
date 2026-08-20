@@ -539,6 +539,13 @@ def get_compile_command(
             # If 8/16 does not move the token, the W2 wait is W13's DURATION,
             # not its arrival count, and narrowing the count cannot help.
             flags = flags + [f"-DMPK_W13_EARLY_REL={_w13_early}"]
+        if int(os.environ.get("MPK_MLA_SKIP_DECODE", "0")) == 1:
+            # Delete the Phase 5 decode loop, keeping every barrier and every
+            # other phase. WRONG OUTPUT by construction. The companion probe to
+            # MPK_W13_EARLY_REL, for the other half of the layer: it prices the
+            # 1.88 ms/iter that gang_mla_full_layer_fused_mi300.cuh:1391
+            # attributes to 232 workers waiting on the 16 that run the decode.
+            flags = flags + ["-DMPK_MLA_SKIP_DECODE"]
         _perf_iter = int(os.environ.get("MPK_PERFETTO", "0"))
         if _perf_iter:
             # Capture raw per-worker phase spans for ONE decode iteration and
