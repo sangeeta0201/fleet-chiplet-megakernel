@@ -1157,7 +1157,21 @@ __device__ __attribute__((always_inline)) void
   if (tid == 0) {
     int prev = atom_add_release_gpu_s32(&w13_barrier[8 * HIER_STRIDE], 1);
     int const arrivals = tiles_per_xcd * 8;
+    // MPK_W13_EARLY_REL: fire the release at FRAC/16 of the arrivals instead of
+    // all of them. WRONG OUTPUT by construction -- W2 reads swiglu columns
+    // whose producers have not run. Ported from gpt-oss
+    // (gang_moe_fused_mxfp4_mi300.cuh:1731) for the same purpose: price the
+    // ceiling of every "narrow the dependency" scheme before paying for the
+    // index surgery. If releasing at half the arrivals does not move the token,
+    // the wait is upstream arrival SPREAD, not the barrier's count, and no
+    // per-expert / split-K narrowing of the count can help.
+#ifdef MPK_W13_EARLY_REL
+    int const _rel_at_raw = (arrivals * MPK_W13_EARLY_REL) / 16;
+    int const _rel_at = (_rel_at_raw < 1) ? 1 : _rel_at_raw;
+    if ((prev % arrivals) == _rel_at - 1) {
+#else
     if ((prev % arrivals) == arrivals - 1) {
+#endif
       for (int x = 0; x < 8; x++) {
         st_wt_u32((void *)&w13_barrier[x * HIER_STRIDE], (unsigned)w13_expected);
       }
