@@ -1371,10 +1371,29 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       } else {
         atomicAdd(&g_subphase_ns[5][6], (_b_t4 - _b_t3) * 10); // idle ranks
       }
-      // The merge ranks arrive ~23 us after everyone else but Phase 7's merge
-      // compute is only ~2.4 us, so the time is in the entry region: the
-      // __syncthreads plus the s_waitcnt vmcnt(0) that drains Phase 7's
-      // write-through attn_out stores. Attribute it to confirm.
+      // Attributed, and the entry-region guess above was wrong. Slot [7] is
+      // _b_t0 - _fl_t0, i.e. exactly that __syncthreads + s_waitcnt, and it
+      // measures 0.36 us/layer -- not the ~23 it was supposed to explain.
+      //
+      // Where the merge population's 27.2 us/layer of lateness actually goes,
+      // NP=8, 75 fused layers, merge_tiles_per_xcd=16 of tiles_per_xcd=29
+      // (divide each slot by ITS OWN population, not by 232):
+      //
+      //   Phase 5  decode compute    16 ranks    6.9 us each (SP4[4])
+      //   Phase 6  decode->merge     128 ranks  22.1 us      (SP4[5])
+      //   Phase 7  merge             128 ranks   1.8 us      (SP4[6])
+      //   Phase 8  entry             128 ranks   0.4 us      (SP5[7])
+      //   Phase 8  spin, merge pop   128 ranks   1.7 us      (SP5[5])
+      //   Phase 8  spin, idle pop    104 ranks  28.9 us      (SP5[6])
+      //
+      // So the merge is not the straggler and neither is this barrier: both
+      // populations are waiting, one phase apart, on the SAME thing -- Phase
+      // 5's decode, which runs on num_q_groups * NUM_KV_CHUNKS work items.
+      // At 4 groups x 4 chunks that is 16 of 232 workers. 128 wait for them
+      // at Phase 6 and the other 104 wait at Phase 8.
+      //
+      // Averaged into makespan that is (128*22.1 + 104*28.9) / 232 = 25.1
+      // us/layer = 1.88 ms/iter, the largest single line in the profile.
       if (xcd_rank < merge_tiles_per_xcd) {
         atomicAdd(&g_subphase_ns[5][7], (_b_t0 - _fl_t0) * 10);
       }
