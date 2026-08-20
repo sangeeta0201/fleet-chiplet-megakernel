@@ -580,7 +580,29 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
 
   // ── MFMA constants ─────────────────────────────────────────────────────
   constexpr int K_PER_MFMA = 128;
-  constexpr int MFMA_ITERS = REDUCTION_SIZE / K_PER_MFMA;
+  // MPK_ATTN_HALFK: run half the K-loop and keep everything else identical --
+  // same tile map, same WG stride, same MFMA shape, half the weight bytes off
+  // HBM. WRONG OUTPUT by construction. This prices MXFP4 for the attention /
+  // dense weights (task #66) before any quantization plumbing is written:
+  // MXFP4 halves bytes at constant FLOPs, HALFK halves both, so HALFK is an
+  // UPPER BOUND on the MXFP4 gain. If the bound is small the lever is dead.
+  // Clamped to the depth-4 pipeline's minimum, so W_UV's K=512 (MFMA_ITERS 4)
+  // is left at full width rather than dropped below the static_assert.
+  constexpr int MFMA_ITERS_FULL = REDUCTION_SIZE / K_PER_MFMA;
+#ifdef MPK_ATTN_HALFK
+  // Floor of 16 after halving, not 4: the K_PARALLEL branch splits MFMA_ITERS
+  // across NUM_WAVES=4 and its own static_assert needs ITERS_PER_WAVE >= 4.
+  // So only stages with MFMA_ITERS >= 32 are halved -- at GLM's shapes that is
+  // qkv_a (K=6144, 48 iters -> 24). q_b (16), W_UK and W_UV (K=512, 4) stay at
+  // full width, which makes this a LOWER bound on the byte lever as well as an
+  // upper bound on the MXFP4 gain for the stage it does reach.
+  constexpr int MFMA_ITERS =
+      (MFMA_ITERS_FULL / 2 >= 16 && (MFMA_ITERS_FULL / 2) % 4 == 0)
+          ? MFMA_ITERS_FULL / 2
+          : MFMA_ITERS_FULL;
+#else
+  constexpr int MFMA_ITERS = MFMA_ITERS_FULL;
+#endif
   static_assert(MFMA_ITERS >= 4,
                 "Depth-4 pipeline requires REDUCTION_SIZE >= 512");
   // Only slot 3 carries a tail guard, so a partial final group would let

@@ -546,6 +546,12 @@ def get_compile_command(
             # 1.88 ms/iter that gang_mla_full_layer_fused_mi300.cuh:1391
             # attributes to 232 workers waiting on the 16 that run the decode.
             flags = flags + ["-DMPK_MLA_SKIP_DECODE"]
+        if int(os.environ.get("MPK_ATTN_HALFK", "0")) == 1:
+            # Halve the K-loop of every MXFP8 attention/dense GEMM (qkv_a, q_b,
+            # o_proj, W_UV, W_UK) at an unchanged tile map and WG stride.
+            # WRONG OUTPUT by construction. Upper bound on the MXFP4 lever for
+            # those weights, which are 41% of all bytes moved per token.
+            flags = flags + ["-DMPK_ATTN_HALFK"]
         _perf_iter = int(os.environ.get("MPK_PERFETTO", "0"))
         if _perf_iter:
             # Capture raw per-worker phase spans for ONE decode iteration and
