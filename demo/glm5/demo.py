@@ -828,6 +828,41 @@ if __name__ == "__main__":
         # 4 is legal -- 8 tiles per XCD -- but doubles the prefetch register
         # array again on top of a kernel already at ~332 VGPRs.
         ROUTER_EPT = int(os.environ.get("GLM_ROUTER_EPT", "2"))
+        # The router fold. Both of the router's contractions -- the gate GEMV
+        # and the RMSNorm's sum-of-squares -- run over the hidden row that the
+        # sharded o_proj has just finished producing a 1/world-th slice of, so
+        # both decompose over exactly that shard and can be reduced across the
+        # ranks on the all-gather rendezvous instead of after it. Needs the
+        # shard, so it needs EP and the whole-layer fusion that carries it.
+        #
+        # MEASURED NEUTRAL, off by default (2026-08-20, four runs, the last two
+        # interleaved in one session so the baseline is not a quoted number):
+        # decode 14.402 ms/iter folded against 14.477 unfolded, a 0.075 ms
+        # difference inside a 0.26 ms noise floor. Both generate coherent text.
+        #
+        #   ns/call            fold=0   fold=1
+        #   SP6[1] ssq           2326     1981   -345
+        #   SP6[2] gate GEMV     2186     2090    -96
+        #   SP6[0] prefetch +    6377     7375   +998
+        #          o_proj spin
+        #   SP3[0] o_proj      0.481ms  0.575ms  +0.094 ms/iter
+        #
+        # The premise was wrong, and the counters say exactly how. Deleting the
+        # gate GEMV bought 96 ns, not the ~2.2 us the step appears to cost,
+        # because #35's prefetch across the o_proj barrier had already hidden
+        # the whole GEMV behind the spin -- the weight was in registers before
+        # the row it multiplies existed. So the fold has nothing to reclaim on
+        # the router side, while the accumulate-and-push it adds to the o_proj
+        # epilogue is ~1 us of genuinely new work on the critical path, which
+        # is what SP6[0] and SP3[0] are reporting. Moving work off a stage that
+        # already had free slack onto one that has none is a wash by
+        # construction; no amount of tuning the fold flips that.
+        #
+        # Kept behind the flag rather than deleted: the plumbing is correct and
+        # exercised, and it is the only worked example in the tree of reducing
+        # a downstream contraction on an existing rendezvous.
+        ROUTER_FOLD = (moe_ep and FUSE_FULL_LAYER
+                       and os.environ.get("GLM_ROUTER_FOLD", "0") == "1")
         assert not MOE_MXFP4 or MOE_MXFP8, \
             "GLM_MOE_MXFP4 narrows the MXFP8 expert path; it is not a bf16 mode"
         # Only the fused tail carries the width through to the kernel. The
@@ -1491,7 +1526,7 @@ if __name__ == "__main__":
                                          torch_dtype=torch.int32)
         # Whole-layer fusion collapses those three buffers into one, not for
         # tidiness but because the merged input list is 27 slots against a
-        # MAX_INPUTS_PER_TASK of 32 (28 before EP needed three more slots).
+        # MAX_INPUTS_PER_TASK of 34 (28 before EP needed three more slots).
         # Slot map (each on its own 64-byte line):
         # attention qkv_a->q_b [0..9], q_b->decode [10..19],
         # decode->merge [20..29], attention->o_proj [30..39],
@@ -1536,6 +1571,7 @@ if __name__ == "__main__":
         # unrelated on the remote rank.
         ep_gather_list = []
         ep_signal = None
+        router_partials = None
         if moe_ep:
             ep_gather_list = [
                 mpk.new_tensor(
@@ -1558,6 +1594,25 @@ if __name__ == "__main__":
                 name="ep_signal",
                 io_category="nvshmem_tensor",
             )
+            if ROUTER_FOLD:
+                # The router fold's reduction scratch. Lines [0..7] are this
+                # rank's per-XCD accumulators, cleared by whichever block wins
+                # the o_proj barrier election; lines [8..] are the per-rank
+                # sums, pushed peer-to-peer on that same rendezvous and
+                # double-buffered by layer parity. Element num_experts of a
+                # line is the RMSNorm's sum-of-squares, which rides along
+                # because it reduces over the identical partition.
+                #
+                # One buffer for all layers, not one per layer like ep_gather:
+                # the whole thing is produced and consumed inside a single
+                # layer's Phase 1-3, and the parity pair already covers the
+                # only overlap (a peer running ahead into its next layer).
+                router_partials = mpk.new_tensor(
+                    dims=(8 + 2 * world_size, num_experts + 1),
+                    dtype=mi.float32,
+                    name="router_partials",
+                    io_category="nvshmem_tensor",
+                )
         moe_mid = make_tensor("moe_mid", (bs, topk_total, 2 * moe_inter))
         moe_act = make_tensor("moe_act", (bs, topk_total, moe_inter))
         moe_out = make_tensor("moe_out", (bs, topk_total, hidden_size))
@@ -2077,6 +2132,26 @@ if __name__ == "__main__":
                 layer.mlp.gate.e_score_correction_bias.data.to(
                     torch.bfloat16).contiguous(),
                 f"layer_{i}_router_bias")
+            # The fold's copy of the same weight: transposed, and sliced to
+            # the hidden columns this rank's o_proj shard owns. Transposed
+            # because an o_proj tile holds four hidden columns and contributes
+            # to all num_experts logits, so the row-major [E, H] form would
+            # have it read num_experts lines at a 2*hidden-byte stride to use
+            # eight bytes of each; [H, E] makes a column's contribution one
+            # contiguous 2*num_experts-byte line.
+            #
+            # 393 KB per rank per layer against the 3.1 MB the un-folded
+            # router reads -- every one of a rank's 128 router workers reads
+            # its own 2-expert pair of full 12 KB rows today, and under the
+            # fold nobody reads the gate weight after the barrier at all.
+            w_router_t = None
+            if ROUTER_FOLD:
+                _rt_cols = hidden_size // world_size
+                w_router_t = _attach_input_keep(
+                    layer.mlp.gate.weight.data.t()[
+                        rank * _rt_cols:(rank + 1) * _rt_cols, :
+                    ].contiguous(),
+                    f"layer_{i}_router_wt")
 
             # Expert stacks, shared expert last. With the SwiGLU fused into
             # W13's epilogue the gate and up rows are interleaved pairwise so
@@ -2270,6 +2345,9 @@ if __name__ == "__main__":
                     fl_kwargs.update(ep_gather=ep_gather_list[i],
                                      ep_signal=ep_signal,
                                      ep_fold_rank=ep_fold_rank)
+                    if ROUTER_FOLD:
+                        fl_kwargs.update(router_weight_t=w_router_t,
+                                         router_partials=router_partials)
                 mpk.gang_mla_full_layer_fused_layer(**fl_kwargs)
                 last_fl_kwargs = fl_kwargs
             elif fuse_oproj_router:

@@ -213,7 +213,26 @@ __device__ __attribute__((always_inline)) void
         // safe because both are written only by that PE, on every peer, and
         // both carry the same run-monotonic layer count. Null on the
         // standalone dispatch, and null is also what disables the all-gather.
-        void *ep_signal_ptr = nullptr) {
+        void *ep_signal_ptr = nullptr,
+        // ── router fold, ROUTER_FOLD only ──────────────────────────────────
+        // logit_e = irms * sum_i h_i * gamma_i * W[e,i], and irms is a
+        // positive scalar over the whole row, so both the gate dot and the
+        // RMSNorm's sum-of-squares are contractions over exactly the hidden
+        // partition the o_proj shard already imposes. Phase 1 can therefore
+        // compute this rank's share of both before the barrier instead of
+        // Phase 3 recomputing all of it after -- see the block in Phase 1.
+        //
+        // [OPROJ_TP_COLS, NUM_EXPERTS] bf16: the gate weight transposed and
+        // sliced to this rank's columns. Transposed because a tile owns four
+        // hidden columns and all 256 experts, so the row-major form would have
+        // it read 256 lines at a 12 KB stride to use 8 bytes of each.
+        void const *router_weight_t_ptr = nullptr,
+        // Symmetric float scratch, [8 + EP_WORLD_SIZE][NUM_EXPERTS + 1]. The
+        // first eight lines are this rank's per-XCD accumulators, reduced
+        // locally; the rest are the per-rank lines the peers push. Element
+        // NUM_EXPERTS of a line is the sum-of-squares, which rides along
+        // because it reduces over the identical partition.
+        void *router_partials_ptr = nullptr) {
 
   int const tid = threadIdx.x;
   int const xcd_id = tile_idx / tiles_per_xcd;
@@ -583,6 +602,22 @@ __device__ __attribute__((always_inline)) void
       }
     }
     bool const oproj_push = oproj_tp && oproj_all_mapped;
+    // The fold rides the same shard: it is exactly the o_proj column slice
+    // that makes each rank's share of the two contractions well defined, so
+    // there is no fold without the push. Both pointers null is the opt-out,
+    // and the standalone dispatch takes it.
+    bool const router_fold = oproj_push && (router_weight_t_ptr != nullptr) &&
+                             (router_partials_ptr != nullptr);
+    __hip_bfloat16 const *const d_norm_w =
+        static_cast<__hip_bfloat16 const *>(norm_weight_ptr);
+    __hip_bfloat16 const *const d_router_wt =
+        static_cast<__hip_bfloat16 const *>(router_weight_t_ptr);
+    // Lines [0 .. 7] are the per-XCD accumulators, one per XCD of this rank;
+    // lines [8 .. 8+EP-1] are the per-rank sums, indexed by the PE that wrote
+    // them. Only the first eight are touched here.
+    float *const xcd_acc =
+        static_cast<float *>(router_partials_ptr) +
+        (size_t)xcd_id * (NUM_EXPERTS + 1);
     for (int t = xcd_rank; t < oproj_tiles_per_xcd; t += tiles_per_xcd) {
       gang_gemv_mxfp8_kernel<BATCH_SIZE,
                              OPROJ_REDUCTION_SIZE,
@@ -643,6 +678,76 @@ __device__ __attribute__((always_inline)) void
           }
         }
       }
+
+      // ── the router fold ─────────────────────────────────────────────────
+      // This tile now holds four FINAL hidden columns -- residual included,
+      // and nothing is added to a rank's own slice afterwards -- so it can
+      // contribute those columns' share of both contractions the router would
+      // otherwise run after the barrier:
+      //
+      //   ssq      += sum_j h_j^2
+      //   logit[e] += sum_j h_j * gamma_j * Wt[col_j][e]     for all 256 e
+      //
+      // irms = rsqrt(ssq/H + eps) is a positive scalar over the whole row, so
+      // it factors out of the dot and can be applied once, after the reduce.
+      //
+      // Thread e owns expert e. Wt's row for one hidden column is 256
+      // contiguous bf16, so the 256 threads read one 512-byte line per column
+      // and the tile touches 2 KB total -- against the 12 KB row and the
+      // 24 KB of gate weight the two Phase-3 steps read per worker.
+      //
+      // The four h values are read back through ld_nt_s32 for the same reason
+      // the peer push does: the GEMV epilogue is WRITE_THROUGH, so this CU's
+      // vL1 may hold the pre-store line. Reusing that read is why the fold
+      // needs nothing from the GEMV kernel itself.
+      if (router_fold) {
+        static_assert(!(OPROJ_ROWS_PER_WG & 1),
+                      "the fold reads the tile back as packed 32-bit pairs");
+        __syncthreads();
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        int const col0 = xcd_id * oproj_tiles_per_xcd * OPROJ_ROWS_PER_WG +
+                         t * OPROJ_ROWS_PER_WG;
+        // Rank-local column index: Wt is already sliced to this rank, so it is
+        // indexed by the offset within the 1/EP-th row, not by oproj_col_base.
+        unsigned short const *const hrow =
+            reinterpret_cast<unsigned short const *>(xcd_out) +
+            (size_t)t * OPROJ_ROWS_PER_WG;
+        float hg[OPROJ_ROWS_PER_WG];
+        float ssq_tile = 0.0f;
+#pragma unroll
+        for (int j = 0; j < OPROJ_ROWS_PER_WG; j += 2) {
+          unsigned int const pair = (unsigned int)ld_nt_s32(
+              reinterpret_cast<int *>(
+                  const_cast<unsigned short *>(hrow) + j));
+          unsigned short const lo = (unsigned short)(pair & 0xFFFFu);
+          unsigned short const hi = (unsigned short)(pair >> 16);
+          float const h0 = __bfloat162float(*(bf16 const *)&lo);
+          float const h1 = __bfloat162float(*(bf16 const *)&hi);
+          ssq_tile += h0 * h0 + h1 * h1;
+          size_t const gcol = oproj_col_base + (size_t)t * OPROJ_ROWS_PER_WG;
+          hg[j] = h0 * __bfloat162float(d_norm_w[gcol + j]);
+          hg[j + 1] = h1 * __bfloat162float(d_norm_w[gcol + j + 1]);
+        }
+        // gamma is indexed globally -- it is the un-sharded [HIDDEN] vector --
+        // while Wt below is indexed rank-locally. The two differ by exactly
+        // EP_MY_PE * OPROJ_TP_COLS, which is the whole content of the shard.
+        for (int e = tid; e < NUM_EXPERTS; e += (int)blockDim.x) {
+          float acc = 0.0f;
+#pragma unroll
+          for (int j = 0; j < OPROJ_ROWS_PER_WG; j++) {
+            acc += hg[j] * __bfloat162float(d_router_wt[(size_t)(col0 + j) *
+                                                            NUM_EXPERTS +
+                                                        e]);
+          }
+          // Distinct address per thread; the contention is the 24 tiles of
+          // this XCD, and it is L2-local because the accumulator line is the
+          // XCD's own.
+          atomicAdd(&xcd_acc[e], acc);
+        }
+        if (tid == 0) {
+          atomicAdd(&xcd_acc[NUM_EXPERTS], ssq_tile);
+        }
+      }
     }
 
     MPK_WS_PHASE(72, routing_expected, xcd_id);
@@ -663,12 +768,74 @@ __device__ __attribute__((always_inline)) void
       _sp_t0 = _sp_t1;
     }
 #endif
+    // The election result is broadcast to the whole block rather than kept in
+    // tid 0, because under the fold the elected block has 2056 floats to
+    // reduce and 257 to push -- work for 256 threads, not for one. Everything
+    // downstream of the election still runs on tid 0 alone.
+    __shared__ int s_oproj_leader;
     if (tid == 0) {
       int prev = atom_add_release_gpu_s32(&hier_barrier[8 * HIER_STRIDE], 1);
       // Modular test rather than a reset: the counter is monotonic for the
       // whole run, so there is no window in which a fast worker from the next
       // layer can observe a zeroed counter.
-      if ((prev % total_barrier_arrivals) == total_barrier_arrivals - 1) {
+      s_oproj_leader =
+          ((prev % total_barrier_arrivals) == total_barrier_arrivals - 1) ? 1
+                                                                          : 0;
+    }
+    __syncthreads();
+    if (s_oproj_leader) {
+      // ── the router fold's rank-local reduce and all-reduce ───────────────
+      // Being elected means every one of this rank's arrivals is in, so all
+      // eight per-XCD accumulators are final. Sum them into this rank's line
+      // and push that line to the peers, ahead of the signal below -- the
+      // signal's release then covers the logits exactly as it covers the
+      // hidden-row slices, and the fold costs no rendezvous of its own.
+      //
+      // 257 floats x 7 links = 7.2 KB per rank per layer, against the 1.38 MB
+      // it would be if all 192 contributing workers pushed their own partials
+      // and skipped this reduce.
+      if (router_fold) {
+        constexpr int RF_LINE = NUM_EXPERTS + 1;
+        float *const parts = static_cast<float *>(router_partials_ptr);
+        // Parity-indexed so a peer that reaches its next layer's push before
+        // this rank's Phase 3 has read the line cannot overwrite it. The
+        // hidden row itself is not double-buffered and relies on the peer
+        // being a whole Phase 3-7 behind; a 257-float line is cheap enough
+        // not to have to make that argument again.
+        float *const my_line =
+            parts + (size_t)(8 + (oproj_expected & 1) * EP_WORLD_SIZE +
+                             EP_MY_PE) *
+                        RF_LINE;
+        for (int e = tid; e < RF_LINE; e += (int)blockDim.x) {
+          float s = 0.0f;
+#pragma unroll
+          for (int x = 0; x < 8; x++) {
+            s += parts[(size_t)x * RF_LINE + e];
+          }
+          my_line[e] = s;
+          // Clear for the next layer. Safe here and only here: no worker on
+          // this rank is released until the fan-out below, so none can be in
+          // the next layer's Phase 1 adding to these lines yet.
+#pragma unroll
+          for (int x = 0; x < 8; x++) {
+            parts[(size_t)x * RF_LINE + e] = 0.0f;
+          }
+        }
+        __syncthreads();
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        for (int e = tid; e < RF_LINE; e += (int)blockDim.x) {
+          float const v = my_line[e];
+#pragma unroll
+          for (int q = 0; q < OPROJ_NPEER; q++) {
+            st_wt_u32((void *)(reinterpret_cast<char *>(my_line + e) +
+                               oproj_peer_delta[q]),
+                      __float_as_uint(v));
+          }
+        }
+        __syncthreads();
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      }
+      if (tid == 0) {
         // ── the all-gather's rendezvous rides this barrier ────────────────
         // Under OPROJ_TP the row is not complete when the local arrivals are
         // in; it is complete when every peer's slice has landed too. This
@@ -810,7 +977,19 @@ __device__ __attribute__((always_inline)) void
           oproj_expected,
           routing_ready,
           /*routing_epoch_hint=*/routing_expected,
-          /*irms_cache=*/&s_router_irms);
+          /*irms_cache=*/&s_router_irms,
+          // Under the fold both contractions are already done and reduced
+          // across the ranks; the router's job shrinks to scaling by irms,
+          // and it is handed the parity block's line 0 plus the offset of
+          // this XCD's expert range inside a line.
+          /*folded_lines=*/
+          router_fold ? (static_cast<float const *>(router_partials_ptr) +
+                         (size_t)(8 + (oproj_expected & 1) * EP_WORLD_SIZE) *
+                             (NUM_EXPERTS + 1))
+                      : nullptr,
+          /*folded_ranks=*/router_fold ? EP_WORLD_SIZE : 0,
+          /*folded_stride=*/NUM_EXPERTS + 1,
+          /*folded_expert_base=*/xcd_id * (NUM_EXPERTS / 8));
     }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     {

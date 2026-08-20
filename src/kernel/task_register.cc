@@ -4042,7 +4042,7 @@ int TaskRegister::register_gang_mla_attn_fused_mi300_task(
 //               11 v_out (un-absorbed kv_b_v only)
 int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 53);
+  assert(params.size() == 54);
   // ── attention half ──
   int batch_size = params[0];
   int qkv_opw = params[1];
@@ -4118,6 +4118,15 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
   // above keep their numbering.
   int router_experts_per_tile = params[52];
   assert(router_experts_per_tile >= 1);
+  // ── the router fold ──
+  // Non-zero moves the router's gate GEMV and the RMSNorm's sum-of-squares
+  // into the o_proj epilogue, reducing both across the ranks on the o_proj
+  // all-gather's rendezvous instead of after it. Needs the column shard that
+  // all-gather imposes, so it is EP-only, and it adds two trailing inputs.
+  int router_fold = params[53];
+  assert((!router_fold || ep_world_size > 1) &&
+         "the router fold reduces over the o_proj column shard, which only "
+         "exists under EP");
   assert(router_tile_n * router_experts_per_tile * 8 == num_experts &&
          "router_tile_n counts tiles, not experts");
   assert(total_router_tiles == router_tile_n * 8);
@@ -4131,8 +4140,11 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
   // unconditionally -- both are inside the fixed task_desc arrays, and the
   // kernel discards them under `if constexpr` -- so the absorbed build passes
   // an unread pointer rather than needing a dummy tensor.
-  int num_inputs =
-      (ep_inline ? 29 : 27) + (unabsorb_v ? 1 : 0) + (unabsorb_k ? 1 : 0);
+  // The fold's pair is the one trailing group the kernel cannot read
+  // unconditionally: it sits past the end of the declared list rather than at
+  // a slot the codegen always emits, so ROUTER_FOLD gates the read.
+  int num_inputs = (ep_inline ? 29 : 27) + (unabsorb_v ? 1 : 0) +
+                   (unabsorb_k ? 1 : 0) + (router_fold ? 2 : 0);
   int num_outputs = 11 + (unabsorb_v ? 1 : 0) + (unabsorb_k ? 1 : 0);
   assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
   for (auto const &op : bgraph.operators) {
@@ -4399,7 +4411,7 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
   code.inc_indent();
   code.e("kernel::gang_mla_full_layer_fused_kernel_mi300<$, $, $, $, $, $, $, "
          "$, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, $, "
-         "$, $, $, $, $, $, $, $, $, $, $, $, $>(",
+         "$, $, $, $, $, $, $, $, $, $, $, $, $, $>(",
          batch_size,
          qkv_opw,
          qkv_reduction,
@@ -4441,7 +4453,8 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
          wuv_v_head_dim,
          qk_nope_head_dim,
          wuk_rows_per_wg,
-         router_experts_per_tile);
+         router_experts_per_tile,
+         router_fold ? "true" : "false");
   code.e("    task_desc->input_ptrs,");
   code.e("    task_desc->output_ptrs,");
   code.e("    runtime_config.qo_indptr_buffer,");

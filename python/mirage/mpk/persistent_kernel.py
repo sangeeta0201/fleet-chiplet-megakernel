@@ -2066,6 +2066,28 @@ class PersistentKernel:
         # round; the row is read once and both gate rows ride the same
         # prefetch across the barrier.
         router_experts_per_tile: int = 1,
+        # -- the router fold --
+        # logit_e = irms * sum_i h_i * gamma_i * W[e,i], and irms is a positive
+        # scalar over the whole row, so both the gate dot and the RMSNorm's
+        # sum-of-squares are contractions over exactly the hidden partition
+        # the sharded o_proj already imposes. Passing these moves both out of
+        # Phase 3 and into the o_proj epilogue, which reduces them across the
+        # ranks on the all-gather rendezvous that already exists -- so the
+        # router's own work shrinks to a scale by irms and the normed write,
+        # and the 3.1 MB of gate weight a rank read per layer becomes 393 KB.
+        #
+        # Needs the column shard, so EP only, and both or neither.
+        #   router_weight_t: [hidden // world_size, num_experts] bf16, the gate
+        #     weight transposed and sliced to this rank's o_proj columns.
+        #     Transposed because a tile owns four hidden columns and all the
+        #     experts, so the row-major form would read num_experts lines at a
+        #     hidden-sized stride to use 8 bytes of each.
+        #   router_partials: symmetric f32 [8 + 2 * world_size, num_experts+1].
+        #     Lines [0..7] are this rank's per-XCD accumulators; the rest are
+        #     the per-rank lines the peers push, double-buffered by parity.
+        #     Element num_experts of a line is the sum-of-squares.
+        router_weight_t: DTensor = None,
+        router_partials: DTensor = None,
         # -- expert parallelism --
         # Symmetric-heap tensors (io_category="nvshmem_tensor"). Passing them
         # turns on the head-of-layer fold: this rank's f32 MoE partial plus
@@ -2365,6 +2387,27 @@ class PersistentKernel:
         router_tile_n = num_experts // 8 // router_experts_per_tile
         total_router_tiles = router_tile_n * 8
         assert router_bias.dim(0) == num_experts
+        # -- the router fold --
+        router_fold = router_weight_t is not None
+        assert router_fold == (router_partials is not None), \
+            "the router fold needs both router_weight_t and router_partials"
+        if router_fold:
+            assert ep_inline, \
+                "the router fold reduces over the o_proj column shard, " \
+                "which only exists under EP"
+            # The same slice the o_proj shard takes; see OPROJ_TP_COLS.
+            oproj_tp_cols = hidden_size // self.world_size
+            assert (router_weight_t.num_dims == 2
+                    and router_weight_t.dim(0) == oproj_tp_cols
+                    and router_weight_t.dim(1) == num_experts), (
+                f"router_weight_t must be [{oproj_tp_cols}, {num_experts}], "
+                f"got [{router_weight_t.dim(0)}, {router_weight_t.dim(1)}]")
+            assert (router_partials.num_dims == 2
+                    and router_partials.dim(0) == 8 + 2 * self.world_size
+                    and router_partials.dim(1) == num_experts + 1), (
+                f"router_partials must be "
+                f"[{8 + 2 * self.world_size}, {num_experts + 1}], got "
+                f"[{router_partials.dim(0)}, {router_partials.dim(1)}]")
         num_shared_experts = routing_indices.dim(0) - num_experts
         assert num_shared_experts in (0, 1)
         assert topk_weight.dim(1) == num_experts_per_tok + num_shared_experts
@@ -2498,8 +2541,10 @@ class PersistentKernel:
             qk_nope_head_dim, wuk_rows_per_wg, wuk_tiles_per_xcd,
             # router tile width (1) -- appended last so nothing renumbers
             router_experts_per_tile,
+            # the router fold (1)
+            1 if router_fold else 0,
         ]
-        assert len(params) == 53
+        assert len(params) == 54
 
         grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
@@ -2545,6 +2590,14 @@ class PersistentKernel:
             # can be on alone. Dim-0 partitioned like every other GEMV weight:
             # the kernel gets this XCD's slice and indexes it locally.
             tb_graph.new_input(wuk_mxfp8_weight, (0, -1, -1), 1, True)
+        if router_fold:
+            # Unpartitioned, both of them. router_weight_t is already sliced
+            # to this RANK's hidden columns and every XCD reads the rows its
+            # own o_proj tiles own, which is a slice of dim 0 the partition
+            # map cannot express (it is by tile, not by XCD-equal-chunk);
+            # router_partials is indexed by XCD and by PE explicitly.
+            tb_graph.new_input(router_weight_t, (-1, -1, -1), -1, True)
+            tb_graph.new_input(router_partials, (-1, -1, -1), -1, True)
         tb_graph.new_input(qkv_a_out, (-1, -1, -1), -1, True)
         tb_graph.new_input(q_workspace, (-1, -1, -1), -1, True)
         tb_graph.new_input(lse, (-1, -1, -1), -1, True)
@@ -2572,6 +2625,7 @@ class PersistentKernel:
             + ([ep_gather, ep_signal] if ep_inline else [])
             + ([wuv_mxfp8_weight] if unabsorb_v else [])
             + ([wuk_mxfp8_weight] if unabsorb_k else [])
+            + ([router_weight_t, router_partials] if router_fold else [])
             + [qkv_a_out, q_workspace, lse, o_acc, attn_out, x_out,
              hidden, topk_weight, routing_indices, active_expert_ids,
              moe_workspace_f32]

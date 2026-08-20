@@ -655,7 +655,23 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     // computes the same `irms` twice, bit for bit. Point this at a __shared__
     // float, set it negative once per layer, and the second call skips Step 1
     // entirely. Null keeps the old behaviour.
-    float *irms_cache = nullptr) {
+    float *irms_cache = nullptr,
+    // ── router fold ────────────────────────────────────────────────────────
+    // Non-null means the caller's o_proj epilogue already accumulated both
+    // contractions this kernel would otherwise run -- sum_i h_i*gamma_i*W[e,i]
+    // for every expert, and sum_i h_i^2 -- each over the rank's own column
+    // slice, and reduced across the ranks on the o_proj all-gather's
+    // rendezvous. Steps 1 and 2 then collapse to a FOLDED_RANKS-long sum and
+    // a scale by irms, and the only thing left that has to walk the row is the
+    // normed write, which the MoE needs and the TopK does not.
+    //
+    // Layout: FOLDED_RANKS lines of FOLDED_STRIDE floats, line p written by
+    // PE p. Element FOLDED_EXPERT_BASE + e of a line is expert e of this XCD's
+    // range; element NUM_EXPERTS is the sum-of-squares.
+    float const *folded_lines = nullptr,
+    int folded_ranks = 0,
+    int folded_stride = 0,
+    int folded_expert_base = 0) {
 
   using bf16 = __hip_bfloat16;
   bf16 const *__restrict__ d_hidden = static_cast<bf16 const *>(norm_input_ptr);
@@ -687,7 +703,51 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   constexpr int MAX_ITERS_PF = OPROJ_BARRIER ? ((H4_PF + 255) / 256) : 1;
   i32x2_pf_t g_pf[MAX_ITERS_PF];
   i32x2_pf_t w_pf[EXPERTS_PER_TILE][MAX_ITERS_PF];
+  // Declared here rather than at Step 1 because it also decides WHICH
+  // prefetch is issued. The unfolded path wants gamma and every gate row of
+  // the tile, whole, because every worker walks the whole row for its dot
+  // product. The folded path reads no gate weight at all -- that is the 24 KB
+  // per worker, 3.1 MB per rank per layer, the fold exists to delete -- and
+  // walks no whole row either: all that is left of Step 2 is this tile's
+  // slice of the normed write, so it prefetches exactly that slice of gamma
+  // and of the hidden row and nothing else.
+  bool const folded = (folded_lines != nullptr);
+  // The fold's share-out of the normed write. Only reachable from the fused
+  // router, where this kernel's expert range is already one XCD's chunk of
+  // NUM_EXPERTS, so the tile count is that chunk over the tile width.
+  constexpr int FOLD_TILES = (NUM_EXPERTS / 8) / EXPERTS_PER_TILE;
+  constexpr int FOLD_COLS = REDUCTION_SIZE / (FOLD_TILES > 0 ? FOLD_TILES : 1);
+  constexpr int FOLD_PF = ((FOLD_COLS / 4) + 255) / 256;
+  static_assert(!OPROJ_BARRIER || FOLD_TILES < 1 ||
+                    REDUCTION_SIZE % (4 * FOLD_TILES) == 0,
+                "the fold's normed write splits the row into whole "
+                "dwordx2-aligned per-tile slices");
+  i32x2_pf_t fg_pf[FOLD_PF]; // gamma, this tile's slice
+  int const fold_col0 = tile_idx * FOLD_COLS;
   if constexpr (OPROJ_BARRIER) {
+    if (folded) {
+      // gamma only. The hidden row is precisely what the barrier below
+      // guards -- the o_proj all-gather has not finished writing it yet --
+      // so it is read after the spin like it always was, just 384 columns at
+      // a time on sixteen tiles instead of 6144 on one.
+      char const *fg_base =
+          (char const *)norm_weight_ptr + (size_t)fold_col0 * 2;
+#pragma unroll
+      for (int iter = 0; iter < FOLD_PF; iter++) {
+        int i_cur = tid + iter * 256;
+        if (i_cur >= (FOLD_COLS >> 2)) {
+          break;
+        }
+        // Same `sc0 nt` as the unfolded prefetch, and for the same reason:
+        // the buffer_inv that closes the barrier would throw an L2-cached
+        // line away again before Step 2 could use it.
+        asm volatile("global_load_dwordx2 %0, %1, off sc0 nt"
+                     : "=v"(fg_pf[iter])
+                     : "v"(fg_base + i_cur * 8)
+                     : "memory");
+      }
+    }
+    if (!folded) {
     char const *g_base_pf = (char const *)norm_weight_ptr;
     char const *w_base_pf = (char const *)gate_weight_ptr +
                             (int64_t)first_expert * REDUCTION_SIZE * 2;
@@ -714,6 +774,7 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
                      : "v"(w_base_pf + (int64_t)e * REDUCTION_SIZE * 2 +
                            byte_off)
                      : "memory");
+      }
       }
     }
     int *hier = static_cast<int *>(oproj_hier_barrier_ptr);
@@ -784,7 +845,7 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   __shared__ float red[16];
   bool const irms_cached = (irms_cache != nullptr) && (*irms_cache > 0.0f);
   float ssq = 0.0f;
-  if (!irms_cached) {
+  if (!irms_cached && !folded) {
     int const h4 = REDUCTION_SIZE >> 2;
     for (int i = tid; i < h4; i += (int)blockDim.x) {
       int base = i * 4;
@@ -804,6 +865,21 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   float irms;
   if (irms_cached) {
     irms = *irms_cache;
+  } else if (folded) {
+    // FOLDED_RANKS floats, read by one thread. The whole of Step 1 -- a 12 KB
+    // row read plus a two-level block reduction -- is this.
+    if (tid == 0) {
+      float tot = 0.0f;
+      for (int p = 0; p < folded_ranks; p++) {
+        tot += folded_lines[(size_t)p * folded_stride + NUM_EXPERTS];
+      }
+      red[0] = rsqrtf(tot / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
+    }
+    __syncthreads();
+    irms = red[0];
+    if (irms_cache != nullptr && tid == 0) {
+      *irms_cache = irms;
+    }
   } else {
 // Wave-level reduction (64 lanes)
 #pragma unroll
@@ -862,7 +938,62 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   // costs nothing and keeps the store in the writer's own L2).
   bool const write_normed = (first_expert == 0);
 
-  if constexpr (OPROJ_BARRIER) {
+  if (folded) {
+    // Both contractions are already reduced across the ranks, and the gate
+    // weight is not read here at all -- it was read once, transposed and four
+    // columns at a time, by the o_proj tiles that own those columns. What is
+    // left of Step 2 is the normed row the MoE quantizer reads.
+    //
+    // Every tile writes FOLD_COLS of it rather than tile 0 writing all of it.
+    // Unfolded, the one-writer rule was free: the write hid inside sixteen
+    // tiles' worth of gate GEMV. Folded there is no GEMV to hide inside, so a
+    // whole-row write on one tile is fifteen idle workers and a routing
+    // barrier that waits for all of it -- measured as +961 ns on this step
+    // and +0.38 ms/iter on RoutingWait. Split sixteen ways it is 384 columns
+    // per tile, already in registers from the Step 0 prefetch.
+    {
+      constexpr int FOLD_H4 = FOLD_COLS >> 2;
+#pragma unroll
+      for (int iter = 0; iter < FOLD_PF; iter++) {
+        int i_cur = tid + iter * 256;
+        if (i_cur >= FOLD_H4) {
+          break;
+        }
+        bf16 const *gp = reinterpret_cast<bf16 const *>(&fg_pf[iter]);
+        int const base = fold_col0 + i_cur * 4;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          d_normed[base + j] = __float2bfloat16(
+              __bfloat162float(d_hidden[base + j]) * irms *
+              __bfloat162float(gp[j]));
+        }
+      }
+    }
+    // irms factored out of the o_proj-side accumulation, applied once here.
+    //
+    // One lane per rank, not one thread per everything. These eight addresses
+    // are on the symmetric heap, written write-through by the peers and read
+    // on the far side of a buffer_inv, so every one of them is an uncached
+    // round trip -- and the loop as first written had all 256 threads reissue
+    // all eight of them per expert. 4096 uncached loads is why this step got
+    // *more* expensive after its GEMV was deleted (2282 -> 3187 ns). Only
+    // wave 0 runs it because only tid 0's copy is read, by the red[] store
+    // below; the other waves' slots are zeroed there.
+    if (wave == 0) {
+#pragma unroll
+      for (int e = 0; e < EXPERTS_PER_TILE; e++) {
+        float s = (lane < folded_ranks)
+                      ? folded_lines[(size_t)lane * folded_stride +
+                                     folded_expert_base + first_expert + e]
+                      : 0.0f;
+#pragma unroll
+        for (int off = 32; off > 0; off >>= 1) {
+          s += __shfl_xor(s, off);
+        }
+        dp[e] = s * irms;
+      }
+    }
+  } else if constexpr (OPROJ_BARRIER) {
     // Same arithmetic as the branch below, but iterating over the prefetch
     // slots so `iter` is a literal -- an array indexed by a runtime value
     // would be spilled to scratch and the prefetch would be worthless.
@@ -961,14 +1092,36 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   // waves is the ceiling, and nothing here wants to go that wide.
   static_assert(EXPERTS_PER_TILE * NUM_WAVES <= 16,
                 "red[] holds NUM_WAVES partial sums per expert");
+  if (folded) {
+    // dp is already whole and identical in every thread -- there is nothing
+    // to reduce. Land it in the slot the store below reads so that store stays
+    // one code path.
+    //
+    // The sync is not the store's; it is irms's. Step 1's folded branch left
+    // irms in red[0], and on this path Step 2 is empty for 15 of 16 tiles, so
+    // wave 0 can reach the overwrite below before wave 3 has read it. The
+    // legacy path is only safe here because its Step 2 is thousands of cycles
+    // long, which is not a property worth inheriting.
+    __syncthreads();
+    if (tid == 0) {
 #pragma unroll
-  for (int e = 0; e < EXPERTS_PER_TILE; e++) {
-#pragma unroll
-    for (int off = 32; off > 0; off >>= 1) {
-      dp[e] += __shfl_xor(dp[e], off);
+      for (int e = 0; e < EXPERTS_PER_TILE; e++) {
+        for (int w = 1; w < NUM_WAVES; w++) {
+          red[e * NUM_WAVES + w] = 0.0f;
+        }
+        red[e * NUM_WAVES] = dp[e];
+      }
     }
-    if (lane == 0) {
-      red[e * NUM_WAVES + wave] = dp[e];
+  } else {
+#pragma unroll
+    for (int e = 0; e < EXPERTS_PER_TILE; e++) {
+#pragma unroll
+      for (int off = 32; off > 0; off >>= 1) {
+        dp[e] += __shfl_xor(dp[e], off);
+      }
+      if (lane == 0) {
+        red[e * NUM_WAVES + wave] = dp[e];
+      }
     }
   }
   __syncthreads();

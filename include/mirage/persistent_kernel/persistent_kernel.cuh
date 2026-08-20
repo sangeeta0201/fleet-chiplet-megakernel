@@ -4465,7 +4465,7 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
     // refresh only the first 24/11 slots and leave the LM-head pointers
     // holding layer 0's values for every later layer. Sizing to the TaskDesc
     // capacity keeps this correct for any variant.
-    constexpr int ML_N_IN = MAX_INPUTS_PER_TASK;   // 32
+    constexpr int ML_N_IN = MAX_INPUTS_PER_TASK;
     constexpr int ML_N_OUT = MAX_OUTPUTS_PER_TASK; // 13
     int n_tasks_pre = (int)all_tasks.size();
     int n_events_pre = (int)all_events.size();

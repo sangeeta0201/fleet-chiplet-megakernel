@@ -304,7 +304,15 @@ template <
     int WUK_ROWS_PER_WG = 0,
     // Experts per router tile; `router_tile_n` below is the tile count, not
     // the expert count. See Phase 3 in gang_oproj_router_fused_mi300.cuh.
-    int ROUTER_EXPERTS_PER_TILE = 1>
+    int ROUTER_EXPERTS_PER_TILE = 1,
+    // ── the router fold ───────────────────────────────────────────────────
+    // Move the router's two contractions -- the gate GEMV and the RMSNorm's
+    // sum-of-squares -- out of Phase 3 and into the o_proj epilogue that
+    // already produced the row they contract over, reducing them across the
+    // ranks on the all-gather rendezvous instead of after it. Adds two
+    // inputs; needs the o_proj column shard, so it is EP-only.
+    // See ROUTER_FOLD in gang_oproj_router_fused_mi300.cuh.
+    bool ROUTER_FOLD = false>
 __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     // Pointer arrays are passed whole rather than unpacked into 38 named
     // parameters, which is what gpt-oss's full-layer task does and for the
@@ -387,6 +395,14 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
   // the gap when W_UV is absorbed, so either can be on alone.
   constexpr int FL_WUK_WEIGHT_IN =
       FL_WUV_WEIGHT_IN + ((WUV_ROWS_PER_WG > 0) ? 1 : 0);
+  // The fold's pair, appended last and closing both gaps ahead of it, so it
+  // does not renumber under either un-absorption. Unlike the W_UV / W_UK
+  // slots these cannot be read unconditionally: nothing is allocated for them
+  // when the fold is off, so the index would run past the end of the list.
+  // That is what ROUTER_FOLD is for -- the guard has to be compile-time.
+  constexpr int FL_ROUTER_WT_IN =
+      FL_WUK_WEIGHT_IN + ((WUK_ROWS_PER_WG > 0) ? 1 : 0);
+  constexpr int FL_ROUTER_PARTS_IN = FL_ROUTER_WT_IN + 1;
   constexpr int FL_QNOPE_OUT = (WUV_ROWS_PER_WG > 0) ? 12 : 11;
   // Phase 8b's W_UV -> o_proj barrier. The MoE half's own [30 .. 38] would
   // land on top of the router counter here, so it gets its own base past the
@@ -1466,7 +1482,14 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       // counter otherwise -- and a value read from a local counter is not the
       // value a peer would publish. input_ptrs[28] is the same signal array
       // Phase 9 uses; see OPROJ_EP_SIGNAL_SLOT for how the line is split.
-      /*ep_signal=*/(EP_WORLD_SIZE > 1 && ml_mode) ? input_ptrs[28] : nullptr);
+      /*ep_signal=*/(EP_WORLD_SIZE > 1 && ml_mode) ? input_ptrs[28] : nullptr,
+      // The fold reduces on this same all-gather's rendezvous, so it is off
+      // in exactly the cases the signal is: no EP, or the single-layer
+      // dispatch, which has no all-gather to ride.
+      /*router_weight_t=*/
+      (ROUTER_FOLD && ml_mode) ? input_ptrs[FL_ROUTER_WT_IN] : nullptr,
+      /*router_partials=*/
+      (ROUTER_FOLD && ml_mode) ? input_ptrs[FL_ROUTER_PARTS_IN] : nullptr);
   static_assert(OPROJ_EP_SIGNAL_STRIDE == FULL_LAYER_EP_SIGNAL_STRIDE &&
                     QB_EP_SIGNAL_STRIDE == FULL_LAYER_EP_SIGNAL_STRIDE,
                 "the o_proj and q_b all-gathers share the EP fold's signal "

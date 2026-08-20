@@ -103,7 +103,12 @@ typedef unsigned long long int EventCounter;
 // Raising them costs 8 XCDs * layers * 4 extra pointers -- ~12 KB at GLM's 46
 // layers -- and changes no semantics. Slots past a task's declared arity are
 // legitimately null; see the null-table diagnostic in persistent_kernel.cuh.
-int const MAX_INPUTS_PER_TASK = 32;
+// 34, not 32: the fused GLM layer's worst case is 29 fixed + EP pair + W_UV +
+// W_UK + the router fold's two, which is exactly 34. The fold's pair in
+// particular cannot fall back to "read an unallocated slot" the way the W_UV
+// and W_UK slots do, because it is indexed past the end of the list rather
+// than at a slot the codegen emits unconditionally.
+int const MAX_INPUTS_PER_TASK = 34;
 int const MAX_OUTPUTS_PER_TASK = 13;
 
 // Nil-address tripwire buffer geometry (see MPK_NIL_TRIPWIRE).

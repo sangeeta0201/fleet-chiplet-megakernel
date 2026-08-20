@@ -927,14 +927,14 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         std::make_tuple(15, 6, TASK_GANG_MLA_DECODE_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[24]; // tiles_per_xcd
   } else if (name == "gang_mla_full_layer_fused_mi300") {
-    assert(params.size() == 53 &&
+    assert(params.size() == 54 &&
            "gang_mla_full_layer_fused_mi300 takes the 25 attention params "
            "of gang_mla_attn_fused_mi300, the 17 MoE params of "
            "gang_oproj_router_fused_mi300 that are not already among them, "
            "then [ep_world_size, ep_my_pe, ep_fold_pe, ep_tail_only], "
            "[wuv_rows_per_wg, wuv_v_head_dim, wuv_tiles_per_xcd], "
-           "[qk_nope_head_dim, wuk_rows_per_wg, wuk_tiles_per_xcd] and "
-           "[router_experts_per_tile]");
+           "[qk_nope_head_dim, wuk_rows_per_wg, wuk_tiles_per_xcd], "
+           "[router_experts_per_tile] and [router_fold]");
     int variant_id =
         task_register->register_gang_mla_full_layer_fused_mi300_task(
             customized->bgraph, params);
@@ -950,11 +950,14 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     // the [bs, H*v_head] V workspace Phase 8b writes for o_proj to consume.
     // Un-absorbing kv_b_k adds another pair: the packed W_UK weight and the
     // [bs, H*(nope+rope)] nope scratch Phase 3 writes for Phase 3b to reduce.
+    // The router fold adds two more inputs and no output: the transposed
+    // rank-sliced gate weight and the symmetric partials scratch.
     bool const unabsorb_v = params[46] > 0;
     bool const unabsorb_k = params[50] > 0;
+    bool const router_fold = params[53] > 0;
     task_config[op] =
         std::make_tuple((params[42] > 1 ? 29 : 27) + (unabsorb_v ? 1 : 0) +
-                            (unabsorb_k ? 1 : 0),
+                            (unabsorb_k ? 1 : 0) + (router_fold ? 2 : 0),
                         11 + (unabsorb_v ? 1 : 0) + (unabsorb_k ? 1 : 0),
                         TASK_GANG_MLA_FULL_LAYER_FUSED_MI300,
                         variant_id);
