@@ -211,20 +211,11 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
     }
 #endif
 
-    // Reset input buffer to 0 (for split-k gate linear compatibility)
-    for (int ldg = 0; ldg < LDG_PER_THREAD; ++ldg) {
-      int src_offset = ldg * THREADS_PER_ROW * ELTS_PER_LDG;
-      for (int e = 0; e < ELTS_PER_LDG; ++e) {
-        thread_read_ptr[src_offset + e] = static_cast<T>(0);
-      }
-    }
-
-#ifdef MPK_ENABLE_SUBPHASE_TIMING
-    unsigned long long _tk_a3 = __builtin_amdgcn_s_memrealtime();
-    if (threadIdx.x == 0 && g_subphase_active) {
-      atomicAdd(&g_subphase_ns[7][2], (_tk_a3 - _tk_a2) * 10); // logit clear
-    }
-#endif
+    // The zero fill of the logit row used to sit here, ahead of selection.
+    // It now runs after it, because the sort-then-merge path below recovers
+    // the eight winners' unbiased weights by re-reading their logits, and a
+    // cleared row would hand it eight sigmoid(0) = 0.5. Nothing between the
+    // two reads the row, so the move is order-only.
 
     // No max/sum reduction here: sigmoid is elementwise, unlike softmax.
 
@@ -242,12 +233,111 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
       col[i] = start_col + i;
     }
 
+    // ── Branchless top-8 by sort-then-merge ────────────────────────────────
+    // The k-loop below runs K strictly dependent rounds: local argmax, a
+    // log2(THREADS_PER_ROW)-step shfl_xor reduce, then blank the winner so the
+    // next round can run. Nothing in it overlaps -- round k+1's argmax needs
+    // round k's blank, which needs round k's reduce -- and at GLM-5's 256
+    // experts on 32 lanes it measured 3454 ns of the router's 8590 ns serial
+    // tail (SP7[3] of SP6[4]), with 231 other blocks idle for all of it.
+    //
+    // Sorting has about the same operation count and no chain. Each lane
+    // bitonic-sorts its own VPT=8 keys -- six stages of four independent
+    // compare-exchanges -- and then log2(THREADS_PER_ROW) shfl_xor rounds each
+    // merge two descending 8-lists into the top 8 of their union: with both
+    // sorted descending, max(a[i], b[7-i]) is a bitonic sequence holding
+    // exactly those eight, and three more stages sort it. Every lane in the
+    // group ends with the same answer, so the winners need no final broadcast.
+    //
+    // One register per candidate, not three. The comparison key packs the
+    // expert id into the low 8 bits of the order-preserving u32 image of the
+    // biased score, so v_max_u32/v_min_u32 carry the id for free -- that is
+    // what deletes the two v_cndmask per compare that made the argmax's
+    // payload expensive, and it is why a network with more comparators than
+    // the k-loop has fewer instructions. The cost is eight mantissa bits of
+    // the *selection* key; the logits and the correction bias are both bf16
+    // (8-bit mantissa), so two experts that collide in the surviving 16 bits
+    // were already a tie, and the packed id then breaks it toward the higher
+    // id, deterministically. The emitted weight is never truncated: it is
+    // recomputed at full precision from the logit for the eight winners.
+    constexpr bool FAST_SORT_MERGE = (K_STATIC == 8) && (VPT == 8) &&
+                                     (LDG_PER_THREAD == 1) &&
+                                     (NUM_EXPERTS <= 256);
+    bool used_fast = false;
+#define MTK_D(i, j)                                                            \
+  {                                                                            \
+    unsigned _a = key[i], _b = key[j];                                         \
+    key[i] = _a > _b ? _a : _b;                                                \
+    key[j] = _a > _b ? _b : _a;                                                \
+  }
+#define MTK_A(i, j)                                                            \
+  {                                                                            \
+    unsigned _a = key[i], _b = key[j];                                         \
+    key[i] = _a > _b ? _b : _a;                                                \
+    key[j] = _a > _b ? _a : _b;                                                \
+  }
+    if constexpr (FAST_SORT_MERGE) {
+      if (k == 8) {
+        used_fast = true;
+        unsigned key[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          // Order-preserving float -> u32: flip the sign bit for positives,
+          // invert everything for negatives. Biased scores are sigmoid plus a
+          // signed correction bias, so both halves are reachable.
+          unsigned b = __float_as_uint(row_chunk[i]);
+          b = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+          key[i] = (b & 0xFFFFFF00u) | (unsigned)col[i];
+        }
+        // Bitonic sort of 8, descending: the textbook ascending network with
+        // every arrow reversed. MTK_D puts the larger at the lower index.
+        MTK_D(0, 1) MTK_A(2, 3) MTK_D(4, 5) MTK_A(6, 7)
+        MTK_D(0, 2) MTK_D(1, 3) MTK_A(4, 6) MTK_A(5, 7)
+        MTK_D(0, 1) MTK_D(2, 3) MTK_A(4, 5) MTK_A(6, 7)
+        MTK_D(0, 4) MTK_D(1, 5) MTK_D(2, 6) MTK_D(3, 7)
+        MTK_D(0, 2) MTK_D(1, 3) MTK_D(4, 6) MTK_D(5, 7)
+        MTK_D(0, 1) MTK_D(2, 3) MTK_D(4, 5) MTK_D(6, 7)
+#pragma unroll
+        for (int mask = 1; mask < THREADS_PER_ROW; mask <<= 1) {
+          unsigned o[8];
+#pragma unroll
+          for (int i = 0; i < 8; ++i) {
+            o[i] = (unsigned)__shfl_xor((int)key[i], mask, THREADS_PER_ROW);
+          }
+          // Reversing the partner's descending list and taking the elementwise
+          // max keeps exactly the top 8 of the 16, as a bitonic sequence.
+#pragma unroll
+          for (int i = 0; i < 8; ++i) {
+            unsigned const b = o[7 - i];
+            key[i] = key[i] > b ? key[i] : b;
+          }
+          MTK_D(0, 4) MTK_D(1, 5) MTK_D(2, 6) MTK_D(3, 7)
+          MTK_D(0, 2) MTK_D(1, 3) MTK_D(4, 6) MTK_D(5, 7)
+          MTK_D(0, 1) MTK_D(2, 3) MTK_D(4, 5) MTK_D(6, 7)
+        }
+        if (thread_group_idx == 0) {
+#pragma unroll
+          for (int i = 0; i < 8; ++i) {
+            int const e = (int)(key[i] & 0xFFu);
+            // Full precision, and from this lane's L1: the row was read a few
+            // hundred nanoseconds ago by this same wavefront.
+            float const s = fast_sigmoid(static_cast<float>(thread_row_ptr[e]));
+            topk_experts[i] = e;
+            topk_vals[i] = s;
+            row_sum_for_renorm += s;
+          }
+        }
+      }
+    }
+#undef MTK_D
+#undef MTK_A
+
     // topk_vals is 8 wide, so k has always been capped at 8 here; the unroll
     // bound just makes that cap explicit. The `break` is dead code whenever
     // K_STATIC == k, and it is what keeps the runtime-k callers correct.
     constexpr int K_UNROLL = (K_STATIC > 0) ? K_STATIC : 8;
 #pragma unroll
-    for (int k_idx = 0; k_idx < K_UNROLL; ++k_idx) {
+    for (int k_idx = 0; !used_fast && k_idx < K_UNROLL; ++k_idx) {
       if (k_idx >= k) {
         break;
       }
@@ -364,11 +454,34 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
     }
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
+    unsigned long long _tk_a3 = __builtin_amdgcn_s_memrealtime();
+    if (threadIdx.x == 0 && g_subphase_active) {
+      // Selection, whichever path ran: the sort-then-merge network, or the k
+      // dependent argmax passes it replaced. Measured from _tk_a2 now that the
+      // zero fill has moved past selection -- the slot still means the same
+      // thing, and SP7[2] still means the fill.
+      atomicAdd(&g_subphase_ns[7][3], (_tk_a3 - _tk_a2) * 10); // select
+    }
+#endif
+
+    // Reset input buffer to 0 (for split-k gate linear compatibility).
+    // Deliberately after selection: the winners' weights are recomputed from
+    // this row. Lane 0 read eight arbitrary elements of it a few instructions
+    // ago and every lane is about to overwrite its own eight, so drain first
+    // -- the addresses cross lanes, which is exactly the case neither the
+    // compiler's alias analysis nor same-wave VMEM ordering covers.
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    for (int ldg = 0; ldg < LDG_PER_THREAD; ++ldg) {
+      int src_offset = ldg * THREADS_PER_ROW * ELTS_PER_LDG;
+      for (int e = 0; e < ELTS_PER_LDG; ++e) {
+        thread_read_ptr[src_offset + e] = static_cast<T>(0);
+      }
+    }
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
     unsigned long long _tk_a4 = __builtin_amdgcn_s_memrealtime();
     if (threadIdx.x == 0 && g_subphase_active) {
-      // The k dependent argmax passes: eight rounds of an 8-wide branchless
-      // local argmax plus a five-step shfl_xor reduce over THREADS_PER_ROW=32.
-      atomicAdd(&g_subphase_ns[7][3], (_tk_a4 - _tk_a3) * 10); // k-loop select
+      atomicAdd(&g_subphase_ns[7][2], (_tk_a4 - _tk_a3) * 10); // logit clear
     }
 #endif
 
