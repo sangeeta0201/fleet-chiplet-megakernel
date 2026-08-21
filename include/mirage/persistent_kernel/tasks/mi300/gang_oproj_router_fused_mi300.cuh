@@ -706,7 +706,13 @@ __device__ __attribute__((always_inline)) void
     // that makes each rank's share of the two contractions well defined, so
     // there is no fold without the push. Both pointers null is the opt-out,
     // and the standalone dispatch takes it.
-    bool const router_fold = oproj_push && (router_weight_t_ptr != nullptr) &&
+    // BATCH_SIZE == 1: folded_lines carry ONE row's two contractions (the
+    // sum of squares and the per-expert gate dot), with no row index anywhere
+    // in the line layout. Widening it is a real design change, not a stride
+    // fix, and GLM_ROUTER_FOLD already measured neutral (96 ns), so the
+    // multi-row build simply takes the unfolded path.
+    bool const router_fold = (BATCH_SIZE == 1) && oproj_push &&
+                             (router_weight_t_ptr != nullptr) &&
                              (router_partials_ptr != nullptr);
     __hip_bfloat16 const *const d_norm_w =
         static_cast<__hip_bfloat16 const *>(norm_weight_ptr);
@@ -1063,9 +1069,12 @@ __device__ __attribute__((always_inline)) void
     static_assert(NUM_EXPERTS % (8 * ROUTER_EXPERTS_PER_TILE) == 0,
                   "the router's experts split evenly over the XCDs and then "
                   "over a tile; router_tile_n is that quotient");
-    __shared__ float s_router_irms;
-    if (tid == 0) {
-      s_router_irms = -1.0f;
+    // One cached 1/rms per query row. The router kernel treats a positive
+    // entry as "already computed", so every row must be poisoned, not just
+    // row 0.
+    __shared__ float s_router_irms[BATCH_SIZE];
+    if (tid < BATCH_SIZE) {
+      s_router_irms[tid] = -1.0f;
     }
     __syncthreads();
     for (int t = xcd_rank; t < router_tile_n; t += tiles_per_xcd) {
@@ -1104,7 +1113,7 @@ __device__ __attribute__((always_inline)) void
           oproj_expected,
           routing_ready,
           /*routing_epoch_hint=*/routing_expected,
-          /*irms_cache=*/&s_router_irms,
+          /*irms_cache=*/s_router_irms,
           // Under the fold both contractions are already done and reduced
           // across the ranks; the router's job shrinks to scaling by irms,
           // and it is handed the parity block's line 0 plus the offset of

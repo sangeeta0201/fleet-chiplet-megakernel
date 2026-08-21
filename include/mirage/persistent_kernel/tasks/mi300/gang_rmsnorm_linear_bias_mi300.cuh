@@ -848,29 +848,55 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   // for the same row. The cache is LDS written by tid 0 and read by all 256,
   // which is safe without a fence of its own: the producing call ends in
   // __syncthreads (Step 3) and this read is the next call's first LDS access.
-  __shared__ float red[16];
-  bool const irms_cached = (irms_cache != nullptr) && (*irms_cache > 0.0f);
-  float ssq = 0.0f;
+  // red[] carries, in order, the per-(row, wave) sum of squares and then the
+  // per-(row, expert, wave) gate partial. The second is the wider of the two.
+  // At BATCH_SIZE 1 this is the 16 floats it always was.
+  constexpr int RED_SLOTS = BATCH_SIZE * EXPERTS_PER_TILE * NUM_WAVES;
+  __shared__ float red[RED_SLOTS > 16 ? RED_SLOTS : 16];
+  // Separate from red[] rather than folded into it: the dp reduction below
+  // overwrites red while irms is still needed, and at BATCH_SIZE > 1 the
+  // read-then-overwrite ordering that made a single red[0] safe stops being
+  // obvious. BATCH_SIZE floats of LDS is not a number worth being clever for.
+  __shared__ float s_irms[BATCH_SIZE];
+  bool const irms_cached = (irms_cache != nullptr) && (irms_cache[0] > 0.0f);
+  float ssq[BATCH_SIZE];
+#pragma unroll
+  for (int m = 0; m < BATCH_SIZE; m++) {
+    ssq[m] = 0.0f;
+  }
   if (!irms_cached && !folded) {
     int const h4 = REDUCTION_SIZE >> 2;
     for (int i = tid; i < h4; i += (int)blockDim.x) {
       int base = i * 4;
-      float v0 = __bfloat162float(d_hidden[base]);
-      float v1 = __bfloat162float(d_hidden[base + 1]);
-      float v2 = __bfloat162float(d_hidden[base + 2]);
-      float v3 = __bfloat162float(d_hidden[base + 3]);
-      ssq += v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3;
+      // Rows are REDUCTION_SIZE apart; the row loop is unrolled so `m` stays
+      // a literal and ssq[] never leaves registers. At BATCH_SIZE 1 the row
+      // offset is a constant zero and this is the original loop.
+#pragma unroll
+      for (int m = 0; m < BATCH_SIZE; m++) {
+        bf16 const *hr = d_hidden + (size_t)m * REDUCTION_SIZE;
+        float v0 = __bfloat162float(hr[base]);
+        float v1 = __bfloat162float(hr[base + 1]);
+        float v2 = __bfloat162float(hr[base + 2]);
+        float v3 = __bfloat162float(hr[base + 3]);
+        ssq[m] += v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3;
+      }
     }
     // Scalar tail
     for (int i = (h4 << 2) + tid; i < REDUCTION_SIZE; i += (int)blockDim.x) {
-      float v = __bfloat162float(d_hidden[i]);
-      ssq += v * v;
+#pragma unroll
+      for (int m = 0; m < BATCH_SIZE; m++) {
+        float v = __bfloat162float(d_hidden[(size_t)m * REDUCTION_SIZE + i]);
+        ssq[m] += v * v;
+      }
     }
   }
 
-  float irms;
+  float irms[BATCH_SIZE];
   if (irms_cached) {
-    irms = *irms_cache;
+#pragma unroll
+    for (int m = 0; m < BATCH_SIZE; m++) {
+      irms[m] = irms_cache[m];
+    }
   } else if (folded) {
     // FOLDED_RANKS floats, read by one thread. The whole of Step 1 -- a 12 KB
     // row read plus a two-level block reduction -- is this.
@@ -879,38 +905,60 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
       for (int p = 0; p < folded_ranks; p++) {
         tot += folded_lines[(size_t)p * folded_stride + NUM_EXPERTS];
       }
-      red[0] = rsqrtf(tot / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
+      // The fold is single-row by construction -- the o_proj epilogue that
+      // produces folded_lines accumulates one row's two contractions -- and
+      // the caller disables it at BATCH_SIZE > 1 for exactly that reason.
+      s_irms[0] = rsqrtf(tot / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
     }
     __syncthreads();
-    irms = red[0];
+#pragma unroll
+    for (int m = 0; m < BATCH_SIZE; m++) {
+      irms[m] = s_irms[0];
+    }
     if (irms_cache != nullptr && tid == 0) {
-      *irms_cache = irms;
+#pragma unroll
+      for (int m = 0; m < BATCH_SIZE; m++) {
+        irms_cache[m] = irms[m];
+      }
     }
   } else {
-// Wave-level reduction (64 lanes)
+// Wave-level reduction (64 lanes), one chain per row
 #pragma unroll
-    for (int off = 32; off > 0; off >>= 1) {
-      ssq += __shfl_xor(ssq, off);
-    }
-
-    // Cross-wave reduction via LDS
-    if (lane == 0) {
-      red[wave] = ssq;
+    for (int m = 0; m < BATCH_SIZE; m++) {
+      float v = ssq[m];
+#pragma unroll
+      for (int off = 32; off > 0; off >>= 1) {
+        v += __shfl_xor(v, off);
+      }
+      // Cross-wave reduction via LDS
+      if (lane == 0) {
+        red[m * NUM_WAVES + wave] = v;
+      }
     }
     __syncthreads();
 
     if (tid == 0) {
-      float tot = 0.0f;
-      for (int w = 0; w < NUM_WAVES; w++) {
-        tot += red[w];
+#pragma unroll
+      for (int m = 0; m < BATCH_SIZE; m++) {
+        float tot = 0.0f;
+        for (int w = 0; w < NUM_WAVES; w++) {
+          tot += red[m * NUM_WAVES + w];
+        }
+        s_irms[m] = rsqrtf(tot / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
       }
-      red[0] = rsqrtf(tot / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
     }
     __syncthreads();
-    irms = red[0];
-    // `red` is reused by the dp reduction below, so the cache cannot alias it.
+#pragma unroll
+    for (int m = 0; m < BATCH_SIZE; m++) {
+      irms[m] = s_irms[m];
+    }
+    // `red` is reused by the dp reduction below; s_irms is not, which is why
+    // it is its own array.
     if (irms_cache != nullptr && tid == 0) {
-      *irms_cache = irms;
+#pragma unroll
+      for (int m = 0; m < BATCH_SIZE; m++) {
+        irms_cache[m] = irms[m];
+      }
     }
   }
 
@@ -928,12 +976,27 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   //
   // Gate weight layout: [chunk_N, REDUCTION_SIZE] bf16, row-major.
   // tile_idx = expert index within this XCD (0..chunk_N-1).
-  float dp[EXPERTS_PER_TILE];
+  // One dot product per (row, expert). The gate row is row-independent, so
+  // widening this costs BATCH_SIZE accumulators and no extra weight traffic --
+  // which is the whole reason the row loop sits INSIDE the k loop below.
+  float dp[BATCH_SIZE][EXPERTS_PER_TILE];
 #pragma unroll
-  for (int e = 0; e < EXPERTS_PER_TILE; e++) {
-    dp[e] = 0.0f;
+  for (int m = 0; m < BATCH_SIZE; m++) {
+#pragma unroll
+    for (int e = 0; e < EXPERTS_PER_TILE; e++) {
+      dp[m][e] = 0.0f;
+    }
   }
   bf16 const *my_gate = d_gate_w + (int64_t)first_expert * REDUCTION_SIZE;
+  // Rows past the live token count hold whatever the last step left behind,
+  // so their normed row and their logit are garbage. Computing them is free
+  // (the loops are unrolled on a compile-time bound); STORING them is not
+  // always harmless -- a NaN in a dead hidden row would reach the MoE
+  // quantizer -- so the stores, and only the stores, are masked.
+  int const live_rows =
+      (BATCH_SIZE == 1)
+          ? 1
+          : (num_active_tokens < BATCH_SIZE ? num_active_tokens : BATCH_SIZE);
 
   // Every worker walks the whole row for its own gate dot product, so every
   // worker *can* write the normed row -- and until now every worker did, all
@@ -970,7 +1033,7 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
 #pragma unroll
         for (int j = 0; j < 4; j++) {
           d_normed[base + j] = __float2bfloat16(
-              __bfloat162float(d_hidden[base + j]) * irms *
+              __bfloat162float(d_hidden[base + j]) * irms[0] *
               __bfloat162float(gp[j]));
         }
       }
@@ -996,7 +1059,7 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
         for (int off = 32; off > 0; off >>= 1) {
           s += __shfl_xor(s, off);
         }
-        dp[e] = s * irms;
+        dp[0][e] = s * irms[0];
       }
     }
   } else if constexpr (OPROJ_BARRIER) {
@@ -1011,29 +1074,40 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
         break;
       }
       int base = i * 4;
-      float h0 = __bfloat162float(d_hidden[base]);
-      float h1 = __bfloat162float(d_hidden[base + 1]);
-      float h2 = __bfloat162float(d_hidden[base + 2]);
-      float h3 = __bfloat162float(d_hidden[base + 3]);
-
       bf16 const *gp = reinterpret_cast<bf16 const *>(&g_pf[iter]);
-      float n0 = h0 * irms * __bfloat162float(gp[0]);
-      float n1 = h1 * irms * __bfloat162float(gp[1]);
-      float n2 = h2 * irms * __bfloat162float(gp[2]);
-      float n3 = h3 * irms * __bfloat162float(gp[3]);
+      // Row loop innermost so gamma and the EXPERTS_PER_TILE gate rows are
+      // fetched once and reused across rows; only d_hidden is re-read. At
+      // BATCH_SIZE 1 the offsets are constant zeroes and this is the loop it
+      // was.
+#pragma unroll
+      for (int m = 0; m < BATCH_SIZE; m++) {
+        bf16 const *hr = d_hidden + (size_t)m * REDUCTION_SIZE;
+        float h0 = __bfloat162float(hr[base]);
+        float h1 = __bfloat162float(hr[base + 1]);
+        float h2 = __bfloat162float(hr[base + 2]);
+        float h3 = __bfloat162float(hr[base + 3]);
 
-      if (write_normed) {
-        d_normed[base] = __float2bfloat16(n0);
-        d_normed[base + 1] = __float2bfloat16(n1);
-        d_normed[base + 2] = __float2bfloat16(n2);
-        d_normed[base + 3] = __float2bfloat16(n3);
-      }
+        float n0 = h0 * irms[m] * __bfloat162float(gp[0]);
+        float n1 = h1 * irms[m] * __bfloat162float(gp[1]);
+        float n2 = h2 * irms[m] * __bfloat162float(gp[2]);
+        float n3 = h3 * irms[m] * __bfloat162float(gp[3]);
+
+        if (write_normed && (BATCH_SIZE == 1 || m < live_rows)) {
+          bf16 *nr = d_normed + (size_t)m * REDUCTION_SIZE;
+          nr[base] = __float2bfloat16(n0);
+          nr[base + 1] = __float2bfloat16(n1);
+          nr[base + 2] = __float2bfloat16(n2);
+          nr[base + 3] = __float2bfloat16(n3);
+        }
 
 #pragma unroll
-      for (int e = 0; e < EXPERTS_PER_TILE; e++) {
-        bf16 const *wp = reinterpret_cast<bf16 const *>(&w_pf[e][iter]);
-        dp[e] += __bfloat162float(wp[0]) * n0 + __bfloat162float(wp[1]) * n1 +
-                 __bfloat162float(wp[2]) * n2 + __bfloat162float(wp[3]) * n3;
+        for (int e = 0; e < EXPERTS_PER_TILE; e++) {
+          bf16 const *wp = reinterpret_cast<bf16 const *>(&w_pf[e][iter]);
+          dp[m][e] += __bfloat162float(wp[0]) * n0 +
+                      __bfloat162float(wp[1]) * n1 +
+                      __bfloat162float(wp[2]) * n2 +
+                      __bfloat162float(wp[3]) * n3;
+        }
       }
     }
     static_assert(!OPROJ_BARRIER || (REDUCTION_SIZE % 4) == 0,
@@ -1043,52 +1117,61 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     int const h4 = REDUCTION_SIZE >> 2;
     for (int i = tid; i < h4; i += (int)blockDim.x) {
       int base = i * 4;
-      float h0 = __bfloat162float(d_hidden[base]);
-      float h1 = __bfloat162float(d_hidden[base + 1]);
-      float h2 = __bfloat162float(d_hidden[base + 2]);
-      float h3 = __bfloat162float(d_hidden[base + 3]);
-
       float g0 = __bfloat162float(d_gamma[base]);
       float g1 = __bfloat162float(d_gamma[base + 1]);
       float g2 = __bfloat162float(d_gamma[base + 2]);
       float g3 = __bfloat162float(d_gamma[base + 3]);
 
-      float n0 = h0 * irms * g0;
-      float n1 = h1 * irms * g1;
-      float n2 = h2 * irms * g2;
-      float n3 = h3 * irms * g3;
-
-      // Write normed output (redundant across 128 workers, idempotent).
-      // Needed by downstream MoE FP8 quant task.
-      if (write_normed) {
-        d_normed[base] = __float2bfloat16(n0);
-        d_normed[base + 1] = __float2bfloat16(n1);
-        d_normed[base + 2] = __float2bfloat16(n2);
-        d_normed[base + 3] = __float2bfloat16(n3);
-      }
-
-      // Gate GEMV: accumulate dot product
 #pragma unroll
-      for (int e = 0; e < EXPERTS_PER_TILE; e++) {
-        bf16 const *ge = my_gate + (int64_t)e * REDUCTION_SIZE;
-        float w0 = __bfloat162float(ge[base]);
-        float w1 = __bfloat162float(ge[base + 1]);
-        float w2 = __bfloat162float(ge[base + 2]);
-        float w3 = __bfloat162float(ge[base + 3]);
-        dp[e] += w0 * n0 + w1 * n1 + w2 * n2 + w3 * n3;
+      for (int m = 0; m < BATCH_SIZE; m++) {
+        bf16 const *hr = d_hidden + (size_t)m * REDUCTION_SIZE;
+        float h0 = __bfloat162float(hr[base]);
+        float h1 = __bfloat162float(hr[base + 1]);
+        float h2 = __bfloat162float(hr[base + 2]);
+        float h3 = __bfloat162float(hr[base + 3]);
+
+        float n0 = h0 * irms[m] * g0;
+        float n1 = h1 * irms[m] * g1;
+        float n2 = h2 * irms[m] * g2;
+        float n3 = h3 * irms[m] * g3;
+
+        // Write normed output (redundant across 128 workers, idempotent).
+        // Needed by downstream MoE FP8 quant task.
+        if (write_normed && (BATCH_SIZE == 1 || m < live_rows)) {
+          bf16 *nr = d_normed + (size_t)m * REDUCTION_SIZE;
+          nr[base] = __float2bfloat16(n0);
+          nr[base + 1] = __float2bfloat16(n1);
+          nr[base + 2] = __float2bfloat16(n2);
+          nr[base + 3] = __float2bfloat16(n3);
+        }
+
+        // Gate GEMV: accumulate dot product
+#pragma unroll
+        for (int e = 0; e < EXPERTS_PER_TILE; e++) {
+          bf16 const *ge = my_gate + (int64_t)e * REDUCTION_SIZE;
+          float w0 = __bfloat162float(ge[base]);
+          float w1 = __bfloat162float(ge[base + 1]);
+          float w2 = __bfloat162float(ge[base + 2]);
+          float w3 = __bfloat162float(ge[base + 3]);
+          dp[m][e] += w0 * n0 + w1 * n1 + w2 * n2 + w3 * n3;
+        }
       }
     }
     // Scalar tail
     for (int i = (h4 << 2) + tid; i < REDUCTION_SIZE; i += (int)blockDim.x) {
-      float h = __bfloat162float(d_hidden[i]);
       float g = __bfloat162float(d_gamma[i]);
-      float n = h * irms * g;
-      if (write_normed) {
-        d_normed[i] = __float2bfloat16(n);
-      }
 #pragma unroll
-      for (int e = 0; e < EXPERTS_PER_TILE; e++) {
-        dp[e] += __bfloat162float(my_gate[(int64_t)e * REDUCTION_SIZE + i]) * n;
+      for (int m = 0; m < BATCH_SIZE; m++) {
+        float h = __bfloat162float(d_hidden[(size_t)m * REDUCTION_SIZE + i]);
+        float n = h * irms[m] * g;
+        if (write_normed && (BATCH_SIZE == 1 || m < live_rows)) {
+          d_normed[(size_t)m * REDUCTION_SIZE + i] = __float2bfloat16(n);
+        }
+#pragma unroll
+        for (int e = 0; e < EXPERTS_PER_TILE; e++) {
+          dp[m][e] +=
+              __bfloat162float(my_gate[(int64_t)e * REDUCTION_SIZE + i]) * n;
+        }
       }
     }
   }
@@ -1096,8 +1179,8 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   // Wave-level reduction, then one LDS slot per (wave, expert). `red` is 16
   // floats, so EXPERTS_PER_TILE * NUM_WAVES has to fit -- 4 experts at four
   // waves is the ceiling, and nothing here wants to go that wide.
-  static_assert(EXPERTS_PER_TILE * NUM_WAVES <= 16,
-                "red[] holds NUM_WAVES partial sums per expert");
+  static_assert(BATCH_SIZE * EXPERTS_PER_TILE * NUM_WAVES <= 32,
+                "red[] holds NUM_WAVES partial sums per (row, expert)");
   if (folded) {
     // dp is already whole and identical in every thread -- there is nothing
     // to reduce. Land it in the slot the store below reads so that store stays
@@ -1115,30 +1198,41 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
         for (int w = 1; w < NUM_WAVES; w++) {
           red[e * NUM_WAVES + w] = 0.0f;
         }
-        red[e * NUM_WAVES] = dp[e];
+        red[e * NUM_WAVES] = dp[0][e];
       }
     }
   } else {
 #pragma unroll
-    for (int e = 0; e < EXPERTS_PER_TILE; e++) {
+    for (int m = 0; m < BATCH_SIZE; m++) {
 #pragma unroll
-      for (int off = 32; off > 0; off >>= 1) {
-        dp[e] += __shfl_xor(dp[e], off);
-      }
-      if (lane == 0) {
-        red[e * NUM_WAVES + wave] = dp[e];
+      for (int e = 0; e < EXPERTS_PER_TILE; e++) {
+        float v = dp[m][e];
+#pragma unroll
+        for (int off = 32; off > 0; off >>= 1) {
+          v += __shfl_xor(v, off);
+        }
+        if (lane == 0) {
+          red[(m * EXPERTS_PER_TILE + e) * NUM_WAVES + wave] = v;
+        }
       }
     }
   }
   __syncthreads();
 
-  // tid==0 writes logit + bias via write-through store
+  // tid==0 writes logit + bias via write-through store. One logit row per
+  // token; moe_gate_out is [batch, NUM_EXPERTS] and this pointer is already
+  // this XCD's column slice, so NUM_EXPERTS is still the row stride.
   if (tid == 0) {
+#pragma unroll
+    for (int m = 0; m < BATCH_SIZE; m++) {
+    if (BATCH_SIZE > 1 && m >= live_rows) {
+      break;
+    }
 #pragma unroll
     for (int e = 0; e < EXPERTS_PER_TILE; e++) {
       float s = 0.0f;
       for (int w = 0; w < NUM_WAVES; w++) {
-        s += red[e * NUM_WAVES + w];
+        s += red[(m * EXPERTS_PER_TILE + e) * NUM_WAVES + w];
       }
       // `noaux_tc` keeps its bias out of the logit -- it only steers
       // selection, and the weight that gets emitted comes from the unbiased
@@ -1148,8 +1242,9 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
         s += __bfloat162float(d_bias[first_expert + e]);
       }
       bf16 bval = __float2bfloat16(s);
-      st_wt_u16(&d_logits[first_expert + e],
+      st_wt_u16(&d_logits[(size_t)m * NUM_EXPERTS + first_expert + e],
                 *reinterpret_cast<unsigned short *>(&bval));
+    }
     }
   }
 
