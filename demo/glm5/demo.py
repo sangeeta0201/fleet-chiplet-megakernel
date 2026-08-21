@@ -1428,7 +1428,23 @@ if __name__ == "__main__":
               f" tasks (of {num_workers} workers)")
 
         y = make_tensor("embed_out", (bs, hidden_size))
-        rmsnorm_out = make_tensor("rmsnorm_out", (bs, hidden_size))
+        # MPK_QKV_PRO_HOIST publishes the quantized qkv_a row into the tail of
+        # this buffer, past the (bs, hidden_size) bf16 it nominally holds. Per
+        # XCD: bs (E4M3 row, one E8M0 per 128) pairs, then one 256 B line per
+        # token for the 6 slice partials and the 6 epoch stamps. The layout is
+        # duplicated in gang_mla_attn_fused_mi300.cuh -- keep the two in step.
+        # Always allocated: it is 53 KB against a 744B model, and sizing the
+        # buffer off a compile-time knob the Python side does not see is how a
+        # silent out-of-bounds store gets written.
+        # The room is taken as extra ROWS, not a wider row: the kernel finds the
+        # tail at bs * hidden_size * 2 bytes, so the row stride has to stay
+        # hidden_size or that offset lands inside token 1's activations.
+        _pub_tok = hidden_size + hidden_size // 128
+        _pub_part_off = ((_pub_tok * bs + 127) // 128) * 128
+        _pub_stride = ((_pub_part_off + bs * 256 + 255) // 256) * 256
+        _pub_rows = -(-8 * _pub_stride // (hidden_size * 2))
+        rmsnorm_out = make_tensor(
+            "rmsnorm_out", (bs + _pub_rows, hidden_size))
         qkv_a_out = make_tensor("qkv_a_out", (bs, qkv_a_pad))
         q_a_norm_out = make_tensor("q_a_norm_out", (bs, qkv_a_pad))
         # The absorbed q_b_proj writes the roped Q straight into this, so the

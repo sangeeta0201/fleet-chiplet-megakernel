@@ -421,24 +421,88 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // and the whole win here is ~5 us/layer, so a global barrier would eat it.
   // Every XCD folds its own copy to the same addresses -- identical bytes per
   // L2, which is exactly the argument `store_x`'s one-WG-per-XCD store makes.
+  // MPK_QKV_PRO_HOIST: hoist the WHOLE prologue, not just the fold.
+  //
+  // 48fea7f split the tile and the fold is the cheap third of the prologue:
+  // resolve + LDS staging + the RMSNorm reciprocal is 6.107 us of a 17.199 us
+  // tile, the quantizer another 0.869, and the MFMA K-loop that reads all 98 KB
+  // of weight is only 5.407 -- 90% of the per-CU byte roof. So the GEMM is
+  // saturated and 41% of the tile is a norm+quant that 192 tiles per layer per
+  // rank derive from the same 6144-element row. Hoisting the fold alone
+  // measured neutral (c72b559), which is consistent: the fold's 8 planes are
+  // L2-resident and were never the expensive part.
+  //
+  // The same six workgroups per XCD now fold, reduce, normalize and quantize,
+  // and publish E4M3 + one E8M0 per 128 into the tail of pre_norm_scratch --
+  // the buffer the fused path otherwise leaves unwritten. The tiles copy 6192
+  // bytes into LDS instead of staging 24 KB of bf16 and re-deriving. The
+  // release below is the fold's, unchanged, so the layer gains no rendezvous.
+#if defined(MPK_QKV_PRO_HOIST)
+  constexpr bool QKV_PRO_HOIST = (EP_PEER_SLOTS > 1);
+#else
+  constexpr bool QKV_PRO_HOIST = false;
+#endif
 #if defined(MPK_QKV_EP_FOLD)
-  constexpr bool QKV_EP_FOLD = (EP_PEER_SLOTS > 1);
+  constexpr bool QKV_EP_FOLD = (EP_PEER_SLOTS > 1) && !QKV_PRO_HOIST;
 #else
   constexpr bool QKV_EP_FOLD = false;
 #endif
-  if constexpr (QKV_EP_FOLD) {
-    constexpr int FOLD_WGS = 6; // 6144 / (256 * 4) = 6 float4 passes
+  // Per-XCD publish block in the tail of pre_norm_scratch, past the
+  // REDUCTION_SIZE bf16 the buffer nominally holds.
+  //
+  // Layout, per XCD: BATCH_SIZE consecutive (E4M3 row, E8M0 scales) pairs, then
+  // one 256 B line per token holding the PRO_WGS f32 partials and, 128 B on,
+  // the PRO_WGS epoch stamps. The tokens must not share stamps -- the second
+  // token would find the first's stamps already at this epoch and read its
+  // partials. The partials and the stamps get separate 128 B lines for the same
+  // reason: an nt read of a stamp must not be served a line that also carries a
+  // partial the writer has not stored yet. Only the leading pair is addressed
+  // by the consumer, which is why its stride is derivable from REDUCTION_SIZE
+  // alone.
+  constexpr int PRO_WGS = 6; // 6144 / (256 * 4) = 6 float4 passes
+  constexpr int PUB_DATA = QKV_REDUCTION_SIZE;
+  constexpr int PUB_SCALES = QKV_REDUCTION_SIZE / 128;
+  constexpr int PUB_TOK = PUB_DATA + PUB_SCALES;
+  constexpr int PUB_PART_OFF = ((PUB_TOK * BATCH_SIZE + 127) / 128) * 128;
+  constexpr int PUB_STRIDE =
+      ((PUB_PART_OFF + BATCH_SIZE * 256 + 255) / 256) * 256;
+  uint8_t *const pro_pub =
+      (uint8_t *)pre_norm_scratch_ptr +
+      (size_t)BATCH_SIZE * QKV_REDUCTION_SIZE * 2 + (size_t)xcd_id * PUB_STRIDE;
+
+  if constexpr (QKV_PRO_HOIST || QKV_EP_FOLD) {
+    constexpr int FOLD_WGS = PRO_WGS;
     if (xcd_rank < FOLD_WGS) {
       for (int tok = 0; tok < num_active_tokens; tok++) {
-        _rnlm8_ep_fold_slice<QKV_REDUCTION_SIZE,
+        if constexpr (QKV_PRO_HOIST) {
+          _rnlm8_pro_publish<QKV_REDUCTION_SIZE,
+                             QKV_ACTUAL_HIDDEN,
                              EP_PEER_SLOTS,
                              BATCH_SIZE * QKV_REDUCTION_SIZE,
                              FOLD_WGS>(
-            static_cast<unsigned short const *>(x_ptr) +
-                tok * QKV_REDUCTION_SIZE,
-            static_cast<unsigned short *>(x_out_ptr) +
-                tok * QKV_REDUCTION_SIZE,
-            xcd_rank);
+              static_cast<unsigned short const *>(x_ptr) +
+                  tok * QKV_REDUCTION_SIZE,
+              static_cast<unsigned short *>(x_out_ptr) +
+                  tok * QKV_REDUCTION_SIZE,
+              static_cast<unsigned short const *>(pre_norm_weight_ptr),
+              pro_pub + tok * PUB_TOK,
+              pro_pub + tok * PUB_TOK + PUB_DATA,
+              (int *)(pro_pub + PUB_PART_OFF + tok * 256),
+              (int *)(pro_pub + PUB_PART_OFF + tok * 256 + 128),
+              xcd_rank,
+              qkv_expected,
+              /*eps=*/1e-5f);
+        } else {
+          _rnlm8_ep_fold_slice<QKV_REDUCTION_SIZE,
+                               EP_PEER_SLOTS,
+                               BATCH_SIZE * QKV_REDUCTION_SIZE,
+                               FOLD_WGS>(
+              static_cast<unsigned short const *>(x_ptr) +
+                  tok * QKV_REDUCTION_SIZE,
+              static_cast<unsigned short *>(x_out_ptr) +
+                  tok * QKV_REDUCTION_SIZE,
+              xcd_rank);
+        }
       }
     }
     __syncthreads();
@@ -493,11 +557,15 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
                                           /*WRITE_THROUGH=*/true,
                                           /*FUSE_RESADD=*/true,
                                           EP_PEER_SLOTS,
-                                          /*EP_PRE_FOLDED=*/QKV_EP_FOLD,
-                                          /*SP_QKV=*/true>(
+                                          /*EP_PRE_FOLDED=*/QKV_EP_FOLD ||
+                                              QKV_PRO_HOIST,
+                                          /*SP_QKV=*/true,
+                                          /*PRO_PUB=*/QKV_PRO_HOIST>(
         // Pre-folded, the resolved row is in x_out_ptr and the gather buffer
         // is not read again.
-        /*norm_input_ptr=*/QKV_EP_FOLD ? (void const *)x_out_ptr : x_ptr,
+        /*norm_input_ptr=*/(QKV_EP_FOLD || QKV_PRO_HOIST)
+            ? (void const *)x_out_ptr
+            : x_ptr,
         pre_norm_weight_ptr,
         pre_norm_scratch_ptr,
         qkv_weight_ptr,
@@ -508,7 +576,8 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         qkv_output_stride,
         t,
         moe_ws_f32_ptr,
-        x_out_ptr);
+        x_out_ptr,
+        pro_pub);
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     if (tid == 0 && g_subphase_active) {
       atomicAdd(&g_subphase_ns[0][0],

@@ -568,6 +568,18 @@ def get_compile_command(
             # eight. CORRECT OUTPUT -- same addresses, same summation order,
             # same bf16 rounding. Removes 20.7 -> 2.6 MB/layer/rank.
             flags = flags + ["-DMPK_QKV_EP_FOLD"]
+        if int(os.environ.get("MPK_QKV_PRO_HOIST", "0")) == 1:
+            # Hoist the WHOLE qkv_a prologue, not just the fold: the same six
+            # workgroups per XCD fold, block-reduce the sum of squares across
+            # the six slices, normalize and quantize, and publish E4M3 + one
+            # E8M0 per 128 into the tail of rmsnorm_out. The 24 tiles copy 6192
+            # bytes into LDS instead of staging 24 KB of bf16 and re-deriving
+            # the norm 24 times. 48fea7f measured that prologue at 40.4% of a
+            # 17.20 us tile against a K-loop already at 90% of its byte roof.
+            # Supersedes MPK_QKV_EP_FOLD, which this disables. Compile-time and
+            # in MPK_FORWARD_VARS: it changes the XCD-local release's writer
+            # set, so a rank that misses it deadlocks.
+            flags = flags + ["-DMPK_QKV_PRO_HOIST"]
         if int(os.environ.get("MPK_BAR_TREE", "0")) == 1:
             # Two-level arrival for every GPU-wide Mechanism-C rendezvous:
             # 29 atomics on the XCD's own line, then 8 on the global one,

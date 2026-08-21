@@ -364,6 +364,198 @@ _rnlm8_ep_fold_slice(unsigned short const *__restrict__ d_res,
   }
 }
 
+// ── The hoisted prologue ─────────────────────────────────────────────────
+// _rnlm8_ep_fold_slice hoists the EP reduction and stops there, so every tile
+// still stages the row and the norm weight into LDS, still block-reduces the
+// sum of squares, and still quantizes -- 6.98 us of a 17.20 us qkv_a tile,
+// derived 192 times per layer per rank from one 6144-element row (48fea7f).
+// The fold was the cheap third of that and hoisting it alone measured neutral
+// (c72b559); this hoists the whole thing.
+//
+// PRO_WGS workgroups per XCD each take one slice. A slice folds its columns,
+// publishes the resolved bf16 to d_x_out exactly as the fold did, and squares
+// what it stored. The sum of squares is the only cross-slice term, so the
+// slices exchange it and nothing else: each writes its partial and then an
+// epoch stamp, and each spins until all PRO_WGS stamps carry this layer's
+// epoch. Stamping instead of counting is what keeps the buffer from needing to
+// be zeroed between layers -- a counter would, and there is no phase left in
+// the layer that could do it.
+//
+// Then each slice normalizes and quantizes its own columns into the publish
+// buffer, in the layout the consumer's LDS wants: E4M3 bytes at [base] and one
+// E8M0 per 128 at [base/128], which is _gang_wave_parallel_fp8_quant_rmsnorm's
+// own layout, called here on the slice. That is legal only because a slice is
+// a whole number of 128-element scale groups; the static_assert below is the
+// load-bearing one.
+//
+// The exchange is XCD-local and PRO_WGS wide, not a rendezvous: every XCD runs
+// its own copy writing the same bytes to its own L2, the same
+// identical-value-per-L2 argument store_x and the fold already rely on. The 24
+// tiles are released by the XCD-local flag the fold already built, so the
+// layer gains no barrier.
+//
+// The squares are taken on the ROUNDED bf16, not on the f32 accumulator. The
+// un-hoisted prologue reads the row back out of memory as bf16, so squaring
+// the wider value here would give a different rms_rcp and the hoist would not
+// be a refactor.
+//
+// ── MEASURED NEUTRAL. Defaulted off; MPK_QKV_PRO_HOIST=1 turns it on. ──
+// Correct output: 4/4 correctness prompts, generated text read, all 8 ranks
+// identical. Alternated OFF/ON/OFF/ON/OFF/ON in one batch, one -D the variable:
+//
+//   OFF  10.620 / 10.880 / 10.882   mean 10.794
+//   ON   11.036 / 10.882 / 11.026   mean 10.981   (+0.187 ms)
+//
+// Inside the 0.26 ms noise floor and the wrong sign. The 6.98 us this deletes
+// from each of 24 tiles is real, and it does not show up, because the 24 tiles
+// were deriving it CONCURRENTLY -- 24 workgroups each spending 6.98 us at the
+// same time is 6.98 us of makespan, not 168. What replaces it is serial: six
+// workgroups fold, exchange six partials through L2 (a spin, not a barrier, but
+// still a round trip), quantize, and only then does the 29-arrival release let
+// the tiles start. Publish + release costs about what the deleted prologue
+// cost, so the phase is a wash.
+//
+// The general form, and this is the seventh instance: deleting redundant work
+// inside a GLM phase is absorbed unless the redundancy was SERIAL. Hoisting
+// converts parallel redundancy into a serial producer plus a rendezvous, and at
+// GLM's per-phase occupancy that trade is at best even. Price the hoisted
+// producer's own makespan against the per-tile saving before building one.
+template <int REDUCTION_SIZE,
+          int ACTUAL_HIDDEN_DIM,
+          int EP_PEER_SLOTS,
+          int EP_SLOT_ELEMS,
+          int PRO_WGS>
+__device__ __forceinline__ void
+_rnlm8_pro_publish(unsigned short const *__restrict__ d_res,
+                   unsigned short *__restrict__ d_x_out,
+                   unsigned short const *__restrict__ d_nw,
+                   uint8_t *__restrict__ pub_fp8,
+                   uint8_t *__restrict__ pub_scales,
+                   int *__restrict__ pub_part,
+                   int *__restrict__ pub_flag,
+                   int slice,
+                   int epoch,
+                   float eps) {
+  constexpr int SLICE_ELEMS = REDUCTION_SIZE / PRO_WGS;
+  constexpr int VEC = 4;
+  constexpr int NTHREADS = 256;
+  constexpr int ITERS = SLICE_ELEMS / (NTHREADS * VEC);
+  static_assert(REDUCTION_SIZE % (PRO_WGS * 128) == 0,
+                "a prologue slice must be a whole number of 128-element E8M0 "
+                "groups, or the published scales do not line up with the "
+                "consumer's");
+  static_assert(SLICE_ELEMS % (NTHREADS * VEC) == 0 && ITERS >= 1,
+                "a prologue slice must be a whole number of 256 x float4 "
+                "passes, the walk _rnlm8_ep_fold_slice uses");
+
+  int const tid = threadIdx.x;
+  int const base = slice * SLICE_ELEMS;
+  float ssq = 0.0f;
+
+#pragma unroll 1
+  for (int v = 0; v < ITERS; v++) {
+    int const off = base + (v * NTHREADS + tid) * VEC;
+    float f[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (int p = 0; p < EP_PEER_SLOTS; p++) {
+      uint2 const pk = *reinterpret_cast<uint2 const *>(
+          d_res + (size_t)p * EP_SLOT_ELEMS + off);
+      f[0] += _gang_bf16_to_float((unsigned short)pk.x);
+      f[1] += _gang_bf16_to_float((unsigned short)(pk.x >> 16));
+      f[2] += _gang_bf16_to_float((unsigned short)pk.y);
+      f[3] += _gang_bf16_to_float((unsigned short)(pk.y >> 16));
+    }
+    unsigned short const b[4] = {
+        _gang_float_to_bf16(f[0]), _gang_float_to_bf16(f[1]),
+        _gang_float_to_bf16(f[2]), _gang_float_to_bf16(f[3])};
+    st_wt_u64((void *)(d_x_out + off),
+              (unsigned long long)((unsigned)b[0] | ((unsigned)b[1] << 16)) |
+                  ((unsigned long long)((unsigned)b[2] |
+                                        ((unsigned)b[3] << 16))
+                   << 32));
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      float const q = _gang_bf16_to_float(b[i]);
+      ssq += q * q;
+    }
+  }
+
+  // Block-reduce this slice's partial. rmsnorm_rcp_amd's Phase 3, verbatim.
+#pragma unroll
+  for (int offset = 32; offset > 0; offset >>= 1) {
+    ssq += __shfl_xor(ssq, offset);
+  }
+  __shared__ float pro_red[16];
+  int const wave_id = tid >> 6;
+  int const lane_id = tid & 63;
+  int const num_waves = blockDim.x >> 6;
+  if (lane_id == 0) {
+    pro_red[wave_id] = ssq;
+  }
+  __syncthreads();
+  if (wave_id == 0) {
+    ssq = (lane_id < num_waves) ? pro_red[lane_id] : 0.0f;
+    for (int offset = num_waves >> 1; offset > 0; offset >>= 1) {
+      ssq += __shfl_xor(ssq, offset);
+    }
+    if (lane_id == 0) {
+      pro_red[0] = ssq;
+    }
+  }
+  __syncthreads();
+
+  // Exchange the PRO_WGS partials. Write-through past L1 and read back nt, the
+  // same pairing every XCD-local flag in this file uses; the partial has to be
+  // ordered before the stamp or a peer can read a stale float under a fresh
+  // epoch.
+  if (tid == 0) {
+    union {
+      float f;
+      unsigned u;
+    } pv;
+    pv.f = pro_red[0];
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    st_wt_u32((void *)(pub_part + slice), pv.u);
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    st_wt_u32((void *)(pub_flag + slice), (unsigned)epoch);
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+
+    float tot = 0.0f;
+#pragma unroll 1
+    for (int w = 0; w < PRO_WGS; w++) {
+      int _spins = 0;
+      while (ld_nt_s32(pub_flag + w) < epoch) {
+        ++_spins;
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+#pragma unroll 1
+    for (int w = 0; w < PRO_WGS; w++) {
+      union {
+        float f;
+        unsigned u;
+      } rv;
+      rv.u = (unsigned)ld_nt_s32(pub_part + w);
+      tot += rv.f;
+    }
+    pro_red[0] = rsqrtf(tot / float(ACTUAL_HIDDEN_DIM) + eps);
+  }
+  __syncthreads();
+  float const rms_rcp = pro_red[0];
+
+  // d_x_out was written through this WG's own L1; drop the stale lines before
+  // the quantizer reads them back.
+  asm volatile("buffer_inv" ::: "memory");
+  _gang_wave_parallel_fp8_quant_rmsnorm<SLICE_ELEMS,
+                                        /*SRC_IS_GLOBAL=*/true>(
+      d_x_out + base,
+      d_nw + base,
+      rms_rcp,
+      pub_fp8 + base,
+      pub_scales + base / 128);
+  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+}
+
 //
 // ── PRE_FOLDED ───────────────────────────────────────────────────────────
 // The argument above -- "making the consumer BE the reduction leaves no
@@ -651,7 +843,12 @@ template <int BATCH_SIZE,
           // With the split owned by one call site, [1][2][3] are qkv_a's
           // prologue / quantizer / MFMA and [1][5] is its own tile count, so
           // the three divide out against the [0][0] whole-tile timer.
-          bool SP_QKV = false>
+          bool SP_QKV = false,
+          // The prologue was hoisted: a group ahead of this phase published
+          // the quantized row and `pro_pub_ptr` points at it, so Step 1+2 and
+          // the quantizer are both deleted and the tile copies E4M3 + E8M0
+          // into LDS instead of deriving them. See _rnlm8_pro_publish.
+          bool PRO_PUB = false>
 __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     void const *norm_input_ptr,  // [batch, REDUCTION_SIZE] bf16
     void const *norm_weight_ptr, // [REDUCTION_SIZE] bf16
@@ -668,7 +865,10 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     // norm_input_ptr, which under the fold holds the unresolved residual
     // stream rather than a finished row.
     void const *resadd_workspace_f32_ptr = nullptr, // [batch, REDUCTION_SIZE] f32
-    void *resadd_x_out_ptr = nullptr) {             // [batch, REDUCTION_SIZE] bf16
+    void *resadd_x_out_ptr = nullptr,               // [batch, REDUCTION_SIZE] bf16
+    // PRO_PUB only: this XCD's published prologue. REDUCTION_SIZE bytes of
+    // E4M3 followed by REDUCTION_SIZE/128 bytes of E8M0.
+    void const *pro_pub_ptr = nullptr) {
 
   static_assert(OUTPUT_PER_WG % 16 == 0,
                 "OUTPUT_PER_WG must be multiple of 16");
@@ -855,10 +1055,18 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
   //
   // The loop over batch rows goes too: it normalized every row of the batch on
   // every block and then used one. rms_rcp is this block's own token's.
+  //
+  // PRO_PUB deletes this whole step. A group of workgroups ahead of the phase
+  // has already resolved the row, taken the RMSNorm reciprocal and quantized,
+  // and published E4M3 + one E8M0 per 128 -- exactly what the quantizer below
+  // would have written into LDS. See _rnlm8_pro_publish.
   (void)norm_output_ptr;
-  unsigned short const *input_row;
-  float rms_rcp;
-  if constexpr (FUSE_RESADD) {
+  unsigned short const *input_row = nullptr;
+  float rms_rcp = 0.0f;
+  if constexpr (PRO_PUB) {
+    (void)resadd_workspace_f32_ptr;
+    (void)resadd_x_out_ptr;
+  } else if constexpr (FUSE_RESADD) {
     // norm_input_ptr is the *residual*, not an already-resolved row: the row
     // this pass normalizes does not exist yet, it is workspace + residual, and
     // producing it is what this pass does.
@@ -954,16 +1162,50 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     _sp_t1 = __builtin_amdgcn_s_memrealtime();
   }
 #endif
-  _gang_wave_parallel_fp8_quant_rmsnorm<REDUCTION_SIZE,
-                                        /*SRC_IS_GLOBAL=*/!FUSE_RESADD &&
-                                            !LDS_PROLOGUE,
-                                        /*NW_IS_LDS=*/LDS_PROLOGUE,
-                                        /*BARRIER_LDS_ONLY=*/HOIST_PREFILL>(
-      input_row,
-      LDS_PROLOGUE ? s_nw_bf16 : (unsigned short const *)norm_weight_ptr,
-      rms_rcp,
-      s_tok_fp8,
-      s_tok_scales);
+  if constexpr (PRO_PUB) {
+    // Straight copy of the published row into the LDS the MFMA loop reads.
+    // FP8_TOK_DATA bytes of E4M3 plus REDUCTION_SIZE/128 E8M0 -- 6144 + 48 at
+    // qkv_a's shape, against the 24 KB of bf16 the deleted prologue staged.
+    // dwordx4 over the data, bytes over the tail of the scales.
+    constexpr int PUB_SCALES = REDUCTION_SIZE / 128;
+    // The publisher lays the tokens out back to back, row then scales, so this
+    // stride is derivable here without knowing the rest of its block.
+    uint8_t const *pub = (uint8_t const *)pro_pub_ptr +
+                         (size_t)tok_idx * (FP8_TOK_DATA + PUB_SCALES);
+    using gu32 = __attribute__((address_space(1))) unsigned const *;
+    int4 *s4 = (int4 *)s_tok_fp8;
+    gu32 g4 = (gu32)pub;
+    for (int i = tid; i < FP8_TOK_DATA / 16; i += blockDim.x) {
+      int4 v;
+      v.x = (int)g4[i * 4 + 0];
+      v.y = (int)g4[i * 4 + 1];
+      v.z = (int)g4[i * 4 + 2];
+      v.w = (int)g4[i * 4 + 3];
+      s4[i] = v;
+    }
+    using gu8 = __attribute__((address_space(1))) uint8_t const *;
+    gu8 gs = (gu8)(pub + FP8_TOK_DATA);
+    for (int i = tid; i < PUB_SCALES; i += blockDim.x) {
+      s_tok_scales[i] = gs[i];
+    }
+    if constexpr (HOIST_PREFILL) {
+      asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+      __builtin_amdgcn_s_barrier();
+    } else {
+      __syncthreads();
+    }
+  } else {
+    _gang_wave_parallel_fp8_quant_rmsnorm<REDUCTION_SIZE,
+                                          /*SRC_IS_GLOBAL=*/!FUSE_RESADD &&
+                                              !LDS_PROLOGUE,
+                                          /*NW_IS_LDS=*/LDS_PROLOGUE,
+                                          /*BARRIER_LDS_ONLY=*/HOIST_PREFILL>(
+        input_row,
+        LDS_PROLOGUE ? s_nw_bf16 : (unsigned short const *)norm_weight_ptr,
+        rms_rcp,
+        s_tok_fp8,
+        s_tok_scales);
+  }
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   if (_sp_rec) {
