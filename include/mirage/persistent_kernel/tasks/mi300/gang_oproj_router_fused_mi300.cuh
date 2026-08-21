@@ -581,6 +581,10 @@ __device__ __attribute__((always_inline)) void
 
   if (xcd_rank < oproj_topk_tiles_per_xcd) {
     MPK_WS_PHASE(71, routing_expected, xcd_id);
+    // Stage stamp 29: o_proj/router worker set entered (SUBSET: xcd_rank < oproj_topk_tiles_per_xcd).
+    if (tid == 0) {
+      mpk_stage_stamp(29);
+    }
     // ══════════════════════════════════════════════════════════════════════
     // Phase 1: absorbed o_proj (MXFP8 GEMV + residual)
     // ══════════════════════════════════════════════════════════════════════
@@ -835,6 +839,10 @@ __device__ __attribute__((always_inline)) void
     }
 
     MPK_WS_PHASE(72, routing_expected, xcd_id);
+    // Stage stamp 30: o_proj GEMV + residual tiles done (SUBSET).
+    if (tid == 0) {
+      mpk_stage_stamp(30);
+    }
     // ══════════════════════════════════════════════════════════════════════
     // Phase 2: o_proj -> router barrier (arrival only)
     // ══════════════════════════════════════════════════════════════════════
@@ -1006,6 +1014,10 @@ __device__ __attribute__((always_inline)) void
 #endif
 
     MPK_WS_PHASE(73, routing_expected, xcd_id);
+    // Stage stamp 31: o_proj -> router barrier arrival done (SUBSET).
+    if (tid == 0) {
+      mpk_stage_stamp(31);
+    }
     // ══════════════════════════════════════════════════════════════════════
     // Phase 3: RMSNorm + router GEMV + sigmoid/bias TopK
     // ══════════════════════════════════════════════════════════════════════
@@ -1098,6 +1110,10 @@ __device__ __attribute__((always_inline)) void
   }
 
   MPK_WS_PHASE(74, routing_expected, xcd_id);
+  // Stage stamp 32: RMSNorm + router GEMV + sigmoid/bias TopK done (all workers).
+  if (tid == 0) {
+    mpk_stage_stamp(32);
+  }
   // ════════════════════════════════════════════════════════════════════════
   // Phase 4: wait for routing
   // ════════════════════════════════════════════════════════════════════════
