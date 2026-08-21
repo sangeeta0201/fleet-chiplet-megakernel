@@ -1953,12 +1953,8 @@ if __name__ == "__main__":
             # and a real merge phase, which one KV chunk does not have.
             fuse_attn = (FUSE_ATTN and DENSE_MXFP8 and QB_MXFP8
                          and num_kv_chunks > 1)
-            # More than one live row forces it, because the unfused chain it
-            # would otherwise take is single-row in two places at once:
-            # gang_mla_decode_layer has no tok_back, so row 0 attends over the
-            # whole prefill chunk instead of its causal prefix, and the merge's
-            # grid is (max_num_batched_requests, q_groups * dim_splits) with no
-            # token axis at all, so row 1 is never written.
+            # The bs > 1 break lived here and it is fixed, but not by forcing
+            # this flag -- read the history before re-adding that force.
             #
             # Measured, dense prologue layer 0, prompt "The capital of France
             # is", the o_proj's view of attn_out:
@@ -1968,21 +1964,34 @@ if __name__ == "__main__":
             #   row 1     --              0.000000
             #
             # while that layer's INPUT (x, and q_b's 2048-wide norm input) was
-            # bit-identical between the two arms -- so this pair is the whole
-            # bs>1 break, and the three dense layers were the last uninstrumented
-            # window: GLM_FUSE_ATTN defaults to 0, so they are the only layers
-            # that take this path (every MoE layer is whole-layer fused, which
-            # sets fuse_attn itself). The fused attention task carries both the
-            # per-token q row and tok_back, so routing the prologue through it
-            # is the fix rather than widening a path nothing else uses.
-            if bs > 1 and not fuse_attn:
-                assert DENSE_MXFP8 and QB_MXFP8 and num_kv_chunks > 1, (
-                    "batch > 1 needs the fused attention task for the dense "
-                    "prologue (the standalone decode + split-KV merge are "
-                    "single-row), and it needs DENSE_MXFP8, QB_MXFP8 and "
-                    f"num_kv_chunks > 1: got {DENSE_MXFP8}, {QB_MXFP8}, "
-                    f"{num_kv_chunks}")
-                fuse_attn = True
+            # bit-identical between the two arms. GLM_FUSE_ATTN defaults to 0,
+            # so the three dense layers are the only ones that take the
+            # unfused chain -- every MoE layer is whole-layer fused, which sets
+            # fuse_attn itself -- and that chain was the last uninstrumented
+            # window in the bs=2 hunt.
+            #
+            # Forcing fuse_attn = True here does produce correct text, and it
+            # was the first fix. It is also expensive: GLM_FUSE_ATTN=1 measured
+            # 11.465 ms against 10.469 for the unfused prologue, n=3 each,
+            # serialized (+0.996 ms, ~0.33 ms for each of the three dense
+            # layers, against a 0.26 ms noise floor). The fused attention task
+            # holds every dispatched worker at wide in-kernel barriers around
+            # phases a dense layer barely uses.
+            #
+            # The cheaper fix is that the standalone chain was never actually
+            # single-row in the kernels -- gang_mla_decode_kernel has carried
+            # token_idx and tok_back since the fused path got them; it was
+            # gang_mla_decode_layer's total_work_items that had no batch_size
+            # factor and its registration that instantiated BATCH_SIZE = 1, so
+            # the dispatch was one token wide and row 1 was never written. The
+            # split-KV merge needed nothing: merge_splitkv_ck_fmha already
+            # loops tok over num_tokens * heads off qo_indptr, which is why the
+            # fused caller's merge_total carries no batch factor either.
+            if bs > 1:
+                assert num_kv_chunks > 1 or fuse_attn, (
+                    "batch > 1 with a single KV chunk skips the split-KV "
+                    "merge, and the decode's direct-to-attn_out path is not "
+                    "row-indexed")
             # Whole-layer fusion is the union of both halves' preconditions,
             # and it is emitted at the MoE call site further down because the
             # expert weights it needs are not built until then. Here it only

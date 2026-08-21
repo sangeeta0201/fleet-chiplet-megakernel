@@ -3766,7 +3766,7 @@ int TaskRegister::register_gang_attn_split_kv_mi300_task(
 //          total_work_items, q_workspace_stride]
 int TaskRegister::register_gang_mla_decode_mi300_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 10);
+  assert(params.size() == 11);
   int num_q_heads = params[0];
   int kv_lora_rank = params[1];
   int qk_rope_head_dim = params[2];
@@ -3776,6 +3776,7 @@ int TaskRegister::register_gang_mla_decode_mi300_task(
   int num_kv_chunks = params[6];
   int total_work_items = params[8];
   int q_workspace_stride = params[9];
+  int batch_size = params[10];
 
   std::vector<tb::TBInputOp *> input_ops;
   std::vector<tb::TBInputOp *> output_ops;
@@ -3803,8 +3804,12 @@ int TaskRegister::register_gang_mla_decode_mi300_task(
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
+  // WRITE_THROUGH stays false here -- the standalone decode always feeds the
+  // split-KV merge, so its o_acc is read back on the same CU and there is
+  // nothing to flush past L2. BATCH_SIZE is what makes the tile decomposition
+  // recover a token index; see the token_idx line in gang_mla_decode_kernel.
   code.e("kernel::gang_mla_decode_kernel<bfloat16,");
-  code.e("    $, $, $, $, $, $, $, $>(",
+  code.e("    $, $, $, $, $, $, $, $, false, $>(",
          num_q_heads,        // NUM_Q_HEADS
          kv_lora_rank,       // KV_LORA_RANK
          qk_rope_head_dim,   // QK_ROPE_HEAD_DIM
@@ -3812,7 +3817,8 @@ int TaskRegister::register_gang_mla_decode_mi300_task(
          max_seq_len,        // MAX_SEQ_LEN
          num_kv_chunks,      // NUM_KV_CHUNKS
          q_workspace_stride, // Q_WORKSPACE_STRIDE
-         kv_cache_stride);   // KV_CACHE_STRIDE
+         kv_cache_stride,    // KV_CACHE_STRIDE
+         batch_size);        // BATCH_SIZE
   code.e("    task_desc->input_ptrs[0],");  // q_workspace (full)
   code.e("    task_desc->input_ptrs[1],");  // latent kv cache (full)
   code.e("    task_desc->output_ptrs[1],"); // output (full)

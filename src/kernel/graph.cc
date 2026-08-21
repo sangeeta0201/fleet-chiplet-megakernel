@@ -905,7 +905,10 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         std::make_tuple(7, 3, TASK_GANG_ATTN_SPLIT_KV_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[7]; // total_work_items_per_xcd
   } else if (name == "gang_mla_decode_mi300") {
-    assert(params.size() == 10);
+    // 11 since the token dimension: params[10] is batch_size, which the
+    // register function needs as a TEMPLATE argument (the kernel divides
+    // tile_idx by it to recover token_idx), not just as a dispatch bound.
+    assert(params.size() == 11);
     int variant_id = task_register->register_gang_mla_decode_mi300_task(
         customized->bgraph, params);
     task_config[op] =

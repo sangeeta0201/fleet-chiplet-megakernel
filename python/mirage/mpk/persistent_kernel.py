@@ -2007,20 +2007,36 @@ class PersistentKernel:
             kv_lora_rank + qk_rope_head_dim)
 
         num_q_groups = num_q_heads // 16
-        total_work_items = (
-            self.max_num_batched_requests * num_q_groups * num_kv_chunks
-        )
+        # The tile decomposition is (request, query row, q group, kv chunk) --
+        # see the comment above gang_mla_decode_task_impl. The token dimension
+        # sits INSIDE the request one because a request's rows share its page
+        # list, so this product needs the batch_size factor the fused caller
+        # already carries (gang_mla_attn_fused_layer's mla_total_work_items).
+        # Without it the kernel is dispatched exactly one token's worth of
+        # tiles, every one of them decodes token 0, and row 1 of the output is
+        # never written -- which is precisely how the dense prologue produced
+        # attn_out row 1 == 0.000000 at BATCH_SIZE 2 while the MoE layers,
+        # which take the fused path, were correct. At batch_size 1 this is the
+        # old product unchanged.
+        total_work_items = (self.max_num_batched_requests
+                            * self.max_num_batched_tokens
+                            * num_q_groups * num_kv_chunks)
         import math
         total_work_items_per_xcd = math.ceil(total_work_items / 8)
 
         # params: [num_q_heads, kv_lora_rank, qk_rope_head_dim, qk_head_dim,
         #          max_seq_len, page_size, num_kv_chunks,
         #          total_work_items_per_xcd, total_work_items,
-        #          q_workspace_stride]
+        #          q_workspace_stride, batch_size]
+        #
+        # batch_size is a template argument, not just a bound: the kernel
+        # recovers token_idx from tile_idx by dividing by it, so a dispatch
+        # that carries the factor while the kernel is instantiated at 1 would
+        # decode token 0 four times over and address the wrong request.
         params = [num_q_heads, kv_lora_rank, qk_rope_head_dim, qk_head_dim,
                   self.max_seq_length, self.page_size, num_kv_chunks,
                   total_work_items_per_xcd, total_work_items,
-                  q_workspace_stride]
+                  q_workspace_stride, self.max_num_batched_tokens]
 
         grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
