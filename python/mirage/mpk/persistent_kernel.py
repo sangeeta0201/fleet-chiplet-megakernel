@@ -620,6 +620,12 @@ def get_compile_command(
             # combine is needed. CORRECT output: it redistributes the reduction
             # rather than dropping it (unlike MPK_W2_HALFK above).
             flags = flags + ["-DMPK_W2_SPLITK"]
+        _moe_lb = os.environ.get("MPK_MOE_LIVE_BOUND")
+        if _moe_lb is not None:
+            # Default is 1 in the header; only forward an explicit override so
+            # the A/B is one -D and every rank builds the same thing.
+            assert _moe_lb in ("0", "1"), "MPK_MOE_LIVE_BOUND is 0 or 1"
+            flags = flags + [f"-DMPK_MOE_LIVE_BOUND={_moe_lb}"]
         _w2_ks = int(os.environ.get("MPK_W2_KSPLIT", "1"))
         if _w2_ks != 1:
             # The GLM fused-layer W2 (gang_moe_linear_mxfp8_mi300.cuh), not the

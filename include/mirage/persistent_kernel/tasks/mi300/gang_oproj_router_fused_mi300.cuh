@@ -90,6 +90,13 @@ namespace kernel {
 #ifndef MPK_FL_REPUBLISH_SPINS
 #define MPK_FL_REPUBLISH_SPINS 1024
 #endif
+// Shorten the two MoE dispatch loops to the tiles this rank actually owns
+// rather than the replicated worst case. Correctness-preserving either way --
+// the tiles it stops walking all return false -- so it is a knob only so the
+// A/B can be one variable inside one build. See the note at Phase 5.
+#ifndef MPK_MOE_LIVE_BOUND
+#define MPK_MOE_LIVE_BOUND 1
+#endif
 // One boolean for "the W13 ceiling probe forced the flat arrival", so the
 // self-heal's quota and the arrival cannot disagree across the #ifdef.
 #ifdef MPK_W13_EARLY_REL
@@ -1125,10 +1132,64 @@ __device__ __attribute__((always_inline)) void
 #endif
 
   MPK_WS_PHASE(76, routing_expected, xcd_id);
+
+  // ── live MoE tile bounds ─────────────────────────────────────────────────
+  // moe_w{13,2}_tiles_per_xcd are host constants and have to cover the
+  // REPLICATED worst case -- moe_max_activated = TOPK + shared -- because the
+  // dispatch is precomputed and cannot know the routing. Under EP the tile
+  // space is compacted to the OWNED subsequence of the activated list (see
+  // _gang_moe_mxfp8_tile), so a rank that owns k of the activated experts has
+  // live tiles only below k * TILES_PER_EXPERT and every tile above that
+  // decodes, finds e < 0, and returns false. MPK_PRINT_GEOMETRY says the host
+  // bounds are 72 W13 and 108 W2 tiles/XCD -- 3 and 4 grid-stride rounds --
+  // while at EP=8 a rank typically owns one activated expert, i.e. 8 and 12.
+  // So most of those rounds are a decode and a return.
+  //
+  // The routing is known now (the barrier above is exactly the point where it
+  // becomes readable), so count the owned experts once, with the same
+  // predicate the decode uses, and shorten both loops to what is live. This
+  // changes no tile's work and no barrier's arrival count -- the barriers
+  // below count workers, not tiles -- it only stops walking dead tile space.
+  int moe_w13_live = moe_w13_tiles_per_xcd;
+  int moe_w2_live = moe_w2_tiles_per_xcd;
+#if MPK_MOE_LIVE_BOUND
+  {
+    int const *d_mask_live = static_cast<int const *>(active_expert_ids_ptr);
+    int const n_act = d_mask_live[MOE_NUM_EXPERTS];
+    int owned;
+    if constexpr (EP_WORLD_SIZE > 1) {
+      constexpr int EP_LOCAL_ROUTED = NUM_EXPERTS / EP_WORLD_SIZE;
+      constexpr int EP_BASE = EP_MY_PE * EP_LOCAL_ROUTED;
+      owned = 0;
+      for (int i = 0; i < n_act; i++) {
+        int const cand = d_mask_live[i];
+        bool const is_owned =
+            (cand >= NUM_EXPERTS)
+                ? (EP_MY_PE == EP_SHARED_PE)
+                : (cand >= EP_BASE && cand < EP_BASE + EP_LOCAL_ROUTED);
+        owned += is_owned ? 1 : 0;
+      }
+    } else {
+      owned = n_act;
+    }
+    // Round UP to the XCD stride: the last live global tile can sit on any
+    // XCD, and global_tile = t * 8 + xcd_id. A tile or two past the end still
+    // returns false, which is correct and costs one decode.
+    int const w13_live = (owned * MOE_W13_TILES_PER_EXPERT + 7) / 8;
+    int const w2_live = (owned * MOE_W2_TILES_PER_EXPERT + 7) / 8;
+    if (w13_live < moe_w13_live) {
+      moe_w13_live = w13_live;
+    }
+    if (w2_live < moe_w2_live) {
+      moe_w2_live = w2_live;
+    }
+  }
+#endif
+
   // ════════════════════════════════════════════════════════════════════════
   // Phase 5: MoE W13 (gate+up) with the SwiGLU folded into the epilogue
   // ════════════════════════════════════════════════════════════════════════
-  for (int t = xcd_rank; t < moe_w13_tiles_per_xcd; t += tiles_per_xcd) {
+  for (int t = xcd_rank; t < moe_w13_live; t += tiles_per_xcd) {
     gang_moe_w13_linear_mxfp8_kernel<BATCH_SIZE,
                                      2 * MOE_INTERMEDIATE,
                                      2 * MOE_INTERMEDIATE,
@@ -1252,7 +1313,7 @@ __device__ __attribute__((always_inline)) void
   // ════════════════════════════════════════════════════════════════════════
   // The routing weights come from output[1], which the TopK tail wrote through
   // in Phase 3 -- W2 does not need a slot of its own for them.
-  for (int t = xcd_rank; t < moe_w2_tiles_per_xcd; t += tiles_per_xcd) {
+  for (int t = xcd_rank; t < moe_w2_live; t += tiles_per_xcd) {
     gang_moe_w2_linear_mxfp8_kernel<BATCH_SIZE,
                                     HIDDEN_SIZE,
                                     HIDDEN_SIZE,
