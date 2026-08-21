@@ -370,6 +370,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
 #endif
 
   MPK_WS_PHASE(21, qkv_expected, xcd_id);
+  // Stage stamp 16: attention entry: first instruction of the attn half.
+  if (tid == 0) {
+    mpk_stage_stamp(16);
+  }
   // ══════════════════════════════════════════════════════════════════════
   // Phase 1: residual resolve + input RMSNorm + [q_a_proj | kv_a_proj_with_mqa]
   // ══════════════════════════════════════════════════════════════════════
@@ -589,6 +593,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
 #endif
 
   MPK_WS_PHASE(22, qkv_expected, xcd_id);
+  // Stage stamp 17: qkv_a tiles done.
+  if (tid == 0) {
+    mpk_stage_stamp(17);
+  }
   // ══════════════════════════════════════════════════════════════════════
   // Phase 2: qkv_a -> q_b barrier
   // ══════════════════════════════════════════════════════════════════════
@@ -668,6 +676,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
 #endif
 
   MPK_WS_PHASE(23, qkv_expected, xcd_id);
+  // Stage stamp 18: qkv_a -> q_b barrier passed.
+  if (tid == 0) {
+    mpk_stage_stamp(18);
+  }
   // ══════════════════════════════════════════════════════════════════════
   // Phase 3: q_a RMSNorm + absorbed q_b + latent KV-cache append
   // ══════════════════════════════════════════════════════════════════════
@@ -998,6 +1010,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   }
 
   MPK_WS_PHASE(24, qkv_expected, xcd_id);
+  // Stage stamp 19: q_b tiles + KV-cache update done.
+  if (tid == 0) {
+    mpk_stage_stamp(19);
+  }
   // ══════════════════════════════════════════════════════════════════════
   // Phase 4: q_b -> decode barrier
   // ══════════════════════════════════════════════════════════════════════
@@ -1137,6 +1153,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
 #endif
 
     MPK_WS_PHASE(25, qkv_expected, xcd_id);
+    // Stage stamp 20: q_b -> decode barrier passed (NESTED -- check cnt).
+    if (tid == 0) {
+      mpk_stage_stamp(20);
+    }
     // ════════════════════════════════════════════════════════════════════
     // Phase 5: absorbed MLA decode, split over (q_head_group, kv_chunk)
     // ════════════════════════════════════════════════════════════════════
@@ -1199,6 +1219,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   }
 
   MPK_WS_PHASE(26, qkv_expected, xcd_id);
+  // Stage stamp 21: MLA decode tiles done.
+  if (tid == 0) {
+    mpk_stage_stamp(21);
+  }
   // ══════════════════════════════════════════════════════════════════════
   // Phase 6: decode -> merge barrier
   // ══════════════════════════════════════════════════════════════════════
@@ -1277,6 +1301,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
 #endif
 
   MPK_WS_PHASE(27, qkv_expected, xcd_id);
+  // Stage stamp 22: decode -> merge barrier passed.
+  if (tid == 0) {
+    mpk_stage_stamp(22);
+  }
   // ══════════════════════════════════════════════════════════════════════
   // Phase 7: split-KV merge
   // ══════════════════════════════════════════════════════════════════════

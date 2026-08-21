@@ -727,7 +727,7 @@ __device__ unsigned long long g_stage_ref;
 // can be differenced against the cumulative BAR_SKEW gap sums. They can NOT
 // be compared across ranks -- the eight entry barriers are not synchronized,
 // which is the mistake recorded on MPK_EP_POLL_BATCH.
-#define MPK_STAGE_SLOTS 16
+#define MPK_STAGE_SLOTS 32
 // Samples longer than this are treated as stale-reference and dropped. See
 // mpk_stage_stamp. 10 ms is the historical value and keeps old runs
 // reproducible; 1 ms is what you want for a ~136 us layer.

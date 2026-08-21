@@ -1364,6 +1364,10 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       /*ep_signal=*/(EP_WORLD_SIZE > 1 && ml_mode) ? input_ptrs[28] : nullptr);
 
   MPK_WS_PHASE(60, task_layer_idx, xcd_id);
+  // Stage stamp 23: split-KV merge done, about to arrive at the Phase 8 barrier.
+  if (tid == 0) {
+    mpk_stage_stamp(23);
+  }
   // ══════════════════════════════════════════════════════════════════════
   // Phase 8: attention -> o_proj cross-XCD barrier
   // ══════════════════════════════════════════════════════════════════════
@@ -1424,6 +1428,10 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     // 61/62/63/64 split them, because a capture with four workers "at the
     // barrier" cannot be read without knowing which.
     MPK_WS_PHASE(61, task_layer_idx, xcd_id);
+    // Stage stamp 24: Phase 8 attention -> o_proj barrier passed.
+    if (tid == 0) {
+      mpk_stage_stamp(24);
+    }
     // ── o_proj weight DMA, issued before the poll ────────────────────────
     // gpt-oss does exactly this at the equivalent barrier
     // (gang_full_layer_fused_mi300.cuh, Phase 6): 42 buffer_load_dwordx4-to-
@@ -1597,6 +1605,10 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     _b_t3 = __builtin_amdgcn_s_memrealtime();
 #endif
     MPK_WS_PHASE(62, task_layer_idx, xcd_id);
+    // Stage stamp 25: o_proj weight prefetch issued (NESTED -- check cnt).
+    if (tid == 0) {
+      mpk_stage_stamp(25);
+    }
     if (tid == 0) {
       int *const my_flag = &attn_release[xcd_id * HIER_STRIDE];
       // Watch this poll. a0 is the raw global arrival counter: it is
@@ -1644,6 +1656,10 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       }
     }
     MPK_WS_PHASE(63, task_layer_idx, xcd_id);
+    // Stage stamp 26: per-XCD attention release observed (NESTED -- check cnt).
+    if (tid == 0) {
+      mpk_stage_stamp(26);
+    }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     if (tid == 0 && g_subphase_active) {
       unsigned long long _b_t4 = __builtin_amdgcn_s_memrealtime();
@@ -1700,6 +1716,10 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     // one of them writes there.
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     MPK_WS_PHASE(64, task_layer_idx, xcd_id);
+    // Stage stamp 27: prefetch DMA retired (NESTED -- check cnt).
+    if (tid == 0) {
+      mpk_stage_stamp(27);
+    }
   }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   {
@@ -1718,6 +1738,10 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
   // halves declared it identically (unpartitioned) so one slot serves both,
   // and the input list has no room for a second.
   MPK_WS_PHASE(70, task_layer_idx, xcd_id);
+  // Stage stamp 28: entering the MoE half.
+  if (tid == 0) {
+    mpk_stage_stamp(28);
+  }
   gang_oproj_router_fused_kernel_mi300<BATCH_SIZE,
                                        OPROJ_REDUCTION_SIZE,
                                        OPROJ_ROWS_PER_WG,

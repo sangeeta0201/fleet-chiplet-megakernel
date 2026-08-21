@@ -1775,7 +1775,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
           // slots with different populations is not a duration. Per-worker
           // rows fix both: same worker, same layer count, and
           // max-over-workers of a worker's own mean is the makespan proxy.
-          for (int s = 5; s <= 14; s++) {
+          for (int s = 0; s < MPK_STAGE_SLOTS - 1; s++) {
             for (int w = 0; w < MPK_STAGE_WORKERS; w++) {
               int const p = w * MPK_STAGE_SLOTS + s;
               if (g_stage_pcnt[p] == 0ull) {
