@@ -225,6 +225,30 @@ def fake_quantize_mxfp4(w: torch.Tensor) -> torch.Tensor:
 MOE_MXFP4 = os.environ.get("GLM_MOE_MXFP4", "1") == "1"
 
 
+# The same question for the attention weights (task #66): qkv_a, q_b, W_UK,
+# W_UV and o_proj are all MXFP8 today, and narrowing them to MXFP4 halves
+# their bytes. The performance ceiling is already priced and it is small --
+# MPK_ATTN_HALFK, which halves qkv_a's bytes AND its FLOPs, bought 4.91
+# us/layer, so the whole program is under ~0.9 ms -- but the ruling is to
+# build the queue largest-first and this is the largest item on it.
+#
+# Quality is the gate, and it is a much harder gate here than on the MoE.
+# GLM ships bf16, so this is post-hoc 4-bit quantization of weights never
+# trained for it (1.18e-01 relative RMS against MXFP8's 2.65e-02), and unlike
+# a routed expert -- one of 256, contributing one of eight top-k terms -- every
+# attention weight is on the path of every token. So run the numerics before
+# writing any kernel, exactly as GLM_FAKE_MXFP4_EXPERTS did for the MoE:
+# round the values through E2M1 but keep packing MXFP8, so the megakernel is
+# byte-for-byte the shipped one and only the numbers it reads are 4-bit.
+# If the tokens survive, the kernel is worth writing; if they do not, no
+# kernel would have saved it.
+#
+# Deliberately NOT applied to the LM head, which pack_dense_mxfp8 also serves:
+# the head is read once per token rather than 78 times, so it is not part of
+# the lever, and including it would confound the quality answer.
+FAKE_MXFP4_ATTN = os.environ.get("GLM_FAKE_MXFP4_ATTN", "0") == "1"
+
+
 def quantize_mxfp4(w: torch.Tensor) -> tuple:
     """Quantize a [..., out, K] bf16 weight to MXFP4: E2M1 nibbles with one
     E8M0 exponent per 32 contiguous K elements.
@@ -290,7 +314,8 @@ def pack_moe_mxfp8(stacked: torch.Tensor,
 
 
 def pack_dense_mxfp8(w: torch.Tensor, output_per_wg: int = 64,
-                     rows_per_chunk: int = 8192) -> torch.Tensor:
+                     rows_per_chunk: int = 8192,
+                     fake_fp4: bool = False) -> torch.Tensor:
     """Quantize + pack a 2-D [out, K] bf16 weight into the MXFP8 per-workgroup
     layout, in row chunks.
 
@@ -299,13 +324,20 @@ def pack_dense_mxfp8(w: torch.Tensor, output_per_wg: int = 64,
     top of the bf16 original. Rows are independent and a workgroup is a
     contiguous run of `output_per_wg` rows, so chunking on a multiple of that
     and concatenating along the workgroup axis is exact.
+
+    fake_fp4 routes the values through E2M1 and back while still packing MXFP8,
+    the same measurement trick GLM_FAKE_MXFP4_EXPERTS uses on the MoE side. It
+    answers the quality half of "MXFP4 for the attention weights" for zero
+    kernel work -- see FAKE_MXFP4_ATTN.
     """
     assert w.dim() == 2, w.shape
     rows = w.shape[0]
     assert rows % output_per_wg == 0, (rows, output_per_wg)
     step = max(output_per_wg,
                (rows_per_chunk // output_per_wg) * output_per_wg)
-    parts = [pack_mxfp8_workgroup(*quantize_mxfp8(w[r:r + step]), output_per_wg)
+    quant = ((lambda x: quantize_mxfp8(fake_quantize_mxfp4(x))) if fake_fp4
+             else quantize_mxfp8)
+    parts = [pack_mxfp8_workgroup(*quant(w[r:r + step]), output_per_wg)
              for r in range(0, rows, step)]
     return torch.cat(parts, dim=0).contiguous()
 
@@ -1827,7 +1859,8 @@ if __name__ == "__main__":
                 # the rest of the layer indexes by still lands where it did.
                 # The padded rows are exactly zero, which quantizes to an
                 # all-zero block with an E8M0 of 0 -- decoded as 1.0.
-                qkv_a_stack = pack_dense_mxfp8(qkv_a_stack, QKV_MXFP8_OPW)
+                qkv_a_stack = pack_dense_mxfp8(qkv_a_stack, QKV_MXFP8_OPW,
+                                              fake_fp4=FAKE_MXFP4_ATTN)
             w_qkv_a = _attach_input_keep(qkv_a_stack, f"layer_{i}_qkv_a_proj")
             # q_a_layernorm weight, zero past q_lora: the padded q_a columns
             # are exactly zero (w_qkv_a's extra rows are zero) so they cost the
@@ -1898,7 +1931,8 @@ if __name__ == "__main__":
                                           (rank + 1) * qb_tp_heads * kv_lora,
                                           :].contiguous()
                 w_wuk = _attach_input_keep(
-                    pack_dense_mxfp8(w_uk_rows, WUK_GEMV_ROWS),
+                    pack_dense_mxfp8(w_uk_rows, WUK_GEMV_ROWS,
+                                     fake_fp4=FAKE_MXFP4_ATTN),
                     f"layer_{i}_w_uk")
             else:
                 q_b_w = absorb_q_b(
@@ -1915,7 +1949,8 @@ if __name__ == "__main__":
                 # The weight is packed per workgroup of qb_opw_this columns, so
                 # the pack width and the kernel's OUTPUT_PER_WG are the same
                 # number and have to be chosen together.
-                q_b_w = pack_dense_mxfp8(q_b_w, qb_opw_this)
+                q_b_w = pack_dense_mxfp8(q_b_w, qb_opw_this,
+                                         fake_fp4=FAKE_MXFP4_ATTN)
             w_q_b = _attach_input_keep(q_b_w, f"layer_{i}_q_b_absorbed")
 
             # ── o_proj, absorbed or not ──────────────────────────────────
@@ -1935,7 +1970,8 @@ if __name__ == "__main__":
                 w_uv_rows = attn._w_uv.reshape(
                     num_heads * v_head, kv_lora).to(torch.bfloat16).contiguous()
                 w_wuv = _attach_input_keep(
-                    pack_dense_mxfp8(w_uv_rows, WUV_GEMV_ROWS),
+                    pack_dense_mxfp8(w_uv_rows, WUV_GEMV_ROWS,
+                                     fake_fp4=FAKE_MXFP4_ATTN),
                     f"layer_{i}_w_uv")
             else:
                 layer_o_proj_red = o_proj_red
@@ -1957,7 +1993,8 @@ if __name__ == "__main__":
                 # One workgroup per GEMV tile, so the packing's workgroup axis
                 # *is* the tile axis: 2048 / 16 = 128 workgroups, 16 per XCD,
                 # exactly the tile count the bf16 GEMV had.
-                o_w = pack_dense_mxfp8(o_w, oproj_tile_n)
+                o_w = pack_dense_mxfp8(o_w, oproj_tile_n,
+                                     fake_fp4=FAKE_MXFP4_ATTN)
             w_o = _attach_input_keep(o_w, f"layer_{i}_o_absorbed")
 
             attn._w_uk = None
