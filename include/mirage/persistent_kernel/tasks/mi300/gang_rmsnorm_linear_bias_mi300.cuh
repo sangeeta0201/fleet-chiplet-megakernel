@@ -19,6 +19,7 @@
 #include "moe_topk_sigmoid_bias_mi300.cuh"
 #include "moe_topk_softmax_mi300.cuh"
 #include <hip/hip_bf16.h>
+#include "mpk_bsdbg.cuh"
 
 namespace kernel {
 
@@ -161,14 +162,26 @@ __device__ __forceinline__ float rmsnorm_rcp_amd(void const *input_ptr,
   return rsqrtf(red[0] / float(ACTUAL_HIDDEN_DIM) + eps);
 }
 
-template <int STORAGE_DIM, int ACTUAL_HIDDEN_DIM, int NORM_SPAN = STORAGE_DIM>
+// NUM_ROWS is the token count, not a tile height: this prologue is the
+// redundant one every gang-linear worker runs before its own tile, so it has
+// to produce the WHOLE normalized activation, all rows of it, or the GEMM
+// reads a row nobody wrote. At NUM_ROWS 1 the loop below is the straight-line
+// code it has always been.
+//
+// The row loop wraps phases 1-4 rather than being pushed inside them: the
+// register cache (in_cache_lo/hi, tail_cache) is sized for one row and is
+// reused per trip, so a second token costs zero extra VGPRs and one more pass
+// over a row that is already in L2 from the first.
+template <int STORAGE_DIM,
+          int ACTUAL_HIDDEN_DIM,
+          int NORM_SPAN = STORAGE_DIM,
+          int NUM_ROWS = 1,
+          int ROW_STRIDE = STORAGE_DIM>
 __device__ __forceinline__ void rmsnorm_inline_amd(void const *input_ptr,
                                                    void const *weight_ptr,
                                                    void *output_ptr,
                                                    float eps = 1e-5f) {
-  bf16 const *__restrict__ d_input = static_cast<bf16 const *>(input_ptr);
   bf16 const *__restrict__ d_weight = static_cast<bf16 const *>(weight_ptr);
-  bf16 *__restrict__ d_output = static_cast<bf16 *>(output_ptr);
 
   constexpr int VEC_SIZE = 8;   // 8 bf16 per 128-bit load
   constexpr int NTHREADS = 256; // block size for gang RMSNorm
@@ -183,6 +196,13 @@ __device__ __forceinline__ void rmsnorm_inline_amd(void const *input_ptr,
   constexpr int _VEC_END = VEC_ITERS * NTHREADS * VEC_SIZE;
   constexpr int _TAIL_ELEMS = STORAGE_DIM - _VEC_END;
   constexpr int _MAX_TAIL = (_TAIL_ELEMS + NTHREADS - 1) / NTHREADS;
+
+#pragma unroll 1
+  for (int _row = 0; _row < NUM_ROWS; ++_row) {
+  bf16 const *__restrict__ d_input =
+      static_cast<bf16 const *>(input_ptr) + (size_t)_row * ROW_STRIDE;
+  bf16 *__restrict__ d_output =
+      static_cast<bf16 *>(output_ptr) + (size_t)_row * ROW_STRIDE;
   float sum = 0.0f;
 
   // Vectorized cache: raw uint64_t pairs (2 per iter = lo + hi)
@@ -290,6 +310,11 @@ __device__ __forceinline__ void rmsnorm_inline_amd(void const *input_ptr,
     float w = __bfloat162float(d_weight[i]);
     d_output[i] = __float2bfloat16(val * rms_rcp * w);
   }
+  // Not optional at NUM_ROWS > 1: red[] is reused by the next row's
+  // cross-wave reduction, and a fast wave would overwrite red[wave_id] while
+  // a slow one is still reading red[0] for this row's rms_rcp.
+  __syncthreads();
+  } // _row
 
   // Workgroup-scope fence: ensure stores visible to the linear loads below
   // within this workgroup. (Cross-XCD coherence not needed: each XCD
@@ -326,9 +351,35 @@ __device__ __forceinline__ void gang_rmsnorm_linear_bias_kernel(
     int wgm,
     int tile_idx) {
   // Step 1: redundant RMSNorm.
-  gang_rmsnorm_detail::
-      rmsnorm_inline_amd<REDUCTION_SIZE, ACTUAL_HIDDEN_DIM, NORM_SPAN>(
-          norm_input_ptr, norm_weight_ptr, norm_output_ptr);
+  // ── bs=2 bisection probe ────────────────────────────────────────────────
+  // GLM_FUSE_ATTN defaults to 0, so the three dense prologue layers run this
+  // UNFUSED chain and the whole-layer task covers every MoE layer -- which is
+  // why the first attempt, a probe inside gang_mla_attn_fused_kernel_mi300,
+  // saw fused layers 0-2 and not a single dense one. The dense layers are
+  // scheduled first, so seq 0..23 (8 XCD tasks x 3 layers) is exactly the
+  // prologue no matter who else calls this kernel later.
+  // Read at task entry, i.e. behind the previous task's event boundary, and
+  // only on the reduction-dim input, which every XCD sees whole -- an output
+  // or residual pointer is column-sliced 8 ways and reading a full row off one
+  // slice runs into the next row.
+  if (tile_idx == 0 && threadIdx.x == 0) {
+    MPK_BSDBG_SEQ(26, norm_input_ptr, REDUCTION_SIZE, "d_attn_proj",
+                  BATCH_SIZE, REDUCTION_SIZE, 24);
+  }
+
+  //
+  // BATCH_SIZE rows, not one. BATCH_SIZE here is m_per_tile, and the callers
+  // that need more than one row all leave m_tiles at 1, so it is the token
+  // count -- which is exactly the number of rows the gang linear below will
+  // read out of norm_output_ptr. Normalizing only row 0 left the second
+  // token's row as whatever the scratch last held, and the row stride is the
+  // reduction extent for both.
+  gang_rmsnorm_detail::rmsnorm_inline_amd<REDUCTION_SIZE,
+                                          ACTUAL_HIDDEN_DIM,
+                                          NORM_SPAN,
+                                          BATCH_SIZE,
+                                          REDUCTION_SIZE>(
+      norm_input_ptr, norm_weight_ptr, norm_output_ptr);
 
   // Step 2: gang linear with bias, reading from norm_output_ptr.
   gang_linear_kernel<T, BATCH_SIZE, REDUCTION_SIZE>(norm_output_ptr,
