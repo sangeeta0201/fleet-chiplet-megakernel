@@ -89,6 +89,10 @@ MPK_FORWARD_VARS=(
   GLM_UNABSORB_OPROJ GLM_WUV_GEMV_ROWS WUV_MFMA
   GLM_UNABSORB_QB GLM_WUK_GEMV_ROWS GLM_QB_OPW GLM_QB_TP
   GLM_MLA_NUM_KV_CHUNKS GLM_MLA_MERGE_DIM_SPLITS GLM_MLA_MERGE_WT
+  # Compile-time and read per-rank via os.environ in persistent_kernel.py, so
+  # without -x only rank 0 builds the pair-local decode barrier and the ranks
+  # deadlock at Phase 6. Same bug the ceiling probes below had.
+  GLM_MLA_PAIR_MERGE
   GANG_TILE_N GANG_WGM GANG_K_SPLITS
   MPK_SPAN_TIMING MPK_SUBPHASE_TIMING MPK_DEVICE_TIMING MPK_WORKER_STATE
   MPK_EP_SIG_DBG MPK_EP_FORCE_STAGED MPK_EP_ABLATE MPK_EP_WAIT_TIMEOUT
