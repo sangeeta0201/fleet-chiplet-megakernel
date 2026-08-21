@@ -152,7 +152,12 @@ template <typename T,
           int NUM_KV_CHUNKS,
           int Q_WORKSPACE_STRIDE,
           int KV_CACHE_STRIDE,
-          bool WRITE_THROUGH = false>
+          bool WRITE_THROUGH = false,
+          // Compile-time width of the query-row dimension. 1 is the decode
+          // shape and keeps the codegen below bit-identical to what it was;
+          // > 1 is MTP verify, where one request carries several query rows
+          // over one page list. See the token_idx block in the body.
+          int BATCH_SIZE = 1>
 // THIS function sets the whole megakernel's register allocation, and two
 // obvious ways to fix that are closed. Recorded so neither gets retried.
 //
@@ -195,6 +200,7 @@ __device__ __noinline__ void
                         int const *kv_indices,
                         int const *kv_last_page_len,
                         int16_t request_id,
+                        int token_idx,
                         int q_head_group,
                         int kv_chunk_idx,
                         float scale_s) {
@@ -225,14 +231,44 @@ __device__ __noinline__ void
 
   int const req = request_id;
   int const query_start = ld_g<int>(&qo_indptr[req]);
-  if (query_start == ld_g<int>(&qo_indptr[req + 1])) {
+  int const query_end = ld_g<int>(&qo_indptr[req + 1]);
+  if (query_start == query_end) {
     return;
+  }
+
+  // ── which query row, and how much of the cache it may see ──────────────
+  //
+  // BATCH_SIZE is the compile-time width of the row dimension; num_tokens is
+  // how many of those rows hold a live token this step. MTP verify runs two --
+  // the accepted token and the draft -- appended to the SAME request's page
+  // list, so row r sits at sequence position (seqlen - num_tokens + r) and
+  // must not attend to the rows after it. Shortening seqlen_k by the suffix
+  // this row may not see IS the causal mask: the per-tile
+  // `kgrp * 4 + h >= tile_len` clamp further down then falls out of the
+  // shortened effective_len for free, so there is no second mask to write and
+  // no branch in the MFMA loop.
+  //
+  // At BATCH_SIZE 1 token_idx is a literal 0, this block compiles to nothing,
+  // and q_row / seqlen_k are exactly the query_start and full length they
+  // always were.
+  int q_row = query_start;
+  int tok_back = 0;
+  if constexpr (BATCH_SIZE > 1) {
+    int const num_tokens = query_end - query_start;
+    if (token_idx >= num_tokens) {
+      // A row the graph is wide enough for that this step does not fill.
+      // Return without stamping LSE: the merge bounds its own token loop by
+      // the same num_tokens, so nothing ever reads this row's partials.
+      return;
+    }
+    q_row = query_start + token_idx;
+    tok_back = num_tokens - 1 - token_idx;
   }
 
   int const first_page = ld_g<int>(&kv_indptr[req]);
   int const num_pages = ld_g<int>(&kv_indptr[req + 1]) - first_page;
-  int const seqlen_k =
-      (num_pages - 1) * PAGE_SIZE + ld_g<int>(&kv_last_page_len[req]);
+  int const seqlen_k = (num_pages - 1) * PAGE_SIZE +
+                       ld_g<int>(&kv_last_page_len[req]) - tok_back;
 
   int const tid = threadIdx.x;
   int const warp_id = tid / 64;
@@ -284,7 +320,7 @@ __device__ __noinline__ void
         constexpr int LSE_STRIDE =
             NUM_Q_GROUPS * NUM_KV_CHUNKS * Q_HEADS_PER_GROUP;
         float *lse_out = reinterpret_cast<float *>(lse_ptr) +
-                         static_cast<long>(query_start) * LSE_STRIDE +
+                         static_cast<long>(q_row) * LSE_STRIDE +
                          q_head_group * NUM_KV_CHUNKS * Q_HEADS_PER_GROUP +
                          kv_chunk_idx * Q_HEADS_PER_GROUP + midx;
         if constexpr (WRITE_THROUGH) {
@@ -405,7 +441,7 @@ __device__ __noinline__ void
   {
     int const q_head = q_head_group * Q_HEADS_PER_GROUP + midx;
     char const *q_ptr = reinterpret_cast<char const *>(q_workspace_ptr) +
-                        (static_cast<long>(query_start) * Q_WORKSPACE_STRIDE +
+                        (static_cast<long>(q_row) * Q_WORKSPACE_STRIDE +
                          static_cast<long>(q_head) * QK_DIM) *
                             2;
 #pragma unroll
@@ -596,7 +632,7 @@ __device__ __noinline__ void
   if constexpr (NUM_KV_CHUNKS == 1) {
     constexpr int OUT_STRIDE = NUM_Q_HEADS * KV_LORA_RANK;
     bf16 *o = reinterpret_cast<bf16 *>(output_ptr) +
-              static_cast<long>(query_start) * OUT_STRIDE +
+              static_cast<long>(q_row) * OUT_STRIDE +
               static_cast<long>(q_head_group * Q_HEADS_PER_GROUP +
                                 q_head_local) *
                   KV_LORA_RANK;
@@ -614,7 +650,7 @@ __device__ __noinline__ void
     constexpr int LSE_S = NUM_Q_GROUPS * NUM_KV_CHUNKS * Q_HEADS_PER_GROUP;
     constexpr int O_S = LSE_S * KV_LORA_RANK;
     float *o = reinterpret_cast<float *>(output_ptr) +
-               static_cast<long>(query_start) * O_S +
+               static_cast<long>(q_row) * O_S +
                static_cast<long>(q_head_group) * NUM_KV_CHUNKS *
                    Q_HEADS_PER_GROUP * KV_LORA_RANK +
                static_cast<long>(kv_chunk_idx) * Q_HEADS_PER_GROUP *
@@ -651,7 +687,7 @@ __device__ __noinline__ void
     constexpr int LSE_STRIDE =
         NUM_Q_GROUPS * NUM_KV_CHUNKS * Q_HEADS_PER_GROUP;
     float *lse_out = reinterpret_cast<float *>(lse_ptr) +
-                     static_cast<long>(query_start) * LSE_STRIDE +
+                     static_cast<long>(q_row) * LSE_STRIDE +
                      q_head_group * NUM_KV_CHUNKS * Q_HEADS_PER_GROUP +
                      kv_chunk_idx * Q_HEADS_PER_GROUP + q_head_local;
     float lse_val = (l_sum > 0.0f)
@@ -688,7 +724,14 @@ __device__ __noinline__ void
 // distinct XCDs the same way kv_head does in gang_attention_mi300.cuh):
 //   q_head_group = tile_idx % NUM_Q_GROUPS
 //   kv_chunk     = (tile_idx / NUM_Q_GROUPS) % NUM_KV_CHUNKS
-//   request_id   = tile_idx / (NUM_Q_GROUPS * NUM_KV_CHUNKS)
+//   token        = (tile_idx / (NUM_Q_GROUPS * NUM_KV_CHUNKS)) % BATCH_SIZE
+//   request_id   =  tile_idx / (NUM_Q_GROUPS * NUM_KV_CHUNKS * BATCH_SIZE)
+//
+// The token dimension sits INSIDE the request one because a request's rows
+// share its page list -- a work item is (row, q group, kv chunk), and the
+// caller's total_work_items has to carry the BATCH_SIZE factor to match. At
+// BATCH_SIZE 1 the token term is a constant 0 and request_id is unchanged, so
+// this is the same decomposition it always was.
 //
 // The latent cache append (c_kv + k_rope for the new token) is done by the
 // preceding task, so unlike gang_attention_split_kv_kernel there is no
@@ -702,7 +745,8 @@ template <typename T,
           int NUM_KV_CHUNKS,
           int Q_WORKSPACE_STRIDE,
           int KV_CACHE_STRIDE,
-          bool WRITE_THROUGH = false>
+          bool WRITE_THROUGH = false,
+          int BATCH_SIZE = 1>
 __device__ __noinline__ void
     gang_mla_decode_kernel(void const *q_workspace_ptr,
                            void const *paged_kv_cache_ptr,
@@ -723,8 +767,12 @@ __device__ __noinline__ void
 
   int const q_head_group = tile_idx % NUM_Q_GROUPS;
   int const kv_chunk_idx = (tile_idx / NUM_Q_GROUPS) % NUM_KV_CHUNKS;
-  int16_t const request_id =
-      static_cast<int16_t>(tile_idx / (NUM_Q_GROUPS * NUM_KV_CHUNKS));
+  int const token_idx =
+      (BATCH_SIZE == 1)
+          ? 0
+          : ((tile_idx / (NUM_Q_GROUPS * NUM_KV_CHUNKS)) % BATCH_SIZE);
+  int16_t const request_id = static_cast<int16_t>(
+      tile_idx / (NUM_Q_GROUPS * NUM_KV_CHUNKS * BATCH_SIZE));
 
   mla_decode_absorbed<T,
                       NUM_Q_HEADS,
@@ -735,7 +783,8 @@ __device__ __noinline__ void
                       NUM_KV_CHUNKS,
                       Q_WORKSPACE_STRIDE,
                       KV_CACHE_STRIDE,
-                      WRITE_THROUGH>(q_workspace_ptr,
+                      WRITE_THROUGH,
+                      BATCH_SIZE>(q_workspace_ptr,
                                        paged_kv_cache_ptr,
                                        output_ptr,
                                        lse_ptr,
@@ -744,6 +793,7 @@ __device__ __noinline__ void
                                        kv_indices,
                                        kv_last_page_len,
                                        request_id,
+                                       token_idx,
                                        q_head_group,
                                        kv_chunk_idx,
                                        scale_s);

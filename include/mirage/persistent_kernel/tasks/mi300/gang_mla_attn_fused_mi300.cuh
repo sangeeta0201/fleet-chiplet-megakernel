@@ -1244,6 +1244,13 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
           PAIR_MERGE
               ? (pair_half * mla_tiles_per_xcd + t) * NUM_Q_GROUPS + pair_id
               : xcd_id * mla_tiles_per_xcd + t;
+      // PAIR_MERGE's remap is a bijection onto [0, NUM_Q_GROUPS *
+      // NUM_KV_CHUNKS) with no room for the token factor, and it is a
+      // default-off knob that already measured neutral. Fail the build rather
+      // than silently decode row 0 twice.
+      static_assert(!(PAIR_MERGE && BATCH_SIZE > 1),
+                    "MPK_GLM_MLA_PAIR_MERGE does not carry the token "
+                    "dimension; it is incompatible with BATCH_SIZE > 1");
       gang_mla_decode_kernel<bfloat16,
                              NUM_Q_HEADS,
                              KV_LORA_RANK,
@@ -1253,7 +1260,8 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
                              NUM_KV_CHUNKS,
                              Q_WORKSPACE_STRIDE,
                              KV_CACHE_STRIDE,
-                             /*WRITE_THROUGH=*/true>(
+                             /*WRITE_THROUGH=*/true,
+                             BATCH_SIZE>(
           q_workspace_ptr,
           kv_cache_ptr,
           o_acc_ptr,

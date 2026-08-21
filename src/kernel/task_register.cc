@@ -3942,13 +3942,14 @@ int TaskRegister::register_gang_mla_attn_fused_mi300_task(
   assert(tiles_per_xcd > 0);
   assert(num_q_heads % 16 == 0);
   int num_q_groups = num_q_heads / 16;
-  // mla_total_work_items counts REQUESTS, not tokens: gang_mla_decode_kernel
-  // decomposes tile_idx into (q_group, kv_chunk, request) and request_id
-  // indexes qo_indptr/kv_indptr. At batch_size > 1 -- MTP's 2-token verify --
-  // the two diverge, and the python layer sizes this from
-  // max_num_batched_requests (which it still asserts is 1).
+  // mla_total_work_items counts (query row, q group, kv chunk) triples, so it
+  // carries batch_size as well as the request count: gang_mla_decode_kernel
+  // decomposes tile_idx into (q_group, kv_chunk, token, request), with the
+  // token dimension inside the request one because a request's rows share its
+  // page list. request_id is still a literal 0 here (see the note below), so
+  // the quotient IS batch_size rather than merely bounded by it.
   assert(mla_total_work_items % (num_q_groups * num_kv_chunks) == 0);
-  assert(mla_total_work_items / (num_q_groups * num_kv_chunks) <= batch_size);
+  assert(mla_total_work_items / (num_q_groups * num_kv_chunks) == batch_size);
   assert(merge_dim_splits >= 1 && kv_lora_rank % merge_dim_splits == 0);
   assert(num_kv_chunks > 1 &&
          "with one chunk the decode writes attn_out directly and there is no "
@@ -4219,13 +4220,14 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
          "1/world-th of it");
   assert(num_q_heads % 16 == 0);
   int num_q_groups = num_q_heads / 16;
-  // mla_total_work_items counts REQUESTS, not tokens: gang_mla_decode_kernel
-  // decomposes tile_idx into (q_group, kv_chunk, request) and request_id
-  // indexes qo_indptr/kv_indptr. At batch_size > 1 -- MTP's 2-token verify --
-  // the two diverge, and the python layer sizes this from
-  // max_num_batched_requests (which it still asserts is 1).
+  // mla_total_work_items counts (query row, q group, kv chunk) triples, so it
+  // carries batch_size as well as the request count: gang_mla_decode_kernel
+  // decomposes tile_idx into (q_group, kv_chunk, token, request), with the
+  // token dimension inside the request one because a request's rows share its
+  // page list. request_id is still a literal 0 here (see the note below), so
+  // the quotient IS batch_size rather than merely bounded by it.
   assert(mla_total_work_items % (num_q_groups * num_kv_chunks) == 0);
-  assert(mla_total_work_items / (num_q_groups * num_kv_chunks) <= batch_size);
+  assert(mla_total_work_items / (num_q_groups * num_kv_chunks) == batch_size);
   assert(merge_dim_splits >= 1 && kv_lora_rank % merge_dim_splits == 0);
   assert(num_kv_chunks > 1 &&
          "with one chunk the decode writes attn_out directly and there is no "

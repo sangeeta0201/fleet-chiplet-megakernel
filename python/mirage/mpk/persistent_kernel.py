@@ -2182,8 +2182,14 @@ class PersistentKernel:
         assert self.max_num_batched_requests == 1, (
             "gang_mla_attn_fused_layer is single-request; the standalone "
             "decode + merge path handles batched requests")
+        # batch_size, not just the request count: a work item is
+        # (query row, q group, kv chunk). The rows of one request share its
+        # page list, so the decode's token dimension lives inside the request
+        # one -- see the decomposition comment in gang_mla_decode_mi300.cuh.
+        # At batch_size 1 this is exactly the old product.
         mla_total_work_items = (
-            self.max_num_batched_requests * num_q_groups * num_kv_chunks)
+            self.max_num_batched_requests * batch_size
+            * num_q_groups * num_kv_chunks)
         import math
         mla_tiles_per_xcd = math.ceil(mla_total_work_items / 8)
         assert merge_dim_splits >= 1 and kv_lora_rank % merge_dim_splits == 0
@@ -2568,8 +2574,14 @@ class PersistentKernel:
         q_workspace_slots = q_workspace_slots or num_q_heads
         assert q_workspace_slots <= num_q_heads
         assert qb_output_stride == q_workspace_slots * qb_head_span
+        # batch_size, not just the request count: a work item is
+        # (query row, q group, kv chunk). The rows of one request share its
+        # page list, so the decode's token dimension lives inside the request
+        # one -- see the decomposition comment in gang_mla_decode_mi300.cuh.
+        # At batch_size 1 this is exactly the old product.
         mla_total_work_items = (
-            self.max_num_batched_requests * num_q_groups * num_kv_chunks)
+            self.max_num_batched_requests * batch_size
+            * num_q_groups * num_kv_chunks)
         import math
         mla_tiles_per_xcd = math.ceil(mla_total_work_items / 8)
         assert merge_dim_splits >= 1 and kv_lora_rank % merge_dim_splits == 0
