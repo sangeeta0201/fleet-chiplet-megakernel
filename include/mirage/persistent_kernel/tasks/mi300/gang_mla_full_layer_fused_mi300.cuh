@@ -153,6 +153,8 @@
 // direct user.
 #include "tasks/mi300/gang_moe_linear_mxfp4_mi300.cuh"
 #include "tasks/mi300/gang_oproj_router_fused_mi300.cuh"
+// Per-stage activation checksums, compiled out unless -DMPK_BS_DEBUG=<layers>.
+#include "tasks/mi300/mpk_bsdbg.cuh"
 
 // Inline-EP ablation. EVERY non-zero setting PRODUCES WRONG OUTPUT -- each
 // rank folds against whatever happens to be in its gather slots -- so no
@@ -1384,6 +1386,16 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
   if (tid == 0) {
     mpk_stage_stamp(2);
   }
+  // Stage 0: the residual stream this layer consumes. Under EP this is slot 0
+  // of the gather buffer, which is where an ordinary residual would sit, so
+  // the two configurations are commensurate. Placed after the entry barrier
+  // and after the fold, so nobody is still writing it.
+  MPK_BSDBG(0,
+            task_layer_idx,
+            (EP_WORLD_SIZE > 1) ? input_ptrs[27] : input_ptrs[0],
+            HIDDEN_SIZE,
+            EP_MY_PE,
+            "resid_in");
   MPK_WS_PHASE(20, task_layer_idx, xcd_id);
   gang_mla_attn_fused_kernel_mi300<BATCH_SIZE,
                                    QKV_OUTPUT_PER_WG,
@@ -1475,6 +1487,15 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       /*ep_signal=*/(EP_WORLD_SIZE > 1 && ml_mode) ? input_ptrs[28] : nullptr);
 
   MPK_WS_PHASE(60, task_layer_idx, xcd_id);
+  // Stages 1-3: the attention half's three published buffers. Every one of
+  // them is behind a barrier inside the call that just returned, so a single
+  // reader here is not racing its producers.
+  MPK_BSDBG(1, task_layer_idx, output_ptrs[0], KV_INPUT_STRIDE, EP_MY_PE,
+            "qkv_a_out");
+  MPK_BSDBG(2, task_layer_idx, output_ptrs[1], Q_WORKSPACE_STRIDE, EP_MY_PE,
+            "q_workspace");
+  MPK_BSDBG(3, task_layer_idx, output_ptrs[4], NUM_Q_HEADS * KV_LORA_RANK,
+            EP_MY_PE, "attn_out");
   // Stage stamp 23: split-KV merge done, about to arrive at the Phase 8 barrier.
   if (tid == 0) {
     mpk_stage_stamp(23);
@@ -2122,6 +2143,18 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       (ROUTER_FOLD && ml_mode) ? input_ptrs[FL_ROUTER_WT_IN] : nullptr,
       /*router_partials=*/
       (ROUTER_FOLD && ml_mode) ? input_ptrs[FL_ROUTER_PARTS_IN] : nullptr);
+  // Stages 4-6: the MoE half's buffers. `hidden` and `norm_output` are both
+  // published before the routing barrier every worker passes, and the swiglu
+  // scratch before the W13 -> W2 one, so none of the three is still being
+  // written when the call returns. The layer's own OUTPUT is an f32 partial in
+  // moe_workspace_f32 that the next layer's Phase 0 folds -- so it is read as
+  // layer L+1's stage 0, not here.
+  MPK_BSDBG(4, task_layer_idx, output_ptrs[6], HIDDEN_SIZE, EP_MY_PE,
+            "oproj_hidden");
+  MPK_BSDBG(5, task_layer_idx, input_ptrs[18], HIDDEN_SIZE, EP_MY_PE,
+            "moe_norm_out");
+  MPK_BSDBG(6, task_layer_idx, input_ptrs[26], MOE_INTERMEDIATE, EP_MY_PE,
+            "swiglu_out");
   static_assert(OPROJ_EP_SIGNAL_STRIDE == FULL_LAYER_EP_SIGNAL_STRIDE &&
                     QB_EP_SIGNAL_STRIDE == FULL_LAYER_EP_SIGNAL_STRIDE,
                 "the o_proj and q_b all-gathers share the EP fold's signal "

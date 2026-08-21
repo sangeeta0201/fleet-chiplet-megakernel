@@ -375,7 +375,11 @@ __device__ __forceinline__ int get_xcd_id() {
 // Without this, inlining TopK into the persistent_kernel function causes the
 // compiler's instruction scheduler to pessimize the CK GEMM pipeline, making
 // ALL task types ~5-12% slower.
-template <typename T, int NUM_EXPERTS, int K>
+// ROUTING_ROW_STRIDE is routing_indices' ALLOCATED row stride, i.e. the
+// graph's BATCH_SIZE, which is not the same thing as num_active_tokens once
+// BATCH_SIZE > 1. 0 keeps the pre-MTP behaviour (stride == num_rows). See the
+// long comment on the parameter in moe_topk_sigmoid_bias_mi300.cuh.
+template <typename T, int NUM_EXPERTS, int K, int ROUTING_ROW_STRIDE = 0>
 __device__ __attribute__((noinline)) void
     topk_noinline(void *logits_scratch_ptr,
                   void *topk_weight_ptr,
@@ -412,7 +416,8 @@ __device__ __attribute__((noinline)) void
                                /*VPT=*/8,
                                NUM_EXPERTS,
                                /*WARPS_PER_CTA=*/4,
-                               /*BYTES_PER_LDG=*/16>(logits_base,
+                               /*BYTES_PER_LDG=*/16,
+                               ROUTING_ROW_STRIDE>(logits_base,
                                                      topk_weight_ptr,
                                                      num_active_tokens,
                                                      K,
@@ -439,7 +444,7 @@ __device__ __attribute__((noinline)) void
 // unbiased sigmoid. So the caller must leave the logit alone and hand the full
 // bias vector down to this tail, instead of folding one element into its own
 // logit the way the softmax path does.
-template <typename T, int NUM_EXPERTS, int K>
+template <typename T, int NUM_EXPERTS, int K, int ROUTING_ROW_STRIDE = 0>
 __device__ __attribute__((noinline)) void
     topk_sigmoid_noinline(void *logits_scratch_ptr,
                           void *bias_ptr,
@@ -475,7 +480,8 @@ __device__ __attribute__((noinline)) void
                                     NUM_EXPERTS,
                                     /*WARPS_PER_CTA=*/4,
                                     /*BYTES_PER_LDG=*/16,
-                                    /*K_STATIC=*/K>(
+                                    /*K_STATIC=*/K,
+                                    ROUTING_ROW_STRIDE>(
       logits_base,
       bias_ptr,
       topk_weight_ptr,
@@ -1197,7 +1203,9 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   // ═══ Step 4: Last worker runs TopK ═══
   if (completed == total_gang_tiles) {
     if constexpr (SIGMOID_BIAS) {
-      gang_rmsnorm_topk_detail::topk_sigmoid_noinline<T, NUM_EXPERTS, K>(
+      gang_rmsnorm_topk_detail::
+          topk_sigmoid_noinline<T, NUM_EXPERTS, K, /*ROUTING_ROW_STRIDE=*/
+                                BATCH_SIZE>(
           logits_scratch_ptr,
           const_cast<void *>(bias_ptr),
           topk_weight_ptr,
@@ -1211,7 +1219,8 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
           routing_ready_ptr,
           routing_epoch_hint);
     } else {
-      gang_rmsnorm_topk_detail::topk_noinline<T, NUM_EXPERTS, K>(
+      gang_rmsnorm_topk_detail::
+          topk_noinline<T, NUM_EXPERTS, K, /*ROUTING_ROW_STRIDE=*/BATCH_SIZE>(
           logits_scratch_ptr,
           topk_weight_ptr,
           routing_indices_ptr,

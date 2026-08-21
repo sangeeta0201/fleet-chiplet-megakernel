@@ -186,11 +186,21 @@ __device__ __attribute__((noinline)) void
   }
   int const gemm_tile_idx = tile_idx - 1;
 
+  // norm_input_ptr is the [q_a | latent] row, KV_INPUT_STRIDE wide, and this
+  // GEMM reduces over its REDUCTION_SIZE-wide q_a prefix. The two differ, so
+  // the row stride has to be handed over explicitly; without it the second
+  // token's row lands REDUCTION_SIZE in rather than KV_INPUT_STRIDE.
   gang_rmsnorm_linear_mxfp8_bias_kernel<BATCH_SIZE,
                                         OUTPUT_PER_WG,
                                         REDUCTION_SIZE,
                                         ACTUAL_HIDDEN_DIM,
-                                        WRITE_THROUGH>(norm_input_ptr,
+                                        WRITE_THROUGH,
+                                        /*FUSE_RESADD=*/false,
+                                        /*EP_PEER_SLOTS=*/0,
+                                        /*EP_PRE_FOLDED=*/false,
+                                        /*SP_QKV=*/false,
+                                        /*PRO_PUB=*/false,
+                                        KV_INPUT_STRIDE>(norm_input_ptr,
                                                            norm_weight_ptr,
                                                            norm_output_ptr,
                                                            weight_ptr,
@@ -259,7 +269,11 @@ __device__ __attribute__((noinline)) void
   // the whole query row.
   bf16 *rope_out = nullptr;
   if constexpr (UNABSORB_K) {
-    static_assert(BATCH_SIZE == 1,
+    // `if constexpr (DEFER_ROPE) return;` above discards the branch, not the
+    // rest of the function, so this tail is still instantiated when the caller
+    // does the rotation itself -- hence the DEFER_ROPE term. Without it a
+    // BATCH_SIZE > 1 build fails here on code that never runs.
+    static_assert(DEFER_ROPE || BATCH_SIZE == 1,
                   "the query row's stride is not plumbed through here, so the "
                   "cross-write is only addressable at one token");
     // The nope rows do NOT have to fill whole workgroups. At OUTPUT_PER_WG 128

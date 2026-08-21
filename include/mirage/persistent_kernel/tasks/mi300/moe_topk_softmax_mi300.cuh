@@ -42,7 +42,13 @@ template <typename T,
           int VPT,
           int NUM_EXPERTS,
           int WARPS_PER_CTA,
-          int BYTES_PER_LDG>
+          int BYTES_PER_LDG,
+          // routing_indices' ALLOCATED row stride -- the graph's BATCH_SIZE,
+          // which stops matching num_rows once BATCH_SIZE > 1. 0 keeps the
+          // pre-MTP behaviour. Same bug and same fix as the sigmoid_bias
+          // variant; see the long comment there. GLM does not take this path,
+          // so this edit is a no-op for every current caller.
+          int ROUTING_ROW_STRIDE = 0>
 __device__ __forceinline__ void topk_softmax_mi300_task_impl(
     void *__restrict__ input_ptr,  // [num_rows, NUM_EXPERTS]
     void *__restrict__ output_ptr, // [num_rows, k] (float weights)
@@ -57,6 +63,7 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
   float *output = static_cast<float *>(output_ptr);
   int *routing_indices = static_cast<int *>(routing_indices_ptr);
   int *active_expert_ids = static_cast<int *>(active_expert_ids_ptr);
+  int const rstride = ROUTING_ROW_STRIDE > 0 ? ROUTING_ROW_STRIDE : num_rows;
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
   unsigned long long _tks_t0 = __builtin_amdgcn_s_memrealtime();
@@ -68,8 +75,8 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
   for (int expert = start_expert + threadIdx.x; expert < end_expert;
        expert += blockDim.x) {
     if (routing_indices != nullptr) {
-      for (int row = 0; row < num_rows; ++row) {
-        routing_indices[expert * num_rows + row] = 0;
+      for (int row = 0; row < rstride; ++row) {
+        routing_indices[expert * rstride + row] = 0;
       }
     }
   }
@@ -264,7 +271,7 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
         if (node_uses && routing_indices != nullptr) {
           int const local_expert = expert - start_expert;
           st_wt_u32(
-              (void *)&routing_indices[local_expert * num_rows + thread_row],
+              (void *)&routing_indices[local_expert * rstride + thread_row],
               (unsigned)(k_idx + 1));
           if (active_expert_ids != nullptr) {
             st_wt_u32((void *)&active_expert_ids[k_idx], (unsigned)expert);
@@ -321,7 +328,7 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
         if (node_uses && routing_indices != nullptr) {
           int const local_expert = expert - start_expert;
           st_wt_u32(
-              (void *)&routing_indices[local_expert * num_rows + thread_row],
+              (void *)&routing_indices[local_expert * rstride + thread_row],
               (unsigned)(k_idx + 1));
           if (active_expert_ids != nullptr) {
             st_wt_u32((void *)&active_expert_ids[k_idx], (unsigned)expert);

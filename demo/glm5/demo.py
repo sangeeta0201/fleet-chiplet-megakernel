@@ -1677,11 +1677,17 @@ if __name__ == "__main__":
         # hidden_size, that lands inside the *next* XCD's accumulator (and off
         # the end for XCD 7), which silently corrupts o_proj -- the decode
         # degenerates to a single repeated token. So give every chunk
-        # n_tiles_xcd extra floats to hold its own counters. The kernel's row
-        # stride stays n_tiles*tile_n, so this only holds at bs == 1.
-        assert bs == 1, "split-K o_proj workspace layout assumes bs == 1"
+        # n_tiles_xcd extra floats to hold its own counters.
+        #
+        # The kernel's row stride is n_tiles*tile_n and its rows are
+        # contiguous *inside the XCD chunk*, so at bs > 1 the chunk is
+        # bs*n_tiles_xcd*tile_n floats then n_tiles_xcd counters -- which a
+        # (bs, W) tensor does NOT lay out, because dim-1 partitioning would
+        # interleave the XCDs between rows. Declare it as one row and let the
+        # (1,-1,-1) input map cut it into 8 contiguous chunks; at bs == 1 this
+        # is byte-identical to the old shape.
         splitk_ws = make_tensor("splitk_workspace",
-                                (bs, hidden_size + 8 * n_tiles_xcd),
+                                (1, bs * hidden_size + 8 * n_tiles_xcd),
                                 torch_dtype=torch.float32)
         rmsnorm_out_moe = make_tensor("rmsnorm_out_moe", (bs, hidden_size))
         layer_out = make_tensor("layer_out", (bs, hidden_size))

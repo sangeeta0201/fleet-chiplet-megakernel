@@ -423,6 +423,13 @@ __device__ __attribute__((always_inline)) void
     static_assert(OPROJ_REDUCTION_SIZE % WUV_V_HEAD_DIM == 0,
                   "o_proj's K is the whole v row, H * V_HEAD_DIM");
     constexpr int TILES_PER_HEAD = WUV_V_HEAD_DIM / WUV_ROWS_PER_WG;
+    // Row width of oproj_input_ptr (attn_out). Under un-absorbed W_UV,
+    // OPROJ_REDUCTION_SIZE is NUM_Q_HEADS * WUV_V_HEAD_DIM, so the head count
+    // -- and hence the attn_out row, which is NUM_Q_HEADS * KV_LORA_RANK --
+    // is recoverable at compile time. The GEMV reduces over one head, so this
+    // is the stride its second token row sits at.
+    constexpr int WUV_ATTN_OUT_STRIDE =
+        (OPROJ_REDUCTION_SIZE / WUV_V_HEAD_DIM) * WUV_REDUCTION;
     // W_UV is the only one of the three bf16-activation GEMVs whose shape the
     // FP8 MFMA can take. o_proj wants 4-row tiles at the NP=8 shard (96
     // columns per XCD, 24 tiles against 29 workers) where the MFMA's unit is
@@ -486,7 +493,8 @@ __device__ __attribute__((always_inline)) void
         // part of that recovers.
         gang_linear_mxfp8_kernel<BATCH_SIZE,
                                  WUV_REDUCTION,
-                                 /*WRITE_THROUGH=*/true>(head_in,
+                                 /*WRITE_THROUGH=*/true,
+                                 WUV_ATTN_OUT_STRIDE>(head_in,
                                                          wuv_weight_ptr,
                                                          xcd_v_out,
                                                          num_active_tokens,
@@ -504,7 +512,8 @@ __device__ __attribute__((always_inline)) void
                                WUV_REDUCTION,
                                WUV_ROWS_PER_WG,
                                /*HAS_RESIDUAL=*/false,
-                               /*WRITE_THROUGH=*/true>(head_in,
+                               /*WRITE_THROUGH=*/true,
+                               WUV_ATTN_OUT_STRIDE>(head_in,
                                                        wuv_weight_ptr,
                                                        /*residual=*/nullptr,
                                                        xcd_v_out,

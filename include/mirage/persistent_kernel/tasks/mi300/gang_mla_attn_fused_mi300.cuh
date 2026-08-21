@@ -909,9 +909,23 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     }
     bool const qb_push = qb_tp && qb_all_mapped;
 
-    // Deferred rope: the position arithmetic the kvupd kernel used to do, at
-    // BATCH_SIZE 1 where the token row is 0. Hoisted out of the tile loop
-    // because it is four scalar loads and does not depend on the tile.
+    // Rows this task actually carries. BATCH_SIZE is the compile-time width of
+    // every scratch row; num_tokens is how many of them hold a live token, and
+    // the two differ whenever the graph is built wider than the step being
+    // run. At BATCH_SIZE 1 this folds to the constant 1 and nothing below it
+    // changes shape -- the bs == 1 codegen is meant to stay identical.
+    int qb_rows = 1;
+    if constexpr (BATCH_SIZE > 1) {
+      int const nt = qo_indptr[request_id + 1] - qo_indptr[request_id];
+      qb_rows = nt < BATCH_SIZE ? nt : BATCH_SIZE;
+      if (qb_rows < 1) {
+        qb_rows = 1;
+      }
+    }
+    // Deferred rope: the position arithmetic the kvupd kernel used to do.
+    // Hoisted out of the tile loop because it is four scalar loads and does
+    // not depend on the tile; `rope_pos` is the position of token row 0, and
+    // row r sits at rope_pos + r, the same walk latent_to_cache does.
     int rope_pos = 0;
     if constexpr (QB_DEFER_ROPE) {
       int const req = request_id;
@@ -922,9 +936,6 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
           (kv_indptr[req + 1] - first_page_pos - 1) * PAGE_SIZE +
           kv_last_page_len[req];
       rope_pos = global_seq_len - num_tokens;
-      static_assert(BATCH_SIZE == 1,
-                    "the deferred rotation reads token row 0 only, like the "
-                    "cross-write in the kvupd kernel it replaces");
     }
 
     for (int t = xcd_rank; t < wuk_tiles_per_xcd; t += tiles_per_xcd) {
@@ -943,10 +954,17 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
           static_cast<size_t>(qb_head_base) * QK_DIM_ +
           static_cast<size_t>(xcd_id) * heads_per_xcd * QK_DIM_ +
           static_cast<size_t>(t / TILES_PER_HEAD) * QK_ROPE_HEAD_DIM;
+      // Both strides are the compile-time row widths, not qb_output_stride:
+      // the nope scratch and the query row are declared at the full head count
+      // on every rank (see the QB_TP note above), and qb_output_stride means
+      // different things to this task's two callers. At BATCH_SIZE 1 neither
+      // is read at all -- m_tiles is 1, so the row term is zero -- which is
+      // exactly why the overloading survived this long.
       gang_gemv_mxfp8_kernel<BATCH_SIZE, QK_NOPE_HEAD_DIM, WUK_ROWS_PER_WG,
-                             /*HAS_RESIDUAL=*/false, /*WRITE_THROUGH=*/true>(
+                             /*HAS_RESIDUAL=*/false, /*WRITE_THROUGH=*/true,
+                             NUM_Q_HEADS * QB_HEAD_SPAN>(
           head_in, wuk_weight_ptr, /*residual=*/nullptr, tile_out,
-          num_active_tokens, WUK_ROWS_PER_WG, qb_output_stride,
+          num_active_tokens, WUK_ROWS_PER_WG, NUM_Q_HEADS * QK_DIM_,
           /*m_tiles=*/1, wuk_tiles_per_xcd, /*wgm=*/0, t);
       // Push the rows this workgroup just produced straight into every peer's
       // copy of the query row, at the identical offset. The head slices are
@@ -977,17 +995,27 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
       if constexpr (QB_DEFER_ROPE) {
         if ((t % TILES_PER_HEAD) == TILES_PER_HEAD - 1) {
           using rope_bf16 = gang_mla_kvupd_detail::bf16;
-          gang_mla_kvupd_detail::rope_tile_inplace<QK_ROPE_HEAD_DIM,
-                                                   /*WRITE_THROUGH=*/true>(
-              reinterpret_cast<rope_bf16 *>(q_nope_ptr) +
-                  static_cast<size_t>(head) * QB_HEAD_SPAN +
-                  QK_NOPE_HEAD_DIM,
-              reinterpret_cast<rope_bf16 const *>(cos_ptr) +
-                  static_cast<size_t>(rope_pos) * QK_ROPE_HEAD_DIM,
-              reinterpret_cast<rope_bf16 const *>(sin_ptr) +
-                  static_cast<size_t>(rope_pos) * QK_ROPE_HEAD_DIM,
-              reinterpret_cast<rope_bf16 *>(q_workspace_ptr) +
-                  static_cast<size_t>(head) * QK_DIM_ + KV_LORA_RANK);
+          // One rotation per live token row. Both scratch rows are declared at
+          // the full head count on every rank (see the QB_TP note above), so
+          // their strides are compile-time -- not qb_output_stride, which the
+          // two callers below pass different meanings of and which nothing
+          // constrains at BATCH_SIZE 1. rope_tile_inplace has a __syncthreads
+          // in it, so the bound has to be block-uniform, which qb_rows is.
+          for (int r = 0; r < qb_rows; ++r) {
+            gang_mla_kvupd_detail::rope_tile_inplace<QK_ROPE_HEAD_DIM,
+                                                     /*WRITE_THROUGH=*/true>(
+                reinterpret_cast<rope_bf16 *>(q_nope_ptr) +
+                    static_cast<size_t>(r) * NUM_Q_HEADS * QB_HEAD_SPAN +
+                    static_cast<size_t>(head) * QB_HEAD_SPAN +
+                    QK_NOPE_HEAD_DIM,
+                reinterpret_cast<rope_bf16 const *>(cos_ptr) +
+                    static_cast<size_t>(rope_pos + r) * QK_ROPE_HEAD_DIM,
+                reinterpret_cast<rope_bf16 const *>(sin_ptr) +
+                    static_cast<size_t>(rope_pos + r) * QK_ROPE_HEAD_DIM,
+                reinterpret_cast<rope_bf16 *>(q_workspace_ptr) +
+                    static_cast<size_t>(r) * NUM_Q_HEADS * QK_DIM_ +
+                    static_cast<size_t>(head) * QK_DIM_ + KV_LORA_RANK);
+          }
         }
       }
       if (qb_push) {
@@ -1002,18 +1030,22 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
             2;
         __syncthreads();
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-        unsigned int *const src32 = reinterpret_cast<unsigned int *>(
-            tile_out + (size_t)t * WUK_ROWS_PER_WG);
-        for (int w = tid; w < push_w32; w += (int)blockDim.x) {
-          unsigned int const v =
-              (unsigned int)ld_nt_s32(reinterpret_cast<int *>(src32 + w));
-          // Unrolled over peers so qb_peer_delta stays in registers: a runtime
-          // index into a per-thread array is a scratch spill.
+        // One push per live token row, at that row's offset in the query row.
+        for (int r = 0; r < qb_rows; ++r) {
+          unsigned int *const src32 = reinterpret_cast<unsigned int *>(
+              tile_out + (size_t)r * NUM_Q_HEADS * QK_DIM_ +
+              (size_t)t * WUK_ROWS_PER_WG);
+          for (int w = tid; w < push_w32; w += (int)blockDim.x) {
+            unsigned int const v =
+                (unsigned int)ld_nt_s32(reinterpret_cast<int *>(src32 + w));
+            // Unrolled over peers so qb_peer_delta stays in registers: a
+            // runtime index into a per-thread array is a scratch spill.
 #pragma unroll
-          for (int q = 0; q < QB_NPEER; q++) {
-            st_wt_u32((void *)(reinterpret_cast<char *>(src32 + w) +
-                               qb_peer_delta[q]),
-                      v);
+            for (int q = 0; q < QB_NPEER; q++) {
+              st_wt_u32((void *)(reinterpret_cast<char *>(src32 + w) +
+                                 qb_peer_delta[q]),
+                        v);
+            }
           }
         }
       }

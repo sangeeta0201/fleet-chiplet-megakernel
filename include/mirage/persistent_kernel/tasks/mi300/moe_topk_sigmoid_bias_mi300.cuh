@@ -84,7 +84,27 @@ template <typename T,
           int NUM_EXPERTS,
           int WARPS_PER_CTA,
           int BYTES_PER_LDG,
-          int K_STATIC = 0>
+          int K_STATIC = 0,
+          // ── routing_indices' ALLOCATED row stride ────────────────────────
+          //
+          // routing_indices is [NUM_EXPERTS + S, batch], and `batch` is the
+          // graph's BATCH_SIZE -- a compile-time constant baked into every
+          // consumer. `num_rows` is num_active_tokens, which is <= that and
+          // varies per iteration. Until MTP they were always both 1, so this
+          // kernel used num_rows as the stride and nothing noticed.
+          //
+          // At BATCH_SIZE = 2 with one active token they differ, and the
+          // failure is silent and total: the producer lays the row out at
+          // stride 1 while _gang_moe_mxfp8_tile reads it at stride
+          // BATCH_SIZE, so every expert's route_val comes from the wrong
+          // slot. This was the whole of the "bs=2 builds, runs, and emits one
+          // token forever" bug -- it needs no second active token to fire,
+          // which is why every bisect that assumed "row 1 is mishandled"
+          // missed it.
+          //
+          // 0 keeps the old behaviour (stride == num_rows) for callers that
+          // have no BATCH_SIZE to hand.
+          int ROUTING_ROW_STRIDE = 0>
 __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
     void *__restrict__ input_ptr, // [num_rows, NUM_EXPERTS]
     void *__restrict__ bias_ptr,  // [NUM_EXPERTS] e_score_correction_bias
@@ -107,6 +127,12 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
   // Slot count per token: the k routed experts, plus the shared expert.
   int const k_total = k + num_shared_experts;
 
+  // The ALLOCATED row stride of routing_indices, which is the graph's
+  // BATCH_SIZE -- not num_rows. See the template parameter's comment. The
+  // zero fill below covers all `rstride` rows, so an inactive row routes
+  // nowhere; only the first num_rows rows get live values.
+  int const rstride = ROUTING_ROW_STRIDE > 0 ? ROUTING_ROW_STRIDE : num_rows;
+
   // SP7 splits SP6[6] -- the 5.78 us selection half of the router's serial
   // tail -- five ways, so the next attempt at it aims at the right microsecond.
   // No s_waitcnt is inserted at the boundaries, deliberately: the stores here
@@ -123,8 +149,8 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
   for (int expert = start_expert + threadIdx.x; expert < end_expert;
        expert += blockDim.x) {
     if (routing_indices != nullptr) {
-      for (int row = 0; row < num_rows; ++row) {
-        routing_indices[expert * num_rows + row] = 0;
+      for (int row = 0; row < rstride; ++row) {
+        routing_indices[expert * rstride + row] = 0;
       }
     }
   }
@@ -138,9 +164,13 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
   // caller has no such boundary. Failure is silent and looks like a token
   // routed through the previous layer's shared expert.
   if (num_shared_experts > 0 && routing_indices != nullptr) {
-    for (int row = threadIdx.x; row < num_rows; row += blockDim.x) {
-      st_wt_u32((void *)&routing_indices[NUM_EXPERTS * num_rows + row],
-                (unsigned)(k + 1));
+    // All `rstride` rows, not just the live ones: the shared expert's row is
+    // outside [start_expert, end_expert) so the zero fill above never touches
+    // it, and the tile decoder walks tok over the full BATCH_SIZE. A dead row
+    // left holding a stale k+1 would run the shared expert on garbage.
+    for (int row = threadIdx.x; row < rstride; row += blockDim.x) {
+      st_wt_u32((void *)&routing_indices[NUM_EXPERTS * rstride + row],
+                (unsigned)(row < num_rows ? (k + 1) : 0));
     }
   }
   __syncthreads();
@@ -507,7 +537,7 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
                   __float_as_uint(topk_vals[k_idx] * inv));
         if (expert >= start_expert && expert < end_expert &&
             routing_indices != nullptr) {
-          st_wt_u32((void *)&routing_indices[(expert - start_expert) * num_rows +
+          st_wt_u32((void *)&routing_indices[(expert - start_expert) * rstride +
                                              thread_row],
                     (unsigned)(k_idx + 1));
           if (active_expert_ids != nullptr) {

@@ -1090,7 +1090,15 @@ template <int BATCH_SIZE,
           // the quantized row and `pro_pub_ptr` points at it, so Step 1+2 and
           // the quantizer are both deleted and the tile copies E4M3 + E8M0
           // into LDS instead of deriving them. See _rnlm8_pro_publish.
-          bool PRO_PUB = false>
+          bool PRO_PUB = false,
+          // Row stride of norm_input_ptr when it is WIDER than the reduction
+          // this GEMM takes. Defaulting it to REDUCTION_SIZE is what pinned
+          // every narrowed-reduction caller to BATCH_SIZE 1: the token row
+          // offset below is the only place a stride is used at all, so at one
+          // row the two could not be told apart. q_b is the caller that needs
+          // it -- it reduces over the q_a prefix of a wider [q_a | latent]
+          // row -- and it passes KV_INPUT_STRIDE, which is that row's width.
+          int INPUT_ROW_STRIDE = REDUCTION_SIZE>
 __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     void const *norm_input_ptr,  // [batch, REDUCTION_SIZE] bf16
     void const *norm_weight_ptr, // [REDUCTION_SIZE] bf16
@@ -1363,7 +1371,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     (void)resadd_workspace_f32_ptr;
     (void)resadd_x_out_ptr;
     unsigned short const *raw_row =
-        (unsigned short const *)norm_input_ptr + tok_idx * REDUCTION_SIZE;
+        (unsigned short const *)norm_input_ptr +
+        (size_t)tok_idx * INPUT_ROW_STRIDE;
     if constexpr (LDS_PROLOGUE) {
       rms_rcp = _rnlm8_stage_norm_rcp<REDUCTION_SIZE, ACTUAL_HIDDEN_DIM>(
           raw_row, (unsigned short const *)norm_weight_ptr, s_x_bf16,

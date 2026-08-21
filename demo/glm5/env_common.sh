@@ -143,6 +143,15 @@ MPK_FORWARD_VARS=(
   MPK_PRINT_GEOMETRY
   MPK_PRINT_ALL_RANKS
   MPK_HOST_DBG_POLL
+  # -DMPK_MAX_TOKENS_PER_REQUEST=1: pins prefill to one token per iteration so
+  # a batch_size > 1 *build* can be gated with only one active row. Read via
+  # os.environ in persistent_kernel.py, i.e. compile-time and per-rank -- an
+  # unforwarded run silently keeps 2 tokens/iter (it did once, and the
+  # "garbage at one row" conclusion drawn from it was wrong).
+  CK_FMHA_1TOK
+  # Per-stage activation checksums (mpk_bsdbg.cuh). Compile-time, so every
+  # rank must see it or the ranks build different megakernels.
+  MPK_BS_DEBUG
   MAX_SAVE_TOKENS
   MPK_NUM_WORKERS
 )

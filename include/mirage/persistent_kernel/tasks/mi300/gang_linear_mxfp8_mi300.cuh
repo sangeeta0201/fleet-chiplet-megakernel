@@ -104,7 +104,14 @@ __device__ __forceinline__ bool _gang_mxfp8_tile_coords(
 // -- the scheduler's end-of-task fence covers it -- hence the default.
 template <int BATCH_SIZE,      // = m_per_tile (rows per M-tile)
           int REDUCTION_SIZE,  // K dimension
-          bool WRITE_THROUGH = false>
+          bool WRITE_THROUGH = false,
+          // Row stride of input_ptr when the caller hands over a slice of a
+          // WIDER row than this GEMM reduces. W_UV is the caller that needs
+          // it: input_ptr is one head of attn_out, so the reduction is
+          // KV_LORA_RANK but the row is NUM_Q_HEADS * KV_LORA_RANK. At one
+          // row the two are indistinguishable, which is why this went
+          // unnoticed until BATCH_SIZE > 1.
+          int INPUT_ROW_STRIDE = REDUCTION_SIZE>
 __device__ __noinline__ void gang_linear_mxfp8_kernel(
     void const *input_ptr,  // [batch, REDUCTION_SIZE] bf16
     void const *weight_ptr, // [1, n_wgs, wg_bytes] MXFP8 packed
@@ -187,22 +194,38 @@ __device__ __noinline__ void gang_linear_mxfp8_kernel(
   int const col = lane_id & 15; // output row within the 16x16 MFMA tile
   int const g = lane_id >> 4;   // K-group (0..3)
 
-  unsigned short const *input_base =
-      A + static_cast<size_t>(m_tile) * BATCH_SIZE * REDUCTION_SIZE;
-
   uint8_t const *wg_data = W_data + static_cast<size_t>(n_tile) * WG_BYTES;
   uint8_t const *wg_scales = wg_data + WG_DATA_BYTES;
 
-  unsigned short *out_base =
-      d_output + static_cast<size_t>(m_tile) * BATCH_SIZE * output_stride +
-      static_cast<size_t>(n_tile) * OUTPUT_PER_WG;
+  // Rows this M-tile actually carries. BATCH_SIZE is the tile height; at one
+  // row the loop below folds to the old straight-line body, which is what
+  // keeps the bs == 1 codegen identical.
+  int tile_rows = 1;
+  if constexpr (BATCH_SIZE > 1) {
+    tile_rows = num_active_tokens - m_tile * BATCH_SIZE;
+    tile_rows = tile_rows > BATCH_SIZE ? BATCH_SIZE : tile_rows;
+    tile_rows = tile_rows < 1 ? 1 : tile_rows;
+  }
 
-  // Phase 1: quantize bf16 input to FP8 E4M3 in shared memory.
-  _gang_wave_parallel_fp8_quant<REDUCTION_SIZE>(
-      input_base, s_tok_fp8, s_tok_scales);
+#pragma unroll 1
+  for (int _row = 0; _row < tile_rows; ++_row) {
+    unsigned short const *input_base =
+        A +
+        (static_cast<size_t>(m_tile) * BATCH_SIZE + _row) * INPUT_ROW_STRIDE;
 
-  // Phase 2: depth-4 pipelined FP8(weight) x FP8(token) MFMA.
-  {
+    unsigned short *out_base =
+        d_output +
+        (static_cast<size_t>(m_tile) * BATCH_SIZE + _row) * output_stride +
+        static_cast<size_t>(n_tile) * OUTPUT_PER_WG;
+
+    // Phase 1: quantize bf16 input to FP8 E4M3 in shared memory. Ends in a
+    // __syncthreads, so the previous row's readers are fenced off from the
+    // rewrite by the one at the bottom of this loop body.
+    _gang_wave_parallel_fp8_quant<REDUCTION_SIZE>(
+        input_base, s_tok_fp8, s_tok_scales);
+
+    // Phase 2: depth-4 pipelined FP8(weight) x FP8(token) MFMA.
+    {
     int wave_tile = warp_id;
     int w_row = wave_tile * 16 + col;
     uint8_t const *w_data_row =
@@ -291,9 +314,10 @@ __device__ __noinline__ void gang_linear_mxfp8_kernel(
         }
       }
     }
-  }
+    }
 
-  __syncthreads();
+    __syncthreads();
+  }
 }
 
 // Dense gang linear with MXFP8 weights + residual add.

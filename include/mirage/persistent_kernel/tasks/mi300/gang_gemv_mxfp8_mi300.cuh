@@ -152,7 +152,10 @@ __device__ __forceinline__ T ld_g(void const *p) {
 // [n_tiles, ROWS_PER_WG * (REDUCTION_SIZE + REDUCTION_SIZE/32)] bytes, so
 // n_tile indexes a workgroup rather than a row block. As in the bf16 kernel
 // the weight row stride is REDUCTION_SIZE while the *input* row stride need
-// not be, which stays correct only while BATCH_SIZE == 1.
+// not be -- INPUT_ROW_STRIDE is that stride, and defaulting it to
+// REDUCTION_SIZE is what used to pin this kernel to BATCH_SIZE == 1. W_UV is
+// the caller that needs it: input_ptr is one head of attn_out, so the
+// reduction is KV_LORA_RANK but the row is NUM_Q_HEADS * KV_LORA_RANK.
 //
 // WRITE_THROUGH sends the epilogue store past the XCD's L2 (sc0 sc1) instead
 // of leaving it dirty there. A standalone task does not need it -- the
@@ -166,7 +169,8 @@ template <int BATCH_SIZE, // = m_per_tile
           int REDUCTION_SIZE,
           int ROWS_PER_WG,
           bool HAS_RESIDUAL,
-          bool WRITE_THROUGH = false>
+          bool WRITE_THROUGH = false,
+          int INPUT_ROW_STRIDE = REDUCTION_SIZE>
 __device__ __noinline__ void
     gang_gemv_mxfp8_kernel(void const *input_ptr,
                            void const *weight_ptr,
@@ -229,7 +233,7 @@ __device__ __noinline__ void
       static_cast<size_t>(m_tile) * BATCH_SIZE * o_stride +
       static_cast<size_t>(n_tile) * ROWS_PER_WG;
   unsigned short const *tile_input =
-      A + static_cast<size_t>(m_tile) * BATCH_SIZE * REDUCTION_SIZE;
+      A + static_cast<size_t>(m_tile) * BATCH_SIZE * INPUT_ROW_STRIDE;
   unsigned char const *wg = W + static_cast<size_t>(n_tile) * WG_BYTES;
 
   int const tid = threadIdx.x;
@@ -263,12 +267,21 @@ __device__ __noinline__ void
     // The tile coords check above is block-uniform, so every thread that
     // reaches this __syncthreads reaches it together, and so is `stage_a`.
     if (stage_a) {
-      u32x4_t const *src = reinterpret_cast<u32x4_t const *>(tile_input);
-      u32x4_t *dst = reinterpret_cast<u32x4_t *>(s_a);
+      // Row-wise, because LDS holds the rows compacted at REDUCTION_SIZE
+      // while global has them INPUT_ROW_STRIDE apart. At BATCH_SIZE 1 this is
+      // one trip of the old flat copy.
+      constexpr int VEC_PER_ROW =
+          REDUCTION_SIZE / static_cast<int>(sizeof(u32x4_t) /
+                                            sizeof(unsigned short));
 #pragma unroll
-      for (int i = tid; i < static_cast<int>(A_LDS_BYTES / sizeof(u32x4_t));
-           i += NTHREADS) {
-        dst[i] = ld_g<u32x4_t>(src + i);
+      for (int m = 0; m < BATCH_SIZE; m++) {
+        u32x4_t const *src = reinterpret_cast<u32x4_t const *>(
+            tile_input + static_cast<size_t>(m) * INPUT_ROW_STRIDE);
+        u32x4_t *dst = reinterpret_cast<u32x4_t *>(s_a) + m * VEC_PER_ROW;
+#pragma unroll
+        for (int i = tid; i < VEC_PER_ROW; i += NTHREADS) {
+          dst[i] = ld_g<u32x4_t>(src + i);
+        }
       }
       __syncthreads();
     }
@@ -318,7 +331,7 @@ __device__ __noinline__ void
           av[u][m][0] = *reinterpret_cast<u32x4_t const *>(a);
           av[u][m][1] = *reinterpret_cast<u32x4_t const *>(a + 8);
         } else {
-          unsigned short const *a = tile_input + m * REDUCTION_SIZE + k;
+          unsigned short const *a = tile_input + m * INPUT_ROW_STRIDE + k;
           av[u][m][0] = ld_g<u32x4_t>(a);
           av[u][m][1] = ld_g<u32x4_t>(a + 8);
         }

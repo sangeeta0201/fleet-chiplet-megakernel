@@ -109,11 +109,17 @@ export MPK_NUM_WORKERS="${MPK_NUM_WORKERS:-232}"
 # Override with MPK_MPI_BIND="--bind-to none" to isolate a binding regression.
 MPK_MPI_BIND="${MPK_MPI_BIND:---map-by ppr:$((NP / 2)):numa --bind-to numa}"
 
+# Extra demo.py flags for callers that build their own argument list and cannot
+# append to it -- run_correctness_suite.sh in particular, which owns "$@" for
+# --prompt/--save-tokens. Unquoted on purpose so it word-splits. Expanded by
+# THIS shell, not on the ranks, so it needs no -x forwarding.
+#   MPK_EXTRA_ARGS="--max-num-batched-tokens 2" ./run_correctness_suite.sh ...
+
 mpirun -np "$NP" --tag-output --allow-run-as-root \
   $MPK_MPI_BIND \
   $(mpk_x_args) \
   stdbuf -oL -eL python3 demo.py $MIRAGE_FLAG \
     --max-seq-length "${MAX_SEQ_LENGTH:-128}" \
     --max-new-tokens "${MAX_NEW_TOKENS:-16}" \
-    --model-path "$MODEL_PATH" "$@"
+    --model-path "$MODEL_PATH" ${MPK_EXTRA_ARGS:-} "$@"
 echo "MPIRUN_EXIT=$?"

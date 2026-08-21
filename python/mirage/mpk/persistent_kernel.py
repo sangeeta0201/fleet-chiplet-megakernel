@@ -711,6 +711,14 @@ def get_compile_command(
             # mpk_atoms.cuh.
             assert 1 <= _w13_reps <= 4, "MPK_W13_REPS is 1..4"
             flags = flags + ["-DMPK_W13_REPS=%d" % _w13_reps]
+        _bs_debug = int(os.environ.get("MPK_BS_DEBUG", "0"))
+        if _bs_debug != 0:
+            # Per-stage activation checksums for the first N fused layers, one
+            # printf per (layer, stage) for the whole run. CORRECTNESS tool --
+            # it does not change any value, but do not quote a latency with it
+            # on. See mpk_bsdbg.cuh.
+            assert 1 <= _bs_debug <= 16, "MPK_BS_DEBUG is 1..16 (layers)"
+            flags = flags + ["-DMPK_BS_DEBUG=%d" % _bs_debug]
         _bar_skew = int(os.environ.get("MPK_BAR_SKEW", "0"))
         if _bar_skew >= 1:
             # Per-rendezvous first-arriver-to-last-arriver spread. O(1) per
@@ -2106,9 +2114,9 @@ class PersistentKernel:
         assert attn_counters.num_dims == 1
 
         batch_size = self.max_num_batched_tokens
-        assert batch_size == 1, (
-            "a narrowed reduction doubles as the row stride in both GEMMs; "
-            "needs one row")
+        # Both GEMMs now take their input row stride explicitly (qkv_a's
+        # happens to equal its reduction; q_b's is KV_INPUT_STRIDE), so the
+        # narrowed reduction no longer stands in for one.
 
         num_q_heads = mla_params[0]
         kv_lora_rank = mla_params[1]
@@ -2472,9 +2480,9 @@ class PersistentKernel:
                 "ep_signal / ep_tail_only only mean anything with ep_gather"
 
         batch_size = self.max_num_batched_tokens
-        assert batch_size == 1, (
-            "a narrowed reduction doubles as the row stride in three of this "
-            "layer's GEMMs; needs one row")
+        # q_b, W_UK and W_UV all take an explicit input row stride now; see
+        # INPUT_ROW_STRIDE in gang_rmsnorm_linear_mxfp8_bias / gang_gemv_mxfp8
+        # / gang_linear_mxfp8.
         assert self.max_num_batched_requests == 1, (
             "the fused layer is single-request; the registrar passes a "
             "literal request index of 0")
@@ -4292,9 +4300,8 @@ class PersistentKernel:
             f"{output.dim(1)}")
         assert batch_size % m_tiles == 0
         m_per_tile = batch_size // m_tiles
-        assert m_per_tile == 1, (
-            "the gemv reads the input at row stride reduction_size, which "
-            "only matches the tensor when there is one row per tile")
+        # The registrar hands the kernel input.dim(1) as INPUT_ROW_STRIDE, so
+        # a reduction narrower than the row no longer implies one row.
         total_tiles_per_xcd = n_tiles_per_xcd * m_tiles
         grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
@@ -4934,8 +4941,9 @@ class PersistentKernel:
             "output_per_wg must equal qk_rope_head_dim and divide the head")
 
         batch_size = self.max_num_batched_tokens
-        assert batch_size == 1, (
-            "a narrowed reduction doubles as the row stride; needs one row")
+        # The GEMM takes norm_input's real row width (kv_input_stride) as its
+        # input row stride now, so the narrowed reduction no longer stands in
+        # for one and batch_size is free.
         # K must clear the depth-4 pipeline's tail: only slot 3 is guarded.
         assert reduction_size % 512 == 0, reduction_size
         assert actual_hidden_dim <= reduction_size <= norm_input.dim(1)

@@ -904,10 +904,14 @@ int TaskRegister::register_gang_linear_res_mi300_task(
     assert(input_ops[1]->dtensor.dim[1] ==
                gemv_rows * (reduction_size + reduction_size / 32) &&
            "MXFP8 weight is not packed at this reduction and row count");
-    code.e("kernel::gang_gemv_mxfp8_kernel<$, $, $, true>(",
+    // The last argument is INPUT_ROW_STRIDE: `reduction_override` lets the
+    // GEMM stop short of a padded tail, so the reduction is not the input
+    // row width and the second token's row does not sit one reduction in.
+    code.e("kernel::gang_gemv_mxfp8_kernel<$, $, $, true, false, $>(",
            m_per_tile,
            reduction_size,
-           gemv_rows);
+           gemv_rows,
+           input_ops[0]->dtensor.dim[1]);
   } else if (gemv_rows > 0) {
     assert(gemv_rows == tile_n &&
            "gemv_rows is the compile-time form of tile_n; they must agree");
@@ -3243,8 +3247,8 @@ int TaskRegister::register_gang_rmsnorm_linear_mxfp8_bias_mla_kvupd_mi300_task(
   int kv_input_stride = input_ops[0]->dtensor.dim[1];
   assert(actual_hidden_dim <= reduction_size);
   assert(reduction_size <= kv_input_stride);
-  assert(batch_size == 1 &&
-         "the narrowed reduction doubles as the row stride; needs one row");
+  // The kernel takes KV_INPUT_STRIDE as the GEMM's input row stride now, so
+  // the narrowed reduction no longer doubles as one and batch_size is free.
   assert(kv_input_offset + kv_lora_rank + qk_rope_head_dim <= kv_input_stride);
   // One shared latent head, so the cache row stride is just the last dim.
   int kv_cache_stride = input_ops[8]->output_tensors[0].dim[3];
@@ -3882,9 +3886,8 @@ int TaskRegister::register_gang_mla_attn_fused_mi300_task(
   assert(input_ops[0]->dtensor.num_dims == 2);
   assert(input_ops[0]->dtensor.dim[0] == batch_size);
   int qkv_reduction = input_ops[0]->dtensor.dim[1];
-  // A narrowed reduction doubles as the row stride in both GEMMs, which only
-  // matches the tensor at one row.
-  assert(batch_size == 1);
+  // Both GEMMs take their input row stride explicitly now (qkv_a's equals its
+  // reduction, q_b's is kv_input_stride), so batch_size is free.
 
   // qkv_a_out carries [q_a | latent] and is the q_b GEMM's input row.
   assert(output_ops[0]->dtensor.num_dims == 2);
@@ -3939,7 +3942,13 @@ int TaskRegister::register_gang_mla_attn_fused_mi300_task(
   assert(tiles_per_xcd > 0);
   assert(num_q_heads % 16 == 0);
   int num_q_groups = num_q_heads / 16;
-  assert(mla_total_work_items == batch_size * num_q_groups * num_kv_chunks);
+  // mla_total_work_items counts REQUESTS, not tokens: gang_mla_decode_kernel
+  // decomposes tile_idx into (q_group, kv_chunk, request) and request_id
+  // indexes qo_indptr/kv_indptr. At batch_size > 1 -- MTP's 2-token verify --
+  // the two diverge, and the python layer sizes this from
+  // max_num_batched_requests (which it still asserts is 1).
+  assert(mla_total_work_items % (num_q_groups * num_kv_chunks) == 0);
+  assert(mla_total_work_items / (num_q_groups * num_kv_chunks) <= batch_size);
   assert(merge_dim_splits >= 1 && kv_lora_rank % merge_dim_splits == 0);
   assert(num_kv_chunks > 1 &&
          "with one chunk the decode writes attn_out directly and there is no "
@@ -4160,7 +4169,8 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
   assert(input_ops[0]->dtensor.num_dims == 2);
   assert(input_ops[0]->dtensor.dim[0] == batch_size);
   int qkv_reduction = input_ops[0]->dtensor.dim[1];
-  assert(batch_size == 1);
+  // See the same note in the attn-fused registrar: the input row stride is a
+  // template argument now, so the narrowed reduction no longer stands in.
   assert(output_ops[0]->dtensor.num_dims == 2);
   int kv_input_stride = output_ops[0]->dtensor.dim[1];
   assert(qkv_output_stride == kv_input_stride);
@@ -4209,7 +4219,13 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
          "1/world-th of it");
   assert(num_q_heads % 16 == 0);
   int num_q_groups = num_q_heads / 16;
-  assert(mla_total_work_items == batch_size * num_q_groups * num_kv_chunks);
+  // mla_total_work_items counts REQUESTS, not tokens: gang_mla_decode_kernel
+  // decomposes tile_idx into (q_group, kv_chunk, request) and request_id
+  // indexes qo_indptr/kv_indptr. At batch_size > 1 -- MTP's 2-token verify --
+  // the two diverge, and the python layer sizes this from
+  // max_num_batched_requests (which it still asserts is 1).
+  assert(mla_total_work_items % (num_q_groups * num_kv_chunks) == 0);
+  assert(mla_total_work_items / (num_q_groups * num_kv_chunks) <= batch_size);
   assert(merge_dim_splits >= 1 && kv_lora_rank % merge_dim_splits == 0);
   assert(num_kv_chunks > 1 &&
          "with one chunk the decode writes attn_out directly and there is no "
