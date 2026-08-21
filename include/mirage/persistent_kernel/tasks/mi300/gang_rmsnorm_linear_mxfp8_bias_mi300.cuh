@@ -338,8 +338,22 @@ _rnlm8_resadd_norm_rcp(float const *__restrict__ d_ws,
   int const tid = threadIdx.x;
   float ssq = 0.0f;
 
+  // MPK_ABL_QKV_PRO: run one of the ITERS passes and zero-fill the rest of the
+  // staged row instead. WRONG OUTPUT by construction. This is the only caller
+  // of the resadd prologue (qkv_a), so it isolates "prologue" from "GEMM"
+  // inside SP4[0] without touching the tile map, the WG stride or the MFMA
+  // count -- MPK_ATTN_HALFK already priced the GEMM half at ~0.
+#ifdef MPK_ABL_QKV_PRO
+  constexpr int ABL_ITERS = 1;
+#else
+  constexpr int ABL_ITERS = ITERS;
+#endif
 #pragma unroll 1
-  for (int v = 0; v < ITERS; v++) {
+  for (int v = ABL_ITERS; v < ITERS; v++) {
+    *reinterpret_cast<uint2 *>(s_x + (v * NTHREADS + tid) * VEC) = uint2{0, 0};
+  }
+#pragma unroll 1
+  for (int v = 0; v < ABL_ITERS; v++) {
     int const off = (v * NTHREADS + tid) * VEC;
     uint2 const r = *reinterpret_cast<uint2 const *>(d_res + off);
     if constexpr (STAGE_NW) {

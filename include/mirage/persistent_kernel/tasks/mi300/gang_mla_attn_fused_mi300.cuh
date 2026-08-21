@@ -389,6 +389,14 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // barriers. Every phase therefore strides by tiles_per_xcd. Where the count
   // fits -- which is all of them at GLM-4.7-Flash -- the loop runs once and
   // the generated code is what it was.
+  // MPK_ABL_QKV: delete the whole Phase 1 tile loop, keeping every barrier and
+  // every other phase. WRONG OUTPUT by construction. Companion to
+  // MPK_MLA_SKIP_DECODE, for the phase SP4[0]+SP4[1] price at 29.7 us/layer
+  // (2.32 ms/token) against 3.2 us/layer of bytes. MPK_ATTN_HALFK already
+  // priced halving this stage's bytes AND its MFMAs at ~0, so if this probe
+  // also comes back near zero the phase is absorbed by the barrier behind it
+  // and no qkv_a lever -- sharding q_a_proj included -- can pay.
+#ifndef MPK_ABL_QKV
   for (int t = xcd_rank; t < qkv_tiles_per_xcd; t += tiles_per_xcd) {
     unsigned short *xcd_out =
         static_cast<unsigned short *>(qkv_a_out_ptr) +
@@ -413,6 +421,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         moe_ws_f32_ptr,
         x_out_ptr);
   }
+#endif
 
   MPK_WS_PHASE(22, qkv_expected, xcd_id);
   // ══════════════════════════════════════════════════════════════════════

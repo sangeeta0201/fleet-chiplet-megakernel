@@ -552,6 +552,15 @@ def get_compile_command(
             # WRONG OUTPUT by construction. Upper bound on the MXFP4 lever for
             # those weights, which are 41% of all bytes moved per token.
             flags = flags + ["-DMPK_ATTN_HALFK"]
+        if int(os.environ.get("MPK_ABL_QKV", "0")) == 1:
+            # Delete the Phase 1 qkv_a tile loop, keeping every barrier and
+            # every other phase. WRONG OUTPUT by construction.
+            flags = flags + ["-DMPK_ABL_QKV"]
+        if int(os.environ.get("MPK_ABL_QKV_PRO", "0")) == 1:
+            # Keep qkv_a's GEMM, run 1 of 6 passes of its resadd+RMSNorm
+            # prologue. WRONG OUTPUT by construction. Splits SP4[0] into
+            # prologue and GEMM; MPK_ABL_QKV is the sum of the two.
+            flags = flags + ["-DMPK_ABL_QKV_PRO"]
         _perf_iter = int(os.environ.get("MPK_PERFETTO", "0"))
         if _perf_iter:
             # Capture raw per-worker phase spans for ONE decode iteration and
