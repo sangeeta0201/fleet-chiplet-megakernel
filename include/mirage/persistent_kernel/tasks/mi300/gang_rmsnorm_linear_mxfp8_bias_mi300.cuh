@@ -891,6 +891,30 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
   // UPPER BOUND on the MXFP4 gain. If the bound is small the lever is dead.
   // Clamped to the depth-4 pipeline's minimum, so W_UV's K=512 (MFMA_ITERS 4)
   // is left at full width rather than dropped below the static_assert.
+  //
+  // ── MEASURED. The bound is small; task #66 is not worth building. ──
+  // One instrumented NP=8 pair, MPK_SUBPHASE_TIMING=1, same batch, us/layer:
+  //
+  //   bank 4 (cnt 1219200)   base   halfk   delta
+  //     qkv_a               31.32   26.41   -4.91
+  //     qkv barrier         13.37   12.19   -1.18
+  //     q_b + kvupd         10.09    9.93   -0.16
+  //     W_UK + barrier      23.26   22.33   -0.93
+  //     bank 4 total       103.82   97.12   -6.70
+  //   bank 3 total          88.46   89.09   +0.63
+  //   instrumented wall     14.779  14.192  -0.587 ms
+  //
+  // Two things fall out. First, the MoE half does not move (+0.63, noise), so
+  // HALFK did not shift the TopK or the EP balance -- this is the one
+  // wrong-output probe on GLM whose wall reading is not confounded the way
+  // ABL_QKV_PRO's was. Second, the reachable prize is tiny: halving qkv_a's K
+  // halves its bytes AND its FLOPs and buys 15.7% of the slot, because the
+  // tile is prologue-heavy (48fea7f) and the phase is one grid-stride round
+  // whose makespan is one tile. MXFP4 halves bytes only, so 4.91 us/layer is a
+  // hard ceiling on qkv_a, ~0.38 ms of wall. Scaling that across every dense
+  // stage -- q_b, the already-8-way-sharded o_proj, W_UK/W_UV -- puts the whole
+  // "MXFP4 for the attention weights" program under ~0.9 ms, upper bound,
+  // before any dequant VALU. Do not build it as a route to 4 ms.
   constexpr int MFMA_ITERS_FULL = REDUCTION_SIZE / K_PER_MFMA;
 #ifdef MPK_ATTN_HALFK
   // Floor of 16 after halving, not 4: the K_PARALLEL branch splits MFMA_ITERS
