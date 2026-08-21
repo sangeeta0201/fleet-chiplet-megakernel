@@ -686,6 +686,15 @@ def get_compile_command(
             # 15.33 us of boundary bookkeeping could ever buy.
             assert 0 < _ml_pad <= 100000, "MPK_ML_BOUNDARY_PAD is 1..100000 ns"
             flags = flags + [f"-DMPK_ML_BOUNDARY_PAD={_ml_pad}"]
+        _shadow_kb = int(os.environ.get("MPK_MOE_SHADOW_KB", "0"))
+        if _shadow_kb > 0:
+            # Item-2 capacity probe. CORRECT OUTPUT: the W13-idle workers
+            # pull a qkv_a-sized dose of cold o_proj weight during the W13
+            # phase and discard it behind an untakeable branch. Answers
+            # "is there a free worker-group-shaped hole in the MoE phase"
+            # without touching the router's inputs.
+            assert 0 < _shadow_kb <= 4096, "MPK_MOE_SHADOW_KB is 1..4096"
+            flags = flags + ["-DMPK_MOE_SHADOW_KB=%d" % _shadow_kb]
         _bar_skew = int(os.environ.get("MPK_BAR_SKEW", "0"))
         if _bar_skew >= 1:
             # Per-rendezvous first-arriver-to-last-arriver spread. O(1) per

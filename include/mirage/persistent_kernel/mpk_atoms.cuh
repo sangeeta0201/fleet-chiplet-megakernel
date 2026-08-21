@@ -747,6 +747,14 @@ __device__ __forceinline__ bool
 #define MPK_ABL_ML_BOUNDARY 0
 #endif
 
+// MPK_MOE_SHADOW_KB: kilobytes of cold weight read that each W13-idle worker
+// pulls during the W13 phase. CORRECT OUTPUT -- see the long note at the
+// probe site in gang_oproj_router_fused_mi300.cuh. 87 is the like-for-like
+// qkv_a dose (16.1 MB/layer/rank over 23 tiles/XCD).
+#ifndef MPK_MOE_SHADOW_KB
+#define MPK_MOE_SHADOW_KB 0
+#endif
+
 #if MPK_ML_PTR_PREFETCH || MPK_ABL_ML_BOUNDARY
 #define MPK_ML_PF 1
 #else

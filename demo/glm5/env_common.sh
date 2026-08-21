@@ -103,6 +103,8 @@ MPK_FORWARD_VARS=(
   # megakernels and the layer barriers deadlock.
   MPK_MLA_SKIP_DECODE MPK_ATTN_HALFK MPK_W13_EARLY_REL
   MPK_ABL_QKV MPK_ABL_QKV_PRO MPK_ABL_ML_BOUNDARY
+  # Correct-output capacity probe, compile-time all the same.
+  MPK_MOE_SHADOW_KB
   # Correct-output pricing probe, but compile-time all the same.
   MPK_NULL_PHASES MPK_NULL_TREE MPK_NULL_TILES
   # Real changes, not probes, but compile-time: every rank must build them or

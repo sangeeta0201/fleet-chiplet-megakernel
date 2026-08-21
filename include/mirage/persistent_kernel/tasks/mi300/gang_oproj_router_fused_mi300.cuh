@@ -1311,6 +1311,77 @@ __device__ __attribute__((always_inline)) void
         moe_swiglu_out_ptr,
         t);
   }
+
+#if MPK_MOE_SHADOW_KB > 0
+  // ── item 2 CAPACITY probe. CORRECT OUTPUT, so the wall number is gateable.
+  //
+  // The question item 2 asks is "can next-layer q_a/kv_a run on a second
+  // worker group concurrently with the MoE?" That has two halves: a data
+  // dependency (qkv_a(L+1) consumes MoE(L)) and a capacity question (is
+  // there a free worker-group-shaped hole in the MoE phase at all?). The
+  // dependency half cannot be probed on the wall -- a wrong-output qkv_a
+  // upstream of the router changes the TopK and hence the EP balance, the
+  // trap recorded in glm-wrong-output-probes-upstream-of-router-are-invalid.
+  //
+  // The capacity half can, and this is it, ADDITIVELY: give the workers that
+  // own no W13 tile exactly the byte volume a qkv_a tile would pull, at the
+  // same instant, from a region nobody else is touching. If the wall does
+  // not rise, qkv_a's compute fits free in the MoE's shadow and the whole of
+  // item 2 rests on the dependency, which is then worth attacking. If the
+  // wall rises by about what qkv_a costs, there is no hole, and item 2 is
+  // dead by measurement no matter what the dependency does.
+  //
+  // Bytes, not MFMAs, on purpose: the MoE tiles are at the HBM roof
+  // (glm-moe-tiles-are-at-the-hbm-roof-narrowing-loses) so bytes are the
+  // binding resource, while the MFMA units on an idle CU are free by
+  // definition. qkv_a is 16.1 MB/layer/rank over 23 tiles/XCD, so ~87 KB per
+  // idle worker is the like-for-like dose; MPK_MOE_SHADOW_KB=87 is it.
+  //
+  // Source is moe_gate_up_weight_ptr -- see SIZING below.
+  //
+  // SIZING, and why it is not oproj_weight_ptr. The first cut read from
+  // this XCD's o_proj chunk and faulted with hipErrorIllegalAddress on every
+  // rank: that pointer's extent is not derivable from anything in scope here
+  // and is not uniform across the variants this kernel is instantiated for
+  // (the three dense layers and the EP tail reach this code with a different
+  // pointer set). moe_gate_up_weight_ptr is: it must hold at least one local
+  // expert's gate+up slab, which is 2*MOE_INTERMEDIATE*HIDDEN_SIZE nibbles =
+  // 12.58 MB at MXFP4 and twice that at MXFP8, so a 2 MB window from its base
+  // is in bounds by construction. 21 idle workers * 87 KB = 1.78 MB fits.
+  //
+  // Caveat, recorded rather than fixed: that window is expert 0's slab, and
+  // expert 0 is routed on roughly 5 tokens in 32, in which case those bytes
+  // are L2-warm and the dose that layer is understated. It is not worth a
+  // second pointer to dodge -- the probe only has to answer "free or not
+  // free", and a warm layer biases it toward "free", which is the answer
+  // that costs a follow-up rather than the answer that closes item 2.
+  size_t const shadow_window = (size_t)2 * 1024 * 1024;
+  if (xcd_rank >= moe_w13_live && moe_w13_live > 0 &&
+      moe_gate_up_weight_ptr != nullptr &&
+      (size_t)(xcd_rank - moe_w13_live + 1) * MPK_MOE_SHADOW_KB * 1024 <=
+          shadow_window) {
+    size_t const shadow_bytes = (size_t)MPK_MOE_SHADOW_KB * 1024;
+    char const *base =
+        (char const *)moe_gate_up_weight_ptr +
+        (size_t)(xcd_rank - moe_w13_live) * shadow_bytes;
+    uint4 acc = make_uint4(0u, 0u, 0u, 0u);
+    for (size_t off = (size_t)tid * 16; off < shadow_bytes;
+         off += (size_t)blockDim.x * 16) {
+      uint4 v = *(uint4 const *)(base + off);
+      acc.x += v.x;
+      acc.y += v.y;
+      acc.z += v.z;
+      acc.w += v.w;
+    }
+    // Sink. Never taken -- the four words would all have to be this exact
+    // sentinel -- but the compiler cannot prove it, so the loads survive.
+    if (acc.x == 0xdeadbeefu && acc.y == 0xdeadbeefu && acc.z == 0xdeadbeefu &&
+        acc.w == 0xdeadbeefu) {
+      st_wt_u32((void *)logits_scratch_ptr, acc.x);
+    }
+  }
+#endif
+
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   {
     unsigned long long _sp_t5 = __builtin_amdgcn_s_memrealtime();
