@@ -680,6 +680,12 @@ __device__ __forceinline__ bool
 // +1.17 ms for the whole probe over the 10.78 baseline. The cost is linear in
 // stamp count and lands mostly on the two MoE barriers (+4.5 and +5.7 us);
 // slot 2 moved +0.13 us, so qkv_a's decomposition is not the probe's doing.
+// MPK_ML_PTR_PREFETCH: see the multi-layer loop in persistent_kernel.cuh.
+// Off by default so the load-at-the-boundary form stays the reference.
+#ifndef MPK_ML_PTR_PREFETCH
+#define MPK_ML_PTR_PREFETCH 0
+#endif
+
 #ifndef MPK_BAR_SKEW
 #define MPK_BAR_SKEW 0
 #endif
@@ -714,13 +720,25 @@ __device__ unsigned long long g_stage_ref;
 // can be differenced against the cumulative BAR_SKEW gap sums. They can NOT
 // be compared across ranks -- the eight entry barriers are not synchronized,
 // which is the mistake recorded on MPK_EP_POLL_BATCH.
-#define MPK_STAGE_SLOTS 13
-__device__ unsigned long long g_stage_sum[MPK_STAGE_SLOTS];
-__device__ unsigned long long g_stage_cnt[MPK_STAGE_SLOTS];
-__device__ unsigned long long g_stage_min[MPK_STAGE_SLOTS] = {
-    ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull,
-    ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull};
-__device__ unsigned long long g_stage_max[MPK_STAGE_SLOTS];
+#define MPK_STAGE_SLOTS 14
+// PRIVATE per-worker accumulators, not four contended atomics.
+//
+// The first version of this stamp did atomicAdd/Min/Max on four GPU-wide
+// addresses. That is 232-way contention on the same cache line, and it is not
+// a small effect: adding two stamps moved the wall 12.862 -> 14.260, ~9 us per
+// stamp per layer. Every stamp therefore sat INSIDE the interval measured by
+// the next one, and the headline "the layer boundary costs 20.2 us" was
+// partly the cost of stamp 8's own atomics. One worker owns one block, so
+// blockIdx.x indexes a private row and the four updates become plain stores
+// with no coherence traffic at all. Reduced by the single printing thread.
+// 304 = MAX_NUM_WORKERS in runtime_header.h, which this header does not
+// include. Kept as a literal with the guard below rather than pulling in the
+// dependency.
+#define MPK_STAGE_WORKERS 304
+__device__ unsigned long long g_stage_psum[MPK_STAGE_WORKERS *MPK_STAGE_SLOTS];
+__device__ unsigned long long g_stage_pcnt[MPK_STAGE_WORKERS *MPK_STAGE_SLOTS];
+__device__ unsigned long long g_stage_pmin[MPK_STAGE_WORKERS *MPK_STAGE_SLOTS];
+__device__ unsigned long long g_stage_pmax[MPK_STAGE_WORKERS *MPK_STAGE_SLOTS];
 
 // One worker's arrival at a named point inside a phase, in ns since the
 // layer-entry barrier completed. Call from tid == 0 only. The min across
@@ -740,21 +758,36 @@ __device__ __forceinline__ void mpk_stage_stamp(int idx) {
   if (d > 10000000ull) {
     return;
   }
-  atomicAdd(&g_stage_sum[idx], d);
-  atomicAdd(&g_stage_cnt[idx], 1ull);
-  atomicMin(&g_stage_min[idx], d);
-  atomicMax(&g_stage_max[idx], d);
-  // Probe-cost attribution. At MPK_BAR_SKEW=2 every stamp does its atomics
-  // twice, the second set into a scratch slot. The stamp is 232-way
-  // contended, so its cost has to be measured, not argued: the shift in a
-  // LATER stage's mean between reps=1 and reps=2 is exactly the cost of one
-  // extra stamp on the path in front of it.
+  unsigned int const w = blockIdx.x;
+  if (w >= MPK_STAGE_WORKERS) {
+    return;
+  }
+  unsigned int const p = w * MPK_STAGE_SLOTS + (unsigned int)idx;
+  // Plain loads and stores: this row belongs to this block and only tid 0
+  // writes it, so there is no race and nothing to make coherent. g_stage_pmin
+  // has no ~0 initializer (3952 entries), so the count doubles as the
+  // "unset" flag.
+  unsigned long long const c = g_stage_pcnt[p];
+  g_stage_psum[p] += d;
+  g_stage_pcnt[p] = c + 1ull;
+  if (c == 0ull || d < g_stage_pmin[p]) {
+    g_stage_pmin[p] = d;
+  }
+  if (d > g_stage_pmax[p]) {
+    g_stage_pmax[p] = d;
+  }
+  // Probe-cost attribution. At MPK_BAR_SKEW=2 every stamp does its work
+  // twice, the second set into a scratch slot: the shift in a LATER stage's
+  // mean between reps=1 and reps=2 is exactly the cost of one extra stamp on
+  // the path in front of it. This mattered enormously when the four updates
+  // were GPU-wide atomics; with private rows it should now read ~0, which is
+  // the check that the rewrite worked.
 #pragma unroll 1
   for (int _r = 1; _r < MPK_BAR_SKEW_REPS; _r++) {
-    atomicAdd(&g_stage_sum[MPK_STAGE_SLOTS - 1], d);
-    atomicAdd(&g_stage_cnt[MPK_STAGE_SLOTS - 1], 1ull);
-    atomicMin(&g_stage_min[MPK_STAGE_SLOTS - 1], d);
-    atomicMax(&g_stage_max[MPK_STAGE_SLOTS - 1], d);
+    unsigned int const q = w * MPK_STAGE_SLOTS + (MPK_STAGE_SLOTS - 1);
+    g_stage_psum[q] += d;
+    g_stage_pcnt[q] += 1ull;
+    g_stage_pmax[q] = d;
   }
 }
 #else

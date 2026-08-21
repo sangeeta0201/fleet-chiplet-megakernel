@@ -1729,13 +1729,30 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                    g_barskew_cnt[s], g_barskew_ns[s], g_barskew_drop[s],
                    g_barskew_gap[s]);
           }
+          // Reduce the private per-worker rows. Serial in one thread, but it
+          // runs once at teardown; the point of the rows is that the hot path
+          // never touches a shared line.
           for (int s = 0; s < MPK_STAGE_SLOTS; s++) {
-            if (g_stage_cnt[s] == 0) {
+            unsigned long long sum = 0ull, cnt = 0ull, mn = ~0ull, mx = 0ull;
+            for (int w = 0; w < MPK_STAGE_WORKERS; w++) {
+              int const p = w * MPK_STAGE_SLOTS + s;
+              if (g_stage_pcnt[p] == 0ull) {
+                continue;
+              }
+              sum += g_stage_psum[p];
+              cnt += g_stage_pcnt[p];
+              if (g_stage_pmin[p] < mn) {
+                mn = g_stage_pmin[p];
+              }
+              if (g_stage_pmax[p] > mx) {
+                mx = g_stage_pmax[p];
+              }
+            }
+            if (cnt == 0ull) {
               continue;
             }
-            printf("BARSTAGE %d cnt %llu sum %llu min %llu max %llu\n", s,
-                   g_stage_cnt[s], g_stage_sum[s], g_stage_min[s],
-                   g_stage_max[s]);
+            printf("BARSTAGE %d cnt %llu sum %llu min %llu max %llu\n", s, cnt,
+                   sum, mn, mx);
           }
         }
 #endif
@@ -2532,7 +2549,42 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
             int ml_n_tile_start = (int)task_desc->task_metadata.n_tile_start;
             int ml_n_tile_count = (int)task_desc->task_metadata.n_tile_count;
 
+            // MPK_ML_PTR_PREFETCH: hold the next layer's pointer-table entries
+            // in registers instead of loading them at the layer boundary.
+            //
+            // Measured: the boundary between a worker's last W2 tile and its
+            // arrival at the next layer-entry barrier is 16.50 us/layer, and
+            // stamp 12 puts 15.33 of that in this copy alone -- 1.20 ms of an
+            // 11 ms wall for 47 pointer loads. It is that expensive because
+            // it is two DEPENDENT cold round trips: the loads feed shared
+            // memory, so the compiler must s_waitcnt before the LDS store,
+            // and the layer streams ~65 MB through a 32 MB L2 in between, so
+            // the 272-byte slice is evicted every single layer.
+            //
+            // MAX_INPUTS_PER_TASK is 34 and MAX_OUTPUTS_PER_TASK 13, both
+            // below blockDim, so the whole table is one element per thread --
+            // four VGPRs, issued before the tile loop and consumed after it.
+            // Registers are free here (320 of 512, occupancy pinned by block
+            // count, see the depth-8 scheduling result), and the tile loop is
+            // ~130 us of cover for a ~1 us latency.
+#if MPK_ML_PTR_PREFETCH
+            void *pf_in = nullptr;
+            void *pf_out = nullptr;
+            int pf_variant = 0;
+            bool const pf_in_ok = (int)threadIdx.x < MAX_INPUTS_PER_TASK;
+            bool const pf_out_ok = (int)threadIdx.x < MAX_OUTPUTS_PER_TASK;
+#endif
+
             for (int ml = 0; ml < config.ml_num_layers; ml++) {
+              // Stage stamp 12: the loop boundary itself. Splits the 16.50 us
+              // that S11 - S8 measures into the part below the previous
+              // iteration's fence (S12 - S8: return from the fused kernel,
+              // the worker-state store, threadfence_gpu, __syncthreads) and
+              // the part above the dispatch (S11 - S12: the 34+13 pointer
+              // table copy and its two __syncthreads).
+              if (threadIdx.x == 0 && ml > 0) {
+                mpk_stage_stamp(12);
+              }
               // Layer 0: task_desc already loaded from precomputed dispatch
               // buffer with correct per-XCD pointers. Skip the copy.
               if (ml > 0) {
@@ -2542,6 +2594,19 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                 // slots. Both sides key off the TaskDesc capacity so the
                 // LM-head variant's input_ptrs[24..27] / output_ptrs[12] get
                 // refreshed too.
+#if MPK_ML_PTR_PREFETCH
+                // Registers, loaded a whole layer ago. No global traffic and
+                // nothing to wait on -- just LDS stores and the barrier.
+                if (pf_in_ok) {
+                  task_desc->input_ptrs[threadIdx.x] = pf_in;
+                }
+                if (pf_out_ok) {
+                  task_desc->output_ptrs[threadIdx.x] = pf_out;
+                }
+                if (threadIdx.x == 0) {
+                  task_desc->variant_id = pf_variant;
+                }
+#else
                 int ml_in_base =
                     (xcd_id * config.ml_num_layers + ml) * MAX_INPUTS_PER_TASK;
                 int ml_out_base =
@@ -2559,6 +2624,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                 if (threadIdx.x == 0) {
                   task_desc->variant_id = config.ml_variant_ids[ml];
                 }
+#endif
                 __syncthreads();
               }
 #ifdef MPK_NIL_TRIPWIRE
@@ -2620,6 +2686,33 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               if (threadIdx.x == 0) {
                 mpk_stage_stamp(11);
               }
+
+#if MPK_ML_PTR_PREFETCH
+              // Issue the NEXT layer's pointer loads here, immediately in
+              // front of the tile loop. The values are not touched again
+              // until the top of the next iteration, on the far side of
+              // ~130 us of layer work, so the round trip is fully covered.
+              // Every s_waitcnt inside the tile loop drains vmcnt anyway,
+              // which is the point: the load completes during the layer
+              // rather than blocking the boundary.
+              if (ml + 1 < config.ml_num_layers) {
+                int const pf_in_base =
+                    (xcd_id * config.ml_num_layers + ml + 1) *
+                    MAX_INPUTS_PER_TASK;
+                int const pf_out_base =
+                    (xcd_id * config.ml_num_layers + ml + 1) *
+                    MAX_OUTPUTS_PER_TASK;
+                if (pf_in_ok) {
+                  pf_in = config.ml_input_table[pf_in_base + threadIdx.x];
+                }
+                if (pf_out_ok) {
+                  pf_out = config.ml_output_table[pf_out_base + threadIdx.x];
+                }
+                if (threadIdx.x == 0) {
+                  pf_variant = config.ml_variant_ids[ml + 1];
+                }
+              }
+#endif
 
               // Execute this layer
               int my_tiles = 0;
