@@ -841,11 +841,22 @@ __device__ __noinline__ void
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   unsigned long long _sp_q0 = __builtin_amdgcn_s_memrealtime();
 #endif
-  _gang_wave_parallel_fp8_quant_nt<REDUCTION_SIZE>(
+  // Stage only THIS split's K window, not the whole reduction. The original
+  // staged all REDUCTION_SIZE bytes whatever k_base was, which is what made
+  // K_SPLITS=2 cost +4.12 ms: the split divided the MFMA loop but doubled the
+  // staging. At K_SPLITS=1, SPLIT_LEN == REDUCTION_SIZE and k_base == 0, so
+  // this is byte-for-byte the old call and the default path is untouched.
+  // The LDS allocation stays full-width and the window is written at its own
+  // offset, so the MFMA loop's s_tok_k = s_tok_fp8 + k_base is unchanged; the
+  // bytes outside the window are never read.
+  constexpr int SPLIT_LEN = REDUCTION_SIZE / K_SPLITS;
+  static_assert(SPLIT_LEN == SPLIT_ITERS * K_PER_MFMA,
+                "the staged window must be exactly the split's MFMA range");
+  _gang_wave_parallel_fp8_quant_nt<SPLIT_LEN>(
       A + static_cast<size_t>(tok_idx) * (NUM_TOPK * REDUCTION_SIZE) +
-          static_cast<size_t>(topk_slot) * REDUCTION_SIZE,
-      s_tok_fp8,
-      s_tok_scales);
+          static_cast<size_t>(topk_slot) * REDUCTION_SIZE + k_base,
+      s_tok_fp8 + k_base,
+      s_tok_scales + k_base / 32);
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   unsigned long long _sp_q1 = __builtin_amdgcn_s_memrealtime();
   if (tid == 0 && g_subphase_active) {
