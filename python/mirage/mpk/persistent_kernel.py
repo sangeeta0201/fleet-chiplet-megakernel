@@ -477,6 +477,21 @@ def get_compile_command(
         # path back for an A/B.
         _ru = int(os.environ.get("GLM_RESADD_UNROLL", "6"))
         flags = flags + ["-DMPK_RESADD_UNROLL=%d" % _ru]
+        # Issue every trip's global loads before consuming any of them, rather
+        # than trusting the unroll to interleave them. The unroll alone left
+        # the loop at ~251 cycles/load (~1.5 in flight) because the per-trip
+        # ds_write to s_x raises lgkmcnt and fences each trip's fetch group
+        # off from the next; splitting the loop hoists all 48 EP loads above
+        # the first ds_write. Costs ~96-108 VGPRs on top of 284+36 of 512 --
+        # inside the budget, but READ THE VGPR COUNT off the built image
+        # before believing any A/B, because a spill to scratch is strictly
+        # worse. Measured: no spill (284 VGPR / 36 AGPR / spill 0, unchanged),
+        # resolve loop 5646 -> 4009 ns (-29.0%), tile 12750 -> 11101 (-12.9%),
+        # wall 10.377 -> 10.261 (-0.116, n=3 paired on min-of-115, device
+        # clock -0.159), correctness 4/4 with all 8 ranks identical. Default 1;
+        # set GLM_RESADD_BATCH=0 for the old code path.
+        _rb = int(os.environ.get("GLM_RESADD_BATCH", "1"))
+        flags = flags + ["-DMPK_RESADD_BATCH=%d" % _rb]
         # Hoist the un-absorbed W_UV GEMV out of the MoE half and run it in the
         # attention half, straight after the split-KV merge, behind a PAIR-LOCAL
         # barrier instead of a GPU-wide one. The layer's existing Phase 8

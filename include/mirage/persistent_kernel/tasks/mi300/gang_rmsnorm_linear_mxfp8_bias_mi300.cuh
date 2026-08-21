@@ -762,18 +762,104 @@ _rnlm8_resadd_norm_rcp(float const *__restrict__ d_ws,
 #endif
 #define MPK_RESADD_STR_(x) #x
 #define MPK_RESADD_STR(x) MPK_RESADD_STR_(x)
+
+  // MPK_RESADD_BATCH: issue every global load for every trip BEFORE consuming
+  // any of them, instead of relying on the unroll to interleave them.
+  //
+  // The unroll above does put all six trips in one basic block, but it only
+  // bought 7.4% and the loads still complete at ~251 cycles apiece (~1.5 in
+  // flight). The blocker is the `ds_write` to s_x at the bottom of each trip:
+  // it raises lgkmcnt, and the compiler will not sink a wait for trip v's LDS
+  // store past trip v+1's global loads, so each trip's fetch group is fenced
+  // off from the next. Splitting the loop hoists all 48 (EP) global loads
+  // above the first ds_write, where nothing orders them against each other.
+  //
+  // Cost is registers: ITERS(6) x (1 + NEXTRA(7)) uint2 = 96 VGPRs, plus 12
+  // more under STAGE_NW. worker_kernel is 284 VGPR + 36 AGPR = 320 of 512 and
+  // occupancy is pinned at 1 wave/SIMD by block count, so ~480 is the real
+  // ceiling and this lands near 428. That is inside the budget but not by
+  // much -- if the compiler spills to scratch this is strictly worse, so the
+  // VGPR count has to be read off the built image before believing an A/B.
+  //
+  // MEASURED. It does not spill: worker_kernel stays at exactly 284 VGPR /
+  // 36 AGPR / private_seg 596 with vgpr_spill_count 0, unchanged from the
+  // baseline -- this region was never the register peak. SP A/B against the
+  // same tile-count guard [1][5] = 1828800:
+  //
+  //   [1][4] resolve loop   5646 -> 4009 ns   -1637  (-29.0%)
+  //   [0][2] quantizer       875 ->  852      noise
+  //   [0][3] MFMA K-loop    5401 -> 5396      noise
+  //   tile total           12750 -> 11101     -1650  (-12.9%)
+  //
+  // and at the wall, n=3 paired with its control in the same batch:
+  //
+  //   min-of-115   10.345 10.400 10.385  ->  10.282 10.226 10.274
+  //   mean of min      10.377           ->      10.261   (-0.116 ms)
+  //   device avg_ms    10.650           ->      10.491   (-0.159 ms)
+  //
+  // 3v3 rank separation again (worst batched min 10.282 beats best unbatched
+  // 10.345). 78 x 1650 ns predicts -0.129 at 1:1, so this transferred at
+  // ~1:1 -- which also revises the 1.95:1 claimed for the unroll above: that
+  // was a -0.037 ms signal read at the edge of resolution and it was
+  // flattered by noise. **Use 1:1 for an in-place tile speedup in an
+  // under-filled phase.** Still the important part: not absorbed.
+  //
+  // NOT bit-identical to the unbatched path (agree@142/264 vs the resunroll
+  // reference) even though the add order is unchanged -- splitting the loop
+  // lets the compiler contract FMAs differently, and that drifts a token
+  // eventually. Correctness gate is 4/4 PASS with all 8 ranks identical and
+  // the text read: Paris, Rayleigh scattering, a correct prime definition.
+  //
+  // Remaining headroom here: 96 KB in 4009 ns is 24 GB/s per CU against the
+  // ~52 GB/s per-CU L2 share, so the loop went 33% -> 46% of roof.
+#ifndef MPK_RESADD_BATCH
+#define MPK_RESADD_BATCH 1
+#endif
+#if MPK_RESADD_BATCH
+  uint2 bat_r[ITERS];
+  uint2 bat_p[ITERS][NEXTRA];
+  float4 bat_w[(!EP && !PRE_FOLDED) ? ITERS : 1];
+  uint64_t bat_nw[STAGE_NW ? ITERS : 1];
+#pragma unroll
+  for (int v = 0; v < ABL_ITERS; v++) {
+    int const off = (v * NTHREADS + tid) * VEC;
+    bat_r[v] = *reinterpret_cast<uint2 const *>(d_res + off);
+    if constexpr (EP) {
+#pragma unroll
+      for (int p = 0; p < NEXTRA; p++) {
+        bat_p[v][p] = *reinterpret_cast<uint2 const *>(
+            d_res + (size_t)(p + 1) * EP_SLOT_ELEMS + off);
+      }
+    } else if constexpr (!PRE_FOLDED) {
+      bat_w[v] = *reinterpret_cast<float4 const *>(d_ws + off);
+    }
+    if constexpr (STAGE_NW) {
+      uint64_t const *nwp = reinterpret_cast<uint64_t const *>(d_nw + off);
+      bat_nw[v] = *(__attribute__((address_space(1))) uint64_t const *)nwp;
+    }
+  }
+#endif
+
   _Pragma(MPK_RESADD_STR(unroll MPK_RESADD_UNROLL))
   for (int v = 0; v < ABL_ITERS; v++) {
     int const off = (v * NTHREADS + tid) * VEC;
+#if MPK_RESADD_BATCH
+    uint2 const r = bat_r[v];
+#else
     uint2 const r = *reinterpret_cast<uint2 const *>(d_res + off);
+#endif
     if constexpr (STAGE_NW) {
       // Four bf16 is eight bytes, and `off` is a multiple of four elements, so
       // this is one aligned dwordx2 each way. Two-step addrspace(1) cast for
       // the same reason rmsnorm_rcp_amd uses one: a flat_load would bump
       // lgkmcnt and be waited on by the ds_write right below it.
+#if MPK_RESADD_BATCH
+      *reinterpret_cast<uint64_t *>(s_nw + off) = bat_nw[v];
+#else
       uint64_t const *nwp = reinterpret_cast<uint64_t const *>(d_nw + off);
       *reinterpret_cast<uint64_t *>(s_nw + off) =
           *(__attribute__((address_space(1))) uint64_t const *)nwp;
+#endif
     }
 
     float f[4];
@@ -784,8 +870,12 @@ _rnlm8_resadd_norm_rcp(float const *__restrict__ d_ws,
       uint2 pk[NEXTRA];
 #pragma unroll
       for (int p = 0; p < NEXTRA; p++) {
+#if MPK_RESADD_BATCH
+        pk[p] = bat_p[v][p];
+#else
         pk[p] = *reinterpret_cast<uint2 const *>(
             d_res + (size_t)(p + 1) * EP_SLOT_ELEMS + off);
+#endif
       }
       f[0] = _gang_bf16_to_float((unsigned short)r.x);
       f[1] = _gang_bf16_to_float((unsigned short)(r.x >> 16));
@@ -807,7 +897,11 @@ _rnlm8_resadd_norm_rcp(float const *__restrict__ d_ws,
       f[2] = _gang_bf16_to_float((unsigned short)r.y);
       f[3] = _gang_bf16_to_float((unsigned short)(r.y >> 16));
     } else {
+#if MPK_RESADD_BATCH
+      float4 const w = bat_w[v];
+#else
       float4 const w = *reinterpret_cast<float4 const *>(d_ws + off);
+#endif
       f[0] = w.x + _gang_bf16_to_float((unsigned short)r.x);
       f[1] = w.y + _gang_bf16_to_float((unsigned short)(r.x >> 16));
       f[2] = w.z + _gang_bf16_to_float((unsigned short)r.y);
