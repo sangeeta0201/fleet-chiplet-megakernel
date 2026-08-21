@@ -1184,6 +1184,30 @@ __device__ __attribute__((always_inline)) void
       owned = 0;
       for (int i = 0; i < n_act; i++) {
         int const cand = d_mask_live[i];
+        // EP_SHARED_PE owns the shared expert on top of its routed share, so
+        // it does ~46%% more MoE work than the other seven ranks. Do NOT
+        // build a hoist, a shard, or a reschedule for that: MEASURED, the
+        // imbalance costs zero makespan. MPK_BAR_SKEW=3 with private
+        // per-worker rows, max-over-workers of each worker's mean stamp
+        // (us from the layer-entry reference), one layer set:
+        //
+        //   rank  S5      S6      S7      S8     W13=S6-S5  MoE=S8-S5
+        //   0 *   114.83  123.38  128.95  141.27    8.55       26.44
+        //   1     115.07  127.64  133.29  141.50   12.56       26.43
+        //   2     115.08  127.73  133.63  141.63   12.65       26.55
+        //   3     115.71  128.32  134.30  142.05   12.61       26.34
+        //   4     115.05  127.79  133.54  141.69   12.74       26.64
+        //   5     114.85  127.35  134.01  141.06   12.51       26.21
+        //   6     115.98  128.43  134.45  142.11   12.45       26.13
+        //   7     115.61  127.49  133.54  141.20   11.88       25.59
+        //   (* = EP_SHARED_PE)
+        //
+        // Rank 0's MoE makespan is mid-pack (26.44 in 25.59..26.64) and its
+        // W13 makespan is the SHORTEST of the eight despite the extra
+        // expert -- because the shared expert's tiles occupy workers that
+        // would otherwise be idle, and every rank's round count is the same.
+        // The "rank 0 is a straggler" reading comes from aggregate
+        // worker-seconds (SP3[k]), which sums work and cannot see makespan.
         bool const is_owned =
             (cand >= NUM_EXPERTS)
                 ? (EP_MY_PE == EP_SHARED_PE)
