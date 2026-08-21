@@ -1221,6 +1221,40 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
   // depth-4 weight prefetch fill, which is this tile's own bytes and could
   // not be hoisted. [0][1] is still the whole prologue, so the fill is
   // [0][1] - [1][4].
+  //
+  // MEASURED at GLM-5 744B / MXFP4 attention weights, MPK_SUBPHASE_TIMING=1,
+  // divided by [1][5] = 1828800 (this call site's own tile count, 186
+  // tiles/layer/rank over 126 iters x 78 layers):
+  //
+  //   [1][4]          resolve + EP fold + RMSNorm rcp + LDS stage  6119 ns  46.2%
+  //   [0][1]-[1][4]   depth-4 prefetch fill issue                   841 ns   6.3%
+  //   [0][2]          FP8 quantizer                                 851 ns   6.4%
+  //   [0][3]          MFMA K-loop + epilogue                       5435 ns  41.0%
+  //                                                        tile  13246 ns
+  //
+  // The tile total agrees with the 13.5 us in the barrier-skew decomposition,
+  // where qkv_a's phase is 32.40 us/layer = 17.57 us EP peer wait + 14.83 us
+  // of tile. So the phase makespan carries exactly ONE tile.
+  //
+  // Two things follow, and both correct earlier readings:
+  //
+  // 1. qkv_a is NOT MFMA-K-loop bound. The K-loop is 41%. Deepening the
+  //    depth-4 pipeline here (the FULL_PRELOAD_ITERS branch above, and the
+  //    gpt-oss depth-8 port) is aimed at 41% of the tile at best, which is
+  //    consistent with both measuring neutral.
+  // 2. The one load-width experiment run against this stage, MPK_QUANT_V16
+  //    (0 -> 657 global_load_dwordx4, +0.062 ms), widened the QUANTIZER --
+  //    [0][2], 6.4% of the tile. It was aimed at 6%, so its null result says
+  //    nothing about the 46% above it.
+  //
+  // The resolve reads EP_PEER_SLOTS=8 x REDUCTION_SIZE bf16 = 96 KB per tile
+  // and takes 6119 ns = 15.7 GB/s per CU. Every one of the 186 tiles reads the
+  // same 96 KB, so it is L2-resident, and the per-CU L2 share is ~52 GB/s --
+  // this is running at ~30% of it, i.e. it is latency/MLP-bound, not at a
+  // roof. Note this is a DIFFERENT claim from the two hoist experiments
+  // (c72b559 +0.090, 7a5c559 +0.187): those MOVED the work to a smaller
+  // worker set behind an extra rendezvous, and paid back in barrier what they
+  // saved in tile. Making the resolve faster in place has no such offset.
   if (_sp_rec) {
     atomicAdd(&g_subphase_ns[1][4],
               (__builtin_amdgcn_s_memrealtime() - _sp_t0) * 10);
