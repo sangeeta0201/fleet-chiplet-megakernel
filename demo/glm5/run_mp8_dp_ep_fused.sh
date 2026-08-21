@@ -41,8 +41,19 @@ export GLM_FUSE_FULL_LAYER="${GLM_FUSE_FULL_LAYER:-1}"
 export PRECOMPUTED_DISPATCH="${PRECOMPUTED_DISPATCH:-1}"
 export MPK_ML_REPLAY="${MPK_ML_REPLAY:-1}"
 
-if [ "${KEEP_BUILD:-0}" != "1" ]; then
-  rm -rf permanent_output_dir permanent_output_dir_rank*
+# USE_MIRAGE=0 runs the same 8-rank EP/DP split through the torch reference
+# instead of the megakernel: each rank evaluates only its own routed experts
+# and one all_reduce sums the partials (GlmMoE.forward). That is the only torch
+# leg the 744B model has -- it does not fit on one GPU in any format -- and it
+# builds no kernel, so it must not clear the build directory.
+USE_MIRAGE="${USE_MIRAGE:-1}"
+if [ "$USE_MIRAGE" = "1" ]; then
+  MIRAGE_FLAG="--use-mirage"
+  if [ "${KEEP_BUILD:-0}" != "1" ]; then
+    rm -rf permanent_output_dir permanent_output_dir_rank*
+  fi
+else
+  MIRAGE_FLAG=""
 fi
 
 # Leave two CUs per XCD idle. This is a liveness fix, not a tuning knob, and
@@ -101,7 +112,7 @@ MPK_MPI_BIND="${MPK_MPI_BIND:---map-by ppr:$((NP / 2)):numa --bind-to numa}"
 mpirun -np "$NP" --tag-output --allow-run-as-root \
   $MPK_MPI_BIND \
   $(mpk_x_args) \
-  stdbuf -oL -eL python3 demo.py --use-mirage \
+  stdbuf -oL -eL python3 demo.py $MIRAGE_FLAG \
     --max-seq-length "${MAX_SEQ_LENGTH:-128}" \
     --max-new-tokens "${MAX_NEW_TOKENS:-16}" \
     --model-path "$MODEL_PATH" "$@"

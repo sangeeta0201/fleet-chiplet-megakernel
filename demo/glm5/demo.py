@@ -491,6 +491,11 @@ if __name__ == "__main__":
              "family default, which is interleaved.")
     parser.add_argument("--no-rope-interleave", dest="rope_interleave",
                         action="store_false")
+    parser.add_argument(
+        "--mtp", type=int, default=0,
+        help="Load N multi-token-prediction draft layers (GLM-5 ships 1) and "
+             "run speculative decode in the torch reference path. 0 (default) "
+             "drops the MTP weights exactly as before.")
     args = parser.parse_args()
 
     # Resolve where to dump generated tokens for the correctness test.
@@ -591,6 +596,7 @@ if __name__ == "__main__":
             ep_rank=(rank if moe_ep else 0),
             ep_world=(world_size if moe_ep else 1),
             mxfp4_experts=args.mxfp4_checkpoint,
+            num_mtp_layers=args.mtp,
         ).to(dtype=torch.bfloat16, device="cuda")
         # A partially-fetched checkpoint (config + shard index only, which is
         # how the 744B geometry is brought up on one GPU) carries no tokenizer
@@ -608,7 +614,9 @@ if __name__ == "__main__":
     eos_token_ids = (list(config.eos_token_id)
                      if isinstance(config.eos_token_id, (list, tuple))
                      else [config.eos_token_id])
-    num_layers = len(model.model.layers)
+    # Main stack only. An MTP draft layer, when loaded, lives past the end of
+    # this list and is not part of the fused per-layer graph.
+    num_layers = model.model.num_main_layers
     print(f"{config.hf_model_type}: {num_layers} layers "
           f"(of {config.num_hidden_layers}), hidden {config.hidden_size}, "
           f"{config.num_attention_heads} q heads, {config.n_routed_experts} "
@@ -833,7 +841,7 @@ if __name__ == "__main__":
         # log and the kernel's expert-id arithmetic mean.
         model_ep_sharded = any(
             getattr(l.mlp, "ep_local", num_experts) != num_experts
-            for l in model.model.layers if l.is_moe)
+            for l in model.model.main_layers if l.is_moe)
         ep_slice_base = 0 if model_ep_sharded else ep_base
         # The single rank that folds the real residual into its MoE partial,
         # so the residual survives the cross-rank sum exactly once. The kernel
@@ -1894,7 +1902,7 @@ if __name__ == "__main__":
         # The last fused layer's argument bundle, reused verbatim by the EP
         # tail task below.
         last_fl_kwargs = None
-        for i, layer in enumerate(model.model.layers):
+        for i, layer in enumerate(model.model.main_layers):
             attn = layer.self_attn
             attn._absorb()
 
@@ -2803,32 +2811,116 @@ if __name__ == "__main__":
     output_len = max(0, min(output_len,
                             tokens.size(1) - prompt_lengths[0].item()))
 
+    mtp_stats = None
     if not args.use_mirage:
         prompt_len = prompt_lengths[0].item()
         decode_limit = prompt_len + output_len
         cur_pos = prompt_len
-        for cur_pos in range(prompt_len, decode_limit):
-            step.fill_(cur_pos - 1)
-            input_ids = tokens[:, prev_pos:cur_pos]
-            cos_embeddings = position_embeddings[0][:, prev_pos:cur_pos]
-            sin_embeddings = position_embeddings[1][:, prev_pos:cur_pos]
-            logits = model.forward(
-                input_ids=input_ids,
-                position_embeddings=(cos_embeddings, sin_embeddings),
-                step=step,
-            )
-            next_token = logits.argmax(dim=-1)[0, -1]
-            tokens[0, cur_pos] = next_token
-            prev_pos = cur_pos
-            if int(next_token) in eos_token_ids and not args.ignore_eos:
-                break
-            if cur_pos == prompt_len:
-                torch.cuda.synchronize()
-                starter.record()
 
-        ender.record()
-        torch.cuda.synchronize()
-        run_time = starter.elapsed_time(ender)
+        if args.mtp:
+            # ── MTP speculative decode (torch reference) ─────────────────
+            # One draft layer predicts token p+1 from (token p, hidden p-1); the
+            # main stack then scores both in a single 2-token pass. If its own
+            # argmax at position p agrees with the draft, both tokens commit and
+            # the iteration produced two tokens for one main-model pass. The
+            # emitted text is argmax-identical to the non-MTP loop either way --
+            # rejection falls back to exactly the token greedy decode would emit.
+            step.fill_(prompt_len - 1)
+            logits, prenorm = model.forward(
+                input_ids=tokens[:, :prompt_len],
+                position_embeddings=(position_embeddings[0][:, :prompt_len],
+                                     position_embeddings[1][:, :prompt_len]),
+                step=step, return_prenorm=True)
+            pos = prompt_len
+            tokens[0, pos] = logits.argmax(dim=-1)[0, -1]
+            # Tokens the draft layer has not consumed yet, and the main-stack
+            # hidden state each one is conditioned on (position - 1).
+            new_ids, new_prev = tokens[:, pos:pos + 1], prenorm[:, -1:, :]
+            n_iters = n_gen = n_accept = n_draft = 0
+            hit_eos = int(tokens[0, pos]) in eos_token_ids and not args.ignore_eos
+
+            torch.cuda.synchronize()
+            starter.record()
+            while (not hit_eos and pos + 1 < decode_limit
+                   and pos + 2 < tokens.size(1)):
+                k = new_ids.shape[1]
+                step.fill_(pos)
+                draft_logits = model.mtp_draft(
+                    input_ids=new_ids, prev_hidden=new_prev,
+                    position_embeddings=(
+                        position_embeddings[0][:, pos - k + 1:pos + 1],
+                        position_embeddings[1][:, pos - k + 1:pos + 1]),
+                    step=step)
+                draft = draft_logits.argmax(dim=-1)[0, -1]
+                tokens[0, pos + 1] = draft
+
+                step.fill_(pos + 1)
+                logits, prenorm = model.forward(
+                    input_ids=tokens[:, pos:pos + 2],
+                    position_embeddings=(
+                        position_embeddings[0][:, pos:pos + 2],
+                        position_embeddings[1][:, pos:pos + 2]),
+                    step=step, all_positions=True, return_prenorm=True)
+                verified = logits.argmax(dim=-1)[0]        # [2]
+                n_iters += 1
+                n_draft += 1
+                if int(verified[0]) == int(draft):
+                    n_accept += 1
+                    tokens[0, pos + 2] = verified[1]
+                    n_acc = 2
+                else:
+                    # The draft was wrong; position p+1 takes the main model's own
+                    # token. Its stale latent row is rewritten by the next pass
+                    # before anything reads it.
+                    tokens[0, pos + 1] = verified[0]
+                    n_acc = 1
+                # An accepted pair may overrun --max-new-tokens by one; the
+                # token is computed either way, it just is not committed, so
+                # the MTP and non-MTP legs emit the same count.
+                n_acc = min(n_acc, decode_limit - 1 - pos)
+                new_ids = tokens[:, pos + 1:pos + 1 + n_acc]
+                new_prev = prenorm[:, :n_acc, :]
+                for j in range(n_acc):
+                    n_gen += 1
+                    if (int(tokens[0, pos + 1 + j]) in eos_token_ids
+                            and not args.ignore_eos):
+                        hit_eos = True
+                        pos = pos + 1 + j
+                        break
+                else:
+                    pos += n_acc
+            ender.record()
+            torch.cuda.synchronize()
+            run_time = starter.elapsed_time(ender)
+            prev_pos, cur_pos = pos, pos
+            mtp_stats = dict(iters=n_iters, gen=n_gen,
+                             accept=(n_accept / n_draft) if n_draft else 0.0,
+                             ms_per_token=run_time / max(1, n_gen),
+                             ms_per_iter=run_time / max(1, n_iters))
+        else:
+            for cur_pos in range(prompt_len, decode_limit):
+                step.fill_(cur_pos - 1)
+                input_ids = tokens[:, prev_pos:cur_pos]
+                cos_embeddings = position_embeddings[0][:, prev_pos:cur_pos]
+                sin_embeddings = position_embeddings[1][:, prev_pos:cur_pos]
+                logits = model.forward(
+                    input_ids=input_ids,
+                    position_embeddings=(cos_embeddings, sin_embeddings),
+                    step=step,
+                )
+                next_token = logits.argmax(dim=-1)[0, -1]
+                tokens[0, cur_pos] = next_token
+                prev_pos = cur_pos
+                if int(next_token) in eos_token_ids and not args.ignore_eos:
+                    break
+                if cur_pos == prompt_len:
+                    torch.cuda.synchronize()
+                    starter.record()
+
+            ender.record()
+            torch.cuda.synchronize()
+            run_time = starter.elapsed_time(ender)
+
 
         end_idx = prev_pos + 1
         generated_ids = tokens[:, :end_idx]
@@ -2838,6 +2930,13 @@ if __name__ == "__main__":
         print("Prompt length {}, generate length {}, per-token latency {} ms"
               .format(prompt_len, cur_pos - prompt_len,
                       run_time / max(1, cur_pos - prompt_len)))
+        if mtp_stats:
+            print("[MTP] {gen} tokens in {iters} iterations, acceptance "
+                  "{acc:.3f}, {mspt:.3f} ms/token, {mspi:.3f} ms/iteration"
+                  .format(gen=mtp_stats["gen"], iters=mtp_stats["iters"],
+                          acc=mtp_stats["accept"],
+                          mspt=mtp_stats["ms_per_token"],
+                          mspi=mtp_stats["ms_per_iter"]))
         # Every rank writes (to its own suffixed path) -- see the save_path
         # resolution above.
         if save_path:

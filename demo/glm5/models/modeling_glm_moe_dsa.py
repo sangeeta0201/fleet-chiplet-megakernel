@@ -110,7 +110,9 @@ class GlmMoeDsaConfig(PretrainedConfig):
         self.index_topk = kw.get("index_topk", 0)
         self.indexer_rope_interleave = kw.get("indexer_rope_interleave", True)
 
-        # MTP. Not executed here -- layer `num_hidden_layers` is skipped.
+        # MTP. Layer `num_hidden_layers` is the draft layer. It is only built
+        # and loaded when the caller asks for it (`num_mtp_layers`); the
+        # default keeps the old behaviour of skipping it entirely.
         self.num_nextn_predict_layers = kw.get("num_nextn_predict_layers", 0)
 
         self.architectures = kw.get("architectures", ["GlmMoeDsaForCausalLM"])
@@ -304,13 +306,14 @@ class GlmMLA(nn.Module):
 
         # Append to the paged latent cache. Page 0 only: the reference path
         # runs one request with page_size >= max_seq_length, matching the demo.
+        # `step` is the absolute index of the LAST token in this call, so the
+        # rows land at [step-q_len+1, step]. That is the same thing the two
+        # old special cases did -- prefill has step = q_len-1 and decode has
+        # q_len = 1 -- and it additionally covers a multi-token call in the
+        # middle of a sequence, which is what MTP verification is.
         row = torch.cat([c_kv, k_rope], dim=-1)  # [q_len, 576]
-        if q_len > 1:
-            self.latent_cache[self.layer_idx, 0, :q_len] = row
-            kv_len = q_len
-        else:
-            self.latent_cache[self.layer_idx, 0, step] = row
-            kv_len = int(step.item()) + 1
+        kv_len = int(step.item()) + 1 if step is not None else q_len
+        self.latent_cache[self.layer_idx, 0, kv_len - q_len:kv_len] = row
 
         kv = self.latent_cache[self.layer_idx, 0, :kv_len].float()  # [S, 576]
         c_cache = kv[:, : self.kv_lora_rank]                        # [S, 512]
@@ -504,13 +507,19 @@ class GlmMoE(nn.Module):
         return F.linear(F.silu(F.linear(x, g)) * F.linear(x, u), d)
 
     def forward(self, hidden_states):
-        if self.ep_local != self.config.n_routed_experts:
+        # Expert-parallel reference. Each rank owns experts
+        # [ep_base, ep_base + ep_local) and evaluates only the routed slots
+        # that land in its own range; one all_reduce sums the partials. This
+        # mirrors what the megakernel's EP fold does, and it is the only way
+        # the 744B model has a torch leg at all -- 256 experts x 76 layers do
+        # not fit on one GPU in any format.
+        sharded = self.ep_local != self.config.n_routed_experts
+        if sharded and not dist.is_initialized():
             raise NotImplementedError(
-                "the Torch reference MoE needs every expert resident; this "
-                "module holds only rank-local "
+                "this module holds only rank-local "
                 f"{'MXFP4' if self.mxfp4_experts else 'bf16'} experts "
-                f"[{self.ep_base}, {self.ep_base + self.ep_local}). Use the "
-                "megakernel path (--use-mirage) for the sharded model.")
+                f"[{self.ep_base}, {self.ep_base + self.ep_local}) and there "
+                "is no process group to sum the partials over.")
         expert = (self._mxfp4_expert if self.experts is None
                   else lambda e, x: self.experts[e](x))
         residuals = hidden_states
@@ -522,11 +531,20 @@ class GlmMoE(nn.Module):
         for tok in range(flat.shape[0]):
             for slot in range(topk_indices.shape[1]):
                 e = int(topk_indices[tok, slot])
+                if not (self.ep_base <= e < self.ep_base + self.ep_local):
+                    continue                       # another rank owns it
                 out[tok] += (expert(e, flat[tok:tok + 1]).float()
                              * float(topk_weights[tok, slot]))[0]
         out = out.to(hidden_states.dtype).view(*orig_shape)
-        # The shared expert runs on every token and is added unweighted.
-        return out + self.shared_experts(residuals), router_logits
+        # The shared expert runs on every token and is added unweighted. Under
+        # EP exactly one rank may add it, or the all_reduce would multiply it
+        # by the world size; the megakernel gives it to the fold rank for the
+        # same reason.
+        if not sharded or self.ep_base == 0:
+            out = out + self.shared_experts(residuals)
+        if sharded:
+            dist.all_reduce(out)
+        return out, router_logits
 
 
 class GlmDecoderLayer(nn.Module):
@@ -567,6 +585,58 @@ class GlmDecoderLayer(nn.Module):
         return hidden_states, router_logits
 
 
+class _SharedHead(nn.Module):
+    """Holds `norm` only. Exists so the checkpoint's
+    `model.layers.78.shared_head.norm.weight` lands without a key remap."""
+
+    def __init__(self, config: GlmMoeDsaConfig):
+        super().__init__()
+        self.norm = GlmRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+
+class GlmMtpLayer(GlmDecoderLayer):
+    """The multi-token-prediction draft layer (checkpoint layer index 78).
+
+    Structurally a full decoder layer -- MLA + MoE, its own latent cache slot,
+    its own 256 routed experts -- with a DeepSeek-V3-style front end. Given the
+    main model's last-layer hidden state for token i and the embedding of the
+    token at i+1, it predicts token i+2:
+
+        h' = eh_proj([enorm(emb(t_{i+1})) ; hnorm(h_i)])
+        h  = TRM(h')
+        logits = lm_head(shared_head.norm(h))
+
+    `h_i` is the main stack's output BEFORE `model.norm`, matching the
+    reference implementation: `model.norm` belongs to the main head, and the
+    draft head has its own `shared_head.norm`.
+
+    Subclassing GlmDecoderLayer rather than wrapping it is deliberate -- the
+    checkpoint names these tensors `model.layers.78.self_attn.*`, flat
+    alongside `model.layers.78.enorm.weight`, so the module has to sit at
+    `model.layers[78]` with the decoder submodules unnested.
+    """
+
+    def __init__(self, config: GlmMoeDsaConfig, latent_cache, layer_idx: int,
+                 world_size: int, ep_rank: int = 0, ep_world: int = 1,
+                 mxfp4_experts: bool = False):
+        super().__init__(config, latent_cache, layer_idx, world_size,
+                         ep_rank=ep_rank, ep_world=ep_world,
+                         mxfp4_experts=mxfp4_experts)
+        self.enorm = GlmRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hnorm = GlmRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size,
+                                 bias=False)
+        self.shared_head = _SharedHead(config)
+
+    def forward(self, inputs_embeds, prev_hidden, position_embeddings=None,
+                step=None):
+        h = self.eh_proj(torch.cat([self.enorm(inputs_embeds),
+                                    self.hnorm(prev_hidden)], dim=-1))
+        h, router_logits = super().forward(
+            h, position_embeddings=position_embeddings, step=step)
+        return self.shared_head.norm(h), router_logits
+
+
 class GlmPreTrainedModel(PreTrainedModel):
     config_class = GlmMoeDsaConfig
     _supports_sdpa = False
@@ -590,38 +660,62 @@ class GlmMoeDsaModel(GlmPreTrainedModel):
     def __init__(self, config: GlmMoeDsaConfig, world_size: int,
                  max_num_pages: int, page_size: int, num_layers: int = None,
                  ep_rank: int = 0, ep_world: int = 1,
-                 mxfp4_experts: bool = False):
+                 mxfp4_experts: bool = False, num_mtp_layers: int = 0):
         super().__init__(config)
         self.config = config
         n = num_layers if num_layers is not None else config.num_hidden_layers
+        # The MTP layer's checkpoint index is `config.num_hidden_layers`, so it
+        # can only be appended to a full stack; with --max-layers it would land
+        # at the wrong index and silently load a main layer's tensors.
+        assert num_mtp_layers == 0 or n == config.num_hidden_layers, (
+            "MTP needs the full layer stack; --max-layers and MTP are "
+            "mutually exclusive")
+        self.num_main_layers = n
+        self.num_mtp_layers = num_mtp_layers
 
         # One 576-wide latent row per token, shared across all heads: 1.15 KB
         # per token per layer against 64 heads x 256 dims x 2 tensors for
-        # unabsorbed MLA.
+        # unabsorbed MLA. The MTP layer attends over its own history and so
+        # needs its own cache slot.
         self.latent_cache = torch.empty(
-            (n, max_num_pages, page_size,
+            (n + num_mtp_layers, max_num_pages, page_size,
              config.kv_lora_rank + config.qk_rope_head_dim),
             dtype=torch.bfloat16, device="cuda")
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([
-            GlmDecoderLayer(config, self.latent_cache, i, world_size,
-                            ep_rank=ep_rank, ep_world=ep_world,
-                            mxfp4_experts=mxfp4_experts)
-            for i in range(n)
-        ])
+        self.layers = nn.ModuleList(
+            [GlmDecoderLayer(config, self.latent_cache, i, world_size,
+                             ep_rank=ep_rank, ep_world=ep_world,
+                             mxfp4_experts=mxfp4_experts)
+             for i in range(n)]
+            + [GlmMtpLayer(config, self.latent_cache, n + j, world_size,
+                           ep_rank=ep_rank, ep_world=ep_world,
+                           mxfp4_experts=mxfp4_experts)
+               for j in range(num_mtp_layers)])
         self.norm = GlmRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = GlmRotaryEmbedding(config)
         self.post_init()
 
-    def forward(self, input_ids, position_embeddings=None, step=None):
+    @property
+    def main_layers(self):
+        return self.layers[:self.num_main_layers]
+
+    @property
+    def mtp_layers(self):
+        return self.layers[self.num_main_layers:]
+
+    def forward(self, input_ids, position_embeddings=None, step=None,
+                return_prenorm=False):
         hidden_states = self.embed_tokens(input_ids)
         all_router_logits = []
-        for layer in self.layers:
+        for layer in self.main_layers:
             hidden_states, router_logits = layer(
                 hidden_states, position_embeddings=position_embeddings,
                 step=step)
             all_router_logits.append(router_logits)
+        if return_prenorm:
+            # The MTP head consumes the pre-`norm` hidden state.
+            return self.norm(hidden_states), all_router_logits, hidden_states
         return self.norm(hidden_states), all_router_logits
 
 
@@ -651,12 +745,13 @@ class GlmMoeDsaForCausalLM(GlmPreTrainedModel):
     def __init__(self, config: GlmMoeDsaConfig, world_size: int = 1,
                  max_num_pages: int = 16, page_size: int = 4096,
                  num_layers: int = None, ep_rank: int = 0, ep_world: int = 1,
-                 mxfp4_experts: bool = False):
+                 mxfp4_experts: bool = False, num_mtp_layers: int = 0):
         super().__init__(config)
         self.model = GlmMoeDsaModel(config, world_size, max_num_pages,
                                     page_size, num_layers=num_layers,
                                     ep_rank=ep_rank, ep_world=ep_world,
-                                    mxfp4_experts=mxfp4_experts)
+                                    mxfp4_experts=mxfp4_experts,
+                                    num_mtp_layers=num_mtp_layers)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size,
                                  bias=False)
@@ -666,7 +761,8 @@ class GlmMoeDsaForCausalLM(GlmPreTrainedModel):
     def from_pretrained(cls, pretrained_model_name_or_path, world_size=1,
                         max_num_pages=16, page_size=4096, num_layers=None,
                         random_weights=False, ep_rank=0, ep_world=1,
-                        mxfp4_experts=False, verbose=True, **kwargs):
+                        mxfp4_experts=False, num_mtp_layers=0, verbose=True,
+                        **kwargs):
         import glob
 
         from safetensors import safe_open
@@ -719,16 +815,26 @@ class GlmMoeDsaForCausalLM(GlmPreTrainedModel):
                       flush=True)
             ep_rank, ep_world = 0, 1
 
+        if num_mtp_layers > config.num_nextn_predict_layers:
+            raise ValueError(
+                f"asked for {num_mtp_layers} MTP layers, checkpoint has "
+                f"num_nextn_predict_layers={config.num_nextn_predict_layers}")
+
         model = cls(config, world_size=world_size, max_num_pages=max_num_pages,
                     page_size=page_size, num_layers=num_layers,
                     ep_rank=ep_rank, ep_world=ep_world,
-                    mxfp4_experts=mxfp4_experts)
+                    mxfp4_experts=mxfp4_experts,
+                    num_mtp_layers=num_mtp_layers)
         if random_weights:
             print("Using randomly initialised weights (--random-weights): "
                   "shapes and kernels are exercised, output text is not "
                   "meaningful.")
             return model
 
+        # Total built layers, main + MTP. Everything past this is dropped, so
+        # with num_mtp_layers=0 the MTP layer is skipped exactly as before and
+        # with 1 it is kept -- its checkpoint index is num_hidden_layers, the
+        # first index past the main stack.
         n_layers = len(model.model.layers)
         files = sorted(glob.glob(os.path.join(model_path,
                                               "model-*.safetensors")))
@@ -780,9 +886,10 @@ class GlmMoeDsaForCausalLM(GlmPreTrainedModel):
             with safe_open(f, framework="pt", device="cpu") as fh:
                 mapped = {}
                 for name in fh.keys():
-                    # Drop the MTP layer, the DSA indexer, and anything past
-                    # --max-layers. `model.layers.N.` is the only place a layer
-                    # index appears.
+                    # Drop the DSA indexer and anything past the built stack
+                    # (the MTP layer unless it was asked for, plus everything
+                    # above --max-layers). `model.layers.N.` is the only place
+                    # a layer index appears.
                     if name.startswith("model.layers."):
                         idx = int(name.split(".")[2])
                         if idx >= n_layers:
@@ -851,18 +958,55 @@ class GlmMoeDsaForCausalLM(GlmPreTrainedModel):
                   f"checkpoint, e.g. {never[:5]}")
         return model
 
-    @torch.inference_mode()
-    def forward(self, input_ids, position_embeddings=None, step=None):
+    def _check_indexer(self, input_ids, step):
         cfg = self.config
-        if cfg.has_indexer:
-            kv_len = (input_ids.shape[-1] if input_ids.shape[-1] > 1
-                      else int(step.item()) + 1)
-            if kv_len > cfg.index_topk:
-                raise NotImplementedError(
-                    f"context {kv_len} exceeds index_topk={cfg.index_topk}; "
-                    "the DSA indexer is a Stage-4 item and dense attention is "
-                    "only equivalent below that threshold.")
-        hidden_states, _ = self.model(input_ids=input_ids,
-                                      position_embeddings=position_embeddings,
-                                      step=step)
-        return self.lm_head(hidden_states[:, -1:, :])
+        if not cfg.has_indexer:
+            return
+        kv_len = (input_ids.shape[-1] if input_ids.shape[-1] > 1
+                  else int(step.item()) + 1)
+        if kv_len > cfg.index_topk:
+            raise NotImplementedError(
+                f"context {kv_len} exceeds index_topk={cfg.index_topk}; "
+                "the DSA indexer is a Stage-4 item and dense attention is "
+                "only equivalent below that threshold.")
+
+    @torch.inference_mode()
+    def forward(self, input_ids, position_embeddings=None, step=None,
+                all_positions=False, return_prenorm=False):
+        """Logits for the last position, or for every position when
+        ``all_positions`` (which MTP verification needs -- it scores several
+        candidate tokens in one pass). ``return_prenorm`` additionally returns
+        the pre-``model.norm`` hidden state, which is what the MTP draft head
+        consumes."""
+        self._check_indexer(input_ids, step)
+        out = self.model(input_ids=input_ids,
+                         position_embeddings=position_embeddings, step=step,
+                         return_prenorm=return_prenorm)
+        hidden_states, prenorm = (out[0], out[2]) if return_prenorm else (
+            out[0], None)
+        if not all_positions:
+            hidden_states = hidden_states[:, -1:, :]
+            if prenorm is not None:
+                prenorm = prenorm[:, -1:, :]
+        logits = self.lm_head(hidden_states)
+        return (logits, prenorm) if return_prenorm else logits
+
+    @torch.inference_mode()
+    def mtp_draft(self, input_ids, prev_hidden, position_embeddings=None,
+                  step=None, mtp_idx=0):
+        """One draft token from MTP layer ``mtp_idx``.
+
+        ``input_ids`` is the token at position p (the one the main model just
+        produced) and ``prev_hidden`` is the main stack's pre-norm hidden state
+        for position p-1. The returned logits predict position p+1.
+        ``position_embeddings``/``step`` describe position p, so the draft
+        layer writes its own latent cache row for p exactly as a main layer
+        would.
+        """
+        assert self.model.num_mtp_layers > mtp_idx, "no MTP layer loaded"
+        self._check_indexer(input_ids, step)
+        embeds = self.model.embed_tokens(input_ids)
+        h, _ = self.model.mtp_layers[mtp_idx](
+            embeds, prev_hidden, position_embeddings=position_embeddings,
+            step=step)
+        return self.lm_head(h[:, -1:, :])
