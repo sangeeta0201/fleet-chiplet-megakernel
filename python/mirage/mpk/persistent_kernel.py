@@ -601,6 +601,13 @@ def get_compile_command(
                 # one line. The controlled A/B for "is the barrier cost just
                 # serialized atomics on a single line?".
                 flags = flags + ["-DMPK_NULL_TREE=1"]
+            _null_tiles = int(os.environ.get("MPK_NULL_TILES", "0"))
+            if _null_tiles:
+                # Put an empty grid-stride tile loop in front of each null
+                # rendezvous, so the probe prices a whole ROUND instead of
+                # just its barrier. 24 matches qkv_a's tiles/XCD.
+                assert 0 < _null_tiles <= 256, "MPK_NULL_TILES is 1..256"
+                flags = flags + [f"-DMPK_NULL_TILES={_null_tiles}"]
         _perf_iter = int(os.environ.get("MPK_PERFETTO", "0"))
         if _perf_iter:
             # Capture raw per-worker phase spans for ONE decode iteration and

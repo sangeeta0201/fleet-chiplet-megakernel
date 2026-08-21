@@ -247,6 +247,47 @@ static constexpr int FULL_LAYER_NULL_PHASE_STRIDE = 24;
 #ifndef MPK_NULL_TREE
 #define MPK_NULL_TREE 0
 #endif
+// MPK_NULL_TILES: give each null rendezvous an empty grid-stride TILE LOOP in
+// front of it, so the probe prices a whole *round* rather than just its
+// barrier. `MPK_NULL_PHASES=4, MPK_NULL_TILES=0` is four bare rendezvous;
+// `MPK_NULL_PHASES=4, MPK_NULL_TILES=24` is four rounds shaped exactly like
+// qkv_a's -- 24 tiles per XCD strided over 29 workers -- whose tiles return
+// immediately. The difference between the two is the per-round cost that is
+// NOT the rendezvous: loop setup, the strided tile walk, and whatever the
+// dispatch of a round costs beyond its sync.
+//
+// Why it decides the next lever. The layer is 15 sequential grid-stride
+// rounds and round_count x one-tile makespan is the wall. If a round's fixed
+// floor is the rendezvous alone (3.77 us, already measured), then fusing two
+// rounds into one heterogeneous round is worth one rendezvous and one tile of
+// makespan, and round-count reduction is arithmetic. If the empty-tile round
+// costs materially more than the bare barrier, the round has a dispatch cost
+// of its own and the fusion is worth more than that.
+//
+// Correctness-preserving like MPK_NULL_PHASES: the loop writes nothing.
+//
+// ── MEASURED. A ROUND'S FIXED COST *IS* ITS RENDEZVOUS. ──────────────────
+// MPK_NULL_PHASES=4 both arms, alternated OFF/ON in one batch, n=4 each, one
+// -D the variable:
+//
+//   NULL_TILES=0    11.858 / 11.688 / 11.810 / 12.044   mean 11.850
+//   NULL_TILES=24   12.166 / 11.992 / 11.769 / 11.642   mean 11.892
+//
+// +0.042 ms over 4 x 78 = 312 added rounds, i.e. **0.14 us per round** of
+// dispatch, against 2.7-3.8 us per rendezvous (this batch's 4 null barriers
+// cost +0.845 ms against the 11.005 n=5 baseline = 2.71 us each; the earlier
+// flat-probe batch said 3.77). Dispatch is 4% of a round. Nothing about a
+// grid-stride round costs anything except the barrier in front of it and the
+// work inside it.
+//
+// So round-count reduction is priced exactly: fusing two rounds is worth ONE
+// rendezvous (~0.25 ms over 78 layers) plus whichever of the two rounds'
+// makespans was the shorter. It is NOT worth a hidden per-round dispatch fee,
+// because there isn't one. A fusion that costs any real byte traffic has to
+// beat 0.25 ms + the shorter round to be worth building.
+#ifndef MPK_NULL_TILES
+#define MPK_NULL_TILES 0
+#endif
 static_assert(MPK_NULL_PHASES >= 0 &&
                   MPK_NULL_PHASES <= FULL_LAYER_MAX_NULL_PHASES,
               "MPK_NULL_PHASES must be 0..4; the counter buffer sizes for 4");
@@ -558,6 +599,21 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
 #pragma unroll
     for (int k = 0; k < MPK_NULL_PHASES; k++) {
       int *const kb = null_bar + k * FULL_LAYER_NULL_PHASE_STRIDE * HIER_STRIDE;
+#if MPK_NULL_TILES > 0
+      // The empty tile loop. Same shape every real phase uses, same worker
+      // stride, a body the compiler cannot delete but that touches no memory.
+      {
+        int _acc = 0;
+        for (int t = xcd_rank; t < MPK_NULL_TILES; t += tiles_per_xcd) {
+          asm volatile("" : "+v"(_acc) : : "memory");
+          _acc += t;
+        }
+        // Never taken; keeps the loop live without a store on the real path.
+        if (_acc == 0x7fffffff) {
+          kb[8 * HIER_STRIDE] = _acc;
+        }
+      }
+#endif
       __syncthreads();
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       if (tid == 0) {
