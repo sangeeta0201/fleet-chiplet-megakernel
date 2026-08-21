@@ -825,6 +825,21 @@ if __name__ == "__main__":
         # of the layer is barrier-bound, so shrinking the phase is absorbed,
         # exactly as in the ceiling probes. Both directions, one conclusion --
         # W2 tile geometry is saturated, stop tuning it.
+        #
+        # 2026-08-21 addendum: per-worker stage stamps (MPK_BAR_SKEW=3) later
+        # showed W2 is the ONE phase whose tile imbalance is not absorbed --
+        # 9.66 us of spread at S8 against 1.63 us of layer boundary after it --
+        # which revives the round-quantization argument: 12 tiles/XCD/expert
+        # over 29 workers means a rank owning 3 experts needs 36 tiles = 2
+        # rounds, so widen until 3 experts fit in one round. It does not
+        # survive the arithmetic. tiles_per_XCD = (hidden_size/OPW)/8 and
+        # task_register.cc asserts hidden_size % OPW == 0, so 9 tiles/XCD needs
+        # OPW = 6144/72 = 85.33 and is unreachable; the clean neighbours are
+        # OPW=96 (8/XCD) and OPW=128 (6/XCD). OPW=128 is the row above, and at
+        # 6 tiles/XCD even FOUR owned experts fit in one round (24 <= 29) --
+        # strictly more aggressive than 8 or 9, and it measured neutral. So the
+        # unabsorbed spread is real but its geometry fix is already tested.
+        # An unabsorbed spread is necessary for a lever, not sufficient.
         MOE_W13_OPW = int(os.environ.get("GLM_MOE_W13_OPW", "64"))
         MOE_W2_OPW = int(os.environ.get("GLM_MOE_W2_OPW", "64"))
         # Experts per router call. The router is one worker per expert, so
