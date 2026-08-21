@@ -126,6 +126,154 @@ __device__ __forceinline__ f32x4_t _gang_mfma_w_x_f8(
   }
 }
 
+// ── DEEP PREFETCH ──────────────────────────────────────────────────────────
+//
+// MPK_MOE_PF_GROUPS: how many k-groups the MoE k-loop holds in registers while
+// that many more are in flight. 0 keeps the shipping loop below byte for byte.
+//
+// WHY. The shipping loop declares a0..a3 and reloads each one immediately
+// after the MFMA that consumes it, which reads as a depth-4 software pipeline
+// but is not one. Dumped ISA, and every k-iteration compiles to:
+//
+//   .LBB_11:                      ; k-loop header
+//     global_load_dwordx4 x4      ; a0..a3 for the NEXT k-group
+//     global_load_ubyte   x4      ; its scales
+//     s_waitcnt vmcnt(1)          ; <-- waits for 7 of the 8, immediately
+//     4x v_mfma_scale_f32_16x16x128_f8f6f4
+//     s_waitcnt vmcnt(0)
+//
+// A load and its use are ~3 MFMAs apart, about 96 cycles, against an HBM
+// latency near 800. There is effectively no overlap.
+//
+// Measured in tests/standalone/test_w13_scale_locality.hip against the real
+// W13 geometry at the real live grid width of 64, 306 MB so the MALL cannot
+// serve it (14560af). Same arithmetic, same row-major weight, same global
+// scales -- the ONLY change is how far ahead the loads are issued:
+//
+//   shipping loop, reproduced   16.22 us/tile   12.1 GB/s/CU
+//   GROUPS=2                    16.47           11.9   <- where shipping sits
+//   GROUPS=4                    11.80           16.7
+//   GROUPS=8                    11.62           16.9
+//   GROUPS=16                   12.79           15.4   <- past the knee
+//
+// 16 is measured worse, matching test_narrow_grid_bandwidth.hip, where depth 4
+// is the optimum at every grid width and depth 8 is 15% worse at narrow ones.
+//
+// The same file measures two further multipliers that are NOT in this knob,
+// because each needs its own change and its own run: staging the E8M0 scales
+// through LDS (-1.0 us on top) and repacking the weight K-major so a wave's
+// k-group is 1024 contiguous bytes instead of sixteen 64-byte pieces
+// (-2.2 us more). Stacked, 16.22 -> 7.90 us/tile.
+//
+// ON W13 THE 28% DOES NOT REACH THE WALL. Default is 0 for that reason.
+// Two paired same-batch A/Bs, n=3 each, MPK_NUM_WORKERS=232:
+//
+//   guarded form      control 10.460  ->  PF=4 10.491   (+0.031)
+//   guard-free form   control 10.503  ->  PF=4 10.517   (+0.014)
+//
+// Both are inside the 0.26 ms noise floor against a predicted -0.37 ms. The
+// first null has an ISA cause (the guards forced a full drain; see the note on
+// the helper). The second does not -- the drain moved but the wall did not.
+// The standing explanation is that W13 is the ABSORBED tile phase: its 16.4
+// us/layer is eaten by the spread of the barrier behind it, while W2's 9.7 us
+// is not (memory: glm-w2-imbalance-is-the-only-unabsorbed-spread). A real
+// in-place tile speedup on an absorbed phase buys zero makespan. W2 is where
+// this knob should be pointed, and that is the next A/B.
+#ifndef MPK_MOE_PF_GROUPS
+#define MPK_MOE_PF_GROUPS 0
+#endif
+
+// The k-loop, with the prefetch distance as a parameter. Accumulates
+// [0, KI_END) and returns the MFMA accumulator; the caller owns the epilogue.
+//
+// EVERY LOAD AND EVERY MFMA HERE IS UNCONDITIONAL, and that is the whole
+// point. The first version of this helper carried `if (kk < ki_end)` guards so
+// GROUPS need not divide the range. It compiled, ran, produced correct output,
+// and bought NOTHING (10.460 -> 10.491 ms, n=3 paired). The ISA says why: the
+// guards put the prefetch loads in their own basic blocks, so the number of
+// outstanding vm ops at the first MFMA differs per path and SIInsertWaitcnts
+// falls back to a full drain --
+//
+//   flat_load_dwordx4 v[16:19], ...     ; next block, partially issued
+//   s_waitcnt vmcnt(0) lgkmcnt(0)       ; <- waits for the prefetch too
+//   v_mfma_scale_f32_16x16x128_f8f6f4   ; x4
+//
+// -- which is exactly the shipping loop's behaviour with more registers live.
+// A prefetch that the wait drains is not a prefetch. Hence the compile-time
+// trip count and the peeled last block: the steady-state body is straight
+// line code, so the wait in front of the MFMAs can be a partial vmcnt and
+// GROUPS loads really do stay in flight across GROUPS MFMAs.
+//
+// TOK_SC_FP8 selects the activation-scale layout: W2 stages an MXFP8 vector
+// whose E8M0 run is per (block, g) and reads base[k*4+g]; W13 stages one scale
+// per 32-element block and reads base[k]. Same loop otherwise.
+template <bool WEIGHT_FP4, bool TOK_SC_FP8, int GROUPS, int KI_END>
+__device__ __forceinline__ f32x4_t
+    _gang_moe_kloop_deep(uint8_t const *w_data_row,
+                         uint8_t const *wg_scales,
+                         int row_scale_base,
+                         uint8_t const *s_tok_fp8,
+                         uint8_t const *s_tok_scales,
+                         int g) {
+  // Every caller declares this as a local constant of the same value; the
+  // scaled MFMA's K is fixed by the instruction, not by the layer shape.
+  constexpr int K_PER_MFMA = 128;
+  static_assert(KI_END % GROUPS == 0,
+                "MPK_MOE_PF_GROUPS must divide the k-loop trip count");
+  constexpr int NBLK = KI_END / GROUPS;
+  auto tok_sc_at = [&](int k) -> int {
+    return TOK_SC_FP8 ? (int)s_tok_scales[k * 4 + g] : (int)s_tok_scales[k];
+  };
+
+  f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
+  i32x8_t A[GROUPS];
+  int S[GROUPS];
+#pragma unroll
+  for (int j = 0; j < GROUPS; j++) {
+    A[j] = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, j * K_PER_MFMA, g);
+    S[j] = (int)wg_scales[row_scale_base + j * 4 + g];
+  }
+
+// IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation. Same reason as the
+// shipping loop; the GROUPS-wide bodies inside are fully unrolled.
+#pragma unroll 1
+  for (int blk = 0; blk < NBLK - 1; blk++) {
+    int const base = blk * GROUPS;
+    i32x8_t N[GROUPS];
+    int NS[GROUPS];
+    // Issue the whole NEXT block before consuming the current one, so GROUPS
+    // loads are outstanding across GROUPS MFMAs instead of ~1 across 3.
+#pragma unroll
+    for (int j = 0; j < GROUPS; j++) {
+      int kk = base + GROUPS + j;
+      N[j] = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kk * K_PER_MFMA, g);
+      NS[j] = (int)wg_scales[row_scale_base + kk * 4 + g];
+    }
+#pragma unroll
+    for (int j = 0; j < GROUPS; j++) {
+      i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (base + j) * K_PER_MFMA, g);
+      acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(A[j], b, acc, S[j],
+                                          tok_sc_at(base + j));
+    }
+#pragma unroll
+    for (int j = 0; j < GROUPS; j++) {
+      A[j] = N[j];
+      S[j] = NS[j];
+    }
+  }
+
+  // Peeled last block: consume what the previous iteration prefetched, and
+  // issue nothing past the end of the row.
+  constexpr int TAIL = (NBLK - 1) * GROUPS;
+#pragma unroll
+  for (int j = 0; j < GROUPS; j++) {
+    i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (TAIL + j) * K_PER_MFMA, g);
+    acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(A[j], b, acc, S[j],
+                                        tok_sc_at(TAIL + j));
+  }
+  return acc;
+}
+
 // Resolve a gang tile index to (expert_id, token, workgroup).
 //
 // Tiles interleave round-robin across the XCDs -- global_tile = tile_idx*8 +
@@ -568,6 +716,11 @@ __device__ __noinline__ void
 
     f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
 
+#if MPK_MOE_PF_GROUPS > 0
+    acc = _gang_moe_kloop_deep<WEIGHT_FP4, false, MPK_MOE_PF_GROUPS,
+                               MFMA_ITERS>(
+        w_data_row, wg_scales, row_scale_base, s_tok_fp8, s_tok_scales, g);
+#else
     i32x8_t a0 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 0 * K_PER_MFMA, g);
     int sa0 = (int)wg_scales[row_scale_base + 0 * 4 + g];
     i32x8_t a1 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 1 * K_PER_MFMA, g);
@@ -624,6 +777,7 @@ __device__ __noinline__ void
         sa3 = (int)wg_scales[row_scale_base + kt7 / 32 + g];
       }
     }
+#endif // MPK_MOE_PF_GROUPS
 
     // Epilogue. acc[i] = C[g*4+i][col]; at one token per tile only col 0 holds
     // a result.
@@ -1116,6 +1270,15 @@ __device__ __noinline__ void
 
     f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
 
+#if MPK_MOE_PF_GROUPS > 0
+    // W2 is the phase whose tile time is NOT absorbed by the barrier behind it
+    // (memory: glm-w2-imbalance-is-the-only-unabsorbed-spread), so this is the
+    // half of the knob with a makespan story. SPLIT_ITERS is 16 at the default
+    // K_SPLITS=1, so GROUPS must divide 16.
+    acc = _gang_moe_kloop_deep<WEIGHT_FP4, INPUT_FP8, MPK_MOE_PF_GROUPS,
+                               SPLIT_ITERS>(
+        w_data_row, wg_scales, row_scale_base, s_tok_k, s_tok_sc_k, g);
+#else
     i32x8_t a0 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 0 * K_PER_MFMA, g);
     int sa0 = (int)wg_scales[row_scale_base + 0 * 4 + g];
     i32x8_t a1 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 1 * K_PER_MFMA, g);
@@ -1172,6 +1335,7 @@ __device__ __noinline__ void
         sa3 = (int)wg_scales[row_scale_base + kt7 / 32 + g];
       }
     }
+#endif // MPK_MOE_PF_GROUPS
 
     if (col == 0) {
       emit(acc, wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4);

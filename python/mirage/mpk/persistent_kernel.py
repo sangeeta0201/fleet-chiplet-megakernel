@@ -823,6 +823,19 @@ def get_compile_command(
             # Compile-time, so every rank must agree.
             assert 8 <= int(_lds) <= 155, "MPK_WORKER_LDS_KB 8..155"
             flags = flags + [f"-DMPK_WORKER_LDS_KB={_lds}"]
+
+        _pf = os.environ.get("MPK_MOE_PF_GROUPS")
+        if _pf is not None:
+            # MoE k-loop prefetch distance: how many k-groups are in flight
+            # while that many are being consumed. 0 keeps the shipping loop,
+            # which the ISA shows issues its loads and then waits on them
+            # immediately -- no load/MFMA overlap at all. 4 is the measured
+            # knee (11.80 us/tile against 16.22, standalone); 16 is worse.
+            # Long note at the define in gang_moe_linear_mxfp8_mi300.cuh.
+            # Compile-time, so every rank must agree.
+            assert _pf in ("0", "2", "4", "8", "16"), \
+                "MPK_MOE_PF_GROUPS is 0, 2, 4, 8 or 16"
+            flags = flags + [f"-DMPK_MOE_PF_GROUPS={_pf}"]
         _w2_sf = os.environ.get("MPK_W2_STAGE_FULL")
         if _w2_sf is not None:
             # Restores W2's pre-fdca420 full-width activation staging so the

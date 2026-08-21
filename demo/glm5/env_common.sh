@@ -114,6 +114,11 @@ MPK_FORWARD_VARS=(
   # 155 of 160 KB/CU is what actually pins 1 block/CU. Compile-time, so a
   # mismatch between ranks is a different binary and the barriers deadlock.
   MPK_WORKER_LDS_KB
+  # MoE k-loop prefetch distance. The shipping loop has NO load/MFMA overlap
+  # (ISA: global_load x8 then s_waitcnt vmcnt(1) in the same block), and 4
+  # k-groups in flight is the measured knee. Compile-time, so a mismatch
+  # between ranks is a different binary and the barriers deadlock.
+  MPK_MOE_PF_GROUPS
   # Scratch backing store. Raising occupancy to 2 waves/SIMD doubles what ROCr
   # must reserve for spills (1192 B/thread x 256 CU x 4 SIMD x 2 waves x 64
   # lanes = 149 MB), which can cross the runtime's default single-dispatch
