@@ -561,6 +561,20 @@ def get_compile_command(
             # prologue. WRONG OUTPUT by construction. Splits SP4[0] into
             # prologue and GEMM; MPK_ABL_QKV is the sum of the two.
             flags = flags + ["-DMPK_ABL_QKV_PRO"]
+        _null_phases = int(os.environ.get("MPK_NULL_PHASES", "0"))
+        if _null_phases:
+            # Insert N extra GPU-wide rendezvous at the head of every layer,
+            # doing no work between them. CORRECT OUTPUT -- this is a pricing
+            # probe, not a ceiling probe, so its wall number is valid and it
+            # can be gated by the correctness suite like any real change.
+            assert 0 <= _null_phases <= 4, "MPK_NULL_PHASES is 0..4"
+            flags = flags + [f"-DMPK_NULL_PHASES={_null_phases}"]
+            if int(os.environ.get("MPK_NULL_TREE", "0")) == 1:
+                # Same null rendezvous, two-level arrival: 29 atomics on the
+                # XCD's own line, then 8 on the global one, instead of 232 on
+                # one line. The controlled A/B for "is the barrier cost just
+                # serialized atomics on a single line?".
+                flags = flags + ["-DMPK_NULL_TREE=1"]
         _perf_iter = int(os.environ.get("MPK_PERFETTO", "0"))
         if _perf_iter:
             # Capture raw per-worker phase spans for ONE decode iteration and

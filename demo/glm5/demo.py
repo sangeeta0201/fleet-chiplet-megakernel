@@ -1604,7 +1604,12 @@ if __name__ == "__main__":
         # its arrival counter eight lines further on, i.e. [106..113].
         full_layer_counter = make_tensor(
             "full_layer_counter",
-            ((114 if UNABSORB_K else 106 if UNABSORB_V else 96) * 16,),
+            # 150, not 114: MPK_NULL_PHASES reserves nine lines per null
+            # rendezvous at [114 + 9k], four of them, whether or not the probe
+            # is compiled in. Sizing it unconditionally keeps the host
+            # allocation independent of a compile-time flag -- the ranks would
+            # otherwise disagree about the buffer length.
+            (((114 + 4 * 24) if UNABSORB_K else 106 if UNABSORB_V else 96) * 16,),
             torch_dtype=torch.int32)
         # ── the EP exchange buffers ──────────────────────────────────────
         # One gather buffer PER FUSED LAYER, plus one for the tail. The fold

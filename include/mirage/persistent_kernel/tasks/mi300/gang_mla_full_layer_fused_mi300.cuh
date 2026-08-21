@@ -189,7 +189,53 @@ static constexpr int FULL_LAYER_MLA_WUV_SLOT = 96;
 // has no global counter: XCD x owns the flag at [106 + x] and the arrival
 // counter eight ints into that same stride.
 static constexpr int FULL_LAYER_MLA_WUK_SLOT = 106;
-static constexpr int FULL_LAYER_COUNTER_SLOTS = 114;
+// MPK_NULL_PHASES: up to four extra GPU-wide rendezvous inserted at the head
+// of the layer, each with its own nine lines (eight per-XCD release flags and
+// an arrival counter) at [114 + 9k .. 122 + 9k].
+//
+// This is a PRICING probe and, unlike the ceiling probes, it is
+// correctness-preserving: nothing is written between the null barriers, so the
+// generated text is unchanged and the wall number is valid. That matters here
+// because every wrong-output probe on this branch sits upstream of the router
+// and is invalid for exactly that reason.
+//
+// What it answers: every work-cut, phase-cut and barrier-cut measured on GLM
+// has been absorbed, while cutting worker count is strongly negative. That is
+// the signature of a critical path made of the phase *sequence* rather than
+// the work in any phase -- a per-phase fixed cost no work-ablation can see.
+// Adding a phase that does no work prices that cost directly. If one null
+// rendezvous is worth ~8.5 us/layer, phase-count reduction is the lever and
+// the layer's 16 phases are worth ~5 ms; if it is worth ~2.5 us, it is not,
+// and the 13 MB/layer/rank exchange rate from the W_UV wash is the whole story.
+static constexpr int FULL_LAYER_NULL_PHASE_SLOT = 114;
+static constexpr int FULL_LAYER_MAX_NULL_PHASES = 4;
+// Per null barrier: [0..7] per-XCD release flags, [8] the global arrival
+// counter, [9..16] the per-XCD arrival counters used only by the tree variant.
+// Each on its own 64-byte line -- eight counters sharing a line would
+// serialize exactly the way the flat counter does, which is the thing under
+// test.
+static constexpr int FULL_LAYER_NULL_PHASE_STRIDE = 24;
+#ifndef MPK_NULL_PHASES
+#define MPK_NULL_PHASES 0
+#endif
+// MPK_NULL_TREE: same null barrier, two-level arrival. Each worker bumps its
+// own XCD's counter (29 arrivals, eight lines in parallel); the last arriver
+// per XCD bumps the global one (8 arrivals); the last of those fans out the
+// release. Serialized atomics per rendezvous drop from 232 to 29 + 8 = 37.
+//
+// The flat probe measured 3.77 us/layer per rendezvous, and 232 atomics on one
+// line at ~16 ns of L2 throughput each is 3.7 us -- so the hypothesis is that a
+// rendezvous IS its atomic serialization. Running the two mechanisms through
+// the same probe is the controlled test of that.
+#ifndef MPK_NULL_TREE
+#define MPK_NULL_TREE 0
+#endif
+static_assert(MPK_NULL_PHASES >= 0 &&
+                  MPK_NULL_PHASES <= FULL_LAYER_MAX_NULL_PHASES,
+              "MPK_NULL_PHASES must be 0..4; the counter buffer sizes for 4");
+static constexpr int FULL_LAYER_COUNTER_SLOTS =
+    FULL_LAYER_NULL_PHASE_SLOT +
+    FULL_LAYER_MAX_NULL_PHASES * FULL_LAYER_NULL_PHASE_STRIDE;
 
 // Self-heal gate for the Mechanism-C flag polls.
 //
@@ -481,6 +527,67 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     __syncthreads();
     // Same reasoning as Phase 8: plain buffer_inv, not an agent-scope acquire.
     asm volatile("buffer_inv" ::: "memory");
+
+    // ── MPK_NULL_PHASES: price one rendezvous ────────────────────────────
+    // Byte-for-byte the barrier above, including the buffer_inv, with no work
+    // between them. See the note at FULL_LAYER_NULL_PHASE_SLOT.
+#if MPK_NULL_PHASES > 0
+    int *const null_bar =
+        counters + FULL_LAYER_NULL_PHASE_SLOT * HIER_STRIDE;
+#pragma unroll
+    for (int k = 0; k < MPK_NULL_PHASES; k++) {
+      int *const kb = null_bar + k * FULL_LAYER_NULL_PHASE_STRIDE * HIER_STRIDE;
+      __syncthreads();
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      if (tid == 0) {
+        bool release;
+        if (MPK_NULL_TREE) {
+          // Two-level: 29 arrivals on this XCD's own line, then 8 on the
+          // global one. The XCD counter's quota is tiles_per_xcd, so its
+          // modular test is the per-XCD analogue of the flat one.
+          int const xprev = atom_add_release_gpu_s32(
+              &kb[(9 + xcd_id) * HIER_STRIDE], 1);
+          release = false;
+          if ((xprev % tiles_per_xcd) == tiles_per_xcd - 1) {
+            int const gprev =
+                atom_add_release_gpu_s32(&kb[8 * HIER_STRIDE], 1);
+            release = (gprev % 8) == 7;
+          }
+        } else {
+          int const prev = atom_add_release_gpu_s32(&kb[8 * HIER_STRIDE], 1);
+          release = (prev % arrivals) == arrivals - 1;
+        }
+        if (release) {
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          for (int x = 0; x < 8; x++) {
+            st_wt_u32((void *)&kb[x * HIER_STRIDE], (unsigned)entry_expected);
+          }
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        }
+        int *const my_flag = &kb[xcd_id * HIER_STRIDE];
+        // Self-heal quota. Under the tree the global counter is bumped once
+        // per XCD, not once per worker, so it tops out at 8 per layer. That
+        // is still the WHOLE predicate the flag stands for -- it only reaches
+        // 8 * entry_expected once every XCD's local counter hit its own
+        // quota, i.e. once all 232 workers arrived. Healing on half a
+        // predicate is what broke the NP=8 EP barrier.
+        int const heal_quota = MPK_NULL_TREE ? 8 : arrivals;
+        int _spins = 0;
+        while (ld_nt_s32(my_flag) < entry_expected) {
+          ++_spins;
+          if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
+            if (ld_nt_s32(&kb[8 * HIER_STRIDE]) >= heal_quota * entry_expected) {
+              st_wt_u32((void *)my_flag, (unsigned)entry_expected);
+              asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+            }
+          }
+          __builtin_amdgcn_s_sleep(1);
+        }
+      }
+      __syncthreads();
+      asm volatile("buffer_inv" ::: "memory");
+    }
+#endif
   }
 
   // ══════════════════════════════════════════════════════════════════════

@@ -28,6 +28,13 @@ TAG="${2:?usage: run_correctness_suite.sh <launcher.sh> <tag>}"
 OUT_DIR="${OUT_DIR:-/tmp/glm5_correctness}"
 mkdir -p "$OUT_DIR"
 
+# Pin the model, exactly as bench_repeat.sh does. env_common.sh defaults to
+# GLM-4.7-Flash, whose MLA shape does not satisfy the absorbed-o_proj assert,
+# so an unpinned sweep dies on every rank at
+# "absorbed o_proj reduces over num_q_heads * kv_lora_rank = 16384, got 10240"
+# before it generates a single token -- i.e. the gate silently does not run.
+export MODEL_PATH="${MODEL_PATH:-/home/claudeuser/models/glm5-mxfp4}"
+
 # Long enough that a subtly wrong reduction shows as divergence rather than as
 # a lucky matching prefix, and short enough to stay inside the page budget.
 export MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-512}"
