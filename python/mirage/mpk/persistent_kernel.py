@@ -597,6 +597,13 @@ def get_compile_command(
             # Folding work-groups per XCD. Default 1 (eight total) is the
             # shape this branch has always had.
             flags = flags + ["-DMPK_EP_FOLD_WGS=%d" % _ep_fold_wgs]
+        if int(os.environ.get("MPK_ML_PTR_PREFETCH", "0")) == 1:
+            # Hold the next layer's 34+13 TaskDesc pointers in registers
+            # across the layer instead of loading them at the layer boundary.
+            # Stage stamp 12 priced that copy at 15.33 us/layer -- two
+            # dependent cold round trips, because the loads feed shared
+            # memory and the layer evicts the table from L2 in between.
+            flags = flags + ["-DMPK_ML_PTR_PREFETCH=1"]
         _bar_skew = int(os.environ.get("MPK_BAR_SKEW", "0"))
         if _bar_skew >= 1:
             # Per-rendezvous first-arriver-to-last-arriver spread. O(1) per
