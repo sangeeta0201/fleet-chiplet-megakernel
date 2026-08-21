@@ -151,7 +151,13 @@ MPK_FORWARD_VARS=(
   CK_FMHA_1TOK
   # Per-stage activation checksums (mpk_bsdbg.cuh). Compile-time, so every
   # rank must see it or the ranks build different megakernels.
-  MPK_BS_DEBUG
+  #
+  # MPK_BSDBG_LAYER0 offsets the dump window by an absolute task_layer_idx --
+  # task_layer_idx is run-monotonic ((pc_iter-1)*76 + ml), so 76 is iteration 1.
+  # Same forwarding requirement as MPK_BS_DEBUG, and it was missing: a run that
+  # sets it in the caller's shell only rebuilds rank 0, which is a different
+  # binary from the other seven.
+  MPK_BS_DEBUG MPK_BSDBG_LAYER0
   MAX_SAVE_TOKENS
   MPK_NUM_WORKERS
 )

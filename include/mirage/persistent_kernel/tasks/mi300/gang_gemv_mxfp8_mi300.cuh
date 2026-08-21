@@ -83,6 +83,7 @@
 
 #pragma once
 #include "tasks/mi300/gang_gemv_mi300.cuh"
+#include "tasks/mi300/mpk_bsdbg.cuh"
 
 namespace kernel {
 
@@ -216,6 +217,24 @@ __device__ __noinline__ void
 
   assert(tile_idx >= 0);
   assert(tile_n == ROWS_PER_WG);
+  // ── bs=2 bisection probe ────────────────────────────────────────────────
+  // GLM_FUSE_ATTN defaults to 0, so the three dense prologue layers run this
+  // UNFUSED chain and the whole-layer task covers every MoE layer -- which is
+  // why the first attempt, a probe inside gang_mla_attn_fused_kernel_mi300,
+  // saw fused layers 0-2 and not a single dense one. The dense layers are
+  // scheduled first, so seq 0..23 (8 XCD tasks x 3 layers) is exactly the
+  // prologue no matter who else calls this kernel later.
+  // Read at task entry, i.e. behind the previous task's event boundary, and
+  // only on the reduction-dim input, which every XCD sees whole -- an output
+  // or residual pointer is column-sliced 8 ways and reading a full row off one
+  // slice runs into the next row.
+  if constexpr (HAS_RESIDUAL) {
+    if (tile_idx == 0 && threadIdx.x == 0) {
+      MPK_BSDBG_SEQ(25, input_ptr, REDUCTION_SIZE, "d_attn_out",
+                    BATCH_SIZE, INPUT_ROW_STRIDE, 24);
+    }
+  }
+
 
   int m_tile, n_tile;
   if (!gang_linear_tile_coords(

@@ -127,7 +127,93 @@ __device__ __forceinline__ void mpk_bsdbg_bf16(int stage,
   }
 }
 
+// The same fingerprint, for a caller that has no task_layer_idx.
+//
+// The three dense prologue layers do not go through fuse_full_layer (it
+// requires layer.is_moe), so they carry no layer index and MPK_BSDBG_N cannot
+// see them at all -- which is exactly the blind spot the bs=2 hunt walked
+// into: the embedding output is bit-identical between the bs=1 and bs=2 arms,
+// the first *fused* layer's input is not, and everything in between was
+// uninstrumented.
+//
+// Ordering instead of indexing. There is a barrier between every task, so the
+// n-th visit of a given stage is the n-th layer to reach it -- no layer id
+// needed. The gate is left to the caller (`tile_idx == 0 && threadIdx.x == 0`
+// in a gang task is one thread per XCD, so a stage emits 8 lines per layer);
+// `seq` is printed rather than divided so a caller with a different workgroup
+// count is still readable.
+//
+// The eight lines are NOT eight copies of the same read, and assuming they
+// were wasted a run. A gang task's tensors are partitioned across the eight
+// workgroups by the task graph's input map -- the residual these probes read
+// comes in as `new_input(residual, (1, -1, -1), ...)`, i.e. dim 1 sliced by
+// bid.x -- so each XCD's pointer is a different 1/8 of the row. Measured: the
+// eight stage-10 lines of one dense layer had eight different sums, exactly
+// one of which (arrival order, not XCD order -- `seq` is an atomicAdd) matched
+// the known embedding.
+//
+// Hence two things. The pointer is printed, so the eight lines of a layer can
+// be sorted back into column order across arms whose allocations differ. And
+// the caller must pass an `n` that fits inside ONE slice, or seven of the eight
+// reads run off the end of their slice and, at BATCH_SIZE > 1, straight into
+// the next row.
+__device__ unsigned int g_bsdbg_seq[32];
+
+__device__ __forceinline__ void mpk_bsdbg_seq_bf16(int stage,
+                                                   void const *p,
+                                                   int n,
+                                                   char const *tag,
+                                                   int rows,
+                                                   int stride,
+                                                   int limit) {
+  if (stage < 0 || stage >= 32 || p == nullptr) {
+    return;
+  }
+  unsigned int const seq = atomicAdd(&g_bsdbg_seq[stage], 1u);
+  if (seq >= (unsigned int)limit) {
+    return;
+  }
+  for (int r = 0; r < rows; r++) {
+    __hip_bfloat16 const *a =
+        (__hip_bfloat16 const *)p + (long long)r * (long long)stride;
+    double sum = 0.0;
+    float amax = 0.0f;
+    for (int i = 0; i < n; i++) {
+      float const v = __bfloat162float(a[i]);
+      sum += (double)v;
+      float const av = v < 0.0f ? -v : v;
+      if (!(av <= amax)) {
+        amax = av;
+      }
+    }
+    // The pointer is not decoration. Gating on `tile_idx == 0` fires once per
+    // XCD *and* once per task, and those two readings of the same seq stream
+    // are indistinguishable from the values alone -- eight hits with eight
+    // different sums is either eight tasks or one task whose eight XCDs raced
+    // the producer. Same pointer across a run of eight says XCD; a cycling
+    // pointer says task.
+    printf("[DENSEDBG] seq=%u stage=%d row=%d %s p=%p n=%d sum=%.6f amax=%.6f "
+           "v0=%.6f v1=%.6f\n",
+           seq,
+           stage,
+           r,
+           tag,
+           p,
+           n,
+           sum,
+           amax,
+           __bfloat162float(a[0]),
+           n > 1 ? __bfloat162float(a[1]) : 0.0f);
+  }
+}
+
 } // namespace kernel
+
+#define MPK_BSDBG_SEQ(stage, ptr, n, tag, rows, stride, limit)                 \
+  do {                                                                         \
+    ::kernel::mpk_bsdbg_seq_bf16(                                              \
+        (stage), (ptr), (n), (tag), (rows), (stride), (limit));                \
+  } while (0)
 
 // `rows` x `stride` dumps more than the first token's row. At BATCH_SIZE > 1
 // a bug that only touches row 1 is invisible in row 0, and row 0 is all the
@@ -153,6 +239,10 @@ __device__ __forceinline__ void mpk_bsdbg_bf16(int stage,
   } while (0)
 
 #define MPK_BSDBG(stage, layer, ptr, n, pe, tag)                               \
+  do {                                                                         \
+  } while (0)
+
+#define MPK_BSDBG_SEQ(stage, ptr, n, tag, rows, stride, limit)                 \
   do {                                                                         \
   } while (0)
 

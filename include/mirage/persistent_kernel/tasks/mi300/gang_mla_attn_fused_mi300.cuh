@@ -87,6 +87,7 @@
 //
 #pragma once
 #include "tasks/ampere/merge_splitkv.cuh"
+#include "tasks/mi300/mpk_bsdbg.cuh"
 #include "tasks/mi300/gang_gemv_mxfp8_mi300.cuh"
 #include "tasks/mi300/gang_mla_decode_mi300.cuh"
 #include "tasks/mi300/gang_rmsnorm_linear_mxfp8_bias_mla_kvupd_mi300.cuh"
@@ -223,6 +224,57 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   int const tid = threadIdx.x;
   int const xcd_id = tile_idx / tiles_per_xcd;
   int const xcd_rank = tile_idx % tiles_per_xcd;
+
+  // ── bs=2 bisection probe ────────────────────────────────────────────────
+  //
+  // This task is the only instrument the dense prologue has. MPK_BSDBG_N keys
+  // off task_layer_idx, which only exists inside a fused layer, and
+  // fuse_full_layer requires layer.is_moe -- so model layers 0-2 are invisible
+  // to it, and that is precisely the window the bs=2 break was localized to
+  // (the embedding output is bit-identical between the arms, the first fused
+  // layer's input is not).
+  //
+  // These fire on FUSED layers, not on the dense prologue -- do not read them
+  // as a dense-layer probe. The premise that they would was wrong and cost a
+  // run: GLM_FUSE_ATTN defaults to 0, so `fuse_attn` is false for the three
+  // dense layers and true only via `fuse_full_layer`, which requires
+  // layer.is_moe. The tell is in the log rather than in the source: x_ptr
+  // walks by exactly EP_WORLD_SIZE * BATCH_SIZE * hidden * 2 + 128 bytes per
+  // visit, because the fused caller passes input_ptrs[27] -- the per-layer
+  // ep_gather buffer -- and not input_ptrs[0]. A dense visit would show the
+  // one embed_out pointer, then layer_out twice.
+  //
+  // For the dense prologue use stages 23/25/26, which sit in the three
+  // unfused kernels only those layers dispatch.
+  //
+  // All three buffers are read at task entry, i.e. behind the previous task's
+  // event boundary, so none of them races a producer. x_out and attn_out
+  // therefore carry the PREVIOUS layer's values -- which is the useful pairing:
+  // x_in(L) against attn_out(L-1) separates a layer's attention half from its
+  // MLP half without needing a probe that waits on this task's own phases.
+  if (tid == 0 && xcd_id == 0 && xcd_rank == 0) {
+    MPK_BSDBG_SEQ(20,
+                  x_ptr,
+                  QKV_REDUCTION_SIZE,
+                  "dl_x_in",
+                  BATCH_SIZE,
+                  QKV_REDUCTION_SIZE,
+                  3);
+    MPK_BSDBG_SEQ(21,
+                  x_out_ptr,
+                  QKV_REDUCTION_SIZE,
+                  "dl_x_res_prev",
+                  BATCH_SIZE,
+                  QKV_REDUCTION_SIZE,
+                  3);
+    MPK_BSDBG_SEQ(22,
+                  attn_out_ptr,
+                  NUM_Q_HEADS * KV_LORA_RANK,
+                  "dl_attn_out_prev",
+                  BATCH_SIZE,
+                  NUM_Q_HEADS * KV_LORA_RANK,
+                  3);
+  }
 
   // The q_b phase is one tile wider than its workgroup count: tile 0 carries
   // the latent row rather than a GEMM tile. See the kvupd header.

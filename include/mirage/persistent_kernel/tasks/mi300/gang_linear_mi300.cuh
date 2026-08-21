@@ -15,6 +15,7 @@
 
 #pragma once
 #include "linear_ck_mi300.cuh"
+#include "mpk_bsdbg.cuh"
 
 namespace kernel {
 

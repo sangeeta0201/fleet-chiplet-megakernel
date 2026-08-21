@@ -1006,6 +1006,21 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       // Both land before any W2 accumulate, so the duplicate is 8 KB of
       // write-through stores and no hazard. Left duplicated rather than
       // threading a flag through the MoE half for it.
+      // Stage 12: the layer's actual input row, read where it is provably
+      // quiescent -- and this is the placement stage 0 should have had.
+      //
+      // input_ptrs[0] is rewritten by Phase 9 of this same layer, so the only
+      // safe window is one where no worker can have reached Phase 9. This is
+      // it: the fold sits at the head of the layer, behind the layer-entry
+      // barrier, and every other worker is parked on the release this
+      // work-group has not published yet. The read is 256 elements inside this
+      // folder's own column window rather than the whole 6144, so it costs a
+      // few microseconds of one work-group and cannot run off the slice.
+      //
+      // xcd_id 0 / xcd_rank 0 is the folder whose window starts at column 0,
+      // so the values line up with the embedding and with the dense probes.
+      MPK_BSDBG_N(12, task_layer_idx, input_ptrs[0], 256, EP_MY_PE,
+                  "layer_x_in", BATCH_SIZE, QKV_REDUCTION_SIZE);
       _full_layer_ep_fold_partial<BATCH_SIZE,
                                   QKV_REDUCTION_SIZE,
                                   QKV_REDUCTION_SIZE,
