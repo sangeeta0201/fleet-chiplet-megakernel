@@ -727,7 +727,13 @@ __device__ unsigned long long g_stage_ref;
 // can be differenced against the cumulative BAR_SKEW gap sums. They can NOT
 // be compared across ranks -- the eight entry barriers are not synchronized,
 // which is the mistake recorded on MPK_EP_POLL_BATCH.
-#define MPK_STAGE_SLOTS 14
+#define MPK_STAGE_SLOTS 16
+// Samples longer than this are treated as stale-reference and dropped. See
+// mpk_stage_stamp. 10 ms is the historical value and keeps old runs
+// reproducible; 1 ms is what you want for a ~136 us layer.
+#ifndef MPK_BAR_SKEW_DROP_NS
+#define MPK_BAR_SKEW_DROP_NS 10000000ull
+#endif
 // PRIVATE per-worker accumulators, not four contended atomics.
 //
 // The first version of this stamp did atomicAdd/Min/Max on four GPU-wide
@@ -760,9 +766,21 @@ __device__ __forceinline__ void mpk_stage_stamp(int idx) {
     return;
   }
   unsigned long long const d = (t - ref) * 10ull;
-  // A sample longer than 10 ms means the reference was updated underneath us
-  // (this worker is a layer behind). Drop rather than skew the mean.
-  if (d > 10000000ull) {
+  // A sample longer than the drop threshold means the reference was updated
+  // underneath us (this worker is a layer behind). Drop rather than skew the
+  // mean.
+  //
+  // The original 10 ms was far too loose. A layer is ~136 us, so at 10 ms a
+  // single stale sample survives and lands with ~10000x the weight of a real
+  // one. That is not hypothetical: it is what made the layer boundary read as
+  // 20.18 us/layer. Slots stamped every ml keep one sample per DECODE
+  // ITERATION whose reference is the previous iteration's last barrier -- a
+  // ~1.2 ms gap -- while slots stamped only for ml > 0 do not, so
+  // differencing the two families reported that whole gap, amortised, as
+  // boundary time. Set MPK_BAR_SKEW_DROP_NS=1000000 (1 ms) to cut those and
+  // equalise the populations; the default is unchanged so older numbers stay
+  // reproducible.
+  if (d > (unsigned long long)MPK_BAR_SKEW_DROP_NS) {
     return;
   }
   unsigned int const w = blockIdx.x;

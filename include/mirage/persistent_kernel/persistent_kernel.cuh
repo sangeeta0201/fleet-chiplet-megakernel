@@ -1765,7 +1765,17 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
           // post-router, last W2 tile, entry arrival), so differencing a
           // single worker's row across them says WHICH phase built that
           // worker's lateness.
-          for (int s = 5; s <= 9; s++) {
+          //
+          // 10..14 continue through the layer boundary (kernel entry, loop
+          // bookkeeping done, loop top, pointer refresh issued, block
+          // joined). They are here because the AGGREGATE means for those
+          // slots are unusable: every slot's max is ~9.4 ms, so a handful of
+          // outlier layers dominate the sum, and 12..14 are stamped only for
+          // ml > 0 while 9..11 are stamped for every ml -- differencing two
+          // slots with different populations is not a duration. Per-worker
+          // rows fix both: same worker, same layer count, and
+          // max-over-workers of a worker's own mean is the makespan proxy.
+          for (int s = 5; s <= 14; s++) {
             for (int w = 0; w < MPK_STAGE_WORKERS; w++) {
               int const p = w * MPK_STAGE_SLOTS + s;
               if (g_stage_pcnt[p] == 0ull) {
@@ -2647,7 +2657,25 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                   task_desc->variant_id = config.ml_variant_ids[ml];
                 }
 #endif
+                // Stage stamp 13: tid 0 has issued its share of the pointer
+                // refresh and is about to join the block. S13 - S12 is the
+                // ISSUE cost -- the global loads and the LDS stores on one
+                // thread. Bisects the 1533 ticks that MPK_ML_BOUNDARY_PAD
+                // priced at 1.46 ms of wall: if S13 - S12 is small and
+                // S14 - S13 holds the region, the cost is tid 0 waiting for
+                // the other 255 threads to arrive, which is intra-block skew
+                // inherited from the previous layer and cannot be recovered
+                // by deleting work here. If S13 - S12 holds it, the refresh
+                // itself is serialized and is deletable.
+                if (threadIdx.x == 0) {
+                  mpk_stage_stamp(13);
+                }
                 __syncthreads();
+                // Stage stamp 14: the block has joined. S14 - S13 is the
+                // WAIT.
+                if (threadIdx.x == 0) {
+                  mpk_stage_stamp(14);
+                }
               }
 #ifdef MPK_NIL_TRIPWIRE
               // Breadcrumb: which layer this worker reached, and whether the

@@ -630,6 +630,14 @@ def get_compile_command(
             # barrier epoch, so unlike MPK_SUBPHASE_TIMING its cost does not
             # scale with tile count.
             flags = flags + ["-DMPK_BAR_SKEW=%d" % _bar_skew]
+            _drop_ns = int(os.environ.get("MPK_BAR_SKEW_DROP_NS", "0"))
+            if _drop_ns > 0:
+                # Stale-reference drop threshold for the stage stamps. The
+                # 10 ms default lets one sample per decode iteration -- the
+                # one whose reference is the previous iteration's last
+                # barrier -- survive with ~10000x the weight of a real
+                # 136 us layer. Set 1000000 for a clean per-layer mean.
+                flags = flags + ["-DMPK_BAR_SKEW_DROP_NS=%dull" % _drop_ns]
         if int(os.environ.get("MPK_QUANT_V16", "0")) == 1:
             # 16-byte loads in the shared RMSNorm+quant prologue. The scalar
             # form only vectorized to dwordx2 because the addrspace(1) cast
