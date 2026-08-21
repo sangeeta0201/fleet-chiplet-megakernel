@@ -1286,6 +1286,14 @@ __device__ __attribute__((always_inline)) void
   // ════════════════════════════════════════════════════════════════════════
   // Phase 5: MoE W13 (gate+up) with the SwiGLU folded into the epilogue
   // ════════════════════════════════════════════════════════════════════════
+  // MPK_W13_REPS: the same marginal-cost probe MPK_QKVA_REPS is, aimed at the
+  // other big tile phase. 1 is the shipping path. CORRECT OUTPUT: W13's
+  // epilogue is pure stores (st_wt_u32 / out_addr[i] = ...) into the swiglu
+  // scratch, which is disjoint from its inputs, so the body is idempotent.
+  // W2 cannot take this probe -- its epilogue f32-atomicAdds into the
+  // residual workspace, so a second pass would double the layer output.
+#pragma unroll 1
+  for (int _w13rep = 0; _w13rep < MPK_W13_REPS; ++_w13rep)
   for (int t = xcd_rank; t < moe_w13_live; t += tiles_per_xcd) {
     gang_moe_w13_linear_mxfp8_kernel<BATCH_SIZE,
                                      2 * MOE_INTERMEDIATE,

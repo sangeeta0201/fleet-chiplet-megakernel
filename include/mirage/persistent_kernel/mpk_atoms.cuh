@@ -799,14 +799,21 @@ __device__ __forceinline__ bool
 //     e6ccf70 is real, but no layer-(L+1) work exists that can legally go in
 //     it, because everything in qkv_a(L+1) is downstream of MoE(L).
 //
-// (2) qkv_a tile time is NOT re-absorbed by the barrier behind it. 8.6 of a
-//     14.8 us/layer tile transfers straight to the wall -- and 8.6 is a lower
-//     bound, since pass 2 re-reads a W that pass 1 just pulled through L2
-//     (2 MB/XCD against a 4 MB slice). This is the in-place-tile-speedup rule
-//     (GLM_RESADD_UNROLL, ~1:1) and NOT the deletion-in-front-of-a-barrier
-//     rule. Cutting work inside the qkv_a tile is a live lever worth up to
-//     ~1.15 ms; MPK_ATTN_HALFK already spent the byte half of it (4.91
-//     us/layer), so what is left is the ~40% VALU prologue.
+// (2) An ADDED pass costs ~1:1. 8.6 of a 14.8 us/layer tile shows up on the
+//     wall, and 8.6 is a lower bound since pass 2 re-reads a W that pass 1
+//     just pulled through L2 (2 MB/XCD against a 4 MB slice).
+//
+//     CORRECTION, and it matters: this is an ADDITIVE probe and it does NOT
+//     upper-bound a DELETION. That is the exact inference retracted in
+//     4fb029a -- MPK_ML_BOUNDARY_PAD's 1.22:1 additive slope priced the layer
+//     boundary at ~1.4 ms and deleting the whole boundary bought 0.051 ms.
+//     Adding uniform time in front of a rendezvous costs what you add;
+//     removing it just moves every worker's arrival earlier and the last
+//     arriver still sets the release. The subtractive counterpart for qkv_a
+//     already exists and disagrees: MPK_ATTN_HALFK removes half the K-loop's
+//     bytes and buys only 4.91 us/layer. So conclusion (1) -- which prices an
+//     ADDITION, which is what the linearity split is -- stands; any claim
+//     that shrinking a tile pays needs its own subtractive probe.
 //
 // Idempotency, checked before trusting the number: on the default path
 // (MPK_QKV_EP_FOLD=0, MPK_QKV_PRO_HOIST=0) norm_input_ptr is x_ptr, the
@@ -824,6 +831,46 @@ __device__ __forceinline__ bool
 #if defined(MPK_QKV_EP_FOLD) || defined(MPK_QKV_PRO_HOIST)
 #error "MPK_QKVA_REPS is only idempotent on the unfolded path: under the fold/hoist norm_input_ptr aliases x_out_ptr and pass 2 would re-resolve an already-resolved row"
 #endif
+#endif
+
+// MPK_W13_REPS: the same probe as MPK_QKVA_REPS, aimed at the MoE W13 phase
+// -- the other big tile phase (34.6 us/layer, 16.9 of it tile). 1 is the
+// shipping path. CORRECT OUTPUT: W13's epilogue is pure stores into the
+// swiglu scratch, disjoint from its inputs, so the body is idempotent.
+//
+// The pair (QKVA_REPS, W13_REPS) is a MARGINAL-cost map of the two phases
+// that hold half the layer. Stage stamps cannot answer this -- they count a
+// worker's spin as its region time -- but doubling a phase and reading the
+// wall prices exactly the part that is on the critical path.
+//
+// W2 deliberately has no such knob: its epilogue f32-atomicAdds into the
+// residual workspace, so a second pass doubles the layer output and the
+// number would not be gateable.
+//
+// ── MEASURED: +1.152 ms. ──
+// Paired A/B, min-of-115, alternating, same batch, correct output both arms:
+//
+//   REPS=1   10.260  10.221  10.281   mean 10.254
+//   REPS=2   11.455  11.390  11.372   mean 11.406
+//   delta    +1.152 ms  =  +14.8 us/layer
+//
+// The W13 phase is 34.6 us/layer of which 16.9 is tile, so a second pass
+// costs 88% of a first one. READ THIS AS AN ADDITION ONLY -- see the
+// correction under MPK_QKVA_REPS. It says the ~17.7 us/layer of barrier spin
+// behind W13 does not absorb added work; it does NOT say that removing W13
+// work would save any. The open question is the subtractive counterpart, and
+// there is no correct-output way to ask it: a wrong-output W13 corrupts the
+// layer output, hence the NEXT layer's TopK and EP balance, which is the trap
+// in glm-wrong-output-probes-upstream-of-router-are-invalid.
+//
+// The structural fact the number does confirm is occupancy, not absorption:
+// W13 runs on 8 of 29 workers per XCD (e6ccf70 measured the other 21 idle and
+// able to pull 87 KB each for free), so the phase draws roughly a quarter of
+// the machine's HBM. Narrowing the tile to fill them is the obvious fix and
+// is already measured out from both directions -- OPW=16 costs 1.34 ms
+// because 16 output rows starve a 4-wave MFMA, and W2 split-K costs 4.12 ms.
+#ifndef MPK_W13_REPS
+#define MPK_W13_REPS 1
 #endif
 
 #if MPK_ML_PTR_PREFETCH || MPK_ABL_ML_BOUNDARY

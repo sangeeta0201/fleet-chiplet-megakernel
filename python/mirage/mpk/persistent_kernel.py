@@ -704,6 +704,13 @@ def get_compile_command(
             # RMSNorm-linearity split would add. See mpk_atoms.cuh.
             assert 1 <= _qkva_reps <= 4, "MPK_QKVA_REPS is 1..4"
             flags = flags + ["-DMPK_QKVA_REPS=%d" % _qkva_reps]
+        _w13_reps = int(os.environ.get("MPK_W13_REPS", "1"))
+        if _w13_reps != 1:
+            # Marginal-cost probe for the MoE W13 phase. CORRECT OUTPUT --
+            # W13's epilogue is pure stores into the swiglu scratch. See
+            # mpk_atoms.cuh.
+            assert 1 <= _w13_reps <= 4, "MPK_W13_REPS is 1..4"
+            flags = flags + ["-DMPK_W13_REPS=%d" % _w13_reps]
         _bar_skew = int(os.environ.get("MPK_BAR_SKEW", "0"))
         if _bar_skew >= 1:
             # Per-rendezvous first-arriver-to-last-arriver spread. O(1) per
