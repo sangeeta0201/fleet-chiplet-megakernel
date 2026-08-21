@@ -121,6 +121,26 @@ __device__ __forceinline__ f32x4_t _gang_mfma_w_x_f8(
 // 36 MB of dead weight per rank at GLM-5.2 dims and not worth a ragged tensor
 // shape to avoid.
 //
+// MEASURED 2026-08-21 -- do not retry the obvious rebalance. EP_SHARED_PE
+// carries one expert MORE than its routed share in EVERY layer, and the MoE
+// phase ends when the last rank does, so splitting the shared expert across
+// the ranks looks free: the weights are already replicated on all of them (see
+// the paragraph above), so it is a change to this decode and nothing else.
+// It is WRONG OUTPUT. An expert's TILES_PER_EXPERT tiles partition its
+// INTERMEDIATE dimension, and W13 writes that intermediate to a rank-LOCAL
+// scratch (moe_swiglu_out_ptr) which this rank's W2 then reduces over in full.
+// Give rank r only the r-th row slice and the other 7/8 of W2's reduction
+// window reads stale memory. The replicated thing is the WEIGHTS; the
+// intermediate ACTIVATION is not replicated, and it is the one that matters.
+// Gate 1 still passed (all 8 ranks agreed -- they agree on garbage), so this
+// is only caught by reading the text.
+// The correct shape is a K-shard: rank r computes W13 rows [r*I/W, (r+1)*I/W)
+// AND runs W2 with its reduction restricted to that same slice, letting the EP
+// collective sum the partials. That is blocked here -- W2 has MFMA_ITERS = 16
+// and the depth-4 pipeline needs the per-rank window to be a multiple of 4, so
+// an 8-way split leaves 2. See MPK_W2_KSPLIT for the intra-rank version and
+// why more, smaller W2 tiles lose anyway.
+//
 // The tile space is built over the OWNED subsequence of the activated list,
 // not over the whole list with the non-owned tiles early-returning. gpt-oss
 // measured why: owned tiles come in runs of TILES_PER_EXPERT, and a run
