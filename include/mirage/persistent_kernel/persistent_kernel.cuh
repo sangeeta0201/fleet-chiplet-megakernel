@@ -2599,7 +2599,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
             // Registers are free here (320 of 512, occupancy pinned by block
             // count, see the depth-8 scheduling result), and the tile loop is
             // ~130 us of cover for a ~1 us latency.
-#if MPK_ML_PTR_PREFETCH
+#if MPK_ML_PF
             void *pf_in = nullptr;
             void *pf_out = nullptr;
             int pf_variant = 0;
@@ -2626,7 +2626,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                 // slots. Both sides key off the TaskDesc capacity so the
                 // LM-head variant's input_ptrs[24..27] / output_ptrs[12] get
                 // refreshed too.
-#if MPK_ML_PTR_PREFETCH
+#if MPK_ML_PF
                 // Registers, loaded a whole layer ago. No global traffic and
                 // nothing to wait on -- just LDS stores and the barrier.
                 if (pf_in_ok) {
@@ -2670,7 +2670,9 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                 if (threadIdx.x == 0) {
                   mpk_stage_stamp(13);
                 }
+#if !MPK_ABL_ML_BOUNDARY
                 __syncthreads();
+#endif
                 // Stage stamp 14: the block has joined. S14 - S13 is the
                 // WAIT.
                 if (threadIdx.x == 0) {
@@ -2727,6 +2729,12 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                 task_desc->task_metadata._linear_reserved =
                     (int32_t)((pc_iter - 1) * config.ml_num_layers + ml);
               }
+              // NOT ablatable. Deleting this one hangs the run at layer 0:
+              // task_desc is a shared-memory slot, every worker derives its
+              // three barrier release values from _linear_reserved, and
+              // without the join the other 255 threads read the previous
+              // layer's epoch and wait on a release that never comes. This
+              // is a sync-correctness barrier, not boundary bookkeeping.
               __syncthreads();
 
               // Boundary pricing probe. Sits exactly where the bookkeeping
@@ -2744,7 +2752,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                 mpk_stage_stamp(11);
               }
 
-#if MPK_ML_PTR_PREFETCH
+#if MPK_ML_PF
               // Issue the NEXT layer's pointer loads here, immediately in
               // front of the tile loop. The values are not touched again
               // until the top of the next iteration, on the far side of
@@ -2807,12 +2815,14 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               // next layer's buffer_inv + QKV epoch barrier sees fresh data.
               // __syncthreads ensures all threads finish before task_desc is
               // modified for the next layer.
+#if MPK_ABL_ML_BOUNDARY < 2
               if (ml < config.ml_num_layers - 1) {
                 if (threadIdx.x == 0 && block_xcd_local_rank == 0) {
                   threadfence_gpu();
                 }
                 __syncthreads();
               }
+#endif
             }
 
             // Deferred event signal: after compaction, layer 0's trigger_event

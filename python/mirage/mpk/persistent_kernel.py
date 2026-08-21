@@ -654,6 +654,18 @@ def get_compile_command(
             # dependent cold round trips, because the loads feed shared
             # memory and the layer evicts the table from L2 in between.
             flags = flags + ["-DMPK_ML_PTR_PREFETCH=1"]
+        _abl_mlb = int(os.environ.get("MPK_ABL_ML_BOUNDARY", "0"))
+        if _abl_mlb > 0:
+            # WRONG OUTPUT ceiling probe. Deletes the multi-layer loop's
+            # per-layer boundary cost -- the pointer-refresh __syncthreads,
+            # and at level 2 the inter-layer threadfence_gpu too -- and
+            # implies MPK_ML_PTR_PREFETCH so the 34+13 pointer entries come
+            # from registers rather than two dependent cold round trips.
+            # The loads still happen, one layer early, so the 65 MB/layer
+            # weight stream is unchanged and the win cannot be a cache
+            # artifact. See the long note in mpk_atoms.cuh.
+            assert _abl_mlb in (1, 2), "MPK_ABL_ML_BOUNDARY is 1 or 2"
+            flags = flags + ["-DMPK_ABL_ML_BOUNDARY=%d" % _abl_mlb]
         if int(os.environ.get("GLM_OPROJ_MXFP4", "1")) == 1:
             # o_proj's GEMV reads E2M1 nibbles instead of E4M3 bytes. Must
             # agree with the host packer -- demo.py reads the SAME env var to

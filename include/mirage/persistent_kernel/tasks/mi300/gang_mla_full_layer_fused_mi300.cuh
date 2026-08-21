@@ -392,6 +392,26 @@ static constexpr int FULL_LAYER_NULL_PHASE_STRIDE = 24;
 // remaining ~4-5 us per phase per layer is ~3 ms of the wall and has no
 // verdict. It is the largest unexplained term left and the only one sized
 // to the gap. Instrument that before tuning another tile interior.
+//
+// ── PARTIAL RETRACTION 2026-08-21 ─────────────────────────────────────────
+//
+// The "~4-5 us/phase unexplained fixed cost" above is not a new term. It is
+// the SAME quantity the multi-layer boundary stamps measured at 8.21-16.50
+// us/layer (b7aa3aa, 9063140) and the pad slope priced at ~1.4 ms, reached
+// by subtracting the accounted terms instead of by stamping. That quantity
+// now has a verdict, and it is zero: MPK_ABL_ML_BOUNDARY deletes the whole
+// per-layer boundary -- the pointer round trip, both deletable joins, the
+// inter-layer threadfence -- and the wall moves 0.051 ms (10.278 -> 10.227,
+// n=3 paired, s_barrier 342 -> 338 in the image). See mpk_atoms.cuh.
+//
+// So "unexplained residual, sized to the gap, therefore the lever" is the
+// wrong reading. The residual is real but it is NOT recoverable, for the
+// same reason four other counted regions were not: it sits in front of a
+// rendezvous whose arrival spread is 82 of 161 us/layer, and deleting
+// uniform time in front of a barrier just moves every arrival earlier.
+// What is left is not a hidden fixed cost to find -- it is the spread
+// itself, which means occupancy and the serial stage chain, not tile
+// interiors and not bookkeeping.
 #ifndef MPK_NULL_TILES
 #define MPK_NULL_TILES 0
 #endif

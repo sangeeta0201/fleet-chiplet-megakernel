@@ -686,6 +686,73 @@ __device__ __forceinline__ bool
 #define MPK_ML_PTR_PREFETCH 0
 #endif
 
+// MPK_ABL_ML_BOUNDARY: the SUBTRACTIVE ceiling probe for the multi-layer
+// loop's per-layer boundary. WRONG OUTPUT by construction.
+//
+// The naive subtraction -- skip the TaskDesc pointer refresh -- is invalid,
+// and the note on MPK_ML_BOUNDARY_PAD below says why: every layer would then
+// reuse one layer's weights, turning a 65 MB/layer HBM stream into a MALL
+// hit and reporting an enormous spurious win. So this probe deletes the
+// boundary's COST while leaving the byte stream alone. It:
+//
+//   * implies MPK_ML_PTR_PREFETCH, so the 34+13 pointer entries come out of
+//     registers loaded a whole layer ago instead of two dependent cold round
+//     trips at the boundary -- the loads still happen, just not here;
+//   * deletes the __syncthreads after the pointer refresh;
+//   * at level 2, also deletes the inter-layer threadfence_gpu and its
+//     __syncthreads.
+//
+// Threads therefore read a mix of layer ml-1 and layer ml pointers -- wrong
+// output, but every pointer is a live buffer of the right shape, so no
+// fault, and the weight stream stays ~per-layer distinct.
+//
+// ── MEASURED. THE BOUNDARY IS NOT A LEVER. RETRACTION BELOW. ──────────────
+//
+// Paired A/B against a control in the same batch, min-of-115 per run, n=3:
+//
+//   level 1 (prefetch + drop the refresh join)
+//     control  10.259 / 10.234 / 10.230   mean 10.241
+//     probe    10.274 / 10.244 / 10.252   mean 10.257    +0.016 ms
+//   level 2 (also drop the inter-layer threadfence_gpu and its join)
+//     control  10.281 / 10.281 / 10.271   mean 10.278
+//     probe    10.234 / 10.224 / 10.224   mean 10.227    -0.051 ms
+//
+// The probe really does less work -- s_barrier in the device image goes
+// 342 -> 340 -> 338 and the instruction count 114042 -> 113947 -> 113893.
+// Deleting the ENTIRE per-layer boundary is worth 0.051 ms, 0.65 us/layer,
+// a fifth of the 0.26 ms wall noise floor and the same size as the batch
+// drift between the two controls above.
+//
+// RETRACTION. MPK_ML_BOUNDARY_PAD's additive slope priced this region at
+// 1533 ticks * 1.22 = ~1.4 ms, and the b7aa3aa / 9063140 stage stamps put
+// 8.21-16.50 us/layer inside it. Both numbers are real; the INFERENCE from
+// them was wrong. A uniform addition at a point on the critical path costs
+// what you add, but the converse does not hold: the boundary sits in front
+// of a GPU-wide rendezvous whose arrival spread is 82 of 161 us/layer, so
+// removing uniform time there just moves every worker's arrival earlier by
+// the same amount and the last arriver still sets the release. This is the
+// fourth instance of the same rule -- see
+// glm-counted-region-time-before-a-barrier-is-not-a-lever and
+// glm-deleting-a-whole-rendezvous-is-neutral. A pad slope is an upper bound
+// on a deletion only when the region is NOT followed by a barrier that
+// re-synchronizes what you saved.
+//
+// MEASURED NOT ABLATABLE: the __syncthreads after the _linear_reserved
+// publish. Deleting it hangs the run at kernel launch -- task_desc is a
+// shared slot, every worker derives its three barrier release values from
+// that store, and without the join the other 255 threads wait on an epoch
+// that never releases. It is sync correctness, not bookkeeping, so it stays
+// in both levels.
+#ifndef MPK_ABL_ML_BOUNDARY
+#define MPK_ABL_ML_BOUNDARY 0
+#endif
+
+#if MPK_ML_PTR_PREFETCH || MPK_ABL_ML_BOUNDARY
+#define MPK_ML_PF 1
+#else
+#define MPK_ML_PF 0
+#endif
+
 // MPK_OPROJ_MXFP4: o_proj's weight is E2M1 nibbles rather than E4M3 bytes.
 // Set by GLM_OPROJ_MXFP4, which also switches the host packer -- the two must
 // agree. Off by default so MXFP8 stays the reference.
@@ -839,6 +906,13 @@ __device__ __forceinline__ void mpk_stage_stamp(int) {}
 // zero. The slope is an UPPER bound on what deleting the real 15.33 us of
 // boundary bookkeeping could buy, because a uniform addition costs at least as
 // much as a uniform deletion saves.
+//
+// RETRACTED 2026-08-21. The last sentence is false, and MPK_ABL_ML_BOUNDARY
+// above is the subtractive form this note claimed was unavailable: deleting
+// the boundary's cost while leaving the byte stream alone buys 0.051 ms, not
+// the ~1.4 ms this slope priced. A uniform addition in front of a barrier
+// costs more than the matching deletion saves, because the deletion is
+// re-absorbed by the barrier's arrival spread.
 #ifndef MPK_ML_BOUNDARY_PAD
 #define MPK_ML_BOUNDARY_PAD 0
 #endif
