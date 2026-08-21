@@ -723,12 +723,40 @@ _rnlm8_resadd_norm_rcp(float const *__restrict__ d_ws,
   // p=0.05) and the device clock agrees in sign. Treat it as ~-0.07 +/- 0.05,
   // not as a resolved number, and do not stack conclusions on it.
   //
-  // Predicted -0.23..-0.31 from the 6119 ns line above; measured a quarter of
-  // that, which is the usual absorption -- shortening one tile's prologue is
-  // eaten by the phase's next barrier (see the two qkv_a hoist experiments,
-  // c72b559 / 7a5c559, which were absorbed completely). Default is 6 because
-  // the change is free, correctness-gated 4/4 with all 8 ranks identical, and
-  // the sign is consistent across two independent clocks.
+  // A follow-up SP A/B (MPK_SUBPHASE_TIMING=1, unroll 1 vs 6, divided by this
+  // call site's own tile count [1][5] = 1828800, identical in both arms) says
+  // the wall number is NOT absorption -- it is the full transfer of a small
+  // tile win:
+  //
+  //   [1][4] resolve loop        6094 -> 5646 ns   -448  (-7.4%)
+  //   prefill fill ([0][1]-[1][4]) 842 ->  828     noise
+  //   [0][2] quantizer            855 ->  875      noise
+  //   [0][3] MFMA K-loop         5432 -> 5401      noise
+  //   tile total                13224 -> 12750     -474  (-3.6%)
+  //
+  // Only the targeted line moved. qkv_a is UNDER-FILLED -- 23 tiles/XCD on 29
+  // workers -- so the phase makespan IS one tile duration, and 78 layers x
+  // 474 ns predicts -0.037 ms at 1:1. Measured -0.072, ratio 1.95. The extra
+  // is almost certainly qkv_a's other 17.57 us, which is the EP peer wait:
+  // all 8 peers ran the same shortened tile, so the wait shrank too.
+  //
+  // So: an IN-PLACE tile speedup in an under-filled phase transfers at 1:1 or
+  // better. That is a different operation from the two qkv_a HOISTS (c72b559
+  // +0.090, 7a5c559 +0.187), which moved work behind an extra rendezvous and
+  // paid back in barrier what they saved in tile. Do not quote "absorbed" for
+  // an in-place tile speedup. At ~2:1 this whole tile is worth ~2.0 ms.
+  //
+  // The unroll captured only 7.4% of the resolve loop because it did not
+  // actually get the loads in flight: 54 loads/thread/tile over 5646 ns at
+  // 2.4 GHz is ~251 cycles per load, i.e. ~1.5 outstanding even at full
+  // unroll. The compiler unrolled but could not hoist -- the in-loop LDS store
+  // to s_x and the non-__restrict__ peer pointers block the reorder. The loop
+  // is at 17 GB/s per CU against a ~52 GB/s per-CU L2 share, so there is 3x
+  // left and it is an issue-order problem, not a byte problem. Next move is
+  // explicit batching: load every trip into registers first, then combine.
+  //
+  // Default is 6 because the change is free, correctness-gated 4/4 with all 8
+  // ranks identical, and the sign is consistent across two independent clocks.
 #ifndef MPK_RESADD_UNROLL
 #define MPK_RESADD_UNROLL 6
 #endif
