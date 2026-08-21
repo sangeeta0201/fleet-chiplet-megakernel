@@ -492,6 +492,16 @@ def get_compile_command(
         # set GLM_RESADD_BATCH=0 for the old code path.
         _rb = int(os.environ.get("GLM_RESADD_BATCH", "1"))
         flags = flags + ["-DMPK_RESADD_BATCH=%d" % _rb]
+        # Same transform on the MXFP4 MoE's K-reduction loop, which is the
+        # other end of the layer's tile budget (W13 + W2 are ~34 of the ~82
+        # us/layer of tile time). That loop is `#pragma unroll 1` with the
+        # A-operand load feeding the MFMA in the same trip, so it runs with
+        # exactly ONE cold weight load in flight for 48 trips at W13's
+        # K=6144. KBATCH issues KB trips' operands (weights, weight scales,
+        # and the LDS token operand -- the MFMA waits on lgkmcnt too) before
+        # consuming any. Costs KB*16 VGPR. 1 = original loop.
+        _mkb = int(os.environ.get("GLM_MOE_KBATCH", "1"))
+        flags = flags + ["-DMPK_MOE_KBATCH=%d" % _mkb]
         # Hoist the un-absorbed W_UV GEMV out of the MoE half and run it in the
         # attention half, straight after the split-KV merge, behind a PAIR-LOCAL
         # barrier instead of a GPU-wide one. The layer's existing Phase 8
