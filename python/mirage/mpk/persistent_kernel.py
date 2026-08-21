@@ -561,6 +561,13 @@ def get_compile_command(
             # prologue. WRONG OUTPUT by construction. Splits SP4[0] into
             # prologue and GEMM; MPK_ABL_QKV is the sum of the two.
             flags = flags + ["-DMPK_ABL_QKV_PRO"]
+        if int(os.environ.get("MPK_BAR_TREE", "0")) == 1:
+            # Two-level arrival for every GPU-wide Mechanism-C rendezvous:
+            # 29 atomics on the XCD's own line, then 8 on the global one,
+            # instead of 232 on a single line. Correct output -- the barrier
+            # semantics are unchanged, only who counts. Priced by the null
+            # probe below at 3.77 -> 2.11 us per rendezvous.
+            flags = flags + ["-DMPK_BAR_TREE=1"]
         _null_phases = int(os.environ.get("MPK_NULL_PHASES", "0"))
         if _null_phases:
             # Insert N extra GPU-wide rendezvous at the head of every layer,

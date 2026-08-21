@@ -207,7 +207,24 @@ static constexpr int FULL_LAYER_MLA_WUK_SLOT = 106;
 // rendezvous is worth ~8.5 us/layer, phase-count reduction is the lever and
 // the layer's 16 phases are worth ~5 ms; if it is worth ~2.5 us, it is not,
 // and the 13 MB/layer/rank exchange rate from the W_UV wash is the whole story.
-static constexpr int FULL_LAYER_NULL_PHASE_SLOT = 114;
+// ── MPK_BAR_TREE's per-XCD arrival counters ──────────────────────────────
+// Not a region of its own: each real barrier's eight counters live at
+// `its own base + 114`, so the eight blocks are scattered through [114 .. 217]
+// at the same spacing as the barrier bases themselves. One uniform offset is
+// legal because the closest two GLM barrier bases -- OPROJ's W13 at 60 and
+// ENTRY at 71 -- are 11 slots apart and a tree block is 8. The largest base
+// that takes a tree block is W_UV's 96, so the region ends at 96 + 114 + 7.
+// Must agree with MPK_BAR_TREE_OFF in mpk_atoms.cuh; the host allocation in
+// demo.py is sized against FULL_LAYER_COUNTER_SLOTS below, unconditionally,
+// so turning the tree on never changes the buffer length across ranks.
+static constexpr int FULL_LAYER_TREE_OFF_SLOTS = MPK_BAR_TREE_OFF;
+static constexpr int FULL_LAYER_TREE_END_SLOT =
+    FULL_LAYER_MLA_WUV_SLOT + FULL_LAYER_TREE_OFF_SLOTS + 8;
+static_assert(FULL_LAYER_TREE_OFF_SLOTS == 114,
+              "the tree offset is baked into FULL_LAYER_TREE_END_SLOT's "
+              "arithmetic and into demo.py's allocation comment");
+
+static constexpr int FULL_LAYER_NULL_PHASE_SLOT = FULL_LAYER_TREE_END_SLOT;
 static constexpr int FULL_LAYER_MAX_NULL_PHASES = 4;
 // Per null barrier: [0..7] per-XCD release flags, [8] the global arrival
 // counter, [9..16] the per-XCD arrival counters used only by the tree variant.
@@ -493,9 +510,13 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     int const arrivals = tiles_per_xcd * 8;
     __syncthreads();
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    // Two-level arrival when the population divides across the eight XCDs,
+    // which for this barrier it does by construction (arrivals is
+    // tiles_per_xcd * 8). See hier_barrier_arrive.
+    bool const entry_tree = MPK_BAR_TREE && (arrivals == tiles_per_xcd * 8);
     if (tid == 0) {
-      int const prev = atom_add_release_gpu_s32(&entry_bar[8 * HIER_STRIDE], 1);
-      if ((prev % arrivals) == arrivals - 1) {
+      if (hier_barrier_arrive(entry_bar, HIER_STRIDE, arrivals, tiles_per_xcd,
+                              xcd_id, entry_tree)) {
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         for (int x = 0; x < 8; x++) {
           st_wt_u32((void *)&entry_bar[x * HIER_STRIDE],
@@ -516,7 +537,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
         // past arrivals * entry_expected the release is owed.
         if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
           if (ld_nt_s32(&entry_bar[8 * HIER_STRIDE]) >=
-              arrivals * entry_expected) {
+              hier_barrier_heal_quota(arrivals, entry_tree) * entry_expected) {
             st_wt_u32((void *)my_flag, (unsigned)entry_expected);
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
           }
@@ -1226,13 +1247,15 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     unsigned long long _b_t0 = 0, _b_t1 = 0, _b_t2 = 0, _b_t3 = 0;
     _b_t0 = __builtin_amdgcn_s_memrealtime();
 #endif
+    bool const rel_tree = MPK_BAR_TREE && (arrivals == tiles_per_xcd * 8);
     if (tid == 0) {
-      int const prev =
-          atom_add_release_gpu_s32(&attn_release[8 * HIER_STRIDE], 1);
+      bool const _owes = hier_barrier_arrive(attn_release, HIER_STRIDE,
+                                             arrivals, tiles_per_xcd, xcd_id,
+                                             rel_tree);
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
       _b_t1 = __builtin_amdgcn_s_memrealtime();
 #endif
-      if ((prev % arrivals) == arrivals - 1) {
+      if (_owes) {
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         for (int x = 0; x < 8; x++) {
           st_wt_u32((void *)&attn_release[x * HIER_STRIDE],
@@ -1452,7 +1475,8 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
         // counter is not, publish the flag ourselves.
         if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
           if (ld_nt_s32(&attn_release[8 * HIER_STRIDE]) >=
-              arrivals * attn_release_expected) {
+              hier_barrier_heal_quota(arrivals, rel_tree) *
+                  attn_release_expected) {
             st_wt_u32((void *)my_flag, (unsigned)attn_release_expected);
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
           }

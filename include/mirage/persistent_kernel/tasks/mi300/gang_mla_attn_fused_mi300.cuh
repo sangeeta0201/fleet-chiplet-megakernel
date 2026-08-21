@@ -234,6 +234,11 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   int *qb_barrier = qkv_barrier + 10 * HIER_STRIDE;
   int *decode_barrier = qkv_barrier + 20 * HIER_STRIDE;
   int const arrivals = tiles_per_xcd * 8;
+  // Two-level arrival for the GPU-wide rendezvous in this task. True by
+  // construction here -- `arrivals` is literally tiles_per_xcd * 8 -- but
+  // written as the test anyway so the flat fallback is one edit away and the
+  // self-heal quota below cannot drift out of step with it.
+  bool const bar_tree = MPK_BAR_TREE && (arrivals == tiles_per_xcd * 8);
 
   // ── pair-local decode -> merge (the gpt-oss CROC port) ──────────────────
   // gpt-oss's chunk barrier is per-XCD because it maps kv_head == xcd_id, so
@@ -281,6 +286,11 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
       &decode_barrier[8 * HIER_STRIDE + (PAIR_MERGE ? 4 * pair_id : 0)];
   int const dec_arrivals =
       PAIR_MERGE ? tiles_per_xcd * XCDS_PER_GROUP : arrivals;
+  // PAIR_MERGE already narrows this rendezvous to two XCDs and moves its
+  // counter to a pair-private address inside slot 8, so the eight-way tree
+  // neither applies nor addresses the right word; only the GPU-wide default
+  // takes it, and there _dec_cnt IS decode_barrier[8 * HIER_STRIDE].
+  bool const dec_tree = bar_tree && !PAIR_MERGE;
   constexpr bool UNABSORB_K = QK_NOPE_HEAD_DIM > 0 && WUK_ROWS_PER_WG > 0;
   // Only dereferenced under UNABSORB_K; the caller owns the region and the
   // standalone dispatch does not allocate one.
@@ -446,10 +456,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   }
 #endif
   if (tid == 0) {
-    int prev = atom_add_release_gpu_s32(&qkv_barrier[8 * HIER_STRIDE], 1);
     // Modular test rather than a reset: the counter is monotonic for the
     // whole run, so no worker from the next layer can observe a zeroed one.
-    if ((prev % arrivals) == arrivals - 1) {
+    if (hier_barrier_arrive(qkv_barrier, HIER_STRIDE, arrivals, tiles_per_xcd,
+                            xcd_id, bar_tree)) {
       for (int x = 0; x < 8; x++) {
         st_wt_u32((void *)&qkv_barrier[x * HIER_STRIDE], (unsigned)qkv_expected);
       }
@@ -477,7 +487,8 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         // written from inside the heal, so a frozen aux[1] means the wave
         // stopped and a growing one means the quota test below keeps failing.
         MPK_WS_WAIT_AUX(_cnt, _spins / MPK_FL_REPUBLISH_SPINS, 0, 0);
-        if (_cnt >= arrivals * qkv_expected) {
+        if (_cnt >= hier_barrier_heal_quota(arrivals, bar_tree) *
+                        qkv_expected) {
           st_wt_u32((void *)_qkv_flag, (unsigned)qkv_expected);
           asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         }
@@ -847,8 +858,8 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   }
 #endif
   if (tid == 0) {
-    int prev = atom_add_release_gpu_s32(&qb_barrier[8 * HIER_STRIDE], 1);
-    if ((prev % arrivals) == arrivals - 1) {
+    if (hier_barrier_arrive(qb_barrier, HIER_STRIDE, arrivals, tiles_per_xcd,
+                            xcd_id, bar_tree)) {
       // ── the head shard's rendezvous rides this barrier ──────────────────
       // Under QB_TP the query row is not complete when the local arrivals are
       // in; it is complete when every peer's eight heads have landed too. This
@@ -947,8 +958,8 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
               }
             }
           } else {
-            _heal =
-                ld_nt_s32(&qb_barrier[8 * HIER_STRIDE]) >= arrivals * qb_expected;
+            _heal = ld_nt_s32(&qb_barrier[8 * HIER_STRIDE]) >=
+                    hier_barrier_heal_quota(arrivals, bar_tree) * qb_expected;
           }
           if (_heal) {
             st_wt_u32((void *)_qb_flag, (unsigned)qb_expected);
@@ -1042,8 +1053,15 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   __syncthreads();
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
   if (tid == 0) {
-    int prev = atom_add_release_gpu_s32(_dec_cnt, 1);
-    if ((prev % dec_arrivals) == dec_arrivals - 1) {
+    bool _dec_owes;
+    if (dec_tree) {
+      _dec_owes = hier_barrier_arrive(decode_barrier, HIER_STRIDE, dec_arrivals,
+                                      tiles_per_xcd, xcd_id, true);
+    } else {
+      int prev = atom_add_release_gpu_s32(_dec_cnt, 1);
+      _dec_owes = (prev % dec_arrivals) == dec_arrivals - 1;
+    }
+    if (_dec_owes) {
       if constexpr (PAIR_MERGE) {
         // Release only this pair. The other three pairs are computing chunks
         // this pair's merge never reads.
@@ -1081,7 +1099,8 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
       ++_spins;
       MPK_WS_WAIT_TICK(_obs, _spins);
       if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
-        if (ld_nt_s32(_dec_cnt) >= dec_arrivals * decode_expected) {
+        if (ld_nt_s32(_dec_cnt) >=
+            hier_barrier_heal_quota(dec_arrivals, dec_tree) * decode_expected) {
           st_wt_u32((void *)_dec_flag, (unsigned)decode_expected);
           asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         }

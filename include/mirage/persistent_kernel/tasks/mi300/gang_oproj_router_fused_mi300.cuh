@@ -90,6 +90,13 @@ namespace kernel {
 #ifndef MPK_FL_REPUBLISH_SPINS
 #define MPK_FL_REPUBLISH_SPINS 1024
 #endif
+// One boolean for "the W13 ceiling probe forced the flat arrival", so the
+// self-heal's quota and the arrival cannot disagree across the #ifdef.
+#ifdef MPK_W13_EARLY_REL
+#define MPK_W13_EARLY_REL_ON 1
+#else
+#define MPK_W13_EARLY_REL_ON 0
+#endif
 
 // Layout of the symmetric EP signal array, in uint64 units. Duplicated from
 // FULL_LAYER_EP_SIGNAL_STRIDE in gang_full_layer_fused_mi300.cuh rather than
@@ -511,9 +518,10 @@ __device__ __attribute__((always_inline)) void
     __syncthreads();
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     int const wuv_arrivals = tiles_per_xcd * 8;
+    bool const wuv_tree = MPK_BAR_TREE && (wuv_arrivals == tiles_per_xcd * 8);
     if (tid == 0) {
-      int prev = atom_add_release_gpu_s32(&wuv_barrier[8 * HIER_STRIDE], 1);
-      if ((prev % wuv_arrivals) == wuv_arrivals - 1) {
+      if (hier_barrier_arrive(wuv_barrier, HIER_STRIDE, wuv_arrivals,
+                              tiles_per_xcd, xcd_id, wuv_tree)) {
         for (int x = 0; x < 8; x++) {
           st_wt_u32((void *)&wuv_barrier[x * HIER_STRIDE],
                     (unsigned)wuv_expected);
@@ -529,7 +537,7 @@ __device__ __attribute__((always_inline)) void
         MPK_WS_WAIT_TICK(_obs, _spins);
         if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
           if (ld_nt_s32(&wuv_barrier[8 * HIER_STRIDE]) >=
-              wuv_arrivals * wuv_expected) {
+              hier_barrier_heal_quota(wuv_arrivals, wuv_tree) * wuv_expected) {
             st_wt_u32((void *)my_flag, (unsigned)wuv_expected);
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
           }
@@ -832,13 +840,22 @@ __device__ __attribute__((always_inline)) void
     // downstream of the election still runs on tid 0 alone.
     __shared__ int s_oproj_leader;
     if (tid == 0) {
-      int prev = atom_add_release_gpu_s32(&hier_barrier[8 * HIER_STRIDE], 1);
       // Modular test rather than a reset: the counter is monotonic for the
       // whole run, so there is no window in which a fast worker from the next
       // layer can observe a zeroed counter.
+      //
+      // Nothing downstream of this barrier reads the arrival counter -- the
+      // wait at MPK_WS_WAIT_BEGIN(765) polls routing_ready's epoch, not the
+      // count -- so the tree changes only who does the counting, and there is
+      // no heal quota here to keep in step.
       s_oproj_leader =
-          ((prev % total_barrier_arrivals) == total_barrier_arrivals - 1) ? 1
-                                                                          : 0;
+          hier_barrier_arrive(hier_barrier, HIER_STRIDE,
+                              total_barrier_arrivals,
+                              total_barrier_arrivals / 8, xcd_id,
+                              MPK_BAR_TREE != 0 &&
+                                  (total_barrier_arrivals % 8) == 0)
+              ? 1
+              : 0;
     }
     __syncthreads();
     if (s_oproj_leader) {
@@ -1155,8 +1172,16 @@ __device__ __attribute__((always_inline)) void
   __syncthreads();
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
   if (tid == 0) {
-    int prev = atom_add_release_gpu_s32(&w13_barrier[8 * HIER_STRIDE], 1);
     int const arrivals = tiles_per_xcd * 8;
+    // MPK_W13_EARLY_REL needs the raw modular position, not just "am I last",
+    // so this site keeps the flat arrival whenever the ceiling probe is on.
+#ifdef MPK_W13_EARLY_REL
+    int prev = atom_add_release_gpu_s32(&w13_barrier[8 * HIER_STRIDE], 1);
+#else
+    bool const _w13_owes =
+        hier_barrier_arrive(w13_barrier, HIER_STRIDE, arrivals, tiles_per_xcd,
+                            xcd_id, MPK_BAR_TREE != 0);
+#endif
     // MPK_W13_EARLY_REL: fire the release at FRAC/16 of the arrivals instead of
     // all of them. WRONG OUTPUT by construction -- W2 reads swiglu columns
     // whose producers have not run. Ported from gpt-oss
@@ -1170,7 +1195,7 @@ __device__ __attribute__((always_inline)) void
     int const _rel_at = (_rel_at_raw < 1) ? 1 : _rel_at_raw;
     if ((prev % arrivals) == _rel_at - 1) {
 #else
-    if ((prev % arrivals) == arrivals - 1) {
+    if (_w13_owes) {
 #endif
       for (int x = 0; x < 8; x++) {
         st_wt_u32((void *)&w13_barrier[x * HIER_STRIDE], (unsigned)w13_expected);
@@ -1196,7 +1221,12 @@ __device__ __attribute__((always_inline)) void
       ++_spins;
       MPK_WS_WAIT_TICK(_obs, _spins);
       if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
-        if (ld_nt_s32(&w13_barrier[8 * HIER_STRIDE]) >= arrivals * w13_expected) {
+        // Quota is 8 under the tree -- the global counter is bumped once per
+        // XCD -- except when MPK_W13_EARLY_REL forced the flat arrival above.
+        bool const _w13_tree =
+            MPK_BAR_TREE != 0 && !MPK_W13_EARLY_REL_ON;
+        if (ld_nt_s32(&w13_barrier[8 * HIER_STRIDE]) >=
+            hier_barrier_heal_quota(arrivals, _w13_tree) * w13_expected) {
           st_wt_u32((void *)my_flag, (unsigned)w13_expected);
           asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         }

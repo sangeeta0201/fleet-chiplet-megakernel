@@ -515,3 +515,98 @@ __device__ __forceinline__ unsigned long long int
                        unsigned long long int val) {
   return atomicCAS(addr, cmp, val);
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// Two-level arrival for the Mechanism-C hierarchical barrier.
+//
+// The flat mechanism has all `arrivals` workers atomically bump ONE counter
+// (`bar[8 * HIER_STRIDE]`), so the rendezvous costs `arrivals` serialized L2
+// round trips on a single cache line. Measured on GLM-5 at 232 workers that
+// is 3.77 us/layer, via the correct-output MPK_NULL_PHASES probe (11.005 ->
+// 12.180 ms at four extra rendezvous). The same probe with this two-level
+// arrival measures 2.11 us -- 11.663 ms at four extra, -44% of the mechanism.
+//
+// Each worker bumps its OWN XCD's counter (29 arrivals, eight cache lines
+// contending in parallel); the last arriver per XCD bumps the global one
+// (8 arrivals); the last of those fans the release out. Serialized atomics
+// per rendezvous drop from `arrivals` to `per_xcd + 8` -- 232 to 37.
+//
+// Layout, all offsets in units of HIER_STRIDE ints from `bar`:
+//   [0 .. 7]     per-XCD write-through release flags   (unchanged)
+//   [8]          global arrival counter                (unchanged, but now
+//                                                       counts XCDs, not
+//                                                       workers, so it is
+//                                                       monotonic at 8/epoch)
+//   [tree + x]   per-XCD arrival counter, one per cache line -- eight of them
+//                sharing a line would serialize exactly the way the flat
+//                counter does, which is the thing being removed.
+//
+// The counters stay monotonic and are tested modularly, never reset, so no
+// worker from the next epoch can observe a zeroed one. Both levels must use
+// release ordering: the XCD-level atomic publishes this worker's stores to
+// its XCD leader, and the global one republishes the leader's observation.
+//
+// Returns true on exactly one thread in the whole grid -- the one that owes
+// the release fan-out.
+__device__ __forceinline__ bool
+    hier_barrier_tree_arrive(int *bar,
+                             int tree_off_slots,
+                             int hier_stride,
+                             int per_xcd,
+                             int xcd_id) {
+  int *const my_cnt = &bar[(tree_off_slots + xcd_id) * hier_stride];
+  int const xprev = atom_add_release_gpu_s32(my_cnt, 1);
+  if ((xprev % per_xcd) != per_xcd - 1) {
+    return false;
+  }
+  int const gprev = atom_add_release_gpu_s32(&bar[8 * hier_stride], 1);
+  return (gprev % 8) == 7;
+}
+
+// MPK_BAR_TREE: use the two-level arrival above for every GPU-wide
+// Mechanism-C rendezvous. Off by default so the flat mechanism stays the
+// reference; the counter buffer is sized for the tree either way, so this is
+// a pure A/B.
+#ifndef MPK_BAR_TREE
+#define MPK_BAR_TREE 0
+#endif
+// Offset, in HIER_STRIDE slots, from a barrier's own base to its block of
+// eight per-XCD arrival counters. One uniform offset works for every barrier
+// because the closest two bases in the GLM counter map are 11 slots apart and
+// a tree block is 8 -- see FULL_LAYER_TREE_OFF_SLOTS, which must agree with
+// this and is what the host allocation is sized against.
+#define MPK_BAR_TREE_OFF 114
+
+// One arrival at a Mechanism-C barrier. Returns true on the single thread in
+// the grid that owes the release fan-out.
+//
+// `use_tree` has to be computed the same way at the arrival and at the
+// self-heal (see hier_barrier_heal_quota) or a worker heals on a quota the
+// counter never reaches and the rendezvous wedges -- that is the failure mode
+// recorded in a-self-heal-must-test-the-whole-predicate. Deriving both from
+// one expression at the call site is what keeps them in step. The tree is
+// only legal when the population divides evenly across the eight XCDs; a
+// barrier whose arrivals are not per_xcd * 8 falls back to flat.
+__device__ __forceinline__ bool hier_barrier_arrive(int *bar,
+                                                    int hier_stride,
+                                                    int arrivals,
+                                                    int per_xcd,
+                                                    int xcd_id,
+                                                    bool use_tree) {
+  if (use_tree) {
+    return hier_barrier_tree_arrive(bar, MPK_BAR_TREE_OFF, hier_stride,
+                                    per_xcd, xcd_id);
+  }
+  int const prev = atom_add_release_gpu_s32(&bar[8 * hier_stride], 1);
+  return (prev % arrivals) == arrivals - 1;
+}
+
+// Per-epoch increment of bar[8 * hier_stride], i.e. the multiplier the
+// self-heal's "the release is owed" test compares against. Eight under the
+// tree, because the global counter is bumped once per XCD rather than once
+// per worker -- still the WHOLE predicate, since it only reaches 8 * epoch
+// once every XCD's own counter hit its own quota.
+__device__ __forceinline__ int hier_barrier_heal_quota(int arrivals,
+                                                       bool use_tree) {
+  return use_tree ? 8 : arrivals;
+}
