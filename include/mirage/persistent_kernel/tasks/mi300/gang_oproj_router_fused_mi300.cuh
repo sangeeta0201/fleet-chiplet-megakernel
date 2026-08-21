@@ -780,16 +780,36 @@ __device__ __attribute__((always_inline)) void
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         unsigned int *const src32 = reinterpret_cast<unsigned int *>(
             xcd_out + (size_t)t * OPROJ_ROWS_PER_WG);
-        for (int w = tid; w < OPROJ_TILE_W32; w += (int)blockDim.x) {
-          unsigned int const v =
-              (unsigned int)ld_nt_s32(reinterpret_cast<int *>(src32 + w));
-          // Unrolled over peers so oproj_peer_delta stays in registers: a
-          // runtime index into a per-thread array is a scratch spill.
+        // Every live query row, not just the first. The GEMV above writes
+        // rows [0, num_active_tokens) of this tile's columns; the all-gather
+        // has to carry all of them or a peer's copy of row m > 0 keeps
+        // whatever the last step left in it -- which is exactly the
+        // signature the bs=2 checksum probe showed, row 0 identical on all
+        // eight ranks and row 1 different on every one of them. Rows are
+        // o_stride bf16 apart, i.e. HIDDEN_SIZE / 2 dwords.
+        constexpr int OPROJ_ROW_W32 = HIDDEN_SIZE / 2;
+        int const push_rows =
+            (BATCH_SIZE == 1)
+                ? 1
+                : (num_active_tokens < BATCH_SIZE ? num_active_tokens
+                                                  : BATCH_SIZE);
 #pragma unroll
-          for (int q = 0; q < OPROJ_NPEER; q++) {
-            st_wt_u32((void *)(reinterpret_cast<char *>(src32 + w) +
-                               oproj_peer_delta[q]),
-                      v);
+        for (int m = 0; m < BATCH_SIZE; m++) {
+          if (BATCH_SIZE > 1 && m >= push_rows) {
+            break;
+          }
+          unsigned int *const row32 = src32 + (size_t)m * OPROJ_ROW_W32;
+          for (int w = tid; w < OPROJ_TILE_W32; w += (int)blockDim.x) {
+            unsigned int const v =
+                (unsigned int)ld_nt_s32(reinterpret_cast<int *>(row32 + w));
+            // Unrolled over peers so oproj_peer_delta stays in registers: a
+            // runtime index into a per-thread array is a scratch spill.
+#pragma unroll
+            for (int q = 0; q < OPROJ_NPEER; q++) {
+              st_wt_u32((void *)(reinterpret_cast<char *>(row32 + w) +
+                                 oproj_peer_delta[q]),
+                        v);
+            }
           }
         }
       }
