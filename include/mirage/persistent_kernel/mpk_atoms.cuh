@@ -104,6 +104,60 @@ __device__ __forceinline__ unsigned long long int
 #endif
 }
 
+// Eight signal lines, ONE round trip.
+//
+// ld_sys_u64 carries its own s_waitcnt, so a poll pass over seven peer signal
+// lines is seven SERIALIZED uncached round trips. That much is true of the
+// instruction stream. What is NOT true is that it costs anything: replacing
+// the seven trips with this one burst moved the measured peer-wait region by
+// 0.00 us/layer (17.49 -> 17.49). See the MEASURED NEUTRAL note on
+// MPK_EP_POLL_BATCH in gang_full_layer_fused_mi300.cuh -- the poll is not the
+// EP wait's cost, inter-rank skew is, and a poll pass is amortized over a
+// wait that is 13x longer than it.
+//
+// Issuing all eight loads before the single s_waitcnt makes a pass cost one
+// round trip. The eight lines are FULL_LAYER_EP_SIGNAL_STRIDE (8 uint64 = 64
+// bytes) apart and span 512 bytes, so they all reach through the 13-bit
+// signed immediate offset off one base address. Reading my own line too and
+// discarding it is cheaper than branching around it.
+struct mpk_u64x8 {
+  unsigned long long v[8];
+};
+__device__ __forceinline__ mpk_u64x8
+    ld_sys_u64_x8(unsigned long long const *base) {
+  mpk_u64x8 r;
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  asm volatile(
+               "global_load_dwordx2 %0, %8, off offset:0 sc0 sc1 nt\n"
+               "global_load_dwordx2 %1, %8, off offset:64 sc0 sc1 nt\n"
+               "global_load_dwordx2 %2, %8, off offset:128 sc0 sc1 nt\n"
+               "global_load_dwordx2 %3, %8, off offset:192 sc0 sc1 nt\n"
+               "global_load_dwordx2 %4, %8, off offset:256 sc0 sc1 nt\n"
+               "global_load_dwordx2 %5, %8, off offset:320 sc0 sc1 nt\n"
+               "global_load_dwordx2 %6, %8, off offset:384 sc0 sc1 nt\n"
+               "global_load_dwordx2 %7, %8, off offset:448 sc0 sc1 nt\n"
+               "s_waitcnt vmcnt(0)"
+:
+                 "=v"(r.v[0]),
+                 "=v"(r.v[1]),
+                 "=v"(r.v[2]),
+                 "=v"(r.v[3]),
+                 "=v"(r.v[4]),
+                 "=v"(r.v[5]),
+                 "=v"(r.v[6]),
+                 "=v"(r.v[7])
+               : "v"(base)
+               : "memory");
+#else
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    r.v[i] = reinterpret_cast<unsigned long long volatile const *>(base)[i * 8];
+  }
+#endif
+  return r;
+}
+
 // 32-bit barrier-poll load. Every Mechanism-C barrier poll in the gang tasks is
 // built on this, so its coherence is the coherence of every barrier in the
 // megakernel: 45 call sites, 33 of them inside a `while`.

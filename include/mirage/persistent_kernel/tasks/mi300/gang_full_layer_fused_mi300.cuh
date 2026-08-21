@@ -591,6 +591,10 @@ __device__ __forceinline__ unsigned long long
 #ifndef MPK_EP_TMO_PRINT_LAYERS
 #define MPK_EP_TMO_PRINT_LAYERS 2
 #endif
+// MPK_EP_POLL_BATCH: read all eight EP signal lines with one s_waitcnt.
+#ifndef MPK_EP_POLL_BATCH
+#define MPK_EP_POLL_BATCH 0
+#endif
 
 template <int EP_WORLD_SIZE, int EP_MY_PE>
 __device__ __forceinline__ void
@@ -653,16 +657,57 @@ __device__ __forceinline__ void
     unsigned long long _home_low = 0ull;
     (void)_home_low;
     while (remaining) {
+#if MPK_EP_POLL_BATCH
+      // One round trip for all eight lines instead of one per peer. See
+      // ld_sys_u64_x8: the loop below is concurrent in the sense that it does
+      // not WAIT on peer 0 before looking at peer 1, but every ld_sys_u64
+      // still ends in its own s_waitcnt, so the loads themselves serialize.
+      // Requires the eight lines to be one strided block, which they are.
+      //
+      // MEASURED NEUTRAL, AND THE MEASUREMENT KILLED THE HYPOTHESIS.
+      // The stage stamps put the peer wait (S4 - S3) at 17.49 us/layer with
+      // this off and 17.49 us/layer with it on -- per rank, 8.15/18.83/19.02/
+      // 18.58/18.26/18.25/18.81/20.00 off against 8.09/18.94/18.74/18.25/
+      // 18.58/18.53/18.54/20.28 on. Zero. The wall A/B agreed to within the
+      // noise floor (10.810 -> 10.670, n=3 each, floor 0.26).
+      //
+      // So the seven serialized round trips were never the cost. The reading
+      // that made them look like one -- "the rank that publishes last still
+      // spends 9.65 us, and 9.65/7 is one MALL round trip" -- was wrong,
+      // because every stamp is measured from that rank's OWN layer-entry
+      // barrier and the eight barriers are not synchronized. There is no
+      // cross-rank arrival order in these numbers. The wait is real waiting:
+      // inter-rank skew, whose source is MoE expert imbalance, not transport.
+      //
+      // Kept, defaulted off. It is strictly fewer instructions for the same
+      // predicate, so turning it on costs nothing; it just buys nothing.
+      if constexpr (EP_WORLD_SIZE == 8 && FULL_LAYER_EP_SIGNAL_STRIDE == 8) {
+        mpk_u64x8 const _b = ld_sys_u64_x8(
+            reinterpret_cast<unsigned long long const *>(ep_signal));
 #pragma unroll
-      for (int p = 0; p < EP_WORLD_SIZE; p++) {
-        if (remaining & (1u << p)) {
-          uint64_t *sp = ep_signal + (size_t)p * FULL_LAYER_EP_SIGNAL_STRIDE;
-          unsigned long long _v =
-              ld_sys_u64(reinterpret_cast<unsigned long long *>(sp));
-          if (_v >= (unsigned long long)ep_sig_expected) {
-            remaining &= ~(1u << p);
-          } else if (p == (int)(__builtin_ctz(remaining))) {
-            _obs_low = (int)_v;
+        for (int p = 0; p < 8; p++) {
+          if (remaining & (1u << p)) {
+            if (_b.v[p] >= (unsigned long long)ep_sig_expected) {
+              remaining &= ~(1u << p);
+            } else if (p == (int)(__builtin_ctz(remaining))) {
+              _obs_low = (int)_b.v[p];
+            }
+          }
+        }
+      } else
+#endif
+      {
+#pragma unroll
+        for (int p = 0; p < EP_WORLD_SIZE; p++) {
+          if (remaining & (1u << p)) {
+            uint64_t *sp = ep_signal + (size_t)p * FULL_LAYER_EP_SIGNAL_STRIDE;
+            unsigned long long _v =
+                ld_sys_u64(reinterpret_cast<unsigned long long *>(sp));
+            if (_v >= (unsigned long long)ep_sig_expected) {
+              remaining &= ~(1u << p);
+            } else if (p == (int)(__builtin_ctz(remaining))) {
+              _obs_low = (int)_v;
+            }
           }
         }
       }
