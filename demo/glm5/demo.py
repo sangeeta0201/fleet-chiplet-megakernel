@@ -809,6 +809,22 @@ if __name__ == "__main__":
         # layer's W13 is 2*2048/64 = 64 tiles and W2 is 6144/64 = 96 -- 8 and
         # 12 per XCD against 29 workers. At 16 both are 4x that.
         # Separate knobs so the two stages can move one at a time.
+        #
+        # W2's tile width is now measured out in BOTH directions and the knob
+        # should be left at 64 (2026-08-21, n=3 each, one control batch at
+        # 11.020 ms/iter mean):
+        #
+        #   GLM_MOE_W2_OPW=16   (K-parallel, 4x tiles)   -1.34 ms  [earlier]
+        #   MPK_W2_KSPLIT=2     (2x tiles, half K each)  -4.12 ms  -> 15.136
+        #   GLM_MOE_W2_OPW=128  (half the tiles)          10.972,  neutral
+        #
+        # Splitting loses because W2's per-tile cost is mostly fixed -- the
+        # whole-activation LDS stage and quantize, and the full atomicAdd
+        # epilogue -- and neither divides. Widening does not win because the
+        # fixed cost it amortises was never on the critical path: the MoE half
+        # of the layer is barrier-bound, so shrinking the phase is absorbed,
+        # exactly as in the ceiling probes. Both directions, one conclusion --
+        # W2 tile geometry is saturated, stop tuning it.
         MOE_W13_OPW = int(os.environ.get("GLM_MOE_W13_OPW", "64"))
         MOE_W2_OPW = int(os.environ.get("GLM_MOE_W2_OPW", "64"))
         # Experts per router call. The router is one worker per expert, so
