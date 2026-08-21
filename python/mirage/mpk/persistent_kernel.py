@@ -803,6 +803,16 @@ def get_compile_command(
             # Long note at the define in mpk_atoms.cuh.
             assert _pipe in (1, 2), "MPK_ABL_PIPE_W13W2 is 0, 1 or 2"
             flags = flags + ["-DMPK_ABL_PIPE_W13W2=%d" % _pipe]
+        _wpe = os.environ.get("MPK_WORKER_WAVES_PER_EU")
+        if _wpe is not None:
+            # The megakernel's register budget -- MIN_WARPS_PER_EXECUTION_UNIT
+            # on both persistent_kernel and worker_kernel. 3 is what puts the
+            # image at 252 unified VGPRs (granule 256) and therefore 2
+            # waves/SIMD; 2 is WORSE than the default because of the
+            # independent-maxima sum rule. Long note at the define in
+            # persistent_kernel.cuh. Compile-time, so every rank must agree.
+            assert _wpe in ("1", "2", "3", "4"), "MPK_WORKER_WAVES_PER_EU 1..4"
+            flags = flags + [f"-DMPK_WORKER_WAVES_PER_EU={_wpe}"]
         _w2_sf = os.environ.get("MPK_W2_STAGE_FULL")
         if _w2_sf is not None:
             # Restores W2's pre-fdca420 full-width activation staging so the

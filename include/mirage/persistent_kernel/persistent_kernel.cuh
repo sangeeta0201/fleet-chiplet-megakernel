@@ -4143,8 +4143,27 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
-__global__ __launch_bounds__(WORKER_NUM_THREADS,
-                             1) void persistent_kernel(RuntimeConfig config) {
+// Budgeted on the same switch as worker_kernel below, and it MUST be: LLVM's
+// AMDGPUAttributor propagates amdgpu-waves-per-eu from kernels down the call
+// graph, but it MERGES over all callers, so the weakest caller wins. This
+// kernel reaches the same phase functions, so leaving it at 1 kept every
+// device function unconstrained no matter what worker_kernel asked for --
+// that is why the first attempt (worker_kernel alone) read 284 at wpe 1, 2
+// and 3 alike and looked like the attribute did nothing.
+// MPK_WORKER_WAVES_PER_EU is documented next to worker_kernel; predeclare its
+// default here so both launch bounds see the same value.
+#ifndef MPK_WORKER_WAVES_PER_EU
+#define MPK_WORKER_WAVES_PER_EU 1
+#endif
+#if MPK_WORKER_WAVES_PER_EU >= 2
+#define MPK_WORKER_ATTR                                                        \
+  __attribute__((amdgpu_waves_per_eu(MPK_WORKER_WAVES_PER_EU)))
+#else
+#define MPK_WORKER_ATTR
+#endif
+__global__ MPK_WORKER_ATTR __launch_bounds__(
+    WORKER_NUM_THREADS,
+    MPK_WORKER_WAVES_PER_EU) void persistent_kernel(RuntimeConfig config) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
   // Dynamic role election: each block discovers its XCD, then
   // the first block on each XCD becomes the scheduler for that XCD.
@@ -4197,8 +4216,63 @@ __global__ __launch_bounds__(WORKER_NUM_THREADS,
 #endif
 }
 
-__global__ __launch_bounds__(WORKER_NUM_THREADS,
-                             1) void worker_kernel(RuntimeConfig config) {
+// MPK_WORKER_WAVES_PER_EU: the register budget for the WHOLE megakernel.
+//
+// In HIP the second __launch_bounds__ argument is NOT CUDA's
+// minBlocksPerMultiprocessor -- it is MIN_WARPS_PER_EXECUTION_UNIT, waves per
+// SIMD, and it is the direct control on how many VGPRs the allocator may
+// spend. gfx950's unified VGPR file is 512/SIMD with an allocation granule of
+// 8, so 284 granulates to 288 and 512/288 = 1 wave/SIMD: a second block per CU
+// is physically unplaceable. 256 granulates to 256 and gives 2.
+//
+// TWO THINGS HAD TO BE TRUE FOR THIS KNOB TO DO ANYTHING. Both were found the
+// hard way; do not simplify either away.
+//
+// (1) It must be set on BOTH kernels. See the note at persistent_kernel.
+//
+// (2) The reported .vgpr_count is not any one function's pressure. The
+//     megakernel is built with -fgpu-rdc and every phase is __device__
+//     __noinline__ (125 s_swappc_b64 in the image), so the number is a
+//     CALL-GRAPH quantity -- and specifically it is
+//         max(arch VGPR over the call graph) + max(AGPR over the call graph),
+//     the two maxima taken INDEPENDENTLY and then summed. Measured three ways:
+//       wpe=1  248 arch (four functions tie) + 36 acc (mla_decode_absorbed
+//              alone)                                                 = 284
+//       wpe=2  220 arch (persistent_kernel's own body, 0 acc) + 128 acc
+//              (gang_mla_full_layer_fused, which the per-function budget lets
+//              split 128/128)                                         = 348
+//       wpe=3  168 arch + 84 acc                                      = 252
+//     wpe=2 is WORSE than no budget: every function individually honours its
+//     256 and then the independent-maxima sum blows past it. The knob is not
+//     monotonic. Read the number, do not reason about it.
+//
+// Because of (2), the fix was never "shrink mla_decode_absorbed". Its live set
+// is real -- arch peaks at 248 in the same window where 24-36 AGPRs are live,
+// and its 240 baseline scratch ops are the ABI callee-save prologue/epilogue
+// (v40-v143, 60 dwords in at instr 1-60, back out at 880-939), not pressure.
+// The allocator can fit it in 236 when asked; the module-level sum was the
+// gate, and the sum is what this knob moves.
+//
+// Cost at wpe=3, all of it compiler-side and not yet priced on the wall:
+// worker_kernel spills 67 VGPRs (0 before) and private_segment_fixed_size goes
+// 596 -> 1192 B/thread. LDS is 7296 B and never binding (2 x 7296 = 14.6 KB
+// against 160 KB/CU).
+//
+// This is only HALF of 2 blocks/CU. The other half is having >= ~464
+// co-resident workers to place; at MPK_NUM_WORKERS=232 there is 1 block per CU
+// regardless, so this knob alone should cost the spill and buy nothing.
+#ifndef MPK_WORKER_WAVES_PER_EU
+#define MPK_WORKER_WAVES_PER_EU 1
+#endif
+// Spelled as the direct AMDGPU attribute as well as the launch bound. Kept in
+// the header rather than passed as a -D: hipcc re-quotes its argv through a
+// wrapper and a -D carrying parens and commas does not survive the round trip
+// -- it fails the build outright. MPK_WORKER_ATTR is defined at
+// persistent_kernel above, which needs the same budget for the attributor's
+// caller merge to have any effect.
+__global__ MPK_WORKER_ATTR __launch_bounds__(WORKER_NUM_THREADS,
+                                             MPK_WORKER_WAVES_PER_EU) void
+    worker_kernel(RuntimeConfig config) {
   worker_checker(config);
   execute_worker(config);
 }

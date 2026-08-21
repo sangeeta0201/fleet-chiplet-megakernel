@@ -153,6 +153,38 @@ template <typename T,
           int Q_WORKSPACE_STRIDE,
           int KV_CACHE_STRIDE,
           bool WRITE_THROUGH = false>
+// THIS function sets the whole megakernel's register allocation, and two
+// obvious ways to fix that are closed. Recorded so neither gets retried.
+//
+// Under -fgpu-rdc every phase is its own __noinline__ ELF symbol (125
+// s_swappc_b64 in the image), so a kernel's .vgpr_count is a call-graph
+// quantity, not its own body's pressure (worker_kernel's body is 226; it
+// reports 284). At the default budget the 284 is 248 arch + 36 acc and BOTH
+// terms are set here -- 248 arch ties with three other functions, and the 36
+// AGPRs are this function's alone.
+//
+// CLOSED 1: a budget on this function. __attribute__((amdgpu_waves_per_eu))
+// does not compile on a device function -- clang restricts it to kernels
+// ("'amdgpu_waves_per_eu' attribute only applies to kernel functions") and
+// LLVM 20.0.0git as shipped in ROCm 7.0 has no llc equivalent and no
+// "amdgpu-agpr-alloc". A non-kernel function with no waves-per-eu attribute
+// is allocated against the full 512-entry unified file, which is what this
+// one does.
+//
+// CLOSED 2: inlining it into a kernel that CAN be budgeted. Dropping
+// __noinline__ here and on gang_mla_full_layer_fused_kernel_mi300 does not
+// inline anything -- at -O2 the inliner declines a ~950-instruction callee
+// and both symbols survive with .vgpr_count unmoved at 284.
+//
+// What actually worked is MPK_WORKER_WAVES_PER_EU in persistent_kernel.cuh:
+// budget both KERNELS and let LLVM's AMDGPUAttributor push the constraint
+// down the call graph. Long note there.
+//
+// Do not read this function's 240 scratch ops as pressure -- they are the ABI
+// callee-save prologue/epilogue (v40-v143, 60 dwords in at instr 1-60, back
+// out at 880-939). The body spills nothing at 284. Its live set is genuine:
+// arch peaks at 248 in the same window where 24-36 AGPRs are live, so moving
+// the MFMA accumulators to arch VGPRs trades 36 acc for 36 arch and loses.
 __device__ __noinline__ void
     mla_decode_absorbed(void const *q_workspace_ptr,
                         void const *paged_kv_cache_ptr,
