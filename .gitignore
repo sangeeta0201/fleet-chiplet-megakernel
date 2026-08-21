@@ -95,3 +95,5 @@ tests/standalone/test_rope_interleave_partial
 *-host-x86_64-unknown-linux-gnu.hipi
 *-host-x86_64-unknown-linux-gnu.s
 *-hip-amdgcn-amd-amdhsa.hipfb
+# Profiler / debug tensor dumps -- 293 MB each, over GitHub's 100 MB limit
+*.pt
