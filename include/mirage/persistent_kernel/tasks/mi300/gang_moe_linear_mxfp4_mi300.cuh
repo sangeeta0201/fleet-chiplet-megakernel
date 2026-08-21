@@ -464,6 +464,62 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_nt(
   __syncthreads();
 }
 
+// ── Staging copy for an activation that is ALREADY MXFP8 ────────────────────
+//
+// The quantizer above exists because W13 hands W2 a bf16 activation, so every
+// one of W2's tiles re-derives the same E4M3 bytes and the same E8M0 scales
+// from the same 2048-element vector. When the producer emits MXFP8 directly
+// (gang_moe_w13_linear_mxfp8_kernel's EMIT_FP8 epilogue) there is nothing to
+// derive: the bytes W2 wants are the bytes in memory, and this degenerates to
+// a global->LDS copy of half the bytes with no VALU at all.
+//
+// Same coherence rules as the quantizer it replaces. The producer is a W13
+// tile on another XCD and per-XCD L2 is not coherent, so the loads keep
+// `sc0 sc1 nt`: sc0 sc1 to miss this XCD's L2 rather than read a stale line,
+// nt because nothing on this XCD wants the line back.
+//
+// Scale granularity is one E8M0 per 32 elements here, not the quantizer's one
+// per 128. A W13 workgroup owns OUTPUT_PER_WG/2 = 32 consecutive activation
+// columns, so 32 is the widest block whose amax it can compute without a
+// cross-workgroup reduction -- and it is also what the weight side already
+// uses, so the MFMA's B scale just gains the `* 4 + g` the A scale has.
+template <int LEN>
+__device__ __forceinline__ void
+    _gang_stage_mxfp8_nt(uint8_t const *__restrict__ src_data,
+                         uint8_t const *__restrict__ src_scale,
+                         uint8_t *__restrict__ dst_data,
+                         uint8_t *__restrict__ dst_scale) {
+  static_assert(LEN % 128 == 0,
+                "staging moves whole dwordx4s of data and whole dwords of "
+                "per-32 scale");
+  constexpr int NVEC = LEN / 16;   // dwordx4 of E4M3 data
+  constexpr int NSC4 = LEN / 128;  // dword of E8M0 scale (4 blocks of 32)
+  int const tid = threadIdx.x;
+
+  for (int v = tid; v < NVEC; v += blockDim.x) {
+    // Early-clobber for the same reason the quantizer documents: the compiler
+    // will otherwise allocate the destination on top of the live address.
+    i32x4_t d;
+    asm volatile("global_load_dwordx4 %0, %1, off sc0 sc1 nt"
+                 : "=&v"(d)
+                 : "v"((uint32_t const *)src_data + v * 4)
+                 : "memory");
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    *(i32x4_t *)(dst_data + v * 16) = d;
+  }
+  for (int s = tid; s < NSC4; s += blockDim.x) {
+    uint32_t d;
+    asm volatile("global_load_dword %0, %1, off sc0 sc1 nt"
+                 : "=&v"(d)
+                 : "v"((uint32_t const *)src_scale + s)
+                 : "memory");
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    *((uint32_t *)dst_scale + s) = d;
+  }
+  MPK_WS_WAVE_SYNC(tid >> 6);
+  __syncthreads();
+}
+
 // FP4×FP8 scaled MFMA: 16x16x128, hardware dequant + multiply
 // A = weights (FP4 E2M1), 16 bytes/lane in lower 128 bits of i32x8
 // B = tokens  (FP8 E4M3), 32 bytes/lane split across i32x8

@@ -309,10 +309,80 @@ __device__ __forceinline__ void _rnlm8_store4(unsigned short *dst,
 // its own ds_write. The point of having it in LDS at all is that the quantizer
 // then reads no global memory, which is what lets the caller keep an A-tile
 // prefetch in flight across it.
+//
+// ── the one-shot fold ────────────────────────────────────────────────────
+// Sum the EP_PEER_SLOTS planes of one row once and publish the resolved bf16
+// row, so PRE_FOLDED consumers read 12 KB instead of 108 KB. Sliced across
+// NSLICE workgroups: slice `s` walks iterations [s*ITERS/NSLICE, ...) of the
+// same 256 x float4 walk the prologue uses, so the addresses and the rounding
+// are the prologue's, element for element.
+//
+// Summation order matters for bit-identity and is preserved: the prologue
+// starts from slot 0 and adds slots 1..7 in order; starting from 0.0f and
+// adding slot 0 first is the same sequence, since 0.0f + x == x exactly.
+//
+// The store is write-through, and every XCD runs its own copy of the fold
+// writing the same bytes to the same addresses -- the same
+// identical-value-per-L2 argument `store_x` already relies on.
+template <int REDUCTION_SIZE, int EP_PEER_SLOTS, int EP_SLOT_ELEMS, int NSLICE>
+__device__ __forceinline__ void
+_rnlm8_ep_fold_slice(unsigned short const *__restrict__ d_res,
+                     unsigned short *__restrict__ d_x_out,
+                     int slice) {
+  constexpr int VEC = 4;
+  constexpr int NTHREADS = 256;
+  constexpr int ITERS = REDUCTION_SIZE / (NTHREADS * VEC);
+  static_assert(ITERS % NSLICE == 0,
+                "the fold slice count must divide the row's float4 walk");
+  constexpr int PER = ITERS / NSLICE;
+  int const tid = threadIdx.x;
+#pragma unroll 1
+  for (int v = slice * PER; v < (slice + 1) * PER; v++) {
+    int const off = (v * NTHREADS + tid) * VEC;
+    uint2 pk[EP_PEER_SLOTS];
+#pragma unroll
+    for (int p = 0; p < EP_PEER_SLOTS; p++) {
+      pk[p] = *reinterpret_cast<uint2 const *>(
+          d_res + (size_t)p * EP_SLOT_ELEMS + off);
+    }
+    float f[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (int p = 0; p < EP_PEER_SLOTS; p++) {
+      f[0] += _gang_bf16_to_float((unsigned short)pk[p].x);
+      f[1] += _gang_bf16_to_float((unsigned short)(pk[p].x >> 16));
+      f[2] += _gang_bf16_to_float((unsigned short)pk[p].y);
+      f[3] += _gang_bf16_to_float((unsigned short)(pk[p].y >> 16));
+    }
+    unsigned short const b[4] = {
+        _gang_float_to_bf16(f[0]), _gang_float_to_bf16(f[1]),
+        _gang_float_to_bf16(f[2]), _gang_float_to_bf16(f[3])};
+    st_wt_u64((void *)(d_x_out + off),
+              (unsigned long long)((unsigned)b[0] | ((unsigned)b[1] << 16)) |
+                  ((unsigned long long)((unsigned)b[2] |
+                                        ((unsigned)b[3] << 16))
+                   << 32));
+  }
+}
+
+//
+// ── PRE_FOLDED ───────────────────────────────────────────────────────────
+// The argument above -- "making the consumer BE the reduction leaves no
+// window for a barrier to protect" -- is right about the barrier and wrong
+// about the arithmetic once EP_PEER_SLOTS is 8 and the gang is 24 wide. Every
+// one of qkv_a's 24 workgroups per XCD reads all 8 slots of the 6144-wide row:
+// 8 x 12 KB + 12 KB of norm weight = 108 KB per tile, 192 tiles per layer per
+// rank, 20.7 MB/layer/rank of identical traffic -- more than qkv_a's own
+// 16.1 MB of weight. Measured, the prologue is ~60% of a 13.50 us tile and the
+// resadd+fold half of it alone is ~50%.
+// PRE_FOLDED says a step ahead of this one has already summed the slots and
+// published the resolved bf16 row, so this pass reads ONE plane, stages it and
+// squares it. It does not add d_ws either: the folder did that (under EP,
+// d_ws is not a term at all -- see the divergence note above).
 template <int REDUCTION_SIZE,
           int EP_PEER_SLOTS = 0,
           int EP_SLOT_ELEMS = 0,
-          bool STAGE_NW = false>
+          bool STAGE_NW = false,
+          bool PRE_FOLDED = false>
 __device__ __forceinline__ float
 _rnlm8_resadd_norm_rcp(float const *__restrict__ d_ws,
                        unsigned short const *__restrict__ d_res, // == norm_input
@@ -328,7 +398,7 @@ _rnlm8_resadd_norm_rcp(float const *__restrict__ d_ws,
                 "FUSE_RESADD wants the row to divide evenly over 256x float4");
   constexpr int ITERS = REDUCTION_SIZE / (NTHREADS * VEC);
 
-  constexpr bool EP = (EP_PEER_SLOTS > 1);
+  constexpr bool EP = (EP_PEER_SLOTS > 1) && !PRE_FOLDED;
   static_assert(!EP || EP_SLOT_ELEMS >= REDUCTION_SIZE,
                 "the EP gather slot stride must span at least one row");
   // The peers other than slot 0, which is read as the plain `d_res` above.
@@ -388,6 +458,14 @@ _rnlm8_resadd_norm_rcp(float const *__restrict__ d_ws,
         f[2] += _gang_bf16_to_float((unsigned short)pk[p].y);
         f[3] += _gang_bf16_to_float((unsigned short)(pk[p].y >> 16));
       }
+    } else if constexpr (PRE_FOLDED) {
+      // The row is already resolved. Nothing to add -- but it still has to go
+      // through bf16 on the way to s_x and ssq, and it already IS bf16, so the
+      // round-trip is exact and this stays bit-identical to the folded path.
+      f[0] = _gang_bf16_to_float((unsigned short)r.x);
+      f[1] = _gang_bf16_to_float((unsigned short)(r.x >> 16));
+      f[2] = _gang_bf16_to_float((unsigned short)r.y);
+      f[3] = _gang_bf16_to_float((unsigned short)(r.y >> 16));
     } else {
       float4 const w = *reinterpret_cast<float4 const *>(d_ws + off);
       f[0] = w.x + _gang_bf16_to_float((unsigned short)r.x);
@@ -562,7 +640,11 @@ template <int BATCH_SIZE,
           // Expert parallelism: > 1 makes the FUSE_RESADD prologue the
           // cross-rank reduction, reading `norm_input_ptr` as the symmetric
           // gather buffer. See _rnlm8_resadd_norm_rcp.
-          int EP_PEER_SLOTS = 0>
+          int EP_PEER_SLOTS = 0,
+          // The EP slots were already summed into `norm_input_ptr` by a fold
+          // step ahead of this one -- read one plane, not EP_PEER_SLOTS of
+          // them. See _rnlm8_ep_fold_slice.
+          bool EP_PRE_FOLDED = false>
 __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     void const *norm_input_ptr,  // [batch, REDUCTION_SIZE] bf16
     void const *norm_weight_ptr, // [REDUCTION_SIZE] bf16
@@ -782,12 +864,15 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     rms_rcp = _rnlm8_resadd_norm_rcp<REDUCTION_SIZE,
                                      EP_PEER_SLOTS,
                                      BATCH_SIZE * REDUCTION_SIZE,
-                                     /*STAGE_NW=*/LDS_PROLOGUE>(
+                                     /*STAGE_NW=*/LDS_PROLOGUE,
+                                     /*PRE_FOLDED=*/EP_PRE_FOLDED>(
         (float const *)resadd_workspace_f32_ptr + tok_idx * REDUCTION_SIZE,
         (unsigned short const *)norm_input_ptr + tok_idx * REDUCTION_SIZE,
         (unsigned short *)resadd_x_out_ptr + tok_idx * REDUCTION_SIZE,
         s_x_bf16,
-        /*store_x=*/wg_idx == 0,
+        // Pre-folded, the folder already published the resolved row -- which
+        // is the row this pass would be re-storing, byte for byte.
+        /*store_x=*/!EP_PRE_FOLDED && wg_idx == 0,
         /*eps=*/1e-5f,
         (unsigned short const *)norm_weight_ptr,
         s_nw_bf16);

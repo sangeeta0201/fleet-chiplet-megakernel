@@ -79,6 +79,15 @@
 #define MPK_W2_STAGE_FULL 0
 #endif
 
+// Hand the W13 -> W2 activation over as MXFP8 rather than bf16, so W2's tiles
+// stage bytes instead of re-deriving them. Producer side is the W13 kernel's
+// EMIT_FP8 template parameter, consumer side is W2's INPUT_FP8; they are one
+// knob because the layouts have to agree. 0 restores the bf16 handoff, which
+// is what makes this an A/B inside a single build.
+#ifndef MPK_MOE_ACT_FP8
+#define MPK_MOE_ACT_FP8 1
+#endif
+
 namespace kernel {
 
 // The weight operand at whichever width it is packed. FP4 fills only the lower
@@ -266,7 +275,29 @@ template <int BATCH_SIZE,
           int EP_WORLD_SIZE = 1,
           int EP_MY_PE = 0,
           int EP_NUM_ROUTED = NUM_EXPERTS,
-          int EP_SHARED_PE = 0>
+          int EP_SHARED_PE = 0,
+          // ── Emit the SwiGLU result as MXFP8 instead of bf16 ──────────────
+          //
+          // The consumer of this activation is W2, and W2's first act is to
+          // quantize it: every one of the ~96 tiles per expert re-derives the
+          // same E4M3 bytes and the same E8M0 scales from the same 2048
+          // element vector. That is pure redundancy -- 4 KB of activation in
+          // front of a 68 KB weight tile, so no byte-side lever touches it --
+          // and it is redundant work this kernel is uniquely placed to
+          // delete, because the SwiGLU result is already in its registers in
+          // f32 and each of its workgroups owns a contiguous, 32-aligned
+          // slice of the intermediate.
+          //
+          // Deleting it costs one cross-wave amax. A workgroup's slice is
+          // OUTPUT_PER_WG/2 activation columns and the emitting lanes are
+          // spread over all four waves (col == 0, four g each), so the two
+          // f32 results per lane go through LDS and a short pass at the end
+          // of the tile packs them. See the write-out block after the MFMA
+          // branches.
+          //
+          // Requires the N-parallel branch: the K-parallel workgroup owns 8
+          // activation columns, which is narrower than a scale block.
+          bool EMIT_FP8 = false>
 __device__ __noinline__ void
     gang_moe_w13_linear_mxfp8_kernel(void const *input_ptr,
                                      void const *weight_ptr,
@@ -348,6 +379,30 @@ __device__ __noinline__ void
       (float *)(((uintptr_t)(s_tok_scales + NUM_BLOCKS_32) + 15u) &
                 ~(uintptr_t)15);
 
+  // EMIT_FP8 scratch, past s_reduce so it does not alias the K-parallel
+  // reduction (which it never coexists with, but the offsets are constexpr
+  // either way). ACT_COLS floats of SwiGLU result plus one f32 scale and one
+  // E8M0 byte per 32-column block: 160 B at OUTPUT_PER_WG = 64.
+  constexpr int W13_ACT_COLS = EMIT_FP8 ? OUTPUT_PER_WG / 2 : 0;
+  constexpr int W13_ACT_BLKS = EMIT_FP8 ? W13_ACT_COLS / 32 : 0;
+  float *s_act = s_reduce + (K_PARALLEL ? NUM_WAVES * OUTPUT_PER_WG : 0);
+  float *s_act_scale_f = s_act + W13_ACT_COLS;
+  if constexpr (EMIT_FP8) {
+    static_assert(!K_PARALLEL,
+                  "EMIT_FP8 needs the N-parallel branch: a K-parallel "
+                  "workgroup owns 8 activation columns, under one scale "
+                  "block of 32");
+    static_assert(FUSE_SWIGLU,
+                  "EMIT_FP8 quantizes the SwiGLU result; there is no other "
+                  "activation for it to emit");
+    static_assert(OUTPUT_SIZE == OUTPUT_STRIDE,
+                  "EMIT_FP8 packs a dense byte row; a short OUTPUT_SIZE would "
+                  "leave holes the consumer still reads");
+    static_assert((OUTPUT_PER_WG / 2) % 32 == 0,
+                  "a workgroup must own a whole number of 32-element scale "
+                  "blocks");
+  }
+
   int const tid = threadIdx.x;
   int const warp_id = tid >> 6;
   int const lane_id = tid & 63;
@@ -391,6 +446,22 @@ __device__ __noinline__ void
                                  topk_slot * ACT_STRIDE + (out_base >> 1);
       unsigned short act[2];
       bool act_ok[2];
+      if constexpr (EMIT_FP8) {
+        // Park the f32 result; the block amax is not known until every wave
+        // of this workgroup has emitted. `out_base >> 1` is this lane's first
+        // activation column and wg_idx * ACT_COLS is the workgroup's base, so
+        // the difference is the LDS slot directly.
+        int const act_local = (out_base >> 1) - wg_idx * W13_ACT_COLS;
+#pragma unroll
+        for (int p = 0; p < 2; p++) {
+          int const out_n = out_base + 2 * p;
+          float const gate = acc[2 * p] + _gang_bf16_to_float(bias_row[out_n]);
+          float const up =
+              acc[2 * p + 1] + _gang_bf16_to_float(bias_row[out_n + 1]);
+          s_act[act_local + p] = fast_silu(gate) * up;
+        }
+        return;
+      }
 #pragma unroll
       for (int p = 0; p < 2; p++) {
         int const out_n = out_base + 2 * p;
@@ -648,6 +719,65 @@ __device__ __noinline__ void
   }
 
   __syncthreads();
+
+  // ── EMIT_FP8 write-out ────────────────────────────────────────────────────
+  //
+  // Every wave has now parked its SwiGLU results in s_act, so the workgroup's
+  // W13_ACT_COLS contiguous activation columns are complete and any thread can
+  // see all of them. Two short passes: one thread per 32-column block computes
+  // the block amax and its E8M0 scale, then one thread per four columns packs
+  // a dword of E4M3 and stores it.
+  //
+  // The FP8 row and its scales ride in the SAME buffer the bf16 activation
+  // used. A (token, slot) pair owns 2 * ACT_STRIDE bytes there; MXFP8 needs
+  // ACT_STRIDE + ACT_STRIDE/32, which is 2112 of 4096 for GLM-5. Reusing the
+  // slab keeps this change inside the two kernels -- no new tensor, no task
+  // registration, no host plumbing.
+  //
+  // The stores are write-through for exactly the reason the bf16 path is: the
+  // consumer is a W2 tile on another XCD and there is no event boundary
+  // between them to write L2 back.
+  if constexpr (EMIT_FP8) {
+    constexpr int ACT_STRIDE = OUTPUT_STRIDE / 2;
+    constexpr int W13_ACT_PACKS = W13_ACT_COLS / 4;
+    uint8_t *slot_base =
+        (uint8_t *)(d_output +
+                    static_cast<size_t>(tok_idx) * (NUM_TOPK * ACT_STRIDE) +
+                    static_cast<size_t>(topk_slot) * ACT_STRIDE);
+    uint8_t *g_act_fp8 = slot_base + wg_idx * W13_ACT_COLS;
+    uint8_t *g_act_scale = slot_base + ACT_STRIDE + wg_idx * W13_ACT_BLKS;
+
+    if (tid < W13_ACT_BLKS) {
+      float amax = 0.0f;
+#pragma unroll
+      for (int j = 0; j < 32; j++) {
+        amax = fmaxf(amax, fabsf(s_act[tid * 32 + j]));
+      }
+      uint8_t const se = _gang_compute_e8m0_fp8(amax);
+      if (se == 0) {
+        s_act_scale_f[tid] = 1.0f;
+      } else {
+        union {
+          float f;
+          uint32_t u;
+        } sv;
+        sv.u = (uint32_t)se << 23;
+        s_act_scale_f[tid] = sv.f;
+      }
+      st_wt_u8((void *)&g_act_scale[tid], se);
+    }
+    __syncthreads();
+
+    if (tid < W13_ACT_PACKS) {
+      int const c0 = tid * 4;
+      float const sf = s_act_scale_f[c0 >> 5];
+      fp8x4_t pk = _gang_quant_4xfp8(s_act[c0], s_act[c0 + 1], s_act[c0 + 2],
+                                     s_act[c0 + 3], sf);
+      // wg_idx * W13_ACT_COLS is 32-aligned and c0 is 4-aligned, so the dword
+      // store is aligned whatever the workgroup index.
+      st_wt_u32((void *)&g_act_fp8[c0], *(unsigned const *)&pk);
+    }
+  }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   if (tid == 0 && g_subphase_active) {
     atomicAdd(&g_subphase_ns[1][1],
@@ -691,7 +821,13 @@ template <int BATCH_SIZE,
           int EP_SHARED_PE = 0,
           // Reduction split; see the K_SPLITS note in the body. 1 is the
           // identity and every other instantiation in the megakernel keeps it.
-          int W2_K_SPLITS = 1>
+          int W2_K_SPLITS = 1,
+          // The activation is already MXFP8, laid out by the W13 kernel's
+          // EMIT_FP8 epilogue: E4M3 bytes in the low REDUCTION_SIZE bytes of
+          // the (token, slot) slab and one E8M0 per 32 elements right after
+          // them. The prologue becomes a copy and the token scale gains the
+          // per-32 `* 4 + g` selector the weight scale already has.
+          bool INPUT_FP8 = false>
 __device__ __noinline__ void
     gang_moe_w2_linear_mxfp8_kernel(void const *input_ptr,
                                     void const *weight_ptr,
@@ -864,11 +1000,28 @@ __device__ __noinline__ void
   static_assert(MPK_W2_STAGE_FULL || SPLIT_LEN == SPLIT_ITERS * K_PER_MFMA,
                 "the staged window must be exactly the split's MFMA range");
   int const stage_base = MPK_W2_STAGE_FULL ? 0 : k_base;
-  _gang_wave_parallel_fp8_quant_nt<SPLIT_LEN>(
-      A + static_cast<size_t>(tok_idx) * (NUM_TOPK * REDUCTION_SIZE) +
-          static_cast<size_t>(topk_slot) * REDUCTION_SIZE + stage_base,
-      s_tok_fp8 + stage_base,
-      s_tok_scales + stage_base / 32);
+  if constexpr (INPUT_FP8) {
+    // Same slab as the bf16 path, reinterpreted: the producer packed E4M3 into
+    // the low REDUCTION_SIZE bytes and the per-32 E8M0 scales into the
+    // REDUCTION_SIZE/32 bytes after them. 2 * REDUCTION_SIZE bytes were
+    // reserved for the bf16 row, so both fit with room to spare.
+    uint8_t const *slot_base =
+        (uint8_t const *)(A +
+                          static_cast<size_t>(tok_idx) *
+                              (NUM_TOPK * REDUCTION_SIZE) +
+                          static_cast<size_t>(topk_slot) * REDUCTION_SIZE);
+    _gang_stage_mxfp8_nt<SPLIT_LEN>(slot_base + stage_base,
+                                    slot_base + REDUCTION_SIZE +
+                                        stage_base / 32,
+                                    s_tok_fp8 + stage_base,
+                                    s_tok_scales + stage_base / 32);
+  } else {
+    _gang_wave_parallel_fp8_quant_nt<SPLIT_LEN>(
+        A + static_cast<size_t>(tok_idx) * (NUM_TOPK * REDUCTION_SIZE) +
+            static_cast<size_t>(topk_slot) * REDUCTION_SIZE + stage_base,
+        s_tok_fp8 + stage_base,
+        s_tok_scales + stage_base / 32);
+  }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   unsigned long long _sp_q1 = __builtin_amdgcn_s_memrealtime();
   if (tid == 0 && g_subphase_active) {
@@ -881,6 +1034,14 @@ __device__ __noinline__ void
   if constexpr (FUSE_MULSUMADD) {
     rw = d_routing_weight[tok_idx * NUM_TOPK + topk_slot];
   }
+
+  // Token scale for MFMA iteration k. The quantizer coarsens to one E8M0 per
+  // 128 elements and passes the same byte to all four g; the producer-emitted
+  // layout keeps the hardware's per-32 granularity, so g selects its own
+  // sub-block exactly as it does on the weight side.
+  auto tok_sc = [&](uint8_t const *base, int k) -> int {
+    return INPUT_FP8 ? (int)base[k * 4 + g] : (int)base[k];
+  };
 
   // Epilogue, hoisted out of both parallelization branches; see W13.
   auto emit = [&](f32x4_t const &acc, int const out_base) {
@@ -952,7 +1113,7 @@ __device__ __noinline__ void
       {
         i32x8_t b = _gang_load_fp8_mfma_b(s_tok_k, ki * K_PER_MFMA, g);
         acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a0, b, acc, sa0,
-                                            (int)s_tok_sc_k[ki]);
+                                            tok_sc(s_tok_sc_k, ki));
       }
       if (ki + 4 < SPLIT_ITERS) {
         int kt4 = (ki + 4) * K_PER_MFMA;
@@ -963,7 +1124,7 @@ __device__ __noinline__ void
       {
         i32x8_t b = _gang_load_fp8_mfma_b(s_tok_k, (ki + 1) * K_PER_MFMA, g);
         acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a1, b, acc, sa1,
-                                            (int)s_tok_sc_k[ki + 1]);
+                                            tok_sc(s_tok_sc_k, ki + 1));
       }
       if (ki + 5 < SPLIT_ITERS) {
         int kt5 = (ki + 5) * K_PER_MFMA;
@@ -974,7 +1135,7 @@ __device__ __noinline__ void
       {
         i32x8_t b = _gang_load_fp8_mfma_b(s_tok_k, (ki + 2) * K_PER_MFMA, g);
         acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a2, b, acc, sa2,
-                                            (int)s_tok_sc_k[ki + 2]);
+                                            tok_sc(s_tok_sc_k, ki + 2));
       }
       if (ki + 6 < SPLIT_ITERS) {
         int kt6 = (ki + 6) * K_PER_MFMA;
@@ -985,7 +1146,7 @@ __device__ __noinline__ void
       if (ki + 3 < SPLIT_ITERS) {
         i32x8_t b = _gang_load_fp8_mfma_b(s_tok_k, (ki + 3) * K_PER_MFMA, g);
         acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a3, b, acc, sa3,
-                                            (int)s_tok_sc_k[ki + 3]);
+                                            tok_sc(s_tok_sc_k, ki + 3));
       }
       if (ki + 7 < SPLIT_ITERS) {
         int kt7 = (ki + 7) * K_PER_MFMA;
@@ -1042,7 +1203,7 @@ __device__ __noinline__ void
       {
         i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
         acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a0, b, acc, sa0,
-                                            (int)s_tok_scales[ki]);
+                                            tok_sc(s_tok_scales, ki));
       }
       if (ki + 4 < ki_end) {
         int kt4 = (ki + 4) * K_PER_MFMA;
@@ -1053,7 +1214,7 @@ __device__ __noinline__ void
       {
         i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 1) * K_PER_MFMA, g);
         acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a1, b, acc, sa1,
-                                            (int)s_tok_scales[ki + 1]);
+                                            tok_sc(s_tok_scales, ki + 1));
       }
       if (ki + 5 < ki_end) {
         int kt5 = (ki + 5) * K_PER_MFMA;
@@ -1064,7 +1225,7 @@ __device__ __noinline__ void
       {
         i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 2) * K_PER_MFMA, g);
         acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a2, b, acc, sa2,
-                                            (int)s_tok_scales[ki + 2]);
+                                            tok_sc(s_tok_scales, ki + 2));
       }
       if (ki + 6 < ki_end) {
         int kt6 = (ki + 6) * K_PER_MFMA;
@@ -1075,7 +1236,7 @@ __device__ __noinline__ void
       if (ki + 3 < ki_end) {
         i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 3) * K_PER_MFMA, g);
         acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a3, b, acc, sa3,
-                                            (int)s_tok_scales[ki + 3]);
+                                            tok_sc(s_tok_scales, ki + 3));
       }
       if (ki + 7 < ki_end) {
         int kt7 = (ki + 7) * K_PER_MFMA;

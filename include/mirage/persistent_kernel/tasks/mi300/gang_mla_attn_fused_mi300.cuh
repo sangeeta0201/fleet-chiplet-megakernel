@@ -406,6 +406,72 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // priced halving this stage's bytes AND its MFMAs at ~0, so if this probe
   // also comes back near zero the phase is absorbed by the barrier behind it
   // and no qkv_a lever -- sharding q_a_proj included -- can pay.
+  // MPK_QKV_EP_FOLD: hoist the EP reduction out of the tile.
+  //
+  // The prologue is written as "the consumer IS the reduction", which is right
+  // at gpt-oss's shape and wrong at GLM-5's: EP_PEER_SLOTS is 8 and the gang is
+  // 24 wide per XCD, so all 192 workgroups per rank sum the same eight 12 KB
+  // planes. Measured at 20.7 MB/layer/rank of identical traffic -- more than
+  // qkv_a's own 16.1 MB of weight -- and ~50% of a 13.50 us tile.
+  //
+  // Six workgroups per XCD fold one sixth of the row each, publish it to
+  // x_out_ptr (the same buffer, the same bytes, the same rounding `store_x`
+  // was already writing), and one XCD-LOCAL release lets the 24 tiles read it.
+  // XCD-local, not GPU-wide, on purpose: a rendezvous costs 3.77 us GPU-wide
+  // and the whole win here is ~5 us/layer, so a global barrier would eat it.
+  // Every XCD folds its own copy to the same addresses -- identical bytes per
+  // L2, which is exactly the argument `store_x`'s one-WG-per-XCD store makes.
+#if defined(MPK_QKV_EP_FOLD)
+  constexpr bool QKV_EP_FOLD = (EP_PEER_SLOTS > 1);
+#else
+  constexpr bool QKV_EP_FOLD = false;
+#endif
+  if constexpr (QKV_EP_FOLD) {
+    constexpr int FOLD_WGS = 6; // 6144 / (256 * 4) = 6 float4 passes
+    if (xcd_rank < FOLD_WGS) {
+      for (int tok = 0; tok < num_active_tokens; tok++) {
+        _rnlm8_ep_fold_slice<QKV_REDUCTION_SIZE,
+                             EP_PEER_SLOTS,
+                             BATCH_SIZE * QKV_REDUCTION_SIZE,
+                             FOLD_WGS>(
+            static_cast<unsigned short const *>(x_ptr) +
+                tok * QKV_REDUCTION_SIZE,
+            static_cast<unsigned short *>(x_out_ptr) +
+                tok * QKV_REDUCTION_SIZE,
+            xcd_rank);
+      }
+    }
+    __syncthreads();
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    if (tid == 0) {
+      // Hosted in wuk_barrier's spare lanes: that array is XCD-local already
+      // and uses only offsets 0 (flag) and 8 (counter) of its stride-16 block.
+      int *const _cnt = &wuk_barrier[xcd_id * HIER_STRIDE + 9];
+      int *const _flag = &wuk_barrier[xcd_id * HIER_STRIDE + 1];
+      int prev = atom_add_release_gpu_s32(_cnt, 1);
+      if ((prev % tiles_per_xcd) == tiles_per_xcd - 1) {
+        st_wt_u32((void *)_flag, (unsigned)qkv_expected);
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      }
+      MPK_WS_WAIT_BEGIN(769, qkv_expected);
+      int _spins = 0;
+      int _obs;
+      while ((_obs = ld_nt_s32(_flag)) < qkv_expected) {
+        ++_spins;
+        MPK_WS_WAIT_TICK(_obs, _spins);
+        if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
+          if (ld_nt_s32(_cnt) >= tiles_per_xcd * qkv_expected) {
+            st_wt_u32((void *)_flag, (unsigned)qkv_expected);
+            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          }
+        }
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+    __syncthreads();
+    asm volatile("buffer_inv" ::: "memory");
+  }
+
 #ifndef MPK_ABL_QKV
   for (int t = xcd_rank; t < qkv_tiles_per_xcd; t += tiles_per_xcd) {
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
@@ -426,8 +492,11 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
                                           QKV_ACTUAL_HIDDEN,
                                           /*WRITE_THROUGH=*/true,
                                           /*FUSE_RESADD=*/true,
-                                          EP_PEER_SLOTS>(
-        /*norm_input_ptr=*/x_ptr, // the residual, under FUSE_RESADD
+                                          EP_PEER_SLOTS,
+                                          /*EP_PRE_FOLDED=*/QKV_EP_FOLD>(
+        // Pre-folded, the resolved row is in x_out_ptr and the gather buffer
+        // is not read again.
+        /*norm_input_ptr=*/QKV_EP_FOLD ? (void const *)x_out_ptr : x_ptr,
         pre_norm_weight_ptr,
         pre_norm_scratch_ptr,
         qkv_weight_ptr,

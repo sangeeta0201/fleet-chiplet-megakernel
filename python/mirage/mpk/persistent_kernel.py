@@ -561,6 +561,13 @@ def get_compile_command(
             # prologue. WRONG OUTPUT by construction. Splits SP4[0] into
             # prologue and GEMM; MPK_ABL_QKV is the sum of the two.
             flags = flags + ["-DMPK_ABL_QKV_PRO"]
+        if int(os.environ.get("MPK_QKV_EP_FOLD", "0")) == 1:
+            # Hoist the EP reduction out of qkv_a's tile: six workgroups per
+            # XCD sum the 8 peer slots once, an XCD-local release publishes
+            # the resolved row, and the 24 tiles read one plane instead of
+            # eight. CORRECT OUTPUT -- same addresses, same summation order,
+            # same bf16 rounding. Removes 20.7 -> 2.6 MB/layer/rank.
+            flags = flags + ["-DMPK_QKV_EP_FOLD"]
         if int(os.environ.get("MPK_BAR_TREE", "0")) == 1:
             # Two-level arrival for every GPU-wide Mechanism-C rendezvous:
             # 29 atomics on the XCD's own line, then 8 on the global one,
@@ -633,6 +640,15 @@ def get_compile_command(
             # must see it.
             assert _w2_sf in ("0", "1"), "MPK_W2_STAGE_FULL is 0 or 1"
             flags = flags + [f"-DMPK_W2_STAGE_FULL={_w2_sf}"]
+        _moe_afp8 = os.environ.get("MPK_MOE_ACT_FP8")
+        if _moe_afp8 is not None:
+            # W13 emits the SwiGLU result as MXFP8 (E4M3 + one E8M0 per 32) and
+            # W2 stages those bytes instead of re-quantizing the same bf16
+            # vector once per tile. Default is 1 in the header; forward only an
+            # explicit override, and only as one -D, because producer and
+            # consumer layouts have to agree across every rank.
+            assert _moe_afp8 in ("0", "1"), "MPK_MOE_ACT_FP8 is 0 or 1"
+            flags = flags + [f"-DMPK_MOE_ACT_FP8={_moe_afp8}"]
         _w2_ks = int(os.environ.get("MPK_W2_KSPLIT", "1"))
         if _w2_ks != 1:
             # The GLM fused-layer W2 (gang_moe_linear_mxfp8_mi300.cuh), not the

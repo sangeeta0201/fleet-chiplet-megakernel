@@ -1204,7 +1204,8 @@ __device__ __attribute__((always_inline)) void
                                      EP_WORLD_SIZE,
                                      EP_MY_PE,
                                      /*EP_NUM_ROUTED=*/NUM_EXPERTS,
-                                     EP_SHARED_PE>(
+                                     EP_SHARED_PE,
+                                     /*EMIT_FP8=*/MPK_MOE_ACT_FP8 != 0>(
         norm_output_ptr,
         moe_gate_up_weight_ptr,
         routing_indices_ptr,
@@ -1328,7 +1329,8 @@ __device__ __attribute__((always_inline)) void
                                     EP_MY_PE,
                                     /*EP_NUM_ROUTED=*/NUM_EXPERTS,
                                     EP_SHARED_PE,
-                                    MPK_W2_KSPLIT>(
+                                    MPK_W2_KSPLIT,
+                                    /*INPUT_FP8=*/MPK_MOE_ACT_FP8 != 0>(
         moe_swiglu_out_ptr,
         moe_down_weight_ptr,
         routing_indices_ptr,
