@@ -4240,10 +4240,19 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
          (unabsorb_k ? 114 : unabsorb_v ? 106 : 71) * 16);
 
   // ══ MoE geometry ══
-  assert(input_ops[15]->dtensor.dim[1] ==
-             oproj_rows_per_wg *
-                 (oproj_reduction_size + oproj_reduction_size / 32) &&
-         "o_proj MXFP8 weight is not packed at this reduction and row count");
+  // Two legal row widths, not one: MPK_OPROJ_MXFP4 packs the data half as
+  // E2M1 nibbles, halving it, while the E8M0 scale half is one byte per 32
+  // elements either way and does not shrink. The layout is otherwise
+  // identical, so the format is not recoverable from the shape alone -- but
+  // this registration only needs the row to be one of the two, and the
+  // compile-time flag that picks the kernel body also picks the packer.
+  assert((input_ops[15]->dtensor.dim[1] ==
+              oproj_rows_per_wg *
+                  (oproj_reduction_size + oproj_reduction_size / 32) ||
+          input_ops[15]->dtensor.dim[1] ==
+              oproj_rows_per_wg *
+                  (oproj_reduction_size / 2 + oproj_reduction_size / 32)) &&
+         "o_proj weight is not packed at this reduction and row count");
   // Either the whole row, or this rank's 1/world-th of it under output-wise
   // sharded o_proj followed by the in-kernel all-gather. The kernel detects
   // the shard off exactly this ratio -- there is no flag -- so nothing between

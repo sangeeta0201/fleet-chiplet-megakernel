@@ -604,6 +604,16 @@ def get_compile_command(
             # dependent cold round trips, because the loads feed shared
             # memory and the layer evicts the table from L2 in between.
             flags = flags + ["-DMPK_ML_PTR_PREFETCH=1"]
+        if int(os.environ.get("GLM_OPROJ_MXFP4", "1")) == 1:
+            # o_proj's GEMV reads E2M1 nibbles instead of E4M3 bytes. Must
+            # agree with the host packer -- demo.py reads the SAME env var to
+            # decide whether to hand pack_dense_mxfp8 a quantize_mxfp4 output,
+            # and a mismatch mis-addresses every weight row rather than
+            # failing to build. o_proj is 100.7 MB/layer/GPU of the ~166 MB of
+            # attention weight and is the one stage measured byte-bound (76%
+            # of HBM peak), so it is the member of the MXFP4-attention set
+            # where halving bytes should convert to time.
+            flags = flags + ["-DMPK_OPROJ_MXFP4=1"]
         _bar_skew = int(os.environ.get("MPK_BAR_SKEW", "0"))
         if _bar_skew >= 1:
             # Per-rendezvous first-arriver-to-last-arriver spread. O(1) per
@@ -2432,8 +2442,16 @@ class PersistentKernel:
         n_wgs = oproj_mxfp8_weight.dim(0)
         assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
         oproj_tiles_per_xcd = n_wgs // 8
-        assert oproj_mxfp8_weight.dim(1) == oproj_rows_per_wg * (
-            oproj_reduction_size + oproj_reduction_size // 32)
+        # MXFP8 stores K data bytes a row, MXFP4 K/2; the scale half is K/32
+        # either way. Accept both and let the width say which, so the check
+        # still catches a genuinely wrong shape without needing the flag
+        # threaded down here.
+        assert oproj_mxfp8_weight.dim(1) in (
+            oproj_rows_per_wg * (oproj_reduction_size +
+                                 oproj_reduction_size // 32),
+            oproj_rows_per_wg * (oproj_reduction_size // 2 +
+                                 oproj_reduction_size // 32)), (
+            oproj_mxfp8_weight.dim(1), oproj_rows_per_wg, oproj_reduction_size)
         unabsorb_v = wuv_mxfp8_weight is not None
         if unabsorb_v:
             assert v_out is not None and wuv_rows_per_wg > 0 \

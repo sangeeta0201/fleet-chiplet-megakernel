@@ -1478,7 +1478,16 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     //   prefetch off  see below
 #ifndef MPK_GLM_OPROJ_PREFETCH_OFF
     {
+      // The data half is one byte per element at MXFP8 and one nibble at
+      // MXFP4; the E8M0 scale half is one byte per 32 either way. This is not
+      // cosmetic: PF_WG_BYTES is both the buffer resource's range and the
+      // per-tile voffset stride, so an MXFP8 width over an MXFP4 tensor walks
+      // past the end of the allocation and faults.
+#if MPK_OPROJ_MXFP4
+      constexpr int PF_WG_DATA = OPROJ_ROWS_PER_WG * (OPROJ_REDUCTION_SIZE / 2);
+#else
       constexpr int PF_WG_DATA = OPROJ_ROWS_PER_WG * OPROJ_REDUCTION_SIZE;
+#endif
       constexpr int PF_WG_SCALE = OPROJ_ROWS_PER_WG * (OPROJ_REDUCTION_SIZE / 32);
       constexpr int PF_WG_BYTES = PF_WG_DATA + PF_WG_SCALE;
       constexpr int PF_N16 = (PF_WG_BYTES + 15) / 16;

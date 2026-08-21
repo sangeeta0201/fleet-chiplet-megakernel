@@ -77,6 +77,7 @@
 // each phase is handed xcd_rank, not tile_idx.
 
 #pragma once
+#include "tasks/mi300/gang_gemv_mxfp4_mi300.cuh"
 #include "tasks/mi300/gang_gemv_mxfp8_mi300.cuh"
 #include "tasks/mi300/gang_moe_linear_mxfp8_mi300.cuh"
 #include "tasks/mi300/gang_rmsnorm_linear_bias_mi300.cuh"
@@ -693,7 +694,16 @@ __device__ __attribute__((always_inline)) void
         static_cast<float *>(router_partials_ptr) +
         (size_t)xcd_id * (NUM_EXPERTS + 1);
     for (int t = xcd_rank; t < oproj_tiles_per_xcd; t += tiles_per_xcd) {
+      // MXFP4 and MXFP8 differ only in the weight's element format: same
+      // packer layout, same signature, same caller contract including
+      // stage_a. The switch is compile-time because the host packer is
+      // switched by the same env var and a runtime branch would leave both
+      // bodies in the binary for no reason.
+#if MPK_OPROJ_MXFP4
+      gang_gemv_mxfp4_kernel<BATCH_SIZE,
+#else
       gang_gemv_mxfp8_kernel<BATCH_SIZE,
+#endif
                              OPROJ_REDUCTION_SIZE,
                              OPROJ_ROWS_PER_WG,
                              /*HAS_RESIDUAL=*/true,

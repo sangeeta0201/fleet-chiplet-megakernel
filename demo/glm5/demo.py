@@ -249,6 +249,31 @@ MOE_MXFP4 = os.environ.get("GLM_MOE_MXFP4", "1") == "1"
 FAKE_MXFP4_ATTN = os.environ.get("GLM_FAKE_MXFP4_ATTN", "0") == "1"
 
 
+# The real thing, for o_proj only. o_proj is 100.7 MB of the ~166 MB of
+# attention weight a layer reads per GPU -- six times qkv_a, which is what the
+# ~0.9 ms ceiling was extrapolated from -- and it is the only member of the
+# set measured byte-bound (76% of HBM peak), so it is the one where halving
+# bytes should convert to time rather than disappear into a barrier.
+#
+# MEASURED, n=6 alternated in one batch, NP=8, device-clock decode average:
+#   MXFP8  10.768 10.865 10.626 10.791 10.641 10.914  mean 10.768
+#   MXFP4  10.572 10.559 10.680 10.845 10.573 10.541  mean 10.628
+# i.e. -0.139 ms, ~2 sigma and right at the 0.26 ms single-run noise floor.
+# The prediction was -0.76 to -1.0 ms (50 MB/layer/GPU at 76% of 5.17 TB/s),
+# so about 85% of the byte saving does not convert: the o_proj weight block is
+# already DMA'd up the hierarchy during the Phase 6 barrier spin
+# (gang_mla_full_layer_fused_mi300.cuh, the buffer_load_lds ladder), so
+# halving it shortens a transfer that was already hidden. Default on anyway --
+# it is a strict byte reduction, it is correctness-gated, and it takes 7.9 GB
+# of o_proj weight per GPU down to 4.0.
+#
+# The kernel side is MPK_OPROJ_MXFP4, set from this same variable in
+# python/mirage/mpk/persistent_kernel.py. The two MUST agree: the packed
+# layout is identical apart from the row width, so a mismatch mis-addresses
+# every weight row and produces garbage rather than failing to build.
+OPROJ_MXFP4 = os.environ.get("GLM_OPROJ_MXFP4", "1") == "1"
+
+
 def quantize_mxfp4(w: torch.Tensor) -> tuple:
     """Quantize a [..., out, K] bf16 weight to MXFP4: E2M1 nibbles with one
     E8M0 exponent per 32 contiguous K elements.
@@ -315,7 +340,8 @@ def pack_moe_mxfp8(stacked: torch.Tensor,
 
 def pack_dense_mxfp8(w: torch.Tensor, output_per_wg: int = 64,
                      rows_per_chunk: int = 8192,
-                     fake_fp4: bool = False) -> torch.Tensor:
+                     fake_fp4: bool = False,
+                     fp4: bool = False) -> torch.Tensor:
     """Quantize + pack a 2-D [out, K] bf16 weight into the MXFP8 per-workgroup
     layout, in row chunks.
 
@@ -329,13 +355,22 @@ def pack_dense_mxfp8(w: torch.Tensor, output_per_wg: int = 64,
     the same measurement trick GLM_FAKE_MXFP4_EXPERTS uses on the MoE side. It
     answers the quality half of "MXFP4 for the attention weights" for zero
     kernel work -- see FAKE_MXFP4_ATTN.
+
+    fp4 is the real thing: E2M1 nibbles, half the data bytes. The workgroup
+    layout is unchanged -- pack_mxfp8_workgroup takes its row width from the
+    data tensor -- so only the consuming kernel has to know, and it is
+    gang_gemv_mxfp4_kernel rather than gang_gemv_mxfp8_kernel. The two flags
+    are exclusive: fake_fp4 exists to answer the question fp4 acts on.
     """
     assert w.dim() == 2, w.shape
+    assert not (fp4 and fake_fp4), \
+        "fake_fp4 is the probe for fp4; packing both at once measures nothing"
     rows = w.shape[0]
     assert rows % output_per_wg == 0, (rows, output_per_wg)
     step = max(output_per_wg,
                (rows_per_chunk // output_per_wg) * output_per_wg)
-    quant = ((lambda x: quantize_mxfp8(fake_quantize_mxfp4(x))) if fake_fp4
+    quant = (quantize_mxfp4 if fp4
+             else (lambda x: quantize_mxfp8(fake_quantize_mxfp4(x))) if fake_fp4
              else quantize_mxfp8)
     parts = [pack_mxfp8_workgroup(*quant(w[r:r + step]), output_per_wg)
              for r in range(0, rows, step)]
@@ -1388,12 +1423,36 @@ if __name__ == "__main__":
         # plain row-major, and only the MFMA *gather* wanted the split layout,
         # so the GEMV reads it as-is. See gang_gemv_mxfp8_mi300.cuh.
         use_mxfp8_oproj = OPROJ_MXFP8 and use_gemv_oproj
+        if OPROJ_MXFP4 and not (use_mxfp8_oproj and FUSE_FULL_LAYER):
+            # Only the fused whole-layer task calls the MXFP4 GEMV; the dense
+            # prologue's o_proj builders still template on the MXFP8 body and
+            # would mis-address a nibble-packed row rather than fail to build.
+            # Same restriction, and the same reason, as GLM_MOE_MXFP4's.
+            #
+            # Silently fall back rather than assert, because the default is on:
+            # a bf16 or unfused configuration is a legal way to run this demo
+            # and should not be broken by a default. Write the decision back
+            # into the environment, because persistent_kernel.py reads the SAME
+            # variable to set -DMPK_OPROJ_MXFP4 and the two must agree -- a
+            # host packer and a kernel that disagree on the row width produce
+            # garbage rather than a build error.
+            os.environ["GLM_OPROJ_MXFP4"] = "0"
+            OPROJ_MXFP4 = False
+            print("[CFG] GLM_OPROJ_MXFP4 off: needs the MXFP8 GEMV o_proj "
+                  "inside the fused whole-layer task "
+                  f"(mxfp8={use_mxfp8_oproj} fused={FUSE_FULL_LAYER})")
         if use_mxfp8_oproj:
-            # 16 fp8 per lane per iteration over 256/rows lanes.
-            assert o_proj_red % ((256 // oproj_tile_n) * 16) == 0, o_proj_red
+            # Elements per lane per iteration over 256/rows lanes: 16 E4M3
+            # bytes, or 32 E2M1 nibbles, out of the same 16-byte load. Only
+            # o_proj's own reduction changes format -- W_UV stays MXFP8, so
+            # its checks keep the 16.
+            oproj_per_lane = 32 if OPROJ_MXFP4 else 16
+            assert o_proj_red % (
+                (256 // oproj_tile_n) * oproj_per_lane) == 0, o_proj_red
             if UNABSORB_V:
                 assert o_proj_red_unabsorbed % (
-                    (256 // oproj_tile_n) * 16) == 0, o_proj_red_unabsorbed
+                    (256 // oproj_tile_n) * oproj_per_lane) == 0, \
+                    o_proj_red_unabsorbed
                 assert v_head % WUV_GEMV_ROWS == 0
                 assert kv_lora % ((256 // WUV_GEMV_ROWS) * 16) == 0
         if UNABSORB_V and not use_mxfp8_oproj:
@@ -1992,9 +2051,20 @@ if __name__ == "__main__":
             if use_mxfp8_oproj:
                 # One workgroup per GEMV tile, so the packing's workgroup axis
                 # *is* the tile axis: 2048 / 16 = 128 workgroups, 16 per XCD,
-                # exactly the tile count the bf16 GEMV had.
+                # exactly the tile count the bf16 GEMV had. At MXFP4 the
+                # workgroup count is identical and only the row width halves,
+                # so the tile geometry -- and every count derived from
+                # dim(0) -- is untouched.
+                # fuse_full_layer, not FUSE_FULL_LAYER: the flag is global but
+                # the fused task is per layer, and GLM-5's first three layers
+                # are dense. Those keep the standalone MXFP8 GEMV, which
+                # templates on the fp8 body and would mis-address a
+                # nibble-packed row -- it asserts on the row width first, which
+                # is how this was caught. Three of 78 layers, so leaving them
+                # MXFP8 costs nothing measurable.
                 o_w = pack_dense_mxfp8(o_w, oproj_tile_n,
-                                     fake_fp4=FAKE_MXFP4_ATTN)
+                                       fake_fp4=FAKE_MXFP4_ATTN,
+                                       fp4=OPROJ_MXFP4 and fuse_full_layer)
             w_o = _attach_input_keep(o_w, f"layer_{i}_o_absorbed")
 
             attn._w_uk = None

@@ -686,6 +686,13 @@ __device__ __forceinline__ bool
 #define MPK_ML_PTR_PREFETCH 0
 #endif
 
+// MPK_OPROJ_MXFP4: o_proj's weight is E2M1 nibbles rather than E4M3 bytes.
+// Set by GLM_OPROJ_MXFP4, which also switches the host packer -- the two must
+// agree. Off by default so MXFP8 stays the reference.
+#ifndef MPK_OPROJ_MXFP4
+#define MPK_OPROJ_MXFP4 0
+#endif
+
 #ifndef MPK_BAR_SKEW
 #define MPK_BAR_SKEW 0
 #endif
