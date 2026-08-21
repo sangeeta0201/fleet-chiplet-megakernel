@@ -408,6 +408,15 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // and no qkv_a lever -- sharding q_a_proj included -- can pay.
 #ifndef MPK_ABL_QKV
   for (int t = xcd_rank; t < qkv_tiles_per_xcd; t += tiles_per_xcd) {
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+    // SP4[0] is 20.06 us/layer and the phase is one grid-stride round, so
+    // either a tile really costs 20 us or most of SP4[0] is not tile work.
+    // Bank 0 slot 1/2/3 cannot answer it -- its guard is tile_idx == 0 in a
+    // kernel four other callers also reach, so its cnt is 31x qkv_a's share.
+    // Time the tile here instead, against a count of this loop's own trips:
+    // [0][0] is the ns, [2][1] the tiles, so [0][0]/[2][1] is per-tile.
+    unsigned long long _sp_qkv0 = __builtin_amdgcn_s_memrealtime();
+#endif
     unsigned short *xcd_out =
         static_cast<unsigned short *>(qkv_a_out_ptr) +
         static_cast<size_t>(xcd_id) * qkv_n_wgs_per_xcd * QKV_OUTPUT_PER_WG;
@@ -430,6 +439,13 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         t,
         moe_ws_f32_ptr,
         x_out_ptr);
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+    if (tid == 0 && g_subphase_active) {
+      atomicAdd(&g_subphase_ns[0][0],
+                (__builtin_amdgcn_s_memrealtime() - _sp_qkv0) * 10);
+      atomicAdd(&g_subphase_ns[2][1], 1ULL);
+    }
+#endif
   }
 #endif
 
