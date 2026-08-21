@@ -114,6 +114,12 @@ MPK_FORWARD_VARS=(
   # 155 of 160 KB/CU is what actually pins 1 block/CU. Compile-time, so a
   # mismatch between ranks is a different binary and the barriers deadlock.
   MPK_WORKER_LDS_KB
+  # Scratch backing store. Raising occupancy to 2 waves/SIMD doubles what ROCr
+  # must reserve for spills (1192 B/thread x 256 CU x 4 SIMD x 2 waves x 64
+  # lanes = 149 MB), which can cross the runtime's default single-dispatch
+  # scratch limit. Runtime, not compile-time, but still per-rank.
+  HSA_SCRATCH_SINGLE_LIMIT HSA_NO_SCRATCH_THREAD_LIMITER
+  HSA_NO_SCRATCH_RECLAIM HSA_ENABLE_SCRATCH_ASYNC_RECLAIM HSA_ENABLE_SCRATCH_ALT
   # Correct-output capacity probe, compile-time all the same.
   MPK_MOE_SHADOW_KB
   # Correct-output pricing probe for item 2's dependency half.

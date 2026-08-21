@@ -4283,11 +4283,33 @@ __global__ MPK_WORKER_ATTR __launch_bounds__(
 //  * The LDS request. wpe=1 with the LDS cut below runs clean and correct, and
 //    wpe=3 faults with LDS at its default 155 KB, so the two are independent.
 //
-// Leading unproven suspect: the MFMA inline asm in the GLM phase kernels names
-// PHYSICAL registers (ds_read_b128 v[26:29], v_mfma_scale_f32_16x16x128_f8f6f4
-// a[0:3], v[26:29], v[32:39]). At 284 VGPRs the allocator had slack around
-// them; at 252 it does not, and a missing clobber there corrupts a pointer.
-// Audit the clobber lists before trusting any wpe > 1 number.
+//  * The scratch backing store. Raising occupancy doubles what ROCr reserves
+//    (1192 B/thread x 256 CU x 4 SIMD x 2 waves x 64 lanes = 149 MB), but
+//    HSA_SCRATCH_SINGLE_LIMIT=2G, HSA_NO_SCRATCH_THREAD_LIMITER=1,
+//    HSA_NO_SCRATCH_RECLAIM=1 and HSA_ENABLE_SCRATCH_ASYNC_RECLAIM=0 all leave
+//    it at exactly 7 aperture violations.
+//  * A general fragility to the attribute. wpe=2 RUNS CLEAN -- 0 aperture
+//    violations, correct output, decode min 10.911 ms (slower, and expected to
+//    be: 348 unified VGPRs is worse than the 284 default and buys no
+//    occupancy). So only the wpe=3 allocation is broken, not any perturbation.
+//  * Inline asm naming a physical VGPR above wpe=3's arch cap. At wpe=3 every
+//    phase function is capped at v0-v84 where wpe=2 allows v0-v128, so an asm
+//    naming a register in 85..128 would break exactly wpe=3 and nothing else.
+//    Grepped: there is none, the only v[128:135]/v[144:151] hits are comments.
+//    The one asm block audited in full (the W13 MFMA pipeline) declares every
+//    physical register it touches -- v7-v39 and a0-a3 -- in its clobber list.
+//
+// So: the register lock is still SHUT and its failure is not yet explained.
+// Note the shape of it -- wpe=1 declares 596 B of scratch but has ZERO spills,
+// so the persistent kernel never touches scratch at all; wpe=3's 67 spills are
+// the first scratch traffic it has ever done. wpe=2 spills too and is fine,
+// which weakens but does not kill that.
+//
+// The lower-risk route to <= 256 is NOT this knob. By the sum rule the default
+// is 248 arch + 36 acc = 284, and both maxima are set by mla_decode_absorbed.
+// Cutting its AGPR term alone from 36 to 8 gives 248 + 8 = 256 -> granule 256
+// -> 2 waves/SIMD with NO spilling anywhere, because arch never moves. That is
+// a genuine live-set reduction on a 16-worker phase, not a compiler flag.
 // ---------------------------------------------------------------------------
 #ifndef MPK_WORKER_WAVES_PER_EU
 #define MPK_WORKER_WAVES_PER_EU 1
