@@ -261,6 +261,26 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // pair, and the rendezvous drops from 8 XCDs to 2. Nothing else moves --
   // o_acc and lse are indexed by the decode kernel from its own decomposed
   // (q_group, chunk), so permuting which XCD runs which item is invisible.
+  //
+  // CLOSED 2026-08-21. This is the whole of the "port gpt-oss's CROC chunk
+  // barrier to MLA" item, and it is measured out. PAIR_MERGE cuts the
+  // rendezvous from 8 XCDs to 2 and measured **11.074 vs an 11.005 baseline
+  // (+0.07, n=1, inside a 0.19 ms spread)** at NUM_KV_CHUNKS=16, having
+  // measured +0.6% at 4 chunks back in 69770d6. The remaining variant in the
+  // note -- give ONE XCD a whole q_group so the barrier is per-XCD and the
+  // last arriver runs the merge inline -- goes 2 -> 1. It cannot pay when
+  // 8 -> 2 paid nothing, and it costs the merge a doubling (16 tiles/XCD on 8
+  // becomes 32 on 4). Do not build it.
+  //
+  // The 13.23 us/worker/layer of counted spin below is real and is still not
+  // a lever, for the reason that has now closed five separate barrier
+  // experiments on this branch: **counted spin at a rendezvous is skew
+  // absorption, and narrowing or deleting the rendezvous relocates the skew
+  // rather than removing it.** Same verdict as the arrival tree (-44% in the
+  // null probe, -0.001 ms real), as narrowing W13's barrier (0.51 ms of
+  // counted time deleted, 0.10 ms of wall), and as deleting rendezvous 767
+  // outright (8.28 us/layer of UNIFORM spin removed, wall moved 0.003 ms).
+  // Price the arrival spread before building anything that touches a barrier.
   constexpr int NUM_Q_GROUPS = NUM_Q_HEADS / 16;
   constexpr int XCDS_PER_GROUP =
       (NUM_Q_GROUPS > 0 && (8 % NUM_Q_GROUPS) == 0) ? 8 / NUM_Q_GROUPS : 1;
