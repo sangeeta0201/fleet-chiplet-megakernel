@@ -557,7 +557,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     bool const entry_tree = MPK_BAR_TREE && (arrivals == tiles_per_xcd * 8);
     if (tid == 0) {
       if (hier_barrier_arrive(entry_bar, HIER_STRIDE, arrivals, tiles_per_xcd,
-                              xcd_id, entry_tree)) {
+                              xcd_id, entry_tree, /*skew_slot=*/0)) {
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         for (int x = 0; x < 8; x++) {
           st_wt_u32((void *)&entry_bar[x * HIER_STRIDE],
@@ -1307,7 +1307,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     if (tid == 0) {
       bool const _owes = hier_barrier_arrive(attn_release, HIER_STRIDE,
                                              arrivals, tiles_per_xcd, xcd_id,
-                                             rel_tree);
+                                             rel_tree, /*skew_slot=*/1);
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
       _b_t1 = __builtin_amdgcn_s_memrealtime();
 #endif

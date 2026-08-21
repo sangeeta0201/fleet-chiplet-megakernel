@@ -563,6 +563,65 @@ __device__ __forceinline__ bool
   return (gprev % 8) == 7;
 }
 
+// MPK_BAR_SKEW: accumulate, per named rendezvous, the nanoseconds between the
+// FIRST worker's arrival and the LAST worker's arrival. That interval is the
+// part of a barrier's cost that a null-barrier probe cannot see. Correctness-
+// preserving and O(1) per epoch. Off by default.
+//
+// Two accumulators per slot, and the second is the useful one:
+//   ns  -- first-arrival to last-arrival at THIS barrier ("spread"). When the
+//          phase has fewer tiles per XCD than workers, the first arriver has
+//          no tile, so the spread IS the tile's duration.
+//   gap -- previous barrier's last arrival to this one's. The barriers of a
+//          layer complete in order, so the gaps are per-phase makespans and
+//          they SUM TO THE LAYER. Divide either by cnt to get ns per layer
+//          per iteration directly -- no iteration count needed.
+//
+// ── MEASURED. THE FIRST PER-PHASE WALL DECOMPOSITION. ────────────────────
+// n=1 (skew3/skew4 agree within 5%), correct generated text, instrument
+// costs ~0.35 ms of the 11.3 ms wall so read the SHARE, not the absolute:
+//
+//   slot  phase                     gap us/layer   spread us/layer   share
+//   0     MoE W2 + layer entry          35.18          12.12         23%
+//   7     MoE W13                       34.56          16.92         22%
+//   2     qkv_a                         32.40          14.83         21%
+//   1     decode + merge                18.85          24.60         12%
+//   3     q_b (+ W_UK)                  15.27           6.48         10%
+//   6     o_proj + router                9.63           2.50          6%
+//   5     W_UV                           7.92           5.07          5%
+//                                      ------
+//                                      153.9 us/layer
+//
+// The headline: in the three biggest phases MORE THAN HALF the phase is not
+// tile work. qkv_a's tiles take 14.83 us and the phase costs 32.40. W13's
+// take 16.92 and the phase costs 34.56. W_UV, the phase with the most idle
+// workers, has gap - spread = 2.85 us, which agrees with the 2.71 us null
+// rendezvous -- so the barrier mechanism is NOT the missing 17 us in the big
+// phases. Whatever it is, it is worth more than every remaining named lever
+// on the board combined.
+//
+// slot 1's spread exceeds its gap because the decode and merge populations
+// differ from the previous barrier's, so its "first arriver" waited across a
+// phase it did not participate in. Only compare spread to gap when the two
+// barriers have the same population.
+#ifndef MPK_BAR_SKEW
+#define MPK_BAR_SKEW 0
+#endif
+#if MPK_BAR_SKEW
+#define MPK_BAR_SKEW_SLOTS 16
+__device__ unsigned long long g_barskew_first[MPK_BAR_SKEW_SLOTS];
+__device__ unsigned long long g_barskew_ns[MPK_BAR_SKEW_SLOTS];
+__device__ unsigned long long g_barskew_cnt[MPK_BAR_SKEW_SLOTS];
+__device__ unsigned long long g_barskew_drop[MPK_BAR_SKEW_SLOTS];
+// Gap from the PREVIOUS rendezvous's last arrival to this one's. The layer's
+// barriers complete in order, so these gaps are the per-phase makespans and
+// they sum to the layer. The first->last spread above cannot do this job: a
+// worker with no tile in the phase waits at the *next* barrier for the whole
+// layer, so its spread reads as one full layer and the slots do not sum.
+__device__ unsigned long long g_barskew_gap[MPK_BAR_SKEW_SLOTS];
+__device__ unsigned long long g_barskew_prevlast;
+#endif
+
 // MPK_BAR_TREE: use the two-level arrival above for every GPU-wide
 // Mechanism-C rendezvous. Off by default so the flat mechanism stays the
 // reference; the counter buffer is sized for the tree either way, so this is
@@ -592,13 +651,81 @@ __device__ __forceinline__ bool hier_barrier_arrive(int *bar,
                                                     int arrivals,
                                                     int per_xcd,
                                                     int xcd_id,
-                                                    bool use_tree) {
+                                                    bool use_tree,
+                                                    int skew_slot = -1) {
   if (use_tree) {
-    return hier_barrier_tree_arrive(bar, MPK_BAR_TREE_OFF, hier_stride,
-                                    per_xcd, xcd_id);
+    bool const tlast = hier_barrier_tree_arrive(bar, MPK_BAR_TREE_OFF,
+                                                hier_stride, per_xcd, xcd_id);
+#if MPK_BAR_SKEW
+    // The tree counts per XCD, so a first->last spread here would only be the
+    // cross-XCD part. The gap is still exact -- `tlast` is still the global
+    // last arriver -- so record that and leave the spread slot empty.
+    if (tlast && skew_slot >= 0 && skew_slot < MPK_BAR_SKEW_SLOTS) {
+      unsigned long long const t1m =
+          (unsigned long long)__builtin_amdgcn_s_memrealtime() &
+          0xFFFFFFFFFFull;
+      unsigned long long const pl = atomicExch(&g_barskew_prevlast, t1m);
+      if (pl != 0ull && t1m > pl) {
+        atomicAdd(&g_barskew_gap[skew_slot], (t1m - pl) * 10ull);
+        atomicAdd(&g_barskew_cnt[skew_slot], 1ull);
+      }
+    }
+#else
+    (void)skew_slot;
+#endif
+    return tlast;
   }
   int const prev = atom_add_release_gpu_s32(&bar[8 * hier_stride], 1);
-  return (prev % arrivals) == arrivals - 1;
+  bool const last = (prev % arrivals) == arrivals - 1;
+#if MPK_BAR_SKEW
+  // ARRIVAL SPREAD. The whole point: a *null* rendezvous costs 2.71 us
+  // (glm-round-fixed-cost-is-the-rendezvous) but a real phase's fixed cost
+  // reads ~8.5 us (glm-qb-wuk-phase-is-skew-not-straggler). The difference is
+  // arrival spread, and nothing has ever measured it directly. Two clock
+  // reads per barrier per EPOCH -- not per worker -- so unlike
+  // MPK_SUBPHASE_TIMING the cost does not scale with tile count.
+  if (skew_slot >= 0 && skew_slot < MPK_BAR_SKEW_SLOTS) {
+    int const ph = prev % arrivals;
+    unsigned long long const epoch = (unsigned long long)(prev / arrivals);
+    // The stamp carries its own epoch in the top 24 bits. Without the tag the
+    // last arriver can read the PREVIOUS epoch's t0 -- the first arriver's
+    // atomic is ordered, but its plain store is not, so it can land late --
+    // and the spread then reads as one whole layer plus the real skew. That
+    // is exactly what the first version of this instrument reported: 153 us
+    // per epoch against a 136 us layer. A tag turns a wrong sample into a
+    // dropped one. `t` is 100 MHz ticks, so 40 bits is ~3 hours.
+    if (ph == 0) {
+      unsigned long long const t0 =
+          (unsigned long long)__builtin_amdgcn_s_memrealtime();
+      unsigned long long const packed =
+          (t0 & 0xFFFFFFFFFFull) | ((epoch & 0xFFFFFFull) << 40);
+      __hip_atomic_store(&g_barskew_first[skew_slot], packed, __ATOMIC_RELAXED,
+                         __HIP_MEMORY_SCOPE_AGENT);
+    } else if (last) {
+      unsigned long long const t1 =
+          (unsigned long long)__builtin_amdgcn_s_memrealtime();
+      unsigned long long const packed = __hip_atomic_load(
+          &g_barskew_first[skew_slot], __ATOMIC_RELAXED,
+          __HIP_MEMORY_SCOPE_AGENT);
+      unsigned long long const t0 = packed & 0xFFFFFFFFFFull;
+      unsigned long long const t1m = t1 & 0xFFFFFFFFFFull;
+      if ((packed >> 40) == (epoch & 0xFFFFFFull) && t0 != 0ull && t1m > t0) {
+        atomicAdd(&g_barskew_ns[skew_slot], (t1m - t0) * 10ull);
+        atomicAdd(&g_barskew_cnt[skew_slot], 1ull);
+      } else {
+        atomicAdd(&g_barskew_drop[skew_slot], 1ull);
+      }
+      unsigned long long const pl =
+          atomicExch(&g_barskew_prevlast, t1m);
+      if (pl != 0ull && t1m > pl) {
+        atomicAdd(&g_barskew_gap[skew_slot], (t1m - pl) * 10ull);
+      }
+    }
+  }
+#else
+  (void)skew_slot;
+#endif
+  return last;
 }
 
 // Per-epoch increment of bar[8 * hier_stride], i.e. the multiplier the

@@ -1719,6 +1719,18 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                      : 0.0);
         }
 #endif
+#if MPK_BAR_SKEW
+        if (threadIdx.x == 0 && worker_id == 0) {
+          for (int s = 0; s < MPK_BAR_SKEW_SLOTS; s++) {
+            if (g_barskew_cnt[s] == 0 && g_barskew_drop[s] == 0) {
+              continue;
+            }
+            printf("BARSKEW %d cnt %llu ns %llu drop %llu gap %llu\n", s,
+                   g_barskew_cnt[s], g_barskew_ns[s], g_barskew_drop[s],
+                   g_barskew_gap[s]);
+          }
+        }
+#endif
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
         // Same dump as the TASK_TERMINATE path below. Under precomputed
         // dispatch a worker never fetches a TERMINATE task -- it breaks out of

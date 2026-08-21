@@ -528,7 +528,8 @@ __device__ __attribute__((always_inline)) void
     bool const wuv_tree = MPK_BAR_TREE && (wuv_arrivals == tiles_per_xcd * 8);
     if (tid == 0) {
       if (hier_barrier_arrive(wuv_barrier, HIER_STRIDE, wuv_arrivals,
-                              tiles_per_xcd, xcd_id, wuv_tree)) {
+                              tiles_per_xcd, xcd_id, wuv_tree,
+                              /*skew_slot=*/5)) {
         for (int x = 0; x < 8; x++) {
           st_wt_u32((void *)&wuv_barrier[x * HIER_STRIDE],
                     (unsigned)wuv_expected);
@@ -860,7 +861,8 @@ __device__ __attribute__((always_inline)) void
                               total_barrier_arrivals,
                               total_barrier_arrivals / 8, xcd_id,
                               MPK_BAR_TREE != 0 &&
-                                  (total_barrier_arrivals % 8) == 0)
+                                  (total_barrier_arrivals % 8) == 0,
+                              /*skew_slot=*/6)
               ? 1
               : 0;
     }
@@ -1242,7 +1244,7 @@ __device__ __attribute__((always_inline)) void
 #else
     bool const _w13_owes =
         hier_barrier_arrive(w13_barrier, HIER_STRIDE, arrivals, tiles_per_xcd,
-                            xcd_id, MPK_BAR_TREE != 0);
+                            xcd_id, MPK_BAR_TREE != 0, /*skew_slot=*/7);
 #endif
     // MPK_W13_EARLY_REL: fire the release at FRAC/16 of the arrivals instead of
     // all of them. WRONG OUTPUT by construction -- W2 reads swiglu columns

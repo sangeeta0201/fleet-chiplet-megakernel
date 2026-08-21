@@ -614,7 +614,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     // Modular test rather than a reset: the counter is monotonic for the
     // whole run, so no worker from the next layer can observe a zeroed one.
     if (hier_barrier_arrive(qkv_barrier, HIER_STRIDE, arrivals, tiles_per_xcd,
-                            xcd_id, bar_tree)) {
+                            xcd_id, bar_tree, /*skew_slot=*/2)) {
       for (int x = 0; x < 8; x++) {
         st_wt_u32((void *)&qkv_barrier[x * HIER_STRIDE], (unsigned)qkv_expected);
       }
@@ -1014,7 +1014,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
 #endif
   if (tid == 0) {
     if (hier_barrier_arrive(qb_barrier, HIER_STRIDE, arrivals, tiles_per_xcd,
-                            xcd_id, bar_tree)) {
+                            xcd_id, bar_tree, /*skew_slot=*/3)) {
       // ── the head shard's rendezvous rides this barrier ──────────────────
       // Under QB_TP the query row is not complete when the local arrivals are
       // in; it is complete when every peer's eight heads have landed too. This
@@ -1211,7 +1211,8 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     bool _dec_owes;
     if (dec_tree) {
       _dec_owes = hier_barrier_arrive(decode_barrier, HIER_STRIDE, dec_arrivals,
-                                      tiles_per_xcd, xcd_id, true);
+                                      tiles_per_xcd, xcd_id, true,
+                                      /*skew_slot=*/4);
     } else {
       int prev = atom_add_release_gpu_s32(_dec_cnt, 1);
       _dec_owes = (prev % dec_arrivals) == dec_arrivals - 1;
