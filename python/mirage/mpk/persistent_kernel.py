@@ -459,6 +459,24 @@ def get_compile_command(
         # gang_mla_attn_fused_mi300.cuh.
         if int(os.environ.get("GLM_MLA_PAIR_MERGE", "0")) == 1:
             flags = flags + ["-DMPK_GLM_MLA_PAIR_MERGE"]
+        # Unroll factor for qkv_a's residual-resolve + EP-fold prologue loop
+        # (_rnlm8_resadd_norm_rcp in gang_rmsnorm_linear_mxfp8_bias_mi300.cuh).
+        # That loop is 46.2% of the qkv_a tile -- 6119 of 13246 ns, measured
+        # with MPK_SUBPHASE_TIMING against the call site's own tile count
+        # (8b01e7e) -- and at REDUCTION_SIZE 6144 it runs ITERS=6 trips that
+        # `unroll 1` serializes, so it eats six memory latencies with only ~9
+        # loads in flight while sitting at 30% of the per-CU L2 share.
+        # N divides the number of serialized latencies by N at ~18 VGPRs per
+        # extra trip in flight; registers are free at 320 of 512.
+        #
+        # Default is now 6 (== full at ITERS=6): -0.072 ms on min-of-115 over
+        # n=3 paired reps, -0.070 on the device clock, correctness 4/4 with all
+        # 8 ranks identical. That is under the 0.26 ms wall noise floor and is
+        # only believable because the two arms rank-separate 3v3; see the long
+        # note at the loop itself. Set GLM_RESADD_UNROLL=1 to get the old code
+        # path back for an A/B.
+        _ru = int(os.environ.get("GLM_RESADD_UNROLL", "6"))
+        flags = flags + ["-DMPK_RESADD_UNROLL=%d" % _ru]
         # Hoist the un-absorbed W_UV GEMV out of the MoE half and run it in the
         # attention half, straight after the split-KV merge, behind a PAIR-LOCAL
         # barrier instead of a GPU-wide one. The layer's existing Phase 8

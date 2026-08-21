@@ -693,7 +693,48 @@ _rnlm8_resadd_norm_rcp(float const *__restrict__ d_ws,
   for (int v = ABL_ITERS; v < ITERS; v++) {
     *reinterpret_cast<uint2 *>(s_x + (v * NTHREADS + tid) * VEC) = uint2{0, 0};
   }
-#pragma unroll 1
+  // MEASURED: this loop is 46.2% of the qkv_a tile (6119 of 13246 ns, SP bank
+  // 0 [1][4] over [1][5]) and it moves 96 KB of L2-resident bytes, i.e. 15.7
+  // GB/s per CU against a ~52 GB/s per-CU L2 share. It is at 30% of a roof,
+  // not at one, and the reason is here: at REDUCTION_SIZE 6144 with 256
+  // threads x float4, ITERS is 6, and `unroll 1` makes those six trips strictly
+  // sequential. Each trip issues 9 loads (residual + norm weight + 7 peer
+  // slots) and then consumes them immediately, so the loop pays SIX serialized
+  // memory latencies with only ~9 loads in flight.
+  //
+  // Unrolling puts ITERS/N latencies on the critical path instead of ITERS.
+  // The registers are available: worker_kernel is 284 VGPR + 36 AGPR of 512
+  // and occupancy is pinned at 1 wave/SIMD by block count, so 320..480 are
+  // free (see the depth-8 note in memory). One extra trip in flight costs
+  // ~9 x 2 = 18 VGPRs.
+  //
+  // Unlike the MFMA loop further down, this `unroll 1` never carried a reason
+  // -- the ROCm MAI miscompile that pins that one needs a v_mfma, and there is
+  // none here.
+  //
+  // MEASURED, n=3 paired, GLM_RESADD_UNROLL 1 vs 6 (6 == full at ITERS=6):
+  //   min-of-115-iters   10.466 10.422 10.407  ->  10.375 10.398 10.306
+  //   mean of those          10.432          ->      10.360   (-0.072 ms)
+  //   device avg_ms          10.689          ->      10.619   (-0.070 ms)
+  // Five of six reps carried a box-level 24-27 ms outlier, so the per-rep mean
+  // is unusable and this is read on `min`. -0.072 is BELOW the 0.26 ms wall
+  // noise floor; what makes it believable at all is that all three unroll=6
+  // mins sit below all three unroll=1 mins (3v3 rank separation, permutation
+  // p=0.05) and the device clock agrees in sign. Treat it as ~-0.07 +/- 0.05,
+  // not as a resolved number, and do not stack conclusions on it.
+  //
+  // Predicted -0.23..-0.31 from the 6119 ns line above; measured a quarter of
+  // that, which is the usual absorption -- shortening one tile's prologue is
+  // eaten by the phase's next barrier (see the two qkv_a hoist experiments,
+  // c72b559 / 7a5c559, which were absorbed completely). Default is 6 because
+  // the change is free, correctness-gated 4/4 with all 8 ranks identical, and
+  // the sign is consistent across two independent clocks.
+#ifndef MPK_RESADD_UNROLL
+#define MPK_RESADD_UNROLL 6
+#endif
+#define MPK_RESADD_STR_(x) #x
+#define MPK_RESADD_STR(x) MPK_RESADD_STR_(x)
+  _Pragma(MPK_RESADD_STR(unroll MPK_RESADD_UNROLL))
   for (int v = 0; v < ABL_ITERS; v++) {
     int const off = (v * NTHREADS + tid) * VEC;
     uint2 const r = *reinterpret_cast<uint2 const *>(d_res + off);
