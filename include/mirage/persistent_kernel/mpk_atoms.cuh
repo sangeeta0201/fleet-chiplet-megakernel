@@ -706,11 +706,20 @@ __device__ unsigned long long g_barskew_prevlast;
 // last arrival. Written by slot 0's last arriver before it fans the release
 // out, so every worker it releases reads a value from its own layer.
 __device__ unsigned long long g_stage_ref;
-#define MPK_STAGE_SLOTS 8
+// 0..4 are the attention-half / EP-collective stamps, 5..8 the MoE half,
+// 9..11 the layer boundary, and
+// the LAST slot is the MPK_BAR_SKEW=2 scratch that prices the probe itself.
+// Every stamp is measured from the LAYER-ENTRY barrier's last arrival on this
+// rank, so a stamp's value is its absolute offset into the layer and stamps
+// can be differenced against the cumulative BAR_SKEW gap sums. They can NOT
+// be compared across ranks -- the eight entry barriers are not synchronized,
+// which is the mistake recorded on MPK_EP_POLL_BATCH.
+#define MPK_STAGE_SLOTS 13
 __device__ unsigned long long g_stage_sum[MPK_STAGE_SLOTS];
 __device__ unsigned long long g_stage_cnt[MPK_STAGE_SLOTS];
 __device__ unsigned long long g_stage_min[MPK_STAGE_SLOTS] = {
-    ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull};
+    ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull,
+    ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull};
 __device__ unsigned long long g_stage_max[MPK_STAGE_SLOTS];
 
 // One worker's arrival at a named point inside a phase, in ns since the

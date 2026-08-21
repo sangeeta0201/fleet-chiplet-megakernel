@@ -2613,6 +2613,14 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               }
               __syncthreads();
 
+              // Stage stamp 11: the multi-layer loop has finished its
+              // per-layer bookkeeping (return path from the previous layer,
+              // threadfence, input/output pointer-table refresh) and is about
+              // to dispatch. See stamp 10 in gang_mla_full_layer_fused.
+              if (threadIdx.x == 0) {
+                mpk_stage_stamp(11);
+              }
+
               // Execute this layer
               int my_tiles = 0;
               // Publish the layer index into the worker-state phase slot.

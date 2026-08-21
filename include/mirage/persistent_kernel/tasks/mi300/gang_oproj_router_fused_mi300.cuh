@@ -1134,6 +1134,15 @@ __device__ __attribute__((always_inline)) void
 #endif
 
   MPK_WS_PHASE(76, routing_expected, xcd_id);
+  // Stage stamp 5: routing is ready, W13 has not started. Measured from the
+  // layer-entry barrier, so S5 minus the cumulative gap through barrier 6
+  // (o_proj + router) is Phase 3 + Phase 4 -- the router's own tail plus the
+  // routing poll -- and S6 - S5 is the W13 tile makespan. Together they split
+  // BAR_SKEW slot 7, whose 34.56 us/layer is 22%% of the layer with 17.6 us
+  // of it unattributed.
+  if (tid == 0) {
+    mpk_stage_stamp(5);
+  }
 
   // ── live MoE tile bounds ─────────────────────────────────────────────────
   // moe_w{13,2}_tiles_per_xcd are host constants and have to cover the
@@ -1226,6 +1235,11 @@ __device__ __attribute__((always_inline)) void
   }
 #endif
 
+  // Stage stamp 6: this worker's W13 tiles are done and it is about to
+  // arrive at the W13 -> W2 barrier.
+  if (tid == 0) {
+    mpk_stage_stamp(6);
+  }
   MPK_WS_PHASE(77, routing_expected, xcd_id);
   // ════════════════════════════════════════════════════════════════════════
   // Phase 6: W13 -> W2 barrier
@@ -1311,6 +1325,14 @@ __device__ __attribute__((always_inline)) void
 #endif
 
   MPK_WS_PHASE(78, routing_expected, xcd_id);
+  // Stage stamp 7: the W13 -> W2 release is observed, W2 has not started.
+  // S7 - (gap sum through barrier 7) is what a W2 worker spends in that
+  // barrier; S8 - S7 is the W2 tile makespan. These two split BAR_SKEW
+  // slot 0, the largest phase in the layer at 35.18 us with a 12.12 us
+  // spread -- 23 us unattributed, the biggest single unknown left.
+  if (tid == 0) {
+    mpk_stage_stamp(7);
+  }
   // ════════════════════════════════════════════════════════════════════════
   // Phase 7: MoE W2 (down) with the routing-weight mul-sum-add folded in
   // ════════════════════════════════════════════════════════════════════════
@@ -1341,6 +1363,12 @@ __device__ __attribute__((always_inline)) void
         moe_workspace_f32_ptr,
         t,
         topk_weight_ptr);
+  }
+  // Stage stamp 8: W2 tiles done. This is the last thing the MoE half does,
+  // so S8 is where the layer's work ends; everything between S8 and the next
+  // layer-entry barrier is arrival and rendezvous.
+  if (tid == 0) {
+    mpk_stage_stamp(8);
   }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   {

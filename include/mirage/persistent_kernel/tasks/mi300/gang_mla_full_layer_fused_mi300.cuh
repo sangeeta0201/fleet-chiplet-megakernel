@@ -494,6 +494,18 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
   int const xcd_id = tile_idx / tiles_per_xcd;
   int const xcd_rank = tile_idx % tiles_per_xcd;
 
+  // Stage stamp 10: first instruction of the fused layer body. Bisects the
+  // 20.18 us that S9 - S8 found between a worker's last W2 tile and its
+  // arrival at the next layer-entry barrier -- an interval with no barrier in
+  // it, so it is per-worker latency, not skew. S11 (in persistent_kernel.cuh)
+  // is the multi-layer loop's own boundary, so:
+  //   S11 - S8   loop bookkeeping: return path, threadfence, ptr-table copy
+  //   S10 - S11  gang task dispatch into this kernel
+  //   S9  - S10  this kernel's prologue, above the entry barrier
+  if (tid == 0) {
+    mpk_stage_stamp(10);
+  }
+
   // Drop anything vL1 is still holding from the previous layer's task. The
   // halves do not do this themselves -- they were entered through a dispatch,
   // which does it for them.
@@ -571,6 +583,17 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     // which for this barrier it does by construction (arrivals is
     // tiles_per_xcd * 8). See hier_barrier_arrive.
     bool const entry_tree = MPK_BAR_TREE && (arrivals == tiles_per_xcd * 8);
+    // Stage stamp 9: this worker is about to arrive at the layer-entry
+    // barrier. g_stage_ref is only republished by this barrier's LAST
+    // arriver, so a worker stamping here still reads the PREVIOUS layer's
+    // reference -- which is what makes S9 commensurate with S5..S8 and lets
+    // it split the 30.24 us between the mean worker's last W2 tile (S8) and
+    // this barrier closing. S9 - S8 is task teardown + scheduler dispatch +
+    // next-task setup; the entry gap's close minus S9 is arrival spread plus
+    // the rendezvous itself.
+    if (tid == 0) {
+      mpk_stage_stamp(9);
+    }
     if (tid == 0) {
       if (hier_barrier_arrive(entry_bar, HIER_STRIDE, arrivals, tiles_per_xcd,
                               xcd_id, entry_tree, /*skew_slot=*/0)) {
