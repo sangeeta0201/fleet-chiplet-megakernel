@@ -1729,6 +1729,14 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                    g_barskew_cnt[s], g_barskew_ns[s], g_barskew_drop[s],
                    g_barskew_gap[s]);
           }
+          for (int s = 0; s < MPK_STAGE_SLOTS; s++) {
+            if (g_stage_cnt[s] == 0) {
+              continue;
+            }
+            printf("BARSTAGE %d cnt %llu sum %llu min %llu max %llu\n", s,
+                   g_stage_cnt[s], g_stage_sum[s], g_stage_min[s],
+                   g_stage_max[s]);
+          }
         }
 #endif
 #ifdef MPK_ENABLE_SUBPHASE_TIMING

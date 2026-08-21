@@ -589,6 +589,12 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     __syncthreads();
     // Same reasoning as Phase 8: plain buffer_inv, not an agent-scope acquire.
     asm volatile("buffer_inv" ::: "memory");
+    // Stage stamp 0: the layer-entry release is OBSERVED here. Measured from
+    // the barrier's last arrival, so this interval is pure release
+    // propagation -- the fan-out store plus one poll period.
+    if (tid == 0) {
+      mpk_stage_stamp(0);
+    }
 
     // ── MPK_NULL_PHASES: price one rendezvous ────────────────────────────
     // Byte-for-byte the barrier above, including the buffer_inv, with no work
@@ -853,6 +859,13 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       // 0's arrival atomic, so a consumer that observes the count observes
       // the bytes.
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      // Stage stamp 3: this XCD's column slice folded, its local and seven
+      // peer copies stored and drained. S3 - S0 is the LOCAL half of the EP
+      // cost; S1 - S3 is the cross-rank half. Only the eight folding
+      // work-groups reach here.
+      if (tid == 0) {
+        mpk_stage_stamp(3);
+      }
 
       if (ep_direct) {
         // My slice is in the peer's memory, ordered ahead of the arrival by
@@ -1006,6 +1019,10 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
         _full_layer_ep_wait_peers<EP_WORLD_SIZE, EP_MY_PE>(
             ep_signal, ep_sig_expected, ep_any_direct, tid);
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        // Stage stamp 4: every peer's signal observed, by the one thread on
+        // the rank that waits. S4 - S3 is pure cross-rank wait; S1 - S4 is
+        // the eight-flag release fan-out.
+        mpk_stage_stamp(4);
 #endif
         for (int x = 0; x < 8; x++) {
           st_wt_u32((void *)&ep_release[x * HIER_STRIDE],
@@ -1113,6 +1130,13 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     }
     __syncthreads();
     asm volatile("buffer_inv" ::: "memory");
+    // Stage stamp 1: Phase 0-EP done -- this rank's MoE partial folded,
+    // published to all 8 peers, and every peer's partial observed. This sits
+    // INSIDE the measured qkv_a gap and is a cross-rank dependency, so it is
+    // a fourth candidate alongside propagation / dispatch / first tile.
+    if (tid == 0) {
+      mpk_stage_stamp(1);
+    }
   }
 
   // The tail variant's whole job is the block above: fold the last real
@@ -1179,6 +1203,12 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
   // Workers past merge_tiles_per_xcd return out of this call early, from its
   // Phase 7 guard. They land on the Phase 8 barrier below with nothing to do
   // -- which is exactly where the o_proj weight prefetch is issued from.
+  // Stage stamp 2: the last instruction before qkv_a tile code. S2 - S1 is
+  // per-worker wake/dispatch (the release-value snapshot and the call setup);
+  // gap[2] - S2 is the tile itself plus its barrier arrival.
+  if (tid == 0) {
+    mpk_stage_stamp(2);
+  }
   MPK_WS_PHASE(20, task_layer_idx, xcd_id);
   gang_mla_attn_fused_kernel_mi300<BATCH_SIZE,
                                    QKV_OUTPUT_PER_WG,

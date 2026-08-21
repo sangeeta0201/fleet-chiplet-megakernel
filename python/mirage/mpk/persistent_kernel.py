@@ -587,11 +587,12 @@ def get_compile_command(
             # semantics are unchanged, only who counts. Priced by the null
             # probe below at 3.77 -> 2.11 us per rendezvous.
             flags = flags + ["-DMPK_BAR_TREE=1"]
-        if int(os.environ.get("MPK_BAR_SKEW", "0")) == 1:
+        _bar_skew = int(os.environ.get("MPK_BAR_SKEW", "0"))
+        if _bar_skew >= 1:
             # Per-rendezvous first-arriver-to-last-arriver spread. O(1) per
             # barrier epoch, so unlike MPK_SUBPHASE_TIMING its cost does not
             # scale with tile count.
-            flags = flags + ["-DMPK_BAR_SKEW=1"]
+            flags = flags + ["-DMPK_BAR_SKEW=%d" % _bar_skew]
         if int(os.environ.get("MPK_QUANT_V16", "0")) == 1:
             # 16-byte loads in the shared RMSNorm+quant prologue. The scalar
             # form only vectorized to dwordx2 because the addrspace(1) cast

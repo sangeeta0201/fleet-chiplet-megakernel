@@ -604,11 +604,39 @@ __device__ __forceinline__ bool
 // differ from the previous barrier's, so its "first arriver" waited across a
 // phase it did not participate in. Only compare spread to gap when the two
 // barriers have the same population.
+//
+// ── MEASURED. THE QKV_A GAP IS THE EP COLLECTIVE, AND 79% OF IT IS SKEW. ──
+// The stage stamps below cut the 48.55 us qkv_a phase five ways, all measured
+// from the layer-entry barrier's last arrival (BAR_SKEW=1, wall 11.92):
+//
+//   S0            release propagation                 1.73 us   (min 1.25)
+//   S3 - S0       local EP fold + 7 peer stores       5.37 us   (min 4.62)
+//   S4 - S3       cross-rank peer wait               18.79 us   (min 10.71)
+//   S1 - S4       eight-flag release fan-out          1.33 us
+//   S2 - S1       per-worker wake / dispatch          0.88 us
+//   gap[2] - S2   qkv_a tile + barrier arrival       20.45 us
+//
+// So the three candidates that looked plausible from the outside -- release
+// propagation, wake/dispatch, cold first-tile latency -- are together under
+// 3 us and are dead. The phase's non-tile half is the EP collective: 24.2 us,
+// of which 18.8 is one thread waiting on seven peers.
+//
+// Probe cost is attributed, not assumed: MPK_BAR_SKEW=2 doubles every stamp
+// and costs +0.95 ms of wall (+9.85 us/layer summed over the gaps), against
+// +1.17 ms for the whole probe over the 10.78 baseline. The cost is linear in
+// stamp count and lands mostly on the two MoE barriers (+4.5 and +5.7 us);
+// slot 2 moved +0.13 us, so qkv_a's decomposition is not the probe's doing.
 #ifndef MPK_BAR_SKEW
 #define MPK_BAR_SKEW 0
 #endif
 #if MPK_BAR_SKEW
 #define MPK_BAR_SKEW_SLOTS 16
+// MPK_BAR_SKEW=2 runs the barrier stamp block TWICE, the second copy into
+// scratch. The per-phase gap difference between =2 and =1 is the probe's own
+// cost per barrier, which has to come off the gap before any part of it is
+// called unexplained -- the stamp sits on the last arriver's critical path,
+// immediately before it fans the release out.
+#define MPK_BAR_SKEW_REPS (MPK_BAR_SKEW)
 __device__ unsigned long long g_barskew_first[MPK_BAR_SKEW_SLOTS];
 __device__ unsigned long long g_barskew_ns[MPK_BAR_SKEW_SLOTS];
 __device__ unsigned long long g_barskew_cnt[MPK_BAR_SKEW_SLOTS];
@@ -620,6 +648,54 @@ __device__ unsigned long long g_barskew_drop[MPK_BAR_SKEW_SLOTS];
 // layer, so its spread reads as one full layer and the slots do not sum.
 __device__ unsigned long long g_barskew_gap[MPK_BAR_SKEW_SLOTS];
 __device__ unsigned long long g_barskew_prevlast;
+// Reference clock for the intra-phase stage stamps: the layer-entry barrier's
+// last arrival. Written by slot 0's last arriver before it fans the release
+// out, so every worker it releases reads a value from its own layer.
+__device__ unsigned long long g_stage_ref;
+#define MPK_STAGE_SLOTS 8
+__device__ unsigned long long g_stage_sum[MPK_STAGE_SLOTS];
+__device__ unsigned long long g_stage_cnt[MPK_STAGE_SLOTS];
+__device__ unsigned long long g_stage_min[MPK_STAGE_SLOTS] = {
+    ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull};
+__device__ unsigned long long g_stage_max[MPK_STAGE_SLOTS];
+
+// One worker's arrival at a named point inside a phase, in ns since the
+// layer-entry barrier completed. Call from tid == 0 only. The min across
+// workers is the earliest anyone got there, which is what the barrier's
+// "first arriver" sees; the mean is where the bulk is.
+__device__ __forceinline__ void mpk_stage_stamp(int idx) {
+  unsigned long long const t =
+      (unsigned long long)__builtin_amdgcn_s_memrealtime() & 0xFFFFFFFFFFull;
+  unsigned long long const ref = __hip_atomic_load(
+      &g_stage_ref, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  if (ref == 0ull || t <= ref) {
+    return;
+  }
+  unsigned long long const d = (t - ref) * 10ull;
+  // A sample longer than 10 ms means the reference was updated underneath us
+  // (this worker is a layer behind). Drop rather than skew the mean.
+  if (d > 10000000ull) {
+    return;
+  }
+  atomicAdd(&g_stage_sum[idx], d);
+  atomicAdd(&g_stage_cnt[idx], 1ull);
+  atomicMin(&g_stage_min[idx], d);
+  atomicMax(&g_stage_max[idx], d);
+  // Probe-cost attribution. At MPK_BAR_SKEW=2 every stamp does its atomics
+  // twice, the second set into a scratch slot. The stamp is 232-way
+  // contended, so its cost has to be measured, not argued: the shift in a
+  // LATER stage's mean between reps=1 and reps=2 is exactly the cost of one
+  // extra stamp on the path in front of it.
+#pragma unroll 1
+  for (int _r = 1; _r < MPK_BAR_SKEW_REPS; _r++) {
+    atomicAdd(&g_stage_sum[MPK_STAGE_SLOTS - 1], d);
+    atomicAdd(&g_stage_cnt[MPK_STAGE_SLOTS - 1], 1ull);
+    atomicMin(&g_stage_min[MPK_STAGE_SLOTS - 1], d);
+    atomicMax(&g_stage_max[MPK_STAGE_SLOTS - 1], d);
+  }
+}
+#else
+__device__ __forceinline__ void mpk_stage_stamp(int) {}
 #endif
 
 // MPK_BAR_TREE: use the two-level arrival above for every GPU-wide
@@ -719,6 +795,33 @@ __device__ __forceinline__ bool hier_barrier_arrive(int *bar,
           atomicExch(&g_barskew_prevlast, t1m);
       if (pl != 0ull && t1m > pl) {
         atomicAdd(&g_barskew_gap[skew_slot], (t1m - pl) * 10ull);
+      }
+      if (skew_slot == 0) {
+        __hip_atomic_store(&g_stage_ref, t1m, __ATOMIC_RELAXED,
+                           __HIP_MEMORY_SCOPE_AGENT);
+      }
+#pragma unroll 1
+      for (int _r = 1; _r < MPK_BAR_SKEW_REPS; _r++) {
+        // Identical work, discarded. Prices the block above.
+        unsigned long long const t2 =
+            (unsigned long long)__builtin_amdgcn_s_memrealtime() &
+            0xFFFFFFFFFFull;
+        unsigned long long const p2 = __hip_atomic_load(
+            &g_barskew_first[skew_slot], __ATOMIC_RELAXED,
+            __HIP_MEMORY_SCOPE_AGENT);
+        if ((p2 >> 40) == (epoch & 0xFFFFFFull) && t2 > (p2 & 0xFFFFFFFFFFull)) {
+          atomicAdd(&g_barskew_ns[MPK_BAR_SKEW_SLOTS - 1], 1ull);
+        } else {
+          atomicAdd(&g_barskew_drop[MPK_BAR_SKEW_SLOTS - 1], 1ull);
+        }
+        unsigned long long const q2 = atomicExch(&g_barskew_prevlast, t2);
+        if (q2 != 0ull && t2 > q2) {
+          atomicAdd(&g_barskew_gap[MPK_BAR_SKEW_SLOTS - 1], 1ull);
+        }
+        if (skew_slot == 0) {
+          __hip_atomic_store(&g_stage_ref, t2, __ATOMIC_RELAXED,
+                             __HIP_MEMORY_SCOPE_AGENT);
+        }
       }
     }
   }
