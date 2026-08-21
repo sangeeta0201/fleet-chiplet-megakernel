@@ -2160,7 +2160,7 @@ __device__ __noinline__ void
 
   uint32_t qkv_buf_range = static_cast<uint32_t>(n_wgs_per_xcd) * WG_BYTES;
   constexpr int QKV_LDS_OFF_A = ((FP8_TOK_DATA + MFMA_ITERS + 15) / 16) * 16;
-  static_assert(QKV_LDS_OFF_A + QKV_TILE_BYTES * NUM_WAVES <= 155 * 1024,
+  static_assert(QKV_LDS_OFF_A + QKV_TILE_BYTES * NUM_WAVES <= mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE,
                 "QKV LDS weights exceed MI350X LDS budget");
   uint8_t *qkv_lds_w = (uint8_t *)_rnlm_smem + QKV_LDS_OFF_A;
 

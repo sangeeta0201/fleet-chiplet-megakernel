@@ -30,8 +30,9 @@ def get_scheduler(sm_cnt, worker):
     return sm_cnt - worker
 
 # MAX_NUM_WORKERS must match C++ runtime_header.h (used in MPK device asserts).
-# Increased to 304 to support full CU utilization on AMD MI300X (304 CUs)
-MAX_NUM_WORKERS = 304
+# 304 was MI300X's CU count. 512 is gfx950's block-slot count once the image
+# fits 256 unified VGPRs (2 blocks/CU); see the note in runtime_header.h.
+MAX_NUM_WORKERS = 512
 
 
 # This method auto probe GPUs and return the worker and scheduler count for

@@ -44,8 +44,34 @@ constexpr int LAYER_IDX_SMEM_OFFSET_FROM_END = 4;
 // - MI300 (gfx942): 64KB LDS per workgroup, use conservative 60KB
 // - MI350 (gfx950): 160KB LDS per workgroup, use 155KB for LDS-resident weights
 #if (MPK_TARGET_CC == 95)
+// MPK_WORKER_LDS_KB: THE SECOND OCCUPANCY LOCK, and the one that actually
+// binds. gfx950 has 160 KB of LDS per CU, and worker_kernel asks for 155 KB
+// of it per block, so one block owns the CU's whole LDS and the hardware can
+// never place a second -- no matter what the register budget says. That is
+// why MPK_WORKER_WAVES_PER_EU=3 (284 -> 252 unified VGPR, 1 -> 2 waves/SIMD)
+// bought nothing on its own, and why every MPK_NUM_WORKERS above 248 hung at
+// launch: 264 workers + 8 schedulers = 272 blocks needs 2 blocks/CU, the LDS
+// request forbids it, and the persistent kernel deadlocks waiting on workers
+// that were never made resident.
+//
+// Measured with hipModuleOccupancyMaxActiveBlocksPerMultiprocessor against
+// the real shipped code object (worker_kernel, 252 VGPR, 7296 B static LDS,
+// 256 threads), sweeping the dynamic request:
+//     0..72 KB -> 2 blocks/CU
+//    80..148 KB -> 1 block/CU
+//       155 KB -> 0
+// The cutover is 2 * (7296 + dyn) <= 163840, i.e. dyn <= 74624 B. 78 here
+// gives 78*1024 - 6144 = 73728 = 72 KB and lands on the right side of it.
+//
+// This is a real budget cut, not a free one: the phases carve LDS-resident
+// weight tiles out of this slab, and the static_asserts that used to read a
+// literal 155 * 1024 now read this constant, so the compiler is what proves
+// a given value is legal. Do not raise it past 78 expecting 2 blocks/CU.
+#ifndef MPK_WORKER_LDS_KB
+#define MPK_WORKER_LDS_KB 155
+#endif
 constexpr int MAX_DYNAMIC_SHARED_MEMORY_SIZE =
-    155 * 1024 - WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE;
+    MPK_WORKER_LDS_KB * 1024 - WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE;
 #elif defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300) ||            \
     (MPK_TARGET_CC == 94)
 constexpr int MAX_DYNAMIC_SHARED_MEMORY_SIZE =
@@ -118,8 +144,16 @@ int const MAX_OUTPUTS_PER_TASK = 13;
 #define MPK_TW_PER_WORKER 8
 #define MPK_TW_SLOTS (MPK_TW_HDR + 256 * MPK_TW_PER_WORKER)
 // Increased to 304 to support full CU utilization on AMD MI300X (304 CUs)
-// and NVIDIA Blackwell (160+ SMs which uses 144 workers)
-int const MAX_NUM_WORKERS = 304;
+// and NVIDIA Blackwell (160+ SMs which uses 144 workers).
+//
+// Raised to 512 for gfx950 2-blocks-per-CU. Once the image fits 256 unified
+// VGPRs (MPK_WORKER_WAVES_PER_EU=3 in persistent_kernel.cuh) MI355X has
+// 2 x 256 = 512 co-resident block slots, not 256, so a worker count above the
+// CU count is placeable for the first time. 304 was a CU count, not a
+// structural limit: it bounds three device asserts and MPK_STAGE_WORKERS (a
+// debug stamp buffer), and no per-worker array in RuntimeConfig is sized by
+// it -- those are host-allocated from config.num_workers.
+int const MAX_NUM_WORKERS = 512;
 
 enum TaskType {
   TASK_TERMINATE = 0,

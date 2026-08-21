@@ -79,7 +79,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
   // FP8 token data sits at start of LDS
   constexpr int FP8_TOK_DATA = REDUCTION_SIZE;
   constexpr int QKV_LDS_OFF = ((FP8_TOK_DATA + MFMA_ITERS + 15) / 16) * 16;
-  static_assert(QKV_LDS_OFF + QKV_TILE_BYTES * NUM_WAVES <= 155 * 1024,
+  static_assert(QKV_LDS_OFF + QKV_TILE_BYTES * NUM_WAVES <= mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE,
                 "QKV LDS weights exceed MI350X LDS budget");
 
   uint8_t const *W = (uint8_t const *)weight_ptr;

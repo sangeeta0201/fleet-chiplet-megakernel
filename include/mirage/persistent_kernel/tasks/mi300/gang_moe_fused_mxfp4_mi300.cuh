@@ -500,7 +500,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 
     // Compute LDS base offset (hoisted before loads for direct HBM→LDS path)
     constexpr int LDS_W13_OFF = ((W13_K + W13_MFMA_ITERS + 15) / 16) * 16;
-    static_assert(LDS_W13_OFF + W13_TILE_BYTES * NUM_WAVES <= 155 * 1024,
+    static_assert(LDS_W13_OFF + W13_TILE_BYTES * NUM_WAVES <= mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE,
                   "W13 LDS weight tiles exceed MI350X LDS budget");
     uint8_t *lds_w13_base = (uint8_t *)_fused_smem + LDS_W13_OFF;
     i32x4_t w13_rsrc = make_w_buffer_rsrc(
@@ -1875,7 +1875,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                              static_cast<uint32_t>(w2_row_off);
 
   constexpr int LDS_W2_OFF = ((W2_K + W2_TOK_SCALES + 15) / 16) * 16;
-  static_assert(LDS_W2_OFF + W2_TILE_BYTES * NUM_WAVES <= 155 * 1024,
+  static_assert(LDS_W2_OFF + W2_TILE_BYTES * NUM_WAVES <= mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE,
                 "W2 LDS weight tiles exceed MI350X LDS budget");
   uint8_t *lds_w2_base = (uint8_t *)_fused_smem + LDS_W2_OFF;
 

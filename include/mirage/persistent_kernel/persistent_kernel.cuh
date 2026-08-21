@@ -4261,6 +4261,34 @@ __global__ MPK_WORKER_ATTR __launch_bounds__(
 // This is only HALF of 2 blocks/CU. The other half is having >= ~464
 // co-resident workers to place; at MPK_NUM_WORKERS=232 there is 1 block per CU
 // regardless, so this knob alone should cost the spill and buy nothing.
+//
+// ---------------------------------------------------------------------------
+// CORRECTION. Everything above is a description of the BUILD, and the build is
+// not the run. wpe=3 DOES NOT RUN. Measured at NP=8, MPK_NUM_WORKERS=232, LDS
+// left at its default: all eight ranks abort immediately after
+// "launch_persistent_kernel ENTER", before a single decode iteration, with
+//   HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION ... code: 0x29
+// The commit that introduced this knob called the register gate "OPEN" on the
+// strength of .vgpr_count alone and never ran it. It is not open.
+//
+// Ruled out so far, so nobody re-runs these:
+//  * A stack undercount from -fgpu-rdc's 125 ABI calls. Rebuilding with
+//    -mllvm --amdgpu-assume-external-call-stack-size=16384 leaves
+//    private_segment_fixed_size at exactly 1192 -- LLVM resolved the call
+//    graph itself and is not falling back to an assumed size.
+//  * A metadata inconsistency across the four entry points. prepare_kernel
+//    (53 vgpr / 64 B) and scheduler_kernel (71 / 512 B) are byte-identical
+//    between wpe=1 and wpe=3; only worker_kernel (284/596/0 spill ->
+//    252/1192/67) and persistent_kernel (284/932/0 -> 252/1576/74) move.
+//  * The LDS request. wpe=1 with the LDS cut below runs clean and correct, and
+//    wpe=3 faults with LDS at its default 155 KB, so the two are independent.
+//
+// Leading unproven suspect: the MFMA inline asm in the GLM phase kernels names
+// PHYSICAL registers (ds_read_b128 v[26:29], v_mfma_scale_f32_16x16x128_f8f6f4
+// a[0:3], v[26:29], v[32:39]). At 284 VGPRs the allocator had slack around
+// them; at 252 it does not, and a missing clobber there corrupts a pointer.
+// Audit the clobber lists before trusting any wpe > 1 number.
+// ---------------------------------------------------------------------------
 #ifndef MPK_WORKER_WAVES_PER_EU
 #define MPK_WORKER_WAVES_PER_EU 1
 #endif

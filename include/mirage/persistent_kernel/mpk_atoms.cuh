@@ -1034,10 +1034,11 @@ __device__ unsigned long long g_stage_ref;
 // partly the cost of stamp 8's own atomics. One worker owns one block, so
 // blockIdx.x indexes a private row and the four updates become plain stores
 // with no coherence traffic at all. Reduced by the single printing thread.
-// 304 = MAX_NUM_WORKERS in runtime_header.h, which this header does not
+// 512 = MAX_NUM_WORKERS in runtime_header.h, which this header does not
 // include. Kept as a literal with the guard below rather than pulling in the
-// dependency.
-#define MPK_STAGE_WORKERS 304
+// dependency. Must track it: at 2 blocks/CU the worker count can exceed the
+// 256 CUs, and a short row here is an out-of-bounds store from a high worker.
+#define MPK_STAGE_WORKERS 512
 __device__ unsigned long long g_stage_psum[MPK_STAGE_WORKERS *MPK_STAGE_SLOTS];
 __device__ unsigned long long g_stage_pcnt[MPK_STAGE_WORKERS *MPK_STAGE_SLOTS];
 __device__ unsigned long long g_stage_pmin[MPK_STAGE_WORKERS *MPK_STAGE_SLOTS];

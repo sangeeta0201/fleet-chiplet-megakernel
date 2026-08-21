@@ -813,6 +813,16 @@ def get_compile_command(
             # persistent_kernel.cuh. Compile-time, so every rank must agree.
             assert _wpe in ("1", "2", "3", "4"), "MPK_WORKER_WAVES_PER_EU 1..4"
             flags = flags + [f"-DMPK_WORKER_WAVES_PER_EU={_wpe}"]
+
+        _lds = os.environ.get("MPK_WORKER_LDS_KB")
+        if _lds is not None:
+            # The per-block dynamic LDS request, in KB. The default 155 of 160
+            # KB/CU is what pins the megakernel to 1 block/CU regardless of
+            # registers; 78 is the largest value that still leaves room for a
+            # second block. Long note at the define in runtime_header.h.
+            # Compile-time, so every rank must agree.
+            assert 8 <= int(_lds) <= 155, "MPK_WORKER_LDS_KB 8..155"
+            flags = flags + [f"-DMPK_WORKER_LDS_KB={_lds}"]
         _w2_sf = os.environ.get("MPK_W2_STAGE_FULL")
         if _w2_sf is not None:
             # Restores W2's pre-fdca420 full-width activation staging so the

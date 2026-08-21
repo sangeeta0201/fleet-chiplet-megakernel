@@ -110,6 +110,10 @@ MPK_FORWARD_VARS=(
   # waves/SIMD. MUST reach every rank: a mismatched register budget is a
   # different binary and the layer barriers deadlock.
   MPK_WORKER_WAVES_PER_EU
+  # The other half of the occupancy gate: the per-block dynamic LDS request.
+  # 155 of 160 KB/CU is what actually pins 1 block/CU. Compile-time, so a
+  # mismatch between ranks is a different binary and the barriers deadlock.
+  MPK_WORKER_LDS_KB
   # Correct-output capacity probe, compile-time all the same.
   MPK_MOE_SHADOW_KB
   # Correct-output pricing probe for item 2's dependency half.
