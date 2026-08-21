@@ -15,12 +15,26 @@
 
 // Gang MoE MXFP4 linear kernel for MI350 (gfx950).
 //
-// MPK_MOE_KBATCH: how many K-trips of the MFMA reduction load their operands
-// before any of them is consumed. 1 keeps the original one-load-in-flight
-// loop. See the block comment at the K-reduction loop.
-#ifndef MPK_MOE_KBATCH
-#define MPK_MOE_KBATCH 1
-#endif
+// ── gang_moe_linear_mxfp4_kernel_mi300 HAS NO CALLER. READ THIS FIRST. ─────
+//
+// Nothing in this repo instantiates it -- not the GLM full-layer task, not
+// gpt-oss, not task_register.cc. GLM-5's routed experts go through
+// gang_moe_w13_linear_mxfp8_kernel / gang_moe_w2_linear_mxfp8_kernel in
+// gang_moe_linear_mxfp8_mi300.cuh, dispatched from
+// gang_oproj_router_fused_mi300.cuh:1290 and :1428. ("mxfp8" names the
+// ACTIVATION; those kernels take MXFP4 weights via WEIGHT_FP4.) The helpers
+// above the kernel -- the quantizers, _gang_mfma_*, make_w_buffer_rsrc -- ARE
+// live and are included from several files; the kernel at the bottom is not.
+//
+// This cost a full A/B: the K-reduction loop below is `#pragma unroll 1` with
+// the A-operand load feeding the MFMA in the same trip, which looks exactly
+// like the one-load-in-flight pattern that was worth -0.116 ms on qkv_a's
+// resolve loop (b73b45f). Batching it measured 10.258 -> 10.256 ms, n=3
+// paired -- a null experiment, not a byte-roof result. The LIVE loop already
+// prefetches its A-operand four k-tiles ahead, and depth-8 on top of that was
+// measured neutral separately.
+//
+// Before optimising anything in this file, grep for a caller.
 //
 // Uses hardware-accelerated FP4×FP8 MFMA:
 // __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4
@@ -1025,84 +1039,11 @@ __device__ __noinline__ void
 
     f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    int const w_row = wave_tile * 16 + col;
-
-#if MPK_MOE_KBATCH > 1
-    // ── MPK_MOE_KBATCH: issue KB trips' weight loads before consuming any ──
-    //
-    // The loop below this one is `#pragma unroll 1` with the A-operand load
-    // feeding the MFMA in the same trip, so the wave runs
-    //   global_load a -> s_waitcnt vmcnt(0) lgkmcnt(0) -> v_mfma -> repeat
-    // with exactly ONE load in flight for all MFMA_ITERS trips (48 at W13's
-    // K=6144, 16 at W2's K=2048). That makes the tile a chain of HBM
-    // round-trip latencies, not a bandwidth stream: the expert weights are
-    // read once per token and never reused, so every one of those loads is a
-    // cold miss.
-    //
-    // Same transform as qkv_a's resolve loop (b73b45f): batch the loads into
-    // registers first, then consume. Here the fence is the MFMA's own
-    // s_waitcnt rather than a ds_write, but the effect is identical -- the
-    // compiler cannot hoist trip k+1's load above trip k's wait because the
-    // accumulator chain orders the MFMAs and the wait sits inside it.
-    //
-    // b_reg/sb come from LDS and are batched too: ds_read raises lgkmcnt, and
-    // the MFMA waits on lgkmcnt(0) as well, so leaving them in the consume
-    // loop would just move the serialization from vmcnt to lgkmcnt.
-    //
-    // Cost is KB * 16 VGPR (a_reg 8 + b_reg 8) plus two scalars. Registers
-    // are free here -- see the occupancy table; the block count pins 1
-    // wave/SIMD, not the register file.
-    //
-    // -- MEASURED NEUTRAL. THE MoE K-LOOP IS NOT LOAD-ISSUE-BOUND. ----------
-    // Alternated KB=1/KB=4 in one batch, n=3 each, min-of-115 ms/iter:
-    //   KB=1  10.262 / 10.232 / 10.279   mean 10.258
-    //   KB=4  10.282 / 10.229 / 10.258   mean 10.256
-    // -0.002 ms, ranks fully interleaved, nowhere near the 0.26 ms noise
-    // floor. The build is real: -DMPK_MOE_KBATCH=4 appears 8x in the log and
-    // the two .so images differ by md5. It is not a register problem either:
-    // worker_kernel stays at 284 VGPR / private_seg 596 / vgpr_spill_count 0
-    // on both arms, so the batched operands cost nothing.
-    //
-    // Why it does not pay: the identical transform on qkv_a's resolve loop
-    // (b73b45f) bought -29% because that loop was at ~1.5 loads in flight
-    // against an L2 share it was using 46% of. This loop is already near its
-    // roof -- the W13 tile runs at ~74% of the per-CU HBM share -- so the
-    // wave is waiting on delivered bytes, not on issue slots, and adding
-    // outstanding requests cannot shorten a bandwidth queue. Same verdict,
-    // same reason, as MPK_QUANT_V16 on the qkv_a prologue.
-    //
-    // Default 1. Kept documented rather than deleted so the next person
-    // sizing "one load in flight" against this loop reads the number first:
-    // `#pragma unroll 1` here is not a bug.
-    constexpr int KB = MPK_MOE_KBATCH;
-    for (int k0 = 0; k0 < MFMA_ITERS; k0 += KB) {
-      i32x8_t a_bat[KB];
-      i32x8_t b_bat[KB];
-      int sa_bat[KB];
-      int sb_bat[KB];
-#pragma unroll
-      for (int u = 0; u < KB; u++) {
-        int const kt = (k0 + u) * K_PER_MFMA;
-        if (k0 + u < MFMA_ITERS) {
-          a_bat[u] = *(i32x8_t const *)(wg_data + w_row * (REDUCTION_SIZE / 2) +
-                                        kt / 2 + g * 16);
-          sa_bat[u] = (int)wg_scales[w_row * NUM_BLOCKS_32 + kt / 32 + g];
-          b_bat[u] = _gang_load_fp4_mfma_b(s_tok_fp4, kt, g);
-          sb_bat[u] = (int)s_tok_scales[kt / 32 + g];
-        }
-      }
-#pragma unroll
-      for (int u = 0; u < KB; u++) {
-        if (k0 + u < MFMA_ITERS) {
-          acc = _gang_mfma_f4xf4(a_bat[u], b_bat[u], acc, sa_bat[u], sb_bat[u]);
-        }
-      }
-    }
-#else
 // K-reduction loop: each MFMA processes 128 K-elements
 #pragma unroll 1
     for (int kt = 0; kt < REDUCTION_SIZE; kt += K_PER_MFMA) {
       // Load FP4 weight A-operand: 16 bytes per lane (32 FP4 nibbles)
+      int w_row = wave_tile * 16 + col;
       int a_off = w_row * (REDUCTION_SIZE / 2) + kt / 2 + g * 16;
       i32x8_t a_reg = *(i32x8_t const *)(wg_data + a_off);
 
@@ -1118,7 +1059,6 @@ __device__ __noinline__ void
       // Hardware MFMA: FP4×FP4, 16 cycles
       acc = _gang_mfma_f4xf4(a_reg, b_reg, acc, sa, sb);
     }
-#endif
 
     // ── Epilogue: write result with bias ────────────────────────────────
     // MFMA C layout: col (lane_id & 15) = batch dimension, g (lane_id >> 4) =
