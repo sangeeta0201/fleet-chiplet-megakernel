@@ -337,6 +337,61 @@ static constexpr int FULL_LAYER_NULL_PHASE_STRIDE = 24;
 // makespans was the shorter. It is NOT worth a hidden per-round dispatch fee,
 // because there isn't one. A fusion that costs any real byte traffic has to
 // beat 0.25 ms + the shorter round to be worth building.
+//
+// ── WHERE THE 10.26 ms ACTUALLY IS, FROM THE PROBES ABOVE ────────────────
+//
+// Assembling the pricing probes into one budget, because the individual
+// numbers keep getting re-derived and the sum is what selects the next
+// lever. Per layer, x78 for the wall:
+//
+//   tiles (sum of per-phase makespans)   82.0 us   6.40 ms
+//   10 rendezvous, mechanism only        28.5 us   2.22 ms   (2.85 us each)
+//   EP peer wait                         17.5 us   1.37 ms   (ablates to 5.1)
+//   residual                              7.0 us   0.55 ms
+//                                       -------   -------
+//                                       135.0 us  10.54 ms
+//
+// The tile line is the whole story and it is NOT a byte problem. The model
+// moves ~65 MB/layer, which is 12.5 us at the HBM roof, so 82 us of tile
+// time is 15% of the roof. Every individual tile measures at 74-90% of its
+// PER-CU byte share. Both are true because no phase uses all 232 workers:
+// qkv_a is 23 tiles/XCD on 29, W13 is 8/XCD, decode is 16 workers of 232.
+// The machine is idle, not slow.
+//
+// So the arithmetic for the target is:
+//
+//   perfect tiles (HBM roof)  +  barriers  +  EP  =  12.5 + 28.5 + 5.1
+//                                                 =  46.1 us  =  3.60 ms
+//
+// i.e. even a tile implementation at the byte roof, with the rendezvous
+// structure untouched, lands near 3.6 ms -- and the barrier term alone is
+// 2.22 ms of that. There is headroom to the 4 ms gate but ONLY through
+// filling the machine; no tile-interior win can get there, because the
+// tiles are already near their per-CU roofs.
+//
+// The two facts that make filling hard are recorded above and next to the
+// OPW knobs in demo.py, and they look contradictory until you put them
+// together:
+//
+//   * Shrinking a phase is absorbed. OPW=128 halves the W13/W2 tile count
+//     and fits four owned experts in ONE grid-stride round; neutral.
+//     Narrowing to OPW=16 for 4x the tiles is -1.34 ms. Both directions.
+//   * Deleting a rendezvous outright is also neutral. 8.28 us/layer of
+//     counted, UNIFORM spin removed; the wall moved 0.003 ms.
+//
+// If neither the phase's length nor the barrier in front of it is on the
+// critical path, then what sets the layer is a PER-PHASE FIXED COST that
+// survives both edits. q_b/W_UK put a number on it: 27.9 us/layer against a
+// 6.10 us one-round critical path, ~8.5 us of which is fixed. Nine stages x
+// 8.5 us = 76.5 us/layer = 5.97 ms, which is the tile line to within its
+// error bar.
+//
+// Only ~3-4 us of that 8.5 is accounted for: the barrier mechanism (2.85),
+// dispatch (0.14, measured directly above), first-tile latency and
+// wake/dispatch (both under 2 us and both already measured dead). The
+// remaining ~4-5 us per phase per layer is ~3 ms of the wall and has no
+// verdict. It is the largest unexplained term left and the only one sized
+// to the gap. Instrument that before tuning another tile interior.
 #ifndef MPK_NULL_TILES
 #define MPK_NULL_TILES 0
 #endif
