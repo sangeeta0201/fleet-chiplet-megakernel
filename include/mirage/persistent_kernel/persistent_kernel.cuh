@@ -1754,6 +1754,24 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
             printf("BARSTAGE %d cnt %llu sum %llu min %llu max %llu\n", s, cnt,
                    sum, mn, mx);
           }
+#if MPK_BAR_SKEW >= 3
+          // Per-worker rows. The aggregate above gives the first-to-last
+          // spread but not whether the SAME workers are late every layer.
+          // Static imbalance is a schedule bug and is fixable; jitter is not,
+          // and the two need different work. Only meaningful now that the
+          // rows are private -- under the old contended atomics a worker's
+          // row was other workers' queueing.
+          for (int w = 0; w < MPK_STAGE_WORKERS; w++) {
+            int const p8 = w * MPK_STAGE_SLOTS + 8;
+            int const p9 = w * MPK_STAGE_SLOTS + 9;
+            if (g_stage_pcnt[p8] == 0ull && g_stage_pcnt[p9] == 0ull) {
+              continue;
+            }
+            printf("BARSTAGEW %d c8 %llu s8 %llu c9 %llu s9 %llu mx9 %llu\n", w,
+                   g_stage_pcnt[p8], g_stage_psum[p8], g_stage_pcnt[p9],
+                   g_stage_psum[p9], g_stage_pmax[p9]);
+          }
+#endif
         }
 #endif
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
