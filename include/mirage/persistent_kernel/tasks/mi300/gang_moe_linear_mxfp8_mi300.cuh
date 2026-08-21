@@ -318,6 +318,12 @@ __device__ __noinline__ void
                                      void const *bias_ptr,
                                      void *output_ptr,
                                      int tile_idx) {
+  // CLOSED 2026-08-21: this assert is why W13 tile narrowing has no middle
+  // point left. GLM_MOE_W13_OPW already defaults to 64, so 16 -- the measured
+  // -1.34 ms (95a044a) -- was the ONLY legal value below the default. 32 is
+  // rejected here and would starve the 16-row MFMA anyway (8 rows over 4
+  // waves), which is the same reason 16 lost. Do not reopen looking for a
+  // middle point; there is none.
   static_assert(OUTPUT_PER_WG % 64 == 0 || OUTPUT_PER_WG == 16,
                 "OUTPUT_PER_WG is either N-parallel (a multiple of 64 = 4 "
                 "waves x 16 rows) or the K-parallel width, 16");
