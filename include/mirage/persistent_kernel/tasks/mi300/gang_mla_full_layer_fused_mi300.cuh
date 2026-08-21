@@ -46,6 +46,42 @@
 // in-kernel barrier (Phase 8). The other thirteen phase boundaries already
 // existed in one of the two halves.
 //
+// ── why there is no heterogeneous worker partition ─────────────────────────
+// CLOSED 2026-08-21, on paper, after being carried for many iterations as the
+// one structural lever sized to the remaining gap. The idea is to split the
+// 232 workers into groups that run DIFFERENT phases concurrently, so the
+// phases that occupy only part of the machine (decode 16 workers, W_UK 32,
+// q_b 128) stop idling the rest. It cannot be built, because at batch 1 there
+// is no second stream of work to give the other group.
+//
+// Read the pipeline above as a dependency graph and every arrow is a true
+// producer-consumer edge:
+//
+//   qkv_a -> {q_b || W_UK} -> decode -> merge -> W_UV
+//         -> o_proj -> router -> W13 -> W2 -> (next layer)
+//
+// Nine compute stages, ten rendezvous, and each stage consumes the whole of
+// the previous stage's output -- q_b's GEMM reduces over all of q_a, the
+// merge reduces over every kv_chunk, W2 reduces over the whole intermediate.
+// The only two independent pairs in the layer are ALREADY run concurrently:
+// q_b || W_UK (both consume q_a) and routed || shared expert. This is the
+// same conclusion [[glm-no-legal-independent-round-fusion-exists]] reached
+// from the barrier side -- cut barrier count by deleting a phase, never by
+// finding independence.
+//
+// Across the layer boundary it is worse, not better: h2 = h1 + MoE(RMSNorm(h1))
+// and RMSNorm's sum-of-squares couples all 6144 elements, so NOTHING in layer
+// l+1 -- not even q_a -- can start before layer l's W2 has fully landed. The
+// nonlinearity is the barrier; the rendezvous is just where it shows up.
+//
+// TileRT's models/glm_5/modules/end2end.py was checked as a reference and has
+// no worker-partitioning or overlap concept at all; it is a weight-assembly
+// path.
+//
+// What remains after this is closed: the phases are under-filled, so a phase's
+// makespan is one tile duration, and shortening a tile IN PLACE transfers to
+// the wall at ~1:1 (b73b45f). Tile interiors, not the schedule.
+//
 // ── the counter buffer ────────────────────────────────────────────────────
 // One buffer, because the two halves brought three between them and the input
 // list only has 28 slots. HIER_STRIDE == 16 int32 (one cache line) per slot,
