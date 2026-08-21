@@ -64,7 +64,9 @@ __device__ __forceinline__ void mpk_bsdbg_bf16(int stage,
                                                void const *p,
                                                int n,
                                                int pe,
-                                               char const *tag) {
+                                               char const *tag,
+                                               int rows,
+                                               int stride) {
   if (layer < 0 || layer >= MPK_BS_DEBUG || stage < 0 || stage >= 32) {
     return;
   }
@@ -74,40 +76,57 @@ __device__ __forceinline__ void mpk_bsdbg_bf16(int stage,
   if (atomicExch(&g_bsdbg_seen[layer][stage], 1u) != 0u) {
     return;
   }
-  __hip_bfloat16 const *a = (__hip_bfloat16 const *)p;
-  double sum = 0.0;
-  float amax = 0.0f;
-  for (int i = 0; i < n; i++) {
-    float const v = __bfloat162float(a[i]);
-    sum += (double)v;
-    float const av = v < 0.0f ? -v : v;
-    if (!(av <= amax)) { // NaN-safe: a NaN takes this branch
-      amax = av;
+  for (int r = 0; r < rows; r++) {
+    __hip_bfloat16 const *a =
+        (__hip_bfloat16 const *)p + (long long)r * (long long)stride;
+    double sum = 0.0;
+    float amax = 0.0f;
+    for (int i = 0; i < n; i++) {
+      float const v = __bfloat162float(a[i]);
+      sum += (double)v;
+      float const av = v < 0.0f ? -v : v;
+      if (!(av <= amax)) { // NaN-safe: a NaN takes this branch
+        amax = av;
+      }
     }
+    printf("[BSDBG] pe=%d layer=%d stage=%d row=%d %s n=%d sum=%.6f amax=%.6f "
+           "v0=%.6f v1=%.6f\n",
+           pe,
+           layer,
+           stage,
+           r,
+           tag,
+           n,
+           sum,
+           amax,
+           __bfloat162float(a[0]),
+           n > 1 ? __bfloat162float(a[1]) : 0.0f);
   }
-  printf("[BSDBG] pe=%d layer=%d stage=%d %s n=%d sum=%.6f amax=%.6f "
-         "v0=%.6f v1=%.6f\n",
-         pe,
-         layer,
-         stage,
-         tag,
-         n,
-         sum,
-         amax,
-         __bfloat162float(a[0]),
-         n > 1 ? __bfloat162float(a[1]) : 0.0f);
 }
 
 } // namespace kernel
 
-#define MPK_BSDBG(stage, layer, ptr, n, pe, tag)                               \
+// `rows` x `stride` dumps more than the first token's row. At BATCH_SIZE > 1
+// a bug that only touches row 1 is invisible in row 0, and row 0 is all the
+// original one-row form could see -- which is how the two-genuine-row build
+// got as far as "correct at one active row" while still emitting garbage at
+// two. Callers that do not know their buffer's row stride pass rows=1.
+#define MPK_BSDBG_N(stage, layer, ptr, n, pe, tag, rows, stride)               \
   do {                                                                         \
     if ((layer) < MPK_BS_DEBUG && tid == 0 && xcd_id == 0 && xcd_rank == 0) {  \
-      ::kernel::mpk_bsdbg_bf16((stage), (layer), (ptr), (n), (pe), (tag));     \
+      ::kernel::mpk_bsdbg_bf16(                                                \
+          (stage), (layer), (ptr), (n), (pe), (tag), (rows), (stride));        \
     }                                                                          \
   } while (0)
 
+#define MPK_BSDBG(stage, layer, ptr, n, pe, tag)                               \
+  MPK_BSDBG_N(stage, layer, ptr, n, pe, tag, 1, 0)
+
 #else
+
+#define MPK_BSDBG_N(stage, layer, ptr, n, pe, tag, rows, stride)               \
+  do {                                                                         \
+  } while (0)
 
 #define MPK_BSDBG(stage, layer, ptr, n, pe, tag)                               \
   do {                                                                         \

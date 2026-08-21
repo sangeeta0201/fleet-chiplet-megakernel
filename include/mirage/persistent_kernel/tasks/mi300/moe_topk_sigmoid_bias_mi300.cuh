@@ -199,6 +199,36 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
   static constexpr int ELTS_PER_WARP = MI300_WARP_SIZE * VPT;
   static constexpr int ROWS_PER_WARP = ELTS_PER_WARP / ELTS_PER_ROW;
 
+  // ── active_expert_ids at more than one row ───────────────────────────────
+  //
+  // The list the MoE tile decoder walks is the UNION of every row's top-k, not
+  // one row's. The original code wrote active_expert_ids[k_idx] = expert with
+  // no row index at all, which is correct at one row and silently wrong at
+  // two: the rows race for the same k slots, and whichever wins, the experts
+  // the other row needs are never named, so its tokens are simply not
+  // computed.
+  //
+  // Union via an LDS bitmap rather than an atomic append, because the list has
+  // to come out in a deterministic order -- the tile decoder's owned-expert
+  // scan maps the i'th owned entry to a tile range, so an order that varies
+  // run to run would move work between workers for no reason. Each row's
+  // elected thread ORs its k experts in; the compaction below then emits them
+  // in ascending expert id, with each thread deriving its own output slot from
+  // a popcount of the bits beneath it (8 words at NUM_EXPERTS=256, so it is a
+  // handful of instructions and no second barrier).
+  //
+  // Guarded on num_rows > 1 throughout, so the one-row path stays exactly what
+  // it was, top-k order and all.
+  static constexpr int USED_WORDS = (NUM_EXPERTS + 31) / 32;
+  __shared__ unsigned s_used[USED_WORDS];
+  bool const multirow = num_rows > 1;
+  if (multirow) {
+    for (int w = threadIdx.x; w < USED_WORDS; w += blockDim.x) {
+      s_used[w] = 0u;
+    }
+    __syncthreads();
+  }
+
   int const warp_idx = threadIdx.x / MI300_WARP_SIZE;
   int const lane_idx = threadIdx.x % MI300_WARP_SIZE;
   int const warp_base_row = warp_idx * ROWS_PER_WARP;
@@ -541,7 +571,15 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
                                              thread_row],
                     (unsigned)(k_idx + 1));
           if (active_expert_ids != nullptr) {
-            st_wt_u32((void *)&active_expert_ids[k_idx], (unsigned)expert);
+            if (multirow) {
+              // Local index, so a partitioned [start_expert, end_expert)
+              // caller stays inside the bitmap; the compaction adds
+              // start_expert back.
+              int const loc = expert - start_expert;
+              atomicOr(&s_used[loc >> 5], 1u << (loc & 31));
+            } else {
+              st_wt_u32((void *)&active_expert_ids[k_idx], (unsigned)expert);
+            }
           }
         }
       }
@@ -557,12 +595,51 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
 
   // Set the active expert list tail (thread 0 only, single wavefront handles
   // all rows for batch=1): the shared expert id, then the slot count.
-  if (active_expert_ids != nullptr && threadIdx.x == 0) {
+  if (active_expert_ids != nullptr && !multirow && threadIdx.x == 0) {
     if (num_shared_experts > 0) {
       st_wt_u32((void *)&active_expert_ids[k], (unsigned)NUM_EXPERTS);
     }
     st_wt_u32((void *)&active_expert_ids[NUM_EXPERTS + num_shared_experts],
               (unsigned)k_total);
+  }
+
+  // Multi-row: compact the union bitmap into the list, ascending expert id.
+  //
+  // Each thread owns a span of experts and derives its output slot from the
+  // bits beneath its own -- whole words below it, plus the low bits of its own
+  // word -- so no atomic counter is needed and the order is fixed. The
+  // __syncthreads() above already published every OR.
+  //
+  // The total is recomputed rather than carried: it is the popcount of the
+  // whole bitmap, which every thread can read, and only thread 0 stores it.
+  if (active_expert_ids != nullptr && multirow) {
+    unsigned total = 0;
+#pragma unroll
+    for (int w = 0; w < USED_WORDS; ++w) {
+      total += (unsigned)__popc(s_used[w]);
+    }
+    for (int loc = threadIdx.x; loc < end_expert - start_expert;
+         loc += blockDim.x) {
+      int const word = loc >> 5;
+      unsigned const bit = 1u << (loc & 31);
+      if ((s_used[word] & bit) == 0u) {
+        continue;
+      }
+      unsigned slot = 0;
+      for (int w = 0; w < word; ++w) {
+        slot += (unsigned)__popc(s_used[w]);
+      }
+      slot += (unsigned)__popc(s_used[word] & (bit - 1u));
+      st_wt_u32((void *)&active_expert_ids[slot],
+                (unsigned)(start_expert + loc));
+    }
+    if (threadIdx.x == 0) {
+      if (num_shared_experts > 0) {
+        st_wt_u32((void *)&active_expert_ids[total], (unsigned)NUM_EXPERTS);
+      }
+      st_wt_u32((void *)&active_expert_ids[NUM_EXPERTS + num_shared_experts],
+                total + (unsigned)num_shared_experts);
+    }
   }
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING

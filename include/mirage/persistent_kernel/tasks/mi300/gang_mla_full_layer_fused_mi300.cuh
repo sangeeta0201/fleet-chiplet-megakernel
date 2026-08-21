@@ -1490,12 +1490,12 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
   // Stages 1-3: the attention half's three published buffers. Every one of
   // them is behind a barrier inside the call that just returned, so a single
   // reader here is not racing its producers.
-  MPK_BSDBG(1, task_layer_idx, output_ptrs[0], KV_INPUT_STRIDE, EP_MY_PE,
-            "qkv_a_out");
-  MPK_BSDBG(2, task_layer_idx, output_ptrs[1], Q_WORKSPACE_STRIDE, EP_MY_PE,
-            "q_workspace");
-  MPK_BSDBG(3, task_layer_idx, output_ptrs[4], NUM_Q_HEADS * KV_LORA_RANK,
-            EP_MY_PE, "attn_out");
+  MPK_BSDBG_N(1, task_layer_idx, output_ptrs[0], KV_INPUT_STRIDE, EP_MY_PE,
+              "qkv_a_out", BATCH_SIZE, KV_INPUT_STRIDE);
+  MPK_BSDBG_N(2, task_layer_idx, output_ptrs[1], Q_WORKSPACE_STRIDE, EP_MY_PE,
+              "q_workspace", BATCH_SIZE, Q_WORKSPACE_STRIDE);
+  MPK_BSDBG_N(3, task_layer_idx, output_ptrs[4], NUM_Q_HEADS * KV_LORA_RANK,
+              EP_MY_PE, "attn_out", BATCH_SIZE, NUM_Q_HEADS * KV_LORA_RANK);
   // Stage stamp 23: split-KV merge done, about to arrive at the Phase 8 barrier.
   if (tid == 0) {
     mpk_stage_stamp(23);
@@ -2149,10 +2149,10 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
   // written when the call returns. The layer's own OUTPUT is an f32 partial in
   // moe_workspace_f32 that the next layer's Phase 0 folds -- so it is read as
   // layer L+1's stage 0, not here.
-  MPK_BSDBG(4, task_layer_idx, output_ptrs[6], HIDDEN_SIZE, EP_MY_PE,
-            "oproj_hidden");
-  MPK_BSDBG(5, task_layer_idx, input_ptrs[18], HIDDEN_SIZE, EP_MY_PE,
-            "moe_norm_out");
+  MPK_BSDBG_N(4, task_layer_idx, output_ptrs[6], HIDDEN_SIZE, EP_MY_PE,
+              "oproj_hidden", BATCH_SIZE, HIDDEN_SIZE);
+  MPK_BSDBG_N(5, task_layer_idx, input_ptrs[18], HIDDEN_SIZE, EP_MY_PE,
+              "moe_norm_out", BATCH_SIZE, HIDDEN_SIZE);
   MPK_BSDBG(6, task_layer_idx, input_ptrs[26], MOE_INTERMEDIATE, EP_MY_PE,
             "swiglu_out");
   static_assert(OPROJ_EP_SIGNAL_STRIDE == FULL_LAYER_EP_SIGNAL_STRIDE &&
