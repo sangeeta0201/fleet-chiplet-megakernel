@@ -614,6 +614,16 @@ def get_compile_command(
             # of HBM peak), so it is the member of the MXFP4-attention set
             # where halving bytes should convert to time.
             flags = flags + ["-DMPK_OPROJ_MXFP4=1"]
+        _ml_pad = int(os.environ.get("MPK_ML_BOUNDARY_PAD", "0"))
+        if _ml_pad > 0:
+            # Nanoseconds of uniform delay injected into the multi-layer
+            # loop's per-layer boundary, paid by every thread of every worker.
+            # CORRECT OUTPUT -- an additive pricing probe, so its wall number
+            # is valid and gateable. Measures the slope of wall against
+            # boundary time, which upper-bounds what deleting the real
+            # 15.33 us of boundary bookkeeping could ever buy.
+            assert 0 < _ml_pad <= 100000, "MPK_ML_BOUNDARY_PAD is 1..100000 ns"
+            flags = flags + [f"-DMPK_ML_BOUNDARY_PAD={_ml_pad}"]
         _bar_skew = int(os.environ.get("MPK_BAR_SKEW", "0"))
         if _bar_skew >= 1:
             # Per-rendezvous first-arriver-to-last-arriver spread. O(1) per

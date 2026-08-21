@@ -801,6 +801,47 @@ __device__ __forceinline__ void mpk_stage_stamp(int idx) {
 __device__ __forceinline__ void mpk_stage_stamp(int) {}
 #endif
 
+// MPK_ML_BOUNDARY_PAD: nanoseconds of pure delay injected into the multi-layer
+// loop's per-layer boundary, paid by every thread of every worker.
+//
+// This is a PRICING probe, not a ceiling probe: it ADDS uniform time to a
+// region instead of deleting it, so the output stays correct and the wall
+// number can be gated by the correctness suite. It exists because the
+// subtractive form of this experiment is not available -- skipping the
+// TaskDesc pointer refresh makes all 78 layers reuse layer 0's weights, which
+// turns a 65 MB/layer HBM stream into an L2 hit and would report a huge
+// spurious win (the failure mode recorded in
+// glm-wrong-output-probes-upstream-of-router-are-invalid, in reverse).
+//
+// What it measures: the SLOPE of wall against boundary time. Every worker pays
+// the same pad and the layer's critical path runs through GPU-wide barriers,
+// so if boundary time is on the critical path the wall must rise by
+// pad * layers * iters, one for one. If the boundary instead sits inside slack
+// that the entry barrier's arrival spread already absorbs, the slope is near
+// zero. The slope is an UPPER bound on what deleting the real 15.33 us of
+// boundary bookkeeping could buy, because a uniform addition costs at least as
+// much as a uniform deletion saves.
+#ifndef MPK_ML_BOUNDARY_PAD
+#define MPK_ML_BOUNDARY_PAD 0
+#endif
+
+#if MPK_ML_BOUNDARY_PAD > 0
+// s_memrealtime is the 100 MHz constant-rate counter -- one tick is 10 ns,
+// the same conversion mpk_stage_stamp uses. s_sleep(1) parks the wave for
+// ~64 clocks so the spin does not saturate the scalar unit while every other
+// wave on the SIMD is doing the same thing.
+__device__ __forceinline__ void mpk_ml_boundary_pad() {
+  unsigned long long const t0 =
+      (unsigned long long)__builtin_amdgcn_s_memrealtime();
+  unsigned long long const ticks = (unsigned long long)MPK_ML_BOUNDARY_PAD / 10;
+  while (((unsigned long long)__builtin_amdgcn_s_memrealtime() - t0) < ticks) {
+    __builtin_amdgcn_s_sleep(1);
+  }
+}
+#else
+__device__ __forceinline__ void mpk_ml_boundary_pad() {}
+#endif
+
 // MPK_BAR_TREE: use the two-level arrival above for every GPU-wide
 // Mechanism-C rendezvous. Off by default so the flat mechanism stays the
 // reference; the counter buffer is sized for the tree either way, so this is

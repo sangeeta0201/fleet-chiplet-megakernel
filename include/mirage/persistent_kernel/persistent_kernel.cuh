@@ -2701,6 +2701,13 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               }
               __syncthreads();
 
+              // Boundary pricing probe. Sits exactly where the bookkeeping
+              // does -- after the pointer refresh, before the dispatch -- and
+              // is paid by all 256 threads, so it lengthens the region for
+              // every worker uniformly rather than only for tid 0. Compiles
+              // to nothing at the default MPK_ML_BOUNDARY_PAD=0.
+              mpk_ml_boundary_pad();
+
               // Stage stamp 11: the multi-layer loop has finished its
               // per-layer bookkeeping (return path from the previous layer,
               // threadfence, input/output pointer-table refresh) and is about
