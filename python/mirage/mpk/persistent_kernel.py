@@ -2543,10 +2543,23 @@ class PersistentKernel:
         # worker count, and every barrier in the task is sized against it --
         # but only up to the resident workers, because the barriers count
         # *dispatched* workers and a tile parked behind a busy one deadlocks
-        # them. Past that point the phases grid-stride: GLM-5 wants 108 W2
-        # tiles, 72 W13, 48 o_proj, 33 q_b and 32 router tiles per XCD against
-        # 30 workers, so those phases take 2-4 rounds each. GLM-4.7-Flash fits
-        # in one round everywhere and is unaffected.
+        # them. Past that point the phases grid-stride.
+        #
+        # MEASURED at the current geometry with MPK_PRINT_GEOMETRY=1 (the
+        # numbers this comment used to carry -- 48 o_proj, 33 q_b, 32 router --
+        # predate the head shard and the router EPT=2 and are wrong):
+        #
+        #   dispatch width 29 tiles/XCD
+        #   qkv_a 24  q_b+kvupd 17  mla_decode 8  merge 16
+        #   o_proj 24  router 16  W_UV 16  W_UK 4      -- all ONE round
+        #   moe_W13 72 (3 rounds)   moe_W2 108 (4 rounds)
+        #
+        # So the attention half is not round-quantized at all; it is simply
+        # occupancy-starved, 4/29 to 24/29 busy. The only multi-round phases in
+        # the layer are the two MoE loops, and their bounds are the REPLICATED
+        # worst case (moe_max_activated = topk+shared), not what a rank owns --
+        # under EP=8 a rank owns about one activated expert, so most of those
+        # 3+4 rounds decode a tile that is not theirs and return false.
         tiles_per_xcd = min(max(batch_size * qkv_n_wgs_per_xcd,
                                 batch_size * qb_n_wgs_per_xcd + 1,
                                 mla_tiles_per_xcd, merge_tiles_per_xcd,
@@ -2556,6 +2569,37 @@ class PersistentKernel:
                             self.num_workers // 8)
         total_barrier_arrivals = min(oproj_topk_tiles_per_xcd,
                                      tiles_per_xcd) * 8
+
+        # Host-side only, costs a run nothing, and every tile-geometry decision
+        # on this branch has turned on the same arithmetic: a phase's makespan
+        # is ceil(tiles / workers_per_xcd) ROUNDS, so a phase that wants 33
+        # tiles against 29 workers costs two full rounds with 25 of 29 workers
+        # idle through the second. "util" below is the fraction of the last
+        # round that is doing work -- the smaller it is, the more of the phase
+        # is round-quantization waste rather than work. The MoE rows are the
+        # padded worst case (moe_max_activated), not the owned count.
+        if os.environ.get("MPK_PRINT_GEOMETRY", "0") == "1":
+            _w = max(1, tiles_per_xcd)
+            print(f"[GEOM] dispatch width = {_w} tiles/XCD", flush=True)
+            for _nm, _t in (("qkv_a", batch_size * qkv_n_wgs_per_xcd),
+                            ("q_b+kvupd", batch_size * qb_n_wgs_per_xcd + 1),
+                            ("mla_decode", mla_tiles_per_xcd),
+                            ("merge", merge_tiles_per_xcd),
+                            ("o_proj", oproj_tiles_per_xcd),
+                            ("router", router_tile_n),
+                            ("W_UV", wuv_tiles_per_xcd),
+                            ("W_UK", wuk_tiles_per_xcd),
+                            ("moe_W13*", moe_w13_tiles_per_xcd),
+                            ("moe_W2*", moe_w2_tiles_per_xcd)):
+                if _t <= 0:
+                    print(f"[GEOM]   {_nm:<11} -- not live", flush=True)
+                    continue
+                _r = -(-_t // _w)
+                _last = _t - (_r - 1) * _w
+                print(f"[GEOM]   {_nm:<11} tiles/XCD={_t:<5} rounds={_r}"
+                      f"  last round {_last}/{_w} busy"
+                      f"  ({100.0 * _t / (_r * _w):.0f}% of the rounds it pays)",
+                      flush=True)
 
         # 80 cache-line-strided int32 slots, or 96 under EP. See the kernel
         # header for the map; every barrier is monotonic, so nothing is reset

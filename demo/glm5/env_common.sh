@@ -108,6 +108,7 @@ MPK_FORWARD_VARS=(
   # the arrival counters (BAR_TREE) / the W2 tile space (W2_KSPLIT) disagree
   # with the host loop bound and the layer barriers wedge.
   MPK_BAR_TREE MPK_W2_KSPLIT
+  MPK_PRINT_GEOMETRY
   MPK_PRINT_ALL_RANKS
   MPK_HOST_DBG_POLL
   MAX_SAVE_TOKENS
