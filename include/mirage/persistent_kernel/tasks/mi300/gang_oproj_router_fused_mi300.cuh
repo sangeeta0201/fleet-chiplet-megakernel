@@ -1236,6 +1236,30 @@ __device__ __attribute__((always_inline)) void
         // would otherwise be idle, and every rank's round count is the same.
         // The "rank 0 is a straggler" reading comes from aggregate
         // worker-seconds (SP3[k]), which sums work and cannot see makespan.
+        //
+        // The same table also retires the ROUTED-expert imbalance, which is a
+        // separate and much larger effect on paper. At EP=8 with TOPK=8 over
+        // 256 experts the busiest rank owns E[max] = 3.0 activated experts
+        // against a mean of 1.0, so roofline.py reports 60.16 MB/layer/rank
+        // busiest vs 20.05 MB mean and a per-iter HBM floor of 1.562 ms
+        // busiest vs 0.980 ms mean -- a 0.58 ms gap, and the single largest
+        // line in the floor model. It is NOT a wall lever: the measured
+        // per-rank MoE makespan (S8-S5) above spans 25.59..26.64 us, a 1.05 us
+        // spread, because W13 at 6 tiles/XCD/expert and W2 at 12 both fit
+        // inside one grid-stride round of 29 workers up to 4 owned experts.
+        // The imbalance is paid in idle workers on the light ranks, not in
+        // makespan on the heavy one. Balancing buys ~1 us/layer = 0.08 ms.
+        //
+        // EP=2 x TP=4 inside the expert was priced against this and is NET
+        // NEGATIVE, not built: output-sharding W13 (512 of 2048 intermediate)
+        // and W2 (by hidden rows) takes E[max] to ~5.1 experts over 2 groups,
+        // i.e. W13 10.2 tiles/XCD and W2 15.3 -- one round each instead of
+        // 1 + 2, saving ~1 W2 round = ~3.1 us/layer = 0.23 ms. It costs one
+        // NEW cross-rank rendezvous inside the MoE to all-gather the 4 KB
+        // swiglu row, and the comparable existing cross-rank wait (qkv_a's EP
+        // peer poll) is 17.5 us/layer. The K-split variant that would avoid
+        // the all-gather is separately blocked: W2 split-K measured +4.12 ms
+        // (421782e) and W2's K=2048 does not divide by 512 per group.
         bool const is_owned =
             (cand >= NUM_EXPERTS)
                 ? (EP_MY_PE == EP_SHARED_PE)
