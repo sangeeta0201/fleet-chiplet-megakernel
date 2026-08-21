@@ -339,6 +339,18 @@ __device__ __attribute__((always_inline)) void
   }
 
   constexpr bool UNABSORB_V = WUV_ROWS_PER_WG > 0;
+  // Where the GEMV runs is a separate question from whether it exists.
+  // MPK_WUV_IN_MERGE hoists it into the attention half, straight after the
+  // split-KV merge and behind a pair-local barrier, so that the layer's Phase
+  // 8 attention -> o_proj rendezvous covers W_UV -> o_proj and this block's
+  // own GPU-wide barrier (767) disappears. UNABSORB_V still selects v_out as
+  // Phase 1's activation either way -- the row is produced, just earlier.
+  // See gang_mla_full_layer_fused_mi300.cuh, Phase 7b.
+#ifdef MPK_WUV_IN_MERGE
+  constexpr bool WUV_HERE = false;
+#else
+  constexpr bool WUV_HERE = UNABSORB_V;
+#endif
   // ════════════════════════════════════════════════════════════════════════
   // Phase 0: un-absorbed kv_b_v (W_UV), a block-diagonal GEMV
   // ════════════════════════════════════════════════════════════════════════
@@ -404,7 +416,7 @@ __device__ __attribute__((always_inline)) void
   // diverge from each other at token 14-51, as expected -- un-absorbed
   // quantizes W_UV to MXFP8 on its own and rounds v to bf16, where the
   // absorbed form quantized the product.
-  if constexpr (UNABSORB_V) {
+  if constexpr (WUV_HERE) {
     static_assert(WUV_V_HEAD_DIM % WUV_ROWS_PER_WG == 0,
                   "a workgroup's rows must sit inside one head, or its "
                   "activation slice would not be contiguous");

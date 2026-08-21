@@ -1368,6 +1368,194 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
   if (tid == 0) {
     mpk_stage_stamp(23);
   }
+#ifdef MPK_WUV_IN_MERGE
+  // ══════════════════════════════════════════════════════════════════════
+  // Phase 7b: un-absorbed W_UV, hoisted out of the MoE half
+  // ══════════════════════════════════════════════════════════════════════
+  // Same GEMV, same tiles, same pointers as the copy in
+  // gang_oproj_router_fused_mi300.cuh -- only its position in the phase
+  // sequence moves, and with it which rendezvous separates it from its
+  // producer and its consumer.
+  //
+  //   before:  merge -> [Phase 8, GPU-wide] -> W_UV -> [767, GPU-wide] -> o_proj
+  //   after:   merge -> [pair-local]        -> W_UV -> [Phase 8, GPU-wide] -> o_proj
+  //
+  // Ten per-layer rendezvous become nine, and the one deleted is the one the
+  // stage stamps priced at 8.28 us/layer of spin (ab10e49) -- *uniform* across
+  // workers (faa3b6a: p90 10.44 vs median 10.31 us), so unlike a barrier that
+  // is absorbing skew it is recoverable rather than merely relocated. At the
+  // measured boundary slope of 1.22 wall-ns per uniform tick that is ~0.79 ms.
+  //
+  // Why the new barrier can be pair-local. W_UV's tile map gives XCD x the
+  // global tiles [x * wuv_tiles_per_xcd, +that), and head = g / TILES_PER_HEAD,
+  // so at GLM-5's 64 heads x 4 tiles/head XCD x covers heads [8x, 8x+8) -- all
+  // eight inside q_group x/2. The merge map is already pair-aligned onto the
+  // same grouping (the PAIR_MERGE derivation in gang_mla_attn_fused_mi300.cuh:
+  // offset / MERGE_DIM_SPLITS collapses to xcd_id * NUM_Q_GROUPS / 8, i.e.
+  // xcd_id / 2 here), so everything XCD x's W_UV reads was written by XCDs
+  // 2*(x/2) and 2*(x/2)+1. Nothing outside the pair.
+  //
+  // Why the W_UV -> o_proj edge does NOT need one of its own: o_proj contracts
+  // over the whole 16384-wide v row, i.e. over every XCD's W_UV output, so it
+  // needs a GPU-wide rendezvous -- and Phase 8, immediately below, already is
+  // one that every worker arrives at. Deleting 767 does not weaken the
+  // ordering, it merges two GPU-wide barriers that had only this GEMV between
+  // them into one.
+  //
+  // MEASURED, AND IT IS NEUTRAL. Default off. GLM-5 744B, NP=8 EP, alternated
+  // A/B in one batch, five paired reps, device clock:
+  //
+  //   rep            1       2       3       4       5
+  //   off (decode) 10.679  10.819  10.680  10.547  10.564
+  //   on  (decode) 10.540  10.694  10.686  10.544  10.561
+  //   off (min)    10.443  10.419  10.406  10.422  10.425
+  //   on  (min)    10.406  10.418  10.397  10.389  10.412
+  //
+  // Reps 1-3 each contain one box-level 24-26 ms outlier iteration (the known
+  // NP=8 straggler), so their *means* are contaminated and the -0.12 they show
+  // is that outlier, not this change. Reps 4 and 5 are outlier-free in both
+  // arms and read -0.003 ms. Min-iter, which no outlier can touch, averages
+  // -0.019 ms over all five. Host wall, whose 5/5 negative sign first looked
+  // like a win, is the same outlier leaking through. Correctness: 4/4 prompts,
+  // all 8 ranks identical, and the same torch prefixes (0/90, 28/256, 13/256,
+  // 0/256) the absorbed and un-absorbed forms have always produced.
+  //
+  // So: an entire GPU-wide rendezvous deleted -- ten per layer to nine -- with
+  // 8.28 us/layer of *counted, uniform* spin behind it, and the wall did not
+  // move. That is the fourth independent confirmation of the law in
+  // 24852c8/b7aa3aa: counted barrier time on GLM is not a lever, and it does
+  // not become one just because the barrier is removed outright rather than
+  // narrowed. The mechanism: 767's spin was skew, not traffic, and skew does
+  // not vanish when its barrier does -- W_UV now runs before Phase 8, so the
+  // same tile-time spread it was absorbing is absorbed by Phase 8 instead.
+  // It also bounds the null-barrier probe's 3.77 us/rendezvous price (2334744)
+  // as an *upper* bound that only applies to barriers ADDED to a sequence: a
+  // real barrier adjacent to another real barrier is worth far less than one.
+  //
+  // Kept behind the flag rather than reverted: it is strictly one fewer
+  // rendezvous for identical output, so it is the better structure to build
+  // the next thing on top of, and it costs nothing to carry.
+  //
+  // Every worker runs this, including the ones that fell out of the merge
+  // guard inside the attention call; the arrival count is the full pair width.
+  if constexpr (WUV_ROWS_PER_WG > 0) {
+    constexpr int WUV_REDUCTION = KV_LORA_RANK;
+    static_assert(WUV_V_HEAD_DIM % WUV_ROWS_PER_WG == 0,
+                  "a workgroup's rows must sit inside one head, or its "
+                  "activation slice would not be contiguous");
+    static_assert(OPROJ_REDUCTION_SIZE % WUV_V_HEAD_DIM == 0,
+                  "o_proj's K is the whole v row, H * V_HEAD_DIM");
+    constexpr int TILES_PER_HEAD = WUV_V_HEAD_DIM / WUV_ROWS_PER_WG;
+    constexpr int WUV_Q_GROUPS = NUM_Q_HEADS / 16;
+    // The pairing has to exist for the narrowing to be legal. If it does not
+    // -- 8 % NUM_Q_GROUPS != 0 -- fall back to all eight XCDs, which is the
+    // barrier this replaces and is always correct.
+    constexpr int WUV_XCDS_PER_GROUP =
+        (WUV_Q_GROUPS > 0 && (8 % WUV_Q_GROUPS) == 0) ? 8 / WUV_Q_GROUPS : 8;
+    // And the head span a pair covers has to be exactly the head span the
+    // group's merge produces, or a tile would read a q_group the pair never
+    // merged. Checked against the runtime tile count below.
+    int const wuv_pair = xcd_id / WUV_XCDS_PER_GROUP;
+    int const wuv_pair_half = xcd_id % WUV_XCDS_PER_GROUP;
+    (void)wuv_pair_half;
+    int const wuv_expected = s_exp[7];
+    // Slot 8's line, at 4-int spacing, exactly as PAIR_MERGE's decode counter
+    // rides in its own barrier's slot 8. The GPU-wide form uses offset 0 of
+    // the same line and the two forms are mutually exclusive at compile time.
+    int *const _wuv_cnt = &wuv_counters[8 * HIER_STRIDE + 4 * wuv_pair];
+    int const wuv_arrivals = tiles_per_xcd * WUV_XCDS_PER_GROUP;
+    __syncthreads();
+    // Orders the merge's write-through stores from all 256 threads ahead of
+    // the release atomic; the __syncthreads alone orders execution, not
+    // visibility.
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    if (tid == 0) {
+      int const prev = atom_add_release_gpu_s32(_wuv_cnt, 1);
+      if ((prev % wuv_arrivals) == wuv_arrivals - 1) {
+        for (int h = 0; h < WUV_XCDS_PER_GROUP; h++) {
+          st_wt_u32((void *)&wuv_counters[(wuv_pair * WUV_XCDS_PER_GROUP + h) *
+                                          HIER_STRIDE],
+                    (unsigned)wuv_expected);
+        }
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      }
+      int *const my_flag = &wuv_counters[xcd_id * HIER_STRIDE];
+      // 767 is the id the MoE half's W_UV barrier used; this replaces it and
+      // the two are mutually exclusive at compile time, so the dump decoder
+      // reads the same id for the same edge either way. 766 is taken by the
+      // MoE W13 -> W2 wait.
+      MPK_WS_WAIT_BEGIN(767, wuv_expected);
+      int _spins = 0;
+      int _obs;
+      while ((_obs = ld_nt_s32(my_flag)) < wuv_expected) {
+        ++_spins;
+        MPK_WS_WAIT_TICK(_obs, _spins);
+        if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
+          // The counter is the pair's and the pair's full arrival count is the
+          // WHOLE predicate this flag stands for -- everything a tile below
+          // reads was merged inside the pair. Healing on a partial predicate
+          // is what broke the NP=8 EP barrier; there is no partial one here.
+          if (ld_nt_s32(_wuv_cnt) >= wuv_arrivals * wuv_expected) {
+            st_wt_u32((void *)my_flag, (unsigned)wuv_expected);
+            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          }
+        }
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+    __syncthreads();
+    asm volatile("buffer_inv" ::: "memory");
+#if defined(MPK_WUV_MFMA)
+    constexpr bool WUV_USE_MFMA =
+        (WUV_ROWS_PER_WG == 64) && (WUV_REDUCTION % 512 == 0);
+#else
+    constexpr bool WUV_USE_MFMA = false;
+#endif
+    unsigned short *const xcd_v_out =
+        static_cast<unsigned short *>(output_ptrs[11]) +
+        static_cast<size_t>(xcd_id) * wuv_tiles_per_xcd * WUV_ROWS_PER_WG;
+    for (int t = xcd_rank; t < wuv_tiles_per_xcd; t += tiles_per_xcd) {
+      int const g = xcd_id * wuv_tiles_per_xcd + t;
+      unsigned short const *head_in =
+          static_cast<unsigned short const *>(output_ptrs[4]) +
+          static_cast<size_t>(g / TILES_PER_HEAD) * WUV_REDUCTION;
+      if constexpr (WUV_USE_MFMA) {
+        gang_linear_mxfp8_kernel<BATCH_SIZE,
+                                 WUV_REDUCTION,
+                                 /*WRITE_THROUGH=*/true>(
+            head_in,
+            input_ptrs[FL_WUV_WEIGHT_IN],
+            xcd_v_out,
+            num_active_tokens,
+            WUV_ROWS_PER_WG,
+            OPROJ_REDUCTION_SIZE,
+            /*output_size=*/OPROJ_REDUCTION_SIZE,
+            /*m_tiles=*/1,
+            wuv_tiles_per_xcd,
+            /*wgm=*/0,
+            t,
+            /*bias_ptr=*/nullptr);
+      } else {
+        gang_gemv_mxfp8_kernel<BATCH_SIZE,
+                               WUV_REDUCTION,
+                               WUV_ROWS_PER_WG,
+                               /*HAS_RESIDUAL=*/false,
+                               /*WRITE_THROUGH=*/true>(
+            head_in,
+            input_ptrs[FL_WUV_WEIGHT_IN],
+            /*residual=*/nullptr,
+            xcd_v_out,
+            num_active_tokens,
+            WUV_ROWS_PER_WG,
+            OPROJ_REDUCTION_SIZE,
+            /*m_tiles=*/1,
+            wuv_tiles_per_xcd,
+            /*wgm=*/0,
+            t);
+      }
+    }
+  }
+#endif // MPK_WUV_IN_MERGE
   // ══════════════════════════════════════════════════════════════════════
   // Phase 8: attention -> o_proj cross-XCD barrier
   // ══════════════════════════════════════════════════════════════════════

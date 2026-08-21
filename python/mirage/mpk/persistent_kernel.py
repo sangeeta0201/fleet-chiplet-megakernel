@@ -459,6 +459,23 @@ def get_compile_command(
         # gang_mla_attn_fused_mi300.cuh.
         if int(os.environ.get("GLM_MLA_PAIR_MERGE", "0")) == 1:
             flags = flags + ["-DMPK_GLM_MLA_PAIR_MERGE"]
+        # Hoist the un-absorbed W_UV GEMV out of the MoE half and run it in the
+        # attention half, straight after the split-KV merge, behind a PAIR-LOCAL
+        # barrier instead of a GPU-wide one. The layer's existing Phase 8
+        # attention -> o_proj rendezvous then covers W_UV -> o_proj as well, so
+        # the MoE half's own W_UV barrier (767) is deleted outright: ten
+        # per-layer rendezvous become nine, and the one that goes is 8.28
+        # us/layer of *uniform* within-rank spin (ab10e49).
+        #
+        # Legal because the merge -> W_UV dependency is pair-local. W_UV on XCD
+        # x covers heads [8x, 8x+8), which is q_group x/2, and the merge map
+        # already gives q_group k to XCDs 2k and 2k+1 (see the PAIR_MERGE note
+        # in gang_mla_attn_fused_mi300.cuh). W_UV -> o_proj stays GPU-wide --
+        # o_proj contracts over all 64 heads -- which is exactly what Phase 8
+        # already is. Compile-time and in MPK_FORWARD_VARS: it moves a barrier's
+        # writer set, so a rank that misses it deadlocks.
+        if int(os.environ.get("MPK_WUV_IN_MERGE", "0")) == 1:
+            flags = flags + ["-DMPK_WUV_IN_MERGE"]
         # Ablation for skipping the o_proj GEMV's activation re-stage on the
         # second grid-stride pass. m_tiles is 1 there, so the two passes stage
         # the same 64 KB row; =1 restores the redundant copy.
