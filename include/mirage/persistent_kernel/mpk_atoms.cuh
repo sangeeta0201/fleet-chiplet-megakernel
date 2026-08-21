@@ -873,6 +873,103 @@ __device__ __forceinline__ bool
 #define MPK_W13_REPS 1
 #endif
 
+// ═══════════════════════════════════════════════════════════════════════════
+// MPK_ABL_PIPE_W13W2: the ADJACENT-PHASE OVERLAP CEILING PROBE.
+// ═══════════════════════════════════════════════════════════════════════════
+// 0 = off (shipping).  1 = control, CORRECT OUTPUT.  2 = probe, WRONG OUTPUT.
+//
+// THE QUESTION. Every phase in the GLM layer runs on a fraction of the 29
+// workers per XCD and the rest spin at the next rendezvous
+// (glm-per-phase-occupancy-is-the-whole-story). The standing counter-argument
+// to filling those workers is that the layer's cost is a MAX over a static,
+// skewed arrival distribution, in which case moving work off a worker that was
+// not the last arriver buys nothing -- which is what every deletion probe on
+// this branch has measured (glm-additive-probes-overprice-deletions). The
+// additive probes (MPK_QKVA_REPS, MPK_W13_REPS) cannot settle it: they add
+// work to EVERY worker, so they necessarily lift the max, and that outcome is
+// uninformative about whether an overlap would help.
+//
+// The only probe that settles it MOVES work across a rendezvous. That is this.
+//
+// THE PAIR. W13 -> W2, the widest idle-worker margin in the layer whose
+// successor is large enough to resolve above the 0.26 ms wall floor:
+//   * W13 runs on moe_w13_live ~= 8 of 29 workers/XCD -- 21 idle, and
+//     glm-moe-phase-has-a-free-worker-hole already measured those 21 absorb an
+//     87 KB cold read for +0.030 ms.
+//   * W2 is ~12 tiles/XCD, the biggest MoE phase (35.18 us in BAR_SKEW slot 0).
+// decode -> merge has a wider margin (27 of 29 idle) but merge is ~13 us/layer
+// total, so its whole ceiling is under the noise floor. Not chosen.
+//
+// THE MECHANISM. The W13-idle workers [moe_w13_live, ...) each take exactly
+// one W2 tile off the front of the W2 tile space; the normal W2 loop skips
+// exactly that prefix. Work is MOVED, never added -- tile count, f32-atomicAdd
+// count and barrier arrival count are all identical to the shipping path, so
+// this is NOT another additive probe.
+//
+//   =1  the moved tiles run AFTER the W13->W2 rendezvous. Output is CORRECT
+//       (the swiglu rows they read are finished). This is the control, and it
+//       carries the identical tile->worker permutation, so the A/B isolates
+//       exactly one variable: whether the moved tiles overlap W13 or not.
+//   =2  the same moved tiles run BEFORE the rendezvous, concurrently with the
+//       W13 tiles that produce their inputs. WRONG OUTPUT by construction.
+//
+// Comparing 2 against 1 rather than against the shipping default is the point:
+// the permutation is held fixed, so nothing but the overlap changes.
+//
+// THE CONFOUND, stated rather than fixed. Arm 2's layer output is garbage, so
+// the NEXT layer's router sees garbage logits and the TopK -- hence the EP
+// balance -- differs from the control's. That is the trap in
+// glm-wrong-output-probes-upstream-of-router-are-invalid (MPK_ABL_QKV_PRO did
+// strictly LESS work and cost +2.83 ms). Its sign here is unknown, which is
+// why the decision rule is one-sided and generous to the probe: a ceiling that
+// does not appear is dead, a ceiling that does appear still has to survive a
+// correct-output implementation before it is believed.
+//
+// DECISION RULE (agreed before the run): |arm2 - arm1| < 0.3 ms => adjacent-
+// phase pipelining is dead on GLM and is written up as such. Larger => build
+// the barrier-epoch restructure and do not measure until it is correct.
+//
+// ── MEASURED. THE RULE FIRES: PIPELINING IS DEAD. ──
+// n=3 paired, alternating, min-of-115. Geometry that ran: owned ~= 1 expert,
+// moe_w13_live = 8, moe_w2_live = 12, 21 idle workers/XCD, so _pipe_tiles = 12
+// -- ALL 12 of 12 live W2 tiles relocated. The whole phase, not a slice.
+//
+//   arm 0  shipping                     10.223  10.281  10.229   mean 10.244
+//   arm 1  permutation, below barrier   10.400  10.368  10.410   mean 10.393
+//   arm 2  permutation, above barrier   10.102  10.111  10.082   mean 10.098
+//
+//   arm2 - arm1 = -0.295 ms   overlap isolated, permutation held fixed
+//   arm2 - arm0 = -0.146 ms   the ceiling a CORRECT build must beat, before
+//                             it pays anything for barrier-epoch machinery
+//   arm1 - arm0 = +0.149 ms   the permutation ALONE costs money, so a real
+//                             pipelined schedule starts in the hole
+//
+// 0.295 is under the 0.3 threshold and 0.146 is barely half the 0.26 ms wall
+// floor. Hiding a phase the per-phase decomposition prices at ~16 us/layer of
+// tile time recovered 1.9 us/layer -- the same absorption signature as
+// glm-cutting-work-in-a-phase-is-absorbed and
+// glm-deleting-a-whole-rendezvous-is-neutral. The layer's time is not in the
+// phase boundaries, so re-packing work across them is not a lever. This also
+// closes the last live half of glm-heterogeneous-worker-groups-impossible.
+//
+// W13 -> W2 is the widest idle margin whose successor can resolve at all;
+// decode -> merge has 27 of 29 idle but merge is ~13 us/layer total, entirely
+// under the floor. There is no better pair to retry with.
+//
+// Kept at 0, which is a strict no-op: _pipe_tiles folds to 0 and the Phase 7
+// skip disappears. Arm 0 measured 10.244 against the 10.25 batch baseline.
+//
+// VERIFICATION NOTE: the evidence that the probe was live is not a
+// disassembly diff -- it is that arm 2 emits deterministic garbage ("The
+// capital of France is<think>criptsosas variableso...") identical across all
+// three reps, while arm 1 emits the control's known-good continuation. A
+// compiled-out probe cannot do that.
+#ifndef MPK_ABL_PIPE_W13W2
+#define MPK_ABL_PIPE_W13W2 0
+#endif
+// (the MPK_MOE_LIVE_BOUND dependency is asserted at the use site --
+// gang_oproj_router_fused_mi300.cuh is where that macro gets its default.)
+
 #if MPK_ML_PTR_PREFETCH || MPK_ABL_ML_BOUNDARY
 #define MPK_ML_PF 1
 #else

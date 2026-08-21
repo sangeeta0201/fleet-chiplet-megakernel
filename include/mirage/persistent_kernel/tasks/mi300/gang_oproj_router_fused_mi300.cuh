@@ -1283,6 +1283,43 @@ __device__ __attribute__((always_inline)) void
   }
 #endif
 
+  // ── ADJACENT-PHASE OVERLAP CEILING PROBE (MPK_ABL_PIPE_W13W2). The long
+  // note is at the define in mpk_atoms.cuh. Bounds are computed here because
+  // both the hoisted site (below Phase 5) and the skip in the Phase 7 loop
+  // need them, and because moe_w13_live / moe_w2_live are only final now.
+  //
+  // Every worker on an XCD derives these from the same active_expert_ids row,
+  // so _pipe_lo and _pipe_tiles agree across the XCD -- required, or a W2 tile
+  // would be dropped or run twice.
+#if MPK_ABL_PIPE_W13W2
+#if !MPK_MOE_LIVE_BOUND
+#error "MPK_ABL_PIPE_W13W2 needs MPK_MOE_LIVE_BOUND: without the live clamp moe_w13_live is the full static bound, so there are no W13-idle workers to move W2 tiles onto and the probe silently does nothing"
+#endif
+  // The idle set: workers owning no W13 tile that also survive the Phase 6
+  // early return (xcd_rank >= moe_w2_tiles_per_xcd goes back to the scheduler
+  // before Phase 7, so a moved tile parked there would never run in arm 1).
+  int const _pipe_hi = (moe_w2_tiles_per_xcd < tiles_per_xcd)
+                           ? moe_w2_tiles_per_xcd
+                           : tiles_per_xcd;
+  int const _pipe_lo = moe_w13_live;
+  int const _pipe_n = (_pipe_hi > _pipe_lo) ? (_pipe_hi - _pipe_lo) : 0;
+  // One moved tile per idle worker, capped by the live W2 tile space.
+  int const _pipe_tiles = (_pipe_n < moe_w2_live) ? _pipe_n : moe_w2_live;
+  int const _pipe_my = xcd_rank - _pipe_lo; // this worker's moved tile, or <0
+#define MPK_PIPE_W2_TILE(t_)                                                   \
+  gang_moe_w2_linear_mxfp8_kernel<                                             \
+      BATCH_SIZE, HIDDEN_SIZE, HIDDEN_SIZE, MOE_INTERMEDIATE, MOE_NUM_EXPERTS, \
+      MOE_NUM_TOPK, MOE_W2_TILES_PER_EXPERT, MOE_W2_OPW,                       \
+      /*FUSE_MULSUMADD=*/true, MOE_WEIGHT_FP4, EP_WORLD_SIZE, EP_MY_PE,        \
+      /*EP_NUM_ROUTED=*/NUM_EXPERTS, EP_SHARED_PE, MPK_W2_KSPLIT,              \
+      /*INPUT_FP8=*/MPK_MOE_ACT_FP8 != 0>(                                     \
+      moe_swiglu_out_ptr, moe_down_weight_ptr, routing_indices_ptr,            \
+      active_expert_ids_ptr, moe_w2_bias_ptr, moe_workspace_f32_ptr, (t_),     \
+      topk_weight_ptr)
+#else
+  int const _pipe_tiles = 0; // the Phase 7 skip folds away
+#endif
+
   // ════════════════════════════════════════════════════════════════════════
   // Phase 5: MoE W13 (gate+up) with the SwiGLU folded into the epilogue
   // ════════════════════════════════════════════════════════════════════════
@@ -1387,6 +1424,17 @@ __device__ __attribute__((always_inline)) void
         acc.w == 0xdeadbeefu) {
       st_wt_u32((void *)logits_scratch_ptr, acc.x);
     }
+  }
+#endif
+
+#if MPK_ABL_PIPE_W13W2 == 2
+  // ── THE PROBE ARM. WRONG OUTPUT BY CONSTRUCTION. ──
+  // The W13-idle workers run their moved W2 tile HERE, above the W13 -> W2
+  // rendezvous, so it executes concurrently with the W13 tiles that produce
+  // the swiglu rows it reads. Same tile, same worker, same once-per-layer
+  // atomicAdd as arm 1 -- only the position relative to the barrier differs.
+  if (_pipe_my >= 0 && _pipe_my < _pipe_tiles) {
+    MPK_PIPE_W2_TILE(_pipe_my);
   }
 #endif
 
@@ -1503,7 +1551,22 @@ __device__ __attribute__((always_inline)) void
   // ════════════════════════════════════════════════════════════════════════
   // The routing weights come from output[1], which the TopK tail wrote through
   // in Phase 3 -- W2 does not need a slot of its own for them.
+#if MPK_ABL_PIPE_W13W2 == 1
+  // ── THE CONTROL ARM. CORRECT OUTPUT. ──
+  // Identical tile -> worker permutation to arm 2, but below the rendezvous,
+  // so the swiglu rows are finished. Holding the permutation fixed is what
+  // makes the arm1/arm2 A/B a one-variable test of the overlap itself.
+  if (_pipe_my >= 0 && _pipe_my < _pipe_tiles) {
+    MPK_PIPE_W2_TILE(_pipe_my);
+  }
+#endif
   for (int t = xcd_rank; t < moe_w2_live; t += tiles_per_xcd) {
+    // Tiles [0, _pipe_tiles) were MOVED onto the W13-idle workers above, so
+    // their natural owners skip them. _pipe_tiles is 0 when the probe is off
+    // and this folds away. Work is moved, never added or dropped.
+    if (t < _pipe_tiles) {
+      continue;
+    }
     gang_moe_w2_linear_mxfp8_kernel<BATCH_SIZE,
                                     HIDDEN_SIZE,
                                     HIDDEN_SIZE,
@@ -1529,6 +1592,9 @@ __device__ __attribute__((always_inline)) void
         t,
         topk_weight_ptr);
   }
+#if MPK_ABL_PIPE_W13W2
+#undef MPK_PIPE_W2_TILE
+#endif
   // Stage stamp 8: W2 tiles done. This is the last thing the MoE half does,
   // so S8 is where the layer's work ends; everything between S8 and the next
   // layer-entry barrier is arrival and rendezvous.

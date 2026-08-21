@@ -795,6 +795,14 @@ def get_compile_command(
             # the A/B is one -D and every rank builds the same thing.
             assert _moe_lb in ("0", "1"), "MPK_MOE_LIVE_BOUND is 0 or 1"
             flags = flags + [f"-DMPK_MOE_LIVE_BOUND={_moe_lb}"]
+        _pipe = int(os.environ.get("MPK_ABL_PIPE_W13W2", "0"))
+        if _pipe:
+            # Adjacent-phase overlap ceiling probe. 1 = control, CORRECT
+            # output; 2 = probe, WRONG OUTPUT (the moved W2 tiles run above
+            # the W13 -> W2 rendezvous). Decide on 2 vs 1, not 2 vs default.
+            # Long note at the define in mpk_atoms.cuh.
+            assert _pipe in (1, 2), "MPK_ABL_PIPE_W13W2 is 0, 1 or 2"
+            flags = flags + ["-DMPK_ABL_PIPE_W13W2=%d" % _pipe]
         _w2_sf = os.environ.get("MPK_W2_STAGE_FULL")
         if _w2_sf is not None:
             # Restores W2's pre-fdca420 full-width activation staging so the

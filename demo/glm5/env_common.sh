@@ -103,6 +103,9 @@ MPK_FORWARD_VARS=(
   # megakernels and the layer barriers deadlock.
   MPK_MLA_SKIP_DECODE MPK_ATTN_HALFK MPK_W13_EARLY_REL
   MPK_ABL_QKV MPK_ABL_QKV_PRO MPK_ABL_ML_BOUNDARY
+  # Adjacent-phase overlap ceiling probe. =1 is a CORRECT-output control,
+  # =2 is the wrong-output probe; decide on 2 vs 1.
+  MPK_ABL_PIPE_W13W2
   # Correct-output capacity probe, compile-time all the same.
   MPK_MOE_SHADOW_KB
   # Correct-output pricing probe for item 2's dependency half.
