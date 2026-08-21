@@ -98,6 +98,9 @@ namespace kernel {
 // it to `s_waitcnt vmcnt(0) lgkmcnt(0)` -- and vmcnt(0) would retire exactly
 // the prefetch we are trying to keep outstanding. The barrier is split into
 // its LDS-only parts when the caller has vmem in flight it wants to keep.
+#ifndef MPK_QUANT_V16
+#define MPK_QUANT_V16 0
+#endif
 template <int REDUCTION_SIZE,
           bool SRC_IS_GLOBAL,
           bool NW_IS_LDS = false,
@@ -125,6 +128,57 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_rmsnorm(
     }
   };
 
+  // ── MPK_QUANT_V16: 16-byte loads for the two bf16 operands ──────────────
+  // The scalar loop below reads 32 contiguous bf16 from each of the row and
+  // the norm weight. LLVM's load-store vectorizer merges them, but only into
+  // `global_load_dwordx2` -- through the addrspace(1) cast it cannot prove
+  // better than 8-byte alignment on an `unsigned short const *`. That is 8
+  // loads per operand per sub-block where 4 would do, in what the qkv_a
+  // region split (commit 48fea7f) measured as 40% of the tile.
+  //
+  // Both are 16-byte aligned in fact: every caller's row starts at a token
+  // boundary of a torch tensor or at an LDS array base, and `base` is a
+  // multiple of SUB_BLOCK = 32 elements = 64 bytes. Stating it lets the
+  // dwordx4 out. Bit-identical arithmetic -- only the load width changes.
+//
+// -- MEASURED NEUTRAL. THE PROLOGUE IS NOT LOAD-ISSUE-BOUND. ---------------
+// Alternated OFF/ON in one batch, n=3 each, decode ms/iter:
+//   OFF  10.895 / 10.784 / 10.648   mean 10.776
+//   ON   10.996 / 10.904 / 10.614   mean 10.838
+// +0.062 ms, inside the 0.26 ms noise floor. The ISA change is real -- the
+// image goes from 0 to 657 global_load_dwordx4 -- so this is not a build
+// that did not take. Generated text is correct on the ON arm.
+//
+// Why it does not pay: the 32-element loop is 32 bf16->f32 converts, 32
+// multiplies and 32 fmax per thread against 8 loads, and 192 of 256 threads
+// run exactly one sub-block. Halving the load *count* leaves the same bytes
+// and the same VALU, and the row is in L2 already (qkv_a's 24 tiles per XCD
+// all read it). Load issue was never the queue this prologue waits in.
+// Default OFF; kept because the ISA-histogram recipe that found it is the
+// reusable part.
+  // HIP's int4 is a HIP_vector_type class, which has no constructor reachable
+  // from a raw reinterpreting load; a POD of 8 bf16 with alignas(16) is the
+  // same 16 bytes and lowers to the same dwordx4.
+  struct alignas(16) i4 {
+    unsigned short h[8];
+  };
+  auto ld_src16 = [&](int i) -> i4 {
+    if constexpr (SRC_IS_GLOBAL) {
+      using gi4 = __attribute__((address_space(1))) i4 const *;
+      return *(gi4)(void const *)(src_bf16 + i);
+    } else {
+      return *(i4 const *)(void const *)(src_bf16 + i);
+    }
+  };
+  auto ld_nw16 = [&](int i) -> i4 {
+    if constexpr (NW_IS_LDS) {
+      return *(i4 const *)(void const *)(norm_weight + i);
+    } else {
+      using gi4 = __attribute__((address_space(1))) i4 const *;
+      return *(gi4)(void const *)(norm_weight + i);
+    }
+  };
+
   constexpr int SUB_BLOCK = 32;
   constexpr int NSUBBLOCKS = REDUCTION_SIZE / SUB_BLOCK;
   int const tid = threadIdx.x;
@@ -137,6 +191,28 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_rmsnorm(
 
     float vals[32];
     float amax = 0.0f;
+#if MPK_QUANT_V16
+    {
+      i4 sv[4], nv[4];
+#pragma unroll
+      for (int c = 0; c < 4; c++) {
+        sv[c] = ld_src16(base + c * 8);
+        nv[c] = ld_nw16(base + c * 8);
+      }
+#pragma unroll
+      for (int c = 0; c < 4; c++) {
+#pragma unroll
+        for (int e = 0; e < 8; e++) {
+          float v = _gang_bf16_to_float(sv[c].h[e]) * rms_rcp *
+                    _gang_bf16_to_float(nv[c].h[e]);
+          vals[c * 8 + e] = v;
+          amax = fmaxf(amax, fabsf(v));
+        }
+      }
+      (void)ld_src;
+      (void)ld_nw;
+    }
+#else
 #pragma unroll
     for (int j = 0; j < 32; j++) {
       float v = _gang_bf16_to_float(ld_src(base + j)) * rms_rcp *
@@ -144,6 +220,9 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_rmsnorm(
       vals[j] = v;
       amax = fmaxf(amax, fabsf(v));
     }
+    (void)ld_src16;
+    (void)ld_nw16;
+#endif
 
     int base_lane = lane_id & ~3;
     int const sb_first = sb - sub_idx;

@@ -587,6 +587,11 @@ def get_compile_command(
             # semantics are unchanged, only who counts. Priced by the null
             # probe below at 3.77 -> 2.11 us per rendezvous.
             flags = flags + ["-DMPK_BAR_TREE=1"]
+        if int(os.environ.get("MPK_QUANT_V16", "0")) == 1:
+            # 16-byte loads in the shared RMSNorm+quant prologue. The scalar
+            # form only vectorized to dwordx2 because the addrspace(1) cast
+            # hides the real 16-byte alignment. Bit-identical arithmetic.
+            flags = flags + ["-DMPK_QUANT_V16=1"]
         _null_phases = int(os.environ.get("MPK_NULL_PHASES", "0"))
         if _null_phases:
             # Insert N extra GPU-wide rendezvous at the head of every layer,
