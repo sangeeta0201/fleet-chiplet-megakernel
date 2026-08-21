@@ -493,7 +493,8 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
                                           /*WRITE_THROUGH=*/true,
                                           /*FUSE_RESADD=*/true,
                                           EP_PEER_SLOTS,
-                                          /*EP_PRE_FOLDED=*/QKV_EP_FOLD>(
+                                          /*EP_PRE_FOLDED=*/QKV_EP_FOLD,
+                                          /*SP_QKV=*/true>(
         // Pre-folded, the resolved row is in x_out_ptr and the gather buffer
         // is not read again.
         /*norm_input_ptr=*/QKV_EP_FOLD ? (void const *)x_out_ptr : x_ptr,

@@ -644,7 +644,14 @@ template <int BATCH_SIZE,
           // The EP slots were already summed into `norm_input_ptr` by a fold
           // step ahead of this one -- read one plane, not EP_PEER_SLOTS of
           // them. See _rnlm8_ep_fold_slice.
-          bool EP_PRE_FOLDED = false>
+          bool EP_PRE_FOLDED = false,
+          // Opt in to the bank-0 [1][2][3] region split. Off everywhere but
+          // qkv_a: ~20 call sites reach this kernel, and a shared `tile_idx
+          // == 0` guard made those slots somebody else's tile (see 9710303).
+          // With the split owned by one call site, [1][2][3] are qkv_a's
+          // prologue / quantizer / MFMA and [1][5] is its own tile count, so
+          // the three divide out against the [0][0] whole-tile timer.
+          bool SP_QKV = false>
 __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     void const *norm_input_ptr,  // [batch, REDUCTION_SIZE] bf16
     void const *norm_weight_ptr, // [REDUCTION_SIZE] bf16
@@ -813,7 +820,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   unsigned long long _sp_t0 = 0, _sp_t1 = 0, _sp_t2 = 0, _sp_t3 = 0;
-  bool _sp_rec = (tile_idx == 0 && tid == 0 && g_subphase_active);
+  // Every tile of the one opted-in call site, not tile 0 of all of them.
+  bool _sp_rec = (SP_QKV && tid == 0 && g_subphase_active);
   if (_sp_rec) {
     _sp_t0 = __builtin_amdgcn_s_memrealtime();
   }
@@ -895,6 +903,18 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     }
   }
 
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  // Split the prologue: everything above is the residual resolve, the LDS
+  // staging of the row and the norm weight, and the RMSNorm reciprocal --
+  // the part a hoist could delete. Everything below up to _sp_t1 is the
+  // depth-4 weight prefetch fill, which is this tile's own bytes and could
+  // not be hoisted. [0][1] is still the whole prologue, so the fill is
+  // [0][1] - [1][4].
+  if (_sp_rec) {
+    atomicAdd(&g_subphase_ns[1][4],
+              (__builtin_amdgcn_s_memrealtime() - _sp_t0) * 10);
+  }
+#endif
   // ── The hoisted A-tile prefetch ─────────────────────────────────────────
   // Both MFMA branches below open by filling the depth-4 pipeline's four
   // slots, and both do it after the quantizer. Issue that fill here instead:
@@ -1284,11 +1304,15 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   if (_sp_rec) {
     _sp_t3 = __builtin_amdgcn_s_memrealtime();
-    // Slot 0: QKV. [1]=RMSNorm [2]=FP8Quant [3]=MFMA+Epi
+    // Slot 0, qkv_a only. [1] = residual resolve + RMSNorm rcp + the depth-4
+    // prefetch fill, [2] = the FP8 quantizer, [3] = the MFMA K-loop and the
+    // epilogue store. [1][5] is this call site's own tile count -- do NOT
+    // divide these by g_subphase_cnt[0], which the [0][0] whole-tile timer
+    // and four other banks also feed.
     atomicAdd(&g_subphase_ns[0][1], (_sp_t1 - _sp_t0) * 10);
     atomicAdd(&g_subphase_ns[0][2], (_sp_t2 - _sp_t1) * 10);
     atomicAdd(&g_subphase_ns[0][3], (_sp_t3 - _sp_t2) * 10);
-    atomicAdd(&g_subphase_cnt[0], 1ULL);
+    atomicAdd(&g_subphase_ns[1][5], 1ULL);
   }
 #endif
   __syncthreads();
