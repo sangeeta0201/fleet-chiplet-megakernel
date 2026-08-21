@@ -177,8 +177,20 @@ __device__ __forceinline__ f32x4_t _gang_mfma_w_x_f8(
 // The standing explanation is that W13 is the ABSORBED tile phase: its 16.4
 // us/layer is eaten by the spread of the barrier behind it, while W2's 9.7 us
 // is not (memory: glm-w2-imbalance-is-the-only-unabsorbed-spread). A real
-// in-place tile speedup on an absorbed phase buys zero makespan. W2 is where
-// this knob should be pointed, and that is the next A/B.
+// in-place tile speedup on an absorbed phase buys zero makespan.
+//
+// ON W2 IT IS ALSO NULL, so that explanation does not survive either. Pointing
+// the knob at the unabsorbed phase and pooling n=6 per arm across two batches:
+//
+//   control  n=6  mean 10.526  sd 0.151  min 10.353
+//   PF=4     n=6  mean 10.521  sd 0.168  min 10.323   (-0.005)
+//
+// The first batch on its own read -0.084 and the second +0.075; that spread IS
+// the batch drift the pooling rule exists for. Three paired A/Bs, three nulls.
+// The lever is closed: a 28% standalone tile win on the two biggest MoE tile
+// phases does not appear at the wall in either an absorbed or an unabsorbed
+// phase. Whatever the standalone is measuring, the megakernel's W13/W2 tiles
+// are not paying it.
 #ifndef MPK_MOE_PF_GROUPS
 #define MPK_MOE_PF_GROUPS 0
 #endif
