@@ -561,6 +561,14 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   }
 
 #ifndef MPK_ABL_QKV
+  // MPK_QKVA_REPS: price an EXTRA un-hidden qkv_a pass. 1 is the shipping
+  // path; the long note is at the define in mpk_atoms.cuh. The body is
+  // idempotent on the unfolded path, so output stays correct and the wall
+  // number is gateable. `#pragma unroll 1` keeps the compiler from cloning
+  // the 600-instruction body, which would change the I-cache footprint and
+  // confound the byte question with an issue question.
+#pragma unroll 1
+  for (int _qrep = 0; _qrep < MPK_QKVA_REPS; ++_qrep)
   for (int t = xcd_rank; t < qkv_tiles_per_xcd; t += tiles_per_xcd) {
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     // SP4[0] is 20.06 us/layer and the phase is one grid-stride round, so

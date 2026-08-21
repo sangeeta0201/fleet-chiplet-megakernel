@@ -695,6 +695,15 @@ def get_compile_command(
             # without touching the router's inputs.
             assert 0 < _shadow_kb <= 4096, "MPK_MOE_SHADOW_KB is 1..4096"
             flags = flags + ["-DMPK_MOE_SHADOW_KB=%d" % _shadow_kb]
+        _qkva_reps = int(os.environ.get("MPK_QKVA_REPS", "1"))
+        if _qkva_reps != 1:
+            # Item-2 dependency-half pricing probe. CORRECT OUTPUT: the qkv_a
+            # tile loop's body is idempotent on the unfolded path, so running
+            # it N times writes the same bytes. Prices what an extra
+            # un-hidden qkv_a pass costs, which is exactly the second GEMM the
+            # RMSNorm-linearity split would add. See mpk_atoms.cuh.
+            assert 1 <= _qkva_reps <= 4, "MPK_QKVA_REPS is 1..4"
+            flags = flags + ["-DMPK_QKVA_REPS=%d" % _qkva_reps]
         _bar_skew = int(os.environ.get("MPK_BAR_SKEW", "0"))
         if _bar_skew >= 1:
             # Per-rendezvous first-arriver-to-last-arriver spread. O(1) per

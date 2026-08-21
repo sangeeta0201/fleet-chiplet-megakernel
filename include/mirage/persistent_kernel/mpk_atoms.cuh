@@ -755,6 +755,77 @@ __device__ __forceinline__ bool
 #define MPK_MOE_SHADOW_KB 0
 #endif
 
+// MPK_QKVA_REPS: how many times the qkv_a tile loop runs. 1 is the shipping
+// path. CORRECT OUTPUT at any value, and that is the point of the probe --
+// the loop body is idempotent, so the wall number is gateable.
+//
+// WHY. e6ccf70 measured that the MoE phase has a free worker-shaped hole big
+// enough to hide all of qkv_a, so item 2 (running qkv_a(L+1) concurrently
+// with MoE(L)) is now blocked only by the data dependency: qkv_a(L+1) reads
+// MoE(L) through the residual. RMSNorm is linear in its argument up to a
+// scalar, so that dependency can be split --
+//
+//   q_a = (1/rms(h2)) * [ (h1 . g) @ W  +  (moe_out . g) @ W ]
+//
+// with h1 = x + attn_out available right after o_proj(L). The h1 term could
+// run in the free MoE hole. But BOTH terms are full-size GEMMs over the same
+// 16.1 MB/layer/rank W, so the split does not shrink the un-hidden half; it
+// adds a second pass over W. The whole of item 2 therefore turns on one
+// measurable quantity: what does an EXTRA un-hidden qkv_a pass cost?
+//
+//   * ~+1.1 ms (one qkv_a tile makespan, 14.8 us/layer x 78) => the split is
+//     neutral at best and item 2 closes by measurement.
+//   * ~0 => qkv_a's tile is fully re-absorbed by the barrier behind it, so no
+//     qkv_a lever exists at all. That is consistent with MPK_ATTN_HALFK ~= 0
+//     and with the barrier-reabsorption rule, now 4-for-4.
+//
+// ── MEASURED: +0.669 ms. THE FIRST BRANCH. ITEM 2 IS CLOSED. ──
+// Paired A/B, min-of-115, alternating arms, same batch, identical generated
+// text arm for arm:
+//
+//   REPS=1   10.250  10.267  10.249   mean 10.255
+//   REPS=2   10.882  10.949  10.941   mean 10.924
+//   delta    +0.669 ms  =  +8.6 us/layer     (no overlap; floor is 0.26)
+//
+// Two conclusions, and the second is the more useful one.
+//
+// (1) The RMSNorm-linearity split cannot pay. It does not shrink the
+//     un-hidden GEMM -- term B (moe_out . g) @ W is the same size as today's
+//     single pass over the same W -- it only ADDS term A. So the best case is
+//     that term A is perfectly absorbed by the MoE hole and the wall is
+//     unchanged; the measured case is that an extra pass over W costs 0.669
+//     ms whenever it is not absorbed. There is no version of the split where
+//     the un-hidden half gets cheaper. Item 2 closes: the free hole from
+//     e6ccf70 is real, but no layer-(L+1) work exists that can legally go in
+//     it, because everything in qkv_a(L+1) is downstream of MoE(L).
+//
+// (2) qkv_a tile time is NOT re-absorbed by the barrier behind it. 8.6 of a
+//     14.8 us/layer tile transfers straight to the wall -- and 8.6 is a lower
+//     bound, since pass 2 re-reads a W that pass 1 just pulled through L2
+//     (2 MB/XCD against a 4 MB slice). This is the in-place-tile-speedup rule
+//     (GLM_RESADD_UNROLL, ~1:1) and NOT the deletion-in-front-of-a-barrier
+//     rule. Cutting work inside the qkv_a tile is a live lever worth up to
+//     ~1.15 ms; MPK_ATTN_HALFK already spent the byte half of it (4.91
+//     us/layer), so what is left is the ~40% VALU prologue.
+//
+// Idempotency, checked before trusting the number: on the default path
+// (MPK_QKV_EP_FOLD=0, MPK_QKV_PRO_HOIST=0) norm_input_ptr is x_ptr, the
+// FUSE_RESADD prologue computes d_x_out[h] = bf16(ws_f32[h] + x[h]) as a pure
+// store, and the GEMM write-through-stores to qkv_a_out. Sources and
+// destinations are disjoint and no accumulation is involved, so pass 2 writes
+// the same bytes pass 1 did.
+#ifndef MPK_QKVA_REPS
+#define MPK_QKVA_REPS 1
+#endif
+// Preprocessor, not static_assert: MPK_QKV_EP_FOLD / MPK_QKV_PRO_HOIST are
+// -D-only and undefined on the default path, so a C++ expression naming them
+// would not compile.
+#if MPK_QKVA_REPS != 1
+#if defined(MPK_QKV_EP_FOLD) || defined(MPK_QKV_PRO_HOIST)
+#error "MPK_QKVA_REPS is only idempotent on the unfolded path: under the fold/hoist norm_input_ptr aliases x_out_ptr and pass 2 would re-resolve an already-resolved row"
+#endif
+#endif
+
 #if MPK_ML_PTR_PREFETCH || MPK_ABL_ML_BOUNDARY
 #define MPK_ML_PF 1
 #else

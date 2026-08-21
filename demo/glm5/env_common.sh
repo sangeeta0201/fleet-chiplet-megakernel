@@ -105,6 +105,8 @@ MPK_FORWARD_VARS=(
   MPK_ABL_QKV MPK_ABL_QKV_PRO MPK_ABL_ML_BOUNDARY
   # Correct-output capacity probe, compile-time all the same.
   MPK_MOE_SHADOW_KB
+  # Correct-output pricing probe for item 2's dependency half.
+  MPK_QKVA_REPS
   # Correct-output pricing probe, but compile-time all the same.
   MPK_NULL_PHASES MPK_NULL_TREE MPK_NULL_TILES
   # Real changes, not probes, but compile-time: every rank must build them or
