@@ -719,6 +719,13 @@ def get_compile_command(
             # on. See mpk_bsdbg.cuh.
             assert 1 <= _bs_debug <= 16, "MPK_BS_DEBUG is 1..16 (layers)"
             flags = flags + ["-DMPK_BS_DEBUG=%d" % _bs_debug]
+            # Which forward pass to dump, as the task_layer_idx of its layer 0.
+            # task_layer_idx is run-monotonic, so iteration k of a 76-layer
+            # multi-layer scan starts at 76 * k. Default 0 is iteration 0, the
+            # original behaviour.
+            _bs_l0 = int(os.environ.get("MPK_BSDBG_LAYER0", "0"))
+            assert 0 <= _bs_l0 <= 100000, "MPK_BSDBG_LAYER0 is 0..100000"
+            flags = flags + ["-DMPK_BSDBG_LAYER0=%d" % _bs_l0]
         _bar_skew = int(os.environ.get("MPK_BAR_SKEW", "0"))
         if _bar_skew >= 1:
             # Per-rendezvous first-arriver-to-last-arriver spread. O(1) per

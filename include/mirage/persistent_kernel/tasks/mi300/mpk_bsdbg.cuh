@@ -44,6 +44,27 @@
 #define MPK_BS_DEBUG 0
 #endif
 
+// Which forward pass to dump, expressed as the task_layer_idx of its layer 0.
+//
+// The obvious knob here -- "dump the Nth visit of each (layer, stage)" -- does
+// not work, and the reason is worth stating because it silently produces an
+// empty log. task_layer_idx is run-monotonic, not per-iteration: iteration k
+// covers ml_num_layers * k .. ml_num_layers * k + ml_num_layers - 1 (see the
+// pc_iter arithmetic in persistent_kernel.cuh). So `layer < MPK_BS_DEBUG`
+// selects the first few layers of iteration 0 ONLY, and every (layer, stage)
+// pair it admits is visited exactly once in the whole run.
+//
+// Offsetting the window is what makes two arms comparable. A bs=1 arm and a
+// bs=2 arm consume different numbers of prompt tokens per step, so only their
+// step-0 row 0 lines up by default; at 2 tokens per step, the bs=2 arm's
+// iteration 0 row 1 is the same math as the bs=1 arm's iteration 1 row 0 --
+// both are prompt position 1 attending over a KV cache holding position 0.
+// GLM-5 reports "Multi-layer scan: found 76 fused layers", so iteration 1 is
+// MPK_BSDBG_LAYER0=76.
+#ifndef MPK_BSDBG_LAYER0
+#define MPK_BSDBG_LAYER0 0
+#endif
+
 #if MPK_BS_DEBUG
 
 #include <hip/hip_bf16.h>
@@ -60,13 +81,14 @@ __device__ unsigned int g_bsdbg_seen[MPK_BS_DEBUG][32];
 // (cancellation), the absmax catches a NaN/Inf row, and the first elements
 // tell a "shifted by one row" bug from a "wrong values" bug at a glance.
 __device__ __forceinline__ void mpk_bsdbg_bf16(int stage,
-                                               int layer,
+                                               int abs_layer,
                                                void const *p,
                                                int n,
                                                int pe,
                                                char const *tag,
                                                int rows,
                                                int stride) {
+  int const layer = abs_layer - MPK_BSDBG_LAYER0;
   if (layer < 0 || layer >= MPK_BS_DEBUG || stage < 0 || stage >= 32) {
     return;
   }
@@ -89,9 +111,10 @@ __device__ __forceinline__ void mpk_bsdbg_bf16(int stage,
         amax = av;
       }
     }
-    printf("[BSDBG] pe=%d layer=%d stage=%d row=%d %s n=%d sum=%.6f amax=%.6f "
-           "v0=%.6f v1=%.6f\n",
+    printf("[BSDBG] pe=%d abs=%d layer=%d stage=%d row=%d %s n=%d sum=%.6f "
+           "amax=%.6f v0=%.6f v1=%.6f\n",
            pe,
+           abs_layer,
            layer,
            stage,
            r,
@@ -113,7 +136,8 @@ __device__ __forceinline__ void mpk_bsdbg_bf16(int stage,
 // two. Callers that do not know their buffer's row stride pass rows=1.
 #define MPK_BSDBG_N(stage, layer, ptr, n, pe, tag, rows, stride)               \
   do {                                                                         \
-    if ((layer) < MPK_BS_DEBUG && tid == 0 && xcd_id == 0 && xcd_rank == 0) {  \
+    if ((layer) < MPK_BSDBG_LAYER0 + MPK_BS_DEBUG && tid == 0 &&               \
+        xcd_id == 0 && xcd_rank == 0) {                                        \
       ::kernel::mpk_bsdbg_bf16(                                                \
           (stage), (layer), (ptr), (n), (pe), (tag), (rows), (stride));        \
     }                                                                          \

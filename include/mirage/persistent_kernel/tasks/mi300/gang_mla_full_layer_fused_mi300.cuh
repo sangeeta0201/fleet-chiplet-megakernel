@@ -1386,16 +1386,6 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
   if (tid == 0) {
     mpk_stage_stamp(2);
   }
-  // Stage 0: the residual stream this layer consumes. Under EP this is slot 0
-  // of the gather buffer, which is where an ordinary residual would sit, so
-  // the two configurations are commensurate. Placed after the entry barrier
-  // and after the fold, so nobody is still writing it.
-  MPK_BSDBG(0,
-            task_layer_idx,
-            (EP_WORLD_SIZE > 1) ? input_ptrs[27] : input_ptrs[0],
-            HIDDEN_SIZE,
-            EP_MY_PE,
-            "resid_in");
   MPK_WS_PHASE(20, task_layer_idx, xcd_id);
   gang_mla_attn_fused_kernel_mi300<BATCH_SIZE,
                                    QKV_OUTPUT_PER_WG,
@@ -1487,6 +1477,57 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       /*ep_signal=*/(EP_WORLD_SIZE > 1 && ml_mode) ? input_ptrs[28] : nullptr);
 
   MPK_WS_PHASE(60, task_layer_idx, xcd_id);
+  // Stage 0: the residual stream this layer consumed -- and READ IT AS
+  // ADVISORY ONLY, unlike stages 1-6.
+  //
+  // This dump is a single thread walking HIDDEN_SIZE bf16 elements with no
+  // barrier holding anyone else still, and the buffer it walks is the one the
+  // header calls out as rewritten by Phase 9 of this same layer (`the fold
+  // reading input_ptrs[0] which Phase 9 overwrites via hidden`). 231 other
+  // workers run on through o_proj and into the next layer while the walk is in
+  // progress, so what it prints is a torn blend, not a snapshot. Measured, all
+  // at layer 0 where the answer is known exactly: three builds gave row-0 sums
+  // of -0.265921, -0.350156 and 0.004229, and moving the dump from before the
+  // attention call to after it did not change the value -- while the embedding
+  // kernel's own [EMBOUT] print, which reads its output inside the producing
+  // work-group, reported the correct -0.026845 on every run. Two placements
+  // agreeing on a wrong value is the tell that this is tearing rather than a
+  // race against the embedding task.
+  //
+  // Stages 1-6 do not have this problem: each reads a buffer its producer
+  // published behind a barrier and nothing rewrites until the next layer.
+  // Stage 4 (oproj_hidden) is the same tensor one phase later and IS a
+  // snapshot, so use stage 4 of layer L-1 as layer L's residual.
+  //
+  // Both rows: the residual's row stride is HIDDEN_SIZE, and under EP the
+  // gather buffer's slot stride is the whole [batch, HIDDEN_SIZE] plane, so
+  // slot 0's rows are HIDDEN_SIZE apart as well. Note that under EP the
+  // prologue does not read slot 0 alone -- it sums all EP_WORLD_SIZE slots --
+  // so even a clean read of this pointer is only the first eighth of x.
+  MPK_BSDBG_N(0,
+              task_layer_idx,
+              (EP_WORLD_SIZE > 1) ? input_ptrs[27] : input_ptrs[0],
+              HIDDEN_SIZE,
+              EP_MY_PE,
+              "resid_in",
+              BATCH_SIZE,
+              HIDDEN_SIZE);
+  if constexpr (EP_WORLD_SIZE > 1) {
+    // Stage 7: the other candidate for "the residual this layer consumes".
+    // Under EP, stage 0 reads the gather slot and this reads the plain
+    // residual tensor. MEASURED IDENTICAL, every layer, every run -- so the
+    // "stage 0 is pointed at the wrong buffer" reading of the layer-0 anomaly
+    // is dead, and the tearing above is what is left. Kept because it costs
+    // one line per layer and it is the control for that conclusion.
+    MPK_BSDBG_N(7,
+                task_layer_idx,
+                input_ptrs[0],
+                HIDDEN_SIZE,
+                EP_MY_PE,
+                "resid_p0",
+                BATCH_SIZE,
+                HIDDEN_SIZE);
+  }
   // Stages 1-3: the attention half's three published buffers. Every one of
   // them is behind a barrier inside the call that just returned, so a single
   // reader here is not racing its producers.
@@ -2153,8 +2194,12 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
               "oproj_hidden", BATCH_SIZE, HIDDEN_SIZE);
   MPK_BSDBG_N(5, task_layer_idx, input_ptrs[18], HIDDEN_SIZE, EP_MY_PE,
               "moe_norm_out", BATCH_SIZE, HIDDEN_SIZE);
-  MPK_BSDBG(6, task_layer_idx, input_ptrs[26], MOE_INTERMEDIATE, EP_MY_PE,
-            "swiglu_out");
+  // The swiglu scratch is [batch, MOE_NUM_TOPK, MOE_INTERMEDIATE], so a row
+  // is the whole topk slab wide. Only slot 0 of each row is dumped -- enough
+  // to tell "row 1 was never written" from "row 1 holds different values",
+  // which is the distinction every one of this build's row bugs turned on.
+  MPK_BSDBG_N(6, task_layer_idx, input_ptrs[26], MOE_INTERMEDIATE, EP_MY_PE,
+              "swiglu_out", BATCH_SIZE, MOE_NUM_TOPK * MOE_INTERMEDIATE);
   static_assert(OPROJ_EP_SIGNAL_STRIDE == FULL_LAYER_EP_SIGNAL_STRIDE &&
                     QB_EP_SIGNAL_STRIDE == FULL_LAYER_EP_SIGNAL_STRIDE,
                 "the o_proj and q_b all-gathers share the EP fold's signal "

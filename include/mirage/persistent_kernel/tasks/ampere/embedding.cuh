@@ -39,6 +39,16 @@ __device__ __forceinline__ void
   }
 }
 
+// Under -DMPK_BS_DEBUG the row-bisecting probe needs to know which token each
+// row of a multi-token step actually carries: a per-stage checksum that
+// disagrees between two arms is only evidence if both arms fed the same
+// tokens in. Bounded to the first few steps for the same reason the checksum
+// probe is -- a print that runs every iteration is an instrument that changes
+// what it measures.
+#if defined(MPK_BS_DEBUG) && MPK_BS_DEBUG
+__device__ unsigned int g_embdbg_steps;
+#endif
+
 template <typename T, int BATCH_SIZE, int CHUNK_SIZE, int OUTPUT_DIM_SIZE>
 __device__ __forceinline__ void
     embedding_kernel(void const *__restrict__ input_ptr,
@@ -50,6 +60,21 @@ __device__ __forceinline__ void
       static_cast<int64_t const *>(input_ptr);
   T const *__restrict__ embedding = static_cast<T const *>(embedding_ptr);
   T *__restrict__ output = static_cast<T *>(output_ptr);
+
+#if defined(MPK_BS_DEBUG) && MPK_BS_DEBUG
+  if (threadIdx.x == 0) {
+    unsigned int const s = atomicAdd(&g_embdbg_steps, 1u);
+    if (s < 6u) {
+      long long t0 = (long long)input_ids[0];
+      long long t1 = (BATCH_SIZE > 1) ? (long long)input_ids[1] : -1;
+      printf("[EMBDBG] step=%u bs=%d tok0=%lld tok1=%lld\n",
+             s,
+             BATCH_SIZE,
+             t0,
+             t1);
+    }
+  }
+#endif
 
 #pragma unroll
   for (int batch_idx = 0; batch_idx < BATCH_SIZE; batch_idx++) {
@@ -84,6 +109,42 @@ __device__ __forceinline__ void
     }
 #endif
   }
+
+#if defined(MPK_BS_DEBUG) && MPK_BS_DEBUG
+  // The same fingerprint the BSDBG stages print, taken on this kernel's OWN
+  // output. Without it there is no way to tell "the embedding wrote the wrong
+  // thing" from "something clobbered the residual between here and layer 0",
+  // and the layer-0 stage-0 dump matches the offline embedding table for row 1
+  // and matches nothing at all for row 0 -- which is exactly the ambiguity
+  // this resolves. Guarded by the same step bound as the id print.
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    unsigned int const s2 = atomicAdd(&g_embdbg_steps, 0u);
+    if (s2 <= 6u) {
+      for (int b = 0; b < BATCH_SIZE; b++) {
+        double sum = 0.0;
+        float amax = 0.0f;
+        for (int i = 0; i < OUTPUT_DIM_SIZE; i++) {
+          float const v = (float)output[b * OUTPUT_DIM_SIZE + i];
+          sum += (double)v;
+          float const av = v < 0.0f ? -v : v;
+          if (!(av <= amax)) {
+            amax = av;
+          }
+        }
+        printf("[EMBOUT] step=%u row=%d n=%d sum=%.6f amax=%.6f v0=%.6f "
+               "v1=%.6f\n",
+               s2 - 1u,
+               b,
+               OUTPUT_DIM_SIZE,
+               sum,
+               amax,
+               (float)output[b * OUTPUT_DIM_SIZE + 0],
+               (float)output[b * OUTPUT_DIM_SIZE + 1]);
+      }
+    }
+  }
+#endif
 }
 
 } // namespace kernel
