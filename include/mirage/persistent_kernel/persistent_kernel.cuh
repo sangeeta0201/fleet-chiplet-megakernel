@@ -1761,15 +1761,19 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
           // and the two need different work. Only meaningful now that the
           // rows are private -- under the old contended atomics a worker's
           // row was other workers' queueing.
-          for (int w = 0; w < MPK_STAGE_WORKERS; w++) {
-            int const p8 = w * MPK_STAGE_SLOTS + 8;
-            int const p9 = w * MPK_STAGE_SLOTS + 9;
-            if (g_stage_pcnt[p8] == 0ull && g_stage_pcnt[p9] == 0ull) {
-              continue;
+          // Slots 5..9 walk the MoE half in order (W_UV, pre-o_proj,
+          // post-router, last W2 tile, entry arrival), so differencing a
+          // single worker's row across them says WHICH phase built that
+          // worker's lateness.
+          for (int s = 5; s <= 9; s++) {
+            for (int w = 0; w < MPK_STAGE_WORKERS; w++) {
+              int const p = w * MPK_STAGE_SLOTS + s;
+              if (g_stage_pcnt[p] == 0ull) {
+                continue;
+              }
+              printf("BARSTAGEWS %d %d %llu %llu\n", s, w, g_stage_pcnt[p],
+                     g_stage_psum[p]);
             }
-            printf("BARSTAGEW %d c8 %llu s8 %llu c9 %llu s9 %llu mx9 %llu\n", w,
-                   g_stage_pcnt[p8], g_stage_psum[p8], g_stage_pcnt[p9],
-                   g_stage_psum[p9], g_stage_pmax[p9]);
           }
 #endif
         }
