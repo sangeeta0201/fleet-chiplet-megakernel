@@ -63,6 +63,14 @@
 #include "tasks/mi300/gang_linear_mxfp8_mi300.cuh"
 #include "tasks/mi300/silu_mul_mi300.cuh"
 
+// W2 reduction split. Compile-time, and the host multiplies W2's dispatched
+// tile count by the same number, so every rank must build with the same value
+// or the MoE loop bound and the tile space disagree. See the note at the
+// K_SPLITS constant in the W2 kernel.
+#ifndef MPK_W2_KSPLIT
+#define MPK_W2_KSPLIT 1
+#endif
+
 namespace kernel {
 
 // The weight operand at whichever width it is packed. FP4 fills only the lower
@@ -652,7 +660,10 @@ template <int BATCH_SIZE,
           int EP_WORLD_SIZE = 1,
           int EP_MY_PE = 0,
           int EP_NUM_ROUTED = NUM_EXPERTS,
-          int EP_SHARED_PE = 0>
+          int EP_SHARED_PE = 0,
+          // Reduction split; see the K_SPLITS note in the body. 1 is the
+          // identity and every other instantiation in the megakernel keeps it.
+          int W2_K_SPLITS = 1>
 __device__ __noinline__ void
     gang_moe_w2_linear_mxfp8_kernel(void const *input_ptr,
                                     void const *weight_ptr,
@@ -681,6 +692,64 @@ __device__ __noinline__ void
   static_assert(MFMA_ITERS >= 4 && MFMA_ITERS % 4 == 0,
                 "Depth-4 pipeline requires REDUCTION_SIZE % 512 == 0");
 
+  // ── W2 split-K ───────────────────────────────────────────────────────────
+  // Under EP, GLM-5 activates ~1 routed expert per rank, so W2's real tile
+  // count is EXPERT_WGS = HIDDEN/OPW = 6144/64 = 96 globally, i.e. 12 per XCD
+  // against 29 workers -- 41% of the machine, and the other 17 workers per XCD
+  // spin in the barrier that follows. Narrowing the tile in N is the wrong fix
+  // and is already measured out (OPW=16 is the K_PARALLEL branch below and
+  // costs 4x per byte, -1.34 ms). Splitting the *reduction* instead keeps every
+  // tile at the full 64-row N-parallel shape -- same MFMA, same bytes per row --
+  // and just gives each tile 1/K_SPLITS of the K range.
+  //
+  // No combine step is needed: FUSE_MULSUMADD's epilogue already atomicAdds
+  // into the f32 workspace that the cross-expert sum uses, and that is a linear
+  // reduction, so a partial K sum is just another addend. Only the bias has to
+  // be gated to split 0 or it lands K_SPLITS times.
+  //
+  // The split is in whole depth-4 pipeline groups, so K_SPLITS must divide
+  // MFMA_ITERS/4. GLM-5's W2 has K = MOE_INTERMEDIATE = 2048, K_PER_MFMA = 128,
+  // so MFMA_ITERS = 16 and only 2 and 4 are legal above 1. (3 is not: the
+  // instantiation is <...,2048,...> and 16 % 12 = 4, which is what the assert
+  // below reports if you try it.)
+  // MEASURED A LARGE NEGATIVE, off by default (2026-08-21, n=3 each, control
+  // in the same batch): K_SPLITS=1 11.020 ms/iter mean (10.932/11.185/10.943)
+  // against K_SPLITS=2 15.136 (14.970/15.372/15.066). **+4.12 ms.**
+  //
+  // The premise was that W2's 12 tiles/XCD leave 17 of 29 workers idle, so
+  // splitting K would fill them. It does, and it still loses, because W2's
+  // per-tile cost is dominated by FIXED work that the split does not divide:
+  // every tile stages and quantizes the whole FP8_TOK_DATA = REDUCTION_SIZE
+  // activation into LDS regardless of which K window it will consume, and every
+  // tile runs the full 64-row atomicAdd epilogue. Doubling the tile count
+  // doubles both while halving only the MFMA loop, which was never the
+  // bottleneck. The host loop bound doubles too, so every worker also pays
+  // ceil(216/29) = 8 tile-decode iterations per layer instead of 4.
+  //
+  // The inversion is the useful part: at constant total FLOPs, W2 gets sharply
+  // worse with MORE tiles. Both this and OPW=16 (-1.34 ms) are the same
+  // finding from two directions. If W2 is ever revisited, go the other way --
+  // WIDER tiles via GLM_MOE_W2_OPW, amortising the staging and the epilogue
+  // over more output rows.
+  //
+  // Kept behind the flag at the identity rather than deleted: the control above
+  // shows K_SPLITS=1 is byte-for-byte the old path, and this is the only worked
+  // example in the tree of splitting a reduction across the EP tile space.
+  //
+  // A template parameter and not the macro directly: this kernel is
+  // instantiated at several reduction sizes in one translation unit, and only
+  // the GLM fused-layer call site has a host loop bound that was widened to
+  // match. Reading the macro here made the legality assert fire on every other
+  // instantiation.
+  constexpr int K_SPLITS = W2_K_SPLITS;
+  static_assert(K_SPLITS >= 1, "W2_K_SPLITS is at least 1");
+  static_assert(MFMA_ITERS % (4 * K_SPLITS) == 0,
+                "split-K must divide the reduction into whole depth-4 groups");
+  static_assert(K_SPLITS == 1 || FUSE_MULSUMADD,
+                "split-K needs the atomicAdd epilogue; the bf16 store path "
+                "overwrites rather than accumulates");
+  constexpr int SPLIT_ITERS = MFMA_ITERS / K_SPLITS;
+
   constexpr int NUM_WAVES = 4;
   // See the note on the W13 kernel's branch: K_PARALLEL is the narrow-tile
   // form that keeps all 29 workers per XCD fed when expert parallelism has
@@ -698,10 +767,16 @@ __device__ __noinline__ void
   float const *d_routing_weight = (float const *)routing_weight_ptr;
 
   int expert_id, local_eid, tok_idx, wg_idx, topk_slot;
+  // The split index rides in the workgroup index: the per-expert tile space is
+  // EXPERT_WGS * K_SPLITS wide and the decode is otherwise untouched, so EP's
+  // owned-subsequence compaction still sees a dense run per expert. The split
+  // is the HIGH digit so that consecutive tiles -- which land on consecutive
+  // workers -- cover different output rows, keeping the weight stream spread
+  // rather than three neighbours hammering the same 64 rows.
   if (!_gang_moe_mxfp8_tile<BATCH_SIZE,
                             NUM_EXPERTS,
-                            TILES_PER_EXPERT,
-                            EXPERT_WGS,
+                            TILES_PER_EXPERT * K_SPLITS,
+                            EXPERT_WGS * K_SPLITS,
                             EP_WORLD_SIZE,
                             EP_MY_PE,
                             EP_NUM_ROUTED,
@@ -715,6 +790,14 @@ __device__ __noinline__ void
                                           &topk_slot)) {
     return;
   }
+  int const k_split = (K_SPLITS == 1) ? 0 : (wg_idx / EXPERT_WGS);
+  if constexpr (K_SPLITS > 1) {
+    wg_idx = wg_idx % EXPERT_WGS;
+  }
+  // K offset of this split, in reduction elements. SPLIT_ITERS * K_PER_MFMA is
+  // a multiple of 512, so every base derived from it stays 128 B-aligned on
+  // both the FP8 and the FP4 packing.
+  int const k_base = k_split * SPLIT_ITERS * K_PER_MFMA;
 
   uint8_t const *wg_data = W + static_cast<int64_t>(local_eid) * EXPERT_BYTES +
                            static_cast<int64_t>(wg_idx) * WG_BYTES;
@@ -765,11 +848,17 @@ __device__ __noinline__ void
       // so it needs no special case here.
       float *ws_addr = d_workspace +
                        static_cast<size_t>(tok_idx) * OUTPUT_STRIDE + out_base;
+      // Split-K: every split adds its own partial, so the bias belongs to
+      // exactly one of them. rw multiplies the whole sum and so multiplies
+      // each addend -- it needs no gate.
+      bool const add_bias = (K_SPLITS == 1) || (k_split == 0);
 #pragma unroll
       for (int i = 0; i < 4; i++) {
         if (out_base + i < OUTPUT_SIZE) {
           atomicAdd(&ws_addr[i],
-                    (acc[i] + _gang_bf16_to_float(bias_row[out_base + i])) *
+                    (acc[i] + (add_bias ? _gang_bf16_to_float(
+                                              bias_row[out_base + i])
+                                        : 0.0f)) *
                         rw);
         }
       }
@@ -791,9 +880,17 @@ __device__ __noinline__ void
   for (int tile_iter = 0; tile_iter < TILES_PER_WAVE; tile_iter++) {
     int const wave_tile = warp_id + tile_iter * NUM_WAVES;
     int const w_row = wave_tile * 16 + col;
+    // Split-K enters here and nowhere else in the loop: the weight row, its
+    // scale run, and the LDS activation are all advanced to this split's K
+    // window, so the body below still counts from zero and only its trip count
+    // changes. k_base is 0 when K_SPLITS == 1, so the unsplit code is
+    // byte-for-byte what it was.
     uint8_t const *w_data_row =
-        wg_data + static_cast<size_t>(w_row) * W_ROW_BYTES;
-    int const row_scale_base = w_row * NUM_BLOCKS_32;
+        wg_data + static_cast<size_t>(w_row) * W_ROW_BYTES +
+        (WEIGHT_FP4 ? k_base / 2 : k_base);
+    int const row_scale_base = w_row * NUM_BLOCKS_32 + k_base / 32;
+    uint8_t *s_tok_k = s_tok_fp8 + k_base;
+    uint8_t *s_tok_sc_k = s_tok_scales + k_base / 32;
 
     f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
 
@@ -808,46 +905,46 @@ __device__ __noinline__ void
 
 // IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation.
 #pragma unroll 1
-    for (int ki = 0; ki < MFMA_ITERS; ki += 4) {
+    for (int ki = 0; ki < SPLIT_ITERS; ki += 4) {
       {
-        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_k, ki * K_PER_MFMA, g);
         acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a0, b, acc, sa0,
-                                            (int)s_tok_scales[ki]);
+                                            (int)s_tok_sc_k[ki]);
       }
-      if (ki + 4 < MFMA_ITERS) {
+      if (ki + 4 < SPLIT_ITERS) {
         int kt4 = (ki + 4) * K_PER_MFMA;
         a0 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt4, g);
         sa0 = (int)wg_scales[row_scale_base + kt4 / 32 + g];
       }
 
       {
-        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 1) * K_PER_MFMA, g);
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_k, (ki + 1) * K_PER_MFMA, g);
         acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a1, b, acc, sa1,
-                                            (int)s_tok_scales[ki + 1]);
+                                            (int)s_tok_sc_k[ki + 1]);
       }
-      if (ki + 5 < MFMA_ITERS) {
+      if (ki + 5 < SPLIT_ITERS) {
         int kt5 = (ki + 5) * K_PER_MFMA;
         a1 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt5, g);
         sa1 = (int)wg_scales[row_scale_base + kt5 / 32 + g];
       }
 
       {
-        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 2) * K_PER_MFMA, g);
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_k, (ki + 2) * K_PER_MFMA, g);
         acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a2, b, acc, sa2,
-                                            (int)s_tok_scales[ki + 2]);
+                                            (int)s_tok_sc_k[ki + 2]);
       }
-      if (ki + 6 < MFMA_ITERS) {
+      if (ki + 6 < SPLIT_ITERS) {
         int kt6 = (ki + 6) * K_PER_MFMA;
         a2 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt6, g);
         sa2 = (int)wg_scales[row_scale_base + kt6 / 32 + g];
       }
 
-      if (ki + 3 < MFMA_ITERS) {
-        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 3) * K_PER_MFMA, g);
+      if (ki + 3 < SPLIT_ITERS) {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_k, (ki + 3) * K_PER_MFMA, g);
         acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a3, b, acc, sa3,
-                                            (int)s_tok_scales[ki + 3]);
+                                            (int)s_tok_sc_k[ki + 3]);
       }
-      if (ki + 7 < MFMA_ITERS) {
+      if (ki + 7 < SPLIT_ITERS) {
         int kt7 = (ki + 7) * K_PER_MFMA;
         a3 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt7, g);
         sa3 = (int)wg_scales[row_scale_base + kt7 / 32 + g];
@@ -859,6 +956,12 @@ __device__ __noinline__ void
     }
   }
   } else {
+    // `|| !K_PARALLEL` keeps the condition dependent on a template parameter.
+    // A non-dependent static_assert inside a discarded if-constexpr branch
+    // still fires, which would break every OPW=64 build under split-K.
+    static_assert(K_SPLITS == 1 || !K_PARALLEL,
+                  "split-K and the K-parallel narrow tile are two ways to "
+                  "split the same reduction; enabling both would double-count");
     // K-parallel; see the W13 kernel for the shape argument.
     static_assert(OUTPUT_PER_WG == 16,
                   "the K-parallel branch covers 16 output rows per workgroup");

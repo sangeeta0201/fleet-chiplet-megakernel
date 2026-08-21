@@ -620,6 +620,15 @@ def get_compile_command(
             # combine is needed. CORRECT output: it redistributes the reduction
             # rather than dropping it (unlike MPK_W2_HALFK above).
             flags = flags + ["-DMPK_W2_SPLITK"]
+        _w2_ks = int(os.environ.get("MPK_W2_KSPLIT", "1"))
+        if _w2_ks != 1:
+            # The GLM fused-layer W2 (gang_moe_linear_mxfp8_mi300.cuh), not the
+            # gpt-oss MPK_W2_SPLITK above -- different kernel, different file.
+            # The host multiplies moe_w2_tiles_per_xcd by the same number, so a
+            # rank that misses the flag builds a tile space that disagrees with
+            # its own loop bound. Compile-time, hence in MPK_FORWARD_VARS.
+            assert _w2_ks >= 1, "MPK_W2_KSPLIT is at least 1"
+            flags = flags + [f"-DMPK_W2_KSPLIT={_w2_ks}"]
         if int(os.environ.get("MPK_EP_SKEW_PROBE", "0")) == 1:
             # Measures how much earlier a column slice's W2 tiles finish than
             # the last W2 tile on the GPU -- i.e. the headroom a per-slice
@@ -2518,8 +2527,14 @@ class PersistentKernel:
         moe_max_activated = min(moe_topk_total * batch_size, moe_num_experts)
         moe_w13_tiles_per_xcd = (
             moe_max_activated * batch_size * moe_gate_up_weight.dim(1) + 7) // 8
+        # MPK_W2_KSPLIT widens W2's per-expert tile space by the split factor
+        # (each tile covers 1/N of the reduction), so the dispatch loop bound
+        # has to widen with it or the tiles carrying the tail of K are never
+        # issued and W2's output is short by that fraction. The device reads
+        # the same env var as a -D; they must agree.
         moe_w2_tiles_per_xcd = (
-            moe_max_activated * batch_size * moe_down_weight.dim(1) + 7) // 8
+            moe_max_activated * batch_size * moe_down_weight.dim(1)
+            * int(os.environ.get("MPK_W2_KSPLIT", "1")) + 7) // 8
 
         oproj_topk_tiles_per_xcd = max(oproj_tiles_per_xcd, router_tile_n)
 

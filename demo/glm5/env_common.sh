@@ -104,9 +104,10 @@ MPK_FORWARD_VARS=(
   MPK_ABL_QKV MPK_ABL_QKV_PRO
   # Correct-output pricing probe, but compile-time all the same.
   MPK_NULL_PHASES MPK_NULL_TREE
-  # Real change, not a probe, but compile-time: every rank must build it or
-  # the arrival counters disagree and the layer barriers wedge.
-  MPK_BAR_TREE
+  # Real changes, not probes, but compile-time: every rank must build them or
+  # the arrival counters (BAR_TREE) / the W2 tile space (W2_KSPLIT) disagree
+  # with the host loop bound and the layer barriers wedge.
+  MPK_BAR_TREE MPK_W2_KSPLIT
   MPK_PRINT_ALL_RANKS
   MPK_HOST_DBG_POLL
   MAX_SAVE_TOKENS

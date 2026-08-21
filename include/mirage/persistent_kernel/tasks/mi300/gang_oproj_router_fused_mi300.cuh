@@ -1266,7 +1266,8 @@ __device__ __attribute__((always_inline)) void
                                     EP_WORLD_SIZE,
                                     EP_MY_PE,
                                     /*EP_NUM_ROUTED=*/NUM_EXPERTS,
-                                    EP_SHARED_PE>(
+                                    EP_SHARED_PE,
+                                    MPK_W2_KSPLIT>(
         moe_swiglu_out_ptr,
         moe_down_weight_ptr,
         routing_indices_ptr,
