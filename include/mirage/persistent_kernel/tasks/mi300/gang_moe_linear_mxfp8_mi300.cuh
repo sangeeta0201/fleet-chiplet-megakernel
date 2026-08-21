@@ -71,6 +71,14 @@
 #define MPK_W2_KSPLIT 1
 #endif
 
+// Restore W2's pre-fdca420 activation staging: quantize the WHOLE reduction
+// into LDS whatever K window the tile will consume. Only meaningful with
+// MPK_W2_KSPLIT > 1 (at 1 the window IS the whole reduction). Exists so the
+// staging A/B is one -D inside one build instead of a cross-batch comparison.
+#ifndef MPK_W2_STAGE_FULL
+#define MPK_W2_STAGE_FULL 0
+#endif
+
 namespace kernel {
 
 // The weight operand at whichever width it is packed. FP4 fills only the lower
@@ -849,14 +857,18 @@ __device__ __noinline__ void
   // The LDS allocation stays full-width and the window is written at its own
   // offset, so the MFMA loop's s_tok_k = s_tok_fp8 + k_base is unchanged; the
   // bytes outside the window are never read.
-  constexpr int SPLIT_LEN = REDUCTION_SIZE / K_SPLITS;
-  static_assert(SPLIT_LEN == SPLIT_ITERS * K_PER_MFMA,
+  // MPK_W2_STAGE_FULL=1 restores the old unwindowed stage, so the A/B is one
+  // -D inside one build rather than a comparison against an older batch.
+  constexpr int SPLIT_LEN =
+      MPK_W2_STAGE_FULL ? REDUCTION_SIZE : (REDUCTION_SIZE / K_SPLITS);
+  static_assert(MPK_W2_STAGE_FULL || SPLIT_LEN == SPLIT_ITERS * K_PER_MFMA,
                 "the staged window must be exactly the split's MFMA range");
+  int const stage_base = MPK_W2_STAGE_FULL ? 0 : k_base;
   _gang_wave_parallel_fp8_quant_nt<SPLIT_LEN>(
       A + static_cast<size_t>(tok_idx) * (NUM_TOPK * REDUCTION_SIZE) +
-          static_cast<size_t>(topk_slot) * REDUCTION_SIZE + k_base,
-      s_tok_fp8 + k_base,
-      s_tok_scales + k_base / 32);
+          static_cast<size_t>(topk_slot) * REDUCTION_SIZE + stage_base,
+      s_tok_fp8 + stage_base,
+      s_tok_scales + stage_base / 32);
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   unsigned long long _sp_q1 = __builtin_amdgcn_s_memrealtime();
   if (tid == 0 && g_subphase_active) {

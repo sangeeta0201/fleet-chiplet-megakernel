@@ -626,6 +626,13 @@ def get_compile_command(
             # the A/B is one -D and every rank builds the same thing.
             assert _moe_lb in ("0", "1"), "MPK_MOE_LIVE_BOUND is 0 or 1"
             flags = flags + [f"-DMPK_MOE_LIVE_BOUND={_moe_lb}"]
+        _w2_sf = os.environ.get("MPK_W2_STAGE_FULL")
+        if _w2_sf is not None:
+            # Restores W2's pre-fdca420 full-width activation staging so the
+            # staging A/B is one -D in one build. Compile-time, so every rank
+            # must see it.
+            assert _w2_sf in ("0", "1"), "MPK_W2_STAGE_FULL is 0 or 1"
+            flags = flags + [f"-DMPK_W2_STAGE_FULL={_w2_sf}"]
         _w2_ks = int(os.environ.get("MPK_W2_KSPLIT", "1"))
         if _w2_ks != 1:
             # The GLM fused-layer W2 (gang_moe_linear_mxfp8_mi300.cuh), not the
