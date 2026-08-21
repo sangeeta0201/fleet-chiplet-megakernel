@@ -84,8 +84,20 @@
 // EMIT_FP8 template parameter, consumer side is W2's INPUT_FP8; they are one
 // knob because the layouts have to agree. 0 restores the bf16 handoff, which
 // is what makes this an A/B inside a single build.
+//
+// MEASURED NEUTRAL, defaulted OFF. Same-batch A/B, n=3 each, correct output on
+// all 4 correctness prompts: OFF 10.724 (10.623/10.772/10.777), ON 10.824
+// (10.751/10.777/10.943). +0.100 ms, inside the 0.26 ms noise floor and the
+// wrong sign. The redundancy is real -- 96 W2 tiles per expert each re-derive
+// the same 2048-element activation -- but it is 4 KB against a 68 KB weight
+// tile, the quantize is VALU work that overlaps the tile's own MFMA loop, and
+// the producer side has to pay a __syncthreads plus an LDS round trip to emit
+// the E8M0-per-32 layout. Deleting redundant work inside a GLM phase is
+// absorbed; this is the sixth instance. Kept behind the knob because the
+// FP8-handoff plumbing is the prerequisite for any future W2 change that
+// consumes MXFP8 directly.
 #ifndef MPK_MOE_ACT_FP8
-#define MPK_MOE_ACT_FP8 1
+#define MPK_MOE_ACT_FP8 0
 #endif
 
 namespace kernel {
