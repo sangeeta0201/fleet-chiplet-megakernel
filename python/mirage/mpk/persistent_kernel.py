@@ -587,6 +587,16 @@ def get_compile_command(
             # semantics are unchanged, only who counts. Priced by the null
             # probe below at 3.77 -> 2.11 us per rendezvous.
             flags = flags + ["-DMPK_BAR_TREE=1"]
+        if int(os.environ.get("MPK_EP_POLL_BATCH", "0")) == 1:
+            # One s_waitcnt for all eight EP signal lines instead of one per
+            # peer. The seven-line pass was seven serialized uncached round
+            # trips, measured at 9.65 us on the rank that waits least.
+            flags = flags + ["-DMPK_EP_POLL_BATCH=1"]
+        _ep_fold_wgs = int(os.environ.get("MPK_EP_FOLD_WGS", "0"))
+        if _ep_fold_wgs > 0:
+            # Folding work-groups per XCD. Default 1 (eight total) is the
+            # shape this branch has always had.
+            flags = flags + ["-DMPK_EP_FOLD_WGS=%d" % _ep_fold_wgs]
         _bar_skew = int(os.environ.get("MPK_BAR_SKEW", "0"))
         if _bar_skew >= 1:
             # Per-rendezvous first-arriver-to-last-arriver spread. O(1) per

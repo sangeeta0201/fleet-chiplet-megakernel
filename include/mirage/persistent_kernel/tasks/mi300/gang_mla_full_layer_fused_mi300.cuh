@@ -179,6 +179,22 @@ static constexpr int FULL_LAYER_ENTRY_SLOT = 71;
 // MLA_ prefix, not the bare FULL_LAYER_EP_* gpt-oss uses: both monoliths are
 // included into the same translation unit and share this namespace, and its
 // slot map is its own (its EP barriers live at [48..85] of a 1216-int buffer).
+// MPK_EP_FOLD_WGS: how many work-groups PER XCD fold the EP partial.
+//
+// It has always been 1 -- `xcd_rank == 0` -- so eight work-groups out of 232
+// do the whole exchange while 224 sit in the release poll. The stage stamps
+// price that slice at 5.37 us/layer (S3 - S0), which is 0.42 ms of wall for
+// ~150 bytes per thread of traffic: the cost is the seven-peer store stream
+// and its drain, not the arithmetic. Widening it is the one part of the EP
+// collective that is mechanism rather than inter-rank skew.
+//
+// The arrival counter, the leader election and the self-heal quota all key
+// off the folder count, so they move together with this.
+#ifndef MPK_EP_FOLD_WGS
+#define MPK_EP_FOLD_WGS 1
+#endif
+static constexpr int FULL_LAYER_EP_FOLDERS = 8 * MPK_EP_FOLD_WGS;
+
 static constexpr int FULL_LAYER_MLA_EP_RELEASE_SLOT = 80;
 static constexpr int FULL_LAYER_MLA_EP_FOLD_DONE_SLOT = 88;
 // Phase 8b's W_UV -> o_proj barrier, un-absorbed kv_b_v only: per-XCD release
@@ -766,10 +782,22 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     // 32-bit peer stores never straddle two slices.
     constexpr int EP_FOLD_COLS = QKV_REDUCTION_SIZE;
     constexpr int EP_FOLD_CHUNK = ((EP_FOLD_COLS + 7) / 8 + 1) & ~1;
-    int const ep_col_lo = xcd_id * EP_FOLD_CHUNK;
-    int const ep_col_hi = (ep_col_lo + EP_FOLD_CHUNK) < EP_FOLD_COLS
-                              ? (ep_col_lo + EP_FOLD_CHUNK)
+    int const ep_xcd_lo = xcd_id * EP_FOLD_CHUNK;
+    int const ep_xcd_hi = (ep_xcd_lo + EP_FOLD_CHUNK) < EP_FOLD_COLS
+                              ? (ep_xcd_lo + EP_FOLD_CHUNK)
                               : EP_FOLD_COLS;
+    // Sub-slice for this folding work-group. Even, same reason the XCD chunk
+    // is even: the peer stores are packed 32-bit and must not straddle two
+    // slices. The last folder can come out empty when the rounding overshoots
+    // -- it still bumps the arrival counter, which is what the count is for.
+    constexpr int EP_FOLD_SUB =
+        ((EP_FOLD_CHUNK + MPK_EP_FOLD_WGS - 1) / MPK_EP_FOLD_WGS + 1) & ~1;
+    int const ep_col_lo_raw = ep_xcd_lo + xcd_rank * EP_FOLD_SUB;
+    int const ep_col_lo =
+        (ep_col_lo_raw < ep_xcd_hi) ? ep_col_lo_raw : ep_xcd_hi;
+    int const ep_col_hi = (ep_col_lo + EP_FOLD_SUB) < ep_xcd_hi
+                              ? (ep_col_lo + EP_FOLD_SUB)
+                              : ep_xcd_hi;
 
     // Set on the one thread, rank-wide, that counts the eighth local slice in.
     // That thread is the one that publishes, so it is also the one that waits;
@@ -781,7 +809,11 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
 
     // One folding work-group per XCD, eight in total, on disjoint columns.
     // xcd_rank 0 is the same rank that leads every other per-XCD job here.
-    if (xcd_rank == 0) {
+    // An overshooting last sub-slice comes out empty (lo == hi) and folds
+    // nothing -- but it still enters, because FULL_LAYER_EP_FOLDERS is a
+    // compile-time count and the arrival counter has to see every one of them
+    // or the leader is never elected.
+    if (xcd_rank < MPK_EP_FOLD_WGS) {
       // One delta, two addresses, per peer. The gather slot and the signal
       // line are both symmetric-heap objects and the local->peer offset is
       // heap-wide, so translating the signal costs an add and no second
@@ -874,7 +906,8 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
         // an accumulate, so it stays idempotent.
         if (tid == 0) {
           int const prev_f = atom_add_release_gpu_s32(ep_fold_done, 1);
-          ep_leader = (prev_f % 8 == 7);
+          ep_leader = (prev_f % FULL_LAYER_EP_FOLDERS ==
+                       FULL_LAYER_EP_FOLDERS - 1);
 #ifdef MPK_EP_SIG_DBG
           // Which of the eight folding work-groups actually arrived, and in
           // what order. Leader election is `prev_f % 8 == 7` on a counter that
@@ -894,7 +927,8 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
                    EP_MY_PE, xcd_id, task_layer_idx, prev_f, (int)ep_leader);
           }
 #endif
-          if (prev_f % 8 == 7) {
+          if (prev_f % FULL_LAYER_EP_FOLDERS ==
+              FULL_LAYER_EP_FOLDERS - 1) {
 #if MPK_EP_ABLATE != 1
             // All EP_NPEER stores issued back to back, then a single drain:
             // distinct peers are distinct XGMI links and these pipeline, so
@@ -927,8 +961,12 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
         __shared__ int s_ep_put;
         if (tid == 0) {
           int const prev_f = atom_add_release_gpu_s32(ep_fold_done, 1);
-          s_ep_put = (prev_f % 8 == 7) ? 1 : 0;
-          ep_leader = (prev_f % 8 == 7);
+          s_ep_put = (prev_f % FULL_LAYER_EP_FOLDERS ==
+                      FULL_LAYER_EP_FOLDERS - 1)
+                         ? 1
+                         : 0;
+          ep_leader = (prev_f % FULL_LAYER_EP_FOLDERS ==
+                       FULL_LAYER_EP_FOLDERS - 1);
         }
         __syncthreads();
         if (s_ep_put && tid == 0) {
@@ -1084,7 +1122,9 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
 #else
             bool const _ep_peers_in = true;
 #endif
-            if (ld_nt_s32(ep_fold_done) >= 8 * ep_expected && _ep_peers_in) {
+            if (ld_nt_s32(ep_fold_done) >=
+                    FULL_LAYER_EP_FOLDERS * ep_expected &&
+                _ep_peers_in) {
               st_wt_u32((void *)my_flag, (unsigned)ep_expected);
               asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
             }
@@ -1118,7 +1158,8 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
               printf("[EPREL] pe=%d xcd=%d layer=%d TIMEOUT obs=%d exp=%d "
                      "fold_done=%d (want %d)\n",
                      EP_MY_PE, xcd_id, task_layer_idx, _ep_obs, ep_expected,
-                     ld_nt_s32(ep_fold_done), 8 * (task_layer_idx + 1));
+                     ld_nt_s32(ep_fold_done),
+                     FULL_LAYER_EP_FOLDERS * (task_layer_idx + 1));
             }
             break;
           }
