@@ -190,6 +190,17 @@ if __name__ == "__main__":
 #   work-dominated -> 55% occupancy is the lever and the ceiling is
 #                     13.0 x (1 - 128/232) x 76 = 0.44 ms.
 #
+# ---- ANSWERED SAME DAY, and BOTH BRANCHES ABOVE ARE WRONG.  See
+# router_poll_vs_work.py: the split is 54/46, so NEITHER dominates, and the
+# 0.44 ms ceiling in the second branch is RETRACTED -- there are exactly
+# NUM_EXPERTS/EPT = 128 router TILES and each of the 128 workers already takes
+# one, so the 104 idle workers have nothing to take and the occupancy is not
+# free to change.  An occupancy figure is only a lever when the work is
+# divisible.  Region CLOSED, no component above 0.17 ms.  Also: the probe this
+# block scoped -- a new stage stamp, header edit, two-step rebuild, GPU run --
+# was unnecessary; SP6[0..4] had been compiled in the whole time.  Grep the
+# existing counter banks before adding one.
+#
 # (4) INSTRUMENT NOTE -- rank 0 reads sd 7.13 us at S30 against peers' 0.20.
 # That is ONE outlier row, not an anomaly: r0 has n=191 where peers have 192,
 # and its minimum is worker 208 at mean arrival 0.0 us -- a row that was never
