@@ -505,6 +505,33 @@ if __name__ == "__main__":
              "ms/token ceiling; not a decode mode -- every committed token "
              "still comes from the model's own argmax.")
     args = parser.parse_args()
+    # ── MPK_SPEC_DECODE=1 IS NOT OUTPUT-EXACT. MEASURED 2026-08-22. ─────────
+    # f18dc60 reported 10.609 -> 8.952 ms/token at acceptance 0.848 and gated
+    # it on "all 8 ranks byte-identical, text coherent and on topic". That is
+    # the WRONG GATE: cross-rank identity only proves the eight ranks agree
+    # with each other, and they agree on a continuation greedy decode does not
+    # produce. Under greedy sampling speculation is supposed to be exact -- a
+    # rejected draft falls back to the main model's argmax -- so the emitted
+    # stream must equal the MPK_SPEC_DECODE=0 stream token for token.
+    #
+    # It does not. Both arms, 4-prompt suite, 264 tokens, same build:
+    #
+    #   prompt  ctl        mtp        exact-prefix
+    #   p0      264 tok    264 tok      0/264   diverges at the FIRST token
+    #   p3      264 tok    264 tok     26/264
+    #   p1/p2   ok         rc=124      no pair (one illegal address, one hang)
+    #
+    # and cross-rank identical = True on BOTH arms for both pairs, which is
+    # exactly how the weaker gate passed. Both outputs read as fluent English,
+    # so nothing about the text flags it either.
+    #
+    # Therefore 8.952 ms/token is NOT comparable to the 10.609 baseline: the
+    # two numbers are not decoding the same sequence. The accept/reject step
+    # is committing draft tokens it should have rejected. Left off by default
+    # (MPK_SPEC_DECODE defaults to 0 and no launcher sets it). Do not quote
+    # the MTP figure, and do not price deeper speculation against it, until
+    # this comparison is exact.
+    # ───────────────────────────────────────────────────────────────────────
     # `--mtp` on its own still only loads the draft layer for the torch
     # reference path. Under the megakernel the layer is dispatched only when
     # the speculative harness is compiled in -- otherwise the graph would run
