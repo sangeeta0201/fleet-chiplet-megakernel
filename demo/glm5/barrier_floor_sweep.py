@@ -234,3 +234,47 @@ if __name__ == "__main__":
 # comments before publishing this table; paired_span.py is corrected.  Its
 # RESULT block quoted only S0->S1, S28->S29 and S31->S32, all outside the
 # shifted range, so its findings stand.
+
+# ============================================================================
+# CORRECTION, same day.  THE FLOOR METHOD CANNOT SEE A CROSS-RANK WAIT, and
+# for the largest line in the table that is 82% of it.
+# ============================================================================
+#
+# min_w is taken over the 232 workers of ONE rank.  A wait that every worker on
+# the rank pays equally is therefore indistinguishable from uniform local work
+# -- it lands in FLOOR and reads UNIFORM.  That is exactly what S0->S1 is.
+# Stamp 3 splits it and has the SAME write count as stamps 0 and 1 (38836), so
+# the per-worker difference is legal:
+#
+#   rank              0     1     2     3     4     5     6     7    mean
+#   S3-S0 local fold+publish                                          4.47 us
+#   S1-S3 peer wait + release fan-out                                19.81 us
+#   S0->S1, the 8 EP folders                                         24.30 us
+#   S0->S1, all 232 workers                                          24.33 us  <- 0.03 apart
+#
+#   local fold + publish        4.47 us/lyr   0.340 ms   18.4%
+#   PEER WAIT + release        19.81 us/lyr   1.506 ms   81.6%
+#
+# So the 1.894 ms headline is 0.34 ms of local work and 1.51 ms of the
+# rank-alignment TAX, which glm-inter-rank-skew-is-paid-once already closed --
+# it does not disappear if you delete the collective, it relocates 83% of
+# itself to the q_b gather.  THE HONEST LOCAL FLOOR IS 6.498 - 1.506 = 4.99 ms,
+# and subtracting the layer's other cross-rank rendezvous (the QB_TP peer wait,
+# ceiling 0.312, glm-qb-peer-wait-ceiling-is-0.335ms) puts it near 4.68 ms.
+# Quote 6.498 only as "floor by the intra-rank estimator".
+#
+# RANK 0 IS THE MINIMUM PEER WAIT AGAIN -- 11.52 vs the peers' ~20.7 -- so rank
+# 0 is the LAST ARRIVER at the EP collective.  Third independent sighting of
+# the pattern, and it is the same rank the shared-expert work localizes to
+# (glm-ep-skew-is-half-shared-expert-bias): more work in layer L-1 means later
+# arrival in layer L.  The two findings agree.
+#
+# AND A NEW INSTANCE OF AN OLD TRAP.  The first attempt used stamp 4 (the
+# published split is S3->S4 peer wait, S4->S1 fan-out) and got a NEGATIVE
+# 3.21 us for S1-S4.  Stamp 4 is CONDITIONAL: its write count per worker ranges
+# 32 to 12972 against 38836 for stamps 0/1/3, so t/c is a mean over a biased
+# subset of layers and differencing it against a full-count stamp is illegal.
+# The negative interval is the tell.  glm-subphase-slots-have-per-slot-
+# populations says read the guard before dividing by it; this extends it to
+# STAGE STAMPS, where the count is per-worker and printed right there in the
+# BARSTAGEWS row.  Check it even when the neighbouring slots are full-count.
