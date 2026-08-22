@@ -130,6 +130,72 @@
 # costs ~1:1, removed work saves ~0, four pairs), and the shard's own cost is
 # not netted out.  THE SHARED-EXPERT K-SHARD IS A NO-GO.
 #
+# ===== SECOND MAGNITUDE, MULT=2 (TRIPLE), 2026-08-22: THE RESPONSE IS =======
+# ===== CONVEX.  THE EXISTING EXCESS SITS IN THE FLAT REGION.          =======
+#
+# MULT=2 gives the shared expert THREE W13 slots instead of two, doubling the
+# ADDED work relative to MULT=1.  Fresh base control re-run in the same
+# session (10.516 vs 10.618 the session before -- drift 0.10, inside noise,
+# which is exactly why the control is re-run per session).
+#
+#   arm            runs                       mean    min     max   spread
+#   base (DUP=0)   10.520 10.647 10.382     10.516  10.382  10.647   0.265
+#   dup  (DUP=2)   10.958 11.014 11.157     11.043  10.958  11.157   0.199
+#   delta +0.527 ms -- ARMS FULLY SEPARATED (base max 10.647 < dup min
+#   10.958).  Unlike MULT=1 this is resolvable against the 0.26 floor.
+#
+# LIVENESS, us/layer, count-weighted (base borrowed from /tmp/shdup1: the
+# MULT=2 base counter arm timed out rc=124, and MPK_SHARED_DUP=0 is a
+# byte-for-byte no-op so the two sessions' base builds are the same build):
+#
+#   r0 S5->S6   10.40 -> 14.78 (MULT=1) -> 19.13 (MULT=2)
+#   delta vs base      +4.38            +8.73     <- 2 x 4.37, LINEAR
+#   peers        6.16 ->  6.36          ->  5.92  <- flat
+#   W2 control (must not move)   +0.08 / -0.30    <- flat
+#
+# The added WORK is linear in the copy count, so there is NO W13 round
+# quantization inflating the second point.  The convexity is in the WALL:
+#
+#   MULT   r0 W13 work added   wall delta   cumulative   marginal
+#     1        +0.333 ms         +0.106        0.32        0.32
+#     2        +0.663 ms         +0.527        0.79        1.28
+#
+#   marginal = (0.527 - 0.106) / (0.663 - 0.333) = 0.421 / 0.330 = 1.28
+#
+# THE SLACK-THRESHOLD MODEL IS CONFIRMED and the LINEAR model is refuted.
+# The first ~4.4 us/layer of extra rank-0 work is ~68% absorbed; the second
+# ~4.4 us/layer converts at ~1.28:1, i.e. fully on the critical path and
+# then some.  Both statistics agree on the shape -- makespan max-max goes
+# 18.25 -> 21.46 -> 27.41 (deltas +3.21, +9.16) with peers pinned at
+# 12.27 / 12.26 / 12.25.
+#
+# Peer idle scales with it: peers' S3->S4 EP wait +2.82 then +7.13 us/layer,
+# layer span +3.6 then +8.0/+8.5.  So peer idle is a faithful REPORTER of
+# rank-0 excess and still a bad PREDICTOR of wall -- it grew 2.5x while the
+# wall grew 5x.
+#
+# G1+G2 PASS on both MULT=2 reps that produced JSON (2 of 3; rep 1's file was
+# not collected, rc=0 for all three).  G3 is weaker here than at MULT=1 --
+# both reps read "NEW continuation" at prefix 40 rather than joining a
+# control cluster.  The duplicated tiles rewrite bit-identical values, so any
+# divergence is the same bs=1 attractor nondeterminism the control shows, but
+# 4 control runs under-sample it.  Advisory only; the hard gate is G1+G2.
+#
+# ============ WHAT THE CONVEXITY MEANS FOR THE BOARD ========================
+# 1. THE SHARD CLOSURE IS STRENGTHENED, not weakened.  Removing the existing
+#    4.24 us/layer excess moves LEFT along the curve into the flat region,
+#    where the coefficient is 0.32 and falling -- not the 0.79 measured at
+#    MULT=2.  The <=0.103 ms ceiling above stands and is if anything generous.
+# 2. THE CONVERSE IS A NEW CONSTRAINT.  Rank 0's slack is finite, ~4 us/layer.
+#    Any future design that hands rank 0 extra work "because it has slack"
+#    is free only up to that, and is punished at >1:1 beyond it.  Do not
+#    assume the shared-expert rank can absorb another stage.
+# 3. THE BOARD'S CROSS-RANK WAIT LINES DO NOT CONVERT AT A FIXED RATE.
+#    EP collective 1.187 + QB_TP 0.643 = 1.83 ms are PEER-IDLE numbers.  Near
+#    the operating point they convert at ~0.3, which is consistent with the
+#    measured -0.206 ms wall for deleting the EP collective outright
+#    (0.206/1.187 = 0.17).  Never price a WAIT line at face value.
+#
 # ================= WHAT THIS DOES TO THE TWO PRIOR NOTES ====================
 # glm-shared-expert-hoist-is-zero-makespan is VINDICATED IN ITS CONCLUSION and
 # still WRONG IN ITS EVIDENCE.  Its claim "rank 0's W13 makespan is the
