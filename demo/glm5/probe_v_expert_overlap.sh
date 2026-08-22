@@ -94,3 +94,34 @@ echo VPROBE_DONE
 #   route to different experts, and the 35% they share is worth a third of
 #   the build bar.
 # ===========================================================================
+
+# ===========================================================================
+# CORRECTION 2026-08-22, same day, same V.  The DENOMINATOR above was wrong.
+# ===========================================================================
+#   The region map (glm-second-decode-row-region-map) labels S5->S6 "routing"
+#   and S6->S7 "W13".  Both labels are wrong.  Every mpk_stage_stamp id has
+#   exactly one call site, so the mapping is not ambiguous:
+#
+#     stamp 5 @gang_oproj_router_fused_mi300.cuh:1220  routing wait done
+#     stamp 6 @1521  W13 tiles done      => S5->S6 = Phase 5, W13 TILES  +9.400
+#     stamp 7 @1614  W13->W2 release     => S6->S7 = Phase 6, BARRIER    +3.550
+#     stamp 8 @1669  W2 tiles done       => S7->S8 = Phase 7, W2 TILES   +7.520
+#
+#   I priced the fold against the +3.550 BARRIER line as if it were W13.  The
+#   foldable MoE TILE delta is 9.400 + 7.520 = 16.920 us/layer, not 11.070.
+#   The MoE group total is unchanged (20.470); only the split inside it moves.
+#
+#     MoE tile share of the second row  1.269 ms  (23.6%, was 0.830 / 15.2%)
+#     saving at the measured V = 2.801  0.444 ms  (was 0.291)
+#     bar 0.5 ms now needs V >= 3.15    (was 4.82)
+#
+#   VERDICT UNCHANGED BUT NO LONGER COMFORTABLE: still NO-GO, by 1.13x rather
+#   than 1.7x, and 0.444 ms is now ABOVE the 0.26 ms wall noise floor instead
+#   of below it.  What still carries it is that 0.444 is a BYTES ceiling and
+#   the three discounts are not small: at EP=8 a rank owns ~1-2 activated
+#   experts so a duplicate pair must land on the STRAGGLER rank to pay;
+#   MoE rounds are ceil(tiles/29) so removing tiles that do not cross a round
+#   boundary buys exactly zero; and cutting work inside a phase is absorbed
+#   3 times out of 3.  The honest statement is "priced at 0.444 ms ceiling,
+#   realized well under, against a 0.5 ms bar" -- not "1.7x short".
+# ===========================================================================

@@ -19,8 +19,12 @@ import sys, re, collections
 
 TOPK = 8
 N_ROUTED = 256
-MOE_DELTA = 0.830   # ms, the second live row's MoE share (75 MoE layers;
-                    # see price_moe_row_fold.py -- 78 hidden - 3 dense)
+MOE_DELTA = 1.269   # ms, the second live row's MoE TILE share:
+                    # (9.400 W13 + 7.520 W2) us/layer x 75 MoE layers.
+                    # CORRECTED from 0.830 -- the region map mislabels
+                    # S5->S6 as "routing" (it is the Phase 5 W13 tiles) and
+                    # S6->S7 as "W13" (it is the W13->W2 barrier).  See
+                    # price_moe_row_fold.py for the stamp-site proof.
 ROW = 5.458         # ms, a second live row end to end
 BAR = 0.5           # ms, the build/no-build bar
 

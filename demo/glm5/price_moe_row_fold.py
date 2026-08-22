@@ -43,11 +43,26 @@ MOE_LAYERS = N_LAYERS - DENSE   # 75
 # This raises the fold's ceiling by 2.7%, i.e. it corrects AGAINST the verdict.
 
 # ---- measured (glm-mtp-chain-is-cheap-the-row-is-expensive, region map) ----
+#
+# CORRECTED 2026-08-22.  The region map labels S5->S6 "routing" and S6->S7
+# "W13".  BOTH LABELS ARE WRONG, and I priced the fold off them.  Every
+# mpk_stage_stamp id has exactly ONE call site, so the mapping is not
+# ambiguous -- in gang_oproj_router_fused_mi300.cuh:
+#     stamp 5 @1220  routing wait done, W13 not started
+#     stamp 6 @1521  this worker's W13 TILES are done   -> S5->S6 = Phase 5 W13
+#     stamp 7 @1614  the W13->W2 release is observed    -> S6->S7 = Phase 6 BARRIER
+#     stamp 8 @1669  W2 tiles done                      -> S7->S8 = Phase 7 W2
+# So the second row's W13 TILE delta is the +9.400 line, not the +3.550 line;
+# +3.550 is a barrier, which a row fold cannot delete.  The MoE group total is
+# unchanged (9.400+3.550+7.520 = 20.470); only the split inside it moves.  The
+# tile delta a fold can attack is 53% larger than I first priced -- again a
+# correction AGAINST the verdict.
 ROW_TOTAL  = 5.367   # ms, a second LIVE row end to end
-W13_DELTA  = 3.550   # us/layer added by the second live row
-W2_DELTA   = 7.520   # us/layer added by the second live row
-W2_BASE    = 8.117   # us/layer at bs=1
-W13_BASE   = 12.095  # us/layer at bs=1
+W13_DELTA  = 9.400   # us/layer, Phase 5 TILES   (was 3.550 = the barrier)
+W2_DELTA   = 7.520   # us/layer, Phase 7 TILES
+BAR_DELTA  = 3.550   # us/layer, Phase 6 W13->W2 BARRIER -- NOT foldable
+W13_BASE   = 10.110  # us/layer at bs=1, Phase 5 tiles
+W2_BASE    = 8.117   # us/layer at bs=1, Phase 7 tiles
 
 MOE_DELTA_MS = (W13_DELTA + W2_DELTA) * MOE_LAYERS / 1000.0
 THRESHOLD    = 0.5   # ms -- the guide's build/no-build bar
