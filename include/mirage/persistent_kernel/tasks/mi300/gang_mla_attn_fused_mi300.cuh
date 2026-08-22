@@ -1190,6 +1190,20 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
       // it is already the thread that fans the release out. One thread on the
       // rank polls the remote lines and the other 231 workers keep polling a
       // local flag that is simply published later. No second barrier.
+      // MPK_QB_SKIP_PEER_WAIT: delete the q_b head-shard CROSS-RANK gather --
+      // this rank's 7 peer stores and the poll of all 7 peers -- while keeping
+      // the local hierarchical barrier, the flag release and every other
+      // phase. WRONG OUTPUT by construction: the query row keeps the peers'
+      // previous-layer heads, so decode reads 7/8 stale heads.
+      //
+      // Same purpose as MPK_MLA_SKIP_DECODE next door. It prices the ceiling
+      // on head-sharding attention end-to-end, which would delete this
+      // rendezvous outright rather than narrow it (the one shape the
+      // "skew just relocates" rule does not obviously kill, since it removes
+      // the rendezvous AND its producer set). The number that decides that
+      // rewrite is NOT how much leaves S19->S20 -- it is how much survives at
+      // the wall after S22 and S28 re-absorb the freed skew.
+#ifndef MPK_QB_SKIP_PEER_WAIT
       if (qb_tp) {
         int64_t d[QB_NPEER];
         bool mapped = true;
@@ -1242,6 +1256,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
           asm volatile("buffer_inv" ::: "memory");
         }
       }
+#endif
       for (int x = 0; x < 8; x++) {
         st_wt_u32((void *)&qb_barrier[x * HIER_STRIDE], (unsigned)qb_expected);
       }

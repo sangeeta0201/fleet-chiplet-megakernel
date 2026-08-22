@@ -611,6 +611,18 @@ def get_compile_command(
             # 1.88 ms/iter that gang_mla_full_layer_fused_mi300.cuh:1391
             # attributes to 232 workers waiting on the 16 that run the decode.
             flags = flags + ["-DMPK_MLA_SKIP_DECODE"]
+        if int(os.environ.get("MPK_QB_SKIP_PEER_WAIT", "0")) == 1:
+            # Delete the q_b head-shard CROSS-RANK gather (7 peer stores + the
+            # poll of all 7 peers), keeping the local barrier, the flag release
+            # and every other phase. WRONG OUTPUT by construction: the query
+            # row keeps the peers' previous-layer heads.
+            #
+            # Prices the ceiling on head-sharding attention end-to-end. That
+            # rewrite would DELETE this rendezvous rather than narrow one, so
+            # the usual "skew relocates" verdict does not apply on its face --
+            # but the deciding number is what survives at the WALL after S22
+            # and S28 re-absorb the freed skew, not what leaves S19->S20.
+            flags = flags + ["-DMPK_QB_SKIP_PEER_WAIT"]
         if int(os.environ.get("MPK_ATTN_HALFK", "0")) == 1:
             # Halve the K-loop of every MXFP8 attention/dense GEMM (qkv_a, q_b,
             # o_proj, W_UV, W_UK) at an unchanged tile map and WG stride.
