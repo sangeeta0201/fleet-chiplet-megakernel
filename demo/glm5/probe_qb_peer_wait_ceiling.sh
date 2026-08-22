@@ -54,6 +54,7 @@
 #   skippeer (SKIP_PEER_WAIT=1)  10.103 10.239 10.124   10.155  10.103  10.239
 #
 #   CEILING ON DELETING THE q_b GATHER = 0.335 ms
+#   *** SUPERSEDED -- see the n=6 pooled block below, the ceiling is 0.228 ***
 #
 # Arms disjoint: base_min 10.381 - skippeer_max 10.239 = +0.142 ms.  Flag
 # verified in the build on 8 ranks in the skippeer arm and 0 in base.
@@ -94,6 +95,78 @@
 # latent vs 128 x (512+64)), so the rewrite MOVES a transfer onto o_proj's
 # existing gather rather than deleting one.  Realized gain is strictly less
 # than 0.335 ms, against a rewrite touching decode, merge, W_UV and o_proj.
+#
+# =========== RE-RUN, same day, n=3 MORE PER ARM -> n=6 POOLED ===========
+# Both phases re-run end to end under identical env.  The verdict is UNCHANGED
+# and firmer, but THE CEILING NUMBER IS CORRECTED DOWNWARD: 0.335 -> 0.228 ms.
+#
+# PHASE A, the deciding number.  Second triple: base 10.559 10.560 10.402,
+# skippeer 10.513 10.387 10.258 -> a delta of only +0.121 ms with the arms
+# OVERLAPPING.  The first triple's +0.335 was the high tail of a noisy n=3.
+#
+#   arm       n   mean     min     max     sd
+#   base      6   10.498   10.381  10.677  0.118
+#   skippeer  6   10.271   10.103  10.513  0.157
+#   ------------------------------------------------------------------
+#   CEILING ON DELETING THE q_b GATHER = 0.228 ms   (was published as 0.335)
+#
+# Ranges overlap, but the MEANS are resolvable: pooled sd 0.139, se of the
+# difference 0.080, t = 2.84 on df 10 (p ~ 0.02).  So the effect is real and
+# small -- 0.228 ms is BELOW the 0.26 ms wall noise floor for a single pair
+# (glm5-wall-noise-floor-is-0.26ms) and only n=6 pooling separates it at all.
+# This is exactly the case that memory file exists to warn about: the n=3
+# number was not reproducible and the direction of the error was optimistic.
+# Flag verified in the build on 8 ranks in skippeer, 0 in base, both phases.
+#
+# PHASE B, the counters, fully re-run.  THE COUNTER ROUTE IS REPRODUCIBLE TO
+# ~0.15 us/layer where the wall was not.  Pooled over 8 ranks, us/layer:
+#
+#   region                          MAKESPAN(crit)      run1     MEDIAN(typ)
+#   S19->S20 THE PEER WAIT ITSELF   9.06 ->  5.13  -3.94  (-4.11)  -4.15
+#   S18->S22 qkv_a bar -> dec/merge 33.31 -> 29.44 -3.87  (-3.78)  -3.85
+#   S18->S28 whole attention tail   44.43 -> 40.72 -3.71  (-3.82)  -3.64
+#   S22->S28 ABSORBER TO WATCH      11.12 -> 11.27 +0.16  (-0.04)  +0.22
+#   S28->S5  MoE half (CONFOUNDED)  38.57 -> 38.08 -0.49     n/a   -0.54
+#   S0->S14  LAYER SPAN            159.74 ->155.92 -3.82  (-3.67)  -4.00
+#
+#   layer span -3.82 us/layer x 76 = -0.290 ms   (run 1: -0.279)
+#
+# THE SKEW STILL DOES NOT RELOCATE, now confirmed twice.  S22->S28 moves +0.16
+# us/layer makespan / +0.22 median -- zero within the region's own spread, and
+# it moved -0.04 the first time, i.e. it flips sign between runs.  ~92% of what
+# leaves S19->S20 survives to the layer span.  Deleting THIS rendezvous really
+# does delete its time; the e5d1ff5 relocation rule does not bite here.
+#
+# BUT THE TWO ROUTES NO LONGER AGREE, AND THAT IS THE HONEST HEADLINE.
+# Run 1 had wall -0.335 vs span -0.279, inside 0.06.  At n=6 the wall is -0.228
+# and the span is -0.290 -- the counters now claim 27% MORE than the wall.  Two
+# readings, and this probe cannot separate them:
+#   (a) MPK_BAR_SKEW=3 is common-mode in LEVEL but not in SLOPE.  The stamps
+#       serialize a store per worker per region; deleting a 4 us wait shortens
+#       the window the instrument's own cost hides in, so the instrumented arm
+#       can show a larger delta than the uninstrumented one.
+#   (b) the router confound.  The skippeer arm's output is COHERENT BUT
+#       DIVERGENT (both arms write a sensible paragraph about Rayleigh
+#       scattering, with different wording), so TopK differs and the MoE half's
+#       expert balance is not the same experiment.  S28->S5 moving -0.49
+#       us/layer is that confound, not a result.
+# Either way the wall is the route that counts and it is the SMALLER one.
+#
+# ================== VERDICT: NO-GO, at 0.228 ms not 0.335 ==================
+# Under the ruling's 0.4 ms bar by both routes and by every pooling.  Head-
+# sharding attention end-to-end is CLOSED.  The generosity argument above only
+# gets stronger at the lower number: 0.228 ms is the ceiling for deleting the
+# rendezvous at ZERO cost, while the real rewrite still has to combine the
+# head-sharded output across ranks -- a payload comparable to the query row it
+# stops gathering.  Realized gain is strictly less than 0.228 ms, against a
+# rewrite touching decode, merge, W_UV and o_proj.  Not worth it.
+#
+# METHOD NOTE.  The first base counter arm HUNG: rc=124 at the 1800 s timeout,
+# 0 BARSTAGEWS lines, log ending at "launch_persistent_kernel ENTER".  That is
+# the known ~1-in-3 NP=8 EP hang (glm-np8-fault-has-two-presentations), NOT a
+# consequence of the flag -- the flag is 0 on that arm.  GPUs were confirmed
+# idle with no orphan ranks, and the arm alone was re-run under identical env:
+# rc=0, 52671 BARSTAGEWS lines.
 # ======================================================================
 set -u
 ulimit -c 0
