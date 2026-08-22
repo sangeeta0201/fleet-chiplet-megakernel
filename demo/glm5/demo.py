@@ -3293,7 +3293,11 @@ if __name__ == "__main__":
         run_time = starter.elapsed_time(ender)
 
         if profiler_tensor is not None:
-            torch.save(profiler_tensor.cpu(), "profile_output.pt")
+            # Every rank shares this cwd, so an unsuffixed name means 8
+            # concurrent writers to one path -- the dump comes back torn or
+            # silently belongs to whichever rank finished last.
+            torch.save(profiler_tensor.cpu(),
+                       f"profile_output_rank{rank}.pt")
 
         sys.stdout.flush()
         os.dup2(_saved_stdout_fd, 1)
