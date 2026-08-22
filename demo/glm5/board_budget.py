@@ -47,9 +47,13 @@ REGIONS = [
     (18, 19, "q_b tiles + KV append",
      "0.937  q_b GEMM at the HBM roof; 41% is RMSNorm+quant prologue"),
     (19, 21, "q_b->decode bar + MLA decode",
-     "1.392  ABLATION was 3.40, HARVESTED -2.76 by 8-token KV chunks"),
+     "1.392  SPLIT (decode_barrier_anatomy.py): 0.749 decode WORK, ablated in "
+     "f02753c, overlap NO-GO (movable set empty) + 0.643 QB_TP CROSS-RANK "
+     "peer wait, NO-GO (inter-rank skew, same producer set as the EP "
+     "collective)"),
     (21, 23, "decode->merge bar + merge",
-     "0.415  216 workers idle through a 16-worker phase; serial decode"),
+     "0.415  the idle set crosses this in 1.49 us; the 64 decode workers pay "
+     "6.73 -- it is serial decode drain, not a machine-wide hole"),
     (23, 24, "Phase 8 attn -> o_proj barrier",
      "0.170  straggler, not mechanism: 91% spin, the atomic is 0.49us"),
     (24, 25, "o_proj weight prefetch issue", "0.075  NESTED"),
@@ -138,6 +142,15 @@ for n, c, t, ms in sorted(rows, key=lambda x: -x[3]):
     print(f"{n:<42}{verdict}")
 
 print("""
+TWO LABELS ON THIS BOARD WERE WRONG AND ARE NOW FIXED, see
+decode_barrier_anatomy.py:
+  * S19->S21 is NOT one phase.  It is 0.749 ms of decode tile work plus 0.643
+    ms of the QB_TP cross-rank peer wait.  The layer pays TWO cross-rank
+    rendezvous per layer, not one.
+  * "216 workers idle through a 16-worker phase" was stale geometry (it is
+    64/168 since the KV-chunk harvest) AND mislocated: the idle set crosses
+    S19->S21 in 1.70 us.  It does not wait there.
+
 FINDING OF THIS AUDIT: there is no un-attacked region left above 0.4 ms.
 Every one of the top twelve carries a measured verdict already.  The layer is
 not hiding a lever -- it is a flat distribution of ~1 ms terms, most of them
