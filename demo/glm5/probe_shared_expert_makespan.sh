@@ -150,7 +150,14 @@ cd /home/claudeuser/fleet-chiplet-megakernel/demo/glm5
 export MODEL_PATH=/home/claudeuser/models/glm5-mxfp4
 export MPK_PRINT_ALL_RANKS=0
 N="${N:-3}"
-D=/tmp/shdup
+# MULT = number of EXTRA shared-expert W13 copies on rank 0.  1 DOUBLES the
+# excess (the arm measured 2026-08-22, +0.106 ms), 2 TRIPLES it.  Two
+# magnitudes separate a LINEAR peer-idle->wall response from a slack
+# THRESHOLD, which is the only thing that decides whether the board's
+# cross-rank WAIT lines convert to wall at all.  Log dir is per-MULT so the
+# arms never overwrite each other.
+MULT="${MULT:-1}"
+D=/tmp/shdup${MULT}
 mkdir -p $D
 
 echo "########################## PHASE A: WALL ##########################"
@@ -158,20 +165,20 @@ export MPK_SUBPHASE_TIMING=0
 export MPK_BAR_SKEW=0
 for ARM in base dup; do
   if [ "$ARM" = base ]; then export MPK_SHARED_DUP=0
-  else export MPK_SHARED_DUP=1; fi
+  else export MPK_SHARED_DUP=$MULT; fi
   unset KEEP_BUILD
   rm -rf permanent_output_dir permanent_output_dir_rank*
   echo "########## ARM $ARM  MPK_SHARED_DUP=$MPK_SHARED_DUP ##########"
-  ./bench_repeat.sh "shdup_${ARM}" "$N"
+  ./bench_repeat.sh "shdup${MULT}_${ARM}" "$N"
   # The -D must be in the build on ALL EIGHT ranks.  A flag that never reached
   # the compile is how a null result gets manufactured
   # (mirage-cpp-edits-need-a-two-step-rebuild).
   echo -n "  DMPK_SHARED_DUP in build, rank count: "
-  grep -ho "DMPK_SHARED_DUP" /tmp/glm5_shdup_${ARM}_r1.log | wc -l
+  grep -ho "DMPK_SHARED_DUP" /tmp/glm5_shdup${MULT}_${ARM}_r1.log | wc -l
   # Eyeball the text now, before any number is believed (CLAUDE.md).
   echo "  --- generated text, rep 1 ---"
   grep -hE "^\[1,0\].*(Generated|Output|assistant)" \
-      /tmp/glm5_shdup_${ARM}_r1.log | head -3
+      /tmp/glm5_shdup${MULT}_${ARM}_r1.log | head -3
 done
 
 echo "########################## PHASE B: CORRECTNESS ##########################"
@@ -179,7 +186,7 @@ echo "########################## PHASE B: CORRECTNESS ##########################
 # are runtime, not compile-time, so the megakernel under test is byte-identical
 # to the one phase A just timed.  That is deliberate -- gating a DIFFERENT
 # build than the one that produced the wall number proves nothing.
-export MPK_SHARED_DUP=1
+export MPK_SHARED_DUP=$MULT
 export MAX_SEQ_LENGTH=512
 export MAX_NEW_TOKENS=256
 export MAX_SAVE_TOKENS=264
@@ -211,7 +218,7 @@ export MPK_SUBPHASE_TIMING=0
 export MAX_NEW_TOKENS=96
 for ARM in base dup; do
   if [ "$ARM" = base ]; then export MPK_SHARED_DUP=0
-  else export MPK_SHARED_DUP=1; fi
+  else export MPK_SHARED_DUP=$MULT; fi
   unset KEEP_BUILD
   rm -rf permanent_output_dir permanent_output_dir_rank*
   export MASTER_PORT=$((37600 + (RANDOM % 300)))
@@ -227,7 +234,7 @@ python3 compare_shared_dup_counters.py
 echo "########################## WALL SUMMARY ##########################"
 for ARM in base dup; do
   echo -n "$ARM  "
-  grep -hE '^\[1,0\].*Decode:' /tmp/glm5_shdup_${ARM}_r*.log \
+  grep -hE '^\[1,0\].*Decode:' /tmp/glm5_shdup${MULT}_${ARM}_r*.log \
     | grep -oE 'avg [0-9.]+ms/iter' | grep -oE '[0-9.]+' \
     | awk '{v[n++]=$1; s+=$1; if(n==1||$1<mn)mn=$1; if($1>mx)mx=$1}
            END{if(n)printf "n=%d mean=%.3f min=%.3f max=%.3f spread=%.3f\n",

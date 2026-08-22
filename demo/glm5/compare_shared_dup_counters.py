@@ -37,11 +37,17 @@ rendezvous forces the layer periods equal and the span goes flat regardless
 (that trap produced and retracted 406375b).
 """
 import collections
+import os
 import re
 import sys
 
 ARMS = ("base", "dup")
-LOGS = {a: f"/tmp/shdup/ctr_{a}.log" for a in ARMS}
+# MULT is the number of EXTRA shared-expert W13 copies in the dup arm: 1
+# doubles rank 0's excess, 2 triples it.  Kept out of the filename default
+# so each magnitude keeps its own log dir.
+MULT = os.environ.get("MULT", "1")
+D = f"/tmp/shdup{MULT}"
+LOGS = {a: f"{D}/ctr_{a}.log" for a in ARMS}
 PAT = re.compile(r"\[1,(\d+)\].*BARSTAGEWS (\d+) (\d+) (\d+) (\d+)")
 N_LAYERS = 76
 

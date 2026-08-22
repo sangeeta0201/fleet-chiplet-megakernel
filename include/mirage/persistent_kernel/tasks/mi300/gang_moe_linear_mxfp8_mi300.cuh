@@ -355,12 +355,15 @@ template <int BATCH_SIZE,
           // Routed experts only; the shared expert is id EP_NUM_ROUTED.
           int EP_NUM_ROUTED = NUM_EXPERTS,
           int EP_SHARED_PE = 0,
-          // MPK_SHARED_DUP pricing probe: give the shared expert TWO
-          // consecutive slots in the owned subsequence, so every one of its
-          // tiles runs twice. Long note at the define in mpk_atoms.cuh. Only
-          // the W13 caller may set this -- W2's epilogue is an atomicAdd and
-          // would double-count. Default false is byte-for-byte the old decode.
-          bool DUP_SHARED = false>
+          // MPK_SHARED_DUP pricing probe: give the shared expert
+          // 1 + DUP_SHARED consecutive slots in the owned subsequence, so
+          // every one of its tiles runs that many times. DUP_SHARED is the
+          // number of EXTRA copies: 1 doubles, 2 triples. Two magnitudes are
+          // what separate a LINEAR peer-idle->wall response from a slack
+          // THRESHOLD. Long note at the define in mpk_atoms.cuh. Only the W13
+          // caller may set this -- W2's epilogue is an atomicAdd and would
+          // double-count. Default 0 is byte-for-byte the old decode.
+          int DUP_SHARED = 0>
 __device__ __forceinline__ bool _gang_moe_mxfp8_tile(int tile_idx,
                                                      int const *d_mask,
                                                      int const *d_routing,
@@ -387,11 +390,12 @@ __device__ __forceinline__ bool _gang_moe_mxfp8_tile(int tile_idx,
           (cand >= EP_NUM_ROUTED)
               ? (EP_MY_PE == EP_SHARED_PE)
               : (cand >= EP_BASE && cand < EP_BASE + EP_LOCAL_ROUTED);
-      // At DUP_SHARED the shared expert consumes two slots instead of one.
-      // With mult == 1 `seen` still steps by exactly one from -1, so `>=`
-      // first fires exactly where `== owned_rank` did: the default path is
-      // unchanged.
-      int const mult = (DUP_SHARED && cand >= EP_NUM_ROUTED) ? 2 : 1;
+      // At DUP_SHARED > 0 the shared expert consumes 1 + DUP_SHARED slots
+      // instead of one. With mult == 1 `seen` still steps by exactly one from
+      // -1, so `>=` first fires exactly where `== owned_rank` did: the
+      // default path is unchanged.
+      int const mult =
+          (DUP_SHARED > 0 && cand >= EP_NUM_ROUTED) ? (1 + DUP_SHARED) : 1;
       if (owned) {
         seen += mult;
         if (seen >= owned_rank) {
@@ -555,7 +559,7 @@ __device__ __noinline__ void
                             // write-through) store of a deterministic value,
                             // so a duplicated tile rewrites the same bits and
                             // the output is unchanged. Never set this on W2.
-                            /*DUP_SHARED=*/(MPK_SHARED_DUP != 0)>(
+                            /*DUP_SHARED=*/(MPK_SHARED_DUP)>(
                                           tile_idx,
                                           (int const *)mask_ptr,
                                           (int const *)routing_ptr,

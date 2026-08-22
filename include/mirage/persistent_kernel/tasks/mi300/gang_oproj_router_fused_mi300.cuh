@@ -1376,13 +1376,16 @@ __device__ __attribute__((always_inline)) void
                 ? (EP_MY_PE == EP_SHARED_PE)
                 : (cand >= EP_BASE && cand < EP_BASE + EP_LOCAL_ROUTED);
         owned += is_owned ? 1 : 0;
-        // MPK_SHARED_DUP widens the W13 tile space ONLY, by one extra copy of
-        // the shared expert. It must agree exactly with the DUP_SHARED decode
-        // in _gang_moe_mxfp8_tile, which gives that expert two consecutive
-        // slots in the owned subsequence. W2 keeps `owned`: its epilogue is an
-        // atomicAdd and a duplicated tile would double-count the contribution.
-        owned_w13 +=
-            is_owned ? ((MPK_SHARED_DUP && cand >= NUM_EXPERTS) ? 2 : 1) : 0;
+        // MPK_SHARED_DUP widens the W13 tile space ONLY, by MPK_SHARED_DUP
+        // extra copies of the shared expert. It must agree exactly with the
+        // DUP_SHARED decode in _gang_moe_mxfp8_tile, which gives that expert
+        // 1 + MPK_SHARED_DUP consecutive slots in the owned subsequence. W2
+        // keeps `owned`: its epilogue is an atomicAdd and a duplicated tile
+        // would double-count the contribution.
+        owned_w13 += is_owned ? ((MPK_SHARED_DUP && cand >= NUM_EXPERTS)
+                                     ? (1 + MPK_SHARED_DUP)
+                                     : 1)
+                              : 0;
       }
     } else {
       owned = n_act;
