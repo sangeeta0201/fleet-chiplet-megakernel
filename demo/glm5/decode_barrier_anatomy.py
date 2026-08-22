@@ -179,6 +179,54 @@ print("""
 
 print()
 print("=" * 92)
+print("D2. THE ATTENTION TAIL IS A THREE-WAY SPLIT, AND MOST STAMPS IN IT ARE")
+print("    NOT SYNCHRONIZATION POINTS.  Per-set MEDIAN, us after S18.")
+print("=" * 92)
+M = set(T[22]) - D                      # the merge workers drawn from I
+P = set(T[19]) - D - M                  # stamp neither 20 nor 22
+print(f"  sets: decode D={len(D)}  merge M={len(M)}  neither P={len(P)}")
+ref = q(list(T[18].values()))[1]
+print(f"  {'stamp':<32}{'D':>9}{'M':>9}{'P':>9}")
+for s, lab in ((18, "S18 qkv_a->q_b bar passed"),
+               (19, "S19 q_b + KV append done"),
+               (20, "S20 qb->dec bar passed"),
+               (21, "S21 decode tiles done"),
+               (22, "S22 dec->merge bar passed"),
+               (23, "S23 merge done"),
+               (24, "S24 Phase 8 bar passed"),
+               (28, "S28 enter MoE half")):
+    cells = []
+    for S in (D, M, P):
+        sub = S & set(T[s])
+        cells.append(f"{q([T[s][w] for w in sub])[1]-ref:9.2f}" if sub else f"{'-':>9}")
+    print(f"  {lab:<32}{''.join(cells)}")
+
+print("""
+  THE TRAP, and it invalidates a class of arithmetic on this board: a stamp is
+  only a synchronization point for workers that PARTICIPATE in the phase it
+  ends.  P crosses S21, S23 and S24 in program order without doing decode or
+  merge, so those stamps record P falling through, ~19-24 us EARLIER than D
+  records them.  A region difference is therefore only meaningful when both
+  stamps are crossed by the SAME population on the SAME path.
+
+  The two real rendezvous in the tail are the two where the sets agree:
+      S22 dec->merge  D and M within 0.00 us
+      S28 enter MoE   D and P within 0.03 us
+  Everything between S19 and S28 is per-set program order, not a machine-wide
+  region.  board_budget.py's S21->S23 = 5.46 us mixes populations and must be
+  read as the decode set's drain, never as machine-wide time.
+
+  What the split actually says: 104 of 232 workers -- 45% of the machine --
+  take no part in the attention tail at all and idle from S21 to S28, about
+  33.5 us of a ~159 us layer.  That is a far larger and better-located hole
+  than the board's "216 workers idle through a 16-worker phase" claimed, and
+  it is STILL unfillable for the reason already priced: the movable-work set
+  is empty (glm-decode-overlap-candidate-set-is-empty) and handing idle
+  workers a cold prefetch measured +0.030
+  (glm-moe-phase-has-a-free-worker-hole).""")
+
+print()
+print("=" * 92)
 print("E. THE BUDGET OF THE REGION, AND WHAT THE SURVIVOR IS")
 print("=" * 92)
 region = max(T[21].values()) - max(T[19].values())

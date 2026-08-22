@@ -159,3 +159,13 @@ either at the HBM roof (W13, q_b, o_proj, qkv_a) or majority spin (MLA decode
 close reached from the other direction, and it is why the remaining distance to
 2 ms is a STRUCTURAL question (how many rendezvous a layer needs at all), not a
 tuning question about any single region.""")
+
+print("""
+READ-THIS-BEFORE-DOING-ARITHMETIC-ON-THE-TABLE-ABOVE.  A stamp is only a
+synchronization point for workers that PARTICIPATE in the phase it ends.  In
+the attention tail the machine splits THREE ways -- 64 decode, 64 merge, 104
+neither -- and the 104 cross S21/S23/S24 in program order 19-24 us before the
+decode set does.  So S19->S21 and S21->S23 are the DECODE SET's path, not
+machine-wide regions.  The only two real rendezvous between S19 and S28 are
+S22 and S28, where all sets agree to 0.03 us.  See decode_barrier_anatomy.py.
+""")
