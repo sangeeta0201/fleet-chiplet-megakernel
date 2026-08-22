@@ -1243,6 +1243,35 @@ __device__ __attribute__((always_inline)) void
   {
     int const *d_mask_live = static_cast<int const *>(active_expert_ids_ptr);
     int const n_act = d_mask_live[MOE_NUM_EXPERTS];
+#if MPK_VPROBE
+    // ── V PROBE (MPK_VPROBE=<routing-epoch stride>, 0 = off) ────────────────
+    // Prints the ACTIVATED EXPERT LIST, not just its size, so the union of
+    // any two tokens' top-k sets can be formed offline.
+    //
+    // Why the list and not U from a 2-row build: U from a live 2-row build is
+    // the direct measurement, but the 2-wide build faults intermittently
+    // (~4 of 6 attempts on 2026-08-22) while bs=1 never does.  Printing the
+    // list on the STABLE bs=1 arm gives |topk(t) u topk(t+1)| for every
+    // consecutive token pair, which is what a MoE row fold would actually
+    // face -- MTP's second row is a draft of exactly that next token, and it
+    // is accepted 86% of the time.
+    //
+    // A MoE tile is an (expert,row) pair, so two live rows always yield
+    // 2*TOPK live tiles whatever the routing; what overlap saves is duplicate
+    // weight-slab FETCHES, V = 2*TOPK - |union|.  V is the exact ceiling on
+    // the fold: demo/glm5/price_moe_row_fold.py.
+    //
+    // One rank, one worker, so this cannot reorder anything.  n_act is <= 9
+    // at bs=1 (TOPK=8 + the shared expert), hence nine fixed slots.
+    if (EP_MY_PE == 0 && tid == 0 && xcd_id == 0 && xcd_rank == 0 &&
+        ((unsigned long long)routing_expected % (unsigned long long)MPK_VPROBE) == 0) {
+#define _VP(i) ((i) < n_act ? d_mask_live[(i)] : -1)
+      printf("[VPROBE] e=%d U=%d ids %d %d %d %d %d %d %d %d %d\n",
+             (int)routing_expected, n_act, _VP(0), _VP(1), _VP(2), _VP(3),
+             _VP(4), _VP(5), _VP(6), _VP(7), _VP(8));
+#undef _VP
+    }
+#endif
     int owned;
     if constexpr (EP_WORLD_SIZE > 1) {
       constexpr int EP_LOCAL_ROUTED = NUM_EXPERTS / EP_WORLD_SIZE;

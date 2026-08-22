@@ -31,9 +31,16 @@ Run:  python3 demo/glm5/price_moe_row_fold.py
 # ---- model geometry (config.json, /home/claudeuser/models/glm5-mxfp4) ------
 N_ROUTED   = 256   # n_routed_experts
 TOPK       = 8     # num_experts_per_tok
-N_LAYERS   = 76    # main model; layer 76 is the MTP draft (replay run 2)
+N_LAYERS   = 78    # config.json num_hidden_layers (the MTP draft layer is
+                   # num_nextn_predict_layers=1 ON TOP of these, and runs as
+                   # its own replay run -- it is not one of the 78)
 DENSE      = 3     # first_k_dense_replace
-MOE_LAYERS = N_LAYERS - DENSE   # 73
+MOE_LAYERS = N_LAYERS - DENSE   # 75
+# CORRECTED 2026-08-22 from 76-3=73.  The V probe settles it independently of
+# the config: the router epoch counter advances in a period-76 pattern (75
+# printing invocations + 1 silent epoch per decode iteration), measured as
+# exactly 76 across all 510 iteration boundaries in /tmp/vprobe/bs1.log.
+# This raises the fold's ceiling by 2.7%, i.e. it corrects AGAINST the verdict.
 
 # ---- measured (glm-mtp-chain-is-cheap-the-row-is-expensive, region map) ----
 ROW_TOTAL  = 5.367   # ms, a second LIVE row end to end

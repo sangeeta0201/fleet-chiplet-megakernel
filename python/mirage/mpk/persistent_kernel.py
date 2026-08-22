@@ -837,6 +837,14 @@ def get_compile_command(
             # the A/B is one -D and every rank builds the same thing.
             assert _moe_lb in ("0", "1"), "MPK_MOE_LIVE_BOUND is 0 or 1"
             flags = flags + [f"-DMPK_MOE_LIVE_BOUND={_moe_lb}"]
+        _vprobe = os.environ.get("MPK_VPROBE")
+        if _vprobe is not None and _vprobe != "0":
+            # Measurement only: prints the activated-expert UNION size U from
+            # one worker per rank every <stride> routing epochs, so the MoE
+            # row fold's ceiling V = 2*TOPK - (U - s) can be priced instead of
+            # assumed. Does not change any tile's work.
+            assert _vprobe.isdigit(), "MPK_VPROBE is a non-negative integer"
+            flags = flags + [f"-DMPK_VPROBE={_vprobe}"]
         _pipe = int(os.environ.get("MPK_ABL_PIPE_W13W2", "0"))
         if _pipe:
             # Adjacent-phase overlap ceiling probe. 1 = control, CORRECT

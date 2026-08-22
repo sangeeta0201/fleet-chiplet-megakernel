@@ -134,7 +134,7 @@ MPK_FORWARD_VARS=(
   # Real changes, not probes, but compile-time: every rank must build them or
   # the arrival counters (BAR_TREE) / the W2 tile space (W2_KSPLIT) disagree
   # with the host loop bound and the layer barriers wedge.
-  MPK_BAR_TREE MPK_W2_KSPLIT MPK_MOE_LIVE_BOUND MPK_W2_STAGE_FULL
+  MPK_BAR_TREE MPK_W2_KSPLIT MPK_MOE_LIVE_BOUND MPK_W2_STAGE_FULL MPK_VPROBE
   MPK_MOE_ACT_FP8
   MPK_QKV_EP_FOLD MPK_QKV_PRO_HOIST MPK_QUANT_V16 MPK_QKV_FOLD_ROWS
   MPK_BAR_SKEW MPK_EP_FOLD_WGS MPK_EP_POLL_BATCH MPK_ML_PTR_PREFETCH

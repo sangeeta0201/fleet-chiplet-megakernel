@@ -14,6 +14,13 @@
  */
 #pragma once
 
+
+// MPK_VPROBE: routing-epoch stride for the [VPROBE] U print in
+// gang_oproj_router_fused_mi300.cuh.  0 = off (default).  Measurement only --
+// it prints the activated-expert UNION size so a MoE row fold can be priced.
+#ifndef MPK_VPROBE
+#define MPK_VPROBE 0
+#endif
 // PERF TEST flags (uncomment to test):
 // #define MPK_DISABLE_THREADFENCE  // Disable threadfence_gpu()
 #define MPK_USE_RELAXED_ATOMICS
