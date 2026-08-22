@@ -48,12 +48,21 @@ REGIONS = [
      "us/layer peer wait, 8.98 (0.683 ms) is rank 0's SHARED EXPERT -- its "
      "MoE-half work excess closes against its wait deficit to 0.69 us and "
      "localizes to W13 +6.02 / W2 +3.41 (ep_bias_localize.py), and the "
-     "ablated arm replicates at the q_b gather -- and 10.40 (0.790 ms) is "
-     "unattributed residual. THAT 0.683 IS PEER IDLE, NOT A LEVER: "
-     "MPK_SHARED_DUP doubles the excess (+4.38 us/layer on r0, peers +0.20, "
-     "W2 control flat) and the wall moves +0.106, 10.618 -> 10.724 n=3, "
-     "inside the 0.26 floor. Transfer to the wall is 0.32, so a PERFECT "
-     "shard is worth <=0.103 and a 4-way K-shard <=0.077. NO-GO"),
+     "ablated arm replicates at the q_b gather -- and 10.40 (0.790 ms) was "
+     "unattributed residual. BOTH HALVES ARE NOW CLOSED. (a) THAT 0.683 IS "
+     "PEER IDLE, NOT A LEVER: MPK_SHARED_DUP doubles the excess (+4.38 "
+     "us/layer on r0, peers +0.20, W2 control flat) and the wall moves +0.106, "
+     "10.618 -> 10.724 n=3, inside the 0.26 floor. Transfer to the wall is "
+     "0.32, so a PERFECT shard is worth <=0.103 and a 4-way K-shard <=0.077. "
+     "NO-GO. (b) THE 0.790 IS NOT SKEW AT ALL (rank_arrival_order.py): rank 0 "
+     "is the LAST ARRIVER -- shortest wait, 9.94 vs peers' 19.49 -- and it "
+     "still waits 9.94 us/layer, which IS the residual. A last arriver cannot "
+     "wait on a peer, so that is a UNIFORM FLOOR, same family as the 8.28 "
+     "us/layer of uniform spin whose whole rendezvous deleted for 0.003 ms. "
+     "The 7 peers are uniform to 0.5% (sd 0.48, range 1.38 us/layer) and their "
+     "ordering does not reproduce across 3 independent samples (Spearman "
+     "+0.500..+0.679, under the n=7 bar of 0.786), so a PERFECT static "
+     "rank rebalance is 1.38 x 76 x 0.32 = 0.034 ms. NO-GO"),
     (2, 16, "-> attn call boundary", "0.094  not a phase; the task-body call"),
     (16, 17, "qkv_a tiles",
      "0.900  41% redundant prologue; K-loop at 90% of the per-CU byte roof"),
