@@ -959,6 +959,10 @@ def get_compile_command(
             # Compile-time, so every rank must see it -- the qo_indptr the
             # ranks agree on comes from each rank's own prepare_next_batch.
             flags = flags + ["-DMPK_SPEC_DECODE"]
+            if int(os.environ.get("MPK_SPEC_ORACLE", "0")) == 1:
+                # Draft = whatever the host pre-filled at tokens[step+1]
+                # (--spec-oracle-tokens). The acceptance == 1.0 arm.
+                flags = flags + ["-DMPK_SPEC_ORACLE"]
         amdgpu_target = os.environ.get("AMDGPU_TARGETS", "gfx950")
         if use_rocshmem:
             # rocSHMEM's IPC backend requires an xnack-off code object on gfx950.

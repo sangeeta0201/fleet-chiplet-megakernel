@@ -496,6 +496,14 @@ if __name__ == "__main__":
         help="Load N multi-token-prediction draft layers (GLM-5 ships 1) and "
              "run speculative decode in the torch reference path. 0 (default) "
              "drops the MTP weights exactly as before.")
+    parser.add_argument(
+        "--spec-oracle-tokens", type=str, default=None,
+        help="JSON dump (--save-tokens format) whose token_ids pre-fill the "
+             "token buffer past the prompt. With MPK_SPEC_ORACLE=1 those "
+             "become the speculative drafts, so acceptance is 1.0 wherever "
+             "the reference matches. Gates the accept branch and measures the "
+             "ms/token ceiling; not a decode mode -- every committed token "
+             "still comes from the model's own argmax.")
     args = parser.parse_args()
     # The megakernel builds its task graph from model.main_layers, so the MTP
     # layer is loaded and then never dispatched. Without this guard
@@ -668,6 +676,22 @@ if __name__ == "__main__":
     prompt_lengths = torch.full(
         (total_num_requests,), model_inputs.input_ids.shape[-1],
         dtype=torch.int, device="cuda")
+
+    if args.spec_oracle_tokens:
+        # Pre-fill the continuation so MPK_SPEC_ORACLE's draft row reads a
+        # reference token instead of a guess. Position prompt_len is the first
+        # generated token; the model rewrites every one of these from its own
+        # argmax during the commit, so a stale or wrong reference costs
+        # acceptance and cannot change the answer.
+        with open(args.spec_oracle_tokens) as f:
+            _oracle = json.load(f)["token_ids"]
+        _pl = model_inputs.input_ids.shape[-1]
+        _n = max(0, min(len(_oracle), args.max_seq_length - _pl))
+        for r in range(total_num_requests):
+            for i in range(_n):
+                tokens[r, _pl + i] = _oracle[i]
+        print(f"[SPEC] oracle draft: pre-filled {_n} reference tokens at "
+              f"positions {_pl}..{_pl + _n - 1}")
 
     # Position embeddings: [1, seq, qk_rope_head_dim], HF layout
     # (emb = cat(freqs, freqs)). Only the first half of each row is ever read

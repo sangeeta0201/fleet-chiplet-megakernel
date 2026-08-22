@@ -153,7 +153,7 @@ MPK_FORWARD_VARS=(
   # per-rank: every rank runs its own prepare_next_batch, so a rank that did
   # not build it dispatches one row while its peers dispatch two and the DP
   # attention shapes disagree.
-  MPK_SPEC_DECODE
+  MPK_SPEC_DECODE MPK_SPEC_ORACLE
   # Per-stage activation checksums (mpk_bsdbg.cuh). Compile-time, so every
   # rank must see it or the ranks build different megakernels.
   #

@@ -1162,10 +1162,25 @@ __device__ __forceinline__ bool
         if (num_new_tokens == 1 &&
             MPK_MAX_NUM_BATCHED_TOKENS - num_tokens >= MPK_SPEC_WIDTH &&
             step + MPK_SPEC_WIDTH < config.max_seq_length) {
+#ifdef MPK_SPEC_ORACLE
+          // Oracle draft: leave tokens[step+1] alone. The host has pre-filled
+          // the token buffer past the prompt with a reference continuation,
+          // so the draft is by construction what the verify row is about to
+          // predict. This is the acceptance == 1.0 arm: it gates the accept
+          // branch end-to-end (the output must still come out identical,
+          // because every accepted token is re-derived from output_tokens,
+          // not copied from the oracle) and it measures the ceiling on
+          // ms/token before the MTP draft layer exists to chase it.
+          //
+          // The commit loop overwrites tokens[step+1] with the verify row's
+          // own output, so a wrong oracle degrades to a normal reject rather
+          // than leaking the reference into the answer.
+#else
           config.tokens[request_id * MPK_MAX_SEQ_LENGTH + step + 1] =
               config.spec_draft_tokens != nullptr
                   ? config.spec_draft_tokens[i]
                   : config.tokens[request_id * MPK_MAX_SEQ_LENGTH + step];
+#endif
           num_new_tokens = MPK_SPEC_WIDTH;
           g_spec_iter_is_decode = 1;
         }
