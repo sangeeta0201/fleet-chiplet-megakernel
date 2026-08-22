@@ -28,18 +28,28 @@ its own clock".  Those are durations, not timestamps, so no shared clock is
 needed.  This script only ever compares durations.
 
 ===================== RESULT, 2026-08-22 =====================
-Per-rank, us/layer, median over each slot's writers, base arm.  WORK spans are
-bracketed by stamps with no cross-rank wait between them; WAIT spans contain
-one.  The distinction is the whole point -- see THE TRAP below.
+Per-rank, us/layer, COUNT-WEIGHTED mean over each slot's writers, base arm.
+WORK spans are bracketed by stamps with no cross-rank wait between them; WAIT
+spans contain one.  The distinction is the whole point -- see THE TRAP below.
 
   span                                   r0     r1     r2     r3     r4     r5     r6     r7  spread
-  WORK  S0->S3   local EP fold         4.67   4.60   4.38   4.52   4.47   4.51   4.47   4.68    0.30
-  WORK  S1->S19  attention            27.70  28.03  28.20  27.82  28.28  27.95  28.78  27.86    1.07
-  WORK  S20->S14 decode..MoE+boundary 102.22  92.69  91.94  92.81  90.89  92.19  92.96  90.86   11.36
-  WAIT  S0->S1   EP bracket            15.82  25.30  25.48  24.68  26.80  25.20  23.78  26.46   10.98
-  WAIT  S19->S20 q_b gather            10.52  10.41  10.84  10.79  10.70  11.07  10.77  10.95    0.66
-  WAIT  S3->S4   peer wait (leaders)   10.02  15.14  20.35  21.94  23.94  20.54  20.19  20.77   13.92
-  TOTAL S0->S14  layer span           153.86 154.90 155.18 154.47 155.59 154.87 155.01 155.07    1.73
+  WORK  S0->S3   local EP fold         4.54   4.49   4.42   4.53   4.54   4.42   4.46   4.51    0.12
+  WORK  S1->S19  attention            28.09  28.37  28.69  28.15  28.68  28.41  29.22  28.35    1.13
+  WORK  S20->S14 decode..MoE+boundary  98.24  89.76  89.22  89.91  88.22  89.37  90.17  88.13   10.11
+  WAIT  S0->S1   EP bracket            15.78  25.26  25.46  24.71  26.84  25.05  23.75  26.35   11.06
+  WAIT  S19->S20 q_b gather            12.60  12.49  12.82  12.93  12.96  13.10  12.83  13.34    0.85
+  WAIT  S3->S4   peer wait (leaders)    9.71  19.24  19.50  18.65  20.81  19.24  17.76  20.47   11.10
+  TOTAL S0->S14  layer span           154.71 155.88 156.19 155.69 156.70 155.92 155.96 156.17    1.99
+
+WHY COUNT-WEIGHTED, and the first version of this file got it wrong.  Slot 4
+(the EP peer wait) is stamped by exactly ONE worker per layer -- whichever XCD
+leader actually waited -- and WHICH worker varies layer to layer.  Its 8
+writers hold 108 to 11433 samples on rank 0, totalling 38835, exactly 1/8 of
+slot 3's 310688 (ratio 8.00, checked).  An unweighted median over 8 per-worker
+means weights the 108-sample worker like the 11433-sample one.  Weighting by
+count is the unbiased per-sample mean and is the only correct estimator when a
+slot's writers are not interchangeable.  It moved the headline bias from 10.17
+to 8.98 -- CLOSER to the 9.09 measured independently by the subphase counters.
 
 THE TRAP, and this file first fell into it.  An earlier version of this header
 argued "every rank's mean layer span agrees to 1.73 us, so there is no static
@@ -51,24 +61,36 @@ working rendezvous looks like; it carries no information about imbalance.
 Discriminating needs WORK spans between cross-rank sync points.  It does, and
 the answer flips.
 
-THE FINDING: the ~20.4 us peer wait is HALF static bias, half residual.
+THE FINDING: the ~19.4 us peer wait is HALF static bias, half residual.
 
-  rank 0 work excess, S20->S14 vs peer mean    +10.17 us/layer
-  rank 0 wait deficit, S3->S4 vs peer mean     -10.39 us/layer
+  rank 0 work excess, S20->S14 vs peer mean     +8.98 us/layer
+  rank 0 wait deficit, S3->S4 vs peer mean      -9.67 us/layer
 
-Those close to 0.21 us.  Rank 0 does ~10 us/layer more work in the MoE half and
-waits ~10 us less at the rendezvous; its seven peers pay that as idle.  Rank 0
+Those close to 0.69 us.  Rank 0 does ~9 us/layer more work in the MoE half and
+waits ~9 us less at the rendezvous; its seven peers pay that as idle.  Rank 0
 is the SHARED-EXPERT rank, and glm-shared-expert-is-the-ep-straggler
-independently priced that excess at 9.09 us/layer -- this is a clean
-replication at 10.17 from a different instrument.  Decomposition of the peer
-mean wait of 20.41 us:
+independently priced that excess at 9.09 us/layer -- 8.98 here is a 1.2%
+replication from a different instrument.  Decomposition of the 19.38 us peer
+mean wait:
 
-  rank-0 shared-expert static bias   10.17 us/layer   0.773 ms/token
-  peer-to-peer static spread          2.10 us/layer   (inside the above)
-  residual, not explained by bias    10.24 us/layer   0.778 ms/token
+  rank-0 shared-expert static bias    8.98 us/layer   0.683 ms/token
+  peer-to-peer static spread          2.04 us/layer   (inside the above)
+  residual, not explained by bias    10.40 us/layer   0.790 ms/token
 
-So it is neither "all bias" nor "all variance" -- it is a 50/50 split, and each
-half is worth ~0.78 ms/token.  The two halves need completely different work.
+So it is neither "all bias" nor "all variance" -- it is a ~50/50 split, and each
+half is worth ~0.7-0.8 ms/token.  The halves need completely different work.
+
+LOCALIZED, and this is the part that reopens a closed lever.  See
+ep_bias_localize.py: splitting S20->S14 at every stamp puts the entire excess
+in the two MoE GEMMs and nowhere else --
+
+  S5->S6  W13 tiles   r0 11.82  peers  5.80   +6.02   (peer spread 0.64)
+  S7->S8  W2  tiles   r0  7.54  peers  4.12   +3.41   (peer spread 0.36)
+  the other 16 regions of the MoE half        -0.37 .. +0.54
+
++9.43 of the excess, at ~9x the peer spread, in exactly the two phases the
+shared expert's FFN runs in, split 1.77:1 -- which is the gate+up : down work
+ratio.  That is as clean an attribution as this instrument can give.
 
 THE ABLATED ARM REPLICATES THE WHOLE DECOMPOSITION AT A DIFFERENT RENDEZVOUS,
 which is the strongest single piece of evidence here.  Compile out the EP peer
@@ -76,16 +98,16 @@ wait and the layer's first cross-rank sync becomes the q_b gather.  The bias
 follows it:
 
   arm        first sync   r0 WORK excess   r0 WAIT deficit   closes to
-  base       S3->S4            +10.17           -10.39         0.21 us
-  ablated    S19->S20          +10.42           -10.19         0.23 us
+  base       S3->S4             +8.98            -9.67         0.69 us
+  ablated    S19->S20           +9.14           -10.43         1.29 us
 
-Rank 0's MoE-half work is unchanged at 102.28 -- so the excess is real work, not
-an echo of the wait it happens to be paid at.  And S19->S20 goes from a 0.66
-spread with r0 mid-pack to an 11.46 spread with r0 lowest.  Same rank, same
-~10 us, different rendezvous.  That is exactly what
+Rank 0's MoE-half work is unchanged (98.24 -> 98.26) -- so the excess is real
+work, not an echo of the wait it happens to be collected at.  And S19->S20 goes
+from a 0.85 spread with r0 mid-pack to an 11.93 spread with r0 lowest.  Same
+rank, same ~9 us, different rendezvous.  That is exactly what
 glm-inter-rank-skew-is-paid-once predicts, now with the straggler NAMED.
 
-(The ablated arm's residual rises to 15.50; do not read that as a finding. That
+(The ablated arm's residual rises to 18.93; do not read that as a finding. That
 arm has one fewer sync point, so misalignment accumulates further before it is
 collected, and it is wrong-output by construction.)
 
@@ -99,24 +121,41 @@ unchanged (-8%) -- consistent with glm-inter-rank-skew-is-paid-once: a single
 per-layer alignment tax, collected once, wherever the first cross-rank sync is.
 
 WHAT TO DO WITH EACH HALF.
-  * The BIAS half is the shared expert and is already well-trodden: hoisting it
-    is zero makespan (glm-shared-expert-hoist-is-zero-makespan), row-sharding
-    it is wrong output (glm-shared-expert-cannot-be-row-sharded), and its SP
-    imbalance reads as absorbed (glm-shared-expert-imbalance-is-absorbed).
-    What is NEW here is the price: measured at the rendezvous rather than in
-    the phase, it is 0.773 ms/token of peer idle, not "absorbed".  Those two
-    readings need reconciling before anything is built.
+  * The BIAS half REOPENS glm-shared-expert-hoist-is-zero-makespan, whose
+    evidence does not reproduce.  That note concluded "rank 0's W13 makespan is
+    the SHORTEST of 8" (8.55 vs ~12.5) using max_w(S6) - max_w(S5).  Run the
+    SAME statistic on these logs and rank 0 is the LONGEST of 8 -- 18.11 vs
+    12.27, +5.84.  It is not an order-statistic artifact: median and makespan
+    agree here (+6.02 and +5.84), and they agree on W2 and on the whole MoE
+    half too.  The peers barely moved (12.56 -> 12.27); rank 0 went 8.55 ->
+    18.11.  The likely cause is the instrument: that measurement was recorded
+    2026-08-21 11:44, and glm-stage-stamp-drop-guard-inflated-the-boundary was
+    discovered at 12:00 the SAME DAY -- SIXTEEN MINUTES LATER.  It ran with the
+    default 10 ms guard, under which one ml=0 sample per iteration survives
+    with ~10000x weight, and its conclusion was never re-derived after the fix.
+    Treat the hoist as OPEN, not closed.  (Its sibling
+    glm-shared-expert-imbalance-is-absorbed is untouched by this -- that note
+    is about SP3[k] being aggregate worker-seconds, a separate and still valid
+    warning.  glm-shared-expert-cannot-be-row-sharded is also untouched: row
+    sharding is wrong output regardless of the price.)
   * The RESIDUAL half is not attributed. It is jitter, link/mechanism floor, or
     a second bias this decomposition does not separate.
 
 WHAT THIS SCRIPT CANNOT DO.  The BARSTAGEWS counters are cnt+sum only, so every
-number here is a MEAN.  The bias half is solid -- it is a difference of means
-and closes to 0.22 us.  The residual half is a RESIDUAL and is not evidence for
+number here is a MEAN.  The bias half is solid -- it is a difference of means,
+it closes to 0.69 us, it replicates at a second rendezvous, it localizes to the
+two phases the shared expert runs in, and it agrees with an independent
+instrument to 1.2%.  The residual half is a RESIDUAL and is not evidence for
 any particular mechanism; calling it "variance" would be naming something this
 instrument cannot see.  Splitting it needs a per-layer distribution, which
 needs a histogram, not an accumulator.  The aggregate BARSTAGE min/max is no
 help: its max sits at ~890 us against the 1 ms drop guard, an extreme value
 over 9M samples.
+
+NOTE ON ADDITIVITY.  ep_bias_localize.py's sub-regions do NOT sum to S20->S14
+(116.45 vs 102.22 on rank 0 under the median estimator).  Order statistics of
+different worker subsets are not additive.  Read the r0-peers COLUMN, which is
+a difference of like for like; do not read the column sum as a budget.
 """
 import re
 import collections
@@ -128,34 +167,39 @@ PAT = re.compile(r"\[1,(\d+)\].*BARSTAGEWS (\d+) (\d+) (\d+) (\d+)")
 
 
 def load(path):
+    """rank -> slot -> worker -> (count, total_ns).  Keep the COUNT."""
     d = collections.defaultdict(lambda: collections.defaultdict(dict))
     for ln in open(path, errors="ignore"):
         m = PAT.search(ln)
         if m:
             r, s, w, c, t = (int(x) for x in m.groups())
             if c:
-                d[r][s][w] = t / c / 1000.0
+                d[r][s][w] = (c, t)
     return d
 
 
-def med(vals):
-    v = sorted(vals)
-    return v[len(v) // 2] if v else None
+def wmean(rows, s):
+    """COUNT-WEIGHTED mean stamp over a slot's writers, us.
+
+    Why weighted, and this bit me.  Slot 4 (the EP peer wait) is stamped by
+    exactly ONE worker per layer -- whichever XCD leader actually waited -- and
+    WHICH worker that is varies layer to layer.  Its 8 writers therefore hold
+    wildly unequal sample counts (108 to 11433 on rank 0) even though the total
+    is a clean 38835, exactly 1/8 of slot 3's 310688.  An unweighted median
+    over those 8 per-worker means weights a 108-sample worker the same as an
+    11433-sample one.  Weighting by count is the unbiased per-sample mean and
+    is the only correct estimator when a slot's writers are not interchangeable.
+    """
+    if s not in rows:
+        return None
+    c = sum(x[0] for x in rows[s].values())
+    t = sum(x[1] for x in rows[s].values())
+    return t / c / 1000.0 if c else None
 
 
 def span(rows, x, y):
-    """Median span x->y over the workers that cross BOTH stamps.
-
-    Slot populations differ (3/4 have 8 XCD leaders, 20 has the 64-worker
-    decode set, 14 has all 232), so an unrestricted median differences two
-    different populations.  Intersect first.
-    """
-    if x not in rows or y not in rows:
-        return None
-    w = set(rows[x]) & set(rows[y])
-    if not w:
-        return None
-    return med([rows[y][i] for i in w]) - med([rows[x][i] for i in w])
+    a, b = wmean(rows, x), wmean(rows, y)
+    return None if a is None or b is None else b - a
 
 
 # Durations on each rank's own clock, never timestamps.
@@ -193,7 +237,7 @@ for a in ARMS:
 
 for a in ARMS:
     print("=" * 100)
-    print(f"{a}: per-rank spans, us/layer (median over the workers crossing BOTH stamps)")
+    print(f"{a}: per-rank spans, us/layer (count-weighted mean over each slot's writers)")
     print("=" * 100)
     print(f"{'kind  span':<58}" + "".join(f"{r:>7}" for r in range(8))
           + f"{'spread':>9}")
