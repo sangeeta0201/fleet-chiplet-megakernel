@@ -49,7 +49,11 @@ REGIONS = [
      "MoE-half work excess closes against its wait deficit to 0.69 us and "
      "localizes to W13 +6.02 / W2 +3.41 (ep_bias_localize.py), and the "
      "ablated arm replicates at the q_b gather -- and 10.40 (0.790 ms) is "
-     "unattributed residual"),
+     "unattributed residual. THAT 0.683 IS PEER IDLE, NOT A LEVER: "
+     "MPK_SHARED_DUP doubles the excess (+4.38 us/layer on r0, peers +0.20, "
+     "W2 control flat) and the wall moves +0.106, 10.618 -> 10.724 n=3, "
+     "inside the 0.26 floor. Transfer to the wall is 0.32, so a PERFECT "
+     "shard is worth <=0.103 and a 4-way K-shard <=0.077. NO-GO"),
     (2, 16, "-> attn call boundary", "0.094  not a phase; the task-body call"),
     (16, 17, "qkv_a tiles",
      "0.900  41% redundant prologue; K-loop at 90% of the per-CU byte roof"),
@@ -79,7 +83,7 @@ REGIONS = [
      "1.076  k-loop is 72%; rank-select +33%, fold 96ns, bias prefetch dead"),
     (32, 5, "routing-ready poll", "0.317"),
     (5, 6, "W13 tiles",
-     "1.402  AT THE HBM ROOF; OPW=16 -1.34ms, split-K +4.12ms, prefetch null. RANK-ASYMMETRIC: rank 0 spends +6.02 us/layer here vs peers 5.80 (peer spread 0.64) -- the shared expert. The hoist closure is REOPENED"),
+     "1.402  AT THE HBM ROOF; OPW=16 -1.34ms, split-K +4.12ms, prefetch null. RANK-ASYMMETRIC: rank 0 spends +6.02 us/layer here vs peers 5.80 (peer spread 0.64) -- the shared expert. PRICED AND CLOSED: MPK_SHARED_DUP doubles that excess for +0.106 ms of wall (n=3, inside noise), so a perfect shard is <=0.103 and a 4-way K-shard <=0.077. NO-GO"),
     (6, 7, "W13 -> W2 barrier", "0.404"),
     (7, 8, "W2 tiles",
      "0.943  latency-bound; L2 prefetch neutral, staging pays only at K_SPLITS=2"),

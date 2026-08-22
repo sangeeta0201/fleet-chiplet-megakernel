@@ -1321,8 +1321,32 @@ __device__ __attribute__((always_inline)) void
         //
         // What is still true: the row shard below is wrong output, and SP3[k]
         // is aggregate worker-seconds and cannot see makespan. What changed is
-        // only the makespan evidence. NOT YET RE-MEASURED AT THE WALL -- price
-        // the harvest before building it.
+        // only the makespan evidence.
+        //
+        // ===== AND THE WALL HAS NOW RULED: THE CLOSURE STANDS. NO-GO. =====
+        // MPK_SHARED_DUP (mpk_atoms.cuh) runs rank 0's shared expert's W13
+        // tiles TWICE and nothing else -- an additive, idempotent, correct-
+        // output probe that DOUBLES exactly the excess described above.
+        // demo/glm5/probe_shared_expert_makespan.sh, 2026-08-22:
+        //
+        //   LIVE     r0 S5->S6  10.40 -> 14.78 (+4.38 us/layer), peers +0.20;
+        //            r0-peers gap 4.24 -> 8.42; W2 control +0.10/+0.02.
+        //   COUNTERS peers' EP wait +2.82, layer span +3.6 (= +0.276 ms)
+        //   WALL     10.618 -> 10.724, n=3  (+0.106 ms, INSIDE the 0.26 floor,
+        //            base max 10.812 > dup min 10.594).  Predicted +0.46 if on
+        //            the critical path.  G1+G2 PASS on all three dup runs.
+        //
+        // So ~65%% of the added rank-0 work does propagate into peer idle, and
+        // the wall still barely moves: peer idle at a rendezvous is not wall
+        // time. Transfer coefficient rank-0-W13-excess -> wall is 0.32 (span
+        // route 0.82). Against the EXISTING 4.24 us/layer = 0.322 ms of
+        // overrun, a PERFECT shard is worth <= 0.103 ms (wall) / <= 0.264 ms
+        // (span), and a 4-way K-shard only 3/4 of that: <= 0.077 / <= 0.198.
+        // Both are ceilings twice over -- additive probes overprice deletions
+        // (added work costs ~1:1, removed saves ~0, 4 pairs) and the shard's
+        // own cost is not netted out. Do NOT build a hoist, a shard, or a
+        // reschedule for this. The 0.683 ms above is a description of the
+        // skew, NOT a lever; never quote it as harvestable.
         //
         // The same table also retires the ROUTED-expert imbalance, which is a
         // separate and much larger effect on paper. At EP=8 with TOPK=8 over

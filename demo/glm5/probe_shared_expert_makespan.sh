@@ -71,7 +71,78 @@
 # seven peers must not move.  If S5->S6 does not move, the probe is dead and
 # the wall says nothing.
 #
-# ===================== RESULT: (pending -- filled in on completion) =========
+# ============ RESULT, 2026-08-22: NO-GO. THE SHARD IS NOT WORTH BUILDING ====
+#
+# PHASE A, WALL, n=3 per arm, instruments OFF:
+#   arm             runs                        mean    min     max   spread
+#   base  (DUP=0)   10.387 10.812 10.655      10.618  10.387  10.812   0.425
+#   dup   (DUP=1)   10.705 10.594 10.873      10.724  10.594  10.873   0.279
+#   delta +0.106 ms -- INSIDE the 0.26 ms noise floor, arms heavily overlapping
+#   (base max 10.812 > dup min 10.594).  Predicted +0.46 if on the critical
+#   path.  base mean 10.618 lands on the recorded 10.619 baseline, so DUP=0 is
+#   a verified no-op and the control is not drifting.
+#
+# PHASE B, G1+G2+G3: HARD GATE PASS.  All three dup runs cross-rank identical
+# (8/8) and coherent (distinct 0.542-0.557, top bigram 6-9); dup_r2 shares a
+# 192-token prefix with control r5 and dup_r3 124 with rB, i.e. two of three
+# land INSIDE known control clusters.  The duplication is correct output, as
+# the idempotent-store argument predicted.  Same build as phase A timed.
+#
+# PHASE C, LIVENESS: THE PROBE RAN.  This is the load-bearing phase -- without
+# it the null above is ambiguous.  us/layer, count-weighted, base -> dup:
+#
+#   S5->S6 W13  rank 0  10.40 -> 14.78   +4.38     peers 6.16 -> 6.36  +0.20
+#   S7->S8 W2   rank 0   8.34 ->  8.44   +0.10     peers 5.22 -> 5.24  +0.02
+#   r0-peers W13 gap    +4.24 -> +8.42            (the gap almost exactly
+#                                                   DOUBLED -- one extra
+#                                                   shared expert, as designed)
+#   makespan max-max    18.25 -> 21.46            peers 12.27 -> 12.26
+#
+# W2 did not move, so the W13-only duplication is exactly what executed.
+#
+# WHERE THE ADDED WORK LANDED:
+#   rank 0 MoE half   +4.31 us/layer  (+0.328 ms of work added)
+#   peers' S3->S4     +2.82           (+0.214 ms of peer IDLE)
+#   rank 0's own wait -0.95
+#   LAYER SPAN        +3.63 / +3.59   (+0.276 ms)   vs WALL +0.106 ms
+#
+# So ~65% of rank 0's extra work does propagate into peer idle -- the "on the
+# path" signature at the counter level -- and yet the WALL barely moves.  Peer
+# idle at a rendezvous is not wall time.  That is the same lesson as
+# glm-counted-region-time-before-a-barrier-is-not-a-lever, now measured
+# ADDITIVELY rather than by deletion.
+#
+# ================= THE ARITHMETIC THAT CLOSES THE LEVER =====================
+# Transfer coefficient from "rank-0 W13 excess" to the two routes:
+#     layer span   3.63 / 4.38          = 0.82
+#     wall         0.106 ms / 0.333 ms  = 0.32
+#
+# The EXISTING excess is +4.24 us/layer = 0.322 ms of rank-0 W13 overrun.  A
+# PERFECT shard removing all of it is therefore worth at most
+#     0.82 x 0.322 = 0.264 ms  (span route)
+#     0.32 x 0.322 = 0.103 ms  (wall route)
+# and a 4-WAY K-shard removes only 3/4 of it:
+#     <= 0.198 ms (span)   <= 0.077 ms (wall)
+#
+# Both are below the 0.26 ms noise floor and far below the 0.4 ms bar the q_b
+# head-shard ruling used.  And these are CEILINGS twice over: additive probes
+# overprice deletions (glm-additive-probes-overprice-deletions -- added work
+# costs ~1:1, removed work saves ~0, four pairs), and the shard's own cost is
+# not netted out.  THE SHARED-EXPERT K-SHARD IS A NO-GO.
+#
+# ================= WHAT THIS DOES TO THE TWO PRIOR NOTES ====================
+# glm-shared-expert-hoist-is-zero-makespan is VINDICATED IN ITS CONCLUSION and
+# still WRONG IN ITS EVIDENCE.  Its claim "rank 0's W13 makespan is the
+# SHORTEST of the eight" does not reproduce -- rank 0 is #8 of 8 under BOTH
+# statistics in BOTH arms here (mean +4.24, max-max +5.98).  But its verdict
+# "do not build a hoist, a shard, or a reschedule" is right, for a reason it
+# never measured: the excess is real and rank 0 really is the straggler, and
+# it still does not convert to wall time.
+#
+# f31bc61's 0.683 ms price for the shared-expert bias is a PEER-IDLE figure,
+# not a harvestable one.  It stands as a description of the skew and must not
+# be quoted as a lever.  The board's W13 line is corrected accordingly.
+# ============================================================================
 set -u
 ulimit -c 0
 cd /home/claudeuser/fleet-chiplet-megakernel/demo/glm5
