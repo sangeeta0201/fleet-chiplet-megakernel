@@ -1280,29 +1280,48 @@ __device__ __attribute__((always_inline)) void
       for (int i = 0; i < n_act; i++) {
         int const cand = d_mask_live[i];
         // EP_SHARED_PE owns the shared expert on top of its routed share, so
-        // it does ~46%% more MoE work than the other seven ranks. Do NOT
-        // build a hoist, a shard, or a reschedule for that: MEASURED, the
-        // imbalance costs zero makespan. MPK_BAR_SKEW=3 with private
-        // per-worker rows, max-over-workers of each worker's mean stamp
-        // (us from the layer-entry reference), one layer set:
+        // it does ~46%% more MoE work than the other seven ranks.
         //
-        //   rank  S5      S6      S7      S8     W13=S6-S5  MoE=S8-S5
-        //   0 *   114.83  123.38  128.95  141.27    8.55       26.44
-        //   1     115.07  127.64  133.29  141.50   12.56       26.43
-        //   2     115.08  127.73  133.63  141.63   12.65       26.55
-        //   3     115.71  128.32  134.30  142.05   12.61       26.34
-        //   4     115.05  127.79  133.54  141.69   12.74       26.64
-        //   5     114.85  127.35  134.01  141.06   12.51       26.21
-        //   6     115.98  128.43  134.45  142.11   12.45       26.13
-        //   7     115.61  127.49  133.54  141.20   11.88       25.59
-        //   (* = EP_SHARED_PE)
+        // THIS COMMENT SAID "do NOT build a hoist, a shard, or a reschedule:
+        // MEASURED, the imbalance costs zero makespan." THAT MEASUREMENT DOES
+        // NOT REPRODUCE and the closure is REOPENED (2026-08-22, f31bc61).
+        // It read, max-over-workers of each worker's mean stamp, us from the
+        // layer-entry reference:
         //
-        // Rank 0's MoE makespan is mid-pack (26.44 in 25.59..26.64) and its
-        // W13 makespan is the SHORTEST of the eight despite the extra
-        // expert -- because the shared expert's tiles occupy workers that
-        // would otherwise be idle, and every rank's round count is the same.
-        // The "rank 0 is a straggler" reading comes from aggregate
-        // worker-seconds (SP3[k]), which sums work and cannot see makespan.
+        //   rank  W13=S6-S5  MoE=S8-S5        2026-08-21, DO NOT TRUST
+        //   0 *      8.55       26.44         <- claimed SHORTEST of 8
+        //   1-7   11.88-12.74  25.59-26.64
+        //
+        // Re-run on 2026-08-22 logs with MPK_BAR_SKEW_DROP_NS=1000000 set,
+        // using the SAME max-max statistic, rank 0 is the LONGEST of 8:
+        //
+        //   statistic            r0 W13   peers   r0-peers   r0 rank
+        //   median                11.82    5.80     +6.02    #8 of 8
+        //   makespan (max-max)    18.11   12.27     +5.84    #8 of 8
+        //
+        // Not an order-statistic artifact: the two agree, and agree on W2
+        // (+3.41 / +4.51) and on the whole MoE half (+9.07 / +9.97). The peers
+        // barely moved (12.56 -> 12.27); rank 0 went 8.55 -> 18.11. The likely
+        // cause is the instrument: the old table was taken 08-21 11:44, and the
+        // stage-stamp drop-guard bug was found at 12:00 the SAME DAY -- it ran
+        // with the default 10 ms guard, under which one ml=0 sample per
+        // iteration survives at ~10000x weight, and was never re-derived. The
+        // MoE-dispatch clamp (c8ef8d5, 03:59) landed BEFORE it, so no
+        // intervening code change explains the difference either.
+        //
+        // The excess is now PRICED and LOCALIZED. Rank 0's MoE-half work excess
+        // (+8.98 us/layer, count-weighted) closes against its deficit at the EP
+        // peer wait (-9.67) to 0.69 us, and it replicates at a second
+        // rendezvous when the EP wait is ablated (+9.14 / -10.43). It is
+        // 0.683 ms/token of peer idle, and it sits ENTIRELY in W13 (+6.02) and
+        // W2 (+3.41), split 1.77:1 -- the gate+up : down ratio -- against a
+        // peer-to-peer spread of 0.64 and 0.36. See demo/glm5/ep_bias_localize.py
+        // and demo/glm5/ep_rank_skew_anatomy.py.
+        //
+        // What is still true: the row shard below is wrong output, and SP3[k]
+        // is aggregate worker-seconds and cannot see makespan. What changed is
+        // only the makespan evidence. NOT YET RE-MEASURED AT THE WALL -- price
+        // the harvest before building it.
         //
         // The same table also retires the ROUTED-expert imbalance, which is a
         // separate and much larger effect on paper. At EP=8 with TOPK=8 over
