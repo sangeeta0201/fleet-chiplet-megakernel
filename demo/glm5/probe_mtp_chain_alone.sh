@@ -59,21 +59,48 @@
 # second decode row, at 3.181 ms: 30% of an entire bs=1 iteration for one
 # extra token, on a machine that spends 50% of every layer spinning.
 #
-# WHAT THIS DOES TO THE BOARD.  Item 1 ("make the second decode row cheap")
-# is now correctly aimed for the first time.  Its two targets, both real:
+# WHAT THIS DOES TO THE BOARD.
 #
-#   3.181 ms  the second row          -- work, and the board's stated item
-#   2.186 ms  the 2-wide geometry     -- pure waste, zero tokens, and MTP
-#                                        pays it every iteration
+# CAREFUL WITH THE GEOMETRY TERM -- it is NOT an MTP lever, and the first
+# version of this block said it was.  The +2.186 was measured on a build whose
+# second row is DEAD and clamped (router zero-fills it, the MoE tile decoder
+# drops route_val==0, mla_decode returns before stamping LSE).  It is
+# therefore byte movement sized by BATCH_SIZE regardless of liveness: 2 rows
+# of EP fold payload, activation scratch, epilogue stores, 2x tile space
+# walked.  In a build that under-fills the batch that is pure waste and could
+# be sized on num_active_tokens instead.  MTP DOES NOT UNDER-FILL -- both rows
+# are live -- so there is nothing there for it to shed.  "At zero geometry
+# cost MTP would be 7.68 ms/token" is INVALID; do not quote it.
 #
-# At zero geometry cost MTP is 14.29 ms/iter = 7.68 ms/token (1.38x vs
-# 10.619) instead of 8.884.  Kill BOTH and MTP is 11.11 ms/iter =
-# 5.97 ms/token, 1.78x.  Neither number was reachable while the cost was
-# misattributed to a draft-layer harness that turns out to be 0.494 ms.
+# The additive split 2.186 + 0.494 + 3.181 is exact by construction but the
+# terms are not independently removable.  For MTP the meaningful grouping is:
+#
+#   0.494 ms  the MTP chain        -- overhead proper, and it is small
+#   5.367 ms  a second live row    -- 2.186 to widen the build + 3.181 to
+#                                     activate the row on top of that
+#
+# So a second token costs 5.367 ms of machine time against a 10.619 ms
+# iteration, and MTP's 1.196x comes from acceptance 0.861 buying that back.
+#
+# WHERE THE 3.181 GOES, AND WHY ITEM 1 IS HARD.  The arithmetic is not the
+# cost: an MFMA tile is M=16/32, so a second row rides free in the same
+# instruction -- which is exactly why the row fold measured +0.348 us/layer
+# (glm-batch-row-mfma-fold-is-a-negative).  What a second LIVE row really
+# adds is a second top-8 expert set.  Under EP a rank owns ~1-2 activated
+# experts at bs=1, and a second row with different routes can double that,
+# so the MoE runs up to 2x the expert tiles.  The mtp-vs-bs1 region map is
+# consistent: W2 +7.520 us/layer on a 8.117 base (+93%), W13 +3.550 on 12.095
+# (+29%), and the MoE block is 48% of the captured delta.  That is genuinely
+# new work, not overhead, and it is why "a machine that idle should swallow a
+# second row" does not follow: the idle workers cannot help, because the
+# second row needs weight slabs that are not resident.
 #
 # The "cut the harness" build implied by glm-mtp-harness-costs-3.7ms's
 # sensitivity table is therefore DEAD: its whole budget is 0.494 ms, and the
 # ideal-case row of that table (harness -> 0.186) is worth 0.31 ms, not 1.90.
+# With the geometry term also off the table as an MTP lever, this probe closes
+# out the overhead side of item 1 entirely: there is no 2 ms of MTP bookkeeping
+# to delete.  What remains is the expert-set doubling, which is real work.
 #
 # CAVEAT, STATED PLAINLY: chainonly is n=1.  Reps 2 and 3 both wedged at
 # `[HOST_DBG] launch_persistent_kernel ENTER` on the SAME binary that rep 1
