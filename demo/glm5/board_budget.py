@@ -89,7 +89,7 @@ REGIONS = [
      "0.562  76% of HBM peak; -11.9% already taken by the ep_signal shard"),
     (30, 31, "o_proj -> router barrier", "0.204"),
     (31, 32, "router GEMV + sigmoid/bias TopK",
-     "1.076  k-loop is 72%; rank-select +33%, fold 96ns, bias prefetch dead"),
+     "1.076  MISLABELLED AND UNATTRIBUTED. The listed verdicts price only the TopK TAIL (k-loop 72%, rank-select +33%, fold 96ns, bias prefetch dead) and those are all NANOSECOND items -- they do not touch the 1.076. paired_span.py: the region is SHARPLY BIMODAL, per-worker span p25 0.80 vs median 12.95 us/layer, because `xcd_rank < oproj_topk_tiles_per_xcd` admits 24/XCD (192) to the block and `t = xcd_rank; t < router_tile_n` admits 16/XCD (128) to the router. 128/232 = 55% OCCUPANCY; 104 workers idle through ~13 us/layer. The slow mode is TIGHT (p25 12.98 -> max 14.81 against an S31 arrival sd of 0.40), the signature of a COMMON RELEASE -- and the o_proj hier_barrier WAIT is deliberately deferred INTO this kernel, so S30->S31 (0.204) is only the ARRIVAL and the wait lives here. The GEMV cannot explain it: 2 dots of K=5120 is ~20 KB/worker, under 1 us even at 41.6 GB/s/CU. POLL-vs-WORK NOT YET SPLIT -- that probe decides the lever: poll-dominated = widening buys nothing; work-dominated = ceiling 13.0 x (1 - 128/232) x 76 = 0.44 ms"),
     (32, 5, "routing-ready poll", "0.317"),
     (5, 6, "W13 tiles",
      "1.402  AT THE HBM ROOF; OPW=16 -1.34ms, split-K +4.12ms, prefetch null. RANK-ASYMMETRIC: rank 0 spends +6.02 us/layer here vs peers 5.80 (peer spread 0.64) -- the shared expert. PRICED AND CLOSED: MPK_SHARED_DUP doubles that excess for +0.106 ms of wall (n=3, inside noise), so a perfect shard is <=0.103 and a 4-way K-shard <=0.077. NO-GO"),
