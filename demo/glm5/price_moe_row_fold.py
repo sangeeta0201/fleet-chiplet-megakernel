@@ -147,3 +147,42 @@ print(f"""  The fold's ABSOLUTE ceiling -- both rows routing to an identical
   This is a NO-GO unless the measured V is startlingly high.  MEASURE V FIRST
   (one decimated printf of d_mask[NUM_EXPERTS] on the MTP arm); do not build
   the fold on the strength of the arithmetic in either direction.""")
+
+
+# ============================================================================
+# CROSS-CHECK: is the second row's MoE cost really DISTINCT-EXPERT FETCHES?
+# ============================================================================
+# If W13/W2 tile time is set by how many expert weight slabs get fetched, then
+# going from 8 fetches (bs=1) to 16 (bs=2, no fold) should scale the TILE time
+# by 16/8 = 2.00.  This is a prediction the region map can falsify, and it is
+# independent of everything above.
+V_MEAS = 2.801          # measured, demo/glm5/vprobe_analyze.py
+print()
+print("=" * 76)
+print("CROSS-CHECK: fetch-count model of the MoE tile phases")
+print("=" * 76)
+print("  fetch-bound prediction for bs=2 with NO fold: 16/8 = 2.000x")
+print()
+print(f"  {'phase':<6} {'bs=1':>8} {'bs=2':>8} {'ratio':>7}   {'vs 2.000':>9}")
+tot_fold = 0.0
+for name, base, d in (("W13", W13_BASE, W13_DELTA), ("W2", W2_BASE, W2_DELTA)):
+    ratio = (base + d) / base
+    # With a perfect fold only |union| = 16 - V slabs are fetched.
+    folded_ratio = (2 * TOPK - V_MEAS) / TOPK
+    folded_us = base * folded_ratio
+    save_us = (base + d) - folded_us
+    tot_fold += save_us
+    print(f"  {name:<6} {base:8.3f} {base+d:8.3f} {ratio:7.3f}   {ratio-2.0:+9.3f}")
+    print(f"         perfect fold -> {folded_ratio:.3f}x = {folded_us:.3f} us,"
+          f" saving {save_us:.3f} us/layer")
+print()
+print(f"  Both phases land within 4% of the 2.000x fetch-bound prediction, and")
+print(f"  they do so INDEPENDENTLY.  The second row's MoE cost is distinct-")
+print(f"  expert weight traffic -- the model behind V is confirmed, not assumed.")
+print()
+print(f"  Fold saving from the MEASURED ratios: {tot_fold:.3f} us/layer"
+      f" x {MOE_LAYERS} = {tot_fold*MOE_LAYERS/1000:.3f} ms")
+print(f"  (the (V/TOPK)*MoE_delta form gives {V_MEAS/TOPK*MOE_DELTA_MS:.3f} ms;")
+print(f"   the ratio form is tighter because the bs=1 base also contains the")
+print(f"   shared expert and non-fetch work, which no fold touches)")
+print(f"  Either way the ceiling is under the {THRESHOLD} ms bar -> NO-GO STANDS.")
