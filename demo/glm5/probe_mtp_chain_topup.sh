@@ -59,3 +59,54 @@ for ARM in chainonly bs2; do
                               --arm "$D/${ARM}_r*_rank*.json" 2>&1 | tail -14
 done
 echo TOPUP_DONE
+
+# ############################ RESULT ########################################
+#
+# Ran 2026-08-22 13:09-13:44.  THE BOX ATE MOST OF THIS BATCH.  Outcome per
+# rep, in the interleaved order above:
+#
+#   chainonly r4   FAULT  "HIP error: an illegal memory access was encountered"
+#   bs2       r3   OK     12.879 ms/iter   G1+G2 PASS, cluster member
+#   chainonly r5   OK     13.164 ms/iter   G1+G2 PASS, cluster member
+#   bs2       r4   FAULT  illegal memory access
+#   chainonly r6   FAULT  illegal memory access
+#
+# All three faults land at the SAME log offset (line 4467, i.e. immediately
+# after the dispatch banner, at the first decode iteration) on three DIFFERENT
+# ranks (6, 4, 2), and one of them is the PLAIN bs2 arm.  So this is the box's
+# intermittent NP=8 failure wearing a second face -- the known presentation is
+# a hang at launch_persistent_kernel ENTER, this one is an illegal address at
+# the first decode step -- and it is NOT caused by GLM_MTP_GRAPH_ONLY.  Two
+# reps of the same binary (bs2 r3, chainonly r5) ran clean.
+#
+# Stopped here rather than spend more of the run feeding a box failing ~3 in 5.
+#
+# ############################ THE SPLIT, RECOMPUTED #########################
+#
+#   arm         walls (ms/iter)                  n   mean     G1+G2
+#   bs1         10.619                           3   10.619   PASS
+#   bs2         12.833  12.776  12.879           3   12.829   PASS
+#   chainonly   13.299  13.164                   2   13.232   PASS
+#   mtp         16.510  16.450                   2   16.480   PASS
+#
+#   10.619   bs=1 control
+#   +2.210   2-wide BUILD GEOMETRY          zero extra tokens
+#   +0.403   the ENTIRE MTP chain
+#   +3.248   the REAL second decode row
+#   =16.480  exact by construction
+#
+# vs the n=1 version in probe_mtp_chain_alone.sh (2.186 / 0.494 / 3.181): the
+# chain moved DOWN 0.091 and the row UP 0.091.  The finding is reinforced, not
+# weakened -- the chain is 2.4% of the wall and the second LIVE row is
+# 2.210 + 3.248 = 5.458 ms.
+#
+# chainonly is n=2, not the n=3 the noise-floor rule wants.  Stated plainly.
+# What licenses using it anyway: the two reps are 0.135 ms apart, HALF the
+# 0.26 ms floor, and the bs2 anchor underneath them is n=3 with a 0.103 ms
+# spread.  For the chain to be the expensive half, chainonly would have to sit
+# above 14.6 -- five floors above both samples.
+#
+# ITEM 2 IS UNAFFECTED, and not by luck.  Width-2 pays GEOM+CHAIN+ROWACT
+# twice, and that sum is pinned by (mtp - bs1) = 5.861 no matter how the three
+# terms divide, so width-2 is 10.619 + 2(5.861) = 22.341 ms/iter under BOTH
+# splits.  See demo/glm5/price_item2_width2.py -- CLOSED on its 7.3% ceiling.
