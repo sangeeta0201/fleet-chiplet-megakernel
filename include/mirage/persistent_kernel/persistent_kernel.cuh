@@ -2694,6 +2694,20 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
             int ml_n_tile_start = (int)task_desc->task_metadata.n_tile_start;
             int ml_n_tile_count = (int)task_desc->task_metadata.n_tile_count;
 
+            // Which RUN of back-to-back fused layers this task is the entry
+            // point for. The host stamped the run's first layer index into
+            // _linear_reserved (task_descs is a shared-memory copy reloaded
+            // from all_tasks on every dispatch, so the run-monotonic value the
+            // loop writes below does not clobber the stamp for next time).
+            // One run covering everything is the normal case and gives
+            // ml_begin=0, ml_end=ml_num_layers -- the loop below is then
+            // exactly what it was.
+            int const ml_begin =
+                (int)task_desc->task_metadata._linear_reserved;
+            int const ml_end = config.ml_run_end != nullptr
+                                   ? config.ml_run_end[ml_begin]
+                                   : config.ml_num_layers;
+
             // MPK_ML_PTR_PREFETCH: hold the next layer's pointer-table entries
             // in registers instead of loading them at the layer boundary.
             //
@@ -2720,19 +2734,20 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
             bool const pf_out_ok = (int)threadIdx.x < MAX_OUTPUTS_PER_TASK;
 #endif
 
-            for (int ml = 0; ml < config.ml_num_layers; ml++) {
+            for (int ml = ml_begin; ml < ml_end; ml++) {
               // Stage stamp 12: the loop boundary itself. Splits the 16.50 us
               // that S11 - S8 measures into the part below the previous
               // iteration's fence (S12 - S8: return from the fused kernel,
               // the worker-state store, threadfence_gpu, __syncthreads) and
               // the part above the dispatch (S11 - S12: the 34+13 pointer
               // table copy and its two __syncthreads).
-              if (threadIdx.x == 0 && ml > 0) {
+              if (threadIdx.x == 0 && ml > ml_begin) {
                 mpk_stage_stamp(12);
               }
-              // Layer 0: task_desc already loaded from precomputed dispatch
-              // buffer with correct per-XCD pointers. Skip the copy.
-              if (ml > 0) {
+              // A run's first layer: task_desc already loaded from the
+              // precomputed dispatch buffer with correct per-XCD pointers.
+              // Skip the copy.
+              if (ml > ml_begin) {
                 // Widths must match the host-side ML_N_IN / ML_N_OUT that
                 // built these tables (see the multi-layer scan), or the
                 // strides disagree and every layer past 0 reads the wrong
@@ -2873,7 +2888,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               // Every s_waitcnt inside the tile loop drains vmcnt anyway,
               // which is the point: the load completes during the layer
               // rather than blocking the boundary.
-              if (ml + 1 < config.ml_num_layers) {
+              if (ml + 1 < ml_end) {
                 int const pf_in_base =
                     (xcd_id * config.ml_num_layers + ml + 1) *
                     MAX_INPUTS_PER_TASK;
@@ -2929,7 +2944,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               // __syncthreads ensures all threads finish before task_desc is
               // modified for the next layer.
 #if MPK_ABL_ML_BOUNDARY < 2
-              if (ml < config.ml_num_layers - 1) {
+              if (ml < ml_end - 1) {
                 if (threadIdx.x == 0 && block_xcd_local_rank == 0) {
                   threadfence_gpu();
                 }
@@ -2943,7 +2958,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
             // the two-level path since this task is in the queue.
             if (threadIdx.x == 0) {
               threadfence_gpu();
-              EventId ev_id = config.ml_trigger_events[0];
+              EventId ev_id = config.ml_trigger_events[ml_begin];
               size_t ev_idx = get_event_position_index(ev_id);
               int xcd_slot = xcd_id * config.num_events + (int)ev_idx;
               int xcd_thresh = config.xcd_event_num_tasks != nullptr
@@ -2951,7 +2966,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                                    : 0;
               if (xcd_thresh > 0) {
                 TaskId ml_tid =
-                    compute_task_id(pc_iter, config.ml_task_positions[0]);
+                    compute_task_id(pc_iter, config.ml_task_positions[ml_begin]);
                 EventCounter local_cnt =
                     atom_add_local_u64(
                         reinterpret_cast<unsigned long long int *>(
@@ -5010,19 +5025,63 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
       }
     }
 
-    int inter_layer_gap = 0;
-    for (int L = 1; L < ml_layers; L++) {
-      size_t gap = fused_layer_positions[L] -
-                   (fused_layer_positions[L - 1] + NUM_XCDS_ML);
-      inter_layer_gap += (int)gap;
+    // Group the fused layers into RUNS -- maximal sets that sit back-to-back
+    // in the task graph. Replay executes a run inside ONE task without
+    // returning to the scheduler, so a run is the largest thing it can cover:
+    // anything the graph placed between two fused layers would simply never
+    // execute, and after compaction its dependent events would be triggered by
+    // nothing (the graph stalls with no error).
+    //
+    // Until now the rule was "one run or no replay at all", which is why the
+    // MTP draft layer could not be added: its input is the token the LM head
+    // and argmax produce, so it has to sit after the tail, and a single fused
+    // task on the far side of the tail took all 76 real layers down with it.
+    // Splitting into runs keeps the main block on replay and dispatches the
+    // stray layer as its own one-layer batch, which still gives it ml_mode --
+    // the fused MLA kernel requires ml_mode under EP (its barrier thresholds
+    // ride task_layer_idx, see gang_mla_full_layer_fused_mi300.cuh).
+    std::vector<int> run_start; // indices into fused_layer_positions
+    for (int L = 0; L < ml_layers; L++) {
+      if (L == 0 || fused_layer_positions[L] !=
+                        fused_layer_positions[L - 1] + NUM_XCDS_ML) {
+        run_start.push_back(L);
+      }
     }
-    if (ml_layers > 1 && inter_layer_gap > 0) {
-      printf("[MPK] Multi-layer table: DISABLED -- %d task(s) sit between "
-             "fused layers (per-layer collectives?). Replay would delete "
-             "them; falling back to per-layer dispatch.\n",
-             inter_layer_gap);
+    std::vector<int> h_run_end(ml_layers > 0 ? ml_layers : 1, ml_layers);
+    for (size_t r = 0; r < run_start.size(); r++) {
+      int e = (r + 1 < run_start.size()) ? run_start[r + 1] : ml_layers;
+      for (int L = run_start[r]; L < e; L++) {
+        h_run_end[L] = e;
+      }
+    }
+
+    // Only the shape this was built for is allowed through: one long run of
+    // real layers, plus at most one trailing run. Expert-parallel MoE with a
+    // per-layer collective produces N runs of one layer each -- that is not a
+    // replay win, it is the per-layer dispatch path with extra bookkeeping, and
+    // it is the case the original gap check was written to reject. Keep
+    // rejecting it; `run_start[1] > 1` is what tells the two apart.
+    //
+    // The trailing run is 2 layers, not 1: the MTP draft layer needs its own
+    // EP tail (the ep_tail_only variant that folds the last MoE output),
+    // exactly as the main stack does.
+    bool runs_ok = run_start.size() == 1 ||
+                   (run_start.size() == 2 && run_start[1] > 1);
+    if (ml_layers > 1 && !runs_ok) {
+      printf("[MPK] Multi-layer table: DISABLED -- %d fused layers in %d "
+             "non-contiguous runs (per-layer collectives?). Replay would "
+             "delete the tasks between them; falling back to per-layer "
+             "dispatch.\n",
+             ml_layers,
+             (int)run_start.size());
       fflush(stdout);
       ml_layers = 1; // skip compaction below
+    } else if (run_start.size() == 2) {
+      printf("[MPK] Multi-layer table: 2 runs -- layers 0..%d batched, layer "
+             "%d dispatched separately (MTP draft layer?)\n",
+             run_start[1] - 1,
+             run_start[1]);
+      fflush(stdout);
     }
 
     if (ml_layers > 1) {
@@ -5147,7 +5206,19 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
       std::set<size_t> tasks_to_remove; // positions in all_tasks
       std::set<int> events_to_remove;   // indices in all_events
 
+      // Only layers INSIDE a run are redundant. A run's first layer is a real
+      // dispatch entry point -- removing it would delete the only task that
+      // ever starts that batch.
       for (int L = 1; L < ml_layers; L++) {
+        bool is_run_start = false;
+        for (size_t r = 0; r < run_start.size(); r++) {
+          if (run_start[r] == L) {
+            is_run_start = true;
+          }
+        }
+        if (is_run_start) {
+          continue;
+        }
         size_t pos = fused_layer_positions[L];
         // Remove all 8 XCD copies of this layer
         for (int xcd = 0; xcd < NUM_XCDS_ML; xcd++) {
@@ -5168,16 +5239,21 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
       // Fix layer 0's trigger_event: redirect to last layer's trigger event.
       // The last layer's trigger event gates FUSE_TAIL. After compaction,
       // layers 1..35 are gone, so layer 0 must trigger the FUSE_TAIL consumer.
-      {
-        size_t layer0_pos = fused_layer_positions[0];
+      // Per RUN, not once: with two runs the second run's entry task keeps its
+      // own trigger, and redirecting only run 0 would leave the batch
+      // signalling an event the tail no longer waits on.
+      for (size_t r = 0; r < run_start.size(); r++) {
+        int rb = run_start[r];
+        int re = h_run_end[rb];
+        size_t layer0_pos = fused_layer_positions[rb];
         EventId last_trigger =
-            all_tasks[fused_layer_positions[ml_layers - 1]].trigger_event;
+            all_tasks[fused_layer_positions[re - 1]].trigger_event;
         for (int xcd = 0; xcd < NUM_XCDS_ML; xcd++) {
           all_tasks[layer0_pos + xcd].trigger_event = last_trigger;
         }
-        // Update h_trigger_events[0] to match the redirected trigger_event
+        // Update h_trigger_events[rb] to match the redirected trigger_event
         // (the original was an inter-layer event that gets removed)
-        h_trigger_events[0] = last_trigger;
+        h_trigger_events[rb] = last_trigger;
         // Note: the last layer's event's first/last_task_id already point at
         // the FUSE_TAIL consumer tasks (set by dfs_create_events_add_tasks).
         // Don't modify them — the remap will adjust positions correctly.
@@ -5272,12 +5348,16 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
         h_trigger_events[L] = remap_event(h_trigger_events[L]);
       }
 
-      // Build h_task_positions from layer 0's compacted position
+      // Build h_task_positions from each RUN's first layer's compacted
+      // position; the layers inside a run are removed, so they inherit their
+      // run entry's position as a placeholder.
       std::vector<size_t> h_task_positions(ml_layers);
-      h_task_positions[0] = task_remap[fused_layer_positions[0]];
-      for (int L = 1; L < ml_layers; L++) {
-        // Layers 1..35 are removed — use layer 0's position as placeholder
-        h_task_positions[L] = h_task_positions[0];
+      for (size_t r = 0; r < run_start.size(); r++) {
+        int rb = run_start[r];
+        size_t p = task_remap[fused_layer_positions[rb]];
+        for (int L = rb; L < h_run_end[rb]; L++) {
+          h_task_positions[L] = p;
+        }
       }
 
       // Upload pointer tables + multi-layer config to GPU
@@ -5311,6 +5391,12 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
                        h_variant_ids.data(),
                        ml_layers * sizeof(unsigned),
                        cudaMemcpyHostToDevice);
+      global_runtime_config.ml_run_end = gpu_malloc<int>(ml_layers *
+                                                         sizeof(int));
+      (void)cudaMemcpy(global_runtime_config.ml_run_end,
+                       h_run_end.data(),
+                       ml_layers * sizeof(int),
+                       cudaMemcpyHostToDevice);
 
       // Barrier counters (zeroed)
       global_runtime_config.ml_barrier_arrive =
@@ -5335,6 +5421,7 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
       fflush(stdout);
     } else {
       global_runtime_config.ml_num_layers = 0;
+      global_runtime_config.ml_run_end = nullptr;
       printf("[MPK] Multi-layer table: disabled (%d fused layers found)\n",
              ml_layers);
       fflush(stdout);
@@ -5343,6 +5430,7 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
 #else
   global_runtime_config.ml_num_layers = 0;
   global_runtime_config.ml_scanned_layers = 0;
+  global_runtime_config.ml_run_end = nullptr;
 #endif // MPK_FUSED_LAYER_BATCHING
 
   // =========================================================================

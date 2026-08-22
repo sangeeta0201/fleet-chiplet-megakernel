@@ -540,6 +540,18 @@ struct RuntimeConfig {
   EventId *ml_trigger_events; // [ml_num_layers] per-layer trigger events
   size_t *ml_task_positions;  // [ml_num_layers] per-layer task position indices
   unsigned *ml_variant_ids;   // [ml_num_layers] per-layer variant_id
+  // [ml_num_layers] one-past-the-last layer of the RUN containing this layer.
+  // A "run" is a maximal group of fused layers that sit back-to-back in the
+  // task graph. Replay executes a whole run inside one task without returning
+  // to the scheduler, so it can only ever cover a run -- anything the graph
+  // placed between two fused layers has to be dispatched normally.
+  //
+  // With one run (every model today) this is {N, N, ... N} and the loop below
+  // is unchanged. It exists for the MTP draft layer, which has to sit AFTER
+  // the LM head + argmax because its input is the token they produce, and so
+  // forms a second run of one layer. Before this, a second run made the scan
+  // disable replay for the whole graph.
+  int *ml_run_end;
   int *ml_barrier_arrive;     // [8 * 16] per-XCD arrival counters (cache-line
                               // padded)
   int *ml_barrier_global;     // [16] global arrival counter
