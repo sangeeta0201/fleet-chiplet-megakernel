@@ -278,7 +278,45 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
 
   // The q_b phase is one tile wider than its workgroup count: tile 0 carries
   // the latent row rather than a GEMM tile. See the kvupd header.
-  int const qkv_tiles_per_xcd = BATCH_SIZE * qkv_n_wgs_per_xcd;
+  // MPK_QKV_FOLD_ROWS: put the batch row on the MFMA's output columns instead
+  // of on the tile index. At BATCH_SIZE 1 the 16x16x128 scaled MFMA computes
+  // 16 output columns and the epilogue reads one of them, so a second row is
+  // free in the instruction -- what it is not free in is the tile space, and
+  // 2 * qkv_n_wgs_per_xcd tiles is what pushes qkv_a from one grid-stride
+  // round to two at bs=2 (S17-S16 went 9.22 -> 17.23 us/layer in the spec
+  // decomposition). Folded, the round count is back to one and each tile does
+  // both rows' RMSNorm+quant against a single fetch of its weight slab.
+  //
+  // Not applied to q_b: its tile space is 4 per XCD against 29 workers, so at
+  // bs=2 it is still one round and the fold would only move work around.
+  //
+  // MEASURED NEGATIVE -- off by default, kept as a probe. Paired same-batch
+  // BAR_SKEW A/B, one prompt, spec decode at bs=2:
+  //
+  //     region              ctl      fold     delta
+  //     S16->S17 qkv_a   17.150    16.535    -0.615 us/layer
+  //     S17->S18          6.919     7.882    +0.963
+  //
+  // The fold does delete the redundant MFMA -- but only 0.615 us of the ~4 us
+  // it removes shows up, and the next region gives it all back, because each
+  // folded tile now runs both rows' RMSNorm+quant serially and that lengthens
+  // the single-tile critical path. Net +0.348 us/layer; wall +0.244 ms/iter at
+  // n=1, inside the 0.26 ms floor and the wrong sign. Output is correct
+  // (cross-rank identical, 4/4 ranks agree).
+  //
+  // The lesson is the standing one: cutting work inside a phase is absorbed.
+  // The second decode row's cost at qkv_a is the PER-ROW prologue -- a
+  // different token's norm and quant, genuinely not redundant -- not the
+  // duplicated weight-side MFMA. Do not port this to o_proj; same shape, same
+  // absorption.
+  constexpr bool QKV_FOLD_ROWS =
+#if defined(MPK_QKV_FOLD_ROWS)
+      (BATCH_SIZE > 1);
+#else
+      false;
+#endif
+  int const qkv_tiles_per_xcd =
+      (QKV_FOLD_ROWS ? 1 : BATCH_SIZE) * qkv_n_wgs_per_xcd;
   int const qb_tiles_per_xcd = BATCH_SIZE * qb_n_wgs_per_xcd + 1;
 
   constexpr int HIER_STRIDE = 16;
@@ -644,7 +682,8 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
                                           /*EP_PRE_FOLDED=*/QKV_EP_FOLD ||
                                               QKV_PRO_HOIST,
                                           /*SP_QKV=*/true,
-                                          /*PRO_PUB=*/QKV_PRO_HOIST>(
+                                          /*PRO_PUB=*/QKV_PRO_HOIST,
+                                          /*FOLD_ROWS=*/QKV_FOLD_ROWS>(
         // Pre-folded, the resolved row is in x_out_ptr and the gather buffer
         // is not read again.
         /*norm_input_ptr=*/(QKV_EP_FOLD || QKV_PRO_HOIST)

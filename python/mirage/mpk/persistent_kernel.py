@@ -645,6 +645,18 @@ def get_compile_command(
             # in MPK_FORWARD_VARS: it changes the XCD-local release's writer
             # set, so a rank that misses it deadlocks.
             flags = flags + ["-DMPK_QKV_PRO_HOIST"]
+        if int(os.environ.get("MPK_QKV_FOLD_ROWS", "0")) == 1:
+            # Put the batch row on the MFMA's output columns instead of on
+            # qkv_a's tile index. The 16x16x128 scaled MFMA computes 16 output
+            # columns and at bs=1 the epilogue reads one; the B-operand gather
+            # addresses by k-block only, so every lane already feeds the same
+            # token. Folded, lane column `col` feeds row `col`, the tile space
+            # drops from BATCH_SIZE * n_wgs to n_wgs -- one grid-stride round
+            # instead of two at bs=2 -- and the weight slab is fetched once per
+            # tile instead of once per (tile, row). No-op at BATCH_SIZE 1.
+            # Compile-time and in MPK_FORWARD_VARS: it changes the tile space,
+            # and a rank that misses it disagrees on the phase's work.
+            flags = flags + ["-DMPK_QKV_FOLD_ROWS"]
         if int(os.environ.get("MPK_BAR_TREE", "0")) == 1:
             # Two-level arrival for every GPU-wide Mechanism-C rendezvous:
             # 29 atomics on the XCD's own line, then 8 on the global one,

@@ -200,6 +200,10 @@ __device__ __attribute__((noinline)) void
                                         /*EP_PRE_FOLDED=*/false,
                                         /*SP_QKV=*/false,
                                         /*PRO_PUB=*/false,
+                                        // q_b keeps the row on the tile index:
+                                        // 4 tiles per XCD against 29 workers
+                                        // is one round at bs=2 either way.
+                                        /*FOLD_ROWS=*/false,
                                         KV_INPUT_STRIDE>(norm_input_ptr,
                                                            norm_weight_ptr,
                                                            norm_output_ptr,

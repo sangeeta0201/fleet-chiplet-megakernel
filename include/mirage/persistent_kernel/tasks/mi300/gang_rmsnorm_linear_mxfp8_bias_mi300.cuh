@@ -1092,6 +1092,20 @@ template <int BATCH_SIZE,
           // the quantizer are both deleted and the tile copies E4M3 + E8M0
           // into LDS instead of deriving them. See _rnlm8_pro_publish.
           bool PRO_PUB = false,
+          // Fold the batch rows into the MFMA's N dimension instead of into
+          // the tile index. The 16x16x128 scaled MFMA computes 16 output
+          // columns and at BATCH_SIZE 1 fifteen of them are wasted: the B
+          // operand gather (_gang_load_fp8_mfma_b) addresses by k-block only,
+          // so every lane feeds the same token and the epilogue reads acc
+          // under `col == 0`. With FOLD_ROWS the caller passes
+          // n_wgs_per_xcd tiles instead of BATCH_SIZE * n_wgs_per_xcd, each
+          // tile quantizes every row into its own LDS plane, lane column
+          // `col` feeds row `col`, and the epilogue writes columns
+          // 0..batch_count-1. The weight slab is then fetched once per tile
+          // instead of once per (tile, row) -- which is what the bs=2 cost
+          // decomposition priced at +16 us/layer of pure redundancy across
+          // qkv_a, q_b and o_proj.
+          bool FOLD_ROWS = false,
           // Row stride of norm_input_ptr when it is WIDER than the reduction
           // this GEMM takes. Defaulting it to REDUCTION_SIZE is what pinned
           // every narrowed-reduction caller to BATCH_SIZE 1: the token row
@@ -1230,6 +1244,11 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
 
   // ── Token activation in shared memory ────────────────────────────────────
   constexpr int FP8_TOK_DATA = REDUCTION_SIZE;
+  // One LDS plane per folded row. FOLD_ROWS off is TOK_ROWS == 1, i.e. the
+  // layout below is byte-for-byte what it always was.
+  constexpr int TOK_ROWS = FOLD_ROWS ? BATCH_SIZE : 1;
+  static_assert(!FOLD_ROWS || BATCH_SIZE <= 16,
+                "FOLD_ROWS puts the row on the MFMA's 16 output columns");
 
   uint8_t const *W = (uint8_t const *)weight_ptr;
   unsigned short const *d_bias = (unsigned short const *)bias_ptr;
@@ -1278,14 +1297,14 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
 #endif
 
   extern __shared__ char _rnlm8_smem[];
-  uint8_t *s_tok_fp8 = (uint8_t *)_rnlm8_smem;
-  uint8_t *s_tok_scales = s_tok_fp8 + FP8_TOK_DATA;
+  uint8_t *s_tok_fp8_all = (uint8_t *)_rnlm8_smem;
+  uint8_t *s_tok_scales_all = s_tok_fp8_all + TOK_ROWS * FP8_TOK_DATA;
   // The resadd staging buffer sits past the quantizer's, rounded up to 128 B so
   // its uint2 traffic stays aligned. Only the K-parallel branch reuses
   // _rnlm8_smem (as lds_reduce, from offset 0) and that is after the MFMA, by
   // which point s_x_bf16 is dead.
   constexpr int RESADD_SMEM_OFF =
-      ((FP8_TOK_DATA + NUM_BLOCKS_32 + 127) / 128) * 128;
+      ((TOK_ROWS * (FP8_TOK_DATA + NUM_BLOCKS_32) + 127) / 128) * 128;
   unsigned short *s_x_bf16 =
       (unsigned short *)(_rnlm8_smem + RESADD_SMEM_OFF);
   // The norm weight follows it. REDUCTION_SIZE is a multiple of 128, so the
@@ -1322,11 +1341,16 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
   // take it in front of the __syncthreads() inside the norm below.
   int batch_count =
       (num_active_tokens < BATCH_SIZE) ? num_active_tokens : BATCH_SIZE;
-  int tok_idx = tile_idx / n_wgs_per_xcd;
-  int wg_idx = tile_idx % n_wgs_per_xcd;
+  // Folded, the tile index IS the workgroup index: the row dimension has left
+  // the tile space for the MFMA's output columns.
+  int tok_base = FOLD_ROWS ? 0 : (tile_idx / n_wgs_per_xcd);
+  int wg_idx = FOLD_ROWS ? tile_idx : (tile_idx % n_wgs_per_xcd);
+  int const rows_here = FOLD_ROWS ? batch_count : 1;
 
-  if (tok_idx >= batch_count) {
-    return;
+  if constexpr (!FOLD_ROWS) {
+    if (tok_base >= batch_count) {
+      return;
+    }
   }
 
   // Workgroup weight pointers
@@ -1352,6 +1376,20 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
   // and published E4M3 + one E8M0 per 128 -- exactly what the quantizer below
   // would have written into LDS. See _rnlm8_pro_publish.
   (void)norm_output_ptr;
+  // The depth-4 prefetch fill (below, inside the row loop's first trip) must
+  // outlive the loop -- it is the tile's weights, which no longer depend on
+  // the row.
+  constexpr bool HOIST_PREFILL =
+      LDS_PROLOGUE && (OUTPUT_PER_WG >= 64 ? (TILES_PER_WAVE == 1) : true);
+  i32x8_t ph_a[HOIST_PREFILL ? 4 : 1];
+  int ph_sa[HOIST_PREFILL ? 4 : 1];
+
+  // Steps 1 and 2 run once per folded row, each into its own LDS plane.
+  // rows_here is 1 unless FOLD_ROWS, so this is a no-op loop everywhere else.
+  for (int _row = 0; _row < rows_here; ++_row) {
+  int const tok_idx = tok_base + _row;
+  uint8_t *const s_tok_fp8 = s_tok_fp8_all + _row * FP8_TOK_DATA;
+  uint8_t *const s_tok_scales = s_tok_scales_all + _row * NUM_BLOCKS_32;
   unsigned short const *input_row = nullptr;
   float rms_rcp = 0.0f;
   if constexpr (PRO_PUB) {
@@ -1462,11 +1500,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
   // (N-parallel, TILES_PER_WAVE 1) and QKV_OUTPUT_PER_WG 16 (K-parallel, one
   // fill per wave). A wider OUTPUT_PER_WG would hold these 32 VGPRs live
   // across every later tile_iter for no benefit, so it keeps the old form.
-  constexpr bool HOIST_PREFILL =
-      LDS_PROLOGUE && (OUTPUT_PER_WG >= 64 ? (TILES_PER_WAVE == 1) : true);
-  i32x8_t ph_a[HOIST_PREFILL ? 4 : 1];
-  int ph_sa[HOIST_PREFILL ? 4 : 1];
-  if constexpr (HOIST_PREFILL) {
+  if constexpr (HOIST_PREFILL) if (_row == 0) {
     // N-parallel gives each wave its own 16 rows starting at k-tile 0;
     // K-parallel gives all four waves the same 16 rows and splits K.
     int const h_row = (OUTPUT_PER_WG >= 64) ? (warp_id * 16 + col) : col;
@@ -1532,6 +1566,14 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
         s_tok_fp8,
         s_tok_scales);
   }
+  } // _row: end of the per-row RMSNorm + quantize
+
+  // Lane column `col` feeds output column `col`, which under FOLD_ROWS is
+  // batch row `col`. Columns past the live batch replay row 0 -- the MFMA
+  // computes them either way and the epilogue drops them.
+  int const b_row = FOLD_ROWS ? ((col < rows_here) ? col : 0) : 0;
+  uint8_t const *const s_tok_fp8 = s_tok_fp8_all + b_row * FP8_TOK_DATA;
+  uint8_t const *const s_tok_scales = s_tok_scales_all + b_row * NUM_BLOCKS_32;
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   if (_sp_rec) {
@@ -1720,7 +1762,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
       } // MFMA_ITERS > FULL_PRELOAD_ITERS
 
       // ── Step 4: Bias epilogue, write BF16 output ─────────────────────────
-      if (col == 0) {
+      if (FOLD_ROWS ? (col < rows_here) : (col == 0)) {
         unsigned short packed[4];
         for (int i = 0; i < 4; i++) {
           int out_n = wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4 + i;
@@ -1733,8 +1775,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
 
           packed[i] = _gang_float_to_bf16(sum + bv);
         }
-        int out_idx = tok_idx * output_stride + wg_idx * OUTPUT_PER_WG +
-                      wave_tile * 16 + g * 4;
+        int out_idx = (FOLD_ROWS ? col : tok_base) * output_stride +
+                      wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4;
         _rnlm8_store4<WRITE_THROUGH>(
             d_output + out_idx, packed[0], packed[1], packed[2], packed[3]);
       }
@@ -1837,22 +1879,43 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
       }
     }
 
-    // Cross-wave LDS reduction (reuse token scratch area, dead after MFMA)
+    // Cross-wave LDS reduction (reuse token scratch area, dead after MFMA).
+    // Folded, lane column `col` carries batch row `col`, so the scratch grows
+    // a row axis: [wave][row][n]. At TOK_ROWS 2 and OUTPUT_PER_WG 16 that is
+    // 4 * 2 * 16 floats = 512 B, against the ~12.7 KB of quantized token the
+    // MFMA has just finished with.
+    constexpr int RED_ROWS = TOK_ROWS;
+    constexpr int RED_STRIDE = RED_ROWS * OUTPUT_PER_WG;
+    static_assert(NUM_WAVES * RED_STRIDE * (int)sizeof(float) <=
+                      TOK_ROWS * (FP8_TOK_DATA + NUM_BLOCKS_32),
+                  "the cross-wave reduction no longer fits the token scratch");
     float *lds_reduce = (float *)_rnlm8_smem;
-    if (col == 0) {
+    // "dead after MFMA" is true per wave, not per workgroup. Wave w reads
+    // s_tok_fp8[w*REDUCTION_SIZE/4 ...], but every wave's reduction slot lands
+    // in the first NUM_WAVES*RED_STRIDE*4 bytes -- inside wave 0's read range.
+    // Nothing ordered wave 1's store against wave 0's last k-block load, so a
+    // stalled wave 0 read back another wave's accumulator as token bytes. The
+    // window is 256 B unfolded and 512 B folded; the barrier is one per tile.
+    __syncthreads();
+    if (FOLD_ROWS ? (col < rows_here) : (col == 0)) {
+      int const r = FOLD_ROWS ? col : 0;
       for (int i = 0; i < 4; i++) {
-        lds_reduce[warp_id * OUTPUT_PER_WG + g * 4 + i] = acc[i];
+        lds_reduce[warp_id * RED_STRIDE + r * OUTPUT_PER_WG + g * 4 + i] =
+            acc[i];
       }
     }
     __syncthreads();
 
-    // Wave 0 reduces across waves and writes output with bias
-    if (warp_id == 0 && col == 0) {
+    // Wave 0 reduces across waves and writes output with bias. Folded, wave 0
+    // has 16 lane columns and needs only rows_here of them, so the row it
+    // reduces is again `col` -- the same lane that produced it.
+    if (warp_id == 0 && (FOLD_ROWS ? (col < rows_here) : (col == 0))) {
+      int const r = FOLD_ROWS ? col : 0;
       unsigned short packed[4];
       for (int i = 0; i < 4; i++) {
         float v = 0.0f;
         for (int w = 0; w < NUM_WAVES; w++) {
-          v += lds_reduce[w * OUTPUT_PER_WG + g * 4 + i];
+          v += lds_reduce[w * RED_STRIDE + r * OUTPUT_PER_WG + g * 4 + i];
         }
 
         int out_n = wg_idx * OUTPUT_PER_WG + g * 4 + i;
@@ -1863,7 +1926,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
 
         packed[i] = _gang_float_to_bf16(v + bv);
       }
-      int out_idx = tok_idx * output_stride + wg_idx * OUTPUT_PER_WG + g * 4;
+      int out_idx = (FOLD_ROWS ? (tok_base + r) : tok_base) * output_stride +
+                    wg_idx * OUTPUT_PER_WG + g * 4;
       _rnlm8_store4<WRITE_THROUGH>(
           d_output + out_idx, packed[0], packed[1], packed[2], packed[3]);
     }
