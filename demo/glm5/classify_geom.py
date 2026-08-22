@@ -237,15 +237,89 @@ print(f"\n  cross-check: {span:.3f} us/layer x {N_LAYERS} ="
       f" the wall\n  (87106c0, n=3/n=2).  The instrument accounts for"
       f" {100*span*N_LAYERS/1000.0/GEOM_MS:.0f}% of it.")
 
+# ------------------------------------------------- is GEOM uniform across ranks?
+# The (iii) bucket is 58%, so the obvious follow-up is "the wider geometry
+# widens the per-rank SPREAD, and a rendezvous charges the spread, not the
+# mean".  That is a HYPOTHESIS and this block FALSIFIES it.
+def mk(rows, s):
+    return max(t / c for c, t in rows[s].values()) / 1000.0
+
+
+print()
+print("=" * 78)
+print("IS GEOM UNIFORM ACROSS RANKS?  (the spread hypothesis, FALSIFIED)")
+print("=" * 78)
+print(f"  {'rank':>4} {'span bs1':>10} {'span bs2':>10} {'dGEOM':>9}")
+spans = {}
+for arm, D in (("1", A), ("2", B)):
+    spans[arm] = [mk(D[r], 14) - mk(D[r], 0) for r in range(8)]
+for r in range(8):
+    print(f"  {r:>4} {spans['1'][r]:10.3f} {spans['2'][r]:10.3f}"
+          f" {spans['2'][r]-spans['1'][r]:+9.3f}")
+s1 = max(spans["1"]) - min(spans["1"])
+s2 = max(spans["2"]) - min(spans["2"])
+dg = [spans["2"][r] - spans["1"][r] for r in range(8)]
+print(f"\n  cross-rank SPREAD of the layer span: {s1:.3f} -> {s2:.3f}"
+      f"  ({s2-s1:+.3f} us/layer)")
+print(f"  GEOM per rank: {min(dg):+.3f} to {max(dg):+.3f}, range"
+      f" {max(dg)-min(dg):.3f} us/layer on a ~26.6 mean.")
+print(f"""
+  GEOM IS UNIFORM.  Every one of the 8 ranks pays +25.7..+27.1 us/layer, and
+  the cross-rank spread of the whole layer grows by only {s2-s1:+.3f} us/layer --
+  1.6% of GEOM.  The peer wait moves a lot per rank (+7.1 on rank 0, +11.9 to
+  +14.1 on the others) but the layer TOTAL does not diverge, because that is
+  exactly what a rendezvous does: it re-synchronises.
+
+  So the (iii) bucket is SPIN THAT REDISTRIBUTES, not skew that can be removed.
+  There is no rank-local fix and no skew fix that reaches GEOM: shortening one
+  rank's share just lengthens its wait at the next collective.  Compare
+  glm-counted-region-time-before-a-barrier-is-not-a-lever (3 for 3) and
+  glm-deleting-a-whole-rendezvous-is-neutral (8.28 us/layer of UNIFORM spin
+  deleted, wall moved 0.003).""")
+
+# ------------------------------------------------ which regions are rank-local?
+print()
+print("=" * 78)
+print("PER-RANK dCRIT: which regions are UNIFORM (attackable) vs RANK-LOCAL")
+print("=" * 78)
+for s0, s1_, lab in ((29, 30, "o_proj"), (7, 8, "W2 tiles"),
+                     (5, 6, "W13 tiles"), (6, 7, "W13->W2 bar"),
+                     (2, 16, "qkv_a tiles")):
+    d = [(mk(B[r], s1_) - mk(B[r], s0)) - (mk(A[r], s1_) - mk(A[r], s0))
+         for r in range(8)]
+    peers = sum(d[1:]) / 7
+    print(f"  {lab:<13} " + " ".join(f"{x:+6.2f}" for x in d)
+          + f"   r0-peers {d[0]-peers:+6.2f}")
+print(f"""
+  o_proj is UNIFORM (+3.78..+4.50 on all 8) -- real dead-row work everywhere.
+  The MoE tile phases are NOT: rank 0 pays +6.72 W2 / +2.63 W13 against peer
+  means of +2.65 / +0.64.  Rank 0 owns the shared expert, the shared expert
+  processes BATCH_SIZE rows, so at bs=2 it does two -- one of them for the dead
+  row.  Rank-0 excess over peers across both MoE tile phases: +6.062 us/layer
+  = 0.461 ms, 22% of GEOM.
+
+  CAUTION, and it is not resolved here: glm-shared-expert-hoist-is-zero-makespan
+  measured rank 0 as having the SHORTEST W13 makespan of the 8, which is the
+  opposite sign to this table.  Different instrument (SP counters vs
+  BARSTAGEWS), different build.  Do not spend the 0.461 ms until that is
+  reconciled -- and note the uniformity result above says a rank-local win is
+  absorbed by the collective anyway.""")
+
 print()
 print("=" * 78)
 print("THE NEXT LEVER")
 print("=" * 78)
-print(f"""  Largest single classified term: the EP collective's PEER WAIT,
-  {peer0+rel0:+.3f} us/layer on rank 0 = {(peer0+rel0)*N_LAYERS/1000.0:.3f} ms, {100*(peer0+rel0)/span:.0f}% of GEOM -- and +11.9 to
-  +14.1 us/layer on the seven ranks that wait on rank 0.
+print(f"""  SUPERSEDED by the uniformity result above: the EP collective's PEER WAIT,
+  {peer0+rel0:+.3f} us/layer on rank 0 = {(peer0+rel0)*N_LAYERS/1000.0:.3f} ms, is the largest classified term by
+  size, but it is a redistribution: the layer total does not diverge across
+  ranks, so removing it just moves the wait.
 
-  Largest PURE (i) term, and the most directly deletable: o_proj at
-  {(b[30]['max']-b[29]['max'])-(a[30]['max']-a[29]['max']):+.3f} us/layer = {((b[30]['max']-b[29]['max'])-(a[30]['max']-a[29]['max']))*N_LAYERS/1000.0:.3f} ms.  Its tile count does not change; it computes
-  and writes a second output row for a token nobody reads.  That is dead work
-  with a fixed tile count and no barrier in it.""")
+  THE LEVER IS o_proj: {(b[30]['max']-b[29]['max'])-(a[30]['max']-a[29]['max']):+.3f} us/layer = {((b[30]['max']-b[29]['max'])-(a[30]['max']-a[29]['max']))*N_LAYERS/1000.0:.3f} ms.  It is the only large term
+  that is all three of: pure (i) dead-row bytes, UNIFORM across all 8 ranks
+  (+3.78..+4.50, so no rank absorbs it for the others), and dTYP {(b[30]['med']-b[29]['med'])-(a[30]['med']-a[29]['med']):+.3f} of
+  dCRIT {(b[30]['max']-b[29]['max'])-(a[30]['max']-a[29]['max']):+.3f} -- every worker really does it, there is no barrier inside it,
+  and its tile count does not change (oproj_tiles_per_xcd = n_wgs // 8).  It
+  computes and writes a second output row for a token nobody reads.
+
+  0.303 ms is above the 0.26 ms wall noise floor, but only just: gate it on the
+  region counter, not on n=1 at the wall.""")
