@@ -72,7 +72,8 @@ CLASS = {
                       " dSPIN is the tail that lengthens behind them."),
     (5, 6):   ("ii/iii", "W13: same doubling. dTYP is only +0.352 -- exactly"
                       " what a decode-and-return costs -- and the rest is tail."),
-    (2, 16):  ("ii",  "qkv_a tile count is bs-scaled but already clamped to 29"
+    (2, 16):  ("ii",  "MISLABELLED as qkv_a in 26f8aab/a9018e5: this is the\n                       task->attn-body CALL BOUNDARY, not a phase.  Real qkv_a\n                       tiles are S16->S17.  See board_budget.py."
+                      "  Tile counts are bs-scaled but already clamped to 29"
                       " workers/XCD at bs=1, so bs=2 only adds a stride round."),
     (30, 31): ("iii", "router: dTYP ~0 (-0.023), all of it is tail."),
     (6, 7):   ("iii", "the W13->W2 rendezvous itself."),
@@ -82,7 +83,7 @@ CLASS = {
 
 ORDER = [0, 1, 2, 16, 17, 18, 19, 21, 23, 24, 25, 26, 27, 28,
          29, 30, 31, 32, 5, 6, 7, 8, 12, 13, 14]
-LABEL = {(0, 1): "EP collective", (2, 16): "qkv_a tiles",
+LABEL = {(0, 1): "EP collective", (2, 16): "-> attn call bdry",
          (16, 17): "attn: q_b / W_UK", (17, 18): "attn: W_UV",
          (18, 19): "attn: decode prep", (19, 21): "attn: MLA decode",
          (21, 23): "attn: merge", (28, 29): "attn tail f", (29, 30): "o_proj",
@@ -284,7 +285,7 @@ print("PER-RANK dCRIT: which regions are UNIFORM (attackable) vs RANK-LOCAL")
 print("=" * 78)
 for s0, s1_, lab in ((29, 30, "o_proj"), (7, 8, "W2 tiles"),
                      (5, 6, "W13 tiles"), (6, 7, "W13->W2 bar"),
-                     (2, 16, "qkv_a tiles")):
+                     (2, 16, "-> attn call bdry")):
     d = [(mk(B[r], s1_) - mk(B[r], s0)) - (mk(A[r], s1_) - mk(A[r], s0))
          for r in range(8)]
     peers = sum(d[1:]) / 7
