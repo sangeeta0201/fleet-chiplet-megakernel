@@ -131,13 +131,44 @@
 #
 # LARGEST SINGLE TERM: the EP collective's peer wait, +7.368 us/layer on
 # rank 0 = 0.560 ms, 27% of GEOM -- and +11.9..+14.1 on the seven ranks that
-# wait on rank 0. It is (iii): the wider geometry widens the per-rank SPREAD,
-# and the collective charges the spread, not the mean.
+# wait on rank 0. It is (iii).
 #
-# LARGEST PURE (i) TERM: o_proj, +3.988 us/layer = 0.303 ms, with dTYP +3.874
-# of dCRIT +3.988 -- every worker really does it, there is no barrier in it,
-# and its tile count does not change. It computes and writes a second output
-# row for a token nobody reads.
+# ============ VERDICT: GEOM IS A NO-GO. 0.062-0.201 ms deletable ============
+# Two corrections landed on top of the table above, both self-caught, both from
+# the SAME logs -- no extra GPU run:
+#
+# 1. THE SKEW HYPOTHESIS IS FALSIFIED (a9018e5). "The wider geometry widens the
+#    per-rank spread" is wrong: per-rank layer span dGEOM is +27.11 / +26.58 /
+#    +25.79 / +26.45 / +26.73 / +25.68 / +26.19 / +26.54 -- UNIFORM. The
+#    cross-rank spread grows only 0.792 -> 1.232 = +0.440 us/layer, 1.6% of
+#    GEOM. So the (iii) bucket REDISTRIBUTES; there is no skew to remove.
+#
+# 2. THE o_proj LEVER IS RETRACTED. It was named as "pure (i) dead-row bytes,
+#    0.303 ms". The source says the row is not dead in the sense that matters:
+#      gang_gemv_mxfp8_mi300.cuh:396  if (m_tile*BATCH_SIZE+m >=
+#        num_active_tokens) continue;  -- inside `if (lane == 0)`, the EPILOGUE.
+#        grep -n num_active_tokens on that header returns exactly TWO hits,
+#        :180 (the parameter) and :396. The k-loop accumulates acc[m][*] for all
+#        BATCH_SIZE rows UNCONDITIONALLY.
+#      gang_oproj_router_fused_mi300.cuh:791  push_rows -- the peer all-gather
+#        push is ALREADY liveness-clamped.
+#    So the +3.988 IS the second row's accumulation, and a LIVE row needs it.
+#    Production MTP at bs=2 runs num_active_tokens=2: nothing is dead there.
+#
+# THE DELETABILITY TEST. A microsecond measured on the dead-row arm is only a
+# lever if it stays dead when the row goes live:
+#   (i)   0.614 ms -- work a live row also needs.        NOT deletable.
+#   (iii) 1.199 ms -- uniform spin, redistributes.       NOT deletable.
+#   (ii)  0.210 ms -- the only partly-dead class; MoE tile space is quadratic
+#         in bs while live pairs only double. Priced from dTYP of the MoE tile
+#         phases (the decode-and-return a dead tile actually costs):
+#           peer-typical  0.817 us/layer = 0.062 ms
+#           rank 0        2.641 us/layer = 0.201 ms   (shared expert, 2 rows)
+#         BOTH under the 0.26 ms wall noise floor.
+#
+# CONSEQUENCE: this CONFIRMS glm-item2-width2-closed-on-ceiling. C = BS2/BS1 =
+# 1.206 prices build width and 1.206 cannot be reduced, so item 2's ceiling
+# stands with its largest input independently verified.
 # ======================================================================
 set -u
 ulimit -c 0

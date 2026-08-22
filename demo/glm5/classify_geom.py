@@ -307,19 +307,71 @@ print(f"""
 
 print()
 print("=" * 78)
-print("THE NEXT LEVER")
+print("DELETABILITY -- does any of this survive when the second row is LIVE?")
 print("=" * 78)
-print(f"""  SUPERSEDED by the uniformity result above: the EP collective's PEER WAIT,
-  {peer0+rel0:+.3f} us/layer on rank 0 = {(peer0+rel0)*N_LAYERS/1000.0:.3f} ms, is the largest classified term by
-  size, but it is a redistribution: the layer total does not diverge across
-  ranks, so removing it just moves the wait.
 
-  THE LEVER IS o_proj: {(b[30]['max']-b[29]['max'])-(a[30]['max']-a[29]['max']):+.3f} us/layer = {((b[30]['max']-b[29]['max'])-(a[30]['max']-a[29]['max']))*N_LAYERS/1000.0:.3f} ms.  It is the only large term
-  that is all three of: pure (i) dead-row bytes, UNIFORM across all 8 ranks
-  (+3.78..+4.50, so no rank absorbs it for the others), and dTYP {(b[30]['med']-b[29]['med'])-(a[30]['med']-a[29]['med']):+.3f} of
-  dCRIT {(b[30]['max']-b[29]['max'])-(a[30]['max']-a[29]['max']):+.3f} -- every worker really does it, there is no barrier inside it,
-  and its tile count does not change (oproj_tiles_per_xcd = n_wgs // 8).  It
-  computes and writes a second output row for a token nobody reads.
 
-  0.303 ms is above the 0.26 ms wall noise floor, but only just: gate it on the
-  region counter, not on n=1 at the wall.""")
+def md(rows, s):
+    """Median per-worker mean, us -- the TYPICAL worker (mk() is the makespan)."""
+    v = sorted(t / c for c, t in rows[s].values())
+    return v[len(v) // 2] / 1000.0
+
+
+def dtyp(rank_a, rank_b, s0, s1_):
+    return (md(rank_b, s1_) - md(rank_b, s0)) - (md(rank_a, s1_) - md(rank_a, s0))
+
+
+w13_typ = [dtyp(A[r], B[r], 5, 6) for r in range(8)]
+w2_typ = [dtyp(A[r], B[r], 7, 8) for r in range(8)]
+peer_med = (sorted(w13_typ[1:])[3] + sorted(w2_typ[1:])[3])
+r0_dead = w13_typ[0] + w2_typ[0]
+
+print("""  THE TEST.  GEOM was measured on an arm where the second row is DEAD.  A
+  microsecond in that arm is only DELETABLE if it stays dead when the row goes
+  LIVE -- which is the only configuration that ships (MTP at bs=2 runs
+  num_active_tokens=2, both rows real).  Apply that test per class.
+
+  (i)  DEAD-ROW BYTES, 0.614 ms  --  NOT DELETABLE.  This is the class the
+       previous commit named as the lever, and the source refutes it:
+
+         gang_gemv_mxfp8_mi300.cuh:396
+             if (m_tile * BATCH_SIZE + m >= num_active_tokens) { continue; }
+           inside `if (lane == 0)`, the EPILOGUE.  grep -n num_active_tokens on
+           that header returns exactly TWO hits: :180 (the parameter) and :396.
+           The k-loop accumulates acc[m][*] for all BATCH_SIZE rows
+           UNCONDITIONALLY; num_active_tokens gates only the store.
+         gang_oproj_router_fused_mi300.cuh:791
+             push_rows = num_active_tokens < BATCH_SIZE ? ... -- the peer
+           all-gather push is ALREADY liveness-clamped.
+
+       So o_proj's +3.988 us/layer IS the second row's accumulation, and a live
+       row needs that accumulation.  Nothing to delete.  The same holds for the
+       EP local fold (+2.377, a live row must be folded and published) and the
+       router TopK tail (+1.006, a live row needs its own top-8).
+       RETRACTS the "o_proj, 0.303 ms" lever named in a9018e5.
+
+  (ii) EXTRA TILES, 0.210 ms  --  PARTLY deletable, and it is small.  The MoE
+       tile space is QUADRATIC in batch_size ((min(topk*bs,E) * bs * wgs)) while
+       live expert-row pairs only DOUBLE, so a real fraction stays dead even at
+       num_active_tokens=2.  Price it from dTYP of the two MoE tile phases --
+       the decode-and-return, which is what a dead tile costs:""")
+print("  W13 dTYP  " + " ".join(f"{x:+6.3f}" for x in w13_typ))
+print("  W2  dTYP  " + " ".join(f"{x:+6.3f}" for x in w2_typ))
+print(f"""       peer-typical (median of ranks 1-7)  {peer_med:.3f} us/layer = {peer_med*N_LAYERS/1000.0:.3f} ms
+       rank 0 (owns the shared expert)     {r0_dead:.3f} us/layer = {r0_dead*N_LAYERS/1000.0:.3f} ms
+       Both are BELOW the {0.26:.2f} ms wall noise floor, and the rank-0 figure is
+       rank-local, which the uniformity result says the collective absorbs.
+
+  (iii) BARRIER / SKEW, 1.199 ms  --  NOT DELETABLE.  Already falsified above:
+       uniform across all 8 ranks (+25.7..+27.1), so it redistributes.
+
+  VERDICT: GEOM CLOSES AS A NO-GO.  Of 2.210 ms, the deletable residue is
+  {peer_med*N_LAYERS/1000.0:.3f}-{r0_dead*N_LAYERS/1000.0:.3f} ms, under the noise floor.  GEOM is not a pot of dead
+  overhead -- it is 30% work a live row needs, 58% spin that moves rather than
+  disappears, and 10% dead tiles that are already nearly free because they
+  return before fetching a weight slab.
+
+  CONSEQUENCE: this CONFIRMS glm-item2-width2-closed-on-ceiling rather than
+  reopening it.  C = BS2/BS1 = 1.206 prices build width, and 1.206 cannot be
+  reduced, so item 2's ceiling (a perfect a2=1.0 buys only 8.855 -> 8.208)
+  stands with its largest input now independently verified.""")
