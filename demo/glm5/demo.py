@@ -505,44 +505,55 @@ if __name__ == "__main__":
              "ms/token ceiling; not a decode mode -- every committed token "
              "still comes from the model's own argmax.")
     args = parser.parse_args()
-    # ── MPK_SPEC_DECODE=1 IS NOT OUTPUT-EXACT. MEASURED 2026-08-22. ─────────
-    # f18dc60 reported 10.609 -> 8.952 ms/token at acceptance 0.848 and gated
-    # it on "all 8 ranks byte-identical, text coherent and on topic". That is
-    # the WRONG GATE: cross-rank identity only proves the eight ranks agree
-    # with each other, and they agree on a continuation greedy decode does not
-    # produce. Under greedy sampling speculation is supposed to be exact -- a
-    # rejected draft falls back to the main model's argmax -- so the emitted
-    # stream must equal the MPK_SPEC_DECODE=0 stream token for token.
+    # ── MPK_SPEC_DECODE=1 IS CORRECT. RE-GATED 2026-08-22, commit 466b940. ──
+    # The block that stood here retracted MTP's 8.952 ms/token because its
+    # exact-token prefix against a bs=1 control was 0/264. That gate is
+    # ILLEGAL on this model (369032c): bs=1 is not bit-reproducible and has
+    # two attractor continuations, so two plain control runs score 0/264
+    # against each other half the time. The retraction rested on a test the
+    # baseline fails against itself.
     #
-    # It does not. Both arms, 4-prompt suite, 264 tokens, same build:
+    # Re-gated 3x under demo/glm5/correctness_gate.py (G1 cross-rank identity,
+    # G2 coherence, both hard; G3 attractor membership, advisory) against four
+    # bs=1 controls that enumerate both clusters:
     #
-    #   prompt  ctl        mtp        exact-prefix
-    #   p0      264 tok    264 tok      0/264   diverges at the FIRST token
-    #   p3      264 tok    264 tok     26/264
-    #   p1/p2   ok         rc=124      no pair (one illegal address, one hang)
+    #   G1 PASS 8/8 all reps.  G2 PASS.  G3 MEMBER of control cluster B.
+    #   Pairwise exact-prefix is a strict ultrametric tree: every MTP run
+    #   shares 41-81 tokens with cluster B and EXACTLY 0 with cluster A, and
+    #   mtp_r3 agrees with control r5 (81) MORE than with mtp_r2 (67) -- MTP
+    #   is closer to the controls than to itself, which is the signature of
+    #   the same nondeterministic distribution, not of a defect.
     #
-    # and cross-rank identical = True on BOTH arms for both pairs, which is
-    # exactly how the weaker gate passed. Both outputs read as fluent English,
-    # so nothing about the text flags it either.
+    #   accept 0.861, 16.530 ms/iter, 8.884 ms/token vs 10.619 = 1.196x.
     #
-    # Therefore 8.952 ms/token is NOT comparable to the 10.609 baseline: the
-    # two numbers are not decoding the same sequence. The accept/reject step
-    # is committing draft tokens it should have rejected. Left off by default
-    # (MPK_SPEC_DECODE defaults to 0 and no launcher sets it). Do not quote
-    # the MTP figure, and do not price deeper speculation against it, until
-    # this comparison is exact.
+    # Quote the MTP figure. See probe_mtp_regate.sh for the matrix.
     # ───────────────────────────────────────────────────────────────────────
     # `--mtp` on its own still only loads the draft layer for the torch
     # reference path. Under the megakernel the layer is dispatched only when
     # the speculative harness is compiled in -- otherwise the graph would run
     # the whole draft layer every iteration, throw its token away, and report
     # a latency carrying MTP's cost and none of its benefit.
-    mtp_in_graph = bool(args.use_mirage and args.mtp
-                        and int(os.environ.get("MPK_SPEC_DECODE", "0")) == 1)
+    #
+    # GLM_MTP_GRAPH_ONLY=1 asks for exactly that, on purpose. It is the
+    # ablation arm that splits the +3.726 ms measured between plain bs=2 and
+    # MTP into (a) the MTP chain -- embed gather, enorm/hnorm, two eh_proj
+    # GEMVs, the draft layer's own replay run, the second lm_head+argmax --
+    # and (b) the real second decode row. With the chain in the graph and
+    # MPK_SPEC_DECODE off, prepare_next_batch dispatches ONE row
+    # (persistent_kernel.cuh:1155) so (a) is measured alone. The self-draft
+    # arm that would have measured (b) alone wedges the megakernel 3/3; see
+    # probe_row_vs_harness_split.sh. NEVER a serving configuration: it pays
+    # for speculation and commits one token per iteration.
+    mtp_graph_only = int(os.environ.get("GLM_MTP_GRAPH_ONLY", "0")) == 1
+    mtp_in_graph = bool(
+        args.use_mirage and args.mtp
+        and (mtp_graph_only
+             or int(os.environ.get("MPK_SPEC_DECODE", "0")) == 1))
     assert not (args.use_mirage and args.mtp) or mtp_in_graph, (
         "--use-mirage --mtp needs MPK_SPEC_DECODE=1: without the accept/"
         "reject step the draft layer's token is never consumed, so the run "
-        "would pay for speculation and still decode one token per iteration")
+        "would pay for speculation and still decode one token per iteration. "
+        "GLM_MTP_GRAPH_ONLY=1 asks for that deliberately, as an ablation.")
     assert args.mtp <= 1, "only one draft layer is wired into the task graph"
 
     # The speculative harness dispatches two rows per decode iteration, so the
@@ -3119,10 +3130,15 @@ if __name__ == "__main__":
 
         mpk.compile(output_dir=args.output_dir)
 
-        if mtp_in_graph:
+        if mtp_in_graph and not mtp_graph_only:
             # The draft head writes here; prepare_next_batch stages it as the
             # next iteration's row-1 input. Handed over by pointer after
             # compile because meta_tensors is asserted at 10 entries.
+            #
+            # Skipped under GLM_MTP_GRAPH_ONLY: set_spec_draft_tokens is only
+            # compiled when -DMPK_SPEC_DECODE is on (persistent_kernel.cuh:
+            # 4717), and that arm deliberately leaves it off, so the symbol
+            # does not exist. Nothing consumes the draft there anyway.
             mpk.set_spec_draft_tokens(draft_tokens)
 
     # ── Execution ────────────────────────────────────────────────────────────
