@@ -508,6 +508,20 @@ if __name__ == "__main__":
         "graph yet, so --use-mirage would silently decode one token per "
         "iteration and mis-report ms/token")
 
+    # The speculative harness dispatches two rows per decode iteration, so the
+    # build has to have two rows to dispatch. CK_FMHA_1TOK pins
+    # MPK_MAX_TOKENS_PER_REQUEST to 1, which silently caps the dispatch back to
+    # one row and turns speculation into a no-op that still pays the extra
+    # bookkeeping -- catch it here rather than in a latency table.
+    if int(os.environ.get("MPK_SPEC_DECODE", "0")) == 1:
+        assert args.use_mirage, "MPK_SPEC_DECODE lives in prepare_next_batch"
+        assert args.max_num_batched_tokens >= 2, (
+            "MPK_SPEC_DECODE needs --max-num-batched-tokens 2: the draft row "
+            "is the second row of the batch")
+        assert int(os.environ.get("CK_FMHA_1TOK", "0")) == 0, (
+            "CK_FMHA_1TOK=1 defines MPK_MAX_TOKENS_PER_REQUEST=1, which caps "
+            "a decode iteration at one row and makes speculation a no-op")
+
     # Resolve where to dump generated tokens for the correctness test.
     if args.save_tokens:
         if args.save_tokens == "auto":
@@ -3085,6 +3099,14 @@ if __name__ == "__main__":
         generated_tokens = total_tokens - prompt_len
         prefill_iterations = math.ceil(prompt_len / args.max_num_batched_tokens)
         decode_iterations = generated_tokens
+        if int(os.environ.get("MPK_SPEC_DECODE", "0")) == 1:
+            # One decode iteration no longer commits exactly one token, so
+            # generated_tokens is not the iteration count. Take the count from
+            # the device's own per-iteration log; every downstream split here
+            # keys off prefill_iterations/total_iterations, and leaving them
+            # token-derived would misfile accepted iterations as prefill.
+            _logical_iters = [i - 1 for i in _fwd_times if i - 1 >= 1]
+            decode_iterations = max(0, len(_logical_iters) - prefill_iterations)
         total_iterations = prefill_iterations + decode_iterations
         avg_time_per_iter = (run_time / total_iterations
                              if total_iterations > 0 else 0)

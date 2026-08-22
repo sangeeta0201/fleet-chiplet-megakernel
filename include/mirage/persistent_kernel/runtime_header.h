@@ -453,6 +453,16 @@ struct RuntimeConfig {
   int *paged_kv_last_page_len_buffer; // Metadata for LLM serving
   void *rope_cos_ptr; // [max_seq_len, head_dim] bf16 cosine table for RoPE
   void *rope_sin_ptr; // [max_seq_len, head_dim] bf16 sine table for RoPE
+#ifdef MPK_SPEC_DECODE
+  // [MPK_MAX_NUM_BATCHED_REQUESTS] draft tokens for speculative decode, one
+  // per batch slot, produced by the MTP head at the end of the previous
+  // iteration. Set through set_spec_draft_tokens() rather than the
+  // meta_tensors vector so the 10-entry meta ABI stays shared with gpt-oss.
+  // nullptr means "no draft head wired up yet": prepare_next_batch then
+  // proposes the last committed token, which is a legal but usually-rejected
+  // guess and keeps the output byte-identical either way.
+  long long *spec_draft_tokens;
+#endif
 #if defined(MODE_OFFLINE) || defined(MODE_ONLINE) ||                           \
     defined(MODE_ONLINE_NOTOKEN)
   int *prompt_length;     // Metadata for online/offline serving

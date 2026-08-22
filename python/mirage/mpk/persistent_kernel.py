@@ -950,6 +950,15 @@ def get_compile_command(
         if int(os.environ.get("CK_FMHA_1TOK", "0")) == 1:
             # Force seqlen_q=1: uses merge path only (faster decode, slower prefill)
             flags = flags + ["-DMPK_MAX_TOKENS_PER_REQUEST=1"]
+        if int(os.environ.get("MPK_SPEC_DECODE", "0")) == 1:
+            # Speculative decode: a decode iteration dispatches the verify row
+            # plus one draft row and prepare_next_batch keeps the draft only
+            # if the verify row predicted it. Needs a batch_size >= 2 build
+            # (--max-num-batched-tokens 2); demo.py asserts that.
+            #
+            # Compile-time, so every rank must see it -- the qo_indptr the
+            # ranks agree on comes from each rank's own prepare_next_batch.
+            flags = flags + ["-DMPK_SPEC_DECODE"]
         amdgpu_target = os.environ.get("AMDGPU_TARGETS", "gfx950")
         if use_rocshmem:
             # rocSHMEM's IPC backend requires an xnack-off code object on gfx950.

@@ -149,6 +149,11 @@ MPK_FORWARD_VARS=(
   # unforwarded run silently keeps 2 tokens/iter (it did once, and the
   # "garbage at one row" conclusion drawn from it was wrong).
   CK_FMHA_1TOK
+  # Speculative decode harness (prepare_next_batch). Compile-time and
+  # per-rank: every rank runs its own prepare_next_batch, so a rank that did
+  # not build it dispatches one row while its peers dispatch two and the DP
+  # attention shapes disagree.
+  MPK_SPEC_DECODE
   # Per-stage activation checksums (mpk_bsdbg.cuh). Compile-time, so every
   # rank must see it or the ranks build different megakernels.
   #

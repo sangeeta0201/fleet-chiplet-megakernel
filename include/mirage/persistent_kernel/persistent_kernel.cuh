@@ -996,6 +996,35 @@ __global__ void prepare_kernel(RuntimeConfig config,
   }
 }
 
+#ifdef MPK_SPEC_DECODE
+// Speculative decode bookkeeping. Written only by prepare_next_batch, which is
+// single-threaded on one scheduler, so these need no atomics.
+//
+// g_spec_committed is the denominator that matters: the wall clock is per
+// ITERATION, and speculation buys a cheaper token by making the iteration more
+// expensive, so ms/iter on its own cannot say whether it paid. Report
+// ms/token = total_ms / committed.
+__device__ int g_spec_proposed;
+__device__ int g_spec_accepted;
+__device__ int g_spec_committed;
+// Decode-only wall clock. [FWD_PASS_TOTAL] averages over prefill chunks too,
+// and prefill is a different iteration shape, so dividing that by a decode
+// token count would be a category error. g_spec_iter_is_decode is set by
+// prepare_next_batch when it dispatches a speculative row, and is read one
+// iteration later -- at the point where that iteration's duration is known.
+__device__ unsigned long long g_spec_decode_ns;
+__device__ int g_spec_decode_iters;
+__device__ int g_spec_iter_is_decode;
+
+// How many rows a decode iteration dispatches: 1 verify row + (WIDTH-1) draft
+// rows. Only 2 is implemented -- a deeper draft tree needs the draft model to
+// run WIDTH-1 times, and the accept scan below is written for one draft.
+#ifndef MPK_SPEC_WIDTH
+#define MPK_SPEC_WIDTH 2
+#endif
+static_assert(MPK_SPEC_WIDTH == 2, "only a single draft token is implemented");
+#endif
+
 #ifdef MODE_OFFLINE
 // TODO: parallelize this processing
 __device__ __forceinline__ bool
@@ -1003,6 +1032,11 @@ __device__ __forceinline__ bool
   __shared__ int smem_kv_indices[MPK_MAX_NUM_PAGES];
   int page_queue_head = *config.page_queue_head;
   int page_queue_tail = *config.page_queue_tail;
+#ifdef MPK_SPEC_DECODE
+  // Describes the iteration this call is about to set up, and is read one
+  // iteration later, when that iteration's duration is known.
+  g_spec_iter_is_decode = 0;
+#endif
   // Step 1: finalize previous batch
   for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
     int16_t request_id = config.request_ids[i];
@@ -1012,22 +1046,57 @@ __device__ __forceinline__ bool
       int qo_indptr = config.qo_indptr_buffer[i];
       int num_tokens = config.qo_indptr_buffer[i + 1] - qo_indptr;
       int prompt_len = config.prompt_length[request_id];
-      for (int j = 0; j < num_tokens; j++) {
+      // How many of the num_tokens rows we keep. Equal to num_tokens
+      // everywhere except a speculative decode iteration, where row 1 was
+      // conditioned on a guess and is only real if the guess was right.
+      int num_committed = num_tokens;
+#ifdef MPK_SPEC_DECODE
+      if (step >= prompt_len && num_tokens > 1) {
+        // Row j predicts the token at position step+j+1. Row 1's input was
+        // the draft written into tokens[step+1] at the end of the previous
+        // iteration, so row 1's output is the true continuation iff that
+        // draft is what row 0 actually predicts. Read the draft BEFORE the
+        // commit loop overwrites it.
+        long long draft =
+            config.tokens[request_id * MPK_MAX_SEQ_LENGTH + step + 1];
+        long long verified0 = config.output_tokens[qo_indptr];
+        g_spec_proposed++;
+        if (draft == verified0) {
+          g_spec_accepted++;
+          num_committed = 2;
+          // EOS as the first of an accepted pair: the second token is past
+          // the end of the sequence. Committing it would make speculation
+          // change the output, which is the one thing it must never do.
+          if (verified0 == config.eos_token_id) {
+            num_committed = 1;
+          }
+        } else {
+          num_committed = 1;
+        }
+      }
+      // Generated tokens only: a prefill chunk "commits" prompt positions.
+      if (step >= prompt_len) {
+        g_spec_committed += num_committed;
+      }
+#endif
+      for (int j = 0; j < num_committed; j++) {
         if (step + j + 1 >= prompt_len &&
             step + j + 1 < config.max_seq_length) {
           config.tokens[request_id * MPK_MAX_SEQ_LENGTH + step + j + 1] =
               config.output_tokens[qo_indptr + j];
         }
       }
-      config.step[request_id] = step + num_tokens;
+      config.step[request_id] = step + num_committed;
 #ifdef MPK_ENABLE_PROFILING
+      // num_committed, not num_tokens: under speculation the loop bound is a
+      // token count, so a rejected draft row must not shorten the run.
       if (config.profiling_num_iters > 0 &&
-          step + num_tokens >= config.profiling_num_iters)
+          step + num_committed >= config.profiling_num_iters)
 #else
-      if ((step + num_tokens + 1 >= config.max_seq_length) ||
+      if ((step + num_committed + 1 >= config.max_seq_length) ||
           ((config.tokens[request_id * MPK_MAX_SEQ_LENGTH + step +
-                          num_tokens] == config.eos_token_id) &&
-           (step + num_tokens >= prompt_len)))
+                          num_committed] == config.eos_token_id) &&
+           (step + num_committed >= prompt_len)))
 #endif
       {
         // Request is done
@@ -1072,6 +1141,35 @@ __device__ __forceinline__ bool
       } else {
         // Decode requests
         num_new_tokens = min(1, MPK_MAX_NUM_BATCHED_TOKENS - num_tokens);
+#ifdef MPK_SPEC_DECODE
+        // Speculative decode: dispatch the verify row plus one draft row, and
+        // stage the draft where the input_tokens copy below already looks --
+        // tokens[step+1]. That position is exactly where the verify row's own
+        // output will land, so a rejected draft is overwritten by the truth on
+        // the very next line of the finalize pass and nothing has to unwind.
+        //
+        // The draft row's KV lands at sequence position step+1. On a reject
+        // the next iteration's verify row is that same position and rewrites
+        // it, so no KV invalidation is needed either; on an accept it is
+        // already the KV of the token we just committed.
+        //
+        // MPK_SPEC_DRAFT_SELF=1 is the null draft (propose the last committed
+        // token). It exists so the harness -- 2-row dispatch, accept scan,
+        // step advance, page growth -- can be gated for byte-identical output
+        // BEFORE the MTP layer exists to fill the row with a real guess. It
+        // will accept occasionally on repeated tokens, which is what exercises
+        // the accept branch.
+        if (num_new_tokens == 1 &&
+            MPK_MAX_NUM_BATCHED_TOKENS - num_tokens >= MPK_SPEC_WIDTH &&
+            step + MPK_SPEC_WIDTH < config.max_seq_length) {
+          config.tokens[request_id * MPK_MAX_SEQ_LENGTH + step + 1] =
+              config.spec_draft_tokens != nullptr
+                  ? config.spec_draft_tokens[i]
+                  : config.tokens[request_id * MPK_MAX_SEQ_LENGTH + step];
+          num_new_tokens = MPK_SPEC_WIDTH;
+          g_spec_iter_is_decode = 1;
+        }
+#endif
       }
       // Move tokens to input_tokens
       for (int j = 0; j < num_new_tokens; j++) {
@@ -3720,6 +3818,12 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
           // ones past the end of the ring.
           g_fwdpass_total_ns += dur;
           g_fwdpass_total_iters++;
+#ifdef MPK_SPEC_DECODE
+          if (g_spec_iter_is_decode) {
+            g_spec_decode_ns += dur;
+            g_spec_decode_iters++;
+          }
+#endif
           // Stride-decimate rather than truncate.
           //
           // The old code kept iterations 0..8191 and dropped every one after,
@@ -3790,6 +3894,33 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                            (double)g_fwdpass_total_iters
                      : 0.0,
                  g_fwdpass_dropped);
+#ifdef MPK_SPEC_DECODE
+          // ms_per_token is the number speculation is judged on. decode_ms
+          // above it is per ITERATION and goes UP when speculation works.
+          // Both are decode-only; prefill chunks never speculate and have a
+          // different iteration shape.
+          printf("[SPEC] proposed=%d accepted=%d accept_rate=%.3f "
+                 "committed=%d decode_iters=%d tokens_per_iter=%.3f "
+                 "decode_ms_per_iter=%.3f ms_per_token=%.3f\n",
+                 g_spec_proposed,
+                 g_spec_accepted,
+                 g_spec_proposed > 0
+                     ? (double)g_spec_accepted / (double)g_spec_proposed
+                     : 0.0,
+                 g_spec_committed,
+                 g_spec_decode_iters,
+                 g_spec_decode_iters > 0
+                     ? (double)g_spec_committed / (double)g_spec_decode_iters
+                     : 0.0,
+                 g_spec_decode_iters > 0
+                     ? (double)g_spec_decode_ns / 1000000.0 /
+                           (double)g_spec_decode_iters
+                     : 0.0,
+                 g_spec_committed > 0
+                     ? (double)g_spec_decode_ns / 1000000.0 /
+                           (double)g_spec_committed
+                     : 0.0);
+#endif
 #ifdef MPK_ENABLE_MOE_SUBPHASE
           // Raw timestamps: scratch[0]=entry, [1]=before_lds,
           // [4]=after_compute, [2]=after_barrier
@@ -4541,6 +4672,15 @@ extern "C" void set_rope_tables(void *cos_ptr, void *sin_ptr) {
   global_runtime_config.rope_sin_ptr = sin_ptr;
 }
 
+#ifdef MPK_SPEC_DECODE
+// Hand prepare_next_batch the buffer the draft head writes into. Kept out of
+// meta_tensors on purpose: that vector is asserted at size 10 and is shared
+// with every other model in the repo.
+extern "C" void set_spec_draft_tokens(void *ptr) {
+  global_runtime_config.spec_draft_tokens = static_cast<long long *>(ptr);
+}
+#endif
+
 // Diagnostic: copy `nbytes` from the `index`-th symmetric-heap allocation
 // (allocation order recorded in mpk_shmem_alloc_registry) into device buffer
 // `dst`. Returns 0 on success, -1 on bad index / size. Used by --verify to
@@ -4600,6 +4740,9 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
       static_cast<int *>(meta_tensors[9]);
   global_runtime_config.rope_cos_ptr = nullptr;
   global_runtime_config.rope_sin_ptr = nullptr;
+#ifdef MPK_SPEC_DECODE
+  global_runtime_config.spec_draft_tokens = nullptr;
+#endif
   global_runtime_config.num_workers = num_workers;
   global_runtime_config.num_local_schedulers = num_local_schedulers;
   global_runtime_config.num_remote_schedulers = num_remote_schedulers;
