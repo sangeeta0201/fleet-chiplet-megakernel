@@ -204,3 +204,48 @@ if __name__ == "__main__":
 # 0.749 ms window with zero movable work, because the MPK task graph is a
 # strictly linear chain (mirage-task-graph-is-a-linear-chain).  Nothing here
 # changes that; it says where to look, not that something is there.
+#
+# ============================================================================
+# THE MOVABLE SIDE, same day.  All four RELEASE holes read at the source.
+# min(window, movable) = 0 FOR ALL FOUR.  The hole side of the layer is closed.
+# ============================================================================
+#
+#   hole                       ms    what is already in the window
+#   S25->S26 attn release   0.896    42-load o_proj weight DMA + 17 loads of
+#                                    shared-expert weights, ISSUED AT S24->S25
+#                                    exactly so they fly through this spin
+#   S32->S5  routing poll   0.684    NOTHING.  Bare spin, idle bus.
+#   S6->S7   W13 -> W2      0.492    W2 L2 prefetch, MEASURED NEUTRAL 0.13%
+#   S17->S18 qkv_a -> q_b   0.203    under the 0.26 ms noise floor
+#
+# (6) THE TOP HOLE IS ALREADY FILLED AS FAR AS THE IDIOM GOES.  S24->S25 is the
+# prefetch issue and S25->S26 is the spin it flies through
+# (gang_mla_full_layer_fused_mi300.cuh:1809-2037, the gpt-oss Phase 6 idiom).
+# The in-source measurement is that it "shrinks the release by ~2.5 us per
+# worker per layer", against a 11.80 us hole, and the same comment already
+# states the verdict: "the remaining 27 us of Phase 8 spin is a load-balance
+# problem, not a latency-hiding one."  Widening it is refuted there too -- at
+# GLM-5 shapes PF_WG_BYTES is 528 KB/worker = 15.3 MB/XCD against a 4 MB L2,
+# so the working set is already 3.8x L2 and most of it is evicted before
+# Phase 9 reads it.  Nothing more fits.
+#
+# (7) *** YOU CANNOT PREFETCH THROUGH A BARRIER WHOSE OUTPUT IS THE ADDRESS. ***
+# S32->S5 is the one RELEASE hole in the layer with an idle memory system --
+# gang_oproj_router_fused_mi300.cuh:1174-1195 is a bare ld_nt_s32 spin with no
+# DMA issued before it.  In bandwidth terms the window is enormous: 9 us at
+# 5.17 TB/s is 46 MB, against a 65 MB/layer whole-layer byte budget
+# (glm-layer-byte-budget-and-barrier-share).  And the movable set is still
+# empty, because the thing the poll is WAITING FOR is expert identity, and
+# expert identity is what selects the bytes.  The window and the dependency are
+# the same object.  Every unconditionally-known operand is already resident:
+# the shared expert's weights were prefetched at the o_proj barrier, and the
+# source notes "this XCD's L2 still holds the normed row that Phase 5 is about
+# to consume".  The only escape is a SPECULATIVE prefetch of predicted experts,
+# which is a different project and needs a prediction first.
+#
+# (8) SO THE HOLE SIDE MATCHES THE FLOOR SIDE: nothing left that is tuning.
+# 2.277 ms of provable spin, and each piece is either already covered by a DMA,
+# already measured neutral, under the noise floor, or blocked by the fact that
+# its own dependency is an address.  Same conclusion the board reached from the
+# critical-path direction (glm-board-audit-no-region-above-0.4ms-unattacked),
+# reached independently from the capacity direction.
