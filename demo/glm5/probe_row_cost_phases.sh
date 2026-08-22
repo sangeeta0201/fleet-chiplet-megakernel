@@ -1,5 +1,15 @@
 #!/bin/bash
-# ITEM 1.1 -- where does the second decode row's 5.958 ms go?
+# THE GEOM PROBE -- what does WIDENING THE BUILD to 2 rows cost before any
+# second row is live?
+#
+# RENAMED 2026-08-22.  This was written as "where does the second decode row's
+# 5.958 ms go", which is the wrong question for this arm.  With
+# --max-num-batched-tokens 2 and no MTP the build is BATCH_SIZE=2 but still
+# decodes ONE token per iteration -- the second row is dispatched and DEAD.
+# So this pair measures GEOM (2.210 ms at the wall, 87106c0), not ROWACT.
+# That makes it the right instrument: every microsecond it finds is overhead
+# by construction, because nothing reads the row it is spent on.
+# Classification: demo/glm5/classify_geom.py.
 #
 # ONE VARIABLE: --max-num-batched-tokens (1 vs 2). In persistent_kernel.py
 # `batch_size = self.max_num_batched_tokens` feeds every task template
@@ -91,6 +101,43 @@
 #     samples and reads -12.968 us, i.e. the collective getting FASTER with more
 #     work. Use the count-weighted mean; it is a last-arriver by construction
 #     and therefore already the critical path.
+#
+# ===================== THE CLASSIFICATION, 2026-08-22 =====================
+# demo/glm5/classify_geom.py assigns each region to one of three classes.
+# (i) vs (ii) is NOT decidable from the stamps -- it comes from the task
+# builder, where the two shapes are textually distinct:
+#   oproj_tiles_per_xcd = n_wgs // 8            <- NO batch_size: FIXED tile
+#                                                  count, m_per_tile 1->2
+#   moe_w{13,2}_tiles_per_xcd =
+#       (min(topk*bs, E) * bs * wgs + 7) // 8   <- QUADRATIC in bs: 4x tile
+#                                                  SPACE, and the dead half
+#                                                  hits d_routing==0 and
+#                                                  returns BEFORE any fetch
+#
+#   class                                       us/layer     ms   share
+#   (i)   DEAD-ROW BYTES  (fixed tile count)       8.085  0.614   29.8%
+#   (ii)  EXTRA TILES     (dispatched, dead)       2.770  0.210   10.2%
+#   (iii) BARRIER / SKEW  (wider geometry)        15.777  1.199   58.2%
+#   unclassified (attn tails, decode/merge)        0.482  0.037    1.8%
+#   TOTAL                                         27.113  2.061  = 93% of the
+#                                                                  2.210 ms
+#                                                                  wall GEOM
+#
+# GEOM IS NOT DEAD WORK. It is 58% RENDEZVOUS. Only 10.2% is the extra tiles
+# the dead row dispatches -- because those tiles return before fetching a
+# weight slab, exactly as the source says they do (W13's dTYP is +0.374, which
+# IS a decode-and-return). "Stop dispatching tiles for the dead row" is worth
+# 0.21 ms, not 2.2.
+#
+# LARGEST SINGLE TERM: the EP collective's peer wait, +7.368 us/layer on
+# rank 0 = 0.560 ms, 27% of GEOM -- and +11.9..+14.1 on the seven ranks that
+# wait on rank 0. It is (iii): the wider geometry widens the per-rank SPREAD,
+# and the collective charges the spread, not the mean.
+#
+# LARGEST PURE (i) TERM: o_proj, +3.988 us/layer = 0.303 ms, with dTYP +3.874
+# of dCRIT +3.988 -- every worker really does it, there is no barrier in it,
+# and its tile count does not change. It computes and writes a second output
+# row for a token nobody reads.
 # ======================================================================
 set -u
 ulimit -c 0
