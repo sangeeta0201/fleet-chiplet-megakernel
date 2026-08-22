@@ -72,8 +72,23 @@ REGIONS = [
     (19, 21, "q_b->decode bar + MLA decode",
      "1.392  SPLIT (decode_barrier_anatomy.py): 0.749 decode WORK, ablated in "
      "f02753c, overlap NO-GO (movable set empty) + 0.643 QB_TP CROSS-RANK "
-     "peer wait, NO-GO (inter-rank skew, same producer set as the EP "
-     "collective)"),
+     "peer wait. THE PEER WAIT IS NOW ABLATED, NOT ESTIMATED "
+     "(probe_qb_peer_wait_ceiling.sh, MPK_QB_SKIP_PEER_WAIT deletes the 7 peer "
+     "stores and the 7-peer poll and nothing else). Deleting it outright is "
+     "worth 0.228 ms at the wall, n=6 pooled over two independent triples "
+     "(10.498 -> 10.271, sd 0.118/0.157, t=2.84 df10) -- BELOW the 0.26 ms "
+     "single-pair noise floor. The first triple alone said 0.335 and DID NOT "
+     "REPRODUCE (second triple 0.121, arms overlapping), so 0.335 is retracted; "
+     "and 5cb68f6's 0.643 skew-subtraction was 2x high again. The counter route "
+     "IS reproducible (layer span -0.290 twice, S19->S20 itself -3.94 us/layer) "
+     "and now EXCEEDS the wall by 27%, so the two routes disagree -- take the "
+     "wall. The skew does NOT relocate (S22->S28 moves -0.04 then +0.16, flips "
+     "sign), so this is not the e5d1ff5 pattern; the rendezvous really does give "
+     "its time back, there is just less of it than advertised. NO-GO: 0.228 is "
+     "under the 0.4 bar and is a ZERO-COST-deletion ceiling, while the real "
+     "head-shard rewrite still has to combine the head-sharded output across "
+     "ranks -- a payload comparable to the query row it stops gathering. "
+     "HEAD-SHARDING ATTENTION END-TO-END IS CLOSED"),
     (21, 23, "decode->merge bar + merge",
      "0.415  the idle set crosses this in 1.49 us; the 64 decode workers pay "
      "6.73 -- it is serial decode drain, not a machine-wide hole"),
