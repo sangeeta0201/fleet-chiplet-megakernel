@@ -35,7 +35,13 @@
 # and the stage-stamp probe independently predicted +2.061 ms from region
 # counters alone, so the two instruments agree to ~130 us.
 #
-# *** BUT THE OUTPUT GATE FAILS, SO C = 1.206 IS PROVISIONAL. ***
+# *** RESOLVED 369032c: C = 1.206 IS CONFIRMED. The exact-match gate below was
+# *** ILLEGAL. bs=1 is not bit-reproducible -- it has two attractor
+# *** continuations and splits 2/2 across them -- so "bs=2 diverges from bs=1 at
+# *** token 0" is what two bs=1 runs do to each other half the time. Both bs=2
+# *** runs land inside a control cluster (prefix 145 and 124) and pass the hard
+# *** gate. Use demo/glm5/correctness_gate.py, not the exact-prefix check here.
+# *** The original (wrong) reasoning is kept below as the record.
 #
 #   bs1 r2, r3 vs r1:  exact-prefix 39/264   (r2 and r3 agree with each other)
 #   bs2 r1, r3 vs r1:  exact-prefix  0/264   (r1 and r3 agree with each other)
