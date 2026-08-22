@@ -150,6 +150,15 @@ print(f"{'LAYER SPAN S0->S14':<36}{span:7.2f}{'':7}{'':7}{span*N_LAYERS/1e3:8.3f
 print("""
   * = the two slots have DIFFERENT worker sets, so the region is a makespan
       over a subset and can be understated.  Never a credit, only a floor.
+  READ barrier_floor_sweep.py ALONGSIDE THIS TABLE.  max(b)-max(a) is a
+      CRITICAL-PATH estimator: it telescopes to the layer span, which is what a
+      budget needs, but it HIDES HOLES BY CONSTRUCTION.  S25->S26 is priced
+      0.193 here and carries 2.000 ms of idle worker time; S32->S5 is 0.317
+      against 1.851.  "Small on the board" does not mean "small hole", and a
+      hole is where a lever would have to put the work.  That sweep also splits
+      every region into the last arriver's FLOOR (6.498 ms, 54% of this budget,
+      untouchable by any rebalance) and SKEW (13.441 ms -- larger than the
+      layer, which is the proof that skew is not additive wall time).
   A negative 'spin' is an ORDERING artifact, not a saving: the median worker
   crosses the two stamps in a different order than the makespan worker does
   (S21->S23 reads -20.15 this way).  Do not sum the spin column.""")

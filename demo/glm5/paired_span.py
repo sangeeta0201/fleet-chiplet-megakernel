@@ -38,10 +38,18 @@ N_LAYERS = 76
 # Verified against the mpk_stage_stamp() call sites, 2026-08-22.
 ORDER = [0, 1, 2, 16, 17, 18, 19, 21, 23, 24, 25, 26, 27, 28,
          29, 30, 31, 32, 5, 6, 7, 8, 12, 13, 14]
+# CORRECTED 2026-08-22 against the `// Stage stamp N:` comment at every call
+# site.  The first version of this map was SHIFTED BY ONE across S2..S19 --
+# it called S16->S17 "q_b / W_UK" when stamp 17 is "qkv_a tiles done".
+# board_budget.py had it right all along.  The RESULT block below quotes only
+# S0->S1, S28->S29 and S31->S32, all outside the shifted range, so its findings
+# are unaffected.  See barrier_floor_sweep.py note (7).
 LABEL = {
     (0, 1): "EP collective", (1, 2): "post-EP -> qkv_a",
-    (2, 16): "qkv_a tiles", (16, 17): "q_b / W_UK", (17, 18): "W_UV",
-    (18, 19): "decode prep", (19, 21): "MLA decode", (21, 23): "merge",
+    (2, 16): "-> attn call boundary", (16, 17): "qkv_a tiles",
+    (17, 18): "qkv_a -> q_b barrier", (18, 19): "q_b tiles + KV append",
+    (19, 21): "q_b->decode bar + MLA decode",
+    (21, 23): "decode->merge bar + merge",
     (23, 24): "Phase 8 attn -> o_proj bar", (24, 25): "o_proj wt prefetch",
     (25, 26): "per-XCD attn release", (26, 27): "prefetch DMA retired",
     (27, 28): "entering the MoE half", (28, 29): "W_UK/W_UV + Mech-C bar",
