@@ -98,6 +98,18 @@ static PyObject *set_rope_tables_func(PyObject *self, PyObject *args) {
   Py_RETURN_NONE;
 }
 
+#ifdef MPK_SPEC_DECODE
+static PyObject *set_spec_draft_tokens_func(PyObject *self, PyObject *args) {
+  PyObject *py_ptr;
+  if (!PyArg_ParseTuple(args, "O", &py_ptr)) {
+    PyErr_SetString(PyExc_TypeError, "Expected (draft_tokens_ptr)");
+    return NULL;
+  }
+  set_spec_draft_tokens(PyLong_AsVoidPtr(py_ptr));
+  Py_RETURN_NONE;
+}
+#endif
+
 static PyObject *read_shmem_alloc_func(PyObject *self, PyObject *args) {
   int index;
   PyObject *py_dst;
@@ -130,6 +142,9 @@ static PyMethodDef ModuleMethods[] = {
   {"launch_func", launch_func, METH_VARARGS, "launch persistent kernel"},
   {"finalize_func", finalize_func, METH_VARARGS, "finalize persistent kernel"},
   {"set_rope_tables_func", set_rope_tables_func, METH_VARARGS, "set RoPE cos/sin tables"},
+#ifdef MPK_SPEC_DECODE
+  {"set_spec_draft_tokens_func", set_spec_draft_tokens_func, METH_VARARGS, "set the speculative draft-token buffer"},
+#endif
   {"read_shmem_alloc_func", read_shmem_alloc_func, METH_VARARGS, "snapshot symmetric-heap alloc into device buffer"},
   {"num_shmem_allocs_func", num_shmem_allocs_func, METH_VARARGS, "number of recorded symmetric-heap allocs"},
   {"shmem_alloc_size_func", shmem_alloc_size_func, METH_VARARGS, "byte size of a recorded symmetric-heap alloc"},
@@ -4171,17 +4186,31 @@ class PersistentKernel:
         input: DTensor,
         weight: DTensor,
         output: DTensor,
+        chain_after: DTensor = None,
         block_dim: tuple = (128, 1, 1),
     ):
         """Gang RMSNorm: 8 tasks (1 per XCD), each computes same RMSNorm.
-        Enables XCD-local event counting to avoid cross-XCD barrier."""
+        Enables XCD-local event counting to avoid cross-XCD barrier.
+
+        ``chain_after`` is a dependency edge, not data: the task graph is a
+        linear chain and register_mugraph asserts that consecutive ops share a
+        tensor, so an op whose only real input was produced several ops back
+        has no way to be scheduled. Naming the immediate predecessor's output
+        here supplies the edge. The kernel never reads it. GLM's MTP draft
+        layer needs this: its hnorm reads the LM head's residual output, but
+        argmax and the token embedding sit in between."""
         assert self.target_cc in (94, 95), "Gang RMSNorm only supported on MI300X"
         grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, -1, -1), 1, True)
         tb_graph.new_input(weight, (-1, -1, -1), 0, True)
+        io = [input, weight]
+        if chain_after is not None:
+            tb_graph.new_input(chain_after, (-1, -1, -1), 1, True)
+            io.append(chain_after)
         tb_graph.new_input(output, (-1, -1, -1), -1, True)
-        self.kn_graph.customized([input, weight, output], tb_graph)
+        io.append(output)
+        self.kn_graph.customized(io, tb_graph)
         self.kn_graph.register_task(tb_graph, "gang_rmsnorm_mi300", [])
 
     def gang_linear_layer(
@@ -7426,6 +7455,9 @@ class PersistentKernel:
         self.init_request_func = getattr(mod, "init_request_func")
         self.finalize_func = getattr(mod, "finalize_func")
         self._set_rope_tables_func = getattr(mod, "set_rope_tables_func", None)
+        self._set_spec_draft_tokens_func = getattr(
+            mod, "set_spec_draft_tokens_func", None
+        )
         self._read_shmem_alloc_func = getattr(mod, "read_shmem_alloc_func", None)
         self._num_shmem_allocs_func = getattr(mod, "num_shmem_allocs_func", None)
         self._shmem_alloc_size_func = getattr(mod, "shmem_alloc_size_func", None)
@@ -7469,6 +7501,18 @@ class PersistentKernel:
         assert self._is_compiled, "Must call compile() before set_rope_tables()"
         assert self._set_rope_tables_func is not None
         self._set_rope_tables_func(cos_tensor.data_ptr(), sin_tensor.data_ptr())
+
+    def set_spec_draft_tokens(self, tensor: "torch.Tensor"):
+        """Point RuntimeConfig at the draft head's output (call after compile).
+
+        Kept out of meta_tensors deliberately -- that list is asserted at size
+        10 and is shared with every other model in the repo. Only exists when
+        the megakernel was built with MPK_SPEC_DECODE."""
+        assert self._is_compiled, "Must call compile() before set_spec_draft_tokens()"
+        assert self._set_spec_draft_tokens_func is not None, (
+            "megakernel was not built with MPK_SPEC_DECODE"
+        )
+        self._set_spec_draft_tokens_func(tensor.data_ptr())
 
     def num_shmem_allocs(self) -> int:
         """Number of recorded symmetric-heap (nvshmem/rocshmem) allocations."""

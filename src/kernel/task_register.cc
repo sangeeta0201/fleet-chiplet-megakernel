@@ -774,8 +774,10 @@ int TaskRegister::register_gang_rmsnorm_mi300_task(
   assert(params.size() == 0);
   std::vector<tb::TBInputOp *> input_ops;
   std::vector<tb::TBInputOp *> output_ops;
-  int num_inputs = 2;  // input, weight
+  // input, weight, and optionally a chain_after edge the kernel never reads.
+  int num_inputs = (int)bgraph.operators.size() - 1;
   int num_outputs = 1; // output
+  assert(num_inputs == 2 || num_inputs == 3);
 
   assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
   for (auto const &op : bgraph.operators) {
@@ -787,17 +789,34 @@ int TaskRegister::register_gang_rmsnorm_mi300_task(
     }
   }
   int hidden_dim = input_ops[0]->dtensor.dim[1];
+  int batch_size = input_ops[0]->dtensor.dim[0];
+  assert(input_ops[0]->dtensor.num_dims == 2);
+  assert(output_ops[0]->dtensor.dim[0] == input_ops[0]->dtensor.dim[0]);
+  assert(output_ops[0]->dtensor.dim[1] == hidden_dim);
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
   // Gang RMSNorm: only rank 0 (tile_idx == 0) on each XCD computes.
   // Other workers skip (they see the result via XCD-local L2).
   code.e("if (tile_idx == 0) {");
-  code.e("  kernel::rms_norm_impl<bfloat16, 1, $>(", hidden_dim);
-  code.e("      task_desc->input_ptrs[0],");  // input
-  code.e("      task_desc->input_ptrs[1],");  // weight
-  code.e("      task_desc->output_ptrs[0],"); // output
-  code.e("      1e-6f);");
+  // One call per row. rms_norm_impl static_asserts BATCH_SIZE == 1, so the
+  // row loop has to live here -- without it a multi-row batch normalises row
+  // 0 and silently leaves the rest holding whatever the buffer had, which is
+  // the shape the MTP draft layer's hnorm runs in. At batch 1 this unrolls to
+  // exactly the single call it always was.
+  code.e("  for (int _b = 0; _b < $; _b++) {", batch_size);
+  code.e("    kernel::rms_norm_impl<bfloat16, 1, $>(", hidden_dim);
+  code.e("        (bfloat16 const *)task_desc->input_ptrs[0] + _b * $,",
+         hidden_dim);                            // input row
+  code.e("        task_desc->input_ptrs[1],");    // weight
+  code.e("        (bfloat16 *)task_desc->output_ptrs[0] + _b * $,",
+         hidden_dim);                            // output row
+  code.e("        1e-6f);");
+  // rms_norm_impl's last __syncthreads() precedes the read of reduce_smem[0],
+  // so the next row's write to that same slot has to be fenced behind every
+  // thread's read of it.
+  code.e("    __syncthreads();");
+  code.e("  }");
   code.e("}");
   return register_task_variant(TASK_GANG_RMS_NORM_MI300, code.to_string());
 }

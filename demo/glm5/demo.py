@@ -505,16 +505,18 @@ if __name__ == "__main__":
              "ms/token ceiling; not a decode mode -- every committed token "
              "still comes from the model's own argmax.")
     args = parser.parse_args()
-    # The megakernel builds its task graph from model.main_layers, so the MTP
-    # layer is loaded and then never dispatched. Without this guard
-    # `--use-mirage --mtp 1` runs plain greedy decode, pays the draft layer's
-    # weights in HBM, and reports a per-token latency that looks like MTP's and
-    # is not -- exactly the kind of number this repo does not quote.
-    assert not (args.use_mirage and args.mtp), (
-        "--mtp is torch-reference only for now: the draft layer, its eh_proj "
-        "front end and the accept/reject step are not in the megakernel task "
-        "graph yet, so --use-mirage would silently decode one token per "
-        "iteration and mis-report ms/token")
+    # `--mtp` on its own still only loads the draft layer for the torch
+    # reference path. Under the megakernel the layer is dispatched only when
+    # the speculative harness is compiled in -- otherwise the graph would run
+    # the whole draft layer every iteration, throw its token away, and report
+    # a latency carrying MTP's cost and none of its benefit.
+    mtp_in_graph = bool(args.use_mirage and args.mtp
+                        and int(os.environ.get("MPK_SPEC_DECODE", "0")) == 1)
+    assert not (args.use_mirage and args.mtp) or mtp_in_graph, (
+        "--use-mirage --mtp needs MPK_SPEC_DECODE=1: without the accept/"
+        "reject step the draft layer's token is never consumed, so the run "
+        "would pay for speculation and still decode one token per iteration")
+    assert args.mtp <= 1, "only one draft layer is wired into the task graph"
 
     # The speculative harness dispatches two rows per decode iteration, so the
     # build has to have two rows to dispatch. CK_FMHA_1TOK pins
@@ -703,6 +705,13 @@ if __name__ == "__main__":
                               dtype=torch.long, device="cuda")
     output_tokens = torch.full((args.max_num_batched_tokens, 1), 0,
                                dtype=torch.long, device="cuda")
+    # The MTP draft head's argmax. One row per dispatched row: row j is the
+    # draft that follows committing row j, so prepare_next_batch reads row
+    # num_committed-1. Not in meta_tensors -- that list is asserted at 10 and
+    # shared with gpt-oss -- but handed to RuntimeConfig by
+    # set_spec_draft_tokens() after compile, the way the RoPE tables are.
+    draft_tokens = torch.full((args.max_num_batched_tokens, 1), 0,
+                              dtype=torch.long, device="cuda")
     prev_pos = 0
 
     starter, ender = (torch.cuda.Event(enable_timing=True),
@@ -1474,6 +1483,14 @@ if __name__ == "__main__":
         if oproj_tp_eligible and _oproj_rows_env is None:
             OPROJ_GEMV_ROWS = max(4, OPROJ_GEMV_ROWS // world_size)
         oproj_tile_n = OPROJ_GEMV_ROWS if use_gemv_oproj else GANG_TILE_N
+        # The MTP front end's two eh_proj halves. Both are [hidden, hidden], so
+        # 16 rows per workgroup gives hidden/16 = 384 workgroups, 48 tiles per
+        # XCD -- the shape the o_proj GEMV runs at unsharded. Not sharded:
+        # eh_proj sits on the critical path between the main head and the draft
+        # layer, with no ep_signal rendezvous available to push a partial into.
+        EH_GEMV_ROWS = int(os.environ.get("GLM_EH_GEMV_ROWS", "16"))
+        assert hidden_size % EH_GEMV_ROWS == 0
+        assert (hidden_size // EH_GEMV_ROWS) % 8 == 0
         # 1.97 GB/token of bf16 weight, the last big one left. The packing is
         # the same pack_dense_mxfp8 the MFMA kernels use: its data half is
         # plain row-major, and only the MFMA *gather* wanted the split layout,
@@ -1843,8 +1860,12 @@ if __name__ == "__main__":
                     io_category="nvshmem_tensor",
                 )
                 # num_layers buffers for the fused layers (the dense prologue
-                # layers never use theirs) and one more for the tail.
-                for li in range(num_layers + 1)
+                # layers never use theirs) and one more for the tail. With the
+                # MTP draft layer there are two more -- the draft layer and its
+                # own tail -- and they have to be distinct from the main tail's
+                # slot rather than a reuse: the draft layer's fold runs while a
+                # peer may still be summing the main tail's slots for the head.
+                for li in range(num_layers + 1 + (2 if mtp_in_graph else 0))
             ]
             # uint64 counters, one 64-byte line per PE so two peers' stores
             # never share a line. Declared int32 because that is what
@@ -1953,10 +1974,252 @@ if __name__ == "__main__":
         )
         x = y
 
+        # ── The tail, as a callable ──────────────────────────────────────────
+        # Emitted once for the main stack and, with MTP, a second time for the
+        # draft layer. Identical structure both times -- EP fold tail, final
+        # RMSNorm folded into the LM head, argmax -- differing only in which
+        # norm weight, which gather slot and which token buffer.
+        _head_w = {}
+
+        def _head_weights():
+            """model.norm + the packed LM head, attached on first use.
+
+            Lazily rather than here: the pack is about a gigabyte, and the
+            layer loop releases each layer's bf16 originals as it goes. Both
+            call sites below sit after the last main layer, so this still runs
+            exactly where the straight-line version used to."""
+            if not _head_w:
+                assert not moe_ep or DENSE_MXFP8, \
+                    "MOE_EP needs the MXFP8 LM head: it is the cross-rank combine"
+                _head_w["norm"] = _attach_input_keep(
+                    model.model.norm.weight.data, "model_norm_weight")
+                _head_w["lm"] = _attach_input_keep(
+                    pack_dense_mxfp8(lm_head_weight, DENSE_MXFP8_OPW)
+                    if DENSE_MXFP8 else lm_head_weight, "lm_head")
+            return _head_w
+
+        def emit_tail_and_head(*, x_in, fl_kwargs, gather_slot, norm_weight,
+                               norm_scratch, resadd_x_out, logits,
+                               part_value, part_index, out_tokens_t):
+            # ── The EP tail ──────────────────────────────────────────────
+            # GLM folds at the HEAD of a layer, which buys it one rendezvous
+            # per layer where gpt-oss pays two -- and costs it this: the LAST
+            # fused layer's MoE output is never folded, because there is no
+            # layer L+1 to do it. So emit one more of the same task, in the
+            # variant that runs the layer-entry barrier, the fold, the
+            # exchange and the peer wait and then returns before Phase 1.
+            #
+            # It must be IMMEDIATELY after the last real layer with nothing in
+            # between. The multi-layer scan in persistent_kernel.cuh groups
+            # *consecutive* runs of this task type and swaps variant_id per
+            # layer out of ml_variant_ids, so a different instantiation for
+            # the tail is exactly what that table is for. Since a1329d1 a
+            # break costs one extra replay run rather than replay for the
+            # whole model, which is what lets the draft layer sit past this
+            # tail -- but the tail itself still has to be adjacent. Joining
+            # the batch is not cosmetic either: task_layer_idx has to keep
+            # counting, or the tail's signal threshold would not agree across
+            # ranks.
+            if moe_ep:
+                assert fl_kwargs is not None, \
+                    "MOE_EP found no fused layer to tail"
+                mpk.gang_mla_full_layer_fused_layer(**dict(
+                    fl_kwargs,
+                    # The residual stream the fold adds to moe_ws_f32. `x_in`
+                    # is the last layer's `hidden`, which is what the next
+                    # layer's fold would have read.
+                    x=x_in,
+                    ep_gather=ep_gather_list[gather_slot],
+                    ep_tail_only=True,
+                ))
+            # ── Final norm + LM head + argmax ────────────────────────────
+            if DENSE_MXFP8:
+                # Under EP the LM head IS the combine. Its residual fold
+                # already walks the whole row, so summing world_size gather
+                # slots rides inside a pass it was making anyway -- which is
+                # what lets the tail exchange have no exit barrier behind it:
+                # there is no window between "combined" and "consumed" for one
+                # to protect.
+                #
+                # resadd_workspace_f32 is handed moe_ws_f32 but never read:
+                # the fold already zeroed it, and this rank's partial is in
+                # its own gather slot. It is passed for the task-graph edge --
+                # moe_ws_f32 is an output of the tail task, and it is the only
+                # tensor that orders the LM head after it (ep_gather is an
+                # input to both).
+                #
+                # resadd_x_out is the cross-rank-summed hidden BEFORE the
+                # norm. For the main head that is a by-product; for MTP it is
+                # exactly the `prev_hidden` the draft layer's hnorm consumes.
+                ep_lm_kwargs = dict(
+                    norm_input=ep_gather_list[gather_slot],
+                    resadd_workspace_f32=moe_ws_f32,
+                    resadd_x_out=resadd_x_out,
+                    ep_peer_slots=world_size,
+                ) if moe_ep else dict(norm_input=x_in)
+                mpk.gang_rmsnorm_linear_mxfp8_bias_layer(
+                    norm_weight=norm_weight,
+                    norm_output=norm_scratch,
+                    mxfp8_weight=_head_weights()["lm"],
+                    bias=zero_bias(vocab_size),
+                    output=logits,
+                    actual_hidden_dim=hidden_size,
+                    output_per_wg=DENSE_MXFP8_OPW,
+                    output_stride=vocab_size,
+                    block_dim=(256, 1, 1),
+                    **ep_lm_kwargs,
+                )
+            else:
+                mpk.gang_rmsnorm_linear_bias_layer(
+                    norm_input=x_in,
+                    norm_weight=norm_weight,
+                    norm_output=norm_scratch,
+                    linear_weight=_head_weights()["lm"],
+                    bias=zero_bias(vocab_size),
+                    output=logits,
+                    actual_hidden_dim=hidden_size,
+                    tile_n=GANG_TILE_N,
+                    output_stride=vocab_size,
+                    wgm=GANG_WGM,
+                    block_dim=(256, 1, 1),
+                )
+            mpk.argmax_partial_layer(
+                input=logits,
+                output=(part_value, part_index),
+                grid_dim=(argmax_num_tasks, 1, 1),
+                block_dim=(256, 1, 1),
+            )
+            mpk.argmax_reduce_layer(
+                input=(part_value, part_index),
+                output=out_tokens_t,
+                grid_dim=(1, 1, 1),
+                block_dim=(256, 1, 1),
+            )
+
+        # ── The MTP draft layer's front end ──────────────────────────────────
+        if mtp_in_graph:
+            mtp_module = model.model.mtp_layers[0]
+            # eh_proj is [hidden, 2*hidden] applied to [enorm(e) ; hnorm(h)],
+            # and the concat splits exactly:
+            #     eh_proj([a;b]) = W[:, :H] @ a + W[:, H:] @ b
+            # Two GEMVs rather than one avoids materialising a 2H-wide
+            # activation no other kernel in this graph produces, and lets the
+            # first half ride inside the rmsnorm+linear fusion every other
+            # dense stage already uses.
+            _eh = mtp_module.eh_proj.weight.data
+            assert _eh.shape == (hidden_size, 2 * hidden_size), _eh.shape
+            w_mtp_eh_e = _attach_input_keep(
+                pack_dense_mxfp8(_eh[:, :hidden_size].contiguous(),
+                                 EH_GEMV_ROWS), "mtp_eh_proj_embed")
+            w_mtp_eh_h = _attach_input_keep(
+                pack_dense_mxfp8(_eh[:, hidden_size:].contiguous(),
+                                 EH_GEMV_ROWS), "mtp_eh_proj_hidden")
+            _release(mtp_module.eh_proj.weight)
+            w_mtp_enorm = _attach_input_keep(mtp_module.enorm.weight.data,
+                                             "mtp_enorm")
+            w_mtp_hnorm = _attach_input_keep(mtp_module.hnorm.weight.data,
+                                             "mtp_hnorm")
+            w_mtp_head_norm = _attach_input_keep(
+                mtp_module.shared_head.norm.weight.data, "mtp_head_norm")
+            mtp_embed_out = make_tensor("mtp_embed_out", (bs, hidden_size))
+            mtp_enorm_out = make_tensor("mtp_enorm_out", (bs, hidden_size))
+            mtp_hnorm_out = make_tensor("mtp_hnorm_out", (bs, hidden_size))
+            mtp_eh_partial = make_tensor("mtp_eh_partial", (bs, hidden_size))
+            mtp_eh_out = make_tensor("mtp_eh_out", (bs, hidden_size))
+            # The draft head's own scratch, kept apart from the main head's so
+            # the two never alias -- the draft layer runs while the main head's
+            # buffers are still the last thing a peer read.
+            mtp_layer_out = make_tensor("mtp_layer_out", (bs, hidden_size))
+            mtp_rmsnorm_out = make_tensor("mtp_rmsnorm_out",
+                                          (bs + _pub_rows, hidden_size))
+            mtp_argmax_in = make_tensor("mtp_argmax_in", (bs, vocab_size))
+            mtp_part_value = make_tensor("mtp_part_value",
+                                         (bs, argmax_num_tasks))
+            mtp_part_index = make_tensor("mtp_part_index",
+                                         (bs, argmax_num_tasks),
+                                         torch_dtype=torch.int64)
+            draft_out = mpk.attach_input(torch_tensor=draft_tokens,
+                                         name="draft_token")
+
+        # Reader-keyed gather slots: fused layer L folds into ep_gather[L] and
+        # reads it back in its own Phase 1. The main tail sits at num_layers,
+        # so the draft layer (loop index num_layers) and its tail follow at +1
+        # and +2.
+        def gather_idx(li):
+            return li if li < num_layers else li + 1
+
         # The last fused layer's argument bundle, reused verbatim by the EP
         # tail task below.
         last_fl_kwargs = None
-        for i, layer in enumerate(model.model.main_layers):
+        graph_layers = list(model.model.main_layers)
+        if mtp_in_graph:
+            graph_layers = graph_layers + list(model.model.mtp_layers)
+        for i, layer in enumerate(graph_layers):
+            if i == num_layers:
+                # ── Everything between the main stack and the draft layer ──
+                # The draft layer's input is the token the LM head + argmax
+                # produce, so the main tail has to be emitted here, inside the
+                # loop, before the draft layer's body runs. Those ops are also
+                # what makes the draft layer a second replay run: they sit
+                # between two fused-layer tasks, which is the break a1329d1
+                # taught the multi-layer scan to survive.
+                emit_tail_and_head(
+                    x_in=x, fl_kwargs=last_fl_kwargs,
+                    gather_slot=num_layers,
+                    norm_weight=_head_weights()["norm"],
+                    norm_scratch=rmsnorm_out,
+                    resadd_x_out=layer_out, logits=argmax_in,
+                    part_value=argmax_part_value,
+                    part_index=argmax_part_index, out_tokens_t=argmax_out)
+                # h' = eh_proj([enorm(emb(t_{i+1})) ; hnorm(h_i)])
+                mpk.embed_layer(
+                    input=argmax_out, weight=w_embed, output=mtp_embed_out,
+                    grid_dim=(1, 1, 1), block_dim=(256, 1, 1),
+                    input_source=1,
+                )
+                mpk.gang_rmsnorm_linear_mxfp8_bias_layer(
+                    norm_input=mtp_embed_out,
+                    norm_weight=w_mtp_enorm,
+                    norm_output=mtp_enorm_out,
+                    mxfp8_weight=w_mtp_eh_e,
+                    bias=zero_bias(hidden_size),
+                    output=mtp_eh_partial,
+                    actual_hidden_dim=hidden_size,
+                    output_per_wg=EH_GEMV_ROWS,
+                    output_stride=hidden_size,
+                    block_dim=(256, 1, 1),
+                )
+                # `layer_out` is the main head's resadd_x_out: the
+                # cross-rank-summed hidden BEFORE model.norm, which is exactly
+                # the `prev_hidden` the reference feeds hnorm.
+                #
+                # chain_after is what makes this orderable at all. The task
+                # graph is a linear chain and every op must share a tensor with
+                # the one before it, but the two eh_proj halves are independent
+                # branches that only meet at the GEMV below -- and the branch
+                # carrying the token has to run first, because it starts at
+                # argmax. Naming the enorm half's output here is a pure
+                # dependency edge; the kernel never reads it.
+                mpk.gang_rmsnorm_layer(
+                    input=layer_out,
+                    weight=w_mtp_hnorm,
+                    output=mtp_hnorm_out,
+                    chain_after=mtp_eh_partial,
+                    block_dim=(256, 1, 1),
+                )
+                mpk.gang_gemv_mxfp8_with_residual_layer(
+                    input=mtp_hnorm_out,
+                    mxfp8_weight=w_mtp_eh_h,
+                    residual=mtp_eh_partial,
+                    output=mtp_eh_out,
+                    rows_per_wg=EH_GEMV_ROWS,
+                    output_stride=hidden_size,
+                    reduction_size=hidden_size,
+                    wgm=GANG_WGM,
+                    block_dim=(256, 1, 1),
+                )
+                x = mtp_eh_out
+                last_fl_kwargs = None
             attn = layer.self_attn
             attn._absorb()
 
@@ -2659,9 +2922,10 @@ if __name__ == "__main__":
                     # The fold at the head of this layer publishes the
                     # PREVIOUS layer's partial, so the buffer is keyed by the
                     # layer doing the reading -- one per fused layer.
-                    fl_kwargs.update(ep_gather=ep_gather_list[i],
-                                     ep_signal=ep_signal,
-                                     ep_fold_rank=ep_fold_rank)
+                    fl_kwargs.update(
+                        ep_gather=ep_gather_list[gather_idx(i)],
+                        ep_signal=ep_signal,
+                        ep_fold_rank=ep_fold_rank)
                     if ROUTER_FOLD:
                         fl_kwargs.update(router_weight_t=w_router_t,
                                          router_partials=router_partials)
@@ -2791,100 +3055,30 @@ if __name__ == "__main__":
                 )
                 x = layer_out
 
-        # ── The EP tail ──────────────────────────────────────────────────
-        # GLM folds at the HEAD of a layer, which buys it one rendezvous per
-        # layer where gpt-oss pays two -- and costs it this: the LAST fused
-        # layer's MoE output is never folded, because there is no layer L+1
-        # to do it. So emit one more of the same task, in the variant that
-        # runs the layer-entry barrier, the fold, the exchange and the peer
-        # wait and then returns before Phase 1.
-        #
-        # It must be IMMEDIATELY after the last real layer with nothing in
-        # between. The multi-layer scan in persistent_kernel.cuh groups
-        # *consecutive* runs of this task type and swaps variant_id per layer
-        # out of ml_variant_ids, so a different instantiation for the tail is
-        # exactly what that table is for -- but anything wedged between the
-        # two would break the run and disable replay for the whole model.
-        # Joining the batch is not cosmetic either: task_layer_idx has to
-        # keep counting, or the tail's signal threshold would not agree
-        # across ranks.
-        if moe_ep:
-            assert last_fl_kwargs is not None, \
-                "MOE_EP found no fused layer to tail"
-            mpk.gang_mla_full_layer_fused_layer(**dict(
-                last_fl_kwargs,
-                # The residual stream the fold adds to moe_ws_f32. `x` is the
-                # last layer's `hidden`, which is what the next layer's fold
-                # would have read.
-                x=x,
-                ep_gather=ep_gather_list[num_layers],
-                ep_tail_only=True,
-            ))
-
-        # ── Tail: final norm + LM head + argmax ──────────────────────────────
-        w_final_norm = _attach_input_keep(model.model.norm.weight.data,
-                                          "model_norm_weight")
-        w_lm_head = _attach_input_keep(
-            pack_dense_mxfp8(lm_head_weight, DENSE_MXFP8_OPW) if DENSE_MXFP8
-            else lm_head_weight, "lm_head")
-        assert not moe_ep or DENSE_MXFP8, \
-            "MOE_EP needs the MXFP8 LM head: it is the cross-rank combine"
-        if DENSE_MXFP8:
-            # Under EP the LM head IS the combine. Its residual fold already
-            # walks the whole row, so summing world_size gather slots rides
-            # inside a pass it was making anyway -- which is what lets the
-            # tail exchange have no exit barrier behind it: there is no window
-            # between "combined" and "consumed" for one to protect.
-            #
-            # resadd_workspace_f32 is handed moe_ws_f32 but never read: the
-            # fold already zeroed it, and this rank's partial is in its own
-            # gather slot. It is passed for the task-graph edge -- moe_ws_f32
-            # is an output of the tail task, and it is the only tensor that
-            # orders the LM head after it (ep_gather is an input to both).
-            ep_lm_kwargs = dict(
-                norm_input=ep_gather_list[num_layers],
-                resadd_workspace_f32=moe_ws_f32,
-                resadd_x_out=layer_out,
-                ep_peer_slots=world_size,
-            ) if moe_ep else dict(norm_input=x)
-            mpk.gang_rmsnorm_linear_mxfp8_bias_layer(
-                norm_weight=w_final_norm,
-                norm_output=rmsnorm_out,
-                mxfp8_weight=w_lm_head,
-                bias=zero_bias(vocab_size),
-                output=argmax_in,
-                actual_hidden_dim=hidden_size,
-                output_per_wg=DENSE_MXFP8_OPW,
-                output_stride=vocab_size,
-                block_dim=(256, 1, 1),
-                **ep_lm_kwargs,
-            )
+        # ── The tail ─────────────────────────────────────────
+        # With MTP the main stack's tail was already emitted inside the loop,
+        # ahead of the draft layer's front end; what is left here is the draft
+        # layer's own tail and head. Without MTP this is the only call, and it
+        # is the tail the loop never reached.
+        if mtp_in_graph:
+            emit_tail_and_head(
+                x_in=x, fl_kwargs=last_fl_kwargs, gather_slot=num_layers + 2,
+                # The draft head is `shared_head.norm`, not `model.norm`: the
+                # final norm belongs to whichever head consumes the hidden, and
+                # the checkpoint carries them as two tensors. The lm_head
+                # itself IS shared -- GLM ties it.
+                norm_weight=w_mtp_head_norm, norm_scratch=mtp_rmsnorm_out,
+                resadd_x_out=mtp_layer_out, logits=mtp_argmax_in,
+                part_value=mtp_part_value, part_index=mtp_part_index,
+                out_tokens_t=draft_out)
         else:
-            mpk.gang_rmsnorm_linear_bias_layer(
-                norm_input=x,
-                norm_weight=w_final_norm,
-                norm_output=rmsnorm_out,
-                linear_weight=w_lm_head,
-                bias=zero_bias(vocab_size),
-                output=argmax_in,
-                actual_hidden_dim=hidden_size,
-                tile_n=GANG_TILE_N,
-                output_stride=vocab_size,
-                wgm=GANG_WGM,
-                block_dim=(256, 1, 1),
-            )
-        mpk.argmax_partial_layer(
-            input=argmax_in,
-            output=(argmax_part_value, argmax_part_index),
-            grid_dim=(argmax_num_tasks, 1, 1),
-            block_dim=(256, 1, 1),
-        )
-        mpk.argmax_reduce_layer(
-            input=(argmax_part_value, argmax_part_index),
-            output=argmax_out,
-            grid_dim=(1, 1, 1),
-            block_dim=(256, 1, 1),
-        )
+            emit_tail_and_head(
+                x_in=x, fl_kwargs=last_fl_kwargs, gather_slot=num_layers,
+                norm_weight=_head_weights()["norm"],
+                norm_scratch=rmsnorm_out,
+                resadd_x_out=layer_out, logits=argmax_in,
+                part_value=argmax_part_value, part_index=argmax_part_index,
+                out_tokens_t=argmax_out)
 
         num_ops = len(mpk.kn_graph.cygraph.get_graph_structure())
         print(f"DEBUG: kn_graph has {num_ops} operators before "
@@ -2897,6 +3091,12 @@ if __name__ == "__main__":
             f.write(results["cuda_code"])
 
         mpk.compile(output_dir=args.output_dir)
+
+        if mtp_in_graph:
+            # The draft head writes here; prepare_next_batch stages it as the
+            # next iteration's row-1 input. Handed over by pointer after
+            # compile because meta_tensors is asserted at 10 entries.
+            mpk.set_spec_draft_tokens(draft_tokens)
 
     # ── Execution ────────────────────────────────────────────────────────────
     output_len = args.max_new_tokens if args.max_new_tokens is not None else (

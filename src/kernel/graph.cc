@@ -887,8 +887,12 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     assert(params.size() == 0);
     int variant_id = task_register->register_gang_rmsnorm_mi300_task(
         customized->bgraph, params);
+    // 2 inputs + 1 output, or 3 + 1 when the caller added a chain_after edge
+    // whose only job is to give register_mugraph a shared tensor.
+    int num_inputs = (int)customized->bgraph.operators.size() - 1;
+    assert(num_inputs == 2 || num_inputs == 3);
     task_config[op] =
-        std::make_tuple(2, 1, TASK_GANG_RMS_NORM_MI300, variant_id);
+        std::make_tuple(num_inputs, 1, TASK_GANG_RMS_NORM_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = 1; // 1 RMSNorm per XCD
   } else if (name == "gang_linear_silu_mi300") {
     assert(params.size() == 7);

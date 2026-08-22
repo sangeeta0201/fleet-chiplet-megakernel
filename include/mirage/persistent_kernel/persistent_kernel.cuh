@@ -1015,6 +1015,15 @@ __device__ int g_spec_committed;
 __device__ unsigned long long g_spec_decode_ns;
 __device__ int g_spec_decode_iters;
 __device__ int g_spec_iter_is_decode;
+// Which row of spec_draft_tokens the draft head wrote for this request's NEXT
+// input. The draft layer runs on every dispatched row, so a 2-row decode
+// iteration produces two candidate drafts: row 0's is the guess that follows
+// the verify token, row 1's the guess that follows the accepted pair. Only one
+// of them is on the sequence we are actually continuing, and which one is
+// exactly num_committed. Set in Step 1 next to the accept scan, read in Step 3
+// where the draft is staged; the slots are indexed by batch position `i`,
+// which Step 3 only ever compacts downward.
+__device__ int g_spec_draft_row[MPK_MAX_NUM_BATCHED_REQUESTS];
 
 // How many rows a decode iteration dispatches: 1 verify row + (WIDTH-1) draft
 // rows. Only 2 is implemented -- a deeper draft tree needs the draft model to
@@ -1078,6 +1087,10 @@ __device__ __forceinline__ bool
       if (step >= prompt_len) {
         g_spec_committed += num_committed;
       }
+      // Uniform over all three shapes: reject keeps row 0's draft, accept
+      // takes row 1's, and a prefill chunk of N rows takes row N-1 -- the only
+      // row whose input was the last real token of the chunk.
+      g_spec_draft_row[i] = qo_indptr + num_committed - 1;
 #endif
       for (int j = 0; j < num_committed; j++) {
         if (step + j + 1 >= prompt_len &&
@@ -1178,7 +1191,7 @@ __device__ __forceinline__ bool
 #else
           config.tokens[request_id * MPK_MAX_SEQ_LENGTH + step + 1] =
               config.spec_draft_tokens != nullptr
-                  ? config.spec_draft_tokens[i]
+                  ? config.spec_draft_tokens[g_spec_draft_row[i]]
                   : config.tokens[request_id * MPK_MAX_SEQ_LENGTH + step];
 #endif
           num_new_tokens = MPK_SPEC_WIDTH;
