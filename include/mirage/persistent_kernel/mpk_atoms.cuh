@@ -977,6 +977,58 @@ __device__ __forceinline__ bool
 // (the MPK_MOE_LIVE_BOUND dependency is asserted at the use site --
 // gang_oproj_router_fused_mi300.cuh is where that macro gets its default.)
 
+// MPK_SHARED_DUP: the shared-expert makespan pricing probe. CORRECT OUTPUT,
+// unlike every other ceiling probe in this file -- it is ADDITIVE, not an
+// ablation, and that is the whole point.
+//
+// WHAT IT DOES. EP_SHARED_PE (rank 0) owns the shared expert on top of its
+// routed share. Setting this to 1 gives that expert TWO consecutive slots in
+// rank 0's owned tile subsequence for W13, so every one of its W13 tiles runs
+// twice. Both copies read the same weights and the same activation, compute
+// the same bits, and store them to the same address; W13's epilogue is a plain
+// (or write-through) store, not an accumulate, so the second store is
+// idempotent and the layer's output is UNCHANGED. Rank 0 simply does one
+// expert's worth of extra W13 work per layer, and no other rank does anything
+// different.
+//
+// W13 ONLY, and that is not a simplification -- it is a correctness
+// requirement. W2's epilogue under FUSE_MULSUMADD is an f32 atomicAdd into
+// moe_workspace_f32. A duplicated W2 tile would add the shared expert's
+// contribution twice. Do not extend DUP_SHARED to the W2 call site.
+//
+// WHAT IT MEASURES. Two models of the shared-expert imbalance predict
+// different walls, and the ledger has held both:
+//
+//   "absorbed"       -- the shared expert's tiles occupy workers that would
+//                       otherwise be idle, every rank runs the same number of
+//                       grid-stride rounds, so the extra expert costs ZERO
+//                       makespan. Predicts ~0 ms.
+//   "on the path"    -- rank 0 is the MoE straggler, its peers idle at the
+//                       next cross-rank rendezvous for exactly as long as it
+//                       runs over, and W13 carries +6.02 us/layer of that.
+//                       Predicts about +6.0 us/layer = +0.46 ms/token.
+//
+// 0.46 ms is 1.8x the 0.26 ms wall noise floor, so n=3 resolves it. Decide on
+// 1 vs 0 with nothing else changed.
+//
+// HOW TO READ THE RESULT. Per glm-additive-probes-overprice-deletions, adding
+// work costs about 1:1 while removing the same work saves about nothing, four
+// pairs measured. So a POSITIVE result here is an UPPER bound on what
+// eliminating rank 0's W13 excess could buy -- necessary evidence for building
+// a shared-expert K-shard, not sufficient. A NULL result is decisive the other
+// way: if rank 0 can absorb a whole extra expert of W13 for free, there is no
+// makespan there to harvest and the hoist/shard family is closed for good.
+//
+// This exists because glm-shared-expert-hoist-is-zero-makespan measured
+// "absorbed" on 2026-08-21 at 11:44 and the stage-stamp drop-guard bug was
+// found at 12:00 the same day, sixteen minutes later. That closure was never
+// re-derived, and re-running its own max-max statistic on clean logs now puts
+// rank 0's W13 LONGEST of the eight (18.11 vs 12.27 us) rather than shortest
+// (8.55). This probe settles it at the wall instead of at an instrument.
+#ifndef MPK_SHARED_DUP
+#define MPK_SHARED_DUP 0
+#endif
+
 #if MPK_ML_PTR_PREFETCH || MPK_ABL_ML_BOUNDARY
 #define MPK_ML_PF 1
 #else

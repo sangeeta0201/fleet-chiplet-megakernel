@@ -865,6 +865,23 @@ def get_compile_command(
             # Long note at the define in mpk_atoms.cuh.
             assert _pipe in (1, 2), "MPK_ABL_PIPE_W13W2 is 0, 1 or 2"
             flags = flags + ["-DMPK_ABL_PIPE_W13W2=%d" % _pipe]
+        _shdup = os.environ.get("MPK_SHARED_DUP")
+        if _shdup is not None and _shdup != "0":
+            # Shared-expert makespan pricing probe. Runs rank 0's shared-expert
+            # W13 tiles TWICE, storing the same bits both times: CORRECT
+            # OUTPUT, additive, one variable. W13 only -- W2's atomicAdd
+            # epilogue would double-count. Needs MPK_MOE_LIVE_BOUND=1 (the
+            # default) so the widened W13 tile space is actually walked. Long
+            # note at the define in mpk_atoms.cuh. Compile-time, so every rank
+            # must see it or the ranks build different megakernels.
+            assert _shdup == "1", "MPK_SHARED_DUP is 0 or 1"
+            assert os.environ.get("MPK_MOE_LIVE_BOUND", "1") == "1", (
+                "MPK_SHARED_DUP needs the live clamp: with MPK_MOE_LIVE_BOUND=0 "
+                "the W13 bound is the full static tile space, the duplicate "
+                "tiles are already inside it, and the probe silently does "
+                "nothing"
+            )
+            flags = flags + ["-DMPK_SHARED_DUP=1"]
         _wpe = os.environ.get("MPK_WORKER_WAVES_PER_EU")
         if _wpe is not None:
             # The megakernel's register budget -- MIN_WARPS_PER_EXECUTION_UNIT

@@ -37,6 +37,14 @@
 // so tiles_per_expert does not move; above batch 1 the tile count grows
 // linearly here instead of in steps of 16.
 //
+// MPK_SHARED_DUP -- CORRECT-OUTPUT pricing probe for the shared-expert
+// imbalance. Long note at the define in mpk_atoms.cuh. Guarded here as well
+// because the tile decode below is included by callers that do not pull in
+// mpk_atoms.cuh first.
+#ifndef MPK_SHARED_DUP
+#define MPK_SHARED_DUP 0
+#endif
+//
 // See gang_linear_mxfp8_mi300.cuh for why the scale indexing is what it is --
 // the MFMA addresses its scale operand by matrix position, not by which bytes
 // the lane loaded, and the two only coincide at 4 bits.
@@ -346,7 +354,13 @@ template <int BATCH_SIZE,
           int EP_MY_PE = 0,
           // Routed experts only; the shared expert is id EP_NUM_ROUTED.
           int EP_NUM_ROUTED = NUM_EXPERTS,
-          int EP_SHARED_PE = 0>
+          int EP_SHARED_PE = 0,
+          // MPK_SHARED_DUP pricing probe: give the shared expert TWO
+          // consecutive slots in the owned subsequence, so every one of its
+          // tiles runs twice. Long note at the define in mpk_atoms.cuh. Only
+          // the W13 caller may set this -- W2's epilogue is an atomicAdd and
+          // would double-count. Default false is byte-for-byte the old decode.
+          bool DUP_SHARED = false>
 __device__ __forceinline__ bool _gang_moe_mxfp8_tile(int tile_idx,
                                                      int const *d_mask,
                                                      int const *d_routing,
@@ -373,9 +387,17 @@ __device__ __forceinline__ bool _gang_moe_mxfp8_tile(int tile_idx,
           (cand >= EP_NUM_ROUTED)
               ? (EP_MY_PE == EP_SHARED_PE)
               : (cand >= EP_BASE && cand < EP_BASE + EP_LOCAL_ROUTED);
-      if (owned && ++seen == owned_rank) {
-        e = cand;
-        break;
+      // At DUP_SHARED the shared expert consumes two slots instead of one.
+      // With mult == 1 `seen` still steps by exactly one from -1, so `>=`
+      // first fires exactly where `== owned_rank` did: the default path is
+      // unchanged.
+      int const mult = (DUP_SHARED && cand >= EP_NUM_ROUTED) ? 2 : 1;
+      if (owned) {
+        seen += mult;
+        if (seen >= owned_rank) {
+          e = cand;
+          break;
+        }
       }
     }
     if (e < 0) {
@@ -528,7 +550,13 @@ __device__ __noinline__ void
                             EP_WORLD_SIZE,
                             EP_MY_PE,
                             EP_NUM_ROUTED,
-                            EP_SHARED_PE>(tile_idx,
+                            EP_SHARED_PE,
+                            // W13 ONLY. Its epilogue is a plain (or
+                            // write-through) store of a deterministic value,
+                            // so a duplicated tile rewrites the same bits and
+                            // the output is unchanged. Never set this on W2.
+                            /*DUP_SHARED=*/(MPK_SHARED_DUP != 0)>(
+                                          tile_idx,
                                           (int const *)mask_ptr,
                                           (int const *)routing_ptr,
                                           &expert_id,

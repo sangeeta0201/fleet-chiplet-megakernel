@@ -1272,11 +1272,12 @@ __device__ __attribute__((always_inline)) void
 #undef _VP
     }
 #endif
-    int owned;
+    int owned, owned_w13;
     if constexpr (EP_WORLD_SIZE > 1) {
       constexpr int EP_LOCAL_ROUTED = NUM_EXPERTS / EP_WORLD_SIZE;
       constexpr int EP_BASE = EP_MY_PE * EP_LOCAL_ROUTED;
       owned = 0;
+      owned_w13 = 0;
       for (int i = 0; i < n_act; i++) {
         int const cand = d_mask_live[i];
         // EP_SHARED_PE owns the shared expert on top of its routed share, so
@@ -1351,14 +1352,22 @@ __device__ __attribute__((always_inline)) void
                 ? (EP_MY_PE == EP_SHARED_PE)
                 : (cand >= EP_BASE && cand < EP_BASE + EP_LOCAL_ROUTED);
         owned += is_owned ? 1 : 0;
+        // MPK_SHARED_DUP widens the W13 tile space ONLY, by one extra copy of
+        // the shared expert. It must agree exactly with the DUP_SHARED decode
+        // in _gang_moe_mxfp8_tile, which gives that expert two consecutive
+        // slots in the owned subsequence. W2 keeps `owned`: its epilogue is an
+        // atomicAdd and a duplicated tile would double-count the contribution.
+        owned_w13 +=
+            is_owned ? ((MPK_SHARED_DUP && cand >= NUM_EXPERTS) ? 2 : 1) : 0;
       }
     } else {
       owned = n_act;
+      owned_w13 = n_act;
     }
     // Round UP to the XCD stride: the last live global tile can sit on any
     // XCD, and global_tile = t * 8 + xcd_id. A tile or two past the end still
     // returns false, which is correct and costs one decode.
-    int const w13_live = (owned * MOE_W13_TILES_PER_EXPERT + 7) / 8;
+    int const w13_live = (owned_w13 * MOE_W13_TILES_PER_EXPERT + 7) / 8;
     int const w2_live = (owned * MOE_W2_TILES_PER_EXPERT + 7) / 8;
     if (w13_live < moe_w13_live) {
       moe_w13_live = w13_live;

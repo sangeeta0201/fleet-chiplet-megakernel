@@ -106,6 +106,10 @@ MPK_FORWARD_VARS=(
   # Adjacent-phase overlap ceiling probe. =1 is a CORRECT-output control,
   # =2 is the wrong-output probe; decide on 2 vs 1.
   MPK_ABL_PIPE_W13W2
+  # Shared-expert makespan pricing probe. CORRECT OUTPUT (rank 0 recomputes
+  # its shared-expert W13 tiles and stores the same bits), additive, decide
+  # 1 vs 0. Compile-time, so it must reach every rank or the barriers deadlock.
+  MPK_SHARED_DUP
   # Register budget for the whole megakernel. 3 => 252 unified VGPRs => 2
   # waves/SIMD. MUST reach every rank: a mismatched register budget is a
   # different binary and the layer barriers deadlock.
