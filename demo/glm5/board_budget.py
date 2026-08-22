@@ -152,9 +152,12 @@ print("""
       over a subset and can be understated.  Never a credit, only a floor.
   READ barrier_floor_sweep.py ALONGSIDE THIS TABLE.  max(b)-max(a) is a
       CRITICAL-PATH estimator: it telescopes to the layer span, which is what a
-      budget needs, but it HIDES HOLES BY CONSTRUCTION.  S25->S26 is priced
-      0.193 here and carries 2.000 ms of idle worker time; S32->S5 is 0.317
-      against 1.851.  "Small on the board" does not mean "small hole", and a
+      budget needs, but it HIDES HOLES BY CONSTRUCTION.  hole_audit.py ranks
+      the same 24 regions by fillable slack and gets very nearly the INVERSE
+      order: S25->S26 is priced 0.193 here and is the largest hole in the layer
+      at 0.896 ms, while S0->S1 -- the biggest line in this table at 1.899 --
+      has a hole of 0.015 and is the LEAST fillable region there is.
+      "Small on the board" does not mean "small hole", and a
       hole is where a lever would have to put the work.  That sweep also splits
       every region into the last arriver's FLOOR (6.498 ms, 54% of this budget,
       untouchable by any rebalance) and SKEW (13.441 ms -- larger than the
