@@ -39,7 +39,12 @@ N_LAYERS = 76
 # (from_slot, to_slot, label, ledger verdict)
 REGIONS = [
     (0, 1, "EP collective",
-     "1.187  hoist NEUTRAL, widen NEUTRAL; 5.4us local fold + 17.5us peer wait"),
+     "1.187  NOT DELETABLE (probe_ep_collective_ceiling.sh): MPK_EP_ABLATE=1 "
+     "empties it (-16.63 us/layer) and 83% REAPPEARS at S19->S20, the only "
+     "other cross-rank rendezvous; wall -0.206, layer span -0.198. It is the "
+     "layer's rank-alignment TAX, paid at whatever cross-rank sync exists. "
+     "hoist/widen/poll-batch/delete all NEUTRAL -- attack the skew, not the "
+     "rendezvous"),
     (2, 16, "-> attn call boundary", "0.094  not a phase; the task-body call"),
     (16, 17, "qkv_a tiles",
      "0.900  41% redundant prologue; K-loop at 90% of the per-CU byte roof"),
