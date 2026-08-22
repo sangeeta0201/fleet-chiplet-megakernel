@@ -497,6 +497,16 @@ if __name__ == "__main__":
              "run speculative decode in the torch reference path. 0 (default) "
              "drops the MTP weights exactly as before.")
     args = parser.parse_args()
+    # The megakernel builds its task graph from model.main_layers, so the MTP
+    # layer is loaded and then never dispatched. Without this guard
+    # `--use-mirage --mtp 1` runs plain greedy decode, pays the draft layer's
+    # weights in HBM, and reports a per-token latency that looks like MTP's and
+    # is not -- exactly the kind of number this repo does not quote.
+    assert not (args.use_mirage and args.mtp), (
+        "--mtp is torch-reference only for now: the draft layer, its eh_proj "
+        "front end and the accept/reject step are not in the megakernel task "
+        "graph yet, so --use-mirage would silently decode one token per "
+        "iteration and mis-report ms/token")
 
     # Resolve where to dump generated tokens for the correctness test.
     if args.save_tokens:
