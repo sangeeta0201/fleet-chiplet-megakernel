@@ -44,7 +44,11 @@ REGIONS = [
      "other cross-rank rendezvous; wall -0.206, layer span -0.198. It is the "
      "layer's rank-alignment TAX, paid at whatever cross-rank sync exists. "
      "hoist/widen/poll-batch/delete all NEUTRAL -- attack the skew, not the "
-     "rendezvous"),
+     "rendezvous. THE SKEW IS NOW SPLIT (ep_rank_skew_anatomy.py): of the 20.41 "
+     "us/layer peer wait, 10.17 (0.773 ms) is rank 0's SHARED EXPERT -- its "
+     "MoE-half work excess closes against its wait deficit to 0.21 us, and the "
+     "ablated arm replicates at the q_b gather to 0.23 -- and 10.24 (0.778 ms) "
+     "is unattributed residual"),
     (2, 16, "-> attn call boundary", "0.094  not a phase; the task-body call"),
     (16, 17, "qkv_a tiles",
      "0.900  41% redundant prologue; K-loop at 90% of the per-CU byte roof"),
