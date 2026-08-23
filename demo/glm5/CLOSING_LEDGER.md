@@ -639,7 +639,42 @@ OMP_NUM_THREADS capped     # 8 ranks x 256 threads on 256 cores = 28x oversubscr
 
 ---
 
-## 8. WHAT IT WOULD TAKE TO REACH 2 ms/TOKEN — AND WHY THIS CANNOT
+## 8. WHAT IT WOULD TAKE TO REACH 2 ms/TOKEN
+
+> **CORRECTION, 2026-08-23.** This section originally concluded "2 ms/token is
+> below the floor of this parallelization." **That conclusion is RETRACTED on
+> two counts, both of which survive review of the measurements themselves —
+> the numbers below are right; the inference from them was not.**
+>
+> **(A) The margin was misread.** The floor is 2.144 and the goal is *close to*
+> 2 ms — a **7% margin**. 2.2-2.5 ms/token satisfies the goal. The finding is
+> **"4.1x above the floor,"** not "below" it.
+>
+> **(B) THE FLOOR IS A BYTE FLOOR, AND THE ATTENTION SIDE IS NOT BYTE-BOUND.**
+> Section 2 prices every phase by bytes. Side by side with the measured tile
+> time:
+>
+> | | byte floor | measured tile | ratio |
+> |---|---|---|---|
+> | MoE W13 + W2 | 14.93 us/layer | 26.11 us/layer | 1.75x |
+> | **all non-MoE phases** | **8.55 us/layer** | **55.9 us/layer** | **6.5x** |
+>
+> That 47.3 us/layer x 76 = **3.55 ms is not accounted for anywhere in this
+> ledger** — and it is larger than the 2.94 ms attributed below to all ten
+> rendezvous. The cause was already on the branch in two unjoined pieces:
+> qkv_a's tile is **41% RMSNorm+quant prologue that touches no HBM**, and that
+> prologue is **VALU-bound, not load-issue-bound**. *A VALU-bound region has no
+> byte floor and was never going to appear in a roofline.*
+>
+> Note this does NOT resurrect widening-for-bandwidth (§5, 0.118 ms for the
+> class). That prices moving a phase to the 232-wide *rate*. It does not ask
+> why qkv_a takes 14.8 us of tile when 3.33 us of bytes cross the bus at its
+> own real width of 168. Different question; only the first one is closed.
+>
+> **What replaced the reasoning below:** `demo/glm5/makespan_predictor.py`
+> (`588e1e3`) — the wall delta is the change in the **maximum arrival**, and
+> each proposed change falls into one of three regimes with a computable
+> ceiling. Read it before using anything in this section.
 
 ### The arithmetic
 
@@ -651,11 +686,10 @@ target                       2.000  ms
 ```
 
 Reaching 2 ms/token means running **below the width-corrected HBM+EP floor of
-this parallelization**, or beating it by a factor the floor does not permit. Even
-a *perfect* schedule — zero barrier cost, zero skew, zero spin, every phase at
-its own measured achievable bandwidth — lands at **2.144 ms**, and that number
-excludes the 3 dense layers and lm_head (which `roofline.py` carries, giving
-2.319). **2 ms/token is not merely hard here; it is below the floor.**
+this parallelization** — *if* the floor is what binds. It is not shown to be:
+the floor is a byte floor and the non-MoE tiles run at 6.5x theirs (see the
+correction above). What the arithmetic does establish is the **4.1x gap** and
+that no *byte*-side lever closes it.
 
 ### The gap is one thing, and it is not tuning
 
@@ -720,20 +754,30 @@ Not one of these is a tuning knob. Each is a different program.
    Whether that trade is net-positive is a question this hardware configuration
    cannot answer.
 
-### The plain statement
+### The plain statement — as corrected
 
-**On 8x MI355X, with this parallelization, 2 ms/token of single-stream decode
-latency is not reachable.** The achievable floor is 2.144 ms and the measured
-wall is 8.884 ms/token. The 6.7 ms between them is the bulk-synchronous ladder,
-and both structural ways to shorten a ladder are closed by dependency legality
-rather than by effort: there is no legal independent-round fusion, and
-`qkv_a(L+1) <- MoE(L)` denies cross-layer overlap at batch 1. Everything that is
-*tuning* has been measured, and the sum of every remaining tuning class is under
-the 0.26 ms noise floor.
+**The gap is 4.1x, and it is not a byte gap.** The achievable *byte* floor is
+2.144 ms; the measured bs=1 wall is 10.619 ms. Of the distance:
 
-**The intra-layer program is exhausted.** The next real move is a different
-decomposition of the layer or a different parallelization — a new project, not a
-next experiment on this one.
+| | ms | status |
+|---|---|---|
+| rendezvous (10 GPU-wide + 2 cross-rank, x76) | ~2.94 | item 3 — the CROC per-XCD chunk barrier is on disk and unported |
+| non-MoE tile time above its byte floor | **3.55** | **item 2 — VALU-bound, never profiled at ISA level** |
+| MoE tile above its byte floor | 1.10 | closed both directions |
+| byte floor itself | 2.14 | closed |
+
+Two of these four lines are open, and the larger of the two open lines is the
+one this ledger never priced. **The intra-layer program is not exhausted; the
+BYTE-side intra-layer program is.** Every *tuning* class is measured out and
+sums to under the 0.26 ms noise floor — that part stands and is what §5 is for.
+
+What does **not** stand is the inference "therefore 2 ms is unreachable."
+Before that can be claimed again, the 3.55 ms has to be attributed at ISA
+level, and it has to be attributed **subject to the predictor** — which says
+per-phase tile cuts are capped at 0.000-1.199 us/layer because the workers that
+skip a phase arrive as late as the workers that run it. The 3.55 ms is
+therefore *not* in any one phase's tile. It is in the **plateau**: work every
+worker does regardless of which tile it owns.
 
 ---
 
@@ -756,7 +800,7 @@ next experiment on this one.
 | second-row / GEOM classification | `demo/glm5/classify_geom.py` |
 | bs=1 nondeterminism (the two attractors) | `demo/glm5/probe_bs1_determinism.sh` |
 | paired per-worker span estimator | `demo/glm5/paired_span.py` |
-| stamp parsing | `demo/glm5/parse_barstage_ws.py` |
+| **the makespan predictor (3 regimes, arrival ceilings)** | **`demo/glm5/makespan_predictor.py`** |
 | W2 tile-width ledger | `demo/glm5/demo.py:975-1020` |
 | MoE prefetch ledger (`MPK_MOE_PF_GROUPS`, `W2_K_SPLITS`) | `include/mirage/persistent_kernel/tasks/mi300/gang_moe_linear_mxfp8_mi300.cuh:137-204, 1085-1120` |
 | the narrow-grid bandwidth curve | `tests/standalone/test_narrow_grid_bandwidth.hip` |
