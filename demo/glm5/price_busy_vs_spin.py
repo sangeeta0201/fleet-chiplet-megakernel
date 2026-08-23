@@ -107,6 +107,9 @@ def quantile(xs, q):
     return s[i]
 
 
+budget = {}
+
+
 def analyse(mean, cnt, label, s_start, s_arr, s_exit, note):
     print("=" * 94)
     print(f"PHASE {label}   slots start={s_start} arrive={s_arr} exit={s_exit}")
@@ -206,6 +209,8 @@ def analyse(mean, cnt, label, s_start, s_arr, s_exit, note):
               f"{head * LAYERS / 1000.0 * K:6.3f} ms/token")
     # The plateau check: a rebalance can only pay down to the SECOND highest.
     s = sorted(busy_all, reverse=True)
+    budget[label] = (ct, cb, cs, (mx - sum(active) / len(active))
+                     * LAYERS / 1000.0 * K)
     print(f"    top-5 busy us: {' '.join(f'{x:.3f}' for x in s[:5])}"
           f"   (max - 2nd = {s[0] - s[1]:.3f} us)")
     print()
@@ -331,6 +336,38 @@ def main():
         if v is not None:
             print(f"  {label:8s} critical-worker busy {v:5.1f}% / "
                   f"spin {100 - v:5.1f}%")
+    print()
+    print("=" * 94)
+    print("LABELLED WORK BUDGET -- the critical worker's own time, by phase")
+    print("=" * 94)
+    print(f"{'phase':12s} {'span':>8s} {'busy':>8s} {'spin':>8s} {'busy%':>7s}"
+          f" {'rebal ceil':>11s}")
+    print(f"{'':12s} {'us/lyr':>8s} {'us/lyr':>8s} {'us/lyr':>8s} {'':>7s}"
+          f" {'ms/token':>11s}")
+    tb = ts = 0.0
+    for label, a, b, c, _n in PHASES + EXTRA:
+        r = budget.get(label)
+        if not r:
+            continue
+        span, busy, spin, ceil_ms = r
+        tb += busy
+        ts += spin
+        print(f"{label:12s} {span:8.3f} {busy:8.3f} {spin:8.3f} "
+              f"{pct(busy, span):6.1f}% {ceil_ms:11.3f}")
+    tot = tb + ts
+    print(f"{'-' * 60}")
+    print(f"{'TOTAL':12s} {tot:8.3f} {tb:8.3f} {ts:8.3f} "
+          f"{pct(tb, tot):6.1f}%")
+    print(f"  = {tot * LAYERS / 1000.0 * K:.3f} ms/token of the 10.619, of "
+          f"which {ts * LAYERS / 1000.0 * K:.3f} ms is SPIN.")
+    print(f"  Phases not covered here (W2, the layer boundary, the EP")
+    print(f"  collective) make up the rest of the {164.947:.3f} us layer.")
+    print()
+    print("  The 'rebal ceil' column is max busy - mean busy over the ACTIVE")
+    print("  workers: what a PERFECT static tile->worker map would buy. It is")
+    print("  an upper bound in two ways -- it assumes work is infinitely")
+    print("  divisible (MoE tiles are not: round quantization, and split-K is")
+    print("  a measured +4.12), and it assumes the remap costs nothing.")
     return 0
 
 
