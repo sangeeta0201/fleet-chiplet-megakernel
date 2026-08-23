@@ -77,13 +77,15 @@ ncu_tmp
 # demo / CI run artifacts
 outputs/
 
-# standalone kernel test binaries (tests/standalone/build.sh)
-tests/standalone/test_mfma_simple
-tests/standalone/test_mfma_pipeline_hazards
-tests/standalone/test_mla_decode
-tests/standalone/test_mla_kv_cache_update
-tests/standalone/test_moe_topk_sigmoid_bias
-tests/standalone/test_rope_interleave_partial
+# standalone kernel test binaries (tests/standalone/build.sh).
+# Pattern, not an enumeration -- the explicit list went stale and left ~15
+# untracked ELFs in the tree.  Sources are re-admitted by the negations.
+tests/standalone/test_*
+!tests/standalone/test_*.hip
+!tests/standalone/test_*.cpp
+!tests/standalone/test_*.cu
+!tests/standalone/test_*.py
+!tests/standalone/test_*.sh
 
 # hipcc -save-temps intermediates
 *-hip-amdgcn-amd-amdhsa-*.bc
