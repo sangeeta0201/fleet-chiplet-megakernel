@@ -114,6 +114,16 @@ def main():
     print(f"  HBM floor, busiest-rank routing            {HBM_FLOOR_BUSIEST_MS:7.3f} ms")
     print(f"  + EP collective latency (measured)         {EP_COLLECTIVE_FLOOR_MS:7.3f} ms")
     print(f"  = achievable floor                         {ACHIEVABLE_FLOOR_MS:7.3f} ms")
+    # Second, independent floor construction (different denominator: the tile
+    # class at its own per-phase live widths, not whole-iteration bytes at the
+    # busiest routed rank).  BOTH exceed the 2 ms goal -- see
+    # TWO_MS_IMPOSSIBILITY.md section 2.2.
+    alt_floor = TILE_ROOF_MS + EP_COLLECTIVE_FLOOR_MS
+    print(f"  alt floor: tile byte roof {TILE_ROOF_MS:.3f} + measured EP "
+          f"{EP_COLLECTIVE_FLOOR_MS:.3f}, every")
+    print(f"    zero-roof class exactly 0                {alt_floor:7.3f} ms")
+    print(f"  -> the 2.000 ms goal is BELOW both floors; the wall is "
+          f"{WALL_MS/alt_floor:.1f}x the lower one")
     print()
     print(f"  tile math+bytes, MEASURED                  {tile_ms:7.3f} ms")
     print(f"  its own roof: THE SAME 8 PHASES at their")
