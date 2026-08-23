@@ -1,5 +1,15 @@
 # The shape diff against TileRT — where our 10 rendezvous come from
 
+> **RETRACTED IN PART, 2026-08-23 — see `MOE_TP_FALSIFIED.md`.** The EP→TP
+> pricing below (~1.4 ms) is WRONG on both halves. The collective term is
+> **0.000**: TP needs the identical 8-way hidden-row all-reduce, and
+> `_rnlm8_ep_fold_slice` already IS one. The work term is **~0.03 ms**, not
+> 0.388: the measured response of this phase to this exact variable is 3x
+> bytes → 1.05 µs of spread, because 4.0 experts still fits one grid-stride
+> round. And an 8-way K-split of W2 fails `static_assert(MFMA_ITERS % 4 == 0)`.
+> **The reframe in the section "The cause" and below stands; the price table
+> does not.**
+
 Offline. **No GPU run, no build.** Reads `~/TileRT` (READ-ONLY reference) and the
 closed budget in `demo/glm5/close_the_wall.py`.
 
@@ -66,7 +76,7 @@ same nine ops with two communication points because it chose a layout in which
 the producer's shard and the consumer's contraction agree, and the misalignment
 is paid once, as a fixed-size all-reduce, in the epilogue.
 
-## Pricing the EP → TP re-shard of the MoE
+## Pricing the EP → TP re-shard of the MoE  — **RETRACTED, see MOE_TP_FALSIFIED.md**
 
 Numbers from `tile_roof_by_phase.py` and `close_the_wall.py`, same log.
 
