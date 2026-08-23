@@ -245,7 +245,36 @@ reduction at all.** The only way to remove one of these rendezvous is to change
 the *sharding*, i.e. shard by the reduction axis instead and pay a split-K
 reduction — and that is `glm-w2-splitk-is-a-large-negative`, +4.12 ms.
 
-So the residual after this pass is not "find a third segment". It is that the
-layer's 10 rendezvous are load-bearing, the work between them is essential
-math, and the remaining gap to 2 ms is a **numerics / arithmetic-volume**
-problem, not a schedule problem.
+So the residual after this pass is not "find a third segment". The layer's 10
+rendezvous are load-bearing and the work between them is essential math.
+
+### Correction: the residual is NOT "arithmetic volume"
+
+The first draft of this section said the remaining gap to 2 ms is a
+numerics/arithmetic-volume problem. **That is wrong and
+`demo/glm5/close_the_wall.py` (same commit) shows why.** The measured byte
+volume already permits 2.319 ms (`roofline.py`: 1.936 HBM at busiest-rank
+routing + 0.383 measured EP latency). Volume is not the constraint.
+
+Closing the whole wall against labelled components — the 7-phase busy/spin table
+plus exactly the pieces the two segment decompositions above supply — accounts
+**10.002 of 10.619 ms**, residual 0.617 (5.8%):
+
+| class | ms/token | share | its own roof | headroom |
+|---|---|---|---|---|
+| tile math+bytes | **5.816** | 54.8% | 1.936 (HBM) | **3.880** |
+| cross-rank collective | 1.587 | 14.9% | 0.383 (EP) | 1.204 |
+| rendezvous | 1.848 | 17.4% | 0 | 1.848 |
+| task/layer boundary | 0.751 | 7.1% | 0 | 0.751 |
+| residual | 0.617 | 5.8% | 0 | 0.617 |
+
+**The tiles run at 33% of their own byte roof — 3.00x off — and that 3.880 ms is
+the largest single item in the budget by a factor of two.** It is an efficiency
+problem *inside* the tiles, consistent with
+`glm-attention-tiles-are-latency-bound-not-valu-bound` (qkv_a 68% vmcnt), not a
+FLOP or byte count.
+
+The caveat that keeps this honest: busy converts to wall at ~0.27 near this
+operating point, so 3.880 x 0.27 = **1.048 ms** even if every tile in the layer
+were simultaneously taken to the byte roof. That is still 4x the noise floor and
+the largest predicted lever left on the board — but it is 1.0 ms, not 3.9.
