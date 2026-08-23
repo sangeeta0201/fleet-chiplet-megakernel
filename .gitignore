@@ -99,3 +99,6 @@ tests/standalone/test_*
 *-hip-amdgcn-amd-amdhsa.hipfb
 # Profiler / debug tensor dumps -- 293 MB each, over GitHub's 100 MB limit
 *.pt
+
+# GLM-5 megakernel build/codegen output
+demo/glm5/permanent_output_dir*/

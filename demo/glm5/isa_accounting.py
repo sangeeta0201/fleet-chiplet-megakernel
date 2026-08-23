@@ -1,482 +1,475 @@
 #!/usr/bin/env python3
 """ITEM 2: WHERE THE CYCLES GO IN THE NON-MoE TILES -- ISA-level, static.
 
-The guide's hole in CLOSING_LEDGER.md: the ledger prices every phase by BYTES.
-Non-MoE width-corrected byte floor is 8.55 us/layer; measured non-MoE tile is
-55.9 us/layer.  6.5x.  A roofline was never going to see it, because a
-VALU-bound region has no byte floor.
+THE HOLE THIS FILLS.  CLOSING_LEDGER.md prices every phase by BYTES:
 
-This file does the accounting a roofline cannot: it disassembles the ACTUAL
-gfx950 code object that the benchmark ran and classifies every instruction in
-the attention-side tile kernels into issue classes, then converts to cycles
-with the CDNA issue model and compares against the measured tile time.
+    non-MoE width-corrected BYTE floor       8.55 us/layer
+    non-MoE MEASURED tile time              55.9  us/layer      = 6.5x
+    => 47.3 us/layer x 76 = 3.55 ms, MORE than the 2.94 ms attributed to all
+       ten rendezvous, and absent from the ledger's accounting.
 
-    ISSUE MODEL (gfx950 / CDNA3-class, one wave64 per SIMD):
-      * a CU has 4 SIMD16s.  A worker block is 256 threads = 4 wave64 = exactly
-        ONE wave per SIMD (CLAUDE.md: blockDim is 256, WARPS_PER_CTA=4).
-      * With one resident wave per SIMD there is NO other wave to co-issue,
-        so every stall is exposed and issue cycles ADD.
-      * a wave64 VALU op occupies its SIMD16 for 4 cycles.
-      * SALU/branch issue on the scalar unit, 1 cycle, and can overlap VALU.
-      * MFMA occupies the matrix core; the VALU is free during it ONLY if the
-        compiler scheduled independent VALU there.  We report both.
-      * s_waitcnt / s_barrier cost 0 issue cycles; their cost is the STALL,
-        which static analysis cannot see -- so the static number is a LOWER
-        BOUND on tile time.  That is exactly what makes it decisive: if the
-        static VALU lower bound already accounts for most of the measured
-        tile, the phase is VALU-ISSUE-BOUND and no memory schedule helps.
+MoE runs at 1.75x its byte floor -- that part was priced fairly.  The
+attention side was priced by bytes only.  A roofline cannot see a region that
+issues no loads, so the ledger could not have found this at any width or any
+bandwidth.
 
-Reads the code object next to the megakernel .so.  Offline; no GPU run.
+WHAT THIS IS.  A static accounting off the REAL gfx950 code object the
+benchmark ran, cross-checked against the per-region timings already measured
+in the kernel source.  Not a simulation and not a hardware-counter profile.
+
+WHAT IT CANNOT DO.  It cannot see stalls.  Every "issue" number is exact;
+every "stall" number is a residual against a measured time and inherits that
+measurement's error.  Where a residual is quoted it is labelled.
+
+Usage:  python3 demo/glm5/isa_accounting.py [disassembly.txt]
+Offline; no GPU run.
+
+    llvm-objdump --offloading demo/glm5/permanent_output_dir_rank0/*.so
+    llvm-objdump -d --mcpu=gfx950 <bundle> > /tmp/isa.txt
+
+------------------------------------------------------------------------------
+THREE ISA-READING TRAPS, EACH OF WHICH PRODUCED A WRONG ANSWER FIRST
+------------------------------------------------------------------------------
+1. BRANCH TARGETS ARE NOT HEX ADDRESSES.  llvm-objdump prints the gfx9
+   s_cbranch operand as an UNSIGNED DECIMAL simm16 in DWORDS.
+       target = addr + 4 + 4 * signed16(imm)
+   A first pass looked for `0x...` targets, found none, and reported "no
+   backward branch -- fully unrolled" for every kernel in the binary.  That is
+   false for most of them and it hid the two loops that matter in qkv_a.
+
+2. A SYMBOL NAME IS NOT A SYMBOL.  Several mangled names appear TWICE in the
+   bundle.  Keying a dict by name concatenates both bodies -- qkv_a reads 2910
+   instructions instead of 1455, and every derived address is garbage.  Key by
+   OCCURRENCE.
+
+3. "NO MFMA IN THE MEGAKERNEL" IS AN ARTIFACT OF NOT FOLLOWING CALLS.
+   worker_kernel / persistent_kernel contain zero
+   v_mfma_scale_f32_16x16x128_f8f6f4.  This does NOT mean the megakernel runs a
+   VALU GEMV -- the tile kernels are __noinline__ and are reached through
+   s_swappc_b64.  Resolve the calls (s_getpc_b64 + s_add_u32 + s_swappc_b64)
+   before concluding anything about what the megakernel does.  An earlier draft
+   of this file concluded from the inlined body alone that the scaled fp8 MFMA
+   was unused and that 80% of the hot loop was dequant bit-manipulation.  Both
+   claims are wrong: the loops it measured were in the DENSE PROLOGUE path,
+   and all 54 of worker_kernel's s_swappc_b64 sites resolve to named tile
+   kernels, four of which do carry the scaled MFMA.
 """
 import collections
-from collections import Counter
 import os
 import re
 import subprocess
 import sys
 
+SO = ("demo/glm5/permanent_output_dir_rank0/"
+      "test.cpython-38-x86_64-linux-gnu.so")
+BUNDLE = SO + ".0.hipv4-amdgcn-amd-amdhsa--gfx950:xnack-"
 OBJDUMP = "/opt/rocm/llvm/bin/llvm-objdump"
-OBJ = ("demo/glm5/permanent_output_dir_rank0/"
-       "test.cpython-38-x86_64-linux-gnu.so.0.hipv4-amdgcn-amd-amdhsa--"
-       "gfx950:xnack-")
-CLOCK_GHZ = 2.4          # MI355X peak engine clock
-VALU_CYC = 4             # wave64 op on a SIMD16
+ISA = "/tmp/isa.txt"
 
-# MFMA issue cycles by shape, gfx950.  Key is the K/N/M signature in the
-# mnemonic; value is cycles the matrix core is busy for one wave64 issue.
-MFMA_CYC = {
-    "16x16x32": 16, "16x16x16": 16, "16x16x8": 16, "16x16x4": 16,
-    "32x32x16": 32, "32x32x8": 32, "32x32x4": 64, "32x32x2": 64,
-    "16x16x128": 32, "32x32x64": 64,     # scaled fp8/fp4 shapes
-    "4x4x4": 8,
-}
+CLOCK_GHZ = 2.4
+VALU_CYC = 4       # wave64 op on a SIMD16
+MFMA_CYC = 32      # v_mfma_*_16x16x128_f8f6f4
 
-
-def classify(mnem):
-    """One instruction -> issue class."""
-    if mnem.startswith("v_mfma") or mnem.startswith("v_smfmac"):
-        return "MFMA"
-    if mnem.startswith("v_"):
-        return "VALU"
-    if mnem.startswith("ds_"):
-        return "LDS"
-    if (mnem.startswith("global_") or mnem.startswith("buffer_")
-            or mnem.startswith("flat_") or mnem.startswith("scratch_")):
-        return "VMEM"
-    if mnem.startswith("s_load") or mnem.startswith("s_buffer_load"):
-        return "SMEM"
-    if mnem.startswith("s_waitcnt") or mnem == "s_waitcnt_vscnt":
-        return "WAITCNT"
-    if mnem.startswith("s_barrier"):
-        return "BARRIER"
-    if (mnem.startswith("s_branch") or mnem.startswith("s_cbranch")
-            or mnem.startswith("s_setpc") or mnem.startswith("s_swappc")
-            or mnem.startswith("s_call") or mnem.startswith("s_endpgm")):
-        return "BRANCH"
-    if mnem.startswith("s_sleep") or mnem.startswith("s_nop"):
-        return "NOP/SLEEP"
-    if mnem.startswith("s_"):
-        return "SALU"
-    return "OTHER"
-
-
-def mfma_cycles(mnem):
-    m = re.search(r"(\d+x\d+x\d+)", mnem)
-    if m and m.group(1) in MFMA_CYC:
-        return MFMA_CYC[m.group(1)]
-    return 32  # conservative default; flagged in the report
-
-
-def disasm(path):
-    """symbol -> list of (addr, mnemonic, raw line).
-
-    llvm-objdump for amdgcn emits  `\tMNEMONIC operands   // ADDR: ENCODING`
-    -- the address is in the trailing comment, not at the start of the line.
-    Branch targets appear as `<symbol+0xNNN>` after the encoding.
-    """
-    out = subprocess.run([OBJDUMP, "-d", "--mcpu=gfx950", path],
-                         capture_output=True, text=True).stdout
-    syms = collections.OrderedDict()
-    cur = None
-    symhdr = re.compile(r"^[0-9a-f]+ <(.+)>:")
-    line = re.compile(r"^\t(\S+)(.*?)//\s*([0-9A-F]+):")
-    for ln in out.split("\n"):
-        m = symhdr.match(ln)
-        if m:
-            cur = m.group(1)
-            syms[cur] = []
-            continue
-        if cur is None:
-            continue
-        m = line.match(ln)
-        if m:
-            syms[cur].append((int(m.group(3), 16), m.group(1), ln))
-    return syms
-
-
-def loops(insns):
-    """Innermost backward-branch loop bodies.
-
-    A backward branch's target is printed as `<sym+0xNNN>` in the comment; the
-    symbol base is recovered from the first instruction's address minus its
-    own offset, so we resolve targets without a symbol table.
-    """
-    if not insns:
-        return []
-    addr2i = {a: i for i, (a, _m, _l) in enumerate(insns)}
-    base = None
-    tgtre = re.compile(r"<[^<>]*\+0x([0-9a-f]+)>")
-    # recover the symbol base: any line with a +0x target inside this symbol
-    for a, _m, ln in insns:
-        t = tgtre.search(ln)
-        if t:
-            # candidate base = a - (offset of a).  We do not know a's offset,
-            # so instead assume the symbol starts at the first insn.
-            base = insns[0][0]
-            break
-    if base is None:
-        return []
-    found = []
-    for i, (a, m, ln) in enumerate(insns):
-        if not m.startswith("s_cbranch") and not m.startswith("s_branch"):
-            continue
-        t = tgtre.search(ln)
-        if not t:
-            continue
-        tgt = base + int(t.group(1), 16)
-        if tgt < a and tgt in addr2i:
-            found.append((addr2i[tgt], i))
-    found.sort(key=lambda p: p[1] - p[0])
-    return found
-
-
-def account(insns, label, trip=1):
-    h = collections.Counter()
-    cyc = collections.Counter()
-    for _a, m, _l in insns:
-        c = classify(m)
-        h[c] += 1
-        if c == "VALU":
-            cyc[c] += VALU_CYC
-        elif c == "MFMA":
-            cyc[c] += mfma_cycles(m)
-    n = len(insns)
-    return dict(label=label, n=n, hist=h, cyc=cyc, trip=trip)
-
-
-def report(rows, title):
-    print("=" * 100)
-    print(title)
-    print("=" * 100)
-    print(f"{'region':<44}{'insns':>7}{'VALU':>7}{'MFMA':>6}{'VMEM':>6}"
-          f"{'LDS':>5}{'SALU':>6}{'wait':>6}{'bar':>5}"
-          f"{'VALUcyc':>9}{'MFMAcyc':>9}")
-    for r in rows:
-        h, c = r["hist"], r["cyc"]
-        print(f"{r['label']:<44}{r['n']:>7}{h['VALU']:>7}{h['MFMA']:>6}"
-              f"{h['VMEM']:>6}{h['LDS']:>5}{h['SALU']:>6}{h['WAITCNT']:>6}"
-              f"{h['BARRIER']:>5}{c['VALU']:>9}{c['MFMA']:>9}")
-    print()
-
-
-MEGA = "_Z17persistent_kernelN6mirage7runtime13RuntimeConfigE"
-
-
-def innermost(ins):
-    """Innermost loop bodies, merged across a loop's multiple exit branches."""
-    lps = sorted(set(loops(ins)))
-    inr = [(a, b) for a, b in lps
-           if not any((c, d) != (a, b) and a <= c and d <= b for c, d in lps)]
-    inr.sort()
-    out = []
-    for a, b in inr:
-        if out and a <= out[-1][1]:
-            out[-1] = (out[-1][0], max(out[-1][1], b))
-        else:
-            out.append((a, b))
-    return out
-
-
-def valu_kind(m):
-    if m.startswith("v_mfma"):
-        return "MFMA"
-    if (m.startswith("v_and") or m.startswith("v_or") or m.startswith("v_xor")
-            or m.startswith("v_lshl") or m.startswith("v_lshr")
-            or m.startswith("v_ashr") or m.startswith("v_bfe")
-            or m.startswith("v_perm") or m.startswith("v_not")):
-        return "bit manipulation"
-    if m.startswith("v_cvt") or "pk_fp8" in m or "pk_bf16" in m:
-        return "convert/quant"
-    if m.startswith("v_cmp") or "cndmask" in m:
-        return "select/compare"
-    if (m.startswith("v_exp") or m.startswith("v_rcp") or m.startswith("v_rsq")
-            or m.startswith("v_log") or m.startswith("v_sqrt")):
-        return "transcendental"
-    if ("mul_lo_u32" in m or "mul_hi_u32" in m or "mad_u64" in m
-            or "lshl_add_u64" in m or "add_co" in m or "addc_co" in m):
-        return "64-bit int addr math"
-    if (m.startswith("v_mov") or m.startswith("v_readlane")
-            or m.startswith("v_writelane") or m.startswith("v_readfirstlane")
-            or m.startswith("v_accvgpr") or "permute" in m):
-        return "data movement"
-    if "_f32" in m or "_f64" in m or "_f16" in m:
-        return "float arithmetic"
-    return "integer arithmetic"
-
-
-def megakernel(syms):
-    """The accounting that matters: persistent_kernel, which is what RUNS."""
-    ins = syms.get(MEGA)
-    if not ins:
-        print("no persistent_kernel symbol")
-        return
-    print("=" * 100)
-    print("THE MEGAKERNEL (_Z17persistent_kernel) -- THIS is the code that runs")
-    print("=" * 100)
-    mf = collections.Counter(m for _a, m, _l in ins if m.startswith("v_mfma"))
-    print(f"  {len(ins)} instructions.  MFMA opcodes present:")
-    for k, v in mf.most_common():
-        print(f"    {v:>5}  {k}")
-    print("""
-  *** RETRACTED 2026-08-23, SAME DAY, BY THE CHECK THAT SHOULD HAVE COME FIRST.
-      An earlier version of this file reported "the megakernel contains no
-      scaled fp8 MFMA" because _Z17persistent_kernel has only bf16 MFMA.  THAT
-      WAS A SYMBOL-BOUNDARY ARTIFACT, NOT A FINDING.  The phase kernels are
-      __device__ __noinline__, so they are separate symbols that persistent_kernel
-      reaches through s_swappc_b64 (168 in the object, 61 in persistent_kernel
-      itself), and gang_mla_full_layer_fused_kernel_mi300 is outlined the same
-      way.  Counting MFMA "in the megakernel" by counting them inside one symbol
-      counts the inliner, not the machine.  This is exactly the failure
-      glm-gemm-isa-matches-gpt-oss-and-is-ahead warns about from the other
-      direction.  The census below is per PHASE SYMBOL and is the real one. ***
-
-  See phase_accounting() for the table that replaces it.
-""")
-    v = collections.Counter(valu_kind(m) for _a, m, _l in ins
-                            if m.startswith("v_"))
-    tot = sum(v.values())
-    print(f"  {'VALU category (STATIC, whole symbol)':<32}{'insns':>8}{'share':>8}")
-    for k, n in v.most_common():
-        print(f"  {k:<32}{n:>8}{100*n/tot:>7.1f}%")
-    print("""
-  Static counts over a 27k-instruction symbol are NOT dynamic cycles.  The
-  dynamic answer is in the innermost loop bodies below, which is where trip
-  count multiplies.
-""")
-
-    print("=" * 100)
-    print("INNERMOST LOOP BODIES OF THE MEGAKERNEL, by kind")
-    print("=" * 100)
-    rows = []
-    for a, b in innermost(ins):
-        body = ins[a:b + 1]
-        c = collections.Counter(m for _x, m, _l in body)
-        h = collections.Counter(classify(m) for _x, m, _l in body)
-        fma = sum(n for k, n in c.items()
-                  if k.startswith(("v_fma", "v_fmac", "v_mac", "v_pk_fma",
-                                   "v_pk_mul", "v_pk_add", "v_dot")))
-        bit = sum(n for k, n in c.items() if valu_kind(k) == "bit manipulation")
-        cvt = sum(n for k, n in c.items() if valu_kind(k) == "convert/quant")
-        rows.append((ins[a][0], len(body), h, fma, bit, cvt))
-    gemv = [r for r in rows if r[3] >= 4 and r[2]["VMEM"] >= 1
-            and not r[2]["MFMA"] and r[1] < 100]
-    print("  A. THE fp8 GEMV k-LOOPS (float FMA + VMEM, no MFMA):")
-    print(f"  {'addr':>9}{'insns':>7}{'VALU':>6}{'FMA':>5}{'bitmanip':>10}"
-          f"{'cvt':>5}{'VMEM':>6}{'VALUcyc':>9}{'useful':>8}")
-    for a, n, h, fma, bit, cvt in sorted(gemv):
-        print(f"  {a:>9x}{n:>7}{h['VALU']:>6}{fma:>5}{bit:>10}{cvt:>5}"
-              f"{h['VMEM']:>6}{h['VALU']*VALU_CYC:>9}"
-              f"{100*fma/max(1,h['VALU']):>7.0f}%")
-    print("""
-  READ THE 'useful' COLUMN.  In the widest GEMV k-loop 8 of 40 VALU ops are the
-  actual multiply-accumulate; 19 are BIT MANIPULATION (unpacking fp8/mxfp4 out
-  of packed dwords) and 4 are converts.  80% of the VALU issue slots in the
-  hot loop of the GEMV path are spent turning bytes into floats.  Per
-  phase_accounting() below, the GEMV path is W_UK, W_UV and o_proj -- NOT
-  qkv_a/q_b/W13/W2, which do use the scaled MFMA and have a different problem.
-
-  THIS IS WHERE THE 3.55 ms LIVES, and it is a VALU-issue cost, not a memory
-  cost -- so no prefetch, no L2 hint and no wider load touches it.  Two levers
-  follow, and ONLY these two:
-    (i)  FEWER UNPACK OPS PER ELEMENT.  19 bit ops per 8 FMAs is far above what
-         v_perm_b32 needs to split a dword into 4 scaled bytes.  Note the
-         makespan rule (demo/glm5/MAKESPAN_RULE.md): a cut confined to ONE
-         phase is regime A and capped at 0.000-1.199 us/layer, so this only
-         pays if the SAME cut lands across phases -- which a shared unpack
-         helper does, since W_UK, W_UV and o_proj share this loop.
-    (ii) LET THE MATRIX CORE DO THE DEQUANT.  v_mfma_scale_f32_16x16x128_f8f6f4
-         decodes fp8 in hardware.  At M=1 it wastes 15/16 of the tile, but the
-         matrix core is IDLE during every GEMV, and it would delete the unpack
-         VALU entirely.  That trade has never been priced on this branch.
-
-  NOT YET MEASURED.  Everything above is static ISA; the trip counts that turn
-  it into ms are the next step, and then an A/B.  Do not quote a ms number for
-  this until that lands.
-""")
-    top = sorted(rows, key=lambda r: -r[1])[:6]
-    print("  B. THE LARGEST INNERMOST LOOPS (VALU-only, no MFMA at all):")
-    print(f"  {'addr':>9}{'insns':>7}{'VALU':>6}{'VALUcyc':>9}   likely identity")
-    ID = {0xaf4f0: "router TopK sort (36x ds_bpermute, cmp/cndmask/lshr)",
-          0xad794: "sigmoid block (32x v_exp_f32 + v_ldexp + fmac)",
-          0x9d13c: "64-bit index math (v_mul_lo/hi_u32 pairs)",
-          0x9d668: "64-bit index math (v_mul_lo/hi_u32 pairs)",
-          0x9db30: "64-bit index math (v_mul_lo/hi_u32 pairs)",
-          0xae22c: "sigmoid + bf16 convert"}
-    for a, n, h, fma, bit, cvt in top:
-        print(f"  {a:>9x}{n:>7}{h['VALU']:>6}{h['VALU']*VALU_CYC:>9}   "
-              f"{ID.get(a, '?')}")
-    print()
-
-
-def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else OBJ
-    if not os.path.exists(path):
-        sys.exit(f"no code object at {path}\n"
-                 "  build it: run the benchmark once, then the file appears "
-                 "next to permanent_output_dir_rank0/*.so")
-    syms = disasm(path)
-    print(f"code object: {path}")
-    print(f"symbols: {len(syms)}")
-    print()
-
-    # The attention-side tile kernels, by their template signature.
-    WANT = [
-        ("qkv_a  (rmsnorm+linear+kvupd, N=2048)",
-         "gang_rmsnorm_linear_mxfp8_bias_mla_kvupd_kernel"),
-        ("q_b / W_UK / W_UV  (rmsnorm+linear)",
-         "gang_rmsnorm_linear_mxfp8_bias_kernel"),
-        ("o_proj  (gemv mxfp8)", "gang_gemv_mxfp8_kernel"),
-        ("MLA decode (absorbed)", "mla_decode_absorbed"),
-        ("router (rmsnorm+linear+bias+topk)",
-         "gang_rmsnorm_linear_bias_topk_kernel"),
-        ("MoE W13", "gang_moe_w13_linear_mxfp8_kernel"),
-        ("MoE W2", "gang_moe_w2_linear_mxfp8_kernel"),
-    ]
-    rows = []
-    seen = set()
-    for label, needle in WANT:
-        for s in syms:
-            if needle in s and s not in seen and len(syms[s]) > 40:
-                seen.add(s)
-                # shorten the mangled name to its template args
-                targ = re.search(r"I(.+?)EEEv", s)
-                tag = (targ.group(1)[:22] if targ else "")
-                rows.append(account(syms[s], f"{label.split('(')[0].strip()}"
-                                             f" <{tag}>"))
-                break
-    report(rows, "STANDALONE TILE KERNELS (the UNFUSED dense-prologue path, "
-                 "NOT what the megakernel runs)")
-
-    megakernel(syms)
-    phase_accounting(syms)
-
-    # --- the part that decides it: the innermost loop of each kernel --------
-    print("=" * 100)
-    print("(reference) INNERMOST LOOPS OF THE UNFUSED STANDALONE KERNELS")
-    print("=" * 100)
-    for label, needle in WANT:
-        sym = next((s for s in syms if needle in s and len(syms[s]) > 40),
-                   None)
-        if not sym:
-            continue
-        ins = syms[sym]
-        lp = loops(ins)
-        if not lp:
-            print(f"{label:<44} no backward branch (fully unrolled)")
-            continue
-        i0, i1 = lp[0]
-        body = ins[i0:i1 + 1]
-        r = account(body, label)
-        h, c = r["hist"], r["cyc"]
-        print(f"{label:<44}{len(body):>6} insns  "
-              f"VALU {h['VALU']:>4} MFMA {h['MFMA']:>3} VMEM {h['VMEM']:>3} "
-              f"LDS {h['LDS']:>3} wait {h['WAITCNT']:>3}  "
-              f"-> {c['VALU']:>5} VALU cyc + {c['MFMA']:>5} MFMA cyc")
-    print()
-
-
-
+HDR = re.compile(r"^([0-9a-f]+) <(.+)>:")
+INS = re.compile(r"^\t([a-z][a-z0-9_]*)\s*(.*?)\s*//\s*([0-9A-F]+):")
+LD = ("buffer_load", "global_load", "flat_load", "scratch_load")
+VM = LD + ("buffer_store", "global_store", "flat_store", "scratch_store",
+           "buffer_atomic", "global_atomic", "tbuffer_", "image_")
 
 # ---------------------------------------------------------------------------
-# THE ITEM-2 TABLE.  Per PHASE SYMBOL, not per inlining boundary.
+# The leaves of the fused-layer call graph, i.e. the 76-layer decode phases.
+# us/layer are the board / SP numbers, quoted -- not derived here.
 # ---------------------------------------------------------------------------
+LEAF = [
+    ("qkv_a",        0x030dc8, 14.8,  "SP4[0]; source comment 13.246 us of tile"),
+    ("kvupd inner",  0x0333f0, None,  "inside gang_..._mla_kvupd_kernel"),
+    ("latent2cache", 0x032dcc, None,  "inside gang_..._mla_kvupd_kernel"),
+    ("W_UK/W_UV",    0x034224, 2.0,   "board S28->S29 share, per stage"),
+    ("merge",        0x0361fc, 4.0,   "board S21->S23 share"),
+    ("o_proj",       0x036eac, 6.7,   "board S29->S30"),
+    ("router",       0x0392a0, 12.9,  "S31->S32, 54% poll / 46% work"),
+    ("topk_sigmoid", 0x037d20, None,  "inside router"),
+    ("mla_decode",   0x034894, 18.3,  "board S19->S21, 16.6 of it spin"),
+    ("MoE W13",      0x03a39c, 13.06, "SP3[4]"),
+    ("MoE W2",       0x03aeb8, 13.05, "SP3[6]"),
+]
 
-PHASE_SYMS = [
-    ("qkv_a / q_b", "gang_rmsnorm_linear_mxfp8_bias_k", "scaled fp8 MFMA"),
-    ("W_UK,W_UV,o_proj(fp8)", "gang_gemv_mxfp8_kernel", "NO MFMA -- VALU dot"),
-    ("o_proj (fp4)", "gang_gemv_mxfp4_kernel", "NO MFMA -- VALU dot"),
-    ("W13", "gang_moe_w13_linear_mxfp8", "scaled fp8 MFMA"),
-    ("W2", "gang_moe_w2_linear_mxfp8", "scaled fp8 MFMA"),
-    ("MLA decode", "mla_decode_absorbed", "bf16 MFMA"),
+# qkv_a's tile, MEASURED, from the MPK_SUBPHASE_TIMING block in
+# gang_rmsnorm_linear_mxfp8_bias_mi300.cuh (divided by [1][5] = 1828800 tiles).
+# Quoted, with this file's ISA evidence attached to each row.
+QKVA = [
+    ("resolve + EP fold + RMSNorm rcp + LDS stage", 6119, 46.2,
+     "straight line 0x30dc8-0x32014: 55 loads, MLP 18.3, 632 VALU",
+     "L2 LATENCY -- 96 KB/tile at 15.7 GB/s per CU of ~52 available"),
+    ("depth-4 weight prefetch fill", 841, 6.3,
+     "0x327f0-0x32884: 8 hoisted loads, 4 waitcnt",
+     "VMEM issue + first-use latency"),
+    ("FP8 quantizer", 851, 6.4,
+     "LOOP 0x322b8..0x327f0 x~2.5: 243 insn, 206 VALU, ZERO VMEM, 17 LDS",
+     "VALU ISSUE -- 824 issue cycles/trip, no byte floor at all"),
+    ("MFMA K-loop + epilogue", 5435, 41.0,
+     "LOOP 0x32884..0x32bcc x12 (MFMA_ITERS 48 / depth 4): "
+     "149 insn, 94 VALU, 4 MFMA, 12 VMEM",
+     "35% VALU issue, 12% MFMA busy, ~53% vmcnt stall"),
 ]
 
 
-def _unpackish(m):
-    return m.startswith(("v_and", "v_or", "v_lshl", "v_lshr", "v_bfe", "v_perm",
-                         "v_ashr", "v_xor", "v_bfi", "v_alignb", "v_pack"))
+def cl(op):
+    if op.startswith(("v_mfma", "v_smfmac")):
+        return "MFMA"
+    if op.startswith("v_"):
+        return "VALU"
+    if op.startswith("ds_"):
+        return "LDS"
+    if op.startswith(VM):
+        return "VMEM"
+    if op.startswith(("s_load", "s_buffer_load")):
+        return "SMEM"
+    if op.startswith("s_waitcnt"):
+        return "WAIT"
+    if op.startswith("s_barrier"):
+        return "BAR"
+    if op.startswith(("s_branch", "s_cbranch")):
+        return "BR"
+    if op.startswith("s_"):
+        return "SALU"
+    return "OTH"
 
 
-def _fmaish(m):
-    return m.startswith(("v_fma", "v_mac", "v_fmac", "v_dot", "v_mul_f",
-                         "v_add_f", "v_pk_fma", "v_pk_mul", "v_pk_add"))
+def ensure(path):
+    if os.path.exists(path) and os.path.getsize(path) > (1 << 20):
+        return path
+    if not os.path.exists(BUNDLE):
+        subprocess.run([OBJDUMP, "--offloading", SO], check=True,
+                       capture_output=True)
+    with open(path, "w") as f:
+        subprocess.run([OBJDUMP, "-d", "--mcpu=gfx950", BUNDLE], check=True,
+                       stdout=f)
+    return path
 
 
-def phase_accounting(syms):
-    """The guide's ask: issue-class census of the tile that each phase runs."""
-    print("=" * 108)
-    print("ITEM 2: ISSUE-CLASS CENSUS PER PHASE SYMBOL (largest instantiation)")
-    print("static instruction counts, NOT dynamic cycles -- ratios are the claim")
-    print("=" * 108)
-    hdr = (f"{'phase':24}{'insn':>6}{'VALU%':>7}{'MFMA':>5}{'VMEM':>5}{'LDS':>5}"
-           f"{'SALU':>5}{'WAIT':>5} |{'unpack':>7}{'cvt':>5}{'fma':>5}  matrix path")
-    print(hdr)
-    print("-" * 108)
-    for label, pat, path in PHASE_SYMS:
-        cands = [(k, v) for k, v in syms.items() if pat in k]
-        if not cands:
-            print(f"{label:24}  MISSING")
+def load(path):
+    """-> list of (start_addr, mangled_name, insns), ONE ENTRY PER OCCURRENCE."""
+    occ, cur = [], None
+    for ln in open(path, errors="ignore"):
+        m = HDR.match(ln)
+        if m:
+            cur = (int(m.group(1), 16), m.group(2), [])
+            occ.append(cur)
             continue
-        _, v = max(cands, key=lambda x: len(x[1]))
-        c = Counter(classify(m) for _, m, _ in v)
-        valu = [m for _, m, _ in v if classify(m) == "VALU"]
-        up = sum(1 for m in valu if _unpackish(m))
-        cv = sum(1 for m in valu if "cvt" in m)
-        fm = sum(1 for m in valu if _fmaish(m))
-        print(f"{label:24}{len(v):6}{100.0*c['VALU']/len(v):6.0f}%{c['MFMA']:5}"
-              f"{c['VMEM']:5}{c['LDS']:5}{c['SALU']:5}{c['WAITCNT']:5} |"
-              f"{up:7}{cv:5}{fm:5}  {path}")
+        m = INS.match(ln)
+        if m and cur:
+            cur[2].append((int(m.group(3), 16), m.group(1), m.group(2)))
+    occ = [o for o in occ if o[2]]
+    occ.sort()
+    return occ
+
+
+def callees(insns):
+    """Resolve s_getpc_b64 / s_add_u32 / s_swappc_b64 PC-relative call chains."""
+    pend, tg = {}, collections.Counter()
+    for a, m, ops in insns:
+        if m == "s_getpc_b64":
+            r = re.match(r"s\[(\d+):(\d+)\]", ops.strip())
+            if r:
+                pend[r.group(1)] = (a + 4, None)
+        elif m == "s_add_u32":
+            r = re.match(r"s(\d+),\s*s(\d+),\s*(0x[0-9a-f]+|-?\d+)", ops.strip())
+            if r and r.group(1) == r.group(2) and r.group(1) in pend:
+                b, _ = pend[r.group(1)]
+                pend[r.group(1)] = (b, (b + int(r.group(3), 0)) & 0xffffffff)
+        elif m == "s_swappc_b64":
+            r = re.search(r"s\[(\d+):(\d+)\]\s*$", ops.strip())
+            if r and r.group(1) in pend and pend[r.group(1)][1] is not None:
+                tg[pend[r.group(1)][1]] += 1
+    return tg
+
+
+def backedges(insns):
+    """simm16-in-dwords, printed unsigned decimal.  See trap 1."""
+    out = []
+    for a, op, ops in insns:
+        if not op.startswith(("s_branch", "s_cbranch")):
+            continue
+        m = re.match(r"^(-?\d+)", ops.strip())
+        if not m:
+            continue
+        s = int(m.group(1))
+        if s > 32767:
+            s -= 65536
+        t = a + 4 + 4 * s
+        if t < a:
+            out.append((t, a, op))
+    return out
+
+
+def loops(insns):
+    d = {}
+    for t, a, _op in backedges(insns):
+        body = [x for x in insns if t <= x[0] <= a]
+        if len(body) < 6:
+            continue
+        if t not in d or len(body) > len(d[t][1]):
+            d[t] = (a, body)
+    return [(t, d[t][0], d[t][1]) for t in sorted(d)]
+
+
+def latency_scan(insns):
+    """Exposed-latency structure.
+
+    full   = s_waitcnt vmcnt(0) that actually drains >=1 outstanding load, i.e.
+             one full memory latency exposed with nothing to hide it.
+    serial = longest run of (single load -> vmcnt(0)) pairs, i.e. a dependent
+             POINTER CHASE.  n links cost n x latency, back to back.
+    mlp    = mean loads retired per waitcnt = memory-level parallelism.
+             MI355X needs >= 8 in flight to reach HBM bandwidth
+             (mi355x-memory-hierarchy-bandwidth).
+    """
+    out = full = part = chain = maxchain = since = 0
+    drained = []
+    for _a, op, ops in insns:
+        if op.startswith(LD):
+            out += 1
+            since += 1
+        elif op.startswith("s_waitcnt") and "vmcnt" in ops:
+            m = re.search(r"vmcnt\((\d+)\)", ops)
+            n = int(m.group(1)) if m else 0
+            if out > n:
+                drained.append(out - n)
+                if n == 0:
+                    full += 1
+                    if since == 1:
+                        chain += 1
+                        maxchain = max(maxchain, chain)
+                    else:
+                        chain = 0
+                else:
+                    part += 1
+                    chain = 0
+                out, since = n, 0
+    return dict(loads=sum(1 for _a, m, _o in insns if m.startswith(LD)),
+                full=full, part=part, serial=maxchain,
+                mlp=(sum(drained) / len(drained) if drained else 0.0))
+
+
+def short(n):
+    n = re.sub(r"^_ZN6kernel\d+", "", n)
+    n = re.sub(r"^_Z\d+", "", n)
+    return n.split("I")[0] if n[:1].islower() else n
+
+
+# ---------------------------------------------------------------------------
+
+
+def call_graph(occ, byaddr):
+    print("=" * 100)
+    print("1. THE DEVICE CALL GRAPH -- the tile kernels are __noinline__ CALLEES")
+    print("=" * 100)
+    seen = set()
+
+    def walk(a, d=0):
+        o = byaddr.get(a)
+        if o is None or "ockl" in o[1] or "assert" in o[1]:
+            return
+        mf = sum(1 for _x, m, _p in o[2] if m.startswith("v_mfma"))
+        sc = sum(1 for _x, m, _p in o[2] if m.startswith("v_mfma_scale"))
+        print(f"  {'  ' * d}{a:#08x} {len(o[2]):>5}i  mfma={mf:<4}"
+              f"{'scaled-fp8' if sc else '':<11} {short(o[1])[:56]}")
+        if a in seen or d > 3:
+            return
+        seen.add(a)
+        for t, _n in sorted(callees(o[2]).items(), key=lambda x: -x[1]):
+            walk(t, d + 1)
+
+    root = [o for o in occ if o[1].startswith("_Z13worker_kernel")]
+    if root:
+        walk(root[0][0])
     print("""
-READ THIS TABLE AS TWO SEPARATE PROBLEMS, NOT ONE:
+  READ THIS BEFORE ANY CLAIM ABOUT WHAT THE MEGAKERNEL DOES.  The two branches
+  under worker_kernel are the 76-layer FUSED path
+  (gang_mla_full_layer_fused_kernel_mi300, which calls all ten phase kernels)
+  and the 3-layer UNFUSED DENSE PROLOGUE
+  (glm-dense-prologue-is-the-unfused-attention-path).  Only the first is the
+  decode loop.
 
-  (1) qkv_a / q_b DO use the scaled fp8 MFMA -- and are still 74% VALU.  Eight
-      v_mfma_scale_f32_16x16x128_f8f6f4 carry the whole GEMM; the other ~2150
-      VALU ops (882 bit manipulation + 566 float) are the RMSNorm and the
-      activation quantize.  That is the ISA confirmation of
-      glm-qkva-tile-is-41pct-redundant-prologue and
-      glm-quant-prologue-is-not-load-issue-bound: the prologue is issue cost,
-      it touches almost no HBM, and it is most of the tile.
-
-  (2) W_UK, W_UV AND o_proj HAVE NO MATRIX INSTRUCTION AT ALL.  They run
-      gang_gemv_mxfp8_kernel / gang_gemv_mxfp4_kernel, which are VALU dot
-      products: 516 v_cvt_scalef32_pk_bf16_fp8 + 536 float FMA + 392 bit ops,
-      zero v_mfma.  o_proj is a top-5 board line and was priced at 76% of HBM
-      peak (glm-oproj-is-at-76pct-of-hbm-peak) -- by BYTES.  Its ISSUE cost was
-      never on the board at all.
-
-  This is the byte-pricing hole, located.  The MoE (W13/W2) is fine: 8 scaled
-  MFMA against ~600 VALU of address math and staging.
-
-  THE CHEAPEST TEST OF (2) ALREADY EXISTS IN THE TREE AND IS COMPILED OFF.
-  gang_oproj_router_fused_mi300.cuh:444 and gang_mla_full_layer_fused_mi300.cuh
-  guard a `WUV_USE_MFMA` branch on -DMPK_WUV_MFMA that routes W_UV to
-  gang_linear_mxfp8_kernel (the _gang_mfma_f8xf8 path) instead of the GEMV.
-  One -D, one rebuild, one A/B -- that is the next measurement, and it is a
-  ONE-VARIABLE change.
-
-  CAVEAT, STATED UP FRONT: static counts are not cycles.  These ratios say what
-  the tile is MADE of; they do not say how many times each loop trips.  No ms
-  number is claimed from this table.
+  The scaled fp8 MFMA IS used: qkv_a, q_b, MoE W13 and MoE W2 each carry 4
+  v_mfma_scale_f32_16x16x128_f8f6f4 per k-loop trip.  W_UK, W_UV, merge and
+  o_proj are gang_gemv_mxfp8/mxfp4_kernel and carry NONE -- they dequantize on
+  the VALU and accumulate with v_dot2c_f32_bf16.  That is correct for M=1 (an
+  MFMA tile would waste 15/16 of the matrix core) and it is why the
+  megakernel's own inlined body shows only bf16 16x16x16, which are the MLA
+  decode's.  This CONFIRMS rather than contradicts
+  glm-gemm-isa-matches-gpt-oss-and-is-ahead.
 """)
+
+
+def leaves(byaddr):
+    print("=" * 100)
+    print("2. PER-LEAF STATIC COMPOSITION AND LOOP STRUCTURE")
+    print("=" * 100)
+    print(f"  {'kernel':<14}{'us/lyr':>7}{'insns':>7}{'loops':>6}{'MFMA':>6}"
+          f"{'VALU':>6}{'VMEM':>6}{'LDS':>5}{'SALU':>6}{'WAIT':>5}"
+          f"{'VALU%':>7}{'VALUcyc':>9}")
+    for nm, a, us, _src in LEAF:
+        o = byaddr.get(a)
+        if not o:
+            continue
+        ins = o[2]
+        h = collections.Counter(cl(m) for _x, m, _p in ins)
+        print(f"  {nm:<14}{(us if us else '-'):>7}{len(ins):>7}"
+              f"{len(loops(ins)):>6}{h['MFMA']:>6}{h['VALU']:>6}{h['VMEM']:>6}"
+              f"{h['LDS']:>5}{h['SALU']:>6}{h['WAIT']:>5}"
+              f"{100 * h['VALU'] / len(ins):>6.0f}%{h['VALU'] * VALU_CYC:>9}")
+    print()
+    print("  LOOP BODIES (trip counts from the template args; qkv_a below):")
+    for nm, a, _us, _src in LEAF:
+        o = byaddr.get(a)
+        if not o:
+            continue
+        lp = loops(o[2])
+        if not lp:
+            print(f"    {nm:<14} FULLY UNROLLED -- no backward branch")
+            continue
+        for t, e, body in lp:
+            h = collections.Counter(cl(m) for _x, m, _p in body)
+            print(f"    {nm:<14}[{t:#08x}..{e:#08x}] n={len(body):>4} "
+                  f"VALU={h['VALU']:>4} MFMA={h['MFMA']:>2} VMEM={h['VMEM']:>3} "
+                  f"LDS={h['LDS']:>3} -> {h['VALU'] * VALU_CYC:>5} VALU cyc"
+                  f" + {h['MFMA'] * MFMA_CYC:>4} MFMA cyc")
+    print()
+
+
+def qkva():
+    print("=" * 100)
+    print("3. qkv_a's TILE -- THE ACCOUNTING ITEM 2 ASKED FOR")
+    print("=" * 100)
+    tot = sum(r[1] for r in QKVA)
+    print("  measured tile 13246 ns; phase 32.40 us/layer = 14.83 tile"
+          " + 17.57 EP peer wait\n")
+    print(f"  {'region':<42}{'ns':>7}{'%':>7}  bound by")
+    for lab, ns, pc, isa, bound in QKVA:
+        print(f"  {lab:<42}{ns:>7}{pc:>6.1f}%  {bound}")
+        print(f"  {'':<42}{'':>7}{'':>7}  ISA: {isa}")
+    print(f"  {'TOTAL':<42}{tot:>7}\n")
+    print("""  ROLLED UP INTO THE CATEGORIES ITEM 2 NAMED, as % of tile cycles:
+
+      VALU issue        ~21%    quantizer 851 ns (100% VALU, 0 VMEM)
+                                + k-loop VALU 12 x 94 x 4 cyc = 1880 ns
+      MFMA issue         ~5%    12 x 4 x 32 cyc = 640 ns; the matrix core is
+                                IDLE 88% of the tile
+      vmcnt wait        ~68%    6119 resolve (L2 latency) + 841 fill
+                                + ~2900 k-loop residual
+      lgkmcnt / LDS      ~5%    61 ds ops, all in the quantizer and k-loop
+      s_barrier          ~0%    6 static, none inside a loop
+      -----------------------------------------------------------------------
+  THE GUIDE'S HYPOTHESIS IS HALF RIGHT, AND THE WRONG HALF IS THE EXPENSIVE
+  ONE.  The quant prologue IS a pure-VALU region with no byte floor -- the loop
+  at 0x322b8 has 206 VALU and LITERALLY ZERO memory instructions, so no
+  roofline at any width could ever have priced it.  Confirmed at ISA level.
+
+  But it is 6.4% of the tile, not 41%.  glm-qkva-tile-is-41pct-redundant-
+  prologue is counting the RESOLVE + EP FOLD + RMSNorm + LDS stage, which is
+  46.2% -- and that region issues 55 loads and is L2-LATENCY-bound, at
+  15.7 GB/s per CU against ~52 GB/s of per-CU L2 share.  It reads the same
+  96 KB in all 186 tiles.
+
+  So the 3.55 ms above the byte floor is MEMORY LATENCY, not VALU issue and
+  not bandwidth.  "If the answer is VALU-bound, the fix is fewer VALU ops per
+  tile" does not follow from the data: fewer VALU ops buys at most the 21%.
+""")
+
+
+def latency(byaddr):
+    print("=" * 100)
+    print("4. EXPOSED-LATENCY STRUCTURE -- the actual shape of the 68%")
+    print("=" * 100)
+    print(f"  {'kernel':<14}{'us/lyr':>7}{'loads':>7}{'vmcnt(0)':>10}"
+          f"{'partial':>9}{'serial':>8}{'MLP':>7}")
+    print(f"  {'':<14}{'':>7}{'':>7}{'full drain':>10}{'drain':>9}"
+          f"{'chain':>8}{'':>7}")
+    for nm, a, us, _src in LEAF:
+        o = byaddr.get(a)
+        if not o:
+            continue
+        s = latency_scan(o[2])
+        print(f"  {nm:<14}{(us if us else '-'):>7}{s['loads']:>7}"
+              f"{s['full']:>10}{s['part']:>9}{s['serial']:>8}{s['mlp']:>7.1f}")
+    print("""
+  'serial chain' is the longest run of (ONE load -> s_waitcnt vmcnt(0)), i.e. a
+  DEPENDENT POINTER CHASE: n links cost n full memory latencies, back to back,
+  with nothing to overlap them.
+
+  THE ROUTER HAS A 17-LINK CHAIN.  Eighteen full drains, seventeen of them
+  single-load.  At an L2 hit (~300 cyc) that is ~5100 cycles = 2.1 us of the
+  router's 12.9 us/layer; at an HBM miss it is the whole phase.  This is the
+  worst memory-level-parallelism structure in the layer by a wide margin and it
+  is not in the ledger.
+
+  o_proj has a 3-link chain at tile entry and then pipelines properly -- the
+  main v_dot2c body issues 8-10 loads before draining.  (An earlier read of
+  this file's own mean-MLP column called o_proj "MLP 1.2, waits after every
+  load"; that was the entry chain dominating the mean.  Read the chain column,
+  not the mean.)  W_UK/W_UV and merge do sit at MLP 1.0 throughout, against
+  the >= 8 in flight MI355X needs for bandwidth.
+
+  qkv_a's resolve is the ONE well-pipelined region on the attention side, at
+  MLP 18.3, and it still reaches only 30% of its per-CU L2 share.  That is the
+  ceiling this class of fix runs into.
+""")
+
+
+def verdict():
+    print("=" * 100)
+    print("5. WHAT THIS LICENSES -- READ WITH demo/glm5/makespan_predictor.py")
+    print("=" * 100)
+    print("""
+  NOTHING SINGLE-PHASE.  The regime-A ceilings say a cut inside one phase,
+  with its rendezvous surviving, is capped at max_all - max_outside:
+
+      qkv_a 0.248   q_b 0.000   decode 0.000   o_proj 0.011   router 1.199
+      us/layer -- 0.111 ms of wall for all five together, under the 0.26 ms
+      noise floor EVEN IF ALL FIVE PHASES WERE MADE INSTANTANEOUS.
+
+  So "o_proj has a pointer chase" and "the router has a 17-link chain" are true
+  ISA facts that are NOT levers on their own.  Fixing the router's chain
+  outright is worth at most 0.091 ms.
+
+  THE ONE SHAPE THAT TRANSFERS 1:1 is a cut landing on ALL 29 xcd_ranks,
+  because a uniform cut is regime C run backwards.  Two candidates exist in
+  this data and only two:
+
+    (a) The RESOLVE + EP FOLD, 6119 ns and 46.2% of qkv_a's tile, re-reading
+        the same 96 KB in every one of the 186 tiles.  Hoisting it is MEASURED
+        TWICE AND NEUTRAL (+0.090, +0.187) because it moved the work behind an
+        extra rendezvous.  What is NOT measured is making it faster IN PLACE --
+        it is at 30% of per-CU L2 and the source says so.
+
+    (b) The QUANTIZER, 851 ns, 206 VALU per trip and zero memory ops, present
+        in qkv_a, q_b, the kvupd inner call, MoE W13 and MoE W2 -- five call
+        sites, so it lands on nearly every worker in nearly every phase.
+
+  Both are small.  (b) is 851 ns of a 139.7 us layer even if deleted outright,
+  i.e. 0.6% of the layer, ~0.05 ms of wall.  That is the honest size of the
+  "VALU-bound tile" lever, and it is why this file's answer to item 2 is a
+  diagnosis, not a speedup.
+
+  NOT MEASURED.  Everything above is static ISA plus the source's own
+  MPK_SUBPHASE_TIMING numbers.  No wall number is quoted and none should be
+  until an A/B lands.
+""")
+
+
+def main():
+    path = sys.argv[1] if len(sys.argv) > 1 else ensure(ISA)
+    occ = load(path)
+    byaddr = {o[0]: o for o in occ}
+    print(f"code object: {path}")
+    print(f"{len(occ)} symbol occurrences\n")
+    call_graph(occ, byaddr)
+    leaves(byaddr)
+    qkva()
+    latency(byaddr)
+    verdict()
 
 
 if __name__ == "__main__":
