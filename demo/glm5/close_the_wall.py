@@ -44,7 +44,14 @@ BUDGET = [
     ("decode (busy)", 9.389, "tile"),
     ("merge / Phase 8 (busy)", 3.026, "tile"),
     ("o_proj tiles (busy)", 7.404, "tile"),
-    ("router (busy)", 15.062, "tile"),
+    # The router's stage-stamp span contains the OPROJ_BARRIER spin inside the
+    # router kernel (gang_rmsnorm_linear_bias_mi300.cuh:852).  That rendezvous
+    # has no barrier slot of its own, so the span bills it as "busy".  The
+    # region is MEASURED 54% poll / 46% compute
+    # (glm-router-region-is-a-55pct-narrow-phase), so split it here: the total
+    # is unchanged, only the class is corrected.
+    ("router (busy, compute only: 46% of 15.062)", 6.929, "tile"),
+    ("router internal OPROJ_BARRIER spin (54%)", 8.133, "rdv"),
     ("W13 tiles (busy)", 18.660, "tile"),
     ("spin at qkv_barrier", 4.916, "rdv"),
     ("spin at qb_barrier (QB_TP cross-rank gather)", 9.034, "coll"),
@@ -144,12 +151,20 @@ READING IT.
     every tile in the layer were simultaneously taken to the byte roof.
 
 2b. AND IT IS NOT A BANDWIDTH STORY.  tile_roof_by_phase.py resolves this
-    headroom per phase: the top three rows are router 0.944, q_b 0.695 and
-    decode 0.597 -- the three phases carrying the LEAST bytes (1.62, 6.22 and
-    0.07 MB).  The three byte-heavy phases holding 97 of the layer's 118 MB
-    (W13, W2, qkv_a) have only 1.390 ms between them, and W13's and W2's shares
-    are already closed by measurement.  So the {x:.2f}x is concentrated exactly
-    where bandwidth is irrelevant: it is latency and fixed per-tile cost.
+    headroom per phase, AFTER subtracting the internal-rendezvous spin that the
+    stage-stamp spans misbill as busy.  Ranked: q_b 0.695 (UPPER BOUND, has an
+    unmeasured internal W_UK spin), decode 0.597 (CLEAN), qkv_a 0.524 (UPPER
+    BOUND), W13 0.445, W2 0.421, router 0.420, o_proj 0.285, merge 0.195.  The
+    three byte-heavy phases holding 97 of the layer's 118 MB (W13, W2, qkv_a)
+    have only 1.390 ms between them, and W13's and W2's shares are already
+    closed by measurement.  The rows with headroom carry 0.07 to 6.22 MB.  So
+    the {x:.2f}x is concentrated exactly where bandwidth is irrelevant: it is
+    latency and fixed per-tile cost.
+
+2c. AND THE TABLE IS FLAT.  No phase holds more than 0.695 ms of headroom, and
+    that top row is an upper bound.  At 0.27 the largest single tile lever in
+    the layer is 0.188 ms -- under the 0.26 ms noise floor.  There is no big
+    single item inside the biggest class in the budget.
 
 3.  The three zero-roof classes -- rendezvous {rdv:.3f}, boundary {bound:.3f},
     residual {res:.3f} = {zsum:.3f} ms -- are the only components whose floor is

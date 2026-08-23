@@ -72,6 +72,32 @@ def main() -> int:
     moe_b = 3.0 * per_expert * mq + n_shared * per_expert * mq  # busiest rank
     kv_b = (kv_lora + qk_rope) * 1.0 * seq
 
+    # INTERNAL-SPIN AUDIT.  A stage-stamp span bills everything between the two
+    # stamps as "busy", including any rendezvous that lives INSIDE the phase and
+    # therefore has no barrier slot of its own.  Grepped every span and its
+    # callees for `while (`, `s_sleep` and MPK_WS_WAIT_BEGIN:
+    #
+    #   qkv_a   CONTAMINATED  attn_fused:641   XCD-local EP-fold rendezvous
+    #                         (this is exactly what stamps 44/45 straddle;
+    #                          they are committed but NOT YET COMPILED, so the
+    #                          magnitude is unmeasured)
+    #   q_b     CONTAMINATED  attn_fused:954   XCD-local W_UK rendezvous,
+    #                         also unstamped and unmeasured
+    #   router  CONTAMINATED  gang_rmsnorm_linear_bias_mi300.cuh:852, the
+    #                         OPROJ_BARRIER spin inside the router kernel.
+    #                         THIS ONE HAS A MEASUREMENT: the router region is
+    #                         54% poll / 46% compute
+    #                         (glm-router-region-is-a-55pct-narrow-phase).
+    #   decode, merge, o_proj, W13, W2   CLEAN -- no spin in the span or in any
+    #                         callee (gang_mla_decode / mla_kv_cache_update,
+    #                          gang_linear_mxfp8, gang_moe_linear_mxfp4).
+    #
+    # compute_frac below applies ONLY where a measurement exists.  Where it does
+    # not, the row keeps 1.0 and is flagged UPPER BOUND -- do not invent a
+    # fraction for it.
+    COMPUTE_FRAC = {"router": 0.46}
+    CONTAMINATED = {"qkv_a", "q_b (+W_UK,W_UV)", "router"}
+
     # (label, measured busy us/lyr INSTRUMENTED, bytes/lyr/rank, tiles/XCD, note)
     #
     # busy: price_busy_vs_spin.py's critical-worker busy column, except W2 which
@@ -103,8 +129,8 @@ def main() -> int:
     print("=" * 100)
     print(f"  {'phase':<18} {'MB':>6} {'wrk':>4} {'GB/s':>6} "
           f"{'roof us':>8} {'meas us':>8} {'x off':>6} {'% roof':>7} "
-          f"{'head ms':>8} {'x0.27':>7}")
-    print("  " + "-" * 96)
+          f"{'head ms':>8} {'x0.27':>7}  spin?")
+    print("  " + "-" * 104)
 
     tot_meas = tot_roof = tot_head = 0.0
     rows = []
@@ -112,7 +138,8 @@ def main() -> int:
         workers = min(tiles, 29) * XCDS
         bw = bw_at(workers)
         roof_us = b / (bw * 1e3)
-        meas_us = busy_us * K            # shipping coordinates
+        frac = COMPUTE_FRAC.get(name, 1.0)
+        meas_us = busy_us * K * frac     # shipping coordinates, spin removed
         head_ms = max(0.0, meas_us - roof_us) * LAYERS / 1e3
         tot_meas += meas_us
         tot_roof += roof_us
@@ -120,11 +147,17 @@ def main() -> int:
         xoff = meas_us / roof_us if roof_us > 0 else float("inf")
         pct = 100.0 * roof_us / meas_us
         xs = "inf" if roof_us == 0 else f"{xoff:.2f}"
+        if frac < 1.0:
+            tag = f"x{frac:.2f} measured"
+        elif name in CONTAMINATED:
+            tag = "YES, UPPER BOUND"
+        else:
+            tag = "clean"
         print(f"  {name:<18} {b/1e6:>6.2f} {workers:>4} {bw:>6.0f} "
               f"{roof_us:>8.2f} {meas_us:>8.2f} {xs:>6} {pct:>6.1f}% "
-              f"{head_ms:>8.3f} {head_ms*BUSY_TO_WALL:>7.3f}"
+              f"{head_ms:>8.3f} {head_ms*BUSY_TO_WALL:>7.3f}  {tag}"
               + (f"   {note}" if note else ""))
-        rows.append((name, head_ms, pct, workers, b))
+        rows.append((name, head_ms, pct, workers, b, tag))
 
     print("  " + "-" * 96)
     print(f"  {'LAYER (tiles)':<18} {'':>6} {'':>4} {'':>6} "
@@ -161,37 +194,46 @@ def main() -> int:
 
     rows.sort(key=lambda r: -r[1])
     print("  RANKED BY HEADROOM:")
-    for name, head_ms, pct, workers, b in rows:
+    for name, head_ms, pct, workers, b, tag in rows:
         print(f"    {name:<18} {head_ms:>7.3f} ms  at {pct:>5.1f}% of roof, "
-              f"{workers:>3} workers, {b/1e6:>6.2f} MB")
+              f"{workers:>3} workers, {b/1e6:>6.2f} MB   [{tag}]")
+    clean = [r for r in rows if r[5] == "clean"]
+    print(f"\n    largest CLEAN row: {clean[0][0]} at {clean[0][1]:.3f} ms "
+          f"on {clean[0][4]/1e6:.2f} MB -- pure latency, no bytes to blame")
 
     print("""
-  READING IT -- three phases are NOT byte-explicable and that is the point.
+  READING IT.
 
-  merge/Ph8, decode and router carry essentially no weight bytes (0, 0.07 and
-  1.62 MB) yet burn measurable busy time.  Their byte roof is ~0, so "% of
-  roof" is meaningless for them and their headroom is nominally 100%.  That
-  headroom is NOT bandwidth -- it is latency and fixed per-tile cost, exactly
-  what glm-attention-tiles-are-latency-bound-not-valu-bound and
-  glm-router-region-is-a-55pct-narrow-phase already say.  A bandwidth argument
-  cannot touch them.
+  1. THE TABLE IS FLAT.  No row holds more than 0.695 ms of headroom, and the
+     two rows above 0.5 are decode (0.597, CLEAN) and q_b (0.695, an UPPER
+     BOUND).  At the 0.27 busy->wall coefficient that is 0.161 and 0.188 ms --
+     at or under the 0.26 ms noise floor.  The whole tile class is 0.967 ms of
+     wall and only if EVERY phase reaches its byte roof simultaneously.  There
+     is no big single item inside the biggest class in the budget.
 
-  W13 READS 63% HERE BUT 76% IN width_corrected_roofline.py, AND THAT SCRIPT IS
-  RIGHT.  It uses the MEASURED subphase counter SP3[4] = 13.06 us for the MoE
-  W13 tiles.  This table uses the stage-stamp span 5->6 (routing-poll exit to
-  w13_barrier arrival) = 15.81 us, which is a SUPERSET: it also contains the MoE
-  dispatch and expert-table prologue.  Every "busy" row in this table is a
-  superset of its phase's tile time for the same reason -- the stamps bracket
-  the block, not the GEMM.  So every % of roof here is a LOWER bound and every
-  headroom an UPPER bound.  Where a subphase counter exists, prefer it.
+  2. IT IS NOT A BANDWIDTH STORY.  decode carries 0.07 MB and merge/Ph8 carries
+     none, yet they burn 7.95 and 2.56 us; their byte roof is ~0 so "% of roof"
+     is meaningless for them.  Their headroom is latency and fixed per-tile
+     cost, matching glm-attention-tiles-are-latency-bound-not-valu-bound.
+     Meanwhile the three byte-heavy phases holding 97 of the layer's 118 MB
+     (W13, W2, qkv_a) hold only 1.390 ms between them, and W13's and W2's
+     shares are already closed by measurement (MPK_MOE_PF_GROUPS null twice;
+     OPW=16 -1.34, KSPLIT=2 -4.12, OPW=128 neutral).
 
-  WHAT THE RANKING ACTUALLY SAYS.  The top three headroom rows -- router 0.944,
-  q_b 0.695, decode 0.597 -- are the three with the least bytes.  The three
-  byte-heavy phases (W13, W2, qkv_a: 97 of the layer's 118 MB) hold only 1.390
-  ms of headroom between them, and W13's and W2's shares are already closed by
-  measurement (MPK_MOE_PF_GROUPS null twice; OPW=16 -1.34, KSPLIT=2 -4.12,
-  OPW=128 neutral).  So the 3.4x is NOT a bandwidth-efficiency story after all:
-  it is concentrated in the phases where bandwidth is irrelevant.""")
+  3. THE ROUTER ROW MOVED, AND THAT IS THE METHOD POINT.  Uncorrected it was
+     the #1 row at 0.944 ms.  Its span contains the OPROJ_BARRIER spin inside
+     the router kernel (gang_rmsnorm_linear_bias_mi300.cuh:852), which the
+     stage-stamp span bills as "busy" because that rendezvous has no barrier
+     slot of its own.  Applying the MEASURED 46% compute fraction drops it to
+     0.420 ms and sixth place.  qkv_a and q_b have the same defect
+     (attn_fused:641 and :954) with NO measurement to correct by, so both are
+     UPPER BOUNDS -- and q_b, the nominal #1, is one of them.
+
+  4. W13 READS 63% HERE BUT 76% IN width_corrected_roofline.py, AND THAT SCRIPT
+     IS RIGHT: it uses the MEASURED subphase counter SP3[4] = 13.06 us, while
+     this table's span 5->6 also contains the MoE dispatch and expert-table
+     prologue.  Every row here brackets the BLOCK, not the GEMM.  Prefer a
+     subphase counter wherever one exists.""")
     print("=" * 100)
     return 0
 

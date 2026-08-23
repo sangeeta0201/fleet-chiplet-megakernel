@@ -262,50 +262,64 @@ plus exactly the pieces the two segment decompositions above supply — accounts
 
 | class | ms/token | share | its own roof | headroom |
 |---|---|---|---|---|
-| tile math+bytes | **5.816** | 54.8% | 1.712 (same 8 phases, own widths) | **4.104** |
+| tile math+bytes | **5.292** | 49.8% | 1.712 (same 8 phases, own widths) | **3.580** |
 | cross-rank collective | 1.587 | 14.9% | 0.383 (EP) | 1.204 |
-| rendezvous | 1.848 | 17.4% | 0 | 1.848 |
+| rendezvous | 2.371 | 22.3% | 0 | 2.371 |
 | task/layer boundary | 0.751 | 7.1% | 0 | 0.751 |
 | residual | 0.617 | 5.8% | 0 | 0.617 |
 
-**The tiles run at 29% of their own byte roof — 3.40x off — and that 4.104 ms is
-the largest single item in the budget by a factor of two.** It is an efficiency
-problem *inside* the tiles, consistent with
-`glm-attention-tiles-are-latency-bound-not-valu-bound` (qkv_a 68% vmcnt), not a
-FLOP or byte count.
+**The tiles run at 32% of their own byte roof — 3.09x off — and that 3.580 ms is
+the largest single item in the budget.** It is an efficiency problem *inside* the
+tiles, consistent with `glm-attention-tiles-are-latency-bound-not-valu-bound`
+(qkv_a 68% vmcnt), not a FLOP or byte count.
 
 Denominator warning: the tile roof is **1.712 ms**, from
 `demo/glm5/tile_roof_by_phase.py` — the same eight phases priced at their own
 live widths. It is *not* `roofline.py`'s 1.936, which is a whole-*iteration*
-floor including the dense prologue layers, embeddings and lm_head. A first pass
-here divided by 1.936 and got 3.00x; the apples-to-apples figure is 3.40x.
+floor including the dense prologue layers, embeddings and lm_head.
+
+Spin warning (this moved the table twice): the "tile" class started at 5.816 ms
+because the router's stage-stamp span bills the `OPROJ_BARRIER` spin *inside* the
+router kernel (`gang_rmsnorm_linear_bias_mi300.cuh:852`) as busy — that
+rendezvous has no barrier slot of its own. Reclassifying its measured 54% poll
+share moves 0.524 ms from `tile` to `rendezvous` and drops the gap 3.40x → 3.09x.
+`qkv_a` and `q_b` have the same defect (`gang_mla_attn_fused_mi300.cuh:641` and
+`:954`) with **no measurement to correct by**, so both of their rows below are
+upper bounds — including the nominal #1.
 
 The caveat that keeps this honest: busy converts to wall at ~0.27 near this
-operating point, so 4.104 x 0.27 = **1.108 ms** even if every tile in the layer
-were simultaneously taken to the byte roof. That is still 4x the noise floor and
-the largest predicted lever left on the board — but it is 1.1 ms, not 4.1.
+operating point, so 3.580 x 0.27 = **0.967 ms** even if every tile in the layer
+were simultaneously taken to the byte roof.
 
-### ...and it is not a BANDWIDTH story either
+### ...and it is not a BANDWIDTH story either — and the table is FLAT
 
-`tile_roof_by_phase.py` resolves the 4.104 ms per phase, ranked by headroom:
+`tile_roof_by_phase.py` resolves the 3.580 ms per phase, ranked by headroom:
 
-| phase | headroom ms | % of roof | workers | MB |
-|---|---|---|---|---|
-| router | **0.944** | 2.7% | 128 | 1.62 |
-| q_b (+W_UK, W_UV) | **0.695** | 12.5% | 128 | 6.22 |
-| decode | **0.597** | 1.3% | 16 | 0.07 |
-| qkv_a | 0.524 | 32.6% | 168 | 16.63 |
-| W13 | 0.445 | 63.0% | 232 | 53.48 |
-| W2 | 0.421 | 47.4% | 232 | 26.74 |
-| o_proj | 0.285 | 40.3% | 192 | 12.98 |
-| merge / Ph8 | 0.195 | 0.0% | 128 | 0.00 |
+| phase | headroom ms | ×0.27 | % of roof | workers | MB | internal spin? |
+|---|---|---|---|---|---|---|
+| q_b (+W_UK, W_UV) | **0.695** | 0.188 | 12.5% | 128 | 6.22 | yes — UPPER BOUND |
+| decode | **0.597** | 0.161 | 1.3% | 16 | 0.07 | **clean** |
+| qkv_a | 0.524 | 0.141 | 32.6% | 168 | 16.63 | yes — UPPER BOUND |
+| W13 | 0.445 | 0.120 | 63.0% | 232 | 53.48 | clean |
+| W2 | 0.421 | 0.114 | 47.4% | 232 | 26.74 | clean |
+| router | 0.420 | 0.113 | 5.8% | 128 | 1.62 | ×0.46 measured |
+| o_proj | 0.285 | 0.077 | 40.3% | 192 | 12.98 | clean |
+| merge / Ph8 | 0.195 | 0.053 | 0.0% | 128 | 0.00 | clean |
 
-**The top three headroom rows are the three phases carrying the least bytes.**
-The three byte-heavy phases hold 97 of the layer's 118 MB and only 1.390 ms of
-headroom between them — and W13's and W2's shares are already closed by
-measurement (`MPK_MOE_PF_GROUPS` null twice; OPW=16 −1.34, KSPLIT=2 −4.12,
-OPW=128 neutral). So the 3.40x is concentrated exactly where bandwidth is
-irrelevant. It is latency and fixed per-tile cost.
+Two conclusions, and the second is the one that matters:
+
+1. **Not bandwidth.** The rows with headroom carry 0.07–6.22 MB. The three
+   byte-heavy phases hold 97 of the layer's 118 MB and only 1.390 ms between
+   them — and W13's and W2's shares are already closed by measurement
+   (`MPK_MOE_PF_GROUPS` null twice; OPW=16 −1.34, KSPLIT=2 −4.12, OPW=128
+   neutral). The 3.09x sits where bandwidth is irrelevant: latency and fixed
+   per-tile cost.
+2. **Flat.** No row exceeds 0.695 ms, and that one is an upper bound. At the
+   0.27 coefficient **the largest single tile lever in the layer is 0.188 ms —
+   under the 0.26 ms noise floor.** The largest *clean* row is `decode` at 0.597
+   (0.161 ms of wall) on 0.07 MB and 16 workers: pure latency, no bytes to
+   blame. So the biggest class in the budget contains no big single item, only
+   eight sub-noise-floor ones.
 
 Two guards on that table:
 * every "busy" row is a stage-stamp span bracketing the **block**, not the GEMM,
