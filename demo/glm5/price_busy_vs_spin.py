@@ -368,6 +368,17 @@ def main():
     print("  an upper bound in two ways -- it assumes work is infinitely")
     print("  divisible (MoE tiles are not: round quantization, and split-K is")
     print("  a measured +4.12), and it assumes the remap costs nothing.")
+    print()
+    print("  *** DO NOT READ THE BUSY COLUMN AS A LEVER. *** Busy time")
+    print("  converts to wall at roughly 0.3, not 1.0, near this operating")
+    print("  point. MPK_ATTN_HALFK cut qkv_a UNIFORMLY across its active set")
+    print("  by 2.3 us/layer -- 0.175 ms at 1:1 -- and moved the wall 0.047,")
+    print("  a coefficient of 0.27. That matches the independently measured")
+    print("  convex peer-idle response (coeff 0.32 near the operating point,")
+    print("  marginal 1.28 only well beyond it). There is ~4 us/layer of")
+    print("  slack that absorbs small cuts wherever they are taken, which is")
+    print("  why 'the critical worker is N% busy' does NOT by itself make")
+    print("  that busy time addressable. A cut must be LARGE to escape it.")
     return 0
 
 
