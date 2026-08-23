@@ -56,6 +56,29 @@ Method notes, stated because they bound what the answer is worth
 * Worker -> XCD is xcd_id = w / 29 (gang_mla_attn_fused_mi300.cuh:225).
 * The baseline reconstruction is an identity check, not evidence: simulating
   with NOTHING narrowed must reproduce the measured layer span exactly.
+
+*** TRAP: D[i][w] IS NOT A DURATION.  DO NOT SUM IT PER WORKER. ***
+------------------------------------------------------------------
+D[i][w] = arr_w(B_i) - M_{i-1} is a per-worker MEAN arrival minus a
+MAX-over-workers of means.  Those are not commensurable, and **18.2% of the
+2280 entries come out NEGATIVE** (worker 37 "does" -23.244 us in the rel_tree
+segment).  It is a valid quantity for exactly one purpose -- the invariant
+that survives a change of barrier SCOPE, which is what simulate() propagates
+through maxima -- and it is meaningless as "worker w's work."
+
+This matters because summing it is an inviting mistake with an inviting
+answer: sum_i D[i][w] maxes out at 162.055 us against a 164.947 us layer,
+which reads as "the critical worker is 98.2% busy, and the entire cost of
+bulk synchrony is 0.186 ms."  That number is an ARTIFACT.  The same sum puts
+40 workers at ~7.5 us/layer, which is impossible -- W13 is 54 tiles/XCD and W2
+is 108 over 29 ranks, so **every** worker runs MoE tiles worth ~26 us before
+anything else.  A per-layer log would be needed to make a real busy fraction,
+and this log is means.
+
+The conclusions below do not rest on it.  Table 3.1 is MODEL-FREE -- it reads
+maxima straight out of the log with no D at all -- and clamping every negative
+to zero changes the 3.2/3.3 numbers by less than 1e-4 ms.  Both checks are
+printed.
 """
 import collections
 import re
@@ -255,6 +278,24 @@ def main():
         print(f"{n:<18}{sp:>10.3f}{saved:>10.3f}{ms:>10.4f}"
               f"{LEGALITY[n][0]:>10}   {LEGALITY[n][1][:34]}")
     print()
+
+    print("=" * 94)
+    print("3.2b  ROBUSTNESS: 3.2/3.3 DO NOT DEPEND ON THE NEGATIVE-D ENTRIES")
+    print("=" * 94)
+    neg = sum(1 for d in D for v in d.values() if v < 0)
+    tot = sum(len(d) for d in D)
+    Dc = [{w: max(0.0, v) for w, v in d.items()} for d in D]
+    bc, _ = simulate(names, Dc, set())
+    ac, _ = simulate(names, Dc, set(names))
+    ar, _ = simulate(names, D, set(names))
+    print(f"  negative D entries (see the TRAP in the docstring): "
+          f"{neg}/{tot} = {100*neg/tot:.1f}%")
+    print(f"  all-ten-narrowed saving, raw D          "
+          f"{(base-ar)*N_LAYERS/1e3*k:.4f} ms/token")
+    print(f"  all-ten-narrowed saving, D clamped >=0  "
+          f"{(bc-ac)*N_LAYERS/1e3*k:.4f} ms/token")
+    print("  identical -> the maxima are set by workers with large POSITIVE D,")
+    print("  and table 3.1 uses no D at all.\n")
 
     print("=" * 94)
     print("3.3  THE CEILING: ALL TEN NARROWED AT ONCE (ILLEGAL -- IT IS A BOUND)")
