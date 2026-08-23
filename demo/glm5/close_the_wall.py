@@ -22,9 +22,15 @@ K = SHIPPING_LAYER_US / INSTRUMENTED_LAYER_US
 F = LAYERS * K / 1000.0  # us/layer (instrumented) -> ms/token (shipping)
 
 # HBM roof, from demo/glm5/roofline.py.  MEASURED constants, not re-derived.
+# NOTE: HBM_FLOOR_BUSIEST_MS is a whole-ITERATION floor -- all 10.01 GB/iter/rank
+# including the dense prologue layers, embeddings and lm_head.  It is the right
+# denominator for the WALL, and the wrong one for the tile line alone.  For the
+# tile line use TILE_ROOF_MS, which is the same eight phases priced at their own
+# live widths by demo/glm5/tile_roof_by_phase.py.
 HBM_FLOOR_BUSIEST_MS = 1.936
 EP_COLLECTIVE_FLOOR_MS = 0.383
 ACHIEVABLE_FLOOR_MS = HBM_FLOOR_BUSIEST_MS + EP_COLLECTIVE_FLOOR_MS
+TILE_ROOF_MS = 1.712
 
 # (label, us/layer, class)
 # class: 'tile'  = a GEMM/attention tile doing real math+bytes
@@ -103,12 +109,15 @@ def main():
     print(f"  = achievable floor                         {ACHIEVABLE_FLOOR_MS:7.3f} ms")
     print()
     print(f"  tile math+bytes, MEASURED                  {tile_ms:7.3f} ms")
-    print(f"  its own roof (HBM, busiest rank)           {HBM_FLOOR_BUSIEST_MS:7.3f} ms")
+    print(f"  its own roof: THE SAME 8 PHASES at their")
+    print(f"    own live widths (tile_roof_by_phase.py)  {TILE_ROOF_MS:7.3f} ms")
     print(f"  -> tiles run at "
-          f"{HBM_FLOOR_BUSIEST_MS / tile_ms * 100:.0f}% of the byte roof, "
-          f"i.e. {tile_ms / HBM_FLOOR_BUSIEST_MS:.2f}x off")
+          f"{TILE_ROOF_MS / tile_ms * 100:.0f}% of the byte roof, "
+          f"i.e. {tile_ms / TILE_ROOF_MS:.2f}x off")
     print(f"     headroom INSIDE the tiles              "
-          f"{tile_ms - HBM_FLOOR_BUSIEST_MS:7.3f} ms")
+          f"{tile_ms - TILE_ROOF_MS:7.3f} ms")
+    print(f"     (do NOT divide tile_ms by {HBM_FLOOR_BUSIEST_MS} -- that is a")
+    print(f"      whole-ITERATION floor and a denominator mismatch)")
     print()
     print(f"  cross-rank collective, MEASURED            {coll_ms:7.3f} ms")
     print(f"  its own roof (measured EP latency)         {EP_COLLECTIVE_FLOOR_MS:7.3f} ms")
@@ -134,6 +143,14 @@ READING IT.
     {head:.3f} ms of tile headroom x 0.27 = {conv:.3f} ms of wall -- and only if
     every tile in the layer were simultaneously taken to the byte roof.
 
+2b. AND IT IS NOT A BANDWIDTH STORY.  tile_roof_by_phase.py resolves this
+    headroom per phase: the top three rows are router 0.944, q_b 0.695 and
+    decode 0.597 -- the three phases carrying the LEAST bytes (1.62, 6.22 and
+    0.07 MB).  The three byte-heavy phases holding 97 of the layer's 118 MB
+    (W13, W2, qkv_a) have only 1.390 ms between them, and W13's and W2's shares
+    are already closed by measurement.  So the {x:.2f}x is concentrated exactly
+    where bandwidth is irrelevant: it is latency and fixed per-tile cost.
+
 3.  The three zero-roof classes -- rendezvous {rdv:.3f}, boundary {bound:.3f},
     residual {res:.3f} = {zsum:.3f} ms -- are the only components whose floor is
     actually 0.  Every one of them has been attacked and measured out
@@ -146,13 +163,13 @@ distributed across four classes with NO single class above {mx:.3f} ms and no
 class that converts to wall at better than ~0.27 without deleting a whole
 rendezvous -- which the legality pass just proved is impossible for all ten.
 """.format(floor=ACHIEVABLE_FLOOR_MS,
-           x=tile_ms / HBM_FLOOR_BUSIEST_MS,
-           head=tile_ms - HBM_FLOOR_BUSIEST_MS,
-           conv=(tile_ms - HBM_FLOOR_BUSIEST_MS) * 0.27,
+           x=tile_ms / TILE_ROOF_MS,
+           head=tile_ms - TILE_ROOF_MS,
+           conv=(tile_ms - TILE_ROOF_MS) * 0.27,
            rdv=rdv_ms, bound=bound_ms, res=resid,
            zsum=rdv_ms + bound_ms + resid,
            wall=WALL_MS, gap=WALL_MS - ACHIEVABLE_FLOOR_MS,
-           mx=max(tile_ms - HBM_FLOOR_BUSIEST_MS,
+           mx=max(tile_ms - TILE_ROOF_MS,
                   coll_ms - EP_COLLECTIVE_FLOOR_MS,
                   rdv_ms, bound_ms, resid)))
 
