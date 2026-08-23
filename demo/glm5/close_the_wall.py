@@ -166,6 +166,23 @@ READING IT.
     the layer is 0.188 ms -- under the 0.26 ms noise floor.  There is no big
     single item inside the biggest class in the budget.
 
+2d. AND 2b IS NOW MEASURED, NOT INFERRED.  2b argued "latency, not bandwidth"
+    from WHERE the headroom sits in the byte table.  TILE_CLASS_BOUND.md asks
+    the two units directly, over the class as one item: MFMA issue occupancy is
+    2.65% on the live SIMDs (1.72% of all 1024), and the achieved HBM rate is
+    1.691 TB/s = 32.7% of the measured 5.17.  NEITHER unit is saturated.  The
+    escape -- that real traffic is ~3x the model, putting the class at the roof
+    after all -- needs ~49% HBM controller busy; sampled mem_busy_percent on a
+    shipping run reads 5.2% (10 ms, n=149/GPU) and 13.0% (1 Hz, n=4/GPU)
+    against 16.3% predicted by the byte model.  Excluded with a wide margin.
+    The bandwidth is not being eaten, it is not being requested.
+
+2e. AND THE NUMERICS RUN THE OTHER WAY.  Our mxfp8-attention + mxfp4-MoE byte
+    roof is 117.73 MB/layer -> 1.731 ms/token; TileRT's W8A16 is 187.45 MB ->
+    2.756.  Ours is 1.59x SMALLER, and at 1.731 it sits UNDER the 2 ms goal.
+    MXFP4+FP8 is not what makes 2 ms unreachable -- it is the only reason 2 ms
+    is arithmetically on the table.  Do not argue the goal away from numerics.
+
 3.  The three zero-roof classes -- rendezvous {rdv:.3f}, boundary {bound:.3f},
     residual {res:.3f} = {zsum:.3f} ms -- are the only components whose floor is
     actually 0.  Every one of them has been attacked and measured out
