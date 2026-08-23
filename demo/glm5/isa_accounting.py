@@ -29,6 +29,7 @@ with the CDNA issue model and compares against the measured tile time.
 Reads the code object next to the megakernel .so.  Offline; no GPU run.
 """
 import collections
+from collections import Counter
 import os
 import re
 import subprocess
@@ -237,21 +238,19 @@ def megakernel(syms):
     for k, v in mf.most_common():
         print(f"    {v:>5}  {k}")
     print("""
-  *** THERE IS NOT ONE v_mfma_scale_f32_16x16x128_f8f6f4 IN THE MEGAKERNEL. ***
-  The scaled fp8 MFMA appears only in the standalone, non-inlined
-  gang_rmsnorm_linear_mxfp8_* / gang_moe_w13 / gang_moe_w2 symbols (4 each) --
-  which are the UNFUSED dense-prologue path, not the 76-layer megakernel
-  (glm-dense-prologue-is-the-unfused-attention-path).  The megakernel's only
-  matrix instruction is bf16 16x16x16 and those are the MLA decode's.
+  *** RETRACTED 2026-08-23, SAME DAY, BY THE CHECK THAT SHOULD HAVE COME FIRST.
+      An earlier version of this file reported "the megakernel contains no
+      scaled fp8 MFMA" because _Z17persistent_kernel has only bf16 MFMA.  THAT
+      WAS A SYMBOL-BOUNDARY ARTIFACT, NOT A FINDING.  The phase kernels are
+      __device__ __noinline__, so they are separate symbols that persistent_kernel
+      reaches through s_swappc_b64 (168 in the object, 61 in persistent_kernel
+      itself), and gang_mla_full_layer_fused_kernel_mi300 is outlined the same
+      way.  Counting MFMA "in the megakernel" by counting them inside one symbol
+      counts the inliner, not the machine.  This is exactly the failure
+      glm-gemm-isa-matches-gpt-oss-and-is-ahead warns about from the other
+      direction.  The census below is per PHASE SYMBOL and is the real one. ***
 
-  THIS IS NOT A BUG, AND SAYING SO WOULD BE THE WRONG READ.  At bs=1 every
-  linear layer has M=1, so it is a GEMV; an MFMA tile would waste 15/16 of the
-  matrix core.  Choosing GEMV is correct.  What it COSTS is the subject of the
-  next table: gfx950 has no fp8 VALU dot (gfx950-has-no-fp8-valu-dot), so a
-  bs=1 fp8 GEMV has to dequantize on the VALU, one packed dword at a time.
-  That work has no byte floor, which is why the ledger's roofline could not
-  see it.  Confirmed against glm-gemm-isa-matches-gpt-oss-and-is-ahead, which
-  measured the STANDALONE symbol -- a different code path, not a conflict.
+  See phase_accounting() for the table that replaces it.
 """)
     v = collections.Counter(valu_kind(m) for _a, m, _l in ins
                             if m.startswith("v_"))
@@ -292,17 +291,19 @@ def megakernel(syms):
   READ THE 'useful' COLUMN.  In the widest GEMV k-loop 8 of 40 VALU ops are the
   actual multiply-accumulate; 19 are BIT MANIPULATION (unpacking fp8/mxfp4 out
   of packed dwords) and 4 are converts.  80% of the VALU issue slots in the
-  hot loop of every fp8 linear layer are spent turning bytes into floats.
+  hot loop of the GEMV path are spent turning bytes into floats.  Per
+  phase_accounting() below, the GEMV path is W_UK, W_UV and o_proj -- NOT
+  qkv_a/q_b/W13/W2, which do use the scaled MFMA and have a different problem.
 
   THIS IS WHERE THE 3.55 ms LIVES, and it is a VALU-issue cost, not a memory
   cost -- so no prefetch, no L2 hint and no wider load touches it.  Two levers
   follow, and ONLY these two:
     (i)  FEWER UNPACK OPS PER ELEMENT.  19 bit ops per 8 FMAs is far above what
-         v_perm_b32 needs to split a dword into 4 scaled bytes.  A cheaper
-         unpack is a UNIFORM cut -- it lands on every worker running any fp8
-         linear layer, in every phase -- which is the ONE case the makespan
-         rule (demo/glm5/MAKESPAN_RULE.md) says transfers 1:1 rather than
-         being capped by a per-phase regime-A ceiling.
+         v_perm_b32 needs to split a dword into 4 scaled bytes.  Note the
+         makespan rule (demo/glm5/MAKESPAN_RULE.md): a cut confined to ONE
+         phase is regime A and capped at 0.000-1.199 us/layer, so this only
+         pays if the SAME cut lands across phases -- which a shared unpack
+         helper does, since W_UK, W_UV and o_proj share this loop.
     (ii) LET THE MATRIX CORE DO THE DEQUANT.  v_mfma_scale_f32_16x16x128_f8f6f4
          decodes fp8 in hardware.  At M=1 it wastes 15/16 of the tile, but the
          matrix core is IDLE during every GEMV, and it would delete the unpack
@@ -367,6 +368,7 @@ def main():
                  "NOT what the megakernel runs)")
 
     megakernel(syms)
+    phase_accounting(syms)
 
     # --- the part that decides it: the innermost loop of each kernel --------
     print("=" * 100)
@@ -391,6 +393,90 @@ def main():
               f"LDS {h['LDS']:>3} wait {h['WAITCNT']:>3}  "
               f"-> {c['VALU']:>5} VALU cyc + {c['MFMA']:>5} MFMA cyc")
     print()
+
+
+
+
+# ---------------------------------------------------------------------------
+# THE ITEM-2 TABLE.  Per PHASE SYMBOL, not per inlining boundary.
+# ---------------------------------------------------------------------------
+
+PHASE_SYMS = [
+    ("qkv_a / q_b", "gang_rmsnorm_linear_mxfp8_bias_k", "scaled fp8 MFMA"),
+    ("W_UK,W_UV,o_proj(fp8)", "gang_gemv_mxfp8_kernel", "NO MFMA -- VALU dot"),
+    ("o_proj (fp4)", "gang_gemv_mxfp4_kernel", "NO MFMA -- VALU dot"),
+    ("W13", "gang_moe_w13_linear_mxfp8", "scaled fp8 MFMA"),
+    ("W2", "gang_moe_w2_linear_mxfp8", "scaled fp8 MFMA"),
+    ("MLA decode", "mla_decode_absorbed", "bf16 MFMA"),
+]
+
+
+def _unpackish(m):
+    return m.startswith(("v_and", "v_or", "v_lshl", "v_lshr", "v_bfe", "v_perm",
+                         "v_ashr", "v_xor", "v_bfi", "v_alignb", "v_pack"))
+
+
+def _fmaish(m):
+    return m.startswith(("v_fma", "v_mac", "v_fmac", "v_dot", "v_mul_f",
+                         "v_add_f", "v_pk_fma", "v_pk_mul", "v_pk_add"))
+
+
+def phase_accounting(syms):
+    """The guide's ask: issue-class census of the tile that each phase runs."""
+    print("=" * 108)
+    print("ITEM 2: ISSUE-CLASS CENSUS PER PHASE SYMBOL (largest instantiation)")
+    print("static instruction counts, NOT dynamic cycles -- ratios are the claim")
+    print("=" * 108)
+    hdr = (f"{'phase':24}{'insn':>6}{'VALU%':>7}{'MFMA':>5}{'VMEM':>5}{'LDS':>5}"
+           f"{'SALU':>5}{'WAIT':>5} |{'unpack':>7}{'cvt':>5}{'fma':>5}  matrix path")
+    print(hdr)
+    print("-" * 108)
+    for label, pat, path in PHASE_SYMS:
+        cands = [(k, v) for k, v in syms.items() if pat in k]
+        if not cands:
+            print(f"{label:24}  MISSING")
+            continue
+        _, v = max(cands, key=lambda x: len(x[1]))
+        c = Counter(classify(m) for _, m, _ in v)
+        valu = [m for _, m, _ in v if classify(m) == "VALU"]
+        up = sum(1 for m in valu if _unpackish(m))
+        cv = sum(1 for m in valu if "cvt" in m)
+        fm = sum(1 for m in valu if _fmaish(m))
+        print(f"{label:24}{len(v):6}{100.0*c['VALU']/len(v):6.0f}%{c['MFMA']:5}"
+              f"{c['VMEM']:5}{c['LDS']:5}{c['SALU']:5}{c['WAITCNT']:5} |"
+              f"{up:7}{cv:5}{fm:5}  {path}")
+    print("""
+READ THIS TABLE AS TWO SEPARATE PROBLEMS, NOT ONE:
+
+  (1) qkv_a / q_b DO use the scaled fp8 MFMA -- and are still 74% VALU.  Eight
+      v_mfma_scale_f32_16x16x128_f8f6f4 carry the whole GEMM; the other ~2150
+      VALU ops (882 bit manipulation + 566 float) are the RMSNorm and the
+      activation quantize.  That is the ISA confirmation of
+      glm-qkva-tile-is-41pct-redundant-prologue and
+      glm-quant-prologue-is-not-load-issue-bound: the prologue is issue cost,
+      it touches almost no HBM, and it is most of the tile.
+
+  (2) W_UK, W_UV AND o_proj HAVE NO MATRIX INSTRUCTION AT ALL.  They run
+      gang_gemv_mxfp8_kernel / gang_gemv_mxfp4_kernel, which are VALU dot
+      products: 516 v_cvt_scalef32_pk_bf16_fp8 + 536 float FMA + 392 bit ops,
+      zero v_mfma.  o_proj is a top-5 board line and was priced at 76% of HBM
+      peak (glm-oproj-is-at-76pct-of-hbm-peak) -- by BYTES.  Its ISSUE cost was
+      never on the board at all.
+
+  This is the byte-pricing hole, located.  The MoE (W13/W2) is fine: 8 scaled
+  MFMA against ~600 VALU of address math and staging.
+
+  THE CHEAPEST TEST OF (2) ALREADY EXISTS IN THE TREE AND IS COMPILED OFF.
+  gang_oproj_router_fused_mi300.cuh:444 and gang_mla_full_layer_fused_mi300.cuh
+  guard a `WUV_USE_MFMA` branch on -DMPK_WUV_MFMA that routes W_UV to
+  gang_linear_mxfp8_kernel (the _gang_mfma_f8xf8 path) instead of the GEMV.
+  One -D, one rebuild, one A/B -- that is the next measurement, and it is a
+  ONE-VARIABLE change.
+
+  CAVEAT, STATED UP FRONT: static counts are not cycles.  These ratios say what
+  the tile is MADE of; they do not say how many times each loop trips.  No ms
+  number is claimed from this table.
+""")
 
 
 if __name__ == "__main__":
