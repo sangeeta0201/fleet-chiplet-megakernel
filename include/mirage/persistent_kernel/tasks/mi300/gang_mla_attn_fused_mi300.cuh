@@ -626,6 +626,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
       // and uses only offsets 0 (flag) and 8 (counter) of its stride-16 block.
       int *const _cnt = &wuk_barrier[xcd_id * HIER_STRIDE + 9];
       int *const _flag = &wuk_barrier[xcd_id * HIER_STRIDE + 1];
+      // Stage stamp 45/44: this XCD-local EP-fold rendezvous sits INSIDE the
+      // qkv_a span, between the layer-entry release (slot 0) and qkv_a tiles
+      // done (slot 17). Charging 0->17 to "busy" would bill this spin as work.
+      mpk_stage_stamp(45);
       int prev = atom_add_release_gpu_s32(_cnt, 1);
       if ((prev % tiles_per_xcd) == tiles_per_xcd - 1) {
         st_wt_u32((void *)_flag, (unsigned)qkv_expected);
@@ -645,6 +649,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         }
         __builtin_amdgcn_s_sleep(1);
       }
+      mpk_stage_stamp(44);
     }
     __syncthreads();
     asm volatile("buffer_inv" ::: "memory");

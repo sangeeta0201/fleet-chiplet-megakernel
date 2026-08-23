@@ -1076,7 +1076,34 @@ __device__ unsigned long long g_stage_ref;
 // can be differenced against the cumulative BAR_SKEW gap sums. They can NOT
 // be compared across ranks -- the eight entry barriers are not synchronized,
 // which is the mistake recorded on MPK_EP_POLL_BATCH.
-#define MPK_STAGE_SLOTS 36
+//
+// 36..43 are the BARRIER EXIT bank, added 2026-08-23. Every other stamp in
+// this map records an ARRIVAL; nothing has ever recorded when a worker
+// actually LEAVES a rendezvous, and without that the only available notion of
+// "worker w's work" is arr_w(B_i) minus a MAX-over-workers of arrivals at
+// B_{i-1} -- a mean minus a max-of-means, 18.2% of whose entries come out
+// negative (glm-barskew-per-worker-sum-is-not-busy-time). That defect is the
+// whole reason this bank exists.
+//
+// An exit stamp is taken by the SAME worker, in the SAME epoch, against the
+// SAME g_stage_ref as its own arrival stamp, so
+//
+//     spin_w(B)    = exit_w(B)      - arrival_w(B)
+//     busy_w(phase)= arrival_w(B_i) - exit_w(B_{i-1})
+//
+// are both differences of two per-worker means over an identical layer
+// population. They are true durations and they cannot go negative.
+//
+//   36 entry_bar      full_layer:711     40 attn_release   full_layer:1782
+//   37 qkv_barrier    attn:743           41 wuv_barrier    oproj:552
+//   38 qb_barrier     attn:1183          42 hier_barrier   oproj:925
+//   39 decode_barrier attn:1411          43 w13_barrier    oproj:1595
+//
+// The two the deliverable needs: qkv_a is (37 arrival = stamp 17) against
+// exit 36, and o_proj is (hier arrival = stamp 30) against exit 41.
+// rel_tree and the routing poll are polls rather than hier_barrier_arrive
+// call sites and are NOT in this bank; neither bounds qkv_a or o_proj.
+#define MPK_STAGE_SLOTS 46
 // Samples longer than this are treated as stale-reference and dropped. See
 // mpk_stage_stamp. 10 ms is the historical value and keeps old runs
 // reproducible; 1 ms is what you want for a ~136 us layer.
