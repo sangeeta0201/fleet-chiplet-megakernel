@@ -115,9 +115,17 @@ MPK_MPI_BIND="${MPK_MPI_BIND:---map-by ppr:$((NP / 2)):numa --bind-to numa}"
 # THIS shell, not on the ranks, so it needs no -x forwarding.
 #   MPK_EXTRA_ARGS="--max-num-batched-tokens 2" ./run_correctness_suite.sh ...
 
+# Optional per-rank launch wrapper, inserted between mpirun and stdbuf.
+# Empty by default -- it must stay a no-op so every latency number already
+# recorded against this script keeps meaning the same thing. Used by
+# profile_tile_class.sh to put rocprofv3 on rank 0 only. Unquoted so it
+# word-splits; expanded by THIS shell, so it needs no -x forwarding.
+MPK_RANK_WRAPPER="${MPK_RANK_WRAPPER:-}"
+
 mpirun -np "$NP" --tag-output --allow-run-as-root \
   $MPK_MPI_BIND \
   $(mpk_x_args) \
+  $MPK_RANK_WRAPPER \
   stdbuf -oL -eL python3 demo.py $MIRAGE_FLAG \
     --max-seq-length "${MAX_SEQ_LENGTH:-128}" \
     --max-new-tokens "${MAX_NEW_TOKENS:-16}" \
