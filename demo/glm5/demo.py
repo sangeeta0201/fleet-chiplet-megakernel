@@ -129,8 +129,39 @@ def quantize_mxfp8(w: torch.Tensor) -> tuple:
             se.to(torch.uint8))
 
 
+# Weight layout inside a MoE workgroup. Read here and passed as -D
+# MPK_MOE_KMAJOR by persistent_kernel.py, so the packer and the kernel cannot
+# disagree. 0 = row-major (what every earlier build shipped), 1 = data half
+# K-major, 2 = data and scales both K-major. Long note at the define in
+# gang_moe_linear_mxfp8_mi300.cuh; the short version is that row-major makes
+# one global_load_dwordx4 fan out to 16 L2 requests and K-major makes it 8.
+# MoE call sites only -- pack_dense_mxfp8 feeds a different kernel.
+# Must match the #ifndef default of MPK_MOE_KMAJOR in
+# gang_moe_linear_mxfp8_mi300.cuh. The packer and the kernel index the same
+# buffer, so a mismatch is silent garbage, not a build error.
+MOE_KMAJOR = int(os.environ.get("MPK_MOE_KMAJOR", "1"))
+
+
+def _kmajor_permute(x: torch.Tensor, output_per_wg: int,
+                    bytes_per_ktile: int) -> torch.Tensor:
+    """[E, wgs, OPW, per_row] -> the same bytes as [E, wgs, OPW/16, k, 16, bpk].
+
+    A wave covers 16 rows and one k-tile at a time, so this is exactly the
+    order it reads them in. Serves both halves: bytes_per_ktile is 64 (MXFP4
+    data) or 128 (MXFP8 data) for the weight and 4 for the E8M0 scales.
+    """
+    E, wgs, opw, per_row = x.shape
+    assert opw % 16 == 0, f"K-major needs OPW % 16 == 0, got {opw}"
+    assert per_row % bytes_per_ktile == 0, (per_row, bytes_per_ktile)
+    k_tiles = per_row // bytes_per_ktile
+    return (x.reshape(E, wgs, opw // 16, 16, k_tiles, bytes_per_ktile)
+             .permute(0, 1, 2, 4, 3, 5)
+             .reshape(E, wgs, opw * per_row))
+
+
 def pack_mxfp8_workgroup(data: torch.Tensor, scales: torch.Tensor,
-                         output_per_wg: int = 64) -> torch.Tensor:
+                         output_per_wg: int = 64,
+                         kmajor: int = 0) -> torch.Tensor:
     """Repack quantize_mxfp8 or quantize_mxfp4 output into the per-workgroup
     layout the MXFP8/MXFP4 kernels read, mirroring gpt-oss's
     pack_mxfp4_workgroup:
@@ -157,10 +188,22 @@ def pack_mxfp8_workgroup(data: torch.Tensor, scales: torch.Tensor,
         f"out_dim {out_dim} must be divisible by output_per_wg {output_per_wg}"
 
     wgs = out_dim // output_per_wg
-    packed = torch.cat(
-        [data.reshape(E, wgs, output_per_wg * row_bytes),
-         scales.reshape(E, wgs, output_per_wg * (K // 32))],
-        dim=2).contiguous()
+    if kmajor:
+        # bpk: bytes one row contributes to one 128-element k-tile. row_bytes
+        # is exactly (K/128) of them, at either width.
+        bpk = row_bytes * 128 // K
+        d = _kmajor_permute(data.reshape(E, wgs, output_per_wg, row_bytes),
+                            output_per_wg, bpk)
+        if kmajor >= 2:
+            sc = _kmajor_permute(
+                scales.reshape(E, wgs, output_per_wg, K // 32),
+                output_per_wg, 4)
+        else:
+            sc = scales.reshape(E, wgs, output_per_wg * (K // 32))
+    else:
+        d = data.reshape(E, wgs, output_per_wg * row_bytes)
+        sc = scales.reshape(E, wgs, output_per_wg * (K // 32))
+    packed = torch.cat([d, sc], dim=2).contiguous()
     return packed.squeeze(0) if squeeze else packed
 
 
@@ -400,7 +443,8 @@ def pack_moe_mxfp8(stacked: torch.Tensor,
         quant = lambda w: quantize_mxfp8(fake_quantize_mxfp4(w))
     else:
         quant = quantize_mxfp8
-    packed = [pack_mxfp8_workgroup(*quant(stacked[e]), output_per_wg)
+    packed = [pack_mxfp8_workgroup(*quant(stacked[e]), output_per_wg,
+                                   MOE_KMAJOR)
               for e in range(stacked.shape[0])]
     return torch.stack(packed).contiguous()
 
@@ -2926,8 +2970,10 @@ if __name__ == "__main__":
                     if MOE_WIDEN_MXFP8:
                         gu_b = widen_mxfp4_to_mxfp8(gu_b)
                         db = widen_mxfp4_to_mxfp8(db)
-                    return (pack_mxfp8_workgroup(gu_b, gu_s, MOE_W13_OPW),
-                            pack_mxfp8_workgroup(db, ds, MOE_W2_OPW))
+                    return (pack_mxfp8_workgroup(gu_b, gu_s, MOE_W13_OPW,
+                                                 MOE_KMAJOR),
+                            pack_mxfp8_workgroup(db, ds, MOE_W2_OPW,
+                                                 MOE_KMAJOR))
 
                 gu_parts, down_parts = [], []
                 for d in layer.mlp.expert_mxfp4:

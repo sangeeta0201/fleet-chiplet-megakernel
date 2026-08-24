@@ -922,6 +922,18 @@ def get_compile_command(
                 "MPK_MOE_PF_GROUPS is 0, 2, 4, 8 or 16"
             flags = flags + [f"-DMPK_MOE_PF_GROUPS={_pf}"]
 
+        _km = os.environ.get("MPK_MOE_KMAJOR")
+        if _km is not None:
+            # Permutes the data half (1) and optionally the E8M0 scales (2) of
+            # the packed MoE weight so a wave's k-group is contiguous instead
+            # of sixteen pieces W_ROW_BYTES apart -- 8 L2 requests per
+            # global_load_dwordx4 instead of 16. Same bytes, same MFMA.
+            # demo/glm5/demo.py's packer reads the SAME env var and has to
+            # agree, so this is one -D and every rank must see it. Long note at
+            # the define in gang_moe_linear_mxfp8_mi300.cuh.
+            assert _km in ("0", "1", "2"), "MPK_MOE_KMAJOR is 0, 1 or 2"
+            flags = flags + [f"-DMPK_MOE_KMAJOR={_km}"]
+
         _apf = os.environ.get("MPK_ATTN_PF_GROUPS")
         if _apf is not None:
             # Same knob for the attention-half GEMM (qkv_a, q_b, W_UK, W_UV,

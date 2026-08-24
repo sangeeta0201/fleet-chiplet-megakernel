@@ -108,6 +108,64 @@
 #define MPK_MOE_ACT_FP8 0
 #endif
 
+// ── K-MAJOR WEIGHT ─────────────────────────────────────────────────────────
+//
+// MPK_MOE_KMAJOR: permute the data half of the per-workgroup weight so a
+// wave's k-group is contiguous. 0 = the row-major layout everything shipped
+// with; 1 = data half K-major; 2 = data and E8M0 scales both K-major.
+//
+// The bytes are identical and so is the arithmetic -- this is a permutation of
+// the packed buffer plus the address expression that reads it. The lever is
+// COALESCING, not traffic. Row-major stores a workgroup as [row][k], so the
+// sixteen rows one wave covers at k-tile k are sixteen 64-byte pieces (FP4)
+// W_ROW_BYTES = 3072 apart. One `global_load_dwordx4` across the 64 lanes
+// therefore fans out to sixteen distinct 128-byte L2 requests, each half used
+// on this trip. K-major stores it as [row/16][k][row%16], which makes the same
+// wave read 16*64 = 1024 CONTIGUOUS bytes -- eight fully-used requests.
+//
+// Row-major does not over-fetch: the unused half of each line is consumed at
+// k+1, and at MPK_MOE_PF_GROUPS=4 four k-tiles (256 B/row) are in flight. So
+// the byte count is unchanged and only the request count moves, 16 -> 8 for
+// the data at FP4 and 16 -> 1 for the scales at KMAJOR=2 (sixteen 4-byte reads
+// K/32 = 192 apart become one 64-byte run).
+//
+// Predicted from tests/standalone/test_w13_scale_locality.hip, which measured
+// this exact permutation on top of the shipping GROUPS=4:
+//
+//   GROUPS=4                        11.85 us/tile   16.6 GB/s/CU
+//   GROUPS=4 + K-major weight        9.70           20.3   <- -2.15, -18%
+//
+// At the conversion rate the prefetch itself established (-4.44 us/tile
+// standalone bought -0.142 ms of wall at NP=4) that projects to about -0.07 ms
+// -- under the 0.26 ms noise floor, so it needs n>=6 pooling to resolve.
+//
+// EVERY RANK MUST BUILD WITH THE SAME VALUE, and so must the packer:
+// pack_mxfp8_workgroup in demo/glm5/demo.py reads MPK_MOE_KMAJOR and applies
+// the same permutation to the MoE call sites only. The dense/attention-half
+// weights go through pack_dense_mxfp8 into a different kernel and stay
+// row-major.
+// MEASURED AT NP=4, bs=1, devices 4-7, paired n=8 vs n=8 (clean runs only;
+// this box intermittently wedges a run at launch_persistent_kernel ENTER at
+// BOTH settings, so hung runs are excluded from both arms):
+//
+//   KMAJOR=0   mean 10.960   range 10.933 .. 11.006
+//   KMAJOR=1   mean 10.682   range 10.639 .. 10.720   -0.278 ms
+//
+// The ranges do not overlap, so this clears the 0.26 ms noise floor on the
+// pooled comparison rather than on a single pair. It is 4x the -0.07 ms this
+// header projected from the MPK_MOE_PF_GROUPS conversion rate -- that estimate
+// priced the coalescing win as if it were a bandwidth win, and it is not: the
+// tile class is latency-bound, so collapsing 16 L2 requests to 8 buys back
+// request-issue latency, not bytes.
+//
+// Correctness: G1 (cross-rank agreement) PASSES 4/4 ranks; the generated text
+// is coherent and factually correct. G2 flags the continuation as repetitive,
+// but the control scores the same top-bigram count on the same prompt -- it is
+// the documented bs=1 two-attractor split, not a numerics failure.
+#ifndef MPK_MOE_KMAJOR
+#define MPK_MOE_KMAJOR 1
+#endif
+
 namespace kernel {
 
 // The weight operand at whichever width it is packed. FP4 fills only the lower
@@ -122,6 +180,42 @@ __device__ __forceinline__ i32x8_t _gang_load_w_mfma_a(uint8_t const *row,
   } else {
     return _gang_load_fp8_mfma_b(row, kt, g);
   }
+}
+
+// The same load addressed by a BYTE offset the caller has already scaled,
+// rather than by a k-element index this helper halves for FP4. Both layouts
+// (row-major and K-major) then reduce to `base + k * w_kstride + g*16`, so the
+// k-loops carry one runtime stride instead of a layout template parameter.
+template <bool FP4>
+__device__ __forceinline__ i32x8_t
+    _gang_load_w_mfma_a_at(uint8_t const *base, int byte_off, int g) {
+  // kt = 0: _gang_load_fp4_mfma_b halves it and _gang_load_fp8_mfma_b does
+  // not, so passing zero makes the two paths agree on a byte-addressed base.
+  if constexpr (FP4) {
+    return _gang_load_fp4_mfma_b(base + byte_off, 0, g);
+  } else {
+    return _gang_load_fp8_mfma_b(base + byte_off, 0, g);
+  }
+}
+
+// Bytes one weight row contributes to one 128-element k-tile. W_ROW_BYTES is
+// exactly MFMA_ITERS of these.
+template <bool FP4>
+__device__ __forceinline__ constexpr int _gang_moe_bytes_per_ktile() {
+  return FP4 ? 64 : 128;
+}
+
+// The two runtime strides the k-loop walks, given the layout. Data: the next
+// k-tile of THIS row is one row-chunk away when row-major, sixteen away when
+// K-major (the intervening fifteen belong to the other rows of the 16-row
+// block this wave covers). Scales: 4 E8M0 bytes per k-tile per row, so 4 when
+// row-major and 16*4 when K-major.
+template <bool FP4>
+__device__ __forceinline__ constexpr int _gang_moe_w_kstride() {
+  return (MPK_MOE_KMAJOR >= 1 ? 16 : 1) * _gang_moe_bytes_per_ktile<FP4>();
+}
+__device__ __forceinline__ constexpr int _gang_moe_sc_kstride() {
+  return MPK_MOE_KMAJOR >= 2 ? 64 : 4;
 }
 
 template <bool FP4>
@@ -230,6 +324,7 @@ __device__ __forceinline__ f32x4_t _gang_mfma_w_x_f8(
 #define MPK_MOE_PF_GROUPS 4
 #endif
 
+
 // The k-loop, with the prefetch distance as a parameter. Accumulates
 // [0, KI_END) and returns the MFMA accumulator; the caller owns the epilogue.
 //
@@ -268,6 +363,10 @@ __device__ __forceinline__ f32x4_t
   static_assert(KI_END % GROUPS == 0,
                 "MPK_MOE_PF_GROUPS must divide the k-loop trip count");
   constexpr int NBLK = KI_END / GROUPS;
+  // Layout-dependent byte strides; both callers have already folded the layout
+  // into w_data_row / row_scale_base, so the loop below is layout-blind.
+  constexpr int W_KS = _gang_moe_w_kstride<WEIGHT_FP4>();
+  constexpr int SC_KS = _gang_moe_sc_kstride();
   auto tok_sc_at = [&](int k) -> int {
     return TOK_SC_FP8 ? (int)s_tok_scales[k * 4 + g] : (int)s_tok_scales[k];
   };
@@ -277,8 +376,8 @@ __device__ __forceinline__ f32x4_t
   int S[GROUPS];
 #pragma unroll
   for (int j = 0; j < GROUPS; j++) {
-    A[j] = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, j * K_PER_MFMA, g);
-    S[j] = (int)wg_scales[row_scale_base + j * 4 + g];
+    A[j] = _gang_load_w_mfma_a_at<WEIGHT_FP4>(w_data_row, j * W_KS, g);
+    S[j] = (int)wg_scales[row_scale_base + j * SC_KS + g];
   }
 
 // IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation. Same reason as the
@@ -293,8 +392,8 @@ __device__ __forceinline__ f32x4_t
 #pragma unroll
     for (int j = 0; j < GROUPS; j++) {
       int kk = base + GROUPS + j;
-      N[j] = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kk * K_PER_MFMA, g);
-      NS[j] = (int)wg_scales[row_scale_base + kk * 4 + g];
+      N[j] = _gang_load_w_mfma_a_at<WEIGHT_FP4>(w_data_row, kk * W_KS, g);
+      NS[j] = (int)wg_scales[row_scale_base + kk * SC_KS + g];
     }
 #pragma unroll
     for (int j = 0; j < GROUPS; j++) {
@@ -336,19 +435,23 @@ __device__ __forceinline__ f32x4_t
                          uint8_t const *s_tok_scales,
                          int g) {
   constexpr int K_PER_MFMA = 128;
+  // See the deep loop: the layout lives entirely in these two strides plus the
+  // bases the caller passed in.
+  constexpr int W_KS = _gang_moe_w_kstride<WEIGHT_FP4>();
+  constexpr int SC_KS = _gang_moe_sc_kstride();
   auto tok_sc_at = [&](int k) -> int {
     return TOK_SC_FP8 ? (int)s_tok_scales[k * 4 + g] : (int)s_tok_scales[k];
   };
 
   f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
-  i32x8_t a0 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 0 * K_PER_MFMA, g);
-  int sa0 = (int)wg_scales[row_scale_base + 0 * 4 + g];
-  i32x8_t a1 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 1 * K_PER_MFMA, g);
-  int sa1 = (int)wg_scales[row_scale_base + 1 * 4 + g];
-  i32x8_t a2 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 2 * K_PER_MFMA, g);
-  int sa2 = (int)wg_scales[row_scale_base + 2 * 4 + g];
-  i32x8_t a3 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 3 * K_PER_MFMA, g);
-  int sa3 = (int)wg_scales[row_scale_base + 3 * 4 + g];
+  i32x8_t a0 = _gang_load_w_mfma_a_at<WEIGHT_FP4>(w_data_row, 0 * W_KS, g);
+  int sa0 = (int)wg_scales[row_scale_base + 0 * SC_KS + g];
+  i32x8_t a1 = _gang_load_w_mfma_a_at<WEIGHT_FP4>(w_data_row, 1 * W_KS, g);
+  int sa1 = (int)wg_scales[row_scale_base + 1 * SC_KS + g];
+  i32x8_t a2 = _gang_load_w_mfma_a_at<WEIGHT_FP4>(w_data_row, 2 * W_KS, g);
+  int sa2 = (int)wg_scales[row_scale_base + 2 * SC_KS + g];
+  i32x8_t a3 = _gang_load_w_mfma_a_at<WEIGHT_FP4>(w_data_row, 3 * W_KS, g);
+  int sa3 = (int)wg_scales[row_scale_base + 3 * SC_KS + g];
 
 // IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation.
 #pragma unroll 1
@@ -358,9 +461,9 @@ __device__ __forceinline__ f32x4_t
       acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a0, b, acc, sa0, tok_sc_at(ki));
     }
     if (ki + 4 < KI_END) {
-      int kt4 = (ki + 4) * K_PER_MFMA;
-      a0 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt4, g);
-      sa0 = (int)wg_scales[row_scale_base + kt4 / 32 + g];
+      int k4 = ki + 4;
+      a0 = _gang_load_w_mfma_a_at<WEIGHT_FP4>(w_data_row, k4 * W_KS, g);
+      sa0 = (int)wg_scales[row_scale_base + k4 * SC_KS + g];
     }
 
     {
@@ -368,9 +471,9 @@ __device__ __forceinline__ f32x4_t
       acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a1, b, acc, sa1, tok_sc_at(ki + 1));
     }
     if (ki + 5 < KI_END) {
-      int kt5 = (ki + 5) * K_PER_MFMA;
-      a1 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt5, g);
-      sa1 = (int)wg_scales[row_scale_base + kt5 / 32 + g];
+      int k5 = ki + 5;
+      a1 = _gang_load_w_mfma_a_at<WEIGHT_FP4>(w_data_row, k5 * W_KS, g);
+      sa1 = (int)wg_scales[row_scale_base + k5 * SC_KS + g];
     }
 
     {
@@ -378,9 +481,9 @@ __device__ __forceinline__ f32x4_t
       acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a2, b, acc, sa2, tok_sc_at(ki + 2));
     }
     if (ki + 6 < KI_END) {
-      int kt6 = (ki + 6) * K_PER_MFMA;
-      a2 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt6, g);
-      sa2 = (int)wg_scales[row_scale_base + kt6 / 32 + g];
+      int k6 = ki + 6;
+      a2 = _gang_load_w_mfma_a_at<WEIGHT_FP4>(w_data_row, k6 * W_KS, g);
+      sa2 = (int)wg_scales[row_scale_base + k6 * SC_KS + g];
     }
 
     if (ki + 3 < KI_END) {
@@ -388,9 +491,9 @@ __device__ __forceinline__ f32x4_t
       acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a3, b, acc, sa3, tok_sc_at(ki + 3));
     }
     if (ki + 7 < KI_END) {
-      int kt7 = (ki + 7) * K_PER_MFMA;
-      a3 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt7, g);
-      sa3 = (int)wg_scales[row_scale_base + kt7 / 32 + g];
+      int k7 = ki + 7;
+      a3 = _gang_load_w_mfma_a_at<WEIGHT_FP4>(w_data_row, k7 * W_KS, g);
+      sa3 = (int)wg_scales[row_scale_base + k7 * SC_KS + g];
     }
   }
   return acc;
@@ -655,6 +758,10 @@ __device__ __noinline__ void
 
   constexpr int NUM_BLOCKS_32 = REDUCTION_SIZE / 32;
   constexpr int W_ROW_BYTES = WEIGHT_FP4 ? REDUCTION_SIZE / 2 : REDUCTION_SIZE;
+  // Bytes one row contributes to one k-tile; W_ROW_BYTES is MFMA_ITERS of it.
+  constexpr int W_BPK = _gang_moe_bytes_per_ktile<WEIGHT_FP4>();
+  static_assert(MPK_MOE_KMAJOR == 0 || OUTPUT_PER_WG % 16 == 0,
+                "K-major groups the rows a wave covers 16 at a time");
   constexpr int WG_DATA_BYTES = OUTPUT_PER_WG * W_ROW_BYTES;
   constexpr int WG_SCALE_BYTES = OUTPUT_PER_WG * NUM_BLOCKS_32;
   constexpr int WG_BYTES = WG_DATA_BYTES + WG_SCALE_BYTES;
@@ -891,9 +998,19 @@ __device__ __noinline__ void
   for (int tile_iter = 0; tile_iter < TILES_PER_WAVE; tile_iter++) {
     int const wave_tile = warp_id + tile_iter * NUM_WAVES;
     int const w_row = wave_tile * 16 + col;
+    // Row base under whichever weight layout was packed. Row-major is
+    // [row][k]; K-major is [row/16][k][row%16], so the row's k-tile 0 sits at
+    // its 16-row block, then its lane slot inside that block's first k-tile.
+    // See MPK_MOE_KMAJOR.
     uint8_t const *w_data_row =
-        wg_data + static_cast<size_t>(w_row) * W_ROW_BYTES;
-    int const row_scale_base = w_row * NUM_BLOCKS_32;
+        wg_data + (MPK_MOE_KMAJOR >= 1
+                       ? static_cast<size_t>(w_row / 16) * (16 * W_ROW_BYTES) +
+                             static_cast<size_t>(w_row % 16) * W_BPK
+                       : static_cast<size_t>(w_row) * W_ROW_BYTES);
+    int const row_scale_base =
+        (MPK_MOE_KMAJOR >= 2
+             ? (w_row / 16) * (16 * NUM_BLOCKS_32) + (w_row % 16) * 4
+             : w_row * NUM_BLOCKS_32);
 
     // MFMA_ITERS is 48 for GLM-5's 6144 hidden, so the default depth of 4 is
     // taken here.
@@ -912,6 +1029,12 @@ __device__ __noinline__ void
     // reduction between them, then reduce through LDS.
     static_assert(OUTPUT_PER_WG == 16,
                   "the K-parallel branch covers 16 output rows per workgroup");
+    // This branch keeps the pre-MPK_MOE_KMAJOR row-major addressing. It is
+    // measured negative and off by default, so it is guarded rather than
+    // ported. The `|| !K_PARALLEL` keeps the condition dependent -- a
+    // non-dependent static_assert fires even in a discarded if-constexpr arm.
+    static_assert(MPK_MOE_KMAJOR == 0 || !K_PARALLEL,
+                  "K-major weight is not wired into the K-parallel branch");
     constexpr int ITERS_PER_WAVE = MFMA_ITERS / NUM_WAVES;
     static_assert(MFMA_ITERS % NUM_WAVES == 0,
                   "MFMA_ITERS must be divisible by NUM_WAVES for K-parallel");
@@ -1139,6 +1262,10 @@ __device__ __noinline__ void
 
   constexpr int NUM_BLOCKS_32 = REDUCTION_SIZE / 32;
   constexpr int W_ROW_BYTES = WEIGHT_FP4 ? REDUCTION_SIZE / 2 : REDUCTION_SIZE;
+  // Bytes one row contributes to one k-tile; W_ROW_BYTES is MFMA_ITERS of it.
+  constexpr int W_BPK = _gang_moe_bytes_per_ktile<WEIGHT_FP4>();
+  static_assert(MPK_MOE_KMAJOR == 0 || OUTPUT_PER_WG % 16 == 0,
+                "K-major groups the rows a wave covers 16 at a time");
   constexpr int WG_DATA_BYTES = OUTPUT_PER_WG * W_ROW_BYTES;
   constexpr int WG_SCALE_BYTES = OUTPUT_PER_WG * NUM_BLOCKS_32;
   constexpr int WG_BYTES = WG_DATA_BYTES + WG_SCALE_BYTES;
@@ -1383,10 +1510,22 @@ __device__ __noinline__ void
     // window, so the body below still counts from zero and only its trip count
     // changes. k_base is 0 when K_SPLITS == 1, so the unsplit code is
     // byte-for-byte what it was.
+    // Row base + this split's k-window. Expressed in k-TILES times the
+    // layout's k-stride, which reduces to the old k_base/2 (FP4) and
+    // k_base/32 under the row-major default. See MPK_MOE_KMAJOR.
+    int const k_tile_base = k_base / 128;
     uint8_t const *w_data_row =
-        wg_data + static_cast<size_t>(w_row) * W_ROW_BYTES +
-        (WEIGHT_FP4 ? k_base / 2 : k_base);
-    int const row_scale_base = w_row * NUM_BLOCKS_32 + k_base / 32;
+        wg_data +
+        (MPK_MOE_KMAJOR >= 1
+             ? static_cast<size_t>(w_row / 16) * (16 * W_ROW_BYTES) +
+                   static_cast<size_t>(w_row % 16) * W_BPK
+             : static_cast<size_t>(w_row) * W_ROW_BYTES) +
+        static_cast<size_t>(k_tile_base) * _gang_moe_w_kstride<WEIGHT_FP4>();
+    int const row_scale_base =
+        (MPK_MOE_KMAJOR >= 2
+             ? (w_row / 16) * (16 * NUM_BLOCKS_32) + (w_row % 16) * 4
+             : w_row * NUM_BLOCKS_32) +
+        k_tile_base * _gang_moe_sc_kstride();
     uint8_t *s_tok_k = s_tok_fp8 + k_base;
     uint8_t *s_tok_sc_k = s_tok_scales + k_base / 32;
 
@@ -1412,6 +1551,12 @@ __device__ __noinline__ void
     // K-parallel; see the W13 kernel for the shape argument.
     static_assert(OUTPUT_PER_WG == 16,
                   "the K-parallel branch covers 16 output rows per workgroup");
+    // This branch keeps the pre-MPK_MOE_KMAJOR row-major addressing. It is
+    // measured negative and off by default, so it is guarded rather than
+    // ported. The `|| !K_PARALLEL` keeps the condition dependent -- a
+    // non-dependent static_assert fires even in a discarded if-constexpr arm.
+    static_assert(MPK_MOE_KMAJOR == 0 || !K_PARALLEL,
+                  "K-major weight is not wired into the K-parallel branch");
     constexpr int ITERS_PER_WAVE = MFMA_ITERS / NUM_WAVES;
     static_assert(MFMA_ITERS % NUM_WAVES == 0,
                   "MFMA_ITERS must be divisible by NUM_WAVES for K-parallel");
