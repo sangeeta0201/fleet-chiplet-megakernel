@@ -67,6 +67,16 @@ constexpr int LAYER_IDX_SMEM_OFFSET_FROM_END = 4;
 // weight tiles out of this slab, and the static_asserts that used to read a
 // literal 155 * 1024 now read this constant, so the compiler is what proves
 // a given value is legal. Do not raise it past 78 expecting 2 blocks/CU.
+//
+// PRICED 2026-08-24, and it turns out to be free at the wall. NP=4, 232
+// workers, wpe left at 1, one variable against the 11.418 baseline:
+//     MPK_WORKER_LDS_KB=78 -> 11.436 ms/iter (n=2, 11.458 / 11.415), text
+//     checked (coherent <think> then "Paris.")
+// +0.018 ms, well inside the 0.26 ms noise floor. So 77 KB of the default
+// 155 KB request was never load-bearing, and the LDS half of the occupancy
+// lock can be opened for nothing whenever the register half is solved.
+// The default stays 155 because gpt-oss shares this branch and was not
+// re-measured against 78.
 #ifndef MPK_WORKER_LDS_KB
 #define MPK_WORKER_LDS_KB 155
 #endif

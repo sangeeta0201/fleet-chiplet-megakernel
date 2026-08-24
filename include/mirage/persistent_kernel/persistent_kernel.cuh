@@ -4484,6 +4484,56 @@ __global__ MPK_WORKER_ATTR __launch_bounds__(
 // Cutting its AGPR term alone from 36 to 8 gives 248 + 8 = 256 -> granule 256
 // -> 2 waves/SIMD with NO spilling anywhere, because arch never moves. That is
 // a genuine live-set reduction on a 16-worker phase, not a compiler flag.
+//
+// ---------------------------------------------------------------------------
+// SECOND CORRECTION, 2026-08-24. Three claims above are now measured wrong.
+//
+// (1) THE AGPR ROUTE DOES NOT EXIST. "Cut the 36 to 8 and get 256" assumes the
+//     AGPRs are mla_decode_absorbed's live accumulators. They are not -- the
+//     AGPR file is SPILL SLACK, and whoever has pressure takes whatever is
+//     free. Probed by dividing NUM_V_BLOCKS (o_acc[8] -> o_acc[1], i.e. 32
+//     accumulators -> 4) and reading .vgpr_count out of the linked image:
+//         VSPLIT  1     2     4     8
+//         count   284   280   280   280
+//     284 -> 280 for an 8x cut in the thing supposedly setting it. The
+//     per-function disassembly says why: at VSPLIT=1 decode holds 36 AGPRs and
+//     gang_mla_full_layer_fused_kernel_mi300 holds ZERO; at VSPLIT=8 decode
+//     drops to 16 and the full-layer kernel immediately takes 32. Freeing
+//     AGPRs just relocates them. 280 is the floor of that approach.
+//
+//     Corollary: arch 248 is not decode's either. FOUR functions tie at exactly
+//     248 (decode, the mla_kvupd kernel, the full-layer kernel, and two
+//     rmsnorm_linear_mxfp8 instantiations at 228) -- that is the gfx950 arch
+//     VGPR ceiling, not a live set. There is no spill-free route to 256.
+//
+// (2) wpe=3 RUNS. The aperture violation above was measured with LDS at its
+//     default 155 KB and was read as independent of it. It is not:
+//         MPK_WORKER_WAVES_PER_EU=3 MPK_WORKER_LDS_KB=78, NP=4, 232 workers
+//         -> 0 aperture violations, correct text, 13.799 ms/iter
+//     The register lock is OPEN. It is just expensive: 13.799 against an
+//     11.418 baseline, +2.38 ms, which is the spill cost and nothing else --
+//     LDS=78 ALONE measures 11.436 (n=2), i.e. free. The mandatory
+//     precondition for 2 blocks/CU costs nothing; the register squeeze costs
+//     2.38 ms.
+//
+// (3) 2 BLOCKS/CU STILL DOES NOT HAPPEN AT RUNTIME, so the knob buys nothing
+//     even now. hipModuleOccupancyMaxActiveBlocksPerMultiprocessor against the
+//     real wpe=3 + LDS=78 code object (252 VGPR, 7328 B static, 256 threads)
+//     reports 2 blocks/CU for every dynamic request <= 72 KB, and we request
+//     exactly 72. Despite that, MPK_NUM_WORKERS=264 (272 blocks) and 464 (472
+//     blocks) BOTH hang in the bootstrap wait, exactly as they did at 1
+//     block/CU. The ceiling is still 256 blocks = the CU count. Ruled out as
+//     the cause: MAX_WORKER_PER_SCHEDULER (auto-scales, 30 -> 59, confirmed in
+//     the build flags) and the LDS request (the calculator agrees it fits).
+//     The static calculator does not model scratch, and wpe=3 is the first
+//     configuration this kernel has ever had that touches scratch at all.
+//     That is the open question, and it is the ONLY thing between here and
+//     2 blocks/CU.
+//
+// Whether it is worth answering: doubling workers 232 -> 464 halves the round
+// count for the round-quantised phases (q_b 2->1, o_proj 2->1, router 5->3,
+// W13/W2), worth ~1.8 ms at the optimistic end against a +2.38 ms spill bill.
+// That is net negative unless the spills go away, and (1) says they cannot.
 // ---------------------------------------------------------------------------
 #ifndef MPK_WORKER_WAVES_PER_EU
 #define MPK_WORKER_WAVES_PER_EU 1
