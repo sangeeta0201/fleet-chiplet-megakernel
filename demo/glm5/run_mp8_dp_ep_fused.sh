@@ -97,7 +97,31 @@ fi
 # principle, but the failure has only ever been observed at NP=8, and changing
 # their worker count would silently move every latency number already recorded
 # against them.
-export MPK_NUM_WORKERS="${MPK_NUM_WORKERS:-232}"
+#
+# AND THE 232 IS SCOPED TO NP=8 TOO. Everything above is an NP=8 diagnosis, and
+# NP=4 is the shipping config now. Re-measured at NP=4, bs=1, devices 4-7, n=6
+# each, paired in one session (2026-08-24):
+#
+#   workers  blocks  tiles/XCD  n=6 mean   note
+#     232      240       29      11.041     the NP=8 margin, carried over
+#     240      248       30      10.933     -0.108; every run beat 232's best
+#     248      256       31      10.979*    RESIDENCY RACE -- see below
+#
+# 248 is not merely slower, it is unsafe: 248 workers + 8 schedulers is exactly
+# 256 blocks on 256 CUs, so the moment two of the eight scheduler blocks
+# round-robin onto the same XCD that XCD needs 33 slots for 32 and the last
+# worker never becomes resident. Runs 1-2 completed (10.979, 10.937); run 3
+# hung at "launch_persistent_kernel ENTER" and had to be killed. The * is those
+# two survivors, not an n=6. 240 keeps one CU of margin on every XCD and did
+# not hang in 6 of 6.
+#
+# The NP=8 default stays 232 -- the fault above is real and this box reproduces
+# it. Only the NP=4 path moves.
+if [ "$NP" -ge 8 ]; then
+  export MPK_NUM_WORKERS="${MPK_NUM_WORKERS:-232}"
+else
+  export MPK_NUM_WORKERS="${MPK_NUM_WORKERS:-240}"
+fi
 
 # Pin each rank to the NUMA node its GPU hangs off.
 #
