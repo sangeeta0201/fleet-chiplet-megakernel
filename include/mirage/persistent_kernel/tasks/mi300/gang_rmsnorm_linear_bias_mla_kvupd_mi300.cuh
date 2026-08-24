@@ -69,6 +69,28 @@ namespace kernel {
 namespace gang_mla_kvupd_detail {
 using bf16 = __hip_bfloat16;
 
+// Flatten latent_to_cache's index chase (see the block comment inside it).
+//
+// MEASURED NULL, and defaulted off for that reason. NP=4, bs=1, devices 4-7,
+// paired same session, n=6 each:
+//
+//   MPK_KVUPD_FAST=1   11.221 ms/tok  sd 0.045
+//   MPK_KVUPD_FAST=0   11.183 ms/tok  sd 0.048   <- shipped
+//
+// +0.038 with t = 1.4, i.e. inside the 0.26 ms noise floor in the wrong
+// direction. The transform itself is real -- four dependent HBM round trips
+// become two, one full re-read of the latent row disappears, and a
+// __syncthreads goes away -- but it buys the wall nothing, and the reason is
+// in this file's own header comment: step 2 was given a dispatch slot of its
+// own (tile 0) precisely so it runs *alongside* the other 288 workers' MFMA.
+// It is not the last arriver of the q_b segment, so shortening it moves
+// nothing. Kept behind the flag as a priced null, not deleted -- if the q_b
+// phase is ever re-tiled such that tile 0 does set the arrival, this is the
+// version to switch on.
+#ifndef MPK_KVUPD_FAST
+#define MPK_KVUPD_FAST 0
+#endif
+
 // Step 2, verbatim from mla_kv_cache_update_impl minus the Q half. Kept
 // noinline so its LDS and register pressure stay off the 287 workers that
 // never call it.
@@ -114,6 +136,7 @@ __device__ __attribute__((noinline)) void
   constexpr int NUM_WARPS = NUM_THREADS / 64;
   constexpr int MAX_PAGES_PER_REQUEST =
       (MAX_SEQ_LEN + PAGE_SIZE - 1) / PAGE_SIZE;
+  constexpr int PER_THREAD = (KV_LORA_RANK + NUM_THREADS - 1) / NUM_THREADS;
 
   static_assert(QK_ROPE_HEAD_DIM % 2 == 0, "rope dim must be even");
   static_assert(KV_CACHE_STRIDE >= KV_LORA_RANK + QK_ROPE_HEAD_DIM,
@@ -123,6 +146,36 @@ __device__ __attribute__((noinline)) void
                 "latent slice must fit in the projection row");
 
   int const req = request_id;
+
+#if MPK_KVUPD_FAST
+  // The index chase, flattened.
+  //
+  // All five of these are indexed by `req` alone, so they are mutually
+  // independent -- but the old form put the qo_indptr equality test in front
+  // of the kv_indptr / kv_last_page_len loads, and vmcnt is in-order, so the
+  // compare forced an s_waitcnt vmcnt(0) and the second group paid a second
+  // cold HBM round trip. Issuing all five above the branch collapses that to
+  // one wait. The shipped ISA showed the serialized form directly:
+  //
+  //   flat_load_dwordx2 v[4:5], v[4:5]        ; qo_indptr[req], [req+1]
+  //   s_waitcnt vmcnt(0) lgkmcnt(0)           ; <- the branch's fault
+  //   v_cmp_ne_u32_e32 vcc, v5, v4
+  //   s_and_saveexec_b64 s[6:7], vcc
+  //   flat_load_dwordx2 v[6:7], v[6:7]        ; kv_indptr, a full trip later
+  //   flat_load_dword   v12, v[10:11]
+  //   s_waitcnt vmcnt(0) lgkmcnt(0)
+  int const first_token_pos = qo_indptr[req];
+  int const last_token_pos = qo_indptr[req + 1];
+  int const first_page_pos = kv_indptr[req];
+  int const last_page_pos = kv_indptr[req + 1];
+  int const last_page_len = kv_last_page_len[req];
+  if (first_token_pos == last_token_pos) {
+    return;
+  }
+  int const num_tokens = last_token_pos - first_token_pos;
+  int const num_pages = last_page_pos - first_page_pos;
+  int const global_seq_len = (num_pages - 1) * PAGE_SIZE + last_page_len;
+#else
   int const first_token_pos = qo_indptr[req];
   int const last_token_pos = qo_indptr[req + 1];
   if (first_token_pos == last_token_pos) {
@@ -134,16 +187,21 @@ __device__ __attribute__((noinline)) void
   int const num_pages = kv_indptr[req + 1] - first_page_pos;
   int const global_seq_len =
       (num_pages - 1) * PAGE_SIZE + kv_last_page_len[req];
+#endif
 
   int const tid = threadIdx.x;
   int const warp_idx = tid >> 6;
   int const lane_idx = tid & 63;
 
-  __shared__ int page_indices[MAX_PAGES_PER_REQUEST];
   __shared__ float s_reduce[NUM_WARPS];
+#if !MPK_KVUPD_FAST
+  __shared__ int page_indices[MAX_PAGES_PER_REQUEST];
   for (int i = tid; i < num_pages; i += NUM_THREADS) {
     page_indices[i] = kv_indices[first_page_pos + i];
   }
+#else
+  (void)num_pages;
+#endif
 
   bf16 const *__restrict__ d_kv = reinterpret_cast<bf16 const *>(kv_latent_ptr) +
                                   (long)first_token_pos * KV_INPUT_STRIDE +
@@ -154,20 +212,57 @@ __device__ __attribute__((noinline)) void
   bf16 const *__restrict__ d_cos = reinterpret_cast<bf16 const *>(cos_ptr);
   bf16 const *__restrict__ d_sin = reinterpret_cast<bf16 const *>(sin_ptr);
 
+#if !MPK_KVUPD_FAST
   __syncthreads();
+#endif
 
   for (int token = 0; token < num_tokens; token++) {
     int const pos = global_seq_len - num_tokens + token;
+#if MPK_KVUPD_FAST
+    // Straight to the one page this token lands on. Staging the whole
+    // MAX_PAGES_PER_REQUEST table in LDS bought a decode nothing -- it read
+    // exactly one entry back out, behind a __syncthreads.
+    int const page_idx = kv_indices[first_page_pos + pos / PAGE_SIZE];
+#else
     int const page_idx = page_indices[pos / PAGE_SIZE];
+#endif
     int const dst_row = page_idx * PAGE_SIZE + (pos % PAGE_SIZE);
     bf16 const *src = d_kv + (long)token * KV_INPUT_STRIDE;
     bf16 *dst = d_cache + (long)dst_row * KV_CACHE_STRIDE;
 
     float sum_sq = 0.0f;
+#if MPK_KVUPD_FAST
+    // Hold the row in registers: PER_THREAD is 2 at GLM's 512/256. The old
+    // form read src[] twice, once for the sum of squares and once for the
+    // scaled store, and the second pass could not issue until rms_rcp was
+    // known -- so it was a second full latency, not just a second KB.
+    float xv[PER_THREAD];
+#pragma unroll
+    for (int u = 0; u < PER_THREAD; u++) {
+      int const i = tid + u * NUM_THREADS;
+      xv[u] = (i < KV_LORA_RANK) ? __cvt_bf16_to_f32_mla(src[i]) : 0.0f;
+      sum_sq += xv[u] * xv[u];
+    }
+    // The rope operands depend on nothing the reduction produces, so pull
+    // them in now and let them fly under the shuffle chain and the barrier.
+    bf16 const *cos_data = d_cos + (long)pos * QK_ROPE_HEAD_DIM;
+    bf16 const *sin_data = d_sin + (long)pos * QK_ROPE_HEAD_DIM;
+    bool const has_rope = tid < ROPE_HALF;
+    float rx0 = 0.0f, rx1 = 0.0f, rc = 0.0f, rs = 0.0f;
+    if (has_rope) {
+      rx0 = __cvt_bf16_to_f32_mla(src[KV_LORA_RANK + 2 * tid]);
+      rx1 = __cvt_bf16_to_f32_mla(src[KV_LORA_RANK + 2 * tid + 1]);
+      rc = __cvt_bf16_to_f32_mla(cos_data[tid]);
+      rs = __cvt_bf16_to_f32_mla(sin_data[tid]);
+    }
+    static_assert(ROPE_HALF <= NUM_THREADS,
+                  "the hoisted rope operands assume one pair per thread");
+#else
     for (int i = tid; i < KV_LORA_RANK; i += NUM_THREADS) {
       float const val = __cvt_bf16_to_f32_mla(src[i]);
       sum_sq += val * val;
     }
+#endif
 #pragma unroll
     for (int offset = 32; offset > 0; offset >>= 1) {
       sum_sq += __shfl_xor(sum_sq, offset);
@@ -183,6 +278,22 @@ __device__ __attribute__((noinline)) void
     }
     float const rms_rcp = rsqrtf(sum_sq / float(KV_LORA_RANK) + kv_eps);
 
+#if MPK_KVUPD_FAST
+#pragma unroll
+    for (int u = 0; u < PER_THREAD; u++) {
+      int const i = tid + u * NUM_THREADS;
+      if (i < KV_LORA_RANK) {
+        cache_store<WRITE_THROUGH>(
+            &dst[i], xv[u] * rms_rcp * __cvt_bf16_to_f32_mla(kv_weight[i]));
+      }
+    }
+    if (has_rope) {
+      cache_store<WRITE_THROUGH>(&dst[KV_LORA_RANK + tid],
+                                 rx0 * rc - rx1 * rs);
+      cache_store<WRITE_THROUGH>(&dst[KV_LORA_RANK + ROPE_HALF + tid],
+                                 rx1 * rc + rx0 * rs);
+    }
+#else
     for (int i = tid; i < KV_LORA_RANK; i += NUM_THREADS) {
       float const val = __cvt_bf16_to_f32_mla(src[i]) * rms_rcp *
                         __cvt_bf16_to_f32_mla(kv_weight[i]);
@@ -200,6 +311,7 @@ __device__ __attribute__((noinline)) void
       cache_store<WRITE_THROUGH>(&dst[KV_LORA_RANK + ROPE_HALF + j],
                                  x1 * c + x0 * s);
     }
+#endif
     // The next token's reduction overwrites s_reduce.
     __syncthreads();
   }

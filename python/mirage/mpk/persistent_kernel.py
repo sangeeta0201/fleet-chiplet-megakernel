@@ -934,6 +934,15 @@ def get_compile_command(
                 "MPK_ATTN_PF_GROUPS is 0, 2, 4, 8 or 16"
             flags = flags + [f"-DMPK_ATTN_PF_GROUPS={_apf}"]
 
+        _kvf = os.environ.get("MPK_KVUPD_FAST")
+        if _kvf is not None:
+            # latent_to_cache's index chase: 1 issues all five req-indexed
+            # index loads above the early-return compare, drops the LDS page
+            # table, and holds the latent row in registers across the norm
+            # reduction. 0 restores the four-round-trip original.
+            assert _kvf in ("0", "1"), "MPK_KVUPD_FAST is 0 or 1"
+            flags = flags + [f"-DMPK_KVUPD_FAST={_kvf}"]
+
         _w2_sf = os.environ.get("MPK_W2_STAGE_FULL")
         if _w2_sf is not None:
             # Restores W2's pre-fdca420 full-width activation staging so the

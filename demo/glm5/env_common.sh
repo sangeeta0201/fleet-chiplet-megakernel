@@ -127,6 +127,8 @@ MPK_FORWARD_VARS=(
   MPK_MOE_PF_GROUPS
   # The same knob for the attention-half GEMM's k-loop. Compile-time.
   MPK_ATTN_PF_GROUPS
+  # latent_to_cache's flattened index chase. Compile-time.
+  MPK_KVUPD_FAST
   # Scratch backing store. Raising occupancy to 2 waves/SIMD doubles what ROCr
   # must reserve for spills (1192 B/thread x 256 CU x 4 SIMD x 2 waves x 64
   # lanes = 149 MB), which can cross the runtime's default single-dispatch
