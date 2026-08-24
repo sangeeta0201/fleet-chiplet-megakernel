@@ -1581,12 +1581,47 @@ if __name__ == "__main__":
         # tile_n=16 gives 6 tiles against 29 workers. Give the factor back to
         # the tile, down to the 4-row floor (256/ROWS lanes at 16 fp8 each).
         # Measured, sharded, ms/iter: 16 -> 13.057, 8 -> 12.598, 4 -> 12.533.
+        #
+        # What that sweep actually found is a TILE COUNT, not a row count. Each
+        # of those three arms ran at world_size 8, where hidden/8 = 768 columns
+        # per rank and the winner, 4 rows, is 768/8/4 = 24 tiles per XCD -- one
+        # clean round against the 29-wide dispatch with 83% of it busy. Writing
+        # the rule as `rows // world_size` then re-derives 4 at EVERY world
+        # size, which silently doubles the tile count each time the shard gets
+        # coarser: at world_size 4, 1536/8/4 = 48 tiles, i.e. TWO rounds with
+        # 19 of 29 workers busy in the second. MPK_PRINT_GEOMETRY says so
+        # directly.
+        #
+        # So target the 24 tiles instead, which reproduces the shipped 4 rows
+        # at world_size 8 exactly and gives 8 at world_size 4. Re-measured at
+        # NP=4, bs=1, devices 4-7, n=6 each, paired in one session:
+        #
+        #   tiles/XCD  rows  ms/tok
+        #     48        4    11.186   <- the `// world_size` rule
+        #     24        8    11.038   <- this, -0.148
+        #     12       16    11.216
+        #
+        # Non-monotonic in the same way and for the same reason as the K=10240
+        # sweep above: 12 tiles starves the XCD, 48 pays a second round, 24
+        # fits. Widening also drops bytes -- the shared fp8 activation row is
+        # re-read once per tile, so halving the tile count halves that term --
+        # but the byte saving is ~10% of o_proj's traffic and cannot be the
+        # whole 0.148; the round is.
+        OPROJ_TILES_PER_XCD = int(os.environ.get("GLM_OPROJ_TILES_XCD", "24"))
         oproj_tp_eligible = (int(os.environ.get("GLM_OPROJ_TP", "1")) == 1
                              and moe_ep and world_size > 1
                              and FUSE_FULL_LAYER and OPROJ_MXFP8
                              and use_gemv_oproj)
         if oproj_tp_eligible and _oproj_rows_env is None:
-            OPROJ_GEMV_ROWS = max(4, OPROJ_GEMV_ROWS // world_size)
+            # Snapped down to a power of two: the tile width is also the lane
+            # split (256/ROWS lanes at 16 E4M3 bytes each), so a width that is
+            # not a power of two does not divide 256 and the o_proj_red assert
+            # below would fire on a shape this rule invented rather than on one
+            # anybody asked for. Down, not nearest, because too FEW tiles is
+            # the arm that measured worst (12 -> 11.216).
+            _want = max(4, (hidden_size // world_size) // 8
+                        // OPROJ_TILES_PER_XCD)
+            OPROJ_GEMV_ROWS = 1 << (_want.bit_length() - 1)
         oproj_tile_n = OPROJ_GEMV_ROWS if use_gemv_oproj else GANG_TILE_N
         # The MTP front end's two eh_proj halves. Both are [hidden, hidden], so
         # 16 rows per workgroup gives hidden/16 = 384 workgroups, 48 tiles per
