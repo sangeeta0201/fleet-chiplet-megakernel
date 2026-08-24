@@ -921,6 +921,19 @@ def get_compile_command(
             assert _pf in ("0", "2", "4", "8", "16"), \
                 "MPK_MOE_PF_GROUPS is 0, 2, 4, 8 or 16"
             flags = flags + [f"-DMPK_MOE_PF_GROUPS={_pf}"]
+
+        _apf = os.environ.get("MPK_ATTN_PF_GROUPS")
+        if _apf is not None:
+            # Same knob for the attention-half GEMM (qkv_a, q_b, W_UK, W_UV,
+            # o_proj). 0 restores the rotating depth-4 loop, whose ISA shows a
+            # full `s_waitcnt vmcnt(0)` plus 28 v_mov at every loop back-edge.
+            # Long note at _rnlm8_kloop_deep in
+            # gang_rmsnorm_linear_mxfp8_bias_mi300.cuh. Compile-time, so every
+            # rank must agree.
+            assert _apf in ("0", "2", "4", "8", "16"), \
+                "MPK_ATTN_PF_GROUPS is 0, 2, 4, 8 or 16"
+            flags = flags + [f"-DMPK_ATTN_PF_GROUPS={_apf}"]
+
         _w2_sf = os.environ.get("MPK_W2_STAGE_FULL")
         if _w2_sf is not None:
             # Restores W2's pre-fdca420 full-width activation staging so the

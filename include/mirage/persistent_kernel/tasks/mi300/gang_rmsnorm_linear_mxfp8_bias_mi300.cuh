@@ -1066,6 +1066,159 @@ _rnlm8_stage_norm_rcp(unsigned short const *__restrict__ d_in,
   return rsqrtf(red[0] / float(ACTUAL_HIDDEN_DIM) + eps);
 }
 
+// ── The GROUPS-deep, guard-free k-loop ─────────────────────────────────────
+//
+// Both branches of the GEMM below shipped the same rotating depth-4 pipeline:
+// four slot registers a0..a3, each reloaded right after the MFMA that consumes
+// it, under `#pragma unroll 1` with an `if (ki + N < end)` tail guard on every
+// refill. It reads as depth 4. Disassembling the shipping image
+// (llvm-objdump of permanent_output_dir_rank0's gfx950 bundle, the
+// REDUCTION_SIZE=6144 / OUTPUT_PER_WG=16 instantiation, i.e. qkv_a) says it is
+// not:
+//
+//   0002B6FC  s_or_b64 exec, exec, s[8:9]      ; <- loop back-edge target
+//   0002B714  s_waitcnt vmcnt(0)               ; <- FULL DRAIN, every trip
+//   0002B718  v_mov_b32_e32 v178, v167         ; 28 more of these: the slot
+//   ...                                        ;  rotation the unroll-1 forbids
+//   0002B7A8  ds_read_b128 ...                 ; body proper starts here
+//
+// Not one `s_waitcnt vmcnt` appears anywhere inside the body after that. The
+// entire prefetch is cashed in at the top of each trip, so the loop runs one
+// k-group of latency exposed per four MFMAs -- which is what
+// memory:glm-attention-tiles-are-latency-bound-not-valu-bound measured as
+// qkv_a at 68% vmcnt.
+//
+// Two things cause it, and they are the same two the MoE k-loop had
+// (gang_moe_linear_mxfp8_mi300.cuh, MPK_MOE_PF_GROUPS):
+//
+//   1. The tail guards put each refill in its own basic block, so the number
+//      of outstanding vm ops at the join differs per path and SIInsertWaitcnts
+//      gives up and emits vmcnt(0). A prefetch that the wait drains is not a
+//      prefetch.
+//   2. `#pragma unroll 1` (mandatory -- it is what stops LLVM sinking the MFMA
+//      chain under the `col == 0` EXEC mask) denies the compiler the unroll it
+//      would need to rotate registers by renaming, so it rotates them with 28
+//      v_mov instead, and those movs need the vmcnt(0) to be legal.
+//
+// The fix is the MoE one: make the steady-state body straight-line by fixing
+// the trip count at compile time and peeling the last block. GROUPS loads
+// issue for block b+1 before any MFMA of block b runs, the copies become a
+// compile-time array shuffle the register allocator resolves for free, and the
+// wait in front of the MFMAs can be a partial vmcnt.
+//
+// KI_LEN is the number of k-tiles THIS WAVE walks -- MFMA_ITERS on the
+// N-parallel branch, ITERS_PER_WAVE on the K-parallel one -- and ki_start is
+// where it starts. GROUPS must divide KI_LEN; the caller's `_rnlm8_pf_groups`
+// picks the largest divisor <= the requested depth and returns 0 when there is
+// none, which selects the rotating loop instead.
+//
+// SEEDED takes the four A tiles the prologue already hoisted above the
+// quantizer (HOIST_PREFILL). That hoist issues exactly 4 tiles, so it only
+// composes with GROUPS == 4.
+template <int GROUPS, int KI_LEN, bool SEEDED>
+__device__ __forceinline__ f32x4_t
+    _rnlm8_kloop_deep(uint8_t const *w_data_row,
+                      uint8_t const *wg_scales,
+                      int row_scale_base,
+                      uint8_t const *s_tok_fp8,
+                      uint8_t const *s_tok_scales,
+                      int ki_start,
+                      int g,
+                      i32x8_t const *seed_a,
+                      int const *seed_sa) {
+  constexpr int K_PER_MFMA = 128;
+  static_assert(KI_LEN % GROUPS == 0,
+                "the deep k-loop needs GROUPS to divide the trip count");
+  static_assert(!SEEDED || GROUPS == 4,
+                "the hoisted prefill issues exactly four A tiles");
+  constexpr int NBLK = KI_LEN / GROUPS;
+
+  f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
+  i32x8_t A[GROUPS];
+  int S[GROUPS];
+#pragma unroll
+  for (int j = 0; j < GROUPS; j++) {
+    if constexpr (SEEDED) {
+      A[j] = seed_a[j];
+      S[j] = seed_sa[j];
+    } else {
+      int kk = ki_start + j;
+      A[j] = _gang_load_fp8_mfma_b_g(w_data_row, kk * K_PER_MFMA, g);
+      S[j] = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + kk * 4 + g);
+    }
+  }
+
+// IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation -- it is what keeps
+// LLVM from sinking the MFMA chain into the `col == 0` epilogue block, where it
+// would run under a 1-in-16 EXEC mask and silently compute on a quarter of the
+// wave. The GROUPS-wide bodies inside are fully unrolled, so the steady state
+// is still straight-line code.
+#pragma unroll 1
+  for (int blk = 0; blk < NBLK - 1; blk++) {
+    int const base = ki_start + blk * GROUPS;
+    i32x8_t N[GROUPS];
+    int NS[GROUPS];
+    // Issue the whole NEXT block before consuming the current one.
+#pragma unroll
+    for (int j = 0; j < GROUPS; j++) {
+      int kk = base + GROUPS + j;
+      N[j] = _gang_load_fp8_mfma_b_g(w_data_row, kk * K_PER_MFMA, g);
+      NS[j] = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + kk * 4 + g);
+    }
+#pragma unroll
+    for (int j = 0; j < GROUPS; j++) {
+      i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (base + j) * K_PER_MFMA, g);
+      acc = _gang_mfma_f8xf8(A[j], b, acc, S[j], (int)s_tok_scales[base + j]);
+    }
+#pragma unroll
+    for (int j = 0; j < GROUPS; j++) {
+      A[j] = N[j];
+      S[j] = NS[j];
+    }
+  }
+
+  // Peeled last block: consume what the previous trip prefetched, issue
+  // nothing past the end of this wave's range.
+  int const tail = ki_start + (NBLK - 1) * GROUPS;
+#pragma unroll
+  for (int j = 0; j < GROUPS; j++) {
+    i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (tail + j) * K_PER_MFMA, g);
+    acc = _gang_mfma_f8xf8(A[j], b, acc, S[j], (int)s_tok_scales[tail + j]);
+  }
+  // Pin the accumulator. At NBLK == 1 -- ITERS_PER_WAVE == GROUPS, which is
+  // the K=2048 / OUTPUT_PER_WG=16 instantiation -- the block loop above has a
+  // zero trip count and vanishes, leaving a straight-line MFMA chain. The
+  // caller reads `acc` only under `col == 0` (or `col < rows_here`), and given
+  // straight-line code LLVM sinks the whole chain into that block: the asm
+  // shows `s_and_b64 exec, exec, vcc` landing above the first v_mfma. MFMA
+  // gathers its operands across all 64 lanes, so under a 1-in-16 EXEC mask it
+  // silently computes on a quarter of the data. Same hazard, same fix, as the
+  // FULL_PRELOAD_ITERS branch in the caller.
+  asm volatile("" : "+v"(acc));
+  return acc;
+}
+
+// Largest divisor of `ki` that is <= `req` and >= 2, or 0 if there is none.
+// GLM-5's attention stages give MFMA_ITERS of 48 (qkv_a), 16 (q_b) and 4
+// (W_UK/W_UV); the K-parallel branch divides those by NUM_WAVES=4 first. Every
+// one of those is a power of two times 3, so a requested depth of 4 is taken
+// exactly wherever there are at least 4 tiles to walk.
+__device__ __host__ constexpr int _rnlm8_pf_groups(int ki, int req) {
+  for (int gr = (req < ki ? req : ki); gr >= 2; gr--) {
+    if (ki % gr == 0) {
+      return gr;
+    }
+  }
+  return 0;
+}
+
+// Prefetch depth for the attention-half GEMM's k-loop. 0 restores the rotating
+// depth-4 loop above, which is what every number before this knob was measured
+// against.
+#ifndef MPK_ATTN_PF_GROUPS
+#define MPK_ATTN_PF_GROUPS 4
+#endif
+
 template <int BATCH_SIZE,
           int OUTPUT_PER_WG,
           int REDUCTION_SIZE,
@@ -1680,6 +1833,16 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
         // move: same "+v" optimization-barrier idiom as
         // gang_mla_full_layer_fused_mi300.cuh:467.
         asm volatile("" : "+v"(acc));
+      } else if constexpr (_rnlm8_pf_groups(MFMA_ITERS, MPK_ATTN_PF_GROUPS) >=
+                           2) {
+        // ── Guard-free GROUPS-deep pipeline ────────────────────────────────
+        // See _rnlm8_kloop_deep for the ISA the rotating loop below actually
+        // compiles to. HOIST_PREFILL implies TILES_PER_WAVE == 1 here
+        // (OUTPUT_PER_WG >= 64 on this branch), so ph_a is this tile's fill.
+        constexpr int GR = _rnlm8_pf_groups(MFMA_ITERS, MPK_ATTN_PF_GROUPS);
+        acc = _rnlm8_kloop_deep<GR, MFMA_ITERS, HOIST_PREFILL && GR == 4>(
+            w_data_row, wg_scales, row_scale_base, s_tok_fp8, s_tok_scales,
+            /*ki_start=*/0, g, ph_a, ph_sa);
       } else {
         // Pre-fill: load k-tiles 0..3 into pipeline slots. Under HOIST_PREFILL
         // this wave's only fill was already issued above the quantizer, so the
@@ -1806,6 +1969,18 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
 
     f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
 
+    // ── Guard-free GROUPS-deep pipeline ──────────────────────────────────
+    // Same transform as the N-parallel branch; here the trip count is this
+    // wave's slice of K, not all of it. The hoisted prefill used w_row = col
+    // and ki0 = warp_id * ITERS_PER_WAVE, which is exactly (w_row, ki_start),
+    // so it seeds the first block directly.
+    constexpr int KGR = _rnlm8_pf_groups(ITERS_PER_WAVE, MPK_ATTN_PF_GROUPS);
+    if constexpr (KGR >= 2) {
+      acc = _rnlm8_kloop_deep<KGR, ITERS_PER_WAVE, HOIST_PREFILL && KGR == 4>(
+          w_data_row, wg_scales, row_scale_base, s_tok_fp8, s_tok_scales,
+          ki_start, g, ph_a, ph_sa);
+    } else {
+
     // Pre-fill: load k-tiles 0..3 into pipeline slots. Under HOIST_PREFILL
     // these were issued above the quantizer; the hoist used w_row = col and
     // ki0 = warp_id * ITERS_PER_WAVE, which is exactly (w_row, ki_start) here.
@@ -1878,6 +2053,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
         sa3 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + kt7 / 32 + g);
       }
     }
+
+    } // KGR < 2: the rotating depth-4 loop
 
     // Cross-wave LDS reduction (reuse token scratch area, dead after MFMA).
     // Folded, lane column `col` carries batch row `col`, so the scratch grows
