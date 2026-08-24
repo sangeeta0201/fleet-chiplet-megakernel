@@ -53,6 +53,29 @@ BPE = {
 }
 
 
+def _emax_balls_in_bins(n: int, R: int) -> float:
+    """Exact E[max bin load] for n balls thrown uniformly into R bins.
+
+    This is the EP routing makespan term: topk experts are drawn per token and
+    the layer waits on whichever rank drew the most.  Exact enumeration over
+    compositions -- n=8, R<=8 is tiny, so there is no reason to approximate.
+    """
+    from math import comb
+
+    total, norm = 0.0, float(R) ** n
+
+    def rec(bin_i: int, rem: int, mx: int, ways: float) -> None:
+        nonlocal total
+        if bin_i == R - 1:
+            total += ways * max(mx, rem)
+            return
+        for k in range(rem + 1):
+            rec(bin_i + 1, rem - k, max(mx, k), ways * comb(rem, k))
+
+    rec(0, n, 0, 1.0)
+    return total / norm
+
+
 def human(b: float) -> str:
     for unit, div in (("GB", 1e9), ("MB", 1e6), ("KB", 1e3)):
         if b >= div:
@@ -128,8 +151,15 @@ def main() -> int:
     # LAYER's makespan is set by the BUSIEST rank, not the mean. Balls-in-bins
     # with 8 balls in 8 bins has an expected max of ~3. That gap is a real,
     # structural cost of EP at batch 1 and is priced separately below.
+    # v9: max_active was HARDCODED 3.0.  That is ~right at R=8 and badly wrong
+    # at any other world size, which made every cross-world-size comparison
+    # wrong -- at R=2 it produced a "busiest rank" byte count BELOW the mean,
+    # which is impossible.  Compute E[max] exactly instead.  This is a
+    # combinatorial model parameter, NOT one of the measured hardware constants
+    # (HBM_TBS, EP_COLLECTIVE_US), which are untouched.
+    #   R=8 -> 2.597   R=4 -> 3.538   R=2 -> 5.094   (was 3.0 for all three)
     mean_active = topk / R
-    max_active = 3.0                        # E[max] for 8 balls in 8 bins ~= 2.9
+    max_active = _emax_balls_in_bins(topk, R)
     moe_mean = mean_active * per_expert * mq
     moe_max = max_active * per_expert * mq
     shared_b = n_shared * per_expert * mq   # replicated: every rank computes it
