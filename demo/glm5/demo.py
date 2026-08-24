@@ -168,6 +168,33 @@ def pack_mxfp8_workgroup(data: torch.Tensor, scales: torch.Tensor,
 # eight magnitudes and a 6.0 ceiling against E4M3's 448.
 _E2M1_LEVELS = torch.tensor([0., 0.5, 1., 1.5, 2., 3., 4., 6.])
 
+# The E4M3 byte for each of the sixteen E2M1 codes (bit 3 is the sign, bits
+# 0-2 index _E2M1_LEVELS). Built from torch's own cast rather than a
+# hand-derived table so the encoding is the hardware's.
+_E2M1_TO_E4M3 = torch.cat([_E2M1_LEVELS, -_E2M1_LEVELS]) \
+    .to(torch.float8_e4m3fn).view(torch.uint8)
+
+
+def widen_mxfp4_to_mxfp8(packed: torch.Tensor) -> torch.Tensor:
+    """Re-express a nibble-packed MXFP4 block tensor [..., K/2] as an MXFP8
+    one [..., K], WITHOUT changing a single represented value.
+
+    This is a byte-axis measurement tool (RE-STEER v9 Item 1.2), not a code
+    path to ship: it doubles the MoE weight footprint to buy nothing. It is
+    exact, not approximate -- every E2M1 level (0, .5, 1, 1.5, 2, 3, 4, 6) is
+    representable in E4M3, and the two formats share the same E8M0 per-32
+    scale and the same value = code * scale convention -- so the widened run
+    must emit BIT-IDENTICAL logits to the MXFP4 one. That is the point: it
+    moves bytes and nothing else, so the wall delta prices bytes alone.
+
+    Low nibble first, matching quantize_mxfp4's
+    ``nib[..., 0::2] | (nib[..., 1::2] << 4)``.
+    """
+    lut = _E2M1_TO_E4M3.to(packed.device)
+    codes = torch.stack([packed & 0xF, packed >> 4], dim=-1) \
+        .reshape(*packed.shape[:-1], -1)
+    return lut[codes.long()]
+
 
 def fake_quantize_mxfp4(w: torch.Tensor) -> torch.Tensor:
     """Round a bf16 weight through MXFP4 and back, in place of quantizing to it.
@@ -223,6 +250,46 @@ def fake_quantize_mxfp4(w: torch.Tensor) -> torch.Tensor:
 # 0.17 and because the byte budget has to come down anyway before utilization
 # work can cash out. Set GLM_MOE_MXFP4=0 for MXFP8.
 MOE_MXFP4 = os.environ.get("GLM_MOE_MXFP4", "1") == "1"
+
+# RE-STEER v9 Item 1.2 -- the bytes-only ablation. NP=2 will not fit (219.1
+# GiB resident and then the rocSHMEM heap alloc fails on a 252 GiB part), so
+# the third point on the byte axis has to come from varying bytes at FIXED
+# world size. GLM_MOE_MXFP4=0 is not available on an MXFP4 checkpoint -- there
+# is nothing to re-quantize from -- so instead widen the nibbles back out to
+# E4M3 at load (widen_mxfp4_to_mxfp8, exact), which doubles the MoE weight
+# byte term while leaving the task graph, the rendezvous count, the worker
+# assignment AND the emitted tokens identical. persistent_kernel.py infers the
+# element width from the packed workgroup stride, so no -D and no flag has to
+# be threaded down.
+#
+#   ""/"0" ship MXFP4        "all" widen both W13 and W2
+#
+# It is all-or-nothing: persistent_kernel.py:2879 derives ONE `moe_fp4` from
+# W13's stride and then asserts W2 agrees with it, so widening only the
+# cheaper of the two is not a legal tensor pair without splitting that bool
+# through the fused kernel. That would be a header edit, and the point of this
+# probe is to change nothing but bytes.
+#
+# MEMORY, computed before running: routed weights are 89.64 GiB a rank at
+# NP=4 (75 MoE layers x 64 local experts x 3 x 6144 x 2048 x 0.5312 B) and the
+# shared replica 1.40 GiB. At 1.0312 B/param those become 174.01 and 2.72, so
+# the widen adds 85.69 GiB on top of the measured 129.4 GiB baseline resident
+# = 215.1 GiB of a 252.0 GiB part. NP=2 died at 219.1 GiB resident on a 1 GiB
+# fine-grained rocSHMEM heap alloc (rocSHMEM/src/envvar.cpp:42, HEAP_SIZE
+# defaults to 1L<<30), which means ~33 GiB of real use sits above whatever the
+# loader calls "resident". 215.1 + 33 = 248 of 252 -- so this may OOM too, and
+# if it does that is the report, not a thing to fight.
+#
+# CAVEAT to carry into any conclusion drawn from it: MXFP8 is not ONLY more
+# bytes. The scaled MFMA does half the K per instruction at E4M3 that it does
+# at E2M1, so the widened path also issues 2x the MoE MFMAs. MFMA occupancy is
+# 2.65% (glm-tile-class-is-latency-neither-unit-saturated), so the byte term
+# should dominate -- but this is why the brief itself called it a weaker test
+# than an NP sweep.
+MOE_WIDEN_MXFP8 = os.environ.get("GLM_MOE_WIDEN_MXFP8", "0").lower()
+if MOE_WIDEN_MXFP8 in ("0", "", "off", "none"):
+    MOE_WIDEN_MXFP8 = ""
+assert MOE_WIDEN_MXFP8 in ("", "all"), MOE_WIDEN_MXFP8
 
 
 # The same question for the attention weights (task #66): qkv_a, q_b, W_UK,
@@ -2795,6 +2862,15 @@ if __name__ == "__main__":
                 assert MOE_MXFP8 and MOE_MXFP4, (
                     "an MXFP4 checkpoint needs the MXFP4 expert kernel "
                     "(GLM_MOE_MXFP4=1); there is no bf16 path for it")
+                if MOE_WIDEN_MXFP8:
+                    # GLM_MOE_MXFP4 stays 1 -- it describes the CHECKPOINT,
+                    # and the checkpoint really is MXFP4. What selects the
+                    # kernel is the packed workgroup stride, which the widen
+                    # changes underneath both of them.
+                    print("[CFG] GLM_MOE_WIDEN_MXFP8: routed + shared experts "
+                          "widened MXFP4 -> MXFP8 losslessly; +85.69 GiB "
+                          "resident, +1.243 ms of HBM roof, identical tokens",
+                          flush=True)
 
                 def _pair(d, key):
                     b, s = d[key]
@@ -2807,6 +2883,14 @@ if __name__ == "__main__":
                     else:
                         gu_b = torch.cat([gb, ub], dim=0)
                         gu_s = torch.cat([gs, us], dim=0)
+                    # Widen AFTER the interleave: interleave_gate_up only ever
+                    # reshapes dim 0, so it commutes with a per-element format
+                    # change, and doing it here means one call site instead of
+                    # two. The scale halves are untouched by construction --
+                    # E8M0 is the same in both formats.
+                    if MOE_WIDEN_MXFP8:
+                        gu_b = widen_mxfp4_to_mxfp8(gu_b)
+                        db = widen_mxfp4_to_mxfp8(db)
                     return (pack_mxfp8_workgroup(gu_b, gu_s, MOE_W13_OPW),
                             pack_mxfp8_workgroup(db, ds, MOE_W2_OPW))
 
@@ -2827,6 +2911,16 @@ if __name__ == "__main__":
                 gu_stack = torch.stack(gu_parts).contiguous()
                 down_stack = torch.stack(down_parts).contiguous()
                 layer.mlp.expert_mxfp4 = None   # drop the unpacked references
+                # NO torch.cuda.empty_cache() here, however tempting the 91
+                # GiB of cached MXFP4 blocks look under GLM_MOE_WIDEN_MXFP8.
+                # Tried it: all four ranks died silently four MoE layers into
+                # the pack, no traceback, no HIP error. _attach_input_keep
+                # exists precisely because attach_input records a RAW POINTER
+                # and the comment on it says "keep tensor alive to prevent
+                # pointer reuse"; empty_cache returns freed pages to the
+                # driver and breaks that invariant for anything the refs list
+                # does not cover. The allocator's own reuse is the supported
+                # path -- if the widen does not fit, let it OOM out loud.
                 _release(shared.gate_proj.weight, shared.up_proj.weight,
                          shared.down_proj.weight)
             else:

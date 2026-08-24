@@ -97,8 +97,16 @@ def errors():
 
 
 def fit():
+    """The two-point fit.  SUPERSEDED by recut() -- read that first.
+
+    Kept because it is the thing the third point falsified, and because its
+    fixed component (7.915) is the number recut() has to move.  Both of the
+    numbers it produces -- marginal 1.460, fixed 7.915 -- are WRONG; the
+    slope is contaminated by structure, not bytes.  See recut().
+    """
     print("=" * 78)
     print("ITEM 1 -- THE TWO-POINT FIT, REDONE ON CORRECTED BYTES")
+    print("        (SUPERSEDED -- both numbers below are falsified by 1.2)")
     print("=" * 78)
     d_wall = NP4_WALL - NP8_WALL
     d_floor = FLOOR[4] - FLOOR[8]
@@ -220,7 +228,13 @@ def predict(marginal, fixed):
 # assignment and numerics are all held fixed; only bytes move.
 # ---------------------------------------------------------------------------
 NP4_FLOOR_MXFP8 = 3.642     # roofline.py --ranks 4 --moe-quant mxfp8
-NP4_WIDEN_WALL = None       # filled in from the measured n=3
+NP4_WIDEN_WALL = 12.550     # MEASURED n=3: 12.531 / 12.575 / 12.545, spread
+                            # 0.044 ms, all three texts read and coherent,
+                            # [CFG] GLM_MOE_WIDEN_MXFP8 present in all three.
+                            # (A fourth run, the first of the v9widen launch,
+                            # OOMed during LOAD -- I relaunched without
+                            # checking for orphan ranks and stale VRAM was
+                            # still held.  Discarded, not averaged in.)
 
 
 def item12(marginal, fixed):
@@ -257,15 +271,80 @@ def item12(marginal, fixed):
     print("  'bytes cost 1:1' AND with 'bytes are free and the MFMAs cost'.")
     print("  Only a result at or above M1 discriminates cleanly.")
     print()
-    if NP4_WIDEN_WALL is None:
-        print("  MEASURED: pending.")
-    else:
-        d = NP4_WIDEN_WALL - NP4_WALL
-        print(f"  MEASURED: {NP4_WIDEN_WALL:.3f} ms, delta {d:+.3f} ms")
-        print(f"  implied marginal wall per ms of roof: {d / (f8 - f4):.3f}")
-        best = min(models, key=lambda m: abs(m[1] - NP4_WIDEN_WALL))
-        print(f"  closest model: {best[0]}")
+    d = NP4_WIDEN_WALL - NP4_WALL
+    slope = d / (f8 - f4)
+    print(f"  MEASURED: {NP4_WIDEN_WALL:.3f} ms  n=3 "
+          f"(12.531 / 12.575 / 12.545), delta {d:+.3f} ms")
+    print(f"  {'':<40}{'wall':>9}{'error':>9}")
+    print(f"  {'-' * 40} {'-' * 8} {'-' * 8}")
+    for name, p in sorted(models, key=lambda m: abs(m[1] - NP4_WIDEN_WALL)):
+        mark = "  <-- lands" if abs(p - NP4_WIDEN_WALL) < 0.26 else ""
+        print(f"  {name:<40}{p:>9.3f}{p - NP4_WIDEN_WALL:>+9.3f}{mark}")
     print()
+    print(f"  M2 is the only model inside the 0.26 ms noise floor.  M1 -- this")
+    print(f"  file's own two-point fit -- misses by "
+          f"{models[0][1] - NP4_WIDEN_WALL:+.3f} ms, 2.6x the floor.")
+    print()
+    return slope
+
+
+def recut(marginal_2pt, fixed_2pt, slope):
+    print("=" * 78)
+    print("ITEM 1 -- THE RE-CUT.  THE THIRD POINT BREAKS THE SLOPE AND SAVES")
+    print("          THE FIXED COMPONENT.")
+    print("=" * 78)
+    f4, f8 = FLOOR[4], NP4_FLOOR_MXFP8
+    d = NP4_WIDEN_WALL - NP4_WALL
+    d_floor_np = FLOOR[4] - FLOOR[8]
+    d_wall_np = NP4_WALL - NP8_WALL
+    structural = d_wall_np - slope * d_floor_np
+    fixed4 = NP4_WALL - slope * FLOOR[4]
+    fixed8 = NP8_WALL - slope * FLOOR[8]
+
+    print(f"""
+  TWO SLOPES, MEASURED TWO WAYS, AND THEY DISAGREE:
+
+    across world size  NP=8 -> NP=4   {d_wall_np:+.3f} wall / {d_floor_np:+.3f} roof = {marginal_2pt:.3f}
+    within  world size, bytes only    {d:+.3f} wall / {f8 - f4:+.3f} roof = {slope:.3f}
+
+  The disagreement IS the finding.  A world-size change is not a byte change:
+  it moves shard widths, the EP fan-out, E[max], the collective payload and
+  the per-rank tile counts all at once.  The MXFP4 -> MXFP8 widen moves ONLY
+  bytes -- same task graph, same 10 rendezvous, same 232 workers, same
+  per-XCD tile counts, bit-identical values.  {slope:.3f} is therefore the honest
+  marginal byte rate and {marginal_2pt:.3f} was contaminated.
+
+  Splitting the NP=8 -> NP=4 delta on the clean slope:
+    total                              {d_wall_np:+.3f} ms
+    explained by bytes  {slope:.3f} x {d_floor_np:.3f}   {slope * d_floor_np:+.3f} ms
+    STRUCTURAL residual                {structural:+.3f} ms
+  So {100 * structural / d_wall_np:.0f} % of the cost of halving the world size is NOT bytes.
+
+  THE BYTE-INDEPENDENT COMPONENT, re-cut on the clean slope:
+    at NP=4   {NP4_WALL:.3f} - {slope:.3f} x {FLOOR[4]:.3f} = {fixed4:.3f} ms  ({100 * fixed4 / NP4_WALL:.1f} % of the wall)
+    at NP=8   {NP8_WALL:.3f} - {slope:.3f} x {FLOOR[8]:.3f} = {fixed8:.3f} ms  ({100 * fixed8 / NP8_WALL:.1f} % of the wall)
+    (the {fixed4 - fixed8:.3f} ms gap between them is exactly the structural residual
+     above -- the decomposition is self-consistent.)
+
+  VERDICT, one line: the fixed component SURVIVES and is BIGGER than the
+  two-point fit said -- {fixed4:.2f} ms at NP=4, {100 * fixed4 / NP4_WALL:.0f} % of the wall -- so the v9 brief's
+  9.34 ms lands within {abs(fixed4 - 9.34):.2f} ms of a structure-controlled measurement even
+  though every step of its derivation was wrong.  The board is the fixed
+  component.
+
+  AND THE {fixed4:.2f} IS A LOWER BOUND.  MXFP8 does not only add bytes: the
+  scaled MFMA covers half the K per instruction at E4M3, so the widened MoE
+  also issues 2x the MFMAs.  Any part of the {d:+.3f} ms that is MFMA issue
+  rather than bytes makes the true byte slope SMALLER than {slope:.3f} and the
+  fixed component LARGER than {fixed4:.2f}.  It cannot move the other way.
+
+  WHAT DIED HERE: this file's own 'marginal bytes cost {marginal_2pt:.2f}x their roof
+  time, there is no free absorption' paragraph.  Refuted by measurement.
+  Marginal bytes cost {slope:.2f}x their roof -- a hair UNDER 1:1, which is the
+  ordinary additive-probe rate in the ledger
+  (glm-additive-probes-overprice-deletions), not an absorption effect.
+""")
+    return fixed4
 
 
 def corollary():
@@ -286,15 +365,49 @@ def corollary():
     print("  HOWEVER -- the brief's DECISION to retire the 7.32 target stands,")
     print("  on its other stated reason, which the corrections do not touch:")
     print("  efficiency-vs-byte-roof is the wrong denominator when most of the")
-    print("  wall is not bytes.  A byte-independent share of 74 % makes that")
+    print("  wall is not bytes.  A byte-independent share of 81 % makes that")
     print("  argument just as well as 88 % did.  v8's target stays retired;")
     print("  only its epitaph changes.")
     print()
+
+
+def board(fixed4):
+    print("=" * 78)
+    print("WHAT ITEM 2 SHOULD BE BUILT ON")
+    print("=" * 78)
+    print(f"""
+  The NP=4 wall, {NP4_WALL:.3f} ms, splits into exactly two pieces now, both
+  measured rather than modelled:
+
+    byte-attributable   {NP4_WALL - fixed4:6.3f} ms   ({100 * (NP4_WALL - fixed4) / NP4_WALL:4.1f} %)  slope measured at fixed NP
+    byte-INDEPENDENT    {fixed4:6.3f} ms   ({100 * fixed4 / NP4_WALL:4.1f} %)  <-- THE BOARD
+
+  Item 2 asks what the byte-independent piece is made of.  Build its table
+  against {fixed4:.2f}, not against the brief's 9.34 and not against this file's
+  earlier 7.915.  The three candidate contents, from the existing ledger:
+
+    - last-arriver floor        54 % of the layer is arrival spread, of which
+                                1.506 ms is cross-rank
+                                (glm-layer-is-54pct-last-arriver-floor)
+    - VALU prologues            quant / RMSNorm / rope on the CRITICAL worker.
+                                The '+0.187 hoist is a wash' null does NOT
+                                cover this -- it removed REDUNDANCY across
+                                parallel workers, not VALU from the critical
+                                path (glm-hoisting-parallel-redundancy-is-a-wash)
+    - rendezvous count          10 device-wide, 2 cross-rank, 3.77 us each
+                                (glm-one-rendezvous-costs-3.77us)
+
+  All three are latency, none is bytes, and that is consistent with the tile
+  class already measuring 3.09x over its own byte roof with MFMA at 2.65 %
+  and HBM at 32.7 % (glm-tile-class-is-latency-neither-unit-saturated).
+""")
 
 
 if __name__ == "__main__":
     errors()
     m, f = fit()
     predict(m, f)
-    item12(m, f)
+    s = item12(m, f)
+    fixed4 = recut(m, f, s)
     corollary()
+    board(fixed4)
