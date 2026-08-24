@@ -167,40 +167,67 @@ __device__ __forceinline__ f32x4_t _gang_mfma_w_x_f8(
 // 16 is measured worse, matching test_narrow_grid_bandwidth.hip, where depth 4
 // is the optimum at every grid width and depth 8 is 15% worse at narrow ones.
 //
-// The same file measures two further multipliers that are NOT in this knob,
-// because each needs its own change and its own run: staging the E8M0 scales
-// through LDS (-1.0 us on top) and repacking the weight K-major so a wave's
-// k-group is 1024 contiguous bytes instead of sixteen 64-byte pieces
-// (-2.2 us more). Stacked, 16.22 -> 7.90 us/tile.
+// The same file measures the two candidate multipliers ON TOP OF GROUPS=4,
+// which is what ships. Both had only ever been measured on top of the
+// standalone's own optimum of 8, and one of them does not survive the move:
 //
-// ON W13 THE 28% DOES NOT REACH THE WALL. Default is 0 for that reason.
-// Two paired same-batch A/Bs, n=3 each, MPK_NUM_WORKERS=232:
+//   GROUPS=4                        11.85 us/tile   16.6 GB/s/CU
+//   GROUPS=4 + LDS-staged scales    12.24           16.1   <- +0.39, NEGATIVE
+//   GROUPS=4 + K-major weight        9.70           20.3   <- -2.15, -18%
+//   GROUPS=4 + both                 10.92           18.0
 //
-//   guarded form      control 10.460  ->  PF=4 10.491   (+0.031)
-//   guard-free form   control 10.503  ->  PF=4 10.517   (+0.014)
+// LDS scale staging pays at depth 8 (10.72 vs 11.66) and costs at depth 4. The
+// file's own arms 3/5 already showed the scale load is nearly free and that
+// what the LDS arm really buys is a coalesced burst from ANY address, so it was
+// never a scale fix; at depth 4 the prefetch has already bought that pacing and
+// the extra barriers are pure cost.
 //
-// Both are inside the 0.26 ms noise floor against a predicted -0.37 ms. The
-// first null has an ISA cause (the guards forced a full drain; see the note on
-// the helper). The second does not -- the drain moved but the wall did not.
-// The standing explanation is that W13 is the ABSORBED tile phase: its 16.4
-// us/layer is eaten by the spread of the barrier behind it, while W2's 9.7 us
-// is not (memory: glm-w2-imbalance-is-the-only-unabsorbed-spread). A real
-// in-place tile speedup on an absorbed phase buys zero makespan.
+// K-MAJOR IS THE REMAINING LEVER AND IT IS UNBUILT. It repacks the weight so a
+// wave's k-group is 1024 contiguous bytes instead of sixteen 64-byte pieces
+// strided W_ROW_BYTES apart. Same bytes, same MFMA, same pipeline -- purely a
+// packer change (pack_mxfp8_workgroup in demo/glm5/demo.py) plus the address
+// arithmetic here. At the PF conversion rate measured above (-4.44 us/tile
+// standalone bought -0.142 ms of wall) it projects to about -0.07 ms, which is
+// under the 0.26 ms noise floor and needs n=6 pooling to resolve.
 //
-// ON W2 IT IS ALSO NULL, so that explanation does not survive either. Pointing
-// the knob at the unabsorbed phase and pooling n=6 per arm across two batches:
+// IT IS NULL AT NP=8 AND A WIN AT NP=4. Default is 4, which is the NP=4
+// optimum. Both halves are measured; the NP=8 nulls below are kept because they
+// are the reason this stayed off for so long, not because they generalize.
 //
-//   control  n=6  mean 10.526  sd 0.151  min 10.353
-//   PF=4     n=6  mean 10.521  sd 0.168  min 10.323   (-0.005)
+// NP=8, three paired same-batch A/Bs, MPK_NUM_WORKERS=232, all three null:
 //
-// The first batch on its own read -0.084 and the second +0.075; that spread IS
-// the batch drift the pooling rule exists for. Three paired A/Bs, three nulls.
-// The lever is closed: a 28% standalone tile win on the two biggest MoE tile
-// phases does not appear at the wall in either an absorbed or an unabsorbed
-// phase. Whatever the standalone is measuring, the megakernel's W13/W2 tiles
-// are not paying it.
+//   W13, guarded form      control 10.460  ->  PF=4 10.491   (+0.031, n=3)
+//   W13, guard-free form   control 10.503  ->  PF=4 10.517   (+0.014, n=3)
+//   W2,  guard-free form   control 10.526  ->  PF=4 10.521   (-0.005, n=6)
+//
+// All inside the 0.26 ms noise floor against a predicted -0.37. The first has
+// an ISA cause (the guards forced a full drain; see the note on the helper);
+// the other two do not. The W13 null was explained as absorption -- W13's 16.4
+// us/layer is eaten by the spread of the barrier behind it -- but W2 is the
+// UNABSORBED phase (memory: glm-w2-imbalance-is-the-only-unabsorbed-spread) and
+// read null too, so absorption was never the whole story.
+//
+// NP=4 (devices 4,5,6,7, the shipping config), same knob, both call sites live,
+// two independent batches of n=3 pooled per arm:
+//
+//   control  n=6  mean 11.441  sd 0.087  min 11.344
+//   PF=4     n=6  mean 11.298  sd 0.016  min 11.280   (-0.142)
+//   PF=8     n=3  mean 11.701           min 11.621   (+0.260, clearly worse)
+//
+// The two batches agree to 0.014 ms and the populations do not overlap; PF=4's
+// run-to-run spread is 5x tighter than the control's. WHY IT CONVERTS HERE AND
+// NOT AT NP=8: at NP=4 a rank owns ~2 activated experts instead of ~1, so the
+// MoE phase runs 16 W13 and 24 W2 tiles per XCD against 29 workers rather than
+// 8 and 12. The phase is one full round of nearly-saturated workers instead of
+// a half-empty one, so per-tile time is the makespan rather than something the
+// round quantization rounds away (memory:
+// glm-moe-phase-is-round-quantized-and-w2-is-latency-bound).
+//
+// 8 is worse at the wall even though the standalone put its knee at 8; that
+// matches test_narrow_grid_bandwidth.hip, where depth 4 wins at every grid
+// width and depth 8 costs 15% at narrow ones.
 #ifndef MPK_MOE_PF_GROUPS
-#define MPK_MOE_PF_GROUPS 0
+#define MPK_MOE_PF_GROUPS 4
 #endif
 
 // The k-loop, with the prefetch distance as a parameter. Accumulates
@@ -292,6 +319,116 @@ __device__ __forceinline__ f32x4_t
                                         tok_sc_at(TAIL + j));
   }
   return acc;
+}
+
+// The shipping k-loop, hoisted verbatim out of the two call sites so the
+// prefetch depth can be selected with `if constexpr` instead of `#if`. Declares
+// a0..a3 and reloads each one right after the MFMA that consumes it; see the
+// ISA dump above for why that is a depth-1 pipeline in practice and not the
+// depth-4 it reads as. Kept because it is the only form that does not need
+// GROUPS to divide the trip count.
+template <bool WEIGHT_FP4, bool TOK_SC_FP8, int KI_END>
+__device__ __forceinline__ f32x4_t
+    _gang_moe_kloop_ship(uint8_t const *w_data_row,
+                         uint8_t const *wg_scales,
+                         int row_scale_base,
+                         uint8_t const *s_tok_fp8,
+                         uint8_t const *s_tok_scales,
+                         int g) {
+  constexpr int K_PER_MFMA = 128;
+  auto tok_sc_at = [&](int k) -> int {
+    return TOK_SC_FP8 ? (int)s_tok_scales[k * 4 + g] : (int)s_tok_scales[k];
+  };
+
+  f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
+  i32x8_t a0 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 0 * K_PER_MFMA, g);
+  int sa0 = (int)wg_scales[row_scale_base + 0 * 4 + g];
+  i32x8_t a1 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 1 * K_PER_MFMA, g);
+  int sa1 = (int)wg_scales[row_scale_base + 1 * 4 + g];
+  i32x8_t a2 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 2 * K_PER_MFMA, g);
+  int sa2 = (int)wg_scales[row_scale_base + 2 * 4 + g];
+  i32x8_t a3 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 3 * K_PER_MFMA, g);
+  int sa3 = (int)wg_scales[row_scale_base + 3 * 4 + g];
+
+// IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation.
+#pragma unroll 1
+  for (int ki = 0; ki < KI_END; ki += 4) {
+    {
+      i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
+      acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a0, b, acc, sa0, tok_sc_at(ki));
+    }
+    if (ki + 4 < KI_END) {
+      int kt4 = (ki + 4) * K_PER_MFMA;
+      a0 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt4, g);
+      sa0 = (int)wg_scales[row_scale_base + kt4 / 32 + g];
+    }
+
+    {
+      i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 1) * K_PER_MFMA, g);
+      acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a1, b, acc, sa1, tok_sc_at(ki + 1));
+    }
+    if (ki + 5 < KI_END) {
+      int kt5 = (ki + 5) * K_PER_MFMA;
+      a1 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt5, g);
+      sa1 = (int)wg_scales[row_scale_base + kt5 / 32 + g];
+    }
+
+    {
+      i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 2) * K_PER_MFMA, g);
+      acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a2, b, acc, sa2, tok_sc_at(ki + 2));
+    }
+    if (ki + 6 < KI_END) {
+      int kt6 = (ki + 6) * K_PER_MFMA;
+      a2 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt6, g);
+      sa2 = (int)wg_scales[row_scale_base + kt6 / 32 + g];
+    }
+
+    if (ki + 3 < KI_END) {
+      i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 3) * K_PER_MFMA, g);
+      acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a3, b, acc, sa3, tok_sc_at(ki + 3));
+    }
+    if (ki + 7 < KI_END) {
+      int kt7 = (ki + 7) * K_PER_MFMA;
+      a3 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt7, g);
+      sa3 = (int)wg_scales[row_scale_base + kt7 / 32 + g];
+    }
+  }
+  return acc;
+}
+
+// Largest divisor of KI that is at most REQ and at least 2, or 0 if there is
+// none. The deep loop's trip count is a compile-time constant with no
+// remainder handling -- that is what keeps its steady-state body straight-line
+// and its s_waitcnt partial -- so a shape whose k-loop does not divide has to
+// fall back rather than fail to compile. GLM-5 is 48 (W13) and 16 (W2), both
+// clean at 4; GLM-4.7-Flash's W2 runs 11 iterations and takes the fallback.
+__device__ __host__ constexpr int _gang_moe_pf_groups(int ki, int req) {
+  for (int gr = (req < ki ? req : ki); gr >= 2; gr--) {
+    if (ki % gr == 0) {
+      return gr;
+    }
+  }
+  return 0;
+}
+
+// Prefetch-depth dispatch. GROUPS_REQ == 0, or a trip count no divisor fits,
+// selects the shipping loop.
+template <bool WEIGHT_FP4, bool TOK_SC_FP8, int GROUPS_REQ, int KI_END>
+__device__ __forceinline__ f32x4_t
+    _gang_moe_kloop(uint8_t const *w_data_row,
+                    uint8_t const *wg_scales,
+                    int row_scale_base,
+                    uint8_t const *s_tok_fp8,
+                    uint8_t const *s_tok_scales,
+                    int g) {
+  constexpr int GR = _gang_moe_pf_groups(KI_END, GROUPS_REQ);
+  if constexpr (GR >= 2) {
+    return _gang_moe_kloop_deep<WEIGHT_FP4, TOK_SC_FP8, GR, KI_END>(
+        w_data_row, wg_scales, row_scale_base, s_tok_fp8, s_tok_scales, g);
+  } else {
+    return _gang_moe_kloop_ship<WEIGHT_FP4, TOK_SC_FP8, KI_END>(
+        w_data_row, wg_scales, row_scale_base, s_tok_fp8, s_tok_scales, g);
+  }
 }
 
 // Resolve a gang tile index to (expert_id, token, workgroup).
@@ -758,70 +895,11 @@ __device__ __noinline__ void
         wg_data + static_cast<size_t>(w_row) * W_ROW_BYTES;
     int const row_scale_base = w_row * NUM_BLOCKS_32;
 
-    f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
-
-#if MPK_MOE_PF_GROUPS > 0
-    acc = _gang_moe_kloop_deep<WEIGHT_FP4, false, MPK_MOE_PF_GROUPS,
-                               MFMA_ITERS>(
+    // MFMA_ITERS is 48 for GLM-5's 6144 hidden, so the default depth of 4 is
+    // taken here.
+    f32x4_t acc = _gang_moe_kloop<WEIGHT_FP4, false, MPK_MOE_PF_GROUPS,
+                                  MFMA_ITERS>(
         w_data_row, wg_scales, row_scale_base, s_tok_fp8, s_tok_scales, g);
-#else
-    i32x8_t a0 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 0 * K_PER_MFMA, g);
-    int sa0 = (int)wg_scales[row_scale_base + 0 * 4 + g];
-    i32x8_t a1 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 1 * K_PER_MFMA, g);
-    int sa1 = (int)wg_scales[row_scale_base + 1 * 4 + g];
-    i32x8_t a2 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 2 * K_PER_MFMA, g);
-    int sa2 = (int)wg_scales[row_scale_base + 2 * 4 + g];
-    i32x8_t a3 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 3 * K_PER_MFMA, g);
-    int sa3 = (int)wg_scales[row_scale_base + 3 * 4 + g];
-
-// IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation.
-#pragma unroll 1
-    for (int ki = 0; ki < MFMA_ITERS; ki += 4) {
-      {
-        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
-        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a0, b, acc, sa0,
-                                            (int)s_tok_scales[ki]);
-      }
-      if (ki + 4 < MFMA_ITERS) {
-        int kt4 = (ki + 4) * K_PER_MFMA;
-        a0 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt4, g);
-        sa0 = (int)wg_scales[row_scale_base + kt4 / 32 + g];
-      }
-
-      {
-        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 1) * K_PER_MFMA, g);
-        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a1, b, acc, sa1,
-                                            (int)s_tok_scales[ki + 1]);
-      }
-      if (ki + 5 < MFMA_ITERS) {
-        int kt5 = (ki + 5) * K_PER_MFMA;
-        a1 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt5, g);
-        sa1 = (int)wg_scales[row_scale_base + kt5 / 32 + g];
-      }
-
-      {
-        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 2) * K_PER_MFMA, g);
-        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a2, b, acc, sa2,
-                                            (int)s_tok_scales[ki + 2]);
-      }
-      if (ki + 6 < MFMA_ITERS) {
-        int kt6 = (ki + 6) * K_PER_MFMA;
-        a2 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt6, g);
-        sa2 = (int)wg_scales[row_scale_base + kt6 / 32 + g];
-      }
-
-      if (ki + 3 < MFMA_ITERS) {
-        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 3) * K_PER_MFMA, g);
-        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a3, b, acc, sa3,
-                                            (int)s_tok_scales[ki + 3]);
-      }
-      if (ki + 7 < MFMA_ITERS) {
-        int kt7 = (ki + 7) * K_PER_MFMA;
-        a3 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt7, g);
-        sa3 = (int)wg_scales[row_scale_base + kt7 / 32 + g];
-      }
-    }
-#endif // MPK_MOE_PF_GROUPS
 
     // Epilogue. acc[i] = C[g*4+i][col]; at one token per tile only col 0 holds
     // a result.
@@ -1312,74 +1390,13 @@ __device__ __noinline__ void
     uint8_t *s_tok_k = s_tok_fp8 + k_base;
     uint8_t *s_tok_sc_k = s_tok_scales + k_base / 32;
 
-    f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
-
-#if MPK_MOE_PF_GROUPS > 0
     // W2 is the phase whose tile time is NOT absorbed by the barrier behind it
     // (memory: glm-w2-imbalance-is-the-only-unabsorbed-spread), so this is the
     // half of the knob with a makespan story. SPLIT_ITERS is 16 at the default
-    // K_SPLITS=1, so GROUPS must divide 16.
-    acc = _gang_moe_kloop_deep<WEIGHT_FP4, INPUT_FP8, MPK_MOE_PF_GROUPS,
-                               SPLIT_ITERS>(
+    // K_SPLITS=1, which the default depth of 4 divides.
+    f32x4_t acc = _gang_moe_kloop<WEIGHT_FP4, INPUT_FP8, MPK_MOE_PF_GROUPS,
+                                  SPLIT_ITERS>(
         w_data_row, wg_scales, row_scale_base, s_tok_k, s_tok_sc_k, g);
-#else
-    i32x8_t a0 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 0 * K_PER_MFMA, g);
-    int sa0 = (int)wg_scales[row_scale_base + 0 * 4 + g];
-    i32x8_t a1 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 1 * K_PER_MFMA, g);
-    int sa1 = (int)wg_scales[row_scale_base + 1 * 4 + g];
-    i32x8_t a2 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 2 * K_PER_MFMA, g);
-    int sa2 = (int)wg_scales[row_scale_base + 2 * 4 + g];
-    i32x8_t a3 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, 3 * K_PER_MFMA, g);
-    int sa3 = (int)wg_scales[row_scale_base + 3 * 4 + g];
-
-// IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation.
-#pragma unroll 1
-    for (int ki = 0; ki < SPLIT_ITERS; ki += 4) {
-      {
-        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_k, ki * K_PER_MFMA, g);
-        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a0, b, acc, sa0,
-                                            tok_sc(s_tok_sc_k, ki));
-      }
-      if (ki + 4 < SPLIT_ITERS) {
-        int kt4 = (ki + 4) * K_PER_MFMA;
-        a0 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt4, g);
-        sa0 = (int)wg_scales[row_scale_base + kt4 / 32 + g];
-      }
-
-      {
-        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_k, (ki + 1) * K_PER_MFMA, g);
-        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a1, b, acc, sa1,
-                                            tok_sc(s_tok_sc_k, ki + 1));
-      }
-      if (ki + 5 < SPLIT_ITERS) {
-        int kt5 = (ki + 5) * K_PER_MFMA;
-        a1 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt5, g);
-        sa1 = (int)wg_scales[row_scale_base + kt5 / 32 + g];
-      }
-
-      {
-        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_k, (ki + 2) * K_PER_MFMA, g);
-        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a2, b, acc, sa2,
-                                            tok_sc(s_tok_sc_k, ki + 2));
-      }
-      if (ki + 6 < SPLIT_ITERS) {
-        int kt6 = (ki + 6) * K_PER_MFMA;
-        a2 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt6, g);
-        sa2 = (int)wg_scales[row_scale_base + kt6 / 32 + g];
-      }
-
-      if (ki + 3 < SPLIT_ITERS) {
-        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_k, (ki + 3) * K_PER_MFMA, g);
-        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(a3, b, acc, sa3,
-                                            tok_sc(s_tok_sc_k, ki + 3));
-      }
-      if (ki + 7 < SPLIT_ITERS) {
-        int kt7 = (ki + 7) * K_PER_MFMA;
-        a3 = _gang_load_w_mfma_a<WEIGHT_FP4>(w_data_row, kt7, g);
-        sa3 = (int)wg_scales[row_scale_base + kt7 / 32 + g];
-      }
-    }
-#endif // MPK_MOE_PF_GROUPS
 
     if (col == 0) {
       emit(acc, wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4);

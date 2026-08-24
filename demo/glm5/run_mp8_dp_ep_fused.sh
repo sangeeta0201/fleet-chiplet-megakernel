@@ -22,10 +22,21 @@
 set -u
 cd "$(dirname "${BASH_SOURCE[0]}")"
 # Before env_common.sh: it divides the core count by NP to size OMP_NUM_THREADS.
-NP="${NP:-8}"
+#
+# DEVICES 4,5,6,7 ONLY -- standing instruction from the user. Do not widen this
+# to 0-7 to buy wall time; an NP=8 number is not comparable to anything on this
+# branch and is not the config being asked for.
+NP="${NP:-4}"
+# GPUs 4-7 all hang off NUMA 1, so every rank belongs on socket 1. Sizing
+# OMP_NUM_THREADS off `nproc` (256) would hand each rank 64 threads on a socket
+# that only has 64 physical cores for all four of them. Use the socket's core
+# count instead. Must precede env_common.sh, which only fills this in if unset.
+if [ -z "${OMP_NUM_THREADS:-}" ] && [ "$NP" -le 4 ]; then
+  export OMP_NUM_THREADS=$(( 64 / NP ))
+fi
 source ./env_common.sh
 
-export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-4,5,6,7}"
 export ROCSHMEM_MAX_NUM_CONTEXTS="${ROCSHMEM_MAX_NUM_CONTEXTS:-8}"
 # DP attention is not a tuning knob. MLA keeps one shared latent head, so the
 # kv_head==xcd_id mapping the fused attention task assumes has no TP analogue,
@@ -107,6 +118,24 @@ export MPK_NUM_WORKERS="${MPK_NUM_WORKERS:-232}"
 # own terms; do NOT credit it with fixing anything.
 #
 # Override with MPK_MPI_BIND="--bind-to none" to isolate a binding regression.
+#
+# On the 4-GPU config (devices 4,5,6,7) `ppr:$((NP/2)):numa` is WRONG: it fills
+# NUMA 0 with ranks 0-1 and NUMA 1 with ranks 2-3, but all four of those GPUs
+# are on NUMA 1, so half the ranks drive their GPU across the socket link. There
+# is no --map-by spelling that says "put everything on node 1" (and --cpu-set
+# conflicts with --map-by and exits 1 with no message on OpenMPI 4.1.2), so use
+# a generated rankfile: `slot=1:*` = socket 1, all cores. Verified with
+# --report-bindings: all four ranks land on socket 1 cores 64-127.
+if [ -z "${MPK_MPI_BIND:-}" ] && [ "$NP" -le 4 ] && \
+   [ "$HIP_VISIBLE_DEVICES" = "4,5,6,7" ]; then
+  _rf="/tmp/mpk_glm5_rankfile_$$.txt"
+  : > "$_rf"
+  for _r in $(seq 0 $((NP - 1))); do
+    echo "rank $_r=$(hostname) slot=1:*" >> "$_rf"
+  done
+  trap 'rm -f "$_rf"' EXIT
+  MPK_MPI_BIND="--rankfile $_rf"
+fi
 MPK_MPI_BIND="${MPK_MPI_BIND:---map-by ppr:$((NP / 2)):numa --bind-to numa}"
 
 # Extra demo.py flags for callers that build their own argument list and cannot

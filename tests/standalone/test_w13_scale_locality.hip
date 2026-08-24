@@ -653,6 +653,25 @@ int main() {
     printf("  %-32s%10.3f%12.2f%14.1f\n", d[i].name, d[i].ms, us_tile, gbs);
   }
 
+  // GROUPS=4 IS WHAT SHIPS. The knee here is 8, but 8 measured +0.26 ms at the
+  // NP=4 wall while 4 measured -0.142, so every stacked multiplier has to be
+  // priced on top of 4, not on top of the standalone's own optimum.
+  printf("\n  --- multipliers ON TOP OF THE SHIPPING GROUPS=4 ---\n");
+  struct {
+    char const *name;
+    float ms;
+  } e[4];
+  e[0] = {"GROUPS=4  (shipping default)", run_deep<4, 0, 0>(grid, 10)};
+  e[1] = {"GROUPS=4  + LDS scales", run_deep<4, 1, 0>(grid, 10)};
+  e[2] = {"GROUPS=4  + K-major", run_deep<4, 0, 1>(grid, 10)};
+  e[3] = {"GROUPS=4  + LDS scales + K-major", run_deep<4, 1, 1>(grid, 10)};
+  for (int i = 0; i < 4; i++) {
+    double us_tile = e[i].ms * 1000.0 / (g_tiles / (double)grid);
+    double gbs = (double)WG_DATA_BYTES / (us_tile * 1e-6) / 1e9;
+    printf("  %-32s%10.3f%12.2f%14.1f\n", e[i].name, e[i].ms, us_tile, gbs);
+  }
+
+
   printf("\nRead: arm0 vs arm2 prices the scattered E8M0 scale load itself.\n"
          "arm1 vs arm3 prices LDS as a scale SOURCE holding the barrier and\n"
          "burst fixed. arm4 vs arm0 prices a bare per-tile barrier alone. If\n"
