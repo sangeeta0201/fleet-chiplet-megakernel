@@ -1511,6 +1511,43 @@ if __name__ == "__main__":
         # ~3.77 us of rendezvous against ~190 us of duplicated weight read.
         LMHEAD_TP = (moe_ep and DENSE_MXFP8
                      and os.environ.get("GLM_LMHEAD_TP", "1") == "1")
+        # Same argument, one layer down. The three dense MLPs are 226.5M
+        # parameters each and every rank reads all of it: ~700 MB per rank per
+        # token in MXFP8. Shard the INTERMEDIATE dim four ways -- gate_up
+        # column-parallel, down_proj K-parallel over the matching slice -- and
+        # sum the four partial hidden vectors cross-rank. Three rendezvous a
+        # token (one per dense layer) against 525 MB of duplicated read.
+        #
+        # Measured NP=4 bs=1, 3 paired runs, one variable:
+        #   off -> 9.404 / 9.367 / 9.375  (mean 9.382)
+        #   on  -> 9.299 / 9.338 / 9.286  (mean 9.308)   -0.074 ms
+        # Every armed run beats every control run; the spreads are disjoint.
+        # ~55% of the 0.134 ms byte prediction; the three added serial
+        # xrank_sum_add tasks eat the rest.
+        #
+        # NUMERICS. down_proj's reduction is reordered: four bf16-rounded
+        # partials summed, instead of one fp32 accumulation over the full
+        # K=12288. That is ~half a bf16 ulp and it deterministically tips
+        # near-ties at bs=1. Gated at 160 tokens, 2x2 on a determined prompt:
+        # G1 cross-rank bit-identity PASSES on every run and every rank (a
+        # broken sum desyncs ranks on token 0), and both arms emit correct,
+        # coherent text. The control's own two runs diverge from each other
+        # at generated token 9, so a token-0 split between arms is inside the
+        # bs=1 attractor spread, not evidence of a defect.
+        DENSE_MLP_TP = (moe_ep and DENSE_MLP_MXFP8
+                        and os.environ.get("GLM_DENSE_MLP_TP", "1") == "1")
+        # Rank p owns intermediate columns [p*S, (p+1)*S).
+        dense_inter_shard = (dense_inter // world_size
+                             if DENSE_MLP_TP else dense_inter)
+        if DENSE_MLP_TP:
+            # gate_up is interleaved at granularity 8, so a contiguous row
+            # range of the interleaved matrix maps to the matching gate/up
+            # slices only when the shard is a multiple of 8.
+            assert dense_inter % (world_size * 8) == 0
+            # And each rank's own slice still has to satisfy the two gang GEMM
+            # geometry rules on its own.
+            assert (2 * dense_inter_shard) % GANG_OUT_ALIGN == 0
+            assert dense_inter_shard % GANG_RED_ALIGN == 0
         # Each rank's slice has to satisfy the gang GEMM's own n_wgs % 8 == 0
         # on its own, so the pad granularity picks up world_size * 8 * OPW.
         vocab_align = (math.lcm(GANG_OUT_ALIGN,
@@ -2051,8 +2088,18 @@ if __name__ == "__main__":
         # FUSE_RESADD wiring below.
         dense_resid = make_tensor("dense_resid", (bs, hidden_size))
 
-        dense_mid = make_tensor("dense_mid", (bs, 2 * dense_inter))
-        dense_act = make_tensor("dense_act", (bs, dense_inter))
+        dense_mid = make_tensor("dense_mid", (bs, 2 * dense_inter_shard))
+        dense_act = make_tensor("dense_act", (bs, dense_inter_shard))
+        # Under DENSE_MLP_TP the down_proj GEMV is K-parallel, so what it
+        # writes is a PARTIAL hidden vector; the residual has to be held back
+        # or it would be summed world_size times. `dense_zero_resid` stays all
+        # zeros for the whole run -- it is only there because the GEMV has no
+        # residual-free entry point.
+        dense_partial = dense_zero_resid = None
+        if DENSE_MLP_TP:
+            dense_partial = make_tensor("dense_partial", (bs, hidden_size))
+            dense_zero_resid = make_tensor("dense_zero_resid",
+                                           (bs, hidden_size))
 
         # Routing tables are sized for the total expert / slot count; the
         # router derives `num_shared` from the gap between these and the
@@ -2213,6 +2260,21 @@ if __name__ == "__main__":
                 lmhead_xrank_mtp = mpk.new_tensor(
                     dims=(world_size * 16,), dtype=mi.int32,
                     name="lmhead_xrank_mtp", io_category="nvshmem_tensor")
+        # The dense-MLP partial-sum mailboxes: world_size bf16 hidden slots
+        # plus world_size 64-byte epoch lines, declared in int32 units because
+        # only the byte count matters (mi.uint64 has no size entry).
+        #
+        # ONE BUFFER PER DENSE LAYER. Consecutive dense layers have no
+        # cross-rank rendezvous between them, so a rank could re-enter layer
+        # i+1's sum while a peer is still reading layer i's slots. Across
+        # tokens the 75 MoE layers' EP folds separate the reuses.
+        dense_xbufs = []
+        if DENSE_MLP_TP:
+            n_u32 = (world_size * bs * hidden_size * 2) // 4 + world_size * 16
+            for d in range(first_k_dense):
+                dense_xbufs.append(mpk.new_tensor(
+                    dims=(n_u32,), dtype=mi.int32,
+                    name=f"dense_xrank_{d}", io_category="nvshmem_tensor"))
 
         # Zero biases. gang_rmsnorm_linear_bias_layer partitions `bias` with
         # map (1, -1, -1), so it has to be 2-D [1, output_size]; the MoE gang
@@ -2995,6 +3057,17 @@ if __name__ == "__main__":
                 gu_w = interleave_gate_up(layer.mlp.gate_proj.weight.data,
                                           layer.mlp.up_proj.weight.data, 8)
                 down_w = layer.mlp.down_proj.weight.data.contiguous()
+                if DENSE_MLP_TP:
+                    # Shard the intermediate dim. gate_up is column-parallel:
+                    # the interleave is at granularity 8 and the shard is a
+                    # multiple of 8, so interleaved rows [p*2S, (p+1)*2S) are
+                    # exactly gate rows [p*S,(p+1)*S) interleaved with the
+                    # matching up rows. down_proj is then K-parallel over the
+                    # same slice -- columns, since its weight is [hidden, S].
+                    _s2 = 2 * dense_inter_shard
+                    gu_w = gu_w[rank * _s2:(rank + 1) * _s2].contiguous()
+                    down_w = down_w[:, rank * dense_inter_shard:
+                                    (rank + 1) * dense_inter_shard].contiguous()
                 if DENSE_MLP_MXFP8:
                     w_dense_gu = _attach_input_keep(
                         pack_dense_mxfp8(gu_w, DENSE_MXFP8_OPW),
@@ -3017,11 +3090,11 @@ if __name__ == "__main__":
                         norm_weight=w_norm_moe,
                         norm_output=rmsnorm_out_moe,
                         mxfp8_weight=w_dense_gu,
-                        bias=zero_bias(2 * dense_inter),
+                        bias=zero_bias(2 * dense_inter_shard),
                         output=dense_mid,
                         actual_hidden_dim=hidden_size,
                         output_per_wg=DENSE_MXFP8_OPW,
-                        output_stride=2 * dense_inter,
+                        output_stride=2 * dense_inter_shard,
                         block_dim=(256, 1, 1),
                     )
                 else:
@@ -3030,11 +3103,11 @@ if __name__ == "__main__":
                         norm_weight=w_norm_moe,
                         norm_output=rmsnorm_out_moe,
                         linear_weight=w_dense_gu,
-                        bias=zero_bias(2 * dense_inter),
+                        bias=zero_bias(2 * dense_inter_shard),
                         output=dense_mid,
                         actual_hidden_dim=hidden_size,
                         tile_n=GANG_TILE_N,
-                        output_stride=2 * dense_inter,
+                        output_stride=2 * dense_inter_shard,
                         wgm=GANG_WGM,
                         block_dim=(256, 1, 1),
                     )
@@ -3043,6 +3116,11 @@ if __name__ == "__main__":
                     grid_dim=(8, 1, 1), block_dim=(256, 1, 1),
                 )
                 dense_out = dense_resid if fold_resadd else layer_out
+                # K-parallel: the GEMV writes a partial, and the residual is
+                # added once, in the cross-rank sum below.
+                gemv_out = dense_partial if DENSE_MLP_TP else dense_out
+                gemv_resid = (dense_zero_resid if DENSE_MLP_TP
+                              else attn_proj_out)
                 if DENSE_MLP_MXFP8:
                     # rows_per_wg plays tile_n's role here, and the packed
                     # weight erases N, so the geometry is set by the row count:
@@ -3051,11 +3129,11 @@ if __name__ == "__main__":
                     mpk.gang_gemv_mxfp8_with_residual_layer(
                         input=dense_act,
                         mxfp8_weight=w_dense_down,
-                        residual=attn_proj_out,
-                        output=dense_out,
+                        residual=gemv_resid,
+                        output=gemv_out,
                         rows_per_wg=DENSE_MLP_DOWN_ROWS,
                         output_stride=hidden_size,
-                        reduction_size=dense_inter,
+                        reduction_size=dense_inter_shard,
                         wgm=GANG_WGM,
                         block_dim=(256, 1, 1),
                     )
@@ -3063,11 +3141,20 @@ if __name__ == "__main__":
                     mpk.gang_linear_with_residual_layer(
                         input=dense_act,
                         weight=w_dense_down,
-                        residual=attn_proj_out,
-                        output=dense_out,
+                        residual=gemv_resid,
+                        output=gemv_out,
                         tile_n=GANG_TILE_N,
                         output_stride=hidden_size,
                         wgm=GANG_WGM,
+                        block_dim=(256, 1, 1),
+                    )
+                if DENSE_MLP_TP:
+                    mpk.xrank_sum_add_layer(
+                        partial=dense_partial,
+                        residual=attn_proj_out,
+                        xbuf=dense_xbufs[i],
+                        output=dense_out,
+                        grid_dim=(1, 1, 1),
                         block_dim=(256, 1, 1),
                     )
                 x = dense_out

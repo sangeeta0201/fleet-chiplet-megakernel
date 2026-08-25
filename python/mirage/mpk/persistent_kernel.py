@@ -7341,6 +7341,46 @@ class PersistentKernel:
             [chunk_size, self.world_size, self.mpi_rank, vocab_shard],
         )
 
+    def xrank_sum_add_layer(
+        self,
+        partial: DTensor,
+        residual: DTensor,
+        xbuf: DTensor,
+        output: DTensor,
+        grid_dim: tuple,
+        block_dim: tuple,
+    ):
+        """output = residual + sum over ranks of each rank's `partial`.
+
+        For the intermediate-sharded dense MLP: gate_up is column-parallel and
+        down_proj is K-parallel over the matching slice, so every rank produces
+        a full-width hidden vector that is only a PARTIAL sum. This exchanges
+        the four partials and adds the residual exactly once.
+
+        ``xbuf`` is a symmetric-heap buffer of at least
+        world_size * batch * hidden bf16 payload words followed by
+        world_size * XRANK_SUM_SLOT_U64 (= 8) u64 epoch words. The caller must
+        pass the down_proj GEMV a ZERO residual -- a folded residual would be
+        summed world_size times here.
+        """
+        assert partial.num_dims == 2  # (batch_size, hidden)
+        assert residual.num_dims == 2
+        assert output.num_dims == 2
+        assert self.world_size > 1, "xrank_sum_add needs more than one rank"
+        hidden = partial.dim(1)
+        assert residual.dim(1) == hidden and output.dim(1) == hidden
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(partial, (-1, -1, -1), -1, True)
+        tb_graph.new_input(residual, (-1, -1, -1), -1, True)
+        tb_graph.new_input(xbuf, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output, (-1, -1, -1), -1, True)
+        self.kn_graph.customized([partial, residual, xbuf, output], tb_graph)
+        self.kn_graph.register_task(
+            tb_graph,
+            "xrank_sum_add",
+            [hidden, self.world_size, self.mpi_rank],
+        )
+
     def sampling_sm100_layer(
         self,
         logits: DTensor,      # [batch_size, vocab_size]

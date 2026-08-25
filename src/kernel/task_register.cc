@@ -4842,6 +4842,49 @@ int TaskRegister::register_argmax_reduce_xrank_task(
   return register_task_variant(TASK_ARGMAX_REDUCE, code.to_string());
 }
 
+// Cross-rank sum of one hidden-width partial, plus a residual add. Used by the
+// intermediate-sharded dense MLP: every rank owns a slice of the intermediate
+// dim, so down_proj is K-parallel and each rank holds a partial hidden vector.
+// Also rides TASK_ARGMAX_REDUCE -- the dispatch is (task_type, variant_id).
+int TaskRegister::register_xrank_sum_add_task(threadblock::Graph const &bgraph,
+                                              std::vector<int> const &params) {
+  // params[0]: hidden size
+  // params[1]: EP world size
+  // params[2]: this rank's PE id
+  assert(params.size() == 3);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 3;
+  int num_outputs = 1;
+
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  assert(input_ops[0]->output_tensors[0].num_dims == 2);
+  int batch_size = input_ops[0]->output_tensors[0].dim[0];
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::xrank_sum_add_kernel<bfloat16, $, $, $, $>(",
+         batch_size,
+         params[0],
+         params[1],
+         params[2]);
+  code.e("    task_desc->input_ptrs[0],");
+  code.e("    task_desc->input_ptrs[1],");
+  code.e("    task_desc->input_ptrs[2],");
+  code.e("    task_desc->output_ptrs[0],");
+  code.e("    runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS],");
+  code.e("    runtime_config.step[0]);");
+  return register_task_variant(TASK_ARGMAX_REDUCE, code.to_string());
+}
+
 int TaskRegister::register_reduce_task(threadblock::Graph const &bgraph,
                                        std::vector<int> const &params) {
   // Currently, allreduce task is split to two sub-tasks: allgather + reduce
