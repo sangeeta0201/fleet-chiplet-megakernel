@@ -125,6 +125,10 @@ MPK_FORWARD_VARS=(
   # k-groups in flight is the measured knee. Compile-time, so a mismatch
   # between ranks is a different binary and the barriers deadlock.
   MPK_MOE_PF_GROUPS
+  # addrspace(1) the MoE weight + scale loads AND hoist the B-operand ds_reads
+  # above the MFMA group, so the per-MFMA lgkmcnt(0) stops draining the weight
+  # prefetch. Compile-time; a rank that misses it is a different binary.
+  MPK_MOE_WGLOBAL
   # Double-buffered form of that same k-loop: swap two register buffers instead
   # of copying one into the other at the backedge, which is what forces the two
   # s_waitcnt vmcnt(0) per trip in the shipped ISA. Compile-time.

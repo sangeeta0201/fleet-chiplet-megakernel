@@ -237,6 +237,19 @@ __device__ __forceinline__ i32x8_t
   }
 }
 
+// Global-addressed twin of the above, for MPK_MOE_WGLOBAL. Identical
+// addressing; the gathers go through _gang_ld_g so they emit global_load
+// instead of flat_load and stop incrementing lgkmcnt.
+template <bool FP4>
+__device__ __forceinline__ i32x8_t
+    _gang_load_w_mfma_a_at_g(uint8_t const *base, int byte_off, int g) {
+  if constexpr (FP4) {
+    return _gang_load_fp4_mfma_b_g(base + byte_off, 0, g);
+  } else {
+    return _gang_load_fp8_mfma_b_g(base + byte_off, 0, g);
+  }
+}
+
 // Bytes one weight row contributes to one 128-element k-tile. W_ROW_BYTES is
 // exactly MFMA_ITERS of these.
 template <bool FP4>
@@ -363,6 +376,54 @@ __device__ __forceinline__ f32x4_t _gang_mfma_w_x_f8(
 #define MPK_MOE_PF_GROUPS 4
 #endif
 
+// MPK_MOE_WGLOBAL: address the weight *and its E8M0 scales* through
+// addrspace(1), AND hoist the whole GROUPS-wide batch of B-operand ds_reads
+// above the MFMA group. The two halves only work together, which is why they
+// share one knob.
+//
+// THE PATHOLOGY, read off the shipped W13 body [0x41894..0x41a28]:
+//
+//   s_waitcnt vmcnt(0)                          <- top of trip, FULL DRAIN
+//   flat_load_dwordx4 v[52:55], v[6:7]          \
+//   flat_load_dwordx4 v[48:51], v[6:7] off:1024  |  the next block's weights
+//   flat_load_dwordx4 v[36:39], v[6:7] off:2048 /
+//   ds_read_b128 x5 ; ds_read_u8 x4             <- this block's B operand
+//   s_waitcnt lgkmcnt(0)                        <- DRAINS THE WEIGHTS TOO
+//   v_mfma_scale_f32_16x16x128_f8f6f4
+//   ds_read_b128 ; s_waitcnt lgkmcnt(0) ; v_mfma
+//   ds_read_b128 x2 ; s_waitcnt lgkmcnt(0) ; v_mfma
+//
+// Three `s_waitcnt lgkmcnt(0)` per trip, each of which -- because the weight
+// loads are FLAT, and a flat op increments both vmcnt and lgkmcnt -- retires
+// every outstanding weight load as well. The prefetch is dead on arrival:
+// `isa_loads_in_flight.py` reports `issued 0 / minvm 0` on this loop, and
+// MPK_MOE_PF_GROUPS=4 only buys anything because the four loads at the top
+// overlap *each other* for one memory latency before being drained.
+//
+// WHY THE PREVIOUS ATTEMPT LOST. Task #77 cast the weight pointer to
+// addrspace(1) and nothing else, and measured **+0.87 ms** with W13's
+// s_waitcnt count going 40 -> 54 (memory:
+// glm-moe-addrspace1-is-a-negative-waitcnt-count-is-the-metric). That is the
+// expected result of doing half of this: with the weights out of lgkmcnt the
+// compiler still needs the three lgkmcnt(0) for the interleaved ds_reads AND
+// now needs separate vmcnt waits for the weights, so the count goes up while
+// the pipeline stays broken. The B-side hoist is what removes the other two
+// lgkm waits, and only then does the decoupling pay for itself.
+//
+// So the arithmetic per trip is 1 lgkm + partial vmcnts, against today's
+// 1 full vmcnt + 3 full lgkm, and -- the point -- the vmcnt waits become
+// PARTIAL, because vmcnt is in-order on gfx9 and global_load only touches it.
+// GROUPS weight loads really do stay in flight across GROUPS MFMAs.
+//
+// Correctness: _gang_ld_g is only ever pointed at `w_data_row` and
+// `wg_scales`, both of which are the megakernel workspace's weight buffer. The
+// B operand keeps the plain (LDS) loader. Never point _gang_ld_g at LDS.
+#ifndef MPK_MOE_WGLOBAL
+// Measured -0.108 ms at NP=4 bs=1 (arm n=6 mean 9.841 vs control n=7 mean
+// 9.949; the two ranges do not overlap). Default ON; =0 is the ablation.
+#define MPK_MOE_WGLOBAL 1
+#endif
+
 
 // The k-loop, with the prefetch distance as a parameter. Accumulates
 // [0, KI_END) and returns the MFMA accumulator; the caller owns the epilogue.
@@ -409,14 +470,60 @@ __device__ __forceinline__ f32x4_t
   auto tok_sc_at = [&](int k) -> int {
     return TOK_SC_FP8 ? (int)s_tok_scales[k * 4 + g] : (int)s_tok_scales[k];
   };
-
+  // Declared before `consume` captures it.
   f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
+  // The weight (A) operand and its E8M0 scale. Under MPK_MOE_WGLOBAL both go
+  // through addrspace(1) so they leave lgkmcnt; see the knob's header.
+  auto load_w = [&](int kk) -> i32x8_t {
+    if constexpr (MPK_MOE_WGLOBAL) {
+      return _gang_load_w_mfma_a_at_g<WEIGHT_FP4>(w_data_row, kk * W_KS, g);
+    } else {
+      return _gang_load_w_mfma_a_at<WEIGHT_FP4>(w_data_row, kk * W_KS, g);
+    }
+  };
+  auto load_ws = [&](int kk) -> int {
+    int const off = row_scale_base + kk * SC_KS + g;
+    if constexpr (MPK_MOE_WGLOBAL) {
+      return (int)_gang_ld_g<uint8_t>(wg_scales + off);
+    } else {
+      return (int)wg_scales[off];
+    }
+  };
+  // Consume GROUPS k-tiles. Under MPK_MOE_WGLOBAL the whole batch of LDS
+  // reads is issued BEFORE the first MFMA, so SIInsertWaitcnts needs one
+  // lgkmcnt(0) for the batch instead of one per MFMA. That is the half of the
+  // knob task #77 was missing: with the weights out of lgkmcnt, each of those
+  // per-MFMA lgkm waits would still have drained the pipeline.
+  auto consume = [&](int base, i32x8_t const *Ap, int const *Sp) {
+    if constexpr (MPK_MOE_WGLOBAL) {
+      i32x8_t B[GROUPS];
+      int BS[GROUPS];
+#pragma unroll
+      for (int j = 0; j < GROUPS; j++) {
+        B[j] = _gang_load_fp8_mfma_b(s_tok_fp8, (base + j) * K_PER_MFMA, g);
+        BS[j] = tok_sc_at(base + j);
+      }
+#pragma unroll
+      for (int j = 0; j < GROUPS; j++) {
+        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(Ap[j], B[j], acc, Sp[j], BS[j]);
+      }
+    } else {
+#pragma unroll
+      for (int j = 0; j < GROUPS; j++) {
+        i32x8_t b =
+            _gang_load_fp8_mfma_b(s_tok_fp8, (base + j) * K_PER_MFMA, g);
+        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(Ap[j], b, acc, Sp[j],
+                                            tok_sc_at(base + j));
+      }
+    }
+  };
+
   i32x8_t A[GROUPS];
   int S[GROUPS];
 #pragma unroll
   for (int j = 0; j < GROUPS; j++) {
-    A[j] = _gang_load_w_mfma_a_at<WEIGHT_FP4>(w_data_row, j * W_KS, g);
-    S[j] = (int)wg_scales[row_scale_base + j * SC_KS + g];
+    A[j] = load_w(j);
+    S[j] = load_ws(j);
   }
 
 // IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation. Same reason as the
@@ -431,15 +538,10 @@ __device__ __forceinline__ f32x4_t
 #pragma unroll
     for (int j = 0; j < GROUPS; j++) {
       int kk = base + GROUPS + j;
-      N[j] = _gang_load_w_mfma_a_at<WEIGHT_FP4>(w_data_row, kk * W_KS, g);
-      NS[j] = (int)wg_scales[row_scale_base + kk * SC_KS + g];
+      N[j] = load_w(kk);
+      NS[j] = load_ws(kk);
     }
-#pragma unroll
-    for (int j = 0; j < GROUPS; j++) {
-      i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (base + j) * K_PER_MFMA, g);
-      acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(A[j], b, acc, S[j],
-                                          tok_sc_at(base + j));
-    }
+    consume(base, A, S);
 #pragma unroll
     for (int j = 0; j < GROUPS; j++) {
       A[j] = N[j];
@@ -450,12 +552,7 @@ __device__ __forceinline__ f32x4_t
   // Peeled last block: consume what the previous iteration prefetched, and
   // issue nothing past the end of the row.
   constexpr int TAIL = (NBLK - 1) * GROUPS;
-#pragma unroll
-  for (int j = 0; j < GROUPS; j++) {
-    i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (TAIL + j) * K_PER_MFMA, g);
-    acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(A[j], b, acc, S[j],
-                                        tok_sc_at(TAIL + j));
-  }
+  consume(TAIL, A, S);
   return acc;
 }
 

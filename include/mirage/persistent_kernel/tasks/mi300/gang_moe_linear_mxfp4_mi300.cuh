@@ -802,6 +802,22 @@ __device__ __forceinline__ i32x8_t _gang_load_fp4_mfma_b(uint8_t const *data,
   return r;
 }
 
+// Global-memory twin of _gang_load_fp4_mfma_b, for the weight (A) operand.
+// Same one-chunk addressing; the gather goes through _gang_ld_g so it emits
+// global_load_dwordx4 and stays out of lgkmcnt. See _gang_ld_g's header for
+// why that matters in a loop whose B operand comes from LDS.
+__device__ __forceinline__ i32x8_t _gang_load_fp4_mfma_b_g(uint8_t const *data,
+                                                           int kt,
+                                                           int g) {
+  i32x4_t lo = _gang_ld_g<i32x4_t>(data + kt / 2 + g * 16);
+  i32x8_t r = {};
+  r[0] = lo[0];
+  r[1] = lo[1];
+  r[2] = lo[2];
+  r[3] = lo[3];
+  return r;
+}
+
 // FP4×FP4 scaled MFMA: 16x16x128, 16 cycles (half of FP4×FP8)
 // Both A and B are FP4 in lower 128 bits of i32x8
 __device__ __forceinline__ f32x4_t _gang_mfma_f4xf4(

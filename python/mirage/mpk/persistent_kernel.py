@@ -1008,6 +1008,20 @@ def get_compile_command(
                 "MPK_MOE_PF_GROUPS is 0, 2, 4, 8 or 16"
             flags = flags + [f"-DMPK_MOE_PF_GROUPS={_pf}"]
 
+        _wg = os.environ.get("MPK_MOE_WGLOBAL")
+        if _wg is not None:
+            # Address the MoE weight and its E8M0 scales through addrspace(1)
+            # AND hoist the whole batch of B-operand ds_reads above the MFMA
+            # group. Both halves together: a flat_load increments lgkmcnt as
+            # well as vmcnt, so today's three per-MFMA `s_waitcnt lgkmcnt(0)`
+            # each drain the weight prefetch. Casting alone was measured
+            # +0.87 ms (task #77) because it left those three waits in place
+            # and added vmcnt waits on top. Long note at the define in
+            # gang_moe_linear_mxfp8_mi300.cuh.
+            # Compile-time, so every rank must agree.
+            assert _wg in ("0", "1"), "MPK_MOE_WGLOBAL is 0 or 1"
+            flags = flags + [f"-DMPK_MOE_WGLOBAL={_wg}"]
+
         _pfd = os.environ.get("MPK_MOE_PF_DBUF")
         if _pfd is not None:
             # Double-buffered form of the same k-loop. The deep loop's
