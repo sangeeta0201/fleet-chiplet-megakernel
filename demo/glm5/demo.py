@@ -1288,6 +1288,15 @@ if __name__ == "__main__":
         # The kernel's OPW<64 branch splits K across the 4 waves instead of N,
         # which is what un-starves it, the same trade #19 made for o_proj.
         DENSE_MXFP8_OPW = int(os.environ.get("GLM_DENSE_MXFP8_OPW", "64"))
+        # The first_k_dense_replace=3 layers' feed-forward. Separate from
+        # DENSE_MXFP8, which covers the attention-half GEMMs: this one was
+        # never converted, and at intermediate_size 12288 it is 1.36 GB of
+        # bf16 weight per rank per token.
+        DENSE_MLP_MXFP8 = (int(os.environ.get("GLM_DENSE_MLP_MXFP8", "1")) == 1)
+        # down_proj's GEMV rows per workgroup: 6144 / 32 = 192 wgs = 24 tiles
+        # per XCD.
+        DENSE_MLP_DOWN_ROWS = int(
+            os.environ.get("GLM_DENSE_MLP_DOWN_ROWS", "32"))
         # 16 rather than 64: worth 6.30 -> 6.13 ms/token. It is the only
         # value the K-parallel branch is correct for.
         QKV_MXFP8_OPW = int(os.environ.get("GLM_QKV_MXFP8_OPW", "16"))
@@ -1485,7 +1494,9 @@ if __name__ == "__main__":
               f"fuse_moe_mulsumadd={int(FUSE_MOE_MULSUMADD)} "
               f"moe_mxfp8={int(MOE_MXFP8)} dense_mxfp8={int(DENSE_MXFP8)} "
               f"qb_mxfp8={int(QB_MXFP8)} "
-              f"qkv_opw={QKV_MXFP8_OPW} dense_opw={DENSE_MXFP8_OPW}")
+              f"qkv_opw={QKV_MXFP8_OPW} dense_opw={DENSE_MXFP8_OPW} "
+              f"dense_mlp_mxfp8={int(DENSE_MLP_MXFP8)}"
+              f"/{DENSE_MLP_DOWN_ROWS}")
 
         num_workers, num_schedulers = mi.get_configurations_from_gpu(rank)
 
@@ -2925,42 +2936,91 @@ if __name__ == "__main__":
 
             if not layer.is_moe:
                 # 6a. Dense layer (the first `first_k_dense_replace` of them).
-                w_dense_gu = _attach_input_keep(
-                    interleave_gate_up(layer.mlp.gate_proj.weight.data,
-                                       layer.mlp.up_proj.weight.data, 8),
-                    f"layer_{i}_dense_gate_up")
-                w_dense_down = _attach_input_keep(
-                    layer.mlp.down_proj.weight.data.contiguous(),
-                    f"layer_{i}_dense_down")
+                #
+                # These three were left bf16 long after everything else moved
+                # to MXFP8, on the reasoning that three of 78 layers cannot
+                # matter. They do: intermediate_size is 12288 against the MoE
+                # expert's 2048, so one dense MLP is 226.5M parameters and the
+                # three of them are 1.36 GB of weight per rank per token --
+                # ~14% of the whole byte budget, replicated on every rank.
+                gu_w = interleave_gate_up(layer.mlp.gate_proj.weight.data,
+                                          layer.mlp.up_proj.weight.data, 8)
+                down_w = layer.mlp.down_proj.weight.data.contiguous()
+                if DENSE_MLP_MXFP8:
+                    w_dense_gu = _attach_input_keep(
+                        pack_dense_mxfp8(gu_w, DENSE_MXFP8_OPW),
+                        f"layer_{i}_dense_gate_up")
+                    w_dense_down = _attach_input_keep(
+                        pack_dense_mxfp8(down_w, DENSE_MLP_DOWN_ROWS),
+                        f"layer_{i}_dense_down")
+                else:
+                    w_dense_gu = _attach_input_keep(
+                        gu_w, f"layer_{i}_dense_gate_up")
+                    w_dense_down = _attach_input_keep(
+                        down_w, f"layer_{i}_dense_down")
+                del gu_w, down_w
                 _release(layer.mlp.gate_proj.weight, layer.mlp.up_proj.weight)
-                mpk.gang_rmsnorm_linear_bias_layer(
-                    norm_input=attn_proj_out,
-                    norm_weight=w_norm_moe,
-                    norm_output=rmsnorm_out_moe,
-                    linear_weight=w_dense_gu,
-                    bias=zero_bias(2 * dense_inter),
-                    output=dense_mid,
-                    actual_hidden_dim=hidden_size,
-                    tile_n=GANG_TILE_N,
-                    output_stride=2 * dense_inter,
-                    wgm=GANG_WGM,
-                    block_dim=(256, 1, 1),
-                )
+                if DENSE_MLP_MXFP8:
+                    _release(layer.mlp.down_proj.weight)
+                if DENSE_MLP_MXFP8:
+                    mpk.gang_rmsnorm_linear_mxfp8_bias_layer(
+                        norm_input=attn_proj_out,
+                        norm_weight=w_norm_moe,
+                        norm_output=rmsnorm_out_moe,
+                        mxfp8_weight=w_dense_gu,
+                        bias=zero_bias(2 * dense_inter),
+                        output=dense_mid,
+                        actual_hidden_dim=hidden_size,
+                        output_per_wg=DENSE_MXFP8_OPW,
+                        output_stride=2 * dense_inter,
+                        block_dim=(256, 1, 1),
+                    )
+                else:
+                    mpk.gang_rmsnorm_linear_bias_layer(
+                        norm_input=attn_proj_out,
+                        norm_weight=w_norm_moe,
+                        norm_output=rmsnorm_out_moe,
+                        linear_weight=w_dense_gu,
+                        bias=zero_bias(2 * dense_inter),
+                        output=dense_mid,
+                        actual_hidden_dim=hidden_size,
+                        tile_n=GANG_TILE_N,
+                        output_stride=2 * dense_inter,
+                        wgm=GANG_WGM,
+                        block_dim=(256, 1, 1),
+                    )
                 mpk.silu_mul_layer(
                     input=dense_mid, output=dense_act,
                     grid_dim=(8, 1, 1), block_dim=(256, 1, 1),
                 )
                 dense_out = dense_resid if fold_resadd else layer_out
-                mpk.gang_linear_with_residual_layer(
-                    input=dense_act,
-                    weight=w_dense_down,
-                    residual=attn_proj_out,
-                    output=dense_out,
-                    tile_n=GANG_TILE_N,
-                    output_stride=hidden_size,
-                    wgm=GANG_WGM,
-                    block_dim=(256, 1, 1),
-                )
+                if DENSE_MLP_MXFP8:
+                    # rows_per_wg plays tile_n's role here, and the packed
+                    # weight erases N, so the geometry is set by the row count:
+                    # 6144 / 32 = 192 workgroups = 24 tiles per XCD, which is
+                    # the target this branch keeps re-deriving.
+                    mpk.gang_gemv_mxfp8_with_residual_layer(
+                        input=dense_act,
+                        mxfp8_weight=w_dense_down,
+                        residual=attn_proj_out,
+                        output=dense_out,
+                        rows_per_wg=DENSE_MLP_DOWN_ROWS,
+                        output_stride=hidden_size,
+                        reduction_size=dense_inter,
+                        wgm=GANG_WGM,
+                        block_dim=(256, 1, 1),
+                    )
+                else:
+                    mpk.gang_linear_with_residual_layer(
+                        input=dense_act,
+                        weight=w_dense_down,
+                        residual=attn_proj_out,
+                        output=dense_out,
+                        tile_n=GANG_TILE_N,
+                        output_stride=hidden_size,
+                        wgm=GANG_WGM,
+                        block_dim=(256, 1, 1),
+                    )
                 x = dense_out
                 continue
 
