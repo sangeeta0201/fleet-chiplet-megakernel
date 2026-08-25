@@ -11,14 +11,21 @@
  *              C = f32x4  (4 f32/lane)
  *
  *   gfx1250  v_wmma_scale_f32_16x16x128_f8f6f4   wave32
- *              A = i32x16 (64 B/lane)
- *              B = i32x16 (64 B/lane)
+ *              A = i32x16 (64 B/lane declared, only 32 B live for FP4)
+ *              B = i32x16 (64 B/lane declared, only 32 B live for FP4)
  *              C = f32x8  (8 f32/lane)
  *
- * The tile holds the same 16x16x128 of data either way; with half the lanes,
- * each lane carries twice as much. That doubling is the register-pressure
- * story for this port and the thing to watch when the MoE kernels start
- * spilling.
+ * The tile holds the same 16x16x128 of data either way. For FP4 the operand
+ * type is oversized: 16 rows x 128 k x 4 bit = 1024 B, which over 32 lanes is
+ * 32 B/lane, and a live-byte scan on FFM confirms the hardware consumes only
+ * bytes 0..31 of each i32x16. So the MX datapath costs the same 8 live VGPRs
+ * per operand as gfx950 -- there is no register-pressure penalty here. (The
+ * i32x16 width is there for the FP8 case, where all 64 B are live.)
+ *
+ * The per-lane element mapping is NOT a rescaling of the wave64 one, and is
+ * documented and derived in mx_layout_mi450.cuh. Do not hand-index these
+ * operands without reading that file: the K dimension is interleaved between
+ * the two lane-halves, and the scale operand has two separate traps.
  *
  * The builtin signature also changes shape, and not in a way that can be
  * guessed -- decoded from BuiltinsAMDGPU.def
@@ -61,9 +68,17 @@ typedef float __attribute__((ext_vector_type(8))) mx_f32x8_t;
 constexpr int MX_FMT_FP8_E4M3 = 0;
 constexpr int MX_FMT_FP4_E2M1 = 4;
 
-// Scale format: 0 = E8M0, the MX standard exponent-only scale. The scale_sel
-// immediate picks which byte of the 32-bit scale operand applies to this
-// block; Fleet passes one scale per 32-element block, so sel = 0.
+// Scale format: 0 = E8M0, the MX standard exponent-only scale.
+//
+// The scale_sel immediate is NOT a block selector. It is SCL_OPSEL: 0 = read
+// scale bytes from lanes 0..15, 1 = read them from lanes 16..31 (unused for
+// this shape). Which K block a scale byte covers is fixed by its *byte
+// position* in the 32-bit operand -- byte b covers k in [32b, 32b+32).
+// Measured on FFM and stated in the MI400 guide S4.6.12.6.2. Always pass 0.
+//
+// Related trap: the scale operand must be lane-varying so it lands in a VGPR.
+// From an SGPR only bits [7:0] are read, so blocks 1..3 silently inherit
+// block 0's scale. See mx_layout_mi450.cuh.
 constexpr int MX_SCALE_FMT_E8M0 = 0;
 
 // FP4xFP8 scaled WMMA: 16x16x128 with hardware dequant.
