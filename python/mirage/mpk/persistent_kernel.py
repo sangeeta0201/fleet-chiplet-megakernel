@@ -530,6 +530,15 @@ def get_compile_command(
         # gang_mla_full_layer_fused_mi300.cuh.
         _mg = int(os.environ.get("GLM_MLFL_LDS", "1"))
         flags = flags + ["-DMPK_MLFL_LDS=%d" % _mg]
+        # MEASURED NEUTRAL, default 0. The EP fold's staged `else` branch --
+        # rocshmem_putmem_signal_wg -- inlines into the fused layer twice per
+        # instantiation at 53 flat ops each and is never executed here, but
+        # eliding it (=2) takes the fused layer from 454 flat ops to 142 and
+        # moves the wall 10.086 -> 10.104: nothing. =1 additionally plants a
+        # __builtin_trap and costs +0.067. The flat-op census is not the metric;
+        # only flat that EXECUTES is. See MPK_EP_ASSUME_DIRECT in mpk_comm.cuh.
+        _ad = int(os.environ.get("GLM_EP_ASSUME_DIRECT", "0"))
+        flags = flags + ["-DMPK_EP_ASSUME_DIRECT=%d" % _ad]
         # Hoist the un-absorbed W_UV GEMV out of the MoE half and run it in the
         # attention half, straight after the split-KV merge, behind a PAIR-LOCAL
         # barrier instead of a GPU-wide one. The layer's existing Phase 8

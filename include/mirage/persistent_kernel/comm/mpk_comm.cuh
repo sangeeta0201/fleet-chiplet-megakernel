@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <utility>
 #include <vector>
 
@@ -50,6 +51,75 @@
 #define MPK_SIGNAL_ADD rocshmem::ROCSHMEM_SIGNAL_ADD
 #else
 #define MPK_SIGNAL_ADD 0
+#endif
+
+// ---------------------------------------------------------------------------
+// MEASURED NEUTRAL -- kept at 0. Assume every peer is directly mapped and
+// compile the staged fallback out.
+//
+// On a single node with XGMI and the IPC backend mpk_shmem_peer_delta succeeds
+// for every peer, so the `ep_direct` branch is the only one ever taken. The
+// staged `else` looked expensive: rocshmem_putmem_signal_wg inlines into the
+// fused-layer kernel twice per instantiation at 53 flat ops apiece -- 212 of
+// the fused layer's 454, the whole of the four-deep dependent chain
+//
+//   ROCSHMEM_CTX_DEFAULT -> ctx_opaque -> +12 my_pe / +32 ipc_bases
+//                        -> ipc_bases[my_pe], ipc_bases[pe]
+//
+// plus a 1536-trip flat_load/flat_store dwordx2 copy loop with a vmcnt(0) per
+// 8 bytes. Eliding it takes the fused layer from 454 flat ops to 142 and the
+// whole device image from 1337 to 957.
+//
+// It buys nothing. GLM-5, NP=4, devices 4-7, bs=1, one session, n>=2 per arm:
+//
+//   0 (staged kept)          10.067 10.105                   mean 10.086
+//   2 (elided silently)      10.113 10.116 10.083            mean 10.104
+//   1 (elided + trap)        10.158 10.161 10.141            mean 10.153
+//
+// So the flat-op CENSUS is not the metric -- only flat ops that actually
+// EXECUTE are. This does not weaken MPK_RESADD_GLOBAL or MPK_MLFL_LDS, which
+// each removed flat from a hot path and each paid; it bounds how much of the
+// remaining census is worth chasing.
+//
+// Value 1 is a measured NEGATIVE and exists only to record it: `__builtin_trap`
+// is a `noreturn` terminator planted in the middle of the fused layer, and
+// +0.067 ms is what that costs in block layout and register allocation. Never
+// use a trap to prove a branch is dead in a hot kernel.
+//
+// Nonzero also arms a host-side check: mpk_shmem_init_peer_deltas aborts if any
+// peer came back unmapped, since the device fallback is no longer there.
+// ---------------------------------------------------------------------------
+#ifndef MPK_EP_ASSUME_DIRECT
+#define MPK_EP_ASSUME_DIRECT 0
+#endif
+
+// 1 = elide and trap; 2 = elide silently.
+#if MPK_EP_ASSUME_DIRECT == 1
+#define MPK_EP_STAGED_PUT(dst, src, nbytes, sig, val, op, pe)                  \
+  do {                                                                         \
+    (void)(dst);                                                               \
+    (void)(src);                                                               \
+    (void)(nbytes);                                                            \
+    (void)(sig);                                                               \
+    (void)(val);                                                               \
+    (void)(op);                                                                \
+    (void)(pe);                                                                \
+    __builtin_trap();                                                          \
+  } while (0)
+#elif MPK_EP_ASSUME_DIRECT == 2
+#define MPK_EP_STAGED_PUT(dst, src, nbytes, sig, val, op, pe)                  \
+  do {                                                                         \
+    (void)(dst);                                                               \
+    (void)(src);                                                               \
+    (void)(nbytes);                                                            \
+    (void)(sig);                                                               \
+    (void)(val);                                                               \
+    (void)(op);                                                                \
+    (void)(pe);                                                                \
+  } while (0)
+#else
+#define MPK_EP_STAGED_PUT(dst, src, nbytes, sig, val, op, pe)                  \
+  mpk_putmem_signal_block(dst, src, nbytes, sig, val, op, pe)
 #endif
 
 // ---------------------------------------------------------------------------
@@ -355,6 +425,27 @@ __host__ inline void mpk_shmem_init_peer_deltas(void *probe) {
   if (allocs_d) {
     (void)hipFree(allocs_d);
   }
+#if MPK_EP_ASSUME_DIRECT != 0
+  // The device staged fallback has been compiled down to a trap, so an
+  // unmapped peer must be caught here rather than 36 layers deep. Every bit up
+  // to n_pes, including my own (rocshmem_ptr(probe, my_pe) == probe, delta 0).
+  {
+    uint32_t valid_h = 0;
+    (void)hipMemcpyFromSymbol(&valid_h, HIP_SYMBOL(mpk_peer_heap_valid_d),
+                              sizeof(valid_h));
+    uint32_t const want =
+        (n_pes >= 32) ? ~0u : ((1u << (unsigned)n_pes) - 1u);
+    if ((valid_h & want) != want) {
+      fprintf(stderr,
+              "[MPK] MPK_EP_ASSUME_DIRECT=1 but peer mapping is incomplete: "
+              "valid=0x%x want=0x%x (my_pe=%d n_pes=%d). Rebuild with "
+              "-DMPK_EP_ASSUME_DIRECT=0 to restore the staged putmem "
+              "fallback.\n",
+              valid_h, want, my_pe, n_pes);
+      abort();
+    }
+  }
+#endif
 #else
   (void)probe;
 #endif

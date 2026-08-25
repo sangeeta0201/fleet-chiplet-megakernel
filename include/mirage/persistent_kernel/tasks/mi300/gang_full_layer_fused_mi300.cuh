@@ -2298,7 +2298,7 @@ __device__ __noinline__ void
             if (p == EP_MY_PE) {
               continue;
             }
-            mpk_putmem_signal_block(
+            MPK_EP_STAGED_PUT(
                 ep_gather + EP_MY_PE * EP_SLOT_ELEMS,
                 ep_gather + EP_MY_PE * EP_SLOT_ELEMS,
                 EP_SLOT_BYTES,
