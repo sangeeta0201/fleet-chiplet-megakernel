@@ -1933,6 +1933,46 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
           }
         }
 #endif
+#ifdef MPK_ENABLE_SPAN_TIMING
+        // Same reason as the SUBPHASE copy above: the [SPAN] report lives in
+        // the TASK_TERMINATE branch, and precomputed dispatch returns from
+        // here instead, so MPK_SPAN_TIMING=1 silently produced no output at
+        // all on this branch.
+        //
+        // Raw accumulators, not the other copy's us/layer: that copy divides
+        // by a hardcoded nl = 36, which is gpt-oss's layer count and wrong
+        // here. gap/span is a ratio and is invariant to the divisor, so
+        // normalizing offline loses nothing and cannot silently mis-scale.
+        //
+        // DO NOT READ THIS AS A GLM PHASE TABLE. Measured 2026-08-25 at NP=4:
+        // OPROJ_TOPK and MOE_FUSED both come back span=0 compute=0, because
+        // their stage stamps sit on gpt-oss's decomposition and GLM's fused
+        // full-layer path never traverses them. And QKV_KVUPD reports
+        // span=1322700 against compute=4931 -- a 268:1 ratio that is the
+        // stamp accumulating wall time from first start to last end, not a
+        // per-invocation span. Only two of four stages report at all, and the
+        // one that dominates is not reporting what its name says. Use the
+        // NP=4 per-phase breakdown instead; this emitter is kept only because
+        // producing NO output at all under precomputed dispatch was a
+        // separate, real bug.
+        if (threadIdx.x == 0 && worker_id == 0 && g_span_active) {
+          static char const *stage_names[SPAN_STAGES] = {
+              "QKV_KVUPD", "CK_FMHA", "OPROJ_TOPK", "MOE_FUSED"};
+          printf("[SPANRAW] events=%d stages=%d\n", g_span_event_count,
+                 (int)SPAN_STAGES);
+          unsigned long long total_span = 0, total_compute = 0;
+          for (int s = 0; s < SPAN_STAGES; s++) {
+            unsigned long long sp = g_span_accum_us[s];
+            unsigned long long cp = g_span_compute_us[s];
+            total_span += sp;
+            total_compute += cp;
+            printf("[SPANRAW] %s span=%llu compute=%llu gap=%llu\n",
+                   stage_names[s], sp, cp, sp - cp);
+          }
+          printf("[SPANRAW] TOTAL span=%llu compute=%llu gap=%llu\n",
+                 total_span, total_compute, total_span - total_compute);
+        }
+#endif
         return;
       }
 
