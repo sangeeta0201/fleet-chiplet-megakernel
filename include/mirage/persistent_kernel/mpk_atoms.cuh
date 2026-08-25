@@ -1248,6 +1248,43 @@ __device__ __forceinline__ void mpk_ml_boundary_pad() {}
 // Mechanism-C rendezvous. Off by default so the flat mechanism stays the
 // reference; the counter buffer is sized for the tree either way, so this is
 // a pure A/B.
+//
+// MEASURED TWICE, NULL BOTH TIMES -- and the second measurement is worth more
+// than the null, because it prices the arrival atomic directly.
+//
+//   NP=8:  -0.001 ms.  Dismissed at the time on the grounds that "at a real
+//          barrier the arrivals are already spread over microseconds by
+//          upstream skew", so the 232-way same-address contention the
+//          standalone null-probe measured (3.77 -> 2.11 us, -44%) never
+//          actually forms.
+//
+//   That reason turned out to be FALSE. The makespan predictor measured the
+//   top of the arrival distribution two days later and found it FLAT: max
+//   minus second-arrival is 0.005-0.369 us at all ten real rendezvous, and the
+//   workers within 1 us of max are 232 of 232 at wuv_barrier and 192 of 192 at
+//   hier_barrier. That is precisely the null-probe's condition, so the tree
+//   should have paid ~1.66 us x 10 barriers x 78 layers = 1.29 ms.
+//
+//   NP=4:  -0.015 ms on per-iter min (10.265 n=5, 10.244..10.299, against a
+//          control of 10.280 n=5, 10.248..10.335) and -0.021 on clean avg.
+//          Same sign, both an order of magnitude under the 0.26 ms noise
+//          floor, distributions almost entirely overlapping.
+//
+// So the arrival atomic is not what a rendezvous costs. Divide it out: 10
+// barriers x 78 layers is 780 arrivals per iteration, and the tree's whole
+// effect is 15 us of wall, i.e. it removes about 19 NANOSECONDS per barrier.
+// A 232-way device-scope atomic on one address does not serialize 232 ways --
+// the L2 atomic unit pipelines same-address adds -- so there was never 1.66 us
+// there to take. The standalone probe measured a loop of nothing but atomics,
+// where issue rate is the only thing left to measure.
+//
+// What that leaves is the RELEASE half, which this flag does not touch: the
+// single global last arriver still does `for (x = 0; x < 8; x++) st_wt_u32`
+// out to eight per-XCD flags, and every worker then observes a line written
+// from a different XCD's L2. At 3.77 us measured per rendezvous against 0.019
+// us of arrival, essentially all of a barrier is release fan-out plus
+// cross-XCD observation latency. Any further work here belongs on the release
+// side; see glm-one-rendezvous-costs-3.77us.
 #ifndef MPK_BAR_TREE
 #define MPK_BAR_TREE 0
 #endif
