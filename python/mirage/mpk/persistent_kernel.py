@@ -426,6 +426,24 @@ def get_compile_command(
             _psi = os.environ.get("MPK_PHASE_START_ITER", "")
             if _psi:
                 flags = flags + ["-DMPK_PHASE_START_ITER=" + str(int(_psi))]
+            # Raw per-(worker, layer, slot) timestamps for a Perfetto trace,
+            # on top of the accumulated spans. Separate flag because it costs
+            # ~857 KB of BSS and tens of thousands of printfs at teardown,
+            # where the span table is a fixed 248 lines. Feed the log to
+            # tests/ci-tests/phase_slots_to_perfetto.py.
+            if int(os.environ.get("MPK_PHASE_TRACE", "0")) == 1:
+                flags = flags + ["-DMPK_PHASE_TRACE"]
+                _ptl = os.environ.get("MPK_PHASE_TRACE_LAYERS", "")
+                if _ptl:
+                    flags = flags + [
+                        "-DMPK_PHASE_TRACE_LAYERS=" + str(int(_ptl))]
+        elif int(os.environ.get("MPK_PHASE_TRACE", "0")) == 1:
+            # The trace buffers and the dump both live inside the
+            # MPK_PHASE_SLOTS #ifdef, so this would compile clean and produce
+            # nothing at all. Fail instead of silently tracing nothing.
+            raise ValueError(
+                "MPK_PHASE_TRACE=1 requires MPK_PHASE_SLOTS=1; the trace is "
+                "recorded by the phase-slot marks.")
         if _opt("MPK_W2_CONSUMER_GATE"):
             flags = flags + ["-DMPK_W2_CONSUMER_GATE"]
         if _opt("MPK_WIDE_FP8_QUANT"):

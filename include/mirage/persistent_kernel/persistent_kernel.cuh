@@ -159,6 +159,31 @@ __device__ volatile int g_phase_arm;
 // every other slot.
 __device__ int g_phase_live[MPK_PHASE_MAX_WORKERS];
 
+#ifdef MPK_PHASE_TRACE
+// Raw per-(worker, layer, slot) timestamps, for a Perfetto trace.
+//
+// The [PSLOTW] table above is a *mean* per worker band, and a mean cannot show
+// overlap: two workers each averaging 5 us in MoE tell you nothing about
+// whether they ran at the same time or back to back. Overlap is the whole
+// claim a megakernel makes, so showing it needs absolute timestamps on a
+// common clock -- which s_memrealtime is, being a constant-rate counter shared
+// across every XCD on the die.
+//
+// Bounded to one token's worth of layers. 248 workers x 36 layers x 12 slots
+// x 8 B = 857 KB of BSS, which is why this is opt-in on top of
+// MPK_PHASE_SLOTS rather than always compiled.
+#ifndef MPK_PHASE_TRACE_LAYERS
+#define MPK_PHASE_TRACE_LAYERS 36
+#endif
+__device__ unsigned long long
+    g_trace_ts[MPK_PHASE_MAX_WORKERS * MPK_PHASE_TRACE_LAYERS *
+               MPK_PHASE_SLOT_COUNT];
+// Which XCD each worker landed on. Recorded on the device rather than derived
+// on the host: the worker -> XCD map is a runtime property of the dispatch,
+// and assuming worker_id % 8 or worker_id / 31 has been wrong before.
+__device__ int g_trace_xcd[MPK_PHASE_MAX_WORKERS];
+#endif
+
 __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
   if (threadIdx.x != 0 || worker >= MPK_PHASE_MAX_WORKERS) {
     return;
@@ -175,6 +200,24 @@ __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
   unsigned long long const t = __builtin_amdgcn_s_memrealtime();
   asm volatile("" ::: "memory");
   int const base = worker * MPK_PHASE_SLOT_COUNT;
+#ifdef MPK_PHASE_TRACE
+  // g_phase_n is bumped at slot 11, so it is this layer's index for every
+  // slot including slot 11 itself.
+  {
+    unsigned long long const l = g_phase_n[worker];
+    if (l < MPK_PHASE_TRACE_LAYERS) {
+      g_trace_ts[(worker * (unsigned long long)MPK_PHASE_TRACE_LAYERS + l) *
+                     MPK_PHASE_SLOT_COUNT +
+                 slot] = t;
+      if (slot == 0) {
+        int xcc;
+        asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)"
+                     : "=s"(xcc));
+        g_trace_xcd[worker] = xcc;
+      }
+    }
+  }
+#endif
   // Slot 0 accumulates the *inter-layer* span: last layer's slot 11 to this
   // layer's slot 0. It used to record only a timestamp, which left everything
   // between two layers outside the trace -- and that hole is not small. At
@@ -3723,6 +3766,51 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
               printf("\n");
             }
           }
+#ifdef MPK_PHASE_TRACE
+          // Raw timestamps for the Perfetto converter: one line per
+          // (worker, layer), 12 absolute s_memrealtime ticks.
+          //
+          // Ticks, not nanoseconds: the conversion is one multiply the host
+          // can do, and keeping the raw counter means a rounding choice here
+          // cannot silently reorder two marks that were 1 tick apart.
+          //
+          // Deliberately last, after every other diagnostic line. This is tens
+          // of thousands of printfs; anything printed after it risks being
+          // truncated if the device printf buffer wraps.
+          {
+            printf("[PTRACE] slots=%d layers=%d tick_ns=10\n",
+                   MPK_PHASE_SLOT_COUNT,
+                   MPK_PHASE_TRACE_LAYERS);
+            for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+              if (g_phase_n[w] == 0) {
+                continue;
+              }
+              unsigned long long lmax = g_phase_n[w];
+              if (lmax > MPK_PHASE_TRACE_LAYERS) {
+                lmax = MPK_PHASE_TRACE_LAYERS;
+              }
+              for (unsigned long long l = 0; l < lmax; l++) {
+                unsigned long long const *row =
+                    &g_trace_ts[(w * (unsigned long long)
+                                         MPK_PHASE_TRACE_LAYERS +
+                                 l) *
+                                MPK_PHASE_SLOT_COUNT];
+                // Slot 11 is written last; a zero there means this layer was
+                // still in flight when the kernel exited. Emitting it would
+                // put a span ending at t=0 in the trace.
+                if (row[MPK_PHASE_SLOT_COUNT - 1] == 0) {
+                  continue;
+                }
+                printf("[PTRACEW] w=%d x=%d l=%llu", w, g_trace_xcd[w], l);
+                for (int s = 0; s < MPK_PHASE_SLOT_COUNT; s++) {
+                  printf(" %llu", row[s]);
+                }
+                printf("\n");
+              }
+            }
+            printf("[PTRACE_END]\n");
+          }
+#endif
 #endif
 #ifdef MPK_ENABLE_MOE_SUBPHASE
           // Raw timestamps: scratch[0]=entry, [1]=before_lds,
