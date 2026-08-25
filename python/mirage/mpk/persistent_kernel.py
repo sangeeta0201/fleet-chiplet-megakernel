@@ -7298,6 +7298,49 @@ class PersistentKernel:
                 tb_graph, "argmax_reduce", [self.argmax_partial_output_size]
             )
 
+    def argmax_reduce_xrank_layer(
+        self,
+        input: tuple[DTensor, DTensor],
+        xrank: DTensor,
+        output: DTensor,
+        vocab_shard: int,
+        grid_dim: tuple,
+        block_dim: tuple,
+    ):
+        """argmax_reduce over a vocab-SHARDED logit slice, plus a peer exchange.
+
+        The sharded LM head leaves rank p holding logits for global vocab rows
+        [p*vocab_shard, (p+1)*vocab_shard). This finishes the local reduce the
+        same way argmax_reduce_layer does, rebases the winning index into the
+        global vocab, and then exchanges one 64-bit (value, index) word with
+        every peer so all ranks emit the same token.
+
+        ``xrank`` is a symmetric-heap u64 buffer of at least
+        world_size * ARGMAX_XRANK_SLOT_U64 (= 8) words; the kernel writes this
+        rank's slot on every peer and spins on the others'.
+        """
+        assert len(input) == 2
+        input_value, input_index = input
+        assert input_value.num_dims == 2  # (batch_size, num_tasks)
+        assert input_index.num_dims == 2  # (batch_size, num_tasks)
+        assert output.num_dims == 2  # (batch_size, 1)
+        assert self.world_size > 1, "xrank argmax needs more than one rank"
+        num_parts = input_value.dim(1)
+        assert vocab_shard % num_parts == 0
+        chunk_size = vocab_shard // num_parts
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input_value, (1, 0, -1), -1, True)
+        tb_graph.new_input(input_index, (1, 0, -1), -1, True)
+        tb_graph.new_input(xrank, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output, (0, 1, -1), -1, True)
+        self.kn_graph.customized(
+            [input_value, input_index, xrank, output], tb_graph)
+        self.kn_graph.register_task(
+            tb_graph,
+            "argmax_reduce_xrank",
+            [chunk_size, self.world_size, self.mpi_rank, vocab_shard],
+        )
+
     def sampling_sm100_layer(
         self,
         logits: DTensor,      # [batch_size, vocab_size]

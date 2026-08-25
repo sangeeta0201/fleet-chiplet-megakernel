@@ -53,6 +53,8 @@ public:
                                    std::vector<int> const &params);
   int register_argmax_reduce_task(threadblock::Graph const &bgraph,
                                   std::vector<int> const &params);
+  int register_argmax_reduce_xrank_task(threadblock::Graph const &bgraph,
+                                        std::vector<int> const &params);
   int register_reduce_task(threadblock::Graph const &bgraph,
                            std::vector<int> const &params);
   int register_find_ngram_partial_task(threadblock::Graph const &bgraph,

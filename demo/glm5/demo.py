@@ -1502,10 +1502,30 @@ if __name__ == "__main__":
 
         # LM head. Pad the vocab to the gang GEMM's 512-column granularity,
         # then pick an argmax task count that divides the padded vocab.
-        vocab_size = align_up(config.vocab_size, GANG_OUT_ALIGN)
+        #
+        # Under EP every rank reads the WHOLE head -- 155648 x 6144, 983 MB in
+        # MXFP8, identically on all four ranks, every token. It is the largest
+        # replicated unsharded weight read left in the model. Shard it
+        # row-wise: rank p owns vocab rows [p*shard, (p+1)*shard), argmaxes its
+        # own slice, and one 64-bit peer exchange picks the global winner.
+        # ~3.77 us of rendezvous against ~190 us of duplicated weight read.
+        LMHEAD_TP = (moe_ep and DENSE_MXFP8
+                     and os.environ.get("GLM_LMHEAD_TP", "1") == "1")
+        # Each rank's slice has to satisfy the gang GEMM's own n_wgs % 8 == 0
+        # on its own, so the pad granularity picks up world_size * 8 * OPW.
+        vocab_align = (math.lcm(GANG_OUT_ALIGN,
+                                world_size * 8 * DENSE_MXFP8_OPW)
+                       if LMHEAD_TP else GANG_OUT_ALIGN)
+        vocab_size = align_up(config.vocab_size, vocab_align)
         lm_head_weight = pad_rows(model.lm_head.weight.data, vocab_size)
-        argmax_num_tasks = max_factor_leq_n(vocab_size, num_workers)
+        # The width the head GEMM and the argmax actually see.
+        vocab_shard = vocab_size // world_size if LMHEAD_TP else vocab_size
+        if LMHEAD_TP:
+            lm_head_weight = lm_head_weight[
+                rank * vocab_shard:(rank + 1) * vocab_shard].contiguous()
+        argmax_num_tasks = max_factor_leq_n(vocab_shard, num_workers)
         print(f"[CFG] vocab {config.vocab_size} -> {vocab_size}, "
+              f"lmhead_tp={int(LMHEAD_TP)} shard={vocab_shard}, "
               f"argmax tasks={argmax_num_tasks} (workers={num_workers})")
 
         if args.profiling:
@@ -2172,7 +2192,7 @@ if __name__ == "__main__":
         moe_ws_f32 = make_tensor("moe_ws_f32", (bs, hidden_size),
                                  torch_dtype=torch.float32)
 
-        argmax_in = make_tensor("argmax_in", (bs, vocab_size))
+        argmax_in = make_tensor("argmax_in", (bs, vocab_shard))
         argmax_part_value = make_tensor("argmax_part_value",
                                         (bs, argmax_num_tasks))
         argmax_part_index = make_tensor("argmax_part_index",
@@ -2180,6 +2200,19 @@ if __name__ == "__main__":
                                         torch_dtype=torch.int64)
         argmax_out = mpk.attach_input(torch_tensor=output_tokens,
                                       name="output_token")
+        # The cross-rank argmax exchange's mailbox: one 64-byte line per PE,
+        # payload at word 0 and epoch at word 1. Same int32-declaration reason
+        # as ep_signal. A separate buffer per head -- the draft head runs while
+        # a peer may still be reading the main head's line.
+        lmhead_xrank = lmhead_xrank_mtp = None
+        if LMHEAD_TP:
+            lmhead_xrank = mpk.new_tensor(
+                dims=(world_size * 16,), dtype=mi.int32,
+                name="lmhead_xrank", io_category="nvshmem_tensor")
+            if mtp_in_graph:
+                lmhead_xrank_mtp = mpk.new_tensor(
+                    dims=(world_size * 16,), dtype=mi.int32,
+                    name="lmhead_xrank_mtp", io_category="nvshmem_tensor")
 
         # Zero biases. gang_rmsnorm_linear_bias_layer partitions `bias` with
         # map (1, -1, -1), so it has to be 2-D [1, output_size]; the MoE gang
@@ -2268,7 +2301,8 @@ if __name__ == "__main__":
 
         def emit_tail_and_head(*, x_in, fl_kwargs, gather_slot, norm_weight,
                                norm_scratch, resadd_x_out, logits,
-                               part_value, part_index, out_tokens_t):
+                               part_value, part_index, out_tokens_t,
+                               xrank=None):
             # ── The EP tail ──────────────────────────────────────────────
             # GLM folds at the HEAD of a layer, which buys it one rendezvous
             # per layer where gpt-oss pays two -- and costs it this: the LAST
@@ -2329,11 +2363,11 @@ if __name__ == "__main__":
                     norm_weight=norm_weight,
                     norm_output=norm_scratch,
                     mxfp8_weight=_head_weights()["lm"],
-                    bias=zero_bias(vocab_size),
+                    bias=zero_bias(vocab_shard),
                     output=logits,
                     actual_hidden_dim=hidden_size,
                     output_per_wg=DENSE_MXFP8_OPW,
-                    output_stride=vocab_size,
+                    output_stride=vocab_shard,
                     block_dim=(256, 1, 1),
                     **ep_lm_kwargs,
                 )
@@ -2343,11 +2377,11 @@ if __name__ == "__main__":
                     norm_weight=norm_weight,
                     norm_output=norm_scratch,
                     linear_weight=_head_weights()["lm"],
-                    bias=zero_bias(vocab_size),
+                    bias=zero_bias(vocab_shard),
                     output=logits,
                     actual_hidden_dim=hidden_size,
                     tile_n=GANG_TILE_N,
-                    output_stride=vocab_size,
+                    output_stride=vocab_shard,
                     wgm=GANG_WGM,
                     block_dim=(256, 1, 1),
                 )
@@ -2357,12 +2391,26 @@ if __name__ == "__main__":
                 grid_dim=(argmax_num_tasks, 1, 1),
                 block_dim=(256, 1, 1),
             )
-            mpk.argmax_reduce_layer(
-                input=(part_value, part_index),
-                output=out_tokens_t,
-                grid_dim=(1, 1, 1),
-                block_dim=(256, 1, 1),
-            )
+            if LMHEAD_TP:
+                # Each rank reduced only its own vocab slice. Rebase into the
+                # global vocab and take the max across the four ranks, so every
+                # rank emits the same token -- which is what G1 tests.
+                assert xrank is not None
+                mpk.argmax_reduce_xrank_layer(
+                    input=(part_value, part_index),
+                    xrank=xrank,
+                    output=out_tokens_t,
+                    vocab_shard=vocab_shard,
+                    grid_dim=(1, 1, 1),
+                    block_dim=(256, 1, 1),
+                )
+            else:
+                mpk.argmax_reduce_layer(
+                    input=(part_value, part_index),
+                    output=out_tokens_t,
+                    grid_dim=(1, 1, 1),
+                    block_dim=(256, 1, 1),
+                )
 
         # ── The MTP draft layer's front end ──────────────────────────────────
         if mtp_in_graph:
@@ -2400,7 +2448,7 @@ if __name__ == "__main__":
             mtp_layer_out = make_tensor("mtp_layer_out", (bs, hidden_size))
             mtp_rmsnorm_out = make_tensor("mtp_rmsnorm_out",
                                           (bs + _pub_rows, hidden_size))
-            mtp_argmax_in = make_tensor("mtp_argmax_in", (bs, vocab_size))
+            mtp_argmax_in = make_tensor("mtp_argmax_in", (bs, vocab_shard))
             mtp_part_value = make_tensor("mtp_part_value",
                                          (bs, argmax_num_tasks))
             mtp_part_index = make_tensor("mtp_part_index",
@@ -2438,7 +2486,8 @@ if __name__ == "__main__":
                     norm_scratch=rmsnorm_out,
                     resadd_x_out=layer_out, logits=argmax_in,
                     part_value=argmax_part_value,
-                    part_index=argmax_part_index, out_tokens_t=argmax_out)
+                    part_index=argmax_part_index, out_tokens_t=argmax_out,
+                    xrank=lmhead_xrank)
                 # h' = eh_proj([enorm(emb(t_{i+1})) ; hnorm(h_i)])
                 mpk.embed_layer(
                     input=argmax_out, weight=w_embed, output=mtp_embed_out,
@@ -3424,7 +3473,7 @@ if __name__ == "__main__":
                 norm_weight=w_mtp_head_norm, norm_scratch=mtp_rmsnorm_out,
                 resadd_x_out=mtp_layer_out, logits=mtp_argmax_in,
                 part_value=mtp_part_value, part_index=mtp_part_index,
-                out_tokens_t=draft_out)
+                out_tokens_t=draft_out, xrank=lmhead_xrank_mtp)
         else:
             emit_tail_and_head(
                 x_in=x, fl_kwargs=last_fl_kwargs, gather_slot=num_layers,
@@ -3432,7 +3481,7 @@ if __name__ == "__main__":
                 norm_scratch=rmsnorm_out,
                 resadd_x_out=layer_out, logits=argmax_in,
                 part_value=argmax_part_value, part_index=argmax_part_index,
-                out_tokens_t=argmax_out)
+                out_tokens_t=argmax_out, xrank=lmhead_xrank)
 
         num_ops = len(mpk.kn_graph.cygraph.get_graph_structure())
         print(f"DEBUG: kn_graph has {num_ops} operators before "

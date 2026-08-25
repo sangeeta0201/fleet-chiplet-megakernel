@@ -32,6 +32,7 @@
 // MI300-specific task implementations
 #include "tasks/mi300/rmsnorm_mi300.cuh"
 #include "tasks/mi300/argmax_mi300.cuh"
+#include "tasks/mi300/argmax_reduce_xrank_mi300.cuh"
 #include "tasks/mi300/rotary_embedding_mi300.cuh"
 #include "tasks/mi300/silu_mul_mi300.cuh"
 #include "tasks/mi300/silu_mul_linear_mi300.cuh"

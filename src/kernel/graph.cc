@@ -499,6 +499,10 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     int variant_id =
         task_register->register_argmax_reduce_task(customized->bgraph, params);
     task_config[op] = std::make_tuple(2, 1, TASK_ARGMAX_REDUCE, variant_id);
+  } else if (name == "argmax_reduce_xrank") {
+    int variant_id = task_register->register_argmax_reduce_xrank_task(
+        customized->bgraph, params);
+    task_config[op] = std::make_tuple(3, 1, TASK_ARGMAX_REDUCE, variant_id);
   } else if (name == "allreduce") {
     // `register_reduce_task` will register two tasks, but we only record one
     int variant_id =
