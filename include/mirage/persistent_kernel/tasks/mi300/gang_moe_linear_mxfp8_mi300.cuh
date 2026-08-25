@@ -593,6 +593,29 @@ __device__ __forceinline__ f32x4_t
       N[j] = load_w(base + GROUPS + j);
     }
     consume(base, A, S);
+    // NO-GO, measured: sinking copy j to just after slot j's MFMA.
+    //
+    // The motivation is real. The block below reads N[GROUPS-1], the LAST load
+    // issued, and vmcnt is in-order, so the whole block takes `vmcnt(0)` --
+    // and it lands between MFMA 0 and MFMA 1 with three of the four still to
+    // issue. Copy j alone reads only load j, so an interleaved form should
+    // admit `vmcnt(GROUPS-1-j)` and let the drain walk down with the MFMAs.
+    //
+    // It emits a **byte-identical** hot body (W13 `[0x4178c..0x418e8]`) at an
+    // unchanged 333 VGPRs / 0 spills. LLVM's scheduler already sinks and
+    // hoists these copies freely; source placement is not the constraint. Not
+    // measured on the GPU -- refuted against the image, as MPK_DENSE_SCBASE
+    // was (`8e949cd`).
+    //
+    // What IS the constraint is the allocation. The rotate form lets the
+    // allocator coalesce A[j] with N[j] into one physical register -- which is
+    // why only three or four `v_mov_b64` survive here rather than 2*GROUPS --
+    // and the `vmcnt(0)` is the price of that coalescing. Forbidding it is
+    // exactly MPK_MOE_PF_DBUF, which costs +31 unified VGPRs (333 -> 364) and
+    // was measured a loss twice. The two are alternatives, and LLVM already
+    // picked the one the wall agrees with. Attack the *dependence*, not the
+    // order: break the WAR that makes the 4th weight load's destination
+    // collide with what the rotation reads.
 #pragma unroll
     for (int j = 0; j < GROUPS; j++) {
       A[j] = N[j];

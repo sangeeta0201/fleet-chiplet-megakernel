@@ -333,6 +333,35 @@ __device__ __noinline__ void
     u32x4_t wv[UNROLL];
     unsigned char sv[UNROLL];
     u32x4_t av[UNROLL][BATCH_SIZE][2];
+    // NO-GO, measured: hoisting a base pointer for these two batches.
+    //
+    // `s_row + k / SCALE_BLOCK` with `k` a signed int is two things LLVM
+    // cannot strength-reduce across the unroll -- a *signed* divide, which
+    // needs the round-toward-zero correction unless k >= 0 is provable, and a
+    // sign-extended add, which does not distribute. So it emits UNROLL
+    // independent 64-bit address chains for UNROLL scale bytes: 18
+    // `v_lshl_add_u64` per trip and 0 of 8 `global_load_ubyte` in
+    // immediate-offset form, against a weight half that folds cleanly onto
+    // `v[34:35] offset:512/1024/1536`. That is exactly the detector
+    // MPK_MOE_SCBASE was built from, and it was worth -0.123 ms there.
+    //
+    // Hoisting `wp`/`sp` once per trip and indexing by `u * W_USTRIDE` /
+    // `u * (W_USTRIDE / SCALE_BLOCK)` (exact, since LANES_PER_ROW * VEC is a
+    // whole multiple of SCALE_BLOCK) lands completely: 18 -> 4
+    // `v_lshl_add_u64`, 0/8 -> 7/8 immediate-offset, body 217 -> 201 insns,
+    // waitcnt 27 -> 22, `.vgpr_count` unchanged at 333 with 0 spills.
+    //
+    // It measures **9.752 (n=3) against a 9.718 (n=5) control** -- neutral to
+    // marginally worse. The tell is in the same disassembly: the first wait of
+    // the trip goes from `vmcnt(7)` to `vmcnt(3)`. The scheduler spent the
+    // registers the fold handed back on a SHALLOWER load pipeline, and this
+    // loop is latency-bound (128 of its 217 instructions are v_cvt + v_dot2c
+    // with no MFMA at all), so depth is worth more than the 16 instructions.
+    //
+    // Rule this establishes, and the reason MPK_MOE_SCBASE is not a general
+    // transform: an address-arithmetic cut only pays if the load depth at the
+    // top of the trip does not shrink. Read `vmcnt(N)` at the first wait
+    // before and after, not just the instruction count.
 #pragma unroll
     for (int u = 0; u < UNROLL; u++) {
       // Chunk index within the row, in units of VEC elements.
