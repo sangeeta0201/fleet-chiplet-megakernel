@@ -1160,6 +1160,25 @@ if __name__ == "__main__":
         # strictly more aggressive than 8 or 9, and it measured neutral. So the
         # unabsorbed spread is real but its geometry fix is already tested.
         # An unabsorbed spread is necessary for a lever, not sufficient.
+        # W13's own width was swept at NP=8 and re-swept at NP=4 on 2026-08-25,
+        # because constants tuned at NP=8 are a live bug class here (o_proj
+        # -0.148, worker count -0.108 both came from re-sweeping one). W13 is
+        # NOT one of them. Arithmetic first: a NP=4 rank owns ~2 activated
+        # experts (top-8 of 256, EP=4 -> 64 experts/rank), so tiles/XCD =
+        # (4096/OPW)/8 * 2, i.e. 16 at OPW=64 -- already one round against 29
+        # workers and already UNDER the 24-tiles/XCD target. The constraint
+        # block below admits only OPW % 64 == 0 or OPW == 16, so the sole
+        # untested legal value is 128, which halves it to 8/XCD and moves
+        # further from the target. Measured anyway, paired against the
+        # MPK_DENSE_KMAJOR=1 control, one variable:
+        #   per-iter min  64: 10.428 (n=5, 10.398-10.447)
+        #                128: 10.608 (n=4, 10.582-10.636)   +0.180
+        #   clean avg     64: 10.582 (n=5)   128: 10.667 (n=4)   +0.085
+        # The min ranges do not overlap -- 128's best run is worse than 64's
+        # worst -- and the regression is itself proof the flag reached codegen.
+        # 16 is the remaining value; it is the K-parallel path at 3 rounds,
+        # whose W2 twin measured -1.34 ms. W13 width is closed in both
+        # directions at NP=4.
         MOE_W13_OPW = int(os.environ.get("GLM_MOE_W13_OPW", "64"))
         MOE_W2_OPW = int(os.environ.get("GLM_MOE_W2_OPW", "64"))
         # Experts per router call. The router is one worker per expert, so
