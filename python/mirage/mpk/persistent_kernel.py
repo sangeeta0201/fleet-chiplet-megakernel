@@ -507,6 +507,18 @@ def get_compile_command(
         # set GLM_RESADD_BATCH=0 for the old code path.
         _rb = int(os.environ.get("GLM_RESADD_BATCH", "1"))
         flags = flags + ["-DMPK_RESADD_BATCH=%d" % _rb]
+        # Address the batched resolve loads through addrspace(1). Read off the
+        # built image, the batch already carries all 30 loads to a single
+        # `s_waitcnt vmcnt(0)` -- but 24 of the 30 are `flat_load_dwordx2`,
+        # because only the norm-weight load carries an addrspace cast. flat has
+        # no SGPR-base form on gfx9, so each of those 24 pays a 64-bit
+        # v_add_co/v_addc_co pair, and flat also raises lgkmcnt, which is why
+        # the drain reads `vmcnt(0) lgkmcnt(0)`. This is 3c1fa83's edit applied
+        # to the resolve loop; it is NOT the MoE k-loop case that regressed,
+        # because that one changed the s_waitcnt count and this region has
+        # exactly one drain.
+        _rg = int(os.environ.get("GLM_RESADD_GLOBAL", "1"))
+        flags = flags + ["-DMPK_RESADD_GLOBAL=%d" % _rg]
         # Hoist the un-absorbed W_UV GEMV out of the MoE half and run it in the
         # attention half, straight after the split-KV merge, behind a PAIR-LOCAL
         # barrier instead of a GPU-wide one. The layer's existing Phase 8

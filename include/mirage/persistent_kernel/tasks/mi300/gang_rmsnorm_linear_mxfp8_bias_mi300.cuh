@@ -650,6 +650,36 @@ _rnlm8_pro_publish(unsigned short const *__restrict__ d_res,
 // published the resolved bf16 row, so this pass reads ONE plane, stages it and
 // squares it. It does not add d_ws either: the folder did that (under EP,
 // d_ws is not a term at all -- see the divergence note above).
+// addrspace(1) load helpers for the resolve batch. They go through a scalar
+// uint64_t rather than casting the vector type directly: dereferencing an
+// `address_space(1)` pointer to a class type (uint2/float4 are classes in HIP)
+// yields an address-space-qualified prvalue, and the implicit copy-assignment
+// operator does not accept one -- "no viable overloaded '='". uint64_t has no
+// user-declared operator=, so the same cast on it compiles, which is exactly
+// why the STAGE_NW load below could already do this and the others could not.
+// One global_load_dwordx2 per call; the float4 form is two of them and is only
+// reached off the EP path.
+__device__ __forceinline__ uint2 _rnlm8_ld_g_u2(void const *p) {
+  uint64_t const v =
+      *(__attribute__((address_space(1))) uint64_t const *)(uint64_t const *)p;
+  uint2 r;
+  r.x = (unsigned)v;
+  r.y = (unsigned)(v >> 32);
+  return r;
+}
+__device__ __forceinline__ float4 _rnlm8_ld_g_f4(void const *p) {
+  auto const *q =
+      (__attribute__((address_space(1))) uint64_t const *)(uint64_t const *)p;
+  uint64_t const a = q[0];
+  uint64_t const b = q[1];
+  float4 r;
+  r.x = __uint_as_float((unsigned)a);
+  r.y = __uint_as_float((unsigned)(a >> 32));
+  r.z = __uint_as_float((unsigned)b);
+  r.w = __uint_as_float((unsigned)(b >> 32));
+  return r;
+}
+
 template <int REDUCTION_SIZE,
           int EP_PEER_SLOTS = 0,
           int EP_SLOT_ELEMS = 0,
@@ -816,29 +846,65 @@ _rnlm8_resadd_norm_rcp(float const *__restrict__ d_ws,
 #ifndef MPK_RESADD_BATCH
 #define MPK_RESADD_BATCH 1
 #endif
+
+  // MPK_RESADD_GLOBAL: address the batched loads through addrspace(1).
+  //
+  // The batch above works -- the built image issues all ITERS x (1 + NEXTRA)
+  // + ITERS loads back to back and drains them at ONE `s_waitcnt vmcnt(0)`,
+  // so `carry` is 30 at EP_PEER_SLOTS=4, not the ~1.5 the note above inferred
+  // from bandwidth. But 24 of those 30 are `flat_load_dwordx2` and only the 6
+  // norm-weight loads are `global_load_dwordx2`, because `bat_nw` is the only
+  // one of the four that carries the addrspace(1) cast. Two costs follow:
+  //
+  //   1. flat has no SGPR-base form on gfx9, so every one of the 24 needs a
+  //      64-bit `v_add_co_u32`/`v_addc_co_u32` pair to materialize its
+  //      address -- ~90 VALU ops of pure addressing in the region.
+  //   2. flat raises lgkmcnt as well as vmcnt, which is why the drain reads
+  //      `s_waitcnt vmcnt(0) lgkmcnt(0)`: the batch is fenced against LDS
+  //      traffic it has no dependence on.
+  //
+  // Under addrspace(1) the peer slots become `global_load_dwordx2 v, voff,
+  // s[base] offset:imm` -- one shared 32-bit voffset, an SGPR base per slot
+  // and immediate trip offsets. This is the same edit 3c1fa83 made in the MLA
+  // decode kernel, and the opposite of the MoE result
+  // (glm-moe-addrspace1-is-a-negative...), which regressed because it changed
+  // the s_waitcnt COUNT in a k-loop. It cannot do that here: the region has
+  // exactly one drain before and after.
+#ifndef MPK_RESADD_GLOBAL
+#define MPK_RESADD_GLOBAL 1
+#endif
 #if MPK_RESADD_BATCH
   uint2 bat_r[ITERS];
   uint2 bat_p[ITERS][NEXTRA];
   float4 bat_w[(!EP && !PRE_FOLDED) ? ITERS : 1];
   uint64_t bat_nw[STAGE_NW ? ITERS : 1];
+#if MPK_RESADD_GLOBAL
+#define MPK_RA_LD_U2(p) _rnlm8_ld_g_u2((void const *)(p))
+#define MPK_RA_LD_F4(p) _rnlm8_ld_g_f4((void const *)(p))
+#else
+#define MPK_RA_LD_U2(p) (*reinterpret_cast<uint2 const *>(p))
+#define MPK_RA_LD_F4(p) (*reinterpret_cast<float4 const *>(p))
+#endif
 #pragma unroll
   for (int v = 0; v < ABL_ITERS; v++) {
     int const off = (v * NTHREADS + tid) * VEC;
-    bat_r[v] = *reinterpret_cast<uint2 const *>(d_res + off);
+    bat_r[v] = MPK_RA_LD_U2(d_res + off);
     if constexpr (EP) {
 #pragma unroll
       for (int p = 0; p < NEXTRA; p++) {
-        bat_p[v][p] = *reinterpret_cast<uint2 const *>(
-            d_res + (size_t)(p + 1) * EP_SLOT_ELEMS + off);
+        bat_p[v][p] =
+            MPK_RA_LD_U2(d_res + (size_t)(p + 1) * EP_SLOT_ELEMS + off);
       }
     } else if constexpr (!PRE_FOLDED) {
-      bat_w[v] = *reinterpret_cast<float4 const *>(d_ws + off);
+      bat_w[v] = MPK_RA_LD_F4(d_ws + off);
     }
     if constexpr (STAGE_NW) {
       uint64_t const *nwp = reinterpret_cast<uint64_t const *>(d_nw + off);
       bat_nw[v] = *(__attribute__((address_space(1))) uint64_t const *)nwp;
     }
   }
+#undef MPK_RA_LD_U2
+#undef MPK_RA_LD_F4
 #endif
 
   _Pragma(MPK_RESADD_STR(unroll MPK_RESADD_UNROLL))
