@@ -19,7 +19,52 @@
 // cache，
 // it taks the output of multitoken_paged_attention_task_impl_32_64_split_kv and
 // the log exp sum as input,
+
+// ---------------------------------------------------------------------------
+// MPK_MERGE_GLOBAL: name the address space of the split-KV merge's two reads.
+//
+// merge_splitkv_ck_fmha's `lse_ptr` / `o_ptr` are plain `float const *`, so the
+// compiler cannot prove they are global and emits `flat_load_dword` for both --
+// 32 + 32 of them per instantiation in the fused MLA layer, and another 16 + 16
+// each in worker_kernel / persistent_kernel. They are the o_acc / lse_acc HBM
+// staging buffers, so addrspace(1) is what they actually are.
+//
+// This body is the online-softmax rescan: NUM_KV_CHUNKS fully-unrolled
+// dependent (lse, o) pairs per output dim. Flat raises lgkmcnt as well as
+// vmcnt, so every one of those loads fences against LDS traffic it never
+// touches. Unlike the MoE k-loop negative, there is no loop-carried s_waitcnt
+// count to change here -- the whole chain is unrolled flat.
+//
+// MEASURED NEUTRAL. It does exactly what it says to the image -- fused layer
+// 280 -> 216 flat, worker_kernel 126 -> 94, persistent_kernel 133 -> 101, all
+// of the delta being these two lines -- and the wall does not move:
+//
+//   GLM-5, NP=4, devices 4-7, bs=1, one session
+//   0   10.068 10.087 10.156 10.110 10.078 10.086 10.103 10.063   n=8 mean 10.094
+//   1   10.020 10.065 10.123 10.092 10.084 10.068                 n=6 mean 10.075
+//
+// -0.019 against a 0.26 ms n=1 noise floor: not resolvable, and the ranges
+// interleave. Default is 1 anyway because addrspace(1) is what these pointers
+// ACTUALLY are, and the two prior wins in this class both came from saying so
+// -- but do not count this as one of them.
+//
+// Taken with MPK_EP_ASSUME_DIRECT (dead flat, also neutral), this is the second
+// measurement saying the flat-op vein is spent at NP=4: even flat that EXECUTES
+// buys nothing once it is outside a k-loop and outside a phase that is on the
+// critical path. The merge is not.
+// ---------------------------------------------------------------------------
+#ifndef MPK_MERGE_GLOBAL
+#define MPK_MERGE_GLOBAL 1
+#endif
+
 namespace kernel {
+
+#if MPK_MERGE_GLOBAL
+using _mrg_gf32 = __attribute__((address_space(1))) float const *;
+#define MPK_MRG_G(p) ((::kernel::_mrg_gf32)(p))
+#else
+#define MPK_MRG_G(p) (p)
+#endif
 
 template <typename T,
           int NUM_QO_HEADS_PER_KV,
@@ -219,6 +264,9 @@ __device__ __forceinline__ void
   int thread_in_group = threadIdx.x % THREADS_PER_TOKEN;
   int group_id = threadIdx.x / THREADS_PER_TOKEN;
 
+  auto const lse_g = MPK_MRG_G(lse_ptr);
+  auto const o_g = MPK_MRG_G(o_ptr);
+
   // Optional sink correction (GPT-OSS): out *= 1 / (1 + exp(sink -
   // LSE_natural)) Layout: sinks[num_q_heads] in bf16, indexed by
   // kv_head_idx*NUM_QO_HEADS_PER_KV + head.
@@ -265,12 +313,12 @@ __device__ __forceinline__ void
                        thread_in_group * VAL_PER_THREAD + i;
 
         // CK FMHA stores LSE in natural log scale; convert to log2 for ptx_exp2
-        float other_m = lse_ptr[lse_offset] * 1.44269504088896340736f,
+        float other_m = lse_g[lse_offset] * 1.44269504088896340736f,
               other_d = 1;
         m_global = max(m_prev, other_m);
         d_global = d_prev * ptx_exp2(m_prev - m_global) +
                    other_d * ptx_exp2(other_m - m_global);
-        float other_o = o_ptr[o_offset];
+        float other_o = o_g[o_offset];
         o_global = o_global * ptx_exp2(m_prev - m_global) +
                    other_o * ptx_exp2(other_m - m_global);
       }

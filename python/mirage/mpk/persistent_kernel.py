@@ -390,6 +390,12 @@ def get_compile_command(
             # dumps colliding intermediate object files (test-hip-amdgcn-*.o),
             # corrupting the device link (undefined __hip_gpubin_handle).
             # Omit -lineinfo for ROCm: hipcc forwards it to ld.lld which treats it as -l lineinfo
+            # MPK_LINE_TABLES=1 adds -gline-tables-only so `llvm-objdump -d -l`
+            # maps an ISA address back to file:line. It changes nothing about
+            # codegen at -O2 but it does grow the image, so it is opt-in and
+            # must never be on for a run whose latency is being quoted.
+            *(["-gline-tables-only"]
+              if os.environ.get("MPK_LINE_TABLES", "0") == "1" else []),
             f"-I{py_include_dir}",
             f"-I{mirage_inc_path}",
             f"-I{hip_compat_inc}",  # HIP compatibility headers (before CUTLASS, includes cuda/std/ compatibility)
@@ -539,6 +545,16 @@ def get_compile_command(
         # only flat that EXECUTES is. See MPK_EP_ASSUME_DIRECT in mpk_comm.cuh.
         _ad = int(os.environ.get("GLM_EP_ASSUME_DIRECT", "0"))
         flags = flags + ["-DMPK_EP_ASSUME_DIRECT=%d" % _ad]
+        # addrspace(1) on the split-KV merge's lse_acc / o_acc reads. Located by
+        # line-table census, not by guessing: merge_splitkv.cuh:268 and :273 are
+        # 32 + 32 flat_load_dword in the fused MLA layer and 16 + 16 more in
+        # worker_kernel / persistent_kernel -- the largest EXECUTED flat cluster
+        # left after MPK_EP_ASSUME_DIRECT retired the dead putmem one.
+        # MEASURED NEUTRAL: -0.019 ms, n=6 arm vs n=8 control, interleaved
+        # ranges. Default 1 because it is the correct address space, not because
+        # it paid. See MPK_MERGE_GLOBAL in merge_splitkv.cuh for the samples.
+        _mrg = int(os.environ.get("GLM_MERGE_GLOBAL", "1"))
+        flags = flags + ["-DMPK_MERGE_GLOBAL=%d" % _mrg]
         # Hoist the un-absorbed W_UV GEMV out of the MoE half and run it in the
         # attention half, straight after the split-KV merge, behind a PAIR-LOCAL
         # barrier instead of a GPU-wide one. The layer's existing Phase 8
