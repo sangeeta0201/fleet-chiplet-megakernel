@@ -686,6 +686,15 @@ def get_compile_command(
             # read-shared line in the kernel, worth -0.36 us per rendezvous in
             # tests/standalone/test_barrier_release.hip.
             flags = flags + [f"-DMPK_BAR_POLL_NT={_bpn}"]
+        _ppn = os.environ.get("MPK_PEER_POLL_NT")
+        if _ppn is not None:
+            assert _ppn in ("0", "1"), "MPK_PEER_POLL_NT is 0 or 1"
+            # The same `nt` drop on the CROSS-RANK peer poll (ld_sys_u64 and
+            # ld_sys_u64_x8): the EP signal wait and the q_b gather. 1 restores
+            # the historical form, 0 (the header default) drops it. `sc0 sc1`
+            # is untouched, so the stale-L2 livelock this poll was hardened
+            # against cannot come back.
+            flags = flags + [f"-DMPK_PEER_POLL_NT={_ppn}"]
         if int(os.environ.get("MPK_EP_POLL_BATCH", "0")) == 1:
             # One s_waitcnt for all eight EP signal lines instead of one per
             # peer. The seven-line pass was seven serialized uncached round

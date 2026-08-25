@@ -93,6 +93,13 @@
 // Both are valid approaches; NT is more explicit about bypassing cache.
 // =============================================================================
 
+// MPK_PEER_POLL_NT: the `nt` token on the CROSS-RANK peer poll (ld_sys_u64 and
+// ld_sys_u64_x8). Default 0 = dropped. Same mechanism and same reasoning as
+// MPK_BAR_POLL_NT below, which measured -0.367 us/barrier and -0.206 ms/token.
+#ifndef MPK_PEER_POLL_NT
+#define MPK_PEER_POLL_NT 0
+#endif
+
 // Non-temporal load (bypasses cache, reads from memory)
 __device__ __forceinline__ unsigned long long int
     ld_nt_u64(unsigned long long int *addr) {
@@ -135,6 +142,7 @@ __device__ __forceinline__ mpk_u64x8
   mpk_u64x8 r;
 #if defined(__HIP_DEVICE_COMPILE__) &&                                         \
     (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#if MPK_PEER_POLL_NT
   asm volatile(
                "global_load_dwordx2 %0, %8, off offset:0 sc0 sc1 nt\n"
                "global_load_dwordx2 %1, %8, off offset:64 sc0 sc1 nt\n"
@@ -145,6 +153,18 @@ __device__ __forceinline__ mpk_u64x8
                "global_load_dwordx2 %6, %8, off offset:384 sc0 sc1 nt\n"
                "global_load_dwordx2 %7, %8, off offset:448 sc0 sc1 nt\n"
                "s_waitcnt vmcnt(0)"
+#else
+  asm volatile(
+               "global_load_dwordx2 %0, %8, off offset:0 sc0 sc1\n"
+               "global_load_dwordx2 %1, %8, off offset:64 sc0 sc1\n"
+               "global_load_dwordx2 %2, %8, off offset:128 sc0 sc1\n"
+               "global_load_dwordx2 %3, %8, off offset:192 sc0 sc1\n"
+               "global_load_dwordx2 %4, %8, off offset:256 sc0 sc1\n"
+               "global_load_dwordx2 %5, %8, off offset:320 sc0 sc1\n"
+               "global_load_dwordx2 %6, %8, off offset:384 sc0 sc1\n"
+               "global_load_dwordx2 %7, %8, off offset:448 sc0 sc1\n"
+               "s_waitcnt vmcnt(0)"
+#endif
 :
                  "=v"(r.v[0]),
                  "=v"(r.v[1]),
@@ -275,11 +295,25 @@ __device__ __forceinline__ unsigned long long int
 #if defined(__HIP_DEVICE_COMPILE__) &&                                         \
     (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
   unsigned long long int val;
+#if MPK_PEER_POLL_NT
   asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1 nt\n"
                "s_waitcnt vmcnt(0)"
                : "=v"(val)
                : "v"(addr)
                : "memory");
+#else
+  // MPK_PEER_POLL_NT=0 (default): same `nt` drop that bought -0.206 ms/token on
+  // the intra-GPU barrier poll (commit a494a9d), applied to the CROSS-RANK peer
+  // poll. `nt` is a replacement-policy hint only -- sc0 sc1 already bypasses L1
+  // and the per-XCD L2, so this changes no coherence and cannot reintroduce the
+  // stale-L2 livelock the sc0 sc1 comment above is about. It only stops asking
+  // MALL not to retain a signal line that every worker re-reads every spin.
+  asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1\n"
+               "s_waitcnt vmcnt(0)"
+               : "=v"(val)
+               : "v"(addr)
+               : "memory");
+#endif
   return val;
 #else
   return *reinterpret_cast<unsigned long long int volatile *>(addr);

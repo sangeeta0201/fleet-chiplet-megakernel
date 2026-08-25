@@ -159,7 +159,7 @@ MPK_FORWARD_VARS=(
   MPK_BAR_SKEW MPK_EP_FOLD_WGS MPK_EP_POLL_BATCH MPK_ML_PTR_PREFETCH
   # Not a semantic change -- both settings are coherent -- but still
   # compile-time, and an A/B is only one variable if every rank agrees.
-  MPK_BAR_POLL_NT
+  MPK_BAR_POLL_NT MPK_PEER_POLL_NT
   MPK_ML_BOUNDARY_PAD MPK_BAR_SKEW_DROP_NS MPK_WUV_IN_MERGE GLM_RESADD_UNROLL
   GLM_RESADD_BATCH
   MPK_PRINT_GEOMETRY
