@@ -753,6 +753,17 @@ def get_compile_command(
             # without touching the router's inputs.
             assert 0 < _shadow_kb <= 4096, "MPK_MOE_SHADOW_KB is 1..4096"
             flags = flags + ["-DMPK_MOE_SHADOW_KB=%d" % _shadow_kb]
+        _qkva_pf_kb = int(os.environ.get("MPK_QKVA_PF_KB", "0"))
+        if _qkva_pf_kb > 0:
+            # The real lever the shadow probe stood in for. Each W13-idle
+            # worker pulls this many KB of the NEXT layer's qkv_a weight into
+            # cache during this layer's W13 phase. CORRECT OUTPUT: it reads a
+            # constant nobody writes and stores nothing.
+            assert 0 < _qkva_pf_kb <= 4096, "MPK_QKVA_PF_KB is 1..4096"
+            flags = flags + ["-DMPK_QKVA_PF_KB=%d" % _qkva_pf_kb]
+            _qkva_pf_at = int(os.environ.get("MPK_QKVA_PF_AT", "2"))
+            assert _qkva_pf_at in (2, 13), "MPK_QKVA_PF_AT is 13 (W13 hole) or 2 (W2 hole)"
+            flags = flags + ["-DMPK_QKVA_PF_AT=%d" % _qkva_pf_at]
         _qkva_reps = int(os.environ.get("MPK_QKVA_REPS", "1"))
         if _qkva_reps != 1:
             # Item-2 dependency-half pricing probe. CORRECT OUTPUT: the qkv_a

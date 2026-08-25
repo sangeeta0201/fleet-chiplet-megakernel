@@ -2960,6 +2960,30 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               }
 #endif
 
+#if MPK_QKVA_PF_KB > 0
+              // Publish layer ml+1's qkv_a weight base for this XCD so the
+              // W13-idle workers can pull it into cache during this layer's
+              // MoE phase. input_ptrs[3] is the qkv_weight slot (see the map
+              // at gang_mla_full_layer_fused_mi300.cuh's call site) and the
+              // ml_input_table is already partitioned per XCD, so this is
+              // exactly the slice this XCD's own qkv_a tiles read next layer.
+              //
+              // This runs above the dispatch and therefore above the layer's
+              // entry barrier, so every block's write is ordered before any
+              // block's read. Last layer of an iteration publishes null.
+              if (threadIdx.x == 0) {
+                void *nxt = nullptr;
+                if (ml + 1 < ml_end) {
+                  nxt = config.ml_input_table[(xcd_id * config.ml_num_layers +
+                                               ml + 1) *
+                                                  MAX_INPUTS_PER_TASK +
+                                              3];
+                }
+                __atomic_store_n(&g_ml_next_qkv_w[xcd_id & 7], nxt,
+                                 __ATOMIC_RELAXED);
+              }
+#endif
+
               // Execute this layer
               int my_tiles = 0;
               // Publish the layer index into the worker-state phase slot.

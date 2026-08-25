@@ -1549,6 +1549,61 @@ __device__ __attribute__((always_inline)) void
   }
 #endif
 
+#if MPK_QKVA_PF_KB > 0
+// ── The real thing the MPK_MOE_SHADOW_KB probe was a stand-in for. ──
+//
+// Same worker set as that probe (the ones that own no tile in the phase they
+// sit in), same instant, same bounded-window guard -- but the bytes are the
+// NEXT layer's qkv_a weight for this XCD instead of a dummy slab, and they are
+// left in cache instead of summed into an untakeable branch. Correct output by
+// construction: this reads a weight nobody writes and stores nothing.
+//
+// Ordinary loads on purpose. `nt` would ask MALL not to retain the very lines
+// this exists to retain, which is the mistake MPK_BAR_POLL_NT documents on the
+// poll side.
+//
+// PLACEMENT IS THE WHOLE LEVER, and MPK_QKVA_PF_AT selects it:
+//
+//   13  the W13-idle hole -- 21 of 29 workers, the biggest hole, and the one
+//       MPK_MOE_SHADOW_KB proved holds 14.6 MB for +0.030 ms. MEASURED
+//       NEUTRAL at 72 KB (n=3 mean 10.227 vs control 10.200): the bytes land,
+//       and then W2 streams ~12 MB/XCD over them before qkv_a(L+1) ever runs.
+//   2   the W2-idle hole -- 17 of 29 workers, smaller, but it is the LAST
+//       streaming phase in the layer. Only the residual add and the layer
+//       barrier separate it from the consumer, so what lands has a chance of
+//       surviving.
+#define MPK_QKVA_PF_BODY(live)                                                 \
+  do {                                                                         \
+    void *const nxt_w =                                                        \
+        __atomic_load_n(&g_ml_next_qkv_w[xcd_id & 7], __ATOMIC_RELAXED);       \
+    size_t const pf_bytes = (size_t)MPK_QKVA_PF_KB * 1024;                     \
+    if (nxt_w != nullptr && xcd_rank >= (live) && (live) > 0 &&                \
+        (size_t)(xcd_rank - (live) + 1) * pf_bytes <= MPK_QKVA_PF_WINDOW) {    \
+      char const *base =                                                       \
+          (char const *)nxt_w + (size_t)(xcd_rank - (live)) * pf_bytes;        \
+      uint4 acc = make_uint4(0u, 0u, 0u, 0u);                                  \
+      for (size_t off = (size_t)tid * 16; off < pf_bytes;                      \
+           off += (size_t)blockDim.x * 16) {                                   \
+        uint4 v = *(uint4 const *)(base + off);                                \
+        acc.x += v.x;                                                          \
+        acc.y += v.y;                                                          \
+        acc.z += v.z;                                                          \
+        acc.w += v.w;                                                          \
+      }                                                                        \
+      /* Same untakeable sink as the shadow probe: the compiler cannot prove   \
+         the branch is dead, so the loads survive, and no store happens. */    \
+      if (acc.x == 0xdeadbeefu && acc.y == 0xdeadbeefu &&                      \
+          acc.z == 0xdeadbeefu && acc.w == 0xdeadbeefu) {                      \
+        st_wt_u32((void *)logits_scratch_ptr, acc.x);                          \
+      }                                                                        \
+    }                                                                          \
+  } while (0)
+#endif
+
+#if MPK_QKVA_PF_KB > 0 && MPK_QKVA_PF_AT == 13
+  MPK_QKVA_PF_BODY(moe_w13_live);
+#endif
+
 #if MPK_ABL_PIPE_W13W2 == 2
   // ── THE PROBE ARM. WRONG OUTPUT BY CONSTRUCTION. ──
   // The W13-idle workers run their moved W2 tile HERE, above the W13 -> W2
@@ -1681,6 +1736,12 @@ __device__ __attribute__((always_inline)) void
   if (_pipe_my >= 0 && _pipe_my < _pipe_tiles) {
     MPK_PIPE_W2_TILE(_pipe_my);
   }
+#endif
+#if MPK_QKVA_PF_KB > 0 && MPK_QKVA_PF_AT == 2
+  // The W2-idle hole. Above the W2 tile loop, so a worker that owns no W2 tile
+  // issues its dose concurrently with the workers that do, and then falls
+  // through the loop with zero trips.
+  MPK_QKVA_PF_BODY(moe_w2_live);
 #endif
   for (int t = xcd_rank; t < moe_w2_live; t += tiles_per_xcd) {
     // Tiles [0, _pipe_tiles) were MOVED onto the W13-idle workers above, so

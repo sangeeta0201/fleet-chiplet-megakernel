@@ -146,6 +146,10 @@ MPK_FORWARD_VARS=(
   HSA_NO_SCRATCH_RECLAIM HSA_ENABLE_SCRATCH_ASYNC_RECLAIM HSA_ENABLE_SCRATCH_ALT
   # Correct-output capacity probe, compile-time all the same.
   MPK_MOE_SHADOW_KB
+  # Next-layer qkv_a weight prefetch into the MoE worker hole. Real change,
+  # correct output, compile-time -- and the publisher lives in the shared
+  # multi-layer loop, so every rank must build it identically.
+  MPK_QKVA_PF_KB MPK_QKVA_PF_AT
   # Correct-output pricing probe for item 2's dependency half.
   MPK_QKVA_REPS MPK_W13_REPS
   # Correct-output pricing probe, but compile-time all the same.

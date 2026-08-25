@@ -835,6 +835,58 @@ __device__ __forceinline__ bool
 #define MPK_MOE_SHADOW_KB 0
 #endif
 
+// MPK_QKVA_PF_KB: kilobytes of the NEXT layer's qkv_a weight that each
+// W13-idle worker pulls into cache during this layer's W13 phase. 0 = off.
+//
+// THE LOOPHOLE THIS EXPLOITS. glm-heterogeneous-worker-groups-impossible was
+// closed by MPK_QKVA_REPS=2 measuring +0.669 ms, but that priced moving
+// qkv_a's COMPUTE, which really does depend on MoE(L) through the residual and
+// the RMSNorm. qkv_a's WEIGHTS do not: they are constants, known a whole
+// layer ahead, and moving only the bytes is dependency-free. The capacity
+// question was already answered the other way -- MPK_MOE_SHADOW_KB put
+// 14.6 MB/layer/rank of cold read on the 21-of-29 W13-idle workers for
+// +0.030 ms (glm-moe-phase-has-a-free-worker-hole), which is ~90% of qkv_a's
+// entire weight volume, free. So the bytes fit and nothing forbids moving
+// them; what is unknown is whether they SURVIVE to the qkv_a phase, since the
+// MoE streams ~25 MB/layer/rank through the same L2.
+//
+// The pointer comes from g_ml_next_qkv_w below, not from a kernel argument:
+// input_ptrs[3] is already this XCD's own partitioned qkv_a weight slice, and
+// the multi-layer loop can read layer ml+1's copy of it out of
+// config.ml_input_table without any new plumbing through task_register.
+//
+// A worker reads [j * KB, (j+1) * KB) of the slice, j = xcd_rank - w13_live,
+// and skips itself if that would leave the bounded window -- exactly the guard
+// MPK_MOE_SHADOW_KB uses, for exactly the same reason (that probe's first cut
+// faulted every rank by reading a pointer whose extent is not in scope).
+#ifndef MPK_QKVA_PF_KB
+#define MPK_QKVA_PF_KB 0
+#endif
+// The window a worker's dose must fit inside. qkv_a's per-XCD slice is
+// output_size_per_xcd * (K + K/32) bytes = 328 * 6336 = 2.078 MB at GLM-5's
+// 2624-wide qkv_a output, so 1.5 MB is comfortably in bounds without the
+// kernel having to derive the extent it cannot see.
+#define MPK_QKVA_PF_WINDOW ((size_t)1536 * 1024)
+
+// Which idle-worker hole issues the dose. 13 = the W13-idle hole (21 of 29
+// workers, measured NEUTRAL -- W2 streams over the lines before qkv_a(L+1)
+// reads them); 2 = the W2-idle hole (17 of 29, but nothing streams between it
+// and the consumer). See the placement comment in
+// gang_oproj_router_fused_mi300.cuh.
+#ifndef MPK_QKVA_PF_AT
+#define MPK_QKVA_PF_AT 2
+#endif
+
+#if MPK_QKVA_PF_KB > 0
+// Layer ml+1's qkv_a weight base, one slot per XCD, published by the
+// multi-layer loop in persistent_kernel.cuh before it dispatches layer ml.
+// Every block on an XCD writes the same value, and every write lands before
+// the layer-entry barrier that the reader passes, so the benign race is
+// ordered. Null on the last layer of an iteration, which turns the prefetch
+// off for that layer.
+__device__ void *g_ml_next_qkv_w[8];
+#endif
+
 // MPK_QKVA_REPS: how many times the qkv_a tile loop runs. 1 is the shipping
 // path. CORRECT OUTPUT at any value, and that is the point of the probe --
 // the loop body is idempotent, so the wall number is gateable.
