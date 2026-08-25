@@ -934,6 +934,18 @@ def get_compile_command(
             assert _km in ("0", "1", "2"), "MPK_MOE_KMAJOR is 0, 1 or 2"
             flags = flags + [f"-DMPK_MOE_KMAJOR={_km}"]
 
+        _dkm = os.environ.get("MPK_DENSE_KMAJOR")
+        if _dkm is not None:
+            # The same permutation on the attention-half GEMM, at a 64-byte
+            # granule because an FP8 k-tile is 128 and one instruction reaches
+            # half of it. Applies to the OUTPUT_PER_WG == 16 K-parallel call
+            # sites only -- qkv_a and the un-absorbed q_b; the LM head and the
+            # dense MLP share the packer and the kernel but not this layout.
+            # Long note at the define in
+            # gang_rmsnorm_linear_mxfp8_bias_mi300.cuh.
+            assert _dkm in ("0", "1", "2"), "MPK_DENSE_KMAJOR is 0, 1 or 2"
+            flags = flags + [f"-DMPK_DENSE_KMAJOR={_dkm}"]
+
         _apf = os.environ.get("MPK_ATTN_PF_GROUPS")
         if _apf is not None:
             # Same knob for the attention-half GEMM (qkv_a, q_b, W_UK, W_UV,

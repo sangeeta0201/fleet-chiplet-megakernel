@@ -129,6 +129,7 @@ MPK_FORWARD_VARS=(
   # weight, so a rank that misses it reads a permuted buffer as if it were
   # row-major and produces silent garbage -- forward it or leave it unset.
   MPK_MOE_KMAJOR
+  MPK_DENSE_KMAJOR
   # The same knob for the attention-half GEMM's k-loop. Compile-time.
   MPK_ATTN_PF_GROUPS
   # latent_to_cache's flattened index chase. Compile-time.

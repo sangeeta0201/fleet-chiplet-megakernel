@@ -1066,6 +1066,103 @@ _rnlm8_stage_norm_rcp(unsigned short const *__restrict__ d_in,
   return rsqrtf(red[0] / float(ACTUAL_HIDDEN_DIM) + eps);
 }
 
+// ── K-major weight layout for the attention-half GEMM ──────────────────────
+//
+// The MoE twin of this (MPK_MOE_KMAJOR, gang_moe_linear_mxfp8_mi300.cuh)
+// measured -0.278 ms at NP=4 by turning sixteen scattered L2 requests per
+// instruction into eight fully-used ones. The same pathology is here, in the
+// same shape:
+//
+//   w_data_row = wg_data + w_row * REDUCTION_SIZE,   w_row = wave_tile*16 + col
+//   _gang_load_fp8_mfma_b_g reads  data + kt + g*16  and  + 64
+//
+// A wave's 64 lanes are (col, g) with col in [0,16) and g in [0,4), so one
+// global_load_dwordx4 covers sixteen rows x sixty-four bytes at REDUCTION_SIZE
+// stride: sixteen distinct 128-byte requests, each half-used. The `hi` load at
+// +64 is another sixteen.
+//
+// K-major stores the workgroup's data half as [row/16][k][row%16][64B] --
+// exactly the order the wave reads it -- so the same instruction reads
+// 16*64 = 1024 CONTIGUOUS bytes: eight fully-used requests.
+//
+// The granule is 64 bytes, not the 128 an FP8 k-tile occupies, and that is the
+// one place this differs from the MoE version. The MoE ships MXFP4, whose
+// k-tile IS 64 bytes per row, so grouping at the k-tile gave contiguity for
+// free. At FP8 the k-tile is 128 bytes and one instruction only reaches half
+// of it, so grouping at 128 would leave the wave reading sixteen 64-byte
+// pieces 128 bytes apart -- the same request count as row-major, just with
+// better locality. Splitting each k-tile into its lo and hi half and grouping
+// sixteen rows within EACH half is what actually collapses the count.
+//
+// Both layouts then reduce to `base + kt*KMUL + g*16` for the lo half and
+// `+ HI_OFF` for the hi, so the k-loops carry two compile-time constants
+// instead of a layout branch:
+//
+//              base                                   KMUL  HI_OFF
+//   row-major  wg_data + w_row*RS                       1      64
+//   K-major    wg_data + (w_row/16)*RS*16               16   1024
+//                      + (w_row%16)*64
+//
+// Level 2 does the same to the E8M0 scales: four bytes per row per k-tile, so
+// a wave reads sixteen 4-byte pieces NUM_BLOCKS_32 apart today and one
+// contiguous 64-byte run under [row/16][k][row%16][4B].
+//
+// Scope: this applies ONLY to the OUTPUT_PER_WG == 16 (K-parallel) branch,
+// which is qkv_a and the unabsorbed q_b and nothing else. The N-parallel
+// branch serves the LM head and the dense MLP out of the same packer, and
+// those call sites are not repacked, so they must stay row-major. demo.py's
+// pack_dense_mxfp8 enforces the identical rule -- a mismatch here is silent
+// garbage, not a build error.
+#ifndef MPK_DENSE_KMAJOR
+// 1 = K-major weight data. Measured at NP=4 bs=1 on devices 4-7, paired,
+// one variable: clean avg 10.681 (n=3) -> 10.582 (n=5), per-iter min
+// 10.531 (n=5, 10.509-10.551) -> 10.428 (n=5, 10.398-10.447). The min
+// ranges do not overlap -- the control's best run is worse than the arm's
+// worst -- and both statistics agree at -0.10 ms. 2 additionally puts the
+// E8M0 scales in K-major; unmeasured.
+#define MPK_DENSE_KMAJOR 1
+#endif
+
+// Whether THIS instantiation reads a K-major weight. See the scope note.
+template <int OUTPUT_PER_WG>
+__device__ __forceinline__ constexpr bool _rnlm8_wk() {
+  return MPK_DENSE_KMAJOR >= 1 && OUTPUT_PER_WG == 16;
+}
+template <int OUTPUT_PER_WG>
+__device__ __forceinline__ constexpr bool _rnlm8_sck() {
+  return MPK_DENSE_KMAJOR >= 2 && OUTPUT_PER_WG == 16;
+}
+
+// The A-operand load, addressed by the k-tile BYTE offset the row-major
+// callers already pass (kt = ki * 128) and scaled here by the layout's stride
+// multiplier. KMUL/HI_OFF are template parameters rather than reads of the
+// macro so that a single translation unit could hold both layouts.
+template <int KMUL, int HI_OFF>
+__device__ __forceinline__ i32x8_t
+    _rnlm8_load_w(uint8_t const *base, int kt, int g) {
+  uint8_t const *p = base + kt * KMUL + g * 16;
+  i32x4_t lo = _gang_ld_g<i32x4_t>(p);
+  i32x4_t hi = _gang_ld_g<i32x4_t>(p + HI_OFF);
+  i32x8_t r;
+  r[0] = lo[0];
+  r[1] = lo[1];
+  r[2] = lo[2];
+  r[3] = lo[3];
+  r[4] = hi[0];
+  r[5] = hi[1];
+  r[6] = hi[2];
+  r[7] = hi[3];
+  return r;
+}
+
+// The matching scale byte. `off4` is the row-major offset the callers already
+// compute -- ki*4, or equivalently kt/32 -- and is scaled the same way.
+template <int KMUL>
+__device__ __forceinline__ int
+    _rnlm8_load_sc(uint8_t const *base, int off4, int g) {
+  return (int)_gang_ld_g<uint8_t>(base + off4 * KMUL + g);
+}
+
 // ── The GROUPS-deep, guard-free k-loop ─────────────────────────────────────
 //
 // Both branches of the GEMM below shipped the same rotating depth-4 pipeline:
@@ -1115,11 +1212,20 @@ _rnlm8_stage_norm_rcp(unsigned short const *__restrict__ d_in,
 // SEEDED takes the four A tiles the prologue already hoisted above the
 // quantizer (HOIST_PREFILL). That hoist issues exactly 4 tiles, so it only
 // composes with GROUPS == 4.
-template <int GROUPS, int KI_LEN, bool SEEDED>
+//
+// W_KMUL/W_HIOFF/SC_KMUL carry the weight layout (see MPK_DENSE_KMAJOR). The
+// loop is layout-blind: both layouts are `base + kt*KMUL + g*16`, so the only
+// thing that changes is the constant, and `w_data_row`/`w_scale_row` are the
+// caller's already-offset bases for this wave's sixteen rows.
+template <int GROUPS,
+          int KI_LEN,
+          bool SEEDED,
+          int W_KMUL,
+          int W_HIOFF,
+          int SC_KMUL>
 __device__ __forceinline__ f32x4_t
     _rnlm8_kloop_deep(uint8_t const *w_data_row,
-                      uint8_t const *wg_scales,
-                      int row_scale_base,
+                      uint8_t const *w_scale_row,
                       uint8_t const *s_tok_fp8,
                       uint8_t const *s_tok_scales,
                       int ki_start,
@@ -1143,8 +1249,8 @@ __device__ __forceinline__ f32x4_t
       S[j] = seed_sa[j];
     } else {
       int kk = ki_start + j;
-      A[j] = _gang_load_fp8_mfma_b_g(w_data_row, kk * K_PER_MFMA, g);
-      S[j] = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + kk * 4 + g);
+      A[j] = _rnlm8_load_w<W_KMUL, W_HIOFF>(w_data_row, kk * K_PER_MFMA, g);
+      S[j] = _rnlm8_load_sc<SC_KMUL>(w_scale_row, kk * 4, g);
     }
   }
 
@@ -1162,8 +1268,8 @@ __device__ __forceinline__ f32x4_t
 #pragma unroll
     for (int j = 0; j < GROUPS; j++) {
       int kk = base + GROUPS + j;
-      N[j] = _gang_load_fp8_mfma_b_g(w_data_row, kk * K_PER_MFMA, g);
-      NS[j] = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + kk * 4 + g);
+      N[j] = _rnlm8_load_w<W_KMUL, W_HIOFF>(w_data_row, kk * K_PER_MFMA, g);
+      NS[j] = _rnlm8_load_sc<SC_KMUL>(w_scale_row, kk * 4, g);
     }
 #pragma unroll
     for (int j = 0; j < GROUPS; j++) {
@@ -1314,6 +1420,22 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
   constexpr int WG_DATA_BYTES = OUTPUT_PER_WG * REDUCTION_SIZE;
   constexpr int WG_SCALE_BYTES = OUTPUT_PER_WG * NUM_BLOCKS_32;
   constexpr int WG_BYTES = WG_DATA_BYTES + WG_SCALE_BYTES;
+
+  // The layout of the data and scale halves inside the workgroup. Row-major
+  // and K-major differ only in these three constants and in the per-wave base
+  // each branch computes -- WG_BYTES and the tile map are identical, because
+  // K-major is a permutation of a workgroup's bytes and not a resize. See
+  // MPK_DENSE_KMAJOR.
+  constexpr bool W_KMAJOR = _rnlm8_wk<OUTPUT_PER_WG>();
+  constexpr bool SC_KMAJOR = _rnlm8_sck<OUTPUT_PER_WG>();
+  constexpr int W_KMUL = W_KMAJOR ? 16 : 1;
+  constexpr int W_HIOFF = W_KMAJOR ? 1024 : 64;
+  constexpr int SC_KMUL = SC_KMAJOR ? 16 : 1;
+  static_assert(!W_KMAJOR || OUTPUT_PER_WG == 16,
+                "the K-major weight layout is only packed for the K-parallel "
+                "(OUTPUT_PER_WG == 16) call sites; see pack_dense_mxfp8");
+  static_assert(!SC_KMAJOR || NUM_BLOCKS_32 % 4 == 0,
+                "K-major scales group four E8M0 bytes per row per k-tile");
 
   // ── MFMA constants ─────────────────────────────────────────────────────
   constexpr int K_PER_MFMA = 128;
@@ -1659,14 +1781,23 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     int const h_row = (OUTPUT_PER_WG >= 64) ? (warp_id * 16 + col) : col;
     int const h_ki0 =
         (OUTPUT_PER_WG >= 64) ? 0 : (warp_id * (MFMA_ITERS / NUM_WAVES));
-    uint8_t const *h_data = wg_data + static_cast<int64_t>(h_row) * REDUCTION_SIZE;
-    int const h_scale_base = h_row * NUM_BLOCKS_32;
+    // Under K-major the wave's sixteen rows are one contiguous block and the
+    // row index moves inside it rather than scaling REDUCTION_SIZE; the k
+    // stride then lives in W_KMUL, not in this base.
+    uint8_t const *h_data =
+        wg_data + (W_KMAJOR
+                       ? static_cast<int64_t>(h_row / 16) * REDUCTION_SIZE * 16 +
+                             static_cast<int64_t>(h_row % 16) * 64
+                       : static_cast<int64_t>(h_row) * REDUCTION_SIZE);
+    uint8_t const *h_scale =
+        wg_scales + (SC_KMAJOR ? (h_row / 16) * NUM_BLOCKS_32 * 16 +
+                                     (h_row % 16) * 4
+                               : h_row * NUM_BLOCKS_32);
 #pragma unroll
     for (int ki = 0; ki < 4; ki++) {
-      ph_a[ki] =
-          _gang_load_fp8_mfma_b_g(h_data, (h_ki0 + ki) * K_PER_MFMA, g);
-      ph_sa[ki] = (int)_gang_ld_g<uint8_t>(wg_scales + h_scale_base +
-                                           (h_ki0 + ki) * 4 + g);
+      ph_a[ki] = _rnlm8_load_w<W_KMUL, W_HIOFF>(
+          h_data, (h_ki0 + ki) * K_PER_MFMA, g);
+      ph_sa[ki] = _rnlm8_load_sc<SC_KMUL>(h_scale, (h_ki0 + ki) * 4, g);
     }
   }
 
@@ -1740,9 +1871,18 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
       int wave_tile = warp_id + tile_iter * NUM_WAVES;
       int w_row = wave_tile * 16 + col;
 
+      // W_KMAJOR is false on this branch by construction (see _rnlm8_wk), so
+      // these are the row-major bases; the form is shared with the K-parallel
+      // branch only so the two read alike.
       uint8_t const *w_data_row =
-          wg_data + static_cast<int64_t>(w_row) * REDUCTION_SIZE;
-      int const row_scale_base = w_row * NUM_BLOCKS_32;
+          wg_data + (W_KMAJOR
+                         ? static_cast<int64_t>(w_row / 16) * REDUCTION_SIZE * 16 +
+                               static_cast<int64_t>(w_row % 16) * 64
+                         : static_cast<int64_t>(w_row) * REDUCTION_SIZE);
+      uint8_t const *w_scale_row =
+          wg_scales + (SC_KMAJOR ? (w_row / 16) * NUM_BLOCKS_32 * 16 +
+                                       (w_row % 16) * 4
+                                 : w_row * NUM_BLOCKS_32);
 
       f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
 
@@ -1771,9 +1911,9 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
         int sa[MFMA_ITERS];
 #pragma unroll
         for (int ki = 0; ki < MFMA_ITERS; ki++) {
-          a[ki] = _gang_load_fp8_mfma_b_g(w_data_row, ki * K_PER_MFMA, g);
+          a[ki] = _rnlm8_load_w<W_KMUL, W_HIOFF>(w_data_row, ki * K_PER_MFMA, g);
           sa[ki] =
-              (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + ki * 4 + g);
+              _rnlm8_load_sc<SC_KMUL>(w_scale_row, ki * 4, g);
         }
         // The B operands come out of LDS and have to be preloaded too, into
         // their own registers -- this is hazard 1 from
@@ -1840,8 +1980,9 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
         // compiles to. HOIST_PREFILL implies TILES_PER_WAVE == 1 here
         // (OUTPUT_PER_WG >= 64 on this branch), so ph_a is this tile's fill.
         constexpr int GR = _rnlm8_pf_groups(MFMA_ITERS, MPK_ATTN_PF_GROUPS);
-        acc = _rnlm8_kloop_deep<GR, MFMA_ITERS, HOIST_PREFILL && GR == 4>(
-            w_data_row, wg_scales, row_scale_base, s_tok_fp8, s_tok_scales,
+        acc = _rnlm8_kloop_deep<GR, MFMA_ITERS, HOIST_PREFILL && GR == 4,
+                                      W_KMUL, W_HIOFF, SC_KMUL>(
+            w_data_row, w_scale_row, s_tok_fp8, s_tok_scales,
             /*ki_start=*/0, g, ph_a, ph_sa);
       } else {
         // Pre-fill: load k-tiles 0..3 into pipeline slots. Under HOIST_PREFILL
@@ -1857,14 +1998,14 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
           a2 = ph_a[2]; sa2 = ph_sa[2];
           a3 = ph_a[3]; sa3 = ph_sa[3];
         } else {
-          a0 = _gang_load_fp8_mfma_b_g(w_data_row, 0 * K_PER_MFMA, g);
-          sa0 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + 0 * 4 + g);
-          a1 = _gang_load_fp8_mfma_b_g(w_data_row, 1 * K_PER_MFMA, g);
-          sa1 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + 1 * 4 + g);
-          a2 = _gang_load_fp8_mfma_b_g(w_data_row, 2 * K_PER_MFMA, g);
-          sa2 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + 2 * 4 + g);
-          a3 = _gang_load_fp8_mfma_b_g(w_data_row, 3 * K_PER_MFMA, g);
-          sa3 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + 3 * 4 + g);
+          a0 = _rnlm8_load_w<W_KMUL, W_HIOFF>(w_data_row, 0 * K_PER_MFMA, g);
+          sa0 = _rnlm8_load_sc<SC_KMUL>(w_scale_row, 0 * 4, g);
+          a1 = _rnlm8_load_w<W_KMUL, W_HIOFF>(w_data_row, 1 * K_PER_MFMA, g);
+          sa1 = _rnlm8_load_sc<SC_KMUL>(w_scale_row, 1 * 4, g);
+          a2 = _rnlm8_load_w<W_KMUL, W_HIOFF>(w_data_row, 2 * K_PER_MFMA, g);
+          sa2 = _rnlm8_load_sc<SC_KMUL>(w_scale_row, 2 * 4, g);
+          a3 = _rnlm8_load_w<W_KMUL, W_HIOFF>(w_data_row, 3 * K_PER_MFMA, g);
+          sa3 = _rnlm8_load_sc<SC_KMUL>(w_scale_row, 3 * 4, g);
         }
 
         // IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation -- see the
@@ -1879,8 +2020,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
           }
           if (ki + 4 < MFMA_ITERS) {
             int kt4 = (ki + 4) * K_PER_MFMA;
-            a0 = _gang_load_fp8_mfma_b_g(w_data_row, kt4, g);
-            sa0 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + kt4 / 32 + g);
+            a0 = _rnlm8_load_w<W_KMUL, W_HIOFF>(w_data_row, kt4, g);
+            sa0 = _rnlm8_load_sc<SC_KMUL>(w_scale_row, kt4 / 32, g);
           }
 
           // Slot 1: compute k-tile ki+1, prefetch ki+5
@@ -1892,8 +2033,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
           }
           if (ki + 5 < MFMA_ITERS) {
             int kt5 = (ki + 5) * K_PER_MFMA;
-            a1 = _gang_load_fp8_mfma_b_g(w_data_row, kt5, g);
-            sa1 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + kt5 / 32 + g);
+            a1 = _rnlm8_load_w<W_KMUL, W_HIOFF>(w_data_row, kt5, g);
+            sa1 = _rnlm8_load_sc<SC_KMUL>(w_scale_row, kt5 / 32, g);
           }
 
           // Slot 2: compute k-tile ki+2, prefetch ki+6
@@ -1905,8 +2046,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
           }
           if (ki + 6 < MFMA_ITERS) {
             int kt6 = (ki + 6) * K_PER_MFMA;
-            a2 = _gang_load_fp8_mfma_b_g(w_data_row, kt6, g);
-            sa2 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + kt6 / 32 + g);
+            a2 = _rnlm8_load_w<W_KMUL, W_HIOFF>(w_data_row, kt6, g);
+            sa2 = _rnlm8_load_sc<SC_KMUL>(w_scale_row, kt6 / 32, g);
           }
 
           // Slot 3: compute k-tile ki+3, prefetch ki+7
@@ -1918,8 +2059,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
           }
           if (ki + 7 < MFMA_ITERS) {
             int kt7 = (ki + 7) * K_PER_MFMA;
-            a3 = _gang_load_fp8_mfma_b_g(w_data_row, kt7, g);
-            sa3 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + kt7 / 32 + g);
+            a3 = _rnlm8_load_w<W_KMUL, W_HIOFF>(w_data_row, kt7, g);
+            sa3 = _rnlm8_load_sc<SC_KMUL>(w_scale_row, kt7 / 32, g);
           }
         }
       } // MFMA_ITERS > FULL_PRELOAD_ITERS
@@ -1963,9 +2104,17 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     int const ki_end = ki_start + ITERS_PER_WAVE;
 
     int w_row = col; // All 4 waves process same 16 output rows
+    // w_row is `col` in [0,16) here, so under K-major w_row/16 is 0 and the
+    // base is just this lane's 64-byte slot inside the wave's block.
     uint8_t const *w_data_row =
-        wg_data + static_cast<int64_t>(w_row) * REDUCTION_SIZE;
-    int const row_scale_base = w_row * NUM_BLOCKS_32;
+        wg_data + (W_KMAJOR
+                       ? static_cast<int64_t>(w_row / 16) * REDUCTION_SIZE * 16 +
+                             static_cast<int64_t>(w_row % 16) * 64
+                       : static_cast<int64_t>(w_row) * REDUCTION_SIZE);
+    uint8_t const *w_scale_row =
+        wg_scales + (SC_KMAJOR ? (w_row / 16) * NUM_BLOCKS_32 * 16 +
+                                     (w_row % 16) * 4
+                               : w_row * NUM_BLOCKS_32);
 
     f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
 
@@ -1976,8 +2125,9 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     // so it seeds the first block directly.
     constexpr int KGR = _rnlm8_pf_groups(ITERS_PER_WAVE, MPK_ATTN_PF_GROUPS);
     if constexpr (KGR >= 2) {
-      acc = _rnlm8_kloop_deep<KGR, ITERS_PER_WAVE, HOIST_PREFILL && KGR == 4>(
-          w_data_row, wg_scales, row_scale_base, s_tok_fp8, s_tok_scales,
+      acc = _rnlm8_kloop_deep<KGR, ITERS_PER_WAVE, HOIST_PREFILL && KGR == 4,
+                                  W_KMUL, W_HIOFF, SC_KMUL>(
+          w_data_row, w_scale_row, s_tok_fp8, s_tok_scales,
           ki_start, g, ph_a, ph_sa);
     } else {
 
@@ -1992,14 +2142,14 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
       a2 = ph_a[2]; sa2 = ph_sa[2];
       a3 = ph_a[3]; sa3 = ph_sa[3];
     } else {
-      a0 = _gang_load_fp8_mfma_b_g(w_data_row, ki_start * K_PER_MFMA, g);
-      sa0 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + ki_start * 4 + g);
-      a1 = _gang_load_fp8_mfma_b_g(w_data_row, (ki_start + 1) * K_PER_MFMA, g);
-      sa1 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + (ki_start + 1) * 4 + g);
-      a2 = _gang_load_fp8_mfma_b_g(w_data_row, (ki_start + 2) * K_PER_MFMA, g);
-      sa2 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + (ki_start + 2) * 4 + g);
-      a3 = _gang_load_fp8_mfma_b_g(w_data_row, (ki_start + 3) * K_PER_MFMA, g);
-      sa3 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + (ki_start + 3) * 4 + g);
+      a0 = _rnlm8_load_w<W_KMUL, W_HIOFF>(w_data_row, ki_start * K_PER_MFMA, g);
+      sa0 = _rnlm8_load_sc<SC_KMUL>(w_scale_row, ki_start * 4, g);
+      a1 = _rnlm8_load_w<W_KMUL, W_HIOFF>(w_data_row, (ki_start + 1) * K_PER_MFMA, g);
+      sa1 = _rnlm8_load_sc<SC_KMUL>(w_scale_row, (ki_start + 1) * 4, g);
+      a2 = _rnlm8_load_w<W_KMUL, W_HIOFF>(w_data_row, (ki_start + 2) * K_PER_MFMA, g);
+      sa2 = _rnlm8_load_sc<SC_KMUL>(w_scale_row, (ki_start + 2) * 4, g);
+      a3 = _rnlm8_load_w<W_KMUL, W_HIOFF>(w_data_row, (ki_start + 3) * K_PER_MFMA, g);
+      sa3 = _rnlm8_load_sc<SC_KMUL>(w_scale_row, (ki_start + 3) * 4, g);
     }
 
 // IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation.
@@ -2013,8 +2163,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
       }
       if (ki + 4 < ki_end) {
         int kt4 = (ki + 4) * K_PER_MFMA;
-        a0 = _gang_load_fp8_mfma_b_g(w_data_row, kt4, g);
-        sa0 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + kt4 / 32 + g);
+        a0 = _rnlm8_load_w<W_KMUL, W_HIOFF>(w_data_row, kt4, g);
+        sa0 = _rnlm8_load_sc<SC_KMUL>(w_scale_row, kt4 / 32, g);
       }
 
       // Slot 1: compute k-tile ki+1, prefetch ki+5
@@ -2025,8 +2175,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
       }
       if (ki + 5 < ki_end) {
         int kt5 = (ki + 5) * K_PER_MFMA;
-        a1 = _gang_load_fp8_mfma_b_g(w_data_row, kt5, g);
-        sa1 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + kt5 / 32 + g);
+        a1 = _rnlm8_load_w<W_KMUL, W_HIOFF>(w_data_row, kt5, g);
+        sa1 = _rnlm8_load_sc<SC_KMUL>(w_scale_row, kt5 / 32, g);
       }
 
       // Slot 2: compute k-tile ki+2, prefetch ki+6
@@ -2037,8 +2187,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
       }
       if (ki + 6 < ki_end) {
         int kt6 = (ki + 6) * K_PER_MFMA;
-        a2 = _gang_load_fp8_mfma_b_g(w_data_row, kt6, g);
-        sa2 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + kt6 / 32 + g);
+        a2 = _rnlm8_load_w<W_KMUL, W_HIOFF>(w_data_row, kt6, g);
+        sa2 = _rnlm8_load_sc<SC_KMUL>(w_scale_row, kt6 / 32, g);
       }
 
       // Slot 3: compute k-tile ki+3, prefetch ki+7
@@ -2049,8 +2199,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
       }
       if (ki + 7 < ki_end) {
         int kt7 = (ki + 7) * K_PER_MFMA;
-        a3 = _gang_load_fp8_mfma_b_g(w_data_row, kt7, g);
-        sa3 = (int)_gang_ld_g<uint8_t>(wg_scales + row_scale_base + kt7 / 32 + g);
+        a3 = _rnlm8_load_w<W_KMUL, W_HIOFF>(w_data_row, kt7, g);
+        sa3 = _rnlm8_load_sc<SC_KMUL>(w_scale_row, kt7 / 32, g);
       }
     }
 

@@ -141,6 +141,24 @@ def quantize_mxfp8(w: torch.Tensor) -> tuple:
 # buffer, so a mismatch is silent garbage, not a build error.
 MOE_KMAJOR = int(os.environ.get("MPK_MOE_KMAJOR", "1"))
 
+# The same lever on the attention half. gang_rmsnorm_linear_mxfp8_bias_kernel
+# gathers its A operand with exactly the MoE's access pattern -- 16 rows x 64
+# bytes at REDUCTION_SIZE stride per instruction -- so K-major collapses the
+# same 16 requests to 8. Two differences from the MoE flag:
+#
+#   * The granule is 64 bytes, not the 128 an FP8 k-tile occupies. The MoE
+#     ships MXFP4, where a k-tile IS 64 bytes per row; at FP8 one instruction
+#     reaches only half a k-tile, so the halves are grouped separately.
+#   * It applies to the OUTPUT_PER_WG == 16 (K-parallel) call sites ONLY --
+#     qkv_a and the unabsorbed q_b. The LM head and the dense MLP go through
+#     the same packer into the same kernel's N-parallel branch and are not
+#     repacked, so pack_dense_mxfp8 refuses K-major at any other width and the
+#     kernel's _rnlm8_wk<> gates on the same condition.
+#
+# Must match the #ifndef default of MPK_DENSE_KMAJOR in
+# gang_rmsnorm_linear_mxfp8_bias_mi300.cuh.
+DENSE_KMAJOR = int(os.environ.get("MPK_DENSE_KMAJOR", "1"))
+
 
 def _kmajor_permute(x: torch.Tensor, output_per_wg: int,
                     bytes_per_ktile: int) -> torch.Tensor:
@@ -161,7 +179,8 @@ def _kmajor_permute(x: torch.Tensor, output_per_wg: int,
 
 def pack_mxfp8_workgroup(data: torch.Tensor, scales: torch.Tensor,
                          output_per_wg: int = 64,
-                         kmajor: int = 0) -> torch.Tensor:
+                         kmajor: int = 0,
+                         kmajor_bpk: int = 0) -> torch.Tensor:
     """Repack quantize_mxfp8 or quantize_mxfp4 output into the per-workgroup
     layout the MXFP8/MXFP4 kernels read, mirroring gpt-oss's
     pack_mxfp4_workgroup:
@@ -191,7 +210,15 @@ def pack_mxfp8_workgroup(data: torch.Tensor, scales: torch.Tensor,
     if kmajor:
         # bpk: bytes one row contributes to one 128-element k-tile. row_bytes
         # is exactly (K/128) of them, at either width.
-        bpk = row_bytes * 128 // K
+        #
+        # kmajor_bpk overrides that, and the attention-half packer uses it to
+        # ask for 64 at MXFP8. The grouping granule has to be what ONE
+        # global_load_dwordx4 covers per row, and at FP8 that is half a k-tile
+        # -- _gang_load_fp8_mfma_b_g issues two 16-byte gathers 64 bytes apart,
+        # so the wave's sixteen rows are contiguous only if each half is
+        # grouped on its own. At MXFP4 a k-tile is already 64 bytes and the
+        # override is unnecessary.
+        bpk = kmajor_bpk or (row_bytes * 128 // K)
         d = _kmajor_permute(data.reshape(E, wgs, output_per_wg, row_bytes),
                             output_per_wg, bpk)
         if kmajor >= 2:
@@ -452,7 +479,8 @@ def pack_moe_mxfp8(stacked: torch.Tensor,
 def pack_dense_mxfp8(w: torch.Tensor, output_per_wg: int = 64,
                      rows_per_chunk: int = 8192,
                      fake_fp4: bool = False,
-                     fp4: bool = False) -> torch.Tensor:
+                     fp4: bool = False,
+                     kmajor: int = 0) -> torch.Tensor:
     """Quantize + pack a 2-D [out, K] bf16 weight into the MXFP8 per-workgroup
     layout, in row chunks.
 
@@ -483,7 +511,18 @@ def pack_dense_mxfp8(w: torch.Tensor, output_per_wg: int = 64,
     quant = (quantize_mxfp4 if fp4
              else (lambda x: quantize_mxfp8(fake_quantize_mxfp4(x))) if fake_fp4
              else quantize_mxfp8)
-    parts = [pack_mxfp8_workgroup(*quant(w[r:r + step]), output_per_wg)
+    # K-major is only correct where the consuming kernel takes its K-parallel
+    # branch, which is OUTPUT_PER_WG == 16 and nothing else -- see DENSE_KMAJOR
+    # and _rnlm8_wk<> in gang_rmsnorm_linear_mxfp8_bias_mi300.cuh. A caller
+    # that asks for it at another width would silently hand the N-parallel
+    # branch, the LM head or the GEMV kernel a permuted buffer, so refuse
+    # rather than clamp: at the two sites that opt in, the width is fixed and
+    # a mismatch means the geometry moved out from under this flag.
+    assert not kmajor or output_per_wg == 16, (
+        f"K-major is packed for OUTPUT_PER_WG == 16 only, got {output_per_wg}")
+    # 64-byte granule regardless of width: it is what one instruction covers.
+    parts = [pack_mxfp8_workgroup(*quant(w[r:r + step]), output_per_wg,
+                                  kmajor, 64)
              for r in range(0, rows, step)]
     return torch.cat(parts, dim=0).contiguous()
 
@@ -2427,8 +2466,12 @@ if __name__ == "__main__":
                 # the rest of the layer indexes by still lands where it did.
                 # The padded rows are exactly zero, which quantizes to an
                 # all-zero block with an E8M0 of 0 -- decoded as 1.0.
-                qkv_a_stack = pack_dense_mxfp8(qkv_a_stack, QKV_MXFP8_OPW,
-                                              fake_fp4=FAKE_MXFP4_ATTN)
+                qkv_a_stack = pack_dense_mxfp8(
+                    qkv_a_stack, QKV_MXFP8_OPW,
+                    fake_fp4=FAKE_MXFP4_ATTN,
+                    # QKV_MXFP8_OPW is 16, so this is one of the two K-parallel
+                    # call sites K-major is packed for. See DENSE_KMAJOR.
+                    kmajor=DENSE_KMAJOR if QKV_MXFP8_OPW == 16 else 0)
             w_qkv_a = _attach_input_keep(qkv_a_stack, f"layer_{i}_qkv_a_proj")
             # q_a_layernorm weight, zero past q_lora: the padded q_a columns
             # are exactly zero (w_qkv_a's extra rows are zero) so they cost the
@@ -2556,8 +2599,12 @@ if __name__ == "__main__":
                 # The weight is packed per workgroup of qb_opw_this columns, so
                 # the pack width and the kernel's OUTPUT_PER_WG are the same
                 # number and have to be chosen together.
-                q_b_w = pack_dense_mxfp8(q_b_w, qb_opw_this,
-                                         fake_fp4=FAKE_MXFP4_ATTN)
+                q_b_w = pack_dense_mxfp8(
+                    q_b_w, qb_opw_this, fake_fp4=FAKE_MXFP4_ATTN,
+                    # Only the un-absorbed layers land on QB_GEMM_OPW == 16 and
+                    # take the kernel's K-parallel branch; the absorbed ones
+                    # pack at qk_rope (64) and must stay row-major.
+                    kmajor=DENSE_KMAJOR if qb_opw_this == 16 else 0)
             w_q_b = _attach_input_keep(q_b_w, f"layer_{i}_q_b_absorbed")
 
             # ── o_proj, absorbed or not ──────────────────────────────────
