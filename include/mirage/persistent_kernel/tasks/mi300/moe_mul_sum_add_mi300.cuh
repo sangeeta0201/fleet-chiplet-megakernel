@@ -62,7 +62,7 @@ __device__ __forceinline__ void
 #endif
 
   for (int row_idx = 0; row_idx < BATCH_SIZE; ++row_idx) {
-    for (int i = threadIdx.x; i < OUTPUT_SIZE; i += blockDim.x) {
+    for (int i = threadIdx.x; i < OUTPUT_SIZE; i += MPK_NT) {
       T res_val = d_residual[row_idx * OUTPUT_STRIDE + i];
       float sum_val = static_cast<float>(res_val);
 #pragma unroll

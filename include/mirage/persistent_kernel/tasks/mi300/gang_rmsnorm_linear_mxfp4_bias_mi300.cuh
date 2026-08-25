@@ -487,7 +487,7 @@ __device__ __noinline__ void gang_mulsumradd_rmsnorm_linear_mxfp4_bias_kernel(
 
       // Pass 1: Fused weighted-sum + residual-add + SSQ accumulation
       float ssq = 0.0f;
-      for (int i = tid; i < REDUCTION_SIZE; i += blockDim.x) {
+      for (int i = tid; i < REDUCTION_SIZE; i += MPK_NT) {
         unsigned r_bits = (unsigned)d_residual[b * REDUCTION_SIZE + i] << 16;
         float sum;
         __builtin_memcpy(&sum, &r_bits, 4);
@@ -519,7 +519,7 @@ __device__ __noinline__ void gang_mulsumradd_rmsnorm_linear_mxfp4_bias_kernel(
       float *s_red = (float *)_rnlm_smem;
       int _wave_id = tid >> 6;
       int _lane_id = tid & 63;
-      int _num_waves = blockDim.x >> 6;
+      int _num_waves = MPK_NT >> 6;
       if (_lane_id == 0) {
         s_red[_wave_id] = ssq;
       }
@@ -546,7 +546,7 @@ __device__ __noinline__ void gang_mulsumradd_rmsnorm_linear_mxfp4_bias_kernel(
         bf16 const *w_in = (bf16 const *)d_norm_w;
         bf16 *out = (bf16 *)d_norm_out + b * REDUCTION_SIZE;
         constexpr int VEC_ITERS = REDUCTION_SIZE / (VEC);
-        for (int vi = tid; vi < VEC_ITERS; vi += blockDim.x) {
+        for (int vi = tid; vi < VEC_ITERS; vi += MPK_NT) {
           int off = vi * VEC;
           uint64_t xv, wv;
           __builtin_memcpy(&xv, &x_in[off], 8);
@@ -894,7 +894,7 @@ __device__ __forceinline__ void _kvupd_rope_epilogue(
   __syncthreads();
 
   // Step 3: Write HEAD_DIM bf16 values from LDS to destination
-  for (int d = tid; d < HEAD_DIM; d += 256 /*blockDim.x*/) {
+  for (int d = tid; d < HEAD_DIM; d += 256 /*MPK_NT*/) {
     dst[tok_idx * dst_stride + head_offset + d] = s_rope[d];
   }
 }
@@ -1269,7 +1269,7 @@ __device__ __noinline__ void
 
       // Pass 1: Fused weighted-sum + residual-add + SSQ accumulation
       float ssq = 0.0f;
-      for (int i = tid; i < REDUCTION_SIZE; i += blockDim.x) {
+      for (int i = tid; i < REDUCTION_SIZE; i += MPK_NT) {
         unsigned r_bits = (unsigned)d_residual[b * REDUCTION_SIZE + i] << 16;
         float sum;
         __builtin_memcpy(&sum, &r_bits, 4);
@@ -1299,7 +1299,7 @@ __device__ __noinline__ void
       float *s_red = (float *)_rnlm_smem;
       int _wave_id = tid >> 6;
       int _lane_id = tid & 63;
-      int _num_waves = blockDim.x >> 6;
+      int _num_waves = MPK_NT >> 6;
       if (_lane_id == 0) {
         s_red[_wave_id] = ssq;
       }
@@ -1327,7 +1327,7 @@ __device__ __noinline__ void
         bf16 const *w_in = (bf16 const *)d_norm_w;
         bf16 *out = (bf16 *)d_norm_out + b * REDUCTION_SIZE;
         constexpr int VEC_ITERS = REDUCTION_SIZE / (VEC);
-        for (int vi = tid; vi < VEC_ITERS; vi += blockDim.x) {
+        for (int vi = tid; vi < VEC_ITERS; vi += MPK_NT) {
           int off = vi * VEC;
           uint64_t xv, wv;
           __builtin_memcpy(&xv, &x_in[off], 8);
@@ -1730,7 +1730,7 @@ __device__ __noinline__ void gang_resaddf32_rmsnorm_linear_mxfp4_bias_kernel(
       float *s_red = (float *)_rnlm_smem;
       int _wave_id = tid >> 6;
       int _lane_id = tid & 63;
-      int _num_waves = blockDim.x >> 6;
+      int _num_waves = MPK_NT >> 6;
       if (_lane_id == 0) {
         s_red[_wave_id] = ssq;
       }
@@ -2384,7 +2384,7 @@ __device__ __noinline__ void
       float *s_red = (float *)_rnlm_smem;
       int _wave_id = tid >> 6;
       int _lane_id = tid & 63;
-      int _num_waves = blockDim.x >> 6;
+      int _num_waves = MPK_NT >> 6;
       if (_lane_id == 0) {
         s_red[_wave_id] = ssq;
       }

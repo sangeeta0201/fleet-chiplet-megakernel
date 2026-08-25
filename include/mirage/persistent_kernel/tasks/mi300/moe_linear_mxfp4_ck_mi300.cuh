@@ -165,7 +165,7 @@ __device__ __forceinline__ void
             A + tok * (NUM_TOPK * REDUCTION_SIZE) + topk_slot * REDUCTION_SIZE;
       }
 
-      for (int i = tid; i < REDUCTION_SIZE; i += blockDim.x) {
+      for (int i = tid; i < REDUCTION_SIZE; i += MPK_NT) {
         s_input[i] = input_base[i];
       }
       __syncthreads();

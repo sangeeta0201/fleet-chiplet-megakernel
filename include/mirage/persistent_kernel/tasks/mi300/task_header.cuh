@@ -21,6 +21,9 @@
 // kv_cache_update_mi300.cuh needs vec_load_8/vec_store_8). Do not alphabetize.
 
 // clang-format off
+// MPK_NT (the grid-stride step) must be visible before any task header; see
+// worker_config.h for why blockDim.x is not free on gfx9.
+#include "tasks/common/worker_config.h"
 // Generic tasks reused from ampere/ (platform-independent)
 #include "tasks/ampere/embedding.cuh"
 #include "tasks/ampere/identity.cuh"

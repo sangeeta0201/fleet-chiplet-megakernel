@@ -1698,7 +1698,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
     size_t *tmpl_src =
         config.precomp_xcd_template + tmpl_flat * config.precomp_max_tpw;
     // Parallel copy: each thread copies a chunk
-    for (int i = threadIdx.x; i < tmpl_len; i += blockDim.x) {
+    for (int i = threadIdx.x; i < tmpl_len; i += MPK_NT) {
       pc_my_queue[i] = tmpl_src[i];
     }
     __syncthreads();
@@ -1990,7 +1990,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
       static_assert(sizeof(TaskDesc) % 16 == 0);
       constexpr int TASK_SIZE_PC = sizeof(TaskDesc) / 16;
       for (int i = threadIdx.x; i < num_loaded_tasks * TASK_SIZE_PC;
-           i += blockDim.x) {
+           i += MPK_NT) {
         int task_idx = i / TASK_SIZE_PC;
         int offset = i % TASK_SIZE_PC;
         load_smem(reinterpret_cast<char *>(task_descs) + i * 16,
@@ -2075,7 +2075,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
       static_assert(sizeof(TaskDesc) % 16 == 0);
       constexpr int TASK_SIZE = sizeof(TaskDesc) / 16; // 128b copy-async
       for (int i = threadIdx.x; i < num_loaded_tasks * TASK_SIZE;
-           i += blockDim.x) {
+           i += MPK_NT) {
         int task_idx = i / TASK_SIZE;
         int offset = i % TASK_SIZE;
         load_smem(reinterpret_cast<char *>(task_descs) + i * 16,
@@ -2825,12 +2825,12 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                 int ml_out_base =
                     (xcd_id * config.ml_num_layers + ml) * MAX_OUTPUTS_PER_TASK;
                 for (int i = threadIdx.x; i < MAX_INPUTS_PER_TASK;
-                     i += blockDim.x) {
+                     i += MPK_NT) {
                   task_desc->input_ptrs[i] =
                       config.ml_input_table[ml_in_base + i];
                 }
                 for (int i = threadIdx.x; i < MAX_OUTPUTS_PER_TASK;
-                     i += blockDim.x) {
+                     i += MPK_NT) {
                   task_desc->output_ptrs[i] =
                       config.ml_output_table[ml_out_base + i];
                 }
@@ -3143,7 +3143,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                 }
                 constexpr int TS = sizeof(TaskDesc) / 16;
                 for (int i = threadIdx.x; i < num_to_load * TS;
-                     i += blockDim.x) {
+                     i += MPK_NT) {
                   int ti = i / TS, off = i % TS;
                   load_smem(reinterpret_cast<char *>(task_descs) + i * 16,
                             reinterpret_cast<char *>(

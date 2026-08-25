@@ -2,6 +2,9 @@
 #define MIRAGE_USE_CUTLASS_KERNEL 1
 #endif // MIRAGE_USE_CUTLASS_KERNEL
 
+// MPK_NT (the grid-stride step) must be visible before any task header; see
+// worker_config.h for why blockDim.x is not free on gfx9.
+#include "../common/worker_config.h"
 #include "argmax.cuh"
 #include "embedding.cuh"
 #include "identity.cuh"

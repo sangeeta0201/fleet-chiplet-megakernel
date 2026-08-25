@@ -222,7 +222,7 @@ __device__ __forceinline__ void _full_layer_ep_fold_partial(
     // below exists only so the helper stays correct for any width.
     int const pair_lo = col_lo >> 1;
     int const pair_hi = col_hi >> 1;
-    for (int p = pair_lo + threadIdx.x; p < pair_hi; p += blockDim.x) {
+    for (int p = pair_lo + threadIdx.x; p < pair_hi; p += MPK_NT) {
       int off = p << 1;
       unsigned packed = 0;
 #pragma unroll
@@ -2425,7 +2425,7 @@ __device__ __noinline__ void
         // store and the matching remote slice.
         for (int row = 0; row < QKV_BATCH_SIZE; ++row) {
           size_t const row_base = (size_t)row * QKV_REDUCTION_SIZE;
-          for (int c = ep_col_lo + tid; c < ep_col_hi; c += blockDim.x) {
+          for (int c = ep_col_lo + tid; c < ep_col_hi; c += MPK_NT) {
             size_t idx = row_base + c;
             float acc = 0.0f;
             for (int p = 0; p < EP_WORLD_SIZE; p++) {

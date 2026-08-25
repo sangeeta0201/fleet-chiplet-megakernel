@@ -81,7 +81,7 @@ __device__ __forceinline__ float rmsnorm_rcp_amd(void const *input_ptr,
   constexpr int NTHREADS = 256;
   constexpr int VEC_SIZE = (STORAGE_DIM % (NTHREADS * 8) == 0) ? 8 : 4;
   int const tid = threadIdx.x;
-  int const nthreads = blockDim.x;
+  int const nthreads = MPK_NT;
   constexpr int VEC_ITERS = STORAGE_DIM / (NTHREADS * VEC_SIZE);
   constexpr int VEC_END = VEC_ITERS * NTHREADS * VEC_SIZE;
   float sum = 0.0f;
@@ -186,7 +186,7 @@ __device__ __forceinline__ void rmsnorm_inline_amd(void const *input_ptr,
   constexpr int VEC_SIZE = 8;   // 8 bf16 per 128-bit load
   constexpr int NTHREADS = 256; // block size for gang RMSNorm
   int const tid = threadIdx.x;
-  int const nthreads = blockDim.x;
+  int const nthreads = MPK_NT;
   constexpr int VEC_ITERS = STORAGE_DIM / (NTHREADS * VEC_SIZE);
 
   // ── Phase 1: sum of squares + cache input in registers ──
@@ -917,7 +917,7 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   }
   if (!irms_cached && !folded) {
     int const h4 = REDUCTION_SIZE >> 2;
-    for (int i = tid; i < h4; i += (int)blockDim.x) {
+    for (int i = tid; i < h4; i += (int)MPK_NT) {
       int base = i * 4;
       // Rows are REDUCTION_SIZE apart; the row loop is unrolled so `m` stays
       // a literal and ssq[] never leaves registers. At BATCH_SIZE 1 the row
@@ -933,7 +933,7 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
       }
     }
     // Scalar tail
-    for (int i = (h4 << 2) + tid; i < REDUCTION_SIZE; i += (int)blockDim.x) {
+    for (int i = (h4 << 2) + tid; i < REDUCTION_SIZE; i += (int)MPK_NT) {
 #pragma unroll
       for (int m = 0; m < BATCH_SIZE; m++) {
         float v = __bfloat162float(d_hidden[(size_t)m * REDUCTION_SIZE + i]);
@@ -1166,7 +1166,7 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
                   "multiple of 4");
   } else {
     int const h4 = REDUCTION_SIZE >> 2;
-    for (int i = tid; i < h4; i += (int)blockDim.x) {
+    for (int i = tid; i < h4; i += (int)MPK_NT) {
       int base = i * 4;
       float g0 = __bfloat162float(d_gamma[base]);
       float g1 = __bfloat162float(d_gamma[base + 1]);
@@ -1209,7 +1209,7 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
       }
     }
     // Scalar tail
-    for (int i = (h4 << 2) + tid; i < REDUCTION_SIZE; i += (int)blockDim.x) {
+    for (int i = (h4 << 2) + tid; i < REDUCTION_SIZE; i += (int)MPK_NT) {
       float g = __bfloat162float(d_gamma[i]);
 #pragma unroll
       for (int m = 0; m < BATCH_SIZE; m++) {

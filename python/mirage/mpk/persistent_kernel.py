@@ -555,6 +555,14 @@ def get_compile_command(
         # it paid. See MPK_MERGE_GLOBAL in merge_splitkv.cuh for the samples.
         _mrg = int(os.environ.get("GLM_MERGE_GLOBAL", "1"))
         flags = flags + ["-DMPK_MERGE_GLOBAL=%d" % _mrg]
+        # Replace blockDim.x with the compile-time NUM_THREADS in every task
+        # kernel's grid-stride loop. blockDim.x is not a register on gfx9 -- it
+        # is a dispatch-packet read (global_load_ushort + s_waitcnt vmcnt(0), a
+        # full VMEM drain) that the compiler re-emits on every backedge. Every
+        # task kernel is launched at WORKER_NUM_THREADS == 256, so the value is
+        # a constant. See MPK_NT in tasks/common/worker_config.h.
+        _cbd = int(os.environ.get("GLM_CONST_BLOCKDIM", "1"))
+        flags = flags + ["-DMPK_CONST_BLOCKDIM=%d" % _cbd]
         # Hoist the un-absorbed W_UV GEMV out of the MoE half and run it in the
         # attention half, straight after the split-KV merge, behind a PAIR-LOCAL
         # barrier instead of a GPU-wide one. The layer's existing Phase 8

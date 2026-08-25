@@ -147,7 +147,7 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
   // active_expert_ids initialization is NOT needed: we write directly to
   // active_expert_ids[0..k-1] during TopK and set the count after.
   for (int expert = start_expert + threadIdx.x; expert < end_expert;
-       expert += blockDim.x) {
+       expert += MPK_NT) {
     if (routing_indices != nullptr) {
       for (int row = 0; row < rstride; ++row) {
         routing_indices[expert * rstride + row] = 0;
@@ -168,7 +168,7 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
     // outside [start_expert, end_expert) so the zero fill above never touches
     // it, and the tile decoder walks tok over the full BATCH_SIZE. A dead row
     // left holding a stale k+1 would run the shared expert on garbage.
-    for (int row = threadIdx.x; row < rstride; row += blockDim.x) {
+    for (int row = threadIdx.x; row < rstride; row += MPK_NT) {
       st_wt_u32((void *)&routing_indices[NUM_EXPERTS * rstride + row],
                 (unsigned)(row < num_rows ? (k + 1) : 0));
     }
@@ -223,7 +223,7 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
   __shared__ unsigned s_used[USED_WORDS];
   bool const multirow = num_rows > 1;
   if (multirow) {
-    for (int w = threadIdx.x; w < USED_WORDS; w += blockDim.x) {
+    for (int w = threadIdx.x; w < USED_WORDS; w += MPK_NT) {
       s_used[w] = 0u;
     }
     __syncthreads();
@@ -619,7 +619,7 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
       total += (unsigned)__popc(s_used[w]);
     }
     for (int loc = threadIdx.x; loc < end_expert - start_expert;
-         loc += blockDim.x) {
+         loc += MPK_NT) {
       int const word = loc >> 5;
       unsigned const bit = 1u << (loc & 31);
       if ((s_used[word] & bit) == 0u) {

@@ -35,7 +35,7 @@ __device__ __forceinline__ void
   // For BS=1: each thread handles HIDDEN_DIM/blockDim.x elements
   // Compute sum of squares
   float local_sum = 0.0f;
-  for (int i = threadIdx.x; i < HIDDEN_DIM; i += blockDim.x) {
+  for (int i = threadIdx.x; i < HIDDEN_DIM; i += MPK_NT) {
     float v = (float)inp[i];
     local_sum += v * v;
   }
@@ -53,7 +53,7 @@ __device__ __forceinline__ void
   float *red = (float *)(smem + RED_OFFSET);
   int warp_id = threadIdx.x >> 5;
   int lane_id = threadIdx.x & 31;
-  int num_warps = blockDim.x >> 5;
+  int num_warps = MPK_NT >> 5;
 
   if (lane_id == 0) {
     red[warp_id] = local_sum;
@@ -75,7 +75,7 @@ __device__ __forceinline__ void
 
   // All workers write the same values — writes are idempotent.
   // Use non-temporal stores to avoid L2 write amplification.
-  for (int i = threadIdx.x; i < HIDDEN_DIM; i += blockDim.x) {
+  for (int i = threadIdx.x; i < HIDDEN_DIM; i += MPK_NT) {
     float v = (float)inp[i] * rms_rcp * (float)wgt[i];
     out[i] = (T)v;
   }

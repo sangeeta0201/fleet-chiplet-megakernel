@@ -169,7 +169,7 @@ __device__ __forceinline__ void gang_ksplit_finalize_kernel(
 
   for (int idx = start + (int)threadIdx.x;
        idx < min(start + ELEMS_PER_TILE, total);
-       idx += (int)blockDim.x) {
+       idx += (int)MPK_NT) {
     int row = idx / n_cols;
     int col = idx % n_cols;
     int ws_idx = row * ws_stride_u + n_col_offset_u + col;

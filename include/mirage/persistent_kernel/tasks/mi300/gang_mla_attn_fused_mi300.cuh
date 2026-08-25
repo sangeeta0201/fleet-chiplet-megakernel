@@ -1131,7 +1131,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
           unsigned int *const src32 = reinterpret_cast<unsigned int *>(
               tile_out + (size_t)r * NUM_Q_HEADS * QK_DIM_ +
               (size_t)t * WUK_ROWS_PER_WG);
-          for (int w = tid; w < push_w32; w += (int)blockDim.x) {
+          for (int w = tid; w < push_w32; w += (int)MPK_NT) {
             unsigned int const v =
                 (unsigned int)ld_nt_s32(reinterpret_cast<int *>(src32 + w));
             // Unrolled over peers so qb_peer_delta stays in registers: a

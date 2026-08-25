@@ -656,7 +656,7 @@ __device__ __noinline__ void paged_attention_ck_fmha_prefill(
         __syncthreads();
         bf16_t const *d_sinks = reinterpret_cast<bf16_t const *>(sinks_ptr);
         float sink_val = type_convert<float>(d_sinks[i_nhead]);
-        int const total_threads = blockDim.x;
+        int const total_threads = MPK_NT;
         int const tid = threadIdx.x;
         for (index_t s = 0; s < seqlen_q; s++) {
           float lse_val = lse_for_head[s * LSE_STRIDE];

@@ -73,7 +73,7 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
   // active_expert_ids initialization is NOT needed: we write directly to
   // active_expert_ids[0..k-1] during TopK and set the count after.
   for (int expert = start_expert + threadIdx.x; expert < end_expert;
-       expert += blockDim.x) {
+       expert += MPK_NT) {
     if (routing_indices != nullptr) {
       for (int row = 0; row < rstride; ++row) {
         routing_indices[expert * rstride + row] = 0;

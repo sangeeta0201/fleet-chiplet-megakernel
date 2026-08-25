@@ -137,7 +137,7 @@ __device__ __noinline__ void gang_moe_swiglu_w2_mxfp4_kernel_mi300(
       A + tok_idx * (NUM_TOPK * W13_OUT_DIM) + topk_slot * W13_OUT_DIM;
 
 #pragma unroll 1
-  for (int blk = tid; blk < MFMA_ITERS; blk += blockDim.x) {
+  for (int blk = tid; blk < MFMA_ITERS; blk += MPK_NT) {
     int base_k = blk * K_PER_MFMA;
     unsigned short const *blk_base = w13_base + 2 * base_k;
 

@@ -799,7 +799,7 @@ __device__ __attribute__((always_inline)) void
             break;
           }
           unsigned int *const row32 = src32 + (size_t)m * OPROJ_ROW_W32;
-          for (int w = tid; w < OPROJ_TILE_W32; w += (int)blockDim.x) {
+          for (int w = tid; w < OPROJ_TILE_W32; w += (int)MPK_NT) {
             unsigned int const v =
                 (unsigned int)ld_nt_s32(reinterpret_cast<int *>(row32 + w));
             // Unrolled over peers so oproj_peer_delta stays in registers: a
@@ -866,7 +866,7 @@ __device__ __attribute__((always_inline)) void
         // gamma is indexed globally -- it is the un-sharded [HIDDEN] vector --
         // while Wt below is indexed rank-locally. The two differ by exactly
         // EP_MY_PE * OPROJ_TP_COLS, which is the whole content of the shard.
-        for (int e = tid; e < NUM_EXPERTS; e += (int)blockDim.x) {
+        for (int e = tid; e < NUM_EXPERTS; e += (int)MPK_NT) {
           float acc = 0.0f;
 #pragma unroll
           for (int j = 0; j < OPROJ_ROWS_PER_WG; j++) {
@@ -955,7 +955,7 @@ __device__ __attribute__((always_inline)) void
             parts + (size_t)(8 + (oproj_expected & 1) * EP_WORLD_SIZE +
                              EP_MY_PE) *
                         RF_LINE;
-        for (int e = tid; e < RF_LINE; e += (int)blockDim.x) {
+        for (int e = tid; e < RF_LINE; e += (int)MPK_NT) {
           float s = 0.0f;
 #pragma unroll
           for (int x = 0; x < 8; x++) {
@@ -972,7 +972,7 @@ __device__ __attribute__((always_inline)) void
         }
         __syncthreads();
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-        for (int e = tid; e < RF_LINE; e += (int)blockDim.x) {
+        for (int e = tid; e < RF_LINE; e += (int)MPK_NT) {
           float const v = my_line[e];
 #pragma unroll
           for (int q = 0; q < OPROJ_NPEER; q++) {
@@ -1533,7 +1533,7 @@ __device__ __attribute__((always_inline)) void
         (size_t)(xcd_rank - moe_w13_live) * shadow_bytes;
     uint4 acc = make_uint4(0u, 0u, 0u, 0u);
     for (size_t off = (size_t)tid * 16; off < shadow_bytes;
-         off += (size_t)blockDim.x * 16) {
+         off += (size_t)MPK_NT * 16) {
       uint4 v = *(uint4 const *)(base + off);
       acc.x += v.x;
       acc.y += v.y;
@@ -1583,7 +1583,7 @@ __device__ __attribute__((always_inline)) void
           (char const *)nxt_w + (size_t)(xcd_rank - (live)) * pf_bytes;        \
       uint4 acc = make_uint4(0u, 0u, 0u, 0u);                                  \
       for (size_t off = (size_t)tid * 16; off < pf_bytes;                      \
-           off += (size_t)blockDim.x * 16) {                                   \
+           off += (size_t)MPK_NT * 16) {                                   \
         uint4 v = *(uint4 const *)(base + off);                                \
         acc.x += v.x;                                                          \
         acc.y += v.y;                                                          \

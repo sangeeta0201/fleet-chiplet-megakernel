@@ -198,7 +198,7 @@ __device__ __forceinline__ void
   int const tid = threadIdx.x;
   int const lane_id = tid & 63;
 
-  for (int sb = tid; sb < NSUBBLOCKS; sb += blockDim.x) {
+  for (int sb = tid; sb < NSUBBLOCKS; sb += MPK_NT) {
     int const base = sb * SUB_BLOCK;
     int const super_blk = sb / 4; // which 128-element block
     int const sub_idx = sb & 3;   // which sub-block within super-block
@@ -376,7 +376,7 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_nt(
   int const lane_id = tid & 63;
   uint32_t const *src32 = (uint32_t const *)src_bf16;
 
-  for (int sb = tid; sb < NSUBBLOCKS; sb += blockDim.x) {
+  for (int sb = tid; sb < NSUBBLOCKS; sb += MPK_NT) {
     int const base = sb * SUB_BLOCK;
     int const super_blk = sb / 4;
     int const sub_idx = sb & 3;
@@ -517,7 +517,7 @@ __device__ __forceinline__ void
   constexpr int NSC4 = LEN / 128;  // dword of E8M0 scale (4 blocks of 32)
   int const tid = threadIdx.x;
 
-  for (int v = tid; v < NVEC; v += blockDim.x) {
+  for (int v = tid; v < NVEC; v += MPK_NT) {
     // Early-clobber for the same reason the quantizer documents: the compiler
     // will otherwise allocate the destination on top of the live address.
     i32x4_t d;
@@ -528,7 +528,7 @@ __device__ __forceinline__ void
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     *(i32x4_t *)(dst_data + v * 16) = d;
   }
-  for (int s = tid; s < NSC4; s += blockDim.x) {
+  for (int s = tid; s < NSC4; s += MPK_NT) {
     uint32_t d;
     asm volatile("global_load_dword %0, %1, off sc0 sc1 nt"
                  : "=&v"(d)
@@ -665,7 +665,7 @@ __device__ __forceinline__ void
   constexpr int NBLOCKS = REDUCTION_SIZE / BLOCK_SIZE;
   int const tid = threadIdx.x;
 
-  for (int blk = tid; blk < NBLOCKS; blk += blockDim.x) {
+  for (int blk = tid; blk < NBLOCKS; blk += MPK_NT) {
     int base = blk * BLOCK_SIZE;
 
     // Load 32 bf16 values and find amax using fmaxf/fabsf (v_max_f32, no VCC
@@ -721,7 +721,7 @@ __device__ __forceinline__ void
   int const tid = threadIdx.x;
   uint32_t const *src32 = (uint32_t const *)src_bf16;
 
-  for (int blk = tid; blk < NBLOCKS; blk += blockDim.x) {
+  for (int blk = tid; blk < NBLOCKS; blk += MPK_NT) {
     int base = blk * BLOCK_SIZE;
     uint32_t const *base_ptr = src32 + base / 2;
 

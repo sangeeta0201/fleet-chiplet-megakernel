@@ -45,7 +45,7 @@ __device__ __forceinline__ void bias_add_task_impl(void const *input_ptr,
     constexpr int VEC_ITERS = SIZE / VEC_SIZE;
 
     for (int vec_idx = threadIdx.x; vec_idx < VEC_ITERS;
-         vec_idx += blockDim.x) {
+         vec_idx += MPK_NT) {
       int offset = vec_idx * VEC_SIZE;
 
       uint64_t in_lo = *reinterpret_cast<uint64_t const *>(&d_input[offset]);
@@ -81,7 +81,7 @@ __device__ __forceinline__ void bias_add_task_impl(void const *input_ptr,
     // Remainder
     constexpr int REMAINDER_START = VEC_ITERS * VEC_SIZE;
     if constexpr (SIZE % VEC_SIZE != 0) {
-      for (int i = REMAINDER_START + threadIdx.x; i < SIZE; i += blockDim.x) {
+      for (int i = REMAINDER_START + threadIdx.x; i < SIZE; i += MPK_NT) {
         d_output[i] = __float2bfloat16(__bfloat162float(d_input[i]) +
                                        __bfloat162float(d_bias[i]));
       }
@@ -93,7 +93,7 @@ __device__ __forceinline__ void bias_add_task_impl(void const *input_ptr,
     constexpr int VEC_ITERS = TOTAL_ELEMS / VEC_SIZE;
 
     for (int vec_idx = threadIdx.x; vec_idx < VEC_ITERS;
-         vec_idx += blockDim.x) {
+         vec_idx += MPK_NT) {
       int elem_start = vec_idx * VEC_SIZE;
       int batch_idx = elem_start / SIZE;
       int offset = elem_start % SIZE;
@@ -144,7 +144,7 @@ __device__ __forceinline__ void bias_add_task_impl(void const *input_ptr,
     constexpr int REMAINDER = TOTAL_ELEMS % VEC_SIZE;
     if constexpr (REMAINDER > 0) {
       int start_idx = VEC_ITERS * VEC_SIZE;
-      for (int i = start_idx + threadIdx.x; i < TOTAL_ELEMS; i += blockDim.x) {
+      for (int i = start_idx + threadIdx.x; i < TOTAL_ELEMS; i += MPK_NT) {
         int batch_idx = i / SIZE;
         int offset = i % SIZE;
         d_output[batch_idx * O_STRIDE + offset] = __float2bfloat16(

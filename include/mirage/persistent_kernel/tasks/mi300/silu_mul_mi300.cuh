@@ -65,7 +65,7 @@ __device__ __forceinline__ void silu_mul_task_impl(void const *input_ptr,
     constexpr int VEC_ITERS = OUTPUT_SIZE / VEC_SIZE;
 
     for (int vec_idx = threadIdx.x; vec_idx < VEC_ITERS;
-         vec_idx += blockDim.x) {
+         vec_idx += MPK_NT) {
       int offset = vec_idx * VEC_SIZE;
 
       uint64_t in_lo = *reinterpret_cast<uint64_t const *>(&d_input[offset]);
@@ -103,7 +103,7 @@ __device__ __forceinline__ void silu_mul_task_impl(void const *input_ptr,
     constexpr int REMAINDER_START = VEC_ITERS * VEC_SIZE;
     if constexpr (OUTPUT_SIZE % VEC_SIZE != 0) {
       for (int i = REMAINDER_START + threadIdx.x; i < OUTPUT_SIZE;
-           i += blockDim.x) {
+           i += MPK_NT) {
         float x = __bfloat162float(d_input[i]);
         float m = __bfloat162float(d_mul[i]);
         nt_store_bf16_hip(&d_output[i], __float2bfloat16(fast_silu(x) * m));
@@ -116,7 +116,7 @@ __device__ __forceinline__ void silu_mul_task_impl(void const *input_ptr,
     constexpr int VEC_ITERS = TOTAL_ELEMS / VEC_SIZE;
 
     for (int vec_idx = threadIdx.x; vec_idx < VEC_ITERS;
-         vec_idx += blockDim.x) {
+         vec_idx += MPK_NT) {
       int elem_start = vec_idx * VEC_SIZE;
       int batch_idx = elem_start / OUTPUT_SIZE;
       int offset = elem_start % OUTPUT_SIZE;
@@ -176,7 +176,7 @@ __device__ __forceinline__ void silu_mul_task_impl(void const *input_ptr,
     constexpr int REMAINDER = TOTAL_ELEMS % VEC_SIZE;
     if constexpr (REMAINDER > 0) {
       int start_idx = VEC_ITERS * VEC_SIZE;
-      for (int i = start_idx + threadIdx.x; i < TOTAL_ELEMS; i += blockDim.x) {
+      for (int i = start_idx + threadIdx.x; i < TOTAL_ELEMS; i += MPK_NT) {
         int batch_idx = i / OUTPUT_SIZE;
         int offset = i % OUTPUT_SIZE;
         if (batch_idx < num_active_tokens) {

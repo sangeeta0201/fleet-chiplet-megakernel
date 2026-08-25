@@ -71,7 +71,7 @@ __device__ __forceinline__ void swigluoai_task_impl(void const *input_ptr,
         4; // Process 4 output elements at a time (reads 8 input elements)
 
     for (int vec_idx = threadIdx.x; vec_idx < OUTPUT_SIZE / VEC_SIZE;
-         vec_idx += blockDim.x) {
+         vec_idx += MPK_NT) {
       int out_offset = vec_idx * VEC_SIZE;
       int in_offset = out_offset * 2; // interleaved layout
 
@@ -94,7 +94,7 @@ __device__ __forceinline__ void swigluoai_task_impl(void const *input_ptr,
     constexpr int REMAINDER_START = VEC_ITERS * VEC_SIZE;
     if constexpr (OUTPUT_SIZE % VEC_SIZE != 0) {
       for (int i = REMAINDER_START + threadIdx.x; i < OUTPUT_SIZE;
-           i += blockDim.x) {
+           i += MPK_NT) {
         float gate = __bfloat162float(d_input[2 * i]);
         float up = __bfloat162float(d_input[2 * i + 1]);
         d_output[i] = __float2bfloat16(fast_swigluoai(gate, up));
@@ -107,7 +107,7 @@ __device__ __forceinline__ void swigluoai_task_impl(void const *input_ptr,
     constexpr int TOTAL_ELEMS = BATCH_SIZE * OUTPUT_SIZE;
 
     for (int elem_idx = threadIdx.x * VEC_SIZE; elem_idx < TOTAL_ELEMS;
-         elem_idx += blockDim.x * VEC_SIZE) {
+         elem_idx += MPK_NT * VEC_SIZE) {
       int batch_idx = elem_idx / OUTPUT_SIZE;
       int offset = elem_idx % OUTPUT_SIZE;
 
@@ -146,7 +146,7 @@ __device__ __forceinline__ void swigluoai_task_impl(void const *input_ptr,
     constexpr int REMAINDER = TOTAL_ELEMS % VEC_SIZE;
     if constexpr (REMAINDER > 0) {
       int start_idx = (TOTAL_ELEMS / VEC_SIZE) * VEC_SIZE;
-      for (int i = start_idx + threadIdx.x; i < TOTAL_ELEMS; i += blockDim.x) {
+      for (int i = start_idx + threadIdx.x; i < TOTAL_ELEMS; i += MPK_NT) {
         int batch_idx = i / OUTPUT_SIZE;
         int offset = i % OUTPUT_SIZE;
         if (batch_idx < num_active_tokens) {

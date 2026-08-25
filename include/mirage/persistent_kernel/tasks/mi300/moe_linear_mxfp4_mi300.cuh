@@ -149,7 +149,7 @@ __device__ __forceinline__ void
                      topk_slot * REDUCTION_SIZE;
       }
 
-      for (int i = tid; i < REDUCTION_SIZE; i += blockDim.x) {
+      for (int i = tid; i < REDUCTION_SIZE; i += MPK_NT) {
         s_input[i] = __bfloat162float(input_base[i]);
       }
       __syncthreads();

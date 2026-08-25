@@ -185,7 +185,7 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_rmsnorm(
   int const tid = threadIdx.x;
   int const lane_id = tid & 63;
 
-  for (int sb = tid; sb < NSUBBLOCKS; sb += blockDim.x) {
+  for (int sb = tid; sb < NSUBBLOCKS; sb += MPK_NT) {
     int const base = sb * SUB_BLOCK;
     int const super_blk = sb / 4;
     int const sub_idx = sb & 3;
@@ -568,7 +568,7 @@ _rnlm8_pro_publish(unsigned short const *__restrict__ d_res,
   __shared__ float pro_red[16];
   int const wave_id = tid >> 6;
   int const lane_id = tid & 63;
-  int const num_waves = blockDim.x >> 6;
+  int const num_waves = MPK_NT >> 6;
   if (lane_id == 0) {
     pro_red[wave_id] = ssq;
   }
@@ -1005,7 +1005,7 @@ _rnlm8_resadd_norm_rcp(float const *__restrict__ d_ws,
   __shared__ float red[16];
   int const wave_id = tid >> 6;
   int const lane_id = tid & 63;
-  int const num_waves = blockDim.x >> 6;
+  int const num_waves = MPK_NT >> 6;
   if (lane_id == 0) {
     red[wave_id] = ssq;
   }
@@ -1062,7 +1062,7 @@ _rnlm8_stage_norm_rcp(unsigned short const *__restrict__ d_in,
   using gu64 = __attribute__((address_space(1))) uint64_t const *;
 
   int const tid = threadIdx.x;
-  int const nthreads = blockDim.x;
+  int const nthreads = MPK_NT;
   float ssq = 0.0f;
 
   auto stage4 = [&](int off) -> uint64_t {
@@ -1113,7 +1113,7 @@ _rnlm8_stage_norm_rcp(unsigned short const *__restrict__ d_in,
   __shared__ float red[16];
   int const wave_id = tid >> 6;
   int const lane_id = tid & 63;
-  int const num_waves = blockDim.x >> 6;
+  int const num_waves = MPK_NT >> 6;
   if (lane_id == 0) {
     red[wave_id] = ssq;
   }
@@ -2063,7 +2063,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     using gu32 = __attribute__((address_space(1))) unsigned const *;
     int4 *s4 = (int4 *)s_tok_fp8;
     gu32 g4 = (gu32)pub;
-    for (int i = tid; i < FP8_TOK_DATA / 16; i += blockDim.x) {
+    for (int i = tid; i < FP8_TOK_DATA / 16; i += MPK_NT) {
       int4 v;
       v.x = (int)g4[i * 4 + 0];
       v.y = (int)g4[i * 4 + 1];
@@ -2073,7 +2073,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     }
     using gu8 = __attribute__((address_space(1))) uint8_t const *;
     gu8 gs = (gu8)(pub + FP8_TOK_DATA);
-    for (int i = tid; i < PUB_SCALES; i += blockDim.x) {
+    for (int i = tid; i < PUB_SCALES; i += MPK_NT) {
       s_tok_scales[i] = gs[i];
     }
     if constexpr (HOIST_PREFILL) {
