@@ -519,6 +519,17 @@ def get_compile_command(
         # exactly one drain.
         _rg = int(os.environ.get("GLM_RESADD_GLOBAL", "1"))
         flags = flags + ["-DMPK_RESADD_GLOBAL=%d" % _rg]
+        # The fused layer's 29-entry input_ptrs / 11-entry output_ptrs tables
+        # live in LDS -- task_descs is a reinterpret_cast of a __shared__ char
+        # array -- but the cast drops the address space, so they arrive as
+        # generic pointers and every subscript compiles to flat_load against
+        # the LDS aperture. A flat access to LDS raises vmcnt as well as
+        # lgkmcnt, so the pointer table pollutes every vector-memory wait in
+        # the phase. addrspace(3) turns them into ds_read_b64. NOT addrspace(1)
+        # -- that faults, the data is not global. See MPK_MLFL_LDS in
+        # gang_mla_full_layer_fused_mi300.cuh.
+        _mg = int(os.environ.get("GLM_MLFL_LDS", "1"))
+        flags = flags + ["-DMPK_MLFL_LDS=%d" % _mg]
         # Hoist the un-absorbed W_UV GEMV out of the MoE half and run it in the
         # attention half, straight after the split-KV merge, behind a PAIR-LOCAL
         # barrier instead of a GPU-wide one. The layer's existing Phase 8

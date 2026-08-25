@@ -452,6 +452,63 @@ static constexpr int FULL_LAYER_COUNTER_SLOTS =
 #define MPK_FL_REPUBLISH_SPINS 1024
 #endif
 
+// MPK_MLFL_LDS: read the 29-entry input_ptrs / 11-entry output_ptrs tables
+// through addrspace(3).
+//
+// These tables are NOT in global memory. `task_desc` is `task_descs +
+// queue_pos`, and `task_descs` is a reinterpret_cast of the __shared__ char
+// array declared at persistent_kernel.cuh:1538 -- the pointer table lives in
+// LDS. The reinterpret_cast drops the address space, so `input_ptrs` reaches
+// this kernel as a generic pointer and every subscript compiles to
+// `flat_load_dwordx2/x4` against the LDS aperture.
+//
+// That is the worst of both worlds. A flat access to LDS raises **vmcnt as
+// well as lgkmcnt**, so the pointer table pollutes every vector-memory wait in
+// the phase, and it goes through the flat path instead of the direct `ds_read`
+// the data actually wants. In the built image at 0x44A0C:
+//
+//   flat_load_dwordx2/x4  x13        <- the pointer table, in LDS
+//   ds_read_b128 v[136:139], ...     <- the phase's control word
+//   s_waitcnt lgkmcnt(0)
+//   v_cmp_lt_i32_e32 vcc, -1, v136   <- branches on the LDS value alone
+//
+// Under addrspace(3) the thirteen become `ds_read_b64`, which is what they
+// should always have been: no vmcnt, and the lgkmcnt they do raise is real LDS
+// traffic that the following `s_waitcnt lgkmcnt(0)` was going to pay anyway.
+//
+// NOT addrspace(1). That was tried first and faults with an illegal memory
+// access on every rank -- the tables are shared memory, so telling the
+// compiler they are global is simply false. The 24-load win in
+// gang_rmsnorm_linear_mxfp8_bias_mi300.cuh's resolve batch does not
+// generalize by opcode; it generalizes by "name the address space the data is
+// actually in".
+//
+// The proxy exists because the uses are all `input_ptrs[i]` subscripts, 77 of
+// them, and because dereferencing an address-space-qualified pointer to a
+// class type yields an AS-qualified prvalue that an implicit operator=
+// rejects. A scalar uint64_t has no user-declared operator=, so reading the
+// slot as uint64_t and casting to void* afterwards is well-formed.
+// operator[] returns the same `void *` the raw table did, so every call site
+// is unchanged.
+#ifndef MPK_MLFL_LDS
+#define MPK_MLFL_LDS 1
+#endif
+#if MPK_MLFL_LDS
+struct _MlflPtrTable {
+  __attribute__((address_space(3))) uint64_t const *p;
+  __device__ __forceinline__ void *operator[](int i) const {
+    return (void *)p[i];
+  }
+};
+#define MPK_MLFL_BIND(name, param)                                             \
+  _MlflPtrTable const name {                                                   \
+    (__attribute__((address_space(3))) uint64_t const *)(uint64_t const *)     \
+        param                                                                  \
+  }
+#else
+#define MPK_MLFL_BIND(name, param) void *const *const name = param
+#endif
+
 template <
     // ── shared ──
     int BATCH_SIZE,
@@ -551,10 +608,13 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     // parameters, which is what gpt-oss's full-layer task does and for the
     // same reason: the unpacked form costs a few hundred bytes of stack frame
     // per thread for pointers that are read once each.
-    void *const *input_ptrs,  // 29, see the demo's layer for the map
-                              // ([27] and [28] are EP-only and may be null
-                              //  at EP_WORLD_SIZE == 1)
-    void *const *output_ptrs, // 11
+    // `_raw` because MPK_MLFL_BIND rebinds each of these to a same-named
+    // addrspace(1) proxy at the top of the body; the 77 subscript sites below
+    // are untouched.
+    void *const *input_ptrs_raw,  // 29, see the demo's layer for the map
+                                  // ([27] and [28] are EP-only and may be null
+                                  //  at EP_WORLD_SIZE == 1)
+    void *const *output_ptrs_raw, // 11
     // ── runtime config ──
     int const *qo_indptr,
     int const *kv_indptr,
@@ -602,6 +662,9 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
                 "instead of an event, so the merge has to write through");
   static_assert(HIDDEN_SIZE == QKV_REDUCTION_SIZE,
                 "o_proj's N is the next layer's qkv_a K; they are one row");
+
+  MPK_MLFL_BIND(input_ptrs, input_ptrs_raw);
+  MPK_MLFL_BIND(output_ptrs, output_ptrs_raw);
 
   int const tid = threadIdx.x;
   int const xcd_id = tile_idx / tiles_per_xcd;
