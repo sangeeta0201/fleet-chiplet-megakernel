@@ -1233,6 +1233,27 @@ __device__ __forceinline__ i32x8_t
 
 // The matching scale byte. `off4` is the row-major offset the callers already
 // compute -- ki*4, or equivalently kt/32 -- and is scaled the same way.
+//
+// MEASURED NO-GO (2026-08-25): folding the GROUPS-wide batch of these onto ONE
+// base pointer with compile-time immediate offsets -- the change that bought
+// -0.123 ms on the MoE twin as MPK_MOE_SCBASE -- is a small LOSS here.
+//
+//   arm (folded)  n=5 mean 9.766  (9.797 9.784 9.750 9.729 9.771)
+//   control       n=5 mean 9.718  (9.735 9.704 9.733 9.695 9.725)
+//
+// and that is despite worker_kernel .vgpr_count 333 -> 327 with zero spills,
+// and despite the fold landing (the qkv_a OPW=16/K=6144 body goes from 0 of 24
+// `global_load_ubyte` in immediate-offset form to 12 of 24).
+//
+// The issue-order hypothesis -- that batching four one-byte loads ahead of the
+// weight tiles shortens the window the weight loads have to themselves, vmcnt
+// being in-order -- is REFUTED by the image: an interleaved variant that keeps
+// the fold but restores `W W SC` order emits a byte-identical hot-body load
+// sequence, because the scheduler was already interleaving them. It only costs
+// 4 VGPRs back (331) for the base pointer it keeps live.
+//
+// So the dense k-loop is not address-register-bound the way the MoE one was.
+// Do not re-try this without a new mechanism; the arm has been built and run.
 template <int KMUL>
 __device__ __forceinline__ int
     _rnlm8_load_sc(uint8_t const *base, int off4, int g) {
