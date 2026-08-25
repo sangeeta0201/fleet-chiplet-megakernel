@@ -54,6 +54,21 @@ PAT = re.compile(r"\[1,(\d+)\].*BARSTAGEWS (\d+) (\d+) (\d+) (\d+)")
 N_LAYERS = 76
 XFER = 0.32  # peer-idle -> wall, glm-peer-idle-to-wall-response-is-convex
 
+# MPK_BAR_SKEW=3 is NOT free and the ms columns are unreadable without saying
+# so.  Measured 2026-08-25 at HEAD, same tree, same command line, NP=4 devices
+# 4-7 bs=1:  instrumented 13.102/13.018,  uninstrumented control 9.737.  The
+# instrumented layer span (max-arrival telescoping) is 157.34 us, so the
+# uninstrumented span is 157.34 - 3320/76 = 113.7 us and every ms column below
+# is scaled by 113.7/157.34.
+#
+# The inflation is NOT a fixed per-stamp cost.  If it were, it would land
+# entirely in FLOOR (a constant added to every worker's wait leaves SKEW
+# untouched) at 43.7/24 = 1.82 us per region -- but seven regions have a floor
+# BELOW 1.82 and sum_i min(floor_i, 1.82) = 32.4 us cannot absorb 43.7.  So the
+# instrument scales with the work, and a proportional de-inflation is the
+# defensible one.  Override with argv[3] if you re-measure the pair.
+DEFLATE = 113.7 / 157.34
+
 # Verified against the `// Stage stamp N:` comments at every call site,
 # 2026-08-22.  These agree with board_budget.py.  They do NOT agree with
 # paired_span.py's older map, which was shifted by one across 16..19 and has
@@ -110,11 +125,14 @@ def report(path, rank):
     print(f"\n{path}   rank {rank}   ({N_LAYERS} layers)")
     print("=" * 106)
     print(f"{'region':<34}{'n':>5}{'x/lyr':>7}{'sd(a)':>7}{'sd(b)':>7}"
-          f"{'shape':>9}{'floor':>8}{'skew':>8}{'floor':>9}{'skew':>8}")
+          f"{'shape':>9}{'floor':>8}{'skew':>8}{'floor':>9}{'skew':>8}"
+          f"{'crit':>8}{'EXCESS':>8}")
     print(f"{'':<34}{'':>5}{'':>7}{'us':>7}{'us':>7}{'':>9}"
-          f"{'us/lyr':>8}{'us/lyr':>8}{'ms':>9}{'ms':>8}")
-    print("=" * 106)
+          f"{'us/lyr':>8}{'us/lyr':>8}{'ms':>9}{'ms':>8}{'ms':>8}{'ms':>8}")
+    print("=" * 122)
     tot_f = tot_s = rel_s = 0.0
+    tot_c = tot_x = 0.0
+    excess = []
     for a, b in zip(ORDER, ORDER[1:]):
         if a not in rows or b not in rows:
             continue
@@ -127,18 +145,36 @@ def report(path, rank):
         waits = sorted(B[w][0] - A[w][0] for w in both)
         floor, skew = waits[0], waits[-1] - waits[0]
         sh = shape_of(sda, sdb)
-        fm, sm = floor * N_LAYERS / 1e3, skew * N_LAYERS / 1e3
+        fm = floor * N_LAYERS / 1e3 * DEFLATE
+        sm = skew * N_LAYERS / 1e3 * DEFLATE
         tot_f += fm
         tot_s += sm
         if sh == "RELEASE":
             rel_s += sm
+        # CRIT is this region's share of the layer's CRITICAL PATH:
+        # max_w(b) - max_w(a), the segment estimator that telescopes to the
+        # layer span.  EXCESS = CRIT - FLOOR is the only wall-relevant form of
+        # imbalance -- the part of the critical worker's time that a perfectly
+        # balanced arrival would delete.  SKEW is idle time and is NOT it: at a
+        # RELEASE everybody leaves together, so max_w(b) - max_w(a) collapses
+        # onto min_w(b - a) and EXCESS is ~0 no matter how large SKEW is.
+        crit = max(v[0] for v in B.values()) - max(v[0] for v in A.values())
+        cm = crit * N_LAYERS / 1e3 * DEFLATE
+        xm = (crit - floor) * N_LAYERS / 1e3 * DEFLATE
+        tot_c += cm
+        tot_x += xm
+        excess.append((xm, LABEL.get((a, b), "S%d->S%d" % (a, b)), sh))
         nest = statistics.mean(c for _, c in B.values()) / base
         print(f"{('S%d->S%d ' % (a, b)) + LABEL.get((a, b), ''):<34}"
               f"{len(both):>5}{nest:>7.2f}{sda:>7.2f}{sdb:>7.2f}{sh:>9}"
-              f"{floor:>8.2f}{skew:>8.2f}{fm:>9.3f}{sm:>8.3f}")
-    print("=" * 106)
+              f"{floor:>8.2f}{skew:>8.2f}{fm:>9.3f}{sm:>8.3f}"
+              f"{cm:>8.3f}{xm:>8.3f}")
+    print("=" * 122)
     print(f"{'TOTAL':<34}{'':>5}{'':>7}{'':>7}{'':>7}{'':>9}{'':>8}{'':>8}"
-          f"{tot_f:>9.3f}{tot_s:>8.3f}")
+          f"{tot_f:>9.3f}{tot_s:>8.3f}{tot_c:>8.3f}{tot_x:>8.3f}")
+    print("\n  EXCESS, ranked (this is the target list, NOT the skew column):")
+    for xm, lab, sh in sorted(excess, reverse=True)[:8]:
+        print(f"    {lab:<34}{sh:>9}{xm:>9.3f} ms")
     print(f"\n  'x/lyr' = this slot's writes per writer / slot 0's.  Any value "
           f"far from 1.00 means the\n  stamp fires more than once a layer and "
           f"t/c is a blend, not an arrival.")
@@ -151,8 +187,12 @@ def report(path, rank):
 
 
 def main():
+    global DEFLATE
     path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/shdup1/ctr_base.log"
-    for rank in (int(x) for x in (sys.argv[2:] or ["1", "4"])):
+    ranks = sys.argv[2:] or ["1", "4"]
+    if ranks and ranks[-1].startswith("k="):
+        DEFLATE = float(ranks.pop()[2:])
+    for rank in (int(x) for x in ranks):
         report(path, rank)
 
 
@@ -278,3 +318,59 @@ if __name__ == "__main__":
 # populations says read the guard before dividing by it; this extends it to
 # STAGE STAMPS, where the count is per-worker and printed right there in the
 # BARSTAGEWS row.  Check it even when the neighbouring slots are full-count.
+
+# ============================================================================
+# RESULT, 2026-08-25.  REFRESHED AT 9.737 ms, and the estimator changed.
+# /tmp/item110_ws_r1.log, NP=4 devices 4-7, bs=1, seq 128, HEAD = fd19373.
+# Instrumented 13.102 / 13.018;  uninstrumented control 9.737 (prefill 9.711,
+# both normal).  All ms below are de-inflated by 113.7/157.34.
+# ============================================================================
+#
+#   FLOOR 4.588 ms | SKEW 8.714 ms | CRIT 8.232 ms | EXCESS 3.644 ms
+#
+# (0) THE CONTROL PASSED AGAIN.  W13 tiles = SPREAD (sd 0.07 in, 3.50 out).
+#
+# (1) THE FLOOR FRACTION IS INVARIANT.  4.588 of an 8.232 ms critical path is
+# 56%, against 54% at the 12.098-era operating point.  Two operating points
+# 2.4 ms apart, same shape: every lever landed on floor and on excess in
+# proportion.  The layer does not have a "scheduling problem" that grew or
+# shrank -- it has a fixed 56/44 split.
+#
+# (2) THE NEW COLUMN, AND IT INVERTS THE OLD RANKING.  SKEW is idle worker
+# time; EXCESS = CRIT - FLOOR is the part of it that is ON THE WALL.  They
+# disagree completely:
+#
+#     region                          SKEW ms   EXCESS ms
+#     per-XCD attention release        1.346      0.000
+#     routing-ready poll               1.200      0.007
+#     W13 -> W2 barrier                0.580      0.003
+#     qkv_a -> q_b barrier             0.479      0.005
+#     decode->merge bar + merge        1.230      0.193
+#
+# EVERY RELEASE HAS EXCESS ~= 0, and it is analytic, not luck: at a release all
+# workers leave together, so max_w(b) - max_w(a) collapses onto min_w(b - a)
+# and CRIT == FLOOR by construction.  This is the mechanism behind the four
+# independent negative results on barrier narrowing
+# (glm-barrier-narrowing-is-measured-out, glm-deleting-a-whole-rendezvous-is-
+# neutral, glm-all-thread-barrier-polling-is-a-negative, glm-per-xcd-barrier-
+# narrowing-is-zero-by-measurement).  The barrier class is closed by algebra.
+#
+# (3) ALL 3.644 ms OF EXCESS IS IN FIVE TILE PHASES:
+#
+#     MLA decode (S19->S21)     0.867   8 of 64 tiles live; 224 workers exit
+#                                       in ~1 us while 8 run 17 us.  Capped at
+#                                       0.598 by the ablation -- price by
+#                                       ablation, not by this estimator.
+#     router GEMV + TopK        0.575
+#     W13 tiles                 0.572   54 tiles/XCD over 29 workers = 2 rounds
+#     qkv_a tiles               0.425
+#     W2 tiles                  0.364   108 over 29 = 4 rounds
+#     ---------------------------------
+#     five phases               2.803   77% of all excess
+#
+# (4) WHAT 5 ms/TOKEN WOULD REQUIRE.  Layer span 8.232 ms + 1.10 ms of harness
+# outside the layer = the 9.34 ms this log accounts for.  Deleting ALL 3.644 ms
+# of excess -- perfect arrival balance everywhere, which no mechanism achieves
+# -- lands at 5.69 ms/token.  So 5 ms is not reachable by rebalancing alone
+# even in the limit; the floor has to move too.  But the excess is no longer
+# unattributed, and it is not in the class that has been measured out.
