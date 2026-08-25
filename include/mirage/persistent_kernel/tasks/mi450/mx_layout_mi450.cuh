@@ -195,6 +195,76 @@ __device__ __forceinline__ mx_i32x16_t
   return out;
 }
 
+// --- Global-address-space variants ------------------------------------------
+//
+// mx_load_operand_fp4() above takes a generic pointer, which is correct but
+// costs performance when the source really is global memory. Fleet passes
+// weights in as a `void const *` kernel argument, so the compiler cannot prove
+// the address space and emits FLAT_LOAD. Per MI400 guide S4.9.5:
+//
+//   "Flat instructions are simultaneously issued as a VMEM and LDS
+//    instruction. This means that both VMEM and LDS must be available before
+//    the instruction can be launched. [...] Global and Scratch instructions
+//    are generally faster because they do not require access to the LDS."
+//
+// Confirmed in the emitted ISA: the MoE K-loop had `flat_load_b128` for the
+// weight operand and `ds_load_b128` for the token operand -- the token side
+// was inferred correctly because it comes from __shared__, the weight side was
+// not. Casting to address_space(1) turns it into `global_load_b128`.
+//
+// ONLY call this with a pointer that is genuinely in global memory. The cast
+// is unchecked; handing it an LDS or scratch address is undefined behaviour,
+// not a slow path.
+using mx_global_u8 = __attribute__((address_space(1))) uint8_t const;
+
+__device__ __forceinline__ mx_global_u8 *mx_to_global(uint8_t const *p) {
+  return (mx_global_u8 *)p;
+}
+
+__device__ __forceinline__ mx_i32x16_t mx_load_operand_fp4_global(
+    mx_global_u8 *base, int row, int k0, int k_stride) {
+  using g_int2 = __attribute__((address_space(1))) int2 const;
+  mx_i32x16_t out;
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    out[i] = 0;
+  }
+  int lane = threadIdx.x & 31;
+#pragma unroll
+  for (int chunk = 0; chunk < 4; ++chunk) {
+    int k = k0 + mx_src_k_base(lane, chunk);
+    mx_global_u8 *src = base + (size_t)row * (k_stride / 2) + k / 2;
+    int2 v = *(g_int2 *)src;
+    out[chunk * 2 + 0] = v.x;
+    out[chunk * 2 + 1] = v.y;
+  }
+  return out;
+}
+
+// Prefetch the K-tile this lane will need `k_ahead` elements from now.
+//
+// GLOBAL_PREFETCH_B8, guide S4.9.6: one byte per lane, but it fetches the
+// entire containing cacheline and returns nothing to the wave. Scope 0 (WGP)
+// "pulls in at all cache levels on miss", which is what we want for weights
+// that are about to be consumed by this same wave.
+//
+// It does not touch LOADcnt, so it needs no wait and cannot be waited on --
+// it is a pure hint. A prefetch past the end of the weight buffer would still
+// issue a real address translation (the guide notes a UTC fault would be
+// reported to the host), so callers must bound-check `k0 + k_ahead`.
+__device__ __forceinline__ void
+    mx_prefetch_operand_fp4_global(mx_global_u8 *base, int row, int k0,
+                                   int k_stride) {
+  int lane = threadIdx.x & 31;
+  // Chunks 0 and 2 sit 32 B apart in the row; one 128 B cacheline covers the
+  // whole 32 B live record and then some, so a single prefetch per lane is
+  // enough for the tile.
+  int k = k0 + mx_src_k_base(lane, 0);
+  mx_global_u8 *src = base + (size_t)row * (k_stride / 2) + k / 2;
+  __builtin_amdgcn_global_prefetch(
+      (__attribute__((address_space(1))) void const *)src, 0);
+}
+
 // Build the per-lane scale operand from 4 consecutive E8M0 bytes.
 //
 // MUST be called with a lane-varying `scales` pointer so the result lands in a
@@ -205,9 +275,68 @@ __device__ __forceinline__ unsigned int mx_pack_scales(uint8_t const *scales) {
          ((unsigned int)scales[2] << 16) | ((unsigned int)scales[3] << 24);
 }
 
+// Global-address-space form of the above. The four byte loads get merged by
+// the backend into a single 32-bit load (verified: the MoE K-loop emits one
+// `global_load_b32` for the scale operand, not four `global_load_u8`), so this
+// is written as bytes for clarity without costing anything. Keeping it as
+// separate bytes also sidesteps an alignment assumption: the scale array is
+// indexed by `row * NUM_BLOCKS_32 + kt/32`, whose 4-byte alignment depends on
+// REDUCTION_SIZE and is not guaranteed for every shape.
+__device__ __forceinline__ unsigned int
+    mx_pack_scales_global(mx_global_u8 *scales) {
+  return (unsigned int)scales[0] | ((unsigned int)scales[1] << 8) |
+         ((unsigned int)scales[2] << 16) | ((unsigned int)scales[3] << 24);
+}
+
 // The scale_sel immediate. Always 0: it selects which lane-half supplies
 // scales, and the upper half is unused. See trap #2.
 constexpr int MX_SCALE_SEL = 0;
+
+// --- FP4 encode -------------------------------------------------------------
+//
+// gfx950 packs FP4 with v_cvt_scalef32_pk_fp4_f32, which gfx1250 does not
+// have (it has the pk8 *decode*, v_cvt_scale_pk8_bf16_fp4, but no matching
+// scaled encode). So the encode is done explicitly.
+//
+// E2M1 codes and magnitudes: 0, 0.5, 1, 1.5, 2, 3, 4, 6; sign in bit 3.
+//
+// Rounding is round-half-to-even on the *code*, which for this format is the
+// same thing as even-mantissa. The seven midpoints and where each one lands:
+//
+//     0.25 -> 0    0.75 -> 2    1.25 -> 2    1.75 -> 4
+//     2.5  -> 4    3.5  -> 6    5.0  -> 6
+//
+// so each code's interval is closed on the side facing an even code and open
+// on the side facing an odd one. Codes 0, 2, 4, 6 therefore own both of their
+// adjacent midpoints and codes 1, 3, 5 own neither.
+//
+// E2M1 has no infinity, so magnitudes above 6.0 saturate rather than
+// overflow. Callers scale by the block's E8M0 reciprocal first, which is what
+// keeps values in range.
+__device__ __forceinline__ uint8_t mx_encode_e2m1(float v) {
+  uint8_t sign = __builtin_signbitf(v) ? 0x8 : 0x0;
+  float a = fabsf(v);
+
+  uint8_t mag;
+  if (a <= 0.25f) {
+    mag = 0; // 0.0
+  } else if (a < 0.75f) {
+    mag = 1; // 0.5
+  } else if (a <= 1.25f) {
+    mag = 2; // 1.0
+  } else if (a < 1.75f) {
+    mag = 3; // 1.5
+  } else if (a <= 2.5f) {
+    mag = 4; // 2.0
+  } else if (a < 3.5f) {
+    mag = 5; // 3.0
+  } else if (a <= 5.0f) {
+    mag = 6; // 4.0
+  } else {
+    mag = 7; // 6.0, saturating
+  }
+  return (uint8_t)(sign | mag);
+}
 
 #endif // MIRAGE_ARCH_GFX1250
 

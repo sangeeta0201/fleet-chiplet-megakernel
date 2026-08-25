@@ -142,6 +142,56 @@ __device__ __forceinline__ unsigned long long realtime_ticks() {
 }
 
 // ---------------------------------------------------------------------------
+// XCD / XCC identity
+// ---------------------------------------------------------------------------
+//
+// Fleet's gang dispatch spreads MoE tiles across XCDs round-robin and needs
+// each workgroup to know which die it landed on. On gfx950 that is
+//
+//     s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)
+//
+// which gfx1250 rejects outright: "invalid hardware register: not supported
+// on this GPU". The replacement is a sendmsg, per MI400 guide Table 28:
+// RTN_GET_SE_HW_ID (0x87) returns SE_ID in bits [3:0] and Virtual_XCC_ID in
+// bits [19:16]. LLVM spells the message MSG_RTN_GET_SE_AID_ID.
+//
+// TWO CAVEATS, both real:
+//
+// 1. NOT VALIDATED. FFM-Lite fails to decode s_sendmsg_rtn_b32 with this
+//    message ("Failed to decode instruction"), so the model cannot execute
+//    it. The encoding is what the gfx1250 assembler produces and the field
+//    layout is from the guide, but neither has been run. Verify on silicon
+//    before trusting the tile distribution.
+//
+// 2. IT IS EXPENSIVE. The guide warns S_SENDMSG_RTN "has very limited
+//    bandwidth and should not be issued by every wave" -- if every wave on a
+//    shader engine uses it, throughput falls to once per 20,000 cycles per
+//    wave. gfx950's s_getreg was nearly free, so call sites that read the XCD
+//    ID per wave need to hoist it: read once per workgroup into LDS, or fold
+//    it into the task descriptor host-side.
+//
+// Define MIRAGE_XCD_ID_FALLBACK=1 to substitute 0, which is what lets the MoE
+// kernels run under FFM. FFM executes workgroups serially on a single modeled
+// die, so a constant 0 changes nothing it can observe -- but it does mean any
+// FFM run has NOT exercised the cross-XCD distribution.
+__device__ __forceinline__ int xcd_id() {
+#if defined(MIRAGE_ARCH_GFX1250)
+#if defined(MIRAGE_XCD_ID_FALLBACK)
+  return 0;
+#else
+  // MSG_RTN_GET_SE_HW_ID: data[3:0]=SE_ID, data[19:16]=Virtual_XCC_ID
+  return (int)((__builtin_amdgcn_s_sendmsg_rtn(0x87) >> 16) & 0xF);
+#endif
+#elif defined(__HIP_DEVICE_COMPILE__)
+  int id;
+  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)" : "=s"(id));
+  return id;
+#else
+  return 0;
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // Cross-lane reduction
 // ---------------------------------------------------------------------------
 //
