@@ -424,6 +424,18 @@ __device__ __forceinline__ f32x4_t _gang_mfma_w_x_f8(
 #define MPK_MOE_WGLOBAL 1
 #endif
 
+// Load the GROUPS-wide E8M0 scale batch off ONE base pointer with compile-time
+// immediate offsets. See load_ws_batch's header in _gang_moe_kloop_deep for
+// the sixteen-VGPR-for-four-bytes reading that motivates it.
+//
+// Measured -0.123 ms at NP=4 bs=1 on top of MPK_MOE_WGLOBAL=1: arm n=5 mean
+// 9.718 (9.735 9.704 9.733 9.695 9.725) against control n=6 mean 9.841
+// (min 9.790).  Arm max 9.735 < control min 9.790, so the ranges do not
+// overlap.  Default ON; =0 is the ablation.
+#ifndef MPK_MOE_SCBASE
+#define MPK_MOE_SCBASE 1
+#endif
+
 
 // The k-loop, with the prefetch distance as a parameter. Accumulates
 // [0, KI_END) and returns the MFMA accumulator; the caller owns the epilogue.
@@ -489,6 +501,46 @@ __device__ __forceinline__ f32x4_t
       return (int)wg_scales[off];
     }
   };
+  // Batched form of load_ws: ONE address register plus compile-time immediate
+  // offsets for the whole GROUPS-wide batch, instead of GROUPS independent
+  // 64-bit address chains.
+  //
+  // Read off the W2 body [0x4243c..0x425b8] of the shipping WGLOBAL=1 image:
+  // the four scale bytes cost SIXTEEN VGPRs -- four 64-bit running offsets
+  // (v[2:3] v[4:5] v[12:13] v[14:15], each bumped by s[0:1] at the backedge)
+  // and four 64-bit addresses derived from them (v[52:53] v[54:55]
+  // v[100:101] v[102:103]).  The weight side of the same loop already folds
+  // to one address with offset:1024/2048/3072, so the four scale chains are
+  // pure allocator waste; the compiler cannot fold them itself because
+  // `row_scale_base + kk * SC_KS + g` is a signed 32-bit add whose sext does
+  // not distribute (the classic sext-of-add strength-reduction blocker).
+  //
+  // Why it should matter beyond the register count: W2's trip opens with a
+  // FULL `s_waitcnt vmcnt(0)`, which is the `minvm 0` the census reports.
+  // Its cause is a WAR, not a true dependence -- the allocator picked
+  // v[36:39] as the destination of the fourth weight load while v[38:39] is
+  // that load's own address register, so the next trip's
+  // `v_lshl_add_u64 v[38:39], ...` cannot issue until load #8 has landed.
+  // Handing the allocator back twelve VGPRs is the source-level way to make
+  // that collision unnecessary.  Register-REDUCING, hence not the same bet as
+  // MPK_MOE_PF_DBUF, which lost on a +26 VGPR bill.
+  auto load_ws_batch = [&](int kbase, int *out) {
+    if constexpr (MPK_MOE_SCBASE) {
+      uint8_t const *p = wg_scales + (row_scale_base + kbase * SC_KS + g);
+#pragma unroll
+      for (int j = 0; j < GROUPS; j++) {
+        // j is a compile-time constant after the unroll, so j * SC_KS is an
+        // immediate byte offset off the single pointer p.
+        out[j] = MPK_MOE_WGLOBAL ? (int)_gang_ld_g<uint8_t>(p + j * SC_KS)
+                                 : (int)p[j * SC_KS];
+      }
+    } else {
+#pragma unroll
+      for (int j = 0; j < GROUPS; j++) {
+        out[j] = load_ws(kbase + j);
+      }
+    }
+  };
   // Consume GROUPS k-tiles. Under MPK_MOE_WGLOBAL the whole batch of LDS
   // reads is issued BEFORE the first MFMA, so SIInsertWaitcnts needs one
   // lgkmcnt(0) for the batch instead of one per MFMA. That is the half of the
@@ -520,10 +572,10 @@ __device__ __forceinline__ f32x4_t
 
   i32x8_t A[GROUPS];
   int S[GROUPS];
+  load_ws_batch(0, S);
 #pragma unroll
   for (int j = 0; j < GROUPS; j++) {
     A[j] = load_w(j);
-    S[j] = load_ws(j);
   }
 
 // IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation. Same reason as the
@@ -535,11 +587,10 @@ __device__ __forceinline__ f32x4_t
     int NS[GROUPS];
     // Issue the whole NEXT block before consuming the current one, so GROUPS
     // loads are outstanding across GROUPS MFMAs instead of ~1 across 3.
+    load_ws_batch(base + GROUPS, NS);
 #pragma unroll
     for (int j = 0; j < GROUPS; j++) {
-      int kk = base + GROUPS + j;
-      N[j] = load_w(kk);
-      NS[j] = load_ws(kk);
+      N[j] = load_w(base + GROUPS + j);
     }
     consume(base, A, S);
 #pragma unroll

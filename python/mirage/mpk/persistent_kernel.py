@@ -1022,6 +1022,16 @@ def get_compile_command(
             assert _wg in ("0", "1"), "MPK_MOE_WGLOBAL is 0 or 1"
             flags = flags + [f"-DMPK_MOE_WGLOBAL={_wg}"]
 
+        _scb = os.environ.get("MPK_MOE_SCBASE")
+        if _scb is not None:
+            # Load the GROUPS-wide E8M0 scale batch off ONE base pointer with
+            # immediate offsets instead of GROUPS independent 64-bit address
+            # chains. Register-reducing; see load_ws_batch's header in
+            # gang_moe_linear_mxfp8_mi300.cuh.
+            # Compile-time, so every rank must agree.
+            assert _scb in ("0", "1"), "MPK_MOE_SCBASE is 0 or 1"
+            flags = flags + [f"-DMPK_MOE_SCBASE={_scb}"]
+
         _pfd = os.environ.get("MPK_MOE_PF_DBUF")
         if _pfd is not None:
             # Double-buffered form of the same k-loop. The deep loop's
