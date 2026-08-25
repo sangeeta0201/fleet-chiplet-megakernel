@@ -1331,6 +1331,32 @@ __device__ __host__ constexpr int _rnlm8_pf_groups(int ki, int req) {
 // Prefetch depth for the attention-half GEMM's k-loop. 0 restores the rotating
 // depth-4 loop above, which is what every number before this knob was measured
 // against.
+//
+// SWEPT BOTH WAYS AT NP=4, 2026-08-25. Four was inherited from the MoE twin's
+// MPK_MOE_PF_GROUPS when this loop was written and had no measurement of its
+// own, which is the constants-set-elsewhere bug class that has paid three
+// times on this branch (o_proj -0.148, workers 232->240 -0.108, both K-major
+// scale levels). It is not one of them: 4 is a real optimum.
+//
+// _rnlm8_pf_groups takes the largest divisor of the trip count that is <= the
+// request, and qkv_a's K-parallel branch walks ITERS_PER_WAVE = 48/4 = 12, so
+// the request maps 2->2, 4->4, 8->6.
+//
+//   request  depth   per-iter min                  clean avg
+//   2        2       10.523  n=2, 10.517..10.529   10.673  n=2   +0.243
+//   4        4       10.280  n=5, 10.248..10.335   10.431  n=4   (shipping)
+//   8        6       10.411  n=4, 10.383..10.436   10.543  n=2   +0.131
+//
+// Concave, with neither neighbour's range touching 4's, and both statistics
+// agreeing at both ends. Shallower exposes load latency in a loop already
+// measured at 68% vmcnt; deeper costs 2 * GROUPS * 8 VGPRs for A[] and N[]
+// together, and at depth 6 that is 96 registers of live prefetch against 64,
+// which buys back less than the occupancy it spends. AGPRs being spill slack
+// (memory: glm-agpr-is-spill-slack-lds-half-is-free) makes depth 6 legal, not
+// free.
+//
+// Depth 12 (request 16) is untested and not worth testing: it puts 192 VGPRs
+// of A[]+N[] live, and the trend from 6 already points the wrong way.
 #ifndef MPK_ATTN_PF_GROUPS
 #define MPK_ATTN_PF_GROUPS 4
 #endif
