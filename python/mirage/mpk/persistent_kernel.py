@@ -922,6 +922,20 @@ def get_compile_command(
                 "MPK_MOE_PF_GROUPS is 0, 2, 4, 8 or 16"
             flags = flags + [f"-DMPK_MOE_PF_GROUPS={_pf}"]
 
+        _pfd = os.environ.get("MPK_MOE_PF_DBUF")
+        if _pfd is not None:
+            # Double-buffered form of the same k-loop. The deep loop's
+            # `A[j] = N[j]` backedge copy is a USE of every load destination,
+            # so the shipped ISA drains to vmcnt(0) twice per trip and the
+            # outstanding count returns to zero every k-block -- the unroll=1
+            # point (3446 GB/s) on the curve in
+            # tests/standalone/test_waves_per_simd_payoff.hip. 1 swaps two
+            # buffers instead of copying. Needs an even NBLK >= 4, which both
+            # GLM-5 MoE shapes have at GROUPS=4; anything else silently keeps
+            # the copying form. Compile-time, so every rank must agree.
+            assert _pfd in ("0", "1"), "MPK_MOE_PF_DBUF is 0 or 1"
+            flags = flags + [f"-DMPK_MOE_PF_DBUF={_pfd}"]
+
         _km = os.environ.get("MPK_MOE_KMAJOR")
         if _km is not None:
             # Permutes the data half (1) and optionally the E8M0 scales (2) of
@@ -957,6 +971,18 @@ def get_compile_command(
             assert _apf in ("0", "2", "4", "8", "16"), \
                 "MPK_ATTN_PF_GROUPS is 0, 2, 4, 8 or 16"
             flags = flags + [f"-DMPK_ATTN_PF_GROUPS={_apf}"]
+
+        _apfd = os.environ.get("MPK_ATTN_PF_DBUF")
+        if _apfd is not None:
+            # The attention-half twin of MPK_MOE_PF_DBUF: swap two register
+            # buffers at the backedge instead of copying one into the other,
+            # which is what forces the s_waitcnt vmcnt(0) the deep loop was
+            # written to avoid. Applies only where the block count is even and
+            # >= 4 -- the N-parallel sites (MFMA_ITERS 48 and 16); the
+            # K-parallel qkv_a site walks 3 blocks and keeps the copying form.
+            # Compile-time, so every rank must agree.
+            assert _apfd in ("0", "1"), "MPK_ATTN_PF_DBUF is 0 or 1"
+            flags = flags + [f"-DMPK_ATTN_PF_DBUF={_apfd}"]
 
         _kvf = os.environ.get("MPK_KVUPD_FAST")
         if _kvf is not None:

@@ -459,6 +459,153 @@ __device__ __forceinline__ f32x4_t
   return acc;
 }
 
+// ── DOUBLE-BUFFERED DEEP LOOP ──────────────────────────────────────────────
+//
+// WHAT IS WRONG WITH THE LOOP ABOVE, read off the shipped gfx950 code object
+// (demo/glm5/isa_loads_in_flight.py over the W13 body at 0x3e614..0x3e7a8):
+//
+//   s_waitcnt vmcnt(0)                     <- top of trip, FULL DRAIN
+//   12 x v_mov / v_mov_b64                 <- the A[j]=N[j] copy, materialised
+//   flat_load_dwordx4  x4                  \  the 8 loads of the next block
+//   flat_load_ubyte    x4                  /
+//   4 x v_mfma_scale_f32_16x16x128_f8f6f4
+//   s_waitcnt vmcnt(0)                     <- bottom of trip, FULL DRAIN AGAIN
+//   v_mov_b32 v12, v87                     <- the reason for it: one scale byte
+//   s_cbranch_scc1 <top>
+//
+// So the header's claim above -- "the wait in front of the MFMAs can be a
+// partial vmcnt and GROUPS loads really do stay in flight across GROUPS MFMAs"
+// -- is not what the compiler emitted. TWO vmcnt(0) per trip. The outstanding
+// count returns to zero every k-block, which is the unroll=1 point on the
+// curve tests/standalone/test_waves_per_simd_payoff.hip measured on this part:
+//
+//   loads in flight   1 -> 3446 GB/s      4 -> 5334      8 -> 5446
+//
+// The cause is `A[j] = N[j]; S[j] = NS[j];`. N[] are load destinations, so a
+// copy out of them at the backedge is a use, and every outstanding load must
+// land before the branch. SIInsertWaitcnts has no cheaper way to express it.
+//
+// THE FIX is to stop copying: unroll the block loop by two and swap the roles
+// of the two buffers instead, so a value stays in the register its load wrote.
+// Same registers live (A[] and N[] are both live in the loop above already),
+// same loads, same MFMAs, same order of issue-then-consume. The only change is
+// that the wait in front of the MFMAs can now name the eight just-issued loads
+// and let them ride across the branch.
+//
+// Requires NBLK even and >= 4, which the two GLM-5 MoE shapes both satisfy at
+// GROUPS=4: W13 KI_END=48 -> NBLK=12, W2 KI_END=16 -> NBLK=4. Anything else
+// falls back to the copying form above rather than growing a remainder path --
+// a remainder is a branch, a branch is a basic block, and the header's note on
+// the guarded first draft records that a prefetch in its own basic block gets
+// drained by the wait and is not a prefetch.
+template <bool WEIGHT_FP4, bool TOK_SC_FP8, int GROUPS, int KI_END>
+__device__ __forceinline__ f32x4_t
+    _gang_moe_kloop_dbuf(uint8_t const *w_data_row,
+                         uint8_t const *wg_scales,
+                         int row_scale_base,
+                         uint8_t const *s_tok_fp8,
+                         uint8_t const *s_tok_scales,
+                         int g) {
+  constexpr int K_PER_MFMA = 128;
+  constexpr int NBLK = KI_END / GROUPS;
+  static_assert(KI_END % GROUPS == 0, "GROUPS must divide the trip count");
+  static_assert(NBLK >= 4 && NBLK % 2 == 0, "dbuf needs an even NBLK >= 4");
+  constexpr int W_KS = _gang_moe_w_kstride<WEIGHT_FP4>();
+  constexpr int SC_KS = _gang_moe_sc_kstride();
+  auto tok_sc_at = [&](int k) -> int {
+    return TOK_SC_FP8 ? (int)s_tok_scales[k * 4 + g] : (int)s_tok_scales[k];
+  };
+
+  f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
+  i32x8_t A[GROUPS], N[GROUPS];
+  int S[GROUPS], NS[GROUPS];
+
+  // Issue block `b` into the given buffer. Taken by reference so the arrays
+  // keep their identity -- passing them by value would reintroduce the copy
+  // this whole variant exists to delete.
+  auto issue = [&](i32x8_t (&dst)[GROUPS], int (&dsc)[GROUPS], int b) {
+#pragma unroll
+    for (int j = 0; j < GROUPS; j++) {
+      int const kk = b * GROUPS + j;
+      dst[j] = _gang_load_w_mfma_a_at<WEIGHT_FP4>(w_data_row, kk * W_KS, g);
+      dsc[j] = (int)wg_scales[row_scale_base + kk * SC_KS + g];
+    }
+  };
+  auto consume = [&](i32x8_t const (&src)[GROUPS], int const (&ssc)[GROUPS],
+                     int b) {
+#pragma unroll
+    for (int j = 0; j < GROUPS; j++) {
+      int const kk = b * GROUPS + j;
+      i32x8_t bb = _gang_load_fp8_mfma_b(s_tok_fp8, kk * K_PER_MFMA, g);
+      acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(src[j], bb, acc, ssc[j],
+                                          tok_sc_at(kk));
+    }
+  };
+
+  issue(A, S, 0);
+
+// IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation. Same reason as the
+// two loops above; the GROUPS-wide bodies inside are fully unrolled.
+#pragma unroll 1
+  for (int blk = 0; blk <= NBLK - 4; blk += 2) {
+    issue(N, NS, blk + 1);
+    consume(A, S, blk);
+    issue(A, S, blk + 2);
+    consume(N, NS, blk + 1);
+  }
+
+  // Tail: blocks NBLK-2 (already in A) and NBLK-1, issuing nothing past the
+  // end of the row.
+  issue(N, NS, NBLK - 1);
+  consume(A, S, NBLK - 2);
+  consume(N, NS, NBLK - 1);
+  return acc;
+}
+
+// MPK_MOE_PF_DBUF: select the double-buffered form above over the copying one.
+//
+// MEASURED AND OFF: it does everything to the ISA it was supposed to do and it
+// is 0.226 ms SLOWER, because it costs 26 unified VGPRs of the WHOLE
+// megakernel's allocation.
+//
+// NP=4, devices 4-7, bs=1, one batch, arm first then control, n=5 each,
+// per-iteration min (the stall-immune statistic on this box):
+//
+//   MPK_MOE_PF_DBUF=1   mean 10.492  min 10.428  max 10.528
+//   MPK_MOE_PF_DBUF=0   mean 10.266  min 10.175  max 10.309   (shipping)
+//
+// The two populations do not overlap. The ISA change is exactly as designed --
+// W13's steady-state body went from 60 instructions / 8 loads / 12 v_mov /
+// TWO s_waitcnt vmcnt(0) per k-block, to 99 instructions / 16 loads / ZERO
+// v_mov / ONE vmcnt(0) per TWO k-blocks. Drain frequency per MFMA fell 4x and
+// every register copy is gone.
+//
+// What it cost, from the code object's own metadata (vgpr_spill_count is 0 in
+// both, so this is allocation, not spilling):
+//
+//                     worker_kernel .vgpr_count   .agpr_count
+//   DBUF=0                          284           36
+//   DBUF=1                          310           58
+//
+// worker_kernel and persistent_kernel share one allocation for every tile
+// kernel in the binary, so 26 VGPRs bought here are 26 VGPRs charged to the
+// whole decode. That is the same lock the occupancy work hit from the other
+// side (memory: glm-occupancy-lock-is-lds-not-registers,
+// glm-agpr-is-spill-slack-lds-half-is-free), and it is why the copying form
+// wins despite the worse schedule: keeping A[] and N[] live across EIGHT
+// MFMAs instead of four extends both live ranges past what the allocator can
+// absorb.
+//
+// THE GENERAL RESULT, which is the useful part: on this kernel, prefetch
+// restructuring is register-bound, not schedule-bound. Any variant that widens
+// the steady-state body pays a binary-wide VGPR bill first. It also retires the
+// open question in memory glm-occupancy-ladder-is-dead-unroll-instead -- the
+// MoE k-loop is NOT at the unroll=1 / 3.45 TB/s point; it holds four loads in
+// flight, and buying eight costs more than it returns.
+#ifndef MPK_MOE_PF_DBUF
+#define MPK_MOE_PF_DBUF 0
+#endif
+
 // The shipping k-loop, hoisted verbatim out of the two call sites so the
 // prefetch depth can be selected with `if constexpr` instead of `#if`. Declares
 // a0..a3 and reloads each one right after the MFMA that consumes it; see the
@@ -564,7 +711,11 @@ __device__ __forceinline__ f32x4_t
                     uint8_t const *s_tok_scales,
                     int g) {
   constexpr int GR = _gang_moe_pf_groups(KI_END, GROUPS_REQ);
-  if constexpr (GR >= 2) {
+  constexpr int NB = GR >= 2 ? KI_END / GR : 0;
+  if constexpr (MPK_MOE_PF_DBUF && GR >= 2 && NB >= 4 && NB % 2 == 0) {
+    return _gang_moe_kloop_dbuf<WEIGHT_FP4, TOK_SC_FP8, GR, KI_END>(
+        w_data_row, wg_scales, row_scale_base, s_tok_fp8, s_tok_scales, g);
+  } else if constexpr (GR >= 2) {
     return _gang_moe_kloop_deep<WEIGHT_FP4, TOK_SC_FP8, GR, KI_END>(
         w_data_row, wg_scales, row_scale_base, s_tok_fp8, s_tok_scales, g);
   } else {

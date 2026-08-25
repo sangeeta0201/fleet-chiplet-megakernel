@@ -125,13 +125,17 @@ MPK_FORWARD_VARS=(
   # k-groups in flight is the measured knee. Compile-time, so a mismatch
   # between ranks is a different binary and the barriers deadlock.
   MPK_MOE_PF_GROUPS
+  # Double-buffered form of that same k-loop: swap two register buffers instead
+  # of copying one into the other at the backedge, which is what forces the two
+  # s_waitcnt vmcnt(0) per trip in the shipped ISA. Compile-time.
+  MPK_MOE_PF_DBUF
   # K-major MoE weight layout. Both a -D and a change to how demo.py PACKS the
   # weight, so a rank that misses it reads a permuted buffer as if it were
   # row-major and produces silent garbage -- forward it or leave it unset.
   MPK_MOE_KMAJOR
   MPK_DENSE_KMAJOR
   # The same knob for the attention-half GEMM's k-loop. Compile-time.
-  MPK_ATTN_PF_GROUPS
+  MPK_ATTN_PF_GROUPS MPK_ATTN_PF_DBUF
   # latent_to_cache's flattened index chase. Compile-time.
   MPK_KVUPD_FAST
   # Scratch backing store. Raising occupancy to 2 waves/SIMD doubles what ROCr

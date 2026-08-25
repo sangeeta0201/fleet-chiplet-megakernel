@@ -1314,6 +1314,148 @@ __device__ __forceinline__ f32x4_t
   return acc;
 }
 
+// ── DOUBLE-BUFFERED FORM OF THE LOOP ABOVE ─────────────────────────────────
+//
+// Same defect, same fix, as the MoE twin (gang_moe_linear_mxfp8_mi300.cuh,
+// _gang_moe_kloop_dbuf, which carries the full ISA dump). `A[j] = N[j]` at the
+// backedge is a USE of every load destination, so SIInsertWaitcnts puts an
+// s_waitcnt vmcnt(0) in front of it -- a full drain -- and the outstanding
+// load count returns to zero every k-block. That is the unroll=1 point on the
+// curve tests/standalone/test_waves_per_simd_payoff.hip measured on this part
+// (3446 GB/s at 1 in flight, 5334 at 4), and it is exactly what the deep loop
+// was written to avoid. Swapping two buffers instead of copying one into the
+// other keeps every value in the register its load wrote, so the wait in front
+// of the MFMAs can name the just-issued loads and let them ride the branch.
+//
+// SEEDED is supported: the hoisted prefill fills the A buffer, and the first
+// thing the loop does is issue into N, which is what the unseeded path does
+// too.
+//
+// Needs an even NBLK >= 4. GLM-5's N-parallel sites give NBLK = MFMA_ITERS/4 =
+// 12 (K=6144) and 4 (K=2048), both fine. The K-parallel qkv_a site walks
+// ITERS_PER_WAVE = 48/4 = 12 with GROUPS=4, i.e. NBLK=3, and keeps the copying
+// form -- an odd trip count needs a peel, a peel is a branch, and the MoE
+// header records that a prefetch in its own basic block gets drained by the
+// wait and is not a prefetch.
+template <int GROUPS,
+          int KI_LEN,
+          bool SEEDED,
+          int W_KMUL,
+          int W_HIOFF,
+          int SC_KMUL>
+__device__ __forceinline__ f32x4_t
+    _rnlm8_kloop_dbuf(uint8_t const *w_data_row,
+                      uint8_t const *w_scale_row,
+                      uint8_t const *s_tok_fp8,
+                      uint8_t const *s_tok_scales,
+                      int ki_start,
+                      int g,
+                      i32x8_t const *seed_a,
+                      int const *seed_sa) {
+  constexpr int K_PER_MFMA = 128;
+  static_assert(KI_LEN % GROUPS == 0,
+                "the deep k-loop needs GROUPS to divide the trip count");
+  static_assert(!SEEDED || GROUPS == 4,
+                "the hoisted prefill issues exactly four A tiles");
+  constexpr int NBLK = KI_LEN / GROUPS;
+  static_assert(NBLK >= 4 && NBLK % 2 == 0, "dbuf needs an even NBLK >= 4");
+
+  f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
+  i32x8_t A[GROUPS], N[GROUPS];
+  int S[GROUPS], NS[GROUPS];
+
+  // By reference: passing the arrays by value would reintroduce the copy this
+  // variant exists to delete.
+  auto issue = [&](i32x8_t (&dst)[GROUPS], int (&dsc)[GROUPS], int b) {
+#pragma unroll
+    for (int j = 0; j < GROUPS; j++) {
+      int const kk = ki_start + b * GROUPS + j;
+      dst[j] = _rnlm8_load_w<W_KMUL, W_HIOFF>(w_data_row, kk * K_PER_MFMA, g);
+      dsc[j] = _rnlm8_load_sc<SC_KMUL>(w_scale_row, kk * 4, g);
+    }
+  };
+  auto consume = [&](i32x8_t const (&src)[GROUPS], int const (&ssc)[GROUPS],
+                     int b) {
+#pragma unroll
+    for (int j = 0; j < GROUPS; j++) {
+      int const kk = ki_start + b * GROUPS + j;
+      i32x8_t bb = _gang_load_fp8_mfma_b(s_tok_fp8, kk * K_PER_MFMA, g);
+      acc = _gang_mfma_f8xf8(src[j], bb, acc, ssc[j], (int)s_tok_scales[kk]);
+    }
+  };
+
+  if constexpr (SEEDED) {
+#pragma unroll
+    for (int j = 0; j < GROUPS; j++) {
+      A[j] = seed_a[j];
+      S[j] = seed_sa[j];
+    }
+  } else {
+    issue(A, S, 0);
+  }
+
+// IMPORTANT: #pragma unroll 1 for the same reason as the loop above -- it is
+// what keeps LLVM from sinking the MFMA chain into the `col == 0` epilogue
+// block, where it would run under a 1-in-16 EXEC mask.
+#pragma unroll 1
+  for (int blk = 0; blk <= NBLK - 4; blk += 2) {
+    issue(N, NS, blk + 1);
+    consume(A, S, blk);
+    issue(A, S, blk + 2);
+    consume(N, NS, blk + 1);
+  }
+
+  issue(N, NS, NBLK - 1);
+  consume(A, S, NBLK - 2);
+  consume(N, NS, NBLK - 1);
+  // Pin the accumulator: same EXEC-mask sinking hazard as the loop above.
+  asm volatile("" : "+v"(acc));
+  return acc;
+}
+
+// MPK_ATTN_PF_DBUF: select the double-buffered form.
+//
+// OFF, AND NOT WORTH MEASURING ON ITS OWN. The MoE twin was measured at NP=4
+// and is 0.226 ms SLOWER (10.492 vs 10.266 per-iter min, n=5 each, populations
+// disjoint) for a reason that is not specific to the MoE: it raised
+// worker_kernel's .vgpr_count from 284 to 310 with zero spills, and that
+// allocation is shared by every tile kernel in the binary. Widening the steady
+// state here extends the same two live ranges by the same four MFMAs and bills
+// the same shared budget. Kept compiling so the arm is one -D away if the
+// register lock ever moves.
+#ifndef MPK_ATTN_PF_DBUF
+#define MPK_ATTN_PF_DBUF 0
+#endif
+
+// Depth dispatch for the two forms above. Falls back to the copying loop
+// whenever the trip count is not an even number of blocks.
+template <int GROUPS,
+          int KI_LEN,
+          bool SEEDED,
+          int W_KMUL,
+          int W_HIOFF,
+          int SC_KMUL>
+__device__ __forceinline__ f32x4_t
+    _rnlm8_kloop_pick(uint8_t const *w_data_row,
+                      uint8_t const *w_scale_row,
+                      uint8_t const *s_tok_fp8,
+                      uint8_t const *s_tok_scales,
+                      int ki_start,
+                      int g,
+                      i32x8_t const *seed_a,
+                      int const *seed_sa) {
+  constexpr int NB = KI_LEN / GROUPS;
+  if constexpr (MPK_ATTN_PF_DBUF && NB >= 4 && NB % 2 == 0) {
+    return _rnlm8_kloop_dbuf<GROUPS, KI_LEN, SEEDED, W_KMUL, W_HIOFF, SC_KMUL>(
+        w_data_row, w_scale_row, s_tok_fp8, s_tok_scales, ki_start, g, seed_a,
+        seed_sa);
+  } else {
+    return _rnlm8_kloop_deep<GROUPS, KI_LEN, SEEDED, W_KMUL, W_HIOFF, SC_KMUL>(
+        w_data_row, w_scale_row, s_tok_fp8, s_tok_scales, ki_start, g, seed_a,
+        seed_sa);
+  }
+}
+
 // Largest divisor of `ki` that is <= `req` and >= 2, or 0 if there is none.
 // GLM-5's attention stages give MFMA_ITERS of 48 (qkv_a), 16 (q_b) and 4
 // (W_UK/W_UV); the K-parallel branch divides those by NUM_WAVES=4 first. Every
@@ -2016,7 +2158,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
         // compiles to. HOIST_PREFILL implies TILES_PER_WAVE == 1 here
         // (OUTPUT_PER_WG >= 64 on this branch), so ph_a is this tile's fill.
         constexpr int GR = _rnlm8_pf_groups(MFMA_ITERS, MPK_ATTN_PF_GROUPS);
-        acc = _rnlm8_kloop_deep<GR, MFMA_ITERS, HOIST_PREFILL && GR == 4,
+        acc = _rnlm8_kloop_pick<GR, MFMA_ITERS, HOIST_PREFILL && GR == 4,
                                       W_KMUL, W_HIOFF, SC_KMUL>(
             w_data_row, w_scale_row, s_tok_fp8, s_tok_scales,
             /*ki_start=*/0, g, ph_a, ph_sa);
@@ -2161,7 +2303,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     // so it seeds the first block directly.
     constexpr int KGR = _rnlm8_pf_groups(ITERS_PER_WAVE, MPK_ATTN_PF_GROUPS);
     if constexpr (KGR >= 2) {
-      acc = _rnlm8_kloop_deep<KGR, ITERS_PER_WAVE, HOIST_PREFILL && KGR == 4,
+      acc = _rnlm8_kloop_pick<KGR, ITERS_PER_WAVE, HOIST_PREFILL && KGR == 4,
                                   W_KMUL, W_HIOFF, SC_KMUL>(
           w_data_row, w_scale_row, s_tok_fp8, s_tok_scales,
           ki_start, g, ph_a, ph_sa);
