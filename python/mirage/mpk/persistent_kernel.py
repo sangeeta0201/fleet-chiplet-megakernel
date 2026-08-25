@@ -1063,11 +1063,11 @@ def get_compile_command(
             # The attention-half twin of MPK_MOE_PF_DBUF: swap two register
             # buffers at the backedge instead of copying one into the other,
             # which is what forces the s_waitcnt vmcnt(0) the deep loop was
-            # written to avoid. Applies only where the block count is even and
-            # >= 4 -- the N-parallel sites (MFMA_ITERS 48 and 16); the
-            # K-parallel qkv_a site walks 3 blocks and keeps the copying form.
-            # Compile-time, so every rank must agree.
-            assert _apfd in ("0", "1"), "MPK_ATTN_PF_DBUF is 0 or 1"
+            # written to avoid. 0 = copying everywhere, 1 = dbuf everywhere,
+            # 2 = dbuf only where the block count is odd, which at GLM-5's
+            # shapes is exactly the K-parallel qkv_a site (NBLK=3) and nothing
+            # else. Compile-time, so every rank must agree.
+            assert _apfd in ("0", "1", "2"), "MPK_ATTN_PF_DBUF is 0, 1 or 2"
             flags = flags + [f"-DMPK_ATTN_PF_DBUF={_apfd}"]
 
         _kvf = os.environ.get("MPK_KVUPD_FAST")

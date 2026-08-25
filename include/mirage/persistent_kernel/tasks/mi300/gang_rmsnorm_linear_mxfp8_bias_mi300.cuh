@@ -1397,12 +1397,31 @@ __device__ __forceinline__ f32x4_t
 // thing the loop does is issue into N, which is what the unseeded path does
 // too.
 //
-// Needs an even NBLK >= 4. GLM-5's N-parallel sites give NBLK = MFMA_ITERS/4 =
-// 12 (K=6144) and 4 (K=2048), both fine. The K-parallel qkv_a site walks
-// ITERS_PER_WAVE = 48/4 = 12 with GROUPS=4, i.e. NBLK=3, and keeps the copying
-// form -- an odd trip count needs a peel, a peel is a branch, and the MoE
-// header records that a prefetch in its own basic block gets drained by the
-// wait and is not a prefetch.
+// ANY NBLK >= 1, including odd. The earlier form required an even NBLK >= 4
+// and so excluded the one site that needs it most: the K-parallel qkv_a branch
+// walks ITERS_PER_WAVE = 48/4 = 12 with GROUPS=4, i.e. NBLK=3, and fell back to
+// the copying loop. Counted on the built image, that loop
+// ([0x2f600..0x2f834], the hottest tile in the model) carries ~40
+// `v_mov_b32_e32` rotation copies against four `v_mfma_scale_f32_16x16x128_
+// f8f6f4` per trip -- which is the "qkv_a is 74% VALU *with* the MFMA" line in
+// the profile.
+//
+// The odd case needs no peel and no extra basic block. Both parities share one
+// steady loop `for (blk = 0; blk + 2 < NBLK; blk += 2)`; on exit A holds block
+// `blk`, which is NBLK-1 when NBLK is odd and NBLK-2 when it is even. So the
+// epilogue differs only by an `if constexpr` on the parity -- a compile-time
+// branch, not a runtime one, which is what the MoE header's warning about a
+// prefetch in its own basic block was about.
+//
+//   NBLK  loop trips  A holds on exit  epilogue
+//   1     0           0 = NBLK-1       consume A
+//   2     0           0 = NBLK-2       issue N(1); consume A(0); consume N(1)
+//   3     1           2 = NBLK-1       consume A
+//   4     1           2 = NBLK-2       issue N(3); consume A(2); consume N(3)
+//   5     2           4 = NBLK-1       consume A
+//
+// For even NBLK this is instruction-identical to the previous form (its bound
+// `blk <= NBLK-4` and this one's `blk <= NBLK-3` select the same even trips).
 template <int GROUPS,
           int KI_LEN,
           bool SEEDED,
@@ -1424,7 +1443,7 @@ __device__ __forceinline__ f32x4_t
   static_assert(!SEEDED || GROUPS == 4,
                 "the hoisted prefill issues exactly four A tiles");
   constexpr int NBLK = KI_LEN / GROUPS;
-  static_assert(NBLK >= 4 && NBLK % 2 == 0, "dbuf needs an even NBLK >= 4");
+  static_assert(NBLK >= 1, "dbuf needs at least one k-block");
 
   f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
   i32x8_t A[GROUPS], N[GROUPS];
@@ -1464,37 +1483,75 @@ __device__ __forceinline__ f32x4_t
 // what keeps LLVM from sinking the MFMA chain into the `col == 0` epilogue
 // block, where it would run under a 1-in-16 EXEC mask.
 #pragma unroll 1
-  for (int blk = 0; blk <= NBLK - 4; blk += 2) {
+  for (int blk = 0; blk + 2 < NBLK; blk += 2) {
     issue(N, NS, blk + 1);
     consume(A, S, blk);
     issue(A, S, blk + 2);
     consume(N, NS, blk + 1);
   }
 
-  issue(N, NS, NBLK - 1);
-  consume(A, S, NBLK - 2);
-  consume(N, NS, NBLK - 1);
+  // On exit A holds block NBLK-1 (odd NBLK) or NBLK-2 (even NBLK).
+  if constexpr (NBLK % 2 == 0) {
+    issue(N, NS, NBLK - 1);
+    consume(A, S, NBLK - 2);
+    consume(N, NS, NBLK - 1);
+  } else {
+    consume(A, S, NBLK - 1);
+  }
   // Pin the accumulator: same EXEC-mask sinking hazard as the loop above.
   asm volatile("" : "+v"(acc));
   return acc;
 }
 
-// MPK_ATTN_PF_DBUF: select the double-buffered form.
+// MPK_ATTN_PF_DBUF: which sites take the double-buffered form.
 //
-// OFF, AND NOT WORTH MEASURING ON ITS OWN. The MoE twin was measured at NP=4
-// and is 0.226 ms SLOWER (10.492 vs 10.266 per-iter min, n=5 each, populations
-// disjoint) for a reason that is not specific to the MoE: it raised
-// worker_kernel's .vgpr_count from 284 to 310 with zero spills, and that
-// allocation is shared by every tile kernel in the binary. Widening the steady
-// state here extends the same two live ranges by the same four MFMAs and bills
-// the same shared budget. Kept compiling so the arm is one -D away if the
-// register lock ever moves.
+//   0  copying (_rnlm8_kloop_deep) everywhere
+//   1  double-buffered everywhere
+//   2  double-buffered only where NBLK is ODD -- i.e. exactly the sites the
+//      previous even-NBLK-only guard excluded. At GLM-5's shapes that is the
+//      K-parallel qkv_a branch (ITERS_PER_WAVE=12, GROUPS=4, NBLK=3) and
+//      nothing else.
+//
+// =1 WAS MEASURED NEGATIVE, but on the even sites only, and the reason was
+// register pressure, not the copies: the MoE twin at NP=4 was 0.226 ms slower
+// (10.492 vs 10.266 per-iter min, n=5 each, disjoint) and raised
+// worker_kernel's .vgpr_count from 284 to 310 with zero spills, an allocation
+// shared by every tile kernel in the binary.
+//
+// =2 is the arm that verdict does NOT cover, and it is what ships. It touches
+// one loop, the hottest one, and that loop already has both A[] and N[] live
+// across the copy block -- `A[j] = N[j]` is a use of every load destination --
+// so deleting the copies does not widen the live range the way adding a whole
+// extra prefetch block to the even sites did.
+//
+// MEASURED, GLM-5, NP=4, devices 4-7, bs=1, 2026-08-25, same session:
+//
+//   =0  9.995 9.941 9.963 9.996                    n=4  mean 9.974  sd 0.023
+//   =2  9.955 9.925 9.964 9.955 9.950 9.972 9.924  n=7  mean 9.949  sd 0.017
+//
+//   delta -0.024 ms (median -0.024, same sign).  Welch t = 1.86, and the
+//   ranges OVERLAP (=0 min 9.941 < =2 max 9.972).  So this is INSIDE the
+//   0.26 ms wall noise floor and is NOT a resolved win -- it is shipped on the
+//   ISA argument with a consistent sign, not on the wall.
+//
+// What changed in the image (`llvm-objdump -d --mcpu=gfx950`):
+//   - gang_rmsnorm_linear_mxfp8_bias_kernel's K-parallel k-loop stops being a
+//     loop at all. At NBLK=3 the single steady trip folds flat, so the ~40
+//     `v_mov_b32_e32` rotation copies and the backedge both disappear and the
+//     12 MFMAs run straight-line. isa_loads_in_flight.py no longer reports a
+//     hot loop in that kernel at all (it was `97 insn / 12 loads / issued 0`).
+//   - worker_kernel .vgpr_count 325 -> 333, .agpr_count 69 -> 77, spills 0
+//     both sides. Both allocations are already far past the 256 that a second
+//     wave/SIMD would need, and the occupancy gate here is LDS (155/160 KB/CU,
+//     memory: glm-occupancy-lock-is-lds-not-registers), so the +8/+8 costs no
+//     occupancy. Re-check that if the LDS lock ever moves.
+//   - Static image grows (110604 -> 114645 disassembly lines) because the
+//     unrolled body is duplicated. Dynamic instruction count per k-loop falls.
 #ifndef MPK_ATTN_PF_DBUF
-#define MPK_ATTN_PF_DBUF 0
+#define MPK_ATTN_PF_DBUF 2
 #endif
 
-// Depth dispatch for the two forms above. Falls back to the copying loop
-// whenever the trip count is not an even number of blocks.
+// Depth dispatch for the two forms above.
 template <int GROUPS,
           int KI_LEN,
           bool SEEDED,
@@ -1511,7 +1568,9 @@ __device__ __forceinline__ f32x4_t
                       i32x8_t const *seed_a,
                       int const *seed_sa) {
   constexpr int NB = KI_LEN / GROUPS;
-  if constexpr (MPK_ATTN_PF_DBUF && NB >= 4 && NB % 2 == 0) {
+  constexpr bool TAKE_DBUF =
+      (MPK_ATTN_PF_DBUF == 1) || (MPK_ATTN_PF_DBUF == 2 && NB % 2 == 1);
+  if constexpr (TAKE_DBUF) {
     return _rnlm8_kloop_dbuf<GROUPS, KI_LEN, SEEDED, W_KMUL, W_HIOFF, SC_KMUL>(
         w_data_row, w_scale_row, s_tok_fp8, s_tok_scales, ki_start, g, seed_a,
         seed_sa);
