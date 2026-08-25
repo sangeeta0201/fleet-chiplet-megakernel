@@ -218,12 +218,43 @@ __device__ __forceinline__ void st_wt_u32_l(void *addr, unsigned val) {
 // One kernel, templated on the arm, so every arm shares the identical loop,
 // grid, and timing path.
 //
+// CLOSED 2026-08-25. Every ingredient of the release is measured out and only
+// the `nt` drop shipped (-0.362 us here, -0.206 ms/token in model). The last
+// three falsifications, in the order they were run:
+//
+//   E: NO RELEASE AT ALL -- every block polls the arrival counter and gates on
+//      `count >= r * arrivals`, deleting the publish hop entirely. 6.75-6.84 us,
+//      +2.6 to +2.7 vs A0. 232 pollers on the atomic line costs far more than
+//      the hop it removes. The A4 one-line penalty (+0.64) is the same effect.
+//
+//   G: flag-line sweep 8/16/24/32/48/64/96 at drop-nt: 3.79 / 3.68 / 3.64 /
+//      3.63 / 3.76 / 3.74 / 3.65. The optimum is 24-32 lines and it is worth
+//      -0.15 us against the shipping 8. At 780 barriers/iteration that is
+//      -0.08 ms/token, under what n=5 per-iter min can resolve, against host
+//      allocation surgery on every barrier base. NOT BUILT.
+//
+//   H: two-level ARRIVAL (= MPK_BAR_TREE, which already exists). Here it is the
+//      biggest single effect on the board -- 3.307 us, -0.449 vs A1 -- and it
+//      does NOT transfer: MPK_BAR_TREE measured -0.001 ms at NP=8 and -0.015 ms
+//      at NP=4, and stacking the tree with 32 flags (H1 3.351) is not additive
+//      either. The floors say why: F0 (flat arrival, no release) 1.843 us and
+//      H2 (tree arrival, no release) 1.864 us are IDENTICAL, so the tree removes
+//      nothing from the arrival itself. What it removes is queue interference
+//      between 232 same-instant atomics and the release store -- a condition
+//      this loop manufactures by having zero work between rounds, and which a
+//      real layer, whose arrivals spread over ~1 us, never builds. Treat any
+//      arrival-side reading from this harness as an upper bound of zero.
+//
+// The transfer rule this harness has earned: RELEASE-side deltas transfer at
+// about 0.7x (nt drop, -0.362 us -> -0.26 us/barrier in model); ARRIVAL-side
+// deltas transfer at 0x.
+//
 //   POLL  0 = sc0 sc1 nt (shipping)  1 = sc0 sc1  2 = 4-deep pipelined nt
 //   SLEEP     s_sleep argument; 0 means no sleep at all
 //   FLAGS 8 = per-XCD lines (shipping)   1 = one line for the whole grid
 //   INV   1 = buffer_inv after the gate (shipping)   0 = omitted
 // ---------------------------------------------------------------------------
-template <int POLL, int SLEEP, int FLAGS, int INV>
+template <int POLL, int SLEEP, int FLAGS, int INV, int TREE = 0>
 __global__ __launch_bounds__(NTHREADS) void barrier_arm(int *bar,
                                                         int rounds,
                                                         unsigned long long *out,
@@ -249,16 +280,38 @@ __global__ __launch_bounds__(NTHREADS) void barrier_arm(int *bar,
       // Counter parked past the widest flag block so the 232-private-line arm
       // cannot alias it. In the megakernel it sits at slot 8 because there are
       // only ever 8 flags.
-      int const prev = __hip_atomic_fetch_add(&bar[(NBLOCKS + 1) * HIER_STRIDE],
-                                              1,
-                                              __ATOMIC_RELEASE,
-                                              __HIP_MEMORY_SCOPE_AGENT);
-      bool const last = (prev % arrivals) == arrivals - 1;
+      // TREE == 1: two-level ARRIVAL. 232 atomics on one line serialise; the
+      // FLOOR arm (POLL == 3) prices that serialisation at ~2.8 us, which is
+      // three quarters of the whole barrier. Here each block increments its own
+      // XCD's counter -- 8 lines, 29-deep each, running 8-way parallel -- and
+      // only the last block on each XCD touches the global line. 232 serialised
+      // becomes 29 + 8.
+      bool last;
+      if (TREE) {
+        int const px = phys_xcd(bid);
+        int const per = arrivals / NXCD;
+        int const pv =
+            __hip_atomic_fetch_add(&bar[(NBLOCKS + 3 * NXCD + px) * HIER_STRIDE],
+                                   1, __ATOMIC_RELEASE,
+                                   __HIP_MEMORY_SCOPE_AGENT);
+        last = false;
+        if ((pv % per) == per - 1) {
+          int const gv = __hip_atomic_fetch_add(
+              &bar[(NBLOCKS + 1) * HIER_STRIDE], 1, __ATOMIC_RELEASE,
+              __HIP_MEMORY_SCOPE_AGENT);
+          last = (gv % NXCD) == NXCD - 1;
+        }
+      } else {
+        int const prev = __hip_atomic_fetch_add(
+            &bar[(NBLOCKS + 1) * HIER_STRIDE], 1, __ATOMIC_RELEASE,
+            __HIP_MEMORY_SCOPE_AGENT);
+        last = (prev % arrivals) == arrivals - 1;
+      }
       // POLL == 3 is the FLOOR arm: it keeps the arrival atomic, the loop, the
       // __syncthreads and the buffer_inv, and drops only the release and the
       // observation. It does NOT synchronise -- that is the point. It is the
       // cost of everything a rendezvous does that is not the release half.
-      if (POLL == 3) {
+      if (POLL == 3 || POLL == 6) {
         (void)last;
       } else if (last) {
         // ---- release fan-out: one thread in the grid, FLAGS write-through
@@ -301,8 +354,23 @@ __global__ __launch_bounds__(NTHREADS) void barrier_arm(int *bar,
           }
         }
       }
+      // POLL == 6: NO RELEASE AT ALL. Every block polls the arrival counter
+      // itself and gates on `count >= r * arrivals`. The last arriver's atomic
+      // IS the release, so the store -> coherence-point -> observe hop that the
+      // two-level arm proved is the whole residue simply does not exist. The
+      // price is that all 232 pollers now hammer one line -- the A4 shape,
+      // which cost +0.67 -- so this is only a win if deleting the hop is worth
+      // more than the line sharing.
+      if (POLL == 6) {
+        int const want = r * arrivals;
+        while (ld_flag_sys(&bar[(NBLOCKS + 1) * HIER_STRIDE]) < want) {
+          if (SLEEP > 0) {
+            __builtin_amdgcn_s_sleep(SLEEP);
+          }
+        }
+      }
       int obs;
-      while (POLL != 3 && POLL != 4 && POLL != 5) {
+      while (POLL != 3 && POLL != 4 && POLL != 5 && POLL != 6) {
         if (POLL == 0) {
           obs = ld_flag_ntsys(flag);
         } else if (POLL == 1) {
@@ -338,7 +406,8 @@ struct Arm {
 // The launcher has to be a real function pointer per arm; a lambda over a
 // template parameter will not do because the kernel address is what hipLaunch
 // needs.
-#define ARM(P, S, F, I) barrier_arm<P, S, F, I>
+#define ARM(P, S, F, I) barrier_arm<P, S, F, I, 0>
+#define ARMT(P, S, F, I) barrier_arm<P, S, F, I, 1>
 
 // The block-count sweep. The arm table above says which INGREDIENT to change;
 // this says whether the residue is LATENCY or CONTENTION, which decides
@@ -389,7 +458,7 @@ int main(int argc, char **argv) {
   // Sized for the widest arm: one private 64 B line per block, plus the
   // arrival counter, which the kernel indexes at NXCD * HIER_STRIDE and which
   // therefore has to live clear of the flag block -- put it past all of them.
-  size_t const barBytes = (size_t)(NBLOCKS + 2 * NXCD + 4) * HIER_STRIDE *
+  size_t const barBytes = (size_t)(NBLOCKS + 5 * NXCD + 4) * HIER_STRIDE *
                           sizeof(int);
   HIP_CHECK(hipMalloc(&bar, barBytes));
   HIP_CHECK(hipMalloc(&out, sizeof(unsigned long long)));
@@ -445,6 +514,18 @@ int main(int argc, char **argv) {
       {"D2 two-level  wt pub   sleep1  inv   ", ARM(5, 1, 8, 1)},
       {"D3 two-level  wt pub   sleep1  noinv ", ARM(5, 1, 8, 0)},
       {"D4 two-level  wt pub   sleep0  inv   ", ARM(5, 0, 8, 1)},
+      {"H0 TREE arrival + drop nt   8 flags   ", ARMT(1, 1, 8, 1)},
+      {"H1 TREE arrival + drop nt  32 flags   ", ARMT(1, 1, 32, 1)},
+      {"H2 TREE arrival, NO release (floor)   ", ARMT(3, 1, 8, 1)},
+      {"G0 drop nt  16 flags                 ", ARM(1, 1, 16, 1)},
+      {"G1 drop nt  24 flags                 ", ARM(1, 1, 24, 1)},
+      {"G2 drop nt  32 flags                 ", ARM(1, 1, 32, 1)},
+      {"G3 drop nt  48 flags                 ", ARM(1, 1, 48, 1)},
+      {"G4 drop nt  64 flags                 ", ARM(1, 1, 64, 1)},
+      {"G5 drop nt  96 flags                 ", ARM(1, 1, 96, 1)},
+      {"E0 no release: poll the counter sleep1", ARM(6, 1, 8, 1)},
+      {"E1 no release: poll the counter sleep0", ARM(6, 0, 8, 1)},
+      {"E2 no release: poll the counter sleep4", ARM(6, 4, 8, 1)},
   };
 
   double base = 0.0;
