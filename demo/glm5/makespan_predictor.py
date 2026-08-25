@@ -325,7 +325,12 @@ def segment_table(R):
     total = order[-1][0]
     # instrument inflation: this log is a BAR_SKEW=3 run; the layer reads
     # longer than the uninstrumented control.  Scale ms/token estimates.
-    UNINSTR_US = 10.619 / 76 * 1e3          # 139.72 us/layer at the 10.619 wall
+    # Refreshed at HEAD 7900e5e.  The old value was 10.619/76 = 139.72 us,
+    # measured on EIGHT devices; NP=4 on devices 4-7 is the governing config
+    # and the wall there is 9.31 (glm-np4-baseline-is-11418 lineage:
+    # 11.418 -> 9.949 -> 9.841 -> 9.718 -> 9.556 -> 9.337 -> 9.308 -> 9.31).
+    # Leaving it stale overstated every ms/token in this table by 15%.
+    UNINSTR_US = 9.31 / 76 * 1e3            # 122.50 us/layer at the 9.31 wall
     k = UNINSTR_US / total
     print(f"  instrumented layer span {total:.2f} us  vs  uninstrumented "
           f"{UNINSTR_US:.2f} us  ->  scale ms by {k:.3f}")

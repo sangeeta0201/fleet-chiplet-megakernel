@@ -1058,6 +1058,30 @@ def get_compile_command(
             assert _pfd in ("0", "1"), "MPK_MOE_PF_DBUF is 0 or 1"
             flags = flags + [f"-DMPK_MOE_PF_DBUF={_pfd}"]
 
+        # W13 and W2 select the loop form and the prefetch width separately.
+        # The +29 unified VGPR bill that killed MPK_MOE_PF_DBUF as a single
+        # knob is entirely W2's: at GROUPS=4 the image reads 335 for
+        # W13-dbuf/W2-ship and 364 for W13-ship/W2-dbuf, against a 335
+        # shipping baseline. Long note at the defines in
+        # gang_moe_linear_mxfp8_mi300.cuh. All compile-time, so every rank
+        # must agree.
+        for _v in (
+            "MPK_MOE_PF_DBUF_W13",
+            "MPK_MOE_PF_DBUF_W2",
+        ):
+            _x = os.environ.get(_v)
+            if _x is not None:
+                assert _x in ("0", "1"), f"{_v} is 0 or 1"
+                flags = flags + [f"-D{_v}={_x}"]
+        for _v in (
+            "MPK_MOE_PF_GROUPS_W13",
+            "MPK_MOE_PF_GROUPS_W2",
+        ):
+            _x = os.environ.get(_v)
+            if _x is not None:
+                assert _x.isdigit() and 0 <= int(_x) <= 8, f"{_v} is 0..8"
+                flags = flags + [f"-D{_v}={_x}"]
+
         _km = os.environ.get("MPK_MOE_KMAJOR")
         if _km is not None:
             # Permutes the data half (1) and optionally the E8M0 scales (2) of

@@ -4586,18 +4586,67 @@ __global__ MPK_WORKER_ATTR __launch_bounds__(
 //     reports 2 blocks/CU for every dynamic request <= 72 KB, and we request
 //     exactly 72. Despite that, MPK_NUM_WORKERS=264 (272 blocks) and 464 (472
 //     blocks) BOTH hang in the bootstrap wait, exactly as they did at 1
-//     block/CU. The ceiling is still 256 blocks = the CU count. Ruled out as
-//     the cause: MAX_WORKER_PER_SCHEDULER (auto-scales, 30 -> 59, confirmed in
-//     the build flags) and the LDS request (the calculator agrees it fits).
-//     The static calculator does not model scratch, and wpe=3 is the first
-//     configuration this kernel has ever had that touches scratch at all.
-//     That is the open question, and it is the ONLY thing between here and
-//     2 blocks/CU.
+//     block/CU. Ruled out as the cause: MAX_WORKER_PER_SCHEDULER (auto-scales,
+//     30 -> 59, confirmed in the build flags) and the LDS request (the
+//     calculator agrees it fits). The static calculator does not model
+//     scratch. That is the open question, and it is the ONLY thing between
+//     here and 2 blocks/CU.
 //
 // Whether it is worth answering: doubling workers 232 -> 464 halves the round
 // count for the round-quantised phases (q_b 2->1, o_proj 2->1, router 5->3,
 // W13/W2), worth ~1.8 ms at the optimistic end against a +2.38 ms spill bill.
 // That is net negative unless the spills go away, and (1) says they cannot.
+//
+// ---------------------------------------------------------------------------
+// THIRD CORRECTION, 2026-08-25. Two claims in (3) above were wrong, the
+// arithmetic is now re-measured at HEAD, and the lever is CLOSED net-negative.
+//
+// (a) "The ceiling is still 256 blocks = the CU count" is FALSE as stated. A
+//     standalone probe (/tmp/coresid) that stamps a per-block residency mark
+//     and spins places 472 AND 512 blocks co-resident on one MI355X at exactly
+//     the wpe=3 footprint (252 unified VGPR, 7328 B static + 72 KB dynamic
+//     LDS, 256 threads), with a validated negative control -- 148 KB dynamic
+//     LDS does NOT co-reside, 76 KB does. The hardware is not the ceiling.
+//     CAVEAT, and it is the whole caveat: that probe uses an inline-asm
+//     clobber list and declares ZERO scratch. It therefore never tested the
+//     scratch axis, which remains the only surviving hypothesis for the hang.
+//
+// (b) "wpe=3 is the first configuration this kernel has ever had that touches
+//     scratch at all" is FALSE. Read straight out of the linked images
+//     (.private_segment_fixed_size in the code-object note):
+//         build   vgpr(unified)  agpr  vspill  sspill  scratch/wi  static LDS
+//         wpe=1   325            69    0       118     596         7328
+//         wpe=2   354            126   0       118     1028        7328
+//         wpe=3   252            84    32      118     1160        7328
+//     The SHIPPING wpe=1 image already declares 596 B/workitem. What is new at
+//     wpe=3 is the VGPR spill count (32), not scratch existence. At 472 blocks
+//     x 256 threads, 1160 B/wi is 137.8 MB -- over ROCr's 128 MB default
+//     HSA_SCRATCH_SINGLE_LIMIT, and wpe=1's 596 B would be 70.8 MB, under it.
+//     That is a real and untested difference, but note the env sweep recorded
+//     at line 4524 (SINGLE_LIMIT=2G, NO_SCRATCH_THREAD_LIMITER,
+//     NO_SCRATCH_RECLAIM, ENABLE_SCRATCH_ASYNC_RECLAIM=0) already moved none
+//     of it, and those vars are in the mpirun -x forward list.
+//
+// (c) The cost, re-measured at HEAD (9.3175 ms ctl, NP=4, devices 4-7, bs=1):
+//         wpe=3 + LDS_KB=78, 240 workers: 11.581 / 11.529 -> 11.555, +2.24 ms
+//     Same build, only the worker count differing from the hanging arm. So the
+//     grid gate costs +2.24 ms to open, against a ~1.8 ms optimistic upside.
+//     Net negative even if 464 worked perfectly (~9.76 vs 9.3175).
+//
+// (d) The upside cannot be bounded from below either. cost(120) - cost(240)
+//     would upper-bound benefit(480), because ceil() rounds the same way in
+//     both directions and 1-round phases cannot go below 1. But 120 workers
+//     (15/XCD) FAULTS with an illegal memory access -- the fused GLM layer's
+//     worst case is 29 inputs, so ~232 workers (29/XCD) is the floor. The
+//     downward slope is unmeasurable on this decomposition.
+//
+// (e) MPK_WORKER_STATE=1 + MPK_HOST_DBG_POLL=1 cannot diagnose the hang: the
+//     instrument wedges even the known-good 240 control (rc=124, 0 SCHED_XCD,
+//     a 212 MB log of "0/240 workers advanced ... STALLED" and not one
+//     ws-residency line). Same class as the host-mapped-debug-buffer trap.
+//
+// VERDICT: closed net-negative. Reopen only if the register squeeze becomes
+// free, which (1) says it cannot on this decomposition.
 // ---------------------------------------------------------------------------
 #ifndef MPK_WORKER_WAVES_PER_EU
 #define MPK_WORKER_WAVES_PER_EU 1

@@ -773,6 +773,37 @@ __device__ __forceinline__ f32x4_t
 // a remainder is a branch, a branch is a basic block, and the header's note on
 // the guarded first draft records that a prefetch in its own basic block gets
 // drained by the wait and is not a prefetch.
+//
+// ── CLOSED NO-GO 2026-08-25 (task #115): CORRECT AT GROUPS=2, BROKEN AT 4 ──
+//
+// The claim two paragraphs up -- "same loads, same MFMAs, same order of
+// issue-then-consume" -- is true of the SOURCE and false of what the machine
+// computes at GROUPS=4. Measured on tests/standalone/test_mxfp8_moe.hip, W13
+// max abs error against a double-precision dequant reference, arm vs the
+// shipping deep loop on identical bytes:
+//
+//   deep@4  (shipping, 4 live i32x8_t)      6.577e-07
+//   dbuf@2  (4 live)                        6.577e-07   <- bit-exact, correct
+//   dbuf@4  (8 live)                        2.161e-04   <- 330x, BROKEN
+//
+// and in the model (NP=4, devices 4-7, bs=1), MPK_MOE_PF_DBUF_W13=1 at the
+// shipping GROUPS=4 emits deterministic garbage 4/4 runs (correctness_gate
+// distinct 0.010 / topbigram 99, prefix 0) while measuring -0.267 ms. The two
+// oracles agree: the ONLY width that wins is the one that is wrong.
+//
+// It is not an index bug. The consume schedule was rewritten below to hoist the
+// LDS B reads exactly as the deep loop does; that changed the error magnitude
+// (1.122e-04 -> 2.161e-04) without fixing it. An off-by-one would be invariant
+// to scheduling. The discriminator that does track the failure is the live
+// buffer count -- 4 live is correct in either loop form, 8 live is wrong in
+// either -- and at 8 live the standalone's allocator spills A[]/N[] to 900 B of
+// scratch per lane. Suspect the spill/remat, not the loop algebra.
+//
+// Why this closes rather than continuing: dbuf@2 is correct but GROUPS=2
+// narrows W13's block width at a measured +0.783 ms, which swamps the copy
+// deletion (the p115 three-arm run: ctl 9.3077, gr2 10.0903, dbuf2 9.4420).
+// There is no correct-and-winning point in the space. Do not re-price this
+// without first re-running the standalone at GROUPS=4 and getting 6.577e-07.
 template <bool WEIGHT_FP4, bool TOK_SC_FP8, int GROUPS, int KI_END>
 __device__ __forceinline__ f32x4_t
     _gang_moe_kloop_dbuf(uint8_t const *w_data_row,
@@ -795,25 +826,91 @@ __device__ __forceinline__ f32x4_t
   i32x8_t A[GROUPS], N[GROUPS];
   int S[GROUPS], NS[GROUPS];
 
+  // Both weight pointers re-typed into addrspace(1) ONCE, exactly as the deep
+  // loop does -- see MPK_MOE_WGPTR's header for why a leaf-level cast does not
+  // survive the inline chain out of these lambdas.
+  //
+  // This variant needs it more than the deep loop does, and that is the whole
+  // reason for the re-price. dbuf's recorded loss is a +26..31 VGPR bill from
+  // holding SIXTEEN loads in flight instead of eight. A flat_ load carries a
+  // full 64-bit VGPR address per chain; a global_ load off one addrspace(1)
+  // base carries a 32-bit voffset plus an SGPR base with immediate offsets. If
+  // the bill is addressing rather than data, doubling the loads in flight is
+  // exactly where the two forms diverge most, and the earlier pricings were
+  // both taken with dbuf on the flat_ path.
+  _gang_gp8 const wdr_g = (_gang_gp8)w_data_row;
+  _gang_gp8 const wsc_g = (_gang_gp8)wg_scales;
+
   // Issue block `b` into the given buffer. Taken by reference so the arrays
   // keep their identity -- passing them by value would reintroduce the copy
   // this whole variant exists to delete.
   auto issue = [&](i32x8_t (&dst)[GROUPS], int (&dsc)[GROUPS], int b) {
+    int const kbase = b * GROUPS;
+    // Scales first and batched: one base pointer plus compile-time immediate
+    // offsets for the whole GROUPS-wide batch, instead of GROUPS independent
+    // 64-bit address chains. Same argument as MPK_MOE_SCBASE in the deep loop,
+    // and register-REDUCING, which is the axis dbuf loses on.
+    if constexpr (MPK_MOE_SCBASE && MPK_MOE_WGLOBAL && MPK_MOE_WGPTR) {
+      _gang_gp8 const p = wsc_g + (row_scale_base + kbase * SC_KS + g);
+#pragma unroll
+      for (int j = 0; j < GROUPS; j++) {
+        dsc[j] = (int)p[j * SC_KS];
+      }
+    } else if constexpr (MPK_MOE_SCBASE) {
+      uint8_t const *p = wg_scales + (row_scale_base + kbase * SC_KS + g);
+#pragma unroll
+      for (int j = 0; j < GROUPS; j++) {
+        dsc[j] = MPK_MOE_WGLOBAL ? (int)_gang_ld_g<uint8_t>(p + j * SC_KS)
+                                 : (int)p[j * SC_KS];
+      }
+    } else {
+#pragma unroll
+      for (int j = 0; j < GROUPS; j++) {
+        dsc[j] = (int)wg_scales[row_scale_base + (kbase + j) * SC_KS + g];
+      }
+    }
 #pragma unroll
     for (int j = 0; j < GROUPS; j++) {
-      int const kk = b * GROUPS + j;
-      dst[j] = _gang_load_w_mfma_a_at<WEIGHT_FP4>(w_data_row, kk * W_KS, g);
-      dsc[j] = (int)wg_scales[row_scale_base + kk * SC_KS + g];
+      int const kk = kbase + j;
+      if constexpr (MPK_MOE_WGLOBAL && MPK_MOE_WGPTR) {
+        dst[j] = _gang_load_w_mfma_a_at_gp<WEIGHT_FP4>(wdr_g, kk * W_KS, g);
+      } else if constexpr (MPK_MOE_WGLOBAL) {
+        dst[j] = _gang_load_w_mfma_a_at_g<WEIGHT_FP4>(w_data_row, kk * W_KS, g);
+      } else {
+        dst[j] = _gang_load_w_mfma_a_at<WEIGHT_FP4>(w_data_row, kk * W_KS, g);
+      }
     }
   };
+  // Same shape as the deep loop's `consume`, INCLUDING the MPK_MOE_WGLOBAL
+  // B-hoist. Getting that hoist here is not (only) a schedule question: the
+  // interleaved form below issues an LDS read between every pair of MFMAs
+  // while sixteen weight loads are outstanding, so SIInsertWaitcnts has to
+  // interleave vmcnt and lgkmcnt waits inside the unrolled body. The hoisted
+  // form asks for one lgkmcnt(0) up front and leaves vmcnt alone -- the same
+  // structure the deep loop has been validated at.
   auto consume = [&](i32x8_t const (&src)[GROUPS], int const (&ssc)[GROUPS],
                      int b) {
+    if constexpr (MPK_MOE_WGLOBAL) {
+      i32x8_t B[GROUPS];
+      int BS[GROUPS];
 #pragma unroll
-    for (int j = 0; j < GROUPS; j++) {
-      int const kk = b * GROUPS + j;
-      i32x8_t bb = _gang_load_fp8_mfma_b(s_tok_fp8, kk * K_PER_MFMA, g);
-      acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(src[j], bb, acc, ssc[j],
-                                          tok_sc_at(kk));
+      for (int j = 0; j < GROUPS; j++) {
+        int const kk = b * GROUPS + j;
+        B[j] = _gang_load_fp8_mfma_b(s_tok_fp8, kk * K_PER_MFMA, g);
+        BS[j] = tok_sc_at(kk);
+      }
+#pragma unroll
+      for (int j = 0; j < GROUPS; j++) {
+        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(src[j], B[j], acc, ssc[j], BS[j]);
+      }
+    } else {
+#pragma unroll
+      for (int j = 0; j < GROUPS; j++) {
+        int const kk = b * GROUPS + j;
+        i32x8_t bb = _gang_load_fp8_mfma_b(s_tok_fp8, kk * K_PER_MFMA, g);
+        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(src[j], bb, acc, ssc[j],
+                                            tok_sc_at(kk));
+      }
     }
   };
 
@@ -982,9 +1079,42 @@ __device__ __host__ constexpr int _gang_moe_pf_groups(int ki, int req) {
   return 0;
 }
 
+// W13 and W2 select their prefetch width and their loop form INDEPENDENTLY.
+//
+// Measured 2026-08-25 (NP=4, bs=1, n=3 each, ctl 9.3077): the two are not one
+// knob. Moving BOTH kernels together from the shipping GROUPS=4 deep loop to
+// a GROUPS=2 double-buffered loop nets +0.14 ms, but that is the sum of two
+// large and opposite effects --
+//
+//   ctl    DBUF=0 GR=4   9.323 / 9.290 / 9.310   -> 9.3077
+//   gr2    DBUF=0 GR=2  10.071 / 10.073 / 10.127 -> 10.090   +0.78  narrowing
+//   dbuf2  DBUF=1 GR=2   9.464 / 9.428 / ...     -> ~9.446   -0.64  copy kill
+//
+// -- so the copy deletion is worth 0.64 ms and only fails to ship because it
+// was bundled with the narrowing that pays for it. The narrowing is forced:
+// dbuf at GR=4 costs 335 -> 364 unified VGPRs binary-wide (see PF_DBUF's
+// header), while GR=2 and GR=3 are both free at 335. Splitting the knobs lets
+// each kernel take the widest dbuf-capable width its own trip count allows.
+#ifndef MPK_MOE_PF_GROUPS_W13
+#define MPK_MOE_PF_GROUPS_W13 MPK_MOE_PF_GROUPS
+#endif
+#ifndef MPK_MOE_PF_GROUPS_W2
+#define MPK_MOE_PF_GROUPS_W2 MPK_MOE_PF_GROUPS
+#endif
+#ifndef MPK_MOE_PF_DBUF_W13
+#define MPK_MOE_PF_DBUF_W13 MPK_MOE_PF_DBUF
+#endif
+#ifndef MPK_MOE_PF_DBUF_W2
+#define MPK_MOE_PF_DBUF_W2 MPK_MOE_PF_DBUF
+#endif
+
 // Prefetch-depth dispatch. GROUPS_REQ == 0, or a trip count no divisor fits,
 // selects the shipping loop.
-template <bool WEIGHT_FP4, bool TOK_SC_FP8, int GROUPS_REQ, int KI_END>
+template <bool WEIGHT_FP4,
+          bool TOK_SC_FP8,
+          int GROUPS_REQ,
+          int KI_END,
+          bool WANT_DBUF>
 __device__ __forceinline__ f32x4_t
     _gang_moe_kloop(uint8_t const *w_data_row,
                     uint8_t const *wg_scales,
@@ -994,7 +1124,7 @@ __device__ __forceinline__ f32x4_t
                     int g) {
   constexpr int GR = _gang_moe_pf_groups(KI_END, GROUPS_REQ);
   constexpr int NB = GR >= 2 ? KI_END / GR : 0;
-  if constexpr (MPK_MOE_PF_DBUF && GR >= 2 && NB >= 4 && NB % 2 == 0) {
+  if constexpr (WANT_DBUF && GR >= 2 && NB >= 4 && NB % 2 == 0) {
     return _gang_moe_kloop_dbuf<WEIGHT_FP4, TOK_SC_FP8, GR, KI_END>(
         w_data_row, wg_scales, row_scale_base, s_tok_fp8, s_tok_scales, g);
   } else if constexpr (GR >= 2) {
@@ -1486,8 +1616,8 @@ __device__ __noinline__ void
 
     // MFMA_ITERS is 48 for GLM-5's 6144 hidden, so the default depth of 4 is
     // taken here.
-    f32x4_t acc = _gang_moe_kloop<WEIGHT_FP4, false, MPK_MOE_PF_GROUPS,
-                                  MFMA_ITERS>(
+    f32x4_t acc = _gang_moe_kloop<WEIGHT_FP4, false, MPK_MOE_PF_GROUPS_W13,
+                                  MFMA_ITERS, (bool)MPK_MOE_PF_DBUF_W13>(
         w_data_row, wg_scales, row_scale_base, s_tok_fp8, s_tok_scales, g);
 
     // Epilogue. acc[i] = C[g*4+i][col]; at one token per tile only col 0 holds
@@ -2005,8 +2135,8 @@ __device__ __noinline__ void
     // (memory: glm-w2-imbalance-is-the-only-unabsorbed-spread), so this is the
     // half of the knob with a makespan story. SPLIT_ITERS is 16 at the default
     // K_SPLITS=1, which the default depth of 4 divides.
-    f32x4_t acc = _gang_moe_kloop<WEIGHT_FP4, INPUT_FP8, MPK_MOE_PF_GROUPS,
-                                  SPLIT_ITERS>(
+    f32x4_t acc = _gang_moe_kloop<WEIGHT_FP4, INPUT_FP8, MPK_MOE_PF_GROUPS_W2,
+                                  SPLIT_ITERS, (bool)MPK_MOE_PF_DBUF_W2>(
         w_data_row, wg_scales, row_scale_base, s_tok_k, s_tok_sc_k, g);
 
     if (col == 0) {
