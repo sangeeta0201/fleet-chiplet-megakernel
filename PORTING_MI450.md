@@ -97,29 +97,65 @@ wrong**. Prefer rocWMMA for the remaining kernels and revisit this file.
 - `include/mirage/persistent_kernel/tasks/mi450/gemm_handtuned_mi450.cuh` —
   one GEMM ported to WMMA. Compiles. **Not executed.**
 
+## FFM is running
+
+Package: `rocdtif-10.1-am+ffmlite-mi400-r9.03` (ROCm 10.1.0a20260805, FFM-Lite
+v9, model `mi400.9102703.540`) from
+`atlartifactory.amd.com:8443/artifactory/SW-ROCDTIF-MI-DEV-LOCAL/Packages/AM+FFM-LITE/Release/`.
+Extracted at `/home/claudeuser/rocdtif-10.1-am+ffmlite-mi400-r9.03`. It is
+self-contained: its own ROCm, HIP runtime, `libhsakmtmodel.so`, and mi450
+topology. Source its `ffmlite_env.sh` rather than setting variables by hand —
+it sets `HSA_KMT_MODEL_GPUVM_BASE/SIZE` and the fast-copy hook that ad-hoc
+setup misses.
+
+**The glibc problem and how it is solved.** The model needs glibc >= 2.38; this
+host is Ubuntu 22.04 with 2.35, and the loader aborts with `version GLIBC_2.38
+not found`. Upgrading the host glibc would break Ubuntu 22.04 system-wide. So
+instead there is an isolated Ubuntu 24.04 (glibc 2.39) sysroot at
+`/home/claudeuser/noble-sysroot`, built with `debootstrap`, and binaries are run
+against *its* loader. The host is unmodified. `./run_ffm.sh <abs-path-to-binary>`
+wraps all of this.
+
+Build test binaries against the FFM package's HIP runtime so the model
+intercepts dispatches:
+
+    clang++ -x hip --offload-arch=gfx1250 --rocm-path=$TOOLCHAIN -Iinclude ... \
+        -L$FFM_PKG/rocm -lamdhip64 -Wl,-rpath,$FFM_PKG/rocm
+
+The model reports the part correctly — `gfx1250` / `mi450`, 256 CUs,
+**wavefront size 32**, which is wave32 confirmed by the model rather than
+inferred from docs.
+
+## Validated
+
+`tests/mi450/test_gemm_wmma.hip` — **PASS** under FFM. All 1024 outputs match a
+host fp32 reference exactly. Verified non-degenerate by pre-poisoning the output
+buffer: 0 elements retained the poison, so every one was genuinely written, and
+the far corner `[15,63]` matches (exercising all 4 waves and both accumulator
+halves). FFM counters agree: `insts_waves=4`, `insts_valu_xdlmacc=64` = 16
+K-steps × 4 waves.
+
+The exact-zero error is expected, not suspicious: inputs are multiples of
+0.125/0.25/0.5, so every product and partial sum is exactly representable and
+bf16 never rounds.
+
+**This settles the fragment-layout question** — the hand-derived per-lane
+mapping in `gemm_handtuned_mi450.cuh` is correct.
+
 ## Not done
 
-Nothing has been run. No numerical validation, no FFM run, no performance data.
-The next concrete step is a reference-vs-WMMA correctness check for the single
-GEMM under FFM, which is what turns the layout question from a guess into a
-fact. FFM is a *functional* model — it can answer "does this compute the right
-values" and cannot answer "is this fast."
+No performance data, and FFM cannot provide any — it models no cycles,
+bandwidth, or contention, and executes workgroups serially. Correctness only;
+performance work needs a different vehicle.
 
-## FFM setup (from the MI450 validation wiki page)
-
-    export FFM_PATH=<extracted ffm-lite>
-    export HSA_MODEL_LIB=$FFM_PATH/libhsakmtmodel.so
-    export HSA_MODEL_TOPOLOGY=$FFM_PATH/topology/mi450
-    export TARGET_ARCH=gfx1250
-    export HSA_ENABLE_SDMA=0 HSA_ENABLE_INTERRUPT=0
-    export HSA_MODEL_NUM_THREADS=256
-
-Package: `atlartifactory.amd.com:8443/artifactory/gfxip-mi400-dev-local/gfxip/mi400/main/jitcu/mi450/master/`
+Still unported: 49 remaining files in `tasks/mi300/`, the 91 `s_memrealtime`
+sites, the 26 `buffer_load_lds` sites, `MAX_SMEM_SIZE` in
+`include/mirage/config.h:71`, and the 240-way XCD barrier (which can relax given
+hardware-coherent GL2).
 
 FFM is slow enough that the wiki's own GPT-OSS runs trim the model to 2 layers
 with `--load-format dummy`; their posted benchmark log shows 30 hours of wall
-clock for 5 requests, all of which failed. Budget accordingly, and plan a
-separate path for performance work.
+clock for 5 requests, all of which failed. Budget accordingly.
 
 The **Data Hazard Plugin** (`FFM_OBSERVER_PLUGINS`) reports missing `s_wait_*`
 synchronization as JSON. For a megakernel this sync-heavy, and with the new

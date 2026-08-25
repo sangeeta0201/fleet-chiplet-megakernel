@@ -30,13 +30,17 @@
  *                   The reuse hints are power optimizations; they are left
  *                   false here and are a tuning knob once this is correct.
  *
- * STATUS -- IMPORTANT: this compiles to the intended v_wmma_f32_16x16x32_bf16
- * and is register-layout-plausible, but it has NOT been executed. There is no
- * gfx1250 hardware on this machine and the FFM model has not been run against
- * it. In particular the per-lane fragment mapping below is the documented
- * wave32 16x16 layout and is the single most likely thing to be wrong; it must
- * be validated against a reference GEMM under FFM before this is trusted.
- * Until then, treat the numerics as unverified.
+ * STATUS: validated numerically under FFM-Lite (mi450 topology, gfx1250) via
+ * tests/mi450/test_gemm_wmma.hip -- all 1024 outputs match a host fp32
+ * reference exactly, with the output buffer pre-poisoned to prove every
+ * element was actually written. FFM's own counters corroborate the dispatch:
+ * insts_waves=4 and insts_valu_xdlmacc=64, i.e. 16 K-steps x 4 waves of WMMA.
+ * The per-lane fragment mapping below is therefore correct, not merely
+ * plausible. Run it with ./run_ffm.sh from the repo root.
+ *
+ * What this does NOT establish: FFM is a functional model. It models no
+ * cycles, bandwidth, or contention, so nothing here is evidence about
+ * performance -- only about correctness.
  */
 #pragma once
 
