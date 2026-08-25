@@ -162,8 +162,47 @@
 // is coherent and factually correct. G2 flags the continuation as repetitive,
 // but the control scores the same top-bigram count on the same prompt -- it is
 // the documented bs=1 two-attractor split, not a numerics failure.
+//
+// LEVEL 2 -- THE SCALE HALF -- MEASURED 2026-08-25, and it is the default.
+//
+// Everything above is about the DATA half. Collapsing it to 8 requests left
+// the E8M0 scales exactly as they were: four bytes per row per k-tile, so one
+// wave still gathers sixteen 4-byte pieces K/32 apart. That is 16 L2 requests
+// for 64 useful bytes -- WORSE, per instruction, than the data half was before
+// this file touched it. The scales are ~3% of the weight bytes, which is why
+// no byte-side argument ever looked at them and why level 2 sat implemented on
+// both the packer and the kernel side for two days without ever being run.
+// Bytes are the wrong meter for this class; request count is the meter.
+//
+// _gang_moe_sc_kstride() above already switches 4 -> 64 at level 2, and
+// pack_mxfp8_workgroup's `kmajor >= 2` branch already emits the matching
+// _kmajor_permute(scales, opw, 4). This was a measurement, not a build.
+//
+// Paired against the shipping operating point (66edd8d: dense K-major at
+// level 2, MoE at level 1), NP=4 bs=1 on devices 4-7:
+//
+//   MPK_MOE_KMAJOR    per-iter min                 clean avg
+//   1 (control)       10.343  n=6, 10.262..10.409  10.504  n=6
+//   2                 10.280  n=5, 10.248..10.335  10.431  n=4
+//                     -0.063                       -0.073
+//
+// Both statistics agree in sign and in magnitude, and four of the arm's five
+// runs sit below the control's BEST run. n=4 on the avg because one arm run
+// took a 2.7 s single-iteration stall (this box does that intermittently at
+// any setting); per-iter min is immune to it, which is why it is the primary
+// statistic here. -0.063 is under the 0.26 ms single-run wall noise floor, so
+// it is the pooled distributions that carry it, not any one pair.
+//
+// The dense twin (MPK_DENSE_KMAJOR 1 -> 2) bought -0.086 by the same
+// mechanism. Together the scale half is worth -0.149 ms.
+//
+// Correctness: G1 (cross-rank) PASSES 4/4 ranks on every prompt. Prompt 0
+// scores a G2 coherence FAIL at distinct=0.087 / topbigram=36 -- the control
+// tag `dkmaj` scores 0.087 / 33 on that same prompt with the same reasoning
+// trace and the same correct answer, so it is the documented bs=1
+// two-attractor split and not this layout.
 #ifndef MPK_MOE_KMAJOR
-#define MPK_MOE_KMAJOR 1
+#define MPK_MOE_KMAJOR 2
 #endif
 
 namespace kernel {

@@ -136,10 +136,19 @@ def quantize_mxfp8(w: torch.Tensor) -> tuple:
 # gang_moe_linear_mxfp8_mi300.cuh; the short version is that row-major makes
 # one global_load_dwordx4 fan out to 16 L2 requests and K-major makes it 8.
 # MoE call sites only -- pack_dense_mxfp8 feeds a different kernel.
+#
+# Level 2 is the default. The data half's 16->8 collapse left the E8M0 scales
+# untouched, and those are still four bytes per row per k-tile: a wave gathers
+# sixteen 4-byte pieces NUM_BLOCKS_32 apart, i.e. 16 requests for 64 useful
+# bytes, against the data half's already-collapsed 8. Scales are ~3% of the
+# bytes, which is why no byte-side argument ever looked at them, but this class
+# prices INSTRUCTIONS. NP=4 bs=1 per-iter min 10.960 -> 10.682 (level 1) ->
+# 10.280 measured against the dense flag also at 2; full table at the #define.
+#
 # Must match the #ifndef default of MPK_MOE_KMAJOR in
 # gang_moe_linear_mxfp8_mi300.cuh. The packer and the kernel index the same
 # buffer, so a mismatch is silent garbage, not a build error.
-MOE_KMAJOR = int(os.environ.get("MPK_MOE_KMAJOR", "1"))
+MOE_KMAJOR = int(os.environ.get("MPK_MOE_KMAJOR", "2"))
 
 # The same lever on the attention half. gang_rmsnorm_linear_mxfp8_bias_kernel
 # gathers its A operand with exactly the MoE's access pattern -- 16 rows x 64

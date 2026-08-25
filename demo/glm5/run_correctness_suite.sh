@@ -57,10 +57,22 @@ PROMPTS=(
 rm -rf permanent_output_dir permanent_output_dir_rank*
 export KEEP_BUILD=1
 
-# Bound each run. The megakernel has an intermittent single-rank livelock (see
-# task #46) that pins one GPU indefinitely; without a bound one bad prompt eats
-# the sweep and the remaining prompts never run.
-RUN_TIMEOUT="${RUN_TIMEOUT:-1200}"
+# Bound each run. The megakernel has an intermittent cold-start wedge that
+# pins all four GPUs indefinitely; without a bound one bad prompt eats the
+# sweep and the remaining prompts never run.
+#
+# A wall-clock bound is the wrong instrument for it, and this sweep is where
+# that showed: RUN_TIMEOUT=1200 means a wedged prompt burns twenty minutes
+# before the next one starts, so in practice the wedge got killed by hand and
+# the kill took the FOLLOWING prompt's mpirun with it -- two prompts lost to
+# one wedge, twice now. The watchdog trips on LOG SILENCE instead, which
+# separates "quiet because hipcc is running" from "quiet because hung", and
+# arms only after every rank prints ENTER. Same mechanism bench_repeat.sh
+# uses. See demo/glm5/stall_watchdog.sh for the full rationale.
+# shellcheck source=stall_watchdog.sh
+. ./stall_watchdog.sh
+STALL_SECS="${STALL_SECS:-120}"
+RETRIES="${RETRIES:-2}"
 
 for i in "${!PROMPTS[@]}"; do
   p="${PROMPTS[$i]}"
@@ -68,17 +80,18 @@ for i in "${!PROMPTS[@]}"; do
   log="$OUT_DIR/${TAG}_p${i}.log"
   # Fresh rendezvous port per prompt: a killed run leaves the listener bound
   # or in TIME_WAIT, and the next launch dies with EADDRINUSE before it builds.
-  export MASTER_PORT=$(( ${MASTER_PORT_BASE:-29950} + i ))
   echo "=== [$TAG] prompt $i: $p"
-  timeout "$RUN_TIMEOUT" ./"$LAUNCHER" --prompt "$p" --save-tokens "$dst" \
-    > "$log" 2>&1
-  rc=$?
-  if [ "$rc" -eq 124 ]; then
-    # A timed-out mpirun leaves the ranks behind, and the next launch then
-    # contends with eight live processes for the same eight GPUs.
-    pkill -9 -f "demo.py" 2>/dev/null; sleep 5
-    pkill -9 -f "mpirun -np" 2>/dev/null; sleep 3
-  fi
+  for attempt in $(seq 0 "$RETRIES"); do
+    # Fresh rendezvous port per ATTEMPT, not just per prompt: a killed run
+    # leaves the listener bound or in TIME_WAIT, and the retry would then die
+    # with EADDRINUSE before it ever reaches the kernel.
+    export MASTER_PORT=$(( ${MASTER_PORT_BASE:-29950} + i * 8 + attempt ))
+    run_with_watchdog "$log" "$STALL_SECS" \
+      ./"$LAUNCHER" --prompt "$p" --save-tokens "$dst"
+    rc=$?
+    [ "$rc" -ne 124 ] && break
+    echo "    STALLED (attempt $((attempt + 1))), retrying"
+  done
   # The multi-rank case writes <stem>_rank<r>.json and never <stem>.json, so
   # test for either shape rather than for the literal path handed to demo.py.
   n=$(ls "$OUT_DIR/${TAG}_p${i}".json "$OUT_DIR/${TAG}_p${i}"_rank*.json \
