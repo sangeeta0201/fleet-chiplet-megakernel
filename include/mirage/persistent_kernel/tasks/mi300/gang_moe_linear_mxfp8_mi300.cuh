@@ -693,6 +693,13 @@ __device__ __forceinline__ f32x4_t
 // MFMAs instead of four extends both live ranges past what the allocator can
 // absorb.
 //
+// RE-PRICED ON TOP OF MPK_MOE_WGLOBAL=1 (2026-08-25) and it still loses, by
+// about the same margin: n=4 mean 10.062 min 10.015 max 10.100, against the
+// WGLOBAL-only n=6 mean 9.841 max 9.905. Non-overlapping again. So the
+// register bill is charged whether the loads are flat_ or global_, and
+// WGLOBAL's win does not come from anything dbuf would have supplied. The two
+// are alternatives, not complements. worker_kernel vgpr 333 -> 364.
+//
 // THE GENERAL RESULT, which is the useful part: on this kernel, prefetch
 // restructuring is register-bound, not schedule-bound. Any variant that widens
 // the steady-state body pays a binary-wide VGPR bill first. It also retires the
