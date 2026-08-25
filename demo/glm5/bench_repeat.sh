@@ -18,13 +18,27 @@ shift 2 2>/dev/null || shift 1
 export MODEL_PATH="${MODEL_PATH:-/home/claudeuser/models/glm5-mxfp4}"
 ulimit -c 0
 
+# shellcheck source=stall_watchdog.sh
+. ./stall_watchdog.sh
+
+# A wedged cold start writes nothing more after "launch_persistent_kernel
+# ENTER" while a healthy run writes continuously, so the watchdog trips on log
+# silence rather than on wall clock. RETRIES re-runs a stalled attempt so a
+# batch still returns n samples instead of n-minus-the-wedges.
+STALL_SECS="${STALL_SECS:-120}"
+RETRIES="${RETRIES:-2}"
+
 for i in $(seq 1 "$N"); do
   log="/tmp/glm5_${TAG}_r${i}.log"
-  # Distinct port per run: a killed run leaves the listener in TIME_WAIT.
-  export MASTER_PORT=$(( 30100 + (RANDOM % 400) ))
   if [ "$i" -gt 1 ]; then export KEEP_BUILD=1; fi
-  timeout "${RUN_TIMEOUT:-2400}" ./run_mp8_dp_ep_fused.sh "$@" > "$log" 2>&1
-  rc=$?
+  for attempt in $(seq 0 "$RETRIES"); do
+    # Distinct port per attempt: a killed run leaves the listener in TIME_WAIT.
+    export MASTER_PORT=$(( 30100 + (RANDOM % 400) ))
+    run_with_watchdog "$log" "$STALL_SECS" ./run_mp8_dp_ep_fused.sh "$@"
+    rc=$?
+    [ "$rc" -ne 124 ] && break
+    echo "[$TAG] run $i: STALLED (attempt $((attempt + 1))), retrying"
+  done
   # The Decode line only -- the Prefill line has the same "avg N ms/iter"
   # shape and is not what any lever here is measured against.
   ms=$(grep -E '^\[1,0\].*Decode:' "$log" | grep -oE 'avg [0-9.]+ms/iter' \

@@ -1114,13 +1114,23 @@ _rnlm8_stage_norm_rcp(unsigned short const *__restrict__ d_in,
 // pack_dense_mxfp8 enforces the identical rule -- a mismatch here is silent
 // garbage, not a build error.
 #ifndef MPK_DENSE_KMAJOR
-// 1 = K-major weight data. Measured at NP=4 bs=1 on devices 4-7, paired,
-// one variable: clean avg 10.681 (n=3) -> 10.582 (n=5), per-iter min
-// 10.531 (n=5, 10.509-10.551) -> 10.428 (n=5, 10.398-10.447). The min
-// ranges do not overlap -- the control's best run is worse than the arm's
-// worst -- and both statistics agree at -0.10 ms. 2 additionally puts the
-// E8M0 scales in K-major; unmeasured.
-#define MPK_DENSE_KMAJOR 1
+// Measured at NP=4 bs=1 on devices 4-7, paired, one variable per step.
+//
+//   level          clean avg          per-iter min (the stall-immune stat)
+//   0 row-major    10.681 (n=3)       10.531 (n=5, 10.509-10.551)
+//   1 data K-maj   10.582 (n=5)       10.428 (n=5, 10.398-10.447)   -0.103
+//   2 + scales     10.504 (n=6)       10.343 (n=6, 10.262-10.409)   -0.086
+//
+// 0->1 and 1->2 each have both statistics agreeing, and at each step five or
+// six of the arm's runs sit below the control's BEST run. Level 2 is the
+// cheaper of the two to believe: the scale half is only ~3% of the bytes but
+// a whole 16-request instruction of its own, and request count -- not bytes
+// -- is what this class pays for. Together they are -0.19 ms.
+//
+// Level 2 is NOT free once OUTPUT_PER_WG != 16: _rnlm8_sck gates it the same
+// way _rnlm8_wk gates the data half, so the N-parallel call sites stay
+// row-major and pack_dense_mxfp8 must agree. A mismatch is silent garbage.
+#define MPK_DENSE_KMAJOR 2
 #endif
 
 // Whether THIS instantiation reads a K-major weight. See the scope note.

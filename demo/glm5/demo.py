@@ -155,9 +155,15 @@ MOE_KMAJOR = int(os.environ.get("MPK_MOE_KMAJOR", "1"))
 #     repacked, so pack_dense_mxfp8 refuses K-major at any other width and the
 #     kernel's _rnlm8_wk<> gates on the same condition.
 #
+# 0 = row-major, 1 = data half K-major, 2 = data AND E8M0 scales K-major.
+# Level 2 is the default: the scale half is ~3% of the bytes but a whole
+# 16-request instruction of its own, and this class pays for request count,
+# not bytes. NP=4 bs=1 per-iter min 10.531 -> 10.428 (level 1) -> 10.343
+# (level 2); both statistics agree at each step. Full table at the #define.
+#
 # Must match the #ifndef default of MPK_DENSE_KMAJOR in
 # gang_rmsnorm_linear_mxfp8_bias_mi300.cuh.
-DENSE_KMAJOR = int(os.environ.get("MPK_DENSE_KMAJOR", "1"))
+DENSE_KMAJOR = int(os.environ.get("MPK_DENSE_KMAJOR", "2"))
 
 
 def _kmajor_permute(x: torch.Tensor, output_per_wg: int,
