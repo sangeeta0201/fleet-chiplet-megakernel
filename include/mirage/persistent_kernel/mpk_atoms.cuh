@@ -198,15 +198,54 @@ __device__ __forceinline__ mpk_u64x8
 // spin per waiter behind an s_sleep(1), against a barrier whose flag line is
 // read-shared -- but if the barrier tail regresses, this is the first thing to
 // re-measure.
+//
+// MPK_BAR_POLL_NT: RE-MEASURED, and the cost note above was right to flag it.
+// `nt` is a replacement-policy hint asking the cache NOT to retain the line.
+// On the flag it is exactly backwards: 29 blocks share each of the eight lines
+// and every one of them polls it, so the line is the most read-shared address
+// in the kernel, and `nt` invites MALL to drop it between polls and re-fetch
+// from DRAM. Dropping the hint changes NO coherence -- `sc0 sc1` still bypasses
+// L1 and the per-XCD L2, which is the whole reason this primitive exists, and
+// MALL sits below the L2s so a MALL hit returns the current value.
+//
+// Measured in tests/standalone/test_barrier_release.hip, a 232-block replica of
+// the release block at gang_mla_attn_fused_mi300.cuh:746-784, two independent
+// runs of 2000 rounds x 3 reps, min:
+//
+//   arm                                     us/barrier   vs shipping
+//   sc0 sc1 nt   sleep1  8 flags (ships)      4.120        --
+//   sc0 sc1      sleep1  8 flags              3.760       -0.361
+//   sc0 sc1      sleep0  8 flags              3.746       -0.374
+//   sc0 sc1      sleep1  32 flags             3.625       -0.495
+//   sc0 sc1 nt   sleep1  1 flag               4.660       +0.540
+//   sc0 sc1 nt   sleep1  232 private lines    4.973       +0.852
+//   arrival atomic + syncthreads, no release  1.835       -2.285
+//
+// Read across the table: line sharing is a real cost in BOTH directions -- one
+// flag for the grid is 0.54 worse, but a private line per block is 0.85 worse
+// still, because the release fan-out is one thread issuing N stores. Eight is
+// near the optimum and 32 is slightly better. s_sleep and buffer_inv are free.
+// Only the `nt` hint is a straight win, and it is a one-token change.
+#ifndef MPK_BAR_POLL_NT
+#define MPK_BAR_POLL_NT 0
+#endif
 __device__ __forceinline__ int ld_nt_s32(int *addr) {
 #if defined(__HIP_DEVICE_COMPILE__) &&                                         \
     (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
   int val;
+#if MPK_BAR_POLL_NT
   asm volatile("global_load_dword %0, %1, off sc0 sc1 nt\n"
                "s_waitcnt vmcnt(0)"
                : "=v"(val)
                : "v"(addr)
                : "memory");
+#else
+  asm volatile("global_load_dword %0, %1, off sc0 sc1\n"
+               "s_waitcnt vmcnt(0)"
+               : "=v"(val)
+               : "v"(addr)
+               : "memory");
+#endif
   return val;
 #else
   return *reinterpret_cast<int volatile *>(addr);

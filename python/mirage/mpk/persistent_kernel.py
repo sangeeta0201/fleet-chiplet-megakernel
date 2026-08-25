@@ -676,6 +676,16 @@ def get_compile_command(
             # semantics are unchanged, only who counts. Priced by the null
             # probe below at 3.77 -> 2.11 us per rendezvous.
             flags = flags + ["-DMPK_BAR_TREE=1"]
+        _bpn = os.environ.get("MPK_BAR_POLL_NT")
+        if _bpn is not None:
+            assert _bpn in ("0", "1"), "MPK_BAR_POLL_NT is 0 or 1"
+            # The `nt` hint on the intra-GPU barrier flag poll. 1 restores the
+            # historical form; 0 (the header default) drops it. Coherence is
+            # unchanged either way -- `sc0 sc1` still bypasses L1 and the
+            # per-XCD L2 -- so this is a replacement-policy change on the most
+            # read-shared line in the kernel, worth -0.36 us per rendezvous in
+            # tests/standalone/test_barrier_release.hip.
+            flags = flags + [f"-DMPK_BAR_POLL_NT={_bpn}"]
         if int(os.environ.get("MPK_EP_POLL_BATCH", "0")) == 1:
             # One s_waitcnt for all eight EP signal lines instead of one per
             # peer. The seven-line pass was seven serialized uncached round
