@@ -25,6 +25,11 @@
 #endif
 #endif
 
+// realtime_ticks() abstracts the constant-rate clock: s_memrealtime on gfx950,
+// s_sendmsg_rtn_b64(MSG_RTN_GET_REALTIME) on gfx1250, which has no
+// s_memrealtime at all. See arch_traits.cuh.
+#include "mirage/persistent_kernel/arch_traits.cuh"
+
 namespace tb {
 
 __device__ __forceinline__ uint32_t get_block_idx() {
@@ -60,10 +65,10 @@ constexpr uint32_t EVENT_FETCHED = 0x3;
 __device__ __forceinline__ void sleep_cycles(uint32_t cycles) {
 #if defined(__HIP_DEVICE_COMPILE__) &&                                         \
     (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
-  uint64_t start = __builtin_amdgcn_s_memrealtime();
+  uint64_t start = mirage::arch::realtime_ticks();
   uint64_t now;
   do {
-    now = __builtin_amdgcn_s_memrealtime();
+    now = mirage::arch::realtime_ticks();
   } while ((now - start) < static_cast<uint64_t>(cycles));
 #else
   uint32_t start = 0, now = 0;
@@ -112,10 +117,23 @@ __device__ __forceinline__ uint32_t make_event_tag_fetched(uint32_t base_tag,
 __device__ __forceinline__ uint32_t get_timestamp() {
 #if defined(__HIP_DEVICE_COMPILE__) &&                                         \
     (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
-  // s_memrealtime on MI300X runs at ~100 MHz (10ns per tick).
-  // Scale to nanoseconds to match NVIDIA's globaltimer_lo (1 GHz).
-  return static_cast<uint32_t>((__builtin_amdgcn_s_memrealtime() * 10) &
-                               0xFFFFFFFFu);
+  // Scale ticks to nanoseconds to match NVIDIA's globaltimer_lo (1 GHz).
+  //
+  // MIRAGE_TICK_NS is the ns-per-tick of the realtime counter. gfx950's runs
+  // at ~100 MHz, hence 10. gfx1250's rate is NOT known to be the same, and
+  // this must not be assumed: hipDeviceAttributeWallClockRate reports 0 under
+  // FFM, so the model cannot supply it either. Until it is measured on silicon
+  // the gfx1250 default below is a placeholder, and every profiler number on
+  // that target is in ticks-scaled-by-a-guess -- fine for comparing phases
+  // within one run, wrong for absolute times. Override at build time once the
+  // real rate is known:
+  //
+  //   -DMIRAGE_TICK_NS=<ns per tick>
+  //
+  // Host-side, prefer querying hipDeviceAttributeWallClockRate and scaling
+  // there rather than baking a constant into device code.
+  return static_cast<uint32_t>(
+      (mirage::arch::realtime_ticks() * MIRAGE_TICK_NS) & 0xFFFFFFFFu);
 #else
   uint32_t volatile ret;
   asm volatile("mov.u32 %0, %globaltimer_lo;" : "=r"(ret));

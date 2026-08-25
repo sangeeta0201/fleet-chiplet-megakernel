@@ -117,6 +117,20 @@ constexpr int LDS_SEGMENT_BYTES = 0;
 // the gfx1250 rate is a separate question that has to be measured on the
 // model or the part. Report raw ticks and convert at the boundary using
 // hipDeviceAttributeWallClockRate.
+// Nanoseconds per realtime tick, used to scale profiler timestamps.
+//
+// gfx950: s_memrealtime runs at ~100 MHz -> 10 ns/tick. Measured and relied on
+// by the existing profiler.
+//
+// gfx1250: UNVERIFIED. hipDeviceAttributeWallClockRate returns 0 under
+// FFM-Lite, so the model cannot tell us and no gfx1250 silicon is available
+// here. 10 is carried over as a placeholder so timestamps stay
+// self-consistent, but absolute microsecond figures on gfx1250 are not
+// trustworthy until this is measured. Override with -DMIRAGE_TICK_NS=<n>.
+#ifndef MIRAGE_TICK_NS
+#define MIRAGE_TICK_NS 10
+#endif
+
 __device__ __forceinline__ unsigned long long realtime_ticks() {
 #if defined(MIRAGE_ARCH_GFX1250)
   return wall_clock64(); // -> s_sendmsg_rtn_b64 sendmsg(MSG_RTN_GET_REALTIME)

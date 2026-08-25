@@ -385,8 +385,9 @@ __device__ __forceinline__ void __nanosleep(unsigned int ns) {
 __device__ __forceinline__ unsigned long long get_wallclock_ns() {
 #if defined(__HIP_DEVICE_COMPILE__) &&                                         \
     (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
-  // s_memrealtime runs at 100 MHz (10 ns/tick) on MI300X
-  return __builtin_amdgcn_s_memrealtime() * 10;
+  // Tick rate is arch-dependent; see MIRAGE_TICK_NS in arch_traits.cuh.
+  // gfx1250's rate is unverified (WallClockRate reports 0 under FFM).
+  return mirage::arch::realtime_ticks() * MIRAGE_TICK_NS;
 #else
   unsigned long long ret;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(ret));
@@ -1533,7 +1534,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #ifdef MPK_ENABLE_GAP_TIMING
     // Timestamp BEFORE dep check — gap = this minus prev_task_end (pure
     // scheduling)
-    unsigned long long _before_dep_t0 = __builtin_amdgcn_s_memrealtime();
+    unsigned long long _before_dep_t0 = mirage::arch::realtime_ticks();
 #endif
 
 #ifdef MPK_ENABLE_PROFILING
@@ -1672,7 +1673,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
     unsigned long long exec_start = clock64();
 #endif
 #ifdef MPK_ENABLE_DEVICE_TASK_ACCUM
-    unsigned long long _accum_t0 = __builtin_amdgcn_s_memrealtime();
+    unsigned long long _accum_t0 = mirage::arch::realtime_ticks();
 #endif
 #ifdef MPK_ENABLE_GAP_TIMING
     // Scheduling gap = _before_dep_t0 - _prev_task_end (queue poll + task load,
@@ -2088,7 +2089,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
           int _ss =
               _span_stage_for_task(task_desc->task_type, task_desc->variant_id);
           if (_ss >= 0 && atomicCAS(&g_span_first_flag[_ss], 0, 1) == 0) {
-            g_span_first_start[_ss] = __builtin_amdgcn_s_memrealtime();
+            g_span_first_start[_ss] = mirage::arch::realtime_ticks();
             __threadfence();
           }
         }
@@ -2522,7 +2523,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
         int _ss =
             _span_stage_for_task(task_desc->task_type, task_desc->variant_id);
         if (_ss >= 0 && atomicCAS(&g_span_first_flag[_ss], 0, 1) == 0) {
-          g_span_first_start[_ss] = __builtin_amdgcn_s_memrealtime();
+          g_span_first_start[_ss] = mirage::arch::realtime_ticks();
           __threadfence();
         }
       }
@@ -2562,7 +2563,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
     if (threadIdx.x == 0 && g_daccum_active &&
         task_desc->task_type != TASK_BEGIN_TASK_GRAPH) {
       unsigned long long _accum_dur =
-          (__builtin_amdgcn_s_memrealtime() - _accum_t0) * 10; // ns
+          (mirage::arch::realtime_ticks() - _accum_t0) * MIRAGE_TICK_NS; // ns
       int slot = 8;                                            // OTHER
       unsigned vid = task_desc->variant_id;
       switch (task_desc->task_type) {
@@ -2658,7 +2659,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
         atomicAdd(&g_daccum_ns[16], _dep_wait);
         atomicAdd(&g_daccum_cnt[16], 1ULL);
       }
-      _prev_task_end = __builtin_amdgcn_s_memrealtime();
+      _prev_task_end = mirage::arch::realtime_ticks();
 #endif
     }
 #endif
@@ -2863,7 +2864,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
         if (event_fired) {
 #ifdef MPK_ENABLE_SPAN_TIMING
           if (g_span_active) {
-            unsigned long long _ev_ticks = __builtin_amdgcn_s_memrealtime();
+            unsigned long long _ev_ticks = mirage::arch::realtime_ticks();
             int _ev_stage = _span_stage_for_task(task_desc->task_type,
                                                  task_desc->variant_id);
             if (_ev_stage >= 0 && g_span_prev_event_ticks > 0) {
