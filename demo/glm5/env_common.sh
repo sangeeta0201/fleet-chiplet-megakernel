@@ -130,6 +130,10 @@ MPK_FORWARD_VARS=(
   # above the MFMA group, so the per-MFMA lgkmcnt(0) stops draining the weight
   # prefetch. Compile-time; a rank that misses it is a different binary.
   MPK_MOE_WGLOBAL
+  # Threads that addrspace(1) through the k-loop's pointer TYPE, which is what
+  # makes MPK_MOE_WGLOBAL land at all -- the leaf cast alone is inert three
+  # inlines below the loader lambdas. Compile-time.
+  MPK_MOE_WGPTR
   MPK_MOE_SCBASE
   # Double-buffered form of that same k-loop: swap two register buffers instead
   # of copying one into the other at the backedge, which is what forces the two

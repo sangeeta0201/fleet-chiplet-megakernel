@@ -1022,6 +1022,18 @@ def get_compile_command(
             assert _wg in ("0", "1"), "MPK_MOE_WGLOBAL is 0 or 1"
             flags = flags + [f"-DMPK_MOE_WGLOBAL={_wg}"]
 
+        _wgp = os.environ.get("MPK_MOE_WGPTR")
+        if _wgp is not None:
+            # Makes MPK_MOE_WGLOBAL actually land. The leaf-level cast in
+            # _gang_ld_g is inert three inlines below a lambda, so the two MoE
+            # k-loops are the ONLY all-flat, all-vmcnt(0) MAC loops left in the
+            # megakernel while every other one is global with a partial vmcnt.
+            # This threads addrspace(1) through the pointer TYPE instead. Long
+            # note at the define in gang_moe_linear_mxfp8_mi300.cuh.
+            # Compile-time, so every rank must agree.
+            assert _wgp in ("0", "1"), "MPK_MOE_WGPTR is 0 or 1"
+            flags = flags + [f"-DMPK_MOE_WGPTR={_wgp}"]
+
         _scb = os.environ.get("MPK_MOE_SCBASE")
         if _scb is not None:
             # Load the GROUPS-wide E8M0 scale batch off ONE base pointer with

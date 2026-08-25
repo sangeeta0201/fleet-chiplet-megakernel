@@ -240,6 +240,33 @@ __device__ __forceinline__ i32x8_t
 // Global-addressed twin of the above, for MPK_MOE_WGLOBAL. Identical
 // addressing; the gathers go through _gang_ld_g so they emit global_load
 // instead of flat_load and stop incrementing lgkmcnt.
+//
+// MEASURED NOT TO WORK HERE, off the shipping 9.308 image (task #106):
+//
+//   loop                     flat  global  vmcnt waits
+//   gang_gemv_mxfp8          0     16      7 6 5 4 3 2 1 ...
+//   mla_decode_absorbed      0      9      17 ... 0
+//   gang_rmsnorm_linear x4   0     12      0 1
+//   gang_moe_w13             8      0      0 0
+//   gang_moe_w2              8      0      0 0
+//
+// Every other MAC loop in the megakernel is global-addressed with a PARTIAL
+// vmcnt.  The two MoE ones are the only all-flat, all-drain loops left, and
+// they are precisely the ones MPK_MOE_WGLOBAL was written for.  So the knob's
+// -0.108 ms came entirely from its OTHER half -- the B-side ds_read hoist --
+// and the address space never landed.
+//
+// WHY.  `_gang_ld_g` casts at the LEAF, one dereference deep, and here that
+// leaf sits three inlines below a `[&]` lambda whose captured base pointer is
+// loop-carried:  load_w -> _gang_load_w_mfma_a_at_g -> _gang_load_fp4_mfma_b_g
+// -> _gang_ld_g.  InferAddressSpaces has to walk that whole chain back to a
+// provably-global root and does not; the dense kernel's `_rnlm8_load_w` calls
+// the same helper one level down from a plain local and keeps its global_load.
+// The cast is not wrong, it is just not load-bearing at this depth.
+//
+// THE FIX is to put the address space in the pointer TYPE and hand it in from
+// the top of the k-loop, so no inference is needed: every byte of arithmetic
+// below already happens on an addrspace(1) pointer.  See MPK_MOE_WGPTR.
 template <bool FP4>
 __device__ __forceinline__ i32x8_t
     _gang_load_w_mfma_a_at_g(uint8_t const *base, int byte_off, int g) {
@@ -248,6 +275,35 @@ __device__ __forceinline__ i32x8_t
   } else {
     return _gang_load_fp8_mfma_b_g(base + byte_off, 0, g);
   }
+}
+
+// The weight pointer as a TYPE, not as a cast at the point of use.
+using _gang_gp8 = __attribute__((address_space(1))) uint8_t const *;
+
+// Pointer-typed twin of _gang_load_w_mfma_a_at_g.  Byte-for-byte the same
+// addressing -- FP4 takes one 16-byte chunk at `+g*16`, FP8 takes that plus a
+// second at `+g*16+64` -- but the base arrives already in addrspace(1), so the
+// only cast left is a pointee-type reinterpret WITHIN that address space,
+// which needs no inference at all.
+template <bool FP4>
+__device__ __forceinline__ i32x8_t
+    _gang_load_w_mfma_a_at_gp(_gang_gp8 base, int byte_off, int g) {
+  using gv4 = __attribute__((address_space(1))) i32x4_t const *;
+  _gang_gp8 const p = base + byte_off + g * 16;
+  i32x4_t lo = *(gv4)p;
+  i32x8_t r = {};
+  r[0] = lo[0];
+  r[1] = lo[1];
+  r[2] = lo[2];
+  r[3] = lo[3];
+  if constexpr (!FP4) {
+    i32x4_t hi = *(gv4)(p + 64);
+    r[4] = hi[0];
+    r[5] = hi[1];
+    r[6] = hi[2];
+    r[7] = hi[3];
+  }
+  return r;
 }
 
 // Bytes one weight row contributes to one 128-element k-tile. W_ROW_BYTES is
@@ -436,6 +492,35 @@ __device__ __forceinline__ f32x4_t _gang_mfma_w_x_f8(
 #define MPK_MOE_SCBASE 1
 #endif
 
+// MPK_MOE_WGPTR: make MPK_MOE_WGLOBAL actually land, by threading
+// addrspace(1) through the k-loop's pointer TYPE instead of casting at the
+// leaf. See the long note on _gang_load_w_mfma_a_at_g for the image census
+// that says the leaf cast is inert here -- the two MoE k-loops are the ONLY
+// all-flat, all-`vmcnt(0)` MAC loops left in the megakernel, and they are the
+// two the knob was written for.
+//
+// Nothing about the addressing changes: same base, same byte offsets, same
+// number of loads, same MFMAs. Only the opcode (global_load, not flat_load)
+// and therefore which counter the loads sit in. That is the whole point: a
+// flat op increments lgkmcnt as well as vmcnt, so the two `s_waitcnt
+// lgkmcnt(0)` that land this trip's B-operand ds_reads also retire every
+// outstanding weight load. Read off the shipping W2 body [0x4278c..0x4290c]:
+//
+//   ds_read_b128 x3 ; ds_read_u8 x4        <- B operand, hoisted (WGLOBAL half 2)
+//   s_waitcnt lgkmcnt(3) ; v_mfma          <- partial, good
+//   s_waitcnt lgkmcnt(2) ; v_mfma
+//   flat_load_ubyte    x4                  \  next block's weights + scales
+//   flat_load_dwordx4  x3                  /
+//   s_waitcnt lgkmcnt(0) ; v_mfma          <- DRAINS ALL SEVEN
+//   flat_load_dwordx4  x1
+//   s_waitcnt lgkmcnt(0) ; v_mfma          <- drains the eighth
+//   s_waitcnt vmcnt(0)                     <- and again at the backedge
+//
+// Requires MPK_MOE_WGLOBAL=1 to have any effect; =0 keeps the generic loaders.
+#ifndef MPK_MOE_WGPTR
+#define MPK_MOE_WGPTR 1
+#endif
+
 
 // The k-loop, with the prefetch distance as a parameter. Accumulates
 // [0, KI_END) and returns the MFMA accumulator; the caller owns the epilogue.
@@ -484,10 +569,19 @@ __device__ __forceinline__ f32x4_t
   };
   // Declared before `consume` captures it.
   f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
+  // Both weight pointers re-typed into addrspace(1) ONCE, at the top of the
+  // loop, so every byte of offset arithmetic below happens on a pointer that
+  // is already global. MPK_MOE_WGPTR's header has the image census showing
+  // why the old leaf-level cast in _gang_ld_g does not survive the inline
+  // chain out of these lambdas.
+  _gang_gp8 const wdr_g = (_gang_gp8)w_data_row;
+  _gang_gp8 const wsc_g = (_gang_gp8)wg_scales;
   // The weight (A) operand and its E8M0 scale. Under MPK_MOE_WGLOBAL both go
   // through addrspace(1) so they leave lgkmcnt; see the knob's header.
   auto load_w = [&](int kk) -> i32x8_t {
-    if constexpr (MPK_MOE_WGLOBAL) {
+    if constexpr (MPK_MOE_WGLOBAL && MPK_MOE_WGPTR) {
+      return _gang_load_w_mfma_a_at_gp<WEIGHT_FP4>(wdr_g, kk * W_KS, g);
+    } else if constexpr (MPK_MOE_WGLOBAL) {
       return _gang_load_w_mfma_a_at_g<WEIGHT_FP4>(w_data_row, kk * W_KS, g);
     } else {
       return _gang_load_w_mfma_a_at<WEIGHT_FP4>(w_data_row, kk * W_KS, g);
@@ -495,7 +589,9 @@ __device__ __forceinline__ f32x4_t
   };
   auto load_ws = [&](int kk) -> int {
     int const off = row_scale_base + kk * SC_KS + g;
-    if constexpr (MPK_MOE_WGLOBAL) {
+    if constexpr (MPK_MOE_WGLOBAL && MPK_MOE_WGPTR) {
+      return (int)wsc_g[off];
+    } else if constexpr (MPK_MOE_WGLOBAL) {
       return (int)_gang_ld_g<uint8_t>(wg_scales + off);
     } else {
       return (int)wg_scales[off];
@@ -525,7 +621,15 @@ __device__ __forceinline__ f32x4_t
   // that collision unnecessary.  Register-REDUCING, hence not the same bet as
   // MPK_MOE_PF_DBUF, which lost on a +26 VGPR bill.
   auto load_ws_batch = [&](int kbase, int *out) {
-    if constexpr (MPK_MOE_SCBASE) {
+    if constexpr (MPK_MOE_SCBASE && MPK_MOE_WGLOBAL && MPK_MOE_WGPTR) {
+      // Same single base pointer, carried in addrspace(1) so the batch emits
+      // global_load_ubyte off one address with immediate offsets.
+      _gang_gp8 const p = wsc_g + (row_scale_base + kbase * SC_KS + g);
+#pragma unroll
+      for (int j = 0; j < GROUPS; j++) {
+        out[j] = (int)p[j * SC_KS];
+      }
+    } else if constexpr (MPK_MOE_SCBASE) {
       uint8_t const *p = wg_scales + (row_scale_base + kbase * SC_KS + g);
 #pragma unroll
       for (int j = 0; j < GROUPS; j++) {
