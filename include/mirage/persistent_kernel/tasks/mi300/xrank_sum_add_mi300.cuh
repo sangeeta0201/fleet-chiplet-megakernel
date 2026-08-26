@@ -183,6 +183,14 @@ __device__ __forceinline__ void
             payload + ((size_t)p * BATCH_SIZE + b) * HIDDEN + j);
         // Written by a peer, or written through by this block a moment ago --
         // either way this CU's vL1 may hold a pre-write line.
+        //
+        // MEASURED NEUTRAL, do not re-try: batching these into one
+        // `global_load_dwordx4 x4 ... s_waitcnt vmcnt(0)` cuts the loop's
+        // s_waitcnt count 15 -> 8 and is bit-identical, and the wall did not
+        // move (off 9.180/9.147/9.173 vs on 9.153). ld_sys_u64's built-in
+        // drain is not this task's cost -- the ~18 us it spans is the peer
+        // WAIT above. It also made the 248-blocks-on-256-CUs bootstrap flaky
+        // (1 clean start of 7 vs 3 of 3), so the batched form is gone.
         unsigned long long w0 = ld_sys_u64(slot);
         unsigned long long w1 = ld_sys_u64(slot + 1);
 #pragma unroll
