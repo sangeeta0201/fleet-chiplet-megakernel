@@ -444,6 +444,12 @@ def get_compile_command(
             flags = flags + [f"-DMPK_PROFILING_NUM_ITERS={profiling_iters}"]
         else:
             flags = flags + ["-DMPK_PROFILING_NUM_ITERS=0"]
+        if int(os.environ.get("MPK_ITER_SPLIT", "0")) == 1:
+            # Worker 0 stamps BEGIN_TASK_GRAPH / first fused task / last fused
+            # task, so the pre-loop (embed + 3 dense layers) and post-loop
+            # (final norm + LM head + argmax) segments are measured directly
+            # instead of inferred from the --max-layers intercept.
+            flags = flags + ["-DMPK_ITER_SPLIT"]
         if int(os.environ.get("MPK_TIMING", "0")) == 1:
             flags = flags + ["-DMPK_ENABLE_TIMING"]
         if int(os.environ.get("MPK_DEVICE_TIMING", "0")) == 1:

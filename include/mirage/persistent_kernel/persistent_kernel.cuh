@@ -1517,6 +1517,37 @@ __device__ int g_fwdpass_dropped;
 __device__ unsigned long long g_fwdpass_total_ns;
 __device__ int g_fwdpass_total_iters;
 
+// MPK_ITER_SPLIT: the only instrument that can see OUTSIDE the fused loop.
+//
+// BAR_SKEW stamps slots *inside* gang_mla_full_layer_fused, so the whole
+// embedding + 3-dense-layer prologue and the final-norm/LM-head/argmax tail
+// are invisible to it -- and the --max-layers regression says that block is
+// 0.776 ms/token, which would rank second on the phase board.
+//
+// Worker 0 keeps its own timeline: BEGIN_TASK_GRAPH -> first fused-layer task
+// -> last fused-layer task -> next BEGIN_TASK_GRAPH. The three segments sum
+// to the iteration exactly by construction, so no scale factor is involved
+// (unlike the BAR_SKEW board, whose clean/instrumented ratio has to be
+// re-derived). One thread, three s_memrealtime reads per iteration.
+//
+// The three per-iteration stamps live in DEVICE GLOBALS, not in worker-local
+// variables. Three `unsigned long long` locals held live across the task loop
+// cost 6 VGPRs, and at MPK_WORKER_WAVES_PER_EU=3 (252 unified VGPRs) that is
+// enough to lose the 248-block co-residency: the first attempt HUNG at
+// `launch_persistent_kernel ENTER`, and the run before it completed at
+// 384 ms/iter instead of 9.3. Globals are written once per task by one thread
+// on one worker, which is free, and cost no registers at all.
+#ifdef MPK_ITER_SPLIT
+__device__ unsigned long long g_is_pre_ns;
+__device__ unsigned long long g_is_fused_ns;
+__device__ unsigned long long g_is_post_ns;
+// volatile: written by worker 0's block, read by the scheduler's block.
+__device__ volatile unsigned long long g_is_fused_first; // first fused entered
+__device__ volatile unsigned long long g_is_fused_last;  // last fused retired
+__device__ int g_is_iters;
+__device__ int g_is_missing; // iterations with no fused task seen
+#endif
+
 __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                                                int assigned_worker_id = -1) {
   // Make sure overall smem usage here do not exceed 3KB
@@ -2250,6 +2281,12 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #ifdef MPK_ENABLE_PROFILING
     if (task_desc->task_type != TASK_TERMINATE) {
       PROFILER_EVENT_START(task_desc->task_type, task_counter);
+    }
+#endif
+#ifdef MPK_ITER_SPLIT
+    if (threadIdx.x == 0 && worker_id == 0 && g_is_fused_first == 0 &&
+        task_desc->task_type == TASK_GANG_MLA_FULL_LAYER_FUSED_MI300) {
+      g_is_fused_first = get_wallclock_ns();
     }
 #endif
 
@@ -3465,6 +3502,12 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
       PROFILER_EVENT_END(task_desc->task_type, task_counter++);
     }
 #endif
+#ifdef MPK_ITER_SPLIT
+    if (threadIdx.x == 0 && worker_id == 0 &&
+        task_desc->task_type == TASK_GANG_MLA_FULL_LAYER_FUSED_MI300) {
+      g_is_fused_last = get_wallclock_ns();
+    }
+#endif
 
     // Trigger event
 #ifdef MPK_FUSED_LAYER_BATCHING
@@ -3925,6 +3968,31 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
           // ones past the end of the ring.
           g_fwdpass_total_ns += dur;
           g_fwdpass_total_iters++;
+#ifdef MPK_ITER_SPLIT
+          // Split `dur` into pre / fused / post using worker 0's two stamps.
+          // The boundaries are the scheduler's own END_OF_TASK_GRAPH clocks,
+          // so the three segments sum to `dur` by construction -- no scale
+          // factor, unlike the BAR_SKEW board.
+          //
+          // This lives here rather than in execute_worker's BEGIN_TASK_GRAPH
+          // branch because under precomputed dispatch a worker never fetches
+          // a BEGIN_TASK_GRAPH task at all: that version compiled, ran, and
+          // reported iters=0.
+          {
+            unsigned long long ff = g_is_fused_first;
+            unsigned long long fl = g_is_fused_last;
+            if (ff >= prev_end_of_graph_clk && fl >= ff && fl <= iter_end_clk) {
+              g_is_pre_ns += ff - prev_end_of_graph_clk;
+              g_is_fused_ns += fl - ff;
+              g_is_post_ns += iter_end_clk - fl;
+              g_is_iters++;
+            } else {
+              g_is_missing++;
+            }
+          }
+          g_is_fused_first = 0;
+          g_is_fused_last = 0;
+#endif
 #ifdef MPK_SPEC_DECODE
           if (g_spec_iter_is_decode) {
             g_spec_decode_ns += dur;
@@ -4001,6 +4069,26 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                            (double)g_fwdpass_total_iters
                      : 0.0,
                  g_fwdpass_dropped);
+#ifdef MPK_ITER_SPLIT
+          // Emitted from the SCHEDULER, not from execute_worker: that function
+          // sits on the register/residency cliff and a printf added to ANY of
+          // its paths -- even a cold one taken once at teardown -- cost the
+          // 248-block launch and hung at `launch_persistent_kernel ENTER`.
+          // The accumulators are device globals written by worker 0, so any
+          // block can read them at the end.
+          {
+            int isn = g_is_iters > 0 ? g_is_iters : 1;
+            printf("[ITERSPLIT] iters=%d missing=%d pre_us=%.2f "
+                   "fused_us=%.2f post_us=%.2f total_us=%.2f\n",
+                   g_is_iters,
+                   g_is_missing,
+                   (double)g_is_pre_ns / 1000.0 / isn,
+                   (double)g_is_fused_ns / 1000.0 / isn,
+                   (double)g_is_post_ns / 1000.0 / isn,
+                   (double)(g_is_pre_ns + g_is_fused_ns + g_is_post_ns) /
+                       1000.0 / isn);
+          }
+#endif
 #ifdef MPK_SPEC_DECODE
           // ms_per_token is the number speculation is judged on. decode_ms
           // above it is per ITERATION and goes UP when speculation works.

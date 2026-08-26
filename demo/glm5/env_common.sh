@@ -99,6 +99,10 @@ MPK_FORWARD_VARS=(
   GLM_MLA_PAIR_MERGE
   GANG_TILE_N GANG_WGM GANG_K_SPLITS
   MPK_SPAN_TIMING MPK_SUBPHASE_TIMING MPK_DEVICE_TIMING MPK_WORKER_STATE
+  # pre/fused/post split of the iteration, stamped by worker 0. Compile-time,
+  # so a mismatch between ranks is a different binary and the barriers
+  # deadlock.
+  MPK_ITER_SPLIT
   MPK_EP_SIG_DBG MPK_EP_FORCE_STAGED MPK_EP_ABLATE MPK_EP_WAIT_TIMEOUT
   MPK_EP_TMO_PRINT_LAYERS
   # Ceiling probes. All are WRONG OUTPUT by construction and all are
