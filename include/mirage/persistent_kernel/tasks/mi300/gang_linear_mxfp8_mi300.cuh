@@ -57,6 +57,55 @@
 
 namespace kernel {
 
+// ── MPK_MFMA_VSCALE ────────────────────────────────────────────────────────
+//
+// THE SCALE OPERANDS OF v_mfma_scale_* MUST BE VGPRs. When LLVM can prove a
+// scale is wave-uniform it puts it in an SGPR, and the result is silently
+// wrong -- the instruction reads a byte that is not the one the source names,
+// which for an E8M0 scale is almost always 0 == 2^-127, so the product
+// underflows and the whole accumulator prints as an exact 0.0.
+//
+// Root cause of task #133 (`MPK_MOE_PF_GROUPS_W13 >= 8` emitting
+// "aniumaniumanium..."), found in tests/standalone/test_moe_kloop_width.hip.
+// Read off `-O3 --offload-arch=gfx950` for the deep k-loop at GROUPS=4,
+// MFMA_ITERS=8 -- the smallest repro, straight-line, no loop at all:
+//
+//   ds_read_b64        v[38:39], v3 offset:1280   <- token scales, LANE-
+//   v_readfirstlane_b32 s0, v38                      INVARIANT address
+//   s_and_b32          s1, s0, 0xff
+//   v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[4:11], v[20:27], 0, v32, s1
+//                                                                       ^^^^
+// against the shipping loop, which emits `v118` in that slot and is correct.
+// Not the addressing, not the arithmetic, not registers: EVERY correct arm
+// has a VGPR there and EVERY broken arm has an SGPR.
+//
+// It is the deep loop's own batching that creates the SGPR: the batched
+// `s_tok_scales[k]` reads collapse into one wide ds_read off a lane-invariant
+// address, uniformity analysis fires, and the value is scalarised. It scales
+// with GROUPS because more of the batch becomes provably uniform at once --
+// hence the GROUPS>=8 cliff, and hence the partial arms (GR=12 kept 16 of 48
+// MFMAs, the ones that still had a VGPR scale).
+//
+// It is specifically the TOKEN scale, which is why only W13 was ever hit:
+// W13 reads `s_tok_scales[k]` (lane-invariant -> scalarisable) and W2 reads
+// `s_tok_scales[k*4+g]` (divergent -> never scalarised). Same reason the
+// shipping GROUPS=4 loop is safe: its per-slot reads never batch far enough
+// for LLVM to bother.
+//
+// The launder below is a zero-instruction constraint on the register class,
+// not a barrier: `+v` forces the value into a VGPR and nothing else changes.
+// Applied to BOTH scales so no future call site can reintroduce this.
+// `_gang_mfma_vscale` itself is defined in gang_moe_linear_mxfp4_mi300.cuh,
+// which this header includes, because the f4xf8/f4xf4 wrappers there need it
+// too.
+//
+// The oracle is tests/standalone/test_moe_kloop_width.hip: nine k-loop widths
+// against the shipping one, bit-exact, ~20 s to build and 1 ms to run. Before
+// the launder, `deep GR>=8` and `dbuf GR>=4` returned 0.0000 or a clean
+// fraction; after it, all nine agree bit-for-bit under both a ones-fill and a
+// random fill, at MFMA_ITERS 8 and 48. Re-run it before trusting ANY new
+// k-loop width.
+
 // FP8xFP8 scaled MFMA: 16x16x128, hardware dequant + multiply.
 // A = weights (FP8 E4M3), 32 bytes/lane. B = tokens (FP8 E4M3), 32 bytes/lane.
 // Both operands fill the whole i32x8, unlike the FP4 case where src0 used only
@@ -65,7 +114,7 @@ __device__ __forceinline__ f32x4_t _gang_mfma_f8xf8(
     i32x8_t a, i32x8_t b, f32x4_t c, int scale_a, int scale_b) {
   return __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
       a, b, c, 0 /*cbsz: FP8 E4M3 src0*/, 0 /*blgp: FP8 E4M3 src1*/,
-      0, scale_a, 0, scale_b);
+      0, _gang_mfma_vscale(scale_a), 0, _gang_mfma_vscale(scale_b));
 }
 
 // Shared prologue for both variants: windowed traversal (HipKittens Alg. 1)

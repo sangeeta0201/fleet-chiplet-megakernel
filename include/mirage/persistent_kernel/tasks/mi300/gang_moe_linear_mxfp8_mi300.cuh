@@ -1095,6 +1095,69 @@ __device__ __host__ constexpr int _gang_moe_pf_groups(int ki, int req) {
 // dbuf at GR=4 costs 335 -> 364 unified VGPRs binary-wide (see PF_DBUF's
 // header), while GR=2 and GR=3 are both free at 335. Splitting the knobs lets
 // each kernel take the widest dbuf-capable width its own trip count allows.
+// W13 STAYS AT THE UNIFIED DEFAULT. It was briefly set to 8 on a -0.256 ms
+// wall measurement; that measurement IS RETRACTED -- W13=8 EMITS GARBAGE.
+//
+// The wall numbers, NP=4 / bs=1 / devices 4-7, n=4 per arm, one build per arm,
+// are reproducible (p130 g8 8.877/8.797 vs p131 w2_ctl 8.876/8.799, same
+// config in separate batches, agreeing to 0.001 ms):
+//
+//   W13 depth, W2 held at 4        avg mean   per-iter-min
+//     4 (ships)                      9.133        8.994
+//     6                              8.966        8.849   -0.167
+//     8                              8.877        8.797   -0.256   RETRACTED
+//    12                              8.884        8.806   -0.249   RETRACTED
+//
+//   W2 depth, W13 held at 8        avg mean   per-iter-min
+//     4                              8.876        8.799
+//     8                              9.352        9.268   +0.476
+//    16                              ~9.33        9.298   +0.499
+//
+// ...and they are meaningless, because at 128 generated tokens W13=8 answers
+// "The capital of France is" with
+//
+//     <think>aniumaniumaniumaniumanium...        (135 of 136 tokens one bigram)
+//
+// against the control's clean list of European capitals, on two INDEPENDENT
+// builds -- the correctness suite's g8 arm and a separate three-repeat
+// recheck. The MoE output feeds the next layer's router, so garbage rewrites
+// TopK and every downstream layer runs a different expert set: the timing is
+// not a timing of this model. See
+// [[glm-wrong-output-probes-upstream-of-router-are-invalid]] -- the MoE is
+// downstream of ITS router but upstream of the NEXT one.
+//
+// The hangs are the same bug, not a separate flake. W13=8 finished 1 of 3
+// standalone repeats and 1 of 8 correctness-suite runs; W13=4 finished 5 of 6.
+// A run whose routing has gone degenerate spins somewhere it should not.
+//
+// It was NOT registers and NOT arithmetic. /tmp/vgpr.sh on the real image,
+// worker_kernel .vgpr_count:
+//
+//   W13   4    6    8   12   16   24          W2 (at W13=8)   4    8   16
+//       325  325  325  327  344  512(180sp)                 325  362  362
+//
+// -- W13 is 325 with ZERO spills at 4, 6 and 8, at MPK_MAX_SEQ_LENGTH 128 and
+// 512 alike, so the famous 325 -> 362 step is W2 crossing depth 8 and W13
+// never paid it. And the MFMA chain is `acc = mfma(A[j], B[j], acc)` in
+// ascending j for every GROUPS, so the accumulation ORDER is identical at any
+// depth: a correct deep loop is bit-identical to the shipping one.
+//
+// ROOT CAUSE, task #133, FIXED: batching the token-scale loads made
+// s_tok_scales[k] provably wave-uniform, LLVM scalarised it through
+// v_readfirstlane_b32, and v_mfma_scale_f32_16x16x128_f8f6f4 SILENTLY
+// COMPUTES GARBAGE when a scale operand is an SGPR. See the writeup above
+// _gang_mfma_f8xf8 in gang_linear_mxfp8_mi300.cuh; the fix is
+// MPK_MFMA_VSCALE, an asm("" : "+v"(s)) launder that costs zero
+// instructions. Only W13 was ever hit: it reads s_tok_scales[k]
+// (lane-invariant), W2 reads s_tok_scales[k*4+g] (divergent, never
+// scalarised). Oracle: tests/standalone/test_moe_kloop_width.hip, 20 s.
+//
+// So the axis is REAL and worth ~0.25 ms -- but every number in the two
+// tables above was measured on a garbage build and must be re-taken on top
+// of the fix (task #134). 3/6/12/24 remain unreachable through
+// MPK_MOE_PF_GROUPS (it asserts membership in ("0","2","4","8","16") and
+// W13's trip count is 48). Anything set here MUST be gated on generated
+// text, not on the wall.
 #ifndef MPK_MOE_PF_GROUPS_W13
 #define MPK_MOE_PF_GROUPS_W13 MPK_MOE_PF_GROUPS
 #endif

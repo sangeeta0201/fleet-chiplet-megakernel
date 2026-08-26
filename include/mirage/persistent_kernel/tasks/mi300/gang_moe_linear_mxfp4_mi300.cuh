@@ -541,6 +541,24 @@ __device__ __forceinline__ void
   __syncthreads();
 }
 
+// ── MPK_MFMA_VSCALE ────────────────────────────────────────────────────────
+// THE SCALE OPERANDS OF v_mfma_scale_* MUST BE VGPRs. Every call site in this
+// repo goes through this launder; the full root-cause writeup (task #133) is
+// in gang_linear_mxfp8_mi300.cuh above _gang_mfma_f8xf8. Short version: when
+// LLVM proves a scale wave-uniform it emits an SGPR there, the instruction
+// then reads a byte the source never named, and an E8M0 scale of 0 == 2^-127
+// silently underflows the whole accumulator to an exact 0.0.
+#ifndef MPK_MFMA_VSCALE
+#define MPK_MFMA_VSCALE 1
+#endif
+
+__device__ __forceinline__ int _gang_mfma_vscale(int s) {
+#if MPK_MFMA_VSCALE
+  asm("" : "+v"(s));
+#endif
+  return s;
+}
+
 // FP4×FP8 scaled MFMA: 16x16x128, hardware dequant + multiply
 // A = weights (FP4 E2M1), 16 bytes/lane in lower 128 bits of i32x8
 // B = tokens  (FP8 E4M3), 32 bytes/lane split across i32x8
@@ -553,9 +571,9 @@ __device__ __forceinline__ f32x4_t _gang_mfma_f4xf8(
       4, // cbsz: FP4 E2M1 for src0 (weights)
       0, // blgp: FP8 E4M3 for src1 (tokens)
       0,
-      scale_a,
+      _gang_mfma_vscale(scale_a),
       0,
-      scale_b);
+      _gang_mfma_vscale(scale_b));
 }
 
 // A load that is *known* to come from device *global* memory.
@@ -829,9 +847,9 @@ __device__ __forceinline__ f32x4_t _gang_mfma_f4xf4(
       4, // cbsz: FP4 for src0 (weights)
       4, // blgp: FP4 for src1 (tokens)
       0,
-      scale_a,
+      _gang_mfma_vscale(scale_a),
       0,
-      scale_b);
+      _gang_mfma_vscale(scale_b));
 }
 
 // ── BF16 MFMA helpers (W4A16 path: FP4 weights dequanted to BF16) ─────────
