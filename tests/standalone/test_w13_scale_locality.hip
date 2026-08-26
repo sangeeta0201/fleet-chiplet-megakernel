@@ -521,10 +521,398 @@ __global__ void __launch_bounds__(256)
   }
 }
 
+// ── THE buffer_load_lds RING ───────────────────────────────────────────────
+//
+// Sixth pass. The depth curve above says the tile wants depth 8-16, and the
+// two best cells both need LDS-staged scales on top:
+//
+//   GROUPS=4  + K-major            9.67 us   <- SHIPS
+//   GROUPS=8  + LDS scales + Kmaj  8.56 us
+//   GROUPS=16 + LDS scales + Kmaj  7.86 us
+//
+// but depth in REGISTERS is not free, and at the wall it has cost every time
+// it was tried: MPK_MOE_PF_GROUPS=8 measured +0.260 ms, MPK_MOE_PF_DBUF=1
+// +0.226 ms (+31 unified VGPR), MPK_ATTN_PF_DBUF=1 +0.226 ms (284 -> 310).
+// GROUPS=16 holds 16 x i32x4 A plus 16 x i32x4 N = 128 VGPRs of pipeline
+// alone. Every standalone win in this file is therefore unshippable as
+// written, and the depth axis looks closed.
+//
+// It is not, because `buffer_load_dwordx4 ... lds:1` has NO DESTINATION VGPR.
+// The data lands straight in LDS and completion is tracked by vmcnt, so a
+// DEPTH-deep pipeline costs DEPTH x 4 KB of LDS -- which is free, 77 KB of the
+// worker's 155 KB request is not load-bearing
+// ([[glm-agpr-is-spill-slack-lds-half-is-free]]) -- and zero registers. This
+// arm prices that, and it is the only untested point on the depth axis.
+//
+// Mechanics, per gfx9 MUBUF LDS mode: the lane's global address is the usual
+// base + voffset(lane), and the returned 16 bytes go to LDS at
+// M0 + lds_ptr + lane_id * 16. One wave64 therefore fills 1024 contiguous LDS
+// bytes -- exactly one K-major k-group -- and the four waves need distinct
+// 1 KB slices. The ring is DEPTH slots x NUM_WAVES x 1 KB.
+//
+// Two things the compiler cannot see and must be told:
+//   * it does not know buffer_load_lds writes s_ring, so the ds_read needs a
+//     hand-written `s_waitcnt vmcnt(DEPTH-1)` (in-order retirement makes that
+//     exactly "the oldest outstanding load has landed"), and
+//   * it must not hoist the next issue above the ds_read of the slot that
+//     issue overwrites -- hence sched_barrier(0) on both sides.
+// The steady-state block always issues, so its wait is a constant DEPTH-1; the
+// final block issues nothing and is peeled so its waits can count down.
+extern "C" __device__ void __llvm_amdgcn_raw_buffer_load_lds(
+    i32x4_t rsrc,
+    __attribute__((address_space(3))) uint32_t *lds_ptr,
+    int32_t size,
+    int32_t voffset,
+    int32_t soffset,
+    int32_t imm_offset,
+    int32_t aux) __asm("llvm.amdgcn.raw.buffer.load.lds");
+
+__device__ __forceinline__ i32x4_t make_w_buffer_rsrc(void const *base,
+                                                      uint32_t range_bytes) {
+  i32x4_t r;
+  uint64_t addr = reinterpret_cast<uint64_t>(base);
+  r[0] = static_cast<int>(
+      __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(addr & 0xFFFFFFFFu)));
+  r[1] = static_cast<int>(
+      __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(addr >> 32)));
+  r[2] = static_cast<int>(__builtin_amdgcn_readfirstlane(range_bytes));
+  r[3] = static_cast<int>(0x00020000u);
+  return r;
+}
+
+template <int N> __device__ __forceinline__ void wait_vmcnt() {
+  asm volatile("s_waitcnt vmcnt(%0)" ::"n"(N) : "memory");
+}
+
+// aux = 1 is sc0, deliberately NOT gpt-oss's 3 (sc0|nt): nt marks the line
+// evict-first and the tile is re-read by nobody but is large, so nt measured
+// worse in the o_proj prefetch (4.674 vs 4.486).
+constexpr int DMA_AUX = 1;
+
+// The peeled final block. `#pragma unroll` does NOT make its induction
+// variable a constant expression, and the countdown wait needs one, so the
+// tail is unrolled by recursion instead.
+template <int DEPTH, int S, typename F>
+__device__ __forceinline__ void dma_tail(F &step) {
+  if constexpr (S < DEPTH) {
+    wait_vmcnt<DEPTH - 1 - S>();
+    step(S);
+    dma_tail<DEPTH, S + 1>(step);
+  }
+}
+
+template <int DEPTH>
+__global__ void __launch_bounds__(256)
+    w13_tile_dma(uint8_t const *__restrict__ W, float *sink, int tiles_total,
+                 uint8_t const *__restrict__ scratch) {
+  extern __shared__ char smem[];
+  uint8_t *s_tok_fp8 = (uint8_t *)smem;
+  uint8_t *s_tok_scales = s_tok_fp8 + FP8_TOK_DATA;
+  uint8_t *s_scales =
+      (uint8_t *)(((uintptr_t)(s_tok_scales + NUM_BLOCKS_32) + 15u) &
+                  ~(uintptr_t)15);
+  uint8_t *s_ring = s_scales + WG_SCALE_BYTES; // 12 KB, already 16B-aligned
+
+  int const tid = threadIdx.x;
+  int const warp_id = tid >> 6;
+  int const lane_id = tid & 63;
+  int const col = lane_id & 15;
+  int const g = lane_id >> 4;
+
+  for (int i = tid; i < FP8_TOK_DATA / 4; i += 256) {
+    ((unsigned *)s_tok_fp8)[i] = 0x3c3c3c3cu;
+  }
+  for (int i = tid; i < NUM_BLOCKS_32; i += 256) {
+    s_tok_scales[i] = 127;
+  }
+  __syncthreads();
+
+  static_assert(MFMA_ITERS % DEPTH == 0, "DEPTH must divide the k-loop");
+  static_assert(MFMA_ITERS / DEPTH >= 2, "need one steady block plus the tail");
+  constexpr int NBLK = MFMA_ITERS / DEPTH;
+  constexpr int WAVE_SLAB = MFMA_ITERS * 1024;
+
+  i32x4_t const rsrc =
+      make_w_buffer_rsrc(W, (uint32_t)((size_t)tiles_total * (size_t)WG_BYTES));
+
+  for (int t = blockIdx.x; t < tiles_total; t += gridDim.x) {
+    int const tile_base = t * WG_BYTES;
+    uint8_t const *wg_scales = W + (size_t)tile_base + WG_DATA_BYTES;
+
+    // Scales staged once, coalesced -- required, not optional: the depth sweep
+    // shows LDS scales HURT at depth 4 (10.90 vs 9.67) and only pay at 8+.
+    __syncthreads();
+    for (int i = tid; i < WG_SCALE_BYTES / 16; i += 256) {
+      ((i32x4_t *)s_scales)[i] = ((i32x4_t const *)wg_scales)[i];
+    }
+    __syncthreads();
+
+    int const wave_voff = tile_base + warp_id * WAVE_SLAB + lane_id * 16;
+    int const row_scale_base = (warp_id * 16 + col) * NUM_BLOCKS_32;
+
+    auto issue = [&](int kk, int slot) {
+      auto *dst = (__attribute__((address_space(3))) uint32_t
+                       *)(s_ring + ((size_t)slot * NUM_WAVES + warp_id) * 1024);
+      __llvm_amdgcn_raw_buffer_load_lds(rsrc, dst, 16, wave_voff + kk * 1024, 0,
+                                        0, DMA_AUX);
+    };
+    auto consume = [&](int kk, int slot, f32x4_t acc) -> f32x4_t {
+      i32x4_t lo = *(i32x4_t const *)(s_ring +
+                                      ((size_t)slot * NUM_WAVES + warp_id) *
+                                          1024 +
+                                      lane_id * 16);
+      i32x8_t a = {};
+      a[0] = lo[0];
+      a[1] = lo[1];
+      a[2] = lo[2];
+      a[3] = lo[3];
+      i32x8_t b = load_fp8_b(s_tok_fp8, kk * K_PER_MFMA, g);
+      return mfma_f4xf8(a, b, acc, (int)s_scales[row_scale_base + kk * 4 + g],
+                        (int)s_tok_scales[kk]);
+    };
+
+#pragma unroll
+    for (int j = 0; j < DEPTH; j++) {
+      issue(j, j);
+    }
+
+    f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
+
+#pragma unroll 1
+    for (int blk = 0; blk < NBLK - 1; blk++) {
+      int const base = blk * DEPTH;
+#pragma unroll
+      for (int s = 0; s < DEPTH; s++) {
+        wait_vmcnt<DEPTH - 1>();
+        acc = consume(base + s, s, acc);
+        __builtin_amdgcn_sched_barrier(0);
+        issue(base + DEPTH + s, s);
+        __builtin_amdgcn_sched_barrier(0);
+      }
+    }
+    {
+      constexpr int base = (NBLK - 1) * DEPTH;
+      auto step = [&](int s) { acc = consume(base + s, s, acc); };
+      dma_tail<DEPTH, 0>(step);
+    }
+
+    if (acc[0] == 1.2345678e-31f && acc[1] == 1.2345678e-31f) {
+      sink[0] = acc[0] + acc[1] + acc[2] + acc[3];
+    }
+  }
+}
+
+// ══ SIXTH PASS VERDICT: THE DEPTH AXIS IS CLOSED. ═════════════════════════
+//
+//   arm                                   us/tile   standalone VGPR   LDS ring
+//   deep G=4  + K-major   (SHIPS)            9.62         72             --
+//   deep G=8  + LDS sc + Kmaj                8.57        116             --
+//   deep G=16 + LDS sc + Kmaj                7.95        198             --
+//   DMA one-slot ring, DEPTH=16             20.69         57            64 KB
+//   DMA2 half-buffered G=8                   9.91         47            64 KB
+//   DMA2 half-buffered G=12                  9.67         50            96 KB
+//   DMA2 half-buffered G=16                  9.17         57           128 KB
+//   DMA BW-ONLY (no ds_read, no MFMA)        4.29          -            64 KB
+//
+// Three things fall out, and together they shut the axis.
+//
+// 1. THE BYTES ARE NOT THE PROBLEM. buffer_load_lds moves the tile's whole
+//    192 KB in 4.29 us = 45.9 GB/s/CU, at or slightly past the 41.6 GB/s/CU
+//    that test_narrow_grid_bandwidth measured for a CU in a 64-wide phase. So
+//    the shipping 9.62 us tile is 55% NON-BYTE, and the older "29% of its real
+//    roof" reading above is about the k-loop's structure, not about a
+//    bandwidth the hardware will not give.
+//
+// 2. THE DMA PAYS A STRUCTURAL LDS TAX THE REGISTER PATH DOES NOT. A global
+//    load lands in a VGPR; a DMA load lands in LDS and must then be ds_read
+//    out. That is 192 KB of extra LDS write plus 192 KB of extra LDS read per
+//    tile, and it is exactly the ~1.3 us that separates DMA2 G=8 (9.91) from
+//    deep G=8 + LDS scales + K-major (8.57) at identical depth. Depth is free
+//    in registers with the DMA, but the delivery is not free in LDS.
+//
+// 3. THE REGISTERS IT SAVES ARE NOT SCARCE. Measured on the real image with
+//    /tmp/vgpr.sh: worker_kernel .vgpr_count is 325 at MPK_MOE_PF_GROUPS = 2
+//    AND at 4, and 362 at 8. The MoE k-loop has ZERO register headroom value
+//    below depth 8 -- something else sets the 325 -- so cutting it 72 -> 47
+//    buys nothing at the wall, and the whole +0.260 ms of PF_GROUPS=8 is the
+//    single 325 -> 362 step.
+//
+// What would ship is DMA2 at G=8, the deepest ring that fits the ~77 KB of
+// free worker LDS ([[glm-agpr-is-spill-slack-lds-half-is-free]]), and it is
+// +0.29 us/tile WORSE than what ships for zero compensating register win.
+// G=16 does beat shipping by 0.45 us/tile but wants a 128 KB ring. Even taken
+// at the optimistic 0.129 ms-per-us/tile conversion that is 0.06 ms, under the
+// 0.26 ms noise floor, and it does not fit.
+//
+// ── DMA, HALF-BUFFERED ─────────────────────────────────────────────────────
+//
+// The one-slot-at-a-time ring above is 20.7-24.8 us against 9.62 shipping, but
+// the BW-ONLY probe below says the DMA delivers the whole tile in 4.3 us at
+// 45.9 GB/s/CU. So the instruction path is not the problem: the ring serialized
+// `wait -> ds_read -> lgkmcnt(0) -> MFMA -> issue` with one wave per SIMD, so
+// every k-group paid a full exposed LDS round trip 48 times.
+//
+// This form separates the two pipelines. The HBM pipeline is a double buffer of
+// G-group halves -- G to 2G KB per wave in flight, zero destination VGPRs. The
+// LDS pipeline is the G independent ds_reads inside a half, which the compiler
+// batches, so LDS latency is paid once per half instead of once per group.
+// Register cost is only the ds_read results (4 VGPRs x G), against the deep
+// kernel's A[G] + N[G] = 8 VGPRs x G.
+template <int G>
+__global__ void __launch_bounds__(256)
+    w13_tile_dma2(uint8_t const *__restrict__ W, float *sink, int tiles_total,
+                  uint8_t const *__restrict__ scratch) {
+  extern __shared__ char smem[];
+  uint8_t *s_tok_fp8 = (uint8_t *)smem;
+  uint8_t *s_tok_scales = s_tok_fp8 + FP8_TOK_DATA;
+  uint8_t *s_scales =
+      (uint8_t *)(((uintptr_t)(s_tok_scales + NUM_BLOCKS_32) + 15u) &
+                  ~(uintptr_t)15);
+  uint8_t *s_ring = s_scales + WG_SCALE_BYTES;
+
+  int const tid = threadIdx.x;
+  int const warp_id = tid >> 6;
+  int const lane_id = tid & 63;
+  int const col = lane_id & 15;
+  int const g = lane_id >> 4;
+
+  for (int i = tid; i < FP8_TOK_DATA / 4; i += 256) {
+    ((unsigned *)s_tok_fp8)[i] = 0x3c3c3c3cu;
+  }
+  for (int i = tid; i < NUM_BLOCKS_32; i += 256) {
+    s_tok_scales[i] = 127;
+  }
+  __syncthreads();
+
+  static_assert(MFMA_ITERS % G == 0, "G must divide the k-loop");
+  constexpr int NB = MFMA_ITERS / G;
+  constexpr int WAVE_SLAB = MFMA_ITERS * 1024;
+
+  i32x4_t const rsrc =
+      make_w_buffer_rsrc(W, (uint32_t)((size_t)tiles_total * (size_t)WG_BYTES));
+
+  for (int t = blockIdx.x; t < tiles_total; t += gridDim.x) {
+    int const tile_base = t * WG_BYTES;
+    uint8_t const *wg_scales = W + (size_t)tile_base + WG_DATA_BYTES;
+
+    __syncthreads();
+    for (int i = tid; i < WG_SCALE_BYTES / 16; i += 256) {
+      ((i32x4_t *)s_scales)[i] = ((i32x4_t const *)wg_scales)[i];
+    }
+    __syncthreads();
+
+    int const wave_voff = tile_base + warp_id * WAVE_SLAB + lane_id * 16;
+    int const row_scale_base = (warp_id * 16 + col) * NUM_BLOCKS_32;
+    // Half h occupies slots [h*G, h*G+G); wave w owns 1 KB inside each slot.
+    auto half_lds = [&](int h) {
+      return s_ring + ((size_t)h * G * NUM_WAVES + warp_id) * 1024;
+    };
+    auto issue_half = [&](int blk, int h) {
+      uint8_t *base = half_lds(h);
+#pragma unroll
+      for (int s = 0; s < G; s++) {
+        auto *dst = (__attribute__((address_space(3))) uint32_t
+                         *)(base + (size_t)s * NUM_WAVES * 1024);
+        __llvm_amdgcn_raw_buffer_load_lds(
+            rsrc, dst, 16, wave_voff + (blk * G + s) * 1024, 0, 0, DMA_AUX);
+      }
+    };
+
+    f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
+    issue_half(0, 0);
+
+#pragma unroll 1
+    for (int b = 0; b < NB; b++) {
+      int const h = b & 1;
+      __builtin_amdgcn_sched_barrier(0);
+      if (b + 1 < NB) {
+        issue_half(b + 1, 1 - h);
+        wait_vmcnt<G>(); // half h has landed; half 1-h stays in flight
+      } else {
+        wait_vmcnt<0>();
+      }
+      __builtin_amdgcn_sched_barrier(0);
+      uint8_t const *base = half_lds(h);
+      int const kbase = b * G;
+#pragma unroll
+      for (int s = 0; s < G; s++) {
+        i32x4_t lo = *(i32x4_t const *)(base + (size_t)s * NUM_WAVES * 1024 +
+                                        lane_id * 16);
+        i32x8_t a = {};
+        a[0] = lo[0];
+        a[1] = lo[1];
+        a[2] = lo[2];
+        a[3] = lo[3];
+        i32x8_t bv = load_fp8_b(s_tok_fp8, (kbase + s) * K_PER_MFMA, g);
+        acc = mfma_f4xf8(a, bv, acc,
+                         (int)s_scales[row_scale_base + (kbase + s) * 4 + g],
+                         (int)s_tok_scales[kbase + s]);
+      }
+    }
+
+    if (acc[0] == 1.2345678e-31f && acc[1] == 1.2345678e-31f) {
+      sink[0] = acc[0] + acc[1] + acc[2] + acc[3];
+    }
+  }
+}
+
+// Pure HBM->LDS throughput at this shape: the same 48 x 1 KB per wave per
+// tile, the same ring, the same waits, and NO ds_read and NO MFMA. If this
+// alone is slower than the full global-load k-loop, the DMA instruction path
+// is the bottleneck and no amount of restructuring above it can help.
+template <int DEPTH>
+__global__ void __launch_bounds__(256)
+    w13_dma_bw(uint8_t const *__restrict__ W, float *sink, int tiles_total,
+               uint8_t const *__restrict__ scratch) {
+  extern __shared__ char smem[];
+  uint8_t *s_ring = (uint8_t *)smem;
+  int const tid = threadIdx.x;
+  int const warp_id = tid >> 6;
+  int const lane_id = tid & 63;
+
+  static_assert(MFMA_ITERS % DEPTH == 0, "DEPTH must divide the k-loop");
+  constexpr int NBLK = MFMA_ITERS / DEPTH;
+  constexpr int WAVE_SLAB = MFMA_ITERS * 1024;
+
+  i32x4_t const rsrc =
+      make_w_buffer_rsrc(W, (uint32_t)((size_t)tiles_total * (size_t)WG_BYTES));
+
+  for (int t = blockIdx.x; t < tiles_total; t += gridDim.x) {
+    int const wave_voff =
+        t * WG_BYTES + warp_id * WAVE_SLAB + lane_id * 16;
+    auto issue = [&](int kk, int slot) {
+      auto *dst = (__attribute__((address_space(3))) uint32_t
+                       *)(s_ring + ((size_t)slot * NUM_WAVES + warp_id) * 1024);
+      __llvm_amdgcn_raw_buffer_load_lds(rsrc, dst, 16, wave_voff + kk * 1024, 0,
+                                        0, DMA_AUX);
+    };
+#pragma unroll
+    for (int j = 0; j < DEPTH; j++) {
+      issue(j, j);
+    }
+#pragma unroll 1
+    for (int blk = 1; blk < NBLK; blk++) {
+#pragma unroll
+      for (int s = 0; s < DEPTH; s++) {
+        wait_vmcnt<DEPTH - 1>();
+        __builtin_amdgcn_sched_barrier(0);
+        issue(blk * DEPTH + s, s);
+        __builtin_amdgcn_sched_barrier(0);
+      }
+    }
+    wait_vmcnt<0>();
+    __syncthreads();
+    if (s_ring[lane_id] == 0xABu && s_ring[lane_id + 1] == 0xCDu) {
+      sink[0] = 1.0f;
+    }
+  }
+}
+
 static uint8_t *g_W;
 static float *g_sink;
 static int g_tiles;
 static size_t g_smem;
+static size_t g_smem_dma;
 static uint8_t *g_scratch;
 
 template <int SRC> static float run(int grid, int iters) {
@@ -573,6 +961,75 @@ template <int G, int L, int K> static float run_deep(int grid, int iters) {
   return ms / iters;
 }
 
+template <int D> static float run_dma(int grid, int iters) {
+  hipEvent_t e0, e1;
+  hipEventCreate(&e0);
+  hipEventCreate(&e1);
+  auto go = [&] {
+    hipLaunchKernelGGL((w13_tile_dma<D>), dim3(grid), dim3(256), g_smem_dma, 0,
+                       g_W, g_sink, g_tiles, g_scratch);
+  };
+  go();
+  hipDeviceSynchronize();
+  hipEventRecord(e0);
+  for (int i = 0; i < iters; i++) {
+    go();
+  }
+  hipEventRecord(e1);
+  hipEventSynchronize(e1);
+  float ms = 0.f;
+  hipEventElapsedTime(&ms, e0, e1);
+  hipEventDestroy(e0);
+  hipEventDestroy(e1);
+  return ms / iters;
+}
+
+template <int D> static float run_dma2(int grid, int iters) {
+  hipEvent_t e0, e1;
+  hipEventCreate(&e0);
+  hipEventCreate(&e1);
+  auto go = [&] {
+    hipLaunchKernelGGL((w13_tile_dma2<D>), dim3(grid), dim3(256), g_smem_dma, 0,
+                       g_W, g_sink, g_tiles, g_scratch);
+  };
+  go();
+  hipDeviceSynchronize();
+  hipEventRecord(e0);
+  for (int i = 0; i < iters; i++) {
+    go();
+  }
+  hipEventRecord(e1);
+  hipEventSynchronize(e1);
+  float ms = 0.f;
+  hipEventElapsedTime(&ms, e0, e1);
+  hipEventDestroy(e0);
+  hipEventDestroy(e1);
+  return ms / iters;
+}
+
+template <int D> static float run_dma_bw(int grid, int iters) {
+  hipEvent_t e0, e1;
+  hipEventCreate(&e0);
+  hipEventCreate(&e1);
+  auto go = [&] {
+    hipLaunchKernelGGL((w13_dma_bw<D>), dim3(grid), dim3(256), g_smem_dma, 0,
+                       g_W, g_sink, g_tiles, g_scratch);
+  };
+  go();
+  hipDeviceSynchronize();
+  hipEventRecord(e0);
+  for (int i = 0; i < iters; i++) {
+    go();
+  }
+  hipEventRecord(e1);
+  hipEventSynchronize(e1);
+  float ms = 0.f;
+  hipEventElapsedTime(&ms, e0, e1);
+  hipEventDestroy(e0);
+  hipEventDestroy(e1);
+  return ms / iters;
+}
+
 int main() {
   hipDeviceProp_t p;
   HIP_CHECK(hipGetDeviceProperties(&p, 0));
@@ -585,6 +1042,11 @@ int main() {
   // the LDS request is not a second variable. At grid = 64 on 256 CUs every
   // block owns a CU regardless, so this cannot move occupancy.
   g_smem = FP8_TOK_DATA + NUM_BLOCKS_32 + 16 + 49152;
+  // The DMA arms need the ring on top of the staged scales. Sized for the
+  // deepest arm (DEPTH=16 -> 64 KB) and held identical across the DMA arms.
+  // Still 1 block/CU at grid = 64 on 256 CUs, so this cannot move occupancy.
+  g_smem_dma = FP8_TOK_DATA + NUM_BLOCKS_32 + 16 + WG_SCALE_BYTES +
+               2 * 16 * NUM_WAVES * 1024;
 
   HIP_CHECK(hipMalloc(&g_W, bytes));
   HIP_CHECK(hipMalloc(&g_sink, sizeof(float)));
@@ -671,6 +1133,48 @@ int main() {
     printf("  %-32s%10.3f%12.2f%14.1f\n", e[i].name, e[i].ms, us_tile, gbs);
   }
 
+
+  // The point of the whole file: depth WITHOUT registers.
+  printf("\n  --- buffer_load_lds ring (zero destination VGPRs) ---\n"
+         "  reference cells: shipping G=4+Kmaj 9.67, reg-best G=16+LDS+Kmaj "
+         "7.86, byte floor 4.9\n");
+  struct {
+    char const *name;
+    float ms;
+  } f[4];
+  f[0] = {"DMA DEPTH=4   (16 KB ring)", run_dma<4>(grid, 10)};
+  f[1] = {"DMA DEPTH=8   (32 KB ring)", run_dma<8>(grid, 10)};
+  f[2] = {"DMA DEPTH=12  (48 KB ring)", run_dma<12>(grid, 10)};
+  f[3] = {"DMA DEPTH=16  (64 KB ring)", run_dma<16>(grid, 10)};
+  struct {
+    char const *name;
+    float ms;
+  } fb[2];
+  struct {
+    char const *name;
+    float ms;
+  } f2[4];
+  f2[0] = {"DMA2 half-buffered G=6", run_dma2<6>(grid, 10)};
+  f2[1] = {"DMA2 half-buffered G=8", run_dma2<8>(grid, 10)};
+  f2[2] = {"DMA2 half-buffered G=12", run_dma2<12>(grid, 10)};
+  f2[3] = {"DMA2 half-buffered G=16", run_dma2<16>(grid, 10)};
+  fb[0] = {"DMA BW-ONLY DEPTH=8 (no MFMA)", run_dma_bw<8>(grid, 10)};
+  fb[1] = {"DMA BW-ONLY DEPTH=16 (no MFMA)", run_dma_bw<16>(grid, 10)};
+  for (int i = 0; i < 4; i++) {
+    double us_tile = f[i].ms * 1000.0 / (g_tiles / (double)grid);
+    double gbs = (double)WG_DATA_BYTES / (us_tile * 1e-6) / 1e9;
+    printf("  %-32s%10.3f%12.2f%14.1f\n", f[i].name, f[i].ms, us_tile, gbs);
+  }
+  for (int i = 0; i < 4; i++) {
+    double us_tile = f2[i].ms * 1000.0 / (g_tiles / (double)grid);
+    double gbs = (double)WG_DATA_BYTES / (us_tile * 1e-6) / 1e9;
+    printf("  %-32s%10.3f%12.2f%14.1f\n", f2[i].name, f2[i].ms, us_tile, gbs);
+  }
+  for (int i = 0; i < 2; i++) {
+    double us_tile = fb[i].ms * 1000.0 / (g_tiles / (double)grid);
+    double gbs = (double)WG_DATA_BYTES / (us_tile * 1e-6) / 1e9;
+    printf("  %-32s%10.3f%12.2f%14.1f\n", fb[i].name, fb[i].ms, us_tile, gbs);
+  }
 
   printf("\nRead: arm0 vs arm2 prices the scattered E8M0 scale load itself.\n"
          "arm1 vs arm3 prices LDS as a scale SOURCE holding the barrier and\n"
