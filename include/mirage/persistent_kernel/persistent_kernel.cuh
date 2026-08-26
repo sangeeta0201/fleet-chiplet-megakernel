@@ -1546,6 +1546,17 @@ __device__ volatile unsigned long long g_is_fused_first; // first fused entered
 __device__ volatile unsigned long long g_is_fused_last;  // last fused retired
 __device__ int g_is_iters;
 __device__ int g_is_missing; // iterations with no fused task seen
+// Pre-window (embedding + the 3 dense layers) decomposition, by task type.
+// Worker 0 only, and only for tasks it retires BEFORE the first fused-layer
+// task, so the post window (LM head + argmax) is excluded by construction.
+// g_is_gap_ns is the sum of the holes BETWEEN those tasks -- the dense
+// prologue is an unfused chain, so the gaps are the thing to look at.
+#define MPK_IS_TT 256
+__device__ unsigned long long g_is_tt_ns[MPK_IS_TT];
+__device__ unsigned int g_is_tt_cnt[MPK_IS_TT];
+__device__ volatile unsigned long long g_is_t0;
+__device__ volatile unsigned long long g_is_prev_end;
+__device__ unsigned long long g_is_gap_ns;
 #endif
 
 __device__ __forceinline__ void execute_worker(RuntimeConfig config,
@@ -2284,9 +2295,16 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
     }
 #endif
 #ifdef MPK_ITER_SPLIT
-    if (threadIdx.x == 0 && worker_id == 0 && g_is_fused_first == 0 &&
-        task_desc->task_type == TASK_GANG_MLA_FULL_LAYER_FUSED_MI300) {
-      g_is_fused_first = get_wallclock_ns();
+    if (threadIdx.x == 0 && worker_id == 0 && g_is_fused_first == 0) {
+      unsigned long long is_now = get_wallclock_ns();
+      if (task_desc->task_type == TASK_GANG_MLA_FULL_LAYER_FUSED_MI300) {
+        g_is_fused_first = is_now;
+      } else {
+        if (g_is_prev_end != 0) {
+          g_is_gap_ns += is_now - g_is_prev_end;
+        }
+        g_is_t0 = is_now;
+      }
     }
 #endif
 
@@ -3503,9 +3521,16 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
     }
 #endif
 #ifdef MPK_ITER_SPLIT
-    if (threadIdx.x == 0 && worker_id == 0 &&
-        task_desc->task_type == TASK_GANG_MLA_FULL_LAYER_FUSED_MI300) {
-      g_is_fused_last = get_wallclock_ns();
+    if (threadIdx.x == 0 && worker_id == 0) {
+      if (task_desc->task_type == TASK_GANG_MLA_FULL_LAYER_FUSED_MI300) {
+        g_is_fused_last = get_wallclock_ns();
+      } else if (g_is_fused_first == 0) {
+        unsigned long long is_now = get_wallclock_ns();
+        int is_tt = (int)task_desc->task_type & (MPK_IS_TT - 1);
+        g_is_tt_ns[is_tt] += is_now - g_is_t0;
+        g_is_tt_cnt[is_tt]++;
+        g_is_prev_end = is_now;
+      }
     }
 #endif
 
@@ -3992,6 +4017,7 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
           }
           g_is_fused_first = 0;
           g_is_fused_last = 0;
+          g_is_prev_end = 0; // gaps must not span an iteration boundary
 #endif
 #ifdef MPK_SPEC_DECODE
           if (g_spec_iter_is_decode) {
@@ -4087,6 +4113,17 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                    (double)g_is_post_ns / 1000.0 / isn,
                    (double)(g_is_pre_ns + g_is_fused_ns + g_is_post_ns) /
                        1000.0 / isn);
+            printf("[ITERSPLIT] pre_gap_us=%.2f\n",
+                   (double)g_is_gap_ns / 1000.0 / isn);
+            for (int t = 0; t < MPK_IS_TT; t++) {
+              if (g_is_tt_cnt[t] == 0u) {
+                continue;
+              }
+              printf("[ITERSPLIT_TT] type=%d calls=%.2f busy_us=%.2f\n",
+                     t,
+                     (double)g_is_tt_cnt[t] / isn,
+                     (double)g_is_tt_ns[t] / 1000.0 / isn);
+            }
           }
 #endif
 #ifdef MPK_SPEC_DECODE
