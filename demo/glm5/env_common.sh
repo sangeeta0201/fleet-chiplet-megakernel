@@ -143,6 +143,12 @@ MPK_FORWARD_VARS=(
   # of copying one into the other at the backedge, which is what forces the two
   # s_waitcnt vmcnt(0) per trip in the shipped ISA. Compile-time.
   MPK_MOE_PF_DBUF
+  # ...and the per-GEMM split of the same two knobs. The +29 VGPR bill that
+  # killed MPK_MOE_PF_DBUF as a single knob is entirely W2's, and the loop form
+  # only wins at GROUPS >= 6 (standalone: ping-pong is 10.11 us/tile at 4,
+  # against the copying form's 9.71, but 8.43 at 6 and 7.82 at 8). Compile-time.
+  MPK_MOE_PF_DBUF_W13 MPK_MOE_PF_DBUF_W2
+  MPK_MOE_PF_GROUPS_W13 MPK_MOE_PF_GROUPS_W2
   # K-major MoE weight layout. Both a -D and a change to how demo.py PACKS the
   # weight, so a rank that misses it reads a permuted buffer as if it were
   # row-major and produces silent garbage -- forward it or leave it unset.

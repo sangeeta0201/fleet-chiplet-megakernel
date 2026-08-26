@@ -521,6 +521,137 @@ __global__ void __launch_bounds__(256)
   }
 }
 
+// ── PING-PONG: THE SAME DEPTH WITH NO ROTATION ─────────────────────────────
+//
+// `w13_tile_deep` above already issues the NEXT block before consuming the
+// current one, so on paper it overlaps. It does not, because of the last loop:
+// `A[j] = N[j]` is GROUPS x 4 `v_mov_b32` whose sources are the loads just
+// issued, so the compiler must plant `s_waitcnt vmcnt(0)` in front of it. The
+// ISA census of the shipping image says exactly that -- MoE W13's k-loop is
+// maxLIF 8 but "mostly vmcnt(0)". Every trip therefore drains to empty and the
+// tile runs bytes-then-compute, which is what the numbers say: bytes alone
+// 4.29 us + compute alone 1.9-3.4 us ~= the 7.86 the deepest register arm hits.
+//
+// This arm deletes the rotation instead of paying it: unroll the block loop by
+// two and swap which register set is "current". Identical depth, identical
+// register count, zero copies, no forced drain. Purely a question of whether
+// the drain is what costs the ~4 us between 7.86 and the 4.29 byte floor.
+template <int GROUPS, int LDS_SCALES, int KMAJOR>
+__global__ void __launch_bounds__(256)
+    w13_tile_pp(uint8_t const *__restrict__ W, float *sink, int tiles_total,
+                uint8_t const *__restrict__ scratch) {
+  extern __shared__ char smem[];
+  uint8_t *s_tok_fp8 = (uint8_t *)smem;
+  uint8_t *s_tok_scales = s_tok_fp8 + FP8_TOK_DATA;
+  uint8_t *s_scales =
+      (uint8_t *)(((uintptr_t)(s_tok_scales + NUM_BLOCKS_32) + 15u) &
+                  ~(uintptr_t)15);
+
+  int const tid = threadIdx.x;
+  int const warp_id = tid >> 6;
+  int const lane_id = tid & 63;
+  int const col = lane_id & 15;
+  int const g = lane_id >> 4;
+
+  for (int i = tid; i < FP8_TOK_DATA / 4; i += 256) {
+    ((unsigned *)s_tok_fp8)[i] = 0x3c3c3c3cu;
+  }
+  for (int i = tid; i < NUM_BLOCKS_32; i += 256) {
+    s_tok_scales[i] = 127;
+  }
+  __syncthreads();
+
+  static_assert(MFMA_ITERS % GROUPS == 0, "GROUPS must divide the k-loop");
+  constexpr int NBLK = MFMA_ITERS / GROUPS;
+  static_assert(NBLK % 2 == 0, "ping-pong needs an even block count");
+
+  for (int t = blockIdx.x; t < tiles_total; t += gridDim.x) {
+    uint8_t const *wg_data = W + (size_t)t * (size_t)WG_BYTES;
+    uint8_t const *wg_scales = wg_data + WG_DATA_BYTES;
+
+    if constexpr (LDS_SCALES) {
+      __syncthreads();
+      for (int i = tid; i < WG_SCALE_BYTES / 16; i += 256) {
+        ((i32x4_t *)s_scales)[i] = ((i32x4_t const *)wg_scales)[i];
+      }
+      __syncthreads();
+    }
+
+    constexpr int WAVE_SLAB = MFMA_ITERS * 1024;
+    uint8_t const *w_packed = wg_data + (size_t)warp_id * WAVE_SLAB;
+    int const w_row = warp_id * 16 + col;
+    uint8_t const *w_data_row = wg_data + (size_t)w_row * W_ROW_BYTES;
+    int const row_scale_base = w_row * NUM_BLOCKS_32;
+
+    auto load_a = [&](int ki_) -> i32x4_t {
+      if constexpr (KMAJOR) {
+        return *(i32x4_t const *)(w_packed + ki_ * 1024 + lane_id * 16);
+      } else {
+        return *(i32x4_t const *)(w_data_row + ki_ * (K_PER_MFMA / 2) + g * 16);
+      }
+    };
+    auto scale_at = [&](int idx) -> int {
+      if constexpr (LDS_SCALES) {
+        return (int)s_scales[idx];
+      } else {
+        return (int)wg_scales[idx];
+      }
+    };
+
+    f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
+    i32x4_t P[GROUPS], Q[GROUPS];
+    int PS[GROUPS], QS[GROUPS];
+#pragma unroll
+    for (int j = 0; j < GROUPS; j++) {
+      P[j] = load_a(j);
+      PS[j] = scale_at(row_scale_base + j * 4 + g);
+    }
+
+    auto consume = [&](i32x4_t const *R, int const *RS, int ki) {
+#pragma unroll
+      for (int j = 0; j < GROUPS; j++) {
+        i32x8_t b = load_fp8_b(s_tok_fp8, (ki + j) * K_PER_MFMA, g);
+        i32x8_t a = {};
+        a[0] = R[j][0];
+        a[1] = R[j][1];
+        a[2] = R[j][2];
+        a[3] = R[j][3];
+        acc = mfma_f4xf8(a, b, acc, RS[j], (int)s_tok_scales[ki + j]);
+      }
+    };
+
+    // Two blocks per trip, P current then Q current. Nothing is ever copied,
+    // so the only vmcnt the compiler can justify is the one in front of the
+    // MFMAs that actually read the register being waited on.
+#pragma unroll 1
+    for (int blk = 0; blk < NBLK; blk += 2) {
+      int const ki0 = blk * GROUPS;
+#pragma unroll
+      for (int j = 0; j < GROUPS; j++) {
+        int kk = ki0 + GROUPS + j;
+        if (kk < MFMA_ITERS) {
+          Q[j] = load_a(kk);
+          QS[j] = scale_at(row_scale_base + kk * 4 + g);
+        }
+      }
+      consume(P, PS, ki0);
+#pragma unroll
+      for (int j = 0; j < GROUPS; j++) {
+        int kk = ki0 + 2 * GROUPS + j;
+        if (kk < MFMA_ITERS) {
+          P[j] = load_a(kk);
+          PS[j] = scale_at(row_scale_base + kk * 4 + g);
+        }
+      }
+      consume(Q, QS, ki0 + GROUPS);
+    }
+
+    if (acc[0] == 1.2345678e-31f && acc[1] == 1.2345678e-31f) {
+      sink[0] = acc[0] + acc[1] + acc[2] + acc[3];
+    }
+  }
+}
+
 // ── THE buffer_load_lds RING ───────────────────────────────────────────────
 //
 // Sixth pass. The depth curve above says the tile wants depth 8-16, and the
@@ -744,6 +875,58 @@ __global__ void __launch_bounds__(256)
 // at the optimistic 0.129 ms-per-us/tile conversion that is 0.06 ms, under the
 // 0.26 ms noise floor, and it does not fit.
 //
+// ══ SEVENTH PASS: THE TILE IS SERIAL, AND THE ROTATION IS WHY. ════════════
+//
+// The BW-ONLY number above raised the obvious follow-on -- if the bytes only
+// cost 4.29 of the 9.62, what is the other 5.33? So two complement arms:
+//
+//   arm                                    us/tile
+//   DMA BW-ONLY  (bytes, no MFMA)             4.29     45.8 GB/s/CU, at roof
+//   COMPUTE-ONLY G=4  (MFMA, no weight)       3.40
+//   COMPUTE-ONLY G=48 (MFMA, no weight)       1.89
+//   deep G=4 + Kmaj  (SHIPS)                  9.71
+//   deep G=16 + LDS sc + Kmaj                 7.86
+//
+// COMPUTE-ONLY runs the identical k-loop -- 48 MFMAs, the same B ds_reads out
+// of s_tok_fp8, the same LDS scale reads, the same loop arithmetic -- with the
+// A operand synthesised in registers, so not one weight byte is fetched.
+//
+// 4.29 + 3.40 = 7.69, and the deepest register arm reaches 7.86. THE TILE IS
+// EXACTLY THE SERIAL SUM OF ITS TWO HALVES. Nothing in this file has ever
+// overlapped the weight stream with the MFMA stream, and shipping is a further
+// 1.85 us worse than even that serial sum.
+//
+// Which is odd, because `w13_tile_deep` looks like it overlaps: it issues the
+// NEXT block's loads into N[] before consuming the current block out of A[].
+// The `A[j] = N[j]` at the backedge is what destroys it -- GROUPS x 4 v_mov
+// whose sources are the loads just issued, so the compiler must plant
+// `s_waitcnt vmcnt(0)` in front of the copy and every trip drains to empty.
+// The ISA census of the shipping image says exactly this: MoE W13's k-loop is
+// maxLIF 8 but "mostly vmcnt(0)"
+// ([[glm-kloop-loads-in-flight-census-closed]]).
+//
+// `w13_tile_pp` deletes the rotation instead of paying it -- unroll the block
+// loop by two and swap which register set is current. Same depth, same
+// register count, zero copies:
+//
+//   PINGPONG G=2 +Kmaj          10.04
+//   PINGPONG G=4 +Kmaj          10.11   <- WORSE than deep G=4's 9.71
+//   PINGPONG G=6 +Kmaj           8.43
+//   PINGPONG G=8 +Kmaj           7.82   <- beats deep G=16, at half the depth
+//                                          and with no LDS scale staging
+//   PINGPONG G=4 +LDS sc +Kmaj  11.00
+//   PINGPONG G=8 +LDS sc +Kmaj   8.07
+//
+// THE CURVE HAS A SIGN CHANGE AT G=6, AND THAT EXPLAINS A SHIPPED VERDICT.
+// MPK_MOE_PF_DBUF is exactly this ping-pong, and it was priced at +0.226 ms --
+// but only ever at GROUPS=4, which is the one cell where the form LOSES. G >= 6
+// was never tried in either the standalone or at the wall. Followed up as
+// task #129: dbuf@6 on W13 alone costs +6 unified VGPRs (325 -> 331 measured
+// with /tmp/vgpr.sh), where dbuf@8 costs +47 (372) and is dead on arrival.
+//
+// And the floor this is all aiming at: a perfectly overlapped tile is
+// max(4.29, 1.89) = 4.29 us, byte-bound at the per-CU roof. Shipping is 9.71.
+//
 // ── DMA, HALF-BUFFERED ─────────────────────────────────────────────────────
 //
 // The one-slot-at-a-time ring above is 20.7-24.8 us against 9.62 shipping, but
@@ -856,6 +1039,76 @@ __global__ void __launch_bounds__(256)
   }
 }
 
+// ── THE OTHER HALF: COMPUTE WITH NO WEIGHT STREAM AT ALL ───────────────────
+//
+// BW-ONLY says the 192 KB arrives in 4.29 us. Shipping is 9.62. This arm is
+// the complement: the identical k-loop -- 48 MFMAs, the same B ds_reads out of
+// s_tok_fp8, the same LDS-staged scale reads, the same loop arithmetic -- with
+// the A operand synthesised in registers so NOT ONE weight byte is fetched.
+//
+// If BW-ONLY + this ~= 9.62 the tile is strictly serial and the whole lever is
+// overlap. If this alone is ~= 9.62 the weight stream is already free and the
+// tile is a pure issue/latency problem in the consume path, which is a
+// different (and much better) target: it does not care about bytes, tile
+// width, or the packer.
+template <int GROUPS>
+__global__ void __launch_bounds__(256)
+    w13_tile_compute(uint8_t const *__restrict__ W, float *sink,
+                     int tiles_total, uint8_t const *__restrict__ scratch) {
+  extern __shared__ char smem[];
+  uint8_t *s_tok_fp8 = (uint8_t *)smem;
+  uint8_t *s_tok_scales = s_tok_fp8 + FP8_TOK_DATA;
+  uint8_t *s_scales =
+      (uint8_t *)(((uintptr_t)(s_tok_scales + NUM_BLOCKS_32) + 15u) &
+                  ~(uintptr_t)15);
+
+  int const tid = threadIdx.x;
+  int const warp_id = tid >> 6;
+  int const lane_id = tid & 63;
+  int const col = lane_id & 15;
+  int const g = lane_id >> 4;
+
+  for (int i = tid; i < FP8_TOK_DATA / 4; i += 256) {
+    ((unsigned *)s_tok_fp8)[i] = 0x3c3c3c3cu;
+  }
+  for (int i = tid; i < NUM_BLOCKS_32; i += 256) {
+    s_tok_scales[i] = 127;
+  }
+  for (int i = tid; i < WG_SCALE_BYTES / 4; i += 256) {
+    ((unsigned *)s_scales)[i] = 0x7f7f7f7fu;
+  }
+  __syncthreads();
+
+  static_assert(MFMA_ITERS % GROUPS == 0, "");
+  int const row_scale_base = (warp_id * 16 + col) * NUM_BLOCKS_32;
+
+  for (int t = blockIdx.x; t < tiles_total; t += gridDim.x) {
+    f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
+    // Lane-dependent so it cannot be folded, register-resident so it costs no
+    // memory traffic. Same MFMA operand shape as every other arm.
+    i32x4_t const a4 = {lane_id + t, warp_id, col, g};
+
+#pragma unroll 1
+    for (int ki = 0; ki < MFMA_ITERS; ki += GROUPS) {
+#pragma unroll
+      for (int j = 0; j < GROUPS; j++) {
+        i32x8_t a = {};
+        a[0] = a4[0];
+        a[1] = a4[1];
+        a[2] = a4[2];
+        a[3] = a4[3];
+        i32x8_t b = load_fp8_b(s_tok_fp8, (ki + j) * K_PER_MFMA, g);
+        acc = mfma_f4xf8(a, b, acc,
+                         (int)s_scales[row_scale_base + (ki + j) * 4 + g],
+                         (int)s_tok_scales[ki + j]);
+      }
+    }
+    if (acc[0] == 1.2345678e-31f && acc[1] == 1.2345678e-31f) {
+      sink[0] = acc[0] + acc[1] + acc[2] + acc[3];
+    }
+  }
+}
+
 // Pure HBM->LDS throughput at this shape: the same 48 x 1 KB per wave per
 // tile, the same ring, the same waits, and NO ds_read and NO MFMA. If this
 // alone is slower than the full global-load k-loop, the DMA instruction path
@@ -904,6 +1157,115 @@ __global__ void __launch_bounds__(256)
     __syncthreads();
     if (s_ring[lane_id] == 0xABu && s_ring[lane_id + 1] == 0xCDu) {
       sink[0] = 1.0f;
+    }
+  }
+}
+
+// ── THE OVERLAP PROBE ──────────────────────────────────────────────────────
+//
+// BW-ONLY 4.31, COMPUTE-ONLY 1.91-3.35, shipping 9.62. Even the best register
+// arm (7.95) is no better than the SERIAL SUM of the two halves, so nothing in
+// this file has ever overlapped the weight stream with the MFMA stream. Before
+// trying to make the real loop overlap, find out whether the hardware will:
+// this arm runs both streams at full rate with NO dependency between them --
+// the DMA writes LDS that nobody reads, the MFMA takes a synthetic register
+// operand. 48 issues and 48 MFMAs per tile, exactly as many of each as the
+// real loop.
+//
+//   lands at ~4.3  -> the machine overlaps perfectly and the entire 5.3 us
+//                     residual is dependency/scheduling in the k-loop.
+//   lands at ~6.2  -> the two streams contend and the serial sum IS the floor.
+//
+// RESULT: neither. 21.44 / 20.57 / 17.48 at DEPTH 4 / 8 / 16 -- i.e. it
+// reproduces `w13_tile_dma`'s 24.85 / 23.41 / 20.65 almost exactly, minus the
+// ds_read it dropped. So THIS ARM DOES NOT ANSWER THE OVERLAP QUESTION; it
+// re-measures the one-slot ring's own pathology, with 48 free MFMAs costing
+// +13 us on top of a 4.3 us byte stream when the two are interleaved one-for-
+// one. The mechanism is M0: `buffer_load_lds` needs M0 = the LDS destination,
+// every DS op needs M0 = -1, so alternating them writes M0 twice per k-group
+// and each write is an SALU with a hazard the wave cannot hide at one wave per
+// SIMD. It is also why DMA2 (G issues, then G reads) beats the one-slot ring
+// by 2.5x at equal depth -- it flips M0 twice per HALF, not twice per group.
+// Kept as the record of why the DMA family cannot be rescued by scheduling.
+// The overlap question is answered by `w13_tile_pp` instead.
+template <int DEPTH>
+__global__ void __launch_bounds__(256)
+    w13_overlap_probe(uint8_t const *__restrict__ W, float *sink,
+                      int tiles_total, uint8_t const *__restrict__ scratch) {
+  extern __shared__ char smem[];
+  uint8_t *s_tok_fp8 = (uint8_t *)smem;
+  uint8_t *s_tok_scales = s_tok_fp8 + FP8_TOK_DATA;
+  uint8_t *s_scales =
+      (uint8_t *)(((uintptr_t)(s_tok_scales + NUM_BLOCKS_32) + 15u) &
+                  ~(uintptr_t)15);
+  uint8_t *s_ring = s_scales + WG_SCALE_BYTES;
+
+  int const tid = threadIdx.x;
+  int const warp_id = tid >> 6;
+  int const lane_id = tid & 63;
+  int const col = lane_id & 15;
+  int const g = lane_id >> 4;
+
+  for (int i = tid; i < FP8_TOK_DATA / 4; i += 256) {
+    ((unsigned *)s_tok_fp8)[i] = 0x3c3c3c3cu;
+  }
+  for (int i = tid; i < NUM_BLOCKS_32; i += 256) {
+    s_tok_scales[i] = 127;
+  }
+  for (int i = tid; i < WG_SCALE_BYTES / 4; i += 256) {
+    ((unsigned *)s_scales)[i] = 0x7f7f7f7fu;
+  }
+  __syncthreads();
+
+  static_assert(MFMA_ITERS % DEPTH == 0, "");
+  constexpr int NBLK = MFMA_ITERS / DEPTH;
+  constexpr int WAVE_SLAB = MFMA_ITERS * 1024;
+  int const row_scale_base = (warp_id * 16 + col) * NUM_BLOCKS_32;
+
+  i32x4_t const rsrc =
+      make_w_buffer_rsrc(W, (uint32_t)((size_t)tiles_total * (size_t)WG_BYTES));
+
+  for (int t = blockIdx.x; t < tiles_total; t += gridDim.x) {
+    int const wave_voff = t * WG_BYTES + warp_id * WAVE_SLAB + lane_id * 16;
+    auto issue = [&](int kk, int slot) {
+      auto *dst = (__attribute__((address_space(3))) uint32_t
+                       *)(s_ring + ((size_t)slot * NUM_WAVES + warp_id) * 1024);
+      __llvm_amdgcn_raw_buffer_load_lds(rsrc, dst, 16, wave_voff + kk * 1024, 0,
+                                        0, DMA_AUX);
+    };
+    f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
+    i32x4_t const a4 = {lane_id + t, warp_id, col, g};
+    auto compute = [&](int kk) {
+      i32x8_t a = {};
+      a[0] = a4[0];
+      a[1] = a4[1];
+      a[2] = a4[2];
+      a[3] = a4[3];
+      i32x8_t b = load_fp8_b(s_tok_fp8, kk * K_PER_MFMA, g);
+      acc = mfma_f4xf8(a, b, acc, (int)s_scales[row_scale_base + kk * 4 + g],
+                       (int)s_tok_scales[kk]);
+    };
+
+#pragma unroll
+    for (int j = 0; j < DEPTH; j++) {
+      issue(j, j);
+    }
+#pragma unroll 1
+    for (int blk = 1; blk < NBLK; blk++) {
+#pragma unroll
+      for (int s = 0; s < DEPTH; s++) {
+        wait_vmcnt<DEPTH - 1>();
+        issue(blk * DEPTH + s, s);
+        compute((blk - 1) * DEPTH + s);
+      }
+    }
+    wait_vmcnt<0>();
+#pragma unroll
+    for (int s = 0; s < DEPTH; s++) {
+      compute((NBLK - 1) * DEPTH + s);
+    }
+    if (acc[0] == 1.2345678e-31f && acc[1] == 1.2345678e-31f) {
+      sink[0] = acc[0] + acc[1] + acc[2] + acc[3];
     }
   }
 }
@@ -1007,6 +1369,29 @@ template <int D> static float run_dma2(int grid, int iters) {
   return ms / iters;
 }
 
+template <int D> static float run_compute(int grid, int iters) {
+  hipEvent_t e0, e1;
+  hipEventCreate(&e0);
+  hipEventCreate(&e1);
+  auto go = [&] {
+    hipLaunchKernelGGL((w13_tile_compute<D>), dim3(grid), dim3(256), g_smem, 0,
+                       g_W, g_sink, g_tiles, g_scratch);
+  };
+  go();
+  hipDeviceSynchronize();
+  hipEventRecord(e0);
+  for (int i = 0; i < iters; i++) {
+    go();
+  }
+  hipEventRecord(e1);
+  hipEventSynchronize(e1);
+  float ms = 0.f;
+  hipEventElapsedTime(&ms, e0, e1);
+  hipEventDestroy(e0);
+  hipEventDestroy(e1);
+  return ms / iters;
+}
+
 template <int D> static float run_dma_bw(int grid, int iters) {
   hipEvent_t e0, e1;
   hipEventCreate(&e0);
@@ -1014,6 +1399,52 @@ template <int D> static float run_dma_bw(int grid, int iters) {
   auto go = [&] {
     hipLaunchKernelGGL((w13_dma_bw<D>), dim3(grid), dim3(256), g_smem_dma, 0,
                        g_W, g_sink, g_tiles, g_scratch);
+  };
+  go();
+  hipDeviceSynchronize();
+  hipEventRecord(e0);
+  for (int i = 0; i < iters; i++) {
+    go();
+  }
+  hipEventRecord(e1);
+  hipEventSynchronize(e1);
+  float ms = 0.f;
+  hipEventElapsedTime(&ms, e0, e1);
+  hipEventDestroy(e0);
+  hipEventDestroy(e1);
+  return ms / iters;
+}
+
+template <int G, int L, int K> static float run_pp(int grid, int iters) {
+  hipEvent_t e0, e1;
+  hipEventCreate(&e0);
+  hipEventCreate(&e1);
+  auto go = [&] {
+    hipLaunchKernelGGL((w13_tile_pp<G, L, K>), dim3(grid), dim3(256), g_smem, 0,
+                       g_W, g_sink, g_tiles, g_scratch);
+  };
+  go();
+  hipDeviceSynchronize();
+  hipEventRecord(e0);
+  for (int i = 0; i < iters; i++) {
+    go();
+  }
+  hipEventRecord(e1);
+  hipEventSynchronize(e1);
+  float ms = 0.f;
+  hipEventElapsedTime(&ms, e0, e1);
+  hipEventDestroy(e0);
+  hipEventDestroy(e1);
+  return ms / iters;
+}
+
+template <int D> static float run_overlap(int grid, int iters) {
+  hipEvent_t e0, e1;
+  hipEventCreate(&e0);
+  hipEventCreate(&e1);
+  auto go = [&] {
+    hipLaunchKernelGGL((w13_overlap_probe<D>), dim3(grid), dim3(256),
+                       g_smem_dma, 0, g_W, g_sink, g_tiles, g_scratch);
   };
   go();
   hipDeviceSynchronize();
@@ -1160,6 +1591,30 @@ int main() {
   f2[3] = {"DMA2 half-buffered G=16", run_dma2<16>(grid, 10)};
   fb[0] = {"DMA BW-ONLY DEPTH=8 (no MFMA)", run_dma_bw<8>(grid, 10)};
   fb[1] = {"DMA BW-ONLY DEPTH=16 (no MFMA)", run_dma_bw<16>(grid, 10)};
+  struct {
+    char const *name;
+    float ms;
+  } fc[3];
+  fc[0] = {"COMPUTE-ONLY G=1 (no weight)", run_compute<1>(grid, 10)};
+  fc[1] = {"COMPUTE-ONLY G=4 (no weight)", run_compute<4>(grid, 10)};
+  fc[2] = {"COMPUTE-ONLY G=48 (no weight)", run_compute<48>(grid, 10)};
+  struct {
+    char const *name;
+    float ms;
+  } fo[3];
+  fo[0] = {"OVERLAP indep DEPTH=4", run_overlap<4>(grid, 10)};
+  fo[1] = {"OVERLAP indep DEPTH=8", run_overlap<8>(grid, 10)};
+  fo[2] = {"OVERLAP indep DEPTH=16", run_overlap<16>(grid, 10)};
+  struct {
+    char const *name;
+    float ms;
+  } fp[6];
+  fp[0] = {"PINGPONG G=2 +Kmaj", run_pp<2, 0, 1>(grid, 10)};
+  fp[1] = {"PINGPONG G=4 +Kmaj", run_pp<4, 0, 1>(grid, 10)};
+  fp[2] = {"PINGPONG G=6 +Kmaj", run_pp<6, 0, 1>(grid, 10)};
+  fp[3] = {"PINGPONG G=8 +Kmaj", run_pp<8, 0, 1>(grid, 10)};
+  fp[4] = {"PINGPONG G=4 +LDSsc +Kmaj", run_pp<4, 1, 1>(grid, 10)};
+  fp[5] = {"PINGPONG G=8 +LDSsc +Kmaj", run_pp<8, 1, 1>(grid, 10)};
   for (int i = 0; i < 4; i++) {
     double us_tile = f[i].ms * 1000.0 / (g_tiles / (double)grid);
     double gbs = (double)WG_DATA_BYTES / (us_tile * 1e-6) / 1e9;
@@ -1174,6 +1629,20 @@ int main() {
     double us_tile = fb[i].ms * 1000.0 / (g_tiles / (double)grid);
     double gbs = (double)WG_DATA_BYTES / (us_tile * 1e-6) / 1e9;
     printf("  %-32s%10.3f%12.2f%14.1f\n", fb[i].name, fb[i].ms, us_tile, gbs);
+  }
+  for (int i = 0; i < 3; i++) {
+    double us_tile = fc[i].ms * 1000.0 / (g_tiles / (double)grid);
+    printf("  %-32s%10.3f%12.2f%14s\n", fc[i].name, fc[i].ms, us_tile, "-");
+  }
+  for (int i = 0; i < 3; i++) {
+    double us_tile = fo[i].ms * 1000.0 / (g_tiles / (double)grid);
+    double gbs = (double)WG_DATA_BYTES / (us_tile * 1e-6) / 1e9;
+    printf("  %-32s%10.3f%12.2f%14.1f\n", fo[i].name, fo[i].ms, us_tile, gbs);
+  }
+  for (int i = 0; i < 6; i++) {
+    double us_tile = fp[i].ms * 1000.0 / (g_tiles / (double)grid);
+    double gbs = (double)WG_DATA_BYTES / (us_tile * 1e-6) / 1e9;
+    printf("  %-32s%10.3f%12.2f%14.1f\n", fp[i].name, fp[i].ms, us_tile, gbs);
   }
 
   printf("\nRead: arm0 vs arm2 prices the scattered E8M0 scale load itself.\n"
