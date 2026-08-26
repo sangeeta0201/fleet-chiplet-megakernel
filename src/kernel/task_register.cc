@@ -4854,10 +4854,16 @@ int TaskRegister::register_xrank_sum_add_task(threadblock::Graph const &bgraph,
   assert(params.size() == 3);
   std::vector<tb::TBInputOp *> input_ops;
   std::vector<tb::TBInputOp *> output_ops;
-  int num_inputs = 3;
   int num_outputs = 1;
+  // A 4th input is a DEPENDENCY-ONLY tensor and is never read by the kernel.
+  // The task graph is a linear chain and every edge is proved by a shared
+  // tensor guid (runtime.cc's `num_shared_tensors >= 1`), so a producer that
+  // writes this rank's COLUMN SLICE of `partial` -- a different DTensor over
+  // the same storage -- has no guid in common with us. Passing the slice as a
+  // trailing input is what makes that edge visible.
+  assert(bgraph.operators.size() == 4 || bgraph.operators.size() == 5);
+  int num_inputs = (int)bgraph.operators.size() - num_outputs;
 
-  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
   for (auto const &op : bgraph.operators) {
     assert(op->op_type == mirage::type::TB_INPUT_OP);
     if (input_ops.size() < (size_t)num_inputs) {

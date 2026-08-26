@@ -1875,6 +1875,25 @@ if __name__ == "__main__":
         oproj_tp_cols = hidden_size // world_size if oproj_tp else hidden_size
         print(f"[CFG] o_proj tp={int(oproj_tp)} cols_per_rank={oproj_tp_cols} "
               f"tiles_per_xcd={oproj_tp_cols // 8 // oproj_tile_n}")
+        # ── the same shard for the DENSE prologue's o_proj ────────────────
+        # The three dense layers were left out of the shard above because they
+        # have no fused whole-layer task to rendezvous inside. That left them
+        # running the REPLICATED, ABSORBED weight: 6144 columns at K=32768 is
+        # 768 workgroups, 96 tiles per XCD against this branch's re-derived
+        # target of 24, and 207 MB per rank per layer against the fused
+        # layer's 26 -- 93.4 us each, 282 of the 662 us prologue.
+        #
+        # The columns are disjoint, so an all-gather is a SUM over a partial
+        # that is zero everywhere this rank does not own: the existing
+        # xrank_sum_add is the gather, unchanged. The price is one more
+        # cross-rank rendezvous per dense layer (~14 us measured).
+        #
+        # bs == 1: the GEMV's output DTensor is a column slice of the shared
+        # partial, addressed by an offset base pointer, which is only a
+        # row-major tensor in its own right when there is one row.
+        dense_oproj_tp = (int(os.environ.get("GLM_DENSE_OPROJ_TP", "1")) == 1
+                          and oproj_tp and bs == 1 and first_k_dense > 0)
+        print(f"[CFG] dense o_proj tp={int(dense_oproj_tp)}")
         # ── rank-sharded q_b + W_UK ───────────────────────────────────────
         # The same trade as o_proj, on the second-largest replicated weight:
         # q_b is 34.6 MB and W_UK 6.6 MB per rank per layer, both read
@@ -2100,6 +2119,39 @@ if __name__ == "__main__":
             dense_partial = make_tensor("dense_partial", (bs, hidden_size))
             dense_zero_resid = make_tensor("dense_zero_resid",
                                            (bs, hidden_size))
+
+        # The dense prologue's sharded o_proj writes this rank's own columns of
+        # a full-width partial and leaves the rest at the zero it was allocated
+        # with, for the whole run -- that is what turns the cross-rank SUM into
+        # the all-gather the disjoint columns actually need.
+        #
+        # `oproj_shard_out` is the SAME storage viewed as a standalone
+        # [1, cols_per_rank] row starting at this rank's offset, so the GEMV's
+        # per-XCD slice arithmetic (dim(1) / 8) and its tile addressing are
+        # both unchanged; only the base pointer moves.
+        oproj_partial = oproj_shard_out = oproj_zero_resid = None
+        oproj_xbufs = []
+        if dense_oproj_tp:
+            _op = torch.zeros(bs, hidden_size, dtype=torch.bfloat16,
+                              device="cuda")
+            _tensor_refs["dense_oproj_partial"] = _op
+            oproj_partial = mpk.attach_input(torch_tensor=_op,
+                                             name="dense_oproj_partial")
+            _ops = _op[0, rank * oproj_tp_cols:
+                       (rank + 1) * oproj_tp_cols].view(1, oproj_tp_cols)
+            oproj_shard_out = mpk.attach_input(torch_tensor=_ops,
+                                               name="dense_oproj_shard")
+            oproj_zero_resid = make_tensor("dense_oproj_zero_resid",
+                                           (bs, oproj_tp_cols))
+            # One mailbox per dense layer, for the reason dense_xbufs gives:
+            # consecutive dense layers have no other cross-rank rendezvous
+            # between them.
+            _n_u32 = (world_size * bs * hidden_size * 2) // 4 + world_size * 16
+            for d in range(first_k_dense):
+                oproj_xbufs.append(mpk.new_tensor(
+                    dims=(_n_u32,), dtype=mi.int32,
+                    name=f"dense_oproj_xrank_{d}",
+                    io_category="nvshmem_tensor"))
 
         # Routing tables are sized for the total expert / slot count; the
         # router derives `num_shared` from the gap between these and the
@@ -2695,6 +2747,11 @@ if __name__ == "__main__":
                                and num_kv_chunks > 1
                                and use_mxfp8_oproj and MOE_MXFP8
                                and FUSE_MOE_SWIGLU and FUSE_MOE_MULSUMADD)
+            # Sharded o_proj + xrank gather, for the dense prologue layers
+            # only. `i < first_k_dense` is what makes oproj_xbufs[i] -- one
+            # mailbox per dense layer -- in range.
+            dense_tp_this = (dense_oproj_tp and not layer.is_moe
+                             and i < first_k_dense)
             if fuse_full_layer:
                 fuse_attn = True
 
@@ -2790,13 +2847,14 @@ if __name__ == "__main__":
                     attn.o_proj.weight.data, attn._w_uv,
                     num_heads, v_head, kv_lora).to(torch.bfloat16)
                 o_w = pad_cols(o_w, layer_o_proj_red)
-            if oproj_tp and fuse_full_layer:
+            if oproj_tp and (fuse_full_layer or dense_tp_this):
                 # Keep only the output rows this rank owns. Everything
                 # downstream follows from dim 0: oproj_tiles_per_xcd is
                 # oproj_weight.dim(0) // 8, so the tile count drops from 48 to
                 # 6 per XCD with no other change, and that ratio is what the
-                # kernel reads the shard off. Only the fused whole-layer task
-                # -- the dense prologue keeps the replicated weight.
+                # kernel reads the shard off. The fused whole-layer task
+                # rendezvouses on its own signal array; the dense prologue
+                # (dense_oproj_tp) gathers with an xrank_sum_add instead.
                 o_w = o_w[rank * oproj_tp_cols:(rank + 1) * oproj_tp_cols, :]
                 o_w = o_w.contiguous()
             if use_mxfp8_oproj:
@@ -3016,17 +3074,40 @@ if __name__ == "__main__":
                     block_dim=(256, 1, 1),
                 )
             elif use_mxfp8_oproj:
+                # Under dense_oproj_tp the GEMV covers only this rank's
+                # columns and the residual is held back to the gather, exactly
+                # as DENSE_MLP_TP holds it back from the down_proj -- folding
+                # it here would add it world_size times.
                 mpk.gang_gemv_mxfp8_with_residual_layer(
                     input=attn_out,
                     mxfp8_weight=w_o,
-                    residual=oproj_resid,
-                    output=attn_proj_out,
+                    residual=(oproj_zero_resid if dense_tp_this
+                              else oproj_resid),
+                    output=(oproj_shard_out if dense_tp_this
+                            else attn_proj_out),
                     rows_per_wg=oproj_tile_n,
-                    output_stride=hidden_size,
+                    output_stride=(oproj_tp_cols if dense_tp_this
+                                   else hidden_size),
                     reduction_size=layer_o_proj_red,
                     wgm=GANG_WGM,
                     block_dim=(256, 1, 1),
                 )
+                if dense_tp_this:
+                    # The partial is zero outside this rank's columns, so the
+                    # sum is a concatenation and the residual lands once.
+                    mpk.xrank_sum_add_layer(
+                        partial=oproj_partial,
+                        residual=oproj_resid,
+                        xbuf=oproj_xbufs[i],
+                        output=attn_proj_out,
+                        grid_dim=(1, 1, 1),
+                        block_dim=(256, 1, 1),
+                        # The GEMV wrote `oproj_shard_out`, a column slice of
+                        # `oproj_partial` over the same storage but with its
+                        # own guid, so the chain's shared-tensor edge test
+                        # cannot see the edge without naming it.
+                        dep=oproj_shard_out,
+                    )
             else:
                 mpk.gang_linear_with_residual_layer(
                     input=attn_out,

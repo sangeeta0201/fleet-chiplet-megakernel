@@ -7391,6 +7391,7 @@ class PersistentKernel:
         output: DTensor,
         grid_dim: tuple,
         block_dim: tuple,
+        dep: DTensor = None,
     ):
         """output = residual + sum over ranks of each rank's `partial`.
 
@@ -7404,6 +7405,11 @@ class PersistentKernel:
         world_size * XRANK_SUM_SLOT_U64 (= 8) u64 epoch words. The caller must
         pass the down_proj GEMV a ZERO residual -- a folded residual would be
         summed world_size times here.
+
+        ``dep`` is a dependency-only trailing input, never read by the kernel.
+        Pass it when the producer writes a column SLICE of ``partial`` -- a
+        distinct DTensor over the same storage -- so the linear task chain's
+        shared-guid edge test can still see the edge.
         """
         assert partial.num_dims == 2  # (batch_size, hidden)
         assert residual.num_dims == 2
@@ -7415,8 +7421,12 @@ class PersistentKernel:
         tb_graph.new_input(partial, (-1, -1, -1), -1, True)
         tb_graph.new_input(residual, (-1, -1, -1), -1, True)
         tb_graph.new_input(xbuf, (-1, -1, -1), -1, True)
+        ins = [partial, residual, xbuf]
+        if dep is not None:
+            tb_graph.new_input(dep, (-1, -1, -1), -1, True)
+            ins.append(dep)
         tb_graph.new_input(output, (-1, -1, -1), -1, True)
-        self.kn_graph.customized([partial, residual, xbuf, output], tb_graph)
+        self.kn_graph.customized(ins + [output], tb_graph)
         self.kn_graph.register_task(
             tb_graph,
             "xrank_sum_add",
