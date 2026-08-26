@@ -1083,9 +1083,18 @@ def get_compile_command(
             "MPK_MOE_PF_GROUPS_W13",
             "MPK_MOE_PF_GROUPS_W2",
         ):
+            # Range is 0..16, not 0..8. The single knob MPK_MOE_PF_GROUPS
+            # asserts membership in ("0","2","4","8","16") -- powers of two --
+            # and W13's trip count is 48, so 3/6/12/24 were unreachable through
+            # it and were never in any sweep. 6 is worth -0.16 ms at the wall
+            # (task #129), which is how the hole was found. VGPR bill for
+            # W13-only, /tmp/vgpr.sh on the real image: 325 at 4/6/8, 327 at
+            # 12, 344 at 16, and 512 with 180 spills at 24 -- so 24 is the
+            # cliff and the ceiling here is set to 16. The historical "depth 8
+            # costs 325 -> 362" was the UNIFIED knob, i.e. it was W2's bill.
             _x = os.environ.get(_v)
             if _x is not None:
-                assert _x.isdigit() and 0 <= int(_x) <= 8, f"{_v} is 0..8"
+                assert _x.isdigit() and 0 <= int(_x) <= 16, f"{_v} is 0..16"
                 flags = flags + [f"-D{_v}={_x}"]
 
         _km = os.environ.get("MPK_MOE_KMAJOR")
