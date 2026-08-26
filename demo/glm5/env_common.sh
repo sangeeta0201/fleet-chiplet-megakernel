@@ -156,6 +156,12 @@ MPK_FORWARD_VARS=(
   MPK_DENSE_KMAJOR
   # The same knob for the attention-half GEMM's k-loop. Compile-time.
   MPK_ATTN_PF_GROUPS MPK_ATTN_PF_DBUF
+  # ...and the per-BRANCH split of the depth. The unified knob drives the
+  # N-parallel loop (walks MFMA_ITERS) and the K-parallel loop (walks
+  # MFMA_ITERS/4) with one request, so its 2/4/8 sweep reported their sum.
+  # Compile-time; an unforwarded one builds a different megakernel per rank
+  # and the layer barriers deadlock.
+  MPK_ATTN_PF_GROUPS_N MPK_ATTN_PF_GROUPS_K
   # latent_to_cache's flattened index chase. Compile-time.
   MPK_KVUPD_FAST
   # Scratch backing store. Raising occupancy to 2 waves/SIMD doubles what ROCr

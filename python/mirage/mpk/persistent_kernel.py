@@ -1133,6 +1133,22 @@ def get_compile_command(
                 "MPK_ATTN_PF_GROUPS is 0, 2, 4, 8 or 16"
             flags = flags + [f"-DMPK_ATTN_PF_GROUPS={_apf}"]
 
+        for _v in ("MPK_ATTN_PF_GROUPS_N", "MPK_ATTN_PF_GROUPS_K"):
+            # The unified knob above drives TWO branches with different trip
+            # counts -- N-parallel walks MFMA_ITERS (48 qkv_a, 16 q_b, 4
+            # W_UK/W_UV), K-parallel walks MFMA_ITERS/4 (12 for qkv_a) -- so
+            # one request lands on different depths in each and its 2/4/8
+            # sweep could only report their sum. That is the same trap the MoE
+            # twin fell into: split per GEMM, W13 wants depth 8 (-0.256 ms) and
+            # W2 wants 4 (+0.476 at 8). Range is 0..16 and NOT restricted to
+            # powers of two: 3/6/12 are divisors of 48 that the unified knob's
+            # membership assert cannot express, and 6 is where the MoE hole was
+            # found. Compile-time, so every rank must agree.
+            _x = os.environ.get(_v)
+            if _x is not None:
+                assert _x.isdigit() and 0 <= int(_x) <= 16, f"{_v} is 0..16"
+                flags = flags + [f"-D{_v}={_x}"]
+
         _apfd = os.environ.get("MPK_ATTN_PF_DBUF")
         if _apfd is not None:
             # The attention-half twin of MPK_MOE_PF_DBUF: swap two register

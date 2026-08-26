@@ -50,6 +50,14 @@ PROMPTS=(
   "Explain the difference between a stack and a queue in computer science."
 )
 
+# Trim the prompt set. Total wall exposure to the long-run mid-decode stall is
+# NUM_PROMPTS x MAX_NEW_TOKENS, and the stall is what kills a sweep -- one run
+# logged "Decode outliers (>10x min): iter 459 = 50665.7ms", a 50-second single
+# iteration, and the 120 s watchdog kills anything worse. A gate that only has
+# to separate two arms does not need all four prompts.
+NUM_PROMPTS="${NUM_PROMPTS:-${#PROMPTS[@]}}"
+PROMPTS=("${PROMPTS[@]:0:$NUM_PROMPTS}")
+
 # The megakernel does not depend on the prompt, so build once and reuse:
 # 4 prompts x a full rebuild is ~an hour, against ~3 min per run on a warm
 # build. Clear it here rather than trusting the caller's KEEP_BUILD, so the

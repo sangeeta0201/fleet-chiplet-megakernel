@@ -1332,8 +1332,16 @@ __device__ __forceinline__ f32x4_t
   constexpr int K_PER_MFMA = 128;
   static_assert(KI_LEN % GROUPS == 0,
                 "the deep k-loop needs GROUPS to divide the trip count");
-  static_assert(!SEEDED || GROUPS == 4,
-                "the hoisted prefill issues exactly four A tiles");
+  // The hoisted prefill issues exactly four A tiles, so a deeper first block
+  // takes those four and loads the rest itself. This used to assert
+  // GROUPS == 4, which quietly coupled the depth knob to the hoist: any depth
+  // other than 4 ALSO switched off the prefetch-across-the-quantizer that
+  // tasks #39/#82 built, so the 2/4/8 sweep in the note at MPK_ATTN_PF_GROUPS
+  // was really measuring depth AND hoist together at its endpoints. Four
+  // registers' worth of seed is worth keeping at any depth.
+  static_assert(!SEEDED || GROUPS >= 4,
+                "the hoisted prefill issues four A tiles; a seeded block must "
+                "be at least that wide");
   constexpr int NBLK = KI_LEN / GROUPS;
 
   f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -1342,13 +1350,15 @@ __device__ __forceinline__ f32x4_t
 #pragma unroll
   for (int j = 0; j < GROUPS; j++) {
     if constexpr (SEEDED) {
-      A[j] = seed_a[j];
-      S[j] = seed_sa[j];
-    } else {
-      int kk = ki_start + j;
-      A[j] = _rnlm8_load_w<W_KMUL, W_HIOFF>(w_data_row, kk * K_PER_MFMA, g);
-      S[j] = _rnlm8_load_sc<SC_KMUL>(w_scale_row, kk * 4, g);
+      if (j < 4) {
+        A[j] = seed_a[j];
+        S[j] = seed_sa[j];
+        continue;
+      }
     }
+    int kk = ki_start + j;
+    A[j] = _rnlm8_load_w<W_KMUL, W_HIOFF>(w_data_row, kk * K_PER_MFMA, g);
+    S[j] = _rnlm8_load_sc<SC_KMUL>(w_scale_row, kk * 4, g);
   }
 
 // IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation -- it is what keeps
@@ -1461,8 +1471,12 @@ __device__ __forceinline__ f32x4_t
   constexpr int K_PER_MFMA = 128;
   static_assert(KI_LEN % GROUPS == 0,
                 "the deep k-loop needs GROUPS to divide the trip count");
-  static_assert(!SEEDED || GROUPS == 4,
-                "the hoisted prefill issues exactly four A tiles");
+  // Same relaxation as _rnlm8_kloop_deep: take the four hoisted tiles and
+  // load the rest of the first block, so depth and the prefill hoist are
+  // independent knobs instead of one.
+  static_assert(!SEEDED || GROUPS >= 4,
+                "the hoisted prefill issues four A tiles; a seeded block must "
+                "be at least that wide");
   constexpr int NBLK = KI_LEN / GROUPS;
   static_assert(NBLK >= 1, "dbuf needs at least one k-block");
 
@@ -1493,8 +1507,14 @@ __device__ __forceinline__ f32x4_t
   if constexpr (SEEDED) {
 #pragma unroll
     for (int j = 0; j < GROUPS; j++) {
-      A[j] = seed_a[j];
-      S[j] = seed_sa[j];
+      if (j < 4) {
+        A[j] = seed_a[j];
+        S[j] = seed_sa[j];
+      } else {
+        int const kk = ki_start + j;
+        A[j] = _rnlm8_load_w<W_KMUL, W_HIOFF>(w_data_row, kk * K_PER_MFMA, g);
+        S[j] = _rnlm8_load_sc<SC_KMUL>(w_scale_row, kk * 4, g);
+      }
     }
   } else {
     issue(A, S, 0);
@@ -1647,6 +1667,31 @@ __device__ __host__ constexpr int _rnlm8_pf_groups(int ki, int req) {
 // of A[]+N[] live, and the trend from 6 already points the wrong way.
 #ifndef MPK_ATTN_PF_GROUPS
 #define MPK_ATTN_PF_GROUPS 4
+#endif
+
+// ...BUT THE SWEEP ABOVE MOVED TWO BRANCHES AT ONCE, so "4 is a real optimum"
+// is a statement about their SUM and not about either one. The N-parallel
+// branch walks MFMA_ITERS (48 for qkv_a, 16 for q_b, 4 for W_UK/W_UV); the
+// K-parallel branch walks ITERS_PER_WAVE = MFMA_ITERS / 4 (12 for qkv_a). One
+// request therefore lands on different depths in the two branches -- the note
+// above says so explicitly ("the request maps 2->2, 4->4, 8->6") without
+// drawing the consequence, which is that a win in one branch and a larger loss
+// in the other are indistinguishable from a null.
+//
+// That is exactly what happened to the MoE twin. MPK_MOE_PF_GROUPS drives W13
+// (48 trips) and W2 (16 trips) together and read +0.260 ms at depth 8, which
+// closed the axis. Split per GEMM, W13 at depth 8 is -0.256 ms at zero
+// register cost and W2 at depth 8 is +0.476 -- opposite signs, and the unified
+// knob could only ever report the sum. See
+// glm-moe-w13-and-w2-want-opposite-prefetch-depths.
+//
+// So give each branch its own request. Both default to the unified knob, so
+// this is a no-op until one is set.
+#ifndef MPK_ATTN_PF_GROUPS_N
+#define MPK_ATTN_PF_GROUPS_N MPK_ATTN_PF_GROUPS
+#endif
+#ifndef MPK_ATTN_PF_GROUPS_K
+#define MPK_ATTN_PF_GROUPS_K MPK_ATTN_PF_GROUPS
 #endif
 
 template <int BATCH_SIZE,
@@ -2297,14 +2342,14 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
         // move: same "+v" optimization-barrier idiom as
         // gang_mla_full_layer_fused_mi300.cuh:467.
         asm volatile("" : "+v"(acc));
-      } else if constexpr (_rnlm8_pf_groups(MFMA_ITERS, MPK_ATTN_PF_GROUPS) >=
-                           2) {
+      } else if constexpr (_rnlm8_pf_groups(MFMA_ITERS,
+                                            MPK_ATTN_PF_GROUPS_N) >= 2) {
         // ── Guard-free GROUPS-deep pipeline ────────────────────────────────
         // See _rnlm8_kloop_deep for the ISA the rotating loop below actually
         // compiles to. HOIST_PREFILL implies TILES_PER_WAVE == 1 here
         // (OUTPUT_PER_WG >= 64 on this branch), so ph_a is this tile's fill.
-        constexpr int GR = _rnlm8_pf_groups(MFMA_ITERS, MPK_ATTN_PF_GROUPS);
-        acc = _rnlm8_kloop_pick<GR, MFMA_ITERS, HOIST_PREFILL && GR == 4,
+        constexpr int GR = _rnlm8_pf_groups(MFMA_ITERS, MPK_ATTN_PF_GROUPS_N);
+        acc = _rnlm8_kloop_pick<GR, MFMA_ITERS, HOIST_PREFILL && GR >= 4,
                                       W_KMUL, W_HIOFF, SC_KMUL>(
             w_data_row, w_scale_row, s_tok_fp8, s_tok_scales,
             /*ki_start=*/0, g, ph_a, ph_sa);
@@ -2447,9 +2492,9 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     // wave's slice of K, not all of it. The hoisted prefill used w_row = col
     // and ki0 = warp_id * ITERS_PER_WAVE, which is exactly (w_row, ki_start),
     // so it seeds the first block directly.
-    constexpr int KGR = _rnlm8_pf_groups(ITERS_PER_WAVE, MPK_ATTN_PF_GROUPS);
+    constexpr int KGR = _rnlm8_pf_groups(ITERS_PER_WAVE, MPK_ATTN_PF_GROUPS_K);
     if constexpr (KGR >= 2) {
-      acc = _rnlm8_kloop_pick<KGR, ITERS_PER_WAVE, HOIST_PREFILL && KGR == 4,
+      acc = _rnlm8_kloop_pick<KGR, ITERS_PER_WAVE, HOIST_PREFILL && KGR >= 4,
                                   W_KMUL, W_HIOFF, SC_KMUL>(
           w_data_row, w_scale_row, s_tok_fp8, s_tok_scales,
           ki_start, g, ph_a, ph_sa);
