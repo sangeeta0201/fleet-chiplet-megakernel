@@ -775,7 +775,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
                               xcd_id, entry_tree, /*skew_slot=*/0)) {
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         for (int x = 0; x < 8; x++) {
-          st_wt_u32((void *)&entry_bar[x * HIER_STRIDE],
+          st_flag_u32((void *)&entry_bar[x * HIER_STRIDE],
                     (unsigned)entry_expected);
         }
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
@@ -783,6 +783,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       int *const my_flag = &entry_bar[xcd_id * HIER_STRIDE];
       MPK_WS_WAIT_BEGIN(761, entry_expected);
       int _spins = 0;
+      int _heals = 0;
       int _obs;
       while ((_obs = ld_nt_s32(my_flag)) < entry_expected) {
         ++_spins;
@@ -792,9 +793,18 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
         // counter is monotonic at `arrivals` per layer, and once it is at or
         // past arrivals * entry_expected the release is owed.
         if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
-          if (ld_nt_s32(&entry_bar[8 * HIER_STRIDE]) >=
-              hier_barrier_heal_quota(arrivals, entry_tree) * entry_expected) {
-            st_wt_u32((void *)my_flag, (unsigned)entry_expected);
+          int const _cnt = ld_nt_s32(&entry_bar[8 * HIER_STRIDE]);
+          // #135. The 762 spin next door already publishes its arrival count
+          // through the aux slots, which is how that barrier could be cleared
+          // as healthy (2879 of 2880, one worker short, exactly as expected).
+          // This one had no aux, so a capture could not separate "the quota is
+          // not met, the heal never fires" from "the heal fires and the store
+          // does not stick". a1 is the heal-fired count for precisely that.
+          MPK_WS_WAIT_AUX(_cnt, _heals, 0, 0);
+          if (hier_barrier_should_heal(entry_bar, HIER_STRIDE, entry_expected,
+                                       xcd_id, arrivals, entry_tree)) {
+            ++_heals;
+            st_flag_u32((void *)my_flag, (unsigned)entry_expected);
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
           }
         }
@@ -858,7 +868,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
         if (release) {
           asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
           for (int x = 0; x < 8; x++) {
-            st_wt_u32((void *)&kb[x * HIER_STRIDE], (unsigned)entry_expected);
+            st_flag_u32((void *)&kb[x * HIER_STRIDE], (unsigned)entry_expected);
           }
           asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         }
@@ -875,7 +885,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
           ++_spins;
           if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
             if (ld_nt_s32(&kb[8 * HIER_STRIDE]) >= heal_quota * entry_expected) {
-              st_wt_u32((void *)my_flag, (unsigned)entry_expected);
+              st_flag_u32((void *)my_flag, (unsigned)entry_expected);
               asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
             }
           }
@@ -1277,7 +1287,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
         mpk_stage_stamp(4);
 #endif
         for (int x = 0; x < 8; x++) {
-          st_wt_u32((void *)&ep_release[x * HIER_STRIDE],
+          st_flag_u32((void *)&ep_release[x * HIER_STRIDE],
                     (unsigned)ep_expected);
         }
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
@@ -1339,7 +1349,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
             if (ld_nt_s32(ep_fold_done) >=
                     FULL_LAYER_EP_FOLDERS * ep_expected &&
                 _ep_peers_in) {
-              st_wt_u32((void *)my_flag, (unsigned)ep_expected);
+              st_flag_u32((void *)my_flag, (unsigned)ep_expected);
               asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
             }
           }
@@ -1724,7 +1734,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       int const prev = atom_add_release_gpu_s32(_wuv_cnt, 1);
       if ((prev % wuv_arrivals) == wuv_arrivals - 1) {
         for (int h = 0; h < WUV_XCDS_PER_GROUP; h++) {
-          st_wt_u32((void *)&wuv_counters[(wuv_pair * WUV_XCDS_PER_GROUP + h) *
+          st_flag_u32((void *)&wuv_counters[(wuv_pair * WUV_XCDS_PER_GROUP + h) *
                                           HIER_STRIDE],
                     (unsigned)wuv_expected);
         }
@@ -1747,7 +1757,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
           // reads was merged inside the pair. Healing on a partial predicate
           // is what broke the NP=8 EP barrier; there is no partial one here.
           if (ld_nt_s32(_wuv_cnt) >= wuv_arrivals * wuv_expected) {
-            st_wt_u32((void *)my_flag, (unsigned)wuv_expected);
+            st_flag_u32((void *)my_flag, (unsigned)wuv_expected);
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
           }
         }
@@ -1851,7 +1861,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       if (_owes) {
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         for (int x = 0; x < 8; x++) {
-          st_wt_u32((void *)&attn_release[x * HIER_STRIDE],
+          st_flag_u32((void *)&attn_release[x * HIER_STRIDE],
                     (unsigned)attn_release_expected);
         }
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
@@ -2084,10 +2094,10 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
         // flag is a one-shot cache of it; if the cache is short and the
         // counter is not, publish the flag ourselves.
         if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
-          if (ld_nt_s32(&attn_release[8 * HIER_STRIDE]) >=
-              hier_barrier_heal_quota(arrivals, rel_tree) *
-                  attn_release_expected) {
-            st_wt_u32((void *)my_flag, (unsigned)attn_release_expected);
+          if (hier_barrier_should_heal(attn_release, HIER_STRIDE,
+                                       attn_release_expected, xcd_id, arrivals,
+                                       rel_tree)) {
+            st_flag_u32((void *)my_flag, (unsigned)attn_release_expected);
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
           }
         }

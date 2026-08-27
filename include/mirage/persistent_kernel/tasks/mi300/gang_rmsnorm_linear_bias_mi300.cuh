@@ -513,6 +513,12 @@ __device__ __attribute__((noinline)) void
   int xcd_id = get_xcd_id();
   void *logits_base = static_cast<T *>(logits_scratch_ptr) -
                       static_cast<int64_t>(xcd_id) * CHUNK_N;
+  // #135. Only the elected block runs this, so these four marks cost one PCIe
+  // write each per MoE layer -- and they are the difference between "wedged
+  // somewhere in the router" and "wedged in the serial tail".
+  int const tid = threadIdx.x;
+  (void)tid;
+  MPK_WS_MARK(775, xcd_id);
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   // Split SP6[4] (the 7.6 us serial tail) into its two halves, so the next
@@ -545,6 +551,7 @@ __device__ __attribute__((noinline)) void
       renormalize,
       routed_scaling_factor,
       num_shared_experts);
+  MPK_WS_MARK(776, xcd_id);
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   unsigned long long _tk_t1 = __builtin_amdgcn_s_memrealtime();
@@ -584,6 +591,7 @@ __device__ __attribute__((noinline)) void
   // removing it costs: buffer_wbl2 drains this XCD's dirty L2 during the one
   // window where 231 workers are parked anyway; defer it and the writeback
   // lands on the MoE critical path instead.
+  MPK_WS_MARK(777, xcd_id);
   if (routing_ready_ptr) {
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -608,13 +616,14 @@ __device__ __attribute__((noinline)) void
       // callers with no layer index to hand.
       int epoch =
           (epoch_hint >= 0) ? epoch_hint : (ld_nt_s32(routing_ready_ptr) + 1);
-      st_wt_u32((void *)routing_ready_ptr, (unsigned)epoch);
+      st_flag_u32((void *)routing_ready_ptr, (unsigned)epoch);
       for (int x = 0; x < 8; x++) {
-        st_wt_u32((void *)&routing_ready_ptr[(1 + x) * 16], (unsigned)epoch);
+        st_flag_u32((void *)&routing_ready_ptr[(1 + x) * 16], (unsigned)epoch);
       }
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
   }
+  MPK_WS_MARK(778, xcd_id);
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   if (threadIdx.x == 0 && g_subphase_active) {
@@ -849,19 +858,68 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
       unsigned long long _sp_spin0 = __builtin_amdgcn_s_memrealtime();
 #endif
       int _spins = 0;
-      while (ld_nt_s32(&hier[oproj_xcd_id * 16]) < oproj_release_expected) {
+      // #135. The caller stamps phase 73 before this call and 74 after it, so
+      // a worker wedged anywhere inside the router shows up as "73" and
+      // nothing more. Give this spin its own barrier id (770) and the region
+      // past it its own marks, so the next capture says *which* of the two it
+      // is instead of leaving the whole kernel as one bucket.
+      MPK_WS_WAIT_BEGIN(770, oproj_release_expected);
+      int _obs770;
+      while ((_obs770 = ld_nt_s32(&hier[oproj_xcd_id * 16])) <
+             oproj_release_expected) {
+        MPK_WS_WAIT_TICK(_obs770, _spins);
         if ((++_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
+          // #135. The old aux reported hier[0], which answers nothing when
+          // the question is *which* of the eight flags is short -- a capture
+          // showed a0=222 while workers on XCD 0 had demonstrably already
+          // read 223 and moved on, i.e. the value was simply stale by the
+          // time it was sampled. Report instead the two values that fork the
+          // diagnosis, computed in the same pass the heal already makes:
+          //   a0 = the barrier's own arrival counter, at [8*HIER_STRIDE].
+          //        Not a multiple of total_barrier_arrivals => an arrival was
+          //        lost in some earlier layer, the modular election never
+          //        fired for this epoch, and NO flag was ever written. That
+          //        is invisible to atomicMax publication, which only makes a
+          //        write that happens order-independent.
+          //   a1 = low 8 bits, the mask of XCDs whose flag is at or past the
+          //        epoch; bits 8..11, this worker's oproj_xcd_id.
+          //        mask == 0  -> the election fired and published stale, or
+          //                      never fired (read a0).
+          //        mask != 0  -> a peer holds it, so the heal below ran; if
+          //                      we are still spinning the store did not
+          //                      stick, which after atomicMax would mean the
+          //                      flag line itself is being written by
+          //                      something else.
+          int _mask = 0;
           for (int x = 0; x < 8; x++) {
             if (ld_nt_s32(&hier[x * 16]) >= oproj_release_expected) {
-              st_wt_u32((void *)&hier[oproj_xcd_id * 16],
-                        (unsigned)oproj_release_expected);
-              asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-              break;
+              _mask |= 1 << x;
             }
+          }
+          MPK_WS_WAIT_AUX(ld_nt_s32(&hier[8 * 16]),
+                          _mask | (oproj_xcd_id << 8), 0, 0);
+          if (_mask) {
+            st_flag_u32((void *)&hier[oproj_xcd_id * 16],
+                        (unsigned)oproj_release_expected);
+            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
           }
         }
         __builtin_amdgcn_s_sleep(1);
       }
+      // #135, capture 4. The p135d capture showed three workers whose `spins`
+      // was FROZEN at 57344 across four consecutive host dumps while every
+      // other worker's grew by ~20M -- i.e. those waves were not executing the
+      // loop above at all. `spins` positive only proves the last write to the
+      // slot was a wait tick, and the aux slot is sticky, so "still polling"
+      // and "left the poll and hung immediately after" are indistinguishable
+      // from that dump. This mark separates them: reaching it makes the slot
+      // NEGATIVE. If the next capture still shows a positive frozen spins, the
+      // wave is genuinely inside the poll; if it shows -779..., the poll was
+      // satisfied and the hang is the buffer_inv / s_waitcnt vmcnt(0) below,
+      // which drains the Step-0 prefetch -- and that is VMEM state carried in
+      // from the previous layer's MoE k-loop, which is exactly what
+      // MPK_MOE_PF_GROUPS_W13 changes.
+      MPK_WS_MARK(779, oproj_xcd_id);
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
       // The caller charges this whole kernel to SP3[2] "Router", so without
       // this the spin and the router's actual work are one number. Guarded
@@ -880,6 +938,7 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     asm volatile("buffer_inv" ::: "memory");
     // Drain the prefetch. nt loads bypass L2 and are unaffected by the inv.
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    MPK_WS_MARK(771, tile_idx);
   }
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
@@ -1333,11 +1392,13 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   // or by none; the dense prefix layers and the EP_TAIL_ONLY variant return
   // before Phase 3 uniformly, so no XCD's line drifts out of step.
   __shared__ int s_completed;
+  MPK_WS_MARK(772, tile_idx);
   if (tid == 0) {
     s_completed = atomicAdd(static_cast<int *>(gang_counter_ptr), 1) + 1;
   }
   __syncthreads();
   int completed = s_completed;
+  MPK_WS_MARK(773, completed);
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   unsigned long long _rt_t3 = __builtin_amdgcn_s_memrealtime();
@@ -1386,6 +1447,7 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     }
 #endif
   }
+  MPK_WS_MARK(774, completed);
 }
 
 } // namespace kernel

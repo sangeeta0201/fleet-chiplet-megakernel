@@ -553,7 +553,7 @@ __device__ __attribute__((always_inline)) void
                               tiles_per_xcd, xcd_id, wuv_tree,
                               /*skew_slot=*/5)) {
         for (int x = 0; x < 8; x++) {
-          st_wt_u32((void *)&wuv_barrier[x * HIER_STRIDE],
+          st_flag_u32((void *)&wuv_barrier[x * HIER_STRIDE],
                     (unsigned)wuv_expected);
         }
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
@@ -566,9 +566,9 @@ __device__ __attribute__((always_inline)) void
         ++_spins;
         MPK_WS_WAIT_TICK(_obs, _spins);
         if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
-          if (ld_nt_s32(&wuv_barrier[8 * HIER_STRIDE]) >=
-              hier_barrier_heal_quota(wuv_arrivals, wuv_tree) * wuv_expected) {
-            st_wt_u32((void *)my_flag, (unsigned)wuv_expected);
+          if (hier_barrier_should_heal(wuv_barrier, HIER_STRIDE, wuv_expected,
+                                       xcd_id, wuv_arrivals, wuv_tree)) {
+            st_flag_u32((void *)my_flag, (unsigned)wuv_expected);
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
           }
         }
@@ -1040,7 +1040,7 @@ __device__ __attribute__((always_inline)) void
           asm volatile("buffer_inv" ::: "memory");
         }
         for (int x = 0; x < 8; x++) {
-          st_wt_u32((void *)&hier_barrier[x * HIER_STRIDE],
+          st_flag_u32((void *)&hier_barrier[x * HIER_STRIDE],
                     (unsigned)oproj_expected);
         }
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
@@ -1186,8 +1186,25 @@ __device__ __attribute__((always_inline)) void
       ++_spins;
       MPK_WS_WAIT_TICK(_obs, _spins);
       if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
-        if (ld_nt_s32(routing_ready) >= routing_expected) {
-          st_wt_u32((void *)my_flag, (unsigned)routing_expected);
+        // #135. This spin had no aux at all, so a capture could only say
+        // "236 workers short by one" and not whether the TopK tail ever
+        // published. a0 is slot 0, the sentinel the heal already tests --
+        // below the epoch means the release never fired and the fault is
+        // upstream in the router, not in this line. a1 is the mask of the
+        // eight per-XCD lines that are at or past the epoch (bits 0..7) with
+        // this worker's xcd_id in bits 8..11, so a partial fan-out is
+        // distinguishable from no fan-out.
+        int _s0 = ld_nt_s32(routing_ready);
+        int _mask = 0;
+        for (int x = 0; x < 8; x++) {
+          if (ld_nt_s32(&routing_ready[(1 + x) * HIER_STRIDE]) >=
+              routing_expected) {
+            _mask |= 1 << x;
+          }
+        }
+        MPK_WS_WAIT_AUX(_s0, _mask | (xcd_id << 8), 0, 0);
+        if (_s0 >= routing_expected) {
+          st_flag_u32((void *)my_flag, (unsigned)routing_expected);
           asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         }
       }
@@ -1666,7 +1683,7 @@ __device__ __attribute__((always_inline)) void
     if (_w13_owes) {
 #endif
       for (int x = 0; x < 8; x++) {
-        st_wt_u32((void *)&w13_barrier[x * HIER_STRIDE], (unsigned)w13_expected);
+        st_flag_u32((void *)&w13_barrier[x * HIER_STRIDE], (unsigned)w13_expected);
       }
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
@@ -1693,9 +1710,9 @@ __device__ __attribute__((always_inline)) void
         // XCD -- except when MPK_W13_EARLY_REL forced the flat arrival above.
         bool const _w13_tree =
             MPK_BAR_TREE != 0 && !MPK_W13_EARLY_REL_ON;
-        if (ld_nt_s32(&w13_barrier[8 * HIER_STRIDE]) >=
-            hier_barrier_heal_quota(arrivals, _w13_tree) * w13_expected) {
-          st_wt_u32((void *)my_flag, (unsigned)w13_expected);
+        if (hier_barrier_should_heal(w13_barrier, HIER_STRIDE, w13_expected,
+                                     xcd_id, arrivals, _w13_tree)) {
+          st_flag_u32((void *)my_flag, (unsigned)w13_expected);
           asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         }
       }

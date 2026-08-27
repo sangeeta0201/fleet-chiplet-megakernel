@@ -1145,36 +1145,58 @@ if __name__ == "__main__":
         # 12 per XCD against 29 workers. At 16 both are 4x that.
         # Separate knobs so the two stages can move one at a time.
         #
-        # W2's tile width is now measured out in BOTH directions and the knob
-        # should be left at 64 (2026-08-21, n=3 each, one control batch at
-        # 11.020 ms/iter mean):
+        # W2's width was "measured out in BOTH directions" here for six days.
+        # It was not: the batch that closed it (2026-08-21, n=3 each) had a
+        # control of 11.020 ms/iter, i.e. an **NP=8** baseline.
         #
         #   GLM_MOE_W2_OPW=16   (K-parallel, 4x tiles)   -1.34 ms  [earlier]
         #   MPK_W2_KSPLIT=2     (2x tiles, half K each)  -4.12 ms  -> 15.136
-        #   GLM_MOE_W2_OPW=128  (half the tiles)          10.972,  neutral
+        #   GLM_MOE_W2_OPW=128  (half the tiles)          10.972,  neutral@NP=8
         #
-        # Splitting loses because W2's per-tile cost is mostly fixed -- the
-        # whole-activation LDS stage and quantize, and the full atomicAdd
-        # epilogue -- and neither divides. Widening does not win because the
-        # fixed cost it amortises was never on the critical path: the MoE half
-        # of the layer is barrier-bound, so shrinking the phase is absorbed,
-        # exactly as in the ceiling probes. Both directions, one conclusion --
-        # W2 tile geometry is saturated, stop tuning it.
+        # Splitting loses at every world size because W2's per-tile cost is
+        # mostly fixed -- the whole-activation LDS stage and quantize, and the
+        # full atomicAdd epilogue -- and neither divides. That half stands.
+        # But the *widening* null was over-generalised. What widening removes
+        # is the second dispatch round, and whether that round fires depends on
+        # how many activated experts a rank owns, which is a function of EP:
         #
-        # 2026-08-21 addendum: per-worker stage stamps (MPK_BAR_SKEW=3) later
-        # showed W2 is the ONE phase whose tile imbalance is not absorbed --
-        # 9.66 us of spread at S8 against 1.63 us of layer boundary after it --
-        # which revives the round-quantization argument: 12 tiles/XCD/expert
-        # over 29 workers means a rank owning 3 experts needs 36 tiles = 2
-        # rounds, so widen until 3 experts fit in one round. It does not
-        # survive the arithmetic. tiles_per_XCD = (hidden_size/OPW)/8 and
-        # task_register.cc asserts hidden_size % OPW == 0, so 9 tiles/XCD needs
-        # OPW = 6144/72 = 85.33 and is unreachable; the clean neighbours are
-        # OPW=96 (8/XCD) and OPW=128 (6/XCD). OPW=128 is the row above, and at
-        # 6 tiles/XCD even FOUR owned experts fit in one round (24 <= 29) --
-        # strictly more aggressive than 8 or 9, and it measured neutral. So the
-        # unabsorbed spread is real but its geometry fix is already tested.
-        # An unabsorbed spread is necessary for a lever, not sufficient.
+        #   owned ~ Binom(TOPK=8, 1/EP), +1 on EP_SHARED_PE
+        #   tiles/XCD = owned * (hidden_size/OPW)/8;  one round if <= workers/8
+        #
+        #     NP=8, OPW=64 : 12 tiles/expert/XCD, P(>=3 owned) = 0.038  -- the
+        #                    2-round case essentially never fires, so there was
+        #                    nothing for a wider tile to remove. The null was
+        #                    real and said nothing about NP=4.
+        #     NP=4, OPW=64 : 12/expert against 30 workers/XCD,
+        #                    P(2 rounds) = 0.32 on a peer, 0.63 on rank 0.
+        #     NP=4, OPW=128:  6/expert -- one round up to 5 owned experts.
+        #
+        # Re-measured at NP=4 (/tmp/p147.sh + /tmp/p148.sh, 2026-08-27; one
+        # cold build per arm since this is a codegen constant, and the control
+        # built and run on BOTH sides of the arms):
+        #
+        #   clean avg ms/iter   OPW=64  9.157 (n=6, 9.129-9.177)
+        #                       OPW=128 9.063 (n=5, 9.014-9.090)   -0.094
+        #                       OPW=192 9.300 (n=2, 9.290-9.311)   +0.143
+        #   per-iter min        OPW=64  9.021    OPW=128  8.872    OPW=192 9.180
+        #
+        # The 64 and 128 ranges are disjoint. 192 is the control that makes
+        # this a geometry win rather than a "wider is better" trend: 192 also
+        # removes the 2-round case (4 tiles/expert/XCD) and still loses 0.24 to
+        # 128, because a 3x-fat tile costs more makespan than the round it
+        # saves. 128 sits at the optimum -- the narrowest width that fits a
+        # realistic owned-expert count in one round.
+        #
+        # This also completes the 2026-08-21 addendum below rather than
+        # refuting it. Per-worker stage stamps (MPK_BAR_SKEW=3) showed W2 is the
+        # ONE phase whose tile imbalance is not absorbed by a following barrier
+        # -- 9.66 us of spread at S8 against 1.63 us of layer boundary -- and
+        # predicted exactly this lever. The prediction was right; the reason it
+        # was dismissed ("its geometry fix is already tested") cited a number
+        # from the wrong world size. Check the world size of any number you
+        # cite here. Note 96 is not legal despite the arithmetic wanting ~85:
+        # task_register asserts OPW % 64 == 0 or OPW == 16, and 96/4 waves = 24
+        # rows/wave is not a multiple of the 16x16 MFMA. Ladder: 16/64/128/192.
         # W13's own width was swept at NP=8 and re-swept at NP=4 on 2026-08-25,
         # because constants tuned at NP=8 are a live bug class here (o_proj
         # -0.148, worker count -0.108 both came from re-sweeping one). W13 is
@@ -1195,7 +1217,7 @@ if __name__ == "__main__":
         # whose W2 twin measured -1.34 ms. W13 width is closed in both
         # directions at NP=4.
         MOE_W13_OPW = int(os.environ.get("GLM_MOE_W13_OPW", "64"))
-        MOE_W2_OPW = int(os.environ.get("GLM_MOE_W2_OPW", "64"))
+        MOE_W2_OPW = int(os.environ.get("GLM_MOE_W2_OPW", "128"))
         # Experts per router call. The router is one worker per expert, so
         # GLM-5's 256 experts are 32 tiles per XCD against 29 workers: two
         # grid-stride rounds for a mean of 1.10 calls, and the second round

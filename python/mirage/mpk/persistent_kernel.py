@@ -738,6 +738,27 @@ def get_compile_command(
             # semantics are unchanged, only who counts. Priced by the null
             # probe below at 3.77 -> 2.11 us per rendezvous.
             flags = flags + ["-DMPK_BAR_TREE=1"]
+        _bfm = os.environ.get("MPK_BAR_FLAG_MAX")
+        if _bfm is not None:
+            # Publish every Mechanism-C release flag with an atomicMax instead
+            # of a plain write-through store, so a late lower epoch is dropped
+            # (mpk_atoms.cuh:444, st_flag_u32). Header default is 1. It closes
+            # a real backwards-stepping-flag race, but it was never priced at
+            # the wall -- 30 sites, 222 flat_atomic_smax in the image -- so
+            # plumb it here to A/B it against 0 in one batch.
+            assert _bfm in ("0", "1"), "MPK_BAR_FLAG_MAX is 0 or 1"
+            flags = flags + [f"-DMPK_BAR_FLAG_MAX={_bfm}"]
+        _bph = os.environ.get("MPK_BAR_PEER_HEAL")
+        if _bph is not None:
+            # The drift-immune arm of every Mechanism-C self-heal
+            # (mpk_atoms.cuh, hier_barrier_should_heal). The counter-quota
+            # test it ORs with is permanently false past ~epoch 155 because
+            # EP_TAIL_ONLY advances the epoch without arriving, one round of
+            # drift per generated token; the peer scan asks instead whether
+            # some OTHER XCD's flag already reached this round, which proves
+            # the election fired and cannot release early. Header default 1.
+            assert _bph in ("0", "1"), "MPK_BAR_PEER_HEAL is 0 or 1"
+            flags = flags + [f"-DMPK_BAR_PEER_HEAL={_bph}"]
         _bpn = os.environ.get("MPK_BAR_POLL_NT")
         if _bpn is not None:
             assert _bpn in ("0", "1"), "MPK_BAR_POLL_NT is 0 or 1"

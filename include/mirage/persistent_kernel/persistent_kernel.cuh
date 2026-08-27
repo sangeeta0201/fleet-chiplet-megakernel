@@ -5133,7 +5133,32 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   // Note: rocprofv3 --pmc serializes kernel dispatches and deadlocks split
   // mode, but --profiling (Perfetto trace) works fine since profiler writes are
   // worker-only.
-  global_runtime_config.split_worker_scheduler = true;
+  //
+  // MPK_SPLIT_SCHED=0 selects the single-grid `persistent_kernel` instead, and
+  // the reason is the co-residency wedge, not profiling. In split mode the 240
+  // worker blocks and the 8 scheduler blocks are TWO dispatches on two streams,
+  // round-robined onto XCDs independently. Nothing puts one scheduler on each
+  // XCD, so an XCD that draws three of them needs 33 slots for 32; the extra
+  // worker block never becomes resident, `worker_xcd_ready_count` stalls one
+  // short, and every scheduler parks in the bootstrap wait forever. That is the
+  // ~50%-of-runs launch wedge, and it hits the exact shipping build
+  // (glm-launch-wedge-is-config-independent-and-precedes-worker-xcd).
+  //
+  // The single grid removes the race by construction rather than by margin:
+  // 248 workgroups from ONE dispatch round-robin to exactly 31 per XCD, and
+  // `persistent_kernel` then elects the scheduler with an atomicCAS on
+  // xcd_scheduler_claimed[my_xcd] -- "exactly 1 scheduler per XCD regardless of
+  // hardware block placement", as its own comment puts it. So it keeps
+  // MPK_NUM_WORKERS=240 (worth -0.108 ms over 232) instead of buying the margin
+  // with eight workers.
+  //
+  // Runtime-only: both kernels are always compiled, so this is an env flip on a
+  // fixed build and the A/B has no build variable in it. Must be on
+  // env_common.sh's mpirun -x whitelist or only rank 0 sees it.
+  {
+    char const *_ss = getenv("MPK_SPLIT_SCHED");
+    global_runtime_config.split_worker_scheduler = !(_ss && atoi(_ss) == 0);
+  }
 
   std::vector<FullTaskDesc> all_fulltasks;
   std::vector<EventDesc> all_events;
@@ -7297,6 +7322,40 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                   case 8306:
                     mn = "MoE W2: epilogue";
                     break;
+                  // #135: the router body, between the caller's phase 73 and
+                  // 74 stamps. 770 is the o_proj spin (a poll, so it shows in
+                  // BARRIER WATCH, not here); everything below is straight
+                  // line, so a worker parked on one of these is the blocker.
+                  case 771:
+                    mn = "router: cleared o_proj barrier";
+                    break;
+                  case 772:
+                    mn = "router: at arrival atomic";
+                    break;
+                  case 773:
+                    mn = "router: past arrival (aux = count)";
+                    break;
+                  case 774:
+                    mn = "router: kernel done";
+                    break;
+                  case 775:
+                    mn = "router tail: elected, entering TopK";
+                    break;
+                  case 776:
+                    mn = "router tail: TopK selection done";
+                    break;
+                  case 777:
+                    mn = "router tail: counter reset done";
+                    break;
+                  case 778:
+                    mn = "router tail: routing_ready published";
+                    break;
+                  // Sits BEFORE 771: the poll was satisfied but the
+                  // buffer_inv + s_waitcnt vmcnt(0) that drains the Step-0
+                  // prefetch has not retired. aux is the XCD id.
+                  case 779:
+                    mn = "router: poll satisfied, draining prefetch";
+                    break;
                 }
                 fprintf(stderr,
                         "    w%d NOT POLLING: mark %d (%s) tile=%d"
@@ -7354,6 +7413,8 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                   bn = "routing-ready xcd flag";
                 } else if (bid == 766) {
                   bn = "GLM MoE W13->W2 xcd flag";
+                } else if (bid == 770) {
+                  bn = "o_proj->router spin INSIDE the router kernel";
                 } else if (bid == 75) {
                   bn = "P7b-routing";
                 }

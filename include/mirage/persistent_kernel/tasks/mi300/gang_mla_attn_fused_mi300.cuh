@@ -632,7 +632,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
       mpk_stage_stamp(45);
       int prev = atom_add_release_gpu_s32(_cnt, 1);
       if ((prev % tiles_per_xcd) == tiles_per_xcd - 1) {
-        st_wt_u32((void *)_flag, (unsigned)qkv_expected);
+        st_flag_u32((void *)_flag, (unsigned)qkv_expected);
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       }
       MPK_WS_WAIT_BEGIN(769, qkv_expected);
@@ -643,7 +643,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         MPK_WS_WAIT_TICK(_obs, _spins);
         if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
           if (ld_nt_s32(_cnt) >= tiles_per_xcd * qkv_expected) {
-            st_wt_u32((void *)_flag, (unsigned)qkv_expected);
+            st_flag_u32((void *)_flag, (unsigned)qkv_expected);
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
           }
         }
@@ -748,7 +748,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     if (hier_barrier_arrive(qkv_barrier, HIER_STRIDE, arrivals, tiles_per_xcd,
                             xcd_id, bar_tree, /*skew_slot=*/2)) {
       for (int x = 0; x < 8; x++) {
-        st_wt_u32((void *)&qkv_barrier[x * HIER_STRIDE], (unsigned)qkv_expected);
+        st_flag_u32((void *)&qkv_barrier[x * HIER_STRIDE], (unsigned)qkv_expected);
       }
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
@@ -774,9 +774,9 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         // written from inside the heal, so a frozen aux[1] means the wave
         // stopped and a growing one means the quota test below keeps failing.
         MPK_WS_WAIT_AUX(_cnt, _spins / MPK_FL_REPUBLISH_SPINS, 0, 0);
-        if (_cnt >= hier_barrier_heal_quota(arrivals, bar_tree) *
-                        qkv_expected) {
-          st_wt_u32((void *)_qkv_flag, (unsigned)qkv_expected);
+        if (hier_barrier_should_heal(qkv_barrier, HIER_STRIDE, qkv_expected,
+                                     xcd_id, arrivals, bar_tree)) {
+          st_flag_u32((void *)_qkv_flag, (unsigned)qkv_expected);
           asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         }
       }
@@ -941,7 +941,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
       int *const _flag = &wuk_barrier[xcd_id * HIER_STRIDE];
       int prev = atom_add_release_gpu_s32(_cnt, 1);
       if ((prev % tiles_per_xcd) == tiles_per_xcd - 1) {
-        st_wt_u32((void *)_flag, (unsigned)wuk_expected_in);
+        st_flag_u32((void *)_flag, (unsigned)wuk_expected_in);
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       }
       // Self-heal, see MPK_FL_REPUBLISH_SPINS. The predicate is the whole
@@ -956,7 +956,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         MPK_WS_WAIT_TICK(_obs, _spins);
         if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
           if (ld_nt_s32(_cnt) >= tiles_per_xcd * wuk_expected_in) {
-            st_wt_u32((void *)_flag, (unsigned)wuk_expected_in);
+            st_flag_u32((void *)_flag, (unsigned)wuk_expected_in);
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
           }
         }
@@ -1263,7 +1263,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
       }
 #endif
       for (int x = 0; x < 8; x++) {
-        st_wt_u32((void *)&qb_barrier[x * HIER_STRIDE], (unsigned)qb_expected);
+        st_flag_u32((void *)&qb_barrier[x * HIER_STRIDE], (unsigned)qb_expected);
       }
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
@@ -1289,22 +1289,19 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
           // rendezvous whose remote half has not happened. Heal off another
           // XCD's flag instead, which the leader writes after the peer wait,
           // so observing it implies the whole predicate.
-          bool _heal;
-          if (qb_tp) {
-            _heal = false;
-            for (int x = 0; x < 8; x++) {
-              if (x != xcd_id &&
-                  ld_nt_s32(&qb_barrier[x * HIER_STRIDE]) >= qb_expected) {
-                _heal = true;
-                break;
-              }
-            }
-          } else {
-            _heal = ld_nt_s32(&qb_barrier[8 * HIER_STRIDE]) >=
-                    hier_barrier_heal_quota(arrivals, bar_tree) * qb_expected;
-          }
+          // Under qb_tp the global counter at [8] is not this barrier's, so
+          // the peer scan is the ONLY legal evidence; otherwise take either.
+          bool const _heal =
+              qb_tp ? (hier_barrier_peer_released(
+                           qb_barrier, HIER_STRIDE, qb_expected, xcd_id) != 0)
+                    : hier_barrier_should_heal(qb_barrier,
+                                               HIER_STRIDE,
+                                               qb_expected,
+                                               xcd_id,
+                                               arrivals,
+                                               bar_tree);
           if (_heal) {
-            st_wt_u32((void *)_qb_flag, (unsigned)qb_expected);
+            st_flag_u32((void *)_qb_flag, (unsigned)qb_expected);
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
           }
         }
@@ -1425,14 +1422,14 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         // Release only this pair. The other three pairs are computing chunks
         // this pair's merge never reads.
         for (int h = 0; h < XCDS_PER_GROUP; h++) {
-          st_wt_u32(
+          st_flag_u32(
               (void *)&decode_barrier[(pair_id * XCDS_PER_GROUP + h) *
                                       HIER_STRIDE],
               (unsigned)decode_expected);
         }
       } else {
         for (int x = 0; x < 8; x++) {
-          st_wt_u32((void *)&decode_barrier[x * HIER_STRIDE],
+          st_flag_u32((void *)&decode_barrier[x * HIER_STRIDE],
                     (unsigned)decode_expected);
         }
       }
@@ -1458,9 +1455,23 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
       ++_spins;
       MPK_WS_WAIT_TICK(_obs, _spins);
       if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
-        if (ld_nt_s32(_dec_cnt) >=
-            hier_barrier_heal_quota(dec_arrivals, dec_tree) * decode_expected) {
-          st_wt_u32((void *)_dec_flag, (unsigned)decode_expected);
+        // The peer scan is only sound when all eight flags stand for ONE
+        // election. Under PAIR_MERGE they do not -- each pair releases on its
+        // own counter, so the other pair's flag at `expected` says nothing
+        // about mine, and healing on it would release a round early. Counter
+        // only in that case.
+        bool const _heal =
+            PAIR_MERGE ? (ld_nt_s32(_dec_cnt) >=
+                          hier_barrier_heal_quota(dec_arrivals, dec_tree) *
+                              decode_expected)
+                       : hier_barrier_should_heal(decode_barrier,
+                                                  HIER_STRIDE,
+                                                  decode_expected,
+                                                  xcd_id,
+                                                  dec_arrivals,
+                                                  dec_tree);
+        if (_heal) {
+          st_flag_u32((void *)_dec_flag, (unsigned)decode_expected);
           asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         }
       }

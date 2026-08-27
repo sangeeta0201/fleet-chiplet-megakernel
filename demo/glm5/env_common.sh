@@ -189,7 +189,10 @@ MPK_FORWARD_VARS=(
   MPK_BAR_SKEW MPK_EP_FOLD_WGS MPK_EP_POLL_BATCH MPK_ML_PTR_PREFETCH
   # Not a semantic change -- both settings are coherent -- but still
   # compile-time, and an A/B is only one variable if every rank agrees.
-  MPK_BAR_POLL_NT MPK_PEER_POLL_NT
+  MPK_BAR_POLL_NT MPK_PEER_POLL_NT MPK_BAR_FLAG_MAX
+  # The drift-immune arm of the barrier self-heal. Compile-time, and a rank
+  # that misses it heals on a different predicate than its peers.
+  MPK_BAR_PEER_HEAL
   MPK_ML_BOUNDARY_PAD MPK_BAR_SKEW_DROP_NS MPK_WUV_IN_MERGE GLM_RESADD_UNROLL
   GLM_RESADD_BATCH GLM_RESADD_GLOBAL GLM_MLFL_LDS GLM_EP_ASSUME_DIRECT GLM_MERGE_GLOBAL
   GLM_CONST_BLOCKDIM
@@ -218,6 +221,10 @@ MPK_FORWARD_VARS=(
   MPK_BS_DEBUG MPK_BSDBG_LAYER0
   MAX_SAVE_TOKENS
   MPK_NUM_WORKERS
+  # Runtime (not compile-time): picks the single-grid persistent_kernel over
+  # the two-stream worker/scheduler split. A rank that misses it runs a
+  # different launch topology than its peers, which is worse than either arm.
+  MPK_SPLIT_SCHED
 )
 
 mpk_x_args() {

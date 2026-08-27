@@ -414,6 +414,53 @@ __device__ __forceinline__ void st_wt_u32(void *addr, unsigned int val) {
 #endif
 }
 
+// MPK_BAR_FLAG_MAX: publish a Mechanism-C release flag MONOTONICALLY.
+//
+// Every per-XCD barrier flag in this codebase holds an epoch that only ever
+// counts up -- entry_expected, qkv_expected, routing_expected, all of them are
+// task_layer_idx + 1, and task_layer_idx is run-monotonic. Two different
+// threads write that flag: the last arriver's eight-way release fan-out, and
+// the self-heal republish. Both used a plain write-through store, and a plain
+// store carries no ordering against a store issued by a DIFFERENT thread on a
+// different XCD. So a straggler still inside layer L-1's spin can land its
+// republish of `L` AFTER layer L's fan-out has already published `L+1`, and
+// the flag goes BACKWARDS. Whoever has not read it yet then waits on an epoch
+// that will never be re-published.
+//
+// That is the exact state task #135 captured: at layer 11 the entry flag for
+// XCD 7 read 11 while 29 of that XCD's 30 workers had already observed 12 and
+// moved on to the next barrier. One worker, w232, spun 3.4 M times on a flag
+// whose correct value had been written and then overwritten. The poll cannot
+// be at fault -- ld_nt_s32 issues `sc0 sc1`, which bypasses vL1 and L2 and
+// reads memory, so the 11 was really there.
+//
+// atomicMax makes the write order-independent: a late store of a lower epoch
+// is simply dropped. Cost is eight device-scope atomics per barrier, executed
+// by the single last-arriver thread, replacing eight write-through stores.
+// Same-address atomics pipeline in the L2 atomic unit and the arrival side
+// already pays one (measured at 19 ns, see hier_barrier_arrive), so this is
+// far below the 3.77 us a rendezvous costs. Set to 0 to get the old stores
+// back for an A/B.
+#ifndef MPK_BAR_FLAG_MAX
+#define MPK_BAR_FLAG_MAX 1
+#endif
+__device__ __forceinline__ void st_flag_u32(void *addr, unsigned int val) {
+#if MPK_BAR_FLAG_MAX
+  // Device scope: the reader may be on any XCD. RELAXED, deliberately -- the
+  // ordering this needs is already there. Every caller puts an explicit
+  // `s_waitcnt vmcnt(0)` ahead of the fan-out, and the payload it advertises
+  // was written with st_wt_u32, i.e. `sc0 sc1`, which bypasses L2 and lands in
+  // memory. __ATOMIC_RELEASE would add a `buffer_wbl2 sc1` L2 writeback in
+  // front of every one of the eight, buying nothing over the store this
+  // replaces (a plain store carries no ordering at all). Compiles to a bare
+  // `global_atomic_smax`, verified on gfx950.
+  __hip_atomic_fetch_max(static_cast<int *>(addr), (int)val, __ATOMIC_RELAXED,
+                         __HIP_MEMORY_SCOPE_AGENT);
+#else
+  st_wt_u32(addr, val);
+#endif
+}
+
 // Write-through 16-bit store (1x bf16)
 __device__ __forceinline__ void st_wt_u16(void *addr, unsigned short val) {
 #if defined(__HIP_DEVICE_COMPILE__) &&                                         \
@@ -1547,4 +1594,82 @@ __device__ __forceinline__ bool hier_barrier_arrive(int *bar,
 __device__ __forceinline__ int hier_barrier_heal_quota(int arrivals,
                                                        bool use_tree) {
   return use_tree ? 8 : arrivals;
+}
+
+// Drift-immune companion to the quota test above.
+//
+// The quota test assumes bar[8 * HIER_STRIDE] == quota * epoch, and that is
+// FALSE past ~epoch 155 on this model: EP_TAIL_ONLY's early return sits above
+// the s_exp block, so one layer per generated token advances task_layer_idx
+// (and therefore the epoch) without any worker arriving. The counter falls one
+// full round behind per token -- measured 0 / +1 / +2 / +3 in ~76-epoch steps,
+// one step per token. Every `counter >= quota * expected` heal is permanently
+// false after that, so a single lost release store wedges the run forever.
+// See memory glm-barrier-counter-drifts-one-round-per-token.
+//
+// This predicate never reads the counter. It asks a strictly stronger and
+// drift-free question: has ANY OTHER XCD's release flag already reached
+// `expected`? Only the elected last arriver writes those flags, and it writes
+// all eight, so one peer flag at `expected` proves the election for THIS round
+// fired and my own flag is owed. It therefore cannot release a round early --
+// the failure mode of the obvious `counter % arrivals == 0 && my_flag ==
+// expected - 1` repair, which is true at every round boundary.
+//
+// Returns a bitmask of the OTHER XCDs already at `expected` (0 = no evidence
+// the release fired), so a caller can hand it straight to MPK_WS_WAIT_AUX
+// without a second pass. `my_xcd`'s own bit is always clear -- the caller is
+// spinning on it, so it carries no information.
+//
+// This generalizes the qb_tp arm that already existed in
+// gang_mla_attn_fused_mi300.cuh; that one was written for a different reason
+// (a TP barrier whose global counter is not this barrier's) but is the same
+// predicate.
+__device__ __forceinline__ int hier_barrier_peer_released(int *bar,
+                                                          int hier_stride,
+                                                          int expected,
+                                                          int my_xcd) {
+  // `unroll 1` is a cold-path size choice, nothing more. This is a 1-in-1024
+  // path, so serial-with-early-exit costs nothing that matters and keeps the
+  // eight loads from going live at once.
+  //
+  // It is NOT a register fix, whatever an earlier version of this comment
+  // claimed. /tmp/regab.sh (an 18-second offline rebuild of the generated TU,
+  // no model load, no GPU) measures worker_kernel at 325 vgpr / 69 agpr at
+  // BOTH -DMPK_BAR_PEER_HEAL=0 and =1: 325 is the pre-existing baseline and
+  // this helper moves it by zero. The silent launch failure that was blamed on
+  // it is the co-residency wedge, which hits the exact shipping build at the
+  // same rate -- see glm-launch-wedge-is-config-independent-and-precedes-
+  // worker-xcd and megakernel-block-co-residency-margin.
+  int mask = 0;
+#pragma unroll 1
+  for (int x = 0; x < 8; x++) {
+    if (x != my_xcd && ld_nt_s32(&bar[x * hier_stride]) >= expected) {
+      mask |= 1 << x;
+      break;
+    }
+  }
+  return mask;
+}
+
+// The heal predicate itself: the cheap counter quota OR the drift-immune peer
+// scan. Kept as one helper so all seven waiters stay in step. MPK_BAR_PEER_HEAL
+// defaults ON; set it to 0 to A/B back to the counter-only form.
+#ifndef MPK_BAR_PEER_HEAL
+#define MPK_BAR_PEER_HEAL 1
+#endif
+__device__ __forceinline__ bool hier_barrier_should_heal(int *bar,
+                                                         int hier_stride,
+                                                         int expected,
+                                                         int my_xcd,
+                                                         int arrivals,
+                                                         bool use_tree) {
+  if (ld_nt_s32(&bar[8 * hier_stride]) >=
+      hier_barrier_heal_quota(arrivals, use_tree) * expected) {
+    return true;
+  }
+#if MPK_BAR_PEER_HEAL
+  return hier_barrier_peer_released(bar, hier_stride, expected, my_xcd) != 0;
+#else
+  return false;
+#endif
 }
