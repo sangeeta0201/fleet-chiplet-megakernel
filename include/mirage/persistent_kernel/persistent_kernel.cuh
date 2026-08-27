@@ -182,6 +182,344 @@ __device__ unsigned long long
 // on the host: the worker -> XCD map is a runtime property of the dispatch,
 // and assuming worker_id % 8 or worker_id / 31 has been wrong before.
 __device__ int g_trace_xcd[MPK_PHASE_MAX_WORKERS];
+
+// ── Which slots this worker actually DID, as opposed to merely reached ──────
+//
+// Every MPK_PHASE_MARK sits *outside* the `if (xcd_rank < ...)` that guards
+// its phase body, because a mark inside the guard would leave non-participants
+// with no timestamp and break the "12 ascending marks per row" invariant every
+// consumer depends on. The consequence is that a worker which skipped a phase
+// still emits a tick pair for it -- one that spans nothing but a not-taken
+// branch and a __syncthreads.
+//
+// That is indistinguishable, in the log, from a worker that ran the phase very
+// fast. It cost us a wrong picture: with GPT-OSS 120B only ranks 0-9 of the 31
+// per XCD run Phase 1, but all 31 got a slot-1 span, so the trace drew 248
+// workers in "qkv_fused" when 80 were doing it and 168 were falling through a
+// branch in ~1.1 us. Read off that trace, MoE || QKV overlap appeared to be
+// 3.02 us; the true value is zero.
+//
+// A bitmask fixes it at the source. The guarded body sets its own bit, so
+// participation is recorded by the code that knows, rather than reconstructed
+// on the host from a copy of the guard conditions -- which would be the same
+// bug relocated, and would silently rot the next time a guard changes.
+__device__ unsigned int
+    g_trace_part[MPK_PHASE_MAX_WORKERS * MPK_PHASE_TRACE_LAYERS];
+
+// ── Which ARM of the phase, for phases whose workers do different things ────
+//
+// The bitmask above answers "did this worker run slot N", which is the whole
+// question for a phase guarded by `if (xcd_rank < K)`: inside the guard every
+// worker does the same op. It is NOT the whole question for MoE, and assuming
+// it was left the same bug standing after the bitmask fixed the other three.
+//
+// MoE has no rank guard -- the strided `for (moe_t = xcd_rank; ...)` reaches
+// every rank -- so the bit was set for all 248 workers and the slot looked
+// 100% participating. But an individual MoE *tile* is W13 or W2, never both
+// (gang_moe_fused_mxfp4_mi300.cuh: `bool is_w2 = global_tile >= TOTAL_W13`),
+// while a *worker* runs as many tiles as the strided loop hands it. With
+// moe_total_tiles_per_xcd = 53 over 31 workers, ranks 0-21 get two tiles and
+// the rest get one, so a worker can genuinely run W13 then W2 in one phase.
+// Drawing all of them "moe(w13+swiglu+w2)" is still wrong -- 9 of 31 do only
+// one of the two, and the phase name asserts both for every worker.
+//
+// So the arm is a SET, not a value: one bit per arm, OR-ed as tiles run. An
+// enum here would silently keep the last tile and report ranks 0-21 as pure
+// W2, which is how this was first written and is exactly wrong for the 22
+// workers that do the most work.
+#define MPK_PHASE_ARM_W13 1u   // MoE: ran at least one W13 + SwiGLU tile
+#define MPK_PHASE_ARM_W2 2u    // MoE: ran at least one W2 tile
+#define MPK_PHASE_ARM_BITS 2   // 2 arms => 2 bits per slot; 0 = ran neither
+#define MPK_PHASE_ARM_MASK 3u
+__device__ unsigned int
+    g_trace_arm[MPK_PHASE_MAX_WORKERS * MPK_PHASE_TRACE_LAYERS];
+
+// Called from INSIDE a phase's guarded body: "this worker really ran slot N".
+// Unmarked slots are not an error -- a phase with no MPK_PHASE_PART call is
+// simply one nobody has annotated yet, and the exporter reports those as
+// unknown rather than assuming either answer.
+__device__ __forceinline__ void mpk_phase_part(int worker, int slot) {
+  if (threadIdx.x != 0 || worker < 0 || worker >= MPK_PHASE_MAX_WORKERS) {
+    return;
+  }
+  if (!g_phase_live[worker]) {
+    return;
+  }
+  unsigned long long const l = g_phase_n[worker];
+  if (l >= MPK_PHASE_TRACE_LAYERS) {
+    return;
+  }
+  g_trace_part[worker * MPK_PHASE_TRACE_LAYERS + (int)l] |= (1u << slot);
+}
+
+// Record that this worker ran ONE tile of the given arm. OR-ed, not assigned:
+// the strided MoE loop hands ranks 0-21 two tiles, and a worker that runs W13
+// then W2 has done both. Assigning would keep only the last and report those
+// 22 workers as pure W2 -- the arm has to say what the worker did across the
+// whole phase, since the phase is what the span covers. Zero (no call) means
+// the worker ran no tile at all.
+__device__ __forceinline__ void mpk_phase_arm(int worker, int slot,
+                                              unsigned int arm) {
+  if (threadIdx.x != 0 || worker < 0 || worker >= MPK_PHASE_MAX_WORKERS) {
+    return;
+  }
+  if (!g_phase_live[worker]) {
+    return;
+  }
+  unsigned long long const l = g_phase_n[worker];
+  if (l >= MPK_PHASE_TRACE_LAYERS) {
+    return;
+  }
+  int const idx = worker * MPK_PHASE_TRACE_LAYERS + (int)l;
+  int const sh = slot * MPK_PHASE_ARM_BITS;
+  g_trace_arm[idx] |= ((arm & MPK_PHASE_ARM_MASK) << sh);
+}
+
+// ── Sub-phase marks: the async work the 12 slots structurally cannot show ───
+//
+// The 12 phase slots mark the *boundaries between* phases, so a span between
+// two of them is by construction one phase wide. That makes the trace show
+// phases running back to back and nothing overlapping -- which is a property
+// of the instrument, not of the kernel.
+//
+// The two overlaps that actually pay for themselves both live *inside* a
+// single phase, between two consecutive slots:
+//
+//   * the next layer's QKV weight DMA, issued into the Phase 9 barrier spin
+//     (MPK_PREFETCH_NEXT_QKV). The barrier costs mean_wait=7683 ns per worker
+//     per layer and the memory system is idle for it, so the weight traffic
+//     is close to free -- but only slot 9 and slot 10 exist around it, so the
+//     DMA is invisible between them.
+//
+//   * the W13 tile-0 weight loads issued *before* FP8 quantization
+//     (MPK_W13_LDS_PREFETCH Phase A), which fly during the quant's ALU+LDS
+//     work and are drained after it in Phase B. Both sit strictly inside the
+//     slot 7 -> slot 8 MoE span.
+//
+// A sub-mark is (code, timestamp) appended to a small per-(worker, layer) ring
+// rather than a fixed slot, because unlike the phase slots these do not fire a
+// fixed number of times per layer: a worker with no QKV tile next layer issues
+// no prefetch, and MoE sub-marks fire once per tile. Overflow is dropped and
+// counted rather than wrapping, so a full ring cannot silently rewrite the
+// beginning of a layer with its end.
+//
+// Sizing: the measured worst case before the barrier marks was 14 of 24 (a
+// two-tile MoE worker: 4 P1 + 1 qkv-prefetch + 2 tiles x 4 W13/W2 arm marks +
+// 1 W2 barrier pair). The barrier/idle marks below add at most 6 more -- five
+// barrier entries, at most one of which coexists with an idle mark in the same
+// phase -- so the worst case becomes 20. The O-proj and W2 prefetch pairs
+// (codes 22-25) add 4 more: O-proj issue/drain fire once per layer, and W2
+// issue/drain once per W2 tile, but a two-tile worker runs W13 then W2 and so
+// takes the W2 pair once -- worst case 24, measured 22 of 32 on the run that
+// added them. The two post-waitcnt marks (26/27) add 2, for 26 worst case.
+// 32 still holds; the arrays are indexed
+// [worker][layer][MPK_PHASE_SUBMARK_CAP] and 256 x 36 x 32 x 12 B is 3.5 MB,
+// which is not a constraint. Overflow is still counted, not wrapped -- check
+// the `dropped=` field in [FWD_PASS_TOTAL] before trusting a trace.
+#ifndef MPK_PHASE_SUBMARK_CAP
+#define MPK_PHASE_SUBMARK_CAP 32
+#endif
+// Codes. Paired begin/end so the host emits a span, not an instant. Kept dense
+// and small; the converter maps them to names.
+#define MPK_SUB_QKV_PF_ISSUE 1  // weight DMA issued into the barrier spin
+#define MPK_SUB_QKV_PF_DRAIN 2  // ...and the s_waitcnt that consumes it
+#define MPK_SUB_W13_PF_ISSUE 3  // W13 tile-0 loads issued before quant
+#define MPK_SUB_W13_QUANT 4     // FP8 quant of the token row (the cover work)
+#define MPK_SUB_W13_PF_DRAIN 5  // drain of the loads that flew during quant
+// Phase 1's own internals. The 12 slots bound the whole fused QKV op with one
+// slice, so the question "is there a wait between ResAdd, RMSNorm and the
+// GEMM" is invisible to them by construction. These four marks cut that one
+// slice at each internal handoff, which is the only way to answer it with a
+// measurement instead of an argument.
+#define MPK_SUB_P1_ENTRY 6    // phase 1 entry, after the weight DMA is issued
+#define MPK_SUB_P1_RESADD 7   // end of ResAdd+RMSNorm pass 1 (the ssq fold)
+#define MPK_SUB_P1_NORM 8     // end of RMSNorm pass 2, before the FP8 quant
+#define MPK_SUB_P1_GEMM 9     // MFMA loop entry, after the quant+drain barrier
+// MoE arm boundaries. Slot 8 is one span covering a phase in which a worker
+// may run a W13 tile, a W2 tile, or (ranks 0-21, where 53 tiles spread over 31
+// workers) one of each back to back. The arm bits say WHICH it ran; only these
+// marks say WHEN it switched, which is what turns a 20 us block into the two
+// ops inside it. Fire once per tile, so a two-tile worker emits four.
+//
+// There is deliberately no SwiGLU mark. SwiGLU is not a region of time here:
+// the epilogue is fused into the W13 MFMA loop and runs per tile-iteration,
+// interleaved with the MFMAs it consumes. Any single pair of marks around it
+// would either bound one iteration's epilogue (not the op) or bound the whole
+// MFMA loop (not SwiGLU). Drawing a "SwiGLU" span would be inventing a
+// boundary the kernel does not have.
+#define MPK_SUB_MOE_W13_BEG 10  // W13 tile: first instruction of real compute
+#define MPK_SUB_MOE_W13_END 11  // ...and its exit, after the arrival
+#define MPK_SUB_MOE_W2_BEG 12   // W2 tile: after the no-token early return
+#define MPK_SUB_MOE_W2_END 13   // ...and its exit
+
+// The W13->W2 barrier, bracketed inside the W2 span. Without these the poll is
+// invisible: it sits at gang_moe_fused_mxfp4_mi300.cuh:2793, which is between
+// W2_BEG and W2_END, so its cost was being read as W2 compute. Naming the gap
+// between the arms "barrier wait" -- as an earlier version of the exporter did
+// -- was wrong for the same reason; that gap is per-tile setup, and the
+// barrier is 250 lines further in.
+//
+// The pair also answers whether the prefetch-under-poll actually works. The
+// weight buffer_load_lds is issued at :2777 BEFORE the poll precisely so HBM
+// latency flies during the wait; if that is working, the drain after the
+// barrier is short and the wait absorbs it. These marks make the wait itself
+// measurable, so the claim can be checked instead of assumed.
+#define MPK_SUB_MOE_W2_BAR_BEG 14  // W2: enter the W13->W2 poll (prefetch flying)
+#define MPK_SUB_MOE_W2_BAR_END 15  // W2: barrier cleared
+
+// ── Barrier entry marks: which wait, and whose ─────────────────────────────
+//
+// The 12 slots already bound four of the layer's waits, but they name them by
+// POSITION ("topk_wait" is whatever sits between mark 6 and mark 7), and a
+// position is not an identity. Two things were being lost:
+//
+//   1. A span named for one wait can contain two. Slot 6->7 is "topk_wait",
+//      but ranks >= oproj_topk_tiles_per_xcd pass through the Phase 7a'
+//      O-proj gate (gang_full_layer_fused_mi300.cuh:1155) FIRST and only then
+//      poll routing_ready. Their 14 us was being read as TopK latency when
+//      half of it is an O-proj barrier. Marks 16/17 cut that span in two.
+//
+//   2. A worker that never polls is drawn identically to one that polls for
+//      20 us. Ranks that fall through a guard have no arrival and no wait --
+//      they are idle, and idle is not a barrier. Without an entry mark the
+//      only signal is a short duration, which is inference, not measurement.
+//
+// Scope is in the name because it decides what a stall means. A LOCAL barrier
+// is one XCD's 31 workers rendezvousing on their own die (qkv_epoch, via
+// MPK_XCD_LOCAL_ATOM_ADD on qkv_epoch[xcd_id*16]); a stall there is a local
+// load-imbalance and is fixable by rebalancing that XCD. A GLOBAL barrier
+// couples all 8 XCDs through one counter, so the slowest XCD on the die sets
+// everyone's release and no local rebalancing helps. Verified both ways --
+// source and measurement -- rather than assumed:
+//
+//   qkv_epoch    LOCAL   per-XCD atomic + per-XCD flag; :506/:514/:525
+//   attn_release GLOBAL  last XCD at attn_global writes all 8 flags; :829
+//   oproj_hier   GLOBAL  single global_arrive, per-XCD release; :1155
+//   routing_ready GLOBAL one TopK completer writes all 8 flags; :1943
+//   moe W13->W2  GLOBAL  one arrival counter, 8-slot fan-out; :2455/:2471
+//   layer_release GLOBAL last XCD broadcasts all 8; :1672
+//
+// Measured exit-time spread across the 8 XCDs, pollers only (a global release
+// lands on every XCD at once; a local one does not): attn_release 0.40 us,
+// routing_ready 0.35 us, moe W13->W2 1.24 us -- all global. qkv_epoch spreads
+// 21.36 us *within* one XCD, which is the load imbalance a local barrier
+// exposes and a global one would hide.
+#define MPK_SUB_BAR_QKV_EPOCH 16   // enter qkv_epoch poll (XCD-LOCAL)
+#define MPK_SUB_BAR_ATTN_REL 17    // enter attn_release poll (GLOBAL)
+#define MPK_SUB_BAR_OPROJ_HIER 18  // enter Phase 7a' O-proj gate (GLOBAL)
+#define MPK_SUB_BAR_ROUTING 19     // enter routing_ready/TopK poll (GLOBAL)
+#define MPK_SUB_BAR_LAYER 20       // enter layer_release poll (GLOBAL)
+// Fired by a worker that reached a phase and fell through its guard: no tile,
+// no arrival, no poll. Distinguishes "waiting on a barrier" from "has no work
+// to do", which the duration alone cannot.
+#define MPK_SUB_IDLE_NO_WORK 21
+
+// ── The other two weight prefetches ────────────────────────────────────────
+//
+// The kernel issues four weight DMAs into a wait, not two. Codes 1-2 (QKV) and
+// 3-5 (W13) covered the first two; these cover the O-proj and W2 prefetches,
+// which had been asserted in comments as "overlaps the poll" for a long time
+// without ever being measured. That is the same mistake as naming a span from
+// its position -- a claim about the code read off the source rather than off
+// the clock -- and it is the one this instrument exists to stop making.
+//
+// Both follow the identical pattern: issue buffer_load_lds, then poll a flag,
+// so the HBM latency is meant to hide inside a wait the worker was paying
+// anyway. Whether it does is exactly what an issue->drain span answers, and
+// for O-proj it matters most: its poll (attn_release) is the single largest
+// span in the trace at 28.9% of worker-time, so idle bandwidth there is the
+// most expensive idle bandwidth on the die.
+//
+//   OPROJ  issue  gang_full_layer_fused_mi300.cuh:920 (Phase 6, in the guard)
+//          drain  :1042, the s_waitcnt before buffer_inv
+//   W2     issue  gang_moe_fused_mxfp4_mi300.cuh:2610 (MPK_W2_LINEAR_LOAD)
+//          drain  :2886, the s_waitcnt after the W13->W2 barrier
+//
+// The drain marks sit at the s_waitcnt, so an issue->drain span is the window
+// the DMA is in flight and a drain->next-mark span is what it cost uncovered.
+#define MPK_SUB_OPROJ_PF_ISSUE 22
+#define MPK_SUB_OPROJ_PF_DRAIN 23
+#define MPK_SUB_W2_PF_ISSUE 24
+#define MPK_SUB_W2_PF_DRAIN 25
+
+// ...and the marks that make the answer falsifiable.
+//
+// issue->drain alone measures how long the DMA HAD to finish, not whether it
+// did. A wide window is consistent with a fully hidden DMA and with one that
+// stalled at the end of it, and the two have opposite implications. Only the
+// time the s_waitcnt itself burns separates them, so each drain mark is paired
+// with one immediately after the wait -- exactly the shape W13 already has
+// (3 -> 4 -> 5), where 4 -> 5 is named "drain (uncovered)" for this reason.
+//
+// A zero-length 23->26 means the prefetch worked. A nonzero one is the part of
+// the load the poll failed to cover, in microseconds, per worker, per layer.
+#define MPK_SUB_OPROJ_PF_DONE 26
+#define MPK_SUB_W2_PF_DONE 27
+
+__device__ unsigned long long
+    g_trace_sub_ts[MPK_PHASE_MAX_WORKERS * MPK_PHASE_TRACE_LAYERS *
+                   MPK_PHASE_SUBMARK_CAP];
+__device__ int g_trace_sub_code[MPK_PHASE_MAX_WORKERS *
+                                MPK_PHASE_TRACE_LAYERS *
+                                MPK_PHASE_SUBMARK_CAP];
+__device__ int
+    g_trace_sub_n[MPK_PHASE_MAX_WORKERS * MPK_PHASE_TRACE_LAYERS];
+__device__ unsigned long long g_trace_sub_drop;
+
+// One store per mark on thread 0, same shape as mpk_phase_mark. Callers are
+// inside the layer body, so `worker` and the armed/live state are already
+// established by the slot marks around them; this reuses g_phase_live so a
+// sub-mark can never land in a layer the slot marks are not recording.
+__device__ __forceinline__ void mpk_phase_submark(int worker, int code) {
+  if (threadIdx.x != 0 || worker >= MPK_PHASE_MAX_WORKERS) {
+    return;
+  }
+  if (!g_phase_live[worker]) {
+    return;
+  }
+  unsigned long long const l = g_phase_n[worker];
+  if (l >= MPK_PHASE_TRACE_LAYERS) {
+    return;
+  }
+  int const row = worker * MPK_PHASE_TRACE_LAYERS + (int)l;
+  int const k = g_trace_sub_n[row];
+  if (k >= MPK_PHASE_SUBMARK_CAP) {
+    g_trace_sub_drop++;
+    return;
+  }
+  asm volatile("" ::: "memory");
+  unsigned long long const t = __builtin_amdgcn_s_memrealtime();
+  asm volatile("" ::: "memory");
+  g_trace_sub_ts[row * MPK_PHASE_SUBMARK_CAP + k] = t;
+  g_trace_sub_code[row * MPK_PHASE_SUBMARK_CAP + k] = code;
+  g_trace_sub_n[row] = k + 1;
+}
+#define MPK_PHASE_SUBMARK(worker, code) mpk_phase_submark((worker), (code))
+#define MPK_PHASE_PART(worker, slot) mpk_phase_part((worker), (slot))
+#define MPK_PHASE_ARM(worker, slot, arm)                                       \
+  mpk_phase_arm((worker), (slot), (arm))
+// For phases whose guard admits everyone and whose real filter lives inside
+// the callee (attention's padded-request early-return). The condition must be
+// the callee's own, restated at the call site.
+#define MPK_PHASE_PART_IF(worker, slot, cond)                                  \
+  do {                                                                         \
+    if (cond) {                                                                \
+      mpk_phase_part((worker), (slot));                                        \
+    }                                                                          \
+  } while (0)
+#else
+#define MPK_PHASE_SUBMARK(worker, code)                                        \
+  do {                                                                         \
+  } while (0)
+#define MPK_PHASE_PART(worker, slot)                                           \
+  do {                                                                         \
+  } while (0)
+#define MPK_PHASE_ARM(worker, slot, arm)                                       \
+  do {                                                                         \
+  } while (0)
+#define MPK_PHASE_PART_IF(worker, slot, cond)                                  \
+  do {                                                                         \
+  } while (0)
 #endif
 
 __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
@@ -248,6 +586,22 @@ __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
 #define MPK_PHASE_MARK(worker, slot) mpk_phase_mark((worker), (slot))
 #else
 #define MPK_PHASE_MARK(worker, slot)                                           \
+  do {                                                                         \
+  } while (0)
+// MPK_PHASE_SUBMARK and MPK_PHASE_PART are defined inside the MPK_PHASE_TRACE
+// block above, which nests inside MPK_PHASE_SLOTS. Without these arms, a call
+// site would fail to compile whenever phase slots are off -- i.e. in every
+// production build.
+#define MPK_PHASE_SUBMARK(worker, code)                                        \
+  do {                                                                         \
+  } while (0)
+#define MPK_PHASE_PART(worker, slot)                                           \
+  do {                                                                         \
+  } while (0)
+#define MPK_PHASE_ARM(worker, slot, arm)                                       \
+  do {                                                                         \
+  } while (0)
+#define MPK_PHASE_PART_IF(worker, slot, cond)                                  \
   do {                                                                         \
   } while (0)
 #endif
@@ -3801,12 +4155,47 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                 if (row[MPK_PHASE_SLOT_COUNT - 1] == 0) {
                   continue;
                 }
-                printf("[PTRACEW] w=%d x=%d l=%llu", w, g_trace_xcd[w], l);
+                // The participation mask rides on this line, not a separate
+                // one, because it qualifies these exact timestamps: a slot
+                // whose bit is clear has a tick pair that spans a not-taken
+                // branch, not the phase the slot is named for. Split across
+                // two lines they could be dropped independently by the printf
+                // interleaving, leaving spans with no way to tell which kind
+                // they are -- which is the failure this field exists to end.
+                printf("[PTRACEW] w=%d x=%d l=%llu p=%u a=%u",
+                       w,
+                       g_trace_xcd[w],
+                       l,
+                       g_trace_part[(int)(w * MPK_PHASE_TRACE_LAYERS + l)],
+                       g_trace_arm[(int)(w * MPK_PHASE_TRACE_LAYERS + l)]);
                 for (int s = 0; s < MPK_PHASE_SLOT_COUNT; s++) {
                   printf(" %llu", row[s]);
                 }
                 printf("\n");
+                // Sub-marks for this (worker, layer), if any fired. Variable
+                // length by construction -- a worker with no QKV tile next
+                // layer issues no prefetch -- so the count leads the line
+                // rather than the converter assuming a fixed width.
+                int const srow = (int)(w * MPK_PHASE_TRACE_LAYERS + l);
+                int const sn = g_trace_sub_n[srow];
+                if (sn > 0) {
+                  printf("[PTRACES] w=%d l=%llu n=%d", w, l, sn);
+                  for (int k = 0; k < sn; k++) {
+                    printf(" %d:%llu",
+                           g_trace_sub_code[srow * MPK_PHASE_SUBMARK_CAP + k],
+                           g_trace_sub_ts[srow * MPK_PHASE_SUBMARK_CAP + k]);
+                  }
+                  printf("\n");
+                }
               }
+            }
+            // A nonzero drop count means MPK_PHASE_SUBMARK_CAP was too small
+            // and some layers are missing their tail sub-marks. That looks
+            // exactly like "the overlap stopped happening", so report it.
+            if (g_trace_sub_drop != 0) {
+              printf("[PTRACE_SUBDROP] %llu marks dropped -- raise "
+                     "MPK_PHASE_SUBMARK_CAP (currently %d)\n",
+                     g_trace_sub_drop, MPK_PHASE_SUBMARK_CAP);
             }
             printf("[PTRACE_END]\n");
           }

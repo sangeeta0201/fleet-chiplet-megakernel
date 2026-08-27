@@ -418,6 +418,11 @@ __device__ __noinline__ void
   // ══════════════════════════════════════════════════════════════════
   MPK_TW_SUB(10, xcd_rank);
   if (xcd_rank < total_qkv_tiles_per_xcd) {
+    // Only ranks below the tile count run this. The slot-1 mark below is
+    // outside the guard, so without this bit the other ranks' not-taken
+    // branch gets drawn as the fused QKV op -- 248 workers "in" a phase 80
+    // of them ran.
+    MPK_PHASE_PART(_pslot_w, 1);
     gang_resaddf32_rmsnorm_linear_mxfp4_bias_kvupd_kernel<QKV_BATCH_SIZE,
                                                           QKV_OUTPUT_PER_WG,
                                                           QKV_REDUCTION_SIZE,
@@ -455,11 +460,11 @@ __device__ __noinline__ void
         // The equality check is not redundant: it is the one place the two
         // ends of the hand-off can disagree, and a mismatch here would be
         // silent wrong numerics rather than a fault.
-        /*weights_preloaded=*/input_ptrs[25] == input_ptrs[4]
+        /*weights_preloaded=*/input_ptrs[25] == input_ptrs[4],
 #else
-        /*weights_preloaded=*/false
+        /*weights_preloaded=*/false,
 #endif
-    );
+        _pslot_w);
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
     _fused_t0a = __builtin_amdgcn_s_memrealtime();
@@ -513,6 +518,13 @@ __device__ __noinline__ void
     // Every participant polls. The participant set is now exactly the workers
     // that need this barrier, so there is no longer a subset that arrives only
     // to carry ordering for someone else.
+    //
+    // Marked XCD-LOCAL: the arrival is MPK_XCD_LOCAL_ATOM_ADD on
+    // qkv_epoch[xcd_id*16] and the release is the same line, so this XCD's
+    // workers rendezvous with each other and with nobody else. That is why a
+    // stall here is a local imbalance -- unlike the four global barriers
+    // later in the layer, rebalancing this XCD alone would fix it.
+    MPK_PHASE_SUBMARK(_pslot_w, MPK_SUB_BAR_QKV_EPOCH);
     MPK_WS_WAIT_BEGIN(20, qkv_epoch_expected);
     if (tid == 0) {
       int _obs;
@@ -574,6 +586,16 @@ __device__ __noinline__ void
   MPK_WS_PHASE(30, qkv_epoch_expected, xcd_id);
   {
     if (xcd_rank < ATTN_PARTICIPANTS) {
+      // ATTN_PARTICIPANTS is NUM_REQS * NUM_KV_CHUNKS, which covers every rank
+      // on the XCD -- so this guard alone does not say who did work. The real
+      // filter is inside the callee: prepare_next_batch pads unused request
+      // slots so qo_indptr[req] == qo_indptr[req+1], and every attention
+      // callee early-returns on that. Ranks mapping to a padded slot arrive,
+      // return immediately, and still get a slot-3 timestamp. Testing the same
+      // condition here is what makes the recorded bit mean "ran attention"
+      // rather than "reached the attention branch".
+      MPK_PHASE_PART_IF(_pslot_w, 3,
+                        qo_indptr[attn_req] != qo_indptr[attn_req + 1]);
       int kv_chunk_idx = attn_chunk;
       using bf16_t = __hip_bfloat16;
       void const *offset_k = reinterpret_cast<bf16_t const *>(output_ptrs[1]) +
@@ -890,6 +912,13 @@ __device__ __noinline__ void
       // Must offset by warp_id*1024 so 4 waves write to distinct slices.
       int const pf_warp_id = tid >> 6;
 
+      // Both unrolled loops below are issue-only -- buffer_load_lds retires on
+      // vmcnt, so the mark goes before them and the drain mark at the
+      // s_waitcnt (:1042) closes the span. Inside the `if`, because the ranks
+      // past oproj_topk_tiles_per_xcd issue nothing and a mark outside would
+      // claim a DMA they never started.
+      MPK_PHASE_SUBMARK(_pslot_w, MPK_SUB_OPROJ_PF_ISSUE);
+
 #pragma unroll
       for (int j = 0; j < OPROJ_LPT; j++) {
         int idx = tid + j * 256;
@@ -920,6 +949,24 @@ __device__ __noinline__ void
     }
   }
 
+  // Marked GLOBAL: attn_release[x] is written by the last XCD to reach the
+  // attn_global barrier, which fans out to all eight flags (:829). Every XCD
+  // is therefore released by the same event, so a stall here is set by the
+  // slowest XCD on the die and no amount of local rebalancing moves it.
+  //
+  // Placed before MPK_WS_WAIT_BEGIN, and outside the MPK_NARROW_GATE_POLL
+  // `if (tid == 0)`, so the mark records block entry into the wait rather
+  // than one thread's. MPK_PHASE_SUBMARK itself stores on thread 0 only.
+  //
+  // The span this opens ends at MPK_PHASE_MARK 5, so it also covers the
+  // vmcnt drain, buffer_inv and __syncthreads below -- it is not purely the
+  // poll. Measured, not assumed: the last worker to ARRIVE at each XCD-layer
+  // barrier does no waiting by definition, so its duration IS that tail, and
+  // it is 0.40 us median over 288 XCD-layers (min 0.36, max 1.16). Against a
+  // 17.84 us span median the poll is ~98% of it. That last arriver is a rank
+  // 0-3 worker in all 288 cases -- the ranks carrying two attention tiles --
+  // so the attention producers, not the barrier, set the release.
+  MPK_PHASE_SUBMARK(_pslot_w, MPK_SUB_BAR_ATTN_REL);
   MPK_WS_WAIT_BEGIN(60, attn_release_expected);
   {
     int _obs;
@@ -988,7 +1035,16 @@ __device__ __noinline__ void
   // *before* the release poll cleaned it up just as completely as one after,
   // and neither an extra invalidate nor a system-scope fence on either side
   // changed anything.
+  // Closes the O-proj prefetch span opened at :920. This s_waitcnt is where
+  // the DMA is actually consumed, so issue->here is the in-flight window and
+  // whatever this instruction stalls for is the part the poll above failed to
+  // cover.
+  MPK_PHASE_SUBMARK(_pslot_w, MPK_SUB_OPROJ_PF_DRAIN);
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  // Straddles the wait, so 23->26 IS the uncovered remainder: zero if the
+  // attn_release poll fully hid the DMA, otherwise the microseconds it did
+  // not. Before buffer_inv, so cache maintenance is not billed to the load.
+  MPK_PHASE_SUBMARK(_pslot_w, MPK_SUB_OPROJ_PF_DONE);
   asm volatile("buffer_inv" ::: "memory");
   // Publish the Phase 6 O-proj weight DMA to the whole block.
   //
@@ -1018,6 +1074,10 @@ __device__ __noinline__ void
   MPK_WS_PHASE(70, qkv_epoch_expected, xcd_id);
   {
     if (xcd_rank < oproj_topk_tiles_per_xcd) {
+      // 23 of the 31 ranks at this model (184 O-proj weight groups / 8 XCDs).
+      // The slot-6 mark is outside this guard, so the other 8 need their span
+      // marked non-participating.
+      MPK_PHASE_PART(_pslot_w, 6);
       int oproj_tile_idx = xcd_id * oproj_topk_tiles_per_xcd + xcd_rank;
       void const *oproj_residual_ptr =
           reinterpret_cast<__hip_bfloat16 const *>(output_ptrs[0]) +
@@ -1132,6 +1192,23 @@ __device__ __noinline__ void
   // ablation flag and compare inside one build.
 #ifndef MPK_NO_OPROJ_SKIP_GATE
   if (xcd_rank >= oproj_topk_tiles_per_xcd) {
+    // Marked GLOBAL, and marked at all because the slot 6->7 span is named
+    // "topk_wait" for everyone -- but the ranks that take this branch pay
+    // TWO waits inside it, this O-proj gate and then the routing_ready poll
+    // below. Measured, those ranks sit in the span ~14 us against ~4.6 us for
+    // ranks 0-15, and attributing the whole difference to TopK would be
+    // wrong: half of it is this barrier. The mark cuts the span at the
+    // handoff so each wait is charged to itself.
+    //
+    // Measured at 6.36 us median with a standard deviation of 0.16 us: every
+    // poller pays the same, so this is a fixed latency rather than a queue.
+    // That follows from the guard -- pollers are ranks >= oproj_topk_tiles_-
+    // per_xcd and producers are the ranks below it, two disjoint sets, so no
+    // poller is ever the last arrival and none of them can shorten the wait
+    // by arriving sooner. barrier_scope.py reports it as carrying no scope
+    // signal for exactly this reason, which is a fact about the measurement,
+    // not a retraction of the GLOBAL reading above.
+    MPK_PHASE_SUBMARK(_pslot_w, MPK_SUB_BAR_OPROJ_HIER);
     int *oproj_hier = static_cast<int *>(input_ptrs[16]);
     while (MPK_LD_GATE2(&oproj_hier[xcd_id * 16]) < qkv_epoch_expected) {
       __builtin_amdgcn_s_sleep(1);
@@ -1146,6 +1223,13 @@ __device__ __noinline__ void
   // signals routing_ready. Other workgroups poll here until TopK
   // results are globally visible.
   // All threads poll independently — eliminates __syncthreads overhead.
+  // Marked GLOBAL: routing_ready's eight per-XCD flags are all written by the
+  // single TopK completer (gang_linear_..._topk_mi300.cuh:1943), and that
+  // completer is elected GPU-wide (`s_topk_done == total_topk_tiles`, :1823)
+  // -- one workgroup on the whole device per layer, not one per XCD. So every
+  // worker here is waiting on one thread, which is why this poll costs 68 ms
+  // of worker-time against ~158 us of actual TopK work.
+  MPK_PHASE_SUBMARK(_pslot_w, MPK_SUB_BAR_ROUTING);
   MPK_TW_SUB(75, routing_expected);
   MPK_WS_PHASE(75, qkv_epoch_expected, xcd_id);
   {
@@ -1246,10 +1330,24 @@ __device__ __noinline__ void
     __builtin_amdgcn_s_sleep(127);
   }
 #endif
+  // No pre-loop arm write: the arm is a set of bits OR-ed by the tiles that
+  // actually run, so zero already means "this worker got no tile". Writing an
+  // EMPTY code here would be a third value to keep consistent with the two the
+  // callee sets, for no information the absence of bits does not already give.
   for (int moe_t = xcd_rank; moe_t < moe_total_tiles_per_xcd;
        moe_t += workers_per_xcd) {
     MPK_TW_SUB(80, moe_t);
     MPK_WS_PHASE(80, qkv_epoch_expected, xcd_id);
+    // Inside the loop, not before it: MoE has no rank guard, so a worker
+    // participates exactly when the strided loop yields it at least one tile.
+    // With moe_total_tiles_per_xcd not a multiple of workers_per_xcd the tail
+    // ranks can get none, and the bit has to reflect that.
+    //
+    // The bit alone is still not enough here, which is why the arm exists: a
+    // MoE worker runs W13 *or* W2, never both, so "participated" leaves the
+    // span named after three ops none of its workers performs. The callee sets
+    // the arm because the is_w2 split is its own.
+    MPK_PHASE_PART(_pslot_w, 8);
     gang_moe_fused_mxfp4_kernel_mi300<QKV_BATCH_SIZE,
                                       MOE_INTERMEDIATE_SIZE,
                                       MOE_HIDDEN_SIZE,
@@ -1267,7 +1365,8 @@ __device__ __noinline__ void
                                                             input_ptrs[22],
                                                             output_ptrs[10],
                                                             input_ptrs[21],
-                                                            moe_t);
+                                                            moe_t,
+                                                            _pslot_w);
   }
   MPK_PHASE_MARK(_pslot_w, 8);
 
@@ -1713,6 +1812,22 @@ __device__ __noinline__ void
         && tid >= 64
 #endif
     ) {
+      // The issue point of the weight DMA that covers the barrier spin.
+      //
+      // This mark is the *start* of the overlap and has no end mark here on
+      // purpose. `qkv_prefetch_weights_lds` issues buffer_load_lds and does
+      // not wait: the loads retire under vmcnt long after this returns, and
+      // the consumer is the *next* layer's Phase 1, which does not drain them
+      // either -- it skips its own DMA entirely (`weights_preloaded=true`).
+      // So there is no instant at which "the prefetch finished" can be
+      // stamped, and a second mark placed right here would time the issue
+      // cost, not the overlap.
+      //
+      // The span the converter draws is therefore issue -> this layer's exit
+      // (slot 11): the window during which the DMA is in flight and the
+      // worker is doing barrier and bookkeeping work rather than waiting on
+      // it. That is exactly the quantity the optimization claims.
+      MPK_PHASE_SUBMARK(_pslot_w, MPK_SUB_QKV_PF_ISSUE);
       qkv_prefetch_weights_lds<QKV_BATCH_SIZE,
                                QKV_OUTPUT_PER_WG,
                                QKV_REDUCTION_SIZE>(
@@ -1773,6 +1888,19 @@ __device__ __noinline__ void
     // like-for-like wait span: the pre-gate half is release-publishing work,
     // not waiting, so folding it in overstates the gate.
     MPK_PHASE_MARK(_pslot_w, 9);
+    // Marked GLOBAL: layer_release's eight flags are broadcast by the last
+    // XCD (:1672), so this is the whole-device layer boundary.
+    //
+    // Marked OUTSIDE the `if` on purpose, with the two arms distinguished.
+    // MPK_LAYER_GATE_JOINS is `xcd_rank < total_qkv_tiles_per_xcd`, so under
+    // MPK_ABLATE_WS_FOLD the ranks past that guard do not join the gate at
+    // all -- they are idle here, not waiting, and drawing them with a barrier
+    // name would assert a rendezvous they never entered.
+    if (MPK_LAYER_GATE_JOINS) {
+      MPK_PHASE_SUBMARK(_pslot_w, MPK_SUB_BAR_LAYER);
+    } else {
+      MPK_PHASE_SUBMARK(_pslot_w, MPK_SUB_IDLE_NO_WORK);
+    }
     if (tid == 0 && MPK_LAYER_GATE_JOINS) {
       while (MPK_LD_GATE(&layer_release[xcd_id * 16]) <= s_layer_rel_prev) {
         __builtin_amdgcn_s_sleep(1);

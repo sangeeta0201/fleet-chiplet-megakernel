@@ -2294,7 +2294,13 @@ __device__ __noinline__ void
         // into this exact LDS region during the previous layer's Phase 9
         // barrier spin. Defaulted so the standalone generated variant and the
         // layer-0 / world_size>1 caller need no change.
-        bool weights_preloaded = false) {
+        bool weights_preloaded = false,
+        // Phase-slot worker identity, for MPK_PHASE_SUBMARK only. Must be the
+        // caller's `_pslot_w`, not blockIdx.x -- the recorder gates on
+        // g_phase_live[worker], which the slot marks set under that same
+        // identity. Defaulted so non-instrumented callers are unaffected.
+        int _pslot_w = -1) {
+  (void)_pslot_w;
 
   static_assert(OUTPUT_PER_WG % 16 == 0);
   static_assert(REDUCTION_SIZE % 128 == 0);
@@ -2401,6 +2407,8 @@ __device__ __noinline__ void
         weight_ptr, n_wgs_per_xcd, tile_idx);
   }
 #endif
+
+  MPK_PHASE_SUBMARK(_pslot_w, MPK_SUB_P1_ENTRY);
 
   // ── Step 0+1 FUSED: ResAddF32 + RMSNorm ───────────────────────────────
   {
@@ -2566,6 +2574,12 @@ __device__ __noinline__ void
         }
       }
 
+      // End of pass 1: every element's ResAdd is done and folded into this
+      // lane's ssq. What follows is the RMSNorm reduction, which is where a
+      // wait between "ResAdd" and "RMSNorm" would have to live if there is
+      // one -- the two __syncthreads below are the only candidates.
+      MPK_PHASE_SUBMARK(_pslot_w, MPK_SUB_P1_RESADD);
+
 #pragma unroll
       for (int offset = 32; offset > 0; offset >>= 1) {
         ssq += __shfl_xor(ssq, offset);
@@ -2624,6 +2638,10 @@ __device__ __noinline__ void
       }
     }
   }
+  // End of RMSNorm: the normalized row is in norm_scratch. Everything after
+  // this mark is GEMM-side work (FP8 quant, the weight-DMA drain, the MFMA).
+  MPK_PHASE_SUBMARK(_pslot_w, MPK_SUB_P1_NORM);
+
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
   __syncthreads();
 
@@ -2681,6 +2699,10 @@ __device__ __noinline__ void
     asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
     __syncthreads();
   }
+
+  // Quant + weight-DMA drain are done; the MFMA can start. NORM -> GEMM is
+  // the span that answers "is there a wait before the GEMM".
+  MPK_PHASE_SUBMARK(_pslot_w, MPK_SUB_P1_GEMM);
 
   // Whole-block early-out only: a column block with no real tokens at all.
   // Individual inactive lanes within a live block must NOT return here -- they

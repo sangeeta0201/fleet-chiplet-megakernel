@@ -110,7 +110,17 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     void *swiglu_out_ptr,           // [batch, topk, INTERMEDIATE_SIZE] BF16
     void *workspace_f32_ptr, // [batch, HIDDEN_SIZE] float32 (atomicAdd target)
     void *barrier_ptr,       // [2*NUM_EXPERTS] int32
-    int tile_idx) {
+    int tile_idx,
+    // Phase-slot worker identity, for MPK_PHASE_SUBMARK only.
+    //
+    // Must be the caller's `_pslot_w` (xcd_id * workers_per_xcd + xcd_rank),
+    // NOT blockIdx.x: the sub-mark recorder gates on g_phase_live[worker],
+    // which the slot marks set under that same identity. Passing blockIdx.x
+    // indexes a different worker whose live flag is usually 0, so every
+    // sub-mark is silently dropped and the overlap looks like it never
+    // happened. Defaulted so non-instrumented callers are unaffected.
+    int _pslot_w = -1) {
+  (void)_pslot_w;
 
   // ── N-axis packing geometry ───────────────────────────────────────────────
   // Token `c` lives at LDS row `c` and feeds N column `c` of the 16x16x128
@@ -300,6 +310,15 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     expert_idx = w2_tile / W2_TILES;
     phase_tile = w2_tile % W2_TILES;
   }
+  // The arm bits are NOT set here, though this is where `is_w2` is decided.
+  // Between this point and the compute there are three early returns -- token
+  // out of batch, token not routed to this expert, W2 tile with no token --
+  // and a tile that takes one of them was assigned to an arm but ran none of
+  // it. Setting the bit here measured assignment and was read as work: 2304
+  // (worker, layer) cells claimed a W13 arm while only 324 reached W13
+  // compute, a 7x overstatement that the per-tile marks caught. So each arm
+  // records itself at its own first instruction of real compute; see
+  // MPK_SUB_MOE_W13_BEG.
 
   // ── Nothing read from the mask may steer control flow ─────────────────────
   // There is one moe_mask buffer for all 36 layers and no layer-boundary
@@ -488,6 +507,11 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   if (!is_w2) {
     MOE_DBG_SUBPHASE(2000);
     MPK_WS_MARK(8200, global_tile); // W13 compute
+    // Bit and mark set together, at the same instruction, so the coarse
+    // "which arms did this worker run" and the fine "when did it run them"
+    // cannot drift apart. The verifier asserts they agree.
+    MPK_PHASE_ARM(_pslot_w, 8, MPK_PHASE_ARM_W13);
+    MPK_PHASE_SUBMARK(_pslot_w, MPK_SUB_MOE_W13_BEG);
 
     // A tile with no routed token has nothing to compute, but it still has to
     // arrive -- the release fires on `% W13_TILES`, which counts every tile in
@@ -816,6 +840,13 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                    : "memory", "m0");
     }
 #endif // MPK_W13_LINEAR_LOAD
+    // 24 dwordx4 weight loads are now in flight, and nothing waits on them
+    // until Phase B below. Everything between this mark and the Phase B drain
+    // -- the FP8 quantization of the token row -- is the work they hide
+    // under. Both marks sit strictly inside the slot 7 -> slot 8 MoE span, so
+    // the 12-slot trace cannot show this overlap at all; it just sees one
+    // wide "moe" slice.
+    MPK_PHASE_SUBMARK(_pslot_w, MPK_SUB_W13_PF_ISSUE);
 #endif // MPK_W13_LDS_PREFETCH — 24 dwordx4 loads in flight
 
     if constexpr (PACK_N && !SINGLE_TOK) {
@@ -903,6 +934,11 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #endif
 
 #ifdef MPK_W13_LDS_PREFETCH
+    // End of the quantization that covered the Phase A loads, and the start
+    // of the drain that consumes them. The gap between this mark and the
+    // vmcnt below is what the prefetch actually cost after the cover: if the
+    // loads fully hid, it is near zero.
+    MPK_PHASE_SUBMARK(_pslot_w, MPK_SUB_W13_QUANT);
     // ── Phase B: Drain tile_iter=0 HBM loads + scales concurrently ──────────
     {
       constexpr int W13_SC_DW4_PER_TILE = W13_TILE_SCALE / 16; // 96
@@ -927,6 +963,12 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       // Drain ALL: buffer_load_lds (Phase A) + scale loads
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+      // Past the drain. QUANT -> here is the residual stall: the part of the
+      // weight-load latency the quantization did *not* manage to cover. The
+      // claim "loads fly during FP4 quant" is exactly the claim that this
+      // span is small relative to ISSUE -> QUANT, and now it is measurable
+      // rather than asserted.
+      MPK_PHASE_SUBMARK(_pslot_w, MPK_SUB_W13_PF_DRAIN);
       {
 #pragma unroll
         for (int j = 0; j < W13_SC_LPT; j++) {
@@ -2460,6 +2502,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     }
 #endif
 
+    MPK_PHASE_SUBMARK(_pslot_w, MPK_SUB_MOE_W13_END);
     return;
   }
 
@@ -2477,6 +2520,10 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     MPK_WS_MARK(8106, global_tile); // exit: W2 tile with no routed token
     return;
   }
+  // After the early return, so a W2 tile that computes nothing records neither
+  // the bit nor the mark. Both are set here for the same reason as W13 above.
+  MPK_PHASE_ARM(_pslot_w, 8, MPK_PHASE_ARM_W2);
+  MPK_PHASE_SUBMARK(_pslot_w, MPK_SUB_MOE_W2_BEG);
 
   // Shared memory layout: FP8 tokens + per-MFMA-tile scales, TOK_ROWS rows.
   // Same +16 row pad as W13 -- see the note there for why it is load-bearing.
@@ -2555,6 +2602,12 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // Issue W2 weight buffer_load_lds BEFORE barrier poll — HBM loads fly
   // during barrier wait (~3us overlap instead of serial).
   // Single inline asm block to prevent compiler vmcnt serialization.
+  //
+  // The "~3us overlap" above was a design intent, never a measurement. This
+  // mark and its drain at :2886 make it one: issue->drain is the in-flight
+  // window, and the W13->W2 barrier span sits inside it, so the two can
+  // finally be compared instead of assumed to line up.
+  MPK_PHASE_SUBMARK(_pslot_w, MPK_SUB_W2_PF_ISSUE);
 #ifdef MPK_W2_LINEAR_LOAD
   // Linear per-wave tile load, same transform as the W13 T0 site above and
   // for the same reason: W2's geometry is identical (W2_K == W13_K == 2880,
@@ -2730,6 +2783,12 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   unsigned long long _mt1 = __builtin_amdgcn_s_memrealtime();
 #endif
 
+  // Bracketed so the poll is its own span rather than part of W2 compute. It
+  // is issued after the weight prefetch on purpose (see :2602), so this
+  // interval is where the HBM latency is meant to hide -- which makes it the
+  // interval that says whether it does.
+  MPK_PHASE_SUBMARK(_pslot_w, MPK_SUB_MOE_W2_BAR_BEG);
+
   // All threads poll per-XCD release flag independently.
   // Eliminates tid==0 + __syncthreads — each thread confirms barrier itself.
   {
@@ -2783,6 +2842,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   }
   MOE_DBG_SUBPHASE(3002);
   MPK_WS_MARK(8302, global_tile); // W2: cleared W13->W2 barrier
+  MPK_PHASE_SUBMARK(_pslot_w, MPK_SUB_MOE_W2_BAR_END);
 #ifdef MPK_MOE_INNER_TIMING
   unsigned long long _mt2 = __builtin_amdgcn_s_memrealtime();
 #endif
@@ -2818,9 +2878,17 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 
   // Drain ALL pending HBM loads: buffer_load_lds (weight) + scale loads
   // Weight loads were issued before barrier poll, should be done by now.
+  //
+  // "should be done by now" is the claim; this mark closes the span that
+  // tests it. What this s_waitcnt stalls for is the uncovered remainder.
   MOE_DBG_SUBPHASE(3004);
   MPK_WS_MARK(8304, global_tile); // W2: drain HBM loads
+  MPK_PHASE_SUBMARK(_pslot_w, MPK_SUB_W2_PF_DRAIN);
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  // Between the two waits, not after: vmcnt is the weight DMA this span is
+  // about, lgkmcnt is LDS traffic that has nothing to do with the prefetch.
+  // 25->27 is what the "~3us overlap" comment above failed to cover.
+  MPK_PHASE_SUBMARK(_pslot_w, MPK_SUB_W2_PF_DONE);
   asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
   {
     constexpr int W2_SC_DW4_PER_TILE = W2_TILE_SCALE / 16;
@@ -3411,6 +3479,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   }
 #endif
 
+  MPK_PHASE_SUBMARK(_pslot_w, MPK_SUB_MOE_W2_END);
   // No barrier reset needed — all counters use monotonically increasing
   // expected values (per-XCD release = layer_idx + 1, global_arrive uses
   // modular check). Eliminates stale L2 issues across layers.
