@@ -7843,15 +7843,18 @@ int TaskRegister::register_paged_attention_split_kv_mi300_task(
       // that knob is set.
       //
       // Sizing MAX_TOKENS against the hardware number while launching with
-      // the smaller one is what produced HSA_STATUS_ERROR_MEMORY_APERTURE_
-      // VIOLATION on all four ranks at MPK_WORKER_LDS_KB=78: the graph was
-      // built for 158720 B of LDS, the kernel got 76800, and the attention
-      // task indexed smem[] straight past the aperture. It is NOT the
-      // register squeeze -- the fault reproduces with and without
-      // MPK_WORKER_WAVES_PER_EU, and 78 is the one thing every faulting run
-      // had in common. This is host code compiled separately from the
-      // device headers, so the knob has to be re-read from the environment
-      // rather than seen as a -D.
+      // the smaller one would let the attention task index smem[] past the
+      // end of the segment it was actually given, so the clamp below is a
+      // real latent fix. It is only that, though: it does NOT explain the
+      // HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION this was first written
+      // for. That fault was re-isolated to MPK_WORKER_WAVES_PER_EU=3 alone
+      // -- it reproduces at the DEFAULT worker count and the DEFAULT
+      // MPK_WORKER_LDS_KB (155), where this clamp is inert, and LDS_KB=78
+      // on its own does not fault. The knob was guilty by association.
+      //
+      // This is host code compiled separately from the device headers, so
+      // the knob has to be re-read from the environment rather than seen as
+      // a -D.
       const char *lds_kb = std::getenv("MPK_WORKER_LDS_KB");
       if (lds_kb != nullptr) {
         int kb = std::atoi(lds_kb);
