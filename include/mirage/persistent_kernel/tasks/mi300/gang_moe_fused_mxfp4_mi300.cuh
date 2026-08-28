@@ -309,6 +309,27 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   //
   // The guard is what keeps the 1-GPU behaviour intact: at 384 real tiles the
   // condition is false and the padding stays exactly as before.
+  //
+  // ── PRICED AT THE WALL, NP=4, 2026-08-28. NULL. ──────────────────────────
+  //   OFF  9.151 / 9.087            mean 9.119  n=2 (one run wedged, cleaned)
+  //   ON   9.105 / 9.118 / 9.099    mean 9.107  n=3
+  // -0.012 ms, an eighth of the 0.26 ms noise floor. -DMPK_MOE_NOPAD was
+  // confirmed present in the ON compile line and absent from OFF, and both
+  // arms' generated text is coherent, so this is a measured null and not a
+  // no-op build.
+  //
+  // The reasoning above is sound and still fails, because the 48 recovered
+  // slots are not on the critical path. The MoE phase already has 21 of 29
+  // workers idle (memory: glm-moe-phase-has-a-free-worker-hole), so the
+  // no-op tiles were never displacing work -- they were occupying workers
+  // that had nothing else to do. Handing those workers a real W2 tile moves
+  // W2 *starts* earlier without moving the W2 *last arriver*, and the wall
+  // tracks only the max arrival (glm-makespan-predictor-three-regimes).
+  //
+  // Keep the knob and the guard: it costs nothing, it is correct output by
+  // construction (it reorders which worker runs which tile, never what a
+  // tile computes), and the ON arm's run-to-run spread is 0.019 against the
+  // control's 0.064. Do not re-price it as a latency lever.
   bool const w13_fits_one_round = (total_w13_real <= PAD_MULTIPLE);
 #ifdef MPK_MOE_NOPAD
   int total_w13 =
