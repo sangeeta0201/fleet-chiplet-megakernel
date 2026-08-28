@@ -1149,13 +1149,19 @@ if __name__ == "__main__":
         # It was not: the batch that closed it (2026-08-21, n=3 each) had a
         # control of 11.020 ms/iter, i.e. an **NP=8** baseline.
         #
-        #   GLM_MOE_W2_OPW=16   (K-parallel, 4x tiles)   -1.34 ms  [earlier]
-        #   MPK_W2_KSPLIT=2     (2x tiles, half K each)  -4.12 ms  -> 15.136
-        #   GLM_MOE_W2_OPW=128  (half the tiles)          10.972,  neutral@NP=8
+        #   GLM_MOE_W2_OPW=16   (K-parallel, 4x tiles)  +1.34 ms  [earlier]
+        #   MPK_W2_KSPLIT=2     (2x tiles, half K each) +0.47 ms  -> 11.493
+        #   GLM_MOE_W2_OPW=128  (half the tiles)         10.972,  neutral@NP=8
         #
-        # Splitting loses at every world size because W2's per-tile cost is
-        # mostly fixed -- the whole-activation LDS stage and quantize, and the
-        # full atomicAdd epilogue -- and neither divides. That half stands.
+        # The KSPLIT row used to read "+4.12 -> 15.136" here. That is STALE:
+        # `fdca420 GLM: stage only the split's K window in W2` post-dates the
+        # sweep and took it to 11.493, i.e. +0.47 against the same 11.020.
+        # Splitting still loses at every world size because W2's per-tile cost
+        # is mostly fixed -- the whole-activation LDS stage and quantize, and
+        # the full atomicAdd epilogue -- and neither divides. That half stands,
+        # and NP=4 does not reopen it: KSPLIT moves W2 tiles *up* (12-18 ->
+        # 24-36 per XCD, crossing the 30-worker round boundary), which is the
+        # exact direction the OPW result below falsifies.
         # But the *widening* null was over-generalised. What widening removes
         # is the second dispatch round, and whether that round fires depends on
         # how many activated experts a rank owns, which is a function of EP:

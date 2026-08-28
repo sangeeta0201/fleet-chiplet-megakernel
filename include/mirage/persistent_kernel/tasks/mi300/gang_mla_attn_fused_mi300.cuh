@@ -810,6 +810,23 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // tile_idx 0 is the latent row and returns immediately on every XCD but 0;
   // the GEMM tiles are shifted up by one inside the kernel. Handing it
   // xcd_rank reproduces the standalone dispatch exactly.
+  //
+  // DO NOT "un-pair" tile 0 -- it is arithmetically zero, 2026-08-28. The
+  // identity map hands the latent row to xcd_rank 0, which at NP=4 is also one
+  // of the three workers that runs a SECOND tile (33 tiles, 30 workers). That
+  // looks like a straggler you can delete for free by rotating the logical
+  // index onto the first single-tile worker. It is not: the subphase split at
+  // Phase 3b below prices tile 0 at **2.09 us against a GEMM tile's 10.28**,
+  // so xcd_rank 0's chain is 12.4 us while xcd_rank 1 and 2 already pay 20.6.
+  // The makespan is max(kvupd + GEMM, 2*GEMM) = 2*GEMM either way; rotating
+  // moves work off a worker that was never on the critical path.
+  //
+  // The 2-round straggler itself is real (~10.3 us/layer of spin) and CLOSED
+  // in both directions: #139 swept GLM_QB_OPW at NP=4 and widening to one
+  // round costs +0.19 ms, because a tile's cost is ~linear in its width and
+  // 512 columns over 30 workers is 17.07 tiles' worth of work at a 16-column
+  // granularity. Nothing that keeps 16-column tiles can beat 2 rounds, and
+  // nothing wider is cheaper. See glm-qb-tile-width-is-closed-at-16.
   for (int t = xcd_rank; t < qb_tiles_per_xcd; t += tiles_per_xcd) {
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     // The W_UK barrier at [0][4] charges 10.6 us/layer of spin, and q_b's own
