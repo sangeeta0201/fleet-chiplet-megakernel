@@ -1209,6 +1209,62 @@ __device__ __forceinline__ constexpr bool _rnlm8_sck() {
   return MPK_DENSE_KMAJOR >= 2 && OUTPUT_PER_WG == 16;
 }
 
+// MPK_ATTN_STREAM_NT -- MEASURED NEGATIVE, DO NOT SHIP. Kept compiled out so
+// the arm is not rebuilt a third time. 0 = off (shipping), 1 = weight + E8M0
+// scale, 2 = weight only.
+//
+// The idea: mark the ATTENTION/DENSE k-loop's weight stream non-temporal, the
+// exact twin of MPK_MOE_STREAM_NT (gang_moe_linear_mxfp8_mi300.cuh), which
+// bought -0.061 ms on the other half of the layer. Task #97's census of the
+// shipped image found only 50 `nt`-tagged memory ops in the whole megakernel
+// and **zero** of them inside `gang_mla_full_layer_fused_kernel`. `nt` is a
+// replacement-policy hint on an axis ORTHOGONAL to scope
+// (mpk_atoms.cuh:58-76): it changes no coherence, so it cannot affect
+// correctness -- only what the line evicts on its way past. And the zero-reuse
+// argument that licensed it on the MoE side holds here verbatim: at bs=1
+// decode each weight element is read exactly ONCE per token, within a tile,
+// across the tiles on an XCD, across XCDs, and across tokens.
+//
+// It still lost, in both directions, by four times the noise floor:
+//
+//   arm                       wall ms/iter   per-iter min   order
+//   0  control                    9.028          8.901      2nd
+//   1  weight + scale             9.300          9.172      1st   +0.272
+//   0  control                    9.026          8.879      1st
+//   2  weight only                9.261          9.133      2nd   +0.235
+//
+// (NP=4, bs=1, devices 4-7, N=4/arm, launch-wedge runs dropped. The two
+// batches run the arms in opposite order, so this is not an order artifact.
+// ISA-gated first, /tmp/attn_nt_gate.sh: nt 0 -> 530 (arm 1) / 0 -> 324
+// (arm 2) across 11 functions with global_load, s_waitcnt and mfma counts
+// bit-identical -- so the delta is purely the cache bits.)
+//
+// Why the same transform has opposite signs on the two halves of the layer:
+// the MoE k-loop is byte-shaped, so shedding L2 pollution converts to time;
+// the attention half is LATENCY-bound and neither unit is saturated -- qkv_a
+// spends 68% of its time on vmcnt with MFMA issue at 2.65% and achieved HBM at
+// 32.7%. There is no bandwidth being freed, and `nt` makes each individual
+// load a little slower to return. Arm 2 rules out the one site with genuine
+// intra-loop line reuse (32 consecutive k share one E8M0 byte, 64 of those
+// share a line), so the cost is not concentrated in the scale load either.
+//
+// The general rule this establishes: `nt` pays only where the loop is
+// byte-bound. Do not tag a stream non-temporal on a zero-reuse argument alone.
+// See glm-attn-stream-nt-is-a-negative.
+#ifndef MPK_ATTN_STREAM_NT
+#define MPK_ATTN_STREAM_NT 0
+#endif
+
+// The non-temporal twin of _gang_ld_g. Same two-step cast for the same reason
+// (clang rejects changing pointee type and address space at once); T must be a
+// POD or an ext_vector_type.
+template <typename T>
+__device__ __forceinline__ T _rnlm8_ld_g_nt(void const *p) {
+  T const *q = static_cast<T const *>(p);
+  return __builtin_nontemporal_load(
+      (__attribute__((address_space(1))) T const *)q);
+}
+
 // The A-operand load, addressed by the k-tile BYTE offset the row-major
 // callers already pass (kt = ki * 128) and scaled here by the layout's stride
 // multiplier. KMUL/HI_OFF are template parameters rather than reads of the
@@ -1217,8 +1273,13 @@ template <int KMUL, int HI_OFF>
 __device__ __forceinline__ i32x8_t
     _rnlm8_load_w(uint8_t const *base, int kt, int g) {
   uint8_t const *p = base + kt * KMUL + g * 16;
+#if MPK_ATTN_STREAM_NT >= 1
+  i32x4_t lo = _rnlm8_ld_g_nt<i32x4_t>(p);
+  i32x4_t hi = _rnlm8_ld_g_nt<i32x4_t>(p + HI_OFF);
+#else
   i32x4_t lo = _gang_ld_g<i32x4_t>(p);
   i32x4_t hi = _gang_ld_g<i32x4_t>(p + HI_OFF);
+#endif
   i32x8_t r;
   r[0] = lo[0];
   r[1] = lo[1];
@@ -1257,7 +1318,11 @@ __device__ __forceinline__ i32x8_t
 template <int KMUL>
 __device__ __forceinline__ int
     _rnlm8_load_sc(uint8_t const *base, int off4, int g) {
+#if MPK_ATTN_STREAM_NT == 1
+  return (int)_rnlm8_ld_g_nt<uint8_t>(base + off4 * KMUL + g);
+#else
   return (int)_gang_ld_g<uint8_t>(base + off4 * KMUL + g);
+#endif
 }
 
 // ── The GROUPS-deep, guard-free k-loop ─────────────────────────────────────

@@ -120,6 +120,7 @@ __device__ __noinline__ void
   using gang_gemv_mxfp4_detail::cvt_fp4_pair;
   using gang_gemv_mxfp8_detail::e8m0_to_f32;
   using gang_gemv_mxfp8_detail::ld_g;
+  using gang_gemv_mxfp8_detail::ld_g_nt;
   using gang_gemv_mxfp8_detail::u32x4_t;
 
   constexpr int NTHREADS = 256;
@@ -232,9 +233,20 @@ __device__ __noinline__ void
       // Chunk index within the row, in units of VEC elements.
       int const c = (i0 + u) * LANES_PER_ROW + lane;
       int const k = c * VEC;
+      // MPK_ATTN_STREAM_NT: weight + scale only. o_proj is the biggest single
+      // weight stream in the attention half (100.7 MB/layer/GPU before the
+      // 4-way shard) and, like the rest, is read exactly once per token.
+#if MPK_ATTN_STREAM_NT >= 1
+      wv[u] = ld_g_nt<u32x4_t>(w_row + c * VEC_BYTES);
+#else
       wv[u] = ld_g<u32x4_t>(w_row + c * VEC_BYTES);
+#endif
       // k / SCALE_BLOCK == c, since a chunk is exactly one scale block.
+#if MPK_ATTN_STREAM_NT == 1
+      sv[u] = ld_g_nt<unsigned char>(s_row + c);
+#else
       sv[u] = ld_g<unsigned char>(s_row + c);
+#endif
 #pragma unroll
       for (int m = 0; m < BATCH_SIZE; m++) {
         // if constexpr, not a ternary on the pointer: a select between an

@@ -143,6 +143,20 @@ __device__ __forceinline__ T ld_g(void const *p) {
   T const *q = static_cast<T const *>(p);
   return *(__attribute__((address_space(1))) T const *)q;
 }
+
+// Non-temporal twin, for the weight + E8M0 scale stream only. See the
+// MPK_ATTN_STREAM_NT header in gang_rmsnorm_linear_mxfp8_bias_mi300.cuh for
+// the reuse argument; this GEMV is the W_UK / W_UV / o_proj instantiation of
+// it. `nt` is replacement policy, not coherence, so it cannot change results.
+#ifndef MPK_ATTN_STREAM_NT
+#define MPK_ATTN_STREAM_NT 0
+#endif
+template <typename T>
+__device__ __forceinline__ T ld_g_nt(void const *p) {
+  T const *q = static_cast<T const *>(p);
+  return __builtin_nontemporal_load(
+      (__attribute__((address_space(1))) T const *)q);
+}
 } // namespace gang_gemv_mxfp8_detail
 
 // Same signature and same tile addressing as gang_gemv_kernel, minus the
@@ -191,6 +205,7 @@ __device__ __noinline__ void
   using gang_gemv_mxfp8_detail::cvt_fp8_pair;
   using gang_gemv_mxfp8_detail::e8m0_to_f32;
   using gang_gemv_mxfp8_detail::ld_g;
+  using gang_gemv_mxfp8_detail::ld_g_nt;
   using gang_gemv_mxfp8_detail::u32x4_t;
 
   constexpr int NTHREADS = 256;
@@ -367,8 +382,16 @@ __device__ __noinline__ void
       // Chunk index within the row, in units of VEC elements.
       int const c = (i0 + u) * LANES_PER_ROW + lane;
       int const k = c * VEC;
+#if MPK_ATTN_STREAM_NT >= 1
+      wv[u] = ld_g_nt<u32x4_t>(w_row + k);
+#else
       wv[u] = ld_g<u32x4_t>(w_row + k);
+#endif
+#if MPK_ATTN_STREAM_NT == 1
+      sv[u] = ld_g_nt<unsigned char>(s_row + k / SCALE_BLOCK);
+#else
       sv[u] = ld_g<unsigned char>(s_row + k / SCALE_BLOCK);
+#endif
 #pragma unroll
       for (int m = 0; m < BATCH_SIZE; m++) {
         // if constexpr, not a ternary on the pointer: a select between an

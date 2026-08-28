@@ -1083,6 +1083,24 @@ def get_compile_command(
             assert _snt in ("0", "1"), "MPK_MOE_STREAM_NT is 0 or 1"
             flags = flags + [f"-DMPK_MOE_STREAM_NT={_snt}"]
 
+        _ant = os.environ.get("MPK_ATTN_STREAM_NT")
+        if _ant is not None:
+            # The other half of the layer. Same argument as MPK_MOE_STREAM_NT:
+            # at bs=1 decode every attention/dense weight byte is read exactly
+            # once per token, and the #97 census found ZERO cache hints in
+            # gang_mla_full_layer_fused_kernel. Covers _rnlm8_load_w /
+            # _rnlm8_load_sc (qkv_a, q_b, the dense MLP, the LM head) and the
+            # two GEMV k-loops (W_UK, W_UV, o_proj) -- weight and E8M0 scale
+            # only, never the staged activation, which IS re-read.
+            # `nt` is replacement policy, not coherence. Compile-time, so
+            # every rank must agree.
+            # 0 = off (shipping). 1 = weight + E8M0 scale. 2 = weight only.
+            # The scale load has intra-loop line reuse -- 32 consecutive k map
+            # to one scale byte and 64 scale bytes share a 64 B line -- so `nt`
+            # on it evicts a line that IS re-read. Arm 2 separates the two.
+            assert _ant in ("0", "1", "2"), "MPK_ATTN_STREAM_NT is 0, 1 or 2"
+            flags = flags + [f"-DMPK_ATTN_STREAM_NT={_ant}"]
+
         _pfd = os.environ.get("MPK_MOE_PF_DBUF")
         if _pfd is not None:
             # Double-buffered form of the same k-loop. The deep loop's
