@@ -158,11 +158,15 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_rmsnorm(
 // Default OFF; kept because the ISA-histogram recipe that found it is the
 // reusable part.
   // HIP's int4 is a HIP_vector_type class, which has no constructor reachable
-  // from a raw reinterpreting load; a POD of 8 bf16 with alignas(16) is the
-  // same 16 bytes and lowers to the same dwordx4.
-  struct alignas(16) i4 {
-    unsigned short h[8];
-  };
+  // from a raw reinterpreting load. Neither is a plain POD struct: returning
+  // `*(addrspace(1) S const *)p` by value needs a copy constructor able to
+  // bind an addrspace(1) reference, and the implicit one takes `S const &` in
+  // the generic space -- so the struct form only ever compiled on the
+  // SRC_IS_GLOBAL=false instantiations, and broke the moment PRO_HOIST asked
+  // for a global one. An ext_vector_type is not a class type, so the
+  // lvalue-to-rvalue conversion needs no constructor at all; 8 x u16 with
+  // 16-byte alignment is the same dwordx4.
+  typedef unsigned short __attribute__((ext_vector_type(8))) i4;
   auto ld_src16 = [&](int i) -> i4 {
     if constexpr (SRC_IS_GLOBAL) {
       using gi4 = __attribute__((address_space(1))) i4 const *;
@@ -204,8 +208,8 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_rmsnorm(
       for (int c = 0; c < 4; c++) {
 #pragma unroll
         for (int e = 0; e < 8; e++) {
-          float v = _gang_bf16_to_float(sv[c].h[e]) * rms_rcp *
-                    _gang_bf16_to_float(nv[c].h[e]);
+          float v = _gang_bf16_to_float(sv[c][e]) * rms_rcp *
+                    _gang_bf16_to_float(nv[c][e]);
           vals[c * 8 + e] = v;
           amax = fmaxf(amax, fabsf(v));
         }
@@ -500,6 +504,28 @@ _rnlm8_ep_fold_slice(unsigned short const *__restrict__ d_res,
 // converts parallel redundancy into a serial producer plus a rendezvous, and at
 // GLM's per-phase occupancy that trade is at best even. Price the hoisted
 // producer's own makespan against the per-tile saving before building one.
+//
+// ── RE-PRICED AT NP=4, 2026-08-28. Still a negative, and larger. ──────────
+// The verdict above is an NP=8 number, and constants tuned at NP=8 are a live
+// bug class on this branch (GLM_MOE_W2_OPW flipped sign at NP=4). Re-run on
+// devices 4-7, bs=1, one -D the variable, same batch:
+//
+//   OFF  9.113                     (+ 9.095 n=2 from the batch before)
+//   ON   9.364 / 9.401 / 9.422     mean 9.396   (+0.30 ms)
+//
+// Outside the 0.26 ms noise floor and the same sign as at NP=8. Generated text
+// read on the ON arm and coherent, so this is a real slowdown, not a broken
+// build. Halving EP_PEER_SLOTS 8 -> 4 halves BOTH sides of the trade -- the
+// per-tile fold the hoist deletes and the producer's own fold -- so the ratio
+// does not move, and what is left is the release the tiles now wait on. The
+// knob stays default-off; do not re-price it at a third world size.
+//
+// The ON arm did not compile when this was re-run: `i4` was a POD struct, and
+// returning `*(addrspace(1) i4 const *)p` by value needs a copy constructor
+// that can bind an addrspace(1) reference. Only the SRC_IS_GLOBAL=false
+// instantiations existed in the shipping build, so the breakage was invisible
+// until PRO_HOIST asked for a global one. Fixed by making `i4` an
+// ext_vector_type -- not a class type, so no constructor is involved.
 template <int REDUCTION_SIZE,
           int ACTUAL_HIDDEN_DIM,
           int EP_PEER_SLOTS,
@@ -1758,6 +1784,25 @@ __device__ __host__ constexpr int _rnlm8_pf_groups(int ki, int req) {
 #ifndef MPK_ATTN_PF_GROUPS_K
 #define MPK_ATTN_PF_GROUPS_K MPK_ATTN_PF_GROUPS
 #endif
+// ── BOTH BRANCHES SWEPT ALONE AT NP=4, 2026-08-28. AXIS CLOSED. ──────────
+// The split was the right diagnosis and it did not pay: neither branch hides
+// a win that the unified knob was cancelling. All arms are outlier-cleaned
+// means (see /tmp/decode_stat.sh) against a same-batch control.
+//
+//   _N  ctl 9.159 | 6: 9.202 | 8: 9.182 | 12: 9.168 | 16: 9.239
+//   _K  ctl 9.108 | 3: 9.150 |                    12: 9.083
+//
+// Every _N arm is at or above its control, so the shipping request 4 is
+// already the N optimum. On _K the two open cells straddle the control by
+// less than a tenth of the 0.26 ms noise floor. Request 6 was skipped on _K
+// because by elimination it is where the unified sweep's +0.131 at request 8
+// lives -- i.e. the joint number was a K-branch loss, and it does not
+// reproduce when either branch moves alone either.
+//
+// Both knobs stay wired to the unified default. Keep them: the split costs
+// nothing and the per-branch table above is the reusable part. Do not re-run
+// this axis -- it is the third prefetch-depth sweep on this kernel to land
+// inside the noise floor.
 
 template <int BATCH_SIZE,
           int OUTPUT_PER_WG,
