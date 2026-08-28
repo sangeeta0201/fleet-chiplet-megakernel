@@ -90,7 +90,7 @@ MPK_FORWARD_VARS=(
   GLM_QKV_MXFP8_OPW GLM_MOE_W13_OPW GLM_MOE_W2_OPW
   GLM_OPROJ_GEMV_ROWS GLM_OPROJ_PREFETCH GLM_OPROJ_TP GLM_DENSE_OPROJ_TP
   GLM_PROLOGUE_PREFETCH GLM_OPROJ_RESTAGE
-  GLM_UNABSORB_OPROJ GLM_WUV_GEMV_ROWS WUV_MFMA
+  GLM_UNABSORB_OPROJ GLM_WUV_GEMV_ROWS WUV_MFMA GLM_WUV_TP
   GLM_UNABSORB_QB GLM_WUK_GEMV_ROWS GLM_QB_OPW GLM_QB_TP
   GLM_MLA_NUM_KV_CHUNKS GLM_MLA_MERGE_DIM_SPLITS GLM_MLA_MERGE_WT
   # Compile-time and read per-rank via os.environ in persistent_kernel.py, so
@@ -99,6 +99,11 @@ MPK_FORWARD_VARS=(
   GLM_MLA_PAIR_MERGE
   GANG_TILE_N GANG_WGM GANG_K_SPLITS
   MPK_SPAN_TIMING MPK_SUBPHASE_TIMING MPK_DEVICE_TIMING MPK_WORKER_STATE
+  # Host-side getenv in launch_persistent_kernel: dispatch the 8-block
+  # scheduler grid BEFORE the 240-block worker grid so the schedulers cannot
+  # be starved of CUs by the workers. Default 1; =0 restores the old order.
+  # Read per-rank, so every rank must see it or the arms are mixed.
+  MPK_SCHED_LAUNCH_FIRST
   # pre/fused/post split of the iteration, stamped by worker 0. Compile-time,
   # so a mismatch between ranks is a different binary and the barriers
   # deadlock.
@@ -109,6 +114,7 @@ MPK_FORWARD_VARS=(
   # compile-time, so every rank has to see them or the ranks build different
   # megakernels and the layer barriers deadlock.
   MPK_MLA_SKIP_DECODE MPK_ATTN_HALFK MPK_W13_EARLY_REL MPK_QB_SKIP_PEER_WAIT
+  MPK_WUV_SKIP_PEER_WAIT
   MPK_ABL_QKV MPK_ABL_QKV_PRO MPK_ABL_ML_BOUNDARY
   # Adjacent-phase overlap ceiling probe. =1 is a CORRECT-output control,
   # =2 is the wrong-output probe; decide on 2 vs 1.
@@ -125,6 +131,16 @@ MPK_FORWARD_VARS=(
   # 155 of 160 KB/CU is what actually pins 1 block/CU. Compile-time, so a
   # mismatch between ranks is a different binary and the barriers deadlock.
   MPK_WORKER_LDS_KB
+  # Bootstrap residency census. Host-pinned coherent slots the device stamps
+  # and a detached host thread prints to stderr at t=8s and t=20s, with no HIP
+  # call at read time -- the only channel that survives a wedged runtime AND
+  # the watchdog's SIGKILL. Runtime-only, so it does not have to match across
+  # ranks, but it is in the list so every rank reports.
+  MPK_BOOT_PROBE
+  # TaskDesc slots in execute_worker's LDS staging buffer. Compile-time, so it
+  # must match across ranks; in the whitelist so every rank gets the same one.
+  MPK_TASK_DESC_SLOTS
+  MPK_TASK_DESC_PAD
   # MoE k-loop prefetch distance. The shipping loop has NO load/MFMA overlap
   # (ISA: global_load x8 then s_waitcnt vmcnt(1) in the same block), and 4
   # k-groups in flight is the measured knee. Compile-time, so a mismatch

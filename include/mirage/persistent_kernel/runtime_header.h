@@ -63,6 +63,29 @@ constexpr int LAYER_IDX_SMEM_OFFSET_FROM_END = 4;
 // The cutover is 2 * (7296 + dyn) <= 163840, i.e. dyn <= 74624 B. 78 here
 // gives 78*1024 - 6144 = 73728 = 72 KB and lands on the right side of it.
 //
+// CORRECTION, 2026-08-28, and it is the whole reason #74/#118/#119/#149 all
+// failed to place a second block. Both constants above are wrong for THIS
+// branch:
+//
+//   * the reserve subtracted below is WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE
+//     = 3 * 1024, not 6144. 6144 is the MIRAGE_GRACE_* value.
+//   * the image's static LDS is 7328 B, not 7296 (llvm-readelf --notes on the
+//     built .so: group_segment_fixed_size).
+//
+// So 78 gives dyn = 79872 - 3072 = 76800, per block 76800 + 7328 = 84128, and
+// 2 * 84128 = 168256 > 163840. **78 was always 1 block/CU.** MEASURED, not
+// recomputed: MPK_BOOT_PROBE at 464 workers / LDS_KB=78 / wpe=3 reports
+// `resident=256/464 per_xcd=[32 32 32 32 32 32 32 32]` on all four ranks --
+// exactly one block on each of the 256 CUs, and the schedulers park forever
+// at rdy=256. That is the entire 264/472-worker "bootstrap hang": not the
+// hardware, not scratch (HSA_NO_SCRATCH_THREAD_LIMITER=1 changes nothing),
+// not MAX_WORKER_PER_SCHEDULER -- an off-by-3072 in this comment.
+//
+// The real cutover is 2 * (7328 + dyn) <= 163840, i.e. dyn <= 74592, i.e.
+//     MPK_WORKER_LDS_KB <= (74592 + 3072) / 1024 = 75.8  ->  75.
+// 75 gives dyn = 76800 - 3072 = 73728 -- the exact number the stale line
+// above thought 78 gave.
+//
 // This is a real budget cut, not a free one: the phases carve LDS-resident
 // weight tiles out of this slab, and the static_asserts that used to read a
 // literal 155 * 1024 now read this constant, so the compiler is what proves

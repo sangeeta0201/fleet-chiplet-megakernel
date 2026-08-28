@@ -2297,6 +2297,15 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
                     QB_EP_SIGNAL_SLOT < FULL_LAYER_EP_SIGNAL_STRIDE,
                 "the three signals must occupy distinct slots of the line, "
                 "and slot 0 belongs to the Phase-9 fold");
+  // W_UV's all-gather is the fourth rendezvous on this line. It first took
+  // slot 2 and deadlocked at iteration 0 against q_b, which already owns it;
+  // this assert is the check that would have caught it at compile time.
+  static_assert(WUV_EP_SIGNAL_SLOT != 0 &&
+                    WUV_EP_SIGNAL_SLOT != OPROJ_EP_SIGNAL_SLOT &&
+                    WUV_EP_SIGNAL_SLOT != QB_EP_SIGNAL_SLOT &&
+                    WUV_EP_SIGNAL_SLOT < FULL_LAYER_EP_SIGNAL_STRIDE,
+                "W_UV's all-gather signal must not alias the Phase-9 fold, "
+                "o_proj's or q_b's");
   MPK_WS_PHASE(90, task_layer_idx, xcd_id);
 }
 

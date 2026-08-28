@@ -1867,6 +1867,52 @@ if __name__ == "__main__":
             print("[CFG] GLM_OPROJ_MXFP4 off: needs the MXFP8 GEMV o_proj "
                   "inside the fused whole-layer task "
                   f"(mxfp8={use_mxfp8_oproj} fused={FUSE_FULL_LAYER})")
+        # ── rank-sharded W_UV ─────────────────────────────────────────────
+        # The last replicated weight in the layer, and the third stage to take
+        # this trade after o_proj (#53) and q_b/W_UK (#55). W_UV is
+        # [num_heads * v_head, kv_lora] = 16384 x 512 MXFP8 = 8.4 MB, read
+        # identically on all ranks every MoE layer because attention is
+        # data-parallel at batch 1 -- 638 MB per rank per token at 76 layers.
+        #
+        # Output-wise, like o_proj: rank p owns v rows
+        # [p * H*v_head/EP, +that), which is heads [p * H/EP, +that) because
+        # rows map onto heads exactly. Disjoint, so the row is completed by an
+        # ALL-GATHER, not a reduction, and the kernel pushes each tile into
+        # the peers' copy of v_out as it lands, then folds the rendezvous into
+        # the existing Mechanism-C barrier (ep_signal slot 2; slot 0 is the
+        # Phase-9 MoE fold, slot 1 o_proj's gather).
+        #
+        # The width drops with the shard. At 128 rows the unsharded stage is
+        # 16384/128/8 = 16 tiles per XCD; slicing 4 ways at the same width
+        # would leave 4, which throws away 26 of 30 workers per XCD to buy
+        # bytes. 32 rows keeps 4096/32/8 = 16 tiles per XCD -- the identical
+        # one round -- while the per-tile work falls 4x, which is the whole
+        # point: the round-quantization rule says the width sweep only pays
+        # where the count crosses workers_per_XCD, and here it must NOT.
+        #
+        # No kernel flag: the task reads the shard off its own tile ratio
+        # (wuv_tp in gang_oproj_router_fused_mi300.cuh), so this slice plus
+        # the width is the entire switch.
+        wuv_tp_eligible = (int(os.environ.get("GLM_WUV_TP", "1")) == 1
+                           and moe_ep and world_size > 1
+                           and FUSE_FULL_LAYER and UNABSORB_V
+                           and int(os.environ.get("WUV_MFMA", "0")) == 0
+                           # Whole heads per rank, so a rank slice starts on a
+                           # head boundary and every tile stays inside a head.
+                           and num_heads % world_size == 0)
+        if wuv_tp_eligible and os.environ.get("GLM_WUV_GEMV_ROWS") is None:
+            WUV_GEMV_ROWS = 32
+        wuv_tp_rows = (o_proj_red_unabsorbed // world_size
+                       if wuv_tp_eligible else o_proj_red_unabsorbed)
+        wuv_tp = (wuv_tp_eligible
+                  # Whole tiles per XCD out of the rank's slice, which is also
+                  # exactly the identity the kernel detects the shard by.
+                  and wuv_tp_rows % (8 * WUV_GEMV_ROWS) == 0)
+        if not wuv_tp:
+            wuv_tp_rows = o_proj_red_unabsorbed
+        print(f"[CFG] W_UV tp={int(wuv_tp)} rows_per_rank={wuv_tp_rows} "
+              f"wuv_rows={WUV_GEMV_ROWS} "
+              f"tiles_per_xcd={wuv_tp_rows // 8 // WUV_GEMV_ROWS}")
         if use_mxfp8_oproj:
             # Elements per lane per iteration over 256/rows lanes: 16 E4M3
             # bytes, or 32 E2M1 nibbles, out of the same 16-byte load. Only
@@ -2070,8 +2116,28 @@ if __name__ == "__main__":
         # Phase 8b's output and o_proj's input when W_UV is un-absorbed: the
         # per-head V slice, num_heads * v_head wide against attn_out's
         # num_heads_pad * kv_lora.
-        mla_v_out = (make_tensor("mla_v_out", (bs, o_proj_red_unabsorbed))
-                     if UNABSORB_V else None)
+        if UNABSORB_V and wuv_tp:
+            # Under the rank shard every rank computes a disjoint 1/EP-th of
+            # this row and pushes it straight into the peers' copies, so it
+            # has to live on the symmetric heap -- a plain cudaMalloc would
+            # put the peer store at an unrelated address on the remote rank.
+            # Declared at the FULL width on every rank: the shard is in the
+            # weight, not in the buffer, and o_proj reduces over the whole row.
+            #
+            # One buffer for all layers, safe for the same reason
+            # attn_proj_out's and mla_q_workspace's are: a peer cannot reach
+            # layer L+1's Phase 8b without passing the layer-L MoE fold, which
+            # needs this rank's layer-L MoE output, which needs this rank's
+            # layer-L o_proj to have read the row.
+            mla_v_out = mpk.new_tensor(
+                dims=(bs, o_proj_red_unabsorbed),
+                dtype=mi.bfloat16,
+                name="mla_v_out",
+                io_category="nvshmem_tensor",
+            )
+        else:
+            mla_v_out = (make_tensor("mla_v_out", (bs, o_proj_red_unabsorbed))
+                         if UNABSORB_V else None)
         # Phase 3's output and Phase 3b's input when W_UK is un-absorbed: the
         # per-head [nope | rope] row. The rope columns are written (that is
         # where the GEMM puts them) and never read -- the rotation lands in
@@ -2864,6 +2930,18 @@ if __name__ == "__main__":
                 # kv_lora slice of attn_out.
                 w_uv_rows = attn._w_uv.reshape(
                     num_heads * v_head, kv_lora).to(torch.bfloat16).contiguous()
+                if wuv_tp:
+                    # Keep only the v rows this rank owns. Everything
+                    # downstream follows from dim 0, exactly as it does for
+                    # o_proj: wuv_tiles_per_xcd is w_wuv.dim(0) // 8 // rows,
+                    # and that ratio against OPROJ_REDUCTION_SIZE / EP is what
+                    # the kernel reads the shard off. v_out itself stays
+                    # declared at the full width on every rank -- the tiles
+                    # are pushed into the peers' copies at the identical
+                    # offset, so the buffer must be symmetric.
+                    w_uv_rows = w_uv_rows[
+                        rank * wuv_tp_rows:(rank + 1) * wuv_tp_rows, :
+                    ].contiguous()
                 w_wuv = _attach_input_keep(
                     pack_dense_mxfp8(w_uv_rows, WUV_GEMV_ROWS,
                                      fake_fp4=FAKE_MXFP4_ATTN),

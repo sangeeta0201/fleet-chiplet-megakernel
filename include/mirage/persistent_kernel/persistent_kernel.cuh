@@ -380,6 +380,38 @@ __device__ __forceinline__ void
 // telling those apart is exactly what identifies the blocking worker.
 __device__ int *g_ws_dev;
 
+// MPK_BOOT_PROBE -- the bootstrap residency census, and the ONLY instrument on
+// this branch that survives a wedge.
+//
+// Every other channel is blocked on a hung run, and each for its own reason:
+//   * device printf lands on stdout, which mpirun's forwarder block-buffers
+//     and the watchdog's SIGKILL discards (see
+//     device-printf-is-lost-to-stdout-buffering-not-to-the-hang). Forcing
+//     _IOLBF in the CHILD is not enough -- the forwarder buffers too.
+//   * a host D2H read of worker_xcd_map cannot run: when the kernel hangs the
+//     ROCm runtime wedges with it and hipMemcpyAsync/hipStreamSynchronize
+//     block forever even on a private stream (see the MPK_HOST_DBG_POLL note
+//     near the bottom of this file, which was written after exactly that).
+//
+// So the buffer is host-pinned COHERENT memory the device stores into
+// directly, and the reader is a detached host thread doing plain loads plus
+// fprintf(stderr) -- no HIP call at read time, and stderr is unbuffered.
+//
+// Layout, num_workers + MAX_NUM_SCHEDULERS ints:
+//   [0 .. num_workers)      1 + xcd_id, stamped by each worker block when it
+//                           becomes resident. A slot still 0 names a block
+//                           that never got a CU.
+//   [num_workers + s]       1 + the ready count scheduler s last observed.
+// Off by default; the pointer is null and both stores are one predicted
+// branch on a bootstrap-only path.
+__device__ int *g_boot_probe;
+__device__ int g_boot_probe_nw;
+// Host-side handles onto the same pinned pages. Plain loads only.
+static int *g_boot_probe_host = nullptr;
+static int g_boot_probe_slots = 0;
+static int g_boot_probe_nworkers = 0;
+static int const MAX_NUM_SCHEDULERS = 64;
+
 // Sentinel the host pre-stamps into every worker's phase slot before the
 // launch. Zero is a legal phase and `in_task` is `wphase >= 0`, so a slot the
 // device never wrote is otherwise indistinguishable from a worker parked at
@@ -755,11 +787,35 @@ using namespace kernel;
 // Number of XCDs on MI300X
 constexpr int MI300X_NUM_XCDS = 8;
 
-// Get the XCD (XCC) ID for the current thread
+// Get the XCD (XCC) ID for the current thread.
+//
+// MASKED, and the mask is load-bearing (#135). The XCC_ID field of
+// HW_REG_XCC_ID is 4 bits wide; this read asks for 16 and returns bits [15:0]
+// verbatim. Every consumer then uses the result as a direct index into an
+// exactly-8-int allocation, twice under an atomicCAS that cannot fault
+// silently:
+//
+//   elect_xcd_leader()  -> atomicCAS(&config.xcd_leader_worker[xcd_id], ...)
+//                          gpu_malloc<int>(NUM_XCDS_INIT * sizeof(int)) = 8
+//   persistent_kernel() -> atomicCAS(&config.xcd_scheduler_claimed[my_xcd], ...)
+//                          gpu_malloc<int>(NUM_XCDS_PC   * sizeof(int)) = 8
+//
+// So a single set bit anywhere in [15:4] is an out-of-bounds atomic write
+// within microseconds of kernel entry, on every block, before the [ELECTION]
+// and [SCHED_XCD] printfs. That LOOKS like the launch wedge's signature, and
+// the mask was tried as a cure -- it is not one: wedges continue with it in,
+// and a census of 108644 historical `xcd=` samples finds all of them already
+// in [0,7]. Nor is "no [SCHED_XCD] in the log" evidence of anything; that is
+// a lost stdout buffer, see the note in launch_persistent_kernel. Keep the
+// mask as hardening only. Masking is free (the compiler folds it into the s_getreg width) and cannot
+// be wrong here: NUM_XCDS is a compile-time 8 in every consumer, so an id
+// outside [0,8) has no valid meaning anyway. Worst case the mask turns a
+// fault into a mis-attributed XCD, which costs scheduling quality, not memory
+// safety.
 __device__ __forceinline__ int get_current_xcd_id() {
   int xcd_id;
   asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)" : "=s"(xcd_id));
-  return xcd_id;
+  return xcd_id & (MI300X_NUM_XCDS - 1);
 }
 
 // Per-block shared state for XCD info (computed once at block start)
@@ -1577,10 +1633,69 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
   // arrays HIP doesn't support default construction of __shared__ array
   // elements HIP doesn't support alignas with __shared__, use __align__ instead
   static_assert(TASK_DESCS_BUFFER_LENGTH <= 16, "Buffer length exceeds 16");
-  __shared__ __align__(
-      alignof(TaskDesc)) char task_descs_storage[16 * sizeof(TaskDesc)];
-  __shared__ __align__(
-      alignof(TaskId)) char task_ids_storage[16 * sizeof(TaskId)];
+  // These were sized at a hardcoded 16 while every consumer clamps to
+  // TASK_DESCS_BUFFER_LENGTH (see the three min(..., TASK_DESCS_BUFFER_LENGTH)
+  // sites below), so the tail slots were allocated and never touched. At
+  // sizeof(TaskDesc) ~= 408 the computed length is 7, which made ~9 dead slots
+  // -- about 3.7 KB of static LDS, and THE reason worker_kernel's
+  // group_segment_fixed_size was 7328 B against a 3072 B reserve. That overrun
+  // is what pushed 2 * (static + dyn) past 163840 and left the 464-worker
+  // grid at exactly 1 block/CU (see the CORRECTION in runtime_header.h and the
+  // MPK_BOOT_PROBE census that measured it). Sizing to the length that is
+  // actually used is a pure deletion of unreachable storage.
+  // Swept, not hardcoded: shrinking this to TASK_DESCS_BUFFER_LENGTH cuts
+  // worker_kernel's static LDS 7328 -> 3512 B and is what opens the 2
+  // blocks/CU gate, but it also moves the dynamic-LDS base by 3816 B, and
+  // every task carves _fused_smem at fixed offsets from that base. So the
+  // slot count is a knob and the wall is measured at both ends rather than
+  // assumed free. 16 reproduces the shipping image exactly.
+#ifndef MPK_TASK_DESC_SLOTS
+#define MPK_TASK_DESC_SLOTS 16
+#endif
+  static_assert(MPK_TASK_DESC_SLOTS >= TASK_DESCS_BUFFER_LENGTH,
+                "task_descs_storage is smaller than the length every consumer "
+                "clamps to");
+  __shared__ __align__(alignof(TaskDesc))
+      char task_descs_storage[MPK_TASK_DESC_SLOTS * sizeof(TaskDesc)];
+  __shared__ __align__(alignof(TaskId))
+      char task_ids_storage[MPK_TASK_DESC_SLOTS * sizeof(TaskId)];
+
+  // MPK_TASK_DESC_PAD -- dead bytes, deliberately.
+  //
+  // MEASURED: dropping the slot count 16 -> 7 cuts static LDS 7328 -> 3512 B
+  // and costs +1.49 ms at the wall (9.113 -> 10.601, n=2 each, same session,
+  // and the two images have byte-identical register footprints: 325 VGPR / 69
+  // AGPR / 0 spill / 596 B scratch). Nothing about the WORK changed, so the
+  // cost is the layout: the dynamic segment is based just past the static
+  // block, every task carves _fused_smem at fixed offsets from that base, and
+  // the swizzles were tuned at the shipping base. 7328 % 128 == 32 while
+  // 3512 % 128 == 56 -- a different bank phase for every buffer in the
+  // MoE/attention k-loops.
+  //
+  // So the useful slots and the base offset are separated: shrink the former
+  // to open the 2-blocks/CU gate, pad the latter back to the phase the
+  // swizzles expect. 4768 keeps 7328's residue mod BOTH 128 (32) and 512
+  // (160) while leaving static under the 5120 B that
+  // 2 * (static + 76800) <= 163840 allows.
+#ifndef MPK_TASK_DESC_PAD
+#define MPK_TASK_DESC_PAD 0
+#endif
+#if MPK_TASK_DESC_PAD > 0
+  __shared__ char task_desc_lds_pad[MPK_TASK_DESC_PAD];
+  // Keeping the allocation alive takes more than it looks. An untouched
+  // __shared__ array is deleted outright (the coresid_scratch2 probe lost a
+  // 7328 B array to exactly this), and a guarded STORE is no better: nothing
+  // reads it back, so dead-store elimination removes the store and the array
+  // follows. That was measured, not guessed -- the first attempt used
+  // `if (config.num_workers < 0) pad[...] = ...` and hipcc still emitted
+  // group_segment_fixed_size 3512.
+  //
+  // An empty asm that CONSUMES the array's address is what survives: the
+  // compiler must materialise the LDS offset, so the allocation cannot be
+  // folded away, and not one instruction is emitted for it.
+  asm volatile("" ::"v"(static_cast<unsigned>(
+      reinterpret_cast<unsigned long long>(&task_desc_lds_pad[0]))));
+#endif
   TaskDesc *task_descs = reinterpret_cast<TaskDesc *>(task_descs_storage);
   TaskId *task_ids = reinterpret_cast<TaskId *>(task_ids_storage);
 #else
@@ -1653,6 +1768,16 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
     // Write this worker's XCD ID to shared map for scheduler to read
     if (config.worker_xcd_map != nullptr) {
       config.worker_xcd_map[worker_id] = block_xcd_id;
+      // The residency stamp (MPK_BOOT_PROBE). Deliberately next to the
+      // worker_xcd_map write rather than folded into it: the map is device
+      // memory the host cannot read on a wedge, which is the whole reason
+      // #74/#118/#119/#149 never learned whether 264 and 472 blocks were
+      // resident. This slot is host-pinned coherent, so the count of nonzero
+      // entries IS the co-residency at any instant the host looks.
+      if (g_boot_probe != nullptr) {
+        __atomic_store_n(
+            &g_boot_probe[worker_id], 1 + block_xcd_id, __ATOMIC_RELAXED);
+      }
       if (worker_id < 8) {
         printf("[WORKER_XCD] worker_id=%d block=%d xcd=%d\n",
                worker_id,
@@ -3836,6 +3961,24 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
       // Wait for all workers to report their XCD IDs
       if (config.worker_xcd_map != nullptr) {
+        // The bootstrap wait, and the place BOTH the launch wedge (#135) and
+        // the 264/472-worker occupancy hang (#149) come to rest. Silent
+        // before: a scheduler that never sees every worker spins here for the
+        // full 120 s watchdog and the log says nothing at all.
+        //
+        // MPK_SCHED_WAIT_SPINS is a per-scheduler ONE-SHOT report, not a
+        // bail-out -- the loop still waits forever, so a slow-but-fine launch
+        // is unaffected and this cannot itself cause a failure. 30e6
+        // iterations at 100 ns is ~3 s; a healthy bootstrap leaves this loop
+        // in microseconds, so the counter is dead weight on the fast path and
+        // the branch is one compare against an SGPR.
+        //
+        // worker_xcd_map is memset to -1 at :6370 and each worker writes its
+        // own slot before incrementing the counter, so the -1 entries name
+        // the MISSING BLOCKS exactly. That is the whole question at 464
+        // workers: a residency shortfall prints a short list of ids, while a
+        // hang somewhere else prints rdy == need and no missing ids at all.
+        long long _boot_spins = 0;
         while (true) {
           int const _rdy = atomicAdd(config.worker_xcd_ready_count, 0);
 #ifdef MPK_WORKER_STATE
@@ -3846,8 +3989,38 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
             __atomic_store_n(&_ws_sched[1], _rdy, __ATOMIC_RELAXED);
           }
 #endif
+          // The scheduler half of MPK_BOOT_PROBE. Published EVERY trip, not
+          // once: the question is not only "did the count stall" but "at what
+          // value", and the host reader samples asynchronously. +1 so that a
+          // scheduler that never reached this loop (slot 0) is distinguished
+          // from one that reached it and saw zero workers.
+          if (g_boot_probe != nullptr) {
+            __atomic_store_n(
+                &g_boot_probe[g_boot_probe_nw + sched_id], 1 + _rdy,
+                __ATOMIC_RELAXED);
+          }
           if (_rdy >= config.num_workers) {
             break;
+          }
+          if (++_boot_spins == 30000000LL) {
+            int _missing = 0, _first = -1, _last = -1;
+            for (int w = 0; w < config.num_workers; w++) {
+              if (config.worker_xcd_map[w] < 0) {
+                _missing++;
+                if (_first < 0) {
+                  _first = w;
+                }
+                _last = w;
+              }
+            }
+            printf("[SCHED_WAIT] sched_id=%d STUCK ~3s rdy=%d need=%d "
+                   "missing=%d first=%d last=%d\n",
+                   sched_id,
+                   _rdy,
+                   config.num_workers,
+                   _missing,
+                   _first,
+                   _last);
           }
           __nanosleep(100);
         }
@@ -3855,14 +4028,46 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
         threadfence_gpu();
         // Read this scheduler's XCD and collect ALL matching workers
         my_xcd = get_current_xcd_id();
+        // CLAMPED. my_workers[] is MAX_WORKER_PER_SCHEDULER deep and this loop
+        // is bounded by however many worker blocks the DISPATCHER put on this
+        // XCD -- a hardware property, not num_workers/num_schedulers. See the
+        // long note on max_worker_per_scheduler in
+        // python/mirage/mpk/persistent_kernel.py: an unclamped store here is
+        // the launch wedge (#135), and it faults or corrupts BEFORE the
+        // [SCHED_XCD] printf below, which is why a wedged run prints none.
+        // The bound now carries real skew headroom, so `_dropped` should stay
+        // 0; if it ever does not, the run will hang (the dropped workers get
+        // no tasks) but it will hang with a printed reason instead of
+        // scribbling on the stack.
+        int _dropped = 0;
         for (int w = 0; w < config.num_workers; w++) {
           if (config.worker_xcd_map[w] == my_xcd) {
-            my_workers[my_num_workers++] = w;
+            if (my_num_workers < MAX_WORKER_PER_SCHEDULER) {
+              my_workers[my_num_workers++] = w;
+            } else {
+              _dropped++;
+            }
           }
         }
-        // Device printf never reaches the log on a hang -- the buffer is
-        // flushed at kernel exit and the kernel does not exit -- so the same
-        // two facts also go to the pinned worker-state buffer.
+        if (_dropped != 0) {
+          printf("[SCHED_OVF] sched_id=%d xcd=%d kept=%d DROPPED=%d "
+                 "(MAX_WORKER_PER_SCHEDULER=%d) -- raise the bound\n",
+                 sched_id,
+                 my_xcd,
+                 my_num_workers,
+                 _dropped,
+                 (int)MAX_WORKER_PER_SCHEDULER);
+        }
+        // CORRECTED. Device printf DOES drain while the kernel is still
+        // running -- ROCm's printf is hostcall-based, verified with a
+        // standalone spinner that printed 8 s before it was released. What
+        // loses the output on a hang is the HOST's stdout buffer: device
+        // printf lands on stdout, mpirun forwards it block-buffered, and the
+        // watchdog SIGKILLs the pgid before that buffer flushes.
+        // launch_persistent_kernel now calls setvbuf(stdout, _IOLBF) on the
+        // first launch, so these lines survive a kill. The pinned
+        // worker-state buffer below is still the more reliable channel, but
+        // it is no longer the ONLY one.
 #ifdef MPK_WORKER_STATE
         if (_ws_sched != nullptr) {
           __atomic_store_n(&_ws_sched[2], my_xcd * 1000 + my_num_workers,
@@ -6315,6 +6520,36 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   global_runtime_config.worker_xcd_ready_count = gpu_malloc<int>(sizeof(int));
   (void)cudaMemset(
       global_runtime_config.worker_xcd_ready_count, 0, sizeof(int));
+  // MPK_BOOT_PROBE: the host-pinned mirror of the two lines above. See the
+  // g_boot_probe declaration for why device memory cannot answer this.
+  {
+    char const *bp = getenv("MPK_BOOT_PROBE");
+    if (bp != nullptr && atoi(bp) == 1) {
+      int const slots = num_workers + MAX_NUM_SCHEDULERS;
+      int *host_probe = nullptr;
+      hipError_t e = hipHostMalloc((void **)&host_probe,
+                                   (size_t)slots * sizeof(int),
+                                   hipHostMallocCoherent);
+      if (e == hipSuccess && host_probe != nullptr) {
+        memset(host_probe, 0, (size_t)slots * sizeof(int));
+        (void)hipMemcpyToSymbol(
+            HIP_SYMBOL(g_boot_probe), &host_probe, sizeof(int *));
+        (void)hipMemcpyToSymbol(
+            HIP_SYMBOL(g_boot_probe_nw), &num_workers, sizeof(int));
+        g_boot_probe_host = host_probe;
+        g_boot_probe_slots = slots;
+        g_boot_probe_nworkers = num_workers;
+        fprintf(stderr,
+                "[BOOT_PROBE] armed: %d worker slots + %d scheduler slots\n",
+                num_workers,
+                (int)MAX_NUM_SCHEDULERS);
+      } else {
+        fprintf(stderr,
+                "[BOOT_PROBE] hipHostMalloc failed: %s\n",
+                hipGetErrorString(e));
+      }
+    }
+  }
   // Per-XCD per-event task thresholds for two-level event counting
   // xcd_event_num_tasks may already be allocated+filled by precomputed dispatch
   if (global_runtime_config.xcd_event_num_tasks == nullptr) {
@@ -6424,6 +6659,52 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
 // TODO: change launch config
 extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
   fprintf(stderr, "[HOST_DBG] launch_persistent_kernel ENTER\n");
+  // HOST-SIDE breadcrumbs for the launch wedge (#135). MEASURED: on a wedged
+  // run all four ranks print A, B, C and D, D reports `err=no error`, and then
+  // nothing. So the host side of the launch is clean on every rank; the wedge
+  // is downstream of both hipLaunchKernelGGL calls. These are plain host
+  // fprintf(stderr): they always reach the log, they issue no GPU work, and
+  // they add no allocation -- which matters, because MPK_WORKER_STATE and
+  // MPK_HOST_DBG_POLL both wedge the known-good control and are therefore
+  // useless here. Capped at the first three calls so a 118-iteration run does
+  // not gain 1400 lines; the wedge is always on the first.
+  //
+  // DO NOT read "a wedged log has zero [WORKER_XCD]" as "no worker block ran".
+  // That inference is RETRACTED, and the trap is worth stating because it is
+  // easy to fall into twice:
+  //
+  //   * A census of 1152 logs finds 190 wedges, EVERY one at exactly
+  //     0 [WORKER_XCD] and 0 [SCHED_XCD] -- never a partial, never one rank
+  //     printing while another does not. Four independent ranks failing
+  //     identically 190/190 is not a residency distribution.
+  //   * Device printf lands on <stdout>; these breadcrumbs land on <stderr>.
+  //     stdout is block-buffered through mpirun's forwarder, stderr is not.
+  //     The watchdog SIGKILLs the pgid, so the stdout buffer is DISCARDED and
+  //     every device print with it. That, not residency, is why the count is
+  //     always zero.
+  //   * ROCm printf itself does drain live while a kernel spins -- verified
+  //     with a standalone spinner under `stdbuf -o0`. The loss is purely the
+  //     buffer, so line-buffering stdout below recovers it.
+  //
+  // With stdout line-buffered, the next wedge log finally separates the three
+  // live candidates: (a) no worker block resident [0 WORKER_XCD], (b) partial
+  // residency deadlocking the schedulers' worker_xcd_ready_count spin
+  // [1..63 WORKER_XCD, 0 SCHED_XCD], (c) both grids up and the hang is later
+  // [64 WORKER_XCD, 64 SCHED_XCD].
+  static int _wedge_bc = 0;
+  bool const _bc = (_wedge_bc++ < 3);
+  // Line-buffer stdout so device printf survives the watchdog's SIGKILL.
+  // Once, on the first launch. Costs one flush per line on a path that only
+  // the debug printfs use at steady state.
+  if (_wedge_bc == 1) {
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+  }
+#define MPK_WEDGE_BC(tag)                                                      \
+  do {                                                                         \
+    if (_bc) {                                                                 \
+      fprintf(stderr, "[HOST_DBG] launch bc: " tag "\n");                      \
+    }                                                                          \
+  } while (0)
   // Prepare next persistent kernel by resetting queue pointers
   {
     int end_of_task_graph_event_pos = global_runtime_config.num_events - 1;
@@ -6434,10 +6715,24 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                                        end_of_task_graph_event_pos);
     (void)cudaEventRecord(global_runtime_config.prepare_done_event,
                           default_stream);
+    MPK_WEDGE_BC("A prepare_kernel enqueued");
 #if defined(USE_NVSHMEM) || defined(USE_ROCSHMEM)
     mpk_shmem_barrier_all();
+    MPK_WEDGE_BC("B shmem_barrier_all returned");
 #endif
+    // Non-blocking: does prepare_kernel actually retire? cudaEventQuery does
+    // not serialise the stream, so the launch order below is unchanged whether
+    // this reports ready or not-yet. A wedge that reports `not-yet` here and
+    // never advances puts the fault in prepare_kernel; one that reports
+    // `ready` clears the device of everything upstream of the two grids.
+    if (_bc) {
+      hipError_t _q = hipEventQuery(global_runtime_config.prepare_done_event);
+      fprintf(stderr,
+              "[HOST_DBG] launch bc: C prepare_done=%s\n",
+              _q == hipSuccess ? "ready" : "not-yet");
+    }
   }
+#undef MPK_WEDGE_BC
   int num_schedulers = global_runtime_config.num_local_schedulers +
                        global_runtime_config.num_remote_schedulers;
   if (global_runtime_config.split_worker_scheduler) {
@@ -6451,17 +6746,133 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
     // The split kernel does not support NVSHMEM because
     // nvshmemx_collective_launch launches kernels sequentially, which blocks
     // the interaction between the worker kernel and the scheduler kernel
+    //
+    // LAUNCH ORDER IS A CO-RESIDENCY HAZARD, not a stylistic choice. The two
+    // kernels are mutually blocking: every scheduler spins in the
+    // `worker_xcd_ready_count >= num_workers` loop until all worker blocks are
+    // resident, and every worker spins on a task queue that only a resident
+    // scheduler ever fills. Nothing makes progress until BOTH grids are fully
+    // co-resident, so whichever grid the hardware dispatches second must still
+    // find free CUs.
+    //
+    // The margin is one CU per XCD. Blocks are assigned to XCDs round-robin by
+    // block index, so at the shipping 240 workers + 8 local schedulers each of
+    // the 8 XCDs must host 30 worker blocks + 1 scheduler block = 31 of its 32
+    // CUs. The worker image is LDS-locked to 1 block/CU
+    // (MAX_DYNAMIC_SHARED_MEMORY_SIZE out of 160 KB), so a scheduler block
+    // cannot share a CU with a worker -- it needs a CU of its own. Launching
+    // the 240-block worker grid FIRST lets it claim CUs the 8 schedulers then
+    // cannot get, and the run wedges. CAVEAT on how that was diagnosed: the
+    // "ZERO `[SCHED_XCD]` lines" half of the signature is worthless. EVERY
+    // wedged log has zero -- 190 of them, and zero `[WORKER_XCD]` too --
+    // because device printf lands on stdout and the watchdog's SIGKILL
+    // discards that buffer. See the note in launch_persistent_kernel. The
+    // half that does survive is four `launch_persistent_kernel ENTER` lines
+    // and 100% GPU utilisation forever (something resident and spinning). It
+    // is intermittent because it depends on how the two streams' dispatch
+    // packets interleave. 248 workers = 32/XCD leaves the schedulers no CU at all,
+    // which is why that count hangs deterministically.
+    //
+    // Fix: dispatch the 8-block scheduler grid first. It is 3% of the blocks,
+    // so it always fits, and it then simply spins in the ready loop -- which
+    // it was going to do anyway -- while the worker grid fills in behind it.
+    // Costs nothing at steady state; the two grids still run concurrently.
+    // MPK_SCHED_LAUNCH_FIRST=0 restores the old order for A/B.
+    static int const _sched_first = [] {
+      char const *e = getenv("MPK_SCHED_LAUNCH_FIRST");
+      return (e != nullptr) ? atoi(e) : 1;
+    }();
+    if (_sched_first) {
+      scheduler_kernel<<<dim3(global_runtime_config.num_local_schedulers, 1, 1),
+                         dim3(128, 1, 1),
+                         0 /*smem*/,
+                         global_runtime_config.scheduler_stream>>>(
+          global_runtime_config);
+    }
     worker_kernel<<<dim3(global_runtime_config.num_workers, 1, 1),
                     dim3(WORKER_NUM_THREADS, 1, 1),
                     MAX_DYNAMIC_SHARED_MEMORY_SIZE /*smem*/,
                     global_runtime_config.worker_stream>>>(
         global_runtime_config);
-    scheduler_kernel<<<dim3(global_runtime_config.num_local_schedulers, 1, 1),
-                       dim3(128, 1, 1),
-                       0 /*smem*/,
-                       global_runtime_config.scheduler_stream>>>(
-        global_runtime_config);
+    if (!_sched_first) {
+      scheduler_kernel<<<dim3(global_runtime_config.num_local_schedulers, 1, 1),
+                         dim3(128, 1, 1),
+                         0 /*smem*/,
+                         global_runtime_config.scheduler_stream>>>(
+          global_runtime_config);
+    }
 
+    if (_bc) {
+      fprintf(stderr,
+              "[HOST_DBG] launch bc: D both grids enqueued (sched_first=%d, "
+              "workers=%d, scheds=%d, err=%s)\n",
+              _sched_first,
+              global_runtime_config.num_workers,
+              global_runtime_config.num_local_schedulers,
+              hipGetErrorString(hipGetLastError()));
+    }
+    // MPK_BOOT_PROBE reader. Detached, plain loads, fprintf(stderr) only --
+    // no HIP call, because on a wedge the ROCm runtime is stuck and any HIP
+    // call blocks forever even on a private stream. Fires once at 8 s and
+    // again at 20 s, then stops: a healthy bootstrap completes in
+    // microseconds, so the 8 s sample already reads "ALL RESIDENT" and the
+    // two samples together separate a stalled count from a slow one.
+    if (g_boot_probe_host != nullptr) {
+      static bool _probe_started = false;
+      if (!_probe_started) {
+        _probe_started = true;
+        int *probe = g_boot_probe_host;
+        int const nw = g_boot_probe_nworkers;
+        int const nsched = global_runtime_config.num_local_schedulers;
+        std::thread([probe, nw, nsched]() {
+          for (int sample = 0; sample < 2; sample++) {
+            std::this_thread::sleep_for(
+                std::chrono::seconds(sample == 0 ? 8 : 12));
+            int resident = 0, first_missing = -1, last_missing = -1;
+            int per_xcd[16] = {0};
+            for (int w = 0; w < nw; w++) {
+              int const v = __atomic_load_n(&probe[w], __ATOMIC_RELAXED);
+              if (v != 0) {
+                resident++;
+                int const x = v - 1;
+                if (x >= 0 && x < 16) {
+                  per_xcd[x]++;
+                }
+              } else {
+                if (first_missing < 0) {
+                  first_missing = w;
+                }
+                last_missing = w;
+              }
+            }
+            char xbuf[128];
+            int off = 0;
+            for (int x = 0; x < 8 && off < (int)sizeof(xbuf) - 8; x++) {
+              off += snprintf(xbuf + off, sizeof(xbuf) - off, "%d ", per_xcd[x]);
+            }
+            char sbuf[256];
+            int soff = 0;
+            for (int s = 0; s < nsched && soff < (int)sizeof(sbuf) - 12; s++) {
+              int const v = __atomic_load_n(&probe[nw + s], __ATOMIC_RELAXED);
+              soff += snprintf(sbuf + soff,
+                               sizeof(sbuf) - soff,
+                               "%d ",
+                               v == 0 ? -1 : v - 1);
+            }
+            fprintf(stderr,
+                    "[BOOT_PROBE] t=%ds resident=%d/%d missing_first=%d "
+                    "missing_last=%d per_xcd=[ %s] sched_rdy=[ %s]\n",
+                    sample == 0 ? 8 : 20,
+                    resident,
+                    nw,
+                    first_missing,
+                    last_missing,
+                    xbuf,
+                    sbuf);
+          }
+        }).detach();
+      }
+    }
     (void)cudaEventRecord(global_runtime_config.worker_done_event,
                           global_runtime_config.worker_stream);
     (void)cudaEventRecord(global_runtime_config.scheduler_done_event,

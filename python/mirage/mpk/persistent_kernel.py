@@ -206,8 +206,47 @@ def get_compile_command(
             min_schedulers = num_local_schedulers
         else:
             min_schedulers = min(num_local_schedulers, num_remote_schedulers)
-        # advance by 1 for the scheduler who are handling the not divisiable num_worker.
-        max_worker_per_scheduler = (num_workers // min_schedulers) + 1
+        # This bounds two stack arrays in execute_scheduler -- my_workers[] and
+        # worker_queue_next_free_task_pos[] -- and on AMD it is NOT a
+        # divisibility question. Each scheduler collects the workers whose
+        # HARDWARE-REPORTED XCD (worker_xcd_map[w], written by the worker
+        # itself) matches its own, so the bound is "how many of the N worker
+        # blocks can the dispatcher land on a single XCD", not "N / nsched".
+        # Nothing makes that even. The old `(num_workers // min_schedulers) + 1`
+        # gave exactly ONE slot of slack: at the shipping 240 workers / 8
+        # schedulers it is 31 against a mean of 30, so a dispatch skew of +2 on
+        # any one XCD overruns the array.
+        #
+        # That overrun IS the launch wedge (#135). The collection loop sits
+        # ABOVE the `[SCHED_XCD]` printf, so a run that overflows dies before
+        # printing any -- which is the exact observed signature: four
+        # `launch_persistent_kernel ENTER` lines, ZERO `[SCHED_XCD]` lines, and
+        # then either 100% GPU utilisation forever (the write landed on an
+        # adjacent stack slot and corrupted my_num_workers / the queue state) or
+        # HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION on all ranks (it landed
+        # past the scratch allocation). Both presentations, one bug. It also
+        # explains the worker-count cliff: 248 workers is a mean of 31 against a
+        # bound of 32 and hangs near-deterministically, and 464 is 58 against
+        # 59. Healthy runs print workers_on_xcd=30 for all 8 schedulers on all 4
+        # ranks -- never 31 -- i.e. the runs that survive are the ones the
+        # dispatcher happened to split evenly.
+        #
+        # Fix: CLAMP the kernel-side collection loop (that is what makes the
+        # store safe at any bound) and give the array a little real headroom on
+        # top of the mean.
+        #
+        # MEASURED, and this is the part to not re-litigate: the overflow is a
+        # genuine latent out-of-bounds write, but it is NOT what wedges the
+        # launch. Over n=10 at bound 46 the box still produced 1 aperture
+        # violation and 1 hang (8 OK / 2 BAD, against a 4-bad-in-11 baseline --
+        # no significant change), the clamp's [SCHED_OVF] line never printed
+        # once, and every healthy run reports workers_on_xcd=30 for all 8
+        # schedulers on all 4 ranks. The dispatcher does not in fact skew here.
+        # So the headroom is cheap insurance, not a cure; keep it small, since
+        # both arrays are indexed dynamically in the scheduler's dispatch loop
+        # and a larger scratch footprint is not free.
+        _mean = (num_workers + min_schedulers - 1) // min_schedulers
+        max_worker_per_scheduler = _mean + 4
 
     common_cmd = [
         cc,
@@ -685,6 +724,32 @@ def get_compile_command(
             # but the deciding number is what survives at the WALL after S22
             # and S28 re-absorb the freed skew, not what leaves S19->S20.
             flags = flags + ["-DMPK_QB_SKIP_PEER_WAIT"]
+        _wuv_abl = int(os.environ.get("MPK_WUV_SKIP_PEER_WAIT", "0"))
+        if _wuv_abl == 2:
+            # Level 2: keep the rendezvous (the leader's peer signal and the
+            # poll of all peers) and delete ONLY the per-tile data push into
+            # the peers' copies of mla_v_out. Bisects "the collective hangs"
+            # into "the handshake hangs" vs "the data stores land somewhere
+            # they should not". WRONG OUTPUT by construction.
+            flags = flags + ["-DMPK_WUV_ABL=2"]
+        if _wuv_abl == 3:
+            # Level 3: full collective, but the leader's peer poll is bounded
+            # and dumps (expected, remaining mask, all four slot values) once
+            # before giving up. Diagnostic only -- it releases on a poll that
+            # never satisfied, so the output is wrong past that layer.
+            flags = flags + ["-DMPK_WUV_ABL=3"]
+        if _wuv_abl == 1:
+            # The W_UV twin of the knob above: delete the W_UV row-shard
+            # CROSS-RANK all-gather (the per-tile peer stores and the leader's
+            # poll of all peers) while keeping the rank shard itself -- the
+            # sliced weight, the biased row base, the local barrier and the
+            # flag release. WRONG OUTPUT by construction: 3/4 of the v row
+            # keeps whatever the peers left there last layer.
+            #
+            # This is the bisect for "does GLM_WUV_TP=1 hang in the geometry
+            # or in the collective". It is not a perf probe; the additive
+            # rule in glm-additive-probes-overprice-deletions applies.
+            flags = flags + ["-DMPK_WUV_SKIP_PEER_WAIT"]
         if int(os.environ.get("MPK_ATTN_HALFK", "0")) == 1:
             # Halve the K-loop of every MXFP8 attention/dense GEMM (qkv_a, q_b,
             # o_proj, W_UV, W_UK) at an unchanged tile map and WG stride.
@@ -1021,6 +1086,32 @@ def get_compile_command(
             # Compile-time, so every rank must agree.
             assert 8 <= int(_lds) <= 155, "MPK_WORKER_LDS_KB 8..155"
             flags = flags + [f"-DMPK_WORKER_LDS_KB={_lds}"]
+
+        _tds = os.environ.get("MPK_TASK_DESC_SLOTS")
+        if _tds is not None:
+            # How many TaskDesc slots execute_worker's LDS staging buffer
+            # holds. The shipping image hardcodes 16 while every consumer
+            # clamps to TASK_DESCS_BUFFER_LENGTH (7 at sizeof(TaskDesc) ~424),
+            # so 9 slots are allocated and never read -- 3816 B of static LDS
+            # that is THE reason 2 * (static + dyn) overran 160 KB/CU and left
+            # a 464-worker grid at 1 block/CU. Dropping to 7 cuts
+            # group_segment_fixed_size 7328 -> 3512 B and opens that gate, but
+            # it also slides the dynamic-LDS base, which every task carves at
+            # fixed offsets, so it is swept rather than assumed free.
+            # Compile-time, so every rank must agree.
+            assert 4 <= int(_tds) <= 16, "MPK_TASK_DESC_SLOTS 4..16"
+            flags = flags + [f"-DMPK_TASK_DESC_SLOTS={_tds}"]
+
+        _tdp = os.environ.get("MPK_TASK_DESC_PAD")
+        if _tdp is not None:
+            # Dead LDS bytes that hold the dynamic-segment base where the task
+            # swizzles expect it. Shrinking MPK_TASK_DESC_SLOTS alone costs
+            # +1.49 ms at the wall with registers held identical, because the
+            # dynamic base slides and every _fused_smem carve changes bank
+            # phase. Long note at the array in persistent_kernel.cuh.
+            # Compile-time, so every rank must agree.
+            assert 0 <= int(_tdp) <= 8192, "MPK_TASK_DESC_PAD 0..8192"
+            flags = flags + [f"-DMPK_TASK_DESC_PAD={_tdp}"]
 
         _pf = os.environ.get("MPK_MOE_PF_GROUPS")
         if _pf is not None:
@@ -3037,9 +3128,16 @@ class PersistentKernel:
             wuv_n_wgs = wuv_mxfp8_weight.dim(0)
             assert wuv_n_wgs % 8 == 0
             wuv_tiles_per_xcd = wuv_n_wgs // 8
-            assert wuv_n_wgs * wuv_rows_per_wg == oproj_reduction_size, (
-                f"packed W_UV covers {wuv_n_wgs * wuv_rows_per_wg} columns, "
-                f"the V row is {oproj_reduction_size}")
+            # Either the whole V row, or this rank's 1/world-th of it under
+            # output-wise sharded W_UV followed by the in-kernel all-gather.
+            # The kernel detects the shard off exactly this ratio -- there is
+            # no flag -- and oproj_reduction_size stays the FULL row either
+            # way: it is o_proj's K and the all-gather's target width. Same
+            # relaxation the o_proj weight already has in task_register.cc.
+            wuv_covered = wuv_n_wgs * wuv_rows_per_wg
+            assert wuv_covered > 0 and oproj_reduction_size % wuv_covered == 0, (
+                f"packed W_UV covers {wuv_covered} columns, which neither is "
+                f"nor evenly divides the V row {oproj_reduction_size}")
             assert wuv_mxfp8_weight.dim(1) == wuv_rows_per_wg * (
                 kv_lora_rank + kv_lora_rank // 32)
             assert v_out.num_dims == 2

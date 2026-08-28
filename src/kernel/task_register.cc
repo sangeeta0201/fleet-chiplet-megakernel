@@ -16,6 +16,10 @@
 #include "mirage/kernel/operator.h"
 #include "mirage/transpiler/utils.h"
 
+// std::getenv / std::atoi, for re-reading MPK_WORKER_LDS_KB when sizing the
+// attention kernel's LDS budget (see the cached_lds_limit lambda below).
+#include <cstdlib>
+
 #ifdef MIRAGE_BACKEND_USE_ROCM
 // Forward declaration of mirage::utils::get_max_shared_mem(); the full
 // header (rocm_helper.h) drags in device-only templates that don't compile
@@ -4321,8 +4325,17 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
                wuv_rows_per_wg * (kv_lora_rank + kv_lora_rank / 32) &&
            "W_UV MXFP8 weight is not packed at kv_lora_rank and this row "
            "count");
-    assert(wuv_tiles_per_xcd * wuv_rows_per_wg * 8 == oproj_reduction_size &&
-           "the packed W_UV weight does not cover the V row exactly");
+    // Either the whole V row, or this rank's 1/world-th of it under
+    // output-wise sharded W_UV followed by the in-kernel all-gather -- the
+    // same relaxation, for the same reason, as the o_proj weight above. The
+    // kernel detects the shard off exactly this ratio, so nothing between the
+    // two is legal, and oproj_reduction_size stays the FULL row either way.
+    assert((wuv_tiles_per_xcd * wuv_rows_per_wg * 8 == oproj_reduction_size ||
+            (ep_inline &&
+             wuv_tiles_per_xcd * wuv_rows_per_wg * 8 * ep_world_size ==
+                 oproj_reduction_size)) &&
+           "the packed W_UV weight covers neither the V row nor this rank's "
+           "1/world-th of it");
     assert(output_ops[11]->dtensor.num_dims == 2);
     assert(output_ops[11]->dtensor.dim[0] == batch_size);
     assert(output_ops[11]->dtensor.dim[1] == oproj_reduction_size);
@@ -7822,6 +7835,33 @@ int TaskRegister::register_paged_attention_split_kv_mi300_task(
     // (3 KB worker static + 2 KB safety margin).
     static int cached_lds_limit = []() {
       size_t per_block = mirage::utils::get_max_shared_mem();
+      // MPK_WORKER_LDS_KB shrinks the DYNAMIC segment the worker kernel is
+      // actually launched with -- MAX_DYNAMIC_SHARED_MEMORY_SIZE in
+      // runtime_header.h is MPK_WORKER_LDS_KB*1024 minus the 3 KB static
+      // reserve. The device query below reports what the HARDWARE offers
+      // (160 KB on gfx950), which is a different number entirely the moment
+      // that knob is set.
+      //
+      // Sizing MAX_TOKENS against the hardware number while launching with
+      // the smaller one is what produced HSA_STATUS_ERROR_MEMORY_APERTURE_
+      // VIOLATION on all four ranks at MPK_WORKER_LDS_KB=78: the graph was
+      // built for 158720 B of LDS, the kernel got 76800, and the attention
+      // task indexed smem[] straight past the aperture. It is NOT the
+      // register squeeze -- the fault reproduces with and without
+      // MPK_WORKER_WAVES_PER_EU, and 78 is the one thing every faulting run
+      // had in common. This is host code compiled separately from the
+      // device headers, so the knob has to be re-read from the environment
+      // rather than seen as a -D.
+      const char *lds_kb = std::getenv("MPK_WORKER_LDS_KB");
+      if (lds_kb != nullptr) {
+        int kb = std::atoi(lds_kb);
+        if (kb >= 8 && kb <= 155) {
+          size_t budget = static_cast<size_t>(kb) * 1024;
+          if (budget < per_block) {
+            per_block = budget;
+          }
+        }
+      }
       if (per_block > 5 * 1024) {
         return static_cast<int>(per_block - 5 * 1024);
       }
