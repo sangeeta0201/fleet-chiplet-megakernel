@@ -113,10 +113,20 @@ namespace kernel {
 // the two agree, from a point where both are in scope.
 //
 // One 64-byte line per PE, written only by that PE (on every peer's copy), so
-// two independent per-layer signals can share it with no false sharing: slot 0
-// is Phase 9's MoE fold, slot 1 is this task's o_proj all-gather.
+// independent per-layer signals can share it with no false sharing: slot 0 is
+// Phase 9's MoE fold, slot 1 is this task's o_proj all-gather, **slot 2 is
+// q_b/W_UK's** (QB_EP_SIGNAL_SLOT, gang_mla_attn_fused_mi300.cuh) and slot 3
+// is this task's W_UV all-gather. Four of the eight u64 in the line are live;
+// the line is still one cache line per PE, so adding slot 3 costs no bytes
+// beyond the EP_NPEER stores themselves.
+//
+// Slot 3, not 2. W_UV first took 2 and the run deadlocked at iteration 0,
+// because q_b's rendezvous is live on the same u64 with a different epoch:
+// each side saw the other's value and neither predicate could hold. The
+// static_assert in gang_mla_full_layer_fused_mi300.cuh now covers all four.
 static constexpr int OPROJ_EP_SIGNAL_STRIDE = 8;
 static constexpr int OPROJ_EP_SIGNAL_SLOT = 1;
+static constexpr int WUV_EP_SIGNAL_SLOT = 3;
 
 template <int BATCH_SIZE,
           int OPROJ_REDUCTION_SIZE, // absorbed o_proj K (10240 for GLM)
@@ -422,7 +432,11 @@ __device__ __attribute__((always_inline)) void
                   "activation slice would not be contiguous");
     static_assert(OPROJ_REDUCTION_SIZE % WUV_V_HEAD_DIM == 0,
                   "o_proj's K is the whole v row, H * V_HEAD_DIM");
-    constexpr int TILES_PER_HEAD = WUV_V_HEAD_DIM / WUV_ROWS_PER_WG;
+    // Tiles per head. Not used directly any more -- the head is now taken off
+    // the global row index, which the rank shard biases -- but the ratio is
+    // still what makes that divide exact.
+    static_assert(WUV_V_HEAD_DIM / WUV_ROWS_PER_WG >= 1,
+                  "a head must span at least one whole tile");
     // Row width of oproj_input_ptr (attn_out). Under un-absorbed W_UV,
     // OPROJ_REDUCTION_SIZE is NUM_Q_HEADS * WUV_V_HEAD_DIM, so the head count
     // -- and hence the attn_out row, which is NUM_Q_HEADS * KV_LORA_RANK --
@@ -446,14 +460,81 @@ __device__ __attribute__((always_inline)) void
 #else
     constexpr bool WUV_USE_MFMA = false;
 #endif
+    // ── rank-sharded W_UV ────────────────────────────────────────────────
+    // The last replicated weight in the layer. W_UV is
+    // [H * V_HEAD_DIM, KV_LORA] = 16384 x 512 fp8 = 8.4 MB, read identically
+    // on all four ranks every layer because attention is data-parallel at
+    // batch 1 -- 638 MB per rank per token at 76 MoE layers.
+    //
+    // The shard is output-wise, the same trade o_proj and q_b/W_UK already
+    // take: rank p owns v rows [p * OPROJ_REDUCTION_SIZE/EP, +that). Those
+    // rows are disjoint, so the row is completed by an all-gather, not a
+    // reduction. Rows map onto heads exactly -- row n belongs to head
+    // n / V_HEAD_DIM -- so a shard that divides the head count keeps every
+    // workgroup's rows inside one head and the activation slice contiguous,
+    // which is the same static_assert the unsharded form already passes.
+    //
+    // Detected, not plumbed, like the other two: demo.py slices the weight,
+    // wuv_tiles_per_xcd falls out of its dim 0, and "my tiles cover a 1/EP-th
+    // of the row" is the whole condition. The demo drops GLM_WUV_GEMV_ROWS
+    // 128 -> 32 alongside the slice so tiles_per_xcd stays at 16 -- one round
+    // against 30 workers, unchanged -- while the per-tile work falls 4x. If
+    // it did not, the shard would buy bytes and lose a round.
+    constexpr int WUV_TP_ROWS =
+        (EP_WORLD_SIZE > 1) ? (OPROJ_REDUCTION_SIZE / EP_WORLD_SIZE) : 0;
+    bool const wuv_tp =
+        (EP_WORLD_SIZE > 1) && (ep_signal_ptr != nullptr) &&
+        (WUV_TP_ROWS % WUV_ROWS_PER_WG == 0) &&
+        (wuv_tiles_per_xcd * WUV_ROWS_PER_WG * 8 == WUV_TP_ROWS);
     // `wuv_weight_ptr` is this XCD's dim-0 slice of the packed weight, the
     // same partitioning o_proj's input [15] gets, so the GEMV is handed the
     // *local* tile index against wuv_tiles_per_xcd n_tiles. Only the head
     // lookup and the output column need the global index -- and the column is
-    // biased into the pointer, exactly like Phase 1's xcd_out.
-    unsigned short *xcd_v_out =
-        static_cast<unsigned short *>(v_out_ptr) +
+    // biased into the pointer, exactly like Phase 1's xcd_out. Under the shard
+    // that global index simply starts a rank-slice further in; both the head
+    // lookup and the output pointer read it off the one row base below, so
+    // the unsharded form is the wuv_tp == false case of the same expression.
+    size_t const wuv_row_base =
+        (wuv_tp ? (size_t)EP_MY_PE * WUV_TP_ROWS : (size_t)0) +
         static_cast<size_t>(xcd_id) * wuv_tiles_per_xcd * WUV_ROWS_PER_WG;
+    unsigned short *xcd_v_out =
+        static_cast<unsigned short *>(v_out_ptr) + wuv_row_base;
+    // Peer deltas for the per-tile push. Resolved here rather than shared
+    // with o_proj's copy at Phase 1: that block is downstream of this one and
+    // the call is a load from a device global, not a handshake.
+    constexpr int WUV_NPEER = (EP_WORLD_SIZE > 1) ? (EP_WORLD_SIZE - 1) : 1;
+    int64_t wuv_peer_delta[WUV_NPEER];
+    bool wuv_all_mapped = wuv_tp;
+    if (wuv_tp) {
+#pragma unroll
+      for (int q = 0; q < WUV_NPEER; q++) {
+        wuv_peer_delta[q] = 0;
+        if (!mpk_shmem_peer_delta((q < EP_MY_PE) ? q : (q + 1),
+                                  &wuv_peer_delta[q])) {
+          wuv_all_mapped = false;
+        }
+      }
+    }
+    // MPK_WUV_SKIP_PEER_WAIT keeps the shard and deletes only the all-gather.
+    // WRONG OUTPUT by construction -- see persistent_kernel.py for why it
+    // exists.
+#ifdef MPK_WUV_SKIP_PEER_WAIT
+    (void)wuv_all_mapped;
+    bool const wuv_push = false;
+#else
+    bool const wuv_push = wuv_tp && wuv_all_mapped;
+#endif
+    // MPK_WUV_ABL=2 splits the collective in half: keep the leader's
+    // rendezvous (signal + poll all peers) and delete only the per-tile data
+    // stores into the peers' copies of mla_v_out. If the arm still hangs the
+    // handshake is at fault; if it runs, the data stores are landing somewhere
+    // they should not -- which is what a non-symmetric v_out_ptr would do,
+    // since the IPC backend hands back ONE heap delta per PE and applies it
+    // blindly to whatever address you give it.
+#ifndef MPK_WUV_ABL
+#define MPK_WUV_ABL 0
+#endif
+    bool const wuv_data_push = wuv_push && (MPK_WUV_ABL != 2);
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     // [3][7] below is "W_UV + its GPU-wide barrier". Slot 0's spare entry [7]
     // is the GEMV loop alone and [2][7] the barrier, so the two can be told
@@ -462,10 +543,15 @@ __device__ __attribute__((always_inline)) void
     int _wuv_tiles = 0;
 #endif
     for (int t = xcd_rank; t < wuv_tiles_per_xcd; t += tiles_per_xcd) {
-      int const g = xcd_id * wuv_tiles_per_xcd + t;
+      // Global v row this tile starts at, which is what selects the head.
+      // Unsharded this is (xcd_id * wuv_tiles_per_xcd + t) * WUV_ROWS_PER_WG,
+      // i.e. g / TILES_PER_HEAD after the divide -- the same value the
+      // pre-shard form computed.
+      size_t const wuv_row_g =
+          wuv_row_base + (size_t)t * WUV_ROWS_PER_WG;
       unsigned short const *head_in =
           static_cast<unsigned short const *>(oproj_input_ptr) +
-          static_cast<size_t>(g / TILES_PER_HEAD) * WUV_REDUCTION;
+          (wuv_row_g / WUV_V_HEAD_DIM) * WUV_REDUCTION;
       if constexpr (WUV_USE_MFMA) {
         // FP8 activation. The GEMV expands the weight to bf16 a pair at a time
         // (v_cvt_scalef32_pk_bf16_fp8) and accumulates with v_dot2c_f32_bf16,
@@ -525,6 +611,50 @@ __device__ __attribute__((always_inline)) void
                                                        /*wgm=*/0,
                                                        t);
       }
+      // ── the all-gather's payload, pushed per tile ─────────────────────
+      // Same shape and the same reasoning as Phase 1's o_proj push: the
+      // workgroup that produced the bytes sends them, so all eight XCDs load
+      // the links while tiles are still finishing and the elected leader is
+      // left with only the signal and the wait. WUV_ROWS_PER_WG/2 dwords x
+      // EP_NPEER per worker per layer -- 16 x 3 at the sharded width.
+      //
+      // The read-back bypasses vL1 (ld_nt_s32 is the sc0 sc1 load, and it
+      // carries its own vmcnt drain): the GEMV epilogue above is
+      // WRITE_THROUGH, so the bytes are in memory but this CU's L1 may hold
+      // an older copy of the line.
+      if (wuv_data_push) {
+        static_assert((WUV_ROWS_PER_WG % 2) == 0,
+                      "peer stores are packed 32-bit, so a tile must be an "
+                      "even number of bf16");
+        constexpr int WUV_TILE_W32 = WUV_ROWS_PER_WG / 2;
+        constexpr int WUV_ROW_W32 = OPROJ_REDUCTION_SIZE / 2;
+        __syncthreads();
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        unsigned int *const src32 = reinterpret_cast<unsigned int *>(
+            xcd_v_out + (size_t)t * WUV_ROWS_PER_WG);
+        int const wuv_push_rows =
+            (BATCH_SIZE == 1)
+                ? 1
+                : (num_active_tokens < BATCH_SIZE ? num_active_tokens
+                                                  : BATCH_SIZE);
+#pragma unroll
+        for (int m = 0; m < BATCH_SIZE; m++) {
+          if (BATCH_SIZE > 1 && m >= wuv_push_rows) {
+            break;
+          }
+          unsigned int *const row32 = src32 + (size_t)m * WUV_ROW_W32;
+          for (int w = tid; w < WUV_TILE_W32; w += (int)MPK_NT) {
+            unsigned int const v =
+                (unsigned int)ld_nt_s32(reinterpret_cast<int *>(row32 + w));
+#pragma unroll
+            for (int q = 0; q < WUV_NPEER; q++) {
+              st_wt_u32((void *)(reinterpret_cast<char *>(row32 + w) +
+                                 wuv_peer_delta[q]),
+                        v);
+            }
+          }
+        }
+      }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
       ++_wuv_tiles;
 #endif
@@ -552,6 +682,84 @@ __device__ __attribute__((always_inline)) void
       if (hier_barrier_arrive(wuv_barrier, HIER_STRIDE, wuv_arrivals,
                               tiles_per_xcd, xcd_id, wuv_tree,
                               /*skew_slot=*/5)) {
+        // ── the W_UV all-gather's rendezvous rides this barrier ──────────
+        // Under wuv_tp the v row is not complete when the local arrivals are
+        // in; it is complete when every peer's slice has landed too. This
+        // thread is the one the modular test elected, so it has observed all
+        // eight of this rank's XCDs -- exactly the condition for telling the
+        // peers -- and it is already the thread that fans the release out.
+        // One thread per rank polls the remote lines and the other 239
+        // workers keep polling a local flag that is simply published later.
+        // No second barrier and no change to the wait below. This is the same
+        // fold Phase 1's o_proj all-gather uses, on slot 2 of the same line.
+        if (wuv_push) {
+          unsigned long long *const ep_sig =
+              static_cast<unsigned long long *>(ep_signal_ptr);
+          unsigned long long *const my_sig =
+              ep_sig + (size_t)EP_MY_PE * OPROJ_EP_SIGNAL_STRIDE +
+              WUV_EP_SIGNAL_SLOT;
+#pragma unroll
+          for (int q = 0; q < WUV_NPEER; q++) {
+            st_wt_u64((void *)(reinterpret_cast<char *>(my_sig) +
+                               wuv_peer_delta[q]),
+                      (unsigned long long)wuv_expected);
+          }
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          // All peers off one bitmask rather than in rank order, so a slow
+          // link costs its own latency and not the sum.
+          unsigned remaining = (1u << WUV_NPEER) - 1u;
+#if MPK_WUV_ABL == 3
+          // Bounded poll + a one-shot dump of what the leader actually sees.
+          // The arm hangs at iteration 0 with the data push deleted, so the
+          // handshake is at fault and the only thing worth knowing is which
+          // peer never satisfied and what value its slot holds.
+          unsigned long long _spins = 0;
+#endif
+          while (remaining) {
+#pragma unroll
+            for (int q = 0; q < WUV_NPEER; q++) {
+              if (remaining & (1u << q)) {
+                int const p = (q < EP_MY_PE) ? q : (q + 1);
+                if (ld_sys_u64(ep_sig + (size_t)p * OPROJ_EP_SIGNAL_STRIDE +
+                               WUV_EP_SIGNAL_SLOT) >=
+                    (unsigned long long)wuv_expected) {
+                  remaining &= ~(1u << q);
+                }
+              }
+            }
+            if (remaining) {
+              __builtin_amdgcn_s_sleep(1);
+#if MPK_WUV_ABL == 3
+              if (++_spins == 4000000ull) {
+                printf("[WUVDBG] pe=%d xcd=%d exp=%d rem=%x mine=%llu "
+                       "p0=%llu p1=%llu p2=%llu p3=%llu\n",
+                       (int)EP_MY_PE, xcd_id, wuv_expected, remaining,
+                       (unsigned long long)ld_sys_u64(
+                           ep_sig + (size_t)EP_MY_PE * OPROJ_EP_SIGNAL_STRIDE +
+                           WUV_EP_SIGNAL_SLOT),
+                       (unsigned long long)ld_sys_u64(
+                           ep_sig + 0 * OPROJ_EP_SIGNAL_STRIDE +
+                           WUV_EP_SIGNAL_SLOT),
+                       (unsigned long long)ld_sys_u64(
+                           ep_sig + 1 * OPROJ_EP_SIGNAL_STRIDE +
+                           WUV_EP_SIGNAL_SLOT),
+                       (unsigned long long)ld_sys_u64(
+                           ep_sig + 2 * OPROJ_EP_SIGNAL_STRIDE +
+                           WUV_EP_SIGNAL_SLOT),
+                       (unsigned long long)ld_sys_u64(
+                           ep_sig + 3 * OPROJ_EP_SIGNAL_STRIDE +
+                           WUV_EP_SIGNAL_SLOT));
+                break;
+              }
+#endif
+            }
+          }
+          // The peer slices arrived as sc0 sc1 stores, so they are in memory.
+          // Drop vL1 here anyway: o_proj re-reads the whole v row and its own
+          // buffer_inv is downstream of a flag this thread has not written
+          // yet, which is the wrong order to rely on.
+          asm volatile("buffer_inv" ::: "memory");
+        }
         for (int x = 0; x < 8; x++) {
           st_flag_u32((void *)&wuv_barrier[x * HIER_STRIDE],
                     (unsigned)wuv_expected);
@@ -566,8 +774,21 @@ __device__ __attribute__((always_inline)) void
         ++_spins;
         MPK_WS_WAIT_TICK(_obs, _spins);
         if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
-          if (hier_barrier_should_heal(wuv_barrier, HIER_STRIDE, wuv_expected,
-                                       xcd_id, wuv_arrivals, wuv_tree)) {
+          // Under wuv_tp the arrival-counter arm of the self-heal is UNSOUND:
+          // it fires on this rank's own arrivals, which say nothing about
+          // whether the peers' v slices have landed, and releasing on it
+          // would let o_proj read a stale slice. That is bug #46 exactly.
+          // Peer-heal is still sound and is kept: it republishes only from a
+          // flag some other XCD already holds, and all eight are written by
+          // the leader above -- after the peer wait.
+          bool const heal =
+              wuv_tp
+                  ? (hier_barrier_peer_released(wuv_barrier, HIER_STRIDE,
+                                                wuv_expected, xcd_id) != 0)
+                  : hier_barrier_should_heal(wuv_barrier, HIER_STRIDE,
+                                             wuv_expected, xcd_id,
+                                             wuv_arrivals, wuv_tree);
+          if (heal) {
             st_flag_u32((void *)my_flag, (unsigned)wuv_expected);
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
           }
@@ -1421,6 +1642,22 @@ __device__ __attribute__((always_inline)) void
     }
   }
 #endif
+
+  // Stage stamp 15: the live-bound block is done and the W13 tile loop has
+  // not started. Splits the board's biggest region (S5->S6, 16.81 us/layer)
+  // into the LIVE_BOUND prologue and the tile loop proper. The reason to
+  // want the split: /tmp/phasebal.py puts the S5->S6 MINIMUM at 5.54 us over
+  // 240 workers, and the 48 workers at that level own no W13 tile at all
+  // (192 working = 24/XCD), so 5.54 us is a per-worker, every-layer,
+  // tile-free base -- 0.42 ms of wall. The only global reads in here are
+  // d_mask_live[MOE_NUM_EXPERTS] and then, DEPENDENT on it,
+  // d_mask_live[i]: two serialised cold cross-XCD round trips through
+  // active_expert_ids_ptr, which the router wrote and which per-XCD L2 does
+  // not snoop on gfx950. Slot 15 is the one unused stage stamp
+  // (MPK_STAGE_SLOTS is 46; the log shows 0-14 and 16-32).
+  if (tid == 0) {
+    mpk_stage_stamp(15);
+  }
 
   // ── ADJACENT-PHASE OVERLAP CEILING PROBE (MPK_ABL_PIPE_W13W2). The long
   // note is at the define in mpk_atoms.cuh. Bounds are computed here because
