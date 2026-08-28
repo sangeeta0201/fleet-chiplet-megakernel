@@ -1071,6 +1071,18 @@ def get_compile_command(
             assert _scb in ("0", "1"), "MPK_MOE_SCBASE is 0 or 1"
             flags = flags + [f"-DMPK_MOE_SCBASE={_scb}"]
 
+        _snt = os.environ.get("MPK_MOE_STREAM_NT")
+        if _snt is not None:
+            # Mark the MoE k-loop weight + E8M0 scale stream non-temporal. It is
+            # ~57 MB/layer/rank with zero reuse at every level, yet it carries no
+            # cache hint at all, while the W2 prefetch three lines away is
+            # already `sc0 sc1 nt`. `nt` is a replacement-policy hint only -- no
+            # coherence change. ISA-gated: nt goes 0->32 (W13) and 8->72 (W2)
+            # with load/s_waitcnt/mfma counts UNCHANGED.
+            # Compile-time, so every rank must agree.
+            assert _snt in ("0", "1"), "MPK_MOE_STREAM_NT is 0 or 1"
+            flags = flags + [f"-DMPK_MOE_STREAM_NT={_snt}"]
+
         _pfd = os.environ.get("MPK_MOE_PF_DBUF")
         if _pfd is not None:
             # Double-buffered form of the same k-loop. The deep loop's
@@ -3236,6 +3248,25 @@ class PersistentKernel:
                       f"  last round {_last}/{_w} busy"
                       f"  ({100.0 * _t / (_r * _w):.0f}% of the rounds it pays)",
                       flush=True)
+            # The two moe_* rows above are STATIC and are ~3x the live count.
+            # They use moe_max_activated = topk + shared = every slot landing on
+            # one rank; at EP=4 the busiest rank actually owns E[max] = 3.0
+            # activated experts, so the live loop bounds -- computed on device
+            # at gang_oproj_router_fused_mi300.cuh:~1414 -- are ~24 W13 and ~18
+            # W2 tiles/XCD, i.e. ONE grid-stride round each on 30 workers with
+            # 6 and 12 workers idle. Three separate levers have now been derived
+            # from the static numbers and all three were nulls (the last was
+            # MPK_W13_PRESTAGE, which hoists a per-tile prologue out of a loop
+            # that runs exactly once). Read the device-side *_live computation,
+            # not this table, before pricing anything in the MoE.
+            if moe_num_experts > 0:
+                _e_live = 3.0  # E[max owned] at EP=4; see the header comment
+                for _nm, _tpe in (("moe_W13*", moe_gate_up_weight.dim(1)),
+                                  ("moe_W2*", moe_down_weight.dim(1))):
+                    _lt = _e_live * batch_size * _tpe / 8.0
+                    print(f"[GEOM]   {_nm:<11} LIVE ~{_lt:.0f} tiles/XCD"
+                          f"  ({-(-int(_lt) // _w)} round(s)) -- the row above "
+                          f"is the static worst case", flush=True)
 
         # 80 cache-line-strided int32 slots, or 96 under EP. See the kernel
         # header for the map; every barrier is monotonic, so nothing is reset

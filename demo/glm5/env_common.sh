@@ -139,6 +139,7 @@ MPK_FORWARD_VARS=(
   # inlines below the loader lambdas. Compile-time.
   MPK_MOE_WGPTR
   MPK_MOE_SCBASE
+  MPK_MOE_STREAM_NT
   # Double-buffered form of that same k-loop: swap two register buffers instead
   # of copying one into the other at the backedge, which is what forces the two
   # s_waitcnt vmcnt(0) per trip in the shipped ISA. Compile-time.

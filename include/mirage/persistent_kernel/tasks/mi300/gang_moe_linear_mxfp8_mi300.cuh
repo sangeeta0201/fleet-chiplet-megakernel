@@ -280,6 +280,77 @@ __device__ __forceinline__ i32x8_t
 // The weight pointer as a TYPE, not as a cast at the point of use.
 using _gang_gp8 = __attribute__((address_space(1))) uint8_t const *;
 
+// ── MPK_MOE_STREAM_NT ────────────────────────────────────────────────────────
+// `nt` on the MoE k-loop's weight and E8M0-scale loads. A REPLACEMENT-POLICY
+// hint only: no scope bit changes, so coherence is untouched and this cannot
+// affect correctness.
+//
+// Found by the task #97 ISA census of the shipping image. Every `nt` in the
+// megakernel lives in exactly two places, and the k-loop is not one of them:
+//
+//   function                              loads          cache bits
+//   gang_moe_w13_linear_mxfp8_kernel      16 dwordx4     (none)
+//                                         16 ubyte       (none)
+//   gang_moe_w2_linear_mxfp8_kernel       32 dwordx4     (none)
+//                                         32 ubyte       (none)
+//   gang_moe_w2_linear_mxfp8_kernel        8 dwordx4     sc0 sc1 nt   <- #52's
+//                                                                     prefetch
+//   gang_rmsnorm_linear_bias_topk_kernel  34             sc0 nt
+//
+// So W2's prefetch-across-barrier loads are already marked non-temporal and
+// the k-loop three lines away from them is not. That asymmetry is an accident,
+// not a decision -- nothing in either header argues for it.
+//
+// The stream has ZERO reuse, at every level:
+//   * within a tile, each k-group's bytes are consumed once and dropped;
+//   * across tiles on one XCD, each tile owns distinct N columns of the same
+//     expert, so no two tiles read the same weight byte;
+//   * across XCDs, global_tile = t * 8 + xcd_id spreads an expert's tiles over
+//     all eight, and they are still distinct N -- no cross-XCD reuse either;
+//   * across tokens, it is ~57 MB/layer/rank x 75 layers = 4.3 GB against a
+//     256 MB MALL, so nothing survives to the next token.
+//
+// Yet it is the single largest consumer of cache capacity in the layer, and it
+// is the only resident big enough to explain the recorded null
+// glm-decode-hole-prefetch-is-evicted-not-absorbed -- "the decode hole is FREE
+// but the prefetch is EVICTED". The lines that get evicted are precisely the
+// ones tasks #98 (qkv_a L+1), #116 (o_proj) and #137 (speculative expert) put
+// there, which is why all three measured neutral despite landing in free holes.
+//
+// This is the INVERSE of the MPK_BAR_POLL_NT finding. There, `nt` on the most
+// read-shared line in the kernel was backwards and dropping it bought
+// -0.206 ms. Here, the absence of `nt` on a never-re-read stream is backwards
+// for the same reason, read the other way round.
+//
+// GATE: glm-moe-addrspace1-is-a-negative says the metric for this loop is
+// s_waitcnt COUNT, not instruction form -- MPK_MOE_WGLOBAL cost +0.87 ms by
+// perturbing the schedule, not the addressing. `__builtin_nontemporal_load`
+// should set one bit on the same instruction at the same point in the
+// schedule; verify nt count UP and waitcnt count UNCHANGED in the ISA before
+// spending a GPU run.
+//
+// GATE RESULT -- PASSED, exactly. Per-function, arm 0 vs arm 1:
+//   W13  loads 54 -> 54   nt  0 -> 32   s_waitcnt 70  -> 70   mfma 16 -> 16
+//   W2   loads 100 -> 100 nt  8 -> 72   s_waitcnt 126 -> 126  mfma 32 -> 32
+// Only cache bits move. Instruction count, schedule and MFMA placement are
+// bit-identical, so this is not the MPK_MOE_WGLOBAL bet in disguise.
+//
+// WALL, NP=4 / bs=1 / devices 4-7, both arm orders, baseline as its own
+// control in each batch (one 48 ms wedged run dropped from B/arm1):
+//
+//   batch          arm 1 (nt)        arm 0 (control)   delta
+//   A  nt first    9.055  (n=5)      9.107  (n=5)      -0.052
+//   B  ctl first   9.027  (n=4)      9.098  (n=5)      -0.071
+//   pooled         9.042  (n=9)      9.103  (n=10)     -0.061
+//
+// Per-iter min tracks it: 8.918 vs 8.960, -0.043. One overlapping pair out of
+// 90, so the separation is clean at this n even though -0.061 sits under the
+// 0.26 ms single-run noise floor. Reproduces under order reversal, and it is
+// free -- no extra instruction, no register, no schedule change. Default ON.
+#ifndef MPK_MOE_STREAM_NT
+#define MPK_MOE_STREAM_NT 1
+#endif
+
 // Pointer-typed twin of _gang_load_w_mfma_a_at_g.  Byte-for-byte the same
 // addressing -- FP4 takes one 16-byte chunk at `+g*16`, FP8 takes that plus a
 // second at `+g*16+64` -- but the base arrives already in addrspace(1), so the
@@ -290,14 +361,22 @@ __device__ __forceinline__ i32x8_t
     _gang_load_w_mfma_a_at_gp(_gang_gp8 base, int byte_off, int g) {
   using gv4 = __attribute__((address_space(1))) i32x4_t const *;
   _gang_gp8 const p = base + byte_off + g * 16;
+#if MPK_MOE_STREAM_NT
+  i32x4_t lo = __builtin_nontemporal_load((gv4)p);
+#else
   i32x4_t lo = *(gv4)p;
+#endif
   i32x8_t r = {};
   r[0] = lo[0];
   r[1] = lo[1];
   r[2] = lo[2];
   r[3] = lo[3];
   if constexpr (!FP4) {
+#if MPK_MOE_STREAM_NT
+    i32x4_t hi = __builtin_nontemporal_load((gv4)(p + 64));
+#else
     i32x4_t hi = *(gv4)(p + 64);
+#endif
     r[4] = hi[0];
     r[5] = hi[1];
     r[6] = hi[2];
@@ -590,7 +669,11 @@ __device__ __forceinline__ f32x4_t
   auto load_ws = [&](int kk) -> int {
     int const off = row_scale_base + kk * SC_KS + g;
     if constexpr (MPK_MOE_WGLOBAL && MPK_MOE_WGPTR) {
+#if MPK_MOE_STREAM_NT
+      return (int)__builtin_nontemporal_load(wsc_g + off);
+#else
       return (int)wsc_g[off];
+#endif
     } else if constexpr (MPK_MOE_WGLOBAL) {
       return (int)_gang_ld_g<uint8_t>(wg_scales + off);
     } else {
@@ -627,7 +710,11 @@ __device__ __forceinline__ f32x4_t
       _gang_gp8 const p = wsc_g + (row_scale_base + kbase * SC_KS + g);
 #pragma unroll
       for (int j = 0; j < GROUPS; j++) {
+#if MPK_MOE_STREAM_NT
+        out[j] = (int)__builtin_nontemporal_load(p + j * SC_KS);
+#else
         out[j] = (int)p[j * SC_KS];
+#endif
       }
     } else if constexpr (MPK_MOE_SCBASE) {
       uint8_t const *p = wg_scales + (row_scale_base + kbase * SC_KS + g);
@@ -854,7 +941,11 @@ __device__ __forceinline__ f32x4_t
       _gang_gp8 const p = wsc_g + (row_scale_base + kbase * SC_KS + g);
 #pragma unroll
       for (int j = 0; j < GROUPS; j++) {
+#if MPK_MOE_STREAM_NT
+        dsc[j] = (int)__builtin_nontemporal_load(p + j * SC_KS);
+#else
         dsc[j] = (int)p[j * SC_KS];
+#endif
       }
     } else if constexpr (MPK_MOE_SCBASE) {
       uint8_t const *p = wg_scales + (row_scale_base + kbase * SC_KS + g);
