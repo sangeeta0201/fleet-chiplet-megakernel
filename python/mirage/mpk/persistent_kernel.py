@@ -1126,6 +1126,94 @@ def get_compile_command(
                 "MPK_MOE_PF_GROUPS is 0, 2, 4, 8 or 16"
             flags = flags + [f"-DMPK_MOE_PF_GROUPS={_pf}"]
 
+        # Per-kernel prefetch depth. The C++ has carried
+        # MPK_MOE_PF_GROUPS_W13 / _W2 since the two kernels were shown to want
+        # opposite depths, but neither was ever reachable from a run: the only
+        # env knob was the unified one above, whose membership assert excludes
+        # every odd divisor, so W13's 3 / 6 / 12 / 24 could not be selected at
+        # all. That is task #134's blocker, not a preference.
+        #
+        # Why re-taking this sweep is worth a build. The recorded numbers say
+        # W13 depth 6 is -0.167 ms and depth 8 -0.256 ms, reproducible to
+        # 0.001 ms across separate batches -- and they are all RETRACTED,
+        # because depth 8 answered "The capital of France is" with 135 of 136
+        # tokens of one bigram. Root cause was found (task #133) and FIXED:
+        # batching the token-scale loads made s_tok_scales[k] provably
+        # wave-uniform, LLVM scalarised it, and v_mfma_scale_* silently
+        # computes garbage from an SGPR scale. The fix is MPK_MFMA_VSCALE,
+        # default 1, an asm launder costing zero instructions. So the axis is
+        # real, worth ~0.25 ms, and every number on it was measured on a build
+        # that no longer exists.
+        #
+        # tests/standalone/test_moe_kloop_width.hip is the oracle and it now
+        # reports MATCH -- bit-identical accumulators, not merely close -- at
+        # ship / deep 4,6,8,12,16 / dbuf 4,6,8. Bit-exactness is the right
+        # gate: the MFMA chain is `acc = mfma(A[j], B[j], acc)` in ascending j
+        # at every width, so a correct deep loop cannot differ.
+        #
+        # THAT ORACLE IS NECESSARY AND NOT SUFFICIENT. It calls the k-loop on
+        # its own buffers; the scalarisation it is standing in for is a
+        # whole-function property of how the megakernel's caller feeds
+        # s_tok_scales. A width set here needs an IN-SITU gate too, per
+        # [[glm-wrong-output-probes-upstream-of-router-are-invalid]] -- the MoE
+        # is downstream of its own router but UPSTREAM of the next layer's, so
+        # a wrong W13 rewrites every later layer's expert set and the resulting
+        # wall number is not a timing of this model.
+        #
+        # USE THE CHECKSUM, NOT GENERATED TEXT. Text cannot settle a width at
+        # any affordable sample count: correctness_gate.py's own header
+        # measures ~50% token disagreement between two runs of the SAME build,
+        # because the EP fold and the atomic accumulations retire in arrival
+        # order and one flipped argmax cascades. Depth 6 spent seven samples
+        # producing an unresolvable 3/7-vs-0/4 before this was believed.
+        #
+        # What settles it, in ONE run per arm:
+        #
+        #   MPK_BS_DEBUG=2 MPK_BSDBG_LAYER0=0 MAX_NEW_TOKENS=4
+        #
+        # dumps a double-precision sum, absmax and first two elements of every
+        # stage buffer on all four ranks for the first two fused layers, and
+        # the deterministic prefix of a decode is long enough for it. Compare
+        # arm against control record by record; they must be IDENTICAL, and for
+        # depth 6 all 68 were. Stage 5 is W13's input and stage 6 its output,
+        # so an identical 5 with a differing 6 localises the fault to this
+        # k-loop, and an identical layer-1 stage 0 proves the whole MoE half
+        # matched, W2's atomic fold included. Confirm from each run's own log
+        # that the builds really differed -- grep the hipcc line for the -D.
+        #
+        # Both must divide their kernel's trip count or _gang_moe_pf_groups
+        # falls back to the shipping loop and the arm silently measures the
+        # control. At GLM-5 those are 48 for W13 (6144/128) and 16 for W2
+        # (2048/128 at K_SPLITS=1).
+        for _var, _trip in (("MPK_MOE_PF_GROUPS_W13", 48),
+                            ("MPK_MOE_PF_GROUPS_W2", 16)):
+            _v = os.environ.get(_var)
+            if _v is None:
+                continue
+            # Compile-time, so every rank must agree.
+            assert _v.isdigit() and (int(_v) == 0 or 2 <= int(_v) <= 24), \
+                f"{_var} is 0 (ship loop) or 2..24"
+            assert int(_v) == 0 or _trip % int(_v) == 0, \
+                (f"{_var}={_v} does not divide the GLM-5 trip count {_trip}; "
+                 "_gang_moe_pf_groups would fall back to the shipping loop "
+                 "and the arm would measure the control")
+            # NBLK degeneracy. The deep loop peels its last block, so the
+            # pipelined body runs NBLK-1 = trip/depth - 1 times. At depth 8 on
+            # W2 that is ONE trip, LLVM peels it, and the software pipeline
+            # stops existing: measured on the image, the W2 kernel goes from
+            # two 4-MFMA loops to ZERO MFMA loops with all 32 MFMAs inlined
+            # straight-line and AGPR shuffles 16 -> 64. The wall says +0.238 ms
+            # against its own control (9.327 n=3 vs 9.089), with worker_kernel
+            # unchanged at 284 VGPR / 36 AGPR / 0 spills -- so this is the loop
+            # structure collapsing, NOT the register cliff the older W2 note
+            # blamed. Require at least two pipelined trips.
+            assert int(_v) == 0 or _trip // int(_v) - 1 >= 2, \
+                (f"{_var}={_v} leaves {_trip // int(_v) - 1} pipelined trip(s) "
+                 f"of the deep loop (trip count {_trip}, last block is "
+                 "peeled); LLVM peels a 1-trip loop and the k-loop degenerates "
+                 "to straight-line code with no software pipeline at all")
+            flags = flags + [f"-D{_var}={_v}"]
+
         _wg = os.environ.get("MPK_MOE_WGLOBAL")
         if _wg is not None:
             # Address the MoE weight and its E8M0 scales through addrspace(1)
@@ -1173,6 +1261,24 @@ def get_compile_command(
             # Compile-time, so every rank must agree.
             assert _snt in ("0", "1"), "MPK_MOE_STREAM_NT is 0 or 1"
             flags = flags + [f"-DMPK_MOE_STREAM_NT={_snt}"]
+
+        _bsc = os.environ.get("MPK_MOE_BSCHED")
+        if _bsc is not None:
+            # Pin the GROUPS-wide batch of B-operand ds_reads above the MFMA
+            # group in the MoE k-loop. The vmem side of that loop is already
+            # healthy (8 loads carried, zero vmcnt(0)); what is exposed is LDS,
+            # because the allocator recycles v[12:19] across three MFMAs and
+            # pays two `s_waitcnt lgkmcnt(0)` per trip for the WAR. The sibling
+            # dense kernel fixes the identical defect with the identical
+            # intrinsic and it is the only sched_barrier in tasks/mi300. Emits
+            # no instruction, so the only risk is allocation -- ISA-gate
+            # lgkmcnt(0) DOWN, mfma UNCHANGED, vgpr NOT UP, and run
+            # tests/standalone/test_mxfp8_moe.hip, which is what catches the
+            # recorded silent miscompile class. Long note at the define in
+            # gang_moe_linear_mxfp8_mi300.cuh.
+            # Compile-time, so every rank must agree.
+            assert _bsc in ("0", "1", "2"), "MPK_MOE_BSCHED is 0, 1 or 2"
+            flags = flags + [f"-DMPK_MOE_BSCHED={_bsc}"]
 
         _ant = os.environ.get("MPK_ATTN_STREAM_NT")
         if _ant is not None:

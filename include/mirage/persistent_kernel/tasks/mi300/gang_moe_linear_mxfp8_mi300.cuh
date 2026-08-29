@@ -601,6 +601,134 @@ __device__ __forceinline__ f32x4_t _gang_mfma_w_x_f8(
 #endif
 
 
+// ── MPK_MOE_BSCHED ─────────────────────────────────────────────────────────
+// Stop LLVM sinking the B-operand LDS reads below the MFMAs that consume them.
+//
+// THE DEFECT, read off the shipping gfx950 image (demo/glm5/isa_outstanding.py
+// plus the raw body). The W13 trip at [0x4896c..0x48ac4] and both W2 trips at
+// [0x49554..0x496a8] / [0x499b8..0x49b14] are HEALTHY ON THE VMEM SIDE -- 8
+// loads carried across the backedge, peak 8, and ZERO `s_waitcnt vmcnt(0)` in
+// W13. Every earlier attempt on this loop (MPK_MOE_PF_DBUF, MPK_MOE_PF_GROUPS,
+// MPK_MOE_WGLOBAL) was aimed at that side, and it is now closed: the HBM
+// pipeline is on the flat part of the loads-in-flight curve that
+// tests/standalone/test_waves_per_simd_payoff.hip measured (4 -> 5334 GB/s,
+// 8 -> 5446).
+//
+// What is left exposed is the LDS side. `consume` below issues all GROUPS B
+// tiles before the first MFMA in SOURCE order, but the emitted W13 trip splits
+// them 3 / 3 / 2 and RECYCLES v[12:19] as the B operand of MFMA 0, MFMA 2 and
+// MFMA 3, so the trip carries TWO full `s_waitcnt lgkmcnt(0)`:
+//
+//   ds_read_b128 v[12:15] / v[16:19] / v[20:23]   <- MFMA 0's B, MFMA 1's lo
+//   ds_read_u8   x4                               <- the four token scales
+//   s_waitcnt lgkmcnt(3) ; lgkmcnt(2)
+//   v_mfma ... v[12:19]
+//   ds_read_b128 v[24:27] / v[12:15] / v[16:19]   <- v[12:19] REUSED
+//   s_waitcnt lgkmcnt(4) ; lgkmcnt(2)
+//   v_mfma ... v[20:27]
+//   s_waitcnt lgkmcnt(0)                          <- FULL LDS DRAIN
+//   v_mfma ... v[12:19]
+//   ds_read_b128 v[12:15] / v[16:19]              <- REUSED AGAIN
+//   s_waitcnt lgkmcnt(0)                          <- FULL LDS DRAIN
+//   v_mfma ... v[12:19]
+//
+// GROUPS live i32x8_t of B is 32 VGPRs, and the allocator will not hold them,
+// so it recycles and pays a drain for the WAR.
+//
+// THE CAUSE IS ALREADY DOCUMENTED ON THIS BRANCH, for the sibling dense kernel
+// at gang_rmsnorm_linear_mxfp8_bias_mi300.cuh:2421: "the machine scheduler
+// sinks all but two tiles back below the first MFMA -- its register-pressure
+// heuristic targets an occupancy this kernel does not have (the megakernel runs
+// one wave per SIMD) and it happily trades 16 loads in flight for a smaller
+// live set." That kernel pins its batch with __builtin_amdgcn_sched_barrier(0)
+// and keeps it. The MoE twin never got the same line: it is the ONLY
+// sched_barrier in tasks/mi300, and this loop is the other caller of the same
+// _gang_load_fp8_mfma_b batch idiom.
+//
+// 1  sched_barrier(0) between the B batch and the MFMA batch, which is the
+//    dense kernel's exact form. Emits NO instruction -- it is a scheduling
+//    fence, not code -- so the only thing it can cost is allocation.
+//
+//    MEASURED ON THE IMAGE AND REJECTED, standalone gfx950 build of
+//    tests/standalone/test_mxfp8_moe.hip, W13 trip:
+//
+//                      insns  mfma  loads  ds  carry  lgkm(0)  vm(0)
+//      BSCHED=0           72     4     12  12     12        2      1
+//      BSCHED=1          105     4     12  12      8        1      1
+//
+//    It does exactly what it claims -- all eight ds_read_b128 land above the
+//    first MFMA and one of the two LDS drains is gone -- and it is still a
+//    loss, for the third time on this loop and by the same mechanism. The
+//    +33 instructions are 19 `v_accvgpr_read_b32` and 5
+//    `v_accvgpr_write_b32`: holding GROUPS B tiles live pushes the batch into
+//    a[8:43], the weight loads follow it into a[0:7], and every one of them
+//    then has to be copied back out because srcA is wanted in a VGPR. Two
+//    dozen register moves to retire one drain, and HBM loads in flight fall
+//    12 -> 8 on top. This is MPK_MOE_PF_DBUF's bill again, paid in AGPR
+//    shuffles instead of VGPR count -- so it is refuted against the image and
+//    NOT measured on the wall, exactly as MPK_DENSE_SCBASE was (`8e949cd`).
+//
+// 2  sched_group_barrier interleave. Same goal, register-light by
+//    construction: place the ds_reads for B tile j+1 above the MFMA for tile
+//    j so only ~2 tiles are live, which lets the wait name a PARTIAL lgkmcnt
+//    instead of draining, without asking the allocator for 32 more registers.
+//    VMEM is deliberately named in no group, so the healthy weight pipeline
+//    (carry 8-12, zero vmcnt(0) in W13) is left for the scheduler to place as
+//    it does today.
+//
+//    MEASURED ON THE IMAGE AND ALSO REJECTED, same build, same three loops:
+//
+//                      insns  carry  lgkm(0)  accvgpr
+//      BSCHED=0    W13     72     12        2        0
+//      BSCHED=2    W13     66     12        2        0
+//      BSCHED=0    W2a     92     12        2        7
+//      BSCHED=2    W2a     85     12        2        5
+//      BSCHED=0    W2b     88     12        2        7
+//      BSCHED=2    W2b     84     12        3        5
+//
+//    It is register-neutral as designed -- carry holds at 12, no AGPR shuffle
+//    appears, and the body is 4-7 instructions SHORTER -- and it does not do
+//    the one thing it was built for: the LDS drain count is unmoved at 2, and
+//    W2's second loop gets a THIRD. Interleaving the reads does not help
+//    because the wait LLVM emits is not placed by read order; the operand of
+//    MFMA j is in a register the allocator is reusing, so the drain is a WAR
+//    on the register, not a shortage of issue distance.
+//
+// SO THE DRAINS ARE NOT ADDRESSABLE FROM SOURCE AT GROUPS=4, in either
+// direction. Pinning the batch buys the drain and pays 24 register moves;
+// interleaving it is free and buys nothing. Both are off by default and this
+// header is the record, so the next reader does not spend a third build on
+// the LDS side of this loop. What the census DID establish is worth keeping
+// separately: the vmem side is finished. carry 8-12 with zero-to-one vmcnt(0)
+// per trip is the flat part of the loads-in-flight curve, so
+// MPK_MOE_PF_GROUPS-style depth changes can no longer be justified as
+// "more loads in flight" -- if that axis pays now it pays for another reason.
+//
+// The two masks this file needs, from the AMDGPU backend's
+// SchedGroupMask: DS read is 0x100, MFMA/WMMA is 0x8. An instruction matching
+// no named group is left to the scheduler, which is why VMEM is absent below.
+#define MPK_MOE_SGB_DSREAD 0x100
+#define MPK_MOE_SGB_MFMA 0x008
+//
+// GATE, and it is mandatory before any GPU run, per
+// [[glm-moe-addrspace1-is-a-negative]]: the metric for this loop is s_waitcnt
+// COUNT, not instruction form. Require, per kernel, lgkmcnt(0) per trip DOWN,
+// v_mfma count UNCHANGED, and worker_kernel .vgpr_count NOT UP. A variant that
+// raises the unified VGPR count is MPK_MOE_PF_DBUF in disguise -- that one
+// bought a better schedule for +26 to +31 registers binary-wide and was
+// measured a loss twice -- and must be dropped on the image, without spending
+// a wall run.
+//
+// SECOND GATE, numerics, because this loop has a recorded SILENT miscompile:
+// task #115 found the double-buffered form bit-exact at 4 live i32x8_t and
+// 330x wrong at 8 (2.161e-04 vs 6.577e-07 max abs error) with no fault and no
+// warning. Pinning the batch does not change the MFMA order -- `acc` is still
+// accumulated in ascending j -- so a correct build is bit-identical to the
+// shipping one, and tests/standalone/test_mxfp8_moe.hip is what says so.
+#ifndef MPK_MOE_BSCHED
+#define MPK_MOE_BSCHED 0
+#endif
+
 // The k-loop, with the prefetch distance as a parameter. Accumulates
 // [0, KI_END) and returns the MFMA accumulator; the caller owns the epilogue.
 //
@@ -746,10 +874,32 @@ __device__ __forceinline__ f32x4_t
         B[j] = _gang_load_fp8_mfma_b(s_tok_fp8, (base + j) * K_PER_MFMA, g);
         BS[j] = tok_sc_at(base + j);
       }
+#if MPK_MOE_BSCHED == 1
+      // Keep the whole batch on this side of the MFMAs; see MPK_MOE_BSCHED.
+      __builtin_amdgcn_sched_barrier(0);
+#endif
 #pragma unroll
       for (int j = 0; j < GROUPS; j++) {
         acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(Ap[j], B[j], acc, Sp[j], BS[j]);
       }
+#if MPK_MOE_BSCHED == 2
+      // One B tile is two ds_read_b128 plus, amortised over the batch, one
+      // ds_read_u8 of token scale: 3 DS reads per MFMA, 3 * GROUPS in the
+      // trip. Lead by one tile, then step one tile per MFMA, so tile j+1 is
+      // in flight while tile j's MFMA runs. See MPK_MOE_BSCHED.
+      // 6 + 3*(GROUPS-2) == 3*GROUPS, so the groups name every DS read in the
+      // trip exactly once and no more; over-naming would leave the scheduler
+      // an empty group to fill and it silently drops the whole pipeline.
+      static_assert(GROUPS >= 3,
+                    "the leading two-tile DS group needs GROUPS >= 3");
+      __builtin_amdgcn_sched_group_barrier(MPK_MOE_SGB_DSREAD, 6, 0);
+#pragma unroll
+      for (int j = 0; j < GROUPS - 2; j++) {
+        __builtin_amdgcn_sched_group_barrier(MPK_MOE_SGB_MFMA, 1, 0);
+        __builtin_amdgcn_sched_group_barrier(MPK_MOE_SGB_DSREAD, 3, 0);
+      }
+      __builtin_amdgcn_sched_group_barrier(MPK_MOE_SGB_MFMA, 2, 0);
+#endif
     } else {
 #pragma unroll
       for (int j = 0; j < GROUPS; j++) {
@@ -1161,9 +1311,19 @@ __device__ __forceinline__ f32x4_t
 // and its s_waitcnt partial -- so a shape whose k-loop does not divide has to
 // fall back rather than fail to compile. GLM-5 is 48 (W13) and 16 (W2), both
 // clean at 4; GLM-4.7-Flash's W2 runs 11 iterations and takes the fallback.
+//
+// It must also leave the pipeline INTACT, which is a second condition and was
+// found the expensive way. The deep loop peels its last block, so the
+// pipelined body runs NBLK - 1 = ki/gr - 1 times; at NBLK = 2 that is one
+// trip, LLVM peels it, and the k-loop degenerates to straight-line code with
+// no software pipeline at all. Measured on W2 (ki = 16) at gr = 8: the kernel
+// goes from two 4-MFMA loops to ZERO MFMA loops, 32 MFMAs inlined, AGPR
+// shuffles 16 -> 64, and the wall pays +0.238 ms. Requiring NBLK >= 3 makes a
+// too-wide request fall back to the widest width that still pipelines --
+// W2 at req 8 resolves to 4 -- instead of silently losing the loop.
 __device__ __host__ constexpr int _gang_moe_pf_groups(int ki, int req) {
   for (int gr = (req < ki ? req : ki); gr >= 2; gr--) {
-    if (ki % gr == 0) {
+    if (ki % gr == 0 && ki / gr >= 3) {
       return gr;
     }
   }
@@ -1249,8 +1409,124 @@ __device__ __host__ constexpr int _gang_moe_pf_groups(int ki, int req) {
 // MPK_MOE_PF_GROUPS (it asserts membership in ("0","2","4","8","16") and
 // W13's trip count is 48). Anything set here MUST be gated on generated
 // text, not on the wall.
+//
+// ── TASK #134 RE-TAKEN, 2026-08-28: THE WALL REPRODUCES, THE TEXT DOES NOT ──
+//
+// The knobs were unreachable for a second reason nobody had hit: they were in
+// env_common.sh's forward list but had NO wiring in persistent_kernel.py, so
+// setting one changed nothing at all. That is now fixed, with a divisibility
+// assert -- a width that does not divide the trip count makes
+// _gang_moe_pf_groups fall back to the shipping loop, and the arm would
+// silently measure the control.
+//
+// W13 depth 6 on top of MPK_MFMA_VSCALE=1, NP=4 / bs=1 / devices 4-7:
+//
+//   arm  MPK_MOE_PF_GROUPS_W13=6   8.810 8.873 8.938 8.805  -> 8.857  (n=4)
+//   ctl  shipping depth 4          9.066 9.112             -> 9.089  (n=2)
+//
+// -0.232 ms, NON-OVERLAPPING (arm max 8.938 < ctl min 9.066), and the same
+// sign and order as the retracted -0.167. Two runs were dropped as wedges
+// (64.982 and 60.798 ms, the known cold-start stall, one in each arm).
+//
+// Every mechanical gate PASSES:
+//   * tests/standalone/test_moe_kloop_width.hip reports MATCH -- bit-identical
+//     accumulators -- at ship / deep 4,6,8,12,16 / dbuf 4,6,8.
+//   * ZERO SGPR scale operands on v_mfma_scale_* in the arm image, so the
+//     task #133 scalarisation this axis was retracted for is provably absent.
+//   * worker_kernel 284 VGPR / 36 AGPR / 0 spills in BOTH arms. Depth 6 is
+//     register-free, exactly as the earlier census claimed for 4, 6 and 8.
+//   * G1 cross-rank identity PASSES, 4 of 4 ranks byte-identical, both prompts.
+//
+// The text sampling was initially AMBIGUOUS and is what the in-situ checksum
+// below was built to resolve. On "The capital of France is", scored by the
+// correctness gate's own G2 (distinct ratio < 0.30 or a bigram >= 15x), the
+// arm was degenerate in 3 of 7 samples and the control in 0 of 4 -- Fisher
+// p ~ 0.20, not significant, but the same failure SHAPE that retracted depth
+// 8. Text cannot settle this at any affordable n, because
+// correctness_gate.py's own header measures ~50% disagreement between two runs
+// of the SAME build: the EP fold and the atomic accumulations retire in
+// arrival order, that flips argmax on near-ties, and one flip cascades.
+//
+// ── SETTLED BY IN-SITU CHECKSUM, NOT BY SAMPLING ───────────────────────────
+//
+// MPK_BS_DEBUG=2 MPK_BSDBG_LAYER0=0 dumps a double-precision sum, absmax and
+// the first two elements of every stage buffer, on all four ranks, for the
+// first two fused layers. Arm against control, one run each, both builds
+// verified distinct from the hipcc command line in their own logs (the arm
+// carries -DMPK_MOE_PF_GROUPS_W13=6 on all four ranks; the control run logs
+// mpirun's "could not find environment variable" for it):
+//
+//   68 comparable records, 68 IDENTICAL, 0 mismatches.
+//
+// That covers stage 5 (moe_norm_out, W13's INPUT) and stage 6 (swiglu_out,
+// W13's OUTPUT) directly, and it covers the whole MoE half transitively --
+// layer 1's stage 0 resid_in and stage 1 qkv_a_out are bit-identical too, and
+// layer 1's input IS layer 0's complete output, W2's atomicAdd fold included.
+//
+// This is the gate the standalone oracle could not be: same register
+// pressure, same routing, same EP, same four ranks, real weights. It answers
+// the one open worry directly -- depth 6 holds A[6] + N[6] = TWELVE live
+// i32x8_t, above the 8-live point where task #115 found a silent 330x error,
+// and at twelve live this kernel is exact. The degenerate text samples are the
+// documented bs=1 attractor nondeterminism, which both arms have and neither
+// arm causes.
+//
+// ── WHY W13 AND W2 WANT DIFFERENT DEPTHS: IT IS NBLK, NOT REGISTERS ────────
+//
+// The header above says the two kernels "select their prefetch width and their
+// loop form INDEPENDENTLY" and leaves that as an observation. It has a
+// mechanism, and the mechanism also closes W2 for good.
+//
+// The deep loop peels its last block, so the PIPELINED body runs
+// NBLK - 1 = KI_END/GROUPS - 1 times. Trip counts are 48 for W13 and 16 for
+// W2, which is a 3x difference in how much room there is to spend on depth:
+//
+//   depth   W13: NBLK-1 trips        W2: NBLK-1 trips
+//     2         23                        7
+//     4         11                        3   <- W2 ships here
+//     6          7   <- -0.232 ms         1   ! degenerate
+//     8          5                        0   ! no loop at all
+//    16          2                        0
+//
+// W2 at depth 8 was re-taken and it LOSES, +0.238 ms (9.327 n=3, variance
+// 9.315-9.347, against the 9.089 control) -- the same SIGN as the old table's
+// +0.476, so that number was not a garbage-build artifact after all. But the
+// old note blamed "W2 crossing depth 8" on the 325 -> 362 register step, and
+// that is NOT what the image says: worker_kernel is 284 VGPR / 36 AGPR / 0
+// spills in BOTH arms, unchanged.
+//
+// What actually happens, per-function on the shipping vs depth-8 image:
+//
+//                     fn insns   total mfma   MFMA LOOPS      accvgpr
+//   W2 depth 4 (ship)      660           16   [4-mfma, 4-mfma]     16
+//   W2 depth 8             892           32   []                   64
+//
+// ZERO MFMA loops. At NBLK = 2 the pipelined body runs once, LLVM peels it,
+// and the entire k-loop becomes straight-line code -- the software pipeline
+// this whole file is about stops existing, eight tiles go live at once, and
+// the allocator pays 64 AGPR shuffles for it. Depth 16 is worse still: NBLK-1
+// is 0 and there is no loop to peel.
+//
+// So W2 is at its structural optimum at 4. Depth 2 is the only other
+// non-degenerate width and it was measured +0.78 ms (the narrowing). W13 has
+// 3x the trip count and therefore real room -- which is the whole asymmetry.
+// The Python wiring now asserts NBLK-1 >= 2 so this cannot be selected by
+// accident and re-measured a third time.
+//
+// SO THE DEFAULT STAYS 4. What is now settled and did not survive before: the
+// wiring exists, the wall number is real and reproduced on a build whose known
+// miscompile is gone, and the remaining blocker is a named, measurable one --
+// get the arm's degenerate rate to the control's over ~20 samples per arm, or
+// find what makes twelve live tiles differ from four. Do not re-derive the
+// wall number; it is above.
+// W13 DEFAULTS TO 6, NOT TO THE UNIFIED KNOB. -0.232 ms, and the numerics are
+// verified BIT-IDENTICAL IN SITU, which is the gate the earlier attempt on
+// this axis could not clear. See the task #134 block above for the wall
+// numbers and the two-instrument correctness argument. W2 keeps inheriting the
+// unified default because 4 is its structural maximum -- its trip count is 16,
+// so anything wider stops pipelining.
 #ifndef MPK_MOE_PF_GROUPS_W13
-#define MPK_MOE_PF_GROUPS_W13 MPK_MOE_PF_GROUPS
+#define MPK_MOE_PF_GROUPS_W13 6
 #endif
 #ifndef MPK_MOE_PF_GROUPS_W2
 #define MPK_MOE_PF_GROUPS_W2 MPK_MOE_PF_GROUPS

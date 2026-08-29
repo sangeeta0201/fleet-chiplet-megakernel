@@ -167,6 +167,11 @@ MPK_FORWARD_VARS=(
   # against the copying form's 9.71, but 8.43 at 6 and 7.82 at 8). Compile-time.
   MPK_MOE_PF_DBUF_W13 MPK_MOE_PF_DBUF_W2
   MPK_MOE_PF_GROUPS_W13 MPK_MOE_PF_GROUPS_W2
+  # Scheduling of the same k-loop's B-operand (LDS activation) reads against
+  # the MFMA group. Both settings are closed no-gos on the image -- see the
+  # define -- but it is compile-time, so forward it rather than let an
+  # experiment build rank 0 differently from the other seven.
+  MPK_MOE_BSCHED
   # K-major MoE weight layout. Both a -D and a change to how demo.py PACKS the
   # weight, so a rank that misses it reads a permuted buffer as if it were
   # row-major and produces silent garbage -- forward it or leave it unset.
