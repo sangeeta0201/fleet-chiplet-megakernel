@@ -61,6 +61,37 @@
 
 #include <hip/hip_bf16.h>
 
+// MPK_MLA_DECODE_DBLBUF: alternate the KV prefetch between two register
+// buffers so tile t+2's loads survive the tile loop's backedge. Long note at
+// kv_pre_odd in the prologue for the hazard it is meant to remove.
+//
+// MEASURED AND REFUTED, 2026-08-29. Keep it off. GLM-5 744B, NP=4, MI350,
+// paired runs either side of one build each:
+//
+//   arm      8.980 mean / 8.936 min (n=3)
+//   control  8.858 min (n=4; the 9.160 mean carries a 9.996 outlier)
+//
+// so roughly +0.08 ms, and an n=1 probe agreed at +0.108. The disassembly says
+// why, and the reason is not the hazard analysis being wrong -- it is that
+// there is no register headroom to pay for the fix:
+//
+//   loop           insns  loads  carry  drains   image scratch ops
+//   single buffer    348     10      0       2               902
+//   two buffers      495     20      0       5              1054
+//
+// Carry does not move. The +18 VGPRs (9 uint2) push a function whose arch peak
+// is already 248 into spilling -- 152 more scratch ops in the image -- and the
+// parity branch duplicates the refill/prefetch pair, which is where the extra
+// three vmcnt(0) drains come from. See the register note above
+// mla_decode_absorbed: this function sets the WHOLE megakernel's allocation,
+// so it is the worst place in the tree to spend registers.
+//
+// Anything further here has to be carry-neutral in registers, or has to buy
+// the headroom first.
+#ifndef MPK_MLA_DECODE_DBLBUF
+#define MPK_MLA_DECODE_DBLBUF 0
+#endif
+
 // __mfma_qk_hd64 / __mfma_pv_hd64 / __fast_exp2_hd64 / __load_bf16x4_to_fp16 /
 // __load_bf16x4_raw / __cvt_bf16x4_to_fp16 live here. They are tiling-agnostic
 // despite the hd64 name.
@@ -419,14 +450,42 @@ __device__ __noinline__ void
   }
 
   // Prefetch KV[1] -> registers as raw dwords
-  uint2 kv_pre[LDG_PER_TILE];
-  bool has_pre = false;
+  //
+  // ── why there are two buffers ────────────────────────────────────────────
+  // The loop is already two trips deep: trip t writes the buffer holding tile
+  // t+1 into LDS and then issues tile t+2 into it. With ONE buffer that is a
+  // WAR hazard on itself -- the issue cannot be hoisted above the LDS write
+  // that reads the same registers -- so the prefetch never survives the
+  // backedge and each trip pays a full round trip it was written to hide.
+  //
+  // The gfx950 disassembly of the single-buffer form shows it exactly: nine
+  // `global_load_dwordx2` at the top of the rotated body, then a waitcnt
+  // staircase `vmcnt(17)` .. `vmcnt(0)` that reaches zero BEFORE the body
+  // ends. 17 means 18 outstanding, i.e. the 9 just issued plus the previous
+  // trip's 9, and draining to 0 retires the ones this trip does not read.
+  // isa_outstanding.py reports carry 0 / peak 9 for the same reason.
+  //
+  // Alternating by the parity of the tile a buffer holds removes the hazard,
+  // so tile t+2's loads stay in flight across trip t+1's 18 QK and 8 PV MFMAs
+  // and its 50 LDS reads. Two named arrays rather than kv_pre[2][...]: the
+  // index would be loop-variant, and a dynamically indexed register array
+  // goes to scratch, which is the opposite of the point.
+  //
+  // Costs LDG_PER_TILE = 9 uint2 = 18 VGPRs on a function whose arch peak is
+  // 248 of the 512-entry unified file. Verify .vgpr_count did not move before
+  // trusting any wall number from this.
+  uint2 kv_pre_odd[LDG_PER_TILE];  // tiles 1, 3, 5, ...
+  bool has_pre_odd = false;
+#if MPK_MLA_DECODE_DBLBUF
+  uint2 kv_pre_even[LDG_PER_TILE]; // tiles 2, 4, 6, ...
+  bool has_pre_even = false;
+#endif
   if (do_t1) {
 #pragma unroll
     for (int r = 0; r < LDG_PER_TILE; r++) {
-      __ldg_bf16x4_raw(&kv_pre[r], kv_base + row1 + (my_dim0 + r * 64) * 2);
+      __ldg_bf16x4_raw(&kv_pre_odd[r], kv_base + row1 + (my_dim0 + r * 64) * 2);
     }
-    has_pre = true;
+    has_pre_odd = true;
   }
 
   // Q slice for this lane: head (q_head_group * 16 + midx), dims
@@ -579,38 +638,58 @@ __device__ __noinline__ void
 #endif
     __syncthreads();
 
-    if (has_pre) {
-#pragma unroll
-      for (int r = 0; r < LDG_PER_TILE; r++) {
-        *(uint64_t *)&lds_kv[my_tok * QK_DIM + my_dim0 + r * 64] =
-            *(uint64_t *)&kv_pre[r];
-      }
-    } else if (t + 1 < ntiles) {
-      // This lane's token is past the end of tile t+1: zero it so the stale
-      // rows cannot leak into the next tile's QK.
-      uint64_t const zero8 = 0;
-#pragma unroll
-      for (int r = 0; r < LDG_PER_TILE; r++) {
-        *(uint64_t *)&lds_kv[my_tok * QK_DIM + my_dim0 + r * 64] = zero8;
-      }
-    }
-
-    // Prefetch KV[t+2]
-    has_pre = false;
-    if (t + 2 < ntiles) {
-      int t2_start = (t + 2) * KV_TILE;
-      int t2_len = ((effective_len - t2_start) < KV_TILE)
-                       ? (effective_len - t2_start)
-                       : KV_TILE;
-      if (my_tok < t2_len) {
-        long row = get_kv_row(kv_start + t2_start + my_tok);
+    // Trip t drains the buffer holding tile t+1 into LDS and issues tile t+2
+    // into a buffer. Under DBLBUF those are always different buffers, which is
+    // what lets the issue sit above the drain.
+    auto refill_lds = [&](uint2 const(&buf)[LDG_PER_TILE], bool have) {
+      if (have) {
 #pragma unroll
         for (int r = 0; r < LDG_PER_TILE; r++) {
-          __ldg_bf16x4_raw(&kv_pre[r], kv_base + row + (my_dim0 + r * 64) * 2);
+          *(uint64_t *)&lds_kv[my_tok * QK_DIM + my_dim0 + r * 64] =
+              *(uint64_t *)&buf[r];
         }
-        has_pre = true;
+      } else if (t + 1 < ntiles) {
+        // This lane's token is past the end of tile t+1: zero it so the stale
+        // rows cannot leak into the next tile's QK.
+        uint64_t const zero8 = 0;
+#pragma unroll
+        for (int r = 0; r < LDG_PER_TILE; r++) {
+          *(uint64_t *)&lds_kv[my_tok * QK_DIM + my_dim0 + r * 64] = zero8;
+        }
       }
+    };
+    auto prefetch_t2 = [&](uint2(&buf)[LDG_PER_TILE], bool &have) {
+      have = false;
+      if (t + 2 < ntiles) {
+        int t2_start = (t + 2) * KV_TILE;
+        int t2_len = ((effective_len - t2_start) < KV_TILE)
+                         ? (effective_len - t2_start)
+                         : KV_TILE;
+        if (my_tok < t2_len) {
+          long row = get_kv_row(kv_start + t2_start + my_tok);
+#pragma unroll
+          for (int r = 0; r < LDG_PER_TILE; r++) {
+            __ldg_bf16x4_raw(&buf[r], kv_base + row + (my_dim0 + r * 64) * 2);
+          }
+          have = true;
+        }
+      }
+    };
+
+#if MPK_MLA_DECODE_DBLBUF
+    // (t & 1) == 0 means tile t+1 is odd, so it is in the odd buffer and tile
+    // t+2 is even.
+    if ((t & 1) == 0) {
+      refill_lds(kv_pre_odd, has_pre_odd);
+      prefetch_t2(kv_pre_even, has_pre_even);
+    } else {
+      refill_lds(kv_pre_even, has_pre_even);
+      prefetch_t2(kv_pre_odd, has_pre_odd);
     }
+#else
+    refill_lds(kv_pre_odd, has_pre_odd);
+    prefetch_t2(kv_pre_odd, has_pre_odd);
+#endif
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     _d_refill += __builtin_amdgcn_s_memrealtime() - _d_b;
 #endif

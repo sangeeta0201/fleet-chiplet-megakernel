@@ -165,7 +165,7 @@ MPK_FORWARD_VARS=(
   # killed MPK_MOE_PF_DBUF as a single knob is entirely W2's, and the loop form
   # only wins at GROUPS >= 6 (standalone: ping-pong is 10.11 us/tile at 4,
   # against the copying form's 9.71, but 8.43 at 6 and 7.82 at 8). Compile-time.
-  MPK_MOE_PF_DBUF_W13 MPK_MOE_PF_DBUF_W2
+  MPK_MOE_PF_DBUF_W13 MPK_MOE_PF_DBUF_W2 MPK_MLA_DECODE_DBLBUF
   MPK_MOE_PF_GROUPS_W13 MPK_MOE_PF_GROUPS_W2
   # Scheduling of the same k-loop's B-operand (LDS activation) reads against
   # the MFMA group. Both settings are closed no-gos on the image -- see the

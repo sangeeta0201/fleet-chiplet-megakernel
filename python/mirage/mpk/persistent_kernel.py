@@ -1322,6 +1322,13 @@ def get_compile_command(
         for _v in (
             "MPK_MOE_PF_DBUF_W13",
             "MPK_MOE_PF_DBUF_W2",
+            # Same shape of fix one phase over: the MLA decode's KV prefetch is
+            # a single register buffer, so the tile t+2 issue is a WAR hazard on
+            # the tile t+1 drain and cannot be hoisted above it. Alternating two
+            # buffers lets the loads live across the backedge. Long note at
+            # kv_pre_odd in gang_mla_decode_mi300.cuh. Compile-time, so every
+            # rank must agree.
+            "MPK_MLA_DECODE_DBLBUF",
         ):
             _x = os.environ.get(_v)
             if _x is not None:
