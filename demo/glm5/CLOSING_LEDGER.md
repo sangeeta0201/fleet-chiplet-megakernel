@@ -762,7 +762,7 @@ Not one of these is a tuning knob. Each is a different program.
 | | ms | status |
 |---|---|---|
 | rendezvous (10 GPU-wide + 2 cross-rank, x76) | ~2.94 | item 3 — the CROC per-XCD chunk barrier is on disk and unported |
-| non-MoE tile time above its byte floor | **3.55** | **item 2 — VALU-bound, never profiled at ISA level** |
+| non-MoE tile time above its byte floor | **3.55** | item 2 — **PROFILED 2026-08-29, see below** |
 | MoE tile above its byte floor | 1.10 | closed both directions |
 | byte floor itself | 2.14 | closed |
 
@@ -778,6 +778,42 @@ per-phase tile cuts are capped at 0.000-1.199 us/layer because the workers that
 skip a phase arrive as late as the workers that run it. The 3.55 ms is
 therefore *not* in any one phase's tile. It is in the **plateau**: work every
 worker does regardless of which tile it owns.
+
+#### Item 2, profiled — 2026-08-29
+
+`isa_outstanding.py` over today's gfx950 image. The 3.55 ms is **not** VALU and
+it is **not** the plateau. It is **memory-latency serialization in every
+non-MoE loop**, and the split is total:
+
+| loop | loads | carry | drains | verdict |
+|---|---|---|---|---|
+| W13 tile | 12 | **12** | 0 | flat part of the curve |
+| W2 tile | 8 | **8** | 1 | flat part of the curve |
+| router GEMM | 12 | **0** | **12** | one load issued, drained, consumed, x12 |
+| GEMV (W_UK / W_UV / o_proj) | 16 | **0** | 2 | issues 8, drains, issues 8, drains |
+| MLA decode | 10 | **0** | 2 | same shape |
+| KV latent write | 7 | **0** | 3 | same shape |
+
+The two MoE kernels are the only software-pipelined loops in the layer. Every
+other loop carries **nothing** across its backedge, so each trip pays a full
+round trip it never overlaps. The router GEMM is the extreme: twelve
+`s_waitcnt vmcnt(0)` in a 93-instruction body.
+
+**Why fixing it still does not pay, and what would change that.** The
+predictor's ceiling for a phase is `max_all(b) − max_{w∉P}(b)`, and it is ~0
+for exactly these loops *because they are narrow* — router 128 workers, o_proj
+192, MLA decode 64, of 232. The non-participants set the max, so pipelining the
+participants' loops moves nothing. W13 and W2 are the only 232-wide phases,
+which is both why they are the only ones anyone bothered to pipeline and why
+they are the only ones where a tile cut converts 1:1.
+
+So item 2 is now two facts, not one: the time is real and mechanically
+identified, and it is unreachable *at the current phase widths*. The lever that
+unlocks it is not a better k-loop, it is **making a phase 232 wide** — with no
+non-participant there is no one left to set the max, and the phase's ceiling
+becomes its whole span. The obstruction is arithmetic: o_proj's 1536 columns
+per rank divide into 24 or 32 tiles, not the 29 that would put one tile on
+every worker.
 
 ---
 
