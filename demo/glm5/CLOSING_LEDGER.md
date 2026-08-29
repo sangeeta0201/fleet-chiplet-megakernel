@@ -785,35 +785,70 @@ worker does regardless of which tile it owns.
 it is **not** the plateau. It is **memory-latency serialization in every
 non-MoE loop**, and the split is total:
 
-| loop | loads | carry | drains | verdict |
+| loop | loads | carry | drains | within-trip shape, read off the ISA |
 |---|---|---|---|---|
-| W13 tile | 12 | **12** | 0 | flat part of the curve |
-| W2 tile | 8 | **8** | 1 | flat part of the curve |
-| router GEMM | 12 | **0** | **12** | one load issued, drained, consumed, x12 |
-| GEMV (W_UK / W_UV / o_proj) | 16 | **0** | 2 | issues 8, drains, issues 8, drains |
-| MLA decode | 10 | **0** | 2 | same shape |
-| KV latent write | 7 | **0** | 3 | same shape |
+| W13 tile | 12 | **12** | 0 | pipelined across the backedge |
+| W2 tile | 8 | **8** | 1 | pipelined across the backedge |
+| router GEMM | 12 | **0** | **12** | `global_load_dword` + `s_waitcnt vmcnt(0)`, x12 |
+| GEMV (W_UK / W_UV / o_proj) | 16 | **0** | 2 | 8-load bursts, counted staircase, drained between bursts |
+| MLA decode | 10 | **0** | 2 | 9-load burst, full `vmcnt(17)`..`vmcnt(0)` staircase |
+| KV latent write | 7 | **0** | 3 | small bursts |
 
-The two MoE kernels are the only software-pipelined loops in the layer. Every
-other loop carries **nothing** across its backedge, so each trip pays a full
-round trip it never overlaps. The router GEMM is the extreme: twelve
-`s_waitcnt vmcnt(0)` in a 93-instruction body.
+**`carry` measures overlap across the backedge only, and reading it as
+"starved" overstates three of these four rows.** The MLA decode already issues
+its nine loads back to back and walks them down a textbook counted-vmcnt
+staircase — the same shape gpt-oss's W13 counted handoff had to be hand-written
+to get, here emitted by the compiler. The GEMV is the same idea at burst
+granularity. Neither is waiting on one load at a time.
 
-**Why fixing it still does not pay, and what would change that.** The
-predictor's ceiling for a phase is `max_all(b) − max_{w∉P}(b)`, and it is ~0
-for exactly these loops *because they are narrow* — router 128 workers, o_proj
-192, MLA decode 64, of 232. The non-participants set the max, so pipelining the
-participants' loops moves nothing. W13 and W2 are the only 232-wide phases,
-which is both why they are the only ones anyone bothered to pipeline and why
-they are the only ones where a tile cut converts 1:1.
+**Exactly one loop in the layer is genuinely serialized: the router GEMM**,
+which issues a load and drains it with `vmcnt(0)` twelve times in a
+93-instruction body, peak outstanding 1. That one is real and is the only place
+the naive reading holds.
 
-So item 2 is now two facts, not one: the time is real and mechanically
-identified, and it is unreachable *at the current phase widths*. The lever that
-unlocks it is not a better k-loop, it is **making a phase 232 wide** — with no
-non-participant there is no one left to set the max, and the phase's ceiling
-becomes its whole span. The obstruction is arithmetic: o_proj's 1536 columns
-per rank divide into 24 or 32 tiles, not the 29 that would put one tile on
-every worker.
+What the other rows do have is a **cross-iteration** gap: the decode drains to
+`vmcnt(0)` and then runs a long MFMA/LDS block — 18 `v_mfma`, 18 `ds_read_b128`,
+32 `ds_read_u16` — with nothing in flight. Hoisting the next trip's loads above
+that block is the available change, and it is a scheduling change, not a
+counted-vmcnt one.
+
+#### Which phase's ceiling is actually open — and it is not the one the width argument predicts
+
+Run the predictor's `max_all(b) − max_{w∉P}(b)` per phase by splitting the
+stamps into participants and non-participants (`xcd_rank` against the phase's
+tile count), rank 0, same log:
+
+| phase | participants arrive | non-participants | ceiling |
+|---|---|---|---|
+| o_proj | 90.380 | 90.358 | 0.022 us — tie |
+| router | 96.735 | **101.100** | 0 — non-participants are LATER |
+| W13 | 119.934 | **121.444** | 0 — non-participants are LATER |
+| W2 | 138.953 | **140.452** | 0 — non-participants are LATER |
+| **MLA decode** | **58.5** | 41.4 | **17.5 us/layer = 1.13 ms** |
+
+**The MLA decode is the only phase whose participants set the max**, and the
+slot-21 histogram says the same thing independently: 64 workers (`q_groups=4 x
+kv_chunks=16`) at 55-59 us, the other 176 at ~41. The MAKESPAN_RULE table lists
+the decode's regime-A ceiling as 0.000; that was measured at the old 16-worker
+mapping and is stale.
+
+**And widening is refuted, not merely blocked by arithmetic.** The tempting
+reading of the width argument is "make a phase 232 wide and its ceiling becomes
+its span." The table above kills it: for o_proj, router, W13 and W2 the
+non-participants arrive *later* than the participants at every subsequent
+barrier — router by 4.4 us, W13 and W2 by 1.5 us. They are not idle capacity
+waiting to be given work, they are the stragglers. Moving work onto them makes
+the makespan strictly worse. That is also why `GLM_MLA_NUM_KV_CHUNKS=32`, which
+widens the decode from 64 workers to 128, measured +0.157 ms.
+
+The plateau is therefore not slack. It is a schedule that is already balanced
+in total work per worker, with the phase boundaries falling in different places
+for different workers.
+
+So the open item is narrow and specific: **the MLA decode carries a 1.13 ms
+ceiling and its loop has zero cross-iteration overlap.** Release fan-out is not
+a suspect — every worker observes each release within 5-26 ns of every other,
+with no ordering by worker index (checked at eight barrier-exit slots).
 
 ---
 
