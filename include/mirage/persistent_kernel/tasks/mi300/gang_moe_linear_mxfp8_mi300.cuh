@@ -1610,6 +1610,41 @@ __device__ __forceinline__ f32x4_t
 // an 8-way split leaves 2. See MPK_W2_KSPLIT for the intra-rank version and
 // why more, smaller W2 tiles lose anyway.
 //
+// ── REOPENED 2026-09-01: that blocker is world-size-specific ──────────────
+// "an 8-way split leaves 2" is arithmetic about EP_WORLD_SIZE == 8. It does
+// not hold at 4, which is what the GLM-5 bring-up actually runs:
+//
+//   ranks  per-rank W2 reduction  MFMA_ITERS  static_assert(>=4 && %4==0)
+//     8            2048/8 = 256           2   FAILS  <- the note above
+//     4            2048/4 = 512           4   PASSES, exactly at the minimum
+//
+// The assert one screen down spells its own condition as "REDUCTION_SIZE %
+// 512 == 0", and 512 divides 512. So at 4 ranks the K-shard is legal.
+//
+// Why it is worth the trouble, measured rather than argued. Per-rank MoE span,
+// mean over ~38k layers, BARSTAGEWS slots 5..8, NP=4:
+//
+//   rank 0  19.418 us/layer      rank 2  13.716
+//   rank 1  14.493               rank 3  14.145
+//
+// Rank 0 is EP_SHARED_PE, and it is 5.702 us/layer -- 0.367 ms/token -- slower
+// than rank 2 in EVERY layer. The MoE phase ends when the last rank does, so
+// that entire gap is on the critical path. Sharding the shared expert 4 ways
+// takes the max from 3.0 expert-equivalents to 2.25.
+//
+// Two cautions carried forward from the note above, both still live:
+//   - W13 is NOT affected by the assert. It reduces over HIDDEN (6144, so
+//     MFMA_ITERS = 48) and is sharded on its OUTPUT dim, which leaves its
+//     reduction untouched. Only W2's reduction is being cut.
+//   - W2 at MFMA_ITERS == 4 sits at the exact pipeline minimum: every
+//     iteration is fill and none is steady state. That is the shape that cost
+//     W_UV its bake-off (see WUV_MFMA in demo.py), so some of the 0.367 ms
+//     will be handed back. Price it before believing the whole number.
+//
+// And heed the failure mode recorded above: wrong output here passed Gate 1
+// because all ranks agreed on garbage. Gate on generated text, or on
+// MPK_BS_DEBUG=2 checksums against a 1-rank reference -- not on rank agreement.
+//
 // The tile space is built over the OWNED subsequence of the activated list,
 // not over the whole list with the non-owned tiles early-returning. gpt-oss
 // measured why: owned tiles come in runs of TILES_PER_EXPERT, and a run
