@@ -20,18 +20,67 @@ line. Those agree to 2%.
 | tier | floor | what it takes |
 |---|---|---|
 | today | 8.862 ms | — |
-| **every lever currently identified, all landing at its measured ceiling** | **7.6 – 8.3 ms** | the decode slice release, plus scraps |
+| kill the EP routing tax (§1a) | **~7.9 ms** | expert-TP + shard the shared expert |
+| + every intra-layer lever at its measured ceiling | **6.6 – 7.3 ms** | the decode slice release, plus scraps |
 | a schedule redesign — fewer, wider phases | ~4.5 – 5.5 ms | not an optimization; a rewrite |
 | byte roofline | 2.144 ms | unreachable at any schedule |
 
-**2–3 ms is not reachable and neither is 6–7.** An earlier estimate in this
-work said 6–7 ms; the arithmetic below does not support it, and the corrected
-number from identified levers is 7.6–8.3. The 6–7 figure was a loose guess made
-before the per-phase ceilings were measured; this table supersedes it.
+**2–3 ms is not reachable.** Two earlier estimates in this work are superseded:
+a loose 6–7 ms guess made before the per-phase ceilings were measured, and this
+document's own first answer of 7.6–8.3 ms, which was wrong for a more
+interesting reason — see §1a.
 
-The reason the gap is large and the reachable slice is small is not that the
-kernel is badly written. It is that **three of the four budget lines are
-closed, and the fourth is gated by a schedule property rather than by code.**
+### 1a. CORRECTED 2026-09-01 — this document excluded its largest lever
+
+The first version of this analysis put the reachable floor at 7.6–8.3 ms and
+closed with the prediction that *no single remaining lever is worth > 0.5 ms*.
+**That prediction is false, and it was false because the analysis scoped out
+the biggest item in the tree and then did not count it.**
+
+`ROOFLINE.md` line 58 already named it, and calls it "the single largest item
+the roofline shows":
+
+> Expert-*parallel* is the wrong decomposition at batch 1. Splitting each
+> activated expert's weights across all 8 ranks (tensor-parallel *within* an
+> expert) makes every rank read exactly one expert-equivalent, with zero
+> variance.
+
+Sized for our actual NP=4 geometry, using exact balls-in-bins (`roofline.py`'s
+`_emax_balls_in_bins`, top-8 into 4 bins) and the measured W13+W2
+critical-worker busy time of 30.8 us/layer:
+
+| | expert-equivalents at the busiest rank | us/layer | ms |
+|---|---|---|---|
+| routed today (EP) | 3.538 (mean 2.000, imbalance **1.77x**) | | |
+| routed under expert-TP | 2.000, zero variance | −10.44 | **−0.672** |
+| shared expert, replicated today | 1.000 | | |
+| shared expert, sharded 4 ways | 0.250 | −5.09 | **−0.328** |
+| **combined** | | **−15.53** | **−1.000** |
+
+One routed expert is 20.05 MB at mxfp4; the busiest rank reads 4.538
+expert-equivalents per layer, so W13+W2 cost 6.787 us/layer per
+expert-equivalent. These are proportionality estimates off measured busy time,
+not measurements — but they are an order of magnitude above the 0.5 ms the
+falsified prediction allowed.
+
+Two things make this cheaper to build than "a redesign":
+
+- **The reduction already exists.** W13 column-parallel and W2 row-parallel is
+  the standard Megatron MLP split, and it needs no collective between them —
+  SwiGLU is elementwise on the sharded intermediate dim. The cross-rank sum of
+  W2 partials that it *does* need is exactly what the EP fold already performs
+  on `moe_ws_f32`. No new rendezvous.
+- **It lands on W13 and W2**, the only 232-wide phases, hence the only ones
+  where a cut converts at 1:1 rather than ~0.3.
+
+It also removes the straggler, not just the bytes: every rank reads the same
+amount with zero variance, which is the same thing gpt-oss's `9d478ea` bought
+one level down by pinning experts to XCD pairs ("the 240-tile padding space and
+its straggler imbalance are gone").
+
+The rest of this document — §2 through §7 — was written before this was sized
+and still reads as if the intra-layer levers were all there was. Its per-line
+reasoning stands; its bottom line does not.
 
 ---
 
@@ -44,10 +93,33 @@ those cost ~2.94 ms on their own. So the roofline is not a target that any
 schedule with barriers can approach — it is a lower bound on a different
 program.
 
-A calibration that matters, because it has been used as a target: **gpt-oss at
-1.835 ms is a 120B model on MI355.** GLM-5 is 744B. Its byte floor alone is
-larger than gpt-oss's entire wall. Techniques port between the two; numbers do
-not.
+### CORRECTED 2026-09-01 — the gpt-oss comparison below was wrong
+
+This section originally read: "gpt-oss at 1.835 ms is a 120B model on MI355.
+GLM-5 is 744B. Its byte floor alone is larger than gpt-oss's entire wall." That
+compares **models** when the hardware comparison is **per GPU**, and it let a
+real gap hide behind a parameter count.
+
+gpt-oss runs on **one** GPU (`export GPU=0` in its README). GLM-5 runs on four.
+So the honest comparison is 120B/GPU against 744B/4 = **186B/GPU — 1.55x, not
+6x.** Size is not the explanation.
+
+**The actual structural difference is that GLM-5 pays for expert parallelism
+and a single-GPU config does not.** From `ROOFLINE.md`, per iteration:
+
+| EP-specific cost | ms | paid by gpt-oss? |
+|---|---|---|
+| routing imbalance — busiest rank reads ~3 experts where the mean is 1 | 0.58 | no |
+| shared expert replicated on every rank (20.05 MB/layer/rank) | 0.25 | no |
+| EP cross-rank collective (measured 5.1 us x 75) | 0.38 | no |
+| **total** | **~1.21** | |
+
+That is floor, before any inefficiency. On *efficiency* the two are closer than
+the walls suggest: GLM-5 achieves 1.691 TB/s, 32.7% of the measured 5.17 TB/s
+peak.
+
+Techniques port between the two. Numbers do not — but the reason is expert
+parallelism, not 744B.
 
 ---
 
@@ -257,7 +329,12 @@ Recorded so this document can be shown wrong rather than argued with.
    ceiling.
 4. Any change adding ≥12 VGPRs to `mla_decode_absorbed` will regress, regardless
    of how much latency it hides, because the function is at its arch peak.
-5. No single lever remaining in this codebase is worth **> 0.5 ms**.
+5. ~~No single lever remaining in this codebase is worth **> 0.5 ms**.~~
+   **FALSIFIED 2026-09-01, before anyone else had to.** Expert-TP is ~0.672 ms
+   and sharding the shared expert ~0.328 ms, both on the 1:1 phases — see §1a.
+   The prediction held only because this document had scoped both out as "a
+   redesign" without pricing them. Per the rule below, the budget was
+   re-derived rather than patched; §1 and §1a are the result.
 
 If prediction 5 falls, this analysis is wrong in an interesting way and the
 budget above should be re-derived rather than patched.
