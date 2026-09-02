@@ -157,9 +157,54 @@
 //   what it does   NOT buy: registers, occupancy, or LDS traffic beyond the
 //                  9 ds_writes/tile that the DMA deletes
 //
-// Price the barrier removal against subphase slot 5 (`_d_refill`, which
-// already isolates "__syncthreads + vmcnt drain + LDS write + prefetch")
-// before writing any of it. If slot 5 is small, this whole axis is small.
+// ── PRICED 2026-09-02, AND THE WHOLE AXIS IS VOID AT THE BENCHMARK SHAPE ───
+// Subphase slots for this kernel (MPK_SUBPHASE_TIMING=1, SP bank 2, ns summed
+// over workers and layers, one 24-token run):
+//
+//   slot                                        total      share
+//   3  cold start (Q + KV tiles 0/1 + LDS wr)   247.9M      29%
+//   4  per-tile QK / softmax / PV               231.0M      27%
+//   6  epilogue                                 224.6M      26%
+//   5  per-tile refill  <- the DMA target       129.3M      15%
+//   2  chunk partition                           29.5M       3%
+//
+// Slot 5 is 15% of the decode, and the DMA form removes only part of it, so
+// even a perfect implementation is worth ~0.05-0.09 ms against a 0.26 ms noise
+// floor. Do not build it. But the reason is sharper than "the slot is small":
+//
+// **THE TILE LOOP IS SINGLE-TRIP HERE, SO THERE IS NO BACKEDGE TO CARRY LOADS
+// ACROSS.** KV_TILE is 16 and the decode splits the sequence over
+// GLM_MLA_NUM_KV_CHUNKS = 16 chunks, so chunk_len = ceil(seq/16) and
+// ntiles = ceil(chunk_len/16) is ONE for any seq <= 256. The benchmark runs
+// max_seq_length 128 (and the live KV is shorter still -- a 10-token prompt
+// plus 24 generated). So:
+//
+//   * `prefetch_t2` never fires: `t + 2 < ntiles` is false at ntiles == 1.
+//   * carry is 0 because the loop has no second trip, not because of a WAR
+//     hazard or the __syncthreads. THAT is why DBLBUF "did not move carry"
+//     and measured +0.08 ms -- it bought a second buffer for a loop that
+//     never goes round, so the measurement captured its cost and none of its
+//     benefit. The same is true of any pipelining change here.
+//   * cold start + epilogue is 55% of the decode, larger than the tile
+//     compute, exactly as a single-trip loop implies.
+//
+// CONSEQUENCES, and they reach past this kernel:
+//   1. Nothing on the software-pipelining axis for this loop can be evaluated
+//      at max_seq_length <= 256. First re-measure at seq >= 512, where
+//      ntiles >= 2 gives the loop a backedge.
+//   2. The 1.13 ms "MLA decode ceiling" in CLOSING_LEDGER §8 is, at this
+//      shape, almost entirely per-invocation FIXED cost: 64 tiles
+//      (q_groups 4 x chunks 16) each running one nearly-empty 16-token tile
+//      over a KV of ~34. The levers it admits are invocation count and the
+//      prologue/epilogue, NOT the tile loop.
+//   3. That also re-reads the chunks sweep (4 -> 14.189, 16 -> 11.464 ms):
+//      what 16 chunks parallelised was the FIXED cost, since the work per
+//      chunk is one tile either way.
+//
+// Caveat on the table: the instrumented build runs 13.3 ms against 8.75
+// uninstrumented, so absolute values are inflated. Slots 3-6 are each stamped
+// once per invocation at ntiles == 1, so the shares are comparable to each
+// other; do not read them as ms of the shipping wall.
 #ifndef MPK_MLA_DECODE_DBLBUF
 #define MPK_MLA_DECODE_DBLBUF 0
 #endif

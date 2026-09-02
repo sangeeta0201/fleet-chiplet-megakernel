@@ -882,6 +882,39 @@ ceiling and its loop has zero cross-iteration overlap.** Release fan-out is not
 a suspect — every worker observes each release within 5-26 ns of every other,
 with no ordering by worker index (checked at eight barrier-exit slots).
 
+> **AMENDED 2026-09-02: "zero cross-iteration overlap" is true and
+> unactionable, because the loop is SINGLE-TRIP at this benchmark shape.**
+> `KV_TILE` is 16 and the decode splits the sequence over
+> `GLM_MLA_NUM_KV_CHUNKS = 16`, so `chunk_len = ceil(seq/16)` and
+> `ntiles = ceil(chunk_len/16)` is **1 for any seq ≤ 256**. We run
+> `max_seq_length=128`, with a live KV of ~34 (10-token prompt + 24 generated).
+> `prefetch_t2`'s `t + 2 < ntiles` is never true. `carry` is 0 because there is
+> no second trip — not because of a WAR hazard or the `__syncthreads`.
+>
+> That retro-explains `MPK_MLA_DECODE_DBLBUF` measuring **+0.08 ms**: it bought
+> a second register buffer for a loop that never goes round, so the measurement
+> captured all of its cost and none of its benefit. The same holds for any
+> pipelining change here, including the `buffer_load_lds` form now written up
+> at the `MPK_MLA_DECODE_DBLBUF` define — **which is why that note says do not
+> build it.**
+>
+> Subphase evidence (`MPK_SUBPHASE_TIMING=1`, SP bank 2): cold start 29%,
+> per-tile QK/PV 27%, epilogue 26%, per-tile refill 15%, chunk partition 3%.
+> Prologue + epilogue is 55%, larger than the tile compute — exactly what a
+> single-trip loop implies.
+>
+> **So the 1.13 ms is per-invocation FIXED cost**, not loop inefficiency: 64
+> tiles (`q_groups=4 × chunks=16`) each running one nearly-empty 16-token tile
+> over a KV of ~34. The levers it admits are the invocation count and the
+> prologue/epilogue, not the tile body. It also re-reads the chunks sweep
+> (4 → 14.189, 16 → 11.464 ms): what 16 chunks parallelised was the fixed
+> cost, since the work per chunk is one tile either way.
+>
+> **Methodological consequence for this whole document.** Every decode number
+> in it is measured at seq ≤ 128, where the decode is prologue-bound and ~12%
+> tile-utilised. Before any further decode work, re-measure at seq ≥ 512
+> (`ntiles ≥ 2`); optimising the seq=128 shape optimises the harness.
+
 ---
 
 ## 9. INDEX
