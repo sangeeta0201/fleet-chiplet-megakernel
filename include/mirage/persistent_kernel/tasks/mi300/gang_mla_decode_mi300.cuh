@@ -132,11 +132,34 @@
 //     contiguity from get_kv_row before building, and keep the existing
 //     register path as the straddle fallback.
 //
-// Do not start this without first measuring what the freed 18 VGPRs alone are
-// worth: if .vgpr_count does not move when kv_pre_odd goes away, something
-// else sets the allocation and the register half of the payoff is zero (that
-// is exactly the trap point 3 of the W13 verdict documents, where 325 was set
-// by something other than the k-loop).
+// THE REGISTER HALF OF THE PAYOFF IS ZERO. CHECKED 2026-09-02 BEFORE BUILDING,
+// which is the trap point 3 of the W13 verdict documents. On today's image
+// worker_kernel is 325 VGPR / 69 AGPR / 0 spills. gfx950's unified file is 512
+// per thread, so 325 is already 1 wave/SIMD and 2 waves needs <= 256. Handing
+// back kv_pre_odd's 18 takes 325 -> ~307: the same 1 wave/SIMD, no occupancy
+// step, nothing at the wall. Cutting 69 to reach 256 is the only register
+// change here that would buy anything, and 18 is not a quarter of it.
+//
+// So the case rests ENTIRELY on the overlap half, and that case is weaker than
+// the VGPR arithmetic above makes it look, for a reason the DBLBUF measurement
+// already showed: adding a second register buffer did NOT move carry off 0.
+// The drain is not (only) a WAR hazard on kv_pre_odd -- it is the
+// __syncthreads() this loop needs because QK and PV both read the WHOLE
+// lds_kv tile, so no lane may refill it until every lane is done (see the
+// comment above refill_lds). A second REGISTER buffer cannot remove that
+// barrier; a second LDS buffer can, which is the real argument for the DMA
+// form and should be stated that way rather than as a register saving:
+//
+//   what it buys   one fewer full-block barrier per tile, and tile t+2's
+//                  fetch in flight across tile t+1's 18 QK + 8 PV MFMAs and
+//                  50 LDS reads
+//   what it costs  a second 18 KB lds_kv against ~77 KB free
+//   what it does   NOT buy: registers, occupancy, or LDS traffic beyond the
+//                  9 ds_writes/tile that the DMA deletes
+//
+// Price the barrier removal against subphase slot 5 (`_d_refill`, which
+// already isolates "__syncthreads + vmcnt drain + LDS write + prefetch")
+// before writing any of it. If slot 5 is small, this whole axis is small.
 #ifndef MPK_MLA_DECODE_DBLBUF
 #define MPK_MLA_DECODE_DBLBUF 0
 #endif
