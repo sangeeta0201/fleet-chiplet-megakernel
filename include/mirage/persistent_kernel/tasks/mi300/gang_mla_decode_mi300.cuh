@@ -88,6 +88,55 @@
 //
 // Anything further here has to be carry-neutral in registers, or has to buy
 // the headroom first.
+//
+// ── THE CARRY-NEUTRAL FORM: buffer_load_lds. 2026-09-02, NOT YET BUILT ─────
+// The one shape that satisfies that constraint is a DMA prefetch.
+// buffer_load_lds has NO DESTINATION VGPR, so depth is free in registers; the
+// worked primitive and its hazards are in
+// tests/standalone/test_w13_scale_locality.hip ("THE buffer_load_lds RING").
+//
+// That file's SIXTH PASS VERDICT closes the DMA axis for W13, and its point 2
+// is "THE DMA PAYS A STRUCTURAL LDS TAX THE REGISTER PATH DOES NOT: a global
+// load lands in a VGPR; a DMA load lands in LDS and must then be ds_read out."
+// **That reasoning inverts here and the verdict does not carry over.** W13's
+// register path delivers straight to MFMA operands and never touches LDS. This
+// kernel's does the opposite -- look at refill_lds() below: the prefetch
+// registers exist ONLY to be ds_written into lds_kv, so the path today is
+//
+//   global -> kv_pre_odd (VGPR) -> ds_write -> lds_kv -> ds_read -> MFMA
+//
+// and the DMA form deletes two of those stages rather than adding one. It is
+// LDS-traffic NEGATIVE (the 9 ds_writes per tile go away), and it is register
+// POSITIVE: kv_pre_odd's 9 uint2 = 18 VGPRs come back on the function that
+// sets the whole megakernel's allocation. Double buffering then costs a second
+// 18 KB lds_kv tile against the ~77 KB of free worker LDS, not 18 more VGPRs.
+// So it fixes carry 0 and pays for itself twice, which is why it is worth
+// building even though the register form measured +0.08 ms.
+//
+// TWO OBSTACLES, both real, neither obviously fatal:
+//
+//  1. LDS ADDRESSING IS RIGID. buffer_load_lds writes lds at
+//     M0 + inst_offset + lane*4; it cannot honour this kernel's per-lane
+//     lds_kv[my_tok * QK_DIM + my_dim0 + r * 64]. Either the LDS tile is
+//     relaid out to the DMA's natural contiguous image (and the QK/PV
+//     ds_reads re-indexed to match -- QK_DIM = 576 is not a power of two, so
+//     check the bank conflicts before assuming this is free), or the DMA is
+//     issued per token row with exec masking.
+//
+//  2. THE KV IS PAGED. Each lane resolves its own get_kv_row(), so a tile is
+//     a 16-row GATHER in general and one DMA cannot fetch 16 arbitrary rows.
+//     What may rescue it: KV_TILE is 16 tokens and page_size is 4096, so 16
+//     CONSECUTIVE tokens fall inside one page except when the tile straddles a
+//     boundary, and inside a page the rows are contiguous -- 16 * 576 * 2 =
+//     18432 B, which is 4.5 dwordx4 instructions across 256 lanes. Confirm the
+//     contiguity from get_kv_row before building, and keep the existing
+//     register path as the straddle fallback.
+//
+// Do not start this without first measuring what the freed 18 VGPRs alone are
+// worth: if .vgpr_count does not move when kv_pre_odd goes away, something
+// else sets the allocation and the register half of the payoff is zero (that
+// is exactly the trap point 3 of the W13 verdict documents, where 325 was set
+// by something other than the k-loop).
 #ifndef MPK_MLA_DECODE_DBLBUF
 #define MPK_MLA_DECODE_DBLBUF 0
 #endif
