@@ -157,6 +157,10 @@ MPK_FORWARD_VARS=(
   MPK_MOE_SCBASE
   MPK_MOE_STREAM_NT
   MPK_ATTN_STREAM_NT
+  # One-trip software pipeline on the MXFP8 GEMV weight stream (W_UK, W_UV,
+  # o_proj), paid for with the `av` registers that loop spends batching LDS
+  # reads. Compile-time; a rank that misses it is a different binary.
+  MPK_ATTN_GEMV_PF
   # Double-buffered form of that same k-loop: swap two register buffers instead
   # of copying one into the other at the backedge, which is what forces the two
   # s_waitcnt vmcnt(0) per trip in the shipped ISA. Compile-time.

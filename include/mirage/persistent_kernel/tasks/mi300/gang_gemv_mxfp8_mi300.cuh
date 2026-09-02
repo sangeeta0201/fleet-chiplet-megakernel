@@ -151,6 +151,14 @@ __device__ __forceinline__ T ld_g(void const *p) {
 #ifndef MPK_ATTN_STREAM_NT
 #define MPK_ATTN_STREAM_NT 0
 #endif
+// See the MPK_ATTN_GEMV_PF note in the kernel body. Default OFF: the ISA
+// change lands exactly as designed (load depth 8 -> 32, drains 2 -> 1, 0
+// spills) but measures NEUTRAL on the wall, because the instantiation it
+// fires on serves 3 of 81 layers. Ship the knob and the rule, not the
+// default.
+#ifndef MPK_ATTN_GEMV_PF
+#define MPK_ATTN_GEMV_PF 0
+#endif
 template <typename T>
 __device__ __forceinline__ T ld_g_nt(void const *p) {
   T const *q = static_cast<T const *>(p);
@@ -342,6 +350,133 @@ __device__ __noinline__ void
       acc[m][c] = 0.0f;
     }
   }
+
+  // ── MPK_ATTN_GEMV_PF: pipeline the *weight* stream one trip deep ─────────
+  //
+  // This is the axis the NO-GO note below rules in. That note establishes the
+  // payoff variable for this loop: it is latency-bound (128 of 217 body
+  // instructions are v_cvt + v_dot2c, no MFMA), so what matters is the load
+  // depth at the top of the trip, and an address-arithmetic cut that trades
+  // depth for instructions loses. The census agrees -- this body issues its
+  // loads in two bursts of 8, drains both, and carries **zero** across the
+  // backedge, so every trip pays a full memory latency that nothing covers.
+  //
+  // The registers to pay for more depth are already in the loop, spent on the
+  // wrong stream. `av` is UNROLL*2 dwordx4 = 64 VGPRs of *LDS*-staged
+  // activation held live across the whole issue block, and LDS is tens of
+  // cycles with its own counter. Reading `av` just-in-time inside the consume
+  // pass drops that to 8 VGPRs live and hands ~56 back, which buys a second
+  // UNROLL-deep buffer of the global weight+scale stream (+40) with room to
+  // spare. Depth at the top of the trip goes 8 -> 32 in flight, carry 0 -> 16.
+  //
+  // Parity is unrolled by hand rather than indexed: `wv[p]` with a
+  // loop-variant p is a dynamically indexed register array, which goes to
+  // scratch. Hence the 2*UNROLL step and the two named buffers -- the same
+  // reason mla_decode keeps two named kv_pre buffers instead of kv_pre[2].
+  //
+  // The waits are left to SIInsertWaitcnts on purpose. vmcnt is a FIFO, so
+  // "retire wa" is expressible as a *counted* vmcnt(16) that leaves wb's 16
+  // loads in flight; the compiler derives that from the def-use chain without
+  // help. An inline-asm s_waitcnt here could only be vmcnt(0) or a hand-picked
+  // constant that breaks the moment UNROLL changes.
+  //
+  // MEASURED 2026-09-02, and the ISA moved exactly as designed. The census
+  // row goes
+  //     before   217 insns  16 loads  carry 0  peak  8  drains 2
+  //     after    452 insns  32 loads  carry 0  peak 32  drains 1
+  // where 452 now covers TWO trips, so per-trip instruction count is flat
+  // (226 vs 217) for 4x the depth and half the drains. worker_kernel goes
+  // 325 -> 344 VGPR with **0 vgpr spills** -- the `av` registers paid for it
+  // -- and 344 is still one wave/SIMD, so occupancy is unchanged. This is the
+  // case the note below asks for: depth at the top of the trip went UP.
+  //
+  // Wall: NEUTRAL, and the retraction is worth reading. The arm is 8.734
+  // (min-of-decode, n=3, spread 0.003) against a paired control of 8.760
+  // (n=3), reproduced at 8.727/8.741 in a second batch -- i.e. -0.026 ms with
+  // non-overlapping ranges, twice. Then the shipping build with the knob OFF
+  // measured 8.725 (8.711/8.739), FASTER than the arm. The baseline had
+  // drifted ~0.035 ms because orphaned ranks from a `pkill -9`-ed run were
+  // still holding GPU memory during the first batches. Drift > effect, so
+  // there is no resolvable win. See CLOSING_LEDGER for the /dev/kfd orphan
+  // check to run before scoring any paired run on this box.
+  //
+  // Why so small when o_proj is the biggest weight stream in the attention
+  // half: the instantiation this fires on is <1, 32768, 8, HAS_RESIDUAL=true,
+  // WRITE_THROUGH=false>, which is the UNFUSED o_proj, and GLM_FUSE_ATTN=0
+  // means that chain runs for the three dense prologue layers only -- the 78
+  // MoE layers reach o_proj through gang_oproj_router_fused, which at
+  // MPK_OPROJ_MXFP4=1 is the MXFP4 kernel. W_UK and W_UV do not qualify
+  // either: their reductions are small enough that ITERS is 1, so the
+  // ITERS % (2*UNROLL) == 0 guard excludes them. Porting the transform to the
+  // MXFP4 kernel to reach the other 78 layers is a measured NO-GO -- see the
+  // note there; that loop is fully unrolled and has no backedge to pipeline.
+  // So this is a 3-of-81-layer lever that behaves correctly, not a general
+  // one, and the general version does not exist on this image.
+  auto issue = [&](int i0, u32x4_t (&wv)[UNROLL],
+                   unsigned char (&sv)[UNROLL])
+      __attribute__((always_inline)) {
+#pragma unroll
+    for (int u = 0; u < UNROLL; u++) {
+      int const k = ((i0 + u) * LANES_PER_ROW + lane) * VEC;
+#if MPK_ATTN_STREAM_NT >= 1
+      wv[u] = ld_g_nt<u32x4_t>(w_row + k);
+#else
+      wv[u] = ld_g<u32x4_t>(w_row + k);
+#endif
+#if MPK_ATTN_STREAM_NT == 1
+      sv[u] = ld_g_nt<unsigned char>(s_row + k / SCALE_BLOCK);
+#else
+      sv[u] = ld_g<unsigned char>(s_row + k / SCALE_BLOCK);
+#endif
+    }
+  };
+  auto consume = [&](int i0, u32x4_t const (&wv)[UNROLL],
+                     unsigned char const (&sv)[UNROLL])
+      __attribute__((always_inline)) {
+#pragma unroll
+    for (int u = 0; u < UNROLL; u++) {
+      int const k = ((i0 + u) * LANES_PER_ROW + lane) * VEC;
+      float const sc = e8m0_to_f32(sv[u]);
+      unsigned const wd[4] = {wv[u].x, wv[u].y, wv[u].z, wv[u].w};
+#pragma unroll
+      for (int m = 0; m < BATCH_SIZE; m++) {
+        unsigned short const *a = s_a + m * REDUCTION_SIZE + k;
+        u32x4_t const a0 = *reinterpret_cast<u32x4_t const *>(a);
+        u32x4_t const a1 = *reinterpret_cast<u32x4_t const *>(a + 8);
+#pragma unroll
+        for (int h = 0; h < 4; h++) {
+          u32x4_t const av2 = (h >> 1) ? a1 : a0;
+          unsigned const ax = (h & 1) ? av2.z : av2.x;
+          unsigned const ay = (h & 1) ? av2.w : av2.y;
+          acc[m][2 * (h & 1)] = gang_gemv_detail::fma_pair(
+              cvt_fp8_pair<false>(wd[h], sc), ax, acc[m][2 * (h & 1)]);
+          acc[m][2 * (h & 1) + 1] = gang_gemv_detail::fma_pair(
+              cvt_fp8_pair<true>(wd[h], sc), ay, acc[m][2 * (h & 1) + 1]);
+        }
+      }
+    }
+  };
+
+  // STAGE_A only: the !STAGE_A path reads the activation from *global*, so it
+  // would need its own depth budget rather than handing registers back.
+  // o_proj clears this -- REDUCTION_SIZE 32768 is 64 KB of bf16 in a 160 KB
+  // budget. ITERS/UNROLL >= 4 keeps a pipelined loop with a real steady state.
+  constexpr bool GEMV_PF = (MPK_ATTN_GEMV_PF != 0) && STAGE_A &&
+                           (ITERS % (2 * UNROLL) == 0) && (ITERS / UNROLL >= 4);
+
+  if constexpr (GEMV_PF) {
+    u32x4_t wa[UNROLL], wb[UNROLL];
+    unsigned char sa[UNROLL], sb[UNROLL];
+    issue(0, wa, sa);
+    for (int i0 = 0; i0 < ITERS; i0 += 2 * UNROLL) {
+      issue(i0 + UNROLL, wb, sb);
+      consume(i0, wa, sa);
+      if (i0 + 2 * UNROLL < ITERS) {
+        issue(i0 + 2 * UNROLL, wa, sa);
+      }
+      consume(i0 + UNROLL, wb, sb);
+    }
+  } else
 
   for (int i0 = 0; i0 < ITERS; i0 += UNROLL) {
     // Indexed only by fully unrolled loops, so these stay in VGPRs.

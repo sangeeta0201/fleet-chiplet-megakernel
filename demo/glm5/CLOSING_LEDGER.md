@@ -917,6 +917,132 @@ with no ordering by worker index (checked at eight barrier-exit slots).
 
 ---
 
+#### The load-depth axis, worked to the end — 2026-09-02
+
+The outstanding-load census (§8, `isa_outstanding.py`) had one row left that
+named a real defect rather than an instrument artifact:
+
+```
+GEMV (UK/UV/o)   217 insns  16 loads  carry 0  peak 8  drains 2
+```
+
+Two drains per trip and carry 0 means the loop pays a full memory latency
+twice per trip with nothing covering either. The MXFP8 GEMV's own NO-GO note
+had already established the payoff variable for it — the body is 128 v_cvt +
+v_dot2c out of 217 instructions with no MFMA, so it is latency-bound, and an
+earlier address-arithmetic cut that saved 16 instructions **lost** because it
+shrank the first wait from `vmcnt(7)` to `vmcnt(3)`. Depth, not instruction
+count.
+
+The registers to buy depth were already in the loop, spent on the wrong
+stream: `av` is `UNROLL*2` dwordx4 = 64 VGPRs of **LDS**-staged activation held
+live across the whole issue block, while the *global* weight stream was only 8
+deep. LDS is tens of cycles on its own counter, so batching it bought nothing.
+Reading `av` just-in-time in a separate consume pass hands ~56 VGPRs back and
+pays for a second `UNROLL`-deep buffer of the weight+scale stream.
+
+`MPK_ATTN_GEMV_PF=1`, **committed default OFF** — see the verdict at the end
+of this section. The ISA moved as designed:
+
+| | insns | loads | carry | peak | drains | VGPR | spills |
+|---|---|---|---|---|---|---|---|
+| before | 217 | 16 | 0 | 8 | 2 | 325 | 0 |
+| after | 452 (**2 trips**) | 32 | 0 | **32** | **1** | 344 | **0** |
+
+Per-trip instruction count is flat (226 vs 217) for 4× the depth and half the
+drains, and 344 VGPRs is still one wave/SIMD, so occupancy is unchanged.
+
+**Wall: no resolvable effect. The transform is NEUTRAL.** This started out
+looking like −0.026 ms and the retraction is the useful part of the entry:
+
+| build | min-of-decode | n |
+|---|---|---|
+| arm (`PF=1`) | 8.734 (spread 0.003) | 3 |
+| arm, second batch | 8.727 / 8.741 | 2 |
+| control (`PF=0`), paired with arm | 8.760 (spread 0.046) | 3 |
+| **control (`PF=0`), after GPU cleanup** | **8.725** (8.711 / 8.739) | 2 |
+
+Against the first control this is −0.026 ms with non-overlapping ranges,
+reproduced across two arm batches — which is what a real 0.3% lever looks
+like. Then the *same shipping build with the knob off* measured **8.725**,
+faster than the arm. So the baseline drifted ~0.035 ms downward between
+batches and the pairing was confounded; the drift is larger than the effect.
+
+What drifted: the earlier batches ran with GPU memory leaked by `pkill -9`-ed
+runs still resident (four `python3` ranks survived the kill holding the
+allocation — a later launch hit `HIP out of memory` with 126 MiB free and
+`rocm-smi` showed 94% memory use on GPUs 4–7). After killing them by PID the
+baseline came in lower. **Operational rule: check for orphaned ranks holding
+`/dev/kfd` before scoring any paired run** —
+
+```
+for p in $(ls /proc | rg '^[0-9]+$'); do
+  ls -l /proc/$p/fd 2>/dev/null | rg -q kfd && echo "$p $(cat /proc/$p/comm)"
+done
+```
+
+`pkill -f demo.py` does *not* reliably reap them, and a leaked allocation both
+slows survivors and wedges new launches at "both grids enqueued", which is the
+same signature as the co-residency wedge. Three correctness-suite attempts were
+lost to this before it was diagnosed.
+
+**Why a 4× depth win is worth nothing measurable, which is the useful part.**
+The
+instantiation it fires on is `<1, 32768, 8, HAS_RESIDUAL=true,
+WRITE_THROUGH=false>` — the *unfused* o_proj. `GLM_FUSE_ATTN=0` means that
+chain serves the **three dense prologue layers only**; the 78 MoE layers reach
+o_proj through `gang_oproj_router_fused`, which at `MPK_OPROJ_MXFP4=1` is the
+MXFP4 kernel. W_UK/W_UV do not qualify either — their reductions are small
+enough that `ITERS == 1`.
+
+Porting it to the MXFP4 kernel to reach the other 78 layers is a **measured
+NO-GO**: 8.727/8.741 against the MXFP8-arm-only 8.733/8.734/8.736, no
+movement. The census says why — `GEMV mxfp4 -- no load-carrying loop`. At
+o_proj's shape `ITERS=32, UNROLL=8`, so all four trips are fully unrolled into
+straight-line code. There is no backedge to hoist a load across and no drain
+to delete; depth there is limited by the register file, which the scheduler
+was already free to use.
+
+> **Rule.** A pipelining transform pays only where the census reports a *loop*
+> with `drains >= 2` — that names a latency the loop structure forces you to
+> pay twice per trip. A fully unrolled body reports no loop and has nothing to
+> take. Check for the backedge before porting, not the phase's byte share.
+
+**Verdict: committed default OFF.** The transform is correct and the ISA
+evidence is unambiguous, but it buys no measurable time on 3 of 81 layers and
+costs +19 VGPR (325 → 344) and more scratch (`private_segment_fixed_size` 600,
+`sgpr_spill_count` 114). The megakernel requires all 248 blocks co-resident,
+so scratch growth is a liveness risk, not just a perf one. Keep the knob for
+the day `GLM_FUSE_ATTN` or `MPK_OPROJ_MXFP4` changes and the MXFP8 GEMV starts
+serving all 81 layers — the mechanism is already built and verified.
+
+The correctness *evidence* is good, though the suite itself never completed
+(it wedged on the leaked-memory problem above): the transform provably
+preserves accumulation order — same `u, m, h` iteration order onto the same
+four `acc` chains — so bitwise-identical results are expected, and the arm's
+generated text is drawn from the same variant set as the control's. Which
+raises the trap below.
+
+> **Trap, and it invalidates exact-token gating on this config.** The control
+> is **not deterministic run-to-run**. Three control runs of the same binary
+> gave two different continuations ("Its largest city is also Paris…" vs "The
+> official language is French, and many other languages are spoken…"), and the
+> arms produced the same two variants. A near-tie in an early argmax flips on
+> the EP reduction order. This is why `compare_tokens.py` gates on cross-rank
+> agreement and content keywords rather than exact match against a reference —
+> use those two gates, and never read a text diff between two arms as a
+> numerics regression.
+
+This closes the load-depth axis. Every row in the §8 census is now either
+`flat-part` (W13/W2, carry 8), a fully unrolled body with no backedge (both
+o_proj paths), a barrier poll misread as a GEMM (the retracted router row), or
+a single-trip loop (MLA decode). **There is no starved loop left in the layer**
+— which means the 3.55 ms non-MoE overage is not memory-latency serialization
+in any loop, and the remaining levers are structural (invocation count,
+barrier/release edges), not schedulable.
+
+---
+
 ## 9. INDEX
 
 | topic | file |

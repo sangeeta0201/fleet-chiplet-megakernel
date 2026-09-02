@@ -221,6 +221,36 @@ __device__ __noinline__ void
     }
   }
 
+  // NO-GO, measured 2026-09-02: porting MPK_ATTN_GEMV_PF (the MXFP8 twin's
+  // one-trip weight pipeline) to this kernel. It is inert here, and the
+  // reason is worth keeping because it is the same reason the transform pays
+  // next door.
+  //
+  // The port looked like the higher-value half of the two. With
+  // MPK_OPROJ_MXFP4=1 the 78 MoE layers run their o_proj through THIS kernel
+  // -- the MXFP8 kernel's <1,32768,8,residual> instantiation only serves the
+  // three dense prologue layers -- and the register argument is twice as
+  // strong, because `av` here is UNROLL*4 dwordx4 = 128 VGPRs of LDS-staged
+  // activation held live across the issue block against the fp8 kernel's 64
+  // (32 fp4 weight elements need 64 bytes of bf16).
+  //
+  // It measures 8.727 / 8.741 min-of-decode against the MXFP8-arm-only
+  // 8.733 / 8.734 / 8.736 -- the same number, no movement. The census says
+  // why: this loop has **no backedge at all**. At o_proj's shape ITERS is 32
+  // and UNROLL 8, so the four trips are fully unrolled into straight-line
+  // code, `GEMV mxfp4 -- no load-carrying loop`. There is no cross-iteration
+  // gap to hoist a load into and no drain to delete; the scheduler already
+  // issues every load as early as the register file allows, and what limits
+  // depth is the register file, not the loop structure. Handing `av`'s
+  // registers back does not deepen anything the scheduler was not already
+  // free to deepen.
+  //
+  // The distinction that makes this predictive: MPK_ATTN_GEMV_PF pays where
+  // the census reports a *loop* with `drains >= 2`, because that names a
+  // latency the loop structure forces you to pay twice per trip. A fully
+  // unrolled body reports no loop and has nothing to take. Check for the
+  // backedge before porting a pipelining transform, not just the phase's
+  // byte share.
   for (int i0 = 0; i0 < ITERS; i0 += UNROLL) {
     // Indexed only by fully unrolled loops, so these stay in VGPRs. The
     // activation vector is 4 wide rather than 2: 32 elements of weight need

@@ -1298,6 +1298,17 @@ def get_compile_command(
             assert _ant in ("0", "1", "2"), "MPK_ATTN_STREAM_NT is 0, 1 or 2"
             flags = flags + [f"-DMPK_ATTN_STREAM_NT={_ant}"]
 
+        _gpf = os.environ.get("MPK_ATTN_GEMV_PF")
+        if _gpf is not None:
+            # Software-pipeline the weight+scale stream of the MXFP8 GEMV
+            # k-loop (W_UK, W_UV, o_proj) one trip deep, paying for the second
+            # buffer with the `av` registers the loop currently spends
+            # batching LDS reads. See the note in the kernel body: that loop
+            # is latency-bound with carry 0, so depth at the top of the trip
+            # is the payoff variable.
+            assert _gpf in ("0", "1"), "MPK_ATTN_GEMV_PF is 0 or 1"
+            flags = flags + [f"-DMPK_ATTN_GEMV_PF={_gpf}"]
+
         _pfd = os.environ.get("MPK_MOE_PF_DBUF")
         if _pfd is not None:
             # Double-buffered form of the same k-loop. The deep loop's
