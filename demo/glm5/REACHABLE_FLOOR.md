@@ -21,7 +21,7 @@ line. Those agree to 2%.
 |---|---|---|
 | today | 8.862 ms | — |
 | kill the EP routing tax (§1a) | **~8.2 ms** | expert-TP on the routed experts |
-| + every intra-layer lever at its measured ceiling | **6.9 – 7.6 ms** | the decode slice release, plus scraps |
+| + every intra-layer lever at its measured ceiling | **7.4 – 8.1 ms** | the decode slice release, plus scraps |
 | a schedule redesign — fewer, wider phases | ~4.5 – 5.5 ms | not an optimization; a rewrite |
 | byte roofline | 2.144 ms | unreachable at any schedule |
 
@@ -258,7 +258,30 @@ The 17.5 us splits into two unequal halves:
 | half | us/layer | ms | status |
 |---|---|---|---|
 | barrier wait before the decode starts | ~11.2 | ~0.72 | needs the slice-release port |
-| decode compute | 7.8 | 0.50 | attacked, register-bound |
+| decode compute | 7.8 | 0.50 | ~~attacked, register-bound~~ **fixed cost, not recoverable — see below** |
+
+> **AMENDED 2026-09-02: the compute half is not register-bound, it is
+> per-invocation FIXED cost, and it is not a lever at this benchmark shape.**
+> `KV_TILE` is 16 and the sequence is split over `kv_chunks=16`, so
+> `ntiles = ceil(ceil(seq/16)/16)` is **1 for any seq ≤ 256**, and we run
+> `max_seq_length=128` with a live KV of ~34. The tile loop is SINGLE-TRIP:
+> `prefetch_t2`'s `t + 2 < ntiles` never fires, and the WAR-edge story below is
+> describing a backedge that does not exist. Subphase slots confirm it — cold
+> start 29%, tile QK/PV 27%, epilogue 26%, refill 15%, so prologue+epilogue is
+> 55%, which is what a one-trip loop implies.
+>
+> This is why `MPK_MLA_DECODE_DBLBUF` measured **+0.08 ms**: it bought a second
+> buffer for a loop that never goes round. The 0.50 ms is 64 invocations
+> (`q_groups=4 × chunks=16`) of prologue and epilogue around one ~12%-full
+> tile, so **strike it from the reachable budget** — the levers it admits are
+> invocation count (swept: 4 → 14.189, 16 → 11.464, 32 → +0.157; 16 is the
+> knee) and the prologue/epilogue itself, neither of which is the 0.50 ms.
+> Full derivation at the `MPK_MLA_DECODE_DBLBUF` define in
+> `gang_mla_decode_mi300.cuh`.
+>
+> **This invalidates every decode number in this document as a guide to a real
+> deployment**, since all of them are taken at seq ≤ 128 where the decode is
+> prologue-bound. Re-measure at seq ≥ 512 before spending anything here.
 
 **The compute half is register-bound, measured.** The loop is already two trips
 deep, but `kv_pre` is a single register buffer, so trip t drains it for tile t+1
