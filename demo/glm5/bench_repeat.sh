@@ -43,12 +43,34 @@ for i in $(seq 1 "$N"); do
   # shape and is not what any lever here is measured against.
   ms=$(grep -E '^\[1,0\].*Decode:' "$log" | grep -oE 'avg [0-9.]+ms/iter' \
         | grep -oE '[0-9.]+')
-  echo "[$TAG] run $i: rc=$rc  avg=${ms:-FAILED} ms/iter   ($log)"
+  # PER-ITER MIN, and report it next to the avg rather than instead of it.
+  # As of 2026-09-02 this box injects multi-second single-iteration stalls
+  # into most runs -- a K-shard batch had arm averages of 117 and 931 ms
+  # against a per-iter min of 9.0 in the same runs -- so the avg no longer
+  # resolves a sub-ms lever at any n. The min is immune (control spread
+  # 0.010 ms over three runs) and is what the A/Bs below are scored on.
+  # Prefer the avg again only once a batch comes back with no outlier line.
+  mn=$(grep -E '^\[1,0\].*Decode per-iter range:' "$log" \
+        | grep -oE 'min=[0-9.]+ms' | grep -oE '[0-9.]+')
+  echo "[$TAG] run $i: rc=$rc  min=${mn:-FAILED} avg=${ms:-FAILED} ms/iter   ($log)"
 done
 
-echo "--- $TAG summary ---"
-grep -hE '^\[1,0\].*Decode:' /tmp/glm5_${TAG}_r*.log \
-  | grep -oE 'avg [0-9.]+ms/iter' | grep -oE '[0-9.]+' \
-  | awk '{s+=$1; n++; if(n==1||$1<mn)mn=$1; if($1>mx)mx=$1}
-         END{if(n)printf "n=%d mean=%.3f min=%.3f max=%.3f ms/iter\n",n,s/n,mn,mx;
-             else print "no results"}'
+echo "--- $TAG summary (score on MIN; see the note above) ---"
+for _stat in min avg; do
+  if [ "$_stat" = min ]; then
+    _pat='Decode per-iter range:'; _key='min=[0-9.]+ms'
+  else
+    _pat='Decode:'; _key='avg [0-9.]+ms/iter'
+  fi
+  grep -hE "^\[1,0\].*$_pat" /tmp/glm5_${TAG}_r*.log \
+    | grep -oE "$_key" | grep -oE '[0-9.]+' \
+    | awk -v s="$_stat" '{v[n++]=$1; t+=$1; if(n==1||$1<mn)mn=$1; if($1>mx)mx=$1}
+           END{if(n)printf "  %s: n=%d mean=%.3f min=%.3f max=%.3f ms/iter\n",s,n,t/n,mn,mx;
+               else printf "  %s: no results\n",s}'
+done
+# Name the contaminated runs explicitly so a batch is never averaged blind.
+if grep -qhE '^\[1,0\].*Decode outliers' /tmp/glm5_${TAG}_r*.log 2>/dev/null; then
+  echo "  WARNING: stall outliers present -- the avg row above is not usable:"
+  grep -hE '^\[1,0\].*Decode outliers' /tmp/glm5_${TAG}_r*.log \
+    | sed 's/^\[1,0\]<stdout>:/    /'
+fi

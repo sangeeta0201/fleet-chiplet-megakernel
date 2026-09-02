@@ -789,7 +789,7 @@ non-MoE loop**, and the split is total:
 |---|---|---|---|---|
 | W13 tile | 12 | **12** | 0 | pipelined across the backedge |
 | W2 tile | 8 | **8** | 1 | pipelined across the backedge |
-| router GEMM | 12 | **0** | **12** | `global_load_dword` + `s_waitcnt vmcnt(0)`, x12 |
+| ~~router GEMM~~ (o_proj barrier poll — see retraction) | 12 | **0** | **12** | `global_load_dword sc0 sc1` + `s_waitcnt vmcnt(0)`, x12 |
 | GEMV (W_UK / W_UV / o_proj) | 16 | **0** | 2 | 8-load bursts, counted staircase, drained between bursts |
 | MLA decode | 10 | **0** | 2 | 9-load burst, full `vmcnt(17)`..`vmcnt(0)` staircase |
 | KV latent write | 7 | **0** | 3 | small bursts |
@@ -805,6 +805,38 @@ granularity. Neither is waiting on one load at a time.
 which issues a load and drains it with `vmcnt(0)` twelve times in a
 93-instruction body, peak outstanding 1. That one is real and is the only place
 the naive reading holds.
+
+> **RETRACTED 2026-09-02. That row is not a GEMM and it is not a lever.**
+> The census row reproduces exactly on today's image (93 insns, 12 loads,
+> carry 0, peak 1, 12 drains, `[0x3d638..0x3d82c]`), but disassembling the
+> range shows every one of the 12 loads carries `sc0 sc1` — system-scope
+> coherent, cache-bypassing — while the gate-weight prefetch this row was
+> assumed to be uses `sc0 nt`. The address range sits in
+> `gang_rmsnorm_linear_bias_topk_kernel` at the **o_proj hierarchical barrier
+> poll**, `gang_rmsnorm_linear_bias_mi300.cuh:868-902`: one `ld_nt_s32` on
+> this XCD's flag, plus the 8-flag peer-heal scan, each followed by
+> `s_cbranch_execz`.
+>
+> Serialization there is required, not a defect — a poll must observe fresh
+> memory, so it cannot carry a load across the backedge — and the 8-flag scan
+> is gated behind `MPK_FL_REPUBLISH_SPINS = 1024` with an `s_sleep(1)` per
+> spin, making it a cold diagnostic path that does not execute on a healthy
+> release at all.
+>
+> **The router's gate GEMV is not in this table because it has no
+> load-carrying loop left to find:** `MAX_ITERS_PF` prefetches gamma and all
+> `EXPERTS_PER_TILE` gate rows *whole* across the o_proj barrier (6-7
+> `global_load_dwordx2` per array at REDUCTION_SIZE 6144), so the row is in
+> registers before the barrier opens. That is the same thing the ROUTER_FOLD
+> counters already reported from the other side — deleting the gate GEMV
+> bought 96 ns because the prefetch had already hidden it.
+>
+> **Consequence for the 3.55 ms.** The claim "exactly one loop is genuinely
+> serialized" is now **zero loops**, and the 3.55 ms has *no* attribution to a
+> starved data loop anywhere in the layer. Every remaining row in the table
+> above is a burst with peak outstanding 4-9. The open item is therefore only
+> the `carry`-0 cross-iteration gap named below, not a `peak`-1 stall — and
+> the next person should not go optimize a barrier poll.
 
 What the other rows do have is a **cross-iteration** gap: the decode drains to
 `vmcnt(0)` and then runs a long MFMA/LDS block — 18 `v_mfma`, 18 `ds_read_b128`,
