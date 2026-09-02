@@ -98,6 +98,9 @@ namespace kernel {
 #ifndef MPK_MOE_LIVE_BOUND
 #define MPK_MOE_LIVE_BOUND 1
 #endif
+#if MPK_MOE_SHARED_KSHARD > 0 && !MPK_MOE_LIVE_BOUND
+#error "MPK_MOE_SHARED_KSHARD needs MPK_MOE_LIVE_BOUND: the shared W2 loop bound is computed in that block, and the static bound has no separate shared class"
+#endif
 // One boolean for "the W13 ceiling probe forced the flat arrival", so the
 // self-heal's quota and the arrival cannot disagree across the #ifdef.
 #ifdef MPK_W13_EARLY_REL
@@ -1477,6 +1480,10 @@ __device__ __attribute__((always_inline)) void
   // below count workers, not tiles -- it only stops walking dead tile space.
   int moe_w13_live = moe_w13_tiles_per_xcd;
   int moe_w2_live = moe_w2_tiles_per_xcd;
+#if MPK_MOE_SHARED_KSHARD > 0
+  // The shared expert's W2 tiles, run as a second loop past the routed one.
+  int moe_w2_shared_live = 0;
+#endif
 #if MPK_MOE_LIVE_BOUND
   {
     int const *d_mask_live = static_cast<int const *>(active_expert_ids_ptr);
@@ -1511,6 +1518,13 @@ __device__ __attribute__((always_inline)) void
     }
 #endif
     int owned, owned_w13;
+    // Routed-only owned count and whether the shared expert is live, both
+    // used only by the K-shard, which sizes its two W2 loops separately and
+    // gives the shared expert a tile run of a different length from a routed
+    // one. Counted here rather than derived from `owned` because `owned`
+    // folds the shared expert in on EP_SHARED_PE alone.
+    int owned_routed = 0;
+    int shared_act = 0;
     if constexpr (EP_WORLD_SIZE > 1) {
       constexpr int EP_LOCAL_ROUTED = NUM_EXPERTS / EP_WORLD_SIZE;
       constexpr int EP_BASE = EP_MY_PE * EP_LOCAL_ROUTED;
@@ -1614,6 +1628,16 @@ __device__ __attribute__((always_inline)) void
                 ? (EP_MY_PE == EP_SHARED_PE)
                 : (cand >= EP_BASE && cand < EP_BASE + EP_LOCAL_ROUTED);
         owned += is_owned ? 1 : 0;
+        // Gated on holding a slice, not merely on the expert being live: at a
+        // slice count below the world size the high ranks skip it entirely.
+        shared_act += (cand >= NUM_EXPERTS &&
+                       EP_MY_PE < MPK_MOE_SHARED_KSHARD)
+                          ? 1
+                          : 0;
+        owned_routed += (cand < NUM_EXPERTS && cand >= EP_BASE &&
+                         cand < EP_BASE + EP_LOCAL_ROUTED)
+                            ? 1
+                            : 0;
         // MPK_SHARED_DUP widens the W13 tile space ONLY, by MPK_SHARED_DUP
         // extra copies of the shared expert. It must agree exactly with the
         // DUP_SHARED decode in _gang_moe_mxfp8_tile, which gives that expert
@@ -1628,18 +1652,41 @@ __device__ __attribute__((always_inline)) void
     } else {
       owned = n_act;
       owned_w13 = n_act;
+      owned_routed = n_act;
+      shared_act = 0;
     }
     // Round UP to the XCD stride: the last live global tile can sit on any
     // XCD, and global_tile = t * 8 + xcd_id. A tile or two past the end still
     // returns false, which is correct and costs one decode.
+#if MPK_MOE_SHARED_KSHARD > 0
+    // Tile counts stop being "experts x TILES_PER_EXPERT" under the shard,
+    // because the shared expert's run is a different length from a routed
+    // one and differs again between W13 and W2. Count tiles directly and in
+    // the same order the decode walks the mask.
+    //
+    //   W13  routed tiles, plus T13/W for the shared slice, on EVERY rank
+    //   W2   routed tiles only; the shared class is its own loop below, and
+    //        it is the FULL T2 on every rank because W2's tiles partition the
+    //        hidden output, which the shard does not touch
+    int const w13_live =
+        (owned_routed * MOE_W13_TILES_PER_EXPERT +
+         shared_act * (MOE_W13_TILES_PER_EXPERT / MPK_MOE_SHARED_KSHARD) + 7) /
+        8;
+    int const w2_live = (owned_routed * MOE_W2_TILES_PER_EXPERT + 7) / 8;
+#else
     int const w13_live = (owned_w13 * MOE_W13_TILES_PER_EXPERT + 7) / 8;
     int const w2_live = (owned * MOE_W2_TILES_PER_EXPERT + 7) / 8;
+#endif
     if (w13_live < moe_w13_live) {
       moe_w13_live = w13_live;
     }
     if (w2_live < moe_w2_live) {
       moe_w2_live = w2_live;
     }
+#if MPK_MOE_SHARED_KSHARD > 0
+    moe_w2_shared_live =
+        shared_act ? ((MOE_W2_TILES_PER_EXPERT + 7) / 8) : 0;
+#endif
   }
 #endif
 
@@ -1723,7 +1770,8 @@ __device__ __attribute__((always_inline)) void
                                      EP_MY_PE,
                                      /*EP_NUM_ROUTED=*/NUM_EXPERTS,
                                      EP_SHARED_PE,
-                                     /*EMIT_FP8=*/MPK_MOE_ACT_FP8 != 0>(
+                                     /*EMIT_FP8=*/MPK_MOE_ACT_FP8 != 0,
+                                     MPK_MOE_SHARED_KSHARD>(
         norm_output_ptr,
         moe_gate_up_weight_ptr,
         routing_indices_ptr,
@@ -2019,7 +2067,11 @@ __device__ __attribute__((always_inline)) void
                                     /*EP_NUM_ROUTED=*/NUM_EXPERTS,
                                     EP_SHARED_PE,
                                     MPK_W2_KSPLIT,
-                                    /*INPUT_FP8=*/MPK_MOE_ACT_FP8 != 0>(
+                                    /*INPUT_FP8=*/MPK_MOE_ACT_FP8 != 0,
+                                    MPK_MOE_SHARED_KSHARD,
+                                    /*TILE_CLASS=*/(MPK_MOE_SHARED_KSHARD > 0
+                                                        ? 1
+                                                        : 0)>(
         moe_swiglu_out_ptr,
         moe_down_weight_ptr,
         routing_indices_ptr,
@@ -2029,6 +2081,51 @@ __device__ __attribute__((always_inline)) void
         t,
         topk_weight_ptr);
   }
+
+#if MPK_MOE_SHARED_KSHARD > 0
+  // ── The shared expert's W2, K-sharded across ranks ───────────────────────
+  // A second loop and not a wider bound on the one above: this class reduces
+  // over MOE_INTERMEDIATE/W instead of the whole thing, and that length is a
+  // template argument (SPLIT_ITERS on the MFMA loop, SPLIT_LEN on the stage),
+  // so the two classes cannot share an instantiation.
+  //
+  // Every rank runs all MOE_W2_TILES_PER_EXPERT of these -- the tiles
+  // partition the hidden output, which is not the sharded dimension -- and
+  // each produces a PARTIAL sum over its own quarter of the intermediate.
+  // Nothing combines them explicitly: the epilogue atomicAdds into the f32
+  // workspace and the EP collective already sums that workspace across ranks,
+  // and both are linear, so a partial K sum is just another addend. The bias
+  // is the one addend that is not, and K_SPLITS > 1 here routes it through
+  // the existing add_bias gate, landing it on rank 0 only.
+  for (int t = xcd_rank; t < moe_w2_shared_live; t += tiles_per_xcd) {
+    gang_moe_w2_linear_mxfp8_kernel<BATCH_SIZE,
+                                    HIDDEN_SIZE,
+                                    HIDDEN_SIZE,
+                                    MOE_INTERMEDIATE,
+                                    MOE_NUM_EXPERTS,
+                                    MOE_NUM_TOPK,
+                                    MOE_W2_TILES_PER_EXPERT,
+                                    MOE_W2_OPW,
+                                    /*FUSE_MULSUMADD=*/true,
+                                    MOE_WEIGHT_FP4,
+                                    EP_WORLD_SIZE,
+                                    EP_MY_PE,
+                                    /*EP_NUM_ROUTED=*/NUM_EXPERTS,
+                                    EP_SHARED_PE,
+                                    /*W2_K_SPLITS=*/MPK_MOE_SHARED_KSHARD,
+                                    /*INPUT_FP8=*/MPK_MOE_ACT_FP8 != 0,
+                                    MPK_MOE_SHARED_KSHARD,
+                                    /*TILE_CLASS=*/2>(
+        moe_swiglu_out_ptr,
+        moe_down_weight_ptr,
+        routing_indices_ptr,
+        active_expert_ids_ptr,
+        moe_w2_bias_ptr,
+        moe_workspace_f32_ptr,
+        t,
+        topk_weight_ptr);
+  }
+#endif
 #if MPK_ABL_PIPE_W13W2
 #undef MPK_PIPE_W2_TILE
 #endif

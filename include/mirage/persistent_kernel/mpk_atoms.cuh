@@ -1201,6 +1201,86 @@ __device__ void *g_ml_next_qkv_w[8];
 #define MPK_SHARED_DUP 0
 #endif
 
+// ── MPK_MOE_SHARED_KSHARD: shard the shared expert across the EP ranks ──────
+//
+// The number of slices to cut the shared expert into; 0 (default) keeps it
+// whole on EP_SHARED_PE. Capped at 4 by W2's pipeline (see below), so at
+// EP_WORLD_SIZE = 8 it runs on ranks 0..3 and the rest skip the shared expert
+// altogether. This is the fix for the imbalance MPK_SHARED_DUP was built
+// to price: EP_SHARED_PE carries its routed share PLUS the whole shared
+// expert, which measured 19.418 us/layer of MoE against rank 2's 13.716 --
+// 5.702 us/layer, 0.367 ms/token, all of it on the critical path because the
+// barrier after W2 waits for the slowest rank.
+//
+// Rank r takes intermediate slice [r*I/W, (r+1)*I/W) of the shared expert:
+//
+//   W13  its tiles partition the intermediate, so rank r simply runs WGS/W of
+//        them. Gate and up are pairwise interleaved, so the slice is a
+//        contiguous output-row range and the shard is a flat tile offset.
+//        Rank r writes its slice into the same offset of the rank-LOCAL
+//        swiglu scratch its own W2 reads back, so no exchange is needed.
+//   W2   its tiles partition the hidden output, so every rank runs all of
+//        them, each reducing only over its own slice. The partials need no
+//        combine step: the epilogue atomicAdds into the f32 workspace and the
+//        EP collective already sums that across ranks, both linear. The bias
+//        rides the existing split-K add_bias gate and lands on rank 0 only.
+//
+// WHY THIS IS LEGAL AT 4 RANKS AND WAS NOT AT 8. W2's depth-4 pipeline needs
+// MFMA_ITERS >= 4 and divisible by 4. GLM-5's W2 has K = 2048 and
+// K_PER_MFMA = 128, so MFMA_ITERS = 16; at W = 4 the shared class gets 4,
+// exactly the minimum, and at W = 8 it gets 2 and the assert fires. The
+// 2026-08-21 note that closed this off was measured at 8 ranks and does not
+// bind here.
+//
+// EXPECT LESS THAN A CLEAN 1/W. W13 shards exactly, but a W2 tile's cost is
+// staging + MFMA + a 64-row atomicAdd epilogue and the shard divides only the
+// first two; ranks 1..W-1 also pick up an epilogue they did not run before.
+// The makespan drop is ~(W-1)/W of the VARIABLE part only. On top of that the
+// shared class sits at the depth-4 minimum, where every iteration is fill
+// with no steady state.
+//
+// CORRECTNESS IS NOT SELF-EVIDENT HERE. The earlier naive attempt at this
+// passed its mechanical gate because all four ranks agreed on the same wrong
+// answer. Gate on generated text or on MPK_BS_DEBUG=2 checksums against a
+// build with this off, not on rank agreement. Note that checksums will NOT be
+// bit-identical across the knob and must not be gated as such: the shard
+// changes how the reduction is partitioned, so the low bits move legitimately.
+//
+// ── MEASURED 2026-09-02: CORRECT, AND A LOSS. DEFAULT STAYS 0. ─────────────
+//
+//   arm         per-run decode min, ms      n=3, NP=4, one -D apart
+//   control     8.771 / 8.761 / 8.763       mean 8.765
+//   kshard=4    8.987 / 9.028 / 9.020       mean 9.012   **+0.247 ms**
+//
+// Text was coherent and correct on the arm, so this is a real measurement of
+// a real implementation and not a garbage-output artifact. The per-iteration
+// MIN is the statistic: this box injects multi-second stalls that ruined one
+// run of each arm (117 ms and 931 ms averages), and the min is immune to them.
+//
+// The mechanism is in the long note above the W13 kernel in
+// gang_moe_linear_mxfp8_mi300.cuh. Short version: at the shipping tile widths
+// rank 0's three experts already fit in ONE grid-stride round of the 30
+// workers per XCD, so the shared expert runs on otherwise-idle workers and is
+// nearly free in makespan. The shard does not take work off the critical path,
+// it adds a slower tile class to every rank's round.
+//
+// Kept rather than deleted: it is the only worked example in the tree of a
+// cross-rank K-shard with collective-summed partials, and it is the control
+// that shows byte-rebalancing is not the lever while the round count holds.
+#ifndef MPK_MOE_SHARED_KSHARD
+#define MPK_MOE_SHARED_KSHARD 0
+#endif
+// The MPK_MOE_LIVE_BOUND dependency is checked where that macro is defined,
+// in gang_oproj_router_fused_mi300.cuh, which is included after this header.
+#if MPK_MOE_SHARED_KSHARD > 0
+#if MPK_SHARED_DUP
+#error "MPK_MOE_SHARED_KSHARD and MPK_SHARED_DUP both rewrite the shared expert's slot run; DUP is a pricing probe for the imbalance the shard removes, so they answer the same question and must not be combined"
+#endif
+#if MPK_ABL_PIPE_W13W2
+#error "MPK_MOE_SHARED_KSHARD and MPK_ABL_PIPE_W13W2 both re-derive W2 tile bounds; the probe moves tiles off a bound that no longer covers the shared class"
+#endif
+#endif
+
 #if MPK_ML_PTR_PREFETCH || MPK_ABL_ML_BOUNDARY
 #define MPK_ML_PF 1
 #else

@@ -1432,6 +1432,18 @@ def get_compile_command(
             # must see it.
             assert _w2_sf in ("0", "1"), "MPK_W2_STAGE_FULL is 0 or 1"
             flags = flags + [f"-DMPK_W2_STAGE_FULL={_w2_sf}"]
+
+        _sk = os.environ.get("MPK_MOE_SHARED_KSHARD")
+        if _sk is not None:
+            # Shard the shared expert's intermediate across the EP ranks so
+            # EP_SHARED_PE stops carrying it alone. Long note at the define in
+            # mpk_atoms.cuh. Must equal the world size: every rank takes one
+            # slice and the EP collective sums the partials, so a value that
+            # disagrees with the rank count drops or double-counts a slice.
+            # 4 is the cap: W2's depth-4 pipeline needs
+            # MFMA_ITERS/slices >= 4 and GLM-5's W2 has MFMA_ITERS = 16.
+            assert _sk in ("0", "2", "4"), "MPK_MOE_SHARED_KSHARD is 0, 2, or 4"
+            flags = flags + [f"-DMPK_MOE_SHARED_KSHARD={_sk}"]
         _moe_afp8 = os.environ.get("MPK_MOE_ACT_FP8")
         if _moe_afp8 is not None:
             # W13 emits the SwiGLU result as MXFP8 (E4M3 + one E8M0 per 32) and

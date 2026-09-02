@@ -20,8 +20,8 @@ line. Those agree to 2%.
 | tier | floor | what it takes |
 |---|---|---|
 | today | 8.862 ms | — |
-| kill the EP routing tax (§1a) | **~7.9 ms** | expert-TP + shard the shared expert |
-| + every intra-layer lever at its measured ceiling | **6.6 – 7.3 ms** | the decode slice release, plus scraps |
+| kill the EP routing tax (§1a) | **~8.2 ms** | expert-TP on the routed experts |
+| + every intra-layer lever at its measured ceiling | **6.9 – 7.6 ms** | the decode slice release, plus scraps |
 | a schedule redesign — fewer, wider phases | ~4.5 – 5.5 ms | not an optimization; a rewrite |
 | byte roofline | 2.144 ms | unreachable at any schedule |
 
@@ -54,8 +54,26 @@ critical-worker busy time of 30.8 us/layer:
 | routed today (EP) | 3.538 (mean 2.000, imbalance **1.77x**) | | |
 | routed under expert-TP | 2.000, zero variance | −10.44 | **−0.672** |
 | shared expert, replicated today | 1.000 | | |
-| shared expert, sharded 4 ways | 0.250 | −5.09 | **−0.328** |
-| **combined** | | **−15.53** | **−1.000** |
+| ~~shared expert, sharded 4 ways~~ | ~~0.250~~ | ~~−5.09~~ | ~~**−0.328**~~ |
+| **combined** | | **−10.44** | **−0.672** |
+
+> **The shared-expert row is FALSIFIED — it was built and it LOSES 0.247 ms.**
+> `MPK_MOE_SHARED_KSHARD=4`, correct text, n=3 per arm, per-iteration decode
+> min 8.765 → 9.012 ms. The error in the row is that it prices
+> expert-equivalents of BYTES, and bytes are not the unit of makespan here:
+> at the shipping tile widths rank 0's three experts already fit inside ONE
+> grid-stride round of the 30 workers per XCD (W13 24 tiles, W2 18), so the
+> shared expert runs on otherwise-idle workers and is close to free. The shard
+> adds a slower tile class to every rank's round instead of removing one from
+> the critical path. Full note at the `MPK_MOE_SHARED_KSHARD` define in
+> `mpk_atoms.cuh`.
+>
+> This is a caution about the whole table, not just the row: **an
+> expert-equivalent of bytes only converts to makespan when it changes the
+> round count.** The routed row above survives only because the routing
+> imbalance genuinely does cross the 30-tile boundary (3.538 experts is 28
+> W13 tiles/XCD, and 4 is 32); re-derive it at the round, not at the byte,
+> before spending on it.
 
 One routed expert is 20.05 MB at mxfp4; the busiest rank reads 4.538
 expert-equivalents per layer, so W13+W2 cost 6.787 us/layer per
@@ -335,6 +353,16 @@ Recorded so this document can be shown wrong rather than argued with.
    The prediction held only because this document had scoped both out as "a
    redesign" without pricing them. Per the rule below, the budget was
    re-derived rather than patched; §1 and §1a are the result.
+
+   **Half-unfalsified 2026-09-02.** The shared-expert shard was built and
+   measured **+0.247 ms — a loss**, so it was never a >0.5 ms lever and the
+   falsification now rests on expert-TP alone, which is still only estimated.
+   The §1a estimate that scored it was in bytes, and bytes convert to makespan
+   only across a grid-stride round boundary; the shared expert never crossed
+   one. Prediction 5 should be treated as OPEN again until expert-TP is
+   actually built: on the evidence so far, prediction 2's "widening measures
+   ≥ 0" and this result are the same finding, that this kernel's makespan is
+   set by round count and tile cost rather than by how the bytes are dealt out.
 
 If prediction 5 falls, this analysis is wrong in an interesting way and the
 budget above should be re-derived rather than patched.

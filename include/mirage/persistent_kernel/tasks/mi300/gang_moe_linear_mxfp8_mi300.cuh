@@ -1645,6 +1645,42 @@ __device__ __forceinline__ f32x4_t
 // because all ranks agreed on garbage. Gate on generated text, or on
 // MPK_BS_DEBUG=2 checksums against a 1-rank reference -- not on rank agreement.
 //
+// ── RE-CLOSED 2026-09-02: BUILT, CORRECT, AND A MEASURED LOSS ─────────────
+// The K-shard above is implemented and shipping-off behind
+// MPK_MOE_SHARED_KSHARD (long note at the define in mpk_atoms.cuh). It is
+// legal at 4 ranks exactly as predicted and it produces CORRECT TEXT -- the
+// arithmetic works. It is still the wrong lever:
+//
+//   arm         per-run decode min, ms      n=3, NP=4, one -D apart
+//   control     8.771 / 8.761 / 8.763       mean 8.765
+//   kshard=4    8.987 / 9.028 / 9.020       mean 9.012   **+0.247 ms**
+//
+// (The per-iteration MIN is the statistic, not the mean: this box injects
+// multi-second stalls that put one run of each arm at a 117 ms and a 931 ms
+// average. The min is immune and its spread is 0.010 ms on the control.)
+//
+// WHY THE 5.702 us/layer ABOVE IS NOT ON THE CRITICAL PATH. That figure is a
+// per-worker MEAN. Makespan is set by grid-stride ROUNDS, and at the shipping
+// widths both MoE GEMMs fit rank 0's three experts inside ONE round of the
+// 30 workers per XCD:
+//
+//   W13  2*2048/64  = 64 WGs/expert  -> 8 tiles/XCD/expert -> 24 of 30
+//   W2   6144/128   = 48 WGs/expert  -> 6 tiles/XCD/expert -> 18 of 30
+//
+// So the shared expert on rank 0 runs on workers that were otherwise IDLE and
+// costs almost no makespan. Sharding does not remove work from the critical
+// path -- it ADDS a new and SLOWER tile class to every rank's round. A shared
+// W2 tile at SPLIT_ITERS = 4 pays the same staging prologue and the same
+// 64-row atomicAdd epilogue as a routed tile at 16 while sitting at the
+// depth-4 minimum where every iteration is fill, so it is nowhere near 1/4 the
+// cost, and the round ends when the slowest tile in it ends.
+//
+// This is the same conclusion as the 2026-08-21 note, reached from the other
+// direction, and it generalises: on this kernel, rebalancing BYTES between
+// ranks buys nothing while the round count is unchanged. Do not reopen on a
+// per-rank mean. Reopen only if a width change first pushes the owned tile
+// count per XCD above 30, which is where a round boundary actually is.
+//
 // The tile space is built over the OWNED subsequence of the activated list,
 // not over the whole list with the non-owned tiles early-returning. gpt-oss
 // measured why: owned tiles come in runs of TILES_PER_EXPERT, and a run
@@ -1670,7 +1706,42 @@ template <int BATCH_SIZE,
           // THRESHOLD. Long note at the define in mpk_atoms.cuh. Only the W13
           // caller may set this -- W2's epilogue is an atomicAdd and would
           // double-count. Default 0 is byte-for-byte the old decode.
-          int DUP_SHARED = 0>
+          int DUP_SHARED = 0,
+          // ── Shared-expert K-shard ────────────────────────────────────────
+          // 0 is off and the decode below is byte-for-byte the DUP_SHARED
+          // form. Non-zero must equal EP_WORLD_SIZE and makes the shared
+          // expert owned by EVERY rank instead of EP_SHARED_PE alone, with
+          // rank r taking the r-th slice of the MoE intermediate dimension.
+          // See the note above the W13 kernel for why this is legal at 4
+          // ranks when the 2026-08-21 attempt found it illegal at 8.
+          //
+          // SHARED_WG_DIV is how that slice shows up in THIS kernel's tile
+          // space, which differs between the two callers:
+          //
+          //   W13 passes EP_WORLD_SIZE. Its tiles partition the intermediate,
+          //   which IS the sharded dimension, so rank r runs only WGS/W of
+          //   them. Gate and up are pairwise interleaved (row 2j is gate_j,
+          //   row 2j+1 is up_j), so intermediate slice [r*I/W, (r+1)*I/W) is
+          //   the contiguous output-row range [r*2I/W, (r+1)*2I/W) and the
+          //   slice is a flat wg_idx offset rather than a strided gather.
+          //
+          //   W2 passes 1. Its tiles partition the hidden OUTPUT, so every
+          //   rank still needs all of them; the shard shows up as a K window
+          //   inside each tile instead, which that kernel applies itself.
+          int SHARED_KSHARD = 0,
+          int SHARED_WG_DIV = 1,
+          // Which tiles this instantiation claims, under SHARED_KSHARD only:
+          //   0  every owned tile, routed and shared, in one run
+          //   1  owned routed tiles only
+          //   2  the shared expert's tiles only
+          //
+          // W13 uses 0: its reduction is over hidden, which the shard does
+          // not touch, so routed and shared tiles have identical shape and
+          // one loop covers both. W2's reduction IS the sharded dimension and
+          // its length is a template argument two levels down (SPLIT_ITERS on
+          // the MFMA loop, SPLIT_LEN on the stage), so its two classes cannot
+          // share an instantiation and the caller runs 1 and 2 as two loops.
+          int TILE_CLASS = 0>
 __device__ __forceinline__ bool _gang_moe_mxfp8_tile(int tile_idx,
                                                      int const *d_mask,
                                                      int const *d_routing,
@@ -1682,40 +1753,103 @@ __device__ __forceinline__ bool _gang_moe_mxfp8_tile(int tile_idx,
   int const num_activated_experts = d_mask[NUM_EXPERTS];
   int global_tile = tile_idx * 8 + _gang_moe_get_xcd_id();
   int e, leid;
+  // Offset of this tile inside its expert's slot run, and whether that expert
+  // is the K-sharded shared one. `within` replaces the old
+  // `global_tile % TILES_PER_EXPERT`: that identity only holds when every
+  // owned expert occupies the same number of slots, which the K-shard breaks.
+  int within;
+  bool shared_tile = false;
   if constexpr (EP_WORLD_SIZE > 1) {
     static_assert(EP_NUM_ROUTED % EP_WORLD_SIZE == 0,
                   "ep_slice needs the routed expert count to divide by the "
                   "world size");
     constexpr int EP_LOCAL_ROUTED = EP_NUM_ROUTED / EP_WORLD_SIZE;
     constexpr int EP_BASE = EP_MY_PE * EP_LOCAL_ROUTED;
-    int const owned_rank = global_tile / TILES_PER_EXPERT;
-    int seen = -1;
-    e = -1;
-    for (int i = 0; i < num_activated_experts; i++) {
-      int const cand = d_mask[i];
-      bool const owned =
-          (cand >= EP_NUM_ROUTED)
-              ? (EP_MY_PE == EP_SHARED_PE)
-              : (cand >= EP_BASE && cand < EP_BASE + EP_LOCAL_ROUTED);
-      // At DUP_SHARED > 0 the shared expert consumes 1 + DUP_SHARED slots
-      // instead of one. With mult == 1 `seen` still steps by exactly one from
-      // -1, so `>=` first fires exactly where `== owned_rank` did: the
-      // default path is unchanged.
-      int const mult =
-          (DUP_SHARED > 0 && cand >= EP_NUM_ROUTED) ? (1 + DUP_SHARED) : 1;
-      if (owned) {
-        seen += mult;
-        if (seen >= owned_rank) {
+    if constexpr (SHARED_KSHARD > 0) {
+      // <=, not ==: the slice count is capped by W2's depth-4 pipeline
+      // (MFMA_ITERS/SHARED_KSHARD >= 4), which at GLM-5's K = 2048 allows at
+      // most 4 slices. At EP_WORLD_SIZE = 8 the shard therefore runs on ranks
+      // 0..3 only and ranks 4..7 skip the shared expert entirely, which still
+      // takes the heavy rank from a whole shared expert down to a quarter of
+      // one. Ranks at or above the slice count must not participate or their
+      // partial would be summed twice.
+      static_assert(SHARED_KSHARD <= EP_WORLD_SIZE,
+                    "cannot have more shared-expert slices than ranks to sum "
+                    "them");
+      static_assert(TILES_PER_EXPERT % SHARED_WG_DIV == 0 &&
+                        WGS % SHARED_WG_DIV == 0,
+                    "the shared expert's tile run must divide evenly across "
+                    "ranks; an uneven split would leave a rank owning a "
+                    "partial workgroup");
+      // Slot runs are no longer uniform -- the shared expert contributes
+      // TILES_PER_EXPERT/SHARED_WG_DIV of them and a routed expert
+      // contributes TILES_PER_EXPERT -- so walk the owned experts
+      // accumulating tiles rather than dividing by a fixed stride.
+      constexpr int SHARED_TILES = TILES_PER_EXPERT / SHARED_WG_DIV;
+      int tiles_before = 0;
+      e = -1;
+      for (int i = 0; i < num_activated_experts; i++) {
+        int const cand = d_mask[i];
+        bool const is_shared = (cand >= EP_NUM_ROUTED);
+        if (TILE_CLASS == 1 && is_shared) {
+          continue;
+        }
+        if (TILE_CLASS == 2 && !is_shared) {
+          continue;
+        }
+        // The whole point: the shared expert is owned by every rank holding a
+        // slice, not by EP_SHARED_PE alone.
+        bool const owned = is_shared ? (EP_MY_PE < SHARED_KSHARD)
+                                     : (cand >= EP_BASE &&
+                                        cand < EP_BASE + EP_LOCAL_ROUTED);
+        if (!owned) {
+          continue;
+        }
+        int const slots = is_shared ? SHARED_TILES : TILES_PER_EXPERT;
+        if (global_tile < tiles_before + slots) {
           e = cand;
+          within = global_tile - tiles_before;
+          shared_tile = is_shared;
           break;
         }
+        tiles_before += slots;
       }
-    }
-    if (e < 0) {
-      return false;
+      if (e < 0) {
+        return false;
+      }
+    } else {
+      int const owned_rank = global_tile / TILES_PER_EXPERT;
+      int seen = -1;
+      e = -1;
+      for (int i = 0; i < num_activated_experts; i++) {
+        int const cand = d_mask[i];
+        bool const owned =
+            (cand >= EP_NUM_ROUTED)
+                ? (EP_MY_PE == EP_SHARED_PE)
+                : (cand >= EP_BASE && cand < EP_BASE + EP_LOCAL_ROUTED);
+        // At DUP_SHARED > 0 the shared expert consumes 1 + DUP_SHARED slots
+        // instead of one. With mult == 1 `seen` still steps by exactly one
+        // from -1, so `>=` first fires exactly where `== owned_rank` did: the
+        // default path is unchanged.
+        int const mult =
+            (DUP_SHARED > 0 && cand >= EP_NUM_ROUTED) ? (1 + DUP_SHARED) : 1;
+        if (owned) {
+          seen += mult;
+          if (seen >= owned_rank) {
+            e = cand;
+            break;
+          }
+        }
+      }
+      if (e < 0) {
+        return false;
+      }
+      within = global_tile % TILES_PER_EXPERT;
     }
     // Local weight layout: the owned routed range packed down to
-    // [0, EP_LOCAL_ROUTED), then the shared expert.
+    // [0, EP_LOCAL_ROUTED), then the shared expert. Under the K-shard every
+    // rank reads the shared slot, which every rank already stores -- the
+    // replicated copy the non-owners previously held and never read.
     leid = (e >= EP_NUM_ROUTED) ? (EP_LOCAL_ROUTED + (e - EP_NUM_ROUTED))
                                 : (e - EP_BASE);
   } else {
@@ -1724,9 +1858,24 @@ __device__ __forceinline__ bool _gang_moe_mxfp8_tile(int tile_idx,
     }
     e = d_mask[global_tile / TILES_PER_EXPERT];
     leid = e;
+    within = global_tile % TILES_PER_EXPERT;
   }
-  int const within = global_tile % TILES_PER_EXPERT;
-  int const tok = within / WGS;
+  int tok, wg;
+  if constexpr (SHARED_KSHARD > 0 && SHARED_WG_DIV > 1) {
+    // Both divisors are compile-time, so this is the same shift/mask pair the
+    // unsharded path gets, selected by a predicate rather than folded away.
+    constexpr int SHARED_WGS = WGS / SHARED_WG_DIV;
+    if (shared_tile) {
+      tok = within / SHARED_WGS;
+      wg = within % SHARED_WGS + EP_MY_PE * SHARED_WGS;
+    } else {
+      tok = within / WGS;
+      wg = within % WGS;
+    }
+  } else {
+    tok = within / WGS;
+    wg = within % WGS;
+  }
   if (tok >= BATCH_SIZE) {
     return false;
   }
@@ -1737,7 +1886,7 @@ __device__ __forceinline__ bool _gang_moe_mxfp8_tile(int tile_idx,
   *expert_id = e;
   *local_eid = leid;
   *tok_idx = tok;
-  *wg_idx = within % WGS;
+  *wg_idx = wg;
   *topk_slot = route_val - 1;
   return true;
 }
@@ -1802,7 +1951,13 @@ template <int BATCH_SIZE,
           //
           // Requires the N-parallel branch: the K-parallel workgroup owns 8
           // activation columns, which is narrower than a scale block.
-          bool EMIT_FP8 = false>
+          bool EMIT_FP8 = false,
+          // Shared-expert K-shard; see _gang_moe_mxfp8_tile. Rank r computes
+          // only the r-th slice of the shared expert's intermediate, so this
+          // kernel runs WGS/W of its tiles instead of all of them, writing
+          // its slice at the same offset in the rank-local scratch that W2
+          // will read back. Must be set together with W2's.
+          int SHARED_KSHARD = 0>
 __device__ __noinline__ void
     gang_moe_w13_linear_mxfp8_kernel(void const *input_ptr,
                                      void const *weight_ptr,
@@ -1870,7 +2025,11 @@ __device__ __noinline__ void
                             // write-through) store of a deterministic value,
                             // so a duplicated tile rewrites the same bits and
                             // the output is unchanged. Never set this on W2.
-                            /*DUP_SHARED=*/(MPK_SHARED_DUP)>(
+                            /*DUP_SHARED=*/(MPK_SHARED_DUP),
+                            SHARED_KSHARD,
+                            /*SHARED_WG_DIV=*/(SHARED_KSHARD > 0
+                                                   ? SHARED_KSHARD
+                                                   : 1)>(
                                           tile_idx,
                                           (int const *)mask_ptr,
                                           (int const *)routing_ptr,
@@ -2311,7 +2470,32 @@ template <int BATCH_SIZE,
           // the (token, slot) slab and one E8M0 per 32 elements right after
           // them. The prologue becomes a copy and the token scale gains the
           // per-32 `* 4 + g` selector the weight scale already has.
-          bool INPUT_FP8 = false>
+          bool INPUT_FP8 = false,
+          // ── Shared-expert K-shard ────────────────────────────────────────
+          // See _gang_moe_mxfp8_tile. W2's tiles partition the hidden output,
+          // so unlike W13 every rank still runs all of them for the shared
+          // expert; what shards is the reduction inside each tile. Rank r
+          // consumes only intermediate window r, which is exactly the k_split
+          // machinery W2_K_SPLITS already has, with the index taken from the
+          // rank instead of from the tile and the tile space left alone.
+          //
+          // The partials need no combine step for the same reason split-K
+          // needs none: the epilogue atomicAdds into the f32 workspace and
+          // the EP collective that follows sums across ranks, both linear.
+          // The bias is the one non-linear addend and is gated to rank 0.
+          //
+          // This is the half of the shard that does NOT pay off in full. A
+          // W2 tile's cost is staging + MFMA + a 64-row atomicAdd epilogue;
+          // the shard divides the first two by W and the third not at all,
+          // and ranks 1..W-1 pick up an epilogue they did not previously run.
+          // The makespan still drops, by ~(W-1)/W of the variable part, but
+          // budget against that and not against a clean 1/W.
+          int SHARED_KSHARD = 0,
+          // Under SHARED_KSHARD the caller runs this kernel twice, once per
+          // tile class, because the two classes disagree on the reduction
+          // length and that is a template argument. 1 is the routed tiles at
+          // the full reduction, 2 is the shared expert at window EP_MY_PE.
+          int TILE_CLASS = 0>
 __device__ __noinline__ void
     gang_moe_w2_linear_mxfp8_kernel(void const *input_ptr,
                                     void const *weight_ptr,
@@ -2402,6 +2586,33 @@ __device__ __noinline__ void
                 "overwrites rather than accumulates");
   constexpr int SPLIT_ITERS = MFMA_ITERS / K_SPLITS;
 
+  // ── Shared-expert K-shard wiring ─────────────────────────────────────────
+  // The shard reuses split-K's K window wholesale and changes only where the
+  // window index comes from: the RANK, not the tile. So the tile space keeps
+  // its unmultiplied width -- every rank still owns all EXPERT_WGS output
+  // tiles of the shared expert -- while SPLIT_ITERS and SPLIT_LEN come out of
+  // K_SPLITS == SHARED_KSHARD and give each rank its W-th of the reduction.
+  //
+  // GLM-5 W2: MFMA_ITERS = 2048/128 = 16, so at W = 4 the shared class gets
+  // SPLIT_ITERS = 4. That is EXACTLY the depth-4 pipeline minimum the assert
+  // above enforces, which is the whole reason this is legal here and was not
+  // at the 8 ranks the 2026-08-21 attempt measured: 16/8 = 2 fails it. Being
+  // at the minimum means every iteration of that loop is fill with no steady
+  // state, so expect the shared class to run at worse than 1/4 the routed
+  // per-byte rate.
+  static_assert(SHARED_KSHARD == 0 || TILE_CLASS != 0,
+                "the K-shard needs the two tile classes split across two "
+                "instantiations; TILE_CLASS 0 would run each shared tile "
+                "twice");
+  static_assert(SHARED_KSHARD == 0 || TILE_CLASS != 1 || K_SPLITS == 1,
+                "the routed class keeps the full reduction; combining the "
+                "shard with split-K is untested and split-K is a measured "
+                "+4.12 ms besides");
+  static_assert(SHARED_KSHARD == 0 || TILE_CLASS != 2 ||
+                    K_SPLITS == SHARED_KSHARD,
+                "the shared class takes exactly one of SHARED_KSHARD windows");
+  constexpr int TILE_MULT = (SHARED_KSHARD > 0) ? 1 : K_SPLITS;
+
   constexpr int NUM_WAVES = 4;
   // See the note on the W13 kernel's branch: K_PARALLEL is the narrow-tile
   // form that keeps all 29 workers per XCD fed when expert parallelism has
@@ -2427,12 +2638,16 @@ __device__ __noinline__ void
   // rather than three neighbours hammering the same 64 rows.
   if (!_gang_moe_mxfp8_tile<BATCH_SIZE,
                             NUM_EXPERTS,
-                            TILES_PER_EXPERT * K_SPLITS,
-                            EXPERT_WGS * K_SPLITS,
+                            TILES_PER_EXPERT * TILE_MULT,
+                            EXPERT_WGS * TILE_MULT,
                             EP_WORLD_SIZE,
                             EP_MY_PE,
                             EP_NUM_ROUTED,
-                            EP_SHARED_PE>(tile_idx,
+                            EP_SHARED_PE,
+                            /*DUP_SHARED=*/0,
+                            SHARED_KSHARD,
+                            /*SHARED_WG_DIV=*/1,
+                            TILE_CLASS>(tile_idx,
                                           (int const *)mask_ptr,
                                           (int const *)routing_ptr,
                                           &expert_id,
@@ -2442,8 +2657,15 @@ __device__ __noinline__ void
                                           &topk_slot)) {
     return;
   }
-  int const k_split = (K_SPLITS == 1) ? 0 : (wg_idx / EXPERT_WGS);
-  if constexpr (K_SPLITS > 1) {
+  // The shared class reads its window from the rank, so its wg_idx is already
+  // the plain output tile and needs no unpacking. add_bias below is
+  // (K_SPLITS == 1) || (k_split == 0), which under the shard is
+  // EP_MY_PE == 0 -- the bias lands once across the ranks that sum, which is
+  // exactly the gate the partials need.
+  int const k_split = (SHARED_KSHARD > 0 && TILE_CLASS == 2)
+                          ? EP_MY_PE
+                          : ((K_SPLITS == 1) ? 0 : (wg_idx / EXPERT_WGS));
+  if constexpr (SHARED_KSHARD == 0 && K_SPLITS > 1) {
     wg_idx = wg_idx % EXPERT_WGS;
   }
   // K offset of this split, in reduction elements. SPLIT_ITERS * K_PER_MFMA is
