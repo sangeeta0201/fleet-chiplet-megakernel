@@ -193,3 +193,60 @@ This board is **not** closed on a floor argument, and it does not claim
 impossibility. It reports that the gap is 3.251 ms, that it is in two named
 lines, and that neither line is in the tile class where the v8 brief's
 Items 1 and 2 pointed.
+
+---
+
+## §7 RE-VERIFIED against the 1.93 → 1.64 series — 2026-09-03
+
+§2's walk covered `~/mirage`'s 3.339 → 1.936 series. The
+`origin/amd_mi355_gpt_oss120b` branch has since taken gpt-oss to **1.64
+ms/token** with nine further levers, so the "no unported lever" claim was
+re-checked against them rather than assumed to still hold.
+
+**It holds, and now for a stated reason rather than by enumeration.** The
+per-lever assessment lives in
+`.claude/skills/megakernel-decode-levers/references/glm5-port-status.md`; the
+levers themselves are cataloged in that skill's `SKILL.md`. Summary:
+
+| gpt-oss lever | delta | GLM-5 |
+|---|---|---|
+| 5 default-on flag flips | 1.902 → 1.877 | **empty** — all 125 off-by-default `MPK_*` flags audited, none has a recorded win |
+| `MPK_ATTN_SLICE_RELEASE` | 1.880 → 1.864 | capped 0.095 ms (§4 of `RENDEZVOUS_EDGE_TABLE.md`) |
+| `MPK_W13_T0_COUNTED_HANDOFF` | 1.865 → 1.840 | tile channel, closed ×3 |
+| RMSNorm ssq off LDS | 1.851 → 1.835 | **portable**, predicted ~0.035 ms — at the noise floor |
+| `MPK_MOE_XCD_PAIR` | 1.706 → 1.642 | structurally inapplicable under EP |
+| 4 shipped tile levers | — | tile channel, closed ×3 |
+
+Two measurements already in this tree cap the whole class, which is why the
+answer is the same as in §0 for a newer series:
+
+1. **Tile-level wins do not convert.** `MPK_MOE_PF_GROUPS` is a 28% standalone
+   tile win with three nulls in three paired A/Bs (§5d). `MPK_ATTN_GEMV_PF`
+   (`039a35e`) is a fourth instance: load depth 8 → 32, drains 2 → 1, zero
+   spills, **neutral** wall. Most of the gpt-oss series is tile-level latency
+   hiding.
+2. **Barrier-scope narrowing is capped at 0.095 ms** for all ten rendezvous at
+   once, because every chiplet holds a worker at the global max.
+
+**`MPK_MOE_XCD_PAIR` is the one worth understanding**, because GLM-5 genuinely
+still does what it deleted — the W13 prologue walks `d_mask[i]` then loads
+`d_routing[e*B+tok]`, and no weight address exists until that finishes. It
+cannot port because the map is only static when #picks == #XCD-pairs:
+
+| | gpt-oss | GLM-5 |
+|---|---:|---:|
+| routed experts / top-k | 128 / **4** | 256 / **8** |
+| EP ranks | **1** | **4** |
+| live experts per rank | **4** | **~2** |
+| XCDs per GPU | 8 | 8 |
+
+Pinning an expert to an XCD pair would idle ~6 of 8 XCDs. GLM-5's round-robin
+stripe is load balancing, not laziness (`gang_moe_linear_mxfp8_mi300.cuh:1571`).
+
+### The part that reframes the goal
+
+gpt-oss runs at `world_size = 1`. It pays **zero** cross-rank collective and
+**zero** cross-rank rendezvous; GLM-5 pays a measured **1.587 ms**. That is now
+the largest GLM-5 class with no gpt-oss analogue at all — so gpt-oss's 1.64 ms
+is not a template for a 4-rank 744B EP decode, and catch-up levers for the
+`coll` class must come from a multi-GPU reference, not from that branch.
