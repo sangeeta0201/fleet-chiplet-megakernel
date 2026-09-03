@@ -684,10 +684,10 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     gang_task_tiles_per_xcd[op] = params[3]; // total_tiles_per_xcd
   } else if (name == "gang_rmsnorm_linear_mxfp8_bias_mi300") {
     assert(
-        params.size() == 6 &&
+        (params.size() == 6 || params.size() == 7) &&
         "gang_rmsnorm_linear_mxfp8_bias_mi300 needs [o_stride, output_per_wg, "
         "n_wgs_per_xcd, total_tiles_per_xcd, actual_hidden_dim, "
-        "ep_peer_slots]");
+        "ep_peer_slots] plus an optional [ppl_sink]");
     int variant_id =
         task_register->register_gang_rmsnorm_linear_mxfp8_bias_mi300_task(
             customized->bgraph, params);

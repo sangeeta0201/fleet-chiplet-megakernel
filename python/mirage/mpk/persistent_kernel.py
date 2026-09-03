@@ -5484,6 +5484,12 @@ class PersistentKernel:
         # EP is the consumer of the tail layer's exchange.
         ep_peer_slots: int = 0,
         block_dim: tuple = (256, 1, 1),
+        # Perplexity only. Makes the kernel write ``output`` row step+1 rather
+        # than row 0, so a prefill-only pass keeps one logit row per scored
+        # position. ``output`` must then be [max_seq_length, output_stride].
+        # Costs one extra HBM row per step, so decode leaves it False and the
+        # emitted argument list is unchanged.
+        ppl_sink: bool = False,
     ):
         """Fused RMSNorm + MXFP8 Gang Linear + Bias.
 
@@ -5577,7 +5583,8 @@ class PersistentKernel:
         self.kn_graph.register_task(
             tb_graph, "gang_rmsnorm_linear_mxfp8_bias_mi300",
             [output_stride, output_per_wg, n_wgs_per_xcd,
-             total_tiles_per_xcd, actual_hidden_dim, ep_peer_slots]
+             total_tiles_per_xcd, actual_hidden_dim, ep_peer_slots,
+             int(ppl_sink)]
         )
 
     def gang_rmsnorm_linear_mxfp8_bias_mla_kvupd_layer(

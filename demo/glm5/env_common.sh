@@ -247,6 +247,12 @@ MPK_FORWARD_VARS=(
   # binary from the other seven.
   MPK_BS_DEBUG MPK_BSDBG_LAYER0
   MAX_SAVE_TOKENS
+  # Perplexity mode. Not just a host-side flag: it makes the LM head write
+  # output row step+1 instead of row 0, which changes the EMITTED kernel
+  # argument list, so a rank that misses it builds a different megakernel from
+  # its peers and the layer barriers deadlock. It also resizes the sink, so an
+  # unforwarded rank would allocate one row and be written n.
+  PPL_MODE
   MPK_NUM_WORKERS
   # Runtime (not compile-time): picks the single-grid persistent_kernel over
   # the two-stream worker/scheduler split. A rank that misses it runs a

@@ -1851,7 +1851,15 @@ template <int BATCH_SIZE,
           // row the two could not be told apart. q_b is the caller that needs
           // it -- it reduces over the q_a prefix of a wider [q_a | latent]
           // row -- and it passes KV_INPUT_STRIDE, which is that row's width.
-          int INPUT_ROW_STRIDE = REDUCTION_SIZE>
+          int INPUT_ROW_STRIDE = REDUCTION_SIZE,
+          // Perplexity only: honour the `logits_row` argument below. It has to
+          // be compile-time, not just a defaulted argument. This kernel is
+          // __noinline__, so a runtime row that decode always passes as 0 is
+          // still materialized into a register and still costs a 64-bit
+          // multiply-add on every output store. Measured: n=2 min went 8.738
+          // -> 8.780 ms/token with the offset runtime-defaulted, and back to
+          // baseline once it became a template parameter.
+          bool PPL_SINK = false>
 __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     void const *norm_input_ptr,  // [batch, REDUCTION_SIZE] bf16
     void const *norm_weight_ptr, // [REDUCTION_SIZE] bf16
@@ -1871,7 +1879,16 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     void *resadd_x_out_ptr = nullptr,               // [batch, REDUCTION_SIZE] bf16
     // PRO_PUB only: this XCD's published prologue. REDUCTION_SIZE bytes of
     // E4M3 followed by REDUCTION_SIZE/128 bytes of E8M0.
-    void const *pro_pub_ptr = nullptr) {
+    void const *pro_pub_ptr = nullptr,
+    // PPL_MODE only: which row of output_ptr to write. Decode wants row 0
+    // every iteration and gets the literal 0, so the offset folds away and its
+    // stores are the previous code. Perplexity needs the logit row for every
+    // scored position kept, and this LM head otherwise overwrites row 0 each
+    // iteration, discarding all but the last. Unlike the GPT-OSS LM head this
+    // needs no separate f32 sink: the row is already written to HBM here, and
+    // it is written at the same bf16 width the argmax downstream reduces, so
+    // redirecting it captures exactly the values the kernel decided on.
+    int logits_row = 0) {
 
   static_assert(OUTPUT_PER_WG % 16 == 0,
                 "OUTPUT_PER_WG must be multiple of 16");
@@ -2007,6 +2024,10 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
   uint8_t const *W = (uint8_t const *)weight_ptr;
   unsigned short const *d_bias = (unsigned short const *)bias_ptr;
   unsigned short *d_output = (unsigned short *)output_ptr;
+  // Folds to 0 and disappears whenever PPL_SINK is false, which is every
+  // serving build.
+  long long const ppl_row_off =
+      PPL_SINK ? (long long)logits_row * output_stride : 0;
 
   // ── LDS prologue ────────────────────────────────────────────────────────
   // Stage the row and the norm weight in LDS so the quantizer issues no vmem,
@@ -2561,7 +2582,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
         int out_idx = (FOLD_ROWS ? col : tok_base) * output_stride +
                       wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4;
         _rnlm8_store4<WRITE_THROUGH>(
-            d_output + out_idx, packed[0], packed[1], packed[2], packed[3]);
+            d_output + ppl_row_off + out_idx,
+            packed[0], packed[1], packed[2], packed[3]);
       }
     }
   } else {
@@ -2735,7 +2757,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
       int out_idx = (FOLD_ROWS ? (tok_base + r) : tok_base) * output_stride +
                     wg_idx * OUTPUT_PER_WG + g * 4;
       _rnlm8_store4<WRITE_THROUGH>(
-          d_output + out_idx, packed[0], packed[1], packed[2], packed[3]);
+          d_output + ppl_row_off + out_idx,
+          packed[0], packed[1], packed[2], packed[3]);
     }
   }
 

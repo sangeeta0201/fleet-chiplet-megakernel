@@ -3130,7 +3130,7 @@ int TaskRegister::register_gang_moe_linear_mxfp4_mi300_task(
 //          actual_hidden_dim]
 int TaskRegister::register_gang_rmsnorm_linear_mxfp8_bias_mi300_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 6);
+  assert(params.size() == 6 || params.size() == 7);
   int output_stride = params[0];
   int output_per_wg = params[1];
   int n_wgs_per_xcd = params[2];
@@ -3140,6 +3140,11 @@ int TaskRegister::register_gang_rmsnorm_linear_mxfp8_bias_mi300_task(
   // residual fold the cross-rank sum as well, and re-reads input[0] as a
   // symmetric gather buffer of ep_peer_slots [batch, reduction] planes.
   int ep_peer_slots = params[5];
+  // Perplexity mode. Absent (the six-param form) or 0 means the LM head keeps
+  // writing row 0, which is all decode ever reads. 1 makes it write the row
+  // for the position being scored, so a prefill-only pass leaves one logit row
+  // per position instead of overwriting a single row n times.
+  int ppl_sink = params.size() > 6 ? params[6] : 0;
   (void)total_tiles_per_xcd;
 
   std::vector<tb::TBInputOp *> input_ops;
@@ -3197,14 +3202,30 @@ int TaskRegister::register_gang_rmsnorm_linear_mxfp8_bias_mi300_task(
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
-  code.e("kernel::gang_rmsnorm_linear_mxfp8_bias_kernel<$, $, $, $, false, $, "
-         "$>(",
-         batch_size,
-         output_per_wg,
-         reduction_size,
-         actual_hidden_dim,
-         fuse_resadd ? "true" : "false",
-         ep_peer_slots);
+  if (ppl_sink) {
+    // PPL_SINK is the LAST template parameter, so reaching it means naming
+    // every default in between. These five must stay equal to the defaults the
+    // short form below relies on: EP_PRE_FOLDED, SP_QKV, PRO_PUB, FOLD_ROWS,
+    // INPUT_ROW_STRIDE.
+    code.e("kernel::gang_rmsnorm_linear_mxfp8_bias_kernel<$, $, $, $, false, "
+           "$, $, false, false, false, false, $, true>(",
+           batch_size,
+           output_per_wg,
+           reduction_size,
+           actual_hidden_dim,
+           fuse_resadd ? "true" : "false",
+           ep_peer_slots,
+           reduction_size);
+  } else {
+    code.e("kernel::gang_rmsnorm_linear_mxfp8_bias_kernel<$, $, $, $, false, "
+           "$, $>(",
+           batch_size,
+           output_per_wg,
+           reduction_size,
+           actual_hidden_dim,
+           fuse_resadd ? "true" : "false",
+           ep_peer_slots);
+  }
   code.e("    task_desc->input_ptrs[0],");  // norm_input == residual, folding
   code.e("    task_desc->input_ptrs[1],");  // norm_weight
   code.e("    task_desc->input_ptrs[2],");  // norm_output scratch
@@ -3214,12 +3235,30 @@ int TaskRegister::register_gang_rmsnorm_linear_mxfp8_bias_mi300_task(
   code.e("    runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS],");
   code.e("    $,", n_wgs_per_xcd);
   code.e("    $,", output_stride);
+  // Without the sink the emitted argument list stops where it always did, so
+  // the trailing defaults stay defaults and decode's codegen is unchanged.
+  // With it every optional parameter has to be named to reach the last one,
+  // hence the explicit nullptrs for the residual pair and the prologue
+  // publication -- pro_pub_ptr has no caller here either way.
+  char const *tail = ppl_sink ? "," : ");";
   if (fuse_resadd) {
     code.e("    tile_idx,");
-    code.e("    task_desc->input_ptrs[5],");   // previous layer's MoE f32 ws
-    code.e("    task_desc->output_ptrs[1]);"); // resolved residual stream
+    code.e("    task_desc->input_ptrs[5],"); // previous layer's MoE f32 ws
+    code.e("    task_desc->output_ptrs[1]$", // resolved residual stream
+           tail);
   } else {
-    code.e("    tile_idx);");
+    code.e("    tile_idx$", tail);
+  }
+  if (ppl_sink) {
+    if (!fuse_resadd) {
+      code.e("    nullptr,"); // resadd_workspace_f32
+      code.e("    nullptr,"); // resadd_x_out
+    }
+    code.e("    nullptr,"); // pro_pub
+    // step[0] is the last position the loop consumed, so the distribution the
+    // LM head is producing now belongs to step+1. Row 0 is therefore never
+    // written and the scored rows are 1..prompt_len-1.
+    code.e("    runtime_config.step[0] + 1);");
   }
   return register_task_variant(TASK_GANG_RMSNORM_LINEAR_MXFP8_BIAS_MI300,
                                code.to_string());
