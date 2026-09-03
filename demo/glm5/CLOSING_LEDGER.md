@@ -385,6 +385,66 @@ A rendezvous costs **SKEW**. Nothing that touches the barrier *code* can move it
 | The EP peer wait | **skew, not seven serialized round trips** (17.49 -> 17.49 us/layer) | `e5bd5db` |
 | The EP fold is redone **192x** in the qkv_a prologue | hoisting and widening both neutral (above) | — |
 
+#### RE-PRICED AT NP=4 — 2026-09-03. The board line is 40% stale; both halves stay NO-GO
+
+Every number in the table above is an **NP=8** diagnosis at a 10.49 ms
+baseline. `run_mp8_dp_ep_fused.sh` now defaults `NP=4` and says so in its own
+header — *"an NP=8 number is not comparable to anything on this branch"* — and
+a skew term does not transfer across peer count any more than it transferred
+across a 40%-longer layer. Re-measured with the same instrument as the original
+(`MPK_BAR_SKEW=3`, `MPK_BAR_SKEW_DROP_NS=1000000`, `MPK_EP_ABLATE=0`, one run,
+28071 `BARSTAGEWS` rows, text checked legal).
+
+S0→S1 makespan per rank, µs/layer:
+
+| rank | S0 | S1 | S0→S1 |
+|---|---:|---:|---:|
+| 0 | 2.22 | 13.23 | **11.01** |
+| 1 | 2.09 | 17.48 | 15.39 |
+| 2 | 2.22 | 17.76 | 15.53 |
+| 3 | 2.11 | 18.53 | 16.41 |
+
+| quantity | NP=8 | **NP=4** | ×78 layers |
+|---|---:|---:|---:|
+| S0→S1, the EP collective | 24.14 | **14.59** | **1.138 ms** |
+| rank 0's own wait (last-arriver floor) | 9.94 | **11.01** | 0.859 ms |
+| shared-expert bias (peer mean − rank 0) | ~9.5 | **4.77** | 0.372 ms |
+| peer spread (max − min) | 1.38 | **1.02** | 0.080 ms |
+
+**Three findings, and the middle one is the load-bearing confirmation.**
+
+1. **The class is 40% smaller than the board says.** 14.59 vs 24.14 µs/layer.
+   Halving the rank count halved the peer-idle half, as a max-of-N skew term
+   should. The board's 1.187–1.899 ms line for this region should be read as
+   **1.138 ms**.
+2. **The last-arriver floor did not move: 9.94 → 11.01 µs/layer.** It is
+   invariant to peer count, which is exactly what `66746bf` argued from the
+   other direction when loading rank 0 made its own wait *fall* toward a floor
+   rather than toward zero. A term that ignores how many peers exist is not
+   cross-rank skew. This is now confirmed at two rank counts and is the
+   strongest evidence in the ledger that the 0.86 ms is local floor, same
+   family as the 8.28 µs/layer of uniform spin whose whole rendezvous deleted
+   for 0.003 ms.
+3. **The rebalance ceiling is unchanged and still an order of magnitude under
+   the noise floor.** Peer spread 1.02 µs/layer × 78 = 0.080 ms of peer idle,
+   × the 0.32 transfer coefficient (which *falls* going left, `f546b32`) =
+   **0.026 ms** for a perfect static rebalance, against NP=8's 0.034. Peers
+   uniform to 3% on an 15.8 µs wait.
+
+**Verdict: both halves of the EP peer wait remain NO-GO at NP=4.** The
+shared-expert half is now 0.372 ms with a ceiling of ~0.10 ms from the
+`MPK_SHARED_DUP` convexity, and the K-shard built against it measured
+**+0.247 ms** (`MPK_MOE_SHARED_KSHARD`). The floor half is 0.859 ms and is not
+skew at all. What re-pricing bought is not a lever but a corrected budget: the
+largest single board line is 0.75 ms smaller than recorded, so the reachable
+floor above should be revisited before it is quoted again.
+
+> **Trap that cost a run.** `compare_ep_ablate_counters.py` **hardcodes**
+> `/tmp/epabl_ctr_{base,epablate}.log` and ignores `argv`. Pointed at a new log
+> it silently reprints the August NP=8 result — 24.14 → 7.51, `writers=232` —
+> which looks like a successful parse. Check the writer count against your
+> config (NP=4 is 240, not 232) before believing its output.
+
 ### 5h. q_b HEAD-SHARDING — CLOSED AT 0.228 ms (`95b93f6`)
 
 The last open structural item on the board, and the one that moved the most.
