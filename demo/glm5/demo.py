@@ -57,12 +57,25 @@ MAX_SAVE_TOKENS = int(os.environ.get("MAX_SAVE_TOKENS", "100"))
 # numbers from different runs comparable.
 PPL_CORPUS_DESC = "wikitext-2-raw-v1/test, non-header non-blank lines, '\\n\\n'-joined"
 
+# GLM-5 sees "[gMASK]<sop>" at the head of every sequence it was trained on,
+# and the serving path gets it for free from apply_chat_template. Scoring raw
+# text without it is not a neutral choice: it puts the model out of
+# distribution, and it leaves position 0 -- which every later query attends to
+# as the attention sink -- holding an ordinary content token instead of an
+# anchor. Measured, changing only the FIRST corpus token moved perplexity from
+# 94512 to 3009 with all 127 targets held fixed, and adding this prefix is what
+# collapsed that sensitivity. Set PPL_PREFIX='' to score without it.
+PPL_PREFIX = os.environ.get("PPL_PREFIX", "[gMASK]<sop>")
+
 
 def load_ppl_corpus(tokenizer, corpus: str, max_tokens: int):
-    """Return up to `max_tokens` token ids for the perplexity corpus.
+    """Return (ids, n_prefix) for the perplexity corpus.
 
     `corpus` is either 'wikitext2' or a path to a UTF-8 text file. The file
     fallback exists so the measurement runs on a machine with no network.
+
+    `max_tokens` counts CORPUS tokens. The PPL_PREFIX ids are prepended on top
+    and are NOT scored: they are context, not predictions the model owes.
     """
     if corpus == "wikitext2":
         from datasets import load_dataset
@@ -77,7 +90,12 @@ def load_ppl_corpus(tokenizer, corpus: str, max_tokens: int):
             text = f.read()
     ids = tokenizer(text, return_tensors=None,
                     add_special_tokens=False)["input_ids"]
-    return ids[:max_tokens]
+    # add_special_tokens=True is a no-op for this tokenizer (verified: it adds
+    # nothing), so the prefix has to be tokenized explicitly.
+    prefix = (tokenizer(PPL_PREFIX, return_tensors=None,
+                        add_special_tokens=False)["input_ids"]
+              if PPL_PREFIX else [])
+    return prefix + ids[:max_tokens], len(prefix)
 
 
 def report_perplexity(mode, nll_sum, n_scored, args, corpus_tokens, rank,
@@ -89,7 +107,11 @@ def report_perplexity(mode, nll_sum, n_scored, args, corpus_tokens, rank,
     print(f"\n{'=' * 60}")
     print(f"PERPLEXITY ({mode}) rank {rank}")
     print(f"{'=' * 60}")
-    print(f"  corpus          : {args.ppl_corpus} ({PPL_CORPUS_DESC})")
+    # The prefix belongs in the recipe, not just the diagnostics: a prefixed
+    # and an unprefixed run are not comparable numbers, and the test's
+    # slice-identity check compares corpus_desc.
+    desc = f"{PPL_CORPUS_DESC}, prefix={PPL_PREFIX!r}"
+    print(f"  corpus          : {args.ppl_corpus} ({desc})")
     print(f"  corpus tokens   : {corpus_tokens}")
     print(f"  scored positions: {n_scored}")
     print(f"  mean NLL        : {mean_nll:.6f}")
@@ -121,7 +143,7 @@ def report_perplexity(mode, nll_sum, n_scored, args, corpus_tokens, rank,
                 "mode": mode,
                 "rank": rank,
                 "corpus": args.ppl_corpus,
-                "corpus_desc": PPL_CORPUS_DESC,
+                "corpus_desc": desc,
                 "corpus_tokens": corpus_tokens,
                 "scored_positions": n_scored,
                 "mean_nll": mean_nll,
@@ -1001,28 +1023,36 @@ if __name__ == "__main__":
             # commits up to two tokens per iteration, so step+1 no longer
             # names the row the main head just produced.
             raise ValueError("PPL_MODE is incompatible with --mtp.")
-        ppl_token_ids = load_ppl_corpus(
+        ppl_token_ids, ppl_prefix_len = load_ppl_corpus(
             tokenizer, args.ppl_corpus, args.ppl_max_tokens
         )
         n_ppl = len(ppl_token_ids)
-        if n_ppl < 2:
+        # Row r is graded against tokens[r], and the first row the LM head
+        # writes is row 1, so the first gradeable position is max(1, prefix).
+        ppl_score_from = max(1, ppl_prefix_len)
+        if n_ppl - ppl_score_from < 1:
             raise ValueError(
-                f"PPL corpus tokenized to {n_ppl} tokens; need at least 2 "
-                f"to score a single next-token prediction."
+                f"PPL corpus tokenized to {n_ppl} tokens with a "
+                f"{ppl_prefix_len}-token prefix; need at least one scorable "
+                f"position after it."
             )
         # One extra slot so the last scored position has somewhere to land and
         # prepare_next_batch's stop condition fires the moment prefill
         # completes -- prefill-only, no decode.
         args.max_seq_length = n_ppl + 1
         print(f"[PPL] corpus={args.ppl_corpus} tokens={n_ppl} "
+              f"prefix={PPL_PREFIX!r} ({ppl_prefix_len} tok, unscored) "
+              f"scoring rows {ppl_score_from}..{n_ppl - 1} "
               f"max_seq_length={args.max_seq_length}", flush=True)
 
     tokens = torch.full((total_num_requests, args.max_seq_length), 0,
                         dtype=torch.long, device="cuda")
 
     if ppl_mode:
-        # No chat template: the corpus is scored as raw text, and a template
-        # would prepend tokens the recorded corpus_desc does not describe.
+        # No chat template: the corpus is scored as raw text, because the
+        # <|user|>/<|assistant|> turn wrapper would grade the model on
+        # continuing a conversation rather than a document. PPL_PREFIX still
+        # supplies the "[gMASK]<sop>" document head the model expects.
         ids = torch.tensor(ppl_token_ids, dtype=torch.long, device="cuda")
         for r in range(total_num_requests):
             tokens[r, :n_ppl] = ids
@@ -4183,7 +4213,7 @@ if __name__ == "__main__":
         if ppl_mode:
             # Sink row r holds the distribution over tokens[0, r], written by
             # the iteration that consumed tokens[0, r-1]. Row 0 is never
-            # written, so the scored positions are 1..n_ppl-1.
+            # written, so the scored positions are ppl_score_from..n_ppl-1.
             #
             # Slice to config.vocab_size: the row is padded up for MFMA
             # alignment and the pad columns were filled by rows of the
@@ -4191,15 +4221,20 @@ if __name__ == "__main__":
             # must not enter the softmax denominator.
             real_vocab = config.vocab_size
             sink = _tensor_refs["argmax_in"]
-            targets = tokens[0, 1:n_ppl]
+            # Rows below ppl_score_from are the PPL_PREFIX positions: context
+            # the model was given, not predictions it owes.
+            targets = tokens[0, ppl_score_from:n_ppl]
+            n_scored = n_ppl - ppl_score_from
             nll_sum = 0.0
             per_pos, top1, ent = [], [], []
             CH = 64
-            for lo in range(1, n_ppl, CH):
+            for lo in range(ppl_score_from, n_ppl, CH):
                 hi = min(lo + CH, n_ppl)
                 chunk = sink[lo:hi, :real_vocab].float()
                 losses = torch.nn.functional.cross_entropy(
-                    chunk, targets[lo - 1:hi - 1], reduction="none")
+                    chunk,
+                    targets[lo - ppl_score_from:hi - ppl_score_from],
+                    reduction="none")
                 nll_sum += losses.sum().item()
                 per_pos.extend(losses.tolist())
                 top1.extend(chunk.argmax(dim=-1).tolist())
@@ -4212,7 +4247,7 @@ if __name__ == "__main__":
             # whole-tensor compare would allocate another [n, vocab] bool.
             n_zero = 0
             pad_max = 0.0
-            for lo in range(1, n_ppl, CH):
+            for lo in range(ppl_score_from, n_ppl, CH):
                 hi = min(lo + CH, n_ppl)
                 per_row = (sink[lo:hi, :real_vocab] == 0).sum(dim=1)
                 n_zero += int((per_row == real_vocab).sum().item())
@@ -4220,15 +4255,17 @@ if __name__ == "__main__":
                     pad_max = max(pad_max, float(
                         sink[lo:hi, real_vocab:].abs().max().item()))
             if n_zero:
-                print(f"[PPL] WARNING: {n_zero}/{n_ppl - 1} scored rows are "
+                print(f"[PPL] WARNING: {n_zero}/{n_scored} scored rows are "
                       f"all-zero -- the sink was not written for them.")
             print(f"[PPL] pad-column max |logit| (excluded): {pad_max:.4f}")
             report_perplexity(
-                "mpk", nll_sum, n_ppl - 1, args, corpus_tokens=n_ppl,
+                "mpk", nll_sum, n_scored, args, corpus_tokens=n_ppl,
                 rank=rank, per_pos=per_pos, top1=top1,
                 targets=targets.tolist(), ent=ent,
                 diagnostics={"all_zero_rows": n_zero,
-                             "pad_column_max_abs": pad_max},
+                             "pad_column_max_abs": pad_max,
+                             "prefix": PPL_PREFIX,
+                             "prefix_tokens": ppl_prefix_len},
             )
 
         for r in range(total_num_requests):

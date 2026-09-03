@@ -24,17 +24,21 @@ TWO GATES, AND WHAT EACH ONE CATCHES
   P1a SANITY BAND (hard). Catches "the model emitted no signal": a logits row
       the kernel never wrote, or a reduction that collapsed, lands near uniform
       (ln(vocab) = 11.95 nats here). This gate has already earned its keep --
-      it caught a reproducible input-dependent failure at ppl ~95000 with
-      0/127 top-1, on a build whose decode output looks fine and which a token
-      or coherence gate passes. It runs without a reference implementation,
-      which is why it ships first: GLM-5 744B at 4 bits is ~372 GB against
-      288 GB of HBM on one MI350, so the single-GPU Torch arm that
-      test_gpt_oss_perplexity.py compares against does not fit here.
+      it caught a reproducible failure at ppl ~95000 with 0/127 top-1 on a
+      build whose decode output looks fine and which a token or coherence gate
+      passes. That defect turned out to be in the HARNESS, not the kernel: the
+      corpus was fed without the "[gMASK]<sop>" prefix GLM-5 is trained to see
+      (see demo/glm5/PERPLEXITY.md). It runs without a reference
+      implementation, which is why it ships first: GLM-5 744B at 4 bits is
+      ~372 GB against 288 GB of HBM on one MI350, so the single-GPU Torch arm
+      that test_gpt_oss_perplexity.py compares against does not fit here.
 
-  P1b QUALITY TARGET (reported, not blocking). Measured 208-268 against a
-      5-15 expectation. Reported rather than gated because the cause is not
-      yet attributed -- see demo/glm5/PERPLEXITY.md. GLM5_PPL_STRICT=1 makes
-      it hard.
+  P1b QUALITY CEILING (hard). With the prefix supplied, the canonical slice
+      measures 5.64-5.90 and 256 tokens of wikitext2 measures 15.64, so this
+      is now a real gate rather than a reported target. It is set with
+      headroom over the loosest legitimate slice measured (30.28 for a
+      mid-document window, which has almost no context to anchor on), and it
+      is what would catch a regression back to the unprefixed 208-268.
 
   P2  CROSS-RANK AGREEMENT (hard, and specific to this model). PPL_MODE
       requires GLM_LMHEAD_TP=0, so every EP rank scores the FULL vocabulary
@@ -60,7 +64,8 @@ or by hand, per rank, with --ppl-out outputs/glm5/mpk_ppl.json.
 
 Tunables (env):
     GLM5_OUTPUT_DIR        dir holding the json dumps  (default outputs/glm5)
-    GLM5_PPL_MAX           absolute MPK perplexity ceiling
+    GLM5_PPL_SANITY_MAX    near-uniform ceiling, "no signal at all"
+    GLM5_PPL_QUALITY_MAX   absolute MPK perplexity ceiling
     GLM5_PPL_RATIO_MAX     max MPK/Torch ratio, if a torch dump exists
     GLM5_PPL_MIN_SCORED    min scored positions to accept a run
     GLM5_PPL_RANK_RTOL     max relative spread across ranks
@@ -76,28 +81,31 @@ DEFAULT_OUTPUT_DIR = os.environ.get(
 )
 
 # ── The two ceilings, and why there are two ─────────────────────────────────
-# Measured 2026-09-03 on THREE runs of one build against a bit-identical
-# 128-token input: ppl 207.82, 209.68, 268.46. The same-input spread is 29%,
-# because the EP fold and the MoE atomics retire in arrival order, so this
-# number is not repeatable to better than tens of percent and no tight gate on
-# it is honest.
-#
-# SANITY, which is a working gate today. A fourth input on the same build
-# scored 94512 and 97566 on two runs, with 6-7 unique argmax values across 127
-# positions and 0/127 top-1 -- near-uniform output (ln(155136) = 11.95 nats
-# against a measured mean NLL of 11.46). This ceiling separates "the model is
-# mediocre here" from "the model emitted no signal at all", which is the defect
-# class an unwritten logits row or a dead expert produces.
+# SANITY separates "the model is mediocre on this slice" from "the model
+# emitted no signal at all" -- the defect class an unwritten logits row, a dead
+# expert, or a malformed prompt produces. It fires near uniform, ln(155136) =
+# 11.95 nats. Measured example it catches: 94512/97566 with 6-7 unique argmax
+# across 127 positions and 0/127 top-1, mean NLL 11.46.
 PPL_SANITY_MAX = float(os.environ.get("GLM5_PPL_SANITY_MAX", "1000"))
-# QUALITY, which is an open question and NOT a blocking gate. A healthy 744B
-# model on WikiText-2 belongs near 5-15; 208-268 is roughly 20x that, well past
-# the ~2.7x that MXFP4 inflation accounts for on GPT-OSS (92-100 against a
-# Torch 36). Whether the gap is quantization or a kernel defect cannot be
-# decided without the P3 reference arm, so this is reported as an expected
-# failure rather than either blessed or made to block CI. Raise
-# GLM5_PPL_STRICT=1 to make it hard.
-PPL_QUALITY_MAX = float(os.environ.get("GLM5_PPL_QUALITY_MAX", "30"))
-STRICT = os.environ.get("GLM5_PPL_STRICT", "0") == "1"
+# QUALITY, measured 2026-09-03 with the "[gMASK]<sop>" prefix in place:
+#
+#   128 tok, wikitext2 doc head   5.6970 / 5.8966 / 5.6403  (n=3, same ids)
+#   256 tok, wikitext2           15.6414
+#   128 tok, mid-document window 30.2805
+#
+# Same-input spread is 4.5% (n=3), not the 29% measured before the prefix fix:
+# in distribution the model's rows are sharp (entropy 1.23-1.45 nats against
+# 4.46-4.57 without the prefix), so the order-nondeterministic EP/MoE reduction
+# has far fewer near-ties to flip. That is what makes a hard ceiling honest
+# here.
+#
+# 60 is ~2x the loosest legitimate slice measured and ~4x the canonical one.
+# It is deliberately not tight to 6: perplexity legitimately depends on how
+# much context the slice gives the model (5.70 for a document head, 30.28 for a
+# mid-sentence window). What it does catch is the regression class that matters
+# -- dropping the prefix scored 208-268, and a near-uniform collapse scores
+# ~95000.
+PPL_QUALITY_MAX = float(os.environ.get("GLM5_PPL_QUALITY_MAX", "60"))
 # A floor as well as a ceiling. Perplexity below this on WikiText-2 means the
 # scoring slice is wrong -- most likely the targets are offset so the model is
 # being graded against the token it was just given.
@@ -181,13 +189,25 @@ def test_glm5_mpk_perplexity():
                 f"a uniform distribution over part of the corpus."
             )
 
+    # The prompt prefix is the single biggest lever on this number -- omitting
+    # it measured 208-268 where the prefixed run measures 5.7 -- so surface it
+    # before the ceilings rather than leaving it to the failure message.
+    prefix = ref.get("diagnostics", {}).get("prefix")
+    if not prefix:
+        print(
+            "[glm5 perplexity] WARNING: this dump records NO prompt prefix. "
+            "GLM-5 is trained with '[gMASK]<sop>' at the head of every "
+            "sequence, and scoring without it is an out-of-distribution "
+            "measurement, not a kernel result."
+        )
+
     for path, d in dumps:
         acc = _top1_accuracy(d)
         acc_str = f"{acc:.2%}" if acc is not None else "n/a"
         print(
             f"[glm5 perplexity] rank {d.get('rank')}: "
             f"ppl={d['perplexity']:.4f} (sanity <= {PPL_SANITY_MAX}, "
-            f"quality target <= {PPL_QUALITY_MAX}) "
+            f"quality <= {PPL_QUALITY_MAX}) "
             f"mean_nll={d.get('mean_nll'):.4f} "
             f"entropy={d.get('mean_entropy')} "
             f"top-1={acc_str} over {n_scored} positions of {d.get('corpus')}"
@@ -215,20 +235,20 @@ def test_glm5_mpk_perplexity():
                 f"it was already given."
             )
 
-    # ── P1b: quality target (reported, or hard under GLM5_PPL_STRICT) ────
+    # ── P1b: quality ceiling (hard) ──────────────────────────────────────
     worst_q = max(d["perplexity"] for _, d in dumps)
     if worst_q > PPL_QUALITY_MAX:
-        msg = (
-            f"perplexity {worst_q:.4f} is above the quality target "
-            f"{PPL_QUALITY_MAX} over {n_scored} positions. This is a KNOWN "
-            f"OPEN ITEM, not a fresh regression -- see "
-            f"demo/glm5/PERPLEXITY.md. It is unresolved whether the gap is "
-            f"MXFP4 damage or a kernel defect, and separating them needs the "
-            f"Torch reference arm (P3), which does not fit on one GPU."
+        pytest.fail(
+            f"perplexity {worst_q:.4f} exceeds the quality ceiling "
+            f"{PPL_QUALITY_MAX} over {n_scored} positions, on a slice whose "
+            f"canonical value is 5.6-5.9 (128 tok) or 15.6 (256 tok). "
+            f"Check FIRST that the prompt carries the '[gMASK]<sop>' prefix "
+            f"the model is trained on -- dropping it measured 208-268 here, "
+            f"and it is recorded in this dump's corpus_desc "
+            f"({ref.get('corpus_desc')!r}). If the prefix is present, this is "
+            f"a real quality regression in the 78 layers, the attention, the "
+            f"MoE or the EP fold."
         )
-        if STRICT:
-            pytest.fail(msg)
-        print(f"[glm5 perplexity] QUALITY TARGET NOT MET (expected): {msg}")
 
     # ── P2: cross-rank agreement ─────────────────────────────────────────
     # Under GLM_LMHEAD_TP=0 every rank scores the full vocabulary from its own

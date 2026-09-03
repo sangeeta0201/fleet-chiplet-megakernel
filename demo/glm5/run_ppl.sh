@@ -70,13 +70,28 @@ STALL_SECS="${STALL_SECS:-300}"
 echo "=== GLM-5 perplexity: $PPL_MAX_TOKENS tokens of ${PPL_CORPUS:-wikitext2}"
 echo "    MODEL_PATH=$MODEL_PATH  OUT_DIR=$OUT_DIR  NP=${NP:-4}"
 
-run_with_watchdog "$OUT_DIR/ppl_run.log" "$STALL_SECS" \
-  ./run_mp8_dp_ep_fused.sh \
-    --max-num-batched-tokens 1 \
-    --ppl-corpus "${PPL_CORPUS:-wikitext2}" \
-    --ppl-max-tokens "$PPL_MAX_TOKENS" \
-    --ppl-out "$OUT_DIR/mpk_ppl.json"
-rc=$?
+# Retry the cold-start wedge, exactly as run_correctness_suite.sh does. It is
+# not specific to this script -- the suite hit it on prompt 0 of a clean run --
+# and it gets likelier with sequence length: 128 tokens has never wedged here,
+# 256 wedged once in two attempts, 512 twice in two. Without a retry a 512-token
+# gate is a coin flip, and a wedge reads as "no dump" rather than "try again".
+#
+# Fresh rendezvous port per ATTEMPT: a killed run leaves the listener bound or
+# in TIME_WAIT, and the retry would then die with EADDRINUSE before it ever
+# reaches the kernel.
+RETRIES="${RETRIES:-2}"
+for attempt in $(seq 0 "$RETRIES"); do
+  export MASTER_PORT=$(( ${MASTER_PORT_BASE:-29990} + attempt ))
+  run_with_watchdog "$OUT_DIR/ppl_run.log" "$STALL_SECS" \
+    ./run_mp8_dp_ep_fused.sh \
+      --max-num-batched-tokens 1 \
+      --ppl-corpus "${PPL_CORPUS:-wikitext2}" \
+      --ppl-max-tokens "$PPL_MAX_TOKENS" \
+      --ppl-out "$OUT_DIR/mpk_ppl.json"
+  rc=$?
+  [ "$rc" -ne 124 ] && break
+  echo "--- STALLED at launch (attempt $((attempt + 1))), retrying"
+done
 
 n=$(ls "$OUT_DIR"/mpk_ppl*.json 2>/dev/null | wc -l)
 echo "--- run rc=$rc, $n dump(s) in $OUT_DIR"

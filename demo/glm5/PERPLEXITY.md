@@ -27,34 +27,119 @@ This mirrors how GPT-OSS is verified on this repo
 (`tests/ci-tests/test_gpt_oss_perplexity.py`, which records mpk 33.48 against
 torch 36.04 on a 512-token slice, ratio 0.929 against a 3.5 ceiling).
 
+## The prompt prefix is load-bearing
+
+**GLM-5 sees `[gMASK]<sop>` at the head of every sequence it was trained on.**
+The serving path gets it for free from `apply_chat_template`; the first version
+of this harness scored raw text without it, and that single omission dominated
+every number the gate produced.
+
+| Corpus (128 tokens) | no prefix | with `[gMASK]<sop>` |
+|---|---|---|
+| WikiText-2 document head | 268.46 | **5.70** |
+| WikiText-2 offset by 64 tokens | 94512 | **30.28** |
+
+Two tokens of context moved one slice by 47x and the other by **3120x**. Note
+that `add_special_tokens=True` is a **no-op** for this tokenizer -- it adds
+nothing -- so the prefix has to be supplied explicitly. `PPL_PREFIX=''` scores
+without it, and the dump records the prefix in `corpus_desc` so a prefixed and
+an unprefixed run can never be silently compared.
+
+Why the effect is this large: position 0 is the attention sink every later query
+attends to. With no anchor there, an ordinary content token occupies the sink
+slot and distorts the whole sequence. The measured signature was
+position-independence -- **6 unique argmax values across 127 positions** (one
+token 101 times), i.e. a hidden state that had stopped depending on the input,
+with a mean NLL of 11.46 against uniform's `ln(155136)` = 11.95.
+
+The prefix positions are context, not predictions the model owes, so they are
+excluded from scoring: row `r` is graded against `tokens[r]`, and grading starts
+at row 2. `--ppl-max-tokens` counts corpus tokens; the prefix is added on top.
+
 ## What the gate checks
 
 | Gate | Kind | What it catches |
 |---|---|---|
-| P1a sanity band | hard | "No signal at all": an unwritten logits row or a collapsed reduction, which lands near uniform (`ln(155136)` = 11.95 nats). Also a target off-by-one, which scores implausibly *low* |
-| P1b quality target | reported | Absolute quality against a 5-15 expectation. Not blocking, because the cause is unattributed |
+| P1a sanity band | hard | "No signal at all": an unwritten logits row, a collapsed reduction, or a malformed prompt, all of which land near uniform (11.95 nats). Also a target off-by-one, which scores implausibly *low* |
+| P1b quality ceiling | hard | Absolute quality, 60. Catches a regression back to the unprefixed 208-268 |
 | P2 cross-rank agreement | hard | Wrong EP fold, missed barrier, stale gather slot. Every rank scores the full vocabulary independently and owes the same number |
 | P3 Torch ratio | skipped | Needs a reference that does not fit on one GPU. Present only if `torch_ppl.json` exists |
 
 Plus non-gated diagnostics that make a vacuous pass impossible: slice identity
 (`corpus`/`corpus_desc`/`corpus_tokens`/`scored_positions` must match across
-dumps), all-zero row count, pad-column max |logit|, and top-1 accuracy. Top-1 is
-the sharper discriminator but the noisier one across runs of one build (measured
-14.17% and 22.05% on two runs of the same slice), so it is printed, never gated.
+dumps), a loud warning when a dump records no prompt prefix, all-zero row count,
+pad-column max |logit|, and top-1 accuracy. Top-1 is the sharper discriminator
+but the noisier one across runs of one build, so it is printed, never gated.
 
-## Implementation
+## Measured, 2026-09-03
 
-The GPT-OSS LM head keeps logits in registers and never writes them, so it
-needed a separate f32 sink. GLM-5's MXFP8 LM head already writes the full logit
-row to HBM and the argmax reduces that same bf16 row, so the port is a
-*redirect*, not a new write path: `ppl_sink=True` makes the kernel write row
-`step+1` instead of row 0, and `argmax_in` is allocated
-`[max_seq_length, vocab_shard]` instead of `[bs, vocab_shard]`. Capturing bf16
-is not a precision compromise here -- it is exactly the width the kernel's own
-argmax decided on.
+GLM-5 744B MXFP4, NP=4 EP on devices 4-7, `GLM_LMHEAD_TP=0`,
+`--max-num-batched-tokens 1`, prefix `[gMASK]<sop>`.
 
-`argmax_partial` still reads row 0, which is stale in PPL_MODE. That is
-harmless: prefill-only never consumes a sampled token.
+| Slice | scored | perplexity | mean NLL | entropy (nats) | top-1 |
+|---|---|---|---|---|---|
+| wikitext2 doc head, 128 tok | 128 | 5.6970 / 5.8966 / 5.6403 | 1.73-1.77 | 1.23-1.45 | 64.8% |
+| wikitext2, 256 tok | 256 | 15.6414 | 2.7499 | 2.277 | -- |
+| mid-document window, 128 tok | 128 | 30.2805 | 3.4105 | 2.615 | 40.6% |
+
+**5.70 is inside the 5-15 band a healthy 744B model belongs in.** The
+implication is that MXFP4 quantization is *not* visibly damaging quality here,
+and no kernel defect is indicated -- the earlier 20x gap was entirely the
+missing prefix.
+
+Perplexity legitimately rises as a slice gives the model less to anchor on: a
+document head (5.70) is easier than a 256-token span (15.64), which is easier
+than a window starting mid-sentence (30.28). Compare like slices only.
+
+### Same-input spread is 4.5%
+
+Three runs, one build, bit-identical token ids: 5.6970 / 5.8966 / 5.6403, a
+4.5% spread. Before the prefix fix the same measurement spread **29%**
+(207.82 / 209.68 / 268.46 on ids verified identical element for element).
+
+The nondeterminism did not go away -- the reduction still retires in arrival
+order. What changed is that an in-distribution model produces sharp rows
+(entropy 1.23-1.45 nats, against 4.46-4.57 unprefixed), so there are far fewer
+near-ties for a reordered sum to flip. That is what makes a hard quality ceiling
+honest here where it would not have been before.
+
+All four ranks agree to four decimal places within every run, so **P2 passes
+exactly** -- the EP fold, the barriers and the gather slots are consistent. No
+all-zero rows; pad-column max |logit| = 0.0000, so the sink covers every real
+vocabulary column and no pad column leaks into the softmax.
+
+## How the collapse was localized
+
+Recorded because the diagnostic path was not obvious, and because the first
+reading of it was wrong.
+
+1. The failing slice was **not** a degenerate input: it is ordinary WikiText-2
+   prose, the same length as the passing one, and in fact a 64-token shift of
+   it. Its targets round-tripped token-identically against the tokenizer, and
+   its max id (98867) is well inside the 154880 vocabulary.
+2. Configuration was byte-identical between the two runs apart from the corpus
+   path -- same shard count, same sink shape, same env.
+3. The failure was **deterministic** (94512 and 97566 on two runs, per-position
+   NLL identical to 2 decimals for the first 12 positions), which ruled out the
+   order-nondeterministic reduction.
+4. Only **6 unique argmax values across 127 positions** said the hidden state
+   entering the LM head had stopped depending on position -- a collapse, not a
+   quality regression.
+5. Because prefill runs one token per iteration, row 1 conditions on token 0
+   alone. Changing **only token 0** (`' He'` to `'He'`, all 127 targets held
+   fixed) moved perplexity from 94512 to 3009 -- a 31x swing from one token,
+   which no correct model has. That pointed at position 0, hence at the sink,
+   hence at the missing anchor.
+
+**An earlier version of this document attributed this to EP MoE routing** on the
+grounds that the trigger was content-dependent, and reported it as a probable
+kernel defect. That was wrong: content selects the token at position 0, and it
+was position 0 that mattered. There is no evidence of a routing defect.
+
+Similarly retracted: a reading that quality degrades with context position. The
+unprefixed runs did show a reproducible quartile trend (mean NLL 5.52 / 3.49 /
+5.32 / 7.96), but that is the sink distortion spreading through the KV cache,
+not a positional bug.
 
 ### The offset must be compile-time
 
@@ -72,91 +157,29 @@ costs a 64-bit multiply-add on every output store:
 The serving path is back to baseline and the emitted argument list for
 `ppl_sink=0` is unchanged.
 
-## Measured, 2026-09-03
+The prefix fix itself is host-side and reachable only under `PPL_MODE=1`, so it
+cannot touch decode. Re-verified anyway: min 8.739 / 8.757 / 8.746, i.e. 8.739
+against the 8.738 pre-change baseline. Decode text re-checked on the same
+build -- Rayleigh scattering explained correctly, and the first ten primes
+listed correctly with a correct definition.
 
-GLM-5 744B MXFP4, NP=4 EP on devices 4-7, `GLM_LMHEAD_TP=0`,
-`--max-num-batched-tokens 1`, 128 tokens of WikiText-2 (127 scored positions).
+## Implementation
 
-### Same-input spread is 29%, so no tight gate on this number is honest
+The GPT-OSS LM head keeps logits in registers and never writes them, so it
+needed a separate f32 sink. GLM-5's MXFP8 LM head already writes the full logit
+row to HBM and the argmax reduces that same bf16 row, so the port is a
+*redirect*, not a new write path: `ppl_sink=True` makes the kernel write row
+`step+1` instead of row 0, and `argmax_in` is allocated
+`[max_seq_length, vocab_shard]` instead of `[bs, vocab_shard]`. Capturing bf16
+is not a precision compromise here -- it is exactly the width the kernel's own
+argmax decided on.
 
-Three runs, one build, **bit-identical** token ids (verified: the `targets`
-arrays match element for element):
+`argmax_partial` still reads row 0, which is stale in PPL_MODE. That is
+harmless: prefill-only never consumes a sampled token.
 
-| Run | input path | perplexity | mean NLL | entropy (nats) | top-1 |
-|---|---|---|---|---|---|
-| 1 | `wikitext2` | 207.8246 | 5.3367 | 4.485 | 18/127 |
-| 2 | `wikitext2` | 209.6810 | 5.3456 | 4.464 | 28/127 |
-| 3 | text file, same ids | 268.4578 | 5.5927 | 4.568 | 18/127 |
-
-Runs 1 and 2 agreeing to 0.9% was a two-sample fluke; run 3 is 29% above run 1
-on the same input. That is the order-nondeterministic reduction showing up in a
-continuous metric, and it is the reason P1b is a reported target rather than a
-gate. Top-1 moves even harder (18, 28, 18 of 127), which is why it is printed
-and never gated.
-
-All four ranks agreed to four decimal places within every run, so **P2 passes
-exactly** -- the EP fold, the barriers and the gather slots are consistent. No
-all-zero rows; pad-column max |logit| = 0.0000, so the sink covers every real
-vocabulary column and no pad column leaks into the softmax.
-
-### The quality number is POOR and currently UNATTRIBUTED
-
-208-268 is not a plausible WikiText-2 perplexity for a 744B model; a healthy one
-is roughly 5-15. The test does **not** set a ceiling that blesses it. Two
-candidates, not separated:
-
-* **MXFP4 damage.** Some inflation is expected and is precedented here:
-  GPT-OSS's own MXFP4 decode measured a 92-100 spread against a Torch reference
-  of ~36, i.e. ~2.7x. But 208 against an expected ~10 is ~20x, past that.
-* **A kernel defect.** Not localized. An earlier reading of these dumps
-  claimed quality degrades with context position; that does not survive the
-  29% same-input spread above and is **retracted**. The apparent late-sequence
-  NLL rise sat inside run-to-run noise and on proper nouns that are
-  legitimately unpredictable ("B|oul|ter", "John De|ed", "Derek Jac|obi" --
-  the slice is a Wikipedia biography).
-
-Target alignment is *not* a candidate: comparing the dumped top-1 against the
-target shifted by -3..+3, shift 0 wins in the early window (15.62% vs <=1.61%)
-and in the late window (12.70% vs <=3.28%), so the row-to-target mapping is
-right.
-
-Separating quantization from defect requires the P3 reference arm. That is the
-open item.
-
-## The gate has already found a real bug
-
-**A different 128-token input reproducibly produces near-uniform output.** Same
-build, same config, only the corpus text differs:
-
-| Input | perplexity | entropy | unique argmax / 127 | top-1 |
-|---|---|---|---|---|
-| WikiText-2 head | 208-268 | 4.46-4.57 | many | 18-28/127 |
-| WikiText-2 offset by 64 tokens | **97566, 94512** | 9.065, 9.084 | 7, 6 | **0/127** |
-
-Mean NLL 11.46 against uniform's `ln(155136)` = 11.95: the model emits
-essentially no signal, from position 1 onward, not after a warm-up. It
-reproduced on two independent runs, and 95000 is ~350x outside the 29%
-same-input spread, so this is not noise. Six distinct argmax values across 127
-positions (one token 103 times) is a collapse, not a quality regression.
-
-Both inputs are valid English prose of the same length, both tokenize to ids
-well inside the real vocabulary (max 98867 against 154880), and the offset input
-was verified to round-trip token-identically. The distinguishing feature is
-therefore the *content*, which in an EP MoE model points at routing -- different
-tokens select different experts, so an input that routes onto a broken path
-fails while its neighbour does not. Not yet confirmed.
-
-This is the case for the gate: the build that does this passes cross-rank
-identity, passes coherence, and produces clean-looking decode text.
-
-## One reliability finding, independent of this change
-
-**Runs at >= 256 corpus tokens wedge at launch.** 128 tokens completed in 5 of
-5 attempts; 256 and 512 each wedged with all four ranks stopped at `launch bc: D
-both grids enqueued` and no further output, killed by the 300 s silence
-watchdog. This is the same symptom `run_correctness_suite.sh` already hit at
-`--max-seq-length 512`, so it predates the sink, and the sink is not the cause:
-at 256 tokens it is 80 MB.
+`PPL_MODE` is in `MPK_FORWARD_VARS`: it changes the emitted LM head argument
+list, so an unforwarded rank builds a different megakernel and the layer
+barriers deadlock.
 
 ## Scope: what this run does NOT cover
 
@@ -166,3 +189,30 @@ row, and a cross-rank logsumexp is not implemented, so the gate requires the
 untiled head -- which is also what makes P2 meaningful. What is covered is the
 78 layers, the attention, the MoE and the EP fold; what is not is the LM head's
 vocab tiling.
+
+No Torch reference arm: GLM-5 744B at 4 bits is ~372 GB against 288 GB of HBM on
+one MI350, so the single-GPU leg GPT-OSS compares against does not fit. Drop a
+`torch_ppl.json` into the output dir and the test picks up the ratio arm on its
+own. With the absolute number now in band, this is a lower-value follow-up than
+it was when the gap was 20x.
+
+## Reliability note
+
+An earlier version of this document claimed runs at >= 256 corpus tokens wedge
+at launch, as if it were a hard limit. **Corrected:** it is the known
+intermittent cold-start hang -- all four ranks stop at `launch bc: D both grids
+enqueued` and the 300 s silence watchdog kills them -- and it is probabilistic,
+not a ceiling. Observed here:
+
+| corpus tokens | wedged / attempts |
+|---|---|
+| 128 | 0 / 10 |
+| 256 | 1 / 2 (the completing run scored 15.6414) |
+| 512 | 2 / 2 |
+
+It is not specific to PPL_MODE and does not come from the sink (80 MB at 256
+tokens): a clean `run_correctness_suite.sh` run hit the same stall on prompt 0
+and recovered on its retry. `run_ppl.sh` now retries the same way
+(`RETRIES=2`, fresh `MASTER_PORT` per attempt), because without it a
+512-token gate is a coin flip and a wedge reads as "no dump" rather than
+"try again". 512 tokens is still unmeasured.
