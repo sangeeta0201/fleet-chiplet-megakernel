@@ -57,8 +57,16 @@ mkdir -p "$OUT_DIR"
 rm -f "$OUT_DIR"/mpk_ppl*.json
 
 # The sink resizes the megakernel and PPL_MODE changes the emitted LM head
-# argument list, so the decode build cannot be reused.
-unset KEEP_BUILD
+# argument list, so a DECODE build cannot be reused. Reusing a build from
+# another PPL run at the same length is fine, and that is what
+# PPL_KEEP_BUILD=1 is for: run_ppl_repro.sh runs the same config N times to
+# measure run-to-run spread, where rebuilding each rep costs ~5 of the ~7.5
+# minutes and varies the one thing the probe is trying to hold fixed.
+if [ "${PPL_KEEP_BUILD:-0}" = "1" ]; then
+  export KEEP_BUILD=1
+else
+  unset KEEP_BUILD
+fi
 
 # Bound the run on LOG SILENCE, not wall clock: the build is minutes of quiet
 # hipcc and the megakernel has an intermittent cold-start wedge that pins all

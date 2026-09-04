@@ -253,6 +253,13 @@ MPK_FORWARD_VARS=(
   # its peers and the layer barriers deadlock. It also resizes the sink, so an
   # unforwarded rank would allocate one row and be written n.
   PPL_MODE
+  # Host-side corpus selection, but still forwarded: every rank loads the
+  # corpus itself and scores its own copy, so a rank that missed one of these
+  # would score DIFFERENT TEXT than its peers. The cross-rank agreement check
+  # (P2) compares perplexities across ranks and would report a spread that
+  # looks like an EP fold bug. Both have in-code defaults, so an unforwarded
+  # override is silent: the caller's shell changes and the ranks do not.
+  PPL_PREFIX PPL_SKIP_TOKENS
   MPK_NUM_WORKERS
   # Runtime (not compile-time): picks the single-grid persistent_kernel over
   # the two-stream worker/scheduler split. A rank that misses it runs a

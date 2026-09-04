@@ -66,6 +66,13 @@ PPL_CORPUS_DESC = "wikitext-2-raw-v1/test, non-header non-blank lines, '\\n\\n'-
 # 94512 to 3009 with all 127 targets held fixed, and adding this prefix is what
 # collapsed that sensitivity. Set PPL_PREFIX='' to score without it.
 PPL_PREFIX = os.environ.get("PPL_PREFIX", "[gMASK]<sop>")
+# Corpus tokens to drop before the scored window. This exists to separate
+# "this text is hard" from "quality decays with sequence length", which the
+# length sweep alone cannot do: a longer run scores text a shorter run never
+# saw, so the two explanations predict the same full-slice number. Scoring the
+# SAME window standalone at PPL_SKIP_TOKENS=N and inside a longer context
+# distinguishes them, because only the context length differs.
+PPL_SKIP_TOKENS = int(os.environ.get("PPL_SKIP_TOKENS", "0"))
 
 
 def load_ppl_corpus(tokenizer, corpus: str, max_tokens: int):
@@ -95,6 +102,13 @@ def load_ppl_corpus(tokenizer, corpus: str, max_tokens: int):
     prefix = (tokenizer(PPL_PREFIX, return_tensors=None,
                         add_special_tokens=False)["input_ids"]
               if PPL_PREFIX else [])
+    if PPL_SKIP_TOKENS:
+        if len(ids) <= PPL_SKIP_TOKENS:
+            raise ValueError(
+                f"PPL_SKIP_TOKENS={PPL_SKIP_TOKENS} exceeds the corpus "
+                f"({len(ids)} tokens)"
+            )
+        ids = ids[PPL_SKIP_TOKENS:]
     return prefix + ids[:max_tokens], len(prefix)
 
 
@@ -111,6 +125,8 @@ def report_perplexity(mode, nll_sum, n_scored, args, corpus_tokens, rank,
     # and an unprefixed run are not comparable numbers, and the test's
     # slice-identity check compares corpus_desc.
     desc = f"{PPL_CORPUS_DESC}, prefix={PPL_PREFIX!r}"
+    if PPL_SKIP_TOKENS:
+        desc += f", skip={PPL_SKIP_TOKENS}"
     print(f"  corpus          : {args.ppl_corpus} ({desc})")
     print(f"  corpus tokens   : {corpus_tokens}")
     print(f"  scored positions: {n_scored}")
@@ -4241,23 +4257,86 @@ if __name__ == "__main__":
                 lp = torch.log_softmax(chunk, dim=-1)
                 ent.extend((-(lp.exp() * lp).sum(dim=-1)).tolist())
 
+            # ── Sink self-checks ─────────────────────────────────────────
+            # Ported from the GPT-OSS instrument (demo/gpt_oss/demo.py), which
+            # verifies the sink against the kernel's own argmax reduction. That
+            # exact check does NOT port: GPT-OSS's argmax reduces the same row
+            # the sink captures, while GLM-5's argmax_partial reads row 0
+            # (input_map partitions the vocab dim, grid_dim.y is 1) and PPL
+            # rows are step+1. So argmax_part_* here describes a row nothing
+            # wrote, and comparing against it would only check zeros.
+            #
+            # What is ported is the failure mode that check was built for. On
+            # GPT-OSS a wrong input_map wrote alternating 25152-column stripes
+            # and ran half the blocks off the end of the row, and it "scored
+            # 64.5 against a Torch 8.15 while looking like a plausible
+            # accuracy result". A per-ROW all-zero test cannot see that: the
+            # row is mostly written. These three can.
+            #
             # A row the kernel never touched is all zeros, i.e. uniform over
             # the vocabulary. Reporting that as a perplexity would look
             # plausible and mean nothing, so check it explicitly. Chunked: a
             # whole-tensor compare would allocate another [n, vocab] bool.
             n_zero = 0
             pad_max = 0.0
+            zero_cols = 0
+            widest_zero_run = 0
             for lo in range(ppl_score_from, n_ppl, CH):
                 hi = min(lo + CH, n_ppl)
-                per_row = (sink[lo:hi, :real_vocab] == 0).sum(dim=1)
+                block = sink[lo:hi, :real_vocab]
+                is_zero = block == 0
+                per_row = is_zero.sum(dim=1)
                 n_zero += int((per_row == real_vocab).sum().item())
+                zero_cols += int(per_row.sum().item())
+                # (1) STRIPE DETECTOR. Zero columns are expected as isolated
+                # singletons -- logits that genuinely round to 0.0f. A skipped
+                # column range is thousands wide and contiguous, so measure
+                # the widest contiguous run rather than the count.
+                for r in range(block.shape[0]):
+                    if int(per_row[r].item()) == 0:
+                        continue
+                    idx = torch.nonzero(is_zero[r], as_tuple=True)[0]
+                    if idx.numel() == 0:
+                        continue
+                    brk = torch.nonzero(
+                        torch.diff(idx) != 1, as_tuple=True)[0]
+                    bounds = torch.cat([
+                        torch.tensor([-1], device=brk.device), brk,
+                        torch.tensor([idx.numel() - 1], device=brk.device)])
+                    run = int(torch.diff(bounds).max().item())
+                    widest_zero_run = max(widest_zero_run, run)
                 if vocab_shard > real_vocab:
                     pad_max = max(pad_max, float(
                         sink[lo:hi, real_vocab:].abs().max().item()))
+            # (2) The redirect took effect. In PPL_MODE the LM head writes row
+            # step+1, so row 0 must be untouched. If ppl_sink silently did not
+            # apply, every write lands on row 0 instead -- which the all-zero
+            # row count would report as "nothing was written" without saying
+            # why.
+            row0_max = float(sink[0, :real_vocab].abs().max().item())
+            # (3) Consecutive scored rows must differ. A sink that resolved to
+            # one row for every position still produces a plausible-looking
+            # perplexity; it was the actual symptom of the prefix bug (6
+            # unique argmax over 127 positions), so test it directly.
+            dup_rows = 0
+            for lo in range(ppl_score_from, n_ppl - 1, CH):
+                hi = min(lo + CH, n_ppl - 1)
+                a = sink[lo:hi, :real_vocab]
+                b = sink[lo + 1:hi + 1, :real_vocab]
+                dup_rows += int((a == b).all(dim=1).sum().item())
+
             if n_zero:
                 print(f"[PPL] WARNING: {n_zero}/{n_scored} scored rows are "
                       f"all-zero -- the sink was not written for them.")
             print(f"[PPL] pad-column max |logit| (excluded): {pad_max:.4f}")
+            print(f"[PPL] sink self-check: row0 max |logit|={row0_max:.4f} "
+                  f"(want 0), zero columns={zero_cols} "
+                  f"({zero_cols / max(1, n_scored * real_vocab):.2e} of the "
+                  f"scored block), widest contiguous zero run="
+                  f"{widest_zero_run} (a skipped column range is thousands "
+                  f"wide), duplicate adjacent rows={dup_rows} -> "
+                  f"{'OK' if row0_max == 0.0 and dup_rows == 0 else 'SUSPECT'}",
+                  flush=True)
             report_perplexity(
                 "mpk", nll_sum, n_scored, args, corpus_tokens=n_ppl,
                 rank=rank, per_pos=per_pos, top1=top1,
@@ -4265,7 +4344,11 @@ if __name__ == "__main__":
                 diagnostics={"all_zero_rows": n_zero,
                              "pad_column_max_abs": pad_max,
                              "prefix": PPL_PREFIX,
-                             "prefix_tokens": ppl_prefix_len},
+                             "prefix_tokens": ppl_prefix_len,
+                             "row0_max_abs": row0_max,
+                             "zero_columns": zero_cols,
+                             "widest_zero_run": widest_zero_run,
+                             "duplicate_adjacent_rows": dup_rows},
             )
 
         for r in range(total_num_requests):

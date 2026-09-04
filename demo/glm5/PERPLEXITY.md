@@ -61,7 +61,8 @@ at row 2. `--ppl-max-tokens` counts corpus tokens; the prefix is added on top.
 | Gate | Kind | What it catches |
 |---|---|---|
 | P1a sanity band | hard | "No signal at all": an unwritten logits row, a collapsed reduction, or a malformed prompt, all of which land near uniform (11.95 nats). Also a target off-by-one, which scores implausibly *low* |
-| P1b quality ceiling | hard | Absolute quality, 60. Catches a regression back to the unprefixed 208-268 |
+| P1a2 per-block sanity | hard | The same ceiling applied to every block of 64 consecutive positions, so a slice that starts healthy and stops carrying signal partway cannot average its way to a pass. This is what catches the length-dependent collapse below |
+| P1b quality ceiling | hard | Absolute quality, 60, over a **fixed window** of the first 128 scored positions rather than the whole slice. Full-slice perplexity moves with which text a slice includes (5.66 / 15.47 / 435.80 at 128 / 256 / 512 tokens, against 5.66 / 5.34 / 6.67 over the same first 128 positions), so a single ceiling on it is not length-independent. Catches a regression back to the unprefixed 208-268 |
 | P2 cross-rank agreement | hard | Wrong EP fold, missed barrier, stale gather slot. Every rank scores the full vocabulary independently and owes the same number |
 | P3 Torch ratio | skipped | Needs a reference that does not fit on one GPU. Present only if `torch_ppl.json` exists |
 
@@ -91,11 +92,28 @@ Perplexity legitimately rises as a slice gives the model less to anchor on: a
 document head (5.70) is easier than a 256-token span (15.64), which is easier
 than a window starting mid-sentence (30.28). Compare like slices only.
 
-### Same-input spread is 4.5%
+### Same-input spread is 16%, not the 4.5% an n=3 sample suggested
 
-Three runs, one build, bit-identical token ids: 5.6970 / 5.8966 / 5.6403, a
-4.5% spread. Before the prefix fix the same measurement spread **29%**
-(207.82 / 209.68 / 268.46 on ids verified identical element for element).
+Five identical reps of one build, bit-identical token ids
+(`demo/glm5/run_ppl_repro.sh`, 128 tok):
+
+| rep | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|
+| ppl | 6.3355 | 6.2219 | 6.2184 | 5.4502 | 5.5720 |
+
+min 5.4502, max 6.3355, **spread 16.24%**. An earlier n=3 sample
+(5.6970 / 5.8966 / 5.6403) read 4.5% and that number is retracted: it was
+three draws from this same distribution, not a tighter one. Before the prefix
+fix the measurement spread **29%** (207.82 / 209.68 / 268.46 on ids verified
+identical element for element), so the prefix did narrow it -- just to 16%,
+not to 4.5%.
+
+Where the nondeterminism enters: **127 of 128 positions** differ across the
+five reps, the first at position 1, and **40 of 128 positions flip their
+argmax**. Divergence at position 1 means this is not accumulation over the
+sequence; it is present immediately, consistent with the EP fold and the MoE
+W2 f32 atomics retiring in arrival order. The 40 argmax flips are why token
+equality is not a legal gate on this model.
 
 The nondeterminism did not go away -- the reduction still retires in arrival
 order. What changed is that an in-distribution model produces sharp rows
@@ -108,7 +126,57 @@ exactly** -- the EP fold, the barriers and the gather slots are consistent. No
 all-zero rows; pad-column max |logit| = 0.0000, so the sink covers every real
 vocabulary column and no pad column leaks into the softmax.
 
-## How the collapse was localized
+## OPEN BUG: quality collapses with sequence length, ~659x by position 448
+
+A 512-token run scores **435.80** against 5.66 at 128 tokens. That is not the
+corpus getting harder, and it is not the run-to-run spread. Per 64 positions,
+mean NLL over four independent 512-token runs:
+
+| positions | 0-64 | 64-128 | 128-192 | 192-256 | 256-320 | 320-384 | 384-448 | 448-512 |
+|---|---|---|---|---|---|---|---|---|
+| mean NLL | 1.51 | 2.15 | 4.06 | 3.65 | 7.36 | 9.36 | 9.79 | 9.75 |
+
+Uniform over this vocabulary is ln(155136) = 11.95 nats, so the last three
+blocks carry almost no signal, and top-1 falls to 0-3%. The four runs agree to
++/-0.3 nats per block, so the collapse is reproducible, not a wedge.
+
+**The decisive test** is `PPL_SKIP_TOKENS`, which scores the same corpus window
+standalone. A standalone window sees only the 2 prefix tokens of context, so it
+should be *harder*:
+
+| corpus tokens | standalone | inside a 512-token run | ratio |
+|---|---|---|---|
+| 128-256 | 35.7 | 47.6 | 1.3x |
+| 320-448 | 22.7 (n=3, 5% spread) | 14941 (n=4) | **659x** |
+
+Corpus tokens 320-448 score 22.7 on their own with 42-45% top-1. The same
+tokens inside a 512-token sequence score ~15000 with 1-3% top-1. More context
+makes them 659x worse, which no property of the text can explain. The onset is
+a cliff between position 256 and 320, not a gradual decay.
+
+What this rules out:
+
+* **Not the corpus.** The standalone arm holds the text fixed.
+* **Not nondeterminism.** 659x against a 16% spread, and both arms are tight
+  across reps.
+* **Not a global config effect.** The first 128 positions of the 512-token runs
+  (5.556-6.668) overlap the 128-token runs (5.450-6.336). Only later positions
+  break. An earlier reading of a +25% early-position step was n=1 and is
+  retracted.
+* **Not the MFMA hazards.** Both gfx950 scaled-MFMA hazards fixed for gpt-oss
+  are present on this branch and their oracle passes at both loop parities
+  (`tests/standalone/test_mfma_pipeline_hazards.hip`: reference 0/19200, fixed
+  0/19200, broken 19200/19200). GLM-5's own analogous silent hazard -- an SGPR
+  scale operand to `v_mfma_scale_f32_16x16x128_f8f6f4` -- is fixed by
+  `MPK_MFMA_VSCALE`, default 1, and `test_moe_kloop_width.hip` reports MATCH at
+  every k-loop width.
+
+Not yet localized. The shape -- fine early, cliff past ~256, worsening with
+how much KV a position attends over -- points at the prefill attention rather
+than at the MoE or the LM head, but that is a hypothesis and not a measurement.
+The per-block sanity check in the gate now fails any run with this signature.
+
+## How the earlier (retracted) collapse was localized
 
 Recorded because the diagnostic path was not obvious, and because the first
 reading of it was wrong.
