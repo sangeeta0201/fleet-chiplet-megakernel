@@ -77,7 +77,7 @@ dhead = (len(set(head)) / len(head)) if head else 0.0
 g1 = all(json.load(open(p))["token_ids"] == ids for p in dumps)
 dec_avg = dec_min = None
 for line in open(dst + ".log", errors="replace"):
-    m = re.search(r"Decode:\s+(\d+) tokens .* avg ([0-9.]+)ms/iter", line)
+    m = re.search(r"Decode:\s+(\d+) tokens .*avg ([0-9.]+)ms/iter", line)
     if m:
         dec_avg = float(m.group(2))
     m = re.search(r"Decode per-iter range: min=([0-9.]+)ms", line)

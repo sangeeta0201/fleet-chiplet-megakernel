@@ -412,6 +412,20 @@ static int g_boot_probe_slots = 0;
 static int g_boot_probe_nworkers = 0;
 static int const MAX_NUM_SCHEDULERS = 64;
 
+// Host-visible iteration heartbeat. GLM's precomputed-dispatch path defers
+// every [FWD_PASS] printf until the kernel returns, and device printf lands
+// on stdout which mpirun block-buffers, so a healthy 1k-token prefill looks
+// identical to a hang: ENTER, then silence, 100% GPU. The stall watchdog
+// used to kill that. Same channel as MPK_BOOT_PROBE: pinned coherent memory
+// the scheduler stores into, a host thread that only does plain loads plus
+// fprintf(stderr). No HIP call at read time -- hipMemcpy wedges with the
+// kernel (MPK_HOST_DBG_POLL). Always on; one relaxed store per iteration
+// from scheduler 0.
+//   [0] end_of_graph_count  [1] num_active_tokens
+__device__ int *g_iter_hb;
+static int *g_iter_hb_host = nullptr;
+static std::atomic<int> g_iter_hb_epoch{0};
+
 // Sentinel the host pre-stamps into every worker's phase slot before the
 // launch. Zero is a legal phase and `in_task` is `wphase >= 0`, so a slot the
 // device never wrote is otherwise indistinguishable from a worker parked at
@@ -4385,6 +4399,10 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
         }
         prev_end_of_graph_clk = iter_end_clk;
         end_of_graph_count++;
+        if (sched_id == 0 && g_iter_hb != nullptr) {
+          __atomic_store_n(&g_iter_hb[0], end_of_graph_count, __ATOMIC_RELAXED);
+          __atomic_store_n(&g_iter_hb[1], num_active_tokens, __ATOMIC_RELAXED);
+        }
         // Check if we want to continue
 #ifdef MODE_ONLINE_NOTOKEN
         if (!prepare_next_batch(config, iteration_num))
@@ -6704,6 +6722,24 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
       }
     }
   }
+  // Always-on iteration heartbeat. See g_iter_hb. Independent of BOOT_PROBE
+  // so a serving run still feeds the stall watchdog.
+  if (g_iter_hb_host == nullptr) {
+    int *hb = nullptr;
+    hipError_t e = hipHostMalloc((void **)&hb,
+                                 2 * sizeof(int),
+                                 hipHostMallocMapped | hipHostMallocCoherent);
+    if (e == hipSuccess && hb != nullptr) {
+      hb[0] = 0;
+      hb[1] = 0;
+      (void)hipMemcpyToSymbol(HIP_SYMBOL(g_iter_hb), &hb, sizeof(int *));
+      g_iter_hb_host = hb;
+    } else {
+      fprintf(stderr,
+              "[ITER] hipHostMalloc failed: %s\n",
+              hipGetErrorString(e));
+    }
+  }
   // Per-XCD per-event task thresholds for two-level event counting
   // xcd_event_num_tasks may already be allocated+filled by precomputed dispatch
   if (global_runtime_config.xcd_event_num_tasks == nullptr) {
@@ -7026,6 +7062,27 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
           }
         }).detach();
       }
+    }
+    if (g_iter_hb_host != nullptr) {
+      g_iter_hb_host[0] = 0;
+      g_iter_hb_host[1] = 0;
+      int const epoch = g_iter_hb_epoch.fetch_add(1, std::memory_order_relaxed) + 1;
+      int *hb = g_iter_hb_host;
+      std::thread([hb, epoch]() {
+        int last = -1;
+        while (g_iter_hb_epoch.load(std::memory_order_relaxed) == epoch) {
+          std::this_thread::sleep_for(std::chrono::seconds(2));
+          if (g_iter_hb_epoch.load(std::memory_order_relaxed) != epoch) {
+            break;
+          }
+          int const n = __atomic_load_n(&hb[0], __ATOMIC_RELAXED);
+          int const nat = __atomic_load_n(&hb[1], __ATOMIC_RELAXED);
+          if (n != last) {
+            fprintf(stderr, "[ITER] n=%d nat=%d\n", n, nat);
+            last = n;
+          }
+        }
+      }).detach();
     }
     (void)cudaEventRecord(global_runtime_config.worker_done_event,
                           global_runtime_config.worker_stream);
@@ -8234,6 +8291,7 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
 #endif
     (void)cudaStreamSynchronize(global_runtime_config.worker_stream);
     (void)cudaStreamSynchronize(global_runtime_config.scheduler_stream);
+    g_iter_hb_epoch.fetch_add(1, std::memory_order_relaxed);
   } else {
     int num_sms_to_use = global_runtime_config.num_workers + num_schedulers;
 #ifdef USE_NVSHMEM

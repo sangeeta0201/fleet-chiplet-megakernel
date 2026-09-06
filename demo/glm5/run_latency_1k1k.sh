@@ -26,9 +26,11 @@ DST="$OUT_DIR/isl${ISL}_osl${OSL}"
 
 # shellcheck source=stall_watchdog.sh
 . ./stall_watchdog.sh
-# After ENTER the whole 1k prefill + 1k decode is one kernel with FWD_PASS
-# captured off fd 1, so the log is silent until mpk() returns. 400s covers
-# ~200 ms/iter; a cold-start wedge is still killed.
+# After ENTER the whole 1k prefill + 1k decode is one kernel. Device
+# [FWD_PASS] is deferred until mpk() returns, so the log is silent -- but
+# stall_watchdog.sh now treats HBM controller busy as liveness, and the
+# kernel writes a host-visible [ITER] heartbeat. 400s still covers a
+# cold-start wedge; a healthy 1k/1k is ~200s of HBM activity.
 STALL_SECS="${STALL_SECS:-400}"
 RETRIES="${RETRIES:-8}"
 
@@ -88,13 +90,13 @@ decode_avg = decode_min = None
 prefill_avg = None
 gen_tok = None
 for line in open(log, errors="replace"):
-    m = re.search(r"Decode:\s+(\d+) tokens .* avg ([0-9.]+)ms/iter", line)
+    m = re.search(r"Decode:\s+(\d+) tokens .*avg ([0-9.]+)ms/iter", line)
     if m:
         gen_tok, decode_avg = int(m.group(1)), float(m.group(2))
     m = re.search(r"Decode per-iter range: min=([0-9.]+)ms", line)
     if m:
         decode_min = float(m.group(1))
-    m = re.search(r"Prefill: .* avg ([0-9.]+)ms/iter", line)
+    m = re.search(r"Prefill: .*avg ([0-9.]+)ms/iter", line)
     if m:
         prefill_avg = float(m.group(1))
 print(f"ISL={isl} OSL={osl} dumped_osl={n[0]} ranks={len(entries)}")

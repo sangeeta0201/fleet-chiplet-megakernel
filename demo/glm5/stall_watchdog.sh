@@ -82,6 +82,38 @@ run_with_watchdog() {
   local hard_cap=$(( stall * 10 ))
   local elapsed=0
 
+# Cache sysfs mem_busy paths for HIP_VISIBLE_DEVICES (default 4,5,6,7).
+  # Done once, after ENTER, so a missing sysfs is a warning not a 10s tax.
+  local -a hbm_paths=()
+  _watchdog_cache_hbm_paths() {
+    hbm_paths=()
+    local bus pci card d
+    bus=$(rocm-smi --showbus 2>/dev/null) || return 0
+    local IFS=','
+    for d in ${HIP_VISIBLE_DEVICES:-4,5,6,7}; do
+      pci=$(printf '%s\n' "$bus" | awk -v g="$d" '
+        $0 ~ ("GPU\\[" g "\\]") { print tolower($NF); exit }
+      ')
+      [ -n "$pci" ] || continue
+      pci=${pci#0000:}
+      for card in /sys/class/drm/card*/device; do
+        [ -f "$card/mem_busy_percent" ] || continue
+        if grep -qi "$pci" "$card/uevent" 2>/dev/null; then
+          hbm_paths+=("$card/mem_busy_percent")
+          break
+        fi
+      done
+    done
+  }
+  _watchdog_hbm_busy_max() {
+    local m=0 v p
+    for p in "${hbm_paths[@]+"${hbm_paths[@]}"}"; do
+      v=$(cat "$p" 2>/dev/null || echo 0)
+      [ "$v" -gt "$m" ] && m=$v
+    done
+    printf '%s\n' "$m"
+  }
+
   # ARM ONLY AFTER THE KERNEL LAUNCHES. A rebuild is legitimately silent for
   # minutes at a time (one hipcc invocation on the megakernel), so a watchdog
   # armed from t=0 would have to carry a threshold long enough to cover the
@@ -89,7 +121,16 @@ run_with_watchdog() {
   # wedge only ever happens after every rank prints ENTER, so waiting for that
   # string separates "quiet because compiling" from "quiet because hung" and
   # lets the threshold be tight.
-  local last_size=0 quiet=0 armed=0
+  #
+  # After ENTER the megakernel is one kernel for the whole prefill+decode.
+  # GLM precomputed-dispatch defers [FWD_PASS] until mpk() returns, and
+  # device printf lands on stdout which mpirun block-buffers, so LOG GROWTH
+  # is not a liveness signal. A working step moves the HBM controllers; the
+  # cold-start wedge and a barrier deadlock are 100% shader / 0% HBM. Treat
+  # mem_busy>2% on the assigned devices as progress even when the log is
+  # frozen. gpt-oss prefill is the same 1-token-per-iter prepare_next_batch
+  # loop -- it is not a missing FMHA path.
+  local last_size=0 quiet=0 armed=0 hbm=0
   while kill -0 "$child" 2>/dev/null; do
     sleep 10
     elapsed=$(( elapsed + 10 ))
@@ -100,18 +141,23 @@ run_with_watchdog() {
       return 124
     fi
     if [ "$armed" -eq 0 ]; then
-      grep -q "launch_persistent_kernel ENTER" "$log" 2>/dev/null && armed=1
+      if grep -q "launch_persistent_kernel ENTER" "$log" 2>/dev/null; then
+        armed=1
+        _watchdog_cache_hbm_paths
+        echo "[watchdog] armed ENTER hbm_paths=${#hbm_paths[@]}" >> "$log"
+      fi
       continue
     fi
     local size
     size=$(stat -c %s "$log" 2>/dev/null || echo 0)
-    if [ "$size" -gt "$last_size" ]; then
+    hbm=$(_watchdog_hbm_busy_max)
+    if [ "$size" -gt "$last_size" ] || [ "${hbm:-0}" -gt 2 ]; then
       last_size=$size
       quiet=0
     else
       quiet=$(( quiet + 10 ))
       if [ "$quiet" -ge "$stall" ]; then
-        echo "[watchdog] no log growth for ${stall}s -- killing pgid $pgid" \
+        echo "[watchdog] no log growth and HBM busy ${hbm}% for ${stall}s -- killing pgid $pgid" \
              >> "$log"
         _watchdog_reap "$pgid" "$child"
         return 124
