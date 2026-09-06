@@ -478,6 +478,14 @@ struct RuntimeConfig {
   long long *input_tokens;      // Metadata for LLM serving
   long long *output_tokens;     // Metadata for LLM serving
   long long eos_token_id;       // Metadata for LLM serving
+  // Extra stop ids beyond eos_token_id. GLM-5.2 generation_config lists
+  // {154820, 154827, 154829} = <|endoftext|>, <|user|>, <|observation|>.
+  // The megakernel historically carried one id, so a greedy run that
+  // emitted <|user|> at end-of-turn kept decoding into a repetition loop.
+  // -1 / num_extra=0 means unused. Token 0 is a real vocab id, so do not
+  // treat 0 as a sentinel.
+  long long extra_eos_token_ids[3];
+  int num_extra_eos_token_ids;
   int max_seq_length;           // Metadata for LLM serving
   int *new_token_nums;          // Metadata for LLM serving
   int *qo_indptr_buffer;        // Metadata for LLM serving (paged attention)

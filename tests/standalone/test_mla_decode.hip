@@ -44,11 +44,12 @@ static constexpr int Q_WORKSPACE_STRIDE = NUM_Q_HEADS * QK_DIM;
 static constexpr int KV_CACHE_STRIDE = QK_DIM;
 static constexpr int NUM_Q_GROUPS = NUM_Q_HEADS / 16;
 static constexpr int BLOCK_THREADS = 256;
-static constexpr int LDS_BYTES = 16 * QK_DIM * 2;
+static constexpr int LDS_BYTES =
+    16 * QK_DIM * 2 + 256 * 32 * 4;
 
 static constexpr float LOG2E = 1.44269504088896340736f;
 
-template <int NUM_KV_CHUNKS>
+template <int NUM_KV_CHUNKS, bool WRITE_THROUGH>
 __global__ void mla_entry(void const *q_workspace,
                           void const *kv_cache,
                           void *output,
@@ -67,7 +68,8 @@ __global__ void mla_entry(void const *q_workspace,
                                  MAX_SEQ_LEN,
                                  NUM_KV_CHUNKS,
                                  Q_WORKSPACE_STRIDE,
-                                 KV_CACHE_STRIDE>(q_workspace,
+                                 KV_CACHE_STRIDE,
+                                 WRITE_THROUGH>(q_workspace,
                                                   kv_cache,
                                                   output,
                                                   lse,
@@ -108,7 +110,7 @@ static float frand() {
   return ((float)rand() / (float)RAND_MAX - 0.5f) * 2.0f;
 }
 
-template <int NUM_KV_CHUNKS>
+template <int NUM_KV_CHUNKS, bool WRITE_THROUGH>
 static int run_case(int seqlen) {
   int const num_pages = (seqlen + PAGE_SIZE - 1) / PAGE_SIZE;
   int const last_page_len = seqlen - (num_pages - 1) * PAGE_SIZE;
@@ -213,7 +215,7 @@ static int run_case(int seqlen) {
   hipMemcpy(d_last_page_len, h_last_page_len, 4, hipMemcpyHostToDevice);
 
   int const total_work_items = NUM_Q_GROUPS * NUM_KV_CHUNKS;
-  hipLaunchKernelGGL((mla_entry<NUM_KV_CHUNKS>),
+  hipLaunchKernelGGL((mla_entry<NUM_KV_CHUNKS, WRITE_THROUGH>),
                      dim3(total_work_items),
                      dim3(BLOCK_THREADS),
                      LDS_BYTES,
@@ -326,19 +328,41 @@ static int run_case(int seqlen) {
   return 1;
 }
 
-int main() {
-  srand(20250811);
+template <bool WRITE_THROUGH>
+static int run_suite() {
   int rc = 0;
   // 1 exercises the single-token tile, 16/64 the exact-tile cases, the rest
   // partial tails and multi-page indirection.
   for (int seqlen : {1, 7, 16, 17, 64, 65, 129, 333}) {
-    rc |= run_case<1>(seqlen);
+    rc |= run_case<1, WRITE_THROUGH>(seqlen);
   }
   for (int seqlen : {1, 17, 64, 129, 333}) {
-    rc |= run_case<2>(seqlen);
+    rc |= run_case<2, WRITE_THROUGH>(seqlen);
   }
   for (int seqlen : {333, 1024}) {
-    rc |= run_case<4>(seqlen);
+    rc |= run_case<4, WRITE_THROUGH>(seqlen);
   }
+  // Production fused shape: 16 chunks, kv_len just past 16*16 so each
+  // occupied chunk's tile loop trips twice.
+  rc |= run_case<16, WRITE_THROUGH>(257);
+  // The fused break point. Fused decode is correct up to seqlen 225 and wrong
+  // from 241 on, at 16 AND 32 chunks -- so the trigger is global
+  // ntiles = ceil(seqlen/16) >= 16, not tiles_per_chunk (241 and 225 both
+  // give tiles_per_chunk 1). These two straddle it; if the kernel is clean
+  // here in isolation the fault is not in this file's arithmetic.
+  rc |= run_case<16, WRITE_THROUGH>(225);
+  rc |= run_case<16, WRITE_THROUGH>(241);
+  rc |= run_case<32, WRITE_THROUGH>(257);
+  return rc;
+}
+
+int main() {
+  srand(20250811);
+  int rc = 0;
+  printf("=== WRITE_THROUGH=false ===\n");
+  rc |= run_suite<false>();
+  srand(20250811);
+  printf("=== WRITE_THROUGH=true ===\n");
+  rc |= run_suite<true>();
   return rc;
 }

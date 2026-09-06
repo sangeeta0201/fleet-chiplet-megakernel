@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Streaming FP8 -> MXFP4/bf16 converter for GLM-5-FP8 (744B, 142 shards, 756 GB).
+"""Streaming FP8 -> MXFP4/bf16 converter for GLM-5 / GLM-5.2 FP8.
 
-The checkpoint does not fit: 756 GB of shards against 635 GB of free disk. It
-never has to. Per shard we download one file, dequantize its FP8 128x128 blocks
-to bf16, re-pack the routed experts as MXFP4, write the result, and delete the
-FP8 shard -- so peak disk is the converted output plus one 5.4 GB shard.
+GLM-5-FP8 is 744B, 142 shards, ~756 GB. GLM-5.2-FP8 is the same FP8 128x128
+blockscale on a slightly larger 753B IndexShare checkpoint. Default REPO is
+``zai-org/GLM-5.2-FP8``; set GLM5_REPO=zai-org/GLM-5-FP8 for the older model.
+
+The checkpoint does not need to sit on disk all at once. Per shard we download
+one file, dequantize its FP8 128x128 blocks to bf16, re-pack the routed experts
+as MXFP4, write the result, and delete the FP8 shard -- so peak disk is the
+converted output plus one ~5 GB shard.
 
     routed experts  mlp.experts.<e>.{gate,up,down}_proj  ->  MXFP4   390 GB
     everything else (attention, shared/dense MLP, indexer, embed, lm_head,
@@ -53,9 +57,9 @@ from huggingface_hub import hf_hub_download
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from demo import quantize_mxfp4  # noqa: E402  the one true packing
 
-REPO = os.environ.get("GLM5_REPO", "zai-org/GLM-5-FP8")
-STAGE = os.environ.get("GLM5_STAGE", "/home/claudeuser/models/glm5-fp8-stage")
-OUT = os.environ.get("GLM5_OUT", "/home/claudeuser/models/glm5-mxfp4")
+REPO = os.environ.get("GLM5_REPO", "zai-org/GLM-5.2-FP8")
+STAGE = os.environ.get("GLM5_STAGE", "/mnt/nvme1/glm5.2-fp8-stage")
+OUT = os.environ.get("GLM5_OUT", "/mnt/nvme1/GLM-5.2-MXFP4")
 BLK = 128  # weight_block_size = [128, 128]
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
@@ -247,7 +251,8 @@ def prefetcher(shards, q, stop):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--shards", type=int, default=0, help="convert first N")
-    ap.add_argument("--all", action="store_true", help="convert all 142")
+    ap.add_argument("--all", action="store_true",
+                    help="convert every shard in the index")
     ap.add_argument("--start", type=int, default=1, help="1-based start index")
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--keep-fp8", action="store_true")

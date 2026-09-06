@@ -3,19 +3,22 @@
 # Licensed under the Apache License, Version 2.0.
 """GLM MoE + MLA models for Mirage inference.
 
-Covers two checkpoints that share one architecture:
+Covers three checkpoints that share one architecture:
 
-  * ``zai-org/GLM-5-FP8``      -- ``GlmMoeDsaForCausalLM`` (``glm_moe_dsa``),
-    78 layers, 64 heads, 256 routed experts, FP8 128x128 blockscale weights,
-    plus a DSA sparse-attention indexer.
-  * ``zai-org/GLM-4.7-Flash``  -- ``Glm4MoeLiteForCausalLM`` (``glm4_moe_lite``),
+  * ``zai-org/GLM-5.2`` / ``-FP8`` -- ``GlmMoeDsaForCausalLM`` (``glm_moe_dsa``),
+    78 layers, 64 heads, 256 routed experts, FP8 128x128 blockscale, 1M context,
+    RoPE theta 8e6, and IndexShare (one DSA indexer reused across every four
+    sparse layers).
+  * ``zai-org/GLM-5-FP8``          -- same MLA/MoE shape, RoPE theta 1e6,
+    202k context, a *per-layer* indexer (no IndexShare).
+  * ``zai-org/GLM-4.7-Flash``      -- ``Glm4MoeLiteForCausalLM`` (``glm4_moe_lite``),
     47 layers, 20 heads, 64 routed experts, BF16 weights, no indexer.
 
-Both use MLA with identical head geometry (qk_nope 192 + qk_rope 64,
+All three use MLA with identical head geometry (qk_nope 192 + qk_rope 64,
 v_head 256, kv_lora 512) and the same ``noaux_tc`` sigmoid router with an
 ``e_score_correction_bias``, ``norm_topk_prob`` and a ``routed_scaling_factor``.
-That makes GLM-4.7-Flash the natural bring-up vehicle for the GLM-5 megakernel
-path -- same tasks, one eighth the weights.
+That makes GLM-4.7-Flash the natural bring-up vehicle -- same tasks, one
+eighth the weights.
 
 Two deliberate simplifications relative to the HF reference, both documented
 where they happen:
@@ -26,12 +29,12 @@ where they happen:
     This is algebraically exact, and it is the same formulation
     ``gang_mla_decode_kernel`` implements -- keeping the reference in the same
     formulation is what makes a Torch-vs-Mirage comparison meaningful.
-  * **Dense attention, no DSA indexer.** GLM-5's indexer selects the top
+  * **Dense attention, no DSA indexer.** The indexer selects the top
     ``index_topk = 2048`` positions. Below 2048 tokens of context that
     selection is the identity, so at Stage-1 sequence lengths dense attention
-    *is* sparse attention. The indexer weights are loaded and ignored;
-    ``ForCausalLM.forward`` raises if the context ever exceeds ``index_topk``
-    so this can never silently become an approximation.
+    *is* sparse attention -- IndexShare included. Indexer weights are skipped
+    on load; ``ForCausalLM.forward`` raises if the context ever exceeds
+    ``index_topk`` so this can never silently become an approximation.
 """
 
 import json
@@ -109,6 +112,20 @@ class GlmMoeDsaConfig(PretrainedConfig):
         self.index_head_dim = kw.get("index_head_dim", 0)
         self.index_topk = kw.get("index_topk", 0)
         self.indexer_rope_interleave = kw.get("indexer_rope_interleave", True)
+        # GLM-5.2 IndexShare. `indexer_types[i]` is "full" (owns weights) or
+        # "shared" (reuses the previous full layer's indexer). GLM-5 has no
+        # such list: every layer is "full". `index_topk_freq` is 4 on 5.2
+        # (one unique indexer every four sparse layers) and 0/absent on 5.
+        self.indexer_types = list(kw.get("indexer_types") or [])
+        self.index_topk_freq = int(kw.get("index_topk_freq") or 0)
+        self.index_topk_pattern = kw.get("index_topk_pattern")
+        self.index_share_for_mtp_iteration = bool(
+            kw.get("index_share_for_mtp_iteration", False))
+        self.index_skip_topk_offset = int(kw.get("index_skip_topk_offset") or 0)
+        # Per-layer MLP kind. GLM-5.2 ships this explicitly; GLM-5 encodes the
+        # same split as `first_k_dense_replace`.
+        self.mlp_layer_types = list(kw.get("mlp_layer_types") or [])
+        self.moe_router_dtype = kw.get("moe_router_dtype", "float32")
 
         # MTP. Layer `num_hidden_layers` is the draft layer. It is only built
         # and loaded when the caller asks for it (`num_mtp_layers`); the
@@ -126,6 +143,36 @@ class GlmMoeDsaConfig(PretrainedConfig):
     @property
     def has_indexer(self) -> bool:
         return self.index_n_heads > 0
+
+    @property
+    def is_glm52(self) -> bool:
+        """True for IndexShare / 1M-context GLM-5.2 checkpoints."""
+        return bool(self.indexer_types) or self.index_topk_freq > 1
+
+    def layer_is_moe(self, layer_idx: int) -> bool:
+        if self.mlp_layer_types:
+            if layer_idx < len(self.mlp_layer_types):
+                return self.mlp_layer_types[layer_idx] == "sparse"
+            return True
+        return layer_idx >= self.first_k_dense_replace
+
+    def indexer_owner(self, layer_idx: int):
+        """Layer whose indexer weights this layer reuses, or None.
+
+        GLM-5.2 IndexShare: a "shared" layer walks back to the previous
+        "full" owner. GLM-5 (no ``indexer_types``) owns its own indexer.
+        """
+        if not self.has_indexer:
+            return None
+        types = self.indexer_types
+        if not types:
+            return layer_idx
+        if layer_idx < 0 or layer_idx >= len(types):
+            return None
+        for j in range(layer_idx, -1, -1):
+            if types[j] == "full":
+                return j
+        return None
 
     @classmethod
     def from_model_path(cls, model_path: str) -> "GlmMoeDsaConfig":
@@ -559,8 +606,10 @@ class GlmDecoderLayer(nn.Module):
         self.post_attention_layernorm = GlmRMSNorm(config.hidden_size,
                                                    eps=config.rms_norm_eps)
         # first_k_dense_replace leading layers are plain dense MLPs at the full
-        # `intermediate_size`; everything after is MoE.
-        self.is_moe = layer_idx >= config.first_k_dense_replace
+        # `intermediate_size`; everything after is MoE. GLM-5.2 says the same
+        # thing with `mlp_layer_types` ("dense"/"sparse"), which is what we
+        # honour when the list is present.
+        self.is_moe = config.layer_is_moe(layer_idx)
         if self.is_moe:
             self.mlp = GlmMoE(config, ep_rank=ep_rank, ep_world=ep_world,
                               mxfp4_experts=mxfp4_experts)
@@ -780,6 +829,15 @@ class GlmMoeDsaForCausalLM(GlmPreTrainedModel):
                                            allow_patterns=allow)
 
         config = GlmMoeDsaConfig.from_model_path(model_path)
+        if verbose:
+            kind = "GLM-5.2" if config.is_glm52 else config.hf_model_type
+            print(f"[load] {kind} layers={config.num_hidden_layers} "
+                  f"hidden={config.hidden_size} experts={config.n_routed_experts} "
+                  f"rope_theta={config.rope_theta:g} "
+                  f"max_pos={config.max_position_embeddings}"
+                  + (f" index_share_freq={config.index_topk_freq}"
+                     if config.is_glm52 else ""),
+                  flush=True)
 
         # Auto-detect the expert format from the index rather than making the
         # caller assert it: getting this wrong is not a clean failure. Claiming
@@ -894,8 +952,12 @@ class GlmMoeDsaForCausalLM(GlmPreTrainedModel):
                         idx = int(name.split(".")[2])
                         if idx >= n_layers:
                             continue
+                    # DSA indexer: skipped on every checkpoint. Below
+                    # index_topk the selection is the identity, so IndexShare
+                    # (GLM-5.2) vs a per-layer indexer (GLM-5) is a no-op here.
+                    # Shared layers simply omit these keys.
                     if (".indexer." in name
-                            or name.endswith("indexers_proj.weight")):
+                            or ".indexers_proj." in name):
                         continue
                     if mxfp4_experts and route_expert(name, fh):
                         n_expert_t += 1

@@ -34,4 +34,6 @@ python3 demo.py $MIRAGE_FLAG \
   --max-seq-length "${MAX_SEQ_LENGTH:-128}" \
   --max-new-tokens "${MAX_NEW_TOKENS:-16}" \
   --model-path "$MODEL_PATH" "$@"
-echo "RUN_EXIT=$?"
+_run_rc=$?
+echo "RUN_EXIT=$_run_rc"
+exit "$_run_rc"

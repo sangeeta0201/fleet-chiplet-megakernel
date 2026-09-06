@@ -33,7 +33,7 @@ mkdir -p "$OUT_DIR"
 # so an unpinned sweep dies on every rank at
 # "absorbed o_proj reduces over num_q_heads * kv_lora_rank = 16384, got 10240"
 # before it generates a single token -- i.e. the gate silently does not run.
-export MODEL_PATH="${MODEL_PATH:-/home/claudeuser/models/glm5-mxfp4}"
+export MODEL_PATH="${MODEL_PATH:-${GLM_MODEL_PATH:-/mnt/nvme1/GLM-5.2-MXFP4}}"
 
 # Long enough that a subtly wrong reduction shows as divergence rather than as
 # a lucky matching prefix, and short enough to stay inside the page budget.
@@ -97,11 +97,24 @@ for i in "${!PROMPTS[@]}"; do
     run_with_watchdog "$log" "$STALL_SECS" \
       ./"$LAUNCHER" --prompt "$p" --save-tokens "$dst"
     rc=$?
-    [ "$rc" -ne 124 ] && break
-    echo "    STALLED (attempt $((attempt + 1))), retrying"
+    # Rank dumps are <stem>_rank<r>.json, never the literal path handed to
+    # demo.py. Count either shape so a successful multi-rank run is not
+    # mistaken for a miss.
+    n=$(ls "$OUT_DIR/${TAG}_p${i}".json "$OUT_DIR/${TAG}_p${i}"_rank*.json \
+          2>/dev/null | wc -l)
+    if [ "$rc" -eq 0 ] && [ "$n" -gt 0 ]; then
+      break
+    fi
+    # Retry stalls AND hard faults. run_mp8 used to `echo MPIRUN_EXIT=134`
+    # and then exit 0, so an aperture-violation on prompt 2 was recorded as
+    # rc=0/files=0 and never retried. Propagate the mpirun status (see the
+    # launcher) and treat missing dumps as a retryable miss too.
+    if [ "$rc" -eq 124 ]; then
+      echo "    STALLED (attempt $((attempt + 1))), retrying"
+    else
+      echo "    FAIL rc=$rc files=$n (attempt $((attempt + 1))), retrying"
+    fi
   done
-  # The multi-rank case writes <stem>_rank<r>.json and never <stem>.json, so
-  # test for either shape rather than for the literal path handed to demo.py.
   n=$(ls "$OUT_DIR/${TAG}_p${i}".json "$OUT_DIR/${TAG}_p${i}"_rank*.json \
         2>/dev/null | wc -l)
   if [ "$rc" -ne 0 ] || [ "$n" -eq 0 ]; then

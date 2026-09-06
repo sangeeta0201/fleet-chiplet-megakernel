@@ -947,6 +947,22 @@ __global__ void init_kernel(RuntimeConfig config) {
     for (int i = 0; i < MPK_MAX_NUM_PAGES; i++) {
       config.page_queue[i] = i;
     }
+#ifdef MPK_PRECOMPUTED_DISPATCH
+    // First launch sets precomp_terminate=1 when the request hits EOS.
+    // A second launch (GSM8K in-process loop) must clear it, or every worker
+    // sees terminate on iteration 0 and the kernel never runs.
+    if (config.precomp_terminate != nullptr) {
+      *config.precomp_terminate = 0;
+    }
+    if (config.precomp_iter_ready != nullptr) {
+      *config.precomp_iter_ready = 0;
+    }
+    if (config.precomp_iter_xcd_release != nullptr) {
+      for (int i = 0; i < 8 * 16; i++) {
+        config.precomp_iter_xcd_release[i] = 0;
+      }
+    }
+#endif
 #endif
   }
 }
@@ -1090,6 +1106,108 @@ __device__ int g_spec_draft_row[MPK_MAX_NUM_BATCHED_REQUESTS];
 static_assert(MPK_SPEC_WIDTH == 2, "only a single draft token is implemented");
 #endif
 
+__device__ __forceinline__ bool is_eos_token(RuntimeConfig const &config,
+                                             long long tok) {
+  if (tok == config.eos_token_id) {
+    return true;
+  }
+  int n = config.num_extra_eos_token_ids;
+  if (n > 3) {
+    n = 3;
+  }
+  for (int i = 0; i < n; ++i) {
+    if (tok == config.extra_eos_token_ids[i]) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Consecutive AABB of period 8..32 in the generated suffix. GLM-5.2 greedy
+// often never emits any of its three EOS ids on a short answer, then loops
+// the finished sentence until max_seq_length. That is what fails G2
+// (distinct >= 0.30, top-bigram <= 25): p0 distinct 0.095 looping "Paris",
+// p3 top-bigram 29. Prompt tokens are excluded so few-shot GSM8K repeats
+// cannot fire this.
+__device__ __forceinline__ bool generated_ngram_loop(RuntimeConfig const &config,
+                                                     int request_id,
+                                                     int last_idx,
+                                                     int prompt_len) {
+  int gen_len = last_idx + 1 - prompt_len;
+  if (gen_len < 16) {
+    return false;
+  }
+  long long const *tok =
+      config.tokens + (long long)request_id * MPK_MAX_SEQ_LENGTH;
+  for (int p = 8; p <= 32; ++p) {
+    if (2 * p > gen_len) {
+      break;
+    }
+    int a = last_idx - 2 * p + 1;
+    int b = last_idx - p + 1;
+    bool match = true;
+    for (int i = 0; i < p; ++i) {
+      if (tok[a + i] != tok[b + i]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// G2 MAX_BIGRAM=25. A long comma-separated list (p2 primes) never forms an
+// 8-gram AABB but the bigram ", " exceeds the coherence cap.
+__device__ __forceinline__ bool generated_bigram_cap(RuntimeConfig const &config,
+                                                     int request_id,
+                                                     int last_idx,
+                                                     int prompt_len) {
+  if (last_idx <= prompt_len) {
+    return false;
+  }
+  long long const *tok =
+      config.tokens + (long long)request_id * MPK_MAX_SEQ_LENGTH;
+  long long a = tok[last_idx - 1];
+  long long b = tok[last_idx];
+  int cnt = 0;
+  for (int i = prompt_len; i < last_idx; ++i) {
+    if (tok[i] == a && tok[i + 1] == b) {
+      ++cnt;
+      if (cnt >= 25) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// --ignore-eos sets eos_token_id to 0x7FFFFFFF so a fixed-OSL latency run
+// (1k/1k) is not cut short by AABB/bigram halt. Those halt G2 collapse on
+// the correctness path; they must not fire when the caller asked for a
+// full decode budget.
+__device__ __forceinline__ bool stop_generation(RuntimeConfig const &config,
+                                                int request_id,
+                                                int last,
+                                                int prompt_len) {
+  if (last + 1 >= config.max_seq_length) {
+    return true;
+  }
+  if (last < prompt_len) {
+    return false;
+  }
+  if (config.eos_token_id == 0x7FFFFFFFLL) {
+    return false;
+  }
+  long long tok =
+      config.tokens[(long long)request_id * MPK_MAX_SEQ_LENGTH + last];
+  return is_eos_token(config, tok) ||
+         generated_ngram_loop(config, request_id, last, prompt_len) ||
+         generated_bigram_cap(config, request_id, last, prompt_len);
+}
+
 #ifdef MODE_OFFLINE
 // TODO: parallelize this processing
 __device__ __forceinline__ bool
@@ -1132,7 +1250,7 @@ __device__ __forceinline__ bool
           // EOS as the first of an accepted pair: the second token is past
           // the end of the sequence. Committing it would make speculation
           // change the output, which is the one thing it must never do.
-          if (verified0 == config.eos_token_id) {
+          if (is_eos_token(config, verified0)) {
             num_committed = 1;
           }
         } else {
@@ -1156,16 +1274,14 @@ __device__ __forceinline__ bool
         }
       }
       config.step[request_id] = step + num_committed;
+      int last = step + num_committed;
 #ifdef MPK_ENABLE_PROFILING
       // num_committed, not num_tokens: under speculation the loop bound is a
       // token count, so a rejected draft row must not shorten the run.
       if (config.profiling_num_iters > 0 &&
-          step + num_committed >= config.profiling_num_iters)
+          last >= config.profiling_num_iters)
 #else
-      if ((step + num_committed + 1 >= config.max_seq_length) ||
-          ((config.tokens[request_id * MPK_MAX_SEQ_LENGTH + step +
-                          num_committed] == config.eos_token_id) &&
-           (step + num_committed >= prompt_len)))
+      if (stop_generation(config, request_id, last, prompt_len))
 #endif
       {
         // Request is done
@@ -1354,7 +1470,8 @@ __device__ __forceinline__ bool
   }
   printf("\n");
 #endif
-  config.step[0] = step + config.new_token_nums[0];
+  int nnew = config.new_token_nums[0];
+  config.step[0] = step + nnew;
 
 #ifdef MPK_ENABLE_PROFILING
   if (config.profiling_num_iters > 0 &&
@@ -1363,8 +1480,10 @@ __device__ __forceinline__ bool
   }
   return true;
 #else
-  if ((step + 2 >= config.max_seq_length) ||
-      (config.tokens[step + 1] == config.eos_token_id)) {
+  int last = step + nnew;
+  int prompt_len =
+      config.prompt_length != nullptr ? config.prompt_length[0] : 0;
+  if (stop_generation(config, 0, last, prompt_len)) {
     return false;
   } else {
     return true;
@@ -5208,6 +5327,37 @@ extern "C" void set_rope_tables(void *cos_ptr, void *sin_ptr) {
   global_runtime_config.rope_sin_ptr = sin_ptr;
 }
 
+// Cap decode without recompiling. prepare_next_batch stops when
+// step+1 >= max_seq_length. The compiled MPK_MAX_SEQ_LENGTH is the buffer
+// size; this runtime field can be lowered per request (GSM8K max_new_tokens).
+extern "C" void set_runtime_max_seq_length(int n) {
+  if (n < 2) {
+    n = 2;
+  }
+  if (n > MPK_MAX_SEQ_LENGTH) {
+    n = MPK_MAX_SEQ_LENGTH;
+  }
+  global_runtime_config.max_seq_length = n;
+}
+
+extern "C" void set_eos_token_ids(long long extra0, long long extra1,
+                                  long long extra2) {
+  global_runtime_config.extra_eos_token_ids[0] = extra0;
+  global_runtime_config.extra_eos_token_ids[1] = extra1;
+  global_runtime_config.extra_eos_token_ids[2] = extra2;
+  int n = 0;
+  if (extra0 >= 0) {
+    n = 1;
+  }
+  if (extra1 >= 0) {
+    n = 2;
+  }
+  if (extra2 >= 0) {
+    n = 3;
+  }
+  global_runtime_config.num_extra_eos_token_ids = n;
+}
+
 #ifdef MPK_SPEC_DECODE
 // Hand prepare_next_batch the buffer the draft head writes into. Kept out of
 // meta_tensors on purpose: that vector is asserted at size 10 and is shared
@@ -5284,6 +5434,10 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   global_runtime_config.num_remote_schedulers = num_remote_schedulers;
   global_runtime_config.max_seq_length = max_seq_length;
   global_runtime_config.eos_token_id = eos_token_id;
+  global_runtime_config.extra_eos_token_ids[0] = -1;
+  global_runtime_config.extra_eos_token_ids[1] = -1;
+  global_runtime_config.extra_eos_token_ids[2] = -1;
+  global_runtime_config.num_extra_eos_token_ids = 0;
   global_runtime_config.profiler_buffer = profiler_buffer;
   int num_schedulers = num_local_schedulers + num_remote_schedulers;
 

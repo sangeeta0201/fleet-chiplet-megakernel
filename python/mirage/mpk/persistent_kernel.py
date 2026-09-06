@@ -98,6 +98,26 @@ static PyObject *set_rope_tables_func(PyObject *self, PyObject *args) {
   Py_RETURN_NONE;
 }
 
+static PyObject *set_max_seq_length_func(PyObject *self, PyObject *args) {
+  int n;
+  if (!PyArg_ParseTuple(args, "i", &n)) {
+    PyErr_SetString(PyExc_TypeError, "Expected (max_seq_length: int)");
+    return NULL;
+  }
+  set_runtime_max_seq_length(n);
+  Py_RETURN_NONE;
+}
+
+static PyObject *set_eos_token_ids_func(PyObject *self, PyObject *args) {
+  long long extra0, extra1, extra2;
+  if (!PyArg_ParseTuple(args, "LLL", &extra0, &extra1, &extra2)) {
+    PyErr_SetString(PyExc_TypeError, "Expected (extra0, extra1, extra2)");
+    return NULL;
+  }
+  set_eos_token_ids(extra0, extra1, extra2);
+  Py_RETURN_NONE;
+}
+
 #ifdef MPK_SPEC_DECODE
 static PyObject *set_spec_draft_tokens_func(PyObject *self, PyObject *args) {
   PyObject *py_ptr;
@@ -142,6 +162,8 @@ static PyMethodDef ModuleMethods[] = {
   {"launch_func", launch_func, METH_VARARGS, "launch persistent kernel"},
   {"finalize_func", finalize_func, METH_VARARGS, "finalize persistent kernel"},
   {"set_rope_tables_func", set_rope_tables_func, METH_VARARGS, "set RoPE cos/sin tables"},
+  {"set_max_seq_length_func", set_max_seq_length_func, METH_VARARGS, "set runtime max_seq_length"},
+  {"set_eos_token_ids_func", set_eos_token_ids_func, METH_VARARGS, "set extra EOS token ids"},
 #ifdef MPK_SPEC_DECODE
   {"set_spec_draft_tokens_func", set_spec_draft_tokens_func, METH_VARARGS, "set the speculative draft-token buffer"},
 #endif
@@ -8163,6 +8185,12 @@ class PersistentKernel:
         self.init_request_func = getattr(mod, "init_request_func")
         self.finalize_func = getattr(mod, "finalize_func")
         self._set_rope_tables_func = getattr(mod, "set_rope_tables_func", None)
+        self._set_max_seq_length_func = getattr(
+            mod, "set_max_seq_length_func", None
+        )
+        self._set_eos_token_ids_func = getattr(
+            mod, "set_eos_token_ids_func", None
+        )
         self._set_spec_draft_tokens_func = getattr(
             mod, "set_spec_draft_tokens_func", None
         )
@@ -8209,6 +8237,32 @@ class PersistentKernel:
         assert self._is_compiled, "Must call compile() before set_rope_tables()"
         assert self._set_rope_tables_func is not None
         self._set_rope_tables_func(cos_tensor.data_ptr(), sin_tensor.data_ptr())
+
+    def set_max_seq_length(self, n: int) -> None:
+        """Lower the runtime decode cap without recompiling.
+
+        prepare_next_batch stops at step+1 >= this value. Must stay <= the
+        compiled buffer (self.max_seq_length). Used by GSM8K to honour
+        --max-new-tokens instead of running out to the compiled seq length.
+        """
+        assert self._is_compiled, "Must call compile() before set_max_seq_length()"
+        assert self._set_max_seq_length_func is not None
+        cap = min(int(n), int(self.max_seq_length))
+        self._set_max_seq_length_func(cap)
+
+    def set_eos_token_ids(self, ids) -> None:
+        """Register stop ids beyond the single eos_token_id passed at init.
+
+        GLM-5.2 generation_config is [154820, 154827, 154829]. Only the first
+        goes through init_persistent_kernel; the rest are extras. Unused slots
+        are -1. Must be called after compile().
+        """
+        assert self._is_compiled, "Must call compile() before set_eos_token_ids()"
+        assert self._set_eos_token_ids_func is not None
+        extras = [int(x) for x in list(ids)[1:4]]
+        while len(extras) < 3:
+            extras.append(-1)
+        self._set_eos_token_ids_func(extras[0], extras[1], extras[2])
 
     def set_spec_draft_tokens(self, tensor: "torch.Tensor"):
         """Point RuntimeConfig at the draft head's output (call after compile).

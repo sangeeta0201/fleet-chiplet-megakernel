@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""GLM-5 / GLM-4.7-Flash MLA + MoE inference demo on MI350/MI355 using the
-Mirage persistent kernel.
+"""GLM-5.2 / GLM-5 / GLM-4.7-Flash MLA + MoE inference demo on MI350/MI355
+using the Mirage persistent kernel.
 
 Usage:
     # PyTorch reference (no Mirage):
@@ -21,12 +21,29 @@ import torch
 import torch.distributed as dist
 import argparse
 import os
+import sys
 import math
 import json
 
 # Local model directory or HF repo id. Override with --model-path or the
-# GLM_MODEL_PATH env var.
-DEFAULT_MODEL_PATH = os.environ.get("GLM_MODEL_PATH", "zai-org/GLM-4.7-Flash")
+# GLM_MODEL_PATH env var. Prefer a local GLM-5.2 MXFP4 checkpoint when present.
+def _default_model_path():
+    env = os.environ.get("GLM_MODEL_PATH")
+    if env:
+        return env
+    for p in (
+        "/mnt/nvme1/GLM-5.2-MXFP4",
+        "/home/claudeuser/models/GLM-5.2-MXFP4",
+        "/root/schowdha/models/GLM-5.2-MXFP4",
+        "/home/schowdha/models/GLM-5.2-MXFP4",
+        "/home/claudeuser/models/glm5-mxfp4",
+    ):
+        if os.path.isfile(os.path.join(p, "config.json")) and os.path.isfile(
+                os.path.join(p, "model.safetensors.index.json")):
+            return p
+    return "zai-org/GLM-5.2-FP8"
+
+DEFAULT_MODEL_PATH = _default_model_path()
 
 # CI correctness-dump defaults. Torch vs Mirage token dumps land here for
 # tests/ci-tests/test_glm5_inference_output.py.
@@ -112,6 +129,56 @@ def load_ppl_corpus(tokenizer, corpus: str, max_tokens: int):
     return prefix + ids[:max_tokens], len(prefix)
 
 
+def chat_isl_ids(tokenizer, n_isl, enable_thinking, corpus="wikitext2"):
+    """Exact-length chat prompt for 1k/1k ISL.
+
+    Raw WikiText continuation (the PPL prefix) is the wrong serving shape:
+    GLM-5.2 greedy then collapses to a '0.' loop. The chat template puts the
+    model in the assistant slot (including the empty ``<think></think>``
+    enable_thinking=False wrapper). User content is WikiText so the token
+    count is real document text, not repeated padding.
+    """
+    def templated(user_text):
+        messages = [{"role": "user", "content": user_text}]
+        if getattr(tokenizer, "chat_template", None):
+            formatted = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+                enable_thinking=enable_thinking)
+            return tokenizer(formatted, return_tensors=None,
+                             add_special_tokens=False)["input_ids"]
+        return tokenizer(user_text, return_tensors=None,
+                         add_special_tokens=False)["input_ids"]
+
+    # Surplus wiki so binary-search has room after the template wraps it.
+    wiki_ids, prefix_n = load_ppl_corpus(tokenizer, corpus, n_isl * 4)
+    user_text = tokenizer.decode(wiki_ids[prefix_n:], skip_special_tokens=True)
+    lo, hi = 0, len(user_text)
+    best = templated(user_text[:1])
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        cand = templated(user_text[:mid])
+        if len(cand) <= n_isl:
+            best = cand
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    pad_id = 220  # 'Ġ'
+    # Keep the chat generation-prompt suffix (assistant + empty think) on
+    # the right. Length is template-defined, not a constant 3.
+    a, b = templated("x"), templated("y")
+    suffix = 0
+    n = min(len(a), len(b))
+    while suffix < n and a[-1 - suffix] == b[-1 - suffix]:
+        suffix += 1
+    if len(best) < n_isl:
+        n_pad = n_isl - len(best)
+        if len(best) >= suffix > 0:
+            best = best[:-suffix] + [pad_id] * n_pad + best[-suffix:]
+        else:
+            best = best + [pad_id] * n_pad
+    return best[:n_isl]
+
+
 def report_perplexity(mode, nll_sum, n_scored, args, corpus_tokens, rank,
                       per_pos=None, top1=None, targets=None, ent=None,
                       diagnostics=None):
@@ -172,6 +239,94 @@ def report_perplexity(mode, nll_sum, n_scored, args, corpus_tokens, rank,
             }, f, indent=2)
         print(f"Saved perplexity to {out_path}", flush=True)
     return ppl
+
+
+def trim_ngram_loop(ids, min_period=8, max_period=32, max_bigram=25):
+    """Cut generated ids to the G2-coherent prefix.
+
+    Two rules, matching persistent_kernel.cuh:
+      1. First consecutive AABB n-gram of period 8..32 (sentence loops).
+      2. First time any bigram count exceeds ``max_bigram`` (G2's
+         MAX_BIGRAM=25). A comma-separated prime list is the case that (1)
+         misses: ``', '`` is period 2.
+    """
+    ids = list(ids)
+    n = len(ids)
+    cut = n
+    for end in range(2 * min_period, n + 1):
+        found = False
+        for p in range(min_period, max_period + 1):
+            if 2 * p > end:
+                continue
+            if ids[end - 2 * p:end - p] == ids[end - p:end]:
+                cut = end
+                found = True
+                break
+        if found:
+            break
+    ids = ids[:cut]
+    counts = {}
+    for i in range(1, len(ids)):
+        bg = (ids[i - 1], ids[i])
+        counts[bg] = counts.get(bg, 0) + 1
+        if counts[bg] > max_bigram:
+            return ids[:i]
+    return ids
+
+
+def dump_generated_ids(ids, ignore_eos):
+    """Host-side n-gram trim matches the kernel halt.
+
+    Skip it under --ignore-eos so a 1k/1k dump is the full OSL, not a
+    collapse-trimmed prefix.
+    """
+    if ignore_eos:
+        return list(ids)
+    return trim_ngram_loop(ids)
+
+
+def fill_chat_prompt(tokenizer, messages_or_text, tokens, prompt_lengths,
+                     enable_thinking, n_requests):
+    """Write a chat-templated prompt into the megakernel token buffer.
+
+    ``messages_or_text`` is either a string (single user turn) or a list of
+    {role, content} dicts (GSM8K few-shot). Returns prompt length.
+    """
+    if isinstance(messages_or_text, str):
+        messages = [{"role": "user", "content": messages_or_text}]
+    else:
+        messages = messages_or_text
+    if getattr(tokenizer, "chat_template", None):
+        formatted = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+            enable_thinking=enable_thinking)
+        ids = tokenizer([formatted], return_tensors="pt",
+                        add_special_tokens=False).input_ids[0]
+    else:
+        text = messages[-1]["content"] if messages else ""
+        ids = tokenizer([text], return_tensors="pt").input_ids[0]
+    n = int(ids.numel())
+    if n >= tokens.size(1):
+        raise ValueError(
+            f"prompt is {n} tokens, max_seq_length={tokens.size(1)}; "
+            f"raise MAX_SEQ_LENGTH")
+    tokens.zero_()
+    ids = ids.to(device=tokens.device, dtype=tokens.dtype)
+    for r in range(n_requests):
+        tokens[r, :n] = ids
+    prompt_lengths.fill_(n)
+    return n
+
+
+def collect_generation(tokenizer, tokens, prompt_len, end_idx,
+                       max_new_tokens=None):
+    """Generated ids/text after the prompt. Scores GSM8K on this slice only."""
+    end_idx = max(int(end_idx), int(prompt_len))
+    if max_new_tokens is not None:
+        end_idx = min(end_idx, int(prompt_len) + int(max_new_tokens))
+    gen_ids = trim_ngram_loop(tokens[0, prompt_len:end_idx].tolist())
+    text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+    return gen_ids, text
 
 
 # ── Shape helpers ────────────────────────────────────────────────────────────
@@ -763,9 +918,24 @@ if __name__ == "__main__":
         help=("Load the tokenizer from here instead of --model-path. Needed "
               "for a config-only GLM-5 checkpoint, which ships no tokenizer."))
     parser.add_argument("--ignore-eos", action="store_true")
+    parser.add_argument(
+        "--prompt-tokens", type=int, default=None,
+        help=("Exact ISL: WikiText-2 plus [gMASK]<sop>, padded/trimmed to N. "
+              "Latency benches use 1024. Skips the chat template so the "
+              "token count is the KV length, not an estimate."))
     parser.add_argument("--max-new-tokens", type=int, default=None)
     parser.add_argument("--prompt", type=str,
                         default="The capital of France is")
+    parser.add_argument(
+        "--enable-thinking", dest="enable_thinking", action="store_true",
+        default=False,
+        help=("GLM-5.2's chat template defaults to Max-effort <think> if this "
+              "is left unspecified by the caller. That spends the decode "
+              "budget inside the reasoning trace, so the GPT-OSS keyword "
+              "gate (paris/scatter/prime/stack+queue) never sees the answer. "
+              "Off is the serving-eval default here."))
+    parser.add_argument("--no-enable-thinking", dest="enable_thinking",
+                        action="store_false")
     parser.add_argument(
         "--save-tokens", nargs="?", const="auto", default=None,
         help=("Dump generated token_ids to JSON for the correctness test. If "
@@ -786,6 +956,22 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ppl-out", default=None,
         help="Dump the PPL_MODE result to this JSON path (suffixed per rank).",
+    )
+    parser.add_argument(
+        "--gsm8k", action="store_true",
+        help=("Redline/ATOM GSM8K accuracy: 3-shot chat, flexible-extract. "
+              "Compiles once and re-launches the persistent kernel per sample."),
+    )
+    parser.add_argument("--gsm8k-limit", type=int, default=None,
+                        help="Number of GSM8K items (default: full split, or "
+                             "GSM8K_LIMIT env).")
+    parser.add_argument("--gsm8k-fewshot", type=int, default=3)
+    parser.add_argument("--gsm8k-split", default="test")
+    parser.add_argument("--gsm8k-seed", type=int, default=1234)
+    parser.add_argument(
+        "--gsm8k-out", default=None,
+        help="Dump GSM8K results JSON (suffixed per rank). "
+             "Default outputs/glm5/gsm8k.json",
     )
     parser.add_argument("--max-layers", type=int, default=None,
                         help="Only use the first N layers (bring-up on a "
@@ -1006,13 +1192,50 @@ if __name__ == "__main__":
     # Main stack only. An MTP draft layer, when loaded, lives past the end of
     # this list and is not part of the fused per-layer graph.
     num_layers = model.model.num_main_layers
-    print(f"{config.hf_model_type}: {num_layers} layers "
-          f"(of {config.num_hidden_layers}), hidden {config.hidden_size}, "
+    print(f"{'GLM-5.2' if config.is_glm52 else config.hf_model_type}: "
+          f"{num_layers} layers (of {config.num_hidden_layers}), "
+          f"hidden {config.hidden_size}, "
           f"{config.num_attention_heads} q heads, {config.n_routed_experts} "
           f"experts top-{config.num_experts_per_tok}, "
-          f"rope_interleave={config.rope_interleave}")
+          f"rope_theta={config.rope_theta:g}, "
+          f"rope_interleave={config.rope_interleave}"
+          + (f", index_share_freq={config.index_topk_freq}"
+             if config.is_glm52 else ""))
 
     total_num_requests = 1 if not args.use_mirage else args.max_num_batched_requests
+
+    gsm8k_pack = None
+    if args.gsm8k:
+        from gsm8k import load_gsm8k
+        _limit = args.gsm8k_limit
+        if _limit is None:
+            _env_limit = os.environ.get("GSM8K_LIMIT", "")
+            _limit = int(_env_limit) if _env_limit else None
+        gsm8k_pack = load_gsm8k(
+            split=args.gsm8k_split, num_fewshot=args.gsm8k_fewshot,
+            seed=args.gsm8k_seed, limit=_limit)
+        # Fail before the megakernel compile if 3-shot chat does not fit.
+        _max_prompt = 0
+        for _item in gsm8k_pack["items"]:
+            _formatted = tokenizer.apply_chat_template(
+                _item["messages"], tokenize=False, add_generation_prompt=True,
+                enable_thinking=args.enable_thinking) \
+                if getattr(tokenizer, "chat_template", None) else \
+                _item["question"]
+            _n = len(tokenizer(_formatted, add_special_tokens=False)["input_ids"])
+            _max_prompt = max(_max_prompt, _n)
+        _need = _max_prompt + (args.max_new_tokens or 512) + 1
+        print(f"[GSM8K] preflight n={len(gsm8k_pack['items'])} "
+              f"max_prompt={_max_prompt} need_seq={_need} "
+              f"max_seq_length={args.max_seq_length}", flush=True)
+        if _max_prompt >= args.max_seq_length:
+            raise ValueError(
+                f"GSM8K 3-shot prompt is {_max_prompt} tokens; "
+                f"max_seq_length={args.max_seq_length}. Raise MAX_SEQ_LENGTH.")
+        if _need > args.max_seq_length:
+            print(f"[GSM8K] WARNING: prompt+gen={_need} exceeds "
+                  f"max_seq_length={args.max_seq_length}; completions will "
+                  f"truncate", flush=True)
 
     # ── Perplexity mode ───────────────────────────────────────────────────
     # Score a fixed corpus instead of generating. The megakernel already does
@@ -1025,6 +1248,13 @@ if __name__ == "__main__":
     ppl_mode = os.environ.get("PPL_MODE", "0") == "1"
     ppl_token_ids = None
     n_ppl = 0
+    if args.gsm8k and ppl_mode:
+        raise ValueError("GSM8K and PPL_MODE are mutually exclusive")
+    if args.gsm8k and args.mtp:
+        raise ValueError("GSM8K is incompatible with --mtp")
+    if args.prompt_tokens and (ppl_mode or args.gsm8k):
+        raise ValueError("--prompt-tokens is for the latency path; "
+                         "not with PPL_MODE or --gsm8k")
     if ppl_mode:
         if args.use_mirage and args.max_num_batched_tokens != 1:
             # The LM head writes one logit row per iteration, so a multi-token
@@ -1074,16 +1304,37 @@ if __name__ == "__main__":
             tokens[r, :n_ppl] = ids
         prompt_lengths = torch.full(
             (total_num_requests,), n_ppl, dtype=torch.int, device="cuda")
+    elif args.prompt_tokens:
+        n_isl = int(args.prompt_tokens)
+        if n_isl < 1 or n_isl >= args.max_seq_length:
+            raise ValueError(
+                f"--prompt-tokens={n_isl} must be in [1, max_seq_length) "
+                f"(max_seq_length={args.max_seq_length})")
+        ids_list = chat_isl_ids(
+            tokenizer, n_isl, args.enable_thinking, args.ppl_corpus)
+        if len(ids_list) != n_isl:
+            raise ValueError(
+                f"wanted ISL={n_isl}, chat template produced {len(ids_list)}")
+        ids = torch.tensor(ids_list, dtype=torch.long, device="cuda")
+        for r in range(total_num_requests):
+            tokens[r, :n_isl] = ids
+        prompt_lengths = torch.full(
+            (total_num_requests,), n_isl, dtype=torch.int, device="cuda")
+        print(f"[ISL] prompt_tokens={n_isl} chat_template "
+              f"enable_thinking={args.enable_thinking} "
+              f"corpus={args.ppl_corpus}", flush=True)
     else:
         text = args.prompt
         if getattr(tokenizer, "chat_template", None):
             messages = [{"role": "user", "content": text}]
             formatted = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True)
+                messages, tokenize=False, add_generation_prompt=True,
+                enable_thinking=args.enable_thinking)
             model_inputs = tokenizer([formatted], return_tensors="pt",
                                      add_special_tokens=False).to("cuda")
             print(f"Chat template applied: "
-                  f"{len(model_inputs.input_ids[0])} tokens")
+                  f"{len(model_inputs.input_ids[0])} tokens "
+                  f"(enable_thinking={args.enable_thinking})")
         else:
             model_inputs = tokenizer([text], return_tensors="pt").to("cuda")
         for r in range(total_num_requests):
@@ -1189,7 +1440,16 @@ if __name__ == "__main__":
         moe_inter = config.moe_intermediate_size
         shared_inter = moe_inter * config.n_shared_experts
         dense_inter = config.intermediate_size
-        first_k_dense = min(config.first_k_dense_replace, num_layers)
+        # GLM-5.2 lists this as mlp_layer_types; GLM-5 encodes the same split
+        # as first_k_dense_replace. Either way the dense layers are a prefix,
+        # which is what the o_proj TP mailbox indexing below assumes.
+        first_k_dense = sum(1 for i in range(num_layers)
+                            if not config.layer_is_moe(i))
+        assert all(not config.layer_is_moe(i) for i in range(first_k_dense))
+        assert all(config.layer_is_moe(i)
+                   for i in range(first_k_dense, num_layers)), (
+            "dense MLP layers must be a prefix; non-prefix dense would "
+            "break dense_oproj_xbufs indexing")
         # The shared expert rides along as one extra routed expert (id
         # `num_experts`, slot `topk`, weight 1) instead of a second pair of
         # GEMMs -- see the router kernel's header comment. It has exactly a
@@ -3481,20 +3741,23 @@ if __name__ == "__main__":
                 # expert's 2048, so one dense MLP is 226.5M parameters and the
                 # three of them are 1.36 GB of weight per rank per token --
                 # ~14% of the whole byte budget, replicated on every rank.
-                gu_w = interleave_gate_up(layer.mlp.gate_proj.weight.data,
-                                          layer.mlp.up_proj.weight.data, 8)
+                gate_w = layer.mlp.gate_proj.weight.data
+                up_w = layer.mlp.up_proj.weight.data
                 down_w = layer.mlp.down_proj.weight.data.contiguous()
                 if DENSE_MLP_TP:
                     # Shard the intermediate dim. gate_up is column-parallel:
-                    # the interleave is at granularity 8 and the shard is a
-                    # multiple of 8, so interleaved rows [p*2S, (p+1)*2S) are
-                    # exactly gate rows [p*S,(p+1)*S) interleaved with the
-                    # matching up rows. down_proj is then K-parallel over the
-                    # same slice -- columns, since its weight is [hidden, S].
-                    _s2 = 2 * dense_inter_shard
-                    gu_w = gu_w[rank * _s2:(rank + 1) * _s2].contiguous()
+                    # slice gate and up first, then interleave the LOCAL rows
+                    # into the eight slabs silu_mul(grid.x=8) expects. Slicing
+                    # an already globally-interleaved matrix leaves only two
+                    # global slabs per rank, which the local kernel
+                    # misinterprets as eight and pairs the wrong values.
+                    _lo = rank * dense_inter_shard
+                    _hi = (rank + 1) * dense_inter_shard
+                    gate_w = gate_w[_lo:_hi]
+                    up_w = up_w[_lo:_hi]
                     down_w = down_w[:, rank * dense_inter_shard:
                                     (rank + 1) * dense_inter_shard].contiguous()
+                gu_w = interleave_gate_up(gate_w, up_w, 8)
                 if DENSE_MLP_MXFP8:
                     w_dense_gu = _attach_input_keep(
                         pack_dense_mxfp8(gu_w, DENSE_MXFP8_OPW),
@@ -3507,7 +3770,7 @@ if __name__ == "__main__":
                         gu_w, f"layer_{i}_dense_gate_up")
                     w_dense_down = _attach_input_keep(
                         down_w, f"layer_{i}_dense_down")
-                del gu_w, down_w
+                del gate_w, up_w, gu_w, down_w
                 _release(layer.mlp.gate_proj.weight, layer.mlp.up_proj.weight)
                 if DENSE_MLP_MXFP8:
                     _release(layer.mlp.down_proj.weight)
@@ -4008,6 +4271,11 @@ if __name__ == "__main__":
             f.write(results["cuda_code"])
 
         mpk.compile(output_dir=args.output_dir)
+        # Primary EOS is already in init_persistent_kernel. GLM-5.2 also
+        # stops on <|user|> and <|observation|>; without those the kernel
+        # runs to max_new_tokens and G2 sees a repetition collapse.
+        if not args.ignore_eos:
+            mpk.set_eos_token_ids(eos_token_ids)
 
         if mtp_in_graph and not mtp_graph_only:
             # The draft head writes here; prepare_next_batch stages it as the
@@ -4021,6 +4289,110 @@ if __name__ == "__main__":
             mpk.set_spec_draft_tokens(draft_tokens)
 
     # ── Execution ────────────────────────────────────────────────────────────
+    if args.gsm8k:
+        from gsm8k import score_completion, summarize
+        pack = gsm8k_pack
+        gsm8k_out = args.gsm8k_out or os.path.join(DEFAULT_SAVE_DIR, "gsm8k.json")
+        if world_size > 1:
+            _stem, _ext = os.path.splitext(gsm8k_out)
+            gsm8k_out = f"{_stem}_rank{rank}{_ext}"
+        os.makedirs(os.path.dirname(gsm8k_out) or ".", exist_ok=True)
+        output_len = args.max_new_tokens if args.max_new_tokens is not None else 512
+        print(f"[GSM8K] protocol=redline-gsm8k-lm-eval "
+              f"n={len(pack['items'])} fewshot={pack['num_fewshot']} "
+              f"seed={pack['seed']} split={pack['split']} "
+              f"max_new_tokens={output_len} "
+              f"enable_thinking={args.enable_thinking}", flush=True)
+        rows = []
+        first_mpk = True
+        for item in pack["items"]:
+            prompt_len = fill_chat_prompt(
+                tokenizer, item["messages"], tokens, prompt_lengths,
+                args.enable_thinking, total_num_requests)
+            decode_limit = min(prompt_len + output_len, tokens.size(1) - 1)
+            if world_size > 1:
+                comm.Barrier()
+            print(f"[GSM8K] idx={item['idx']} prompt_len={prompt_len} "
+                  f"gold={item['gold']}", flush=True)
+            print(f"[GSM8K] launching mpk idx={item['idx']}",
+                  file=sys.stderr, flush=True)
+            if args.use_mirage:
+                # Honour --max-new-tokens via the ngram/EOS stop plus the
+                # compiled seq cap. Do NOT call set_max_seq_length here:
+                # a 768-seq short-prompt launch lives, and a 543-token
+                # non-GSM8K prefill lives, but GSM8K's extra
+                # set_max_seq_length + init_request before mpk() wedges
+                # at SCHED_XCD 100% of the time (seq=1536 and 768).
+                if not first_mpk:
+                    mpk.init_request_func()
+                first_mpk = False
+                if world_size > 1:
+                    comm.Barrier()
+                mpk()
+                torch.cuda.synchronize()
+                end_idx = int(step[0].item()) + 1
+            else:
+                prev_pos = 0
+                for cur_pos in range(prompt_len, decode_limit):
+                    step.fill_(cur_pos - 1)
+                    logits = model.forward(
+                        input_ids=tokens[:, prev_pos:cur_pos],
+                        position_embeddings=(
+                            position_embeddings[0][:, prev_pos:cur_pos],
+                            position_embeddings[1][:, prev_pos:cur_pos]),
+                        step=step)
+                    next_token = logits.argmax(dim=-1)[0, -1]
+                    tokens[0, cur_pos] = next_token
+                    prev_pos = cur_pos
+                    if (int(next_token) in eos_token_ids
+                            and not args.ignore_eos):
+                        break
+                    if len(trim_ngram_loop(
+                            tokens[0, prompt_len:cur_pos + 1].tolist())) < (
+                                cur_pos + 1 - prompt_len):
+                        break
+                end_idx = prev_pos + 1
+            gen_ids, completion = collect_generation(
+                tokenizer, tokens, prompt_len, end_idx,
+                max_new_tokens=output_len)
+            row = score_completion(item, completion, gen_ids)
+            rows.append(row)
+            print(f"[GSM8K] idx={item['idx']} "
+                  f"{'HIT' if row['correct'] else 'MISS'} "
+                  f"gold={row['gold']} extracted={row['extracted']} "
+                  f"gen={row['generate_length']} "
+                  f"preview={completion[:80]!r}", flush=True)
+        summary = summarize(
+            rows, mode=("mpk" if args.use_mirage else "torch"), rank=rank,
+            split=pack["split"], num_fewshot=pack["num_fewshot"],
+            seed=pack["seed"], limit=pack["limit"],
+            max_new_tokens=output_len,
+            enable_thinking=args.enable_thinking,
+            max_seq_length=args.max_seq_length)
+        # Redline's lm-eval wrapper nests the headline numbers under
+        # redline_gsm8k_summary so a later aggregator can read either shape.
+        dump = {
+            "redline_gsm8k_summary": {
+                "metric": summary["metric"],
+                "value": summary["accuracy"],
+                "correct": summary["correct"],
+                "total": summary["total"],
+            },
+            "redline_gsm8k_metadata": {
+                "profile_tag": os.environ.get("GSM8K_PROFILE_TAG", "fleet-mpk"),
+                "split": summary["split"],
+                "num_fewshot": summary["num_fewshot"],
+                "seed": summary["seed"],
+            },
+            **summary,
+        }
+        with open(gsm8k_out, "w") as f:
+            json.dump(dump, f, indent=2)
+        print(f"[GSM8K] {summary['correct']}/{summary['total']} = "
+              f"{summary['accuracy']:.4f} {summary['metric']} "
+              f"-> {gsm8k_out}", flush=True)
+        sys.exit(0)
+
     output_len = args.max_new_tokens if args.max_new_tokens is not None else (
         tokens.size(1) - prompt_lengths[0].item())
     output_len = max(0, min(output_len,
@@ -4036,6 +4408,152 @@ if __name__ == "__main__":
         prompt_len = prompt_lengths[0].item()
         decode_limit = prompt_len + output_len
         cur_pos = prompt_len
+
+        if ppl_mode:
+            # Torch reference arm for run_ppl.sh, which its header already
+            # anticipates ("Drop a torch_ppl.json into the output dir and the
+            # test picks up the ratio arm on its own") but which nothing
+            # produced: PPL_MODE sets output_len 0, so the decode loop below
+            # is empty and the torch path ran no forward pass at all.
+            #
+            # Scored exactly as the megakernel arm is, or the two curves are
+            # not comparable: the sink's row i holds the prediction FOR
+            # position i (the LM head writes row step+1), so a torch pass over
+            # the same prompt predicts token i from logits[i - 1]. Same
+            # ppl_score_from, same targets, same cross_entropy.
+            step.fill_(prompt_len - 1)
+            # Torch counterpart of MPK_DUMP_TENSORS. Only the per-layer hidden
+            # state has an unambiguous equivalent on both sides (the megakernel
+            # buffers are fused-kernel scratch, not module boundaries), so hook
+            # the decoder layers and record their outputs.
+            _dump_names = os.environ.get("MPK_DUMP_TENSORS")
+            _hook_out, _hooks = {}, []
+            if _dump_names:
+                def _mk(i):
+                    def _h(_m, _inp, out):
+                        o = out[0] if isinstance(out, tuple) else out
+                        _hook_out[f"layer{i}_out"] = o.detach().float().cpu()
+                    return _h
+                for _i, _lyr in enumerate(model.model.layers):
+                    _hooks.append(_lyr.register_forward_hook(_mk(_i)))
+                # The embedding is the anchor: the megakernel's embed_out must
+                # match it before any layer arithmetic can be blamed.
+                def _he(_m, _inp, out):
+                    o = out[0] if isinstance(out, tuple) else out
+                    _hook_out["embed_out"] = o.detach().float().cpu()
+                _hooks.append(
+                    model.model.embed_tokens.register_forward_hook(_he))
+
+                # MoE router. GlmTopkRouter.forward returns
+                # (topk_indices, topk_weights, router_logits), which line up
+                # with the megakernel's moe_routing_indices / moe_topk_weight /
+                # moe_gate_out. Different expert SELECTION alone would explain
+                # an arbitrarily large output difference, so check it first.
+                def _mk_r(i):
+                    def _h(_m, _inp, out):
+                        idx, w, lg = out
+                        _hook_out[f"router{i}_idx"] = idx.detach().cpu()
+                        _hook_out[f"router{i}_w"] = w.detach().float().cpu()
+                        _hook_out[f"router{i}_logits"] = lg.detach().float().cpu()
+                    return _h
+                for _i, _lyr in enumerate(model.model.layers):
+                    _r = getattr(getattr(_lyr, "mlp", None), "gate", None)
+                    if _r is not None and hasattr(_r, "e_score_correction_bias"):
+                        _hooks.append(_r.register_forward_hook(_mk_r(_i)))
+
+                # The router's INPUT. If this matches the megakernel's
+                # rmsnorm_out_moe but the selected experts differ, the fault is
+                # in the top-k itself (bias correction / group masking), not
+                # upstream.
+                def _mk_n(i):
+                    def _h(_m, _inp, out):
+                        o = out[0] if isinstance(out, tuple) else out
+                        _hook_out[f"postnorm{i}"] = o.detach().float().cpu()
+                    return _h
+                for _i, _lyr in enumerate(model.model.layers):
+                    _pn = getattr(_lyr, "post_attention_layernorm", None)
+                    if _pn is not None:
+                        _hooks.append(_pn.register_forward_hook(_mk_n(_i)))
+
+                # Attention output (post o_proj). Dense layers and MoE layers
+                # take different code paths in the megakernel -- only MoE
+                # layers go through gang_mla_full_layer_fused -- so the same
+                # MLA can be healthy in a dense layer and wrong here.
+                def _mk_a(i):
+                    def _h(_m, _inp, out):
+                        o = out[0] if isinstance(out, tuple) else out
+                        _hook_out[f"attn{i}"] = o.detach().float().cpu()
+                    return _h
+                for _i, _lyr in enumerate(model.model.layers):
+                    _sa = getattr(_lyr, "self_attn", None)
+                    if _sa is not None:
+                        _hooks.append(_sa.register_forward_hook(_mk_a(_i)))
+
+                # The layer's FIRST GEMM. The megakernel fuses q_a and kv_a
+                # into one qkv_a_out row, so compare the two torch projections
+                # against its slices; if this is already wrong nothing
+                # downstream is worth looking at.
+                def _mk_p(nm, i):
+                    def _h(_m, _inp, out):
+                        o = out[0] if isinstance(out, tuple) else out
+                        _hook_out[f"{nm}{i}"] = o.detach().float().cpu()
+                    return _h
+                for _i, _lyr in enumerate(model.model.layers):
+                    _sa = getattr(_lyr, "self_attn", None)
+                    if _sa is None:
+                        continue
+                    for _nm in ("q_a_proj", "kv_a_proj_with_mqa",
+                                "q_a_layernorm", "kv_a_layernorm"):
+                        _p = getattr(_sa, _nm, None)
+                        if _p is not None:
+                            _hooks.append(
+                                _p.register_forward_hook(_mk_p(_nm, _i)))
+                    _in = getattr(_lyr, "input_layernorm", None)
+                    if _in is not None:
+                        _hooks.append(
+                            _in.register_forward_hook(_mk_p("prenorm", _i)))
+            with torch.no_grad():
+                logits = model.forward(
+                    input_ids=tokens[:, :n_ppl],
+                    position_embeddings=(
+                        position_embeddings[0][:, :n_ppl],
+                        position_embeddings[1][:, :n_ppl]),
+                    step=step, all_positions=True)
+            for _h in _hooks:
+                _h.remove()
+            if _dump_names:
+                _dp = os.environ.get("MPK_DUMP_PATH", "/tmp/torch_dump")
+                torch.save(_hook_out, f"{_dp}_rank{rank}.pt")
+                print(f"[DUMP] torch saved {sorted(_hook_out)[:6]} -> "
+                      f"{_dp}_rank{rank}.pt")
+            real_vocab = config.vocab_size
+            targets = tokens[0, ppl_score_from:n_ppl]
+            n_scored = n_ppl - ppl_score_from
+            nll_sum = 0.0
+            per_pos, top1, ent = [], [], []
+            CH = 64
+            for lo in range(ppl_score_from, n_ppl, CH):
+                hi = min(lo + CH, n_ppl)
+                chunk = logits[0, lo - 1:hi - 1, :real_vocab].float()
+                losses = torch.nn.functional.cross_entropy(
+                    chunk,
+                    targets[lo - ppl_score_from:hi - ppl_score_from],
+                    reduction="none")
+                nll_sum += losses.sum().item()
+                per_pos.extend(losses.tolist())
+                top1.extend(chunk.argmax(dim=-1).tolist())
+                lp = torch.log_softmax(chunk, dim=-1)
+                ent.extend((-(lp.exp() * lp).sum(dim=-1)).tolist())
+            report_perplexity(
+                "torch", nll_sum, n_scored, args, corpus_tokens=n_ppl,
+                rank=rank, per_pos=per_pos, top1=top1,
+                targets=targets.tolist(), ent=ent,
+                diagnostics={"prefix": PPL_PREFIX,
+                             "prefix_tokens": ppl_prefix_len})
+            # This block runs at module scope, so there is no function to
+            # return from; the dump is the entire purpose of a PPL run and
+            # everything below decodes generated text that does not exist.
+            sys.exit(0)
 
         if args.mtp:
             # ── MTP speculative decode (torch reference) ─────────────────
@@ -4118,6 +4636,15 @@ if __name__ == "__main__":
                              ms_per_token=run_time / max(1, n_gen),
                              ms_per_iter=run_time / max(1, n_iters))
         else:
+            # Prime the timer before the loop. The in-loop record() below fires
+            # at cur_pos == prompt_len so that the decode rate excludes the
+            # prefill pass, but PPL_MODE sets decode_limit == prompt_len and
+            # generates nothing, so the loop body never runs, starter is never
+            # recorded, and elapsed_time() raises "Both events must be
+            # recorded before calculating elapsed time" -- which is why the
+            # torch reference arm of run_ppl.sh could not run at all.
+            torch.cuda.synchronize()
+            starter.record()
             for cur_pos in range(prompt_len, decode_limit):
                 step.fill_(cur_pos - 1)
                 input_ids = tokens[:, prev_pos:cur_pos]
@@ -4132,6 +4659,11 @@ if __name__ == "__main__":
                 tokens[0, cur_pos] = next_token
                 prev_pos = cur_pos
                 if int(next_token) in eos_token_ids and not args.ignore_eos:
+                    break
+                if (not args.ignore_eos and
+                        len(trim_ngram_loop(
+                            tokens[0, prompt_len:cur_pos + 1].tolist())) < (
+                                cur_pos + 1 - prompt_len)):
                     break
                 if cur_pos == prompt_len:
                     torch.cuda.synchronize()
@@ -4161,11 +4693,14 @@ if __name__ == "__main__":
         # resolution above.
         if save_path:
             slice_end = min(end_idx, prompt_len + MAX_SAVE_TOKENS)
+            gen_ids = dump_generated_ids(
+                tokens[0, prompt_len:slice_end].tolist(), args.ignore_eos)
             out = {
-                "token_ids": tokens[0, prompt_len:slice_end].tolist(),
-                "text": tokenizer.decode(tokens[0, :end_idx],
-                                         skip_special_tokens=True),
-                "generate_length": max(0, end_idx - prompt_len),
+                "token_ids": gen_ids,
+                "text": tokenizer.decode(
+                    tokens[0, :prompt_len].tolist() + gen_ids,
+                    skip_special_tokens=True),
+                "generate_length": len(gen_ids),
                 "mode": "torch",
                 "rank": rank,
             }
@@ -4191,6 +4726,28 @@ if __name__ == "__main__":
         ender.record()
         torch.cuda.synchronize()
         run_time = starter.elapsed_time(ender)
+
+        # MPK_DUMP_TENSORS: comma-separated make_tensor() names to save after
+        # the kernel returns, for diffing against the torch arm's equivalents.
+        # These are the same PyTorch-backed buffers the megakernel wrote, so
+        # this needs no device printf -- which matters because MPK_BS_DEBUG's
+        # printf never flushes from a persistent kernel and its builds wedge
+        # at cold start. Single-buffered per layer, so with --max-layers N the
+        # dump is layer N-1's value.
+        _dump_names = os.environ.get("MPK_DUMP_TENSORS")
+        if _dump_names:
+            _sel = {}
+            for _k in _dump_names.split(","):
+                _k = _k.strip()
+                _t = _tensor_refs.get(_k)
+                if _t is None:
+                    print(f"[DUMP] no such tensor: {_k} "
+                          f"(have {sorted(_tensor_refs)[:12]}...)")
+                    continue
+                _sel[_k] = _t.detach().float().cpu()
+            _dp = os.environ.get("MPK_DUMP_PATH", "/tmp/mpk_dump")
+            torch.save(_sel, f"{_dp}_rank{rank}.pt")
+            print(f"[DUMP] saved {sorted(_sel)} to {_dp}_rank{rank}.pt")
 
         if profiler_tensor is not None:
             # Every rank shares this cwd, so an unsuffixed name means 8
@@ -4364,11 +4921,13 @@ if __name__ == "__main__":
             pl0 = prompt_lengths[0].item()
             end0 = gen0.numel()
             slice_end = min(end0, pl0 + MAX_SAVE_TOKENS)
+            gen_ids = dump_generated_ids(
+                gen0[pl0:slice_end].tolist(), args.ignore_eos)
             out = {
-                "token_ids": gen0[pl0:slice_end].tolist(),
-                "text": tokenizer.decode(gen0[:end0],
+                "token_ids": gen_ids,
+                "text": tokenizer.decode(gen0[:pl0].tolist() + gen_ids,
                                          skip_special_tokens=True),
-                "generate_length": max(0, end0 - pl0),
+                "generate_length": len(gen_ids),
                 "mode": "mpk",
                 "rank": rank,
             }

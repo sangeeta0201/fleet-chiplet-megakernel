@@ -16,7 +16,20 @@ FLEET_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export MIRAGE_HOME="$FLEET_HOME"
 export PYTHONPATH="$FLEET_HOME/python:${PYTHONPATH:-}"
 
-export MODEL_PATH="${MODEL_PATH:-zai-org/GLM-4.7-Flash}"
+if [ -z "${MODEL_PATH:-}" ]; then
+  for _d in /mnt/nvme1/GLM-5.2-MXFP4 \
+            /home/claudeuser/models/GLM-5.2-MXFP4 \
+            /root/schowdha/models/GLM-5.2-MXFP4 \
+            /home/schowdha/models/GLM-5.2-MXFP4 \
+            /home/claudeuser/models/glm5-mxfp4; do
+    if [ -f "$_d/config.json" ] && [ -f "$_d/model.safetensors.index.json" ]; then
+      export MODEL_PATH="$_d"
+      break
+    fi
+  done
+  unset _d
+  export MODEL_PATH="${MODEL_PATH:-zai-org/GLM-5.2-FP8}"
+fi
 
 # rocSHMEM + the MPI it was built against. rocSHMEM's IPC backend only needs
 # MPI for bootstrap (rank exchange), not for the data path.

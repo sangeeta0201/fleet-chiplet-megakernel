@@ -65,6 +65,62 @@ Env knobs: `GLM_MLA_NUM_KV_CHUNKS` (sequence split across XCDs),
 **After editing any `.cuh` or task-registration source, `rm -rf
 permanent_output_dir`** — header edits do not invalidate the cached build.
 
+## 744B GLM-5.2 (NP=4, devices 4–7)
+
+Checkpoint: `/mnt/nvme1/GLM-5.2-MXFP4` (same files as
+`/home/schowdha/models/GLM-5.2-MXFP4`). Chat thinking is **off** unless
+`--enable-thinking`. Exact token match is illegal (`correctness_gate.py`).
+
+Run inside `fleet_v2` as `claudeuser`. Do not widen `HIP_VISIBLE_DEVICES`
+off `4,5,6,7`.
+
+```bash
+cd demo/glm5
+
+# Keywords + G1 cross-rank. 4 prompts, seq=512, gen=256.
+./run_correctness_suite.sh run_mp8_dp_ep_fused.sh mp8ep
+python3 compare_tokens.py /tmp/glm5_correctness mp8ep mp8ep
+
+# Teacher-forced PPL (WikiText-2, 128 tokens, [gMASK]<sop>, GLM_LMHEAD_TP=0)
+PPL_MODE=1 GLM_LMHEAD_TP=0 ./run_ppl.sh
+pytest ../../tests/ci-tests/test_glm5_perplexity.py
+
+# GSM8K, Redline 3-shot flexible-extract. Default LIMIT=1 until a second
+# in-process mpk() launch stops wedging at SCHED_XCD.
+./run_gsm8k.sh
+pytest ../../tests/ci-tests/test_glm5_gsm8k.py
+
+# Latency: ALWAYS 1024 ISL / 1024 OSL. Short-prompt TPOT is not the number.
+./run_latency_1k1k.sh
+```
+
+### Measured 2026-09-03, NP=4, `HIP_VISIBLE_DEVICES=4,5,6,7`
+
+| Gate | Result |
+|---|---|
+| `compare_tokens.py` keywords + 4-rank identity | **4/4 PASS** (paris / scatter / prime / stack+queue) |
+| G1 cross-rank | **PASS** all 4 prompts |
+| G2 coherence | **PASS** p0 distinct 0.497 / top-bigram 4, n=183; p1 0.366 / 8, n=216; p2 0.386 / 12, n=207; p3 0.348 / 7, n=201 |
+| PPL 128 WikiText-2 | **PASS** ppl=**19.704**, 4 ranks identical. Ceiling 60. GLM-5 on this slice was ~5.7 |
+| GSM8K pytest | **2 passed**, accuracy 0/1 (floor 0). Gold=18, extracted=0.5, `LIMIT=1` |
+
+G2 n < 256 is the n-gram / extra-EOS halt: GLM-5.2 greedy often never emits
+`<|endoftext|>`, `<|user|>`, or `<|observation|>`, then loops. The kernel
+stops on all three ids, on an AABB 8–32-gram, and when any generated bigram
+hits 25.
+
+### Latency, 1024 / 1024 ISL / OSL
+
+Always this shape. `--ignore-eos` + `--prompt-tokens 1024` so OSL is a full
+1024 and ISL is an exact WikiText-2 prefix (`[gMASK]<sop>` included). Compiled
+`max_seq_length=2048` (DSA identity holds at `kv_len <= 2048`).
+
+| | Prefill avg | Decode avg | Decode min | OSL dumped | G1 | text |
+|---|---|---|---|---|---|---|
+| NP=4, devices 4–7, bs=1 | *pending 1k/1k run* | | | | | |
+
+Do not quote the short-prompt G2 ~9 ms/iter as the latency number.
+
 ## What the megakernel actually computes
 
 ### Absorbed MLA

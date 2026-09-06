@@ -42,7 +42,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 # defaults to GLM-4.7-Flash, whose MLA shape does not satisfy the absorbed
 # o_proj assert, so an unpinned run dies on every rank before it scores a
 # single position -- i.e. the gate silently does not run.
-export MODEL_PATH="${MODEL_PATH:-/home/claudeuser/models/glm5-mxfp4}"
+export MODEL_PATH="${MODEL_PATH:-${GLM_MODEL_PATH:-/mnt/nvme1/GLM-5.2-MXFP4}}"
 
 export PPL_MODE=1
 # Not optional: see the header. demo.py raises rather than silently scoring an

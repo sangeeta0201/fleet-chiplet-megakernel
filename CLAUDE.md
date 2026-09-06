@@ -15,3 +15,8 @@ changes on this branch looked like clean speedups and were producing garbage.
 `demo/gpt_oss/run_correctness_suite.sh` + `compare_tokens.py` gate this.
 
 Change one variable per run.
+
+## Correctness work does not stop at a status report
+
+See `.cursor/rules/correctness-loop.mdc` — kept there rather than duplicated
+here so the two cannot drift.

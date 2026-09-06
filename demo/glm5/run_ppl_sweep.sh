@@ -29,7 +29,7 @@ set -uo pipefail   # NOT -e: one length wedging must not kill the sweep
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 ROOT="$(cd ../.. && pwd)"
-export MODEL_PATH="${MODEL_PATH:-/home/claudeuser/models/glm5-mxfp4}"
+export MODEL_PATH="${MODEL_PATH:-${GLM_MODEL_PATH:-/mnt/nvme1/GLM-5.2-MXFP4}}"
 LENS="${PPL_LENS:-128 256 512 1024}"
 OUT="${PPL_SWEEP_OUT:-$ROOT/outputs/glm5/ppl_sweep}"
 mkdir -p "$OUT"

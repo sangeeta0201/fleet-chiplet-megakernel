@@ -26,14 +26,61 @@
 # orphan-ranks-survive-a-killed-mpirun.
 set -u
 
+# Reap a killed run completely, then WAIT for the GPUs to actually come back.
+#
+# The old inline cleanup killed the group and pkill'd demo.py, but not the
+# mpirun that spawned it -- and mpirun respawns/holds on. A surviving mpirun
+# keeps ~110 GB per device mapped, so the NEXT run dies in hipMalloc with
+# "0 bytes free" and looks like a memory bug in whatever kernel is under test.
+# Two runs were lost to exactly that. Poll VRAM rather than sleeping a fixed
+# 10 s: teardown of a 744B model is not instant and is not a constant.
+_watchdog_reap() {
+  local pgid="$1" child="$2"
+  kill -9 -"$pgid" 2>/dev/null
+  wait "$child" 2>/dev/null
+  for _ in 1 2 3; do
+    pkill -9 -f "[d]emo.py" 2>/dev/null
+    pkill -9 -f "[m]pirun -np" 2>/dev/null
+    sleep 2
+  done
+  # Up to 60 s for the driver to release; give up rather than hang forever.
+  for _ in $(seq 1 12); do
+    if ! pgrep -f "[d]emo.py" >/dev/null 2>&1; then
+      local busy
+      busy=$(rocm-smi --showmemuse 2>/dev/null |
+             grep -c "VRAM%): [1-9]" || true)
+      [ "${busy:-0}" -eq 0 ] && break
+    fi
+    sleep 5
+  done
+}
+
 run_with_watchdog() {
   local log="$1" stall="$2"; shift 2
+
+  # A wedged rank that gets SIGKILLed dumps a multi-GB gpucore next to the
+  # script. The watchdog exists to kill runs, so it is the one place that
+  # knows a kill is coming: five of them filled this box's 3.5 TB root to
+  # zero bytes free, which then fails every later run in ways that look like
+  # kernel bugs (hipMalloc OOM, empty dumps, "no space left for
+  # here-document"). Callers that set their own ulimit are unaffected.
+  ulimit -c 0 2>/dev/null || true
 
   : > "$log"
   setsid "$@" > "$log" 2>&1 &
   local child=$!
   # setsid makes the child its own group leader, so -child is the whole tree.
   local pgid=$child
+
+  # Absolute cap, independent of log growth. LOG GROWTH alone is not a
+  # sufficient liveness signal: a rank that crash-loops (an illegal access
+  # under a bad config, say) writes stack traces and NCCL teardown warnings
+  # forever, so `size` keeps rising and the stall test never trips. One
+  # observed instance grew a 9 MB log and ran 25 minutes before it was killed
+  # by hand. Ten stall periods is far above any healthy run, including a
+  # cold rebuild, and still bounds the worst case.
+  local hard_cap=$(( stall * 10 ))
+  local elapsed=0
 
   # ARM ONLY AFTER THE KERNEL LAUNCHES. A rebuild is legitimately silent for
   # minutes at a time (one hipcc invocation on the megakernel), so a watchdog
@@ -45,6 +92,13 @@ run_with_watchdog() {
   local last_size=0 quiet=0 armed=0
   while kill -0 "$child" 2>/dev/null; do
     sleep 10
+    elapsed=$(( elapsed + 10 ))
+    if [ "$elapsed" -ge "$hard_cap" ]; then
+      echo "[watchdog] hard cap ${hard_cap}s reached -- killing pgid $pgid" \
+           >> "$log"
+      _watchdog_reap "$pgid" "$child"
+      return 124
+    fi
     if [ "$armed" -eq 0 ]; then
       grep -q "launch_persistent_kernel ENTER" "$log" 2>/dev/null && armed=1
       continue
@@ -59,11 +113,7 @@ run_with_watchdog() {
       if [ "$quiet" -ge "$stall" ]; then
         echo "[watchdog] no log growth for ${stall}s -- killing pgid $pgid" \
              >> "$log"
-        kill -9 -"$pgid" 2>/dev/null
-        wait "$child" 2>/dev/null
-        # Belt and braces: reap any rank that escaped the group.
-        pkill -9 -f "[d]emo.py" 2>/dev/null
-        sleep 10
+        _watchdog_reap "$pgid" "$child"
         return 124
       fi
     fi

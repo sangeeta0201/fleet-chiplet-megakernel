@@ -1,0 +1,55 @@
+---
+description: Do not stop a correctness task until the test infra passes
+alwaysApply: true
+---
+
+# Correctness work runs until the gates pass
+
+**The single test: if a gate is red, the turn does not end.** Not after a
+finding, not after answering a question, not after a task notification, not
+after a good stopping point. Keep issuing tool calls. The user has had to
+repeat this; treat any urge to summarise-and-stop as a bug in your own loop.
+
+When the task is fixing a correctness bug, keep working until the test
+infrastructure passes. Do not stop to report status and wait. A status
+summary is not a stopping point; the gates passing is.
+
+Specifically:
+
+- Do not end a turn on "here is what I found, want me to continue?" when the
+  gates are still red. Continue.
+- A negative result (hypothesis disproved) is progress, not a stopping point.
+  Record it and start the next experiment in the same turn.
+- **A question is not a stop signal.** "Did the tests pass?", "what is the
+  status?", a finished-task notification -- answer in a line or two and then
+  KEEP GOING in the SAME turn. Never end a turn whose only content is a status
+  report while a gate is red.
+- Ending a turn is for: gates green, a decision only the user can make, or the
+  box being unsafe to run on. Nothing else.
+- Only stop early if genuinely blocked on a decision that is the user's to
+  make, or if the hardware/repo is in a state that makes further runs unsafe.
+
+## The gates for GLM-5.2 (`demo/glm5`)
+
+| gate | command |
+|---|---|
+| decode kernel | `tests/standalone/test_mla_decode.hip`, both `WRITE_THROUGH` arms |
+| split-KV merge | `tests/standalone/test_mla_merge.hip` |
+| store primitives | `tests/standalone/test_st_wt.hip` |
+| perplexity vs torch | `demo/glm5/run_ppl.sh` (torch arm ~2.1; mpk must be close) |
+| long sequences | `demo/glm5/run_longseq.sh` (256/256, 512/512, 1024/1024) |
+
+A standalone kernel test passing does NOT mean the bug is fixed. The fused
+megakernel is the product; `run_ppl.sh` and `run_longseq.sh` are the gates
+that decide.
+
+## Discipline that still applies
+
+- Never quote a latency number without checking the generated text.
+- Change one variable per run.
+- Clean up after every run: kill container-side `demo.py`/`mpirun` (host-side
+  `kill` leaves them respawning), and confirm VRAM is released before the next
+  run, or the next one dies in `hipMalloc` and looks like a kernel bug.
+- `ulimit -c 0`. A SIGKILLed rank dumps a multi-GB `gpucore`; five of them
+  filled the 3.5 TB root and every later run failed in ways that looked like
+  kernel bugs. `run_with_watchdog` now sets it, but ad-hoc scripts must too.

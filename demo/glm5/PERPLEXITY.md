@@ -126,7 +126,7 @@ exactly** -- the EP fold, the barriers and the gather slots are consistent. No
 all-zero rows; pad-column max |logit| = 0.0000, so the sink covers every real
 vocabulary column and no pad column leaks into the softmax.
 
-## OPEN BUG: quality collapses with sequence length, ~659x by position 448
+## RESOLVED: quality collapse with sequence length
 
 A 512-token run scores **435.80** against 5.66 at 128 tokens. That is not the
 corpus getting harder, and it is not the run-to-run spread. Per 64 positions,
@@ -135,6 +135,21 @@ mean NLL over four independent 512-token runs:
 | positions | 0-64 | 64-128 | 128-192 | 192-256 | 256-320 | 320-384 | 384-448 | 448-512 |
 |---|---|---|---|---|---|---|---|---|
 | mean NLL | 1.51 | 2.15 | 4.06 | 3.65 | 7.36 | 9.36 | 9.79 | 9.75 |
+
+Fixed 2026-09-05. `GLM_DENSE_MLP_TP=1` interleaved the full gate/up matrices
+into eight global XCD slabs and then sliced those slabs by rank. Each local
+`silu_mul(grid.x=8)` interpreted its two retained global slabs as eight local
+slabs and paired the wrong gate/up values. Slice gate and up by rank first,
+then interleave each local pair into eight slabs.
+
+After the fix, on NP=4 devices 4-7:
+
+| corpus tokens | full PPL | first-128 PPL | worst 64-position block |
+|---|---:|---:|---:|
+| 512 | **2.6020** | **2.8702** | **3.07** (positions 448-511) |
+
+All four ranks are identical. The old collapse measurements below are retained
+as the failure signature that localized the bug.
 
 Uniform over this vocabulary is ln(155136) = 11.95 nats, so the last three
 blocks carry almost no signal, and top-1 falls to 0-3%. The four runs agree to

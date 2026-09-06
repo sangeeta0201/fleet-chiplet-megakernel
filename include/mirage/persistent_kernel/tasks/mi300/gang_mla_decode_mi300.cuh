@@ -213,6 +213,7 @@
 // __load_bf16x4_raw / __cvt_bf16x4_to_fp16 live here. They are tiling-agnostic
 // despite the hd64 name.
 #include "tasks/mi300/paged_attention_decode_minimal_hd64_mi300.cuh"
+#include "mpk_atoms.cuh"
 
 namespace kernel {
 
@@ -259,6 +260,58 @@ __device__ __forceinline__ T ld_g(void const *p) {
 typedef __bf16 __attribute__((ext_vector_type(8))) bf16x8_t;
 typedef __bf16 __attribute__((ext_vector_type(4))) bf16x4_t;
 
+// QK is pinned to a[32:35] so the builtin QK MFMA cannot land on a[0:3].
+// PV uses the GPT-OSS pattern: o_acc lives in VGPRs and the builtin PV
+// MFMA borrows a[0:3] only for that instruction. The fused ntiles>=2
+// collapse was RA parking the 32 o_acc floats in a[0:31] AND in VGPRs,
+// then issuing the next tile's KV loads into those VGPRs. Loop-carried
+// o_acc therefore goes through LDS, not AGPRs.
+__device__ __forceinline__ void mla_qk_acc32_zero() {
+  asm volatile("v_accvgpr_write_b32 a32, 0\n"
+               "v_accvgpr_write_b32 a33, 0\n"
+               "v_accvgpr_write_b32 a34, 0\n"
+               "v_accvgpr_write_b32 a35, 0\n"
+               :
+               :
+               : "a32", "a33", "a34", "a35");
+}
+
+__device__ __forceinline__ void mla_qk_acc32_mfma(__bf16 const *a,
+                                                 __bf16 const *b) {
+  bf16x8_t av, bv;
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    av[i] = a[i];
+    bv[i] = b[i];
+  }
+  u32x4_t avu, bvu;
+  __builtin_memcpy(&avu, &av, 16);
+  __builtin_memcpy(&bvu, &bv, 16);
+  asm volatile("v_mfma_f32_16x16x32_bf16 a[32:35], %0, %1, a[32:35]\n"
+               :
+               : "v"(avu), "v"(bvu)
+               : "a32", "a33", "a34", "a35");
+}
+
+__device__ __forceinline__ __mfma_hd64_fp32x4 mla_qk_acc32_read() {
+  float s0, s1, s2, s3;
+  asm volatile("s_nop 15\n"
+               "s_nop 15\n"
+               "v_accvgpr_read_b32 %0, a32\n"
+               "v_accvgpr_read_b32 %1, a33\n"
+               "v_accvgpr_read_b32 %2, a34\n"
+               "v_accvgpr_read_b32 %3, a35\n"
+               : "=v"(s0), "=v"(s1), "=v"(s2), "=v"(s3)
+               :
+               : "a32", "a33", "a34", "a35");
+  __mfma_hd64_fp32x4 r;
+  r[0] = s0;
+  r[1] = s1;
+  r[2] = s2;
+  r[3] = s3;
+  return r;
+}
+
 __device__ __forceinline__ __mfma_hd64_fp32x4
     mfma_qk_bf16(__mfma_hd64_fp32x4 c, __bf16 const *a, __bf16 const *b) {
   bf16x8_t av, bv;
@@ -279,6 +332,178 @@ __device__ __forceinline__ __mfma_hd64_fp32x4
     bv[i] = b[i];
   }
   return __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, bv, c, 0, 0, 0);
+}
+
+// GPT-OSS HD=64 keeps one 4-wide o_acc in VGPRs. MLA has eight PV
+// blocks. Loop-carried o_acc goes through LDS, not AGPRs: fused RA
+// otherwise parks a[0:31] copies in VGPRs that the next tile's KV
+// loads then overwrite (tile 0 hides it, rescale==0).
+//
+// ds addresses are LDS-absolute. The megakernel has ~7 KB of static
+// __shared__ that slides extern __shared__, so tid*128+KV_BYTES from
+// 0 lands inside lds_kv and fused decode emits token 0. Standalone
+// has no static prefix, which is why the oracle still passed.
+// Base = byte address of lds_kv plus tid*128; KV_BYTES is in the
+// ds offset field (fits in 16 bits: 18432+124) so RA cannot drop it.
+constexpr int MLA_OACC_V_BLOCKS = 8;
+constexpr int MLA_OACC_FLOATS = MLA_OACC_V_BLOCKS * 4; // 32
+
+__device__ __forceinline__ unsigned mla_oacc_lds_base(int tid,
+                                                     void const *lds_kv) {
+  unsigned base;
+  unsigned const kv =
+      static_cast<unsigned>(reinterpret_cast<uintptr_t>(lds_kv));
+  asm volatile("v_lshlrev_b32 %[b], 7, %[tid]\n\t"
+               "v_add_u32_e32 %[b], %[kv], %[b]"
+               : [b] "=v"(base)
+               : [tid] "v"(tid), [kv] "v"(kv));
+  return base;
+}
+
+template <int KV_BYTES>
+__device__ __forceinline__ void mla_oacc_zero_lds(unsigned &base) {
+  unsigned z;
+  asm volatile("v_mov_b32_e32 %[z], 0\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o0]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o1]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o2]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o3]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o4]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o5]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o6]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o7]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o8]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o9]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o10]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o11]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o12]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o13]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o14]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o15]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o16]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o17]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o18]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o19]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o20]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o21]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o22]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o23]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o24]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o25]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o26]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o27]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o28]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o29]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o30]\n\t"
+               "ds_write_b32 %[base], %[z] offset:%c[o31]\n\t"
+               "s_waitcnt lgkmcnt(0)"
+               : [z] "=&v"(z), [base] "+v"(base)
+               : [o0] "n"(KV_BYTES + 0), [o1] "n"(KV_BYTES + 4),
+                 [o2] "n"(KV_BYTES + 8), [o3] "n"(KV_BYTES + 12),
+                 [o4] "n"(KV_BYTES + 16), [o5] "n"(KV_BYTES + 20),
+                 [o6] "n"(KV_BYTES + 24), [o7] "n"(KV_BYTES + 28),
+                 [o8] "n"(KV_BYTES + 32), [o9] "n"(KV_BYTES + 36),
+                 [o10] "n"(KV_BYTES + 40), [o11] "n"(KV_BYTES + 44),
+                 [o12] "n"(KV_BYTES + 48), [o13] "n"(KV_BYTES + 52),
+                 [o14] "n"(KV_BYTES + 56), [o15] "n"(KV_BYTES + 60),
+                 [o16] "n"(KV_BYTES + 64), [o17] "n"(KV_BYTES + 68),
+                 [o18] "n"(KV_BYTES + 72), [o19] "n"(KV_BYTES + 76),
+                 [o20] "n"(KV_BYTES + 80), [o21] "n"(KV_BYTES + 84),
+                 [o22] "n"(KV_BYTES + 88), [o23] "n"(KV_BYTES + 92),
+                 [o24] "n"(KV_BYTES + 96), [o25] "n"(KV_BYTES + 100),
+                 [o26] "n"(KV_BYTES + 104), [o27] "n"(KV_BYTES + 108),
+                 [o28] "n"(KV_BYTES + 112), [o29] "n"(KV_BYTES + 116),
+                 [o30] "n"(KV_BYTES + 120), [o31] "n"(KV_BYTES + 124)
+               : "memory");
+}
+
+#define MLA_DEF_PV_BLOCK(NAME, DELTA)                                          \
+  template <int KV_BYTES>                                                      \
+  __device__ __forceinline__ void NAME(unsigned &base,                         \
+                                       float s,                                \
+                                       bf16x4_t va,                            \
+                                       bf16x4_t pb) {                          \
+    float t0, t1, t2, t3;                                                      \
+    u32x2_t avu, bvu;                                                          \
+    __builtin_memcpy(&avu, &va, 8);                                            \
+    __builtin_memcpy(&bvu, &pb, 8);                                            \
+    asm volatile("ds_read_b32 %[t0], %[base] offset:%c[o0]\n\t"                \
+                 "ds_read_b32 %[t1], %[base] offset:%c[o1]\n\t"                \
+                 "ds_read_b32 %[t2], %[base] offset:%c[o2]\n\t"                \
+                 "ds_read_b32 %[t3], %[base] offset:%c[o3]\n\t"                \
+                 "s_waitcnt lgkmcnt(0)\n\t"                                    \
+                 "v_mul_f32_e32 %[t0], %[s], %[t0]\n\t"                        \
+                 "v_mul_f32_e32 %[t1], %[s], %[t1]\n\t"                        \
+                 "v_mul_f32_e32 %[t2], %[s], %[t2]\n\t"                        \
+                 "v_mul_f32_e32 %[t3], %[s], %[t3]\n\t"                        \
+                 "v_accvgpr_write_b32 a0, %[t0]\n\t"                           \
+                 "v_accvgpr_write_b32 a1, %[t1]\n\t"                           \
+                 "v_accvgpr_write_b32 a2, %[t2]\n\t"                           \
+                 "v_accvgpr_write_b32 a3, %[t3]\n\t"                           \
+                 "v_mfma_f32_16x16x16_bf16 a[0:3], %[va], %[pb], a[0:3]\n\t"   \
+                 "s_nop 15\n\t"                                                \
+                 "s_nop 15\n\t"                                                \
+                 "v_accvgpr_read_b32 %[t0], a0\n\t"                            \
+                 "v_accvgpr_read_b32 %[t1], a1\n\t"                            \
+                 "v_accvgpr_read_b32 %[t2], a2\n\t"                            \
+                 "v_accvgpr_read_b32 %[t3], a3\n\t"                            \
+                 "ds_write_b32 %[base], %[t0] offset:%c[o0]\n\t"               \
+                 "ds_write_b32 %[base], %[t1] offset:%c[o1]\n\t"               \
+                 "ds_write_b32 %[base], %[t2] offset:%c[o2]\n\t"               \
+                 "ds_write_b32 %[base], %[t3] offset:%c[o3]\n\t"               \
+                 "s_waitcnt lgkmcnt(0)"                                        \
+                 : [t0] "=&v"(t0), [t1] "=&v"(t1), [t2] "=&v"(t2),             \
+                   [t3] "=&v"(t3), [base] "+v"(base)                           \
+                 : [s] "v"(s), [va] "v"(avu), [pb] "v"(bvu),                   \
+                   [o0] "n"(KV_BYTES + (DELTA) + 0),                           \
+                   [o1] "n"(KV_BYTES + (DELTA) + 4),                           \
+                   [o2] "n"(KV_BYTES + (DELTA) + 8),                           \
+                   [o3] "n"(KV_BYTES + (DELTA) + 12)                           \
+                 : "a0", "a1", "a2", "a3", "memory");                          \
+  }
+
+MLA_DEF_PV_BLOCK(mla_flash_pv_b0, 0)
+MLA_DEF_PV_BLOCK(mla_flash_pv_b1, 16)
+MLA_DEF_PV_BLOCK(mla_flash_pv_b2, 32)
+MLA_DEF_PV_BLOCK(mla_flash_pv_b3, 48)
+MLA_DEF_PV_BLOCK(mla_flash_pv_b4, 64)
+MLA_DEF_PV_BLOCK(mla_flash_pv_b5, 80)
+MLA_DEF_PV_BLOCK(mla_flash_pv_b6, 96)
+MLA_DEF_PV_BLOCK(mla_flash_pv_b7, 112)
+#undef MLA_DEF_PV_BLOCK
+
+template <int KV_BYTES, int VB>
+__device__ __forceinline__ void
+    mla_oacc_load_block(unsigned &base, __mfma_hd64_fp32x4 &out) {
+  float t0, t1, t2, t3;
+  constexpr int off = KV_BYTES + VB * 16;
+  asm volatile("ds_read_b32 %[t0], %[base] offset:%c[o0]\n\t"
+               "ds_read_b32 %[t1], %[base] offset:%c[o1]\n\t"
+               "ds_read_b32 %[t2], %[base] offset:%c[o2]\n\t"
+               "ds_read_b32 %[t3], %[base] offset:%c[o3]\n\t"
+               "s_waitcnt lgkmcnt(0)"
+               : [t0] "=v"(t0), [t1] "=v"(t1), [t2] "=v"(t2), [t3] "=v"(t3),
+                 [base] "+v"(base)
+               : [o0] "n"(off + 0), [o1] "n"(off + 4), [o2] "n"(off + 8),
+                 [o3] "n"(off + 12)
+               : "memory");
+  out[0] = t0;
+  out[1] = t1;
+  out[2] = t2;
+  out[3] = t3;
+}
+
+template <int KV_BYTES>
+__device__ __forceinline__ void
+    mla_oacc_from_lds(unsigned &base, __mfma_hd64_fp32x4 *o_acc) {
+  mla_oacc_load_block<KV_BYTES, 0>(base, o_acc[0]);
+  mla_oacc_load_block<KV_BYTES, 1>(base, o_acc[1]);
+  mla_oacc_load_block<KV_BYTES, 2>(base, o_acc[2]);
+  mla_oacc_load_block<KV_BYTES, 3>(base, o_acc[3]);
+  mla_oacc_load_block<KV_BYTES, 4>(base, o_acc[4]);
+  mla_oacc_load_block<KV_BYTES, 5>(base, o_acc[5]);
+  mla_oacc_load_block<KV_BYTES, 6>(base, o_acc[6]);
+  mla_oacc_load_block<KV_BYTES, 7>(base, o_acc[7]);
 }
 
 // The bf16x4 loads from paged_attention_decode_minimal_hd64, re-expressed so
@@ -356,8 +581,21 @@ __device__ __noinline__ void
   using gang_mla_decode_detail::__ldg_bf16x4_raw;
   using gang_mla_decode_detail::bf16x4_t;
   using gang_mla_decode_detail::ld_g;
-  using gang_mla_decode_detail::mfma_pv_bf16;
-  using gang_mla_decode_detail::mfma_qk_bf16;
+  using gang_mla_decode_detail::mla_flash_pv_b0;
+  using gang_mla_decode_detail::mla_flash_pv_b1;
+  using gang_mla_decode_detail::mla_flash_pv_b2;
+  using gang_mla_decode_detail::mla_flash_pv_b3;
+  using gang_mla_decode_detail::mla_flash_pv_b4;
+  using gang_mla_decode_detail::mla_flash_pv_b5;
+  using gang_mla_decode_detail::mla_flash_pv_b6;
+  using gang_mla_decode_detail::mla_flash_pv_b7;
+  using gang_mla_decode_detail::mla_oacc_from_lds;
+  using gang_mla_decode_detail::mla_oacc_lds_base;
+  using gang_mla_decode_detail::mla_oacc_zero_lds;
+  using gang_mla_decode_detail::mla_qk_acc32_mfma;
+  using gang_mla_decode_detail::mla_qk_acc32_read;
+  using gang_mla_decode_detail::mla_qk_acc32_zero;
+  using gang_mla_decode_detail::u32x2_t;
   using gang_mla_decode_detail::u32x4_t;
 
   constexpr int QK_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM;
@@ -372,10 +610,15 @@ __device__ __noinline__ void
                 "NUM_Q_HEADS must be a multiple of the MFMA M tile (16)");
   static_assert(KV_LORA_RANK % 64 == 0,
                 "KV_LORA_RANK must be a multiple of 64 (4 warps x 16 dims)");
+  static_assert(KV_LORA_RANK / 64 == gang_mla_decode_detail::MLA_OACC_V_BLOCKS,
+                "LDS o_acc spill is 8 PV blocks x 4");
   static_assert(QK_DIM % 64 == 0,
                 "QK_DIM must be a multiple of 64 so the LDS tile loads evenly");
   static_assert(KV_CACHE_STRIDE >= QK_DIM,
                 "KV cache rows must hold the latent + rope dims");
+  constexpr int KV_LDS_BYTES = KV_TILE * QK_DIM * (int)sizeof(__bf16);
+  static_assert(KV_LDS_BYTES + 124 < 65536,
+                "o_acc ds offsets must fit in the 16-bit ds offset field");
 
   int const req = request_id;
   int const query_start = ld_g<int>(&qo_indptr[req]);
@@ -426,11 +669,12 @@ __device__ __noinline__ void
 
   char const *kv_base = reinterpret_cast<char const *>(paged_kv_cache_ptr);
 
-  // LDS: KV[KV_TILE][QK_DIM] bf16 (18 KB for GLM-5), the cache's own format.
-  // K and V are the same rows, so unlike the GQA decode there is only one
-  // buffer.
+  // LDS: KV[KV_TILE][QK_DIM] bf16 (18 KB for GLM-5), then per-thread o_acc
+  // (32 floats x 256 threads = 32 KB) at +KV_TILE*QK_DIM*2, addressed with
+  // one VGPR base and immediate ds offsets.
   extern __shared__ char _mla_decode_smem[];
   __bf16 *lds_kv = reinterpret_cast<__bf16 *>(_mla_decode_smem);
+  unsigned oacc_base = mla_oacc_lds_base(tid, lds_kv);
 
   // 256 threads x 4 elements = 16 tok x 64 dim per round, LDG_PER_TILE rounds
   int const my_tok = tid / 16;
@@ -488,7 +732,10 @@ __device__ __noinline__ void
     if (effective_len > remaining) {
       effective_len = remaining;
     }
-    ntiles = chunk_last_tile - chunk_first_tile;
+    // Recompute from the clamped length. Using (last-first) leaves a phantom
+    // extra tile when the tail chunk is shorter than tiles_per_chunk*KV_TILE
+    // -- tile_len goes negative and the softmax sees leftover LDS.
+    ntiles = (effective_len + KV_TILE - 1) / KV_TILE;
   }
   if (ntiles == 0) {
     return;
@@ -496,123 +743,31 @@ __device__ __noinline__ void
 
   // Byte offset of a token's latent row (bf16 = 2 bytes per element).
   //
-  // The page-table read is a *dependent* load, and it used to sit in front of
-  // every tile's prefetch: the asm showed `flat_load_dword` (kv_indices) then
-  // `s_waitcnt vmcnt(0) lgkmcnt(0)` then the nine KV loads, once per tile. So
-  // each tile paid a full round trip before its first KV byte could even be
-  // addressed, and the drain retired the *previous* tile's prefetch at the
-  // same time -- the software pipeline never actually overlapped anything.
-  //
-  // A worker's whole chunk is at most a few tiles of PAGE_SIZE-token pages, so
-  // the page index is very nearly loop-invariant. Cache the last (page, base)
-  // pair and reload only when it actually changes; at the GLM shape that is
-  // once, in the prologue.
-  int cached_page = -1;
-  long cached_page_base = 0;
+  // Reload kv_indices every tile. Caching (page, base) across QK/PV is
+  // unsafe under fused VGPR pressure: LLVM may reuse those registers, and
+  // a later get_kv_row with page unchanged would skip the reload. The
+  // seq>256 collapse is a different fused-loop hazard (o_acc rescale
+  // copies vs next-tile KV fills); this just keeps the address path honest.
   auto get_kv_row = [&](int global_tok) -> long {
     int const page = global_tok / PAGE_SIZE;
-    if (page != cached_page) {
-      int const pid = ld_g<int>(&kv_indices[first_page + page]);
-      cached_page = page;
-      cached_page_base =
-          static_cast<long>(pid) * PAGE_SIZE * KV_CACHE_STRIDE * 2;
-    }
-    return cached_page_base +
-           static_cast<long>(global_tok % PAGE_SIZE) * KV_CACHE_STRIDE * 2;
+    // volatile + memory clobber: a plain ld_g is hoistable when every token
+    // in the chunk sits on page 0 (PAGE_SIZE=4096, seq<=512), which puts pid
+    // back in a VGPR that QK/PV then reuse.
+    asm volatile("" ::: "memory");
+    int const pid =
+        *(__attribute__((address_space(1))) int const volatile
+              *)static_cast<int const *>(&kv_indices[first_page + page]);
+    long row = static_cast<long>(pid) * PAGE_SIZE * KV_CACHE_STRIDE * 2 +
+               static_cast<long>(global_tok % PAGE_SIZE) * KV_CACHE_STRIDE * 2;
+    asm volatile("" : "+v"(row) : : "memory");
+    return row;
   };
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   unsigned long long _d_t1 = __builtin_amdgcn_s_memrealtime();
 #endif
 
-  // ===== PROLOGUE: page table first, then KV[0], KV[1] and Q all in flight =====
-  //
-  // Order here is load-bearing, and the obvious order is the wrong one.
-  //
-  // The page-table read is the only *dependent* load in the cold start: no KV
-  // address can be formed until it lands. With it issued after the Q block,
-  // the only `s_waitcnt` that retires it is `vmcnt(0)` -- which also retires
-  // all 18 Q loads. The asm showed exactly that: 18 `global_load_dwordx4`,
-  // `s_waitcnt vmcnt(0)`, page load, `s_waitcnt vmcnt(0)`, then tile 0. Three
-  // serialized round trips, which is what the profile charged 5.25 us of a
-  // 10.5 us decode for. Putting Q first only reordered them.
-  //
-  // So: resolve both page rows first, when nothing else is outstanding and the
-  // wait costs exactly one round trip. Everything after that point is
-  // independent and can sit in flight together. Then issue tile 0, tile 1 and
-  // Q *in that order*, so the LDS write below -- the first real consumer --
-  // waits on `vmcnt(27)` (tile 1 + Q still outstanding) rather than draining
-  // the world. With one wave per SIMD there is no occupancy to hide any of
-  // this, so overlap has to be built by hand.
-  int const tile0_len = (KV_TILE < effective_len) ? KV_TILE : effective_len;
-  int const tile1_len = ((effective_len - KV_TILE) < KV_TILE)
-                            ? (effective_len - KV_TILE)
-                            : KV_TILE;
-  bool const do_t0 = (my_tok < tile0_len);
-  bool const do_t1 = (ntiles > 1) && (my_tok < tile1_len);
-  long row0 = 0, row1 = 0;
-  if (do_t0) {
-    row0 = get_kv_row(kv_start + my_tok);
-  }
-  if (do_t1) {
-    row1 = get_kv_row(kv_start + KV_TILE + my_tok);
-  }
-
-  uint2 kv0[LDG_PER_TILE];
-  if (do_t0) {
-#pragma unroll
-    for (int r = 0; r < LDG_PER_TILE; r++) {
-      __ldg_bf16x4_raw(&kv0[r], kv_base + row0 + (my_dim0 + r * 64) * 2);
-    }
-  }
-
-  // Prefetch KV[1] -> registers as raw dwords
-  //
-  // ── why there are two buffers ────────────────────────────────────────────
-  // The loop is already two trips deep: trip t writes the buffer holding tile
-  // t+1 into LDS and then issues tile t+2 into it. With ONE buffer that is a
-  // WAR hazard on itself -- the issue cannot be hoisted above the LDS write
-  // that reads the same registers -- so the prefetch never survives the
-  // backedge and each trip pays a full round trip it was written to hide.
-  //
-  // The gfx950 disassembly of the single-buffer form shows it exactly: nine
-  // `global_load_dwordx2` at the top of the rotated body, then a waitcnt
-  // staircase `vmcnt(17)` .. `vmcnt(0)` that reaches zero BEFORE the body
-  // ends. 17 means 18 outstanding, i.e. the 9 just issued plus the previous
-  // trip's 9, and draining to 0 retires the ones this trip does not read.
-  // isa_outstanding.py reports carry 0 / peak 9 for the same reason.
-  //
-  // Alternating by the parity of the tile a buffer holds removes the hazard,
-  // so tile t+2's loads stay in flight across trip t+1's 18 QK and 8 PV MFMAs
-  // and its 50 LDS reads. Two named arrays rather than kv_pre[2][...]: the
-  // index would be loop-variant, and a dynamically indexed register array
-  // goes to scratch, which is the opposite of the point.
-  //
-  // Costs LDG_PER_TILE = 9 uint2 = 18 VGPRs on a function whose arch peak is
-  // 248 of the 512-entry unified file. Verify .vgpr_count did not move before
-  // trusting any wall number from this.
-  uint2 kv_pre_odd[LDG_PER_TILE];  // tiles 1, 3, 5, ...
-  bool has_pre_odd = false;
-#if MPK_MLA_DECODE_DBLBUF
-  uint2 kv_pre_even[LDG_PER_TILE]; // tiles 2, 4, 6, ...
-  bool has_pre_even = false;
-#endif
-  if (do_t1) {
-#pragma unroll
-    for (int r = 0; r < LDG_PER_TILE; r++) {
-      __ldg_bf16x4_raw(&kv_pre_odd[r], kv_base + row1 + (my_dim0 + r * 64) * 2);
-    }
-    has_pre_odd = true;
-  }
-
-  // Q slice for this lane: head (q_head_group * 16 + midx), dims
-  // [kc * 32 + kgrp * 8, +8) for each MFMA step.
-  //
-  // Issued last of the three, and consumed last -- the first MFMA is past the
-  // loop's opening `__syncthreads()`. At bf16 these land directly in the MFMA
-  // operand registers, so no convert sits between the load and its use and
-  // nothing forces an early drain. All four waves read the same 16 heads, so
-  // waves 1..3 hit L1.
+  // Q first, then one KV tile per loop trip from HBM.
   __bf16 qr[NUM_K32][8];
   {
     int const q_head = q_head_group * Q_HEADS_PER_GROUP + midx;
@@ -628,25 +783,8 @@ __device__ __noinline__ void
     }
   }
 
-  // Now consume tile 0. The cache is bf16 and so is the LDS tile, so this is
-  // a straight 8-byte copy -- no convert between the load and the store.
-  {
-    uint2 const zero2 = {0u, 0u};
-#pragma unroll
-    for (int r = 0; r < LDG_PER_TILE; r++) {
-      uint2 const v = do_t0 ? kv0[r] : zero2;
-      *(uint64_t *)&lds_kv[my_tok * QK_DIM + my_dim0 + r * 64] =
-          *(uint64_t *)&v;
-    }
-  }
-
   // ===== MAIN LOOP =====
-  __mfma_hd64_fp32x4 const zero4 = {0, 0, 0, 0};
-  __mfma_hd64_fp32x4 o_acc[NUM_V_BLOCKS];
-#pragma unroll
-  for (int vb = 0; vb < NUM_V_BLOCKS; vb++) {
-    o_acc[vb] = zero4;
-  }
+  mla_oacc_zero_lds<KV_LDS_BYTES>(oacc_base);
   float m_running = -INFINITY;
   float l_head[4] = {0, 0, 0, 0};
 
@@ -654,96 +792,135 @@ __device__ __noinline__ void
   unsigned long long _d_t2 = __builtin_amdgcn_s_memrealtime();
 #endif
 
+  // One trip at a time. The compiler otherwise pipelines tile t+1's LDS
+  // stores into tile t's QK/PV reads; those stores go through a generic
+  // uint64_t* and LLVM does not see them as aliasing the bf16 LDS loads.
+#pragma unroll 1
   for (int t = 0; t < ntiles; t++) {
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     unsigned long long _d_a = __builtin_amdgcn_s_memrealtime();
 #endif
     int tile_start = t * KV_TILE;
-    int tile_len = ((effective_len - tile_start) < KV_TILE)
-                       ? (effective_len - tile_start)
-                       : KV_TILE;
+    int tile_len = effective_len - tile_start;
+    if (tile_len > KV_TILE) {
+      tile_len = KV_TILE;
+    }
+    if (tile_len < 0) {
+      tile_len = 0;
+    }
 
+    // addrspace(3) so the stores are ds_write (lgkmcnt), not generic/flat
+    // (vmcnt+lgkmcnt). HIP __syncthreads is
+    //   s_waitcnt vmcnt(0) ; s_barrier ; s_waitcnt vmcnt(0)
+    // and does not wait lgkmcnt. Do not put vmcnt(0) inside the my_tok <
+    // tile_len branch: that wait is divergent on a partial tile and hangs
+    // the fused kernel from the first prefill step.
+    if (my_tok < tile_len) {
+      long const row = get_kv_row(kv_start + tile_start + my_tok);
+#pragma unroll
+      for (int r = 0; r < LDG_PER_TILE; r++) {
+        u32x2_t const v =
+            ld_g<u32x2_t>(kv_base + row + (my_dim0 + r * 64) * 2);
+        uint64_t val;
+        __builtin_memcpy(&val, &v, 8);
+        auto *dst = (__attribute__((address_space(3))) uint64_t *)&lds_kv
+                        [my_tok * QK_DIM + my_dim0 + r * 64];
+        *dst = val;
+      }
+    } else {
+      uint64_t const zero8 = 0;
+#pragma unroll
+      for (int r = 0; r < LDG_PER_TILE; r++) {
+        auto *dst = (__attribute__((address_space(3))) uint64_t *)&lds_kv
+                        [my_tok * QK_DIM + my_dim0 + r * 64];
+        *dst = zero8;
+      }
+    }
+    asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
     __syncthreads();
 
-    // QK: lane (midx, kgrp) reads K[tok=midx][dim=kc*32+kgrp*8..+7]
-    __mfma_hd64_fp32x4 scores = {0, 0, 0, 0};
-#pragma unroll
-    for (int kc = 0; kc < NUM_K32; kc++) {
-      __bf16 kr[8];
-      __bf16 const *k_ptr = &lds_kv[midx * QK_DIM + kc * 32 + kgrp * 8];
-#pragma unroll
-      for (int i = 0; i < 8; i++) {
-        kr[i] = k_ptr[i];
-      }
-      scores = mfma_qk_bf16(scores, kr, qr[kc]);
-    }
-
-    scores[0] *= scale_s;
-    scores[1] *= scale_s;
-    scores[2] *= scale_s;
-    scores[3] *= scale_s;
-
-#pragma unroll
-    for (int h = 0; h < 4; h++) {
-      if (kgrp * 4 + h >= tile_len) {
-        scores[h] = -INFINITY;
-      }
-    }
-
-    // Online softmax
-    float tile_max =
-        fmaxf(fmaxf(scores[0], scores[1]), fmaxf(scores[2], scores[3]));
     {
-      float a = tile_max, b = tile_max;
-      asm volatile("s_nop 1\n\tv_permlane32_swap_b32_e32 %0, %1"
-                   : "+v"(a), "+v"(b));
-      tile_max = fmaxf(a, b);
-      a = tile_max;
-      b = tile_max;
-      asm volatile("s_nop 1\n\tv_permlane16_swap_b32_e32 %0, %1"
-                   : "+v"(a), "+v"(b));
-      tile_max = fmaxf(a, b);
-    }
-
-    float new_max = fmaxf(m_running, tile_max);
-    float rescale =
-        (m_running == -INFINITY) ? 0.0f : __fast_exp2_hd64(m_running - new_max);
-
-    float w0 = __fast_exp2_hd64(scores[0] - new_max);
-    float w1 = __fast_exp2_hd64(scores[1] - new_max);
-    float w2 = __fast_exp2_hd64(scores[2] - new_max);
-    float w3 = __fast_exp2_hd64(scores[3] - new_max);
-
-    l_head[0] = l_head[0] * rescale + w0;
-    l_head[1] = l_head[1] * rescale + w1;
-    l_head[2] = l_head[2] * rescale + w2;
-    l_head[3] = l_head[3] * rescale + w3;
-    m_running = new_max;
-
-    bf16x4_t pb;
-    pb[0] = (__bf16)w0;
-    pb[1] = (__bf16)w1;
-    pb[2] = (__bf16)w2;
-    pb[3] = (__bf16)w3;
-
-    // PV: A = V transposed, lane (midx, kgrp) reads
-    // V[tok=kgrp*4+j][dim=vb*64+warp_id*16+midx]. V is the latent prefix of
-    // the same LDS rows the QK step just read.
+      mla_qk_acc32_zero();
 #pragma unroll
-    for (int vb = 0; vb < NUM_V_BLOCKS; vb++) {
-      bf16x4_t va;
-      __bf16 const *v_ptr =
-          &lds_kv[(kgrp * 4) * QK_DIM + vb * 64 + warp_id * 16 + midx];
-      va[0] = v_ptr[0 * QK_DIM];
-      va[1] = v_ptr[1 * QK_DIM];
-      va[2] = v_ptr[2 * QK_DIM];
-      va[3] = v_ptr[3 * QK_DIM];
-      o_acc[vb][0] *= rescale;
-      o_acc[vb][1] *= rescale;
-      o_acc[vb][2] *= rescale;
-      o_acc[vb][3] *= rescale;
-      o_acc[vb] = mfma_pv_bf16(
-          o_acc[vb], (__bf16 const *)&va, (__bf16 const *)&pb);
+      for (int kc = 0; kc < NUM_K32; kc++) {
+        __bf16 kr[8];
+        __bf16 const *k_ptr = &lds_kv[midx * QK_DIM + kc * 32 + kgrp * 8];
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+          kr[i] = k_ptr[i];
+        }
+        mla_qk_acc32_mfma(kr, qr[kc]);
+      }
+      __mfma_hd64_fp32x4 scores = mla_qk_acc32_read();
+      scores[0] *= scale_s;
+      scores[1] *= scale_s;
+      scores[2] *= scale_s;
+      scores[3] *= scale_s;
+#pragma unroll
+      for (int h = 0; h < 4; h++) {
+        if (kgrp * 4 + h >= tile_len) {
+          scores[h] = -INFINITY;
+        }
+      }
+      float tile_max =
+          fmaxf(fmaxf(scores[0], scores[1]), fmaxf(scores[2], scores[3]));
+      {
+        float a = tile_max, b = tile_max;
+        asm volatile("s_nop 1\n\tv_permlane32_swap_b32_e32 %0, %1"
+                     : "+v"(a), "+v"(b));
+        tile_max = fmaxf(a, b);
+        a = tile_max;
+        b = tile_max;
+        asm volatile("s_nop 1\n\tv_permlane16_swap_b32_e32 %0, %1"
+                     : "+v"(a), "+v"(b));
+        tile_max = fmaxf(a, b);
+      }
+      float const new_max = fmaxf(m_running, tile_max);
+      float const rescale = (m_running == -INFINITY)
+                                ? 0.0f
+                                : __fast_exp2_hd64(m_running - new_max);
+      float const w0 = __fast_exp2_hd64(scores[0] - new_max);
+      float const w1 = __fast_exp2_hd64(scores[1] - new_max);
+      float const w2 = __fast_exp2_hd64(scores[2] - new_max);
+      float const w3 = __fast_exp2_hd64(scores[3] - new_max);
+      l_head[0] = l_head[0] * rescale + w0;
+      l_head[1] = l_head[1] * rescale + w1;
+      l_head[2] = l_head[2] * rescale + w2;
+      l_head[3] = l_head[3] * rescale + w3;
+      m_running = new_max;
+
+      bf16x4_t pb;
+      pb[0] = (__bf16)w0;
+      pb[1] = (__bf16)w1;
+      pb[2] = (__bf16)w2;
+      pb[3] = (__bf16)w3;
+#pragma unroll
+      for (int vb = 0; vb < NUM_V_BLOCKS; vb++) {
+        bf16x4_t va;
+        __bf16 const *v_ptr =
+            &lds_kv[(kgrp * 4) * QK_DIM + vb * 64 + warp_id * 16 + midx];
+        va[0] = v_ptr[0 * QK_DIM];
+        va[1] = v_ptr[1 * QK_DIM];
+        va[2] = v_ptr[2 * QK_DIM];
+        va[3] = v_ptr[3 * QK_DIM];
+        if (vb == 0) {
+          mla_flash_pv_b0<KV_LDS_BYTES>(oacc_base, rescale, va, pb);
+        } else if (vb == 1) {
+          mla_flash_pv_b1<KV_LDS_BYTES>(oacc_base, rescale, va, pb);
+        } else if (vb == 2) {
+          mla_flash_pv_b2<KV_LDS_BYTES>(oacc_base, rescale, va, pb);
+        } else if (vb == 3) {
+          mla_flash_pv_b3<KV_LDS_BYTES>(oacc_base, rescale, va, pb);
+        } else if (vb == 4) {
+          mla_flash_pv_b4<KV_LDS_BYTES>(oacc_base, rescale, va, pb);
+        } else if (vb == 5) {
+          mla_flash_pv_b5<KV_LDS_BYTES>(oacc_base, rescale, va, pb);
+        } else if (vb == 6) {
+          mla_flash_pv_b6<KV_LDS_BYTES>(oacc_base, rescale, va, pb);
+        } else {
+          mla_flash_pv_b7<KV_LDS_BYTES>(oacc_base, rescale, va, pb);
+        }
+      }
     }
 
     // The QK and PV steps both read the whole LDS tile, so the refill has to
@@ -753,60 +930,8 @@ __device__ __noinline__ void
     unsigned long long _d_b = __builtin_amdgcn_s_memrealtime();
     _d_compute += _d_b - _d_a;
 #endif
+    // Next trip overwrites LDS; wait for every lane's QK/PV reads.
     __syncthreads();
-
-    // Trip t drains the buffer holding tile t+1 into LDS and issues tile t+2
-    // into a buffer. Under DBLBUF those are always different buffers, which is
-    // what lets the issue sit above the drain.
-    auto refill_lds = [&](uint2 const(&buf)[LDG_PER_TILE], bool have) {
-      if (have) {
-#pragma unroll
-        for (int r = 0; r < LDG_PER_TILE; r++) {
-          *(uint64_t *)&lds_kv[my_tok * QK_DIM + my_dim0 + r * 64] =
-              *(uint64_t *)&buf[r];
-        }
-      } else if (t + 1 < ntiles) {
-        // This lane's token is past the end of tile t+1: zero it so the stale
-        // rows cannot leak into the next tile's QK.
-        uint64_t const zero8 = 0;
-#pragma unroll
-        for (int r = 0; r < LDG_PER_TILE; r++) {
-          *(uint64_t *)&lds_kv[my_tok * QK_DIM + my_dim0 + r * 64] = zero8;
-        }
-      }
-    };
-    auto prefetch_t2 = [&](uint2(&buf)[LDG_PER_TILE], bool &have) {
-      have = false;
-      if (t + 2 < ntiles) {
-        int t2_start = (t + 2) * KV_TILE;
-        int t2_len = ((effective_len - t2_start) < KV_TILE)
-                         ? (effective_len - t2_start)
-                         : KV_TILE;
-        if (my_tok < t2_len) {
-          long row = get_kv_row(kv_start + t2_start + my_tok);
-#pragma unroll
-          for (int r = 0; r < LDG_PER_TILE; r++) {
-            __ldg_bf16x4_raw(&buf[r], kv_base + row + (my_dim0 + r * 64) * 2);
-          }
-          have = true;
-        }
-      }
-    };
-
-#if MPK_MLA_DECODE_DBLBUF
-    // (t & 1) == 0 means tile t+1 is odd, so it is in the odd buffer and tile
-    // t+2 is even.
-    if ((t & 1) == 0) {
-      refill_lds(kv_pre_odd, has_pre_odd);
-      prefetch_t2(kv_pre_even, has_pre_even);
-    } else {
-      refill_lds(kv_pre_even, has_pre_even);
-      prefetch_t2(kv_pre_odd, has_pre_odd);
-    }
-#else
-    refill_lds(kv_pre_odd, has_pre_odd);
-    prefetch_t2(kv_pre_odd, has_pre_odd);
-#endif
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     _d_refill += __builtin_amdgcn_s_memrealtime() - _d_b;
 #endif
@@ -824,6 +949,9 @@ __device__ __noinline__ void
 
   float inv_l = (l_sum > 0.0f) ? (1.0f / l_sum) : 0.0f;
   int const q_head_local = midx;
+
+  __mfma_hd64_fp32x4 o_acc[NUM_V_BLOCKS];
+  mla_oacc_from_lds<KV_LDS_BYTES>(oacc_base, o_acc);
 
   if constexpr (NUM_KV_CHUNKS == 1) {
     constexpr int OUT_STRIDE = NUM_Q_HEADS * KV_LORA_RANK;
@@ -864,7 +992,30 @@ __device__ __noinline__ void
           float v = o_acc[vb][h] * inv_l;
           __builtin_memcpy(&raw[h], &v, 4);
         }
-        st_wt_u128(&o[dim_offset], raw[0], raw[1], raw[2], raw[3]);
+        // Two dwordx2 stores, not one dwordx4, and the reason is NOT that
+        // st_wt_u128 is broken -- tests/standalone/test_st_wt.hip writes a
+        // known pattern through it into a poisoned buffer and every dword
+        // comes back correct, so the two other call sites (the MoE workspace
+        // zeroing in gang_oproj_router_fused and the EP publish in
+        // xrank_sum_add) are fine and should be left alone.
+        //
+        // It is wrong HERE, deterministically. test_mla_decode.hip
+        // instantiated with WRITE_THROUGH=true -- which only the fused layer
+        // does, and which no test covered until now -- fails every split-KV
+        // case with the dwordx4 form, including chunks=2 seqlen=1, and passes
+        // all 19 with this one. The wrong values are always the 4th dword of
+        // each group (dims == 3 mod 4).
+        //
+        // The difference this function brings is register pressure: it sets
+        // the whole megakernel's allocation at 248 arch + 36 AGPR (see the
+        // note above mla_decode_absorbed), and the dwordx4 asm needs a
+        // 4-aligned VGPR quad for its payload operand. Do not "simplify" this
+        // back to one store without re-running the WRITE_THROUGH=true arm.
+        unsigned long long lo, hi;
+        __builtin_memcpy(&lo, &raw[0], 8);
+        __builtin_memcpy(&hi, &raw[2], 8);
+        st_wt_u64((void *)&o[dim_offset], lo);
+        st_wt_u64((void *)&o[dim_offset + 2], hi);
       } else {
 #pragma unroll
         for (int h = 0; h < 4; h++) {

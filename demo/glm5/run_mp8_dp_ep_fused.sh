@@ -183,4 +183,6 @@ mpirun -np "$NP" --tag-output --allow-run-as-root \
     --max-seq-length "${MAX_SEQ_LENGTH:-128}" \
     --max-new-tokens "${MAX_NEW_TOKENS:-16}" \
     --model-path "$MODEL_PATH" ${MPK_EXTRA_ARGS:-} "$@"
-echo "MPIRUN_EXIT=$?"
+_mpk_rc=$?
+echo "MPIRUN_EXIT=$_mpk_rc"
+exit "$_mpk_rc"
