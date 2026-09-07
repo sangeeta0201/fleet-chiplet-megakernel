@@ -140,6 +140,78 @@ Note the MTYPE is a property of the page mapping and applies to **all** VRAM in
 SPX+NPS2, whichever AID the page sits in. An AID-local flag page is still
 MTYPE_NC, still has no hardware coherence, and still serializes its readers.
 
+### Why the coherent MTYPE is unavailable, and why NPS1 gets it
+
+#### The MTYPE is the whole mechanism, and the partition mode is not
+
+Everything above compares NPS1 against NPS2, which confounds two variables: the
+memory partition mode and the MTYPE the driver derives from it. `mtype_local`
+separates them. It is a stock parameter that sets the MTYPE for local VRAM
+directly (0 = RW, 1 = NC, 2 = CC), so NPS1 can be made to run on the same
+MTYPE_NC that SPX+NPS2 is forced onto, with NPS1's fine interleave and single
+coherence domain otherwise untouched.
+
+| SPX+NPS1, `--layers=200 --tiles=23` | stride 4 | stride 64 | stride 256 | 32 pollers | copies=16 |
+| --- | --- | --- | --- | --- | --- |
+| `mtype_local=0`, MTYPE_RW (default) | 2.08 | **1.52** | 1.52 | 1.16 | 1.80 |
+| `mtype_local=2`, MTYPE_CC | 1.92 | **1.52** | 1.56 | - | - |
+| `mtype_local=1`, MTYPE_NC | 67.40 | **17.04** | 12.56 | 1.00 | 2.92 |
+| SPX+NPS2 for comparison, MTYPE_NC | ~68 | **20.20** | ~13 | - | 2.84 |
+
+poll_p50 in us. NPS1 on MTYPE_NC reproduces the entire regression -- the 27x, the
+stride curve, the collapse to ~1 us when only 32 waves poll, and the recovery
+under replication -- in one memory partition, at NPS1 interleave, with no AID
+boundary anywhere. Conversely both coherent MTYPEs, RW and CC, absorb 184 readers
+on one line at 1.52 us.
+
+So the cost is not the AID boundary, not cross-AID distance, and not interleave
+granularity. It is MTYPE_NC, and nothing else. An earlier version of this
+document attributed NPS1's speed to its fine interleave spreading the directory
+load; that is contradicted by the first and third rows above, which differ only
+in MTYPE. The interleave argument survives only as an explanation of why the
+driver *chooses* NC in the spanning case, not as the reason NC is slow.
+
+#### The documented rationale for the choice
+
+The documented hardware mechanism is a directory with a per-channel capacity budget. AMD's
+coherence page for this part (Confluence 369688730, *MI300 Coherence between
+Partition and NPS Modes*, quoted in `DF_REMAP.md` in the aid-local-hbm tree)
+states it directly:
+
+> **Why SPX+NPS2 is illegal:** DF-CS shadow tags only track ~8 L2 lines per
+> channel. Fine NPS1 interleave ? 1 line/XCD/channel. Coarse NPS2 in SPX ? all
+> 8 XCDs fill from one channel ? directory overflow, probes don't reach,
+> MTYPE_RW cannot be saved by flush.
+
+Each memory channel's DF Coherent Station keeps shadow tags recording which XCD
+L2s hold lines it homes. NPS1's fine interleave scatters consecutive lines over
+all channels, so a channel sees about one line per XCD and eight XCDs fit the
+budget exactly. In NPS2 the AIDs are not interleaved, a contiguous structure
+homes on one channel, and the directory overflows; the CS then loses sharers and
+the probes that would invalidate their stale lines are never sent. "Cannot be
+saved by flush" is the load-bearing part: the failure is a missing invalidate,
+not dirty data in a cache, so no software fence recovers it.
+
+Read this as the reason the driver demotes, not as the reason the demotion is
+expensive; the `mtype_local` table above settles the latter. The measurements in
+the next section also refine the capacity framing: the failure reproduces at
+eight lines spread over eight channels and at 32 polling waves, which is far
+inside any plausible directory budget, so what breaks in SPX+NPS2 looks
+structural to the spanning configuration rather than a working-set effect.
+SPX+NPS2 is characterised
+as illegal rather than merely untuned: SPX reports `supported_nps_configs=NPS1`,
+and the same rule appears on the AWS enablement page ("NPS count cannot exceed
+compute partitions. SPX ? NPS1 only"). This benchmark only runs in SPX+NPS2 at
+all because of the patched driver.
+
+The same page gives the intended contract for AID-local memory: "Safe uses:
+local XCDs only, or non-coherent MTYPE. Decode pinning to XCD0-3 vs XCD4-7 is
+the intended software contract." Phase 7 cannot satisfy the first option: the
+K-parallel map forces wave *w* of every workgroup on all eight XCDs to read
+slices 2w and 2w+1, so the far-AID XCDs unavoidably touch every flag line.
+Pinning would require re-partitioning O-proj's reduction dimension. That leaves
+non-coherent MTYPE, which is where the driver already is.
+
 ### It cannot simply be switched back
 
 Reloading with `aid_local_xcp_nc=0` in SPX+NPS2, so pages get MTYPE_RW:
@@ -155,6 +227,114 @@ flag written by a producer on one AID never becomes visible to a poller on the
 other and the spin never retires. This is precisely the correctness bug the
 patch exists to prevent. MTYPE_NC is load-bearing, and the cost of sharing under
 it is the price of correctness -- not a misconfiguration to undo.
+
+Both coherent MTYPEs fail this way, at every stride:
+
+| SPX+NPS2 | stride 4 | stride 64 | stride 256 |
+| --- | --- | --- | --- |
+| `mtype_local=0`, MTYPE_RW | hang | hang | hang |
+| `mtype_local=2`, MTYPE_CC | hang | hang | hang |
+
+No GPU fault, no ring timeout, no reset -- a clean infinite spin.
+
+### What the hang actually is
+
+`bench_hangdiag.hip` bounds every spin with a deadline and, at the instant a
+wave gives up, reads the same address four ways: the `sc0 sc1` load the spin was
+using, a plain load, an atomic RMW (which cannot be answered from a stale local
+copy), and a load after `buffer_inv sc0 sc1`. It also has the producer read back
+its own store, and the host read the flags after the kernel. Under MTYPE_CC in
+SPX+NPS2, at 23 tiles and a 200 ms deadline:
+
+```
+producer self-check:  every XCD read back its own store correctly
+host view of flags:   1 1 1 1 2 2 2 2      (all eight stores landed)
+stuck waves:          736 of 736
+example stuck wave:   plain=0 nosc=0 atomic=0 after_inv=0
+```
+
+The stuck-wave matrix shows each XCD only ever got past the one flag *it owns*:
+xcd0 cleared f0 and stuck on f1, xcd2 cleared f2 and stuck on f3. So a store is
+visible on its own XCD and to the host, and invisible to every other XCD.
+
+Three candidate explanations, each tested and eliminated:
+
+- *Dirty data trapped in the producer's L2.* Adding `buffer_wbl2 sc0 sc1` after
+  every store (`--wb=1`) changes nothing.
+- *Stale lines in the consumer's cache that need invalidating.* Issuing
+  `buffer_inv sc0 sc1` before every polling load (`--cinv=1`) changes nothing,
+  alone or combined with the writeback. All four wb/cinv combinations are
+  byte-identical.
+- *Address aliasing, one virtual address resolving per memory partition.* The
+  `--alias=1` mode has all eight XCDs write a distinct value to the same dword,
+  settle, then read it back. All eight read `0x1005`, the last writer's value,
+  and so does the host. One address, one location, writes ordered.
+
+What does change the outcome is the deadline. At 1000 ms all 736 waves are
+stuck; at 5000 ms, 552 are. Waves do get through, on a timescale four orders of
+magnitude beyond the ~1.5 us the same handshake takes under a coherent MTYPE in
+NPS1.
+
+That combination is only consistent with one mechanism. A polling wave takes the
+line into its L2 before the store happens. Under a coherent MTYPE the L2 is
+permitted to answer subsequent `sc0 sc1` loads from that copy, because the
+protocol guarantees an invalidate probe will arrive when someone writes. In
+SPX+NPS2 the compute partition spans two memory partitions and that probe is
+never delivered, so the copy stays stale until the line is evicted by unrelated
+capacity pressure -- which is what the 5000 ms partial recovery is. `buffer_inv`
+does not rescue it because the invalidate it performs does not reach the level
+holding the line, and the alias test succeeds because those reads happen once,
+on lines not already cached from before the store.
+
+This is the same failure mode the comment at the top of `bench_flagplace.hip`
+records for a weaker load scope, one level further out in the hierarchy. It also
+explains why the poller count does not matter: 32 waves hang exactly like 736,
+because a single wave with a stale line is sufficient.
+
+MTYPE_NC prevents all of it by forbidding the L2 to answer the poll at all.
+Every load goes to the line's home, which is correct, and which is also why 184
+of them per line queue into 20 us. The control confirms the instrument: under
+MTYPE_NC the identical diagnostic reports 0 of 736 stuck and all four layers
+complete.
+
+### Nor per-BO: a coherent MTYPE on the flag page alone also hangs
+
+The shadow-tag account above is a *capacity* argument, which suggests an
+escape: the global switch fails because the model's whole working set overflows
+the directory, but the eight flags are 8 KiB. Give that one BO a coherent MTYPE,
+leave every other page MTYPE_NC, and the coherent working set is eight lines.
+
+Tested, and it does not work. `0003-amdgpu-per-bo-flag-mtype.patch` in this
+directory adds `aid_local_flag_mtype` (0=off, 1=RW, 2=CC), applying only to
+VRAM BOs carrying `AMDGPU_GEM_CREATE_COHERENT` in the spanning case; the
+harness marks its flag array with `--flagmem=1`
+(`hipDeviceMallocFinegrained`). A `DRM_INFO_ONCE` confirmed the branch fired
+with the intended MTYPE.
+
+| flag-page MTYPE | stride 64 | 256 | 512 | 4096 | unmarked control |
+| --- | --- | --- | --- | --- | --- |
+| NC (production) | 20.20 | 13.00 | -- | 12.64 | -- |
+| RW (`flag_mtype=1`) | hang | hang | -- | -- | 20.16 |
+| CC (`flag_mtype=2`) | hang | hang | hang | hang | 20.00 |
+
+The controls confirm the change was surgical -- an unmarked BO in the same run
+still measures 20 us. Stride was swept because the MI350 channel select hashes
+PA[11:8], so a 256 B stride puts each of the eight flags on a different channel
+and reduces the directory load to one line per XCD per channel, the same
+condition that makes NPS1 work. It still hangs. Eight lines on eight channels is
+not enough to stay inside the budget in this mode, so the demotion is not a
+capacity workaround that a small BO can dodge.
+
+Two smaller findings from the same work, both about what userspace can reach:
+`hipDeviceMallocFinegrained` sets `KFD_IOC_ALLOC_MEM_FLAGS_COHERENT`, which this
+ASIC's driver branch computes and then ignores, so it is a no-op on MTYPE
+(measured 20.16 vs 19.88 baseline) and therefore usable as a free marker.
+`hipDeviceMallocUncached` returns **host** memory, not VRAM (`is_vram=0` in the
+probe) -- so the 21.6 us it measures is a page across PCIe, not MTYPE_UC, and
+there is no HIP path to `EXT_COHERENT` at all.
+
+The conclusion for the kernel is that no MTYPE setting recovers this. The fix
+has to be flag replication, which needs no driver change.
 
 ## Would one flag page per AID fix it?
 
@@ -269,6 +449,46 @@ HIP_VISIBLE_DEVICES=6 ./bench_flagplace --layers=200 --tiles=23 \
     --copies=16 --flagstride=256
 ```
 
+To separate the MTYPE from the partition mode, bring the box up in SPX+NPS1 and
+vary `mtype_local` alone. This is what shows the regression is not about NPS2:
+
+```bash
+# NPS1 on the MTYPE that SPX+NPS2 is forced onto -- reproduces the full 27x
+bash spxnps1.sh "aid_local_steal_gb=0 mtype_local=1"
+HIP_VISIBLE_DEVICES=6 ./bench_flagplace --layers=200 --tiles=23 --flagstride=64
+
+# same box, same interleave, coherent MTYPE -- 1.52 us
+bash spxnps1.sh "aid_local_steal_gb=0 mtype_local=0"   # or 2 for MTYPE_CC
+```
+
+Confirm which MTYPE is actually in force with
+`dmesg | grep -o 'Using MTYPE_[A-Z]* for local memory'` rather than inferring it
+from the parameters, because `aid_local_xcp_nc` overrides `is_local` after that
+message is printed.
+
+To diagnose the hang under a coherent MTYPE in SPX+NPS2:
+
+```bash
+hipcc -O3 --offload-arch=gfx950 -o bench_hangdiag bench_hangdiag.hip
+
+bash spxnps2.sh "aid_local_steal_gb=0 aid_local_spx_nps2=1 \
+    aid_local_xcp_span=1 mtype_local=2"
+
+# bounded spin; reports what each stuck wave could see, four ways
+HIP_VISIBLE_DEVICES=6 ./bench_hangdiag --tiles=23 --bailms=1000
+
+# one address, eight writers: is it aliasing or coherence?
+HIP_VISIBLE_DEVICES=6 ./bench_hangdiag --alias=1
+```
+
+| `bench_hangdiag` knob | default | what it isolates |
+| --- | --- | --- |
+| `--bailms=N` | 200 | Deadline per spin. Raising it to 5000 lets some waves through, which is how you tell an infinite hang from an eviction-limited one. |
+| `--pdelay=N` | 10000 | Ticks the producer waits before storing, so consumers cache the line first. 0 stores before anyone polls. |
+| `--wb=1` | 0 | `buffer_wbl2 sc0 sc1` after each store, to test whether data is trapped dirty in the producer's L2. |
+| `--cinv=1` | 0 | `buffer_inv sc0 sc1` before every polling load, to test whether a stale consumer line can be invalidated by hand. |
+| `--alias=1` | 0 | All eight XCDs write a distinct value to one dword and read it back, separating address aliasing from coherence failure. |
+
 Switching modes reloads the patched driver; see `set_mode.sh`. Note that script
 hardcodes the module source path, and the host and container see that tree at
 different mount points, so check `SRC` resolves before running it -- a failed
@@ -277,7 +497,8 @@ different mount points, so check `SRC` resolves before running it -- a failed
 | knob | default | what it isolates |
 | --- | --- | --- |
 | `--copies=K` | 1 | Replicas of the eight-flag array; block rank `local` reads copy `local % K`. Total poll count is unchanged, so this isolates per-line sharing. |
-| `--flagstride=B` | 64 | Byte stride between the eight flags within a copy. Production is 64. |
+| `--flagstride=B` | 64 | Byte stride between the eight flags within a copy. Production is 64. MI350 selects the channel from PA[11:8], so 256 spreads the eight flags over eight channels. |
+| `--flagmem=N` | 0 | Allocation flags for the flag array alone. 0 plain `hipMalloc`, else a `hipExtMallocWithFlags` value: 1 fine-grained (VRAM, marks the BO for `aid_local_flag_mtype`), 3 uncached (host memory, not VRAM). |
 | `--tiles=N` | 23 | Workgroups per XCD, so `32N` polling waves. |
 | `--hier=N` | 0 | 0 flat, 2 two-level, 3 two-level with the local flag replicated over 8 lines. |
 | `--sleep=N` | 1 | `s_sleep(1)` repeats per spin iteration, i.e. backoff. |

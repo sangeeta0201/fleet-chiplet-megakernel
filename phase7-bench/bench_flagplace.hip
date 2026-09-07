@@ -253,6 +253,11 @@ int main(int argc, char **argv) {
   int delay_skew = 0;
   long stride_bytes = 64;
   int hier = 0, sleep_n = 1, n_copies = 1;
+  // Allocation flags for the flag array alone; everything else stays on plain
+  // hipMalloc, so this isolates the flag page's MTYPE from the rest of the
+  // working set. 0 = hipMalloc, else a hipExtMallocWithFlags value:
+  // 1 = hipDeviceMallocFinegrained, 3 = hipDeviceMallocUncached.
+  int flagmem = 0;
   char const *tag = "run";
   for (int i = 1; i < argc; ++i) {
     if (!strncmp(argv[i], "--layers=", 9)) {
@@ -269,6 +274,8 @@ int main(int argc, char **argv) {
       sleep_n = atoi(argv[i] + 8);
     } else if (!strncmp(argv[i], "--copies=", 9)) {
       n_copies = atoi(argv[i] + 9);
+    } else if (!strncmp(argv[i], "--flagmem=", 10)) {
+      flagmem = atoi(argv[i] + 10);
     } else if (!strncmp(argv[i], "--tag=", 6)) {
       tag = argv[i] + 6;
     }
@@ -294,7 +301,12 @@ int main(int argc, char **argv) {
   size_t const nsamp = (size_t)NXCD * tiles * NWAVES * n_layers;
   size_t const flag_bytes = (size_t)n_copies * NXCD * stride_bytes + 4096;
   HIP_OK(hipMalloc(&d_attn, REDUCTION * sizeof(unsigned short)));
-  HIP_OK(hipMalloc(&d_flags, flag_bytes));
+  if (flagmem == 0) {
+    HIP_OK(hipMalloc(&d_flags, flag_bytes));
+  } else {
+    HIP_OK(hipExtMallocWithFlags((void **)&d_flags, flag_bytes,
+                                 (unsigned)flagmem));
+  }
   HIP_OK(hipMalloc(&d_local, 8192));
   HIP_OK(hipMemset(d_local, 0, 8192));
   HIP_OK(hipMalloc(&d_relts, NXCD * RELTS_STRIDE * sizeof(unsigned int)));
@@ -314,10 +326,11 @@ int main(int argc, char **argv) {
   HIP_OK(hipMemset(d_vis, 0, nsamp * sizeof(unsigned int)));
   HIP_OK(hipMemset(d_skew, 0, nsamp * sizeof(int)));
 
-  printf("[%s] flags %p  stride %ld B (%zu B span)  %d tiles/XCD  %d waves "
-         "polling  hier=%d sleep=%d  %d layers\n",
+  printf("[%s] flags %p  stride %ld B (%zu B span)  copies %d  flagmem %d  "
+         "%d tiles/XCD  %d waves polling  hier=%d sleep=%d  %d layers\n",
          tag, (void *)d_flags, stride_bytes, (size_t)(NXCD - 1) * stride_bytes,
-         tiles, NXCD * tiles * NWAVES, hier, sleep_n, n_layers);
+         n_copies, flagmem, tiles, NXCD * tiles * NWAVES, hier, sleep_n,
+         n_layers);
 
   hipEvent_t e0, e1;
   HIP_OK(hipEventCreate(&e0));
