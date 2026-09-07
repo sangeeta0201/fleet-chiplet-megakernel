@@ -20,13 +20,15 @@ Measured with `bench_flagplace.hip`, which isolates the flag handshake from the
 GEMM and splits the wait into terms the in-kernel `slicewait` bucket lumps
 together.
 
-**There is a fix that removes the regression rather than mitigating it.** AID
+**There is a fix that closes the regression rather than mitigating it.** AID
 placement is not useful on its own, for the reason above -- but it is what makes
 a *coherent* MTYPE safe to use, and the coherent MTYPE is what absorbs the 184
-readers. Placing one copy of the flags in each AID and routing each XCD to its
-co-located copy gets visibility to **0.85 us**, against 7.60 us for the same
-placement under MTYPE_NC. It needs no global MTYPE change: the coherent MTYPE
-applies to those two BOs alone and every other page in the process stays NC. See
+readers. Place one copy of the flags in each AID, have every producer write both,
+and route each XCD to its co-located copy. In the Phase 7 reproducer that takes
+SPX+NPS2 from **30.56 to 3.83 us per layer**, against **4.28 us in SPX+NPS1** --
+i.e. slightly better than NPS1, not merely closer to it. It needs no global
+MTYPE change: the coherent MTYPE applies to those two BOs alone and every other
+page in the process stays NC. See
 [The fix](#the-fix-aid-local-placement-plus-a-per-bo-coherent-mtype). Flag
 replication (7.5x, no driver knob at all) remains the fallback and is described
 under [replication](#alternative-replicate-the-flag-array).
@@ -463,7 +465,7 @@ default, 23 tiles x 8 XCDs = 184 blocks, 120 layers, 79,488 samples per cell:
 | --- | --- | --- | --- | --- | --- |
 | `cand` | one copy per AID, split routing | coherent (CC) | **0.85** | 0.97 | yes, 0 timeouts |
 | `nc` | one copy per AID, split routing | NC | 7.60 | 9.61 | yes, 0 timeouts |
-| `broken` | both halves on the AID0 copy | coherent (CC) | (0.80) | 0.94 | **no** -- XCD4-7 zero progress |
+| `misrouted` | both halves on the AID0 copy | coherent (CC) | (0.80) | 0.94 | **no** -- XCD4-7 zero progress |
 | `ord` | plain `hipMalloc` | NC | 17.51 | -- | yes (`poll` 20.92) |
 
 `dmesg` confirms which path the driver took rather than leaving it inferred:
@@ -482,7 +484,7 @@ routing held fixed. This is the term that no amount of replication reaches,
 because it changes what answers the poll: the co-located L2 rather than the
 line's home channel.
 
-**`broken` is the correctness control.** Same coherent buffers, but every XCD
+**`misrouted` is the correctness control.** Same coherent buffers, but every XCD
 routed to the AID0 copy. XCD0-3 continued; XCD4-7 timed out on all 92 layers
 they attempted, having never observed a single release. The 0.80 us figure is
 in-domain XCDs only and is not a result -- it is there to show the cell ran. This
@@ -494,11 +496,60 @@ the coherent MTYPE safe.
 failed. Ordinary `hipMalloc` flags in the same driver configuration still
 measure 20.92 us and do not hang, so those pages really did stay MTYPE_NC.
 
+### End to end, against the NPS1 reference
+
+`bench_aidsplit` measures the handshake in isolation. `bench_phase7` runs the
+real dependency structure -- producer publishes its 512-bf16 slice, every wave
+spins on slices 2w and 2w+1, reads its 2 KiB, then all blocks meet at a
+per-layer rendezvous -- so it can be run in both partition modes and answers
+"does this actually reach NPS1" without any cross-harness comparison.
+
+One correction to the harness was needed first. It launched `dim3(NXCD)`: eight
+blocks, 32 polling waves, which is below the fan-out where the regression
+exists. Measured that way SPX+NPS2 showed a 0.68 us slice wait and all
+configurations were identical, consistent with the poller sweep where NPS2 at 32
+waves is *faster* than NPS1. `--tiles` (default 23, production) gives 184 blocks
+and 736 polling waves, one producer per XCD and the rest pure consumers.
+
+Both synchronization objects get the treatment -- the eight flags and the
+rendezvous counter each have a copy per AID, every XCD publishes to and
+increments both, each XCD polls the copy homed in its own AID. `attn_out` stays
+on plain `hipMalloc`, because its slices are read from both AIDs by
+construction.
+
+23 tiles, 1200 layers, the same module loaded in both modes, so only the memory
+partition mode differs:
+
+| mode and flag placement | flag MTYPE | wall us/layer | `slicewait` p50 |
+| --- | --- | --- | --- |
+| SPX+NPS1, plain `hipMalloc` | RW (coherent) | 4.28 | 1.04 |
+| SPX+NPS1, AID-split copies | coherent | 3.91 | 0.92 |
+| SPX+NPS2, plain `hipMalloc` | NC | 30.56 | 14.48 |
+| SPX+NPS2, AID-split copies | NC | 15.68 | 6.68 |
+| SPX+NPS2, AID-split copies | coherent | **3.83** | **0.80** |
+
+The regression is closed rather than mitigated. SPX+NPS2 goes from 7.1x NPS1's
+whole-phase time to slightly *better* than it, and the slice wait from 13.9x to
+0.8x. Repeating the NPS2 rows after a driver reload reproduced them to within
+noise (30.68/14.64 and 3.90/0.80 on the first pass).
+
+Two details worth noting. The whole-phase gain, 30.56 to 3.83 us, is larger than
+the slice wait alone can account for: `base` spends about as long in the
+rendezvous as in the slice wait, and the counter responds to the same treatment,
+which is the phase-9 barrier pathology appearing in this harness. And the `read`
+term falls from 0.76 to 0.08 us, because the pollers are no longer saturating the
+path the `attn_out` reads share -- under NC the flag traffic was interfering with
+the data traffic.
+
+The NPS1 rows also show the fix is not NPS2-specific: it is worth a little in
+NPS1 too (4.28 to 3.91), which is the extra-line effect, since NPS1's readers
+were already being absorbed.
+
 ### Why this is safe for the rest of the model
 
 The rule is: *a coherent BO's readers must be a subset of the XCDs co-located
 with its home AID.* Note it is a property of routing, not of allocation --
-`broken` is correctly AID-placed and still fails.
+`misrouted` is correctly AID-placed and still fails.
 
 Activations, weights and every other buffer are unaffected because they are
 never promoted. They keep MTYPE_NC, and NC resolves every access at the line's
@@ -511,7 +562,7 @@ previous iteration is a plausible hit that no probe arrives to invalidate. That
 failure returns wrong logits with no crash.
 
 There is a structural reason the per-BO version is easier to trust than "be
-careful about placement". Look at how `broken` failed: the out-of-domain XCDs
+careful about placement". Look at how `misrouted` failed: the out-of-domain XCDs
 **hung**, they did not return garbage. A consumer waiting on a flag that never
 arrives stops, loudly. A consumer reading an activation from a stale line
 returns a plausible number and continues. The two failure modes are separated by
@@ -523,7 +574,7 @@ Two guards are still worth having:
 
 - **Driver-side.** As written the branch promotes *any* coherent VRAM BO, so it
   trusts userspace to only mark buffers it has actually AID-placed. Marking a
-  `hipDeviceMallocFinegrained` buffer that is not placed yields the `broken`
+  `hipDeviceMallocFinegrained` buffer that is not placed yields the `misrouted`
   hang, which is precisely what the earlier `--flagmem=1` experiments hit.
   Gating the branch on `AID_LOCAL && COHERENT` makes that mistake impossible to
   express.
@@ -551,12 +602,10 @@ decision; nothing in this section argues for it.
 
 - `bench_aidsplit` and `bench_flagplace` are not directly comparable. They pace
   layers differently and `bench_aidsplit` inherently carries two flag copies, so
-  the honest apples-to-apples claim is the 7.60 -> 0.85 us within one harness,
-  and 17.51 -> 0.85 us against the ordinary-flag path measured in the same
-  session. NPS1's `vis` on `bench_flagplace` is about 1.21 us, so 0.85 us is at
-  least in NPS1's league, but confirming "better than NPS1" needs
-  `bench_aidsplit` run in NPS1 and it has not been.
-- The `broken` cell leaves XCD4-7 spinning to their deadline. Do not run it
+  within that harness the claim is the 7.60 -> 0.85 us it measures directly.
+  The NPS1 comparison should be read off the `bench_phase7` table above instead,
+  where both modes run the same binary in the same geometry.
+- The `misrouted` cell leaves XCD4-7 spinning to their deadline. Do not run it
   without `--bailms`.
 - Phase 7's K-parallel map is what makes the flags readable from both AIDs in
   the first place; this fix does not change the map, it replicates the flags so
@@ -670,10 +719,10 @@ HIP_VISIBLE_DEVICES=6 ./bench_aidsplit --tiles=23 --layers=120 \
 HIP_VISIBLE_DEVICES=6 ./bench_aidsplit --tiles=23 --layers=120 \
     --split=1 --coherent=0 --tag=nc
 
-# broken: coherent, co-location deliberately violated. XCD4-7 will spin to the
-# deadline, so keep --bailms bounded.
+# misrouted: coherent, co-location deliberately violated. This one is SUPPOSED
+# to fail -- XCD4-7 spin to the deadline, so keep --bailms bounded.
 HIP_VISIBLE_DEVICES=6 ./bench_aidsplit --tiles=23 --layers=120 \
-    --split=0 --coherent=1 --bailms=50 --tag=broken
+    --split=0 --coherent=1 --bailms=50 --tag=misrouted
 
 # ord: ordinary pages must still be NC. ~20 us, and critically NOT a hang.
 HIP_VISIBLE_DEVICES=6 ./bench_flagplace --layers=120 --tiles=23 \

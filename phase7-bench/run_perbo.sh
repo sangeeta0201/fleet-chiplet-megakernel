@@ -10,7 +10,9 @@
 # Four cells, and the conclusion needs all four:
 #   cand   placed + coherent      -> want ~0.9 us
 #   nc     placed, not coherent   -> the same placement under NC, ~7.7 us
-#   broken coherent, co-location deliberately broken -> must degrade/stall
+#   misrouted  coherent, co-location deliberately violated -> must stall. This
+#              cell is expected to fail; it is the control that shows the split
+#              routing, not the AID placement, is what makes CC safe.
 #   ord    ordinary hipMalloc     -> must still be ~20 us and must NOT hang
 set -u
 cd ~/fork-fcm/phase7-bench || exit 1
@@ -64,7 +66,7 @@ run() { # tag split coherent
 
 run cand   1 1
 run nc     1 0
-run broken 0 1
+run misrouted 0 1
 
 echo
 echo "--- ord: ordinary hipMalloc flags must still be NC (~20 us, no hang) ---"
