@@ -93,6 +93,12 @@ static void _init_persistent_kernel(std::vector<FullTaskDesc> &all_tasks,
 #define WG_SCALE_BYTES (OPROJ_OUTPUT_PER_WG * (OPROJ_REDUCTION / 32))
 #define WG_BYTES (WG_DATA_BYTES + WG_SCALE_BYTES)
 
+// Byte offset of the scale half within the staged LDS tile. Must match the
+// kernel's OPROJ_LDS_DATA_PAD exactly, or the MFMA reads its scales from the
+// wrong place; both round WG_DATA_BYTES up to a whole 256-thread x 16-byte
+// pass the same way.
+#define LDS_W_DATA_PAD (((WG_DATA_BYTES / 16 + 255) / 256) * 256 * 16)
+
 #define ATTN_SLICE (OPROJ_REDUCTION / NXCD) // 512 bf16 = 1 KiB
 #define FLAG_STRIDE 16                      // ints, matches attn_release[x*16]
 
@@ -269,6 +275,12 @@ static void *alloc_in_aid(size_t bytes, int aid, bool coherent) {
 // offset so it cannot land on a flag line.
 #define BAR_OFF_INTS (1 << 18)
 
+// The hierarchical-barrier release replicas share the same AID-local buffer, at
+// a 1.5 MiB offset so they land on neither a flag line nor the rendezvous
+// counter. Eight lines of 16 ints, the same layout the kernel uses inside
+// `counters`.
+#define HIER_OFF_INTS (3 << 17)
+
 __device__ unsigned int g_local_claim[NXCD];
 
 __device__ __forceinline__ int drv_get_xcd() {
@@ -300,10 +312,18 @@ __global__ __launch_bounds__(NTHREADS) void drive_phase7(
     void *router_bias, void *logits_scratch, void *counters, void *output,
     void *topk_weight, void *routing_indices, void *active_expert_ids,
     int *flags, int *flags_b, unsigned int *bar, unsigned int *bar_b,
+    int *hier_lo, int *hier_hi,
     int *xcd_seen, int n_layers, int delay_ticks, int delay_skew, int tiles,
     int dual, int split_on) {
   int const xcd = drv_get_xcd();
   int const tid = threadIdx.x;
+
+  // The same dynamic LDS the callee declares, so the tile staged below is the
+  // tile its MFMA reads. The offset comes from the kernel's own constexpr
+  // rather than a copied literal.
+  extern __shared__ char _lm_smem[];
+  constexpr int LDS_W_OFF =
+      kernel::oproj_lds_w_off(OPROJ_BATCH, OPROJ_REDUCTION);
 
   // Claim a rank within this XCD rather than trusting a blockIdx->XCD mapping.
   __shared__ int s_local;
@@ -344,8 +364,16 @@ __global__ __launch_bounds__(NTHREADS) void drive_phase7(
         }
       }
       // 256 threads x 1 dword = 512 bf16 = this XCD's slice.
-      drv_st_wt_u32((unsigned int *)my_slice + tid,
-                    (unsigned)(layer * 2654435761u + xcd));
+      //
+      // A well-conditioned bf16 rather than a hash reinterpreted as two
+      // arbitrary exponents. The value depends on both the layer and the XCD,
+      // which is what lets a slice read too early -- still carrying the
+      // previous layer's value -- change the O-proj result. Every term is a
+      // negative power of two, so the stored bf16 is the intended value rather
+      // than a rounding of it.
+      float const fv = 1.0f + 0.5f * (float)(layer & 3) + 0.0625f * (float)xcd;
+      unsigned int const bf = __float_as_uint(fv) >> 16;
+      drv_st_wt_u32((unsigned int *)my_slice + tid, bf | (bf << 16));
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       __syncthreads();
       if (tid == 0) {
@@ -360,6 +388,59 @@ __global__ __launch_bounds__(NTHREADS) void drive_phase7(
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       }
     }
+
+    // ---- stand-in for Phase 6's buffer_load_lds weight DMA --------------
+    //
+    // Without this the MFMA's B operand is an unpopulated LDS tile and the
+    // whole GEMM is zero, whatever the barriers do.
+    //
+    // Re-staged every layer rather than once before the loop: the kernel's own
+    // scratch lives below oproj_lds_w_off() and should not reach this region,
+    // but a harness meant to catch ordering bugs should not rest on that.
+#ifdef MPK_DRV_STAGE_ONCE
+    // The weights are the same every layer, so one copy is enough -- as long as
+    // nothing in the kernel writes into this LDS region between layers. Compare
+    // the hash against the per-layer build to find out.
+    if (layer == 1)
+#endif
+    {
+      // 16 bytes per thread per pass, as one dwordx4. Every base is at least
+      // 16-byte aligned -- hipMalloc returns 256, WG_BYTES is a multiple of 16,
+      // and oproj_lds_w_off() rounds to 16 -- but saying so through uint4 is
+      // what lets the compiler emit the wide access. Spelled as a byte memcpy
+      // it has to assume alignment 1 and copies a byte at a time.
+      uint4 const *w_src =
+          (uint4 const *)(my_weight + (size_t)local * WG_BYTES);
+      uint4 *w_dst = (uint4 *)((unsigned char *)_lm_smem + LDS_W_OFF);
+      for (int i = tid; i < WG_DATA_BYTES / 16; i += NTHREADS) {
+        w_dst[i] = w_src[i];
+      }
+      uint4 const *s_src = w_src + WG_DATA_BYTES / 16;
+      uint4 *s_dst =
+          (uint4 *)((unsigned char *)_lm_smem + LDS_W_OFF + LDS_W_DATA_PAD);
+      for (int i = tid; i < WG_SCALE_BYTES / 16; i += NTHREADS) {
+        s_dst[i] = s_src[i];
+      }
+    }
+
+    // ---- give RMSNorm a row that is not flat ----------------------------
+    //
+    // Every weight byte is identical, so all 16 of a block's output columns
+    // come out equal, and so does every other block's. RMSNorm divides a flat
+    // row by its own RMS and returns exactly 1.0 in every column whatever the
+    // magnitude, which would erase the layer dependence the check needs.
+    // A per-column residual makes the row non-flat and layer-dependent, so a
+    // column read before its XCD stored it shows up in rmsnorm_out.
+    //
+    // Each block writes only the 16 entries it goes on to read itself, so the
+    // __syncthreads below is the whole of the ordering required.
+    if (tid < OPROJ_OUTPUT_PER_WG) {
+      int const gcol = tile_idx * OPROJ_OUTPUT_PER_WG + tid;
+      float const rv = 0.5f * (float)((gcol + layer) & 15);
+      my_residual[local * OPROJ_OUTPUT_PER_WG + tid] =
+          (unsigned short)(__float_as_uint(rv) >> 16);
+    }
+    __syncthreads();
 
     kernel::gang_linear_mxfp4_res_bias_rmsnorm_topk_kernel<
         OPROJ_BATCH, OPROJ_OUTPUT_PER_WG, OPROJ_REDUCTION, ACTUAL_HIDDEN,
@@ -378,7 +459,9 @@ __global__ __launch_bounds__(NTHREADS) void drive_phase7(
         /*routing_ready_ptr=*/nullptr,
         /*layer_epoch=*/layer,
         /*ts_base=*/nullptr,
-        /*attn_slice_release=*/rel);
+        /*attn_slice_release=*/rel,
+        /*hier_release_lo=*/hier_lo,
+        /*hier_release_hi=*/hier_hi);
 
     // ?? per-layer rendezvous across all 184 tiles, as phase 9 does ??
     __syncthreads();
@@ -430,6 +513,7 @@ int main(int argc, char **argv) {
   void *logits = nullptr, *counters = nullptr, *out = nullptr, *tkw = nullptr;
   void *ridx = nullptr, *aeid = nullptr;
   int *flags = nullptr, *flags_b = nullptr, *xcd_seen = nullptr;
+  int *hier_lo = nullptr, *hier_hi = nullptr;
   unsigned int *bar = nullptr, *bar_b = nullptr;
   int dual = 0;
 
@@ -453,7 +537,20 @@ int main(int argc, char **argv) {
   HIP_OK(hipMalloc(&xcd_seen, NXCD * sizeof(int)));
 
   HIP_OK(hipMemset(attn, 0, OPROJ_REDUCTION * 2));
-  HIP_OK(hipMemset(weight, 0x11, weight_bytes));
+  // Two fills, because a group's data and scale halves are different formats.
+  // e2m1 0x2 is 1.0, so 0x22 is a pair of ones. The scale is E8M0 biased at
+  // 127, and 0x77 is 2^-8, chosen so a 4096-long reduction of ones lands near
+  // 20 instead of 4096: bf16 resolves 0.125 there, and one XCD's slice going
+  // stale moves the result by 1.0, so it survives the store instead of
+  // rounding away.
+  //
+  // The single 0x11 fill this replaces left every scale at 2^-110, which
+  // underflowed all 4096 products and made the harness compute zeros.
+  for (int g = 0; g < NXCD * tiles; ++g) {
+    char *wg = (char *)weight + (size_t)g * WG_BYTES;
+    HIP_OK(hipMemset(wg, 0x22, WG_DATA_BYTES));
+    HIP_OK(hipMemset(wg + WG_DATA_BYTES, 0x77, WG_SCALE_BYTES));
+  }
   HIP_OK(hipMemset(residual, 0, OUTPUT_STRIDE * 2));
   HIP_OK(hipMemset(bias, 0, OUTPUT_STRIDE * 2));
   HIP_OK(hipMemset(nw, 0x3c, ACTUAL_HIDDEN * 2)); // ~1.0 bf16
@@ -487,6 +584,13 @@ int main(int argc, char **argv) {
     flags_b = (int *)fb;
     bar = (unsigned int *)(flags + BAR_OFF_INTS);
     bar_b = (unsigned int *)(flags_b + BAR_OFF_INTS);
+    // Only with --split=1. Handing both halves the same replica would be the
+    // misrouted case: coherent lines whose readers span both partitions, which
+    // hangs rather than running slowly.
+    if (split_on) {
+      hier_lo = flags + HIER_OFF_INTS;
+      hier_hi = flags_b + HIER_OFF_INTS;
+    }
     HIP_OK(hipMemset(flags, 0, sync_bytes));
     HIP_OK(hipMemset(flags_b, 0, sync_bytes));
     dual = 1;
@@ -500,8 +604,8 @@ int main(int argc, char **argv) {
 
   printf("[%s] attn_out %p  flags %p / %p  weight %p (%.2f MiB)\n", tag, attn,
          (void *)flags, (void *)flags_b, weight, weight_bytes / 1048576.0);
-  printf("[%s] aid=%d coherent=%d split=%d\n", tag, use_aid, (int)g_coherent,
-         split_on);
+  printf("[%s] aid=%d coherent=%d split=%d hier_split=%d\n", tag, use_aid,
+         (int)g_coherent, split_on, hier_lo != nullptr);
   printf("[%s] %d tiles (%d/XCD), %d threads, %d layers, delay=%d skew=%d, "
          "%d polling waves\n",
          tag, NXCD * tiles, tiles, NTHREADS, n_layers, delay_ticks, delay_skew,
@@ -518,8 +622,9 @@ int main(int argc, char **argv) {
   hipLaunchKernelGGL(drive_phase7, dim3(NXCD * tiles), dim3(NTHREADS),
                      MAX_DYNAMIC_SHARED_MEMORY_SIZE, 0, attn, weight, residual,
                      bias, nw, no, rw, rb, logits, counters, out, tkw, ridx,
-                     aeid, flags, flags_b, bar, bar_b, xcd_seen, n_layers,
-                     delay_ticks, delay_skew, tiles, dual, split_on);
+                     aeid, flags, flags_b, bar, bar_b, hier_lo, hier_hi,
+                     xcd_seen, n_layers, delay_ticks, delay_skew, tiles, dual,
+                     split_on);
   HIP_OK(hipEventRecord(e1));
   HIP_OK(hipDeviceSynchronize());
   HIP_OK(hipGetLastError());
@@ -534,5 +639,73 @@ int main(int argc, char **argv) {
   }
   printf("\n[%s] wall %.2f ms / %d layers = %.2f us per layer\n", tag, ms,
          n_layers, ms * 1000.0 / n_layers);
+
+  // Correctness gate for the barrier. Inputs are constant memsets and the
+  // per-layer producer value is a pure function of (layer, xcd), so both
+  // buffers below are deterministic when the barrier holds. Two runs that
+  // disagree on rmsnorm_out while agreeing on attn_proj_out mean the norm read
+  // columns that were not yet published -- which is exactly what this barrier
+  // exists to prevent, and what a routing mistake in the release flags would
+  // cause.
+  {
+    size_t const out_bytes = OUTPUT_STRIDE * 2;
+    size_t const norm_bytes = ACTUAL_HIDDEN * 2;
+    size_t const big = out_bytes > norm_bytes ? out_bytes : norm_bytes;
+    unsigned char *hb = (unsigned char *)malloc(big);
+    if (hb != nullptr) {
+      unsigned long long h[2];
+      void *src[2] = {out, no};
+      size_t len[2] = {out_bytes, norm_bytes};
+      for (int k = 0; k < 2; ++k) {
+        HIP_OK(hipMemcpy(hb, src[k], len[k], hipMemcpyDeviceToHost));
+        unsigned long long v = 1469598103934665603ull;
+        for (size_t i = 0; i < len[k]; ++i) {
+          v ^= hb[i];
+          v *= 1099511628211ull;
+        }
+        h[k] = v;
+      }
+      printf("[%s] hash attn_proj_out=%016llx rmsnorm_out=%016llx\n", tag, h[0],
+             h[1]);
+      free(hb);
+    }
+    // Which buffers the kernel actually touched. A zero nonzero-count means
+    // the phase never published anything there, which is a different problem
+    // from publishing the wrong thing.
+    struct {
+      char const *name;
+      void *dev;
+      size_t bytes;
+    } probes[] = {
+        // inputs first: this is the half of the dataflow still unexplained
+        {"attn_out(in)", attn, OPROJ_REDUCTION * 2},
+        {"weight_data(in)", weight, 256},
+        {"weight_scale(in)", (char *)weight + WG_DATA_BYTES, 256},
+        {"norm_weight(in)", nw, 256},
+        {"attn_proj_out", out, OUTPUT_STRIDE * 2},
+        {"rmsnorm_out", no, ACTUAL_HIDDEN * 2},
+        {"topk_weight", tkw, 4096},
+        {"routing_indices", ridx, 4096},
+        {"logits_scratch", logits, 4096},
+        {"counters", counters, 4096},
+    };
+    for (unsigned p = 0; p < sizeof(probes) / sizeof(probes[0]); ++p) {
+      unsigned char *b = (unsigned char *)malloc(probes[p].bytes);
+      if (b == nullptr) {
+        continue;
+      }
+      HIP_OK(hipMemcpy(b, probes[p].dev, probes[p].bytes, hipMemcpyDeviceToHost));
+      size_t nz = 0;
+      for (size_t i = 0; i < probes[p].bytes; ++i) {
+        nz += (b[i] != 0);
+      }
+      unsigned int const *w = (unsigned int const *)b;
+      printf("[%s] %-16s %6zu/%zu nonzero bytes  head %08x %08x %08x %08x\n",
+             tag, probes[p].name, nz, probes[p].bytes, w[0], w[1], w[2], w[3]);
+      free(b);
+    }
+    {
+    }
+  }
   return 0;
 }

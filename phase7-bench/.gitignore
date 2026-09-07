@@ -4,3 +4,6 @@ bench_hangdiag
 bench_phase7
 bench_phase7_dup
 drive_phase7
+drive_phase7_nopoll
+drive_phase7_noslice
+drive_phase7_once

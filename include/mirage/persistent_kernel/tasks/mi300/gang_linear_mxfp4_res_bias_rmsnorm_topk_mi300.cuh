@@ -333,7 +333,18 @@ __device__ __attribute__((noinline)) void
         // not wait for attention at all. Passed rather than derived from
         // `counters_ptr` so the slot number stays owned by the one file that
         // lays that buffer out.
-        int const *attn_slice_release = nullptr) {
+        int const *attn_slice_release = nullptr,
+        // Optional: one replica per memory partition of the eight per-XCD
+        // hierarchical release flags, same 16-int stride as the copy inside
+        // `counters`. In SPX+NPS2 a compute partition spans two memory
+        // partitions, and a coherent MTYPE is only sound for readers
+        // co-located with the line's home partition -- so the caller can place
+        // one replica in each and let each half of the XCDs poll its own. Both
+        // replicas are written the same value; only the reads are partitioned.
+        // Null means the single shared copy, which is the behaviour every
+        // other caller gets.
+        int *hier_release_lo = nullptr,
+        int *hier_release_hi = nullptr) {
 
   static_assert(OUTPUT_PER_WG % 16 == 0,
                 "OUTPUT_PER_WG must be multiple of 16");
@@ -658,7 +669,14 @@ __device__ __attribute__((noinline)) void
         __builtin_amdgcn_s_sleep(1);
       } while (true);
 #else
+#ifdef MPK_OPROJ_SKIP_SLICE_POLL
+      // Negative control; never define this in a real build. The acquire below
+      // still runs, so what changes is only whether the slice was published
+      // before this wave read it.
+      while (false) {
+#else
       while (ld_sys_s32(rel0) < layer_epoch || ld_sys_s32(rel1) < layer_epoch) {
+#endif
 #ifndef MPK_SLICE_BUSY_POLL
         __builtin_amdgcn_s_sleep(1);
 #endif
@@ -1480,9 +1498,19 @@ oproj_barrier :
     // layer loop -- it is one task per dispatch -- so it passes 0 and keeps the
     // snapshot, which is safe there precisely because there is no second layer
     // to race with.
+    // Which copy of the release flags this XCD polls. The global arrival
+    // counter at [8 * HIER_STRIDE] is deliberately not routed: it is the one
+    // place all eight dies aggregate, so it cannot be replicated.
+    int const n_xcds =
+        tiles_per_xcd > 0 ? total_oproj_tiles / tiles_per_xcd : 8;
+    int *const hier_rel =
+        (hier_release_lo && hier_release_hi)
+            ? (xcd_id < n_xcds / 2 ? hier_release_lo : hier_release_hi)
+            : hier_barrier;
+
     int const oproj_release_expected =
         layer_epoch > 0 ? layer_epoch
-                        : ld_nt_s32(&hier_barrier[xcd_id * HIER_STRIDE]) + 1;
+                        : ld_nt_s32(&hier_rel[xcd_id * HIER_STRIDE]) + 1;
 
     // ── Release fan-out: one wave instruction, not eight serial stores ────
     //
@@ -1633,7 +1661,16 @@ oproj_barrier :
     // why 0 is a safe "not the releaser" sentinel.
     oproj_rel_epoch = __builtin_amdgcn_readfirstlane(oproj_rel_epoch);
     if (oproj_rel_epoch != 0) {
-      if (tid < 8) {
+      if (hier_release_lo && hier_release_hi) {
+        // Sixteen flags: eight per replica. Lanes 0..15 of this wave differ
+        // only in the address they form, so both replicas are published in
+        // the same single store instruction the one-copy form uses.
+        if (tid < 16) {
+          int *const dst = (tid < 8) ? hier_release_lo : hier_release_hi;
+          st_wt_u32((void *)&dst[(tid & 7) * HIER_STRIDE],
+                    (unsigned)oproj_rel_epoch);
+        }
+      } else if (tid < 8) {
         st_wt_u32((void *)&hier_barrier[tid * HIER_STRIDE],
                   (unsigned)oproj_rel_epoch);
       }
@@ -1735,8 +1772,15 @@ oproj_barrier :
     // other 255 threads do not need their own sc0 sc1 reads of this line.
     if (tid == 0)
 #endif
-      while (MPK_LD_GATE2(&hier_barrier[xcd_id * HIER_STRIDE]) <
+#ifdef MPK_OPROJ_SKIP_HIER_POLL
+      // Negative control; never define this in a real build. The release flag
+      // is still written, just never waited on, so the only thing that changes
+      // is whether the row is complete when RMSNorm reads it.
+      while (false) {
+#else
+      while (MPK_LD_GATE2(&hier_rel[xcd_id * HIER_STRIDE]) <
              oproj_release_expected) {
+#endif
         __builtin_amdgcn_s_sleep(1);
       }
   }

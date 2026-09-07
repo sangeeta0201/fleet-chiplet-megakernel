@@ -126,6 +126,61 @@ Replicating the flag array 16 times -- same total poll count, 16x fewer readers
 per line, no driver knob at all -- takes the wait from 20.5 us to 2.7 us and
 remains the fallback if per-allocation memory types are unavailable.
 
+## Using this safely: the co-location rule
+
+`aid_local_flag_mtype=2` hands a coherent memory type to any VRAM buffer that
+asks for one, and there is exactly one rule that keeps that safe:
+
+> **A buffer with a coherent MTYPE must only be read by the compute dies
+> co-located with the memory quadrant it is homed in.**
+
+Break it and the out-of-domain readers hang. They cache the line in their own
+L2, the producer's store never reaches them as an invalidation probe -- DF
+probes do not cross the quadrant boundary -- and they spin on a stale value
+until their deadline. The `misrouted` cell in `ROOT-CAUSE.md` is that failure
+reproduced deliberately.
+
+The rule is narrower than it first sounds, in three ways that matter:
+
+- **It binds only promoted buffers.** Everything else keeps MTYPE_NC, which
+  resolves every access at the line's home, so a cross-quadrant read stays
+  correct and is merely slow. Reading remote memory was never the problem;
+  *caching* remote memory is.
+- **It constrains readers, not writers.** A store from a die in the far
+  quadrant still correctly invalidates the sharers that *are* co-located with
+  the line, which is exactly what lets one producer publish into both replicas.
+  `bench_hangdiag` measures this.
+- **Neither half is sufficient alone.** The buffer must be AID-placed *and* its
+  consumers routed to the replica in their own quadrant. `bench_aidsplit`
+  measures all four combinations: placement without coherence is 7.60 us,
+  coherence without correct routing hangs, and only both together reach
+  0.85 us.
+
+### How to avoid the mistake
+
+- Request `AID_LOCAL | AID_SELECT | COHERENT` in a single `GEM_CREATE`, so a
+  buffer can never be marked coherent without also being placed.
+- Derive each consumer's pointer from its own XCD id. Handing one pointer to
+  all eight dies is the entire failure mode.
+- **Confine the coherent MTYPE to synchronization variables.** This is the load
+  bearing one. A routing mistake on a flag hangs immediately and visibly; the
+  same mistake on a data buffer returns a plausible stale number and corrupts
+  results silently. Keeping the promotion inside the category where mistakes
+  announce themselves is what makes it safe to ship.
+- Do not reach for the global `mtype_local=2` instead. It buys the same latency
+  by promoting *all* VRAM, including the activation buffers a megakernel
+  rewrites every layer -- precisely the silent case above.
+- Gate it: run with `aid_local_flag_mtype=0` and `=2` and compare logits
+  bitwise. Bit-identical means no coherent buffer is being read out of domain.
+
+The driver cannot check this for you. It sees where a buffer is placed but not
+which dies will read it, so the routing half is a contract the calling code
+has to keep. Two details of the current implementation are worth knowing:
+the promotion branch tests only `COHERENT`, so a marked-but-unplaced buffer is
+promoted anyway and then hangs; and `AID_LOCAL` stays set on a buffer even when
+`amdgpu_gmc_aid_aperture()` returns NULL and it was placed unconstrained, so
+the flag on its own is not evidence of placement.
+
 ## Geometry being modeled
 
 Lifted from the generated `test.cu`, the fused layer instantiates as
@@ -226,6 +281,45 @@ and confirm the mode independently:
 cat /sys/bus/pci/devices/0000:e5:00.0/current_memory_partition
 ```
 
+### 5. The same-build NPS1 vs NPS2 breakdown
+
+The table in `results/nps1-vs-nps2.md` comes from **one binary**, run in both
+partition modes. That matters: the correctness changes shifted the NPS2 total by
+about 0.5 us, which is the same order as the gap being argued about, so a
+comparison assembled from two builds would not settle anything.
+
+Both source changes are **already applied on this branch** -- the kernel header
+carries the hier-split parameters and the two negative-control `#ifdef`s, and
+`drive_phase7.cu` carries the weight staging. The `patch_*.py` scripts are the
+record of how each was derived, with the reasoning in their docstrings; they
+apply only to an unpatched tree and will refuse to run against this one, since
+each checks its anchor matches exactly once.
+
+So from a checkout of this branch, it is build and run:
+
+```bash
+cp phase7-bench/drive_phase7.cu "$HOME/fleet-chiplet-megakernel/"
+cp phase7-bench/{build_gate.sh,rebuild_all.sh,gate_all.sh,buckets.sh} "$HOME/"
+cp phase7-bench/{combine.sh,cmp_outputs.sh,killhang.sh,violate_colocation.sh} "$HOME/"
+cp phase7-bench/{set_mode2.sh,run_root.py} "$HOME/"
+
+bash rebuild_all.sh                 # the three binaries, from one source state
+bash gate_all.sh                    # sensitivity, determinism, both controls, 3-way identity
+bash violate_colocation.sh          # the rule failing on purpose; then killhang.sh
+
+bash buckets.sh nps2_base --aid=0
+bash buckets.sh nps2_fix  --aid=1 --coherent=1 --split=1
+sudo -n python3 run_root.py set_mode2.sh NPS1     # ~2 min, reloads amdgpu
+bash buckets.sh nps1      --aid=0
+sudo -n python3 run_root.py set_mode2.sh NPS2     # restore
+bash combine.sh                     # assemble the three runs into one table
+bash cmp_outputs.sh                 # every probed buffer, not just the hashed two
+```
+
+`buckets.sh` prints the output hash alongside the medians on purpose. Two modes
+agreeing on latency means nothing if they disagree on the answer, and one of
+them being fast because it was wrong is exactly the failure to rule out.
+
 ## Knobs
 
 | flag | default | isolates |
@@ -241,11 +335,21 @@ model numbers are directly comparable.
 
 ## Known gaps
 
-- **`mfma` does not reproduce** (1.2x vs 3.8x). The harness has no Phase 6
-  weight-DMA overlap and no competing QKV or MoE traffic, and its 6.11 MiB of
-  uniform weights behave differently from the real MXFP4 tensors. The
-  synchronization buckets reproduce; the compute term still needs the full
-  workload to attribute.
+- **`mfma` does not reproduce, and the reason is now specific.** The K-parallel
+  arm reads its MFMA B operand from LDS at `oproj_lds_w_off()`, which the fused
+  caller fills during Phase 6. This harness stages that tile itself, from the
+  *harness* side, outside the kernel's `t0..t4` window -- so the bucket measures
+  the LDS read, the FP8 quantize and the MFMA issue, and never the global weight
+  fetch. Staging real weights instead of leaving the tile empty moved `mfma` by
+  -0.12 us, which is how little it depends on the weights being present at all.
+  The model's `mfma` going 1.56 -> 5.92 is a different quantity and is not
+  addressed here.
+- **The harness has to re-stage the weight tile every layer.** Hoisting the copy
+  out of the layer loop (`patch_lds_once.py`, `-DMPK_DRV_STAGE_ONCE`) produces a
+  different output hash on every run, so something in the kernel writes into the
+  LDS region at or above `oproj_lds_w_off()` between layers. Consistent with the
+  real Phase 6 issuing its DMA per layer; worth knowing before assuming that
+  region is private.
 - **The per-layer rendezvous is itself a cross-AID barrier**, so a little of the
   9.68 us is barrier-release skew rather than pure flag propagation. It is
   bounded by the `bar` number.
@@ -264,6 +368,11 @@ model numbers are directly comparable.
   more distance: see `ROOT-CAUSE.md`.
 - **Output is numerically incomplete at `--tiles < 23`**, since fewer weight
   groups are computed. Timing stays valid; the tensor values do not.
+- **Correctness is now gated, and the gate has been shown to fail.** It did not
+  used to be: every output was identically zero, so a barrier that released
+  early read the wrong layer's data and still hashed the same. See
+  `results/correctness-gate.md` for what was wrong and the two negative controls
+  that now hold the gate honest.
 
 ## Files
 
@@ -279,3 +388,20 @@ model numbers are directly comparable.
 | `bench_flagplace.hip` | Flag-placement probe. Runtime flag stride, poller count, two-level gate and spin backoff; splits the wait into poll / visibility / producer skew / invalidate. |
 | `ROOT-CAUSE.md` | Why NPS2 costs 27x: the page MTYPE plus waves-per-line, with the stride, poller and replication sweeps and a measured 7.5x fix. |
 | `results/` | Captured output backing the tables above. |
+| `patch_hier_split.py` | The fix: one release replica per memory partition, each half of the XCDs polling its own. |
+| `patch_lds_stage.py` | Stands in for Phase 6's weight DMA, fixes the underflowed E8M0 scales, and varies the residual per column. Without it every output is zero. |
+| `patch_lds_fast.py` | Makes the staging a `dwordx4` copy; through `unsigned char *` the compiler cannot assume alignment. |
+| `patch_lds_once.py` | `-DMPK_DRV_STAGE_ONCE`. Kept because it *fails*: proof the kernel reuses the LDS weight region between layers. |
+| `patch_poll_skip.py` | `-DMPK_OPROJ_SKIP_HIER_POLL`. Negative control for the hierarchical barrier. |
+| `patch_slice_skip.py` | `-DMPK_OPROJ_SKIP_SLICE_POLL`. Negative control for the attention-slice barrier. |
+| `build_gate.sh` | Builds with extra defines, deriving the flag list from `build_drive_aid.sh` rather than restating it. |
+| `rebuild_all.sh` | The three gate binaries, from one source state. |
+| `gate_all.sh` | The gate: layer sensitivity, determinism, both negative controls, and the three-way identity check. |
+| `violate_colocation.sh` | The co-location rule failing on purpose. Wedges the GPU; pair with `killhang.sh`. |
+| `buckets.sh` / `combine.sh` | One bucket breakdown per mode, then assembled into a single table. |
+| `cmp_outputs.sh` | Diffs every probed buffer across modes, not just the two that go into the hash. |
+| `cmp_once.sh` | Reproduces the per-layer-staging finding above. |
+| `killhang.sh` | Tears down a wedged run. `pkill -f drive_phase7` does not work: the pattern matches its own ssh wrapper and kills the parent first. |
+| `set_mode2.sh` / `run_root.py` | Partition switch asserting SPX explicitly, and the `sudo -n python3` launcher it needs. |
+| `results/nps1-vs-nps2.md` | The same-build NPS1 / NPS2-base / NPS2-fixed breakdown. |
+| `results/correctness-gate.md` | Why the first gate proved nothing, and the two controls that fixed it. |

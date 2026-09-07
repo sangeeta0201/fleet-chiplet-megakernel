@@ -1,0 +1,7 @@
+# nps2_fix	SPX/NPS2	2240 samples
+slicewait	0.40	0.36	0.40
+mfma	3.92	3.88	4.00
+bar	2.36	2.00	2.64
+rmsnorm_router	1.60	1.44	1.72
+topk	1.76	0.44	6.00
+total	10.04	8.76	14.48
