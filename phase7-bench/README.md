@@ -51,6 +51,30 @@ Reproduced standalone, medians in microseconds per layer:
 The two synchronization buckets -- together 60% of the regression -- reproduce
 within a few percent of the full-model measurement.
 
+### Where it ended up
+
+Same build, same 400 layers, all five columns agreeing on both output hashes
+(`breakdown_all.sh`). `fix` is per-AID release replicas plus per-AID level-1
+arrival lines; `tree` adds the AID-aware inter-layer rendezvous:
+
+| bucket | NPS1 | NPS1 tree | NPS2 base | NPS2 fix | NPS2 tree | tree vs NPS1 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `slicewait` | 0.40 | 0.40 | 4.08 | 0.40 | 0.40 | +0.00 |
+| `mfma` | 3.96 | 3.96 | 5.00 | 3.96 | 3.96 | +0.00 |
+| `bar` | 1.80 | 1.80 | 6.28 | 2.44 | **2.32** | **+0.52** |
+| `rmsnorm_router` | 1.52 | 1.52 | 1.48 | 1.76 | 1.56 | +0.04 |
+| `topk` | 2.00 | 2.12 | 1.92 | 2.16 | 2.20 | +0.20 |
+| **total** | **9.68** | 9.92 | **21.88** | 10.80 | **10.40** | **+0.72** |
+
+NPS2 goes from **2.26x NPS1 to 1.07x**: 11.48 of the 12.20 us partitioning
+penalty recovered, 94%, with 0.72 us left and 0.52 of that in `bar`. `slicewait`
+and `mfma` are at exact parity, so the entire remaining gap is synchronization.
+
+The NPS1-tree column is the control, and it is the reason the tree is a
+partitioning fix rather than a barrier improvement: with one coherence domain
+there is no boundary to keep traffic off, so the extra level is pure overhead and
+costs 0.24 us. `bar` itself is unchanged at 1.80 either way.
+
 ### The cost is queueing, not per-crossing latency
 
 `--tiles=N` varies how many workgroups poll the eight release flags. Every block
@@ -462,4 +486,5 @@ model numbers are directly comparable.
 | `gate_lsplit.sh` | Correctness gate for `--lsplit`. Derives the reference from the first configuration rather than hardcoding a hash, because the recorded pair is specific to 400 layers -- the harness residual is a function of `layer & 15`. |
 | `gate_hrdv.sh` | Correctness gate for `--hrdv`. Four configurations including the tree with one coherence domain, which is both the shape-versus-placement control and the check that the aliased path is still a 4/4 barrier. |
 | `skew_hrdv.sh` | Entry stagger with the tree rendezvous on and off. `bar` alone cannot attribute the change; the entry columns can, because they are read before the barrier has done anything. |
+| `breakdown_all.sh` | The five-column table above, one build, both partition modes, NPS2 restored in an `EXIT` trap. Includes the tree in NPS1, which is the control that separates the fan-in from the placement. |
 | `results/bar-attribution.md` | Where the residual `bar` gap actually goes: arrival skew, not the barrier's memory protocol. Includes the level-1 split that works and buys nothing, the entry-versus-arrival split that exonerates Phase 7, and the tree rendezvous that recovers a third of the skew. |
