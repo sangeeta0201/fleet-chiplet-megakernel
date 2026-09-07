@@ -1,0 +1,35 @@
+diff --git a/include/mirage/persistent_kernel/tasks/mi300/gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh b/include/mirage/persistent_kernel/tasks/mi300/gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh
+index c6265b9..c4ad914 100644
+--- a/include/mirage/persistent_kernel/tasks/mi300/gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh
++++ b/include/mirage/persistent_kernel/tasks/mi300/gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh
+@@ -447,6 +447,7 @@ __device__ __attribute__((noinline)) void
+   // read 17.2 us without it and 599 us with it). Enable one or the other.
+   unsigned long long _op_t0 = __builtin_amdgcn_s_memrealtime();
+   unsigned long long _op_t1 = _op_t0, _op_t2 = _op_t0, _op_t3 = _op_t0;
++  unsigned long long _op_t0b = _op_t0;
+ #endif
+ 
+   int batch_count =
+@@ -674,6 +675,9 @@ __device__ __attribute__((noinline)) void
+ #ifdef MPK_OPROJ_POLL_BEFORE_DRAIN
+       __syncthreads();
+ #endif
++#ifdef MPK_OPROJ_INNER_TIMING
++      _op_t0b = __builtin_amdgcn_s_memrealtime();
++#endif
+ 
+       i32x4_t const *src = (i32x4_t const *)(A + base);
+       i32x4_t v0 = src[0];
+@@ -2789,9 +2793,10 @@ done :
+   // first and last arriver both waiting ~5.6 us).
+   if (tid == 0 && (tile_idx % tiles_per_xcd) == 0) {
+     unsigned long long _op_t4 = __builtin_amdgcn_s_memrealtime();
+-    printf("[OPROJ_INNER] mfma=%.2f bar=%.2f "
++    printf("[OPROJ_INNER] slicewait=%.2f mfma=%.2f bar=%.2f "
+            "rmsnorm_router=%.2f topk=%.2f total=%.2f\n",
+-           (double)(_op_t1 - _op_t0) * 10.0 / 1000.0,
++           (double)(_op_t0b - _op_t0) * 10.0 / 1000.0,
++           (double)(_op_t1 - _op_t0b) * 10.0 / 1000.0,
+            (double)(_op_t2 - _op_t1) * 10.0 / 1000.0,
+            (double)(_op_t3 - _op_t2) * 10.0 / 1000.0,
+            (double)(_op_t4 - _op_t3) * 10.0 / 1000.0,
