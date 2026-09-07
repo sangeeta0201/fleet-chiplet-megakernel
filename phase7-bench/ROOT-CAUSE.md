@@ -28,10 +28,39 @@ and route each XCD to its co-located copy. In the Phase 7 reproducer that takes
 SPX+NPS2 from **30.56 to 3.83 us per layer**, against **4.28 us in SPX+NPS1** --
 i.e. slightly better than NPS1, not merely closer to it. It needs no global
 MTYPE change: the coherent MTYPE applies to those two BOs alone and every other
-page in the process stays NC. See
-[The fix](#the-fix-aid-local-placement-plus-a-per-bo-coherent-mtype). Flag
+page in the process stays NC. It is also confirmed in production code rather
+than only in a reproducer: linking the real kernel, the `slicewait` bucket goes
+from **14.16 to 0.36 us per layer, which is exactly the SPX+NPS1 reference**,
+and it needed no change to the fleet headers. See
+[The fix](#the-fix-aid-local-placement-plus-a-per-bo-coherent-mtype) and
+[the production kernel](#in-the-production-kernel). Flag
 replication (7.5x, no driver knob at all) remains the fallback and is described
 under [replication](#alternative-replicate-the-flag-array).
+
+## Vocabulary
+
+This document uses the driver's and the hardware's own names for things. In
+plain terms:
+
+| term | what it means |
+| --- | --- |
+| memory type, `MTYPE` | A per-page tag the driver writes into the page table entry, telling the caches how they may treat that page. |
+| non-coherent, `MTYPE_NC` | No cache may keep a copy of these lines. Every read is serviced at memory, every time. |
+| cacheable, `MTYPE_RW` / `MTYPE_CC` | Caches may keep copies, and the hardware keeps them consistent by sending messages when a value changes. |
+| buffer object, BO | One allocation, tracked by the driver as a unit with its own properties. Every `hipMalloc` creates one underneath. |
+| `GEM_CREATE` | The driver call that creates one allocation. Unlike `hipMalloc` it lets the caller request properties, which is how a home AID and a cacheable memory type get asked for. |
+| XCD | One compute die. This part has eight. |
+| AID | One memory quadrant, with its own memory controllers. In NPS2 there are two, and each is a separate consistency scope. |
+| compute partition, XCP | How the eight compute dies are grouped. `SPX` puts all eight in one group. |
+| `NPS1` / `NPS2` | Memory presented as one quadrant, or split into two. |
+| L2 | Each compute die's own cache. |
+| home, home channel | The single memory controller that owns a given cache line. All traffic for that line is serviced there. |
+| probe | The message the home controller sends to a cache telling it to drop a now-stale copy. |
+
+The mismatch behind everything here: in `SPX` + `NPS2` the eight compute dies
+form one group while memory is two separate scopes. "Is this page local to my
+group?" then has no correct answer, and the driver's safe response is to mark
+every page non-coherent.
 
 ## What the flags are
 
@@ -545,6 +574,163 @@ The NPS1 rows also show the fix is not NPS2-specific: it is worth a little in
 NPS1 too (4.28 to 3.91), which is the extra-line effect, since NPS1's readers
 were already being absorbed.
 
+### In the production kernel
+
+`bench_phase7` reimplements Phase 7's dependency structure. `drive_phase7`
+instead *links the real kernel*: it calls
+`gang_linear_mxfp4_res_bias_rmsnorm_topk_kernel` with the same template
+instantiation the model uses, built with the same feature defines lifted from a
+model build log, so the five `[OPROJ_INNER]` buckets come out of production code
+rather than a reimplementation that could miss the effect.
+
+It also turns out to be the cheapest place to apply the fix. The real kernel
+receives the flag array as a parameter, `attn_slice_release`, and the producer
+store lives in the harness rather than in the kernel. So the entire slice-wait
+fix lands in the harness with **no change to the fleet headers**: allocate one
+AID-local cacheable replica per AID, publish into both, and hand each XCD the
+pointer to the replica homed in its own AID.
+
+SPX+NPS2, 200 layers, 23 tiles per XCD, 1600 samples per cell, same binary in
+both rows:
+
+| bucket | NPS2 base | NPS2 + fix | NPS1 reference |
+| --- | --- | --- | --- |
+| `slicewait` | 14.16 | **0.36** | 0.36 |
+| `bar` | 6.56 | 3.80 | 2.32 |
+| `mfma` | 3.40 | 4.08 | 1.44 |
+| `rmsnorm_router` | 1.52 | 1.56 | 1.68 |
+| `topk` | 2.16 | 1.80 | 0.76 |
+| `total` | 29.52 | **11.56** | 6.56 |
+
+`slicewait` matches the NPS1 reference exactly, in production code, at
+production fan-out. Two second-order effects are worth recording because both
+are informative:
+
+- **`bar` improved without being touched.** Its lines live in `counters`, still
+  a plain `hipMalloc` and still non-coherent. Removing ~1472 uncached polls per
+  layer freed the channels that the barrier's own traffic shares. The same
+  collateral shows up in `bench_phase7`'s `read` bucket, 0.40 to 0.08. It is a
+  reminder that under `MTYPE_NC` the flag traffic was degrading unrelated
+  traffic, so parts of the regression are not attributable to the phase that
+  appears to own them.
+- **`mfma` moved the wrong way**, 3.40 to 4.08 against NPS1's 1.44. This reads
+  as the bottleneck relocating: the slow flag wait used to stagger the waves,
+  and once it is gone they arrive together and contend for the weight buffer,
+  which is still non-coherent. It is now the largest single unexplained gap.
+
+Ignore the harness's own `wall` line here. `MPK_OPROJ_INNER_TIMING` performs a
+device-side `printf` per XCD per layer, which dominates it; the buckets are the
+signal.
+
+### Replicating the slice data does not help
+
+`attn_out` is the other cross-AID object in the phase, and unlike the flags it
+is genuinely all-to-all: every consumer reads all eight slices, so four are
+remote whatever the placement. Since the buffer is only 8 KiB, replicating it
+per AID and pointing each XCD at its own copy is nearly free, so it was worth
+measuring. It was measured and rejected (`bench_phase7 --dupdata`):
+
+| slice buffer | wall us/layer | `slicewait` p50 | `read` p50 |
+| --- | --- | --- | --- |
+| `--dupdata=0`, single, NC | 3.81 | 0.84 | 0.08 |
+| `--dupdata=1`, one copy per AID, NC | 3.87 | 0.88 | 0.08 |
+| `--dupdata=2`, one copy per AID, cacheable | 3.87 | 0.92 | 0.08 |
+
+The `read` term is 0.08 us in every cell, and 0.08 in NPS1 as well -- there is
+no local-versus-remote asymmetry to recover. The reason is the access shape: the
+2 KiB a wave reads is eight independent coalesced loads issued back to back and
+retired under a single `s_waitcnt`, i.e. one pipelined memory latency with many
+lines in flight, not a queue. Replication only adds a second producer store,
+which is why `wall` rises slightly.
+
+This is the counterpart to the flag result and the two together are the actual
+lesson: what makes an access pattern vulnerable to `MTYPE_NC` is not being
+remote, it is **many readers repeatedly re-reading one line**. Streaming reads
+of many distinct lines are fine.
+
+### Why the wait stops scaling with the number of pollers
+
+The fix does not shorten the queue; it removes the traffic that formed the
+queue. That distinction is the whole result, so it is worth spelling out.
+
+**The fan-out.** 184 workgroups, 4 waves each; wave *w* polls slices *2w* and
+*2w+1*. So 736 waves x 2 flags = 1472 poll sites per layer over 8 flags, which
+is **184 waves spinning on each individual line**. Eight writers, 1472 readers.
+
+**Where the queue is.** A cache line has exactly one home channel, and that
+channel services requests one at a time:
+
+```
+under MTYPE_NC -- 184 waves polling f0, one channel owns f0
+
+   wave   0 poll --+
+   wave   1 poll --+
+   wave   2 poll --+-->  [ request queue ]  -->  channel that homes f0
+     ...           |      depth proportional        serves one at a time
+   wave 183 poll --+      to the poller count
+
+   a poll's latency = its own service time
+                    + waiting behind every other wave's polls
+```
+
+That second term is why the measured wait is very nearly linear in
+waves-per-line, and why the per-wave cost came out flat at ~0.011 us across the
+poller sweep. Splitting into two replicas halves the queue depth -- 184 pollers
+per line becomes 92 -- but it is still a queue fed by every poll, still linear.
+That is the 30.56 to 15.68 row.
+
+**What the cacheable memory type changes.** Not the instructions: the poll is
+the same system-scope `global_load_dword ... sc0 sc1` before and after. What
+changes is whether the *page* permits its lines to live in L2 and take part in
+the consistency protocol. Once it does, a spin loop stops generating memory
+traffic at all:
+
+```
+   XCD1 polls A[f0]:
+
+     poll 1 --> L2 MISS -----------> AID0 home --> line installed in XCD1's L2
+     poll 2 --> L2 HIT  --+
+     poll 3 --> L2 HIT    |  nothing leaves the compute die
+     poll 4 --> L2 HIT  --+
+               ^
+               |  producer's write-through store arrives at AID0 home
+               |  home probes its sharers (XCD0-3) --> INVALIDATE
+               v
+     poll 5 --> L2 MISS -----------> refetch --> new value --> exit spin
+```
+
+**The traffic ledger, per flag line per layer:**
+
+| configuration | memory transactions on that line |
+| --- | --- |
+| one non-coherent copy | 184 waves x however many times each spins -- hundreds to thousands |
+| two non-coherent copies | same law, 92 waves per line |
+| two cacheable copies, routed | 1 miss + 1 refetch per XCD, 4 XCDs per replica, plus the producer's stores -- on the order of 16 |
+
+The spin iterations drop out of the equation entirely. That is why the curve
+goes from linear to flat rather than merely getting shallower, and why a waiting
+wave's time-to-notice stops depending on how many other waves are also waiting.
+
+**The producer deliberately does not cache.** The publish is
+`global_store_dword ... sc0 sc1` -- write-through, system scope -- so it goes to
+the line's home rather than leaving a dirty line in the producing XCD's L2. The
+existing fleet comment gives one reason ("guarantees `ld_nt` sees it"); the fix
+depends on a second. Probes are issued *by the home*, so the store has to
+actually arrive there. A value parked dirty in the producer's own L2 would leave
+the far-AID replica's readers unprobed. This is also why writing across the AID
+boundary is sound while reading across it is not: probes are dispatched based on
+where the *sharers* are, and every sharer of a replica is in-domain by
+construction.
+
+**The `misrouted` cell is direct evidence that caching is really happening.**
+Point all eight XCDs at the AID0 copy with a cacheable memory type and XCD0-3
+run fine while XCD4-7 hang forever. A reader that genuinely went to memory on
+every poll would see the update eventually and merely be slow. Hanging is only
+possible if the line was retained in a cache that never received a probe. So the
+failure mode and the fast path are the same mechanism observed from two sides,
+and the hang is the proof that the win comes from L2 residency rather than from
+anything about distance.
+
 ### Why this is safe for the rest of the model
 
 The rule is: *a coherent BO's readers must be a subset of the XCDs co-located
@@ -733,6 +919,41 @@ sudo dmesg | grep FLAGMTYPE     # expect: fired: knob=2 -> mtype=2
 
 Report all four. `cand` alone does not distinguish the fix from a global MTYPE
 change, and without `ord` there is no evidence the rest of VRAM stayed NC.
+
+### The production kernel
+
+`drive_phase7.cu` includes `persistent_kernel.cuh` and calls the real Phase 7
+kernel, so it must be compiled with the same feature defines the model build
+used -- a mismatch silently measures a different code path, because
+`MPK_ATTN_SLICE_RELEASE` decides whether the per-wave slice wait exists at all
+and `MPK_NARROW_OPROJ_HIER` / `MPK_OPROJ_TREE_BARRIER` pick the barrier shape.
+`build_drive_aid.sh` therefore does not hardcode flags; it parses the `hipcc`
+argv out of a model build log, keeps the include paths, feature defines and link
+flags, retargets the tree path, and adds `-DMPK_OPROJ_INNER_TIMING`.
+
+It needs a tree with the dependency submodules populated. `fork-fcm` does not
+have them and silently falls back to ROCm's own `ck_tile`, which fails with
+~17 errors about `PrefillPipelineProblem`; build against a complete tree.
+
+```bash
+# same module and parameters as the four cells above
+R=/home/schowdha/fleet-chiplet-megakernel
+cp drive_phase7.cu "$R/"
+cd "$R" && bash /path/to/build_drive_aid.sh   # writes ./drive_phase7
+
+# base: one plain hipMalloc'd flag page, non-coherent -- today's model
+HIP_VISIBLE_DEVICES=6 ./drive_phase7 --layers=200 --tiles=23 \
+    --aid=0 --coherent=0 --split=0 --tag=base
+
+# fix: one AID-local cacheable replica per AID, routed per XCD
+HIP_VISIBLE_DEVICES=6 ./drive_phase7 --layers=200 --tiles=23 \
+    --aid=1 --coherent=1 --split=1 --tag=aidcc
+```
+
+Summarize the `[OPROJ_INNER]` lines by bucket rather than reading them
+individually; there are 1600 per cell. Compare `slicewait` against the NPS1
+reference of 0.36, and expect `bar` to improve as collateral even though
+`counters` is untouched.
 
 ### The replication fallback
 

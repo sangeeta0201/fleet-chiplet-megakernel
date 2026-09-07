@@ -77,14 +77,54 @@ merely observing an upstream phase running late.
 
 ### Root cause and a measured fix
 
-`ROOT-CAUSE.md` takes this the rest of the way with `bench_flagplace.hip`, which
-isolates the flag handshake from the GEMM. In one line: the driver maps VRAM
-MTYPE_RW in NPS1 and MTYPE_NC in SPX+NPS2, MTYPE_RW absorbs concurrent
-system-scope readers while MTYPE_NC serializes them, and MTYPE_NC is required
-for correctness. The cost is then very nearly linear in how many waves share a
-flag line, and production puts 184 on each of eight lines. Replicating the
-eight-flag array 16 times -- same total poll count, 16x fewer readers per line --
-takes the wait from 20.5 us to 2.7 us.
+`ROOT-CAUSE.md` takes this the rest of the way. In one line: the driver maps
+VRAM cacheable (`MTYPE_RW`) in NPS1 and non-coherent (`MTYPE_NC`) in SPX+NPS2,
+because one compute partition spanning two memory partitions is local to
+neither. A cacheable page lets a spinning wave's polls be answered by its own
+L2; a non-coherent page forbids that, so all 184 polls per line are serviced at
+the line's single home channel and queue there. Hence a cost very nearly linear
+in waves-per-line, with production putting 184 on each of eight lines.
+
+**The fix closes the regression rather than mitigating it.** Place one copy of
+the flag array in each memory quadrant, have every producer publish into both,
+and route each compute die to the copy homed in its own quadrant. Every reader
+is then in the same consistency scope as the line it polls, which is what makes
+a cacheable memory type safe -- and the cacheable memory type is what absorbs
+the 184 readers. It applies to those two allocations alone; every other page in
+the process stays non-coherent.
+
+| SPX+NPS2, 23 tiles/XCD | wall us/layer | `slicewait` p50 |
+| --- | --- | --- |
+| plain `hipMalloc` flags, non-coherent | 30.56 | 14.48 |
+| one copy per quadrant, still non-coherent | 15.68 | 6.68 |
+| one copy per quadrant, cacheable | **3.83** | **0.80** |
+| _SPX+NPS1 reference_ | _4.26_ | _1.04_ |
+
+The middle row is the informative one: splitting alone buys ~2x by halving the
+queue at each line, and the remaining ~4x comes from the caching, which only
+becomes *legal* once the split guarantees co-location.
+
+Confirmed in production code, not just in the reproducer. `drive_phase7` links
+the real kernel, and the fix lands entirely in the harness with **no change to
+the fleet headers**, because the kernel already takes the flag array as a
+parameter and the producer store lives in the harness:
+
+| bucket | NPS2 base | NPS2 + fix | NPS1 reference |
+| --- | --- | --- | --- |
+| `slicewait` | 14.16 | **0.36** | 0.36 |
+| `bar` | 6.56 | 3.80 | 2.32 |
+| `total` | 29.52 | **11.56** | 6.56 |
+
+`slicewait` matches the NPS1 reference exactly. `bar` improved without being
+touched -- its lines are still non-coherent, but removing ~1472 uncached polls
+per layer freed the channels its own traffic shares. `mfma` went the other way
+(3.40 to 4.08 against NPS1's 1.44), which reads as the bottleneck relocating to
+the still-non-coherent weight buffer now that the flag wait no longer staggers
+the waves; that is the largest remaining gap.
+
+Replicating the flag array 16 times -- same total poll count, 16x fewer readers
+per line, no driver knob at all -- takes the wait from 20.5 us to 2.7 us and
+remains the fallback if per-allocation memory types are unavailable.
 
 ## Geometry being modeled
 
