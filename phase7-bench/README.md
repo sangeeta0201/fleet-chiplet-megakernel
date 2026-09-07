@@ -357,6 +357,7 @@ them being fast because it was wrong is exactly the failure to rule out.
 | `--split=N` | 1 | One release-flag replica per partition, each half of the XCDs polling its own. The fix; `--split=0` with `--aid=1` is the co-location violation, and it hangs. |
 | `--lsplit=N` | 0 | Home the eight per-XCD level-1 arrival lines per AID. Partitioned, not replicated. Correct, and buys nothing -- see Known gaps. |
 | `--hrdv=N` | 0 | Replace the flat inter-layer rendezvous with the AID-aware tree: per-XCD level 1, per-half level 2, then one store across the boundary instead of 184 remote atomics. |
+| `--bsplit=N` | 0 | Split the barrier's *level-2* arrival per partition, with a handshake in place of the shared counter. Correct, and 0.40 us slower -- see Known gaps. Requires `--split=1`. |
 
 Timestamps come from `s_memrealtime`, which ticks at 100 MHz, so one tick is
 10 ns. That is the same conversion the in-kernel printf uses, so benchmark and
@@ -434,6 +435,32 @@ model numbers are directly comparable.
   ever on the critical path -- the last one on the last XCD -- so speeding up
   the other 183 is free and worthless. `gate_lsplit.sh` confirms the hashes
   still agree, so the split is sound; it is just not load-bearing.
+- **A cacheable MTYPE helps polls, not atomics, and the level-2 counter proves
+  it.** The last piece of barrier state left in the plain `hipMalloc`'d `counters`
+  buffer is the level-2 arrival counter, so SPX+NPS2 demotes it to MTYPE_NC while
+  NPS1 keeps it MTYPE_RW: 0.56 us against 0.30. It cannot be replicated, being the
+  one place all eight dies aggregate, but `--bsplit=1` replaces it with per-half
+  counters plus the rendezvous's two-slot handshake. `gate_bsplit.sh` confirms the
+  hashes still agree and it is **0.40 us slower**. The atomic itself moved 0.56 ->
+  0.52, not the 0.26 predicted: a cacheable line lets a second *reader* be served
+  from cache, and does nothing for a read-modify-write, which reaches the
+  coherence point regardless. That is the whole difference between this and the
+  release-flag fix -- the flags are polled 184 times a layer, this line is
+  incremented 8 times and never polled. The handshake then cost 0.36 us in `wait`,
+  because a shared atomic delivers "all eight arrived" in one round trip via its
+  return value while a handshake needs two dependent ones. Busy-polling recovers
+  0.08 (`-DMPK_OPROJ_L2_BUSY_POLL`), which rules out poll granularity. So the
+  single shared counter is the cheapest mechanism for a global fact, not an
+  oversight, and the ~0.26 us it costs in NPS2 is not reachable by placement.
+- **`topk` reads worse in every faster configuration, and that is the barrier fix
+  working.** It is 1.92 us in NPS2 base where `bar` is 6.28, and 2.20 with `bar` at
+  2.32. A barrier that releases with 6 us of spread trickles the 184 blocks into
+  the next stage; one that releases them together makes them contend. `skew_sweep.sh`
+  re-injects exactly that stagger and nothing else: 200 ns per XCD drops `topk`
+  from 2.26 to 1.74 while `bar` rises to absorb it, with `mfma` and `slicewait`
+  flat throughout. The total at 200 ns is 10.28 against 10.60 at zero, so a small
+  deliberate stagger is net positive. Same mechanism moved `mfma` earlier in this
+  work when the flag wait stopped staggering the waves.
 - **Flag placement is resolved.** `bench_flagplace.hip` makes the stride a
   runtime knob: NPS1 is flat across it (2.08 us with all eight flags in one
   cache line vs 1.48 us over eight), so NPS1's advantage never came from
@@ -487,4 +514,7 @@ model numbers are directly comparable.
 | `gate_hrdv.sh` | Correctness gate for `--hrdv`. Four configurations including the tree with one coherence domain, which is both the shape-versus-placement control and the check that the aliased path is still a 4/4 barrier. |
 | `skew_hrdv.sh` | Entry stagger with the tree rendezvous on and off. `bar` alone cannot attribute the change; the entry columns can, because they are read before the barrier has done anything. |
 | `breakdown_all.sh` | The five-column table above, one build, both partition modes, NPS2 restored in an `EXIT` trap. Includes the tree in NPS1, which is the control that separates the fan-in from the placement. |
+| `gate_bsplit.sh` | Correctness gate for `--bsplit`, including that it refuses to run without `--split` rather than hanging. Releasing on the fourth arrival instead of the eighth is silent, so this compares hashes against configurations that share the placement but not the topology. |
+| `cmp_l2.sh` / `trace_l2.sh` | The level-2 split against the shared counter it replaces. `cmp_l2.sh` does the A/B on `bar` with the handshake poll both sleeping and busy; `trace_l2.sh` separates the two opposing effects, showing the atomic moving 0.04 while the handshake costs 0.36. |
+| `skew_sweep.sh` | Re-injects the arrival stagger the barrier fixes removed, which is what identifies `topk`'s regression as bottleneck relocation rather than a partitioning cost. |
 | `results/bar-attribution.md` | Where the residual `bar` gap actually goes: arrival skew, not the barrier's memory protocol. Includes the level-1 split that works and buys nothing, the entry-versus-arrival split that exonerates Phase 7, and the tree rendezvous that recovers a third of the skew. |

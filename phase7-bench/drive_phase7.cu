@@ -325,6 +325,13 @@ static void *alloc_in_aid(size_t bytes, int aid, bool coherent) {
 #define RDV_REL_INTS(h) (192 + (h) * 16)
 #define RDV_REGION_BYTES 1024
 
+// The barrier's level-2 arrival, 12 KiB past the level-1 lines so it clears the
+// rendezvous region above. Four lines of 16 ints: two arrival counters and two
+// handshake slots, indexed by half exactly as the rendezvous is. This is the last
+// piece of barrier state that was still in the plain `hipMalloc`'d `counters`
+// buffer, and therefore the last one the SPX+NPS2 MTYPE_NC demotion applied to.
+#define HIER_L2_OFF_INTS (HIER_LOCAL_OFF_INTS + 3072)
+
 __device__ unsigned int g_local_claim[NXCD];
 
 __device__ __forceinline__ int drv_get_xcd() {
@@ -357,8 +364,8 @@ __global__ __launch_bounds__(NTHREADS) void drive_phase7(
     void *topk_weight, void *routing_indices, void *active_expert_ids,
     int *flags, int *flags_b, unsigned int *bar, unsigned int *bar_b,
     int *hier_lo, int *hier_hi, int *hloc_lo, int *hloc_hi, int *rdv_lo,
-    int *rdv_hi, int *xcd_seen, int n_layers, int delay_ticks, int delay_skew,
-    int tiles, int dual, int split_on) {
+    int *rdv_hi, int *hl2_lo, int *hl2_hi, int *xcd_seen, int n_layers,
+    int delay_ticks, int delay_skew, int tiles, int dual, int split_on) {
   int const xcd = drv_get_xcd();
   int const tid = threadIdx.x;
 
@@ -507,7 +514,9 @@ __global__ __launch_bounds__(NTHREADS) void drive_phase7(
         /*hier_release_lo=*/hier_lo,
         /*hier_release_hi=*/hier_hi,
         /*hier_local_lo=*/hloc_lo,
-        /*hier_local_hi=*/hloc_hi);
+        /*hier_local_hi=*/hloc_hi,
+        /*hier_l2_lo=*/hl2_lo,
+        /*hier_l2_hi=*/hl2_hi);
 
     // ?? per-layer rendezvous across all 184 tiles, as phase 9 does ??
     __syncthreads();
@@ -562,7 +571,7 @@ int main(int argc, char **argv) {
   int n_layers = 200;
   int delay_ticks = 0, delay_skew = 0;
   int tiles = TILES_PER_XCD;
-  int use_aid = 0, split_on = 1, lsplit_on = 0, hrdv_on = 0;
+  int use_aid = 0, split_on = 1, lsplit_on = 0, hrdv_on = 0, bsplit_on = 0;
   char const *tag = "run";
   for (int i = 1; i < argc; ++i) {
     if (!strncmp(argv[i], "--layers=", 9)) {
@@ -583,6 +592,8 @@ int main(int argc, char **argv) {
       lsplit_on = atoi(argv[i] + 9);
     } else if (!strncmp(argv[i], "--hrdv=", 7)) {
       hrdv_on = atoi(argv[i] + 7);
+    } else if (!strncmp(argv[i], "--bsplit=", 9)) {
+      bsplit_on = atoi(argv[i] + 9);
     } else if (!strncmp(argv[i], "--tag=", 6)) {
       tag = argv[i] + 6;
     }
@@ -600,6 +611,7 @@ int main(int argc, char **argv) {
   int *hier_lo = nullptr, *hier_hi = nullptr;
   int *hloc_lo = nullptr, *hloc_hi = nullptr;
   int *rdv_lo = nullptr, *rdv_hi = nullptr;
+  int *hl2_lo = nullptr, *hl2_hi = nullptr;
   unsigned int *bar = nullptr, *bar_b = nullptr;
   int dual = 0;
 
@@ -691,6 +703,17 @@ int main(int argc, char **argv) {
       rdv_lo = flags + RDV_OFF_INTS;
       rdv_hi = flags_b + RDV_OFF_INTS;
     }
+    // Unlike the two above, this one does depend on --split: splitting the
+    // aggregation gives each half its own releaser, and a releaser can only
+    // publish locally into a replica that is in its own partition.
+    if (bsplit_on && split_on) {
+      hl2_lo = flags + HIER_L2_OFF_INTS;
+      hl2_hi = flags_b + HIER_L2_OFF_INTS;
+    } else if (bsplit_on) {
+      fprintf(stderr, "ABORT: --bsplit=1 needs --split=1 (two releasers need "
+                      "two release replicas to publish into)\n");
+      return 2;
+    }
     HIP_OK(hipMemset(flags, 0, sync_bytes));
     HIP_OK(hipMemset(flags_b, 0, sync_bytes));
     dual = 1;
@@ -701,6 +724,9 @@ int main(int argc, char **argv) {
     bar_b = bar;
     split_on = 0;
     lsplit_on = 0;
+    // No release replicas without AID placement, so there is nothing for a
+    // second releaser to publish into. The shared counter stays.
+    bsplit_on = 0;
     // The tree is still worth running with one coherence domain: it is the
     // control that says how much of its benefit is the shape and how much is the
     // placement. Both pointers alias, and the per-half line indices keep it a
@@ -717,9 +743,9 @@ int main(int argc, char **argv) {
   printf("[%s] attn_out %p  flags %p / %p  weight %p (%.2f MiB)\n", tag, attn,
          (void *)flags, (void *)flags_b, weight, weight_bytes / 1048576.0);
   printf("[%s] aid=%d coherent=%d split=%d hier_split=%d local_split=%d "
-         "hier_rdv=%d\n",
+         "hier_rdv=%d l2_split=%d\n",
          tag, use_aid, (int)g_coherent, split_on, hier_lo != nullptr,
-         hloc_lo != nullptr, rdv_lo != nullptr);
+         hloc_lo != nullptr, rdv_lo != nullptr, hl2_lo != nullptr);
   printf("[%s] %d tiles (%d/XCD), %d threads, %d layers, delay=%d skew=%d, "
          "%d polling waves\n",
          tag, NXCD * tiles, tiles, NTHREADS, n_layers, delay_ticks, delay_skew,
@@ -737,8 +763,8 @@ int main(int argc, char **argv) {
                      MAX_DYNAMIC_SHARED_MEMORY_SIZE, 0, attn, weight, residual,
                      bias, nw, no, rw, rb, logits, counters, out, tkw, ridx,
                      aeid, flags, flags_b, bar, bar_b, hier_lo, hier_hi,
-                     hloc_lo, hloc_hi, rdv_lo, rdv_hi, xcd_seen, n_layers,
-                     delay_ticks, delay_skew, tiles, dual, split_on);
+                     hloc_lo, hloc_hi, rdv_lo, rdv_hi, hl2_lo, hl2_hi, xcd_seen,
+                     n_layers, delay_ticks, delay_skew, tiles, dual, split_on);
   HIP_OK(hipEventRecord(e1));
   HIP_OK(hipDeviceSynchronize());
   HIP_OK(hipGetLastError());

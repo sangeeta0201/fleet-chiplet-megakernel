@@ -238,11 +238,68 @@ placement at all is worth 1.2 us over stock (6.36 -> 5.16), so the fan-in matter
 most when the placement is bad, and the two fixes overlap heavily: once the flags
 are replicated, most of what the tree would have saved is already saved.
 
+## Splitting level 2 was correct, and a net loss. The premise was wrong.
+
+The reasoning that motivated this: the level-2 arrival counter is
+`hier_barrier[8 * HIER_STRIDE]`, which lives in the plain `hipMalloc`'d
+`counters` buffer, so SPX+NPS2 demotes it to MTYPE_NC while NPS1 keeps it
+MTYPE_RW. It measures 0.56 us against NPS1's 0.30. It cannot be replicated -- it
+is the one place all eight dies aggregate, so a coherent MTYPE would have readers
+in both partitions -- but it can be *replaced*, by per-half counters plus the same
+two-slot handshake the rendezvous uses. Predicted recovery: most of that 0.26 us.
+
+`--bsplit=1` does exactly that, `gate_bsplit.sh` confirms all five configurations
+still agree on both hashes, and it is **0.40 us slower**:
+
+| | level 2, lo / hi | wait | bar |
+| --- | --- | --- | --- |
+| shared counter | 0.560 / 0.680 | 1.720 | **2.440** |
+| split + handshake | 0.520 / 0.640 | 2.080 | **2.840** |
+
+Two things in that table, and both are worth more than the change was.
+
+**The atomic barely moved: 0.56 -> 0.52.** Not 0.26 us, 0.04. Moving the line into
+an AID-local buffer with a coherent MTYPE bought essentially nothing, which says
+the MTYPE was never what made it cost 0.56. A cacheable line helps a *poll*,
+because the second reader can be served from cache. It does nothing for a
+read-modify-write, which has to reach the coherence point whether or not anyone
+may cache the result. That is the whole difference between this change and the
+release-flag fix: the flags are polled 184 times a layer and replicating them was
+worth 4 us, while this line is atomically incremented 8 times and never polled at
+all. The +0.120 lo-versus-hi asymmetry also survives the move unchanged, so it is
+a property of where the coherence point sits, not of where the line is homed.
+
+**The handshake cost 0.36 us, all of it in `wait`.** A shared atomic counter
+delivers the global fact -- "all eight dies have arrived" -- in the return value
+of a single read-modify-write: one round trip. A two-slot handshake needs two
+dependent ones, my store getting out and then the peer's store being observed by
+my poll. Two dependent trips beat one only if the single trip costs more than
+twice as much, and 0.56 against 0.30 is not that. Busy-polling instead of
+`s_sleep` recovers 0.08 of it (`-DMPK_OPROJ_L2_BUSY_POLL`), which rules out poll
+granularity as the explanation and leaves the structure.
+
+So the single shared counter is not a wart that survived because nobody split it.
+It is the cheapest available mechanism for a global fact, and the kernel comment
+that stops at "it cannot be replicated" was right for a better reason than it
+gives. Kept behind a default-off flag as the record of what the MTYPE fix does and
+does not reach.
+
 ## What is left
 
-0.58 us of entry spread against NPS1's 0.09. The rendezvous accounted for 0.24 of
-the 0.73 us gap; the rest is created somewhere else between layers, and the
-remaining candidate is the one the `drain` column has been pointing at all along:
+Every step a block performs itself is now at or better than NPS1: `drain` 0.44
+against 0.48, `l1` 0.24 against 0.26, `acq` at parity. AID-local placement is the
+faster arrangement, exactly as the absence of an interconnect hop predicts. The
+whole of the remaining +0.64 is `wait`, and it is two things:
+
+- **~0.47 us of entry skew**, still arriving from upstream after the rendezvous
+  tree took 0.24 off. Entry spread is 0.56 against NPS1's 0.09.
+- **~0.26 us of level-2 atomic**, which the section above establishes is not
+  reachable by placement. Eight serialized read-modify-writes is already the
+  minimum for aggregating eight dies, and the semantics forbid skipping the
+  aggregation: RMSNorm needs the whole 2880-element row, which spans all eight.
+
+Only the first is addressable, and the remaining candidate is the one the `drain`
+column has been pointing at all along:
 the upper half pays +0.08-0.12 us to retire its O-proj stores into
 `attn_proj_out`, which is a single hipMalloc'd buffer, single-homed the way
 `counters` was. Unlike the barrier flags it is large enough for placement to

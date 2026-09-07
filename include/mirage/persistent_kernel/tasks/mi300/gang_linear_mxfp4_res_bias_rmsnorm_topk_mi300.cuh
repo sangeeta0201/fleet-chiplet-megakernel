@@ -356,7 +356,34 @@ __device__ __attribute__((noinline)) void
         // copy inside `counters`, so the unused half of each buffer is simply
         // never touched. Null means the single shared copy.
         int *hier_local_lo = nullptr,
-        int *hier_local_hi = nullptr) {
+        int *hier_local_hi = nullptr,
+        // Optional: the *level-2* arrival, split per memory partition. This is
+        // the last line in the barrier that is neither replicable nor trivially
+        // partitionable -- it is the one place all eight dies aggregate, so a
+        // coherent MTYPE on it would have readers in both partitions and hang.
+        // Left in `counters` it is worse than that: in SPX+NPS2 the driver
+        // demotes every plain VRAM page to MTYPE_NC, so nothing may cache it and
+        // both halves pay the full uncached cost. That is exactly why the trace
+        // found no AID asymmetry on it -- 0.520 us either half -- against 0.30 us
+        // in NPS1, where the same line is MTYPE_RW and cacheable.
+        //
+        // It cannot be replicated, but it can be *replaced*: each half keeps its
+        // own arrival counter in its own partition, and the two half-closers
+        // rendezvous with a two-slot handshake instead of a shared counter. Each
+        // signals the other by storing into a slot homed with its *reader*, so
+        // the crossing is a write-through store, which is off the critical path,
+        // rather than a read-modify-write, which is not.
+        //
+        // Layout, `HIER_STRIDE` apart, in each copy. Indexed by half as well as
+        // by placement, so the topology stays a genuine 4/4 split even when both
+        // pointers alias one buffer:
+        //   [0], [1]  arrival counter for half 0, half 1
+        //   [2], [3]  the slot half 0 / half 1 *observes*, written by the other
+        // Requires the release replicas too: with the aggregation split, each
+        // half's closer releases its own four flags locally, and it needs a
+        // replica in its own partition to write them into.
+        int *hier_l2_lo = nullptr,
+        int *hier_l2_hi = nullptr) {
 
   static_assert(OUTPUT_PER_WG % 16 == 0,
                 "OUTPUT_PER_WG must be multiple of 16");
@@ -1560,6 +1587,17 @@ oproj_barrier :
             ? (xcd_id < n_xcds / 2 ? hier_local_lo : hier_local_hi)
             : hier_local;
 
+    // Level 2 split per partition. Requires the release replicas: with two
+    // aggregation points there are two releasers, and each can only publish
+    // locally if it has a replica of its own to publish into.
+    int const l2_per_half = n_xcds / 2;
+    int const l2_half = (xcd_id >= l2_per_half) ? 1 : 0;
+    bool const l2_split = hier_l2_lo != nullptr && hier_l2_hi != nullptr &&
+                          hier_release_lo != nullptr &&
+                          hier_release_hi != nullptr && l2_per_half > 0;
+    int *const l2_my = l2_half ? hier_l2_hi : hier_l2_lo;
+    int *const l2_peer = l2_half ? hier_l2_lo : hier_l2_hi;
+
     int const oproj_release_expected =
         layer_epoch > 0 ? layer_epoch
                         : ld_nt_s32(&hier_rel[xcd_id * HIER_STRIDE]) + 1;
@@ -1698,13 +1736,50 @@ oproj_barrier :
                   (unsigned)oproj_release_expected);
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 #endif
-        int const prev_global =
-            atom_add_release_gpu_s32(&hier_barrier[8 * HIER_STRIDE], 1);
+        // Level 2, either as one shared counter or as two per-partition ones.
+        // `arrivals_here` is what makes the monotonic release test work for both:
+        // 8 dies on the shared line, 4 on a per-half line.
+        int prev_arrival;
+        int arrivals_here;
+        int *hs_signal = nullptr;
+        int *hs_observe = nullptr;
+        if (l2_split) {
+          prev_arrival =
+              atom_add_release_gpu_s32(&l2_my[l2_half * HIER_STRIDE], 1);
+          arrivals_here = l2_per_half;
+          hs_signal = &l2_peer[(2 + (1 - l2_half)) * HIER_STRIDE];
+          hs_observe = &l2_my[(2 + l2_half) * HIER_STRIDE];
+        } else {
+          prev_arrival =
+              atom_add_release_gpu_s32(&hier_barrier[8 * HIER_STRIDE], 1);
+          arrivals_here = 8;
+        }
 #ifdef MPK_OPROJ_BAR_TRACE
+        // Taken before the handshake deliberately, so `l2` keeps meaning "the
+        // level-2 atomic". Waiting for the peer half is waiting for other
+        // blocks, and it belongs in `wait` with the rest of the skew.
         _bt2 = __builtin_amdgcn_s_memrealtime();
         _bt_xcd_last = 1;
 #endif
-        if ((prev_global % 8) == 7) {
+        if ((prev_arrival % arrivals_here) == arrivals_here - 1) {
+          if (l2_split) {
+            // Closed this half. Tell the other one, then wait for it to say the
+            // same. One store out, one local poll -- the whole cross-partition
+            // cost of the barrier's global aggregation.
+            st_wt_u32((void *)hs_signal, (unsigned)oproj_release_expected);
+            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+            // Busy, not `s_sleep`. Every other poll in this file waits on
+            // something that takes microseconds, where a sleep costs nothing and
+            // saves issue slots. This one waits on the peer half, which under a
+            // balanced load has already arrived, so a sleep's granularity is the
+            // whole of what is being measured.
+            while (MPK_LD_GATE2(hs_observe) < oproj_release_expected) {
+#ifndef MPK_OPROJ_L2_BUSY_POLL
+              __builtin_amdgcn_s_sleep(1);
+#endif
+            }
+            asm volatile("buffer_inv" ::: "memory");
+          }
           oproj_rel_epoch = oproj_release_expected;
         }
       }
@@ -1723,7 +1798,19 @@ oproj_barrier :
     // why 0 is a safe "not the releaser" sentinel.
     oproj_rel_epoch = __builtin_amdgcn_readfirstlane(oproj_rel_epoch);
     if (oproj_rel_epoch != 0) {
-      if (hier_release_lo && hier_release_hi) {
+      if (l2_split) {
+        // Two releasers now, one per partition, so each publishes only its own
+        // half -- and only the four slots its own XCDs actually poll. XCD x reads
+        // `hier_rel[x * HIER_STRIDE]` out of its own replica, so slots 4..7 of
+        // the low copy and 0..3 of the high copy were always dead stores; the
+        // single releaser was writing sixteen flags to feed eight readers. Four
+        // local stores per half replaces eight local and eight remote.
+        if (tid < l2_per_half) {
+          st_wt_u32(
+              (void *)&hier_rel[(l2_half * l2_per_half + tid) * HIER_STRIDE],
+              (unsigned)oproj_rel_epoch);
+        }
+      } else if (hier_release_lo && hier_release_hi) {
         // Sixteen flags: eight per replica. Lanes 0..15 of this wave differ
         // only in the address they form, so both replicas are published in
         // the same single store instruction the one-copy form uses.
