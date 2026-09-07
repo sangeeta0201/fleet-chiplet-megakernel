@@ -442,11 +442,17 @@ model numbers are directly comparable.
   one place all eight dies aggregate, but `--bsplit=1` replaces it with per-half
   counters plus the rendezvous's two-slot handshake. `gate_bsplit.sh` confirms the
   hashes still agree and it is **0.40 us slower**. The atomic itself moved 0.56 ->
-  0.52, not the 0.26 predicted: a cacheable line lets a second *reader* be served
-  from cache, and does nothing for a read-modify-write, which reaches the
-  coherence point regardless. That is the whole difference between this and the
-  release-flag fix -- the flags are polled 184 times a layer, this line is
-  incremented 8 times and never polled. The handshake then cost 0.36 us in `wait`,
+  0.52, not the 0.26 predicted, and `mpk_atoms.cuh` gives the reason: `sc1` is what
+  carries an atomic through the device-wide coherency point, and the eight XCDs
+  have separate non-coherent L2s, so an `sc0 sc1` atomic must leave the XCD and
+  serialise there whatever partition the line is homed in. **AID-local placement
+  addresses the memory-partition boundary, of which there are two; this cost is
+  the XCD L2 boundary, of which there are eight.** A per-half counter is still
+  touched by four separately-cached dies, so 4 + 4 is still eight `sc1` atomics.
+  That is also why level 1 *is* cheap -- its participants share one XCD, so it uses
+  `sc0` without `sc1` and never crosses the die boundary. The rule: placement is
+  worth something when the traffic is polls or `sc0` atomics, and nothing when it
+  is `sc1`. The handshake then cost 0.36 us in `wait`,
   because a shared atomic delivers "all eight arrived" in one round trip via its
   return value while a handshake needs two dependent ones. Busy-polling recovers
   0.08 (`-DMPK_OPROJ_L2_BUSY_POLL`), which rules out poll granularity. So the

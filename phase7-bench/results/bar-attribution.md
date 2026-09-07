@@ -258,16 +258,33 @@ still agree on both hashes, and it is **0.40 us slower**:
 
 Two things in that table, and both are worth more than the change was.
 
-**The atomic barely moved: 0.56 -> 0.52.** Not 0.26 us, 0.04. Moving the line into
-an AID-local buffer with a coherent MTYPE bought essentially nothing, which says
-the MTYPE was never what made it cost 0.56. A cacheable line helps a *poll*,
-because the second reader can be served from cache. It does nothing for a
-read-modify-write, which has to reach the coherence point whether or not anyone
-may cache the result. That is the whole difference between this change and the
-release-flag fix: the flags are polled 184 times a layer and replicating them was
-worth 4 us, while this line is atomically incremented 8 times and never polled at
-all. The +0.120 lo-versus-hi asymmetry also survives the move unchanged, so it is
-a property of where the coherence point sits, not of where the line is homed.
+**The atomic barely moved: 0.56 -> 0.52.** Not 0.26 us, 0.04. And `mpk_atoms.cuh`
+says why, in the note on the XCD-local atomic that is level 1's counterpart:
+
+> `sc1` is what carries an atomic through the device-wide coherency point. On
+> MI350 the eight XCDs have separate, non-coherent L2s, so an `sc0 sc1` atomic
+> must leave the XCD and serialise at that point; an `sc0`-only atomic is resolved
+> in the XCD's own L2 and never crosses the die boundary.
+
+Level 2 is `atom_add_release_gpu_s32`, which is `flat_atomic_add ... sc0 sc1`. The
+`sc1` means it *must* leave the XCD and serialise at the device-wide coherency
+point, by construction, no matter which partition the line is homed in and no
+matter what MTYPE it carries. Placement cannot reach that cost.
+
+**The two boundaries are not the same boundary, and that is the whole mistake.**
+AID-local placement addresses the *memory-partition* boundary, of which there are
+two. The level-2 atomic's cost comes from the *XCD L2* boundary, of which there
+are eight. Any counter touched by more than one XCD needs `sc1` and pays the trip
+to the coherency point -- including a per-half counter, because the four XCDs
+within one AID still have four separate non-coherent L2s. Splitting 8 dies into
+4 + 4 changes nothing about that: it is 8 `sc1` atomics either way. The +0.120
+lo-versus-hi asymmetry surviving the move unchanged is the same statement.
+
+This is also why level 1 is cheap and *was* helped a little by `--lsplit`: its
+participants are all on one XCD, so it uses `atom_add_xcd_local_s32`, `sc0`
+without `sc1`, resolved in that XCD's own L2 and never crossing the die boundary.
+The rule that follows: placement is worth something exactly when the traffic is
+polls or `sc0` atomics, and worth nothing when it is `sc1` atomics.
 
 **The handshake cost 0.36 us, all of it in `wait`.** A shared atomic counter
 delivers the global fact -- "all eight dies have arrived" -- in the return value
@@ -294,9 +311,14 @@ whole of the remaining +0.64 is `wait`, and it is two things:
 - **~0.47 us of entry skew**, still arriving from upstream after the rendezvous
   tree took 0.24 off. Entry spread is 0.56 against NPS1's 0.09.
 - **~0.26 us of level-2 atomic**, which the section above establishes is not
-  reachable by placement. Eight serialized read-modify-writes is already the
-  minimum for aggregating eight dies, and the semantics forbid skipping the
-  aggregation: RMSNorm needs the whole 2880-element row, which spans all eight.
+  reachable by placement at all, because `sc1` serialises at the device-wide
+  coherency point regardless of homing. Eight `sc1` atomics is already the minimum
+  for aggregating eight separately-cached dies, and the semantics forbid skipping
+  the aggregation: RMSNorm needs the whole 2880-element row, which spans all
+  eight. The only lever left would be fewer participants in the global step, and
+  `MPK_ROUTER_XCD_FOLD` -- off in this build -- is the existing attempt at that:
+  it publishes each die's slice separately so router workers can consume it
+  without waiting for the other seven.
 
 Only the first is addressable, and the remaining candidate is the one the `drain`
 column has been pointing at all along:
