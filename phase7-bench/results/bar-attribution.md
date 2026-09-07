@@ -152,23 +152,113 @@ cost surfaces, because a barrier is where imbalance becomes visible. Note that
 is not a slowdown in the earlier stages; it is a widening of their *spread*,
 which a median cannot see.
 
-Two things worth checking next, in order:
+## Phase 7 inherits the skew, it does not create it
 
-1. Whether the skew is already present at Phase 7 entry (`_op_t0`) or is created
-   inside `slicewait`/`mfma`. One more absolute tick at `_op_t0` per XCD settles
-   it, and it is the difference between "the barrier inherits imbalance from
-   upstream" and "Phase 7 creates it."
-2. Why XCD 6 specifically. The `drain` column already shows the upper half
-   paying +0.08-0.12 us to retire its O-proj stores into a hipMalloc'd
-   `attn_proj_out`, which is single-homed like `counters` was -- so the output
-   buffer's placement is the next candidate, and unlike the barrier flags it is
-   large enough for placement to matter.
+`[BAR_OBS]` now also carries `t0`, the absolute tick at Phase 7 entry, so the
+stagger at the door can be separated from the stagger at the barrier. Both are
+measured against `rel`, the one tick per layer that every XCD shares, so the two
+spreads are directly comparable.
+
+| | entry spread | arrival spread | created inside Phase 7 |
+| --- | --- | --- | --- |
+| NPS1 | **0.09** | 0.20 | +0.11 |
+| NPS2, flags split | **0.82** | 0.90 | +0.08 |
+| NPS2 base | 11.04 | 6.19 | -4.85 |
+
+That settles it. In NPS1 the eight dies enter Phase 7 within 90 ns of each other
+and leave it within 200 ns. In NPS2 they enter **0.82 us apart**, and Phase 7 adds
+0.08 us of its own -- less than NPS1's 0.11. Per-XCD `sw` and `mf` are flat across
+all eight dies in both modes (0.36-0.40 and 3.92-3.96 us), so Phase 7's own work
+is balanced to the tick.
+
+The barrier was never the problem. It is the instrument that makes an imbalance
+created before it ran visible, and no restructuring of it can recover work that
+was already lost. The NPS2-base row is the same statement from the other side: its
+entry spread is 11 us and the barrier *removes* 4.85 us of it.
+
+## What was upstream: the inter-layer rendezvous
+
+The only thing between one layer's barrier and the next layer's Phase 7 entry is
+the harness's own per-layer rendezvous, the one standing in for phase 9. It was
+flat:
+
+```c
+atomicAdd(bar, 1u);                 // every one of the 184 blocks
+if (dual) atomicAdd(bar_b, 1u);     // ... into both replicas
+while (ld(my_bar) < layer * NXCD * tiles) sleep();
+```
+
+Replicating the two counters fixed the *polling*, which is why `bar` fell from
+6.36 to 2.44 us, and left the *arrivals* untouched: 184 blocks x 2 replicas is 368
+atomics on two lines per layer, and for 92 of those blocks one of the two is a
+read-modify-write across the partition boundary. The two replicas therefore cross
+their thresholds at different times, which releases the two halves at different
+times, which is exactly the AID-aligned entry stagger measured above.
+
+So the tree belongs one level up from the barrier, on the rendezvous. `--hrdv=1`:
+
+- **Level 1**, per XCD, AID-local. 23 blocks, one line, co-located by
+  construction -- partitioned, not replicated, the same argument as `--lsplit`.
+- **Level 2**, per half, AID-local. That half's 4 level-1 closers, one line.
+- **Level 3**, the handshake. Each half's closer signals the *other* half with a
+  single write-through store into a slot homed with its reader, then polls its own
+  slot locally, then releases its own half's 92 blocks locally.
+
+Critical-path boundary crossings per layer: **1 store, down from 184 remote
+atomics**, and no read-modify-write crosses at all.
+
+Every line is indexed by half as well as by placement. That is load-bearing: it
+keeps the topology a genuine 4/4 split when both region pointers alias one buffer,
+which is how NPS1 and `--aid=0` run it. Indexing by placement alone would have all
+eight XCDs share one level-2 counter and release on the fourth arrival instead of
+the eighth -- silently, since the counters are monotonic and tested on residue.
+
+### What it bought
+
+| config | `bar` p50 | entry spread | arrival spread |
+| --- | --- | --- | --- |
+| NPS1 | 1.72-2.00 | 0.09 | 0.20 |
+| NPS2 stock, flat rendezvous | 6.36 | 11.04 | 6.19 |
+| NPS2 flags split, flat rendezvous | 2.44 | 0.82 | 0.90 |
+| NPS2 flags split, **tree rendezvous** | **2.36** | **0.58** | **0.67** |
+| NPS2 one domain, tree rendezvous | 5.16 | -- | -- |
+
+The entry stagger drops 0.82 -> 0.58 us and the arrival spread follows it down
+0.90 -> 0.67, which is the causal claim confirmed: the rendezvous was manufacturing
+about a third of the skew, and removing its cross-AID arrivals removes that third.
+The `bar` spread across XCDs narrows correspondingly, from 2.08-2.76 to 2.24-2.56,
+and the releaser stops pinning to XCD 6 (6:70 -> 5:44 6:46).
+
+`bar` p50 itself only moves 0.08 us, because 0.24 us of recovered skew is shared
+out among eight dies and only the last arriver is on the critical path. The
+last-arriver column is where it shows up: 2.76 -> 2.56.
+
+The one-domain row is the shape-versus-placement control. The tree with no AID
+placement at all is worth 1.2 us over stock (6.36 -> 5.16), so the fan-in matters
+most when the placement is bad, and the two fixes overlap heavily: once the flags
+are replicated, most of what the tree would have saved is already saved.
+
+## What is left
+
+0.58 us of entry spread against NPS1's 0.09. The rendezvous accounted for 0.24 of
+the 0.73 us gap; the rest is created somewhere else between layers, and the
+remaining candidate is the one the `drain` column has been pointing at all along:
+the upper half pays +0.08-0.12 us to retire its O-proj stores into
+`attn_proj_out`, which is a single hipMalloc'd buffer, single-homed the way
+`counters` was. Unlike the barrier flags it is large enough for placement to
+matter, and unlike them it is written every layer by all eight XCDs.
+
+That is the next thing to place per AID. The barrier itself has ~0.2 us of
+protocol headroom left and is not worth further work.
 
 ## Reproducing
 
 ```bash
-bash build_gate.sh '-DMPK_OPROJ_BAR_TRACE' drive_phase7_trace
+bash build_gate.sh '' drive_phase7
 bash gate_lsplit.sh                     # correctness of the level-1 split
+bash gate_hrdv.sh                       # correctness of the tree rendezvous
+bash build_gate.sh '-DMPK_OPROJ_BAR_TRACE' drive_phase7_trace
+bash skew_hrdv.sh                       # entry skew, tree rendezvous on and off
 bash trace_bar.sh fix      --aid=1 --coherent=1 --split=1 --lsplit=0
 bash trace_bar.sh fixlocal --aid=1 --coherent=1 --split=1 --lsplit=1
 sudo -n python3 run_root.py set_mode2.sh NPS1

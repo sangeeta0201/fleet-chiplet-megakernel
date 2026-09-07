@@ -2946,14 +2946,22 @@ done :
   // being published and its poll clearing -- the other 183 arrivals, the eight
   // level-2 atomics and the release store, none of which it can distinguish,
   // but all of which are somebody else's latency rather than this block's.
+  // `t0` is absolute so the *entry* skew can be separated from the *arrival*
+  // skew. Arrival skew is what `bar` pays for, but it does not say who created
+  // it: if the eight XCDs already enter Phase 7 that far apart then the barrier
+  // is only reporting imbalance it inherited, and no amount of restructuring
+  // the barrier will touch it. `sw` and `mf` are the two stages between entry
+  // and arrival, per XCD, which is where it would have to be created otherwise.
   if (tid == 0 && (tile_idx % tiles_per_xcd) == 0) {
     printf("[BAR_OBS] ep=%d xcd=%d drain=%.3f l1=%.3f wait=%.3f acq=%.3f "
-           "obs=%llu bar=%.3f\n",
+           "obs=%llu bar=%.3f t0=%llu sw=%.3f mf=%.3f\n",
            layer_epoch, xcd_id, (double)(_bt0 - _op_t1) * 10.0 / 1000.0,
            (double)(_bt1 - _bt0) * 10.0 / 1000.0,
            (double)(_bt4 - _bt1) * 10.0 / 1000.0,
            (double)(_op_t2 - _bt4) * 10.0 / 1000.0, _bt4,
-           (double)(_op_t2 - _op_t1) * 10.0 / 1000.0);
+           (double)(_op_t2 - _op_t1) * 10.0 / 1000.0, _op_t0,
+           (double)(_op_t0b - _op_t0) * 10.0 / 1000.0,
+           (double)(_op_t1 - _op_t0b) * 10.0 / 1000.0);
   }
   // The XCD-last arriver rotates every layer, because the arrival counter is
   // monotonic and never reset -- so this samples a different one of the 23

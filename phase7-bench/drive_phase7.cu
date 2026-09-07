@@ -288,6 +288,43 @@ static void *alloc_in_aid(size_t bytes, int aid, bool coherent) {
 // indexing both by xcd_id.
 #define HIER_LOCAL_OFF_INTS (7 << 16)
 
+// The hierarchical inter-layer rendezvous, 4 KiB past the level-1 lines, which
+// only need 8 lines of 16 ints. 768 bytes, so it clears the end of the 2 MiB
+// sync buffer with room to spare.
+//
+// The flat rendezvous this replaces has every one of the 184 blocks increment
+// *both* replicas -- 368 atomics on two lines per layer, and for 92 of the
+// blocks each layer one of the two is a read-modify-write across the partition
+// boundary. Measured, that is what staggers the two halves by 0.84 us before
+// Phase 7 even starts, which the Phase 7 barrier then faithfully reports as
+// `wait`. The tree below keeps every step in the arriving block's own AID and
+// puts exactly one store on the critical path that crosses the boundary.
+//
+// Every line below is indexed by the *half* as well, so the two halves never
+// share one. That is what lets the same code run in NPS1, where there is one
+// buffer and both pointers alias it: the topology stays a genuine 4/4 split and
+// only the placement collapses. Indexing solely by placement would have both
+// halves increment one level-2 counter, and the release would fire on the fourth
+// arrival, before the other four XCDs had shown up.
+//
+// Region layout, in ints, relative to the base of one copy:
+//   [x * 16]        level-1 arrival, one line per XCD. Partitioned, not
+//                   replicated: line x is only ever touched by XCD x's own 23
+//                   blocks, which are co-located by construction, so there is no
+//                   misroutable reader here at all.
+//   [128 + h * 16]  level-2 arrival for half h, its own 4 level-1 closers. Local.
+//   [160 + h * 16]  the slot half h *observes*, written by the other half's
+//                   closer. Single-writer, single-reader, and homed with the
+//                   reader: the signal is a remote write-through store, which is
+//                   off the critical path, while the poll is served locally.
+//   [192 + h * 16]  half h's release epoch, polled by its own 92 blocks locally.
+#define RDV_OFF_INTS (HIER_LOCAL_OFF_INTS + 1024)
+#define RDV_L1_INTS(x) ((x) * 16)
+#define RDV_L2_INTS(h) (128 + (h) * 16)
+#define RDV_PEER_INTS(h) (160 + (h) * 16)
+#define RDV_REL_INTS(h) (192 + (h) * 16)
+#define RDV_REGION_BYTES 1024
+
 __device__ unsigned int g_local_claim[NXCD];
 
 __device__ __forceinline__ int drv_get_xcd() {
@@ -319,9 +356,9 @@ __global__ __launch_bounds__(NTHREADS) void drive_phase7(
     void *router_bias, void *logits_scratch, void *counters, void *output,
     void *topk_weight, void *routing_indices, void *active_expert_ids,
     int *flags, int *flags_b, unsigned int *bar, unsigned int *bar_b,
-    int *hier_lo, int *hier_hi, int *hloc_lo, int *hloc_hi,
-    int *xcd_seen, int n_layers, int delay_ticks, int delay_skew, int tiles,
-    int dual, int split_on) {
+    int *hier_lo, int *hier_hi, int *hloc_lo, int *hloc_hi, int *rdv_lo,
+    int *rdv_hi, int *xcd_seen, int n_layers, int delay_ticks, int delay_skew,
+    int tiles, int dual, int split_on) {
   int const xcd = drv_get_xcd();
   int const tid = threadIdx.x;
 
@@ -475,12 +512,46 @@ __global__ __launch_bounds__(NTHREADS) void drive_phase7(
     // ?? per-layer rendezvous across all 184 tiles, as phase 9 does ??
     __syncthreads();
     if (tid == 0) {
-      atomicAdd(bar, 1u);
-      if (dual) {
-        atomicAdd(bar_b, 1u);
-      }
-      while (drv_ld_sys_s32((int *)my_bar) < layer * NXCD * tiles) {
-        __builtin_amdgcn_s_sleep(1);
+      if (rdv_lo != nullptr) {
+        // Three levels, and no counter is shared across the partition boundary.
+        // Every counter here is monotonic rather than reset, so the arrival
+        // tests are on the residue and the release test is `<`: a block that is
+        // slow to leave layer L cannot then mistake layer L+1's release for its
+        // own, which an equality test on a recycled counter would allow.
+        // `half` is the tree's shape and is always a 4/4 split; `split_on` only
+        // decides whether the two halves' lines are placed in different AIDs.
+        int const half = (xcd >= NXCD / 2) ? 1 : 0;
+        int *const my_rdv = (split_on && half) ? rdv_hi : rdv_lo;
+        int *const peer_rdv = (split_on && !half) ? rdv_hi : rdv_lo;
+
+        // Level 1: this XCD's 23 blocks, one line, all co-located.
+        unsigned int const a1 =
+            atomicAdd((unsigned int *)(my_rdv + RDV_L1_INTS(xcd)), 1u);
+        if ((int)(a1 % (unsigned)tiles) == tiles - 1) {
+          // Level 2: this half's 4 level-1 closers, one line, still all local.
+          unsigned int const a2 =
+              atomicAdd((unsigned int *)(my_rdv + RDV_L2_INTS(half)), 1u);
+          if ((int)(a2 % (NXCD / 2u)) == NXCD / 2 - 1) {
+            // Level 3: the only boundary crossing in the whole rendezvous, and
+            // a store rather than a read-modify-write.
+            drv_st_wt_u32(peer_rdv + RDV_PEER_INTS(1 - half), (unsigned)layer);
+            while (drv_ld_sys_s32(my_rdv + RDV_PEER_INTS(half)) < layer) {
+              __builtin_amdgcn_s_sleep(1);
+            }
+            drv_st_wt_u32(my_rdv + RDV_REL_INTS(half), (unsigned)layer);
+          }
+        }
+        while (drv_ld_sys_s32(my_rdv + RDV_REL_INTS(half)) < layer) {
+          __builtin_amdgcn_s_sleep(1);
+        }
+      } else {
+        atomicAdd(bar, 1u);
+        if (dual) {
+          atomicAdd(bar_b, 1u);
+        }
+        while (drv_ld_sys_s32((int *)my_bar) < layer * NXCD * tiles) {
+          __builtin_amdgcn_s_sleep(1);
+        }
       }
     }
     __syncthreads();
@@ -491,7 +562,7 @@ int main(int argc, char **argv) {
   int n_layers = 200;
   int delay_ticks = 0, delay_skew = 0;
   int tiles = TILES_PER_XCD;
-  int use_aid = 0, split_on = 1, lsplit_on = 0;
+  int use_aid = 0, split_on = 1, lsplit_on = 0, hrdv_on = 0;
   char const *tag = "run";
   for (int i = 1; i < argc; ++i) {
     if (!strncmp(argv[i], "--layers=", 9)) {
@@ -510,6 +581,8 @@ int main(int argc, char **argv) {
       split_on = atoi(argv[i] + 8);
     } else if (!strncmp(argv[i], "--lsplit=", 9)) {
       lsplit_on = atoi(argv[i] + 9);
+    } else if (!strncmp(argv[i], "--hrdv=", 7)) {
+      hrdv_on = atoi(argv[i] + 7);
     } else if (!strncmp(argv[i], "--tag=", 6)) {
       tag = argv[i] + 6;
     }
@@ -526,6 +599,7 @@ int main(int argc, char **argv) {
   int *flags = nullptr, *flags_b = nullptr, *xcd_seen = nullptr;
   int *hier_lo = nullptr, *hier_hi = nullptr;
   int *hloc_lo = nullptr, *hloc_hi = nullptr;
+  int *rdv_lo = nullptr, *rdv_hi = nullptr;
   unsigned int *bar = nullptr, *bar_b = nullptr;
   int dual = 0;
 
@@ -610,6 +684,13 @@ int main(int argc, char **argv) {
       hloc_lo = flags + HIER_LOCAL_OFF_INTS;
       hloc_hi = flags_b + HIER_LOCAL_OFF_INTS;
     }
+    // Also independent of --split, and for the same reason: every line in the
+    // region is indexed by the half that owns it, so placing the two halves in
+    // different AIDs partitions the state rather than replicating it.
+    if (hrdv_on) {
+      rdv_lo = flags + RDV_OFF_INTS;
+      rdv_hi = flags_b + RDV_OFF_INTS;
+    }
     HIP_OK(hipMemset(flags, 0, sync_bytes));
     HIP_OK(hipMemset(flags_b, 0, sync_bytes));
     dual = 1;
@@ -620,13 +701,25 @@ int main(int argc, char **argv) {
     bar_b = bar;
     split_on = 0;
     lsplit_on = 0;
+    // The tree is still worth running with one coherence domain: it is the
+    // control that says how much of its benefit is the shape and how much is the
+    // placement. Both pointers alias, and the per-half line indices keep it a
+    // correct 4/4 barrier anyway.
+    if (hrdv_on) {
+      void *r = nullptr;
+      HIP_OK(hipMalloc(&r, RDV_REGION_BYTES));
+      HIP_OK(hipMemset(r, 0, RDV_REGION_BYTES));
+      rdv_lo = (int *)r;
+      rdv_hi = (int *)r;
+    }
   }
 
   printf("[%s] attn_out %p  flags %p / %p  weight %p (%.2f MiB)\n", tag, attn,
          (void *)flags, (void *)flags_b, weight, weight_bytes / 1048576.0);
-  printf("[%s] aid=%d coherent=%d split=%d hier_split=%d local_split=%d\n", tag,
-         use_aid, (int)g_coherent, split_on, hier_lo != nullptr,
-         hloc_lo != nullptr);
+  printf("[%s] aid=%d coherent=%d split=%d hier_split=%d local_split=%d "
+         "hier_rdv=%d\n",
+         tag, use_aid, (int)g_coherent, split_on, hier_lo != nullptr,
+         hloc_lo != nullptr, rdv_lo != nullptr);
   printf("[%s] %d tiles (%d/XCD), %d threads, %d layers, delay=%d skew=%d, "
          "%d polling waves\n",
          tag, NXCD * tiles, tiles, NTHREADS, n_layers, delay_ticks, delay_skew,
@@ -644,8 +737,8 @@ int main(int argc, char **argv) {
                      MAX_DYNAMIC_SHARED_MEMORY_SIZE, 0, attn, weight, residual,
                      bias, nw, no, rw, rb, logits, counters, out, tkw, ridx,
                      aeid, flags, flags_b, bar, bar_b, hier_lo, hier_hi,
-                     hloc_lo, hloc_hi, xcd_seen, n_layers, delay_ticks,
-                     delay_skew, tiles, dual, split_on);
+                     hloc_lo, hloc_hi, rdv_lo, rdv_hi, xcd_seen, n_layers,
+                     delay_ticks, delay_skew, tiles, dual, split_on);
   HIP_OK(hipEventRecord(e1));
   HIP_OK(hipDeviceSynchronize());
   HIP_OK(hipGetLastError());

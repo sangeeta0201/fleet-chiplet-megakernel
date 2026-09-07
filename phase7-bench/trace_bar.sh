@@ -58,7 +58,8 @@ for line in open(src):
     elif "[BAR_OBS]" in line:
         obs.append((int(d["ep"]), int(d["xcd"]), float(d["l1"]),
                     int(d["obs"]), float(d["acq"]), float(d["drain"]),
-                    float(d["wait"]), float(d["bar"])))
+                    float(d["wait"]), float(d["bar"]), int(d["t0"]),
+                    float(d["sw"]), float(d["mf"])))
     elif "[BAR_REL]" in line:
         rel[int(d["ep"])] = (int(d["xcd"]), int(d["rel"]))
 
@@ -132,6 +133,37 @@ for x in range(8):
 if d_lo and d_hi:
     print("    halves:  %.3f  vs  %.3f   delta %+.3f" %
           (med(d_lo), med(d_hi), med(d_hi) - med(d_lo)))
+
+# Entry skew vs arrival skew. Both are measured against `rel`, the one tick per
+# layer that every XCD shares, so the two spreads are directly comparable. If
+# they are the same size the barrier inherited the imbalance and restructuring it
+# cannot help; if entry is tight and arrival is wide, Phase 7 created it, and
+# `sw` / `mf` per XCD say in which stage.
+print("\n  Entry skew vs arrival skew, per XCD, us relative to the release")
+print("  %-5s %10s %10s %9s %9s" % ("xcd", "entry", "arrival", "sw", "mf"))
+ent, arv = {}, {}
+for x in range(8):
+    e, a, sw, mf = [], [], [], []
+    for row in obs:
+        ep, xc = row[0], row[1]
+        if xc != x or ep not in rel:
+            continue
+        r = rel[ep][1]
+        e.append((row[8] - r) * 10.0 / 1000.0)
+        a.append((row[3] - r) * 10.0 / 1000.0 - row[6])
+        sw.append(row[9])
+        mf.append(row[10])
+    if not e:
+        continue
+    ent[x], arv[x] = med(e), med(a)
+    print("  %-5d %10.3f %10.3f %9.3f %9.3f" % (x, ent[x], arv[x], med(sw),
+                                                med(mf)))
+if ent:
+    es = max(ent.values()) - min(ent.values())
+    as_ = max(arv.values()) - min(arv.values())
+    print("    entry spread   %.3f" % es)
+    print("    arrival spread %.3f" % as_)
+    print("    created inside Phase 7: %+.3f" % (as_ - es))
 
 print("\n  Acquire after observation ([BAR_OBS] acq, p50 us): %.3f"
       % med([r[4] for r in obs]))

@@ -328,6 +328,11 @@ them being fast because it was wrong is exactly the failure to rule out.
 | `--tiles=N` | 23 | Workgroups per XCD, so 32*N polling waves. Sweep to separate queueing from per-access latency. |
 | `--skew=N` | 0 | Per-XCD staggered producer release, in 10 ns ticks. Injects arrival skew for comparison against the zero-skew baseline. |
 | `--delay=N` | 0 | Uniform producer delay in ticks. Models attention/merge compute ahead of the release. |
+| `--aid=N` | 0 | Place the sync buffers with `alloc_in_aid` instead of `hipMalloc`. Required by every flag below; there is nothing to place into under one memory partition. |
+| `--coherent=N` | 0 | Request a coherent MTYPE on the AID-local buffers. Sound only while every cached reader is co-located with its line's home AID. |
+| `--split=N` | 1 | One release-flag replica per partition, each half of the XCDs polling its own. The fix; `--split=0` with `--aid=1` is the co-location violation, and it hangs. |
+| `--lsplit=N` | 0 | Home the eight per-XCD level-1 arrival lines per AID. Partitioned, not replicated. Correct, and buys nothing -- see Known gaps. |
+| `--hrdv=N` | 0 | Replace the flat inter-layer rendezvous with the AID-aware tree: per-XCD level 1, per-half level 2, then one store across the boundary instead of 184 remote atomics. |
 
 Timestamps come from `s_memrealtime`, which ticks at 100 MHz, so one tick is
 10 ns. That is the same conversion the in-kernel printf uses, so benchmark and
@@ -371,6 +376,30 @@ model numbers are directly comparable.
   6. Level 2 shows *no* AID asymmetry at all (0.520 us either half). So what is
   left is a load-imbalance problem upstream of the barrier, not a
   synchronization one; see `results/bar-attribution.md`.
+- **Phase 7 inherits the skew rather than creating it.** `[BAR_OBS]` also carries
+  `t0`, the absolute tick at Phase 7 entry, so the stagger at the door is
+  separable from the stagger at the barrier. NPS1 enters Phase 7 with all eight
+  dies within **0.09 us** and NPS2 with **0.82 us** already baked in, while
+  Phase 7's own contribution is 0.08 us in NPS2 against 0.11 us in NPS1 -- it adds
+  *less*. Per-XCD `slicewait` and `mfma` are flat across all eight dies in both
+  modes, so Phase 7's work is balanced to the tick and the barrier is only the
+  place where an imbalance created before it ran becomes visible.
+- **The upstream culprit is the inter-layer rendezvous, and the fix is the same
+  tree.** The flat rendezvous had all 184 blocks increment *both* replicas and
+  poll their own: 368 atomics on two lines per layer, 92 of them read-modify-write
+  across the partition boundary. Replicating the counters fixed the polling and
+  left the arrivals, so the two replicas crossed their thresholds at different
+  times and released the two halves staggered. `--hrdv=1` makes it hierarchical
+  and AID-aware -- per-XCD level 1, per-half level 2, then a two-slot handshake
+  where each half signals the other with one write-through store into a slot homed
+  with its reader and polls its own slot locally. Critical-path boundary crossings
+  drop from 184 remote atomics to **one store**. Entry stagger 0.82 -> 0.58 us,
+  arrival spread 0.90 -> 0.67, last-arriver `bar` 2.76 -> 2.56, and the releaser
+  stops pinning to XCD 6. `bar` p50 moves only 0.08 us, because recovered skew is
+  shared across eight dies and only the last arriver is on the critical path.
+  Every line is indexed by half as well as by placement, which is load-bearing:
+  it keeps the topology a genuine 4/4 split when both region pointers alias one
+  buffer, as they do in NPS1. `gate_hrdv.sh` checks all four configurations agree.
 - **Homing the level-1 arrival lines per AID is correct and buys nothing.**
   `--lsplit=1` partitions the eight per-XCD arrival counters
   (`hier_local_lo`/`hier_local_hi`); unlike the release flags this needs no
@@ -431,4 +460,6 @@ model numbers are directly comparable.
 | `trace_bar.sh` | `-DMPK_OPROJ_BAR_TRACE`: times five points inside the barrier and splits `bar` into `drain + l1 + wait + acq`, per XCD. Ticks are taken in registers and printed past `done:`, so the barrier is not perturbed by its own measurement. |
 | `trace_both_modes.sh` | The same trace either side of a partition switch, with the NPS2 restore in an `EXIT` trap so a mid-run failure cannot leave the node in NPS1. |
 | `gate_lsplit.sh` | Correctness gate for `--lsplit`. Derives the reference from the first configuration rather than hardcoding a hash, because the recorded pair is specific to 400 layers -- the harness residual is a function of `layer & 15`. |
-| `results/bar-attribution.md` | Where the residual `bar` gap actually goes: arrival skew, not the barrier's memory protocol. Includes the level-1 split that works and buys nothing. |
+| `gate_hrdv.sh` | Correctness gate for `--hrdv`. Four configurations including the tree with one coherence domain, which is both the shape-versus-placement control and the check that the aliased path is still a 4/4 barrier. |
+| `skew_hrdv.sh` | Entry stagger with the tree rendezvous on and off. `bar` alone cannot attribute the change; the entry columns can, because they are read before the barrier has done anything. |
+| `results/bar-attribution.md` | Where the residual `bar` gap actually goes: arrival skew, not the barrier's memory protocol. Includes the level-1 split that works and buys nothing, the entry-versus-arrival split that exonerates Phase 7, and the tree rendezvous that recovers a third of the skew. |
