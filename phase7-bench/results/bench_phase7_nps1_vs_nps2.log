@@ -1,0 +1,71 @@
+############ SPX+NPS1 reference ############
+    aid_local_xcp_nc=N
+[07:24:46] SPX+NPS1 confirmed
+  mode=SPX+NPS1  mtype_local=0  xcp_nc=N  flag_mtype=0
+  driver says: Using MTYPE_RW for local memory
+
+--- nps1 (aid=0 coherent=0 split=0) ---
+[nps1] wall 15.33 ms for 3600 layers = 4.26 us/layer
+[nps1] block->XCD round-robin holds for 184 of 184 blocks
+  xcd0 read us            0.16           0.12           0.08           0.08
+  xcd1 read us            0.16           0.16           0.12           0.08
+  xcd2 read us            0.16           0.16           0.08           0.08
+  xcd3 read us            0.12           0.12           0.12           0.08
+  xcd4 read us            0.08           0.12           0.08           0.08
+  xcd5 read us            0.08           0.08           0.08           0.08
+  xcd6 read us            0.08           0.08           0.08           0.08
+  xcd7 read us            0.12           0.08           0.08           0.08
+[nps1] slicewait us  p10 0.84  p50 1.04  p90 1.32  max 1.68
+[nps1] read us       p10 0.04  p50 0.08  p90 0.20  max 0.52
+
+--- nps1_aid (aid=1 coherent=1 split=1) ---
+[AID] 2.00 MiB in AID0 (range 0, COHERENT set) -> 0x752031000000
+[AID] 2.00 MiB in AID1 (range 1, COHERENT set) -> 0x752030c00000
+[nps1_aid] wall 14.60 ms for 3600 layers = 4.05 us/layer
+[nps1_aid] block->XCD round-robin holds for 184 of 184 blocks
+  xcd0 read us            0.08           0.08           0.20           0.20
+  xcd1 read us            0.08           0.08           0.16           0.16
+  xcd2 read us            0.08           0.08           0.16           0.16
+  xcd3 read us            0.08           0.08           0.16           0.16
+  xcd4 read us            0.08           0.04           0.08           0.08
+  xcd5 read us            0.12           0.04           0.08           0.08
+  xcd6 read us            0.08           0.04           0.08           0.08
+  xcd7 read us            0.12           0.04           0.08           0.08
+[nps1_aid] slicewait us  p10 0.64  p50 1.00  p90 1.36  max 2.16
+[nps1_aid] read us       p10 0.04  p50 0.08  p90 0.24  max 0.68
+
+############ back to SPX+NPS2 with the per-BO knob ############
+    aid0 fpfn 0x0 lpfn 0x23fffff size 0x2400000000
+    aid1 fpfn 0x2400000 lpfn 0x47fefff size 0x23ff000000
+  mode=SPX+NPS2  mtype_local=0  xcp_nc=Y  flag_mtype=2
+  driver says: Using MTYPE_RW for local memory
+
+--- nps2_base (aid=0 coherent=0 split=0) ---
+[nps2_base] wall 109.80 ms for 3600 layers = 30.50 us/layer
+[nps2_base] block->XCD round-robin holds for 184 of 184 blocks
+  xcd0 read us            0.52           0.12           0.08           0.44
+  xcd1 read us            0.64           0.12           0.08           0.80
+  xcd2 read us            1.88           0.12           0.12           2.56
+  xcd3 read us            1.84           0.12           0.12           2.52
+  xcd4 read us            1.92           0.12           0.12           2.40
+  xcd5 read us            1.84           0.12           0.12           2.52
+  xcd6 read us            0.44           0.12           0.08           0.40
+  xcd7 read us            0.64           0.12           0.08           0.72
+[nps2_base] slicewait us  p10 5.92  p50 14.36  p90 21.08  max 29.80
+[nps2_base] read us       p10 0.04  p50 0.40  p90 4.40  max 11.64
+
+--- nps2_aidcc (aid=1 coherent=1 split=1) ---
+[AID] 2.00 MiB in AID0 (range 0, COHERENT set) -> 0x7556c8c00000
+[AID] 2.00 MiB in AID1 (range 1, COHERENT set) -> 0x7556c8800000
+[nps2_aidcc] wall 13.78 ms for 3600 layers = 3.83 us/layer
+[nps2_aidcc] block->XCD round-robin holds for 184 of 184 blocks
+  xcd0 read us            0.08           0.08           0.08           0.08
+  xcd1 read us            0.08           0.08           0.08           0.08
+  xcd2 read us            0.08           0.08           0.08           0.08
+  xcd3 read us            0.08           0.08           0.08           0.08
+  xcd4 read us            0.08           0.04           0.08           0.08
+  xcd5 read us            0.08           0.08           0.12           0.12
+  xcd6 read us            0.08           0.04           0.08           0.08
+  xcd7 read us            0.08           0.04           0.08           0.12
+[nps2_aidcc] slicewait us  p10 0.56  p50 0.80  p90 1.20  max 1.76
+[nps2_aidcc] read us       p10 0.04  p50 0.08  p90 0.16  max 0.80

@@ -2,3 +2,5 @@ bench_aidsplit
 bench_flagplace
 bench_hangdiag
 bench_phase7
+bench_phase7_dup
+drive_phase7

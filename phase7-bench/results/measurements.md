@@ -75,3 +75,74 @@ of the queueing the standalone run isolates.
 | Weight placement sweep | AID0 9.322, allocator-scattered 10.430, AID1 12.823 ms/iter; both AID arms served 114.04 GiB with 0 passed through |
 | 12-slot phase profiler | slot 6 18.33 -> 144.01 us (7.9x, 68% of regression); slot 7 35.77 -> 238.74 us (6.7x, 16%); QKV GEMM 0.97x |
 | Phase profiler self-check | 1.000 ns/tick NPS1, 0.999 ns/tick NPS2; reconstructed iteration time within 3.5% of measured |
+
+## Real kernel, the fix applied (drive_phase7, SPX+NPS2)
+
+`drive_phase7` calls the production
+`gang_linear_mxfp4_res_bias_rmsnorm_topk_kernel`, which takes
+`attn_slice_release` as a parameter while the harness performs the producer
+store -- so the release-flag fix lands entirely in the harness, with no change
+to the fleet headers. One AID-local COHERENT replica per AID, producer publishes
+into both, each XCD polls the replica homed in its own AID.
+
+`./drive_phase7 --layers=200 --tiles=23 --aid=N --coherent=N --split=N`,
+`aid_local_xcp_nc=1 aid_local_flag_mtype=2`, 1600 [OPROJ_INNER] samples per cell.
+
+```
+bucket            NPS2 base   NPS2 +fix   NPS1 ref
+slicewait             14.16        0.36       0.36
+bar                    6.56        3.80       2.32
+mfma                   3.40        4.08       1.44
+rmsnorm_router         1.52        1.56       1.68
+topk                   2.16        1.80       0.76
+total                 29.52       11.56       6.56
+```
+
+slicewait matches the NPS1 reference exactly. Two second-order effects:
+
+- `bar` improved 6.56 -> 3.80 without being touched. Its lines live in
+  `counters`, still a plain hipMalloc and still MTYPE_NC. Removing ~1472
+  uncached polls per layer freed the channels that the barrier traffic shares.
+  The same collateral shows up in bench_phase7's `read` bucket, 0.40 -> 0.08.
+- `mfma` went 3.40 -> 4.08. The bottleneck moved: the slow flag wait used to
+  stagger the waves, and once it is gone they arrive together and contend for
+  the still-NC weight buffer.
+
+Remaining gap to NPS1 is `bar` (3.80 vs 2.32) and `mfma` (4.08 vs 1.44). The
+`bar` half needs the arrival/release sites inside the fleet headers to publish
+into both replicas, since those addresses are formed from `counters` rather than
+passed in.
+
+## bench_phase7, NPS1 reference in the same session
+
+`run_phase7_nps1.sh`, LAYERS=3600 TILES=23, one module for both modes so only
+the partition mode differs.
+
+```
+                       wall us/layer   slicewait p50   read p50
+SPX+NPS1, hipMalloc             4.26            1.04       0.08
+SPX+NPS1, AID-split             4.05            1.00       0.08
+SPX+NPS2, hipMalloc            30.x            14.36       0.40
+SPX+NPS2, AID-split coherent    3.83            0.80       0.08
+```
+
+`read` is 0.08 in every cell that is not flag-starved, which is why replicating
+`attn_out` itself buys nothing -- see the dupdata rows below.
+
+## Replicating the slice data buys nothing (bench_phase7 --dupdata)
+
+`attn_out` is genuinely cross-AID: every consumer reads all eight slices, so
+four of them are remote whatever the placement. Replicating it into both AIDs
+and pointing each XCD at its own copy was measured and rejected.
+
+```
+                                 wall us/layer   slicewait p50   read p50
+--dupdata=0 (single, NC)                  3.81            0.84       0.08
+--dupdata=1 (per-AID pair, NC)            3.87            0.88       0.08
+--dupdata=2 (per-AID pair, coherent)      3.87            0.92       0.08
+```
+
+The read is 2 KiB per wave issued as eight independent coalesced loads retired
+under one s_waitcnt, i.e. a single pipelined memory latency (~80 ns) whether
+local or remote -- there is no queue to shorten. Duplication only adds a second
+producer store, which is why wall goes slightly up.

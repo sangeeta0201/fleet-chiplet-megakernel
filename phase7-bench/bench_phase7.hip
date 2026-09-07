@@ -175,10 +175,10 @@ static bool aid_init() {
   return true;
 }
 
-static void *alloc_in_aid(size_t bytes, int aid) {
+static void *alloc_in_aid(size_t bytes, int aid, bool coherent) {
   uint64_t const flags = GEM_CREATE_AID_LOCAL |
                          (g_range_for_aid[aid] & 1u ? GEM_CREATE_AID_SELECT : 0) |
-                         (g_coherent ? GEM_CREATE_COHERENT : 0);
+                         (coherent ? GEM_CREATE_COHERENT : 0);
   union drm_amdgpu_gem_create req;
   memset(&req, 0, sizeof req);
   req.in.bo_size = bytes;
@@ -256,11 +256,11 @@ __global__ void probe_xcd(int *out) {
 }
 
 __global__ __launch_bounds__(NTHREADS) void phase7(
-    unsigned short *attn_out, int *flags_a, int *flags_b, unsigned int *bar_a,
-    unsigned int *bar_b, unsigned long long *samp_wait,
-    unsigned long long *samp_read, unsigned int *sink, int n_layers,
-    int delay_ticks, int delay_skew, int dual, int split_on, int tiles,
-    int *seen) {
+    unsigned short *attn_out, unsigned short *attn_b, int *flags_a,
+    int *flags_b, unsigned int *bar_a, unsigned int *bar_b,
+    unsigned long long *samp_wait, unsigned long long *samp_read,
+    unsigned int *sink, int n_layers, int delay_ticks, int delay_skew, int dual,
+    int split_on, int tiles, int dupdata, int *seen) {
   int const xcd = get_xcd();
   int const tid = threadIdx.x;
   int const warp = tid >> 6;
@@ -288,9 +288,16 @@ __global__ __launch_bounds__(NTHREADS) void phase7(
   int const first_xcd = warp * 2;
   int *rel0 = &flags[first_xcd * FLAG_STRIDE];
   int *rel1 = &flags[(first_xcd + 1) * FLAG_STRIDE];
+  // With dupdata the slice buffer is replicated as well, so a consumer reads
+  // the copy homed in its own AID and no slice read crosses the boundary. This
+  // routes on the XCD's AID directly rather than on split_on, which only
+  // controls the flags. attn_out is the AID0 copy, attn_b the AID1 copy.
+  unsigned short *const attn_rd =
+      (dupdata && xcd >= NXCD / 2) ? attn_b : attn_out;
   unsigned int const *src =
-      (unsigned int const *)(attn_out + first_xcd * ATTN_SLICE);
+      (unsigned int const *)(attn_rd + first_xcd * ATTN_SLICE);
   unsigned int *my_slice = (unsigned int *)(attn_out + xcd * ATTN_SLICE);
+  unsigned int *my_slice_b = (unsigned int *)(attn_b + xcd * ATTN_SLICE);
 
   int const row = ((xcd * tiles + local) * NWAVES + warp) * n_layers;
 
@@ -311,7 +318,13 @@ __global__ __launch_bounds__(NTHREADS) void phase7(
     // consumers.
     if (local == 0) {
       // 256 threads x 1 dword = 256 dwords = 512 bf16 = this XCD's slice.
-      st_wt_u32(&my_slice[tid], (unsigned)(layer * 2654435761u + xcd));
+      // One extra KiB of write-through per XCD per layer buys every consumer a
+      // local read of all eight slices.
+      unsigned int const v = (unsigned)(layer * 2654435761u + xcd);
+      st_wt_u32(&my_slice[tid], v);
+      if (dupdata) {
+        st_wt_u32(&my_slice_b[tid], v);
+      }
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
     __syncthreads();
@@ -391,6 +404,7 @@ int main(int argc, char **argv) {
   int use_aid = 0;
   int split_on = 1;
   int tiles = 23; // O-proj workgroups per XCD in production
+  int dupdata = 0;
   char const *tag = "run";
   for (int i = 1; i < argc; ++i) {
     if (!strncmp(argv[i], "--tiles=", 8)) {
@@ -407,9 +421,16 @@ int main(int argc, char **argv) {
       g_coherent = atoi(argv[i] + 11) != 0;
     } else if (!strncmp(argv[i], "--split=", 8)) {
       split_on = atoi(argv[i] + 8);
+    } else if (!strncmp(argv[i], "--dupdata=", 10)) {
+      dupdata = atoi(argv[i] + 10);
     } else if (!strncmp(argv[i], "--tag=", 6)) {
       tag = argv[i] + 6;
     }
+  }
+
+  if (dupdata && !use_aid) {
+    fprintf(stderr, "ABORT: --dupdata needs --aid=1\n");
+    return 2;
   }
 
   int *d_probe = nullptr;
@@ -439,7 +460,7 @@ int main(int argc, char **argv) {
     }
   }
 
-  unsigned short *d_attn = nullptr;
+  unsigned short *d_attn = nullptr, *d_attn_b = nullptr;
   int *d_flags_a = nullptr, *d_flags_b = nullptr;
   unsigned int *d_bar_a = nullptr, *d_bar_b = nullptr, *d_sink = nullptr;
   unsigned long long *d_wait = nullptr, *d_read = nullptr;
@@ -465,8 +486,8 @@ int main(int argc, char **argv) {
                       "unavailable (stock driver, or not NPS2)\n");
       return 2;
     }
-    d_flags_a = (int *)alloc_in_aid(sync_bytes, 0);
-    d_flags_b = (int *)alloc_in_aid(sync_bytes, 1);
+    d_flags_a = (int *)alloc_in_aid(sync_bytes, 0, g_coherent);
+    d_flags_b = (int *)alloc_in_aid(sync_bytes, 1, g_coherent);
     if (d_flags_a == nullptr || d_flags_b == nullptr) {
       fprintf(stderr, "ABORT: could not place a sync buffer in each AID\n");
       return 2;
@@ -476,6 +497,24 @@ int main(int argc, char **argv) {
     HIP_OK(hipMemset(d_flags_a, 0, sync_bytes));
     HIP_OK(hipMemset(d_flags_b, 0, sync_bytes));
     dual = 1;
+    if (dupdata) {
+      // The slice buffer needs no coherence to be local, and the consumer
+      // issues a buffer_inv before reading anyway, so dupdata=1 (NC) is the
+      // measurement of pure locality. dupdata=2 additionally marks the pair
+      // COHERENT, which is sound for the same reason it is for the flags:
+      // every reader is co-located with the copy it reads.
+      bool const dcoh = dupdata >= 2;
+      void *a = alloc_in_aid(sync_bytes, 0, dcoh);
+      void *b = alloc_in_aid(sync_bytes, 1, dcoh);
+      if (a == nullptr || b == nullptr) {
+        fprintf(stderr, "ABORT: could not place a slice buffer in each AID\n");
+        return 2;
+      }
+      d_attn = (unsigned short *)a;
+      d_attn_b = (unsigned short *)b;
+      HIP_OK(hipMemset(d_attn, 0, REDUCTION * sizeof(unsigned short)));
+      HIP_OK(hipMemset(d_attn_b, 0, REDUCTION * sizeof(unsigned short)));
+    }
   } else {
     // Baseline: exactly what the kernel does today, one hipMalloc'd flag page
     // and one counter, both MTYPE_NC and both read from both AIDs.
@@ -488,21 +527,23 @@ int main(int argc, char **argv) {
     split_on = 0;
   }
 
-  printf("[%s] aid=%d coherent=%d split=%d  %d tiles/XCD = %d blocks, %d "
-         "polling waves, %d layers, delay=%d skew=%d ticks\n",
-         tag, use_aid, (int)g_coherent, split_on, tiles, nblocks,
+  printf("[%s] aid=%d coherent=%d split=%d dupdata=%d  %d tiles/XCD = %d "
+         "blocks, %d polling waves, %d layers, delay=%d skew=%d ticks\n",
+         tag, use_aid, (int)g_coherent, split_on, dupdata, tiles, nblocks,
          nblocks * NWAVES, n_layers, delay_ticks, delay_skew);
-  printf("      attn_out %p (NC, cross-AID by design)  flags %p / %p\n",
-         (void *)d_attn, (void *)d_flags_a, (void *)d_flags_b);
+  printf("      attn_out %p / %p (dupdata=%d)  flags %p / %p\n",
+         (void *)d_attn, (void *)d_attn_b, dupdata, (void *)d_flags_a,
+         (void *)d_flags_b);
 
   hipEvent_t e0, e1;
   HIP_OK(hipEventCreate(&e0));
   HIP_OK(hipEventCreate(&e1));
   HIP_OK(hipEventRecord(e0));
   hipLaunchKernelGGL(phase7, dim3(nblocks), dim3(NTHREADS), 0, 0, d_attn,
-                     d_flags_a, d_flags_b, d_bar_a, d_bar_b, d_wait, d_read,
-                     d_sink, n_layers, delay_ticks, delay_skew, dual, split_on,
-                     tiles, d_seen);
+                     d_attn_b == nullptr ? d_attn : d_attn_b, d_flags_a,
+                     d_flags_b, d_bar_a, d_bar_b, d_wait, d_read, d_sink,
+                     n_layers, delay_ticks, delay_skew, dual, split_on, tiles,
+                     dupdata, d_seen);
   HIP_OK(hipEventRecord(e1));
   HIP_OK(hipDeviceSynchronize());
   HIP_OK(hipGetLastError());

@@ -26,10 +26,19 @@
 #include "persistent_kernel.cuh"
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+#include <drm/amdgpu_drm.h>
+#include <drm/drm.h>
 
 using namespace mirage::runtime;
 
@@ -97,6 +106,169 @@ static void _init_persistent_kernel(std::vector<FullTaskDesc> &all_tasks,
     }                                                                          \
   } while (0)
 
+static constexpr uint64_t GEM_CREATE_AID_LOCAL = 1ULL << 17;
+static constexpr uint64_t GEM_CREATE_AID_SELECT = 1ULL << 18;
+static constexpr uint64_t GEM_CREATE_COHERENT = 1ULL << 13;
+
+static int g_drm_fd = -1;
+static unsigned g_range_for_aid[2] = {~0u, ~0u};
+static bool g_coherent = false;
+
+static int open_render_node(char const *pci) {
+  for (int m = 128; m < 256; m++) {
+    char path[128], link[256];
+    snprintf(path, sizeof path, "/sys/class/drm/renderD%d/device", m);
+    ssize_t n = readlink(path, link, sizeof link - 1);
+    if (n <= 0) {
+      continue;
+    }
+    link[n] = 0;
+    if (strstr(link, pci) == nullptr) {
+      continue;
+    }
+    snprintf(path, sizeof path, "/dev/dri/renderD%d", m);
+    int fd = open(path, O_RDWR | O_CLOEXEC);
+    if (fd >= 0) {
+      return fd;
+    }
+  }
+  return -1;
+}
+
+// Group the aid_aperture ranges by first pfn against the midpoint of the
+// covered span, never by index; the index order is per-GPU.
+static bool resolve_ranges(char const *pci) {
+  char sp[256];
+  snprintf(sp, sizeof sp, "/sys/bus/pci/devices/%s/aid_aperture", pci);
+  FILE *f = fopen(sp, "r");
+  if (f == nullptr) {
+    printf("[AID] %s unreadable -- stock driver or not NPS2\n", sp);
+    return false;
+  }
+  uint64_t sizes[4] = {0, 0, 0, 0}, fpfns[4] = {0, 0, 0, 0};
+  char line[256];
+  while (fgets(line, sizeof line, f) != nullptr) {
+    unsigned idx;
+    uint64_t fp, lp, sz;
+    if (sscanf(line, "aid%u fpfn 0x%lx lpfn 0x%lx size 0x%lx", &idx, &fp, &lp,
+               &sz) == 4 &&
+        idx < 4) {
+      sizes[idx] = sz;
+      fpfns[idx] = fp;
+    }
+  }
+  fclose(f);
+  uint64_t max_end = 0;
+  for (int r = 0; r < 4; r++) {
+    if (sizes[r]) {
+      uint64_t e = fpfns[r] + (sizes[r] >> 12);
+      max_end = e > max_end ? e : max_end;
+    }
+  }
+  if (!max_end) {
+    return false;
+  }
+  uint64_t const boundary = max_end / 2;
+  uint64_t best_lo = 0, best_hi = 0;
+  for (int r = 0; r < 4; r++) {
+    if (!sizes[r]) {
+      continue;
+    }
+    if (fpfns[r] < boundary) {
+      if (sizes[r] > best_lo) {
+        best_lo = sizes[r];
+        g_range_for_aid[0] = (unsigned)r;
+      }
+    } else {
+      if (sizes[r] > best_hi) {
+        best_hi = sizes[r];
+        g_range_for_aid[1] = (unsigned)r;
+      }
+    }
+  }
+  if (g_range_for_aid[0] == ~0u || g_range_for_aid[1] == ~0u) {
+    printf("[AID] could not pick one range per AID\n");
+    return false;
+  }
+  printf("[AID] AID0 -> range %u, AID1 -> range %u\n", g_range_for_aid[0],
+         g_range_for_aid[1]);
+  return true;
+}
+
+static bool aid_init() {
+  int dev = 0;
+  if (hipGetDevice(&dev) != hipSuccess) {
+    return false;
+  }
+  char bus[64] = {0};
+  if (hipDeviceGetPCIBusId(bus, sizeof bus, dev) != hipSuccess) {
+    return false;
+  }
+  for (char *p = bus; *p; p++) {
+    if (*p >= 'A' && *p <= 'F') {
+      *p = (char)(*p - 'A' + 'a');
+    }
+  }
+  if (!resolve_ranges(bus)) {
+    return false;
+  }
+  g_drm_fd = open_render_node(bus);
+  if (g_drm_fd < 0) {
+    printf("[AID] no render node for %s\n", bus);
+    return false;
+  }
+  return true;
+}
+
+static void *alloc_in_aid(size_t bytes, int aid, bool coherent) {
+  uint64_t const flags = GEM_CREATE_AID_LOCAL |
+                         (g_range_for_aid[aid] & 1u ? GEM_CREATE_AID_SELECT : 0) |
+                         (coherent ? GEM_CREATE_COHERENT : 0);
+  union drm_amdgpu_gem_create req;
+  memset(&req, 0, sizeof req);
+  req.in.bo_size = bytes;
+  req.in.alignment = 2ULL << 20;
+  req.in.domains = AMDGPU_GEM_DOMAIN_VRAM;
+  req.in.domain_flags = flags;
+  if (ioctl(g_drm_fd, DRM_IOCTL_AMDGPU_GEM_CREATE, &req) != 0) {
+    printf("[AID] GEM_CREATE %zu B flags 0x%llx failed: %s\n", bytes,
+           (unsigned long long)flags, strerror(errno));
+    return nullptr;
+  }
+  struct drm_prime_handle prime;
+  memset(&prime, 0, sizeof prime);
+  prime.handle = req.out.handle;
+  if (ioctl(g_drm_fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime) != 0) {
+    printf("[AID] PRIME export failed: %s\n", strerror(errno));
+    return nullptr;
+  }
+  hipExternalMemoryHandleDesc hd = {};
+  hd.type = hipExternalMemoryHandleTypeOpaqueFd;
+  hd.handle.fd = prime.fd;
+  hd.size = bytes;
+  hipExternalMemory_t ext;
+  if (hipImportExternalMemory(&ext, &hd) != hipSuccess) {
+    printf("[AID] hipImportExternalMemory failed\n");
+    return nullptr;
+  }
+  hipExternalMemoryBufferDesc bd = {};
+  bd.offset = 0;
+  bd.size = bytes;
+  void *ptr = nullptr;
+  if (hipExternalMemoryGetMappedBuffer(&ptr, ext, &bd) != hipSuccess) {
+    printf("[AID] hipExternalMemoryGetMappedBuffer failed\n");
+    return nullptr;
+  }
+  printf("[AID] %.2f MiB in AID%d (range %u, COHERENT %s) -> %p\n",
+         bytes / 1048576.0, aid, g_range_for_aid[aid],
+         (flags & GEM_CREATE_COHERENT) ? "set" : "clear", ptr);
+  return ptr;
+}
+
+// The rendezvous counter shares the AID-local buffer with the flags, at a 1 MiB
+// offset so it cannot land on a flag line.
+#define BAR_OFF_INTS (1 << 18)
+
 __device__ unsigned int g_local_claim[NXCD];
 
 __device__ __forceinline__ int drv_get_xcd() {
@@ -127,8 +299,9 @@ __global__ __launch_bounds__(NTHREADS) void drive_phase7(
     void *norm_weight, void *norm_output, void *router_weight,
     void *router_bias, void *logits_scratch, void *counters, void *output,
     void *topk_weight, void *routing_indices, void *active_expert_ids,
-    int *flags, unsigned int *bar, int *xcd_seen, int n_layers,
-    int delay_ticks, int delay_skew, int tiles) {
+    int *flags, int *flags_b, unsigned int *bar, unsigned int *bar_b,
+    int *xcd_seen, int n_layers, int delay_ticks, int delay_skew, int tiles,
+    int dual, int split_on) {
   int const xcd = drv_get_xcd();
   int const tid = threadIdx.x;
 
@@ -144,6 +317,14 @@ __global__ __launch_bounds__(NTHREADS) void drive_phase7(
     return; // more blocks than tiles on this XCD; do not corrupt the barrier
   }
   int const tile_idx = xcd * tiles + local;
+
+  // Which replica this XCD touches. The upper half of the XCDs uses the copy
+  // homed in AID1 and the lower half the copy in AID0, so every poll is served
+  // in the reader's own coherence domain -- the precondition that makes a
+  // coherent MTYPE sound on these lines.
+  bool const upper = split_on && xcd >= NXCD / 2;
+  int *const rel = upper ? flags_b : flags;
+  unsigned int *const my_bar = upper ? bar_b : bar;
 
   unsigned short *my_slice = (unsigned short *)attn_out + xcd * ATTN_SLICE;
   unsigned char *my_weight =
@@ -168,7 +349,14 @@ __global__ __launch_bounds__(NTHREADS) void drive_phase7(
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       __syncthreads();
       if (tid == 0) {
+        // Same value into both replicas, so a consumer sees the identical fact
+        // whichever one it polls. The far-AID store still invalidates the
+        // sharers co-located with that line, which is what lets one producer
+        // release both halves.
         drv_st_wt_u32(&flags[xcd * FLAG_STRIDE], (unsigned)layer);
+        if (dual) {
+          drv_st_wt_u32(&flags_b[xcd * FLAG_STRIDE], (unsigned)layer);
+        }
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       }
     }
@@ -190,13 +378,16 @@ __global__ __launch_bounds__(NTHREADS) void drive_phase7(
         /*routing_ready_ptr=*/nullptr,
         /*layer_epoch=*/layer,
         /*ts_base=*/nullptr,
-        /*attn_slice_release=*/flags);
+        /*attn_slice_release=*/rel);
 
     // ?? per-layer rendezvous across all 184 tiles, as phase 9 does ??
     __syncthreads();
     if (tid == 0) {
       atomicAdd(bar, 1u);
-      while (drv_ld_sys_s32((int *)bar) < layer * NXCD * tiles) {
+      if (dual) {
+        atomicAdd(bar_b, 1u);
+      }
+      while (drv_ld_sys_s32((int *)my_bar) < layer * NXCD * tiles) {
         __builtin_amdgcn_s_sleep(1);
       }
     }
@@ -208,6 +399,7 @@ int main(int argc, char **argv) {
   int n_layers = 200;
   int delay_ticks = 0, delay_skew = 0;
   int tiles = TILES_PER_XCD;
+  int use_aid = 0, split_on = 1;
   char const *tag = "run";
   for (int i = 1; i < argc; ++i) {
     if (!strncmp(argv[i], "--layers=", 9)) {
@@ -218,6 +410,12 @@ int main(int argc, char **argv) {
       delay_skew = atoi(argv[i] + 7);
     } else if (!strncmp(argv[i], "--tiles=", 8)) {
       tiles = atoi(argv[i] + 8);
+    } else if (!strncmp(argv[i], "--aid=", 6)) {
+      use_aid = atoi(argv[i] + 6);
+    } else if (!strncmp(argv[i], "--coherent=", 11)) {
+      g_coherent = atoi(argv[i] + 11) != 0;
+    } else if (!strncmp(argv[i], "--split=", 8)) {
+      split_on = atoi(argv[i] + 8);
     } else if (!strncmp(argv[i], "--tag=", 6)) {
       tag = argv[i] + 6;
     }
@@ -231,8 +429,9 @@ int main(int argc, char **argv) {
   void *nw = nullptr, *no = nullptr, *rw = nullptr, *rb = nullptr;
   void *logits = nullptr, *counters = nullptr, *out = nullptr, *tkw = nullptr;
   void *ridx = nullptr, *aeid = nullptr;
-  int *flags = nullptr, *xcd_seen = nullptr;
-  unsigned int *bar = nullptr;
+  int *flags = nullptr, *flags_b = nullptr, *xcd_seen = nullptr;
+  unsigned int *bar = nullptr, *bar_b = nullptr;
+  int dual = 0;
 
   size_t const weight_bytes = (size_t)NXCD * tiles * WG_BYTES;
   HIP_OK(hipMalloc(&attn, OPROJ_REDUCTION * 2));
@@ -271,8 +470,38 @@ int main(int argc, char **argv) {
   HIP_OK(hipMemset(bar, 0, sizeof(unsigned int)));
   HIP_OK(hipMemset(xcd_seen, 0, NXCD * sizeof(int)));
 
-  printf("[%s] attn_out %p  flags %p  weight %p (%.2f MiB)\n", tag, attn,
-         (void *)flags, weight, weight_bytes / 1048576.0);
+  if (use_aid) {
+    if (!aid_init()) {
+      fprintf(stderr, "ABORT: --aid=1 but AID-local allocation is unavailable "
+                      "(stock driver, or not NPS2)\n");
+      return 2;
+    }
+    size_t const sync_bytes = 2ull << 20;
+    void *fa = alloc_in_aid(sync_bytes, 0, g_coherent);
+    void *fb = alloc_in_aid(sync_bytes, 1, g_coherent);
+    if (fa == nullptr || fb == nullptr) {
+      fprintf(stderr, "ABORT: could not place a sync buffer in each AID\n");
+      return 2;
+    }
+    flags = (int *)fa;
+    flags_b = (int *)fb;
+    bar = (unsigned int *)(flags + BAR_OFF_INTS);
+    bar_b = (unsigned int *)(flags_b + BAR_OFF_INTS);
+    HIP_OK(hipMemset(flags, 0, sync_bytes));
+    HIP_OK(hipMemset(flags_b, 0, sync_bytes));
+    dual = 1;
+  } else {
+    // Baseline: one hipMalloc'd flag page and one counter, both MTYPE_NC and
+    // both read from either AID -- exactly what the model does today.
+    flags_b = flags;
+    bar_b = bar;
+    split_on = 0;
+  }
+
+  printf("[%s] attn_out %p  flags %p / %p  weight %p (%.2f MiB)\n", tag, attn,
+         (void *)flags, (void *)flags_b, weight, weight_bytes / 1048576.0);
+  printf("[%s] aid=%d coherent=%d split=%d\n", tag, use_aid, (int)g_coherent,
+         split_on);
   printf("[%s] %d tiles (%d/XCD), %d threads, %d layers, delay=%d skew=%d, "
          "%d polling waves\n",
          tag, NXCD * tiles, tiles, NTHREADS, n_layers, delay_ticks, delay_skew,
@@ -289,8 +518,8 @@ int main(int argc, char **argv) {
   hipLaunchKernelGGL(drive_phase7, dim3(NXCD * tiles), dim3(NTHREADS),
                      MAX_DYNAMIC_SHARED_MEMORY_SIZE, 0, attn, weight, residual,
                      bias, nw, no, rw, rb, logits, counters, out, tkw, ridx,
-                     aeid, flags, bar, xcd_seen, n_layers, delay_ticks,
-                     delay_skew, tiles);
+                     aeid, flags, flags_b, bar, bar_b, xcd_seen, n_layers,
+                     delay_ticks, delay_skew, tiles, dual, split_on);
   HIP_OK(hipEventRecord(e1));
   HIP_OK(hipDeviceSynchronize());
   HIP_OK(hipGetLastError());
