@@ -81,8 +81,10 @@ merely observing an upstream phase running late.
 isolates the flag handshake from the GEMM. In one line: the driver maps VRAM
 MTYPE_RW in NPS1 and MTYPE_NC in SPX+NPS2, MTYPE_RW absorbs concurrent
 system-scope readers while MTYPE_NC serializes them, and MTYPE_NC is required
-for correctness. A two-level gate that cuts flag-polls per layer from 1472 to
-240 recovers 4.0x of it.
+for correctness. The cost is then very nearly linear in how many waves share a
+flag line, and production puts 184 on each of eight lines. Replicating the
+eight-flag array 16 times -- same total poll count, 16x fewer readers per line --
+takes the wait from 20.5 us to 2.7 us.
 
 ## Geometry being modeled
 
@@ -212,13 +214,14 @@ model numbers are directly comparable.
   falls outside every measured span, and the bucket ratios reproduce the
   uninstrumented run -- but do not read `wall ... us per layer` as a real
   latency.
-- **Flag placement is resolved and it is not the cause.** `bench_flagplace.hip`
-  makes the stride a runtime knob: NPS1 is flat across it (2.08 us with all
-  eight flags in one cache line vs 1.48 us spread over eight), so NPS1's
-  advantage never came from spreading them over stacks. The cause is the page
-  MTYPE -- MTYPE_RW in NPS1 vs MTYPE_NC in SPX+NPS2 -- and it cannot be switched
-  back, because MTYPE_RW makes the cross-AID handshake hang. See
-  `ROOT-CAUSE.md`.
+- **Flag placement is resolved.** `bench_flagplace.hip` makes the stride a
+  runtime knob: NPS1 is flat across it (2.08 us with all eight flags in one
+  cache line vs 1.48 us over eight), so NPS1's advantage never came from
+  spreading them over stacks, and neither does AID-locality -- at low fan-out
+  NPS2 is the faster mode. The cause is the page MTYPE, MTYPE_RW in NPS1 vs
+  MTYPE_NC in SPX+NPS2, and it cannot be switched back because MTYPE_RW makes
+  the cross-AID handshake hang. What *does* fix it is more lines rather than
+  more distance: see `ROOT-CAUSE.md`.
 - **Output is numerically incomplete at `--tiles < 23`**, since fewer weight
   groups are computed. Timing stays valid; the tensor values do not.
 
@@ -234,5 +237,5 @@ model numbers are directly comparable.
 | `sweep_pollers.sh` | The `--tiles` sweep that shows the cost is linear in poller count. |
 | `bench_phase7.hip` | Hand-written slicewait-only model, no megakernel dependency. Useful for testing the handshake in isolation. |
 | `bench_flagplace.hip` | Flag-placement probe. Runtime flag stride, poller count, two-level gate and spin backoff; splits the wait into poll / visibility / producer skew / invalidate. |
-| `ROOT-CAUSE.md` | Why NPS2 costs 27x: the page MTYPE, with the stride and poller sweeps and a measured fix. |
+| `ROOT-CAUSE.md` | Why NPS2 costs 27x: the page MTYPE plus waves-per-line, with the stride, poller and replication sweeps and a measured 7.5x fix. |
 | `results/` | Captured output backing the tables above. |

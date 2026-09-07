@@ -81,7 +81,7 @@ __global__ __launch_bounds__(NTHREADS) void flagplace(
     unsigned short *attn_out, int *flags, int *local_flags, unsigned int *rel_ts,
     unsigned int *bar, int *xcd_seen, unsigned int *s_poll, unsigned int *s_inv,
     unsigned int *s_vis, int *s_skew, int n_layers, int tiles, int stride_ints,
-    int delay_skew, int hier, int sleep_n) {
+    int delay_skew, int hier, int sleep_n, int n_copies) {
   int const xcd = get_xcd();
   int const tid = threadIdx.x;
   int const warp = tid >> 6;
@@ -102,8 +102,15 @@ __global__ __launch_bounds__(NTHREADS) void flagplace(
   // Wave w covers K elements [1024w, 1024w+1024) = slices 2w and 2w+1, the
   // same forced mapping the real kernel has.
   int const first_xcd = warp * 2;
-  int *rel0 = flags + first_xcd * stride_ints;
-  int *rel1 = flags + (first_xcd + 1) * stride_ints;
+  // With --copies=K the eight-flag array is replicated K times and block rank
+  // `local` reads copy `local % K`. Producers write every copy, so the
+  // information is identical and only the *sharing* of each line changes: K=1
+  // is 92 waves per line, K=23 is 4. Total poll count is untouched. That
+  // separates per-line serialization from a global request-rate limit, and it
+  // is the general form of "give each AID its own flag page".
+  int const copy = local % n_copies;
+  int *rel0 = flags + (copy * NXCD + first_xcd) * stride_ints;
+  int *rel1 = flags + (copy * NXCD + first_xcd + 1) * stride_ints;
   unsigned int *my_slice = (unsigned int *)(attn_out + xcd * ATTN_SLICE);
   unsigned int const *src =
       (unsigned int const *)(attn_out + first_xcd * ATTN_SLICE);
@@ -131,7 +138,9 @@ __global__ __launch_bounds__(NTHREADS) void flagplace(
         st_wt_u32(&rel_ts[xcd * RELTS_STRIDE],
                   (unsigned)__builtin_amdgcn_s_memrealtime());
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-        st_wt_u32(&flags[xcd * stride_ints], (unsigned)layer);
+        for (int c = 0; c < n_copies; ++c) {
+          st_wt_u32(&flags[(c * NXCD + xcd) * stride_ints], (unsigned)layer);
+        }
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       }
     }
@@ -243,7 +252,7 @@ int main(int argc, char **argv) {
   int tiles = 23;
   int delay_skew = 0;
   long stride_bytes = 64;
-  int hier = 0, sleep_n = 1;
+  int hier = 0, sleep_n = 1, n_copies = 1;
   char const *tag = "run";
   for (int i = 1; i < argc; ++i) {
     if (!strncmp(argv[i], "--layers=", 9)) {
@@ -258,12 +267,17 @@ int main(int argc, char **argv) {
       hier = atoi(argv[i] + 7);
     } else if (!strncmp(argv[i], "--sleep=", 8)) {
       sleep_n = atoi(argv[i] + 8);
+    } else if (!strncmp(argv[i], "--copies=", 9)) {
+      n_copies = atoi(argv[i] + 9);
     } else if (!strncmp(argv[i], "--tag=", 6)) {
       tag = argv[i] + 6;
     }
   }
   if (sleep_n < 1) {
     sleep_n = 1;
+  }
+  if (n_copies < 1) {
+    n_copies = 1;
   }
   if (stride_bytes < 4 || (stride_bytes & 3) != 0) {
     fprintf(stderr, "--flagstride must be a multiple of 4 and >= 4\n");
@@ -278,7 +292,7 @@ int main(int argc, char **argv) {
   unsigned int *d_poll = nullptr, *d_inv = nullptr, *d_vis = nullptr;
 
   size_t const nsamp = (size_t)NXCD * tiles * NWAVES * n_layers;
-  size_t const flag_bytes = (size_t)NXCD * stride_bytes + 4096;
+  size_t const flag_bytes = (size_t)n_copies * NXCD * stride_bytes + 4096;
   HIP_OK(hipMalloc(&d_attn, REDUCTION * sizeof(unsigned short)));
   HIP_OK(hipMalloc(&d_flags, flag_bytes));
   HIP_OK(hipMalloc(&d_local, 8192));
@@ -312,7 +326,7 @@ int main(int argc, char **argv) {
   hipLaunchKernelGGL(flagplace, dim3(NXCD * tiles), dim3(NTHREADS), 0, 0,
                      d_attn, d_flags, d_local, d_relts, d_bar, d_seen, d_poll,
                      d_inv, d_vis, d_skew, n_layers, tiles, stride_ints,
-                     delay_skew, hier, sleep_n);
+                     delay_skew, hier, sleep_n, n_copies);
   HIP_OK(hipEventRecord(e1));
   HIP_OK(hipDeviceSynchronize());
   HIP_OK(hipGetLastError());
@@ -368,10 +382,13 @@ int main(int argc, char **argv) {
 
   printf("[%s] wall %.2f ms / %d layers = %.2f us per layer\n", tag, ms,
          n_layers, ms * 1000.0 / n_layers);
-  printf("[%s] RESULT stride=%ld hier=%d sleep=%d tiles=%d poll_p50=%.2f "
-         "vis_p50=%.2f skew_p50=%.2f inv_p50=%.2f poll_p90=%.2f vis_p90=%.2f\n",
-         tag, stride_bytes, hier, sleep_n, tiles, pct(poll, 0.50),
-         pct(vis, 0.50), (double)skew[skew.size() / 2] * 10.0 / 1000.0,
-         pct(inv, 0.50), pct(poll, 0.90), pct(vis, 0.90));
+  printf("[%s] RESULT stride=%ld copies=%d (%d waves/line) hier=%d sleep=%d "
+         "tiles=%d poll_p50=%.2f vis_p50=%.2f skew_p50=%.2f inv_p50=%.2f "
+         "poll_p90=%.2f vis_p90=%.2f\n",
+         tag, stride_bytes, n_copies,
+         NXCD * ((tiles + n_copies - 1) / n_copies), hier, sleep_n, tiles,
+         pct(poll, 0.50), pct(vis, 0.50),
+         (double)skew[skew.size() / 2] * 10.0 / 1000.0, pct(inv, 0.50),
+         pct(poll, 0.90), pct(vis, 0.90));
   return 0;
 }
