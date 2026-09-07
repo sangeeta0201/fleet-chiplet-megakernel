@@ -344,7 +344,19 @@ __device__ __attribute__((noinline)) void
         // Null means the single shared copy, which is the behaviour every
         // other caller gets.
         int *hier_release_lo = nullptr,
-        int *hier_release_hi = nullptr) {
+        int *hier_release_hi = nullptr,
+        // Optional: the eight per-XCD *arrival* lines of the tree barrier,
+        // partitioned rather than replicated. Unlike the release flags above,
+        // a level-1 line is not shared across the machine -- line `x` is only
+        // ever touched by XCD x's own tiles_per_xcd workers, and those are all
+        // co-located with each other by construction. So each half of the
+        // lines can be homed in the partition whose XCDs use it, and a
+        // coherent MTYPE stays sound with no fan-out and no duplicated write.
+        // Both pointers keep the same `xcd_id * HIER_STRIDE` indexing as the
+        // copy inside `counters`, so the unused half of each buffer is simply
+        // never touched. Null means the single shared copy.
+        int *hier_local_lo = nullptr,
+        int *hier_local_hi = nullptr) {
 
   static_assert(OUTPUT_PER_WG % 16 == 0,
                 "OUTPUT_PER_WG must be multiple of 16");
@@ -459,6 +471,36 @@ __device__ __attribute__((noinline)) void
   unsigned long long _op_t0 = __builtin_amdgcn_s_memrealtime();
   unsigned long long _op_t1 = _op_t0, _op_t2 = _op_t0, _op_t3 = _op_t0;
   unsigned long long _op_t0b = _op_t0;
+#endif
+
+#ifdef MPK_OPROJ_BAR_TRACE
+#ifndef MPK_OPROJ_INNER_TIMING
+#error "MPK_OPROJ_BAR_TRACE reports against _op_t1/_op_t2 from MPK_OPROJ_INNER_TIMING"
+#endif
+  // Absolute s_memrealtime ticks at the four interesting points inside the
+  // Phase 2 barrier. Held in registers and printed after `done:`, alongside the
+  // existing [OPROJ_INNER] line, so the barrier itself is not perturbed by the
+  // trace -- s_memrealtime is a handful of cycles and the printfs are all past
+  // the measured window.
+  //
+  //   _bt0  arrival instant, taken after the drain and the block rendezvous and
+  //         immediately before the level-1 atomic
+  //   _bt1  level 1 returned
+  //   _bt2  level 2 returned -- only the one worker per XCD that gets there
+  //   _bt3  release store retired -- only the single global releaser
+  //   _bt4  this block's poll first observed the release
+  //
+  // Zero means "this worker never reached that point", which is unambiguous
+  // because a real tick is enormous. Every one of these is taken on tid 0,
+  // which is the thread that does the arrival, the release and (under
+  // MPK_NARROW_OPROJ_HIER) the poll, so they all sit on one timeline.
+  //
+  // Ticks are printed raw, not as deltas, for _bt3 and _bt4: attributing the
+  // release-to-observation latency means comparing one block's observation
+  // against a *different* block's release, so the join has to happen in
+  // post-processing on layer_epoch.
+  unsigned long long _bt0 = 0, _bt1 = 0, _bt2 = 0, _bt3 = 0, _bt4 = 0;
+  int _bt_xcd_last = 0, _bt_releaser = 0;
 #endif
 
   int batch_count =
@@ -1508,6 +1550,16 @@ oproj_barrier :
             ? (xcd_id < n_xcds / 2 ? hier_release_lo : hier_release_hi)
             : hier_barrier;
 
+    // Level 1 routed the same way, and for a stronger reason than the release
+    // flags: this line has no cross-partition reader to keep coherent in the
+    // first place. Splitting the release was a workaround for a line that
+    // genuinely is read from both halves; splitting the arrival just puts each
+    // line where its only users already are.
+    int *const hier_loc =
+        (hier_local_lo && hier_local_hi)
+            ? (xcd_id < n_xcds / 2 ? hier_local_lo : hier_local_hi)
+            : hier_local;
+
     int const oproj_release_expected =
         layer_epoch > 0 ? layer_epoch
                         : ld_nt_s32(&hier_rel[xcd_id * HIER_STRIDE]) + 1;
@@ -1625,8 +1677,14 @@ oproj_barrier :
       // The `%` form is a monotonic-counter release, identical in shape to
       // the flat one: counters are never reset, so "this layer's last
       // arrival" is `prev % N == N - 1` rather than a compare against N.
+#ifdef MPK_OPROJ_BAR_TRACE
+      _bt0 = __builtin_amdgcn_s_memrealtime();
+#endif
       int const local_prev =
-          atom_add_xcd_local_s32(&hier_local[xcd_id * HIER_STRIDE], 1);
+          atom_add_xcd_local_s32(&hier_loc[xcd_id * HIER_STRIDE], 1);
+#ifdef MPK_OPROJ_BAR_TRACE
+      _bt1 = __builtin_amdgcn_s_memrealtime();
+#endif
       if ((local_prev % tiles_per_xcd) == tiles_per_xcd - 1) {
         // Last worker on this XCD. Its own stores are drained (above) and so
         // are every other arriving worker's on this XCD -- each drained
@@ -1642,6 +1700,10 @@ oproj_barrier :
 #endif
         int const prev_global =
             atom_add_release_gpu_s32(&hier_barrier[8 * HIER_STRIDE], 1);
+#ifdef MPK_OPROJ_BAR_TRACE
+        _bt2 = __builtin_amdgcn_s_memrealtime();
+        _bt_xcd_last = 1;
+#endif
         if ((prev_global % 8) == 7) {
           oproj_rel_epoch = oproj_release_expected;
         }
@@ -1675,6 +1737,15 @@ oproj_barrier :
                   (unsigned)oproj_rel_epoch);
       }
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#ifdef MPK_OPROJ_BAR_TRACE
+      // After the waitcnt, so this is the instant the release is visible rather
+      // than the instant the store issued. tid 0 only, to stay on the same
+      // timeline as the other four.
+      if (tid == 0) {
+        _bt3 = __builtin_amdgcn_s_memrealtime();
+        _bt_releaser = 1;
+      }
+#endif
     }
 
     // Issue prefetch loads AFTER barrier atomics but BEFORE poll loop.
@@ -1784,6 +1855,15 @@ oproj_barrier :
         __builtin_amdgcn_s_sleep(1);
       }
   }
+
+#ifdef MPK_OPROJ_BAR_TRACE
+  // Poll exit. Outside the block above only because the poll is the statement
+  // controlled by a chain of `if`s and cannot be followed inside it; tid 0 is
+  // the poller, so this is still that thread's observation instant.
+  if (tid == 0) {
+    _bt4 = __builtin_amdgcn_s_memrealtime();
+  }
+#endif
 
   // Rendezvous before the acquire. The per-thread poll above establishes, for
   // each wave independently, that the barrier has been released -- and that
@@ -2845,6 +2925,46 @@ done :
            (double)(_op_t3 - _op_t2) * 10.0 / 1000.0,
            (double)(_op_t4 - _op_t3) * 10.0 / 1000.0,
            (double)(_op_t4 - _op_t0) * 10.0 / 1000.0);
+  }
+#endif
+
+#ifdef MPK_OPROJ_BAR_TRACE
+  // Three lines, deliberately separate rather than folded into [OPROJ_INNER],
+  // because they come from three different populations: every XCD's tile 0, the
+  // one worker per XCD that closed level 1, and the single global releaser.
+  // All are past the timed window, so the cost is wall time and printf
+  // bandwidth, not measurement error -- but there are ~25 per layer against the
+  // stock 8, so run this build with fewer layers.
+  //
+  // Everything that can be a delta is one. `obs` and `rel` are raw ticks
+  // because the quantity they answer -- how long after the release a given XCD
+  // sees it -- spans two different blocks, so it can only be formed after the
+  // fact by joining on `ep`.
+  // The four fields sum to the `bar` bucket, which is the point: bar =
+  // drain + l1 + wait + acq, so whichever one carries the NPS2 excess is the
+  // one worth attacking. `wait` is everything between this block's own arrival
+  // being published and its poll clearing -- the other 183 arrivals, the eight
+  // level-2 atomics and the release store, none of which it can distinguish,
+  // but all of which are somebody else's latency rather than this block's.
+  if (tid == 0 && (tile_idx % tiles_per_xcd) == 0) {
+    printf("[BAR_OBS] ep=%d xcd=%d drain=%.3f l1=%.3f wait=%.3f acq=%.3f "
+           "obs=%llu bar=%.3f\n",
+           layer_epoch, xcd_id, (double)(_bt0 - _op_t1) * 10.0 / 1000.0,
+           (double)(_bt1 - _bt0) * 10.0 / 1000.0,
+           (double)(_bt4 - _bt1) * 10.0 / 1000.0,
+           (double)(_op_t2 - _bt4) * 10.0 / 1000.0, _bt4,
+           (double)(_op_t2 - _op_t1) * 10.0 / 1000.0);
+  }
+  // The XCD-last arriver rotates every layer, because the arrival counter is
+  // monotonic and never reset -- so this samples a different one of the 23
+  // workers each time rather than pinning one.
+  if (tid == 0 && _bt_xcd_last) {
+    printf("[BAR_ARR] ep=%d xcd=%d l1=%.3f l2=%.3f\n", layer_epoch, xcd_id,
+           (double)(_bt1 - _bt0) * 10.0 / 1000.0,
+           (double)(_bt2 - _bt1) * 10.0 / 1000.0);
+  }
+  if (tid == 0 && _bt_releaser) {
+    printf("[BAR_REL] ep=%d xcd=%d rel=%llu\n", layer_epoch, xcd_id, _bt3);
   }
 #endif
   (void)0;

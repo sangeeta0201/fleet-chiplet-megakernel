@@ -358,6 +358,29 @@ model numbers are directly comparable.
   falls outside every measured span, and the bucket ratios reproduce the
   uninstrumented run -- but do not read `wall ... us per layer` as a real
   latency.
+- **The residual `bar` gap is resolved, and it is not the barrier.** The
+  +0.6-0.7 us that survived the release-flag fix was guessed in
+  `results/nps1-vs-nps2.md` to be the level-2 global arrival counter. It is not.
+  `-DMPK_OPROJ_BAR_TRACE` (`trace_bar.sh`) times five points inside the barrier
+  and splits `bar` into `drain + l1 + wait + acq`: every step a block performs
+  itself is at parity between the modes, and the whole +0.80 us sits in `wait`,
+  which is not this block's latency but the last arriver's. Cross-XCD arrival
+  spread grows from 0.22 us in NPS1 to 0.98 us in NPS2 -- +0.76 us against a
+  +0.80 us `bar` delta -- and the releaser, which by construction sits on the
+  XCD that finished last, stops rotating across all eight dies and pins to XCD
+  6. Level 2 shows *no* AID asymmetry at all (0.520 us either half). So what is
+  left is a load-imbalance problem upstream of the barrier, not a
+  synchronization one; see `results/bar-attribution.md`.
+- **Homing the level-1 arrival lines per AID is correct and buys nothing.**
+  `--lsplit=1` partitions the eight per-XCD arrival counters
+  (`hier_local_lo`/`hier_local_hi`); unlike the release flags this needs no
+  replication, because line `x` is only ever incremented by XCD x's own 23
+  workers, who are co-located with each other by construction. It removes the
+  full +0.12 us cross-AID penalty on XCDs 4-7 and `bar` does not move, because
+  the saving goes straight into `wait`. Only one of the 184 level-1 atomics is
+  ever on the critical path -- the last one on the last XCD -- so speeding up
+  the other 183 is free and worthless. `gate_lsplit.sh` confirms the hashes
+  still agree, so the split is sound; it is just not load-bearing.
 - **Flag placement is resolved.** `bench_flagplace.hip` makes the stride a
   runtime knob: NPS1 is flat across it (2.08 us with all eight flags in one
   cache line vs 1.48 us over eight), so NPS1's advantage never came from
@@ -405,3 +428,7 @@ model numbers are directly comparable.
 | `set_mode2.sh` / `run_root.py` | Partition switch asserting SPX explicitly, and the `sudo -n python3` launcher it needs. |
 | `results/nps1-vs-nps2.md` | The same-build NPS1 / NPS2-base / NPS2-fixed breakdown. |
 | `results/correctness-gate.md` | Why the first gate proved nothing, and the two controls that fixed it. |
+| `trace_bar.sh` | `-DMPK_OPROJ_BAR_TRACE`: times five points inside the barrier and splits `bar` into `drain + l1 + wait + acq`, per XCD. Ticks are taken in registers and printed past `done:`, so the barrier is not perturbed by its own measurement. |
+| `trace_both_modes.sh` | The same trace either side of a partition switch, with the NPS2 restore in an `EXIT` trap so a mid-run failure cannot leave the node in NPS1. |
+| `gate_lsplit.sh` | Correctness gate for `--lsplit`. Derives the reference from the first configuration rather than hardcoding a hash, because the recorded pair is specific to 400 layers -- the harness residual is a function of `layer & 15`. |
+| `results/bar-attribution.md` | Where the residual `bar` gap actually goes: arrival skew, not the barrier's memory protocol. Includes the level-1 split that works and buys nothing. |

@@ -281,6 +281,13 @@ static void *alloc_in_aid(size_t bytes, int aid, bool coherent) {
 // `counters`.
 #define HIER_OFF_INTS (3 << 17)
 
+// The eight per-XCD level-1 arrival lines, at 1.75 MiB so they clear the flags,
+// the rendezvous counter and the release replicas. These are *partitioned*, not
+// replicated: lines 0..3 are only ever touched in AID0's buffer and 4..7 only in
+// AID1's, so each buffer's other half stays untouched and the kernel can keep
+// indexing both by xcd_id.
+#define HIER_LOCAL_OFF_INTS (7 << 16)
+
 __device__ unsigned int g_local_claim[NXCD];
 
 __device__ __forceinline__ int drv_get_xcd() {
@@ -312,7 +319,7 @@ __global__ __launch_bounds__(NTHREADS) void drive_phase7(
     void *router_bias, void *logits_scratch, void *counters, void *output,
     void *topk_weight, void *routing_indices, void *active_expert_ids,
     int *flags, int *flags_b, unsigned int *bar, unsigned int *bar_b,
-    int *hier_lo, int *hier_hi,
+    int *hier_lo, int *hier_hi, int *hloc_lo, int *hloc_hi,
     int *xcd_seen, int n_layers, int delay_ticks, int delay_skew, int tiles,
     int dual, int split_on) {
   int const xcd = drv_get_xcd();
@@ -461,7 +468,9 @@ __global__ __launch_bounds__(NTHREADS) void drive_phase7(
         /*ts_base=*/nullptr,
         /*attn_slice_release=*/rel,
         /*hier_release_lo=*/hier_lo,
-        /*hier_release_hi=*/hier_hi);
+        /*hier_release_hi=*/hier_hi,
+        /*hier_local_lo=*/hloc_lo,
+        /*hier_local_hi=*/hloc_hi);
 
     // ?? per-layer rendezvous across all 184 tiles, as phase 9 does ??
     __syncthreads();
@@ -482,7 +491,7 @@ int main(int argc, char **argv) {
   int n_layers = 200;
   int delay_ticks = 0, delay_skew = 0;
   int tiles = TILES_PER_XCD;
-  int use_aid = 0, split_on = 1;
+  int use_aid = 0, split_on = 1, lsplit_on = 0;
   char const *tag = "run";
   for (int i = 1; i < argc; ++i) {
     if (!strncmp(argv[i], "--layers=", 9)) {
@@ -499,6 +508,8 @@ int main(int argc, char **argv) {
       g_coherent = atoi(argv[i] + 11) != 0;
     } else if (!strncmp(argv[i], "--split=", 8)) {
       split_on = atoi(argv[i] + 8);
+    } else if (!strncmp(argv[i], "--lsplit=", 9)) {
+      lsplit_on = atoi(argv[i] + 9);
     } else if (!strncmp(argv[i], "--tag=", 6)) {
       tag = argv[i] + 6;
     }
@@ -514,6 +525,7 @@ int main(int argc, char **argv) {
   void *ridx = nullptr, *aeid = nullptr;
   int *flags = nullptr, *flags_b = nullptr, *xcd_seen = nullptr;
   int *hier_lo = nullptr, *hier_hi = nullptr;
+  int *hloc_lo = nullptr, *hloc_hi = nullptr;
   unsigned int *bar = nullptr, *bar_b = nullptr;
   int dual = 0;
 
@@ -591,6 +603,13 @@ int main(int argc, char **argv) {
       hier_lo = flags + HIER_OFF_INTS;
       hier_hi = flags_b + HIER_OFF_INTS;
     }
+    // Level 1 is independent of --split: it needs no replication, only homing.
+    // Each line's 23 writers are one XCD's workers, already co-located with
+    // each other, so there is no misroutable reader here at all.
+    if (lsplit_on) {
+      hloc_lo = flags + HIER_LOCAL_OFF_INTS;
+      hloc_hi = flags_b + HIER_LOCAL_OFF_INTS;
+    }
     HIP_OK(hipMemset(flags, 0, sync_bytes));
     HIP_OK(hipMemset(flags_b, 0, sync_bytes));
     dual = 1;
@@ -600,12 +619,14 @@ int main(int argc, char **argv) {
     flags_b = flags;
     bar_b = bar;
     split_on = 0;
+    lsplit_on = 0;
   }
 
   printf("[%s] attn_out %p  flags %p / %p  weight %p (%.2f MiB)\n", tag, attn,
          (void *)flags, (void *)flags_b, weight, weight_bytes / 1048576.0);
-  printf("[%s] aid=%d coherent=%d split=%d hier_split=%d\n", tag, use_aid,
-         (int)g_coherent, split_on, hier_lo != nullptr);
+  printf("[%s] aid=%d coherent=%d split=%d hier_split=%d local_split=%d\n", tag,
+         use_aid, (int)g_coherent, split_on, hier_lo != nullptr,
+         hloc_lo != nullptr);
   printf("[%s] %d tiles (%d/XCD), %d threads, %d layers, delay=%d skew=%d, "
          "%d polling waves\n",
          tag, NXCD * tiles, tiles, NTHREADS, n_layers, delay_ticks, delay_skew,
@@ -623,8 +644,8 @@ int main(int argc, char **argv) {
                      MAX_DYNAMIC_SHARED_MEMORY_SIZE, 0, attn, weight, residual,
                      bias, nw, no, rw, rb, logits, counters, out, tkw, ridx,
                      aeid, flags, flags_b, bar, bar_b, hier_lo, hier_hi,
-                     xcd_seen, n_layers, delay_ticks, delay_skew, tiles, dual,
-                     split_on);
+                     hloc_lo, hloc_hi, xcd_seen, n_layers, delay_ticks,
+                     delay_skew, tiles, dual, split_on);
   HIP_OK(hipEventRecord(e1));
   HIP_OK(hipDeviceSynchronize());
   HIP_OK(hipGetLastError());
