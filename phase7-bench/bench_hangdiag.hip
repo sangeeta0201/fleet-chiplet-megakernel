@@ -163,6 +163,56 @@ __global__ __launch_bounds__(NTHREADS) void aliastest(int *flags, int *out,
   out[xcd * 4 + 3] = ld_after_inv_s32(p);
 }
 
+// Which XCD can see which XCD's store, once the reader has the line cached?
+//
+// The alias test reads each line exactly once and succeeds, so it cannot see
+// the failure; a poller fails precisely because it holds the line from before
+// the store. This runs the three phases a poller goes through, separated by
+// milliseconds so the eight participating blocks stay in step without needing a
+// barrier (a barrier would be subject to the very failure being measured):
+//
+//   1. every XCD reads all eight flags, caching all eight lines while zero
+//   2. every XCD stores its own flag
+//   3. every XCD reads all eight flags again
+//
+// Phase 3 is the answer. A blank entry means that reader never saw that
+// writer's store. If only the far-AID half is blank the failure is cross-AID;
+// if everything off the diagonal is blank, coherence is not working between any
+// two XCDs of this compute partition.
+__global__ __launch_bounds__(NTHREADS) void vismatrix(int *flags, int *out,
+                                                      int stride_ints,
+                                                      unsigned int gap) {
+  int const xcd = get_xcd();
+  __shared__ int s_local;
+  if (threadIdx.x == 0) {
+    s_local = (int)atomicAdd(&g_claim[xcd], 1u);
+  }
+  __syncthreads();
+  if (s_local != 0 || threadIdx.x != 0) {
+    return;
+  }
+
+  unsigned long long const t0 = __builtin_amdgcn_s_memrealtime();
+  int sink = 0;
+  for (int x = 0; x < NXCD; ++x) {
+    sink += ld_sys_s32(&flags[x * stride_ints]);
+    out[NXCD * NXCD + x] = sink; // keep the reads, and record phase-1 values
+  }
+
+  while (__builtin_amdgcn_s_memrealtime() < t0 + gap) {
+    __builtin_amdgcn_s_sleep(8);
+  }
+  st_wt_u32(&flags[xcd * stride_ints], (unsigned)(0x100 + xcd));
+  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+
+  while (__builtin_amdgcn_s_memrealtime() < t0 + 3ull * gap) {
+    __builtin_amdgcn_s_sleep(8);
+  }
+  for (int x = 0; x < NXCD; ++x) {
+    out[xcd * NXCD + x] = ld_sys_s32(&flags[x * stride_ints]);
+  }
+}
+
 __global__ __launch_bounds__(NTHREADS) void hangdiag(
     int *flags, int *dbg, int *seen, int *prod_dbg, int tiles, int stride_ints,
     int n_layers, unsigned long long bail_ticks, unsigned int pdelay, int wb,
@@ -244,7 +294,7 @@ int main(int argc, char **argv) {
   long stride_bytes = 64;
   double bail_ms = 200.0;
   unsigned int pdelay = 10000; // ticks; 100 MHz clock, so 100 us
-  int wb = 0, cinv = 0, alias = 0;
+  int wb = 0, cinv = 0, alias = 0, vis = 0;
   char const *tag = "diag";
   for (int i = 1; i < argc; ++i) {
     if (!strncmp(argv[i], "--tiles=", 8)) {
@@ -263,6 +313,8 @@ int main(int argc, char **argv) {
       cinv = atoi(argv[i] + 7);
     } else if (!strncmp(argv[i], "--alias=", 8)) {
       alias = atoi(argv[i] + 8);
+    } else if (!strncmp(argv[i], "--vis=", 6)) {
+      vis = atoi(argv[i] + 6);
     } else if (!strncmp(argv[i], "--tag=", 6)) {
       tag = argv[i] + 6;
     }
@@ -289,6 +341,64 @@ int main(int argc, char **argv) {
          "pdelay %u ticks  %d layers  wb=%d cinv=%d\n",
          tag, (void *)d_flags, stride_bytes, tiles, nblocks * NWAVES, bail_ms,
          pdelay, n_layers, wb, cinv);
+
+  if (vis) {
+    int *d_vis = nullptr;
+    size_t const vn = NXCD * NXCD + NXCD;
+    HIP_OK(hipMalloc(&d_vis, vn * sizeof(int)));
+    HIP_OK(hipMemset(d_vis, 0, vn * sizeof(int)));
+    hipLaunchKernelGGL(vismatrix, dim3(nblocks), dim3(NTHREADS), 0, 0, d_flags,
+                       d_vis, stride_ints, 200000u /* 2 ms per phase */);
+    HIP_OK(hipDeviceSynchronize());
+    HIP_OK(hipGetLastError());
+    std::vector<int> v(vn);
+    HIP_OK(hipMemcpy(v.data(), d_vis, vn * sizeof(int), hipMemcpyDeviceToHost));
+
+    printf("[%s] every XCD cached all eight lines, then each stored its own "
+           "flag, then all re-read. Entry = value the reader saw; xN means the "
+           "writer's 0x1xx was observed, '.' means it was not.\n",
+           tag);
+    printf("             ");
+    for (int w = 0; w < NXCD; ++w) {
+      printf(" wrote%d", w);
+    }
+    printf("\n");
+    int off_diag_seen = 0, off_diag_total = 0;
+    for (int r = 0; r < NXCD; ++r) {
+      printf("        xcd%d ", r);
+      for (int w = 0; w < NXCD; ++w) {
+        int const got = v[r * NXCD + w];
+        int const want = 0x100 + w;
+        if (r != w) {
+          ++off_diag_total;
+          if (got == want) {
+            ++off_diag_seen;
+          }
+        }
+        printf("%6s", (got == want) ? "seen" : ".");
+      }
+      printf("\n");
+    }
+    printf("[%s] remote stores observed: %d of %d\n", tag, off_diag_seen,
+           off_diag_total);
+    if (off_diag_seen == 0) {
+      printf("[%s] VERDICT: no XCD observed ANY other XCD's store, including "
+             "XCDs on the same side of the AID boundary. Coherence is not "
+             "working between any two XCDs of this compute partition, not "
+             "merely across AIDs.\n",
+             tag);
+    } else if (off_diag_seen == off_diag_total) {
+      printf("[%s] VERDICT: every XCD saw every other XCD's store; coherence "
+             "is working here.\n",
+             tag);
+    } else {
+      printf("[%s] VERDICT: partial -- compare the pattern against the XCD to "
+             "AID map; if the blanks are exactly the far-AID pairs the failure "
+             "is cross-AID.\n",
+             tag);
+    }
+    return 0;
+  }
 
   if (alias) {
     hipLaunchKernelGGL(aliastest, dim3(nblocks), dim3(NTHREADS), 0, 0, d_flags,

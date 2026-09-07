@@ -20,6 +20,17 @@ Measured with `bench_flagplace.hip`, which isolates the flag handshake from the
 GEMM and splits the wait into terms the in-kernel `slicewait` bucket lumps
 together.
 
+**There is a fix that removes the regression rather than mitigating it.** AID
+placement is not useful on its own, for the reason above -- but it is what makes
+a *coherent* MTYPE safe to use, and the coherent MTYPE is what absorbs the 184
+readers. Placing one copy of the flags in each AID and routing each XCD to its
+co-located copy gets visibility to **0.85 us**, against 7.60 us for the same
+placement under MTYPE_NC. It needs no global MTYPE change: the coherent MTYPE
+applies to those two BOs alone and every other page in the process stays NC. See
+[The fix](#the-fix-aid-local-placement-plus-a-per-bo-coherent-mtype). Flag
+replication (7.5x, no driver knob at all) remains the fallback and is described
+under [replication](#alternative-replicate-the-flag-array).
+
 ## What the flags are
 
 `attn_release` is eight `int32`s, one per XCD, inside `oproj_topk_counters` -- a
@@ -140,7 +151,7 @@ Note the MTYPE is a property of the page mapping and applies to **all** VRAM in
 SPX+NPS2, whichever AID the page sits in. An AID-local flag page is still
 MTYPE_NC, still has no hardware coherence, and still serializes its readers.
 
-### Why the coherent MTYPE is unavailable, and why NPS1 gets it
+### Why the driver denies the coherent MTYPE, and why NPS1 gets it
 
 #### The MTYPE is the whole mechanism, and the partition mode is not
 
@@ -206,11 +217,18 @@ all because of the patched driver.
 
 The same page gives the intended contract for AID-local memory: "Safe uses:
 local XCDs only, or non-coherent MTYPE. Decode pinning to XCD0-3 vs XCD4-7 is
-the intended software contract." Phase 7 cannot satisfy the first option: the
-K-parallel map forces wave *w* of every workgroup on all eight XCDs to read
-slices 2w and 2w+1, so the far-AID XCDs unavoidably touch every flag line.
-Pinning would require re-partitioning O-proj's reduction dimension. That leaves
-non-coherent MTYPE, which is where the driver already is.
+the intended software contract." Phase 7 does not satisfy the first option as
+written: the K-parallel map forces wave *w* of every workgroup on all eight XCDs
+to read slices 2w and 2w+1, so the far-AID XCDs unavoidably touch every flag
+line, and re-partitioning O-proj's reduction dimension to fix that is a large
+change. That leaves non-coherent MTYPE, which is where the driver already is.
+
+The way out, developed below, is that "local XCDs only" is a constraint on the
+*readers of a given buffer*, not on the work decomposition. Replicating the
+flags into both AIDs lets every XCD read an in-domain copy while the K-parallel
+map is left exactly as it is, because each copy carries all eight releases.
+The contract is satisfied by duplicating the data rather than by re-partitioning
+the computation.
 
 ### It cannot simply be switched back
 
@@ -297,7 +315,7 @@ of them per line queue into 20 us. The control confirms the instrument: under
 MTYPE_NC the identical diagnostic reports 0 of 736 stuck and all four layers
 complete.
 
-### Nor per-BO: a coherent MTYPE on the flag page alone also hangs
+### Nor per-BO on its own: a coherent MTYPE without placement also hangs
 
 The shadow-tag account above is a *capacity* argument, which suggests an
 escape: the global switch fails because the model's whole working set overflows
@@ -333,8 +351,18 @@ ASIC's driver branch computes and then ignores, so it is a no-op on MTYPE
 probe) -- so the 21.6 us it measures is a page across PCIe, not MTYPE_UC, and
 there is no HIP path to `EXT_COHERENT` at all.
 
-The conclusion for the kernel is that no MTYPE setting recovers this. The fix
-has to be flag replication, which needs no driver change.
+What this rules out is *capacity* as the obstacle: shrinking the coherent
+working set to eight lines on eight channels does not help, so the demotion is
+not a directory-budget workaround that a small BO can dodge.
+
+It does **not** rule out a per-BO coherent MTYPE, and the conclusion originally
+drawn here -- "no MTYPE setting recovers this" -- was wrong. The flag array in
+this experiment was an ordinary `hipMalloc` allocation: one buffer, one home
+AID, and pollers on both sides of the boundary. Half the readers were therefore
+outside the coherence domain that homes the line, which is the hang described in
+the previous section, reproduced by construction. The missing ingredient is not
+a smaller working set but **placement plus routing** -- see the next section,
+where the same knob on a buffer whose readers are co-located reaches 0.85 us.
 
 ## Would one flag page per AID fix it?
 
@@ -366,11 +394,179 @@ earlier ambiguity: the serialization is **per line**, not a global request-rate
 limit. At K=23 the visibility term is 1.09 us against NPS1's 1.21 us -- fully
 recovered.
 
-## The fix: replicate the flag array
+## The fix: AID-local placement plus a per-BO coherent MTYPE
 
-Replication is the cheapest thing that works and it is nearly free in layout
-terms: 16 copies x 8 flags x 64 B is 8 KiB. The 256 B stride is marginally
-better at low K and converges by K=16:
+Everything above says two things that look contradictory. A coherent MTYPE is
+what absorbs 184 readers on a line, and a coherent MTYPE hangs in SPX+NPS2. Both
+are true, and the second one has a precondition the first does not need:
+coherence works among the XCDs **co-located with a line's home AID**, and fails
+only for readers outside that domain. The visibility matrix in
+`bench_hangdiag` measured exactly that, including the useful half -- a store
+from a far-AID XCD still correctly invalidates the sharers that *are*
+co-located with the line.
+
+So the coherent MTYPE is not broken; it is scoped. If a buffer's readers are a
+subset of the XCDs co-located with its home AID, coherence is sufficient for it.
+That is a property software can arrange: place one copy of the flags in each AID
+and route each XCD-half to its own copy. Producers write both copies, so the
+information is identical; only the readers are partitioned.
+
+### The approach: the knob already existed
+
+The obvious way to get a coherent MTYPE on one buffer is a new driver
+parameter, and the first attempt here was exactly that -- an `aid_local_bo_mtype`
+gated on `AMDGPU_GEM_CREATE_AID_LOCAL`. It was unnecessary. Reading the driver
+that this box already runs:
+
+```c
+if (amdgpu_aid_local_flag_mtype && is_vram && coherent &&
+    adev->xcp_mgr &&
+    !adev->xcp_mgr->num_xcp_per_mem_partition &&
+    adev->gmc.num_mem_partitions > 1) {
+        mtype = (amdgpu_aid_local_flag_mtype == 2) ? MTYPE_CC : MTYPE_RW;
+```
+
+where, a few lines earlier,
+
+```c
+bool coherent = bo->flags & (AMDGPU_GEM_CREATE_COHERENT |
+                             AMDGPU_GEM_CREATE_EXT_COHERENT);
+```
+
+The comment above that branch says "UNCACHED is the marker", which is stale: the
+code tests `COHERENT`, and `AMDGPU_GEM_CREATE_COHERENT` (bit 13) is listed in
+`AMDGPU_GEM_CREATE_SETTABLE_MASK` in `amdgpu_gem.h`. So the `GEM_CREATE` ioctl
+accepts it directly, and a single ioctl can request a home AID *and* a coherent
+MTYPE on the same BO:
+
+```
+AMDGPU_GEM_CREATE_AID_LOCAL | AMDGPU_GEM_CREATE_AID_SELECT | AMDGPU_GEM_CREATE_COHERENT
+```
+
+`bench_aidsplit --coherent=1` ORs bit 13 into the AID-local allocation it
+already performs. No driver change, no rebuild: the module in
+`aid-local-hbm/src/amdgpu-mtype-test` already exposes the knob.
+
+Two independent things then have to hold at once, which is why the earlier
+attempts each failed on one of them. `aid_local_xcp_nc=1` keeps `is_local` false
+so every ordinary page is MTYPE_NC -- unlike the global `mtype_local=2`, which
+reached the same latency by promoting all VRAM including activations.
+`aid_local_flag_mtype=2` promotes only BOs that ask for it -- unlike the earlier
+per-BO test, which asked on a buffer it had not placed.
+
+### The four cells
+
+SPX+NPS2, `aid_local_xcp_nc=1 aid_local_flag_mtype=2`, `mtype_local` left at its
+default, 23 tiles x 8 XCDs = 184 blocks, 120 layers, 79,488 samples per cell:
+
+| cell | placement | flag MTYPE | `vis` p50 | p90 | all eight XCDs progressing |
+| --- | --- | --- | --- | --- | --- |
+| `cand` | one copy per AID, split routing | coherent (CC) | **0.85** | 0.97 | yes, 0 timeouts |
+| `nc` | one copy per AID, split routing | NC | 7.60 | 9.61 | yes, 0 timeouts |
+| `broken` | both halves on the AID0 copy | coherent (CC) | (0.80) | 0.94 | **no** -- XCD4-7 zero progress |
+| `ord` | plain `hipMalloc` | NC | 17.51 | -- | yes (`poll` 20.92) |
+
+`dmesg` confirms which path the driver took rather than leaving it inferred:
+`FLAGMTYPE fired: knob=2 -> mtype=2`.
+
+The two middle rows are what make this a mechanism rather than a number.
+
+**`nc` isolates placement.** Identical AID-split buffers and identical routing,
+coherence off: 17.51 us to 7.60 us. That is the replication effect and nothing
+more -- two copies means two lines, so waves-per-line halves. It is consistent
+with the `copies=2` row of the replication sweep and it confirms again that
+AID placement per se buys nothing beyond the extra line.
+
+**The coherent MTYPE is the remaining 7.60 to 0.85**, 8.9x, with placement and
+routing held fixed. This is the term that no amount of replication reaches,
+because it changes what answers the poll: the co-located L2 rather than the
+line's home channel.
+
+**`broken` is the correctness control.** Same coherent buffers, but every XCD
+routed to the AID0 copy. XCD0-3 continued; XCD4-7 timed out on all 92 layers
+they attempted, having never observed a single release. The 0.80 us figure is
+in-domain XCDs only and is not a result -- it is there to show the cell ran. This
+is the lost-probe failure of the previous section, reproduced deliberately, and
+it is what establishes that the routing rather than the allocation is what makes
+the coherent MTYPE safe.
+
+**`ord` is the blast-radius control**, and the one the global `mtype_local=2`
+failed. Ordinary `hipMalloc` flags in the same driver configuration still
+measure 20.92 us and do not hang, so those pages really did stay MTYPE_NC.
+
+### Why this is safe for the rest of the model
+
+The rule is: *a coherent BO's readers must be a subset of the XCDs co-located
+with its home AID.* Note it is a property of routing, not of allocation --
+`broken` is correctly AID-placed and still fails.
+
+Activations, weights and every other buffer are unaffected because they are
+never promoted. They keep MTYPE_NC, and NC resolves every access at the line's
+home, so a cross-AID read is always correct and merely slow. That is what the
+driver's demotion is for, and it stays in force. This is the whole reason to
+prefer the per-BO knob over `mtype_local=2` even though both measure the same
+latency: the global switch promotes activation buffers too, and a megakernel
+reuses those every layer and every token, so a stale cached line from the
+previous iteration is a plausible hit that no probe arrives to invalidate. That
+failure returns wrong logits with no crash.
+
+There is a structural reason the per-BO version is easier to trust than "be
+careful about placement". Look at how `broken` failed: the out-of-domain XCDs
+**hung**, they did not return garbage. A consumer waiting on a flag that never
+arrives stops, loudly. A consumer reading an activation from a stale line
+returns a plausible number and continues. The two failure modes are separated by
+buffer category -- synchronization variables fail loudly, data buffers fail
+silently -- so confining the coherent MTYPE to synchronization variables puts
+the entire change inside the category where mistakes announce themselves.
+
+Two guards are still worth having:
+
+- **Driver-side.** As written the branch promotes *any* coherent VRAM BO, so it
+  trusts userspace to only mark buffers it has actually AID-placed. Marking a
+  `hipDeviceMallocFinegrained` buffer that is not placed yields the `broken`
+  hang, which is precisely what the earlier `--flagmem=1` experiments hit.
+  Gating the branch on `AID_LOCAL && COHERENT` makes that mistake impossible to
+  express.
+- **Model-side.** Run the model with `aid_local_flag_mtype=0` (everything NC)
+  and `=2`, and compare logits bitwise. Any routing mistake on a *data* buffer
+  shows up as a numerical difference; a bit-identical result means no coherent
+  buffer is being read out of domain.
+
+### Where this stops working
+
+The flags are cheap to do this way for a specific reason: they are tiny, and
+their access pattern is *already* partitioned -- each XCD only needs the release
+information, and every copy carries all of it, so replicating them costs eight
+extra write-through stores per layer and no reads change hands.
+
+That does not generalise to activations. If AID-local activations are ever
+wanted for bandwidth, the coherent MTYPE stops being free, because both halves
+of the XCDs genuinely need to read each other's output rather than a local copy
+of the same information. Satisfying the co-location rule would mean replicating
+the tensor and having each half read its own copy, which costs a duplicate write
+of real data on the critical path. That is a different tradeoff and a separate
+decision; nothing in this section argues for it.
+
+### Caveats
+
+- `bench_aidsplit` and `bench_flagplace` are not directly comparable. They pace
+  layers differently and `bench_aidsplit` inherently carries two flag copies, so
+  the honest apples-to-apples claim is the 7.60 -> 0.85 us within one harness,
+  and 17.51 -> 0.85 us against the ordinary-flag path measured in the same
+  session. NPS1's `vis` on `bench_flagplace` is about 1.21 us, so 0.85 us is at
+  least in NPS1's league, but confirming "better than NPS1" needs
+  `bench_aidsplit` run in NPS1 and it has not been.
+- The `broken` cell leaves XCD4-7 spinning to their deadline. Do not run it
+  without `--bailms`.
+- Phase 7's K-parallel map is what makes the flags readable from both AIDs in
+  the first place; this fix does not change the map, it replicates the flags so
+  each half has an in-domain copy to read.
+
+## Alternative: replicate the flag array
+
+Replication is the cheapest thing that works without any driver knob, and it is
+nearly free in layout terms: 16 copies x 8 flags x 64 B is 8 KiB. The 256 B
+stride is marginally better at low K and converges by K=16:
 
 | variant (NPS2, 736 waves) | `poll` p50 | vs production |
 | --- | --- | --- |
@@ -438,6 +634,59 @@ from issuing them against more lines, not from weakening them.
 
 ## Reproducing
 
+### The fix, all four cells
+
+`run_perbo.sh` does the whole thing -- builds, reloads the driver, runs the four
+cells, and greps `dmesg` to confirm the driver took the per-BO path. It must
+load the module that has the knob, which is **not** the tree `spxnps2.sh`
+defaults to:
+
+```bash
+bash run_perbo.sh
+```
+
+By hand, the part that matters is the module parameters and the two flags on the
+benchmark:
+
+```bash
+# the module with aid_local_flag_mtype lives in the mtype-test tree; the tree
+# named amdgpu-6.16.13-2278356.24.04 has a gfx_v9_4_3.c newer than its own
+# headers and does not build.
+sed 's|^SRC=.*|SRC=/home/schowdha/aid-local-hbm/src/amdgpu-mtype-test|' \
+    /home/schowdha/_apfix/spxnps2.sh > /tmp/spxnps2_mtype.sh
+
+# xcp_nc=1 keeps every ordinary page NC; flag_mtype=2 promotes only BOs that ask.
+# Do NOT also pass mtype_local=2 -- that is the global switch this replaces.
+bash /tmp/spxnps2_mtype.sh "aid_local_steal_gb=0 aid_local_spx_nps2=1 \
+    aid_local_xcp_span=1 aid_local_xcp_nc=1 aid_local_flag_mtype=2"
+
+hipcc -O3 --offload-arch=gfx950 -o bench_aidsplit bench_aidsplit.hip
+
+# cand: placed AND coherent -- the result
+HIP_VISIBLE_DEVICES=6 ./bench_aidsplit --tiles=23 --layers=120 \
+    --split=1 --coherent=1 --tag=cand
+
+# nc: same placement, coherence off -- isolates the MTYPE's contribution
+HIP_VISIBLE_DEVICES=6 ./bench_aidsplit --tiles=23 --layers=120 \
+    --split=1 --coherent=0 --tag=nc
+
+# broken: coherent, co-location deliberately violated. XCD4-7 will spin to the
+# deadline, so keep --bailms bounded.
+HIP_VISIBLE_DEVICES=6 ./bench_aidsplit --tiles=23 --layers=120 \
+    --split=0 --coherent=1 --bailms=50 --tag=broken
+
+# ord: ordinary pages must still be NC. ~20 us, and critically NOT a hang.
+HIP_VISIBLE_DEVICES=6 ./bench_flagplace --layers=120 --tiles=23 \
+    --flagstride=64 --tag=ord
+
+sudo dmesg | grep FLAGMTYPE     # expect: fired: knob=2 -> mtype=2
+```
+
+Report all four. `cand` alone does not distinguish the fix from a global MTYPE
+change, and without `ord` there is no evidence the rest of VRAM stayed NC.
+
+### The replication fallback
+
 ```bash
 hipcc -O3 --offload-arch=gfx950 -o bench_flagplace bench_flagplace.hip
 
@@ -503,3 +752,19 @@ different mount points, so check `SRC` resolves before running it -- a failed
 | `--hier=N` | 0 | 0 flat, 2 two-level, 3 two-level with the local flag replicated over 8 lines. |
 | `--sleep=N` | 1 | `s_sleep(1)` repeats per spin iteration, i.e. backoff. |
 | `--skew=N` | 0 | Per-XCD staggered producer release, in 10 ns ticks. |
+
+`bench_aidsplit` knobs, which are the two axes of the fix:
+
+| knob | default | what it isolates |
+| --- | --- | --- |
+| `--split=N` | 1 | Consumer routing. 1 sends each XCD-half to the copy in its own AID (readers co-located with the home, coherence sufficient). 0 sends everyone to the AID0 copy, which is the deliberate violation. |
+| `--coherent=N` | 0 | Whether the two AID-local BOs carry `AMDGPU_GEM_CREATE_COHERENT`, i.e. whether `aid_local_flag_mtype` promotes them. With `--split=1` this isolates the MTYPE from the placement. |
+| `--bailms=N` | 50 | Per-spin deadline. Required for `--split=0`, where four XCDs never observe a release. |
+| `--flagstride=B` | 64 | Byte stride between the eight flags within a copy, as in `bench_flagplace`. |
+
+Two structural notes on that harness, both there to keep the measurement from
+depending on the thing being measured. Layers are paced by absolute deadlines
+off the 100 MHz reference rather than a cross-block barrier, because a shared
+barrier line would itself be the cross-AID spin under test. And release
+timestamps live *inside* the AID-local buffers, at a 1 MiB offset from the
+flags, so reading them does not cross the boundary either.

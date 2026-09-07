@@ -77,11 +77,26 @@ __device__ __forceinline__ int ld_sys_s32(int *addr) {
 // that line happens to be evicted. Every gate below is sc0 sc1 for that
 // reason; the hierarchical arm wins by issuing fewer of them, not weaker ones.
 
+// Where copy c of XCD x's flag lives, in units of the flag stride.
+//
+// Layout 0 replicates the whole eight-flag array, so copy c of flag x sits at
+// slot c*8 + x. MI350 selects the channel from PA[11:8], so at a 256 B stride
+// the channel is the slot index mod 16, and for a fixed x that is x or x+8 and
+// nothing else: every copy of a given flag lands on one of two channels.
+// Replication then multiplies lines without spreading the load that a flag's
+// waiters put on a channel.
+//
+// Layout 1 makes a flag's copies contiguous instead, slot x*K + c, so the K
+// copies of one flag walk K consecutive channels.
+__device__ __forceinline__ int flag_slot(int layout, int c, int x, int K) {
+  return layout ? (x * K + c) : (c * NXCD + x);
+}
+
 __global__ __launch_bounds__(NTHREADS) void flagplace(
     unsigned short *attn_out, int *flags, int *local_flags, unsigned int *rel_ts,
     unsigned int *bar, int *xcd_seen, unsigned int *s_poll, unsigned int *s_inv,
     unsigned int *s_vis, int *s_skew, int n_layers, int tiles, int stride_ints,
-    int delay_skew, int hier, int sleep_n, int n_copies) {
+    int delay_skew, int hier, int sleep_n, int n_copies, int layout) {
   int const xcd = get_xcd();
   int const tid = threadIdx.x;
   int const warp = tid >> 6;
@@ -109,8 +124,10 @@ __global__ __launch_bounds__(NTHREADS) void flagplace(
   // separates per-line serialization from a global request-rate limit, and it
   // is the general form of "give each AID its own flag page".
   int const copy = local % n_copies;
-  int *rel0 = flags + (copy * NXCD + first_xcd) * stride_ints;
-  int *rel1 = flags + (copy * NXCD + first_xcd + 1) * stride_ints;
+  int *rel0 =
+      flags + flag_slot(layout, copy, first_xcd, n_copies) * stride_ints;
+  int *rel1 =
+      flags + flag_slot(layout, copy, first_xcd + 1, n_copies) * stride_ints;
   unsigned int *my_slice = (unsigned int *)(attn_out + xcd * ATTN_SLICE);
   unsigned int const *src =
       (unsigned int const *)(attn_out + first_xcd * ATTN_SLICE);
@@ -139,7 +156,8 @@ __global__ __launch_bounds__(NTHREADS) void flagplace(
                   (unsigned)__builtin_amdgcn_s_memrealtime());
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         for (int c = 0; c < n_copies; ++c) {
-          st_wt_u32(&flags[(c * NXCD + xcd) * stride_ints], (unsigned)layer);
+          st_wt_u32(&flags[flag_slot(layout, c, xcd, n_copies) * stride_ints],
+                    (unsigned)layer);
         }
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       }
@@ -252,7 +270,7 @@ int main(int argc, char **argv) {
   int tiles = 23;
   int delay_skew = 0;
   long stride_bytes = 64;
-  int hier = 0, sleep_n = 1, n_copies = 1;
+  int hier = 0, sleep_n = 1, n_copies = 1, layout = 0;
   // Allocation flags for the flag array alone; everything else stays on plain
   // hipMalloc, so this isolates the flag page's MTYPE from the rest of the
   // working set. 0 = hipMalloc, else a hipExtMallocWithFlags value:
@@ -274,6 +292,8 @@ int main(int argc, char **argv) {
       sleep_n = atoi(argv[i] + 8);
     } else if (!strncmp(argv[i], "--copies=", 9)) {
       n_copies = atoi(argv[i] + 9);
+    } else if (!strncmp(argv[i], "--layout=", 9)) {
+      layout = atoi(argv[i] + 9);
     } else if (!strncmp(argv[i], "--flagmem=", 10)) {
       flagmem = atoi(argv[i] + 10);
     } else if (!strncmp(argv[i], "--tag=", 6)) {
@@ -339,7 +359,7 @@ int main(int argc, char **argv) {
   hipLaunchKernelGGL(flagplace, dim3(NXCD * tiles), dim3(NTHREADS), 0, 0,
                      d_attn, d_flags, d_local, d_relts, d_bar, d_seen, d_poll,
                      d_inv, d_vis, d_skew, n_layers, tiles, stride_ints,
-                     delay_skew, hier, sleep_n, n_copies);
+                     delay_skew, hier, sleep_n, n_copies, layout);
   HIP_OK(hipEventRecord(e1));
   HIP_OK(hipDeviceSynchronize());
   HIP_OK(hipGetLastError());
