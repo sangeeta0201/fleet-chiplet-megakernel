@@ -75,6 +75,15 @@ same instant with no work in between. There is no attention merge to finish
 late, yet the 27x still appears. That rules out the explanation that Phase 7 is
 merely observing an upstream phase running late.
 
+### Root cause and a measured fix
+
+`ROOT-CAUSE.md` takes this the rest of the way with `bench_flagplace.hip`, which
+isolates the flag handshake from the GEMM. In one line: the driver maps VRAM
+MTYPE_RW in NPS1 and MTYPE_NC in SPX+NPS2, MTYPE_RW absorbs concurrent
+system-scope readers while MTYPE_NC serializes them, and MTYPE_NC is required
+for correctness. A two-level gate that cuts flag-polls per layer from 1472 to
+240 recovers 4.0x of it.
+
 ## Geometry being modeled
 
 Lifted from the generated `test.cu`, the fused layer instantiates as
@@ -95,8 +104,10 @@ bandwidth to recover and no benefit from spreading it over more stacks.
 `st_wt_u32` (`global_store_dword ... sc0 sc1`), a write-through store; the
 consumer spins on `ld_sys_s32` (`global_load_dword ... sc0 sc1`), a system-scope
 read. Every poll is a real memory round trip. The eight flags are strided 16
-ints (64 B) apart, so all 512 bytes sit inside a single 4 KiB page -- one page,
-one AID under NPS2, with 736 waves polling it.
+ints (64 B) apart, so all 448 bytes sit inside one 4 KiB page, with 736 waves
+polling it. Their *addresses* turn out not to be the mechanism, though -- see
+`ROOT-CAUSE.md`, which measures the stride directly and finds NPS1 flat across
+it. What differs is the MTYPE the driver puts on the page.
 
 ## Reproducing
 
@@ -201,12 +212,13 @@ model numbers are directly comparable.
   falls outside every measured span, and the bucket ratios reproduce the
   uninstrumented run -- but do not read `wall ... us per layer` as a real
   latency.
-- **Where the flag lines physically land is inferred, not measured.** The eight
-  flags span 512 B, so under NPS2 they cannot straddle a 4 KiB page and must
-  share one AID. The NPS1 side is *not* verified: whether the finer interleave
-  scatters those eight lines across stacks depends on the interleave
-  granularity, which we have not confirmed. Note the queueing evidence -- cost
-  linear in poller count -- stands regardless of that detail.
+- **Flag placement is resolved and it is not the cause.** `bench_flagplace.hip`
+  makes the stride a runtime knob: NPS1 is flat across it (2.08 us with all
+  eight flags in one cache line vs 1.48 us spread over eight), so NPS1's
+  advantage never came from spreading them over stacks. The cause is the page
+  MTYPE -- MTYPE_RW in NPS1 vs MTYPE_NC in SPX+NPS2 -- and it cannot be switched
+  back, because MTYPE_RW makes the cross-AID handshake hang. See
+  `ROOT-CAUSE.md`.
 - **Output is numerically incomplete at `--tiles < 23`**, since fewer weight
   groups are computed. Timing stays valid; the tensor values do not.
 
@@ -221,4 +233,6 @@ model numbers are directly comparable.
 | `compare.py` | Parses `[OPROJ_INNER]` lines and prints per-bucket medians and ratios. |
 | `sweep_pollers.sh` | The `--tiles` sweep that shows the cost is linear in poller count. |
 | `bench_phase7.hip` | Hand-written slicewait-only model, no megakernel dependency. Useful for testing the handshake in isolation. |
+| `bench_flagplace.hip` | Flag-placement probe. Runtime flag stride, poller count, two-level gate and spin backoff; splits the wait into poll / visibility / producer skew / invalidate. |
+| `ROOT-CAUSE.md` | Why NPS2 costs 27x: the page MTYPE, with the stride and poller sweeps and a measured fix. |
 | `results/` | Captured output backing the tables above. |
