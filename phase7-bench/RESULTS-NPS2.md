@@ -9,7 +9,7 @@ different hash is not a result.
 | configuration | median total (?s) |
 | --- | --- |
 | SPX+NPS1 baseline | 9.76 / 9.80 / 9.88 |
-| SPX+NPS2 default path | 10.28 ? 10.52 |
+| SPX+NPS2 `--aid=1` (best) | 10.28 - 10.52 |
 | NPS2 `--dsplit=1` (data placed) | 11.04 vs 10.48 control |
 
 `mfma` is pinned at 3.960 ?s in 16 of 16 runs across every placement arm, so the
@@ -111,8 +111,17 @@ A node reboot wipes both the patched driver and the partition mode. Rebuild
 ```bash
 cd ~/fleet-chiplet-megakernel
 ./build_drive_aid.sh
-./drive_phase7 --layers=400 --tiles=23 --aid=0 --split=0 --lsplit=0 --hrdv=0 --tag=base
+# --aid=0 is the SLOW arm (NC sync line, ~22.8 us). It is the control.
+./drive_phase7 --layers=400 --tiles=23 --aid=0 --split=0 --lsplit=0 --hrdv=0 --tag=flat
+
+# --aid=1 is the ~10.3 us arm: sync buffer AID_LOCAL + EXT_COHERENT -> CC.
+./drive_phase7 --layers=400 --tiles=23 --aid=1 --coherent=1 --tag=best
 ```
+
+**`--aid` defaults to 0**, and `--aid=0` is the 22.8 us NC-sync-line case, not
+the ~10.3 us number in the table above. `--coherent=1` on its own does nothing
+(22.84); it only helps once `--aid=1` has made the buffer AID_LOCAL. See
+`REPRODUCE-NPS2-ARMS.md` for the full sweep.
 
 Flags that matter:
 
