@@ -119,6 +119,7 @@ static constexpr uint64_t GEM_CREATE_COHERENT = 1ULL << 13;
 static int g_drm_fd = -1;
 static unsigned g_range_for_aid[2] = {~0u, ~0u};
 static bool g_coherent = false;
+static bool g_dcoh = false;
 
 static int open_render_node(char const *pci) {
   for (int m = 128; m < 256; m++) {
@@ -332,6 +333,19 @@ static void *alloc_in_aid(size_t bytes, int aid, bool coherent) {
 // buffer, and therefore the last one the SPX+NPS2 MTYPE_NC demotion applied to.
 #define HIER_L2_OFF_INTS (HIER_LOCAL_OFF_INTS + 3072)
 
+// --srdv. One slot per participant. Nothing here is ever the target of a
+// read-modify-write, and no slot has more than one writer for the whole run,
+// so the coherency point has nothing to order and the poll never contends with
+// the publish. Tier 1 is NXCD arrays of `tiles` slots; tier 2 is NXCD slots on
+// a single line, which is why it is safe to make that one line device-coherent
+// even though the 2 MiB flag page is not.
+#define SENT_LOC_OFF_INTS (HIER_LOCAL_OFF_INTS + 5120)
+#define SENT_LOC_STRIDE 32
+#define SENT_GLB_OFF_INTS (HIER_LOCAL_OFF_INTS + 6144)
+#ifndef MPK_DRV_SRDV_SLEEP
+#define MPK_DRV_SRDV_SLEEP 1
+#endif
+
 __device__ unsigned int g_local_claim[NXCD];
 
 __device__ __forceinline__ int drv_get_xcd() {
@@ -357,15 +371,165 @@ __device__ __forceinline__ int drv_ld_sys_s32(int *addr) {
   return val;
 }
 
+// ---- placement confirmation, lifted from mtype_micro ----------------------
+//
+// The allocator reporting "range 1 requested" is not evidence that the pages
+// are in AID1. The only evidence is latency: a dependent chase with one lane
+// per XCD, so there is exactly one outstanding load and the number is latency
+// rather than bandwidth. On these MTYPE_NC buffers nothing is cacheable, so
+// every step goes to HBM and the local/remote split shows up directly -- ~148 ns
+// when the reading XCD owns the stacks and ~242 ns when it does not.
+//
+// Destructive: it overwrites the buffer with a pointer chain, so it has to run
+// before the weight fill, never between layers.
+#define PROBE_ELEMS_PER_PAGE 1024 // 4 KiB apart, so no two steps share a page
+
+// A device-coherency read. Unlike a non-temporal load -- which is only an
+// eviction-policy hint and will happily hit a line the L2 already holds -- this
+// has to reach the coherency point on every step. That is what makes placement
+// observable in a buffer small enough to be L2-resident, and it is the same
+// instruction class the barrier polls with, so it reports the latency that
+// actually matters for sync traffic.
+__device__ __forceinline__ uint32_t probe_ld_sys_u32(uint32_t const *p) {
+  uint32_t v;
+  asm volatile("global_load_dword %0, %1, off sc0 sc1\n"
+               "s_waitcnt vmcnt(0)"
+               : "=v"(v)
+               : "v"(p)
+               : "memory");
+  return v;
+}
+
+// mode 0: non-temporal, i.e. the latency the workload actually sees, cache and
+//         all. mode 1: device-scope, i.e. where the pages really are.
+__global__ void aid_probe_chase(uint32_t const *__restrict__ p, int steps,
+                                unsigned long long *__restrict__ ticks,
+                                uint32_t *__restrict__ sink,
+                                unsigned *__restrict__ xcd_of, int mode) {
+  if (threadIdx.x != 0) {
+    return;
+  }
+  xcd_of[blockIdx.x] = (unsigned)drv_get_xcd();
+  uint32_t idx = 0;
+  // Warm the TLB first, so the timed loop measures the data path and not a
+  // page-table walk.
+  for (int i = 0; i < 8192; ++i) {
+    idx = mode ? probe_ld_sys_u32(&p[idx])
+               : __builtin_nontemporal_load(&p[idx]);
+  }
+  unsigned long long t0 = __builtin_amdgcn_s_memrealtime();
+  if (mode) {
+    for (int i = 0; i < steps; ++i) {
+      idx = probe_ld_sys_u32(&p[idx]);
+    }
+  } else {
+    for (int i = 0; i < steps; ++i) {
+      idx = __builtin_nontemporal_load(&p[idx]);
+    }
+  }
+  unsigned long long t1 = __builtin_amdgcn_s_memrealtime();
+  ticks[blockIdx.x] = t1 - t0;
+  sink[blockIdx.x] = idx;
+}
+
+static void probe_placement(char const *name, void *buf, size_t bytes,
+                            int mode) {
+  size_t const nelem = bytes / sizeof(uint32_t);
+  // Space the chain a page apart when there are pages to spare, and a cache
+  // line apart otherwise. The requirement is only that consecutive steps land
+  // on distinct lines; `out` is 5888 B and has no pages to walk, but it is
+  // exactly the buffer whose home matters most, since every access to it is
+  // write-through and reaches HBM.
+  size_t step_elems = PROBE_ELEMS_PER_PAGE;
+  if (nelem / PROBE_ELEMS_PER_PAGE < 64) {
+    step_elems = 16; // 64 B = one line
+  }
+  size_t const nslots = nelem / step_elems;
+  if (nslots < 8) {
+    printf("[PROBE] %-14s too small to chase (%zu slots)\n", name, nslots);
+    return;
+  }
+  std::vector<uint32_t> perm(nslots);
+  for (size_t i = 0; i < nslots; ++i) {
+    perm[i] = (uint32_t)i;
+  }
+  // A fixed shuffle, so the walk order is unpredictable to any prefetcher but
+  // identical between the buffers being compared.
+  unsigned long long s = 88172645463325252ull;
+  for (size_t i = nslots - 1; i > 0; --i) {
+    s ^= s << 13;
+    s ^= s >> 7;
+    s ^= s << 17;
+    std::swap(perm[i], perm[s % (i + 1)]);
+  }
+  std::vector<uint32_t> host(nelem, 0u);
+  for (size_t i = 0; i < nslots; ++i) {
+    host[(size_t)perm[i] * step_elems] =
+        (uint32_t)((size_t)perm[(i + 1) % nslots] * step_elems);
+  }
+  HIP_OK(hipMemcpy(buf, host.data(), bytes, hipMemcpyHostToDevice));
+
+  int const steps = 4096;
+  unsigned long long *d_ticks = nullptr;
+  uint32_t *d_sink = nullptr;
+  unsigned *d_xcd = nullptr;
+  HIP_OK(hipMalloc(&d_ticks, NXCD * sizeof *d_ticks));
+  HIP_OK(hipMalloc(&d_sink, NXCD * sizeof *d_sink));
+  HIP_OK(hipMalloc(&d_xcd, NXCD * sizeof *d_xcd));
+  unsigned long long best[NXCD];
+  for (int b = 0; b < NXCD; ++b) {
+    best[b] = ~0ull;
+  }
+  unsigned long long t[NXCD];
+  unsigned x[NXCD];
+  // Best of 20: the minimum is the uncontended path, which is what placement
+  // determines. A mean would fold in scheduling noise.
+  for (int r = 0; r < 20; ++r) {
+    hipLaunchKernelGGL(aid_probe_chase, dim3(NXCD), dim3(64), 0, 0,
+                       (uint32_t const *)buf, steps, d_ticks, d_sink, d_xcd,
+                       mode);
+    HIP_OK(hipDeviceSynchronize());
+    HIP_OK(hipMemcpy(t, d_ticks, sizeof t, hipMemcpyDeviceToHost));
+    for (int b = 0; b < NXCD; ++b) {
+      best[b] = std::min(best[b], t[b]);
+    }
+  }
+  HIP_OK(hipMemcpy(x, d_xcd, sizeof x, hipMemcpyDeviceToHost));
+  double lo = 0, hi = 0;
+  int nlo = 0, nhi = 0;
+  printf("[PROBE] %-14s (%7zu B, %4zu lines):", name, bytes, nslots);
+  for (int b = 0; b < NXCD; ++b) {
+    double ns = best[b] * 10.0 / (double)steps; // 100 MHz -> 10 ns per tick
+    printf(" xcd%u=%.0f", x[b], ns);
+    if (x[b] < NXCD / 2) {
+      lo += ns;
+      ++nlo;
+    } else {
+      hi += ns;
+      ++nhi;
+    }
+  }
+  if (nlo && nhi) {
+    printf("  | XCD0-3 %.1f  XCD4-7 %.1f  skew %+.1f ns", lo / nlo, hi / nhi,
+           hi / nhi - lo / nlo);
+  }
+  printf("\n");
+  HIP_OK(hipFree(d_ticks));
+  HIP_OK(hipFree(d_sink));
+  HIP_OK(hipFree(d_xcd));
+}
+
 __global__ __launch_bounds__(NTHREADS) void drive_phase7(
-    void *attn_out, void *weight, void *residual, void *bias,
+    void *attn_out, void *weight, void *residual, void *attn_out_b,
+    void *weight_b, void *residual_b, void *bias,
     void *norm_weight, void *norm_output, void *router_weight,
     void *router_bias, void *logits_scratch, void *counters, void *output,
     void *topk_weight, void *routing_indices, void *active_expert_ids,
     int *flags, int *flags_b, unsigned int *bar, unsigned int *bar_b,
     int *hier_lo, int *hier_hi, int *hloc_lo, int *hloc_hi, int *rdv_lo,
     int *rdv_hi, int *hl2_lo, int *hl2_hi, int *xcd_seen, int n_layers,
-    int delay_ticks, int delay_skew, int tiles, int dual, int split_on) {
+    int delay_ticks, int delay_skew, int tiles, int dual, int split_on,
+    int l2_fold, int *srdv_la, int *srdv_lb, int *srdv_ga, int *srdv_gb) {
   int const xcd = drv_get_xcd();
   int const tid = threadIdx.x;
 
@@ -397,11 +561,34 @@ __global__ __launch_bounds__(NTHREADS) void drive_phase7(
   int *const rel = upper ? flags_b : flags;
   unsigned int *const my_bar = upper ? bar_b : bar;
 
-  unsigned short *my_slice = (unsigned short *)attn_out + xcd * ATTN_SLICE;
+  // Which AID this XCD's stacks are in. Independent of split_on: that flag says
+  // whether the *sync* state is replicated, and data placement is a separate
+  // question -- a private slab needs no replica, only the right home.
+  bool const hi_aid = xcd >= NXCD / 2;
+
+  // --dsplit. `weight` and `residual` are already partitioned per XCD by the
+  // index arithmetic below, and every access is inside the XCD's own slab, so
+  // there is exactly one toucher per slab and no replica is needed: the upper
+  // half's slabs simply move to AID1. The index becomes within-half, since each
+  // buffer now holds NXCD/2 slabs rather than NXCD.
+  int const wx = weight_b ? (hi_aid ? xcd - NXCD / 2 : xcd) : xcd;
   unsigned char *my_weight =
-      (unsigned char *)weight + (size_t)xcd * tiles * WG_BYTES;
+      (unsigned char *)((weight_b && hi_aid) ? weight_b : weight) +
+      (size_t)wx * tiles * WG_BYTES;
   unsigned short *my_residual =
-      (unsigned short *)residual + (size_t)xcd * tiles * OPROJ_OUTPUT_PER_WG;
+      (unsigned short *)((residual_b && hi_aid) ? residual_b : residual) +
+      (size_t)wx * tiles * OPROJ_OUTPUT_PER_WG;
+
+  // attn_out is the exception: the O-proj reduction reads all NXCD slices, so
+  // partitioning cannot make it local and it has to be replicated instead. Each
+  // producer publishes its own 1 KiB slice into both copies -- one local store
+  // and one remote -- so that every consumer can read all 4096 values from the
+  // copy in its own AID. That trades 8 remote KiB per layer for the four XCDs
+  // that currently read the entire buffer across the boundary.
+  unsigned short *my_slice = (unsigned short *)attn_out + xcd * ATTN_SLICE;
+  unsigned short *my_slice_b =
+      attn_out_b ? (unsigned short *)attn_out_b + xcd * ATTN_SLICE : nullptr;
+  void *const attn_base = (attn_out_b && hi_aid) ? attn_out_b : attn_out;
 
   for (int layer = 1; layer <= n_layers; ++layer) {
     // ?? stub for the attention merge Phase 7 waits on ??
@@ -425,6 +612,12 @@ __global__ __launch_bounds__(NTHREADS) void drive_phase7(
       float const fv = 1.0f + 0.5f * (float)(layer & 3) + 0.0625f * (float)xcd;
       unsigned int const bf = __float_as_uint(fv) >> 16;
       drv_st_wt_u32((unsigned int *)my_slice + tid, bf | (bf << 16));
+      // Identical bytes into the second replica, so a consumer sees the same
+      // value whichever copy it reads. Placed before the vmcnt below so the one
+      // wait covers both stores and the flag still publishes after both land.
+      if (my_slice_b) {
+        drv_st_wt_u32((unsigned int *)my_slice_b + tid, bf | (bf << 16));
+      }
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       __syncthreads();
       if (tid == 0) {
@@ -496,7 +689,7 @@ __global__ __launch_bounds__(NTHREADS) void drive_phase7(
     kernel::gang_linear_mxfp4_res_bias_rmsnorm_topk_kernel<
         OPROJ_BATCH, OPROJ_OUTPUT_PER_WG, OPROJ_REDUCTION, ACTUAL_HIDDEN,
         NUM_EXPERTS, TOPK_K>(
-        attn_out, my_weight, my_residual, bias, norm_weight, norm_output,
+        attn_base, my_weight, my_residual, bias, norm_weight, norm_output,
         router_weight, router_bias, logits_scratch, counters, output,
         topk_weight, routing_indices, active_expert_ids,
         /*num_active_tokens=*/1,
@@ -516,11 +709,60 @@ __global__ __launch_bounds__(NTHREADS) void drive_phase7(
         /*hier_local_lo=*/hloc_lo,
         /*hier_local_hi=*/hloc_hi,
         /*hier_l2_lo=*/hl2_lo,
-        /*hier_l2_hi=*/hl2_hi);
+        /*hier_l2_hi=*/hl2_hi,
+        /*l2_fold=*/l2_fold);
 
     // ?? per-layer rendezvous across all 184 tiles, as phase 9 does ??
     __syncthreads();
-    if (tid == 0) {
+    if (srdv_la != nullptr && srdv_ga == nullptr) {
+      // --srdv=2, the control: no rendezvous at all. Wrong answer by
+      // construction; the point is what the rendezvous costs.
+    } else if (srdv_la != nullptr) {
+      // Publish. A write-through store, so there is no pre-op value to return
+      // and the wave has nothing to wait on afterwards; the vmcnt(0) below is
+      // ordering this block's data ahead of its own arrival, not the arrival.
+      int *const loc =
+          ((upper && srdv_lb != nullptr) ? srdv_lb : srdv_la) +
+          xcd * SENT_LOC_STRIDE;
+      if (tid == 0) {
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        drv_st_wt_u32((unsigned int *)(loc + local), (unsigned)layer);
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      }
+      if (tid < 64) {
+        // One lane per slot, so each poll iteration is one coalesced load
+        // instead of `tiles` scalar ones. Lanes with no slot vote ready so the
+        // __all() is still a whole-wave vote.
+        if (local == 0) {
+          for (;;) {
+            int const v = ((int)tid < tiles) ? drv_ld_sys_s32(loc + (int)tid)
+                                             : layer;
+            if (__all(v >= layer)) {
+              break;
+            }
+            __builtin_amdgcn_s_sleep(MPK_DRV_SRDV_SLEEP);
+          }
+          if (tid == 0) {
+            // The whole boundary crossing: two stores, and nobody waits on
+            // either. Consumers in each AID read the copy homed in that AID.
+            drv_st_wt_u32((unsigned int *)(srdv_ga + xcd), (unsigned)layer);
+            if (srdv_gb != nullptr) {
+              drv_st_wt_u32((unsigned int *)(srdv_gb + xcd), (unsigned)layer);
+            }
+            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          }
+        }
+        int *const glb = (upper && srdv_gb != nullptr) ? srdv_gb : srdv_ga;
+        for (;;) {
+          int const v =
+              ((int)tid < NXCD) ? drv_ld_sys_s32(glb + (int)tid) : layer;
+          if (__all(v >= layer)) {
+            break;
+          }
+          __builtin_amdgcn_s_sleep(MPK_DRV_SRDV_SLEEP);
+        }
+      }
+    } else if (tid == 0) {
       if (rdv_lo != nullptr) {
         // Three levels, and no counter is shared across the partition boundary.
         // Every counter here is monotonic rather than reset, so the arrival
@@ -572,6 +814,8 @@ int main(int argc, char **argv) {
   int delay_ticks = 0, delay_skew = 0;
   int tiles = TILES_PER_XCD;
   int use_aid = 0, split_on = 1, lsplit_on = 0, hrdv_on = 0, bsplit_on = 0;
+  int srdv_on = 0;
+  int dsplit_on = 0, probe_on = 0, catomic = 0;
   char const *tag = "run";
   for (int i = 1; i < argc; ++i) {
     if (!strncmp(argv[i], "--layers=", 9)) {
@@ -586,14 +830,24 @@ int main(int argc, char **argv) {
       use_aid = atoi(argv[i] + 6);
     } else if (!strncmp(argv[i], "--coherent=", 11)) {
       g_coherent = atoi(argv[i] + 11) != 0;
+    } else if (!strncmp(argv[i], "--dcoh=", 7)) {
+      g_dcoh = atoi(argv[i] + 7) != 0;
     } else if (!strncmp(argv[i], "--split=", 8)) {
       split_on = atoi(argv[i] + 8);
     } else if (!strncmp(argv[i], "--lsplit=", 9)) {
       lsplit_on = atoi(argv[i] + 9);
     } else if (!strncmp(argv[i], "--hrdv=", 7)) {
       hrdv_on = atoi(argv[i] + 7);
+    } else if (!strncmp(argv[i], "--srdv=", 7)) {
+      srdv_on = atoi(argv[i] + 7);
     } else if (!strncmp(argv[i], "--bsplit=", 9)) {
       bsplit_on = atoi(argv[i] + 9);
+    } else if (!strncmp(argv[i], "--dsplit=", 9)) {
+      dsplit_on = atoi(argv[i] + 9);
+    } else if (!strncmp(argv[i], "--probe=", 8)) {
+      probe_on = atoi(argv[i] + 8);
+    } else if (!strncmp(argv[i], "--catomic=", 10)) {
+      catomic = atoi(argv[i] + 10);
     } else if (!strncmp(argv[i], "--tag=", 6)) {
       tag = argv[i] + 6;
     }
@@ -602,8 +856,21 @@ int main(int argc, char **argv) {
     fprintf(stderr, "--tiles must be in [1, %d]\n", TILES_PER_XCD);
     return 2;
   }
+  // The chase destroys what it walks, so the probe has to run before every fill
+  // -- which is before --catomic replaces `counters`. Its "counters" row would
+  // then describe the allocation that was thrown away, and it would look exactly
+  // like a real placement reading. Refuse instead.
+  if (probe_on && catomic) {
+    fprintf(stderr, "ABORT: --probe and --catomic cannot be combined; the probe "
+                    "runs before the counters buffer is replaced, so its row "
+                    "would describe the discarded allocation\n");
+    return 2;
+  }
 
   void *attn = nullptr, *weight = nullptr, *residual = nullptr, *bias = nullptr;
+  // Second homes for the three per-XCD data buffers, non-null only with
+  // --dsplit. The kernel treats null as "one allocation, global index".
+  void *attn_b = nullptr, *weight_b = nullptr, *residual_b = nullptr;
   void *nw = nullptr, *no = nullptr, *rw = nullptr, *rb = nullptr;
   void *logits = nullptr, *counters = nullptr, *out = nullptr, *tkw = nullptr;
   void *ridx = nullptr, *aeid = nullptr;
@@ -611,14 +878,69 @@ int main(int argc, char **argv) {
   int *hier_lo = nullptr, *hier_hi = nullptr;
   int *hloc_lo = nullptr, *hloc_hi = nullptr;
   int *rdv_lo = nullptr, *rdv_hi = nullptr;
+  int *srdv_la = nullptr, *srdv_lb = nullptr;
+  int *srdv_ga = nullptr, *srdv_gb = nullptr;
   int *hl2_lo = nullptr, *hl2_hi = nullptr;
   unsigned int *bar = nullptr, *bar_b = nullptr;
   int dual = 0;
 
   size_t const weight_bytes = (size_t)NXCD * tiles * WG_BYTES;
-  HIP_OK(hipMalloc(&attn, OPROJ_REDUCTION * 2));
-  HIP_OK(hipMalloc(&weight, weight_bytes));
-  HIP_OK(hipMalloc(&residual, OUTPUT_STRIDE * 2));
+  // Each half holds only its own XCDs' slabs, so the pair costs the same VRAM as
+  // the single allocation it replaces. This is a partition, not a replica.
+  size_t const weight_half_bytes = (size_t)(NXCD / 2) * tiles * WG_BYTES;
+  // A bitmask, because the two halves of this change are different mechanisms
+  // and have to be attributed separately. Bit 1 homes the private per-XCD slabs
+  // (weight, residual): one toucher each, so it is pure placement and cannot
+  // cost anything. Bit 2 adds the attn_out replica, which buys a local read for
+  // the all-to-all reduction but pays a remote store on the publish path. Only
+  // measuring 3 conflates a free change with one that has a price.
+  bool const d_wr = (dsplit_on & 1) != 0;
+  bool const d_attn = (dsplit_on & 2) != 0;
+  if (dsplit_on) {
+    if (!use_aid) {
+      fprintf(stderr, "ABORT: --dsplit needs --aid=1 (homing the data needs "
+                      "the AID-local allocator)\n");
+      return 2;
+    }
+    if (!aid_init()) {
+      fprintf(stderr, "ABORT: --dsplit but AID-local allocation is "
+                      "unavailable (stock driver, or not NPS2)\n");
+      return 2;
+    }
+  }
+  // coherent=false deliberately: these are data, not markers. A coherent MTYPE
+  // on a 34 KiB-per-block working set would overflow the DF-CS shadow-tag
+  // directory and hang, and nothing here needs coherence -- the weight and
+  // residual slabs have a single toucher each, and attn_out's two replicas are
+  // published by write-through stores ahead of the flag that gates them.
+  //
+  // These BOs therefore land on MTYPE_NC, the same type the single hipMalloc'd
+  // allocation already gets: with aid_local_xcp_nc=Y the driver forces
+  // is_local=false for all VRAM in a spanning XCP, and !coherent skips the
+  // FLAGMTYPE override, so the chain falls through to NC. That is what makes
+  // this an apples-to-apples test of homing rather than of caching.
+  if (d_attn) {
+    attn = alloc_in_aid(OPROJ_REDUCTION * 2, 0, g_dcoh);
+    attn_b = alloc_in_aid(OPROJ_REDUCTION * 2, 1, g_dcoh);
+  } else {
+    HIP_OK(hipMalloc(&attn, OPROJ_REDUCTION * 2));
+  }
+  if (d_wr) {
+    weight = alloc_in_aid(weight_half_bytes, 0, g_dcoh);
+    weight_b = alloc_in_aid(weight_half_bytes, 1, g_dcoh);
+    residual = alloc_in_aid(OUTPUT_STRIDE * 2, 0, g_dcoh);
+    residual_b = alloc_in_aid(OUTPUT_STRIDE * 2, 1, g_dcoh);
+  } else {
+    HIP_OK(hipMalloc(&weight, weight_bytes));
+    HIP_OK(hipMalloc(&residual, OUTPUT_STRIDE * 2));
+  }
+  if (attn == nullptr || weight == nullptr || residual == nullptr ||
+      (d_attn && attn_b == nullptr) ||
+      (d_wr && (weight_b == nullptr || residual_b == nullptr))) {
+    fprintf(stderr, "ABORT: --dsplit could not place a data buffer in each "
+                    "AID\n");
+    return 2;
+  }
   HIP_OK(hipMalloc(&bias, OUTPUT_STRIDE * 2));
   HIP_OK(hipMalloc(&nw, ACTUAL_HIDDEN * 2));
   HIP_OK(hipMalloc(&no, ACTUAL_HIDDEN * 2));
@@ -634,7 +956,48 @@ int main(int argc, char **argv) {
   HIP_OK(hipMalloc(&bar, sizeof(unsigned int)));
   HIP_OK(hipMalloc(&xcd_seen, NXCD * sizeof(int)));
 
+  // Ahead of every memset and fill, because the chase overwrites what it walks.
+  // Two modes on the same buffer, because they answer different questions and
+  // only together are they evidence. sc0/sc1 bypasses the L2 and reports where
+  // the pages really are, which is the only way to confirm a home for a buffer
+  // small enough to be L2-resident -- and it is also the latency that the
+  // write-through and atomic traffic below genuinely pays. nt reports what a
+  // cached reader sees.
+  //
+  // What nt does NOT establish, and the first reading of this probe got wrong:
+  // a flat nt row does not mean the buffer cannot be a source of skew. This is a
+  // warm best-of-20 dependent chase, so it measures residency under ideal
+  // conditions rather than in the staging loop. `weight` reads flat here at
+  // ~82 ns from all eight XCDs, and homing it per AID still moved the entry
+  // spread 0.585 -> 0.190 us. Flat nt plus skewed sc0/sc1 means "cached when
+  // warm, placed where I asked" -- not "immune to placement".
+  if (probe_on) {
+    for (int mode = 0; mode < 2; ++mode) {
+      printf("[PROBE] --- %s loads ---\n",
+             mode ? "device-scope sc0 sc1" : "non-temporal");
+      if (weight_b) {
+        probe_placement("weight(AID0)", weight, weight_half_bytes, mode);
+        probe_placement("weight(AID1)", weight_b, weight_half_bytes, mode);
+      } else {
+        probe_placement("weight(single)", weight, weight_bytes, mode);
+      }
+      // The buffers whose accesses cannot be cached, and which are therefore the
+      // only data that can contribute to arrival skew:
+      //   out       published with st_wt_u64 (sc0 sc1) and acquired cross-XCD
+      //             with sc1 -- the callee says it bypasses L2 and lands in HBM
+      //   counters  topk_counter, hit with atomicAdd from every block
+      //   logits    written with st_wt_u16, also write-through
+      probe_placement("out", out, OUTPUT_STRIDE * 2, mode);
+      probe_placement("counters", counters, 64 * 1024, mode);
+      probe_placement("logits", logits, 64 * 1024, mode);
+      probe_placement("attn_out", attn, OPROJ_REDUCTION * 2, mode);
+    }
+  }
+
   HIP_OK(hipMemset(attn, 0, OPROJ_REDUCTION * 2));
+  if (attn_b) {
+    HIP_OK(hipMemset(attn_b, 0, OPROJ_REDUCTION * 2));
+  }
   // Two fills, because a group's data and scale halves are different formats.
   // e2m1 0x2 is 1.0, so 0x22 is a pair of ones. The scale is E8M0 biased at
   // 127, and 0x77 is 2^-8, chosen so a 4096-long reduction of ones lands near
@@ -644,12 +1007,32 @@ int main(int argc, char **argv) {
   //
   // The single 0x11 fill this replaces left every scale at 2^-110, which
   // underflowed all 4096 products and made the harness compute zeros.
-  for (int g = 0; g < NXCD * tiles; ++g) {
-    char *wg = (char *)weight + (size_t)g * WG_BYTES;
-    HIP_OK(hipMemset(wg, 0x22, WG_DATA_BYTES));
-    HIP_OK(hipMemset(wg + WG_DATA_BYTES, 0x77, WG_SCALE_BYTES));
+  // Before the fill, because the chase overwrites what it walks. This is the
+  // only statement in the harness about where the data actually is; everything
+  // else is a request, not a confirmation.
+  // Two modes on the same buffer, because they answer different questions and
+  // only together are they evidence. nt reports the latency the staging read
+  // actually sees, cache included -- if that is flat across XCDs the data cannot
+  // be a source of skew whatever its home. sc0/sc1 bypasses the L2 and reports
+  // where the pages really are, which is the only way to confirm the partition
+  // landed in the AID it asked for when the buffer is small enough to be
+  // L2-resident.
+  // Every slab gets the same two fills whichever buffer it lives in, so the
+  // partition is byte-for-byte the allocation it replaces and the result hash is
+  // invariant to --dsplit by construction.
+  void *const wbuf[2] = {weight, weight_b};
+  int const wg_per_buf = weight_b ? (NXCD / 2) * tiles : NXCD * tiles;
+  for (int b = 0; b < (weight_b ? 2 : 1); ++b) {
+    for (int g = 0; g < wg_per_buf; ++g) {
+      char *wg = (char *)wbuf[b] + (size_t)g * WG_BYTES;
+      HIP_OK(hipMemset(wg, 0x22, WG_DATA_BYTES));
+      HIP_OK(hipMemset(wg + WG_DATA_BYTES, 0x77, WG_SCALE_BYTES));
+    }
   }
   HIP_OK(hipMemset(residual, 0, OUTPUT_STRIDE * 2));
+  if (residual_b) {
+    HIP_OK(hipMemset(residual_b, 0, OUTPUT_STRIDE * 2));
+  }
   HIP_OK(hipMemset(bias, 0, OUTPUT_STRIDE * 2));
   HIP_OK(hipMemset(nw, 0x3c, ACTUAL_HIDDEN * 2)); // ~1.0 bf16
   HIP_OK(hipMemset(no, 0, ACTUAL_HIDDEN * 2));
@@ -680,6 +1063,51 @@ int main(int argc, char **argv) {
     }
     flags = (int *)fa;
     flags_b = (int *)fb;
+
+    // --catomic: move the level-2 arrival counter out of plain hipMalloc, which
+    // is the one piece of barrier state whose MTYPE nobody has been able to
+    // choose. This is the direct test of the NPS1-versus-NPS2 question.
+    //
+    // The state of the argument it settles. Physically the counter line has ONE
+    // home in both partition modes, and in both modes four of the eight dies sit
+    // on the other AID, so "half the dies are remote to it" is as true of NPS1 as
+    // of NPS2 -- topology cannot be the difference between 0.30 and 0.96 us. What
+    // does differ is the MTYPE: an AID_LOCAL BO is local to its range, so
+    // `is_local` holds and it takes `mtype_local` (MTYPE_RW, NPS1's default),
+    // while plain hipMalloc VRAM in an XCP that spans both ranges is local to
+    // neither and gets demoted to MTYPE_NC. `--coherent=1` never tested this: it
+    // routes through `aid_local_flag_mtype`, which is 2, so it measured CC.
+    //
+    //   1  AID0, non-coherent  -> MTYPE_RW, the MTYPE NPS1 gives this line
+    //   2  AID0, coherent      -> whatever aid_local_flag_mtype says (CC today)
+    //   3  AID1, non-coherent  -> RW again, but homed in the other partition.
+    //      The placement control: this file has been claiming that homing cannot
+    //      reach an `sc1` atomic because it serialises at the device coherency
+    //      point regardless. With MTYPE held fixed, this is that claim's test.
+    if (catomic) {
+      // Safe only because --split and --lsplit have emptied this buffer of
+      // everything that is *polled*. What is left in it is the level-2 counter
+      // and topk_counter, both touched exclusively by device-scope atomics,
+      // which reach the coherency point and never read a cached copy. The
+      // release flags and the level-1 lines would not be safe here: a
+      // non-temporal poll of an MTYPE_RW line never observes another die's
+      // write-through store, even a die in the same AID, and that is the
+      // recorded hang rather than a slowdown.
+      if (!split_on || !lsplit_on) {
+        fprintf(stderr, "ABORT: --catomic needs --split=1 --lsplit=1, or the "
+                        "release flags and level-1 lines stay in this buffer "
+                        "and an nt poll of an RW line hangs\n");
+        return 2;
+      }
+      void *ca = alloc_in_aid(64 * 1024, catomic == 3 ? 1 : 0, catomic == 2);
+      if (ca == nullptr) {
+        fprintf(stderr, "ABORT: could not place the counters buffer\n");
+        return 2;
+      }
+      HIP_OK(hipFree(counters));
+      counters = ca;
+      HIP_OK(hipMemset(counters, 0, 64 * 1024));
+    }
     bar = (unsigned int *)(flags + BAR_OFF_INTS);
     bar_b = (unsigned int *)(flags_b + BAR_OFF_INTS);
     // Only with --split=1. Handing both halves the same replica would be the
@@ -707,12 +1135,51 @@ int main(int argc, char **argv) {
     // aggregation gives each half its own releaser, and a releaser can only
     // publish locally into a replica that is in its own partition.
     if (bsplit_on && split_on) {
-      hl2_lo = flags + HIER_L2_OFF_INTS;
-      hl2_hi = flags_b + HIER_L2_OFF_INTS;
+      // --bsplit=2 is the negative control for the claim that placement does
+      // nothing for an `sc0 sc1` atomic. It swaps the two regions, so every
+      // half's arrival counter is deliberately homed in the *other* partition
+      // and every level-2 atomic is remote. If the claim is right this costs
+      // nothing measurable; if placement matters after all, this is where it
+      // shows. Safe despite the coherent MTYPE because nothing here is a cached
+      // reader: `sc1` atomics bypass the L2s by definition and the handshake
+      // polls are `ld_nt`. The handshake's signal store is already remote in the
+      // un-swapped form, so remote access to these buffers is nothing new.
+      //
+      // --bsplit=3 is the fold: the same two per-AID regions, but each half's
+      // closer then does one atomic on the global line instead of the
+      // handshake, so that line takes 2 arrivals rather than 8. It exists to
+      // separate the two things --bsplit=1 changed at once -- fewer arrivals on
+      // the shared line, and a handshake that cost 0.36 us -- and so to say
+      // whether the level-2 rise from 0.66 to 0.96 under symmetric arrivals is
+      // really serialization on that line.
+      bool const swap = bsplit_on == 2;
+      hl2_lo = (swap ? flags_b : flags) + HIER_L2_OFF_INTS;
+      hl2_hi = (swap ? flags : flags_b) + HIER_L2_OFF_INTS;
     } else if (bsplit_on) {
-      fprintf(stderr, "ABORT: --bsplit=1 needs --split=1 (two releasers need "
-                      "two release replicas to publish into)\n");
+      fprintf(stderr, "ABORT: --bsplit needs --split=1 (the per-half arrival "
+                      "counters have to be homed in two partitions)\n");
       return 2;
+    }
+    if (srdv_on) {
+      if (srdv_on == 2) {
+        // tier 1 non-null, tier 2 null: the kernel reads that as "skip".
+        srdv_la = flags + SENT_LOC_OFF_INTS;
+      }
+      if (srdv_on == 1 && tiles > SENT_LOC_STRIDE) {
+        fprintf(stderr, "ABORT: --srdv needs tiles <= %d\n", SENT_LOC_STRIDE);
+        return 2;
+      }
+      // Tier 1 goes to the replica homed in each XCD's own AID, so the array a
+      // block writes and the array its aggregator polls are both local. Tier 2
+      // is written to both replicas and read from whichever is local.
+      srdv_la = flags + SENT_LOC_OFF_INTS;
+      if (srdv_on == 1) {
+        srdv_ga = flags + SENT_GLB_OFF_INTS;
+      }
+      if (split_on && srdv_on == 1) {
+        srdv_lb = flags_b + SENT_LOC_OFF_INTS;
+        srdv_gb = flags_b + SENT_GLB_OFF_INTS;
+      }
     }
     HIP_OK(hipMemset(flags, 0, sync_bytes));
     HIP_OK(hipMemset(flags_b, 0, sync_bytes));
@@ -727,6 +1194,10 @@ int main(int argc, char **argv) {
     // No release replicas without AID placement, so there is nothing for a
     // second releaser to publish into. The shared counter stays.
     bsplit_on = 0;
+    // And no way to ask for an MTYPE either: choosing one means allocating the
+    // BO ourselves. In NPS1 this is moot -- the line is MTYPE_RW already, which
+    // is the whole point of the comparison.
+    catomic = 0;
     // The tree is still worth running with one coherence domain: it is the
     // control that says how much of its benefit is the shape and how much is the
     // placement. Both pointers alias, and the per-half line indices keep it a
@@ -742,10 +1213,16 @@ int main(int argc, char **argv) {
 
   printf("[%s] attn_out %p  flags %p / %p  weight %p (%.2f MiB)\n", tag, attn,
          (void *)flags, (void *)flags_b, weight, weight_bytes / 1048576.0);
+  if (dsplit_on) {
+    printf("[%s] dsplit: attn_out %p / %p  weight %p / %p  residual %p / %p\n",
+           tag, attn, attn_b, weight, weight_b, residual, residual_b);
+  }
+  printf("[%s] srdv=%d\n", tag, srdv_on);
   printf("[%s] aid=%d coherent=%d split=%d hier_split=%d local_split=%d "
-         "hier_rdv=%d l2_split=%d\n",
+         "hier_rdv=%d l2_split=%d l2_fold=%d catomic=%d\n",
          tag, use_aid, (int)g_coherent, split_on, hier_lo != nullptr,
-         hloc_lo != nullptr, rdv_lo != nullptr, hl2_lo != nullptr);
+         hloc_lo != nullptr, rdv_lo != nullptr, hl2_lo != nullptr,
+         bsplit_on == 3, catomic);
   printf("[%s] %d tiles (%d/XCD), %d threads, %d layers, delay=%d skew=%d, "
          "%d polling waves\n",
          tag, NXCD * tiles, tiles, NTHREADS, n_layers, delay_ticks, delay_skew,
@@ -761,10 +1238,12 @@ int main(int argc, char **argv) {
   HIP_OK(hipEventRecord(e0));
   hipLaunchKernelGGL(drive_phase7, dim3(NXCD * tiles), dim3(NTHREADS),
                      MAX_DYNAMIC_SHARED_MEMORY_SIZE, 0, attn, weight, residual,
+                     attn_b, weight_b, residual_b,
                      bias, nw, no, rw, rb, logits, counters, out, tkw, ridx,
                      aeid, flags, flags_b, bar, bar_b, hier_lo, hier_hi,
                      hloc_lo, hloc_hi, rdv_lo, rdv_hi, hl2_lo, hl2_hi, xcd_seen,
-                     n_layers, delay_ticks, delay_skew, tiles, dual, split_on);
+                     n_layers, delay_ticks, delay_skew, tiles, dual, split_on,
+                     bsplit_on == 3, srdv_la, srdv_lb, srdv_ga, srdv_gb);
   HIP_OK(hipEventRecord(e1));
   HIP_OK(hipDeviceSynchronize());
   HIP_OK(hipGetLastError());
