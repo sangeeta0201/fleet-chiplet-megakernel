@@ -150,3 +150,75 @@ Medians come from the per-XCD `[OPROJ_INNER]` lines, which report
 a clean run; if it spreads (e.g. 1.76-4.80) the GPU is still busy from a previous
 job and the numbers are contaminated -- let it settle and re-run.
 
+
+## Rendezvous sweep: split / lsplit / hrdv are not where the gap lives
+
+Two sweeps, both SPX+NPS2 on the patched driver, all hashes green, all 8 XCDs
+dispatched.
+
+**Without `--aid=1`** (6 reps, so the sync line stays NC):
+
+| arm | total | bar | slicewait | mfma |
+| --- | --- | --- | --- | --- |
+| defaults | 22.84 | 6.68 | 4.40 | 4.96 |
+| `--split=1` | 22.36 | 6.68 | 4.36 | 4.88 |
+| `--lsplit=1` | 22.12 | 6.56 | 4.28 | 4.68 |
+| `--hrdv=1` | 20.08 | 5.40 | 5.48 | 3.88 |
+| `--aid=1` | **10.56** | 2.64 | 0.40 | 3.92 |
+| all four | 10.88 | 2.60 | 0.40 | 3.96 |
+
+**Layered on `--aid=1 --coherent=1`** (6 reps):
+
+| arm | total | vs NPS1 | bar | vs NPS1 |
+| --- | --- | --- | --- | --- |
+| `--aid=1` | 10.72 | +0.92 | 2.64 | +0.64 |
+| `+ --coherent=1` | 10.40 | +0.60 | 2.64 | +0.64 |
+| `+ --split=1` | 10.40 | +0.60 | 2.64 | +0.64 |
+| `+ --lsplit=1` | **10.36** | **+0.56** | 2.64 | +0.64 |
+| `+ --hrdv=1` | 10.40 | +0.60 | 2.60 | +0.60 |
+| `+ --split --lsplit` | 10.40 | +0.60 | 2.64 | +0.64 |
+| all four | 10.52 | +0.72 | **2.52** | +0.52 |
+
+### Conclusion
+
+The residual NPS2 gap is **not** in the `split` / `lsplit` / `hrdv` rendezvous
+machinery. Two independent directions say so:
+
+* Without `--aid=1`, none of the three rescues the NC sync line -- 22.36, 22.12
+  and 20.08 against a 22.84 baseline. Only `hrdv` moves at all.
+* With `--aid=1`, `bar` is pinned at 2.52-2.64 across every combination; the
+  whole span of the three knobs is 0.12 us.
+
+`--aid=1` is the single decisive knob, worth ~12 us, because it replicates the
+barrier sync buffer per AID (`alloc_in_aid(sync_bytes, 0/1, coherent)`) so each
+die polls a flag line homed on its own die. `--coherent=1` is worth a further
+~0.2-0.3 by marking that buffer EXT_COHERENT so `aid_local_flag_mtype=2` gives
+it CC; on its own it is worth nothing, because the `if (use_aid)` block that
+calls `alloc_in_aid` is skipped entirely.
+
+Best NPS2 is **10.36** (`--aid=1 --coherent=1 --lsplit=1`) against NPS1 **9.800**,
+i.e. **+0.56 us**, inside the previously recorded 10.28-10.52 band.
+
+What remains is `bar` at ~2.6 vs NPS1's 2.00, insensitive to every knob above.
+Working hypothesis, not yet measured: in NPS1 the sync line is `MTYPE_RW`,
+cacheable and coherent within a single memory partition, while the best
+available in NPS2 is `MTYPE_CC`, device-wide coherent through the DF-CS shadow
+tags, which costs more per barrier round. If that holds, NPS1 parity is not
+reachable while the barrier must be device-coherent across two AIDs, and the
+remaining 0.56 us is a hardware property rather than a placement bug. The test
+is a direct CC-vs-RW latency probe on the barrier line.
+
+### Source notes
+
+From `drive_phase7.cu`:
+
+```
+int use_aid = 0, split_on = 1, lsplit_on = 0, hrdv_on = 0, bsplit_on = 0;
+...
+if (use_aid) {
+  void *fa = alloc_in_aid(sync_bytes, 0, g_coherent);
+  void *fb = alloc_in_aid(sync_bytes, 1, g_coherent);
+```
+
+`--aid` defaults to **0** and `--split` defaults to **1**, so `--split=1` adds
+nothing over bare defaults -- it is already on.
