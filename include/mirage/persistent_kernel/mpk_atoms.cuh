@@ -180,6 +180,16 @@ __device__ __forceinline__ void ld_sys_s32x2(int *addr0, int *addr1, int &out0,
 #define MPK_LD_GATE2(p) ld_nt_s32(p)
 #endif
 
+// The reads that derive what a gate should wait for. Same hazard as the gates
+// themselves: on a coherent line a non-temporal read can return a stale epoch,
+// and an expected value computed from a stale epoch is never published, so the
+// poll below it spins forever rather than merely slowly.
+#if defined(MPK_SYS_POLL_LOAD) && MPK_SYS_POLL_LOAD >= 2
+#define MPK_LD_EPOCH(p) ld_sys_s32(p)
+#else
+#define MPK_LD_EPOCH(p) ld_nt_s32(p)
+#endif
+
 // Non-temporal store (bypasses cache, writes to memory)
 __device__ __forceinline__ void st_nt_u64(unsigned long long int *addr,
                                           unsigned long long int val) {

@@ -1,3 +1,8 @@
+#ifdef MPK_OPROJ_SC1_HIDDEN
+#define MPK_HIDDEN_CACHE " sc0 sc1"
+#else
+#define MPK_HIDDEN_CACHE ""
+#endif
 /* Copyright 2025 CMU
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -333,7 +338,77 @@ __device__ __attribute__((noinline)) void
         // not wait for attention at all. Passed rather than derived from
         // `counters_ptr` so the slot number stays owned by the one file that
         // lays that buffer out.
-        int const *attn_slice_release = nullptr) {
+        int const *attn_slice_release = nullptr,
+        // Optional: one replica per memory partition of the eight per-XCD
+        // hierarchical release flags, same 16-int stride as the copy inside
+        // `counters`. In SPX+NPS2 a compute partition spans two memory
+        // partitions, and a coherent MTYPE is only sound for readers
+        // co-located with the line's home partition -- so the caller can place
+        // one replica in each and let each half of the XCDs poll its own. Both
+        // replicas are written the same value; only the reads are partitioned.
+        // Null means the single shared copy, which is the behaviour every
+        // other caller gets.
+        int *hier_release_lo = nullptr,
+        int *hier_release_hi = nullptr,
+        // Optional: the eight per-XCD *arrival* lines of the tree barrier,
+        // partitioned rather than replicated. Unlike the release flags above,
+        // a level-1 line is not shared across the machine -- line `x` is only
+        // ever touched by XCD x's own tiles_per_xcd workers, and those are all
+        // co-located with each other by construction. So each half of the
+        // lines can be homed in the partition whose XCDs use it, and a
+        // coherent MTYPE stays sound with no fan-out and no duplicated write.
+        // Both pointers keep the same `xcd_id * HIER_STRIDE` indexing as the
+        // copy inside `counters`, so the unused half of each buffer is simply
+        // never touched. Null means the single shared copy.
+        int *hier_local_lo = nullptr,
+        int *hier_local_hi = nullptr,
+        // Optional: the *level-2* arrival, split per memory partition. This is
+        // the last line in the barrier that is neither replicable nor trivially
+        // partitionable -- it is the one place all eight dies aggregate, so a
+        // coherent MTYPE on it would have readers in both partitions and hang.
+        // Left in `counters` it is worse than that: in SPX+NPS2 the driver
+        // demotes every plain VRAM page to MTYPE_NC, so nothing may cache it and
+        // both halves pay the full uncached cost. That is exactly why the trace
+        // found no AID asymmetry on it -- 0.520 us either half -- against 0.30 us
+        // in NPS1, where the same line is MTYPE_RW and cacheable.
+        //
+        // It cannot be replicated, but it can be *replaced*: each half keeps its
+        // own arrival counter in its own partition, and the two half-closers
+        // rendezvous with a two-slot handshake instead of a shared counter. Each
+        // signals the other by storing into a slot homed with its *reader*, so
+        // the crossing is a write-through store, which is off the critical path,
+        // rather than a read-modify-write, which is not.
+        //
+        // Layout, `HIER_STRIDE` apart, in each copy. Indexed by half as well as
+        // by placement, so the topology stays a genuine 4/4 split even when both
+        // pointers alias one buffer:
+        //   [0], [1]  arrival counter for half 0, half 1
+        //   [2], [3]  the slot half 0 / half 1 *observes*, written by the other
+        // Requires the release replicas too: with the aggregation split, each
+        // half's closer releases its own four flags locally, and it needs a
+        // replica in its own partition to write them into.
+        int *hier_l2_lo = nullptr,
+        int *hier_l2_hi = nullptr,
+        // Level-2 FOLD, an alternative to the split above rather than an
+        // addition to it. Both use the same two per-half regions; they differ in
+        // what the half's closer does once its four dies have arrived.
+        //
+        //   split (=0, with the pointers set)  the two closers hand off to each
+        //     other through a two-slot handshake and each releases its own half.
+        //     No global line at all, but the handshake is a store plus a poll on
+        //     the peer, measured at 0.36 us in `wait`.
+        //   fold  (=1)  the half's closer instead performs ONE atomic on the
+        //     single global line, so that line sees 2 arrivals instead of 8 and
+        //     only one of the two crossings is remote. No handshake, no peer
+        //     poll, and one global releaser as in the flat form.
+        //
+        // The per-half step still needs device scope in both: `sc0` resolves in
+        // the issuing XCD's private L2, so four dies aggregating with `sc0` would
+        // each read prev==0 and no closer would exist. An AID is a memory
+        // partition, not a cache tier, and there is no scope between an XCD's L2
+        // and the device. What homing the line per AID buys is that all four
+        // participants are local to it -- not a cheaper instruction.
+        int l2_fold = 0) {
 
   static_assert(OUTPUT_PER_WG % 16 == 0,
                 "OUTPUT_PER_WG must be multiple of 16");
@@ -447,6 +522,37 @@ __device__ __attribute__((noinline)) void
   // read 17.2 us without it and 599 us with it). Enable one or the other.
   unsigned long long _op_t0 = __builtin_amdgcn_s_memrealtime();
   unsigned long long _op_t1 = _op_t0, _op_t2 = _op_t0, _op_t3 = _op_t0;
+  unsigned long long _op_t0b = _op_t0;
+#endif
+
+#ifdef MPK_OPROJ_BAR_TRACE
+#ifndef MPK_OPROJ_INNER_TIMING
+#error "MPK_OPROJ_BAR_TRACE reports against _op_t1/_op_t2 from MPK_OPROJ_INNER_TIMING"
+#endif
+  // Absolute s_memrealtime ticks at the four interesting points inside the
+  // Phase 2 barrier. Held in registers and printed after `done:`, alongside the
+  // existing [OPROJ_INNER] line, so the barrier itself is not perturbed by the
+  // trace -- s_memrealtime is a handful of cycles and the printfs are all past
+  // the measured window.
+  //
+  //   _bt0  arrival instant, taken after the drain and the block rendezvous and
+  //         immediately before the level-1 atomic
+  //   _bt1  level 1 returned
+  //   _bt2  level 2 returned -- only the one worker per XCD that gets there
+  //   _bt3  release store retired -- only the single global releaser
+  //   _bt4  this block's poll first observed the release
+  //
+  // Zero means "this worker never reached that point", which is unambiguous
+  // because a real tick is enormous. Every one of these is taken on tid 0,
+  // which is the thread that does the arrival, the release and (under
+  // MPK_NARROW_OPROJ_HIER) the poll, so they all sit on one timeline.
+  //
+  // Ticks are printed raw, not as deltas, for _bt3 and _bt4: attributing the
+  // release-to-observation latency means comparing one block's observation
+  // against a *different* block's release, so the join has to happen in
+  // post-processing on layer_epoch.
+  unsigned long long _bt0 = 0, _bt1 = 0, _bt2 = 0, _bt3 = 0, _bt4 = 0;
+  int _bt_xcd_last = 0, _bt_releaser = 0;
 #endif
 
   int batch_count =
@@ -657,7 +763,14 @@ __device__ __attribute__((noinline)) void
         __builtin_amdgcn_s_sleep(1);
       } while (true);
 #else
+#ifdef MPK_OPROJ_SKIP_SLICE_POLL
+      // Negative control; never define this in a real build. The acquire below
+      // still runs, so what changes is only whether the slice was published
+      // before this wave read it.
+      while (false) {
+#else
       while (ld_sys_s32(rel0) < layer_epoch || ld_sys_s32(rel1) < layer_epoch) {
+#endif
 #ifndef MPK_SLICE_BUSY_POLL
         __builtin_amdgcn_s_sleep(1);
 #endif
@@ -673,6 +786,9 @@ __device__ __attribute__((noinline)) void
       asm volatile("buffer_inv" ::: "memory");
 #ifdef MPK_OPROJ_POLL_BEFORE_DRAIN
       __syncthreads();
+#endif
+#ifdef MPK_OPROJ_INNER_TIMING
+      _op_t0b = __builtin_amdgcn_s_memrealtime();
 #endif
 
       i32x4_t const *src = (i32x4_t const *)(A + base);
@@ -1476,9 +1592,44 @@ oproj_barrier :
     // layer loop -- it is one task per dispatch -- so it passes 0 and keeps the
     // snapshot, which is safe there precisely because there is no second layer
     // to race with.
+    // Which copy of the release flags this XCD polls. The global arrival
+    // counter at [8 * HIER_STRIDE] is deliberately not routed: it is the one
+    // place all eight dies aggregate, so it cannot be replicated.
+    int const n_xcds =
+        tiles_per_xcd > 0 ? total_oproj_tiles / tiles_per_xcd : 8;
+    int *const hier_rel =
+        (hier_release_lo && hier_release_hi)
+            ? (xcd_id < n_xcds / 2 ? hier_release_lo : hier_release_hi)
+            : hier_barrier;
+
+    // Level 1 routed the same way, and for a stronger reason than the release
+    // flags: this line has no cross-partition reader to keep coherent in the
+    // first place. Splitting the release was a workaround for a line that
+    // genuinely is read from both halves; splitting the arrival just puts each
+    // line where its only users already are.
+    int *const hier_loc =
+        (hier_local_lo && hier_local_hi)
+            ? (xcd_id < n_xcds / 2 ? hier_local_lo : hier_local_hi)
+            : hier_local;
+
+    // Level 2 split per partition. Requires the release replicas: with two
+    // aggregation points there are two releasers, and each can only publish
+    // locally if it has a replica of its own to publish into.
+    int const l2_per_half = n_xcds / 2;
+    int const l2_half = (xcd_id >= l2_per_half) ? 1 : 0;
+    bool const l2_split = hier_l2_lo != nullptr && hier_l2_hi != nullptr &&
+                          hier_release_lo != nullptr &&
+                          hier_release_hi != nullptr && l2_per_half > 0;
+    int *const l2_my = l2_half ? hier_l2_hi : hier_l2_lo;
+    int *const l2_peer = l2_half ? hier_l2_lo : hier_l2_hi;
+    // Declared alongside l2_split because both the arrival and the release
+    // fan-out need it: fold reuses the split's per-half regions but keeps a
+    // single global releaser, so the two sites must agree on which form is live.
+    bool const l2_fold_on = l2_fold != 0 && l2_split;
+
     int const oproj_release_expected =
         layer_epoch > 0 ? layer_epoch
-                        : ld_nt_s32(&hier_barrier[xcd_id * HIER_STRIDE]) + 1;
+                        : MPK_LD_EPOCH(&hier_rel[xcd_id * HIER_STRIDE]) + 1;
 
     // ── Release fan-out: one wave instruction, not eight serial stores ────
     //
@@ -1593,8 +1744,14 @@ oproj_barrier :
       // The `%` form is a monotonic-counter release, identical in shape to
       // the flat one: counters are never reset, so "this layer's last
       // arrival" is `prev % N == N - 1` rather than a compare against N.
+#ifdef MPK_OPROJ_BAR_TRACE
+      _bt0 = __builtin_amdgcn_s_memrealtime();
+#endif
       int const local_prev =
-          atom_add_xcd_local_s32(&hier_local[xcd_id * HIER_STRIDE], 1);
+          atom_add_xcd_local_s32(&hier_loc[xcd_id * HIER_STRIDE], 1);
+#ifdef MPK_OPROJ_BAR_TRACE
+      _bt1 = __builtin_amdgcn_s_memrealtime();
+#endif
       if ((local_prev % tiles_per_xcd) == tiles_per_xcd - 1) {
         // Last worker on this XCD. Its own stores are drained (above) and so
         // are every other arriving worker's on this XCD -- each drained
@@ -1608,9 +1765,74 @@ oproj_barrier :
                   (unsigned)oproj_release_expected);
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 #endif
-        int const prev_global =
-            atom_add_release_gpu_s32(&hier_barrier[8 * HIER_STRIDE], 1);
-        if ((prev_global % 8) == 7) {
+        // Level 2, either as one shared counter or as two per-partition ones.
+        // `arrivals_here` is what makes the monotonic release test work for both:
+        // 8 dies on the shared line, 4 on a per-half line.
+        int prev_arrival;
+        int arrivals_here;
+        int *hs_signal = nullptr;
+        int *hs_observe = nullptr;
+        // Fold shares this first step with the split -- aggregate this AID's
+        // four dies on a line homed in that AID -- and differs only in what the
+        // half's closer does once it has closed.
+        if (l2_split) {
+          prev_arrival =
+              atom_add_release_gpu_s32(&l2_my[l2_half * HIER_STRIDE], 1);
+          arrivals_here = l2_per_half;
+          hs_signal = &l2_peer[(2 + (1 - l2_half)) * HIER_STRIDE];
+          hs_observe = &l2_my[(2 + l2_half) * HIER_STRIDE];
+        } else {
+          prev_arrival =
+              atom_add_release_gpu_s32(&hier_barrier[8 * HIER_STRIDE], 1);
+          arrivals_here = 8;
+        }
+        // The fold's second atomic, taken before the trace stamp below because
+        // it is aggregation and not waiting: `l2` has to cover the whole of what
+        // replaces the flat form's single atomic, or the comparison against that
+        // form's 0.66 us is not a comparison of the same thing.
+        //
+        // One atomic per AID on the global line, so that line sees 2 arrivals
+        // rather than 8 and exactly one of the two crossings is remote, against
+        // four in the flat form. No handshake and no peer poll: the global line
+        // is itself the rendezvous, so whichever half closes it becomes the sole
+        // releaser exactly as in the flat form. That is why the release fan-out
+        // below has to take the sixteen-flag path rather than the split's four
+        // local stores -- there is one releaser here, not one per half.
+        if (l2_fold_on &&
+            (prev_arrival % arrivals_here) == arrivals_here - 1) {
+          int const g_prev =
+              atom_add_release_gpu_s32(&hier_barrier[8 * HIER_STRIDE], 1);
+          if ((g_prev % 2) == 1) {
+            oproj_rel_epoch = oproj_release_expected;
+          }
+        }
+#ifdef MPK_OPROJ_BAR_TRACE
+        // Taken before the handshake deliberately, so `l2` keeps meaning "the
+        // level-2 atomic". Waiting for the peer half is waiting for other
+        // blocks, and it belongs in `wait` with the rest of the skew.
+        _bt2 = __builtin_amdgcn_s_memrealtime();
+        _bt_xcd_last = 1;
+#endif
+        if (!l2_fold_on &&
+            (prev_arrival % arrivals_here) == arrivals_here - 1) {
+          if (l2_split) {
+            // Closed this half. Tell the other one, then wait for it to say the
+            // same. One store out, one local poll -- the whole cross-partition
+            // cost of the barrier's global aggregation.
+            st_wt_u32((void *)hs_signal, (unsigned)oproj_release_expected);
+            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+            // Busy, not `s_sleep`. Every other poll in this file waits on
+            // something that takes microseconds, where a sleep costs nothing and
+            // saves issue slots. This one waits on the peer half, which under a
+            // balanced load has already arrived, so a sleep's granularity is the
+            // whole of what is being measured.
+            while (MPK_LD_GATE2(hs_observe) < oproj_release_expected) {
+#ifndef MPK_OPROJ_L2_BUSY_POLL
+              __builtin_amdgcn_s_sleep(1);
+#endif
+            }
+            asm volatile("buffer_inv" ::: "memory");
+          }
           oproj_rel_epoch = oproj_release_expected;
         }
       }
@@ -1629,11 +1851,41 @@ oproj_barrier :
     // why 0 is a safe "not the releaser" sentinel.
     oproj_rel_epoch = __builtin_amdgcn_readfirstlane(oproj_rel_epoch);
     if (oproj_rel_epoch != 0) {
-      if (tid < 8) {
+      if (l2_split && !l2_fold_on) {
+        // Two releasers now, one per partition, so each publishes only its own
+        // half -- and only the four slots its own XCDs actually poll. XCD x reads
+        // `hier_rel[x * HIER_STRIDE]` out of its own replica, so slots 4..7 of
+        // the low copy and 0..3 of the high copy were always dead stores; the
+        // single releaser was writing sixteen flags to feed eight readers. Four
+        // local stores per half replaces eight local and eight remote.
+        if (tid < l2_per_half) {
+          st_wt_u32(
+              (void *)&hier_rel[(l2_half * l2_per_half + tid) * HIER_STRIDE],
+              (unsigned)oproj_rel_epoch);
+        }
+      } else if (hier_release_lo && hier_release_hi) {
+        // Sixteen flags: eight per replica. Lanes 0..15 of this wave differ
+        // only in the address they form, so both replicas are published in
+        // the same single store instruction the one-copy form uses.
+        if (tid < 16) {
+          int *const dst = (tid < 8) ? hier_release_lo : hier_release_hi;
+          st_wt_u32((void *)&dst[(tid & 7) * HIER_STRIDE],
+                    (unsigned)oproj_rel_epoch);
+        }
+      } else if (tid < 8) {
         st_wt_u32((void *)&hier_barrier[tid * HIER_STRIDE],
                   (unsigned)oproj_rel_epoch);
       }
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#ifdef MPK_OPROJ_BAR_TRACE
+      // After the waitcnt, so this is the instant the release is visible rather
+      // than the instant the store issued. tid 0 only, to stay on the same
+      // timeline as the other four.
+      if (tid == 0) {
+        _bt3 = __builtin_amdgcn_s_memrealtime();
+        _bt_releaser = 1;
+      }
+#endif
     }
 
     // Issue prefetch loads AFTER barrier atomics but BEFORE poll loop.
@@ -1731,11 +1983,27 @@ oproj_barrier :
     // other 255 threads do not need their own sc0 sc1 reads of this line.
     if (tid == 0)
 #endif
-      while (MPK_LD_GATE2(&hier_barrier[xcd_id * HIER_STRIDE]) <
+#ifdef MPK_OPROJ_SKIP_HIER_POLL
+      // Negative control; never define this in a real build. The release flag
+      // is still written, just never waited on, so the only thing that changes
+      // is whether the row is complete when RMSNorm reads it.
+      while (false) {
+#else
+      while (MPK_LD_GATE2(&hier_rel[xcd_id * HIER_STRIDE]) <
              oproj_release_expected) {
+#endif
         __builtin_amdgcn_s_sleep(1);
       }
   }
+
+#ifdef MPK_OPROJ_BAR_TRACE
+  // Poll exit. Outside the block above only because the poll is the statement
+  // controlled by a chain of `if`s and cannot be followed inside it; tid 0 is
+  // the poller, so this is still that thread's observation instant.
+  if (tid == 0) {
+    _bt4 = __builtin_amdgcn_s_memrealtime();
+  }
+#endif
 
   // Rendezvous before the acquire. The per-thread poll above establishes, for
   // each wave independently, that the barrier has been released -- and that
@@ -1808,7 +2076,13 @@ oproj_barrier :
   // `rmsnorm_out` differing between two runs whose `attn_proj_out` (the
   // settled HBM content) is bit-identical -- the norm read something that is
   // not what is in memory.
+#ifdef MPK_OPROJ_L2_ACQUIRE
+  // L2 as well as vL1: a cacheable shared `out` (CC/RW) can leave a
+  // stale line in this reader's L2, which a vL1-only invalidate misses.
+  asm volatile("buffer_inv sc1" ::: "memory");
+#else
   asm volatile("buffer_inv" ::: "memory");
+#endif
   // Drain prefetched gamma + router weight loads (issued before barrier).
   // NT loads bypass L2, unaffected by buffer_inv.
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
@@ -2003,7 +2277,7 @@ oproj_barrier :
             continue;
           }
           i32x2_t h_v;
-          asm volatile("global_load_dwordx2 %0, %1, off"
+          asm volatile("global_load_dwordx2 %0, %1, off" MPK_HIDDEN_CACHE
                        : "=v"(h_v)
                        : "v"(h_base + i_cur * 8)
                        : "memory");
@@ -2046,7 +2320,7 @@ oproj_barrier :
         if (i_cur >= H4) {
           break;
         }
-        asm volatile("global_load_dwordx2 %0, %1, off"
+        asm volatile("global_load_dwordx2 %0, %1, off" MPK_HIDDEN_CACHE
                      : "=v"(h_pf[iter])
                      : "v"(h_base + i_cur * 8)
                      : "memory");
@@ -2697,9 +2971,9 @@ topk_barrier :
         // there is no second layer to race with.
 #ifdef MPK_ROUTING_DERIVED_EPOCH
         int epoch = layer_epoch > 0 ? layer_epoch
-                                    : ld_nt_s32(routing_ready_ptr) + 1;
+                                    : MPK_LD_EPOCH(routing_ready_ptr) + 1;
 #else
-        int epoch = ld_nt_s32(routing_ready_ptr) + 1;
+        int epoch = MPK_LD_EPOCH(routing_ready_ptr) + 1;
 #endif
         st_wt_u32((void *)routing_ready_ptr, (unsigned)epoch);
 #ifdef MPK_ROUTING_LANE_RELEASE
@@ -2789,13 +3063,62 @@ done :
   // first and last arriver both waiting ~5.6 us).
   if (tid == 0 && (tile_idx % tiles_per_xcd) == 0) {
     unsigned long long _op_t4 = __builtin_amdgcn_s_memrealtime();
-    printf("[OPROJ_INNER] mfma=%.2f bar=%.2f "
+    printf("[OPROJ_INNER] slicewait=%.2f mfma=%.2f bar=%.2f "
            "rmsnorm_router=%.2f topk=%.2f total=%.2f\n",
-           (double)(_op_t1 - _op_t0) * 10.0 / 1000.0,
+           (double)(_op_t0b - _op_t0) * 10.0 / 1000.0,
+           (double)(_op_t1 - _op_t0b) * 10.0 / 1000.0,
            (double)(_op_t2 - _op_t1) * 10.0 / 1000.0,
            (double)(_op_t3 - _op_t2) * 10.0 / 1000.0,
            (double)(_op_t4 - _op_t3) * 10.0 / 1000.0,
            (double)(_op_t4 - _op_t0) * 10.0 / 1000.0);
+  }
+#endif
+
+#ifdef MPK_OPROJ_BAR_TRACE
+  // Three lines, deliberately separate rather than folded into [OPROJ_INNER],
+  // because they come from three different populations: every XCD's tile 0, the
+  // one worker per XCD that closed level 1, and the single global releaser.
+  // All are past the timed window, so the cost is wall time and printf
+  // bandwidth, not measurement error -- but there are ~25 per layer against the
+  // stock 8, so run this build with fewer layers.
+  //
+  // Everything that can be a delta is one. `obs` and `rel` are raw ticks
+  // because the quantity they answer -- how long after the release a given XCD
+  // sees it -- spans two different blocks, so it can only be formed after the
+  // fact by joining on `ep`.
+  // The four fields sum to the `bar` bucket, which is the point: bar =
+  // drain + l1 + wait + acq, so whichever one carries the NPS2 excess is the
+  // one worth attacking. `wait` is everything between this block's own arrival
+  // being published and its poll clearing -- the other 183 arrivals, the eight
+  // level-2 atomics and the release store, none of which it can distinguish,
+  // but all of which are somebody else's latency rather than this block's.
+  // `t0` is absolute so the *entry* skew can be separated from the *arrival*
+  // skew. Arrival skew is what `bar` pays for, but it does not say who created
+  // it: if the eight XCDs already enter Phase 7 that far apart then the barrier
+  // is only reporting imbalance it inherited, and no amount of restructuring
+  // the barrier will touch it. `sw` and `mf` are the two stages between entry
+  // and arrival, per XCD, which is where it would have to be created otherwise.
+  if (tid == 0 && (tile_idx % tiles_per_xcd) == 0) {
+    printf("[BAR_OBS] ep=%d xcd=%d drain=%.3f l1=%.3f wait=%.3f acq=%.3f "
+           "obs=%llu bar=%.3f t0=%llu sw=%.3f mf=%.3f\n",
+           layer_epoch, xcd_id, (double)(_bt0 - _op_t1) * 10.0 / 1000.0,
+           (double)(_bt1 - _bt0) * 10.0 / 1000.0,
+           (double)(_bt4 - _bt1) * 10.0 / 1000.0,
+           (double)(_op_t2 - _bt4) * 10.0 / 1000.0, _bt4,
+           (double)(_op_t2 - _op_t1) * 10.0 / 1000.0, _op_t0,
+           (double)(_op_t0b - _op_t0) * 10.0 / 1000.0,
+           (double)(_op_t1 - _op_t0b) * 10.0 / 1000.0);
+  }
+  // The XCD-last arriver rotates every layer, because the arrival counter is
+  // monotonic and never reset -- so this samples a different one of the 23
+  // workers each time rather than pinning one.
+  if (tid == 0 && _bt_xcd_last) {
+    printf("[BAR_ARR] ep=%d xcd=%d l1=%.3f l2=%.3f\n", layer_epoch, xcd_id,
+           (double)(_bt1 - _bt0) * 10.0 / 1000.0,
+           (double)(_bt2 - _bt1) * 10.0 / 1000.0);
+  }
+  if (tid == 0 && _bt_releaser) {
+    printf("[BAR_REL] ep=%d xcd=%d rel=%llu\n", layer_epoch, xcd_id, _bt3);
   }
 #endif
   (void)0;

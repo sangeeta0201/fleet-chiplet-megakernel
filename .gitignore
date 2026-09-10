@@ -92,3 +92,12 @@ tests/standalone/test_mfma_pipeline_hazards
 *-host-x86_64-unknown-linux-gnu.hipi
 *-host-x86_64-unknown-linux-gnu.s
 *-hip-amdgcn-amd-amdhsa.hipfb
+# Phase 7 NPS2 scratch: bisect backups, one-off build wrappers, the binary.
+drive_phase7
+drive_phase7.cu.pre-*
+drive_phase7.cu.orig
+*.cuh.pre-*
+build_drive_*.sh
+build_cp.sh
+build_sc1h.sh
+.rocprofv3/

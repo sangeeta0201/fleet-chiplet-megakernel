@@ -2075,7 +2075,7 @@ __device__ __noinline__ void
       // read-modify-write with nothing in front of it -- see the derivation
       // at the post-atomic site.
 #ifndef MPK_LEAN_ARRIVE
-      s_layer_rel_prev = ld_nt_s32(&layer_release[xcd_id * 16]);
+      s_layer_rel_prev = MPK_LD_EPOCH(&layer_release[xcd_id * 16]);
 #endif
 
       // The two arrival targets are division snapshots for the same reason,

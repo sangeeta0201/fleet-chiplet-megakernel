@@ -230,6 +230,85 @@ static bool aid_init() {
   return true;
 }
 
+// alloc_span_gem sets no AID flag, so it needs only the render node -- not
+// resolve_ranges(), which requires the patched driver and two apertures.
+// Splitting this out is what lets the GEM arms run in NPS1.
+static bool aid_init_fd_only() {
+  if (g_drm_fd >= 0) {
+    return true;
+  }
+  int dev = 0;
+  if (hipGetDevice(&dev) != hipSuccess) {
+    return false;
+  }
+  char bus[64] = {0};
+  if (hipDeviceGetPCIBusId(bus, sizeof bus, dev) != hipSuccess) {
+    return false;
+  }
+  for (char *p = bus; *p; p++) {
+    if (*p >= (char)0x41 && *p <= (char)0x46) {
+      *p = (char)(*p - 0x41 + 0x61);
+    }
+  }
+  g_drm_fd = open_render_node(bus);
+  if (g_drm_fd < 0) {
+    printf("[AID] no render node for %s\n", bus);
+    return false;
+  }
+  printf("[AID] fd-only init (no range discovery) -- shared allocs only\n");
+  return true;
+}
+
+// Spanning VRAM through the raw GEM path, pinned to neither AID.
+//
+// `coherent` selects MTYPE_CC: with is_vram and a spanning XCP the driver's
+// FLAGMTYPE branch assigns MTYPE_CC when aid_local_flag_mtype=2 (UNCACHED
+// would instead fall through to MTYPE_UC). EXT_COHERENT has no HIP path,
+// hence the ioctl rather than hipMalloc.
+//
+// This is RETAINED ONLY to reproduce the CC race on demand -- see
+// hipmalloc_shared below for why CC is not a working shared allocator.
+static void *alloc_span_gem(size_t bytes, bool coherent) {
+  uint64_t const flags = coherent ? GEM_CREATE_COHERENT : 0;
+  union drm_amdgpu_gem_create req;
+  memset(&req, 0, sizeof req);
+  req.in.bo_size = bytes;
+  req.in.alignment = 2ULL << 20;
+  req.in.domains = AMDGPU_GEM_DOMAIN_VRAM;
+  req.in.domain_flags = flags;
+  if (ioctl(g_drm_fd, DRM_IOCTL_AMDGPU_GEM_CREATE, &req) != 0) {
+    printf("[SPAN] GEM_CREATE %zu B failed: %s\n", bytes, strerror(errno));
+    return nullptr;
+  }
+  struct drm_prime_handle prime;
+  memset(&prime, 0, sizeof prime);
+  prime.handle = req.out.handle;
+  if (ioctl(g_drm_fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime) != 0) {
+    printf("[SPAN] PRIME export failed: %s\n", strerror(errno));
+    return nullptr;
+  }
+  hipExternalMemoryHandleDesc hd = {};
+  hd.type = hipExternalMemoryHandleTypeOpaqueFd;
+  hd.handle.fd = prime.fd;
+  hd.size = bytes;
+  hipExternalMemory_t ext;
+  if (hipImportExternalMemory(&ext, &hd) != hipSuccess) {
+    printf("[SPAN] hipImportExternalMemory failed\n");
+    return nullptr;
+  }
+  hipExternalMemoryBufferDesc bd = {};
+  bd.offset = 0;
+  bd.size = bytes;
+  void *ptr = nullptr;
+  if (hipExternalMemoryGetMappedBuffer(&ptr, ext, &bd) != hipSuccess) {
+    printf("[SPAN] hipExternalMemoryGetMappedBuffer failed\n");
+    return nullptr;
+  }
+  printf("[SPAN] %.2f MiB spanning both AIDs, %s -> %p\n", bytes / 1048576.0,
+         coherent ? "COHERENT (MTYPE_CC)" : "plain (MTYPE_NC)", ptr);
+  return ptr;
+}
+
 static void *alloc_in_aid(size_t bytes, int aid, bool coherent) {
   uint64_t const flags = GEM_CREATE_AID_LOCAL |
                          (g_range_for_aid[aid] & 1u ? GEM_CREATE_AID_SELECT : 0) |
@@ -273,6 +352,39 @@ static void *alloc_in_aid(size_t bytes, int aid, bool coherent) {
          bytes / 1048576.0, aid, g_range_for_aid[aid],
          (flags & GEM_CREATE_COHERENT) ? "set" : "clear", ptr);
   return ptr;
+}
+
+// The three allocators SPX+NPS2 needs. Measured contract:
+//
+//   hipmalloc_shared   spanning MTYPE_NC. Correct for all-to-all sharing
+//                      *provided* readers acquire with `buffer_inv sc1` --
+//                      0 stale of 16000 cross-AID (~/nps1/bits2.sh). Phase 7
+//                      gets that from the layer-boundary acquire in
+//                      gang_full_layer_fused_mi300.cuh.
+//   hipmalloc_aid0/1   MTYPE_RW pinned to one AID: 97 ns flat, no skew. Only
+//                      correct when every reader runs on the home AID, since
+//                      an RW line is coherent only within its own AID.
+//                      `--dcoh=1` overrides these to CC for experiments.
+//
+// Plain hipMalloc already returns spanning NC in NPS2, so hipmalloc_shared
+// needs no ioctl at all. The GEM path existed solely to carry
+// GEM_CREATE_COHERENT (MTYPE_CC), and that is precisely the flag that does not
+// work: CC bottoms out at 2138/16000 stale same-AID and 9992/16000 cross-AID,
+// unchanged across every store x invalidate combination, because software
+// cannot evict a coherent line and the directory never invalidates the remote
+// copies either. Dropping it took Phase 7 --place=4 from 0/5 to 5/5.
+static void *hipmalloc_shared(size_t bytes) {
+  void *ptr = nullptr;
+  HIP_OK(hipMalloc(&ptr, bytes));
+  return ptr;
+}
+
+static void *hipmalloc_aid0(size_t bytes) {
+  return alloc_in_aid(bytes, 0, g_dcoh);
+}
+
+static void *hipmalloc_aid1(size_t bytes) {
+  return alloc_in_aid(bytes, 1, g_dcoh);
 }
 
 // The rendezvous counter shares the AID-local buffer with the flags, at a 1 MiB
@@ -924,16 +1036,16 @@ int main(int argc, char **argv) {
   // FLAGMTYPE override, so the chain falls through to NC. That is what makes
   // this an apples-to-apples test of homing rather than of caching.
   if (d_attn) {
-    attn = alloc_in_aid(OPROJ_REDUCTION * 2, 0, g_dcoh);
-    attn_b = alloc_in_aid(OPROJ_REDUCTION * 2, 1, g_dcoh);
+    attn = hipmalloc_aid0(OPROJ_REDUCTION * 2);
+    attn_b = hipmalloc_aid1(OPROJ_REDUCTION * 2);
   } else {
     HIP_OK(hipMalloc(&attn, OPROJ_REDUCTION * 2));
   }
   if (d_wr) {
-    weight = alloc_in_aid(weight_half_bytes, 0, g_dcoh);
-    weight_b = alloc_in_aid(weight_half_bytes, 1, g_dcoh);
-    residual = alloc_in_aid(OUTPUT_STRIDE * 2, 0, g_dcoh);
-    residual_b = alloc_in_aid(OUTPUT_STRIDE * 2, 1, g_dcoh);
+    weight = hipmalloc_aid0(weight_half_bytes);
+    weight_b = hipmalloc_aid1(weight_half_bytes);
+    residual = hipmalloc_aid0(OUTPUT_STRIDE * 2);
+    residual_b = hipmalloc_aid1(OUTPUT_STRIDE * 2);
   } else {
     HIP_OK(hipMalloc(&weight, weight_bytes));
     HIP_OK(hipMalloc(&residual, OUTPUT_STRIDE * 2));
@@ -950,38 +1062,34 @@ int main(int argc, char **argv) {
   HIP_OK(hipMalloc(&no, ACTUAL_HIDDEN * 2));
   HIP_OK(hipMalloc(&rw, (size_t)NUM_EXPERTS * ACTUAL_HIDDEN * 2));
   HIP_OK(hipMalloc(&rb, NUM_EXPERTS * 2));
-  // out / counters / logits are touched by every XCD. A spanning hipMalloc is
-  // MTYPE_NC and shows the 182/278 ns sc0-sc1 split (+97 ns skew). AID_LOCAL
-  // non-coherent is MTYPE_RW via the per-BO patch and probes at 97 ns flat on
-  // all 8 XCDs -- same as flags(AID0) / --dsplit attn. Home them in AID0 when
-  // the allocator exists; --catomic can still replace counters later.
-  if (place_on && !use_aid) {
-    fprintf(stderr, "ABORT: --place needs --aid=1 (homing needs the AID-local "
-                    "allocator)\n");
-    return 2;
-  }
-  if (place_on && !aid_init()) {
-    fprintf(stderr, "ABORT: --place but AID-local allocation is unavailable "
-                    "(stock driver, or not NPS2)\n");
-    return 2;
-  }
-  if (place_on & 1) {
-    logits = alloc_in_aid(64 * 1024, 0, g_dcoh);
+  // out / counters / logits are read by every XCD, so they must be shared, not
+  // AID-homed: pinning them makes the line MTYPE_RW, which is coherent only
+  // within its own AID, and Phase 7 then fails the hash 3/5 of the time.
+  // hipmalloc_shared keeps them spanning NC, which the layer-boundary
+  // `buffer_inv sc1` acquire makes correct -- 5/5 green.
+  //
+  // Since hipmalloc_shared is plain hipMalloc, this is what the harness did
+  // before any of this work -- naming it is the point. Bits 1/2/4 of --place
+  // are therefore no-ops now, and the AID-homed arms they used to select are
+  // gone: homing a buffer that all 8 XCDs read is what broke it.
+  logits = hipmalloc_shared(64 * 1024);
+  counters = hipmalloc_shared(64 * 1024);
+
+  // Bit 16 is the only bit that still changes anything: it routes `out`
+  // through the coherent GEM path, and is expected to FAIL the hash (0/5). It
+  // exists to reproduce the CC race on demand, and is the only arm needing a
+  // render node.
+  if (place_on & 16) {
+    if (!aid_init() && !aid_init_fd_only()) {
+      fprintf(stderr, "ABORT: --place&16 but no render node available\n");
+      return 2;
+    }
+    out = alloc_span_gem(OUTPUT_STRIDE * 2, /*coherent=*/true);
   } else {
-    HIP_OK(hipMalloc(&logits, 64 * 1024));
-  }
-  if (place_on & 2) {
-    counters = alloc_in_aid(64 * 1024, 0, g_dcoh);
-  } else {
-    HIP_OK(hipMalloc(&counters, 64 * 1024));
-  }
-  if (place_on & 4) {
-    out = alloc_in_aid(OUTPUT_STRIDE * 2, 0, g_dcoh);
-  } else {
-    HIP_OK(hipMalloc(&out, OUTPUT_STRIDE * 2));
+    out = hipmalloc_shared(OUTPUT_STRIDE * 2);
   }
   if (logits == nullptr || counters == nullptr || out == nullptr) {
-    fprintf(stderr, "ABORT: --place=%d could not place a buffer in AID0\n",
+    fprintf(stderr, "ABORT: --place=%d could not allocate a buffer\n",
             place_on);
     return 2;
   }
@@ -1393,3 +1501,4 @@ int main(int argc, char **argv) {
   }
   return 0;
 }
+
