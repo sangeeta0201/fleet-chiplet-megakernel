@@ -1598,6 +1598,19 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
           }
           __builtin_amdgcn_s_sleep(1);
         }
+#ifdef MPK_TERM_RECHECK
+        // The terminate path bumps precomp_iter_ready specifically to release
+        // workers parked in the loop above, so a worker whose condition is
+        // satisfied by that bump can leave without ever evaluating the check
+        // inside it. It then loads tasks for an iteration that will never be
+        // produced and blocks forever in the dependency wait, which has no
+        // terminate check of its own. Re-test here, where the existing
+        // pc_terminated exit below can still catch it.
+        if (!pc_terminated &&
+            __atomic_load_n(config.precomp_terminate, __ATOMIC_RELAXED)) {
+          pc_terminated = 1;
+        }
+#endif
       }
       __syncthreads();
       if (pc_terminated) {
@@ -1812,7 +1825,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
         size_t event_index = get_event_position_index(event_id);
         EventCounter needed_counts =
             static_cast<EventCounter>(
-                config.all_event_num_triggers[event_index]) *
+                  MPK_LD_EVCFG(&config.all_event_num_triggers[event_index])) *
             get_task_iteration_num(task_ids[queue_pos]);
         EventCounter actual_counts = 0;
 #ifdef MPK_PRECOMPUTED_DISPATCH
@@ -1837,9 +1850,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
           // Single ACQUIRE load — dependency guaranteed satisfied by scheduler
           // dispatch chain.
           actual_counts =
-              __atomic_load_n(reinterpret_cast<unsigned long long *>(
-                                  &config.all_event_counters[event_index]),
-                              __ATOMIC_RELAXED);
+              MPK_LD_EVENT(&config.all_event_counters[event_index]);
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
           // Agent-scope acquire fence (GPU-only, not system scope)
           __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
@@ -1860,9 +1871,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #endif
             while (actual_counts < needed_counts) {
               actual_counts =
-                  __atomic_load_n(reinterpret_cast<unsigned long long *>(
-                                      &config.all_event_counters[event_index]),
-                                  __ATOMIC_RELAXED);
+                  MPK_LD_EVENT(&config.all_event_counters[event_index]);
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
               __builtin_amdgcn_s_sleep(1);
 #endif
@@ -2708,8 +2717,8 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               size_t ev_idx = get_event_position_index(ev_id);
               int xcd_slot = xcd_id * config.num_events + (int)ev_idx;
               int xcd_thresh = config.xcd_event_num_tasks != nullptr
-                                   ? config.xcd_event_num_tasks[xcd_slot]
-                                   : 0;
+                    ? MPK_LD_EVCFG(&config.xcd_event_num_tasks[xcd_slot])
+                    : 0;
               if (xcd_thresh > 0) {
                 TaskId ml_tid =
                     compute_task_id(pc_iter, config.ml_task_positions[0]);
@@ -2785,11 +2794,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                 gang_tiles_executed = my_tiles;
                 EventId ev_id = task_desc->trigger_event;
                 size_t ev_idx = get_event_position_index(ev_id);
-                int num_triggers = config.all_event_num_triggers[ev_idx];
+                int num_triggers = MPK_LD_EVCFG(&config.all_event_num_triggers[ev_idx]);
                 int xcd_slot = xcd_id * config.num_events + (int)ev_idx;
                 int xcd_thresh = config.xcd_event_num_tasks != nullptr
-                                     ? config.xcd_event_num_tasks[xcd_slot]
-                                     : 0;
+                    ? MPK_LD_EVCFG(&config.xcd_event_num_tasks[xcd_slot])
+                    : 0;
                 if (xcd_thresh > 0) {
                   EventCounter local_cnt =
                       atom_add_local_u64(
@@ -3167,7 +3176,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
         size_t gpu_id = get_event_gpu_id(event_id);
         assert(gpu_id == config.my_gpu_id);
         // Case 1: Trigger a local non-nvshmem event
-        int num_triggers = config.all_event_num_triggers[event_index];
+        int num_triggers = MPK_LD_EVCFG(&config.all_event_num_triggers[event_index]);
         EventCounter count = 0;
         bool event_fired = false;
 
@@ -3176,8 +3185,8 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
         // this XCD's share is done. Reduces buffer_wbl2 from ~24K to ~300.
         int xcd_slot = xcd_id * config.num_events + (int)event_index;
         int xcd_threshold = config.xcd_event_num_tasks != nullptr
-                                ? config.xcd_event_num_tasks[xcd_slot]
-                                : 0;
+                    ? MPK_LD_EVCFG(&config.xcd_event_num_tasks[xcd_slot])
+                    : 0;
         if (xcd_threshold > 0) {
 #ifdef MPK_ENABLE_GANG_TASKS
           // Gang tasks: each dispatched worker signals 1 to local counter.
@@ -4206,6 +4215,33 @@ DT *gpu_malloc(size_t size) {
 #endif
   return static_cast<DT *>(dst_ptr);
 }
+
+#ifdef MPK_EVCTR_HOST
+// Pinned, device-mapped allocation for the event counters (debug only).
+//
+// See MPK_EVCTR_HOST at the call sites: device memory is unreadable by the host
+// during a hang, because reading it needs HIP and HIP is wedged behind the
+// spinning persistent kernel. Falls back to device memory if pinning fails, so
+// a build with the flag still runs.
+template <typename DT>
+DT *host_mapped_malloc(size_t bytes, void **host_out) {
+  void *h = nullptr;
+  (void)hipHostMalloc(&h, bytes, hipHostMallocMapped);
+  if (h == nullptr) {
+    fprintf(stderr, "[MPK] EVCTR_HOST: hipHostMalloc(%zu) failed, using VRAM\n",
+            bytes);
+    *host_out = nullptr;
+    return gpu_malloc<DT>(bytes);
+  }
+  memset(h, 0, bytes);
+  void *d = nullptr;
+  if (hipHostGetDevicePointer(&d, h, 0) != hipSuccess || d == nullptr) {
+    d = h;
+  }
+  *host_out = h;
+  return static_cast<DT *>(d);
+}
+#endif
 
 void gpu_free(void *ptr) {
 #ifdef USE_NVSHMEM
@@ -5374,11 +5410,30 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
                      NUM_XCDS_PC * n_events * sizeof(int),
                      cudaMemcpyHostToDevice);
     // Also need xcd_local_event_counters for two-level counting
+#ifdef MPK_EVCTR_HOST
+    {
+      void *h = nullptr;
+      global_runtime_config.xcd_local_event_counters =
+          host_mapped_malloc<EventCounter>(
+              NUM_XCDS_PC * n_events * sizeof(EventCounter), &h);
+      g_dbg_h_xcd_local_counters = static_cast<EventCounter *>(h);
+      // Thresholds never change after upload, so a plain host copy is enough.
+      g_dbg_h_xcd_event_thresholds = new int[NUM_XCDS_PC * n_events];
+      memcpy(g_dbg_h_xcd_event_thresholds,
+             h_xcd_evt.data(),
+             NUM_XCDS_PC * n_events * sizeof(int));
+      printf("[MPK] EVCTR_HOST: xcd_local host=%p dev=%p thresholds mirrored\n",
+             h,
+             (void *)global_runtime_config.xcd_local_event_counters);
+      fflush(stdout);
+    }
+#else
     global_runtime_config.xcd_local_event_counters =
         gpu_malloc<EventCounter>(NUM_XCDS_PC * n_events * sizeof(EventCounter));
     (void)cudaMemset(global_runtime_config.xcd_local_event_counters,
                      0,
                      NUM_XCDS_PC * n_events * sizeof(EventCounter));
+#endif
     g_dbg_num_xcds = NUM_XCDS_PC;
 
     // Set ml_workers_per_xcd (pointer tables uploaded earlier, before
@@ -5424,8 +5479,22 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   //            (num_schedulers + 1) * sizeof(unsigned long long int),
   //            cudaMemcpyHostToDevice);
   //  Initialize all event counters
+#ifdef MPK_EVCTR_HOST
+  {
+    void *h = nullptr;
+    global_runtime_config.all_event_counters = host_mapped_malloc<EventCounter>(
+        all_events.size() * sizeof(EventCounter), &h);
+    g_dbg_h_event_counters = static_cast<EventCounter *>(h);
+    printf("[MPK] EVCTR_HOST: all_event_counters host=%p dev=%p n=%zu\n",
+           h,
+           (void *)global_runtime_config.all_event_counters,
+           all_events.size());
+    fflush(stdout);
+  }
+#else
   global_runtime_config.all_event_counters =
       gpu_malloc<EventCounter>(all_events.size() * sizeof(EventCounter));
+#endif
 #ifdef MPK_PRECOMPUTED_DISPATCH
   g_dbg_num_events = (int)all_events.size();
 #endif
@@ -6361,7 +6430,7 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
           } // verbose
         }
         // Dump event counters to diagnose which events haven't fired
-        if (g_dbg_h_event_counters && dbg_i == 5 * dbg_ticks_per_s) {
+        if (g_dbg_h_event_counters && dbg_i % (5 * dbg_ticks_per_s) == 0) {
           fprintf(stderr,
                   "  === Event counters: last 20 events + event 158 ===\n");
           // Show events 140-158 (the tail where workers are stuck)

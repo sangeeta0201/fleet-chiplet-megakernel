@@ -180,6 +180,32 @@ __device__ __forceinline__ void ld_sys_s32x2(int *addr0, int *addr1, int &out0,
 #define MPK_LD_GATE2(p) ld_nt_s32(p)
 #endif
 
+// The scheduler's event counters are polled by a relaxed load with no
+// invalidate inside the loop -- the acquire fence runs only once it exits.
+// Sound while L2 is device-coherent (MTYPE_RW, which plain hipMalloc gives in
+// NPS1), but in SPX+NPS2 a spanning BO is MTYPE_NC: cacheable and NOT coherent
+// across XCDs, so the waiter re-reads its own stale L2 copy forever and an
+// increment performed on another XCD is never observed. Measured: converting
+// this poll to sc0 sc1 did NOT clear the hang (4/6 still hung). The deadlock
+// is the termination race behind MPK_TERM_RECHECK.
+#ifdef MPK_NPS2_EVENT_POLL
+#define MPK_LD_EVENT(p) ld_sys_u64((void *)(p))
+#else
+#define MPK_LD_EVENT(p)                                                        \
+  __atomic_load_n(reinterpret_cast<unsigned long long *>(p), __ATOMIC_RELAXED)
+#endif
+
+// Scoped read of the event-accounting CONFIG (thresholds / trigger counts), as
+// opposed to MPK_LD_EVENT which reads the COUNTER. Both matter: a stale counter
+// only delays a poll, but a stale threshold makes two XCDs take different
+// branches of the two-level accounting, so the global total never reaches the
+// exact value the trigger tests for and the event never fires at all.
+#ifdef MPK_NPS2_EVENT_POLL
+#define MPK_LD_EVCFG(p) ld_sys_s32((int *)(p))
+#else
+#define MPK_LD_EVCFG(p) (*(p))
+#endif
+
 // Non-temporal store (bypasses cache, writes to memory)
 __device__ __forceinline__ void st_nt_u64(unsigned long long int *addr,
                                           unsigned long long int val) {

@@ -437,6 +437,19 @@ __device__ __noinline__ void
 #ifdef MPK_INTERLAYER_SPLIT
   unsigned long long _il_binv0 = __builtin_amdgcn_s_memrealtime();
 #endif
+#ifdef MPK_NPS2_L2_ACQUIRE
+  // SPX+NPS2 needs this acquire unconditionally, including at QKV_BATCH_SIZE
+  // == 1 where the branch below performs none at all.
+  //
+  // The `#else` is sound only because plain hipMalloc is MTYPE_RW in NPS1, so
+  // the hardware keeps L2 coherent across XCDs and a consumer cannot hold a
+  // stale line. Under aid_local_xcp_nc=Y a spanning BO is local to neither
+  // memory range and is demoted to MTYPE_NC, which removes that guarantee: a
+  // line this XCD cached in an earlier layer is served stale, and the release
+  // poll built on it spins until the line is evicted by capacity. That is the
+  // observed batch-1 deadlock.
+  asm volatile("buffer_inv sc0 sc1" ::: "memory");
+#else
   if (QKV_BATCH_SIZE > 1) {
     asm volatile("buffer_inv sc0 sc1" ::: "memory");
   } else {
@@ -444,6 +457,7 @@ __device__ __noinline__ void
     asm volatile("buffer_inv" ::: "memory");
 #endif
   }
+#endif
 #ifdef MPK_INTERLAYER_SPLIT
   // buffer_inv has no completion counter to wait on, so this brackets issue
   // cost plus whatever the invalidate stalls behind it, not drain latency.

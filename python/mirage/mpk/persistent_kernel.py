@@ -1978,6 +1978,20 @@ def get_compile_command(
             # the nil-address memory fault. Off by default: the per-layer
             # writes cost a little and only matter while chasing that bug.
             flags = flags + ["-DMPK_NIL_TRIPWIRE"]
+        if int(os.environ.get("MPK_TERM_RECHECK", "0")) == 1:
+            flags = flags + ["-DMPK_TERM_RECHECK"]
+        if int(os.environ.get("MPK_EVCTR_HOST", "0")) == 1:
+            flags = flags + ["-DMPK_EVCTR_HOST"]
+        if int(os.environ.get("MPK_NPS2_EVENT_POLL", "0")) == 1:
+            flags = flags + ["-DMPK_NPS2_EVENT_POLL"]
+        if int(os.environ.get("MPK_NPS2_L2_ACQUIRE", "0")) == 1:
+            # Unconditional layer-boundary `buffer_inv sc0 sc1`. Required in
+            # SPX+NPS2, where plain hipMalloc is MTYPE_NC and nothing keeps L2
+            # coherent across XCDs; the batch-1 path otherwise acquires nothing
+            # at all. Off by default: in NPS1 the acquire is redundant (MTYPE_RW
+            # is hardware-coherent) and dropping L2 per layer costs ~0.26
+            # ms/token by this file's own ablation.
+            flags = flags + ["-DMPK_NPS2_L2_ACQUIRE"]
         if int(os.environ.get("MPK_WORKER_STATE", "0")) == 1:
             # Per-phase worker-state breadcrumbs: which phase/barrier each
             # worker is in, dumped on a hang. This is how the fused-layer
