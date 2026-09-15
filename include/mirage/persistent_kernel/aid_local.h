@@ -78,12 +78,27 @@ namespace aid {
 // ranges, so only bit 18 is ever needed here (MI355X_8STACK.md).
 static constexpr uint64_t GEM_CREATE_AID_LOCAL = 1ULL << 17;
 static constexpr uint64_t GEM_CREATE_AID_SELECT = 1ULL << 18;
-// Stock AMDGPU_GEM_CREATE_COHERENT. Without it an AID_LOCAL BO takes
-// MTYPE_RW under aid_local_xcp_nc=1, and a non-temporal poll of an RW line
-// never observes another die's write-through store -- that is a hang, not a
-// slowdown. With it the driver applies aid_local_flag_mtype (CC), which is
-// what makes a replicated flag line safe to spin on.
+// Stock AMDGPU_GEM_CREATE_COHERENT / _UNCACHED. On gfx950 the PTE encoding is
+// MTYPE_NC=0, RW=1, CC=2, UC=3, and the loaded per-BO-flag driver reports its
+// choice in dmesg ("PERBO: AID_LOCAL BO is local -> mtype_local=1",
+// "FLAGMTYPE fired: knob=2 -> mtype=2"). So, in SPX+NPS2:
+//
+//   spanning hipMalloc     -> NC: cacheable, NOT coherent across XCDs, so a
+//                             poll re-reads its own stale line. 182 ns near,
+//                             279 ns far.
+//   AID_LOCAL alone        -> RW: NPS1's default for local memory, coherent
+//                             only within one XCD. A write-through store from
+//                             another die never invalidates this XCD's copy,
+//                             so a poll spins forever -- a hang, not a
+//                             slowdown.
+//   AID_LOCAL | COHERENT   -> CC: kept coherent across XCDs at the coherency
+//                             point, and 97 ns when the line is homed in the
+//                             reader's own AID. This is what a replicated
+//                             flag line needs.
+//   AID_LOCAL | UNCACHED   -> UC: every access goes to memory. Always correct,
+//                             always slowest.
 static constexpr uint64_t GEM_CREATE_COHERENT = 1ULL << 13;
+static constexpr uint64_t GEM_CREATE_UNCACHED = 1ULL << 14;
 
 static constexpr int kNumXcds = 8;
 static constexpr int kMaxRanges = 4;
@@ -243,15 +258,15 @@ static inline Ctx &ctx() {
 
 // GEM_CREATE a VRAM BO pinned to `aid`, export it, and map it into HIP.
 // Returns nullptr on any failure (caller keeps the original pointer).
-static inline void *alloc_in_aid(size_t bytes, int aid, bool coherent = false) {
+static inline void *
+    alloc_in_aid(size_t bytes, int aid, uint64_t extra_flags = 0) {
   Ctx &c = ctx();
   if (!c.ok) {
     return nullptr;
   }
   uint64_t flags = GEM_CREATE_AID_LOCAL |
                    (c.range_for_aid[aid] & 1u ? GEM_CREATE_AID_SELECT : 0) |
-                   (coherent ? GEM_CREATE_COHERENT : 0) |
-                   AMDGPU_GEM_CREATE_NO_CPU_ACCESS;
+                   extra_flags | AMDGPU_GEM_CREATE_NO_CPU_ACCESS;
 
   union drm_amdgpu_gem_create req;
   memset(&req, 0, sizeof req);
@@ -521,9 +536,24 @@ static inline bool alloc_flag_replicas(void *out[2]) {
            "(stock driver, or not SPX+NPS2)\n");
     return false;
   }
+  // MPK_AID_SPLIT_FLAGS_MTYPE selects the PTE memory type of the replicas.
+  // "cc" is the only one that is both correct and fast; the others exist so
+  // the claim can be re-measured rather than inherited.
+  char const *m = getenv("MPK_AID_SPLIT_FLAGS_MTYPE");
+  char const *mname = "cc";
+  uint64_t extra = GEM_CREATE_COHERENT;
+  if (m != nullptr && strcmp(m, "uc") == 0) {
+    mname = "uc";
+    extra = GEM_CREATE_UNCACHED;
+  } else if (m != nullptr && strcmp(m, "rw") == 0) {
+    // Expected to hang: RW is coherent only within an XCD, so a poll never
+    // observes another die's write-through store.
+    mname = "rw";
+    extra = 0;
+  }
   void *rep[2] = {nullptr, nullptr};
   for (int aid = 0; aid < 2; aid++) {
-    rep[aid] = alloc_in_aid(kFlagRepBytes, aid, /*coherent=*/true);
+    rep[aid] = alloc_in_aid(kFlagRepBytes, aid, extra);
     if (rep[aid] == nullptr) {
       printf("[AID] split flags: could not place a replica in AID%d\n", aid);
       return false;
@@ -538,10 +568,11 @@ static inline bool alloc_flag_replicas(void *out[2]) {
   out[0] = rep[0];
   out[1] = rep[1];
   printf("[AID] split flags: AID0 replica %p, AID1 replica %p (%zu B each, "
-         "COHERENT)\n",
+         "mtype=%s)\n",
          rep[0],
          rep[1],
-         kFlagRepBytes);
+         kFlagRepBytes,
+         mname);
   return true;
 }
 

@@ -5670,12 +5670,16 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
 extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
   fprintf(stderr, "[HOST_DBG] launch_persistent_kernel ENTER\n");
 #ifdef MPK_AID_SPLIT_FLAGS
-  // The flag replicas are monotonic per-layer counters, exactly like the
-  // counter tensors demo.py clears in reset_device_barriers(): a relaunch
-  // restarts task_layer_idx at 0, so a stale high flag satisfies this
-  // launch's early gates immediately and the run desynchronizes. They are
-  // therefore allocated once and re-zeroed here, per launch, before the
-  // kernel starts -- never between layers of one launch.
+  // Every replicated flag family also lives in oproj_topk_counters, which
+  // demo.py clears wholesale in reset_device_barriers() between launches. The
+  // replicas must mirror that exactly: clear them here, per launch, before
+  // the kernel starts -- never between layers of one launch.
+  //
+  // Both directions of divergence hang. A layer-derived target like
+  // attn_release would find a stale high flag already satisfying this
+  // launch's early gates; a snapshot target like layer_release would snapshot
+  // the previous launch's terminal value and then wait for a bump that the
+  // freshly-zeroed epoch counter never reaches.
   {
     static void *s_rep[2] = {nullptr, nullptr};
     static bool s_tried = false;

@@ -559,7 +559,8 @@ __device__ __noinline__ void
   // eight flags at the same offsets, so every consumer below -- the Phase 6
   // gate here and the per-wave slice wait inside the Phase 7 kernel -- is
   // unchanged apart from which copy it reads.
-  int *attn_release = mpk_aid_flags(attn_release_shared, xcd_id);
+  int *attn_release = mpk_aid_flags(
+      attn_release_shared, xcd_id, MPK_AID_REGION_ATTN_RELEASE);
 #else
   int *attn_release = attn_release_shared;
 #endif
@@ -1101,7 +1102,8 @@ __device__ __noinline__ void
 #ifdef MPK_AID_SPLIT_FLAGS
           mpk_aid_publish(attn_release_shared,
                           xcd_id,
-                          (unsigned)attn_release_expected);
+                          (unsigned)attn_release_expected,
+                          MPK_AID_REGION_ATTN_RELEASE);
 #else
           st_wt_u32((void *)&attn_release[xcd_id * 16],
                     (unsigned)attn_release_expected);
@@ -1161,7 +1163,8 @@ __device__ __noinline__ void
 #ifdef MPK_AID_SPLIT_FLAGS
               mpk_aid_publish(attn_release_shared,
                               x,
-                              (unsigned)attn_release_expected);
+                              (unsigned)attn_release_expected,
+                              MPK_AID_REGION_ATTN_RELEASE);
 #else
               st_wt_u32((void *)&attn_release[x * 16],
                         (unsigned)attn_release_expected);
@@ -1856,6 +1859,15 @@ __device__ __noinline__ void
     int *layer_local =
         oproj_counters_base + FULL_LAYER_LAYER_BARRIER_SLOT(NUM_REQS);
     int *layer_global = layer_local + 8 * 16;
+    // NOT AID-split, though it is the same shape as attn_release and slot 10
+    // is the worst remaining ratio (0.83 -> 14.54 us/layer). Replicating it
+    // deadlocks the kernel before a single task retires (tasks_done=0), and
+    // the cause is not yet isolated. It is entangled with two flags that
+    // attn_release does not touch: MPK_W2_CONSUMER_GATE makes only the QKV
+    // workers join this gate, and MPK_LEAN_ARRIVE derives the wait target
+    // from the never-reset arrival counters instead of reading the flag, so
+    // publisher and waiter no longer agree by construction the way the
+    // per-XCD slice release does. Re-attempt with those two off first.
     int *layer_release = layer_global + 16;
 
     // ── Who *arrives* ────────────────────────────────────────────────────

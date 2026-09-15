@@ -47,10 +47,19 @@
 // driver or in NPS1.
 __device__ int *g_aid_flag_rep[2];
 
+// Each flag family gets its own eight lines in both replicas. All of them are
+// cleared per launch, because the shared lines they mirror all live in
+// oproj_topk_counters, which demo.py clears wholesale between launches.
+constexpr int MPK_AID_REGION_INTS = 8 * 16; // eight 64 B lines
+constexpr int MPK_AID_REGION_ATTN_RELEASE = 0;
+constexpr int MPK_AID_REGION_LAYER_RELEASE = 1; // reserved, see slot 10 note
+constexpr int MPK_AID_REGION_OPROJ_READY = 2;   // reserved
+
 // The replica this XCD should poll. SPX maps XCD x to AID x>>2.
-__device__ __forceinline__ int *mpk_aid_flags(int *shared_base, int xcd_id) {
+__device__ __forceinline__ int *
+    mpk_aid_flags(int *shared_base, int xcd_id, int region) {
   int *rep = g_aid_flag_rep[xcd_id >> 2];
-  return rep ? rep : shared_base;
+  return rep ? rep + region * MPK_AID_REGION_INTS : shared_base;
 }
 #endif
 
@@ -328,12 +337,13 @@ __device__ __forceinline__ void st_wt_u32(void *addr, unsigned int val) {
 // instead of one; the publish happens 8 times a layer while the flags are
 // polled ~184 times, which is why the trade pays.
 __device__ __forceinline__ void
-    mpk_aid_publish(int *shared_base, int slot, unsigned int val) {
+    mpk_aid_publish(int *shared_base, int slot, unsigned int val, int region) {
   int *a = g_aid_flag_rep[0];
   int *b = g_aid_flag_rep[1];
   if (a != nullptr && b != nullptr) {
-    st_wt_u32((void *)&a[slot * 16], val);
-    st_wt_u32((void *)&b[slot * 16], val);
+    int const off = region * MPK_AID_REGION_INTS + slot * 16;
+    st_wt_u32((void *)&a[off], val);
+    st_wt_u32((void *)&b[off], val);
   } else {
     st_wt_u32((void *)&shared_base[slot * 16], val);
   }
