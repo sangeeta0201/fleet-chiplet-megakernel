@@ -417,7 +417,15 @@ __device__ __attribute__((noinline)) void
   // 8 lines after the fused layer-barrier region. Matches
   // FULL_LAYER_OPROJ_XCD_READY_SLOT in gang_full_layer_fused_mi300.cuh and
   // demo.py counter_size (+128).
-  int *oproj_xcd_ready = hier_barrier + (48 * 16 + 128 * MPK_MAX_NUM_BATCHED_REQUESTS + 272);
+  int *oproj_xcd_ready_shared = hier_barrier + (48 * 16 + 128 * MPK_MAX_NUM_BATCHED_REQUESTS + 272);
+#ifdef MPK_AID_SPLIT_FLAGS
+  // Same producer shape as attn_release: each XCD publishes only its own slot,
+  // and every reader polls all eight from the replica homed in its own AID.
+  int *oproj_xcd_ready =
+      mpk_aid_flags_hw(oproj_xcd_ready_shared, MPK_AID_REGION_OPROJ_READY);
+#else
+  int *oproj_xcd_ready = oproj_xcd_ready_shared;
+#endif
 #endif
 
   extern __shared__ char _lm_smem[];
@@ -1604,8 +1612,15 @@ oproj_barrier :
         // This XCD's 368-col attn_proj_out slice is in HBM. Router workers
         // on every die poll this flag and FMA the slice without waiting
         // for the other seven XCDs.
+#ifdef MPK_AID_SPLIT_FLAGS
+        mpk_aid_publish(oproj_xcd_ready_shared,
+                        xcd_id,
+                        (unsigned)oproj_release_expected,
+                        MPK_AID_REGION_OPROJ_READY);
+#else
         st_wt_u32((void *)&oproj_xcd_ready[xcd_id * HIER_STRIDE],
                   (unsigned)oproj_release_expected);
+#endif
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 #endif
         int const prev_global =

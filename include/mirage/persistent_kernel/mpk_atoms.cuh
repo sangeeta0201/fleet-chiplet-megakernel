@@ -61,6 +61,19 @@ __device__ __forceinline__ int *
   int *rep = g_aid_flag_rep[xcd_id >> 2];
   return rep ? rep + region * MPK_AID_REGION_INTS : shared_base;
 }
+
+// Same, but reading the physical XCC id rather than trusting a caller-derived
+// one. The O-proj kernel computes its `xcd_id` as `tile_idx / tiles_per_xcd`,
+// which is the *intended* binding rather than the hardware's -- and picking
+// the wrong replica here sends every reader to the far AID, which is a silent
+// slowdown rather than a failure. Cheap enough to just ask.
+__device__ __forceinline__ int *
+    mpk_aid_flags_hw(int *shared_base, int region) {
+  int xcc;
+  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)" : "=s"(xcc));
+  int *rep = g_aid_flag_rep[(xcc & 7) >> 2];
+  return rep ? rep + region * MPK_AID_REGION_INTS : shared_base;
+}
 #endif
 
 // =============================================================================

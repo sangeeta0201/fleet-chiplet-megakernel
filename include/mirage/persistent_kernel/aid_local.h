@@ -537,19 +537,28 @@ static inline bool alloc_flag_replicas(void *out[2]) {
     return false;
   }
   // MPK_AID_SPLIT_FLAGS_MTYPE selects the PTE memory type of the replicas.
-  // "cc" is the only one that is both correct and fast; the others exist so
-  // the claim can be re-measured rather than inherited.
+  //
+  // RW is the default despite being slower than CC (4.34 vs 4.11 ms/token),
+  // because CC is backed by the DF-CS shadow tags -- ~8 L2 lines per channel
+  // -- and overflowing that directory loses probes and hangs. Measured: the
+  // same CC build ran clean once and then deadlocked before a single task
+  // retired on a repeat, and produced a third distinct output text on another
+  // run. CC is only safe for a handful of lines, which does not survive
+  // adding more flag families.
+  //
+  // RW needs no directory, so it scales. It is sound here for the same reason
+  // the split works at all: each replica is read only by XCDs inside its own
+  // memory partition, which is exactly RW's coherence domain, and a remote
+  // *writer* still invalidates the sharers co-located with the line.
   char const *m = getenv("MPK_AID_SPLIT_FLAGS_MTYPE");
-  char const *mname = "cc";
-  uint64_t extra = GEM_CREATE_COHERENT;
+  char const *mname = "rw";
+  uint64_t extra = 0;
   if (m != nullptr && strcmp(m, "uc") == 0) {
     mname = "uc";
     extra = GEM_CREATE_UNCACHED;
-  } else if (m != nullptr && strcmp(m, "rw") == 0) {
-    // Expected to hang: RW is coherent only within an XCD, so a poll never
-    // observes another die's write-through store.
-    mname = "rw";
-    extra = 0;
+  } else if (m != nullptr && strcmp(m, "cc") == 0) {
+    mname = "cc";
+    extra = GEM_CREATE_COHERENT;
   }
   void *rep[2] = {nullptr, nullptr};
   for (int aid = 0; aid < 2; aid++) {
