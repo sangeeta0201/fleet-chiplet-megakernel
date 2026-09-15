@@ -1593,11 +1593,40 @@ __device__ __noinline__ void
 #else
     int *oproj_hier = oproj_hier_shared;
 #endif
+#ifdef MPK_NARROW_HIER_POLL
+    // Same contention argument as MPK_NARROW_GATE_POLL, and this site is worse:
+    // every rank that skips Phase 7 waits here, so ~168 blocks x 4 waves poll a
+    // single line. Measured in ~/nps1/relobs3.sh: one shared release line goes
+    // 5.0 us at 64 pollers -> 26.6 at 128 -> 40.1 at 192, while the same fan-out
+    // on AID-local RW replicas stays flat at 2.5 us. The comment below ("all
+    // threads poll independently -- eliminates __syncthreads overhead") predates
+    // that measurement; the __syncthreads is far cheaper than the extra pollers.
+    //
+    // Sound with one poller: `does_oproj` is a per-worker constant so this
+    // branch is block-uniform, and this gate carries no acquire -- it only
+    // orders these ranks against Phase 8 -- so tid 0 observing plus a
+    // __syncthreads gives every thread the same ordering it had before.
+    //
+    // MEASURED NEUTRAL, left off. On top of MPK_NARROW_GATE_POLL=1 this is
+    // 2.751 / 2.738 against 2.696 / 2.725 without it -- no gain. So poller
+    // count alone is not what costs: the ranks waiting here are already idle,
+    // so cutting their polling traffic buys nothing and the __syncthreads
+    // costs about what the polls saved. MPK_NARROW_GATE_POLL wins for a
+    // different reason -- that line is contended exactly when it is about to
+    // be written, and its waiters are about to do work. Do not expect the
+    // remaining all-threads polls (gang_moe_fused d_barrier_rel and
+    // final_release, gang_linear oproj_xcd_ready and the slice rel/rel0/rel1)
+    // to pay just because they have many pollers.
+    if (tid == 0)
+#endif
     while (MPK_LD_GATE2(&oproj_hier[xcd_id * 16]) < qkv_epoch_expected) {
 #ifndef MPK_OPROJ_SKIP_GATE_BUSY_POLL
       __builtin_amdgcn_s_sleep(1);
 #endif
     }
+#ifdef MPK_NARROW_HIER_POLL
+    __syncthreads();
+#endif
   }
 #endif
 
