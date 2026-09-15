@@ -975,6 +975,44 @@ with no ordering by worker index (checked at eight barrier-exit slots).
 > tile-utilised. Before any further decode work, re-measure at seq ≥ 512
 > (`ntiles ≥ 2`); optimising the seq=128 shape optimises the harness.
 
+##### OPEN, and the one decode lever the above does NOT refute — 2026-09-15
+
+Taking that consequence at its word: **the `GLM_MLA_NUM_KV_CHUNKS=32` -> +0.157
+ms result, and every other decode refutation here, is a seq<=128 number.** At
+the scored shape they do not apply, and the width cap becomes load-bearing:
+
+```
+num_kv_chunks = max(1, min(16, _kv_tiles))     demo.py:1954
+_kv_tiles     = (max_seq_length + 7) // 8
+```
+
+At `max_seq_length = 2048` (the 1024/1024 protocol shape) `_kv_tiles` is **256**
+and the `min(16, ...)` pins the split to **16**. So:
+
+| chunks | decode workers (`q_groups=4 x chunks`) | KV tiles per worker |
+|---:|---:|---:|
+| 16 (shipping) | **64 of 240** | 8 |
+| 32 | 128 | 4 |
+| 48 | 192 | ~3 |
+
+176 of 240 workers idle through the one phase whose participants set the max,
+each of the 64 grinding 8 sequential tiles. The cap's own comment concedes it
+"reaches the 16 cap at any sequence >= 128" -- i.e. it was chosen where the
+loop is single-trip and widening could only add cost. At 1k/1k the loop is
+8-trip, so widening removes real serial work rather than splitting a fixed
+prologue.
+
+The counter-cost is the merge, which grows with the partial count (":1930 the
+merge reads NUM_KV_CHUNKS dependent LSE/o_acc columns per chunk") and is
+already the largest phase at 19.52 us/layer. So this is a genuine trade, not a
+free win, and it must be priced at 1024/1024 -- never at the short shape that
+produced the stale verdict.
+
+**NOT YET MEASURED.** The 16/32/48 sweep was launched and abandoned: the
+control arm wedged at `[ITER] n=1` on a box still poisoned by SIGKILLing a
+deadlocked run (see COLL_FUSE_BLOCKED_ON_HOIST.md). Re-run from a verified-idle
+box (`rocm-smi --showpids` empty, VRAM < 8 GB, GPU use 0%).
+
 ---
 
 #### The load-depth axis, worked to the end — 2026-09-02
