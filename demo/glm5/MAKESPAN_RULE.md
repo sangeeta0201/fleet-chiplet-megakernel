@@ -108,12 +108,24 @@ asymmetry: `GLM_MLA_NUM_KV_CHUNKS=8` is regime A and measured null;
 | layer-bdry ptr copy (1.20 ms counted) | A | 0.007 ms | NULL | 0.010 ms | ✓ |
 | delete one whole rendezvous | A | no work removed | NULL | 0.003 ms | ✓ |
 | W13 barrier narrowing (0.51 ms counted) | A | 0.001 ms | NULL | 0.10 ms | ✓ |
+| `MPK_OPROJ_KSPLIT_CEIL=1` (delete a rendezvous, 32.5 us/lyr of counted spin) | A | ~0.03 ms | NULL | 0.169 ms | ✓ |
 | `MPK_MLA_SKIP_DECODE` (phase + rendezvous) | B | 1.179 ms | MOVE | **−0.61 ms** | ✓ |
 | `MPK_QKVA_REPS=2` (+8.6 us/lyr/worker) | C | +0.654 ms | 1:1 | +0.669 ms | ✓ |
 | `MPK_W13_REPS=2` (+14.8 us/lyr/worker) | C | +1.125 ms | 1:1 | +1.152 ms | ✓ |
 
 The rule is **not fitted** to these: the A and B ceilings come from arrival
 stamps taken before any of these probes ran, and regime C has no free parameter.
+The `MPK_OPROJ_KSPLIT_CEIL` row is the strongest of them — its NULL was
+**registered in writing before the run** (`OPROJ_KSPLIT_PREREGISTERED.md`),
+against an external profile that predicted 0.77–2.58 ms.
+
+**Deleting a rendezvous is regime A, not regime B.** Regime B requires removing
+the phase *and* its rendezvous. If the work in front of the barrier still runs,
+the max arriver's wait is ~0 by definition — it *is* the max, it never waits —
+so its arrival at the next barrier is unchanged, and the early arrivers you
+released just spin at the next one instead. **The spin relocates; it does not
+vanish.** The plateau column in the straggler table below is the fastest way to
+see this coming: a barrier whose top is 128-of-232 wide has no straggler to fix.
 
 ---
 

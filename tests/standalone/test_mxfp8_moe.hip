@@ -108,7 +108,13 @@ static constexpr int W2_K = INTER;
 static constexpr int W2_WGS = W2_N / OPW; // 32
 static constexpr int W2_TPE = BATCH * W2_WGS;
 
-static constexpr int SMEM_BYTES = W13_K + W13_K / 128 + 256;
+// Token data + its E8M0 scales + slack for the epilogue scratch. The extra
+// 8 KB is headroom for MPK_W13_WARM_BLOCK0's never-read DMA window: that knob
+// sizes its offset against MAX_DYNAMIC_SHARED_MEMORY_SIZE (the megakernel
+// launches workers with the full budget), so a caller that launches a tight
+// smem would be written past. Keep this >= the knob's WARM_LDS_OFF +
+// NUM_WAVES * 1024 or leave the knob off here.
+static constexpr int SMEM_BYTES = W13_K + W13_K / 128 + 256 + 8192;
 
 // Packed size for an [E, N, K] weight at OPW rows per workgroup.
 static constexpr size_t wg_bytes(int k) {

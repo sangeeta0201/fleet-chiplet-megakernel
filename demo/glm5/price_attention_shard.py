@@ -175,13 +175,22 @@ LEGALITY = [
      "own guards (attn:382) also require 8 % NUM_Q_GROUPS == 0 and "
      "XCDS_PER_GROUP | NUM_KV_CHUNKS."),
     ("attn_release + wuv_barrier",
-     "COMPILES",
+     "COMPILES -- BUT PRICED AND MEASURED NULL, DO NOT BUILD",
      "Both go XCD-local only if o_proj flips from N-split (column, all-gather "
      "on the ep_signal line) to K-split (row, all-reduce) -- TileRT's "
      "unproj_o_allreduce. o_proj has NO MFMA at all "
      "(glm-wuk-wuv-oproj-have-no-mfma), so there is no MFMA_ITERS % 4 "
      "static_assert to fail here -- unlike the W2 K-split that blocked the MoE "
-     "TP shard. This one is legal to build."),
+     "TP shard. This one is legal to build. IT IS STILL NOT WORTH BUILDING: "
+     "MPK_OPROJ_KSPLIT_CEIL deletes both waits (ISA-gated, -4 s_sleep) and "
+     "measures -0.169 ms at 1024/1024, n=2 alternating pairs, under the 0.26 "
+     "noise floor -- and that arm emits token garbage, so it is an upper "
+     "bound, not a speedup. The 33.93 us/lyr from the ATOM-comparison profile "
+     "is MEAN-WORKER OCCUPANCY, not max-arrival: attn_release has a 128-of-232 "
+     "plateau within 1 us of the max, wuv_barrier a 232/232 plateau within "
+     "0.55 us, so releasing the early arrivers just moves their spin to "
+     "hier_barrier. Deleting a rendezvous without deleting the work in front "
+     "of it is regime A, not B. See OPROJ_KSPLIT_NULL.md."),
     ("decode_barrier",
      "COMPILES -- AND IS ALREADY BUILT",
      "MPK_GLM_MLA_PAIR_MERGE, attn:377, wired through "

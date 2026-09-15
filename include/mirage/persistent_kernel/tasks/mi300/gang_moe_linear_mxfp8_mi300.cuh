@@ -729,6 +729,164 @@ __device__ __forceinline__ f32x4_t _gang_mfma_w_x_f8(
 #define MPK_MOE_BSCHED 0
 #endif
 
+// ── MPK_W13_T0_COUNTED_HANDOFF ─────────────────────────────────────────────
+//
+// gpt-oss's named lever: gfx950 retires VMEM in issue order, so
+// `s_waitcnt vmcnt(N)` lands everything older than the N youngest requests
+// and leaves those N in flight. Their W13 tile had a 23 KiB T0 LDS burst
+// and a small activation/scale payload; issuing the payload first made the
+// two rendezvous `vmcnt(25)` / `vmcnt(23)` instead of `vmcnt(0)` on the
+// whole burst (1.865 → 1.840 ms).
+//
+// GLM-5 has no such burst -- W13/W2 stream weights from global inside this
+// k-loop -- but the SAME wait sits in front of consume(). An explicit
+// `vmcnt(KEEP)` with KEEP = the next block's VM ops lands A[] and leaves
+// N[] flying across the MFMA group.
+//
+// The premise was wrong. This comment used to claim the deep loop emits
+// two `s_waitcnt vmcnt(0)` per trip (one at the `A[j]=N[j]` copy, one
+// planted by SIInsertWaitcnts in front of the MFMAs), the second being
+// the gpt-oss drain. Under WGLOBAL that is stale: see the ISA note below,
+// the control already narrows that wait itself. There was no drain to
+// remove, which is why the wall did not move.
+//
+// KEEP is per-wave and the issue is wave-uniform (every lane does GROUPS
+// weight dwordx4 plus GROUPS scale ubytes). FP4 is one dwordx4 per group,
+// FP8 two. Over-counting KEEP would start the MFMA before A[] lands;
+// under-counting only waits longer.
+//
+// STANDALONE ISA. Read at BOTH instantiations via test_moe_kloop_width
+// (-DKLOOP_WEIGHT_FP4 selects which); shipping GLM-5.2 is the FP4 one.
+//   FP8 GR=6 KEEP=18: mfma/loads unchanged, vgpr 134 -> 132.
+//   FP4 GR=6 KEEP=12: mfma 168 and loads 550 unchanged in both arms; the
+//   tail staircase vmcnt(17..29) is GONE, and at the inserted site the
+//   wait survives all the way to the MFMA with no drain behind it:
+//       global_load_dwordx4 v[6:9],  ... nt
+//       global_load_dwordx4 v[2:5],  ... nt
+//       s_waitcnt vmcnt(12)          <-- 12 loads still in flight
+//       ds_read_u16 / ds_read_b128 ...
+// So the lever DOES do at the ISA level exactly what it claims. Bit-exact
+// MATCH at every width on both arms.
+//
+// WHY IT STILL BUYS NOTHING -- and this is the durable part. The wait was
+// never the queue this tile stands in. Measured in the OPW note below:
+// the N-parallel OPW=64 W13 tile moves 208 KB of weight in 13.9 us of
+// body, i.e. 15.0 GB/s against a 20.2 GB/s per-CU share of HBM -- 74% of
+// roof. A bandwidth-bound tile does not care how many loads are in
+// flight past the point where the bus is saturated, so keeping 12 alive
+// instead of draining recovers nothing. This is the same reason
+// MPK_MOE_PF_GROUPS is a 28% standalone tile win and 3/3 wall nulls.
+//
+// The gpt-oss lever is not this. Its weights go HBM->LDS through
+// `buffer_load ... lds` inside one opaque asm block, where there is no
+// register dependency for LLVM to protect, so the manual vmcnt(N) is the
+// ONLY wait in the path and it is load-bearing. Here the weights land in
+// registers the MFMA consumes, so a correct wait must exist regardless
+// and ours can at best tie it. Porting the real lever means moving W13
+// to an LDS weight path (MPK_W13_LDS_PREFETCH), not annotating waits --
+// and at 74% of roof that is a bytes problem, not an overlap problem.
+//
+// WALL: NULL. Three alternating pairs, decode min, all six texts Paris:
+//   C  9.745 / 9.731 / 9.693     V  9.695 / 9.702 / 9.718
+//   mean C 9.723  V 9.705  delta -0.018, inside C's own 0.052 spread.
+// CAVEAT ON THAT A/B: it was run at seq=128 / ignore-eos 64, which is
+// NOT the project's latency shape. demo/glm5/README.md and
+// run_latency_1k1k.sh require 1024 ISL / 1024 OSL, and short-prompt
+// ms/iter must not be quoted as TPOT. Those six numbers are a paired
+// delta on an off-shape harness, not a latency claim. The verdict still
+// stands because the ISA above shows nothing was removed, and because
+// GLM has measured this whole channel closed three times
+// (MPK_MOE_PF_GROUPS: 28% standalone tile win, 3/3 wall nulls).
+//
+// Default OFF. Do not re-run this flag. A counted wait needs a second
+// stream to hide behind; the only shape that would give one is
+// payload-first issue with a T0 LDS burst, which GLM does not have.
+#ifndef MPK_W13_T0_COUNTED_HANDOFF
+#define MPK_W13_T0_COUNTED_HANDOFF 0
+#endif
+
+// ── MPK_W13_WARM_BLOCK0 ────────────────────────────────────────────────────
+//
+// The OTHER half of gpt-oss's T0 handoff, and the half that actually carried
+// the win there. COUNTED_HANDOFF above only widens a wait; it cannot create
+// work to overlap. gpt-oss's Phase A issues the tile-0 weight burst BEFORE
+// the token quant, so the burst flies during microseconds of quant VALU
+// (gang_moe_fused_mxfp4_mi300.cuh, MPK_W13_LDS_PREFETCH).
+//
+// GLM's W13 has that gap wide open and nothing in it. Order today is:
+//   _gang_wave_parallel_fp8_quant(...)   <- token load, amax, pack, barrier
+//   _gang_moe_kloop(...)                 <- FIRST weight byte requested HERE
+// so the whole block-0 HBM latency is exposed with an idle memory system in
+// front of it. TILES_PER_WAVE is 1 at OUTPUT_PER_WG=64, so that prologue is
+// paid once per tile with no later trip to hide it behind.
+//
+// Why this is a warm-up and not gpt-oss's LDS handoff. Their k-loop READS the
+// weights back out of LDS; ours reads them into registers off a global
+// pointer. Porting the read path needs the whole tile resident: at GLM's
+// K=6144 one 16-row MXFP4 tile is 16 * 3072 = 48 KB and four waves need
+// 192 KB against a 160 KB LDS budget -- the same arithmetic that blocked the
+// o_proj port (gang_mla_full_layer_fused_mi300.cuh, Phase 8). gpt-oss fits
+// because its K is 2880, hence its 23 KiB burst.
+//
+// So: DMA block 0 into a never-read 1 KB-per-wave LDS window purely to pull
+// the lines into L2, then let the k-loop's own prefill hit L2 instead of HBM.
+// Byte-identical arithmetic -- the k-loop is not touched at all, which is
+// deliberate: it keeps this off the register allocator and makes the A/B a
+// clean one-variable test. Exactly the idiom GLM already ships for o_proj,
+// including aux=1 (sc0, NOT nt): nt marks the line evict-first, which throws
+// the prefetch away before the consumer reads it (measured there: no
+// prefetch 4.525 ms, nt 4.674, sc0 4.486).
+//
+// Only the N-parallel K-major path. K-major makes a wave's block 0 one
+// contiguous run of GROUPS * W_KS bytes at warp_id * 16 * W_ROW_BYTES;
+// row-major scatters it 16 ways and there is nothing to warm cheaply.
+// Out-of-range voffsets are harmless -- the V# range field returns 0 into a
+// window nobody reads.
+//
+// LDS: the window is sized against MAX_DYNAMIC_SHARED_MEMORY_SIZE, the same
+// assumption every other prefetch in tasks/mi300 makes, because the megakernel
+// launches workers with the whole budget. A caller that launches a TIGHT smem
+// gets written past -- tests/standalone/test_mxfp8_moe.hip had to grow
+// SMEM_BYTES by 8 KB to hold this. Leave the knob off anywhere else.
+//
+// ── ISA GATE, AND THE STRUCTURAL CAP IT EXPOSES ────────────────────────────
+// Verified on test_mxfp8_moe (W13 K=2048, OPW=64, 9 warm loads):
+//   * 9 `buffer_load_dwordx4 ... sc0 lds`, ZERO s_waitcnt between them, one
+//     s_mov to m0 hoisted out of the group -- back to back, not serialized.
+//   * W13 output BIT-IDENTICAL to the unsplit quant, act13 checksum
+//     2f076c8efd8ac445 over 5 runs on both arms. (The w2 checksum in that
+//     test moves run to run on BOTH arms -- pre-existing nondeterminism in a
+//     kernel this knob does not touch.)
+//
+// What the gate also shows, and it caps the whole idea: `s_waitcnt vmcnt(0)`
+// lands 19 instructions after the DMA group, in front of the pack's first
+// `ds_write2_b32`. buffer_load..lds WRITES LDS, so the compiler must order it
+// against this thread's ds_write and cannot prove they do not alias. The
+// available cover is therefore only the pack -- ~16 v_cvt_scalef32_pk_fp8_f32
+// -- because the amax half CANNOT move after the weight issue (that was the
+// first version of this knob: token load consumed after the DMA compiles to
+// one vmcnt(0) that retires all 9 weight loads, and every bit of intended
+// overlap disappears).
+//
+// So this hides load-ISSUE backpressure, not an HBM round trip: ~16 VALU is
+// ~64 cycles against ~400-800 for the fetch. gpt-oss fills 1.8 us of quant
+// VALU against 24 loads (12.34 -> 9.68 us); GLM's FP4 width issues 6, so the
+// stall being filled is roughly a quarter the size while the pack is the same.
+// At ~0.2 us/tile and ~334 W13 tiles per worker-token that projects to
+// ~0.07 ms -- UNDER the 0.26 ms noise floor, so a paired A/B cannot resolve it
+// and n=6 pooling would be needed to bound it. Default OFF on that basis, not
+// on a measured wall number; the ISA and the arithmetic are the evidence.
+#ifndef MPK_W13_WARM_BLOCK0
+#define MPK_W13_WARM_BLOCK0 0
+#endif
+
+template <int N>
+__device__ __forceinline__ void _gang_wait_vmcnt() {
+  static_assert(N >= 0 && N <= 62,
+                "s_waitcnt vmcnt immediate; 63 is the don't-wait encoding");
+  asm volatile("s_waitcnt vmcnt(%c[n])" ::[n] "n"(N) : "memory");
+}
+
 // The k-loop, with the prefetch distance as a parameter. Accumulates
 // [0, KI_END) and returns the MFMA accumulator; the caller owns the epilogue.
 //
@@ -933,6 +1091,12 @@ __device__ __forceinline__ f32x4_t
     for (int j = 0; j < GROUPS; j++) {
       N[j] = load_w(base + GROUPS + j);
     }
+#if MPK_W13_T0_COUNTED_HANDOFF
+    // Land A[] (older) without draining N[] (the KEEP ops just issued).
+    // Weight tile is one dwordx4 at FP4 and two at FP8; scale is one ubyte.
+    constexpr int KEEP = GROUPS * ((WEIGHT_FP4 ? 1 : 2) + 1);
+    _gang_wait_vmcnt<KEEP>();
+#endif
     consume(base, A, S);
     // NO-GO, measured: sinking copy j to just after slot j's MFMA.
     //
@@ -2095,11 +2259,100 @@ __device__ __noinline__ void
   // per-tile microsecond figure without needing a worker/layer divisor.
   unsigned long long _sp_q0 = __builtin_amdgcn_s_memrealtime();
 #endif
+#if MPK_W13_WARM_BLOCK0
+  // Phase 0: put block 0 of this wave's weight rows in flight BEFORE the quant
+  // below spends its VALU. See the knob's header for why this warms L2 rather
+  // than handing LDS to the k-loop.
+  if constexpr (!K_PARALLEL && MPK_MOE_KMAJOR >= 1) {
+    constexpr int W_KS = _gang_moe_w_kstride<WEIGHT_FP4>();
+    constexpr int SC_KS = _gang_moe_sc_kstride();
+    // The k-loop's prefill is exactly the dispatcher's group width, so warming
+    // a different number of k-tiles would warm the wrong bytes.
+    constexpr int WARM_KT =
+        _gang_moe_pf_groups(MFMA_ITERS, MPK_MOE_PF_GROUPS_W13);
+    // One buffer_load_dwordx4-to-LDS moves 16 B per lane, so 1024 B per wave64.
+    constexpr int WARM_LOADS = (WARM_KT * W_KS + 1023) / 1024;
+    // Past everything this kernel puts in LDS. One never-read 1 KB slice per
+    // wave: a constant destination per wave means one s_mov to m0 outside the
+    // group, so the loads stay back to back instead of being serialized by an
+    // s_waitcnt vmcnt(0) apiece.
+    constexpr int WARM_LDS_OFF =
+        ((FP8_TOK_DATA + NUM_BLOCKS_32 + 16 +
+          (K_PARALLEL ? NUM_WAVES * OUTPUT_PER_WG * 4 : 0) +
+          (W13_ACT_COLS + W13_ACT_BLKS + 4) * 4 + 255) /
+         256) *
+        256;
+    static_assert(WARM_LDS_OFF + NUM_WAVES * 1024 <=
+                      mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE,
+                  "the W13 block-0 warm window has to fit past the token "
+                  "staging and the EMIT_FP8 scratch");
+
+    i32x4_t const warm_rsrc =
+        make_w_buffer_rsrc(wg_data, static_cast<uint32_t>(WG_BYTES));
+    auto *warm_dst =
+        (__attribute__((address_space(3)))
+         uint32_t *)(_gang_moe_mxfp8_smem + WARM_LDS_OFF + warp_id * 1024);
+    // K-major: this wave's 16-row block starts here and its first WARM_KT
+    // k-tiles are contiguous from it.
+    int warm_voff = warp_id * (16 * W_ROW_BYTES) + lane_id * 16;
+
+    // ORDER IS THE WHOLE LEVER, and getting it backwards is silent.
+    //
+    // The token load has to be issued and CONSUMED before the weight DMA goes
+    // out. LLVM's waitcnt pass cannot wait on one VMEM op by name: the quant's
+    // first use of the token compiles to `s_waitcnt vmcnt(0)`, which retires
+    // every in-flight weight load with it. Issuing the DMA first therefore
+    // makes the quant BLOCK on the weights rather than cover them -- measured
+    // on this exact code as `9 buffer_load..lds` followed by the token
+    // flat_load and one `vmcnt(0) lgkmcnt(0)` ten instructions later, i.e. all
+    // of the intended overlap gone. Same trap _gang_fp8_quant_front's header
+    // documents for gpt-oss's 98 KB stream.
+    //
+    // So: front() takes the token load and the amax reduction (it ends with
+    // nothing outstanding), the DMA goes out next, and only the pack half
+    // rides behind it -- back_range() touches registers and LDS only, so it
+    // forces no vmcnt and runs while the weights fly.
+    auto qst = _gang_fp8_quant_front<REDUCTION_SIZE>(
+        A + static_cast<size_t>(tok_idx) * REDUCTION_SIZE, s_tok_scales);
+#pragma unroll
+    for (int j = 0; j < WARM_LOADS; j++) {
+      __llvm_amdgcn_raw_buffer_load_lds(warm_rsrc, warm_dst, 16, warm_voff, 0,
+                                        0, 1);
+      warm_voff += 1024;
+      // Opaque, for the reason the o_proj prefetch documents: without it LLVM
+      // reassociates the offsets into WARM_LOADS simultaneously-live VGPRs.
+      asm volatile("" : "+v"(warm_voff) : : "memory");
+    }
+    // The prefill reads scales too, and they are a separate line from the data.
+    __llvm_amdgcn_raw_buffer_load_lds(
+        warm_rsrc, warm_dst, 16,
+        WG_DATA_BYTES + warp_id * (16 * NUM_BLOCKS_32) + lane_id * 16, 0, 0, 1);
+    (void)SC_KS;
+    // The pack, in the four quarters the split form exposes. Interleaving
+    // these with sub-groups of the issue above is what gpt-oss does (12.34 ->
+    // 9.68 us at 24 loads); untried here because WARM_LOADS is 6 at the
+    // shipping FP4 width, where the issue stall is a sixth the size.
+    _gang_fp8_quant_back_range<REDUCTION_SIZE, 0, 8>(qst, s_tok_fp8);
+    _gang_fp8_quant_back_range<REDUCTION_SIZE, 8, 16>(qst, s_tok_fp8);
+    _gang_fp8_quant_back_range<REDUCTION_SIZE, 16, 24>(qst, s_tok_fp8);
+    _gang_fp8_quant_back_range<REDUCTION_SIZE, 24, 32>(qst, s_tok_fp8);
+    // The unsplit quant ends with this; the split form does not, and the
+    // k-loop's B operand reads columns other threads packed.
+    __syncthreads();
+  } else {
+    // Phase 1: quantize this token's activation to FP8 E4M3 in LDS.
+    _gang_wave_parallel_fp8_quant<REDUCTION_SIZE>(
+        A + static_cast<size_t>(tok_idx) * REDUCTION_SIZE,
+        s_tok_fp8,
+        s_tok_scales);
+  }
+#else
   // Phase 1: quantize this token's activation to FP8 E4M3 in LDS.
   _gang_wave_parallel_fp8_quant<REDUCTION_SIZE>(
       A + static_cast<size_t>(tok_idx) * REDUCTION_SIZE,
       s_tok_fp8,
       s_tok_scales);
+#endif
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   unsigned long long _sp_q1 = __builtin_amdgcn_s_memrealtime();
   if (tid == 0 && g_subphase_active) {

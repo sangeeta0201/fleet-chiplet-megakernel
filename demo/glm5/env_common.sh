@@ -123,11 +123,20 @@ MPK_FORWARD_VARS=(
   MPK_ITER_SPLIT
   MPK_EP_SIG_DBG MPK_EP_FORCE_STAGED MPK_EP_ABLATE MPK_EP_WAIT_TIMEOUT
   MPK_EP_TMO_PRINT_LAYERS
+  # Compile-time scheduling knobs. Unforwarded, only rank 0 rebuilds and the
+  # other three deadlock at the layer barrier. MPK_EP_WAIT_AT_USE was on the
+  # gpt-oss list and missing here, which is why it has never been re-priced
+  # at the NP=4 point.
+  MPK_EP_WAIT_AT_USE MPK_MOE_NOPAD MPK_MOE_SHARED_KSHARD
   # Ceiling probes. All are WRONG OUTPUT by construction and all are
   # compile-time, so every rank has to see them or the ranks build different
   # megakernels and the layer barriers deadlock.
   MPK_MLA_SKIP_DECODE MPK_ATTN_HALFK MPK_W13_EARLY_REL MPK_QB_SKIP_PEER_WAIT
   MPK_WUV_SKIP_PEER_WAIT
+  # o_proj N-split -> K-split ceiling probe. Deletes the 767 and Phase 8
+  # local-flag waits. Compile-time, so an unforwarded rank builds a different
+  # megakernel and the layer barriers deadlock rather than error.
+  MPK_OPROJ_KSPLIT_CEIL
   MPK_ABL_QKV MPK_ABL_QKV_PRO MPK_ABL_ML_BOUNDARY
   # Adjacent-phase overlap ceiling probe. =1 is a CORRECT-output control,
   # =2 is the wrong-output probe; decide on 2 vs 1.
@@ -184,6 +193,14 @@ MPK_FORWARD_VARS=(
   # against the copying form's 9.71, but 8.43 at 6 and 7.82 at 8). Compile-time.
   MPK_MOE_PF_DBUF_W13 MPK_MOE_PF_DBUF_W2 MPK_MLA_DECODE_DBLBUF
   MPK_MOE_PF_GROUPS_W13 MPK_MOE_PF_GROUPS_W2
+  # Counted s_waitcnt vmcnt(N) in the MoE deep k-loop (gpt-oss W13 T0
+  # handoff analog). Compile-time; a rank that misses it is a different
+  # binary and the layer barriers deadlock.
+  MPK_W13_T0_COUNTED_HANDOFF
+  # Block-0 W13 weight warm-up issued before the token quant (gpt-oss Phase A).
+  # Compile-time, and it moves the LDS high-water mark, so a rank that misses
+  # it is a different binary.
+  MPK_W13_WARM_BLOCK0
   # Scheduling of the same k-loop's B-operand (LDS activation) reads against
   # the MFMA group. Both settings are closed no-gos on the image -- see the
   # define -- but it is compile-time, so forward it rather than let an
@@ -226,6 +243,7 @@ MPK_FORWARD_VARS=(
   MPK_BAR_TREE MPK_W2_KSPLIT MPK_MOE_LIVE_BOUND MPK_W2_STAGE_FULL MPK_VPROBE
   MPK_MOE_ACT_FP8
   MPK_QKV_EP_FOLD MPK_QKV_PRO_HOIST MPK_QUANT_V16 MPK_QKV_FOLD_ROWS
+  MPK_COLL_FUSE_NORM MPK_COLL_FUSE_REG
   MPK_BAR_SKEW MPK_EP_FOLD_WGS MPK_EP_POLL_BATCH MPK_ML_PTR_PREFETCH
   # Not a semantic change -- both settings are coherent -- but still
   # compile-time, and an A/B is only one variable if every rank agrees.

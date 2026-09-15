@@ -99,6 +99,49 @@ namespace kernel {
 // it to `s_waitcnt vmcnt(0) lgkmcnt(0)` -- and vmcnt(0) would retire exactly
 // the prefetch we are trying to keep outstanding. The barrier is split into
 // its LDS-only parts when the caller has vmem in flight it wants to keep.
+//
+// ── HOW THIS COMPARES TO THE MXFP4 TWIN, AND WHAT IS ACTUALLY MISSING ──────
+// Read off the two shipping gfx950 code objects (gpt-oss vs GLM-5.2), census
+// of `buffer_load ... lds` sites by kernel:
+//
+//   gpt-oss  qkv_a+kvupd 24, MoE fused 24, PIPELINED_* 24 each, LM head 24,
+//            full-layer o_proj 9 x2                          -- FIVE kernels
+//   GLM-5.2  gang_mla_full_layer_fused 34 (o_proj + shared expert) -- ONE
+//
+// So every GLM TILE kernel, this one included, delivers its A operand as
+// register loads while the mxfp4 twin
+// (gang_rmsnorm_linear_mxfp4_bias_mi300.cuh:2152, "Phase A: Issue HBM->LDS
+// weight prefetch BEFORE RMSNorm") stages the whole 16-row weight tile in LDS
+// and runs its MFMA loop out of it.
+//
+// DO NOT read that as a missing lever. This file already hides the same
+// latency by a different mechanism: HOIST_PREFILL lifts the first four k-tiles
+// above the norm and the quant, and BARRIER_LDS_ONLY + NW_IS_LDS are what keep
+// them airborne across a barrier that would otherwise vmcnt(0) them. That IS
+// gpt-oss's payload-first handoff, in register form. The DMA port's marginal
+// value is therefore only the DEPTH BEYOND those four tiles -- not the tile's
+// whole exposed weight latency, which is the mistake the census invites.
+//
+// If it is built anyway, two facts are already established:
+//   * LDS FITS AT THIS SHAPE and not at the MoE's. qkv_a is OPW=16 K=6144
+//     mxfp8 = 96 KB data + 3 KB scales = 99 KB, against a 155 KB budget and
+//     ~18.5 KB already spent here; q_b (OPW=64 K=2048) is 132 KB, tight. The
+//     MoE W13 tile is 51 KB x 4 waves = 204 KB and DOES NOT FIT, which is why
+//     MPK_W13_WARM_BLOCK0 could only warm L2 and why its cover is capped.
+//   * THE SEAM IS _rnlm8_load_w<KMUL, HI_OFF>(base, kt, g). buffer_load..lds
+//     with voffset and LDS destination both stepping 1024 is a byte-exact
+//     contiguous copy, so an addrspace(3) variant needs the SAME arithmetic
+//     against an LDS base -- no relayout.
+//
+// And one trap dominates the work: buffer_load..lds WRITES LDS, so while any
+// of it is outstanding the compiler must order it against the next ds_write it
+// cannot prove disjoint, and emits vmcnt(0) in front of that write. The norm
+// and the quant both write LDS, so a naive Phase A here makes RMSNorm wait on
+// the whole 96 KB rather than overlap it. That is what MPK_QKV_RMSPRE in the
+// mxfp4 twin exists to work around (it hoists pass 1's LOADS above the DMA
+// block), and any port has to carry that too. Measured on MPK_W13_WARM_BLOCK0:
+// vmcnt(0) landed 19 instructions after the DMA group, ahead of the pack's
+// first ds_write2_b32.
 #ifndef MPK_QUANT_V16
 #define MPK_QUANT_V16 0
 #endif
@@ -505,6 +548,68 @@ _rnlm8_ep_fold_slice(unsigned short const *__restrict__ d_res,
 // GLM's per-phase occupancy that trade is at best even. Price the hoisted
 // producer's own makespan against the per-tile saving before building one.
 //
+// ── MPK_COLL_FUSE_NORM: hand the reduced row to the quantizer in LDS ─────
+//
+// The one structural difference between this function and the two independent
+// implementations of the same fusion. redline's
+// `glm52_gfx950/collective.h:fused_pull_rmsnorm` keeps the reduced row in
+// REGISTERS (`values`) across the square-sum exchange and normalizes out of
+// them; ATOM's `fused_qk_rmsnorm_group_quant` is one pass over the activation.
+// This function instead round-trips it:
+//
+//   st_wt_u64 -> d_x_out      write-through, i.e. past L2
+//   s_waitcnt vmcnt(0)        drained for the partial/stamp ordering
+//   buffer_inv                drop the stale L1 lines
+//   quantizer, SRC_IS_GLOBAL  read the same 2 KB/slice back from global
+//
+// so the reduced row goes to HBM and comes back inside a SERIAL producer --
+// the exact round trip the fusion exists to remove. Registers are not an
+// option: the fold gives thread t elements [4t, 4t+4) while the quantizer
+// wants 32 contiguous per lane, so the handoff has to change layout. LDS is
+// where that happens, and the slice is REDUCTION_SIZE/PRO_WGS = 1024 bf16 =
+// 2 KB, which the existing barriers already order (the loop's ds_writes
+// precede the block reduction's first __syncthreads()).
+//
+// d_x_out is still STORED: o_proj adds this layer's resolved residual stream
+// back as its own residual (see the x_out_ptr note in
+// gang_mla_attn_fused_mi300.cuh:497), so the publish is load-bearing. What
+// this removes is the re-READ and the buffer_inv, not the write.
+//
+// Opt-in and default OFF. Wired in persistent_kernel.py and listed in
+// MPK_FORWARD_VARS: it is compile-time, and it rides MPK_QKV_PRO_HOIST, whose
+// header already records that a rank which misses that flag disagrees on the
+// XCD-local release's writer set and deadlocks rather than erroring.
+#ifndef MPK_COLL_FUSE_NORM
+#define MPK_COLL_FUSE_NORM 0
+#endif
+
+// ── MPK_COLL_FUSE_REG: the register-resident form of the same fusion ──────
+// The LDS form above lost +0.30 ms because it removed the global re-read but
+// ADDED 2 KB/slice of LDS traffic and the release the tiles then wait on. Its
+// stated reason for going through LDS -- "the fold gives thread t elements
+// [4t, 4t+4) while the quantizer wants 32 contiguous per lane" -- is a
+// property of REUSING _gang_wave_parallel_fp8_quant_rmsnorm, which was written
+// for the tile path that reads the row back from global. It is not a property
+// of the data.
+//
+// The fold already leaves thread t's four reduced values in REGISTERS, and at
+// ITERS == 1 that is all four of them. The E8M0 group is 128 elements, so a
+// group is exactly 32 consecutive threads: the group amax is a 32-lane
+// cross-lane max (xor masks 1..16 never leave the 32-lane half), not a
+// relayout. Quantizing in place therefore needs no LDS and no re-read, which
+// is what ATOM's fused_qk_rmsnorm_group_quant does -- it holds the row across
+// the square-sum exchange and normalizes out of registers.
+//
+// Removes, versus the default path: the buffer_inv and the 2 KB/slice global
+// re-read. Versus MPK_COLL_FUSE_NORM: those plus the ds_write/ds_read pair.
+// The d_x_out store STAYS -- o_proj adds this row back as its own residual.
+#ifndef MPK_COLL_FUSE_REG
+#define MPK_COLL_FUSE_REG 0
+#endif
+#if MPK_COLL_FUSE_REG && MPK_COLL_FUSE_NORM
+#error "MPK_COLL_FUSE_REG and MPK_COLL_FUSE_NORM are alternative handoffs"
+#endif
+
 // ── RE-PRICED AT NP=4, 2026-08-28. Still a negative, and larger. ──────────
 // The verdict above is an NP=8 number, and constants tuned at NP=8 are a live
 // bug class on this branch (GLM_MOE_W2_OPW flipped sign at NP=4). Re-run on
@@ -558,6 +663,17 @@ _rnlm8_pro_publish(unsigned short const *__restrict__ d_res,
   int const base = slice * SLICE_ELEMS;
   float ssq = 0.0f;
 
+#if MPK_COLL_FUSE_NORM
+  // The LDS handoff buffer. Under #if, not a sized-1 dummy, so the flag-off
+  // build allocates no LDS for it and stays byte-identical to pristine.
+  __shared__ unsigned short pro_x[SLICE_ELEMS];
+#endif
+#if MPK_COLL_FUSE_REG
+  // The register handoff. 4 bf16 per trip; at ITERS == 1 this is 2 VGPRs and
+  // the row never leaves the register file.
+  unsigned short bkeep[4 * ITERS];
+#endif
+
 #pragma unroll 1
   for (int v = 0; v < ITERS; v++) {
     int const off = base + (v * NTHREADS + tid) * VEC;
@@ -579,6 +695,20 @@ _rnlm8_pro_publish(unsigned short const *__restrict__ d_res,
                   ((unsigned long long)((unsigned)b[2] |
                                         ((unsigned)b[3] << 16))
                    << 32));
+#if MPK_COLL_FUSE_NORM
+    // The same 8 bytes, the same rounding, one ds_write_b64. Indexed within
+    // the slice, so the quantizer below addresses it from 0.
+    *reinterpret_cast<unsigned long long *>(pro_x + (off - base)) =
+        (unsigned long long)((unsigned)b[0] | ((unsigned)b[1] << 16)) |
+        ((unsigned long long)((unsigned)b[2] | ((unsigned)b[3] << 16)) << 32);
+#endif
+#if MPK_COLL_FUSE_REG
+    // Same four values, same rounding, held instead of stored. No ds_write.
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      bkeep[v * 4 + i] = b[i];
+    }
+#endif
 #pragma unroll
     for (int i = 0; i < 4; i++) {
       float const q = _gang_bf16_to_float(b[i]);
@@ -649,6 +779,63 @@ _rnlm8_pro_publish(unsigned short const *__restrict__ d_res,
   __syncthreads();
   float const rms_rcp = pro_red[0];
 
+#if MPK_COLL_FUSE_REG
+  // Normalize and quantize out of the registers the fold already filled. The
+  // 128-element E8M0 group is 32 consecutive threads (thread t owns
+  // [4t, 4t+4)), so the group amax is a 32-lane cross-lane max: xor masks
+  // 1..16 never cross the 32-lane half-wave boundary, which is exactly the
+  // group boundary. No LDS, no re-read, no buffer_inv.
+#pragma unroll 1
+  for (int v = 0; v < ITERS; v++) {
+    int const off = base + (v * NTHREADS + tid) * VEC;
+    uint2 const nwp = *reinterpret_cast<uint2 const *>(d_nw + off);
+    unsigned short const nw[4] = {
+        (unsigned short)nwp.x, (unsigned short)(nwp.x >> 16),
+        (unsigned short)nwp.y, (unsigned short)(nwp.y >> 16)};
+    float vals[4];
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      vals[i] = _gang_bf16_to_float(bkeep[v * 4 + i]) * rms_rcp *
+                _gang_bf16_to_float(nw[i]);
+      amax = fmaxf(amax, fabsf(vals[i]));
+    }
+#pragma unroll
+    for (int m = 1; m < 32; m <<= 1) {
+      amax = fmaxf(amax, __shfl_xor(amax, m));
+    }
+    uint8_t const se = _gang_compute_e8m0_fp8(amax);
+    float scale_f;
+    if (se == 0) {
+      scale_f = 1.0f;
+    } else {
+      union {
+        float f;
+        uint32_t u;
+      } sv;
+      sv.u = (uint32_t)se << 23;
+      scale_f = sv.f;
+    }
+    fp8x4_t pk = {};
+    pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(pk, vals[0], vals[1],
+                                                  scale_f, false);
+    pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(pk, vals[2], vals[3],
+                                                  scale_f, true);
+    *(int *)(pub_fp8 + off) = *(int const *)&pk;
+    // One writer per 128-element group, i.e. per 32 threads.
+    if ((tid & 31) == 0) {
+      pub_scales[off / 128] = se;
+    }
+  }
+#elif MPK_COLL_FUSE_NORM
+  // The row never left LDS, so there is nothing stale to invalidate and no
+  // global read to wait on. The __syncthreads() above already published the
+  // loop's ds_writes -- the same barrier the block reduction needed, so this
+  // adds no synchronisation of its own.
+  _gang_wave_parallel_fp8_quant_rmsnorm<SLICE_ELEMS,
+                                        /*SRC_IS_GLOBAL=*/false>(
+      pro_x, d_nw + base, rms_rcp, pub_fp8 + base, pub_scales + base / 128);
+#else
   // d_x_out was written through this WG's own L1; drop the stale lines before
   // the quantizer reads them back.
   asm volatile("buffer_inv" ::: "memory");
@@ -659,6 +846,7 @@ _rnlm8_pro_publish(unsigned short const *__restrict__ d_res,
       rms_rcp,
       pub_fp8 + base,
       pub_scales + base / 128);
+#endif
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 }
 

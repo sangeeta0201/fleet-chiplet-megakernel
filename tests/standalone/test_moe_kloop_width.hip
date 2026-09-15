@@ -80,7 +80,13 @@ using namespace kernel;
 #define KLOOP_MFMA_ITERS 48
 #endif
 static constexpr int MFMA_ITERS = KLOOP_MFMA_ITERS;
-static constexpr bool WEIGHT_FP4 = false;
+// Shipping GLM-5.2 W13 is MXFP4 (GLM_MOE_MXFP4=1), so the counted-handoff KEEP
+// differs from the FP8 default: one dwordx4 per group instead of two. Selectable
+// so the ISA of the shipping instantiation can be read here.
+#ifndef KLOOP_WEIGHT_FP4
+#define KLOOP_WEIGHT_FP4 0
+#endif
+static constexpr bool WEIGHT_FP4 = (bool)KLOOP_WEIGHT_FP4;
 
 // Sized off the loop's own strides so a layout change cannot silently make the
 // reads run off the end.

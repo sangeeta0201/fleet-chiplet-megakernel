@@ -709,6 +709,11 @@ def get_compile_command(
             # gather buffers are per-layer, so deferring the wait exposes no
             # WAR hazard -- so unlike MPK_EP_ABLATE this is a scheduling knob
             # and its output must still pass the correctness suite.
+            #
+            # Re-priced 2026-09-06, GLM-5.2 NP=4 seq=128 ignore-eos 64,
+            # devices 4-7. Score decode min (C2 avg poisoned by a 6.8s stall):
+            #   C1 9.774 / V1 9.632 / C2 9.613. Variant sits between controls.
+            # NULL. Keep off. Original 2.542 vs 2.528 still stands.
             flags = flags + ["-DMPK_EP_WAIT_AT_USE=1"]
         if int(os.environ.get("MPK_MOE_NOPAD", "0")) == 1:
             # Drops the 240-tile W13 padding when W13 already fits in one
@@ -772,6 +777,26 @@ def get_compile_command(
             # or in the collective". It is not a perf probe; the additive
             # rule in glm-additive-probes-overprice-deletions applies.
             flags = flags + ["-DMPK_WUV_SKIP_PEER_WAIT"]
+        _ksplit_ceil = int(os.environ.get("MPK_OPROJ_KSPLIT_CEIL", "0"))
+        if _ksplit_ceil:
+            # CEILING PROBE for the o_proj N-split -> K-split rewrite.
+            # WRONG OUTPUT by construction; never a correctness arm.
+            #
+            # The rewrite's whole claim is that a row-sharded (K-split) o_proj
+            # makes the attention tail head-local and therefore deletes TWO
+            # GPU-wide rendezvous: 767 (W_UV -> o_proj, oproj:685) and Phase 8
+            # (attention -> o_proj, full_layer:1855). Neither has ever been
+            # priced directly -- price_attention_shard.py leaves the row
+            # UNPRICED because no ablation existed. This is that ablation:
+            #
+            #   1  delete the 767 local-flag wait      (W_UV -> o_proj)
+            #   2  ...and the Phase 8 local-flag wait  (attention -> o_proj)
+            #
+            # Level 2 is a strict UPPER bound on the rewrite, which replaces
+            # Phase 8 with a pair-local barrier rather than with nothing. If
+            # level 2 does not clear the 0.26 ms wall noise floor, the rewrite
+            # cannot, and the K-split is not worth building.
+            flags = flags + ["-DMPK_OPROJ_KSPLIT_CEIL=%d" % _ksplit_ceil]
         if int(os.environ.get("MPK_ATTN_HALFK", "0")) == 1:
             # Halve the K-loop of every MXFP8 attention/dense GEMM (qkv_a, q_b,
             # o_proj, W_UV, W_UK) at an unchanged tile map and WG stride.
@@ -806,6 +831,44 @@ def get_compile_command(
             # in MPK_FORWARD_VARS: it changes the XCD-local release's writer
             # set, so a rank that misses it deadlocks.
             flags = flags + ["-DMPK_QKV_PRO_HOIST"]
+        _cfn = int(os.environ.get("MPK_COLL_FUSE_NORM", "0"))
+        if _cfn == 1:
+            # Hand the reduced row from the hoisted producer to the FP8
+            # quantizer in LDS instead of through write-through global memory.
+            # _rnlm8_pro_publish currently does st_wt_u64 -> d_x_out ->
+            # buffer_inv -> global re-read, so the reduced row goes to HBM and
+            # comes back INSIDE a serial producer; redline's collective.h and
+            # ATOM's fused_qk_rmsnorm_group_quant both keep it out of HBM.
+            # 2 KB of LDS per slice. The d_x_out store stays -- o_proj adds
+            # that row back as its own residual.
+            #
+            # Only meaningful with MPK_QKV_PRO_HOIST=1, which is the only
+            # caller of _rnlm8_pro_publish. Asserted rather than silently
+            # ignored: an A/B that sets this alone would measure the control
+            # twice and read as a null.
+            assert int(os.environ.get("MPK_QKV_PRO_HOIST", "0")) == 1, (
+                "MPK_COLL_FUSE_NORM only affects _rnlm8_pro_publish, which "
+                "runs only under MPK_QKV_PRO_HOIST=1"
+            )
+            flags = flags + ["-DMPK_COLL_FUSE_NORM=1"]
+        if int(os.environ.get("MPK_COLL_FUSE_REG", "0")) == 1:
+            # The register-resident form of the same fusion. The LDS form
+            # above measured +0.30 ms because it traded the global re-read for
+            # 2 KB/slice of LDS traffic plus a release; this one trades it for
+            # nothing, because the fold already leaves thread t's four reduced
+            # values in registers and the 128-element E8M0 group is exactly 32
+            # consecutive threads -- so the group amax is a 32-lane cross-lane
+            # max rather than the relayout that forced LDS. Long note at the
+            # define in gang_rmsnorm_linear_mxfp8_bias_mi300.cuh.
+            assert int(os.environ.get("MPK_QKV_PRO_HOIST", "0")) == 1, (
+                "MPK_COLL_FUSE_REG only affects _rnlm8_pro_publish, which "
+                "runs only under MPK_QKV_PRO_HOIST=1"
+            )
+            assert int(os.environ.get("MPK_COLL_FUSE_NORM", "0")) != 1, (
+                "MPK_COLL_FUSE_REG and MPK_COLL_FUSE_NORM are alternative "
+                "handoffs for the same row; set exactly one"
+            )
+            flags = flags + ["-DMPK_COLL_FUSE_REG=1"]
         if int(os.environ.get("MPK_QKV_FOLD_ROWS", "0")) == 1:
             # Put the batch row on the MFMA's output columns instead of on
             # qkv_a's tile index. The 16x16x128 scaled MFMA computes 16 output
@@ -1283,6 +1346,27 @@ def get_compile_command(
             # Compile-time, so every rank must agree.
             assert _snt in ("0", "1"), "MPK_MOE_STREAM_NT is 0 or 1"
             flags = flags + [f"-DMPK_MOE_STREAM_NT={_snt}"]
+
+        _w13ch = os.environ.get("MPK_W13_T0_COUNTED_HANDOFF")
+        if _w13ch is not None:
+            # Explicit s_waitcnt vmcnt(KEEP) in the MoE deep k-loop after
+            # issuing the next k-block, so consume of the current block does
+            # not drain the prefetch. gpt-oss used the same counted wait on
+            # the W13 T0 handoff (payload-first, vmcnt(25)/vmcnt(23)). GLM
+            # has no T0 LDS burst; this is the k-loop analog. Compile-time,
+            # so every rank must agree.
+            assert _w13ch in ("0", "1"), "MPK_W13_T0_COUNTED_HANDOFF is 0 or 1"
+            flags = flags + [f"-DMPK_W13_T0_COUNTED_HANDOFF={_w13ch}"]
+
+        _w13wb = os.environ.get("MPK_W13_WARM_BLOCK0")
+        if _w13wb is not None:
+            # Issue the wave's block-0 W13 weights HBM->LDS (never read, aux=1
+            # so the line stays in L2) BEFORE the token quant, so the k-loop's
+            # prefill hits L2 instead of HBM. This is gpt-oss's Phase A half of
+            # the T0 handoff; the counted wait above is the other half and is
+            # inert without it. Compile-time, so every rank must agree.
+            assert _w13wb in ("0", "1"), "MPK_W13_WARM_BLOCK0 is 0 or 1"
+            flags = flags + [f"-DMPK_W13_WARM_BLOCK0={_w13wb}"]
 
         _bsc = os.environ.get("MPK_MOE_BSCHED")
         if _bsc is not None:

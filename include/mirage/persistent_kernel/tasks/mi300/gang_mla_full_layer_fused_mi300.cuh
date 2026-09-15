@@ -2058,6 +2058,16 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     if (tid == 0) {
       mpk_stage_stamp(25);
     }
+#if MPK_OPROJ_KSPLIT_CEIL >= 2
+    // -- CEILING PROBE, WRONG OUTPUT BY CONSTRUCTION ----------------------
+    // Prices the o_proj K-split's second half. Under a row-sharded o_proj the
+    // merge -> W_UV -> o_proj chain is pair-local, so this GPU-wide Phase 8
+    // rendezvous is replaced by a 2-XCD one; deleting it outright is the
+    // upper bound of that replacement. Combined with level 1 this is the
+    // ceiling on the WHOLE change: both rendezvous the K-split targets, gone.
+    // o_proj then reads whatever v_out happens to hold. Timing only.
+    (void)attn_release_expected;
+#else
     if (tid == 0) {
       int *const my_flag = &attn_release[xcd_id * HIER_STRIDE];
       // Watch this poll. a0 is the raw global arrival counter: it is
@@ -2104,6 +2114,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
         __builtin_amdgcn_s_sleep(1);
       }
     }
+#endif // MPK_OPROJ_KSPLIT_CEIL >= 2
     MPK_WS_PHASE(63, task_layer_idx, xcd_id);
     // Stage stamp 26: per-XCD attention release observed (NESTED -- check cnt).
     if (tid == 0) {

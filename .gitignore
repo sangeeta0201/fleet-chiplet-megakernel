@@ -102,3 +102,7 @@ tests/standalone/test_*
 
 # GLM-5 megakernel build/codegen output
 demo/glm5/permanent_output_dir*/
+
+# Local virtualenv and build log
+.venv/
+build.log

@@ -1,0 +1,4 @@
+interface:
+  display_name: "ROCprof Compute Viewer"
+  short_description: "Capture ATT traces and add megakernel stage markers"
+  default_prompt: "Use $rocprof-compute-viewer to add, capture, or analyze diagnostic ATT/SQTT markers for a persistent megakernel on Fleet."

@@ -769,6 +769,15 @@ __device__ __attribute__((always_inline)) void
         }
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       }
+#if MPK_OPROJ_KSPLIT_CEIL >= 1
+      // -- CEILING PROBE, WRONG OUTPUT BY CONSTRUCTION --------------------
+      // Prices the o_proj K-split's first half: under a row-sharded o_proj
+      // each XCD contracts only over the heads its OWN W_UV wrote, so this
+      // W_UV -> o_proj rendezvous has nothing left to order and disappears.
+      // Here the wait is simply deleted, so o_proj may read a peer XCD's
+      // stale v slice. Timing only; never a correctness arm.
+      (void)wuv_expected;
+#else
       int *my_flag = &wuv_barrier[xcd_id * HIER_STRIDE];
       MPK_WS_WAIT_BEGIN(767, wuv_expected);
       int _spins = 0;
@@ -798,6 +807,7 @@ __device__ __attribute__((always_inline)) void
         }
         __builtin_amdgcn_s_sleep(1);
       }
+#endif // MPK_OPROJ_KSPLIT_CEIL
     }
     __syncthreads();
     asm volatile("buffer_inv" ::: "memory");
