@@ -35,6 +35,25 @@
 #include <atomic>
 #endif
 
+#ifdef MPK_AID_SPLIT_FLAGS
+// The two COHERENT AID-local flag replicas, [0] homed in AID0 and [1] in AID1,
+// each holding eight per-XCD flags one 64 B line apart. Populated once by the
+// host before the first launch (see alloc_flag_replicas in aid_local.h) and
+// re-zeroed per launch, exactly where the shared counter tensors are.
+//
+// A null pair means the allocator was unavailable, in which case every site
+// guarded by MPK_AID_SPLIT_FLAGS falls back to the shared buffer, so a build
+// with this flag on still runs correctly (just without the win) on a stock
+// driver or in NPS1.
+__device__ int *g_aid_flag_rep[2];
+
+// The replica this XCD should poll. SPX maps XCD x to AID x>>2.
+__device__ __forceinline__ int *mpk_aid_flags(int *shared_base, int xcd_id) {
+  int *rep = g_aid_flag_rep[xcd_id >> 2];
+  return rep ? rep : shared_base;
+}
+#endif
+
 // =============================================================================
 // Non-Temporal (NT) Load/Store for MI300X
 // =============================================================================
@@ -302,6 +321,24 @@ __device__ __forceinline__ void st_wt_u32(void *addr, unsigned int val) {
   *reinterpret_cast<unsigned int volatile *>(addr) = val;
 #endif
 }
+
+#ifdef MPK_AID_SPLIT_FLAGS
+// Publish per-XCD flag `slot` into both replicas, so a consumer in either AID
+// finds it on the copy homed in its own range. Two write-through stores
+// instead of one; the publish happens 8 times a layer while the flags are
+// polled ~184 times, which is why the trade pays.
+__device__ __forceinline__ void
+    mpk_aid_publish(int *shared_base, int slot, unsigned int val) {
+  int *a = g_aid_flag_rep[0];
+  int *b = g_aid_flag_rep[1];
+  if (a != nullptr && b != nullptr) {
+    st_wt_u32((void *)&a[slot * 16], val);
+    st_wt_u32((void *)&b[slot * 16], val);
+  } else {
+    st_wt_u32((void *)&shared_base[slot * 16], val);
+  }
+}
+#endif
 
 // Write-through 16-bit store (1x bf16)
 __device__ __forceinline__ void st_wt_u16(void *addr, unsigned short val) {

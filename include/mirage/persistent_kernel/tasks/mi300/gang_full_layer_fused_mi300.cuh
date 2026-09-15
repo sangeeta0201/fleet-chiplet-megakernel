@@ -552,7 +552,17 @@ __device__ __noinline__ void
   int *qkv_epoch = oproj_counters_base + FULL_LAYER_QKV_EPOCH_SLOT;
   int *chunk_barrier = oproj_counters_base + FULL_LAYER_CHUNK_BARRIER_SLOT;
   int *routing_ready = oproj_counters_base + 10 * 16;
-  int *attn_release = oproj_counters_base + FULL_LAYER_ATTN_XCD_RELEASE_SLOT;
+  int *attn_release_shared =
+      oproj_counters_base + FULL_LAYER_ATTN_XCD_RELEASE_SLOT;
+#ifdef MPK_AID_SPLIT_FLAGS
+  // Poll the replica homed in this XCD's own AID. Both replicas carry the same
+  // eight flags at the same offsets, so every consumer below -- the Phase 6
+  // gate here and the per-wave slice wait inside the Phase 7 kernel -- is
+  // unchanged apart from which copy it reads.
+  int *attn_release = mpk_aid_flags(attn_release_shared, xcd_id);
+#else
+  int *attn_release = attn_release_shared;
+#endif
 
   // Barrier release values, derived from the layer counter rather than read.
   //
@@ -1088,8 +1098,14 @@ __device__ __noinline__ void
         // release after the first. The static_assert is at the top of the
         // MPK_ATTN_SLICE_RELEASE block in Phase 6.
         if (tid == 0) {
+#ifdef MPK_AID_SPLIT_FLAGS
+          mpk_aid_publish(attn_release_shared,
+                          xcd_id,
+                          (unsigned)attn_release_expected);
+#else
           st_wt_u32((void *)&attn_release[xcd_id * 16],
                     (unsigned)attn_release_expected);
+#endif
           asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         }
 #else
@@ -1142,8 +1158,14 @@ __device__ __noinline__ void
             // because ld_nt/relaxed loads read stale L2 cached values.
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
             for (int x = 0; x < 8; x++) {
+#ifdef MPK_AID_SPLIT_FLAGS
+              mpk_aid_publish(attn_release_shared,
+                              x,
+                              (unsigned)attn_release_expected);
+#else
               st_wt_u32((void *)&attn_release[x * 16],
                         (unsigned)attn_release_expected);
+#endif
             }
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
           }

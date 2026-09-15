@@ -1352,6 +1352,21 @@ def get_compile_command(
             # Worth roughly 0.036 ms/token.
             flags = flags + ["-DMPK_W13_T1_SPLIT_LDS_STAGE"]
         # Level, not a boolean: 2 is the shipped default, 0 restores `nt`.
+        if os.environ.get("MPK_AID_LOCAL_SLOTS", "") != "":
+            flags = flags + ["-DMPK_AID_LOCAL"]
+        if os.environ.get("MPK_AID_SPLIT_FLAGS", "0") == "1":
+            # SPX+NPS2 only. Hold the eight per-XCD attention release flags in
+            # two COHERENT AID-local replicas instead of one spanning buffer,
+            # and have each XCD poll the copy homed in its own AID. A spanning
+            # hipMalloc is MTYPE_NC in NPS2 -- local to neither range -- so
+            # every poll costs 182 ns near / 279 ns far against 97 ns for an
+            # AID-local line, and the O-proj slice wait polls these ~184 times
+            # a layer. phase7-bench measured slicewait 14.16 -> 0.36 us with
+            # this, exact SPX+NPS1 parity.
+            #
+            # Inert on a stock driver or in NPS1: the allocator reports
+            # unavailable and every guarded site uses the shared buffer.
+            flags = flags + ["-DMPK_AID_SPLIT_FLAGS"]
         _sp = int(os.environ.get("MPK_SYS_POLL_LOAD", "2"))
         if _sp >= 1:
             # Poll the inter-XCD release flags with `global_load_dword sc0 sc1`

@@ -20,6 +20,10 @@
 #endif
 #include "mpk_atoms.cuh"
 #include "runtime_header.h"
+
+#if defined(MPK_AID_LOCAL) || defined(MPK_AID_SPLIT_FLAGS)
+#include "aid_local.h"
+#endif
 #ifdef USE_NVSHMEM
 #include <mpi.h>
 #include <nvshmem.h>
@@ -4684,6 +4688,15 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
 
     if (ml_layers > 1) {
       // Build per-XCD pointer tables from all layers BEFORE compaction
+#ifdef MPK_AID_LOCAL
+      // Move the XCD-sliced weight tensors named by MPK_AID_LOCAL_SLOTS
+      // into AID-local VRAM before the pointer tables are built.
+      // all_tasks is still pre-compaction here, so fused_layer_positions[L]
+      // + xcd is XCD xcd's descriptor for layer L; the table below is built
+      // from all_tasks, so one rewrite covers layer 0 and layers 1+.
+      mirage::aid::relocate_xcd_sliced_inputs(
+          all_tasks, fused_layer_positions, ML_N_IN);
+#endif
       std::vector<void *> h_input_table(NUM_XCDS_ML * ml_layers * ML_N_IN);
       std::vector<void *> h_output_table(NUM_XCDS_ML * ml_layers * ML_N_OUT);
       std::vector<EventId> h_trigger_events(ml_layers);
@@ -5656,6 +5669,37 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
 // TODO: change launch config
 extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
   fprintf(stderr, "[HOST_DBG] launch_persistent_kernel ENTER\n");
+#ifdef MPK_AID_SPLIT_FLAGS
+  // The flag replicas are monotonic per-layer counters, exactly like the
+  // counter tensors demo.py clears in reset_device_barriers(): a relaunch
+  // restarts task_layer_idx at 0, so a stale high flag satisfies this
+  // launch's early gates immediately and the run desynchronizes. They are
+  // therefore allocated once and re-zeroed here, per launch, before the
+  // kernel starts -- never between layers of one launch.
+  {
+    static void *s_rep[2] = {nullptr, nullptr};
+    static bool s_tried = false;
+    if (!s_tried) {
+      s_tried = true;
+      if (mirage::aid::alloc_flag_replicas(s_rep)) {
+        int *dev[2] = {static_cast<int *>(s_rep[0]),
+                       static_cast<int *>(s_rep[1])};
+        if (hipMemcpyToSymbol(HIP_SYMBOL(g_aid_flag_rep), dev, sizeof dev) !=
+            hipSuccess) {
+          fprintf(stderr,
+                  "[AID] split flags: hipMemcpyToSymbol failed, falling "
+                  "back to the shared buffer\n");
+          s_rep[0] = s_rep[1] = nullptr;
+        }
+      }
+    }
+    for (int i = 0; i < 2; i++) {
+      if (s_rep[i] != nullptr) {
+        (void)hipMemset(s_rep[i], 0, mirage::aid::kFlagRepBytes);
+      }
+    }
+  }
+#endif
   // Progress is per-launch, so clear it before the kernel starts rather than
   // after it ends: a streaming reader polling from another thread must never
   // see the previous request's count and emit tokens that do not exist yet.
