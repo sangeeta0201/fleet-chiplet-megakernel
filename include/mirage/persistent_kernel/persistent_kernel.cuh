@@ -5688,8 +5688,20 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
       if (mirage::aid::alloc_flag_replicas(s_rep)) {
         int *dev[2] = {static_cast<int *>(s_rep[0]),
                        static_cast<int *>(s_rep[1])};
-        if (hipMemcpyToSymbol(HIP_SYMBOL(g_aid_flag_rep), dev, sizeof dev) !=
-            hipSuccess) {
+        // Async-on-default_stream + synchronize, for the same reason as the
+        // clear below: the plain form lands on the NULL stream, which does not
+        // synchronize with the hipStreamNonBlocking streams this kernel runs
+        // on. If that write raced the launch, some workgroups would read
+        // g_aid_flag_rep as null and fall back to the shared buffer while
+        // others read the replica -- publisher and consumer split across two
+        // different buffers, which deadlocks instead of merely being slow.
+        if (hipMemcpyToSymbolAsync(HIP_SYMBOL(g_aid_flag_rep),
+                                   dev,
+                                   sizeof dev,
+                                   0,
+                                   hipMemcpyHostToDevice,
+                                   default_stream) != hipSuccess ||
+            hipStreamSynchronize(default_stream) != hipSuccess) {
           fprintf(stderr,
                   "[AID] split flags: hipMemcpyToSymbol failed, falling "
                   "back to the shared buffer\n");
@@ -5697,11 +5709,20 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
         }
       }
     }
+    // On `default_stream`, then synchronized, rather than a bare hipMemset.
+    // hipMemset lands on the NULL stream, and every stream this kernel uses is
+    // created hipStreamNonBlocking -- which by definition does NOT synchronize
+    // with the NULL stream. The clear could therefore still be in flight when
+    // the megakernel starts, and zero a flag that had already been published:
+    // a lost release, i.e. a hang rather than a wrong answer, on whichever
+    // fraction of runs the timing happened to overlap.
     for (int i = 0; i < 2; i++) {
       if (s_rep[i] != nullptr) {
-        (void)hipMemset(s_rep[i], 0, mirage::aid::kFlagRepBytes);
+        (void)hipMemsetAsync(
+            s_rep[i], 0, mirage::aid::kFlagRepBytes, default_stream);
       }
     }
+    (void)hipStreamSynchronize(default_stream);
   }
 #endif
   // Progress is per-launch, so clear it before the kernel starts rather than

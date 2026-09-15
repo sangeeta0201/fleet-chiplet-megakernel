@@ -53,7 +53,12 @@ __device__ int *g_aid_flag_rep[2];
 constexpr int MPK_AID_REGION_INTS = 8 * 16; // eight 64 B lines
 constexpr int MPK_AID_REGION_ATTN_RELEASE = 0;
 constexpr int MPK_AID_REGION_LAYER_RELEASE = 1; // reserved, see slot 10 note
-constexpr int MPK_AID_REGION_OPROJ_READY = 2;   // reserved
+constexpr int MPK_AID_REGION_OPROJ_READY = 2; // MPK_ROUTER_XCD_FOLD only
+// Only the eight per-XCD release flags of the O-proj hierarchical barrier.
+// The global arrival counter at [8*16], topk_counter at [9*16] and the
+// XCD-local tree at [28*16] stay shared: they are atomics, and those are
+// XCD-L2-bound rather than AID-bound, so placement does nothing for them.
+constexpr int MPK_AID_REGION_HIER_RELEASE = 3;
 
 // The replica this XCD should poll. SPX maps XCD x to AID x>>2.
 __device__ __forceinline__ int *

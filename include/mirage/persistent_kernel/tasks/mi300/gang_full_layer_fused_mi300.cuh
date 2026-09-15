@@ -1582,7 +1582,17 @@ __device__ __noinline__ void
   // ablation flag and compare inside one build.
 #ifndef MPK_NO_OPROJ_SKIP_GATE
   if (!does_oproj) {
-    int *oproj_hier = static_cast<int *>(input_ptrs[16]);
+    int *oproj_hier_shared = static_cast<int *>(input_ptrs[16]);
+#ifdef MPK_AID_SPLIT_FLAGS
+    // Second consumer of the O-proj release flags, in a different file from
+    // the kernel that publishes them: these are the ranks that never enter
+    // Phase 7, so they wait on that barrier here instead. It has to follow
+    // the publisher onto the replicas or it polls a line nobody writes.
+    int *oproj_hier = mpk_aid_flags(
+        oproj_hier_shared, xcd_id, MPK_AID_REGION_HIER_RELEASE);
+#else
+    int *oproj_hier = oproj_hier_shared;
+#endif
     while (MPK_LD_GATE2(&oproj_hier[xcd_id * 16]) < qkv_epoch_expected) {
 #ifndef MPK_OPROJ_SKIP_GATE_BUSY_POLL
       __builtin_amdgcn_s_sleep(1);

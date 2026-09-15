@@ -399,6 +399,16 @@ __device__ __attribute__((noinline)) void
   //   total_oproj_tiles) [9*16]:    topk_counter
   constexpr int HIER_STRIDE = 16;
   int *hier_barrier = (int *)counters_ptr;
+#ifdef MPK_AID_SPLIT_FLAGS
+  // Replica view, used ONLY for the eight per-XCD release flags at [x*16].
+  // Every other slot of this buffer is an atomic and keeps using
+  // `hier_barrier` directly. `xcd_id` below is derived from tile_idx, so the
+  // replica is chosen from the hardware XCC id instead.
+  int *hier_release =
+      mpk_aid_flags_hw(hier_barrier, MPK_AID_REGION_HIER_RELEASE);
+#else
+  int *hier_release = hier_barrier;
+#endif
   int *topk_counter = hier_barrier + 9 * HIER_STRIDE;
   // MPK_OPROJ_TREE_BARRIER: eight per-XCD arrival lines for the two-level
   // form of the Phase 2 barrier. Slots 28..35 are dead space -- the chunk
@@ -1486,7 +1496,7 @@ oproj_barrier :
     // to race with.
     int const oproj_release_expected =
         layer_epoch > 0 ? layer_epoch
-                        : ld_nt_s32(&hier_barrier[xcd_id * HIER_STRIDE]) + 1;
+                        : ld_nt_s32(&hier_release[xcd_id * HIER_STRIDE]) + 1;
 
     // ── Release fan-out: one wave instruction, not eight serial stores ────
     //
@@ -1645,8 +1655,15 @@ oproj_barrier :
     oproj_rel_epoch = __builtin_amdgcn_readfirstlane(oproj_rel_epoch);
     if (oproj_rel_epoch != 0) {
       if (tid < 8) {
+#ifdef MPK_AID_SPLIT_FLAGS
+        mpk_aid_publish(hier_barrier,
+                        tid,
+                        (unsigned)oproj_rel_epoch,
+                        MPK_AID_REGION_HIER_RELEASE);
+#else
         st_wt_u32((void *)&hier_barrier[tid * HIER_STRIDE],
                   (unsigned)oproj_rel_epoch);
+#endif
       }
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
@@ -1746,7 +1763,7 @@ oproj_barrier :
     // other 255 threads do not need their own sc0 sc1 reads of this line.
     if (tid == 0)
 #endif
-      while (MPK_LD_GATE2(&hier_barrier[xcd_id * HIER_STRIDE]) <
+      while (MPK_LD_GATE2(&hier_release[xcd_id * HIER_STRIDE]) <
              oproj_release_expected) {
         __builtin_amdgcn_s_sleep(1);
       }
