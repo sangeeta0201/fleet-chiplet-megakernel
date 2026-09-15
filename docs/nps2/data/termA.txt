@@ -1,0 +1,4 @@
+termA_1: 9.957  |  analysisThe user asks: "The capital of France". That's a
+termA_2: 7.413  |  analysisWe need to answer: "The capital of France". That
+termA_3: 8.077  |  analysisThe user asks: "The capital of France". Likely t
+DONE

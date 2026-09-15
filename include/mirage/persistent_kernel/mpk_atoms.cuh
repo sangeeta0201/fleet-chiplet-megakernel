@@ -47,6 +47,15 @@
 // driver or in NPS1.
 __device__ int *g_aid_flag_rep[2];
 
+// Per-AID copies of the multi-layer pointer tables. Every worker re-reads its
+// TaskDesc's input/output pointers out of these at every layer boundary, and
+// the tables are indexed with xcd_id outermost, so each XCD only ever touches
+// its own 1/8 of them. They are read-only after setup and total ~90 KiB, which
+// makes them the opposite profile to the MoE weights: tiny, high-fanout, and
+// squarely on the critical path at the start of every layer.
+__device__ void **g_aid_ml_in[2];
+__device__ void **g_aid_ml_out[2];
+
 // Each flag family gets its own eight lines in both replicas. All of them are
 // cleared per launch, because the shared lines they mirror all live in
 // oproj_topk_counters, which demo.py clears wholesale between launches.

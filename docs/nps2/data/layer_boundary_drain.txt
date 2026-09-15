@@ -1,0 +1,11 @@
+[DRAIN] n=100000 drain=650 sync=30 arrive=1219 spin=8839 tot=10739
+[XCDSPIN] 13758 11348 11652 8794 6051 7367 7053 4656 | last 0 1 0 9 1167 21 10 43
+[INTER] lastlocal_spin=5681 n=4896 | lastglobal_spin=2413 n=624
+[SPLIT] fanout+prefetch=2230 poll=6611 | lastglobal_poll=1178
+[MLPRO] prologue=947 copy=422 n=301815
+[DRAIN] n=200000 drain=655 sync=30 arrive=1223 spin=8843 tot=10753
+[XCDSPIN] 13695 11333 11697 8782 6110 7351 7073 4676 | last 0 3 1 20 2338 55 15 69
+[INTER] lastlocal_spin=5645 n=9645 | lastglobal_spin=2415 n=1208
+[SPLIT] fanout+prefetch=2231 poll=6612 | lastglobal_poll=1170
+[MLPRO] prologue=946 copy=424 n=603135
+[XCDSPIN] 13669 11323 11700 8781 6148 7355 7090 4694 | last 0 6 1 25 2916 76 23 85

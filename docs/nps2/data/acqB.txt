@@ -1,0 +1,4 @@
+acqB_1: 10.618  |  analysisWe have a user asking: "The capital of France is
+acqB_2: 10.554  |  analysisWe have a user asking: "The capital of France". 
+acqB_3: 10.868  |  analysisThe user asks: "The capital of France is". Likel
+DONE

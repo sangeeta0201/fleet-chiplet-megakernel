@@ -1,0 +1,3 @@
+lean_1: 3.328  |  analysisWe need to answer: "The capital of France". That
+lean_2: 3.421  |  analysisWe have a user asking: "The capital of France is
+DONE

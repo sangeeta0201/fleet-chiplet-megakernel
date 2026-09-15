@@ -1473,6 +1473,23 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
   int const xcd_id = block_xcd_id;
   int const is_xcd_leader = block_is_xcd_leader;
 
+#ifdef MPK_AID_SPLIT_FLAGS
+  // Read the ml pointer tables out of this XCD's own AID. Indexing is
+  // unchanged -- each replica is a full copy, so only the base moves. Falls
+  // back to the shared table when the allocator was unavailable.
+  void **const ml_in_tab = (g_aid_ml_in[xcd_id >> 2] != nullptr)
+                               ? g_aid_ml_in[xcd_id >> 2]
+                               : config.ml_input_table;
+  void **const ml_out_tab = (g_aid_ml_out[xcd_id >> 2] != nullptr)
+                                ? g_aid_ml_out[xcd_id >> 2]
+                                : config.ml_output_table;
+#else
+  void **const ml_in_tab = config.ml_input_table;
+  void **const ml_out_tab = config.ml_output_table;
+#endif
+  (void)ml_in_tab;
+  (void)ml_out_tab;
+
 #ifdef MPK_ENABLE_GANG_TASKS
   // XCD-local rank for gang tasks: computed lazily on first gang task.
   // -1 means not yet computed. Safe to compute after scheduler starts
@@ -2402,12 +2419,12 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
             if (_pf_ok) {
               int _pf_base = (xcd_id * config.ml_num_layers + 1);
               if ((int)threadIdx.x < MAX_INPUTS_PER_TASK) {
-                _pf_in = config.ml_input_table[_pf_base * MAX_INPUTS_PER_TASK +
+                _pf_in = ml_in_tab[_pf_base * MAX_INPUTS_PER_TASK +
                                                threadIdx.x];
               }
               if ((int)threadIdx.x < MAX_OUTPUTS_PER_TASK) {
                 _pf_out =
-                    config.ml_output_table[_pf_base * MAX_OUTPUTS_PER_TASK +
+                    ml_out_tab[_pf_base * MAX_OUTPUTS_PER_TASK +
                                            threadIdx.x];
               }
             }
@@ -2452,12 +2469,12 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                   if (_nl < config.ml_num_layers) {
                     int _nb = (xcd_id * config.ml_num_layers + _nl);
                     if ((int)threadIdx.x < MAX_INPUTS_PER_TASK) {
-                      _pf_in = config.ml_input_table[_nb * MAX_INPUTS_PER_TASK +
+                      _pf_in = ml_in_tab[_nb * MAX_INPUTS_PER_TASK +
                                                      threadIdx.x];
                     }
                     if ((int)threadIdx.x < MAX_OUTPUTS_PER_TASK) {
                       _pf_out =
-                          config.ml_output_table[_nb * MAX_OUTPUTS_PER_TASK +
+                          ml_out_tab[_nb * MAX_OUTPUTS_PER_TASK +
                                                  threadIdx.x];
                     }
                   }
@@ -2467,12 +2484,12 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                   for (int i = threadIdx.x; i < MAX_INPUTS_PER_TASK;
                        i += blockDim.x) {
                     task_desc->input_ptrs[i] =
-                        config.ml_input_table[ml_in_base + i];
+                        ml_in_tab[ml_in_base + i];
                   }
                   for (int i = threadIdx.x; i < MAX_OUTPUTS_PER_TASK;
                        i += blockDim.x) {
                     task_desc->output_ptrs[i] =
-                        config.ml_output_table[ml_out_base + i];
+                        ml_out_tab[ml_out_base + i];
                   }
                 }
                 if (threadIdx.x == 0) {
@@ -2576,7 +2593,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                 int const next_ml = ml + 1;
                 task_desc->input_ptrs[24] =
                     (next_ml < config.ml_num_layers)
-                        ? config.ml_input_table[(xcd_id * config.ml_num_layers +
+                        ? ml_in_tab[(xcd_id * config.ml_num_layers +
                                                  next_ml) *
                                                     MAX_INPUTS_PER_TASK +
                                                 4]
@@ -5723,6 +5740,52 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
       }
     }
     (void)hipStreamSynchronize(default_stream);
+  }
+  // Per-AID copies of the ml pointer tables. Read-only after setup, so plain
+  // AID_LOCAL (MTYPE_RW) is enough -- no COHERENT, and therefore no DF-CS
+  // directory pressure. Done once; nothing rewrites them between launches.
+  {
+    static bool s_ml_tried = false;
+    if (!s_ml_tried) {
+      s_ml_tried = true;
+      int const nl = global_runtime_config.ml_num_layers;
+      if (nl > 0 && global_runtime_config.ml_input_table != nullptr) {
+        size_t const in_b = (size_t)8 * nl * MAX_INPUTS_PER_TASK * sizeof(void *);
+        size_t const out_b =
+            (size_t)8 * nl * MAX_OUTPUTS_PER_TASK * sizeof(void *);
+        void *ml[2][2] = {{nullptr, nullptr}, {nullptr, nullptr}};
+        bool ok = true;
+        for (int aid = 0; aid < 2 && ok; aid++) {
+          ml[aid][0] = mirage::aid::alloc_in_aid(in_b, aid);
+          ml[aid][1] = mirage::aid::alloc_in_aid(out_b, aid);
+          ok = ml[aid][0] != nullptr && ml[aid][1] != nullptr;
+          if (ok) {
+            ok = hipMemcpy(ml[aid][0],
+                           global_runtime_config.ml_input_table,
+                           in_b,
+                           hipMemcpyDeviceToDevice) == hipSuccess &&
+                 hipMemcpy(ml[aid][1],
+                           global_runtime_config.ml_output_table,
+                           out_b,
+                           hipMemcpyDeviceToDevice) == hipSuccess;
+          }
+        }
+        if (ok) {
+          void *in_p[2] = {ml[0][0], ml[1][0]};
+          void *out_p[2] = {ml[0][1], ml[1][1]};
+          ok = hipMemcpyToSymbol(HIP_SYMBOL(g_aid_ml_in),
+                                 in_p,
+                                 sizeof in_p) == hipSuccess &&
+               hipMemcpyToSymbol(HIP_SYMBOL(g_aid_ml_out),
+                                 out_p,
+                                 sizeof out_p) == hipSuccess;
+        }
+        printf("[AID] ml tables: %s (%zu + %zu B per AID)\n",
+               ok ? "replicated per AID" : "unavailable, using shared",
+               in_b,
+               out_b);
+      }
+    }
   }
 #endif
   // Progress is per-launch, so clear it before the kernel starts rather than

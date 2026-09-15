@@ -1,0 +1,4 @@
+hierA_1: 3.836  |  analysisWe need to answer: "The capital of France is". L
+hierA_2: 3.637  |  analysisThe user asks: "The capital of France". Likely t
+hierA_3: 3.810  |  analysisWe need to answer: "The capital of France". That
+DONE

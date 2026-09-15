@@ -1,0 +1,4 @@
+ctrlC_1: HANG  |  
+ctrlC_2: HANG  |  
+ctrlC_3: 10.356  |  analysisWe need to answer: "The capital of France". That
+DONE

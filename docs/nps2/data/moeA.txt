@@ -1,0 +1,4 @@
+moeA_1: 3.562  |  analysisWe have a user asking: "The capital of France". 
+moeA_2: 3.657  |  analysisWe need to answer: "The capital of France". That
+moeA_3: 3.744  |  analysisWe need to answer: "The capital of France". That
+DONE
