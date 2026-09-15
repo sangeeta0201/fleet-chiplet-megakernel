@@ -648,6 +648,15 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #endif
 
   int xcd_id = _gang_moe_get_xcd_id();
+#ifdef MPK_AID_SPLIT_FLAGS
+  // Replica view for the per-XCD release flags only. The arrival counter at
+  // MOE_BAR_COUNTER_SLOT stays on `d_barrier`: it is a device-scope atomic,
+  // and those serialize at the XCD L2 boundary regardless of where they live.
+  int *d_barrier_rel =
+      mpk_aid_flags_at(d_barrier, xcd_id, MPK_AID_MOE_BASE_INTS);
+#else
+  int *d_barrier_rel = d_barrier;
+#endif
   // Marker 1000: about to read the routing mask. Everything downstream --
   // expert_id, the weight base pointers, the barrier slot -- derives from it.
   MOE_DBG_ENTRY(1000, (unsigned long long)tile_idx);
@@ -4349,8 +4358,15 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             *reinterpret_cast<int *>(&_fused_smem[LAYER_IDX_SMEM_OFF]);
         int release_val = layer_idx + 1;
         for (int x = 0; x < 8; x++) {
+#ifdef MPK_AID_SPLIT_FLAGS
+          mpk_aid_publish_at(d_barrier,
+                             base + x * MOE_BAR_LINE,
+                             (unsigned)release_val,
+                             MPK_AID_MOE_BASE_INTS);
+#else
           st_wt_u32((void *)&d_barrier[base + x * MOE_BAR_LINE],
                     (unsigned)release_val);
+#endif
         }
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       }
@@ -4666,7 +4682,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     MPK_WS_WAVE_CLEAR(warp_id);
     int _obs;
     int _spins = 0;
-    while ((_obs = MPK_LD_GATE2(&d_barrier[base + xcd_id * MOE_BAR_LINE])) <
+    while ((_obs = MPK_LD_GATE2(&d_barrier_rel[base + xcd_id * MOE_BAR_LINE])) <
            expected) {
       MPK_WS_WAIT_TICK(_obs, _spins);
       // Refresh the discriminating values on the same cadence as the tick:
@@ -4677,7 +4693,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       if ((_spins & (MPK_WS_WAIT_REFRESH - 1)) == 0) {
         int _n_ok = 0, _mn = 0x7fffffff, _mx = -0x7fffffff;
         for (int _x = 0; _x < 8; _x++) {
-          int _v = ld_nt_s32(&d_barrier[base + _x * MOE_BAR_LINE]);
+          int _v = ld_nt_s32(&d_barrier_rel[base + _x * MOE_BAR_LINE]);
           if (_v >= expected) {
             _n_ok++;
           }

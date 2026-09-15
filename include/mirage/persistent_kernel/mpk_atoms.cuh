@@ -60,6 +60,19 @@ constexpr int MPK_AID_REGION_OPROJ_READY = 2; // MPK_ROUTER_XCD_FOLD only
 // XCD-L2-bound rather than AID-bound, so placement does nothing for them.
 constexpr int MPK_AID_REGION_HIER_RELEASE = 3;
 
+// The MoE fused barrier is per-expert (MOE_BAR_STRIDE ints each), so at 128
+// experts it needs ~20k ints rather than the eight lines the families above
+// use. It gets a raw offset past them instead of a region index. The 2 MiB
+// replica has room to spare.
+constexpr int MPK_AID_MOE_BASE_INTS = 1024;
+
+// Replica view at a raw int offset, for families too big for a region slot.
+__device__ __forceinline__ int *
+    mpk_aid_flags_at(int *shared_base, int xcd_id, int off_ints) {
+  int *rep = g_aid_flag_rep[xcd_id >> 2];
+  return rep ? rep + off_ints : shared_base;
+}
+
 // The replica this XCD should poll. SPX maps XCD x to AID x>>2.
 __device__ __forceinline__ int *
     mpk_aid_flags(int *shared_base, int xcd_id, int region) {
@@ -364,6 +377,21 @@ __device__ __forceinline__ void
     st_wt_u32((void *)&b[off], val);
   } else {
     st_wt_u32((void *)&shared_base[slot * 16], val);
+  }
+}
+
+// Same, addressing by raw int index rather than 64 B slot.
+__device__ __forceinline__ void mpk_aid_publish_at(int *shared_base,
+                                                   int idx,
+                                                   unsigned int val,
+                                                   int off_ints) {
+  int *a = g_aid_flag_rep[0];
+  int *b = g_aid_flag_rep[1];
+  if (a != nullptr && b != nullptr) {
+    st_wt_u32((void *)&a[off_ints + idx], val);
+    st_wt_u32((void *)&b[off_ints + idx], val);
+  } else {
+    st_wt_u32((void *)&shared_base[idx], val);
   }
 }
 #endif
