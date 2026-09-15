@@ -1,4 +1,32 @@
-# CLOSED 09-15 — register-resident fusion BUILT, CORRECT, and still not a win
+# CLOSED 09-15 at the PROTOCOL SHAPE — register fusion is a loss AND inherits a deadlock
+
+**Re-measured at 1024/1024, which is the only shape `run_latency_1k1k.sh` permits
+for a latency number** ("Always this, never a short prompt"). The 16/256 triple
+further down was a protocol violation on my part: valid as a relative A/B, not
+quotable, and not the shape this board is scored on. Alternating pairs:
+
+| arm | decode_min (1024/1024) | G1 | note |
+|---|---:|---|---|
+| control r1 | **12.732** | PASS | in canonical 12.642-12.788 |
+| control r2 | **12.753** | PASS | control spread 0.021 ms |
+| reg r1 | **12.888** | PASS | coherent text |
+| reg r2 | — | — | **DEADLOCK**: `[ITER] n=1`, 1033 s, 4x GPU 100% |
+
+**+0.15 ms, and the control's own spread is 0.021 ms**, so the loss is well
+outside run-to-run noise even though it is inside the conservative 0.26 ms
+floor. Same sign as the short-shape result, so that conclusion held — but the
+protocol number is the one to cite.
+
+**The disqualifier is r2, not the 0.15 ms.** `MPK_COLL_FUSE_REG` rides
+`MPK_QKV_PRO_HOIST`, and the hoist **intermittently deadlocks at 1024/1024** --
+r1 completed, r2 wedged at iteration 1 with the GPUs spinning at 100%. The
+stall watchdog does NOT fire on this, because it treats HBM activity as
+liveness and a spin-wait is busy. Any future use of the hoist must fix that
+first; it is a correctness/reliability blocker independent of latency.
+
+---
+
+# (short-shape, protocol-violating) register-resident fusion BUILT, CORRECT, and still not a win
 
 **The "registers are not an option" claim in
 `gang_rmsnorm_linear_mxfp8_bias_mi300.cuh:567` was wrong, and it has now been
