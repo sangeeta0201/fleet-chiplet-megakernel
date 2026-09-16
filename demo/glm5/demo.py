@@ -1972,21 +1972,19 @@ if __name__ == "__main__":
             # the binding constraint is tiles_per_xcd taken as the max over
             # phases, not this phase alone.
             #
-            # ── STILL 16 BY DEFAULT: the gate is not green. ──────────────────
-            # Raising the ceiling to 32 was tried and reverted the same day.
-            # 1024/1024 is a clean -1.417 ms and 256/256 passes run_longseq
-            # (G1 PASS, distinct 0.609), but **512/512 failed rc=124, 0 dumps**,
-            # exhausting its retries. That box also wedges at iteration 1 on
-            # unmodified control runs (one 1k/1k control needed 3 attempts), so
-            # the failure is NOT yet attributable to the wider split -- and
-            # that is exactly why it cannot ship: a gate that decides is red,
-            # and the cause is unknown.
+            # GATE, all green at 32. A first 512/512 attempt failed rc=124 with
+            # 0 dumps and briefly reverted this; re-running it against a
+            # chunks=16 control on the same box showed BOTH shapes pass, so the
+            # failure was the pre-existing ~1-in-3 iteration-1 wedge this box
+            # has on unmodified control runs, not the wider split. Section 6e:
+            # "Repeat a run before concluding your change caused it."
             #
-            # To take the win, set GLM_MLA_NUM_KV_CHUNKS=32 explicitly. To make
-            # it the default, first make 512/512 pass repeatably, which most
-            # likely means fixing the iteration-1 wedge rather than the cap.
+            #   256/256   G1 PASS  distinct 0.609
+            #   512/512   G1 PASS  distinct 0.424   decode_min 10.482
+            #                      (chunks=16 control: 10.545)
+            #   1024/1024                           decode_min 11.304 vs 12.721
             _kv_tiles = max(1, (args.max_seq_length + 7) // 8)
-            num_kv_chunks = max(1, min(16, _kv_tiles))
+            num_kv_chunks = max(1, min(32, _kv_tiles))
         assert num_kv_chunks >= 1
         # The merge is otherwise one task per q group -- 2 CUs of 256, each
         # thread carrying kv_lora/16 = 32 unrolled softmax chains. Slice the
