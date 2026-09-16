@@ -321,3 +321,57 @@ one.
    tile 0 to every 37th tile, which is the instrument for exactly this.
 2. **W2 `compute` doubling** (2.30 -> 4.60). It reads `swiglu_out` (+19%
    far-side) and the W2 weights (+4%), which do not add up to 2x.
+
+## 9. WHY sync is slower in NPS2: NC polls cannot be cache-shared
+
+Same binary, mode the only variable. `relobs3.cpp`, last-of-7-acks vs pollers on
+ONE line:
+
+| pollers | 8 | 64 | 128 | 192 | 256 |
+|---|---|---|---|---|---|
+| **NPS1** (plain `hipMalloc` = MTYPE_RW) | 2565 | 2561 | 2457 | 2476 | **2446** |
+| **NPS2** (plain `hipMalloc` = MTYPE_NC) | 2426 | 5060 | 26620 | 40135 | **52251** |
+
+Single-operation latency is IDENTICAL between modes (round-trip 852 ns NPS1 vs
+781 NPS2; cross-AID penalty +220 vs +211). So it is not distance -- it is that an
+NC line cannot be shared through cache, so every poller's `sc0 sc1` read goes to
+the coherency point and they SERIALISE. On a coherent line 256 readers each hit
+their own cached copy and the fan-out stays flat. AID-local RW replicas are flat
+in NPS2 too (2470-2502), which is the fix.
+
+`gang_oproj_topk_moe_fused_mi300.cuh:190` states the broken assumption outright:
+"polling is XCD-local (hot in L2, no cross-XCD contention)". True in NPS1; in
+NPS2 the line is NC and cannot be hot in L2.
+
+This also explains `MPK_NARROW_GATE_POLL` (-16.5% in NPS2, **0% in NPS1**): it
+only reduces the NUMBER of NC reads, and in NPS1 there was nothing to serialise.
+
+Localizability, by operation:
+
+| operation | localizable? | status |
+|---|---|---|
+| release FLAGS (reads) | yes -- per-AID RW replica makes reads cacheable | done: `attn_release`, `layer_release`, `oproj_hier`, MoE per-XCD |
+| `routing_ready` | yes, same mechanism | added (`MPK_AID_SPLIT_ROUTING`), **measured neutral**, off |
+| arrival COUNTERS (atomics) | **no** -- a counter needs one home, and the tree notes they serialise at the XCD L2 boundary wherever they live | only lever is fewer of them (hierarchy) |
+
+## 10. Session result and the one remaining lever
+
+3.422 -> **2.560 ms**; gap vs SPX+NPS1 (1.695 on the same build/flags)
+**2.02x -> 1.51x**. Compute slots 1/2/3 are at parity (+28, +21, -17 ns) and W13
+total is now BELOW NPS1 (7.84 vs 7.94).
+
+What is left is **the price of the interleave itself**: it buys bandwidth by
+making every MoE weight read ~50% remote, which shows up exactly where predicted
+-- W13 compute 6.89 -> 7.92, W2 compute 2.30 -> 3.01 -- and the W13->W2 barrier
+then amplifies it because it bills the slowest tile.
+
+So interleave and split are mutually exclusive for the same buffer, and the
+remaining headroom needs the SPLIT: place expert E's weights in one AID and route
+E's tiles to an XCD pair in that AID, so each half streams its own range locally
+(3.5 TB/s each, concurrently, all local) instead of trading locality for
+bandwidth. The weights are `[E, W13_WGS, wg_bytes]` indexed purely by
+`expert_id`, so this needs ZERO extra memory; the work is making the dispatch
+pick the consumer from the data's location, plus a fallback for when the 4
+selected experts are not a 2/2 split across AIDs. `MPK_MOE_XCD_PAIR=1` becomes
+the enabler rather than the regression it is today, and `aid_local_ilv_mb=0`
+turns the interleave off for those slots.

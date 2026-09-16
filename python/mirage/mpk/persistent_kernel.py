@@ -1444,6 +1444,8 @@ def get_compile_command(
             flags = flags + ["-DMPK_NARROW_GATE_POLL"]
         if int(os.environ.get("MPK_NARROW_HIER_POLL", "0")) == 1:
             flags = flags + ["-DMPK_NARROW_HIER_POLL"]
+        if int(os.environ.get("MPK_AID_SPLIT_ROUTING", "0")) == 1:
+            flags = flags + ["-DMPK_AID_SPLIT_ROUTING"]
         if int(os.environ.get("MPK_NARROW_MOE_BAR_POLL", "0")) == 1:
             flags = flags + ["-DMPK_NARROW_MOE_BAR_POLL"]
         if int(os.environ.get("MPK_LAYER_GATE_BUSY_POLL", "0")) == 1:

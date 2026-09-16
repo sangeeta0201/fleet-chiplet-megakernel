@@ -2738,7 +2738,14 @@ topk_barrier :
         rr_epoch = epoch;
 #else
         for (int x = 0; x < 8; x++) {
+#ifdef MPK_AID_SPLIT_ROUTING
+          // Must hit BOTH replicas: a reader in the other AID polls the other
+          // copy, and missing it is a hang, not a slowdown.
+          mpk_aid_publish_at(routing_ready_ptr, (1 + x) * 16, (unsigned)epoch,
+                             MPK_AID_ROUTING_BASE_INTS);
+#else
           st_wt_u32((void *)&routing_ready_ptr[(1 + x) * 16], (unsigned)epoch);
+#endif
         }
 #endif
       }

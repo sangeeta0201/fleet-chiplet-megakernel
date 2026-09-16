@@ -1660,7 +1660,15 @@ __device__ __noinline__ void
 #endif
     routed_expert0 = (int)(_rec >> 32);
 #else
+#ifdef MPK_AID_SPLIT_ROUTING
+    // Poll this AID's replica instead of the shared NC line; see
+    // MPK_AID_ROUTING_BASE_INTS in mpk_atoms.cuh.
+    int *my_release = &mpk_aid_flags_at(routing_ready, xcd_id,
+                                        MPK_AID_ROUTING_BASE_INTS)
+                           [(1 + xcd_id) * 16];
+#else
     int *my_release = &routing_ready[(1 + xcd_id) * 16];
+#endif
     MPK_WS_WAIT_BEGIN(75, routing_expected);
     int _obs;
     int _spins = 0;

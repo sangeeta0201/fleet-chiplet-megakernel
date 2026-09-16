@@ -191,7 +191,13 @@ __device__ __attribute__((always_inline)) void
   // TopK worker wrote per-XCD flags via st_wt after threadfence_gpu,
   // so polling is XCD-local (hot in L2, no cross-XCD contention).
   if (tid == 0) {
+#ifdef MPK_AID_SPLIT_ROUTING
+    int *my_release = &mpk_aid_flags_at(routing_ready, xcd_id,
+                                        MPK_AID_ROUTING_BASE_INTS)
+                           [(1 + xcd_id) * 16];
+#else
     int *my_release = &routing_ready[(1 + xcd_id) * 16];
+#endif
     while (ld_nt_s32(my_release) < expected) {
       __builtin_amdgcn_s_sleep(1);
     }

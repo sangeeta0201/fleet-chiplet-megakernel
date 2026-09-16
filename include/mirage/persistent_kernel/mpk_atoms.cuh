@@ -75,6 +75,40 @@ constexpr int MPK_AID_REGION_HIER_RELEASE = 3;
 // replica has room to spare.
 constexpr int MPK_AID_MOE_BASE_INTS = 1024;
 
+// routing_ready's eight per-XCD release flags. Own raw offset because the family
+// spans nine lines (an epoch counter at [0] plus [(1+x)*16] for x in 0..7), one
+// more than a region slot holds. Past the MoE family, which runs to ~21.5k ints;
+// the 2 MiB replica is 524k ints.
+//
+// ONLY the per-XCD flags move. The epoch counter at [0] stays shared: it is read
+// as `ld_nt_s32(routing_ready) + 1` to DERIVE what the poll waits for, and a
+// stale replica there yields an expected value nobody ever publishes -- the
+// MPK_LD_EPOCH hazard, a hang rather than a slowdown. Same split the MoE barrier
+// and the O-proj hier barrier already use: replicate the flags, share the
+// counter.
+//
+// Why this matters in SPX+NPS2. gang_oproj_topk_moe_fused_mi300.cuh:190 claims
+// the poll is "XCD-local (hot in L2, no cross-XCD contention)". That holds in
+// NPS1, where the line is MTYPE_RW and cacheable. In NPS2 plain hipMalloc is
+// demoted to MTYPE_NC, nothing can be shared through cache, and every poller's
+// `sc0 sc1` read goes to the coherency point and serialises. Measured with
+// ~/nps1/relobs3.cpp, last-of-7-acks against pollers on ONE line:
+//   NPS1  8->2565 ns   64->2561   128->2457   256->2446   (flat)
+//   NPS2  8->2426 ns   64->5060   128->26620  256->52251  (21x)
+// An AID-local RW replica is flat in NPS2 too (2470-2502), which is the fix.
+//
+// MEASURED: correct but end-to-end NEUTRAL, so MPK_AID_SPLIT_ROUTING ships off.
+// It does move the right numbers -- slot 7 topk_wait 11618 -> 10750, slot 6
+// 18469 -> 17334, layer total 76854 -> 75883 ns -- and it does not hang, so the
+// replication is sound. It is just ~1 us of a ~25 us gap, because this poll is
+// dominated by WAITING FOR TOPK TO COMPUTE rather than by poll serialization;
+// gang_linear_...:2757 already says so ("that 5.8 us is the TopK compute the
+// release is waiting for, not the release's own latency"). Keep it for the
+// correctness of the mechanism and as the record that the NC-poll cliff, though
+// real in isolation (21x in relobs3), is NOT what is left in fleet: the other
+// three flag families were already replicated.
+constexpr int MPK_AID_ROUTING_BASE_INTS = 32768;
+
 // Replica view at a raw int offset, for families too big for a region slot.
 __device__ __forceinline__ int *
     mpk_aid_flags_at(int *shared_base, int xcd_id, int off_ints) {
