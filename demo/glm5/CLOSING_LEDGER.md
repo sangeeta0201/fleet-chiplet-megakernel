@@ -1028,9 +1028,37 @@ The merge does grow with the partial count, as predicted -- it just loses the
 trade badly.
 
 **Do not read this as "the cap should be 32."** It is the first point off a
-stale constant, not a tuned one. `min(16, _kv_tiles)` should become a function
-of the live KV, and 48/64 are unmeasured (48 wedged once and was auto-retried;
-see the watchdog note below).
+stale constant, not a tuned one. 48 and 64 both wedge at iteration 1,
+reproducibly, 2/2 attempts each.
+
+**Where the ceiling actually is — measured from a healthy chunks=32 run, and it
+is NOT the decode.** The `[CFG]` lines say:
+
+```
+workers=240  scheds=8            -> 30 workers per XCD
+q_groups=4 kv_chunks=32          -> decode tiles/XCD = 4*32/8 = 16
+merge_dim_splits=32              -> merge auto-scaled with the chunk count (was 8)
+qb_tiles_per_xcd=32              <- the max over the four phases
+W_UV tiles_per_xcd=16   o_proj tiles_per_xcd=24   wuk_tiles_per_xcd=8
+```
+
+`gang_mla_attn_fused_mi300.cuh:70` requires `tiles_per_xcd` (the max over the
+four phases) to "stay under the resident worker count or the in-kernel barriers
+deadlock". That max is **q_b at 32**, already at/above the nominal 30 per XCD --
+the decode's 16 is not close. So the earlier reading here ("48 is only 24
+tiles/XCD and still hangs") was measuring the wrong phase: widening the decode
+to 48 leaves it at 24, still under q_b's 32, so the dispatch width does not
+change and the wedge is NOT a simple tiles-per-worker overflow.
+
+Two live hypotheses, neither tested:
+  1. `merge_dim_splits` tracks the chunk count (8 -> 32 observed), so at 48/64
+     the MERGE tile space is what overflows, not the decode.
+  2. The wedge is the same pre-existing ~1-in-3 iteration-1 hang, and 2/2 is
+     simply an unlucky pair -- section 6e's own warning. 48/64 were never
+     retried past the cap.
+
+Distinguish them before touching geometry: re-run 48 with `RETRIES=3` and read
+`merge_dim_splits` out of its `[CFG]` line.
 
 **Watchdog prerequisite, fixed in the same change.** Two earlier attempts at
 this sweep were lost because `stall_watchdog.sh` derived liveness from HBM
