@@ -1971,8 +1971,22 @@ if __name__ == "__main__":
             # tiles per XCD on 30 workers; 48 is 24 per XCD and still hangs, so
             # the binding constraint is tiles_per_xcd taken as the max over
             # phases, not this phase alone.
+            #
+            # ── STILL 16 BY DEFAULT: the gate is not green. ──────────────────
+            # Raising the ceiling to 32 was tried and reverted the same day.
+            # 1024/1024 is a clean -1.417 ms and 256/256 passes run_longseq
+            # (G1 PASS, distinct 0.609), but **512/512 failed rc=124, 0 dumps**,
+            # exhausting its retries. That box also wedges at iteration 1 on
+            # unmodified control runs (one 1k/1k control needed 3 attempts), so
+            # the failure is NOT yet attributable to the wider split -- and
+            # that is exactly why it cannot ship: a gate that decides is red,
+            # and the cause is unknown.
+            #
+            # To take the win, set GLM_MLA_NUM_KV_CHUNKS=32 explicitly. To make
+            # it the default, first make 512/512 pass repeatably, which most
+            # likely means fixing the iteration-1 wedge rather than the cap.
             _kv_tiles = max(1, (args.max_seq_length + 7) // 8)
-            num_kv_chunks = max(1, min(32, _kv_tiles))
+            num_kv_chunks = max(1, min(16, _kv_tiles))
         assert num_kv_chunks >= 1
         # The merge is otherwise one task per q group -- 2 CUs of 256, each
         # thread carrying kv_lora/16 = 32 unrolled softmax chains. Slice the
