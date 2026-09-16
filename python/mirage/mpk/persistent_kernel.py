@@ -869,6 +869,14 @@ def get_compile_command(
                 "handoffs for the same row; set exactly one"
             )
             flags = flags + ["-DMPK_COLL_FUSE_REG=1"]
+        if int(os.environ.get("MPK_RMSNORM_DPP", "0")) == 1:
+            # Take the RMSNorm ssq butterfly off LDS: __shfl_xor lowers to
+            # ds_bpermute, six LDS round trips on the dependency path of every
+            # RMSNorm. gpt-oss measured this exact swap at 1.851 -> 1.835 ms.
+            # Bit-identical for lane 0, which is the only lane the caller
+            # reads. Long note at the define in
+            # gang_rmsnorm_linear_bias_mi300.cuh.
+            flags = flags + ["-DMPK_RMSNORM_DPP=1"]
         if int(os.environ.get("MPK_QKV_FOLD_ROWS", "0")) == 1:
             # Put the batch row on the MFMA's output columns instead of on
             # qkv_a's tile index. The 16x16x128 scaled MFMA computes 16 output

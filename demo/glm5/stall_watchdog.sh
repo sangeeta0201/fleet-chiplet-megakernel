@@ -130,10 +130,37 @@ run_with_watchdog() {
   # mem_busy>2% on the assigned devices as progress even when the log is
   # frozen. gpt-oss prefill is the same 1-token-per-iter prepare_next_batch
   # loop -- it is not a missing FMHA path.
+  # POST-ENTER CAP. The HBM test above cannot see the deadlock we actually
+  # hit at 1024/1024: the comment claims "a barrier deadlock is 100% shader /
+  # 0% HBM", but a spin-wait polls a flag (ld_nt_s32 + s_sleep), so mem_busy
+  # stays above 2% and `quiet` is reset forever. Measured 2026-09-15: a
+  # control arm (no flags) wedged at 923 s with all four GPUs at 100%, and
+  # only the stall*10 = 4000 s hard cap would ever have reaped it -- so the
+  # RETRIES=8 loop in run_latency_1k1k.sh never got its turn and one bad draw
+  # ate the whole run.
+  #
+  # Log growth cannot separate the cases either: GLM defers [FWD_PASS] until
+  # mpk() returns, and [ITER] prints once, so a HEALTHY run is silent too.
+  # Duration does separate them. After ENTER a healthy 1024/1024 run is
+  # ~30-120 s (1024 decode iters at ~12.7 ms, plus prefill); the wedge is
+  # unbounded. 600 s is 5-20x healthy and still reaps a wedge in a tenth of
+  # the time the hard cap would.
+  local post_enter_cap="${MPK_POST_ENTER_CAP:-600}"
+  local since_armed=0
+
   local last_size=0 quiet=0 armed=0 hbm=0
   while kill -0 "$child" 2>/dev/null; do
     sleep 10
     elapsed=$(( elapsed + 10 ))
+    if [ "$armed" -eq 1 ]; then
+      since_armed=$(( since_armed + 10 ))
+      if [ "$post_enter_cap" -gt 0 ] && [ "$since_armed" -ge "$post_enter_cap" ]; then
+        echo "[watchdog] ${since_armed}s since ENTER (cap ${post_enter_cap}s, HBM ${hbm}%) -- wedged, killing pgid $pgid" \
+             >> "$log"
+        _watchdog_reap "$pgid" "$child"
+        return 124
+      fi
+    fi
     if [ "$elapsed" -ge "$hard_cap" ]; then
       echo "[watchdog] hard cap ${hard_cap}s reached -- killing pgid $pgid" \
            >> "$log"

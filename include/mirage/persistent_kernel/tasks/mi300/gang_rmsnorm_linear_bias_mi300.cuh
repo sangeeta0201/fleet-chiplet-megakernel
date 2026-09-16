@@ -66,6 +66,66 @@ using bf16 = __hip_bfloat16;
 // revisits the input, so caching it would only hold VGPRs. Phase 4 is the
 // caller's. The trailing __syncthreads() is the one that publishes red[0], so
 // the returned value is uniform and the LDS is free on return.
+// ── MPK_RMSNORM_DPP: the ssq butterfly off LDS ───────────────────────────
+// `__shfl_xor` lowers to `ds_bpermute` -- an LDS round trip and an
+// `s_waitcnt lgkmcnt` to move a value that never left the register file. The
+// six-step butterfly below therefore pays six of them on the dependency path
+// of every RMSNorm. gpt-oss measured exactly this swap at 1.851 -> 1.835 ms
+// ("RMSNorm ssq off LDS", 2ee5278); the census on today's GLM image says it is
+// unported here -- 514 ds_bpermute against 8 cross-lane VALU ops in the whole
+// code object.
+//
+// BIT-IDENTICAL, and that is checkable rather than hopeful: the only lane this
+// reduction's caller reads is lane 0 (`if (lane_id == 0) red[wave_id] = sum`),
+// and for lane 0 `xor-N` and `shr-N` name the same source lane, since
+// `0 ^ N == 0 + N`. Lane 0 therefore walks the same summation tree in the same
+// order; the other 63 lanes hold different partials and are discarded.
+//
+// The two permlane swaps are the form already validated in this tree at
+// gang_mla_decode_mi300.cuh:868. `bound_ctrl:1` makes an out-of-range DPP lane
+// read 0, the identity for the add. `s_nop 1` before each cross-lane op is
+// required, not defensive: CDNA4 ISA Table 11 gives two wait states for a VALU
+// write followed by a DPP/PERMLANE read of the same register, and every stage
+// here reads what the previous add just wrote.
+#ifndef MPK_RMSNORM_DPP
+#define MPK_RMSNORM_DPP 0
+#endif
+#if MPK_RMSNORM_DPP
+__device__ __forceinline__ float _mpk_wave_sum_to_lane0(float v) {
+  // xor-32, then xor-16, via the register-swap form.
+  {
+    float a = v, b = v;
+    asm volatile("s_nop 1\n\tv_permlane32_swap_b32_e32 %0, %1"
+                 : "+v"(a), "+v"(b));
+    v = a + b;
+  }
+  {
+    float a = v, b = v;
+    asm volatile("s_nop 1\n\tv_permlane16_swap_b32_e32 %0, %1"
+                 : "+v"(a), "+v"(b));
+    v = a + b;
+  }
+  // Fold each 16-lane row into its lane 0. One asm block: separate blocks let
+  // the compiler slip spurious s_nop between the stages.
+  float t;
+  asm volatile(
+      "s_nop 1\n\t"
+      "v_mov_b32_dpp %1, %0 row_shr:8 row_mask:0xf bank_mask:0xf bound_ctrl:1\n\t"
+      "v_add_f32 %0, %0, %1\n\t"
+      "s_nop 1\n\t"
+      "v_mov_b32_dpp %1, %0 row_shr:4 row_mask:0xf bank_mask:0xf bound_ctrl:1\n\t"
+      "v_add_f32 %0, %0, %1\n\t"
+      "s_nop 1\n\t"
+      "v_mov_b32_dpp %1, %0 row_shr:2 row_mask:0xf bank_mask:0xf bound_ctrl:1\n\t"
+      "v_add_f32 %0, %0, %1\n\t"
+      "s_nop 1\n\t"
+      "v_mov_b32_dpp %1, %0 row_shr:1 row_mask:0xf bank_mask:0xf bound_ctrl:1\n\t"
+      "v_add_f32 %0, %0, %1"
+      : "+v"(v), "=&v"(t));
+  return v;
+}
+#endif
+
 template <int STORAGE_DIM, int ACTUAL_HIDDEN_DIM, int NORM_SPAN = STORAGE_DIM>
 __device__ __forceinline__ float rmsnorm_rcp_amd(void const *input_ptr,
                                                  float eps = 1e-5f) {
@@ -135,10 +195,14 @@ __device__ __forceinline__ float rmsnorm_rcp_amd(void const *input_ptr,
     }
   }
 
+#if MPK_RMSNORM_DPP
+  sum = _mpk_wave_sum_to_lane0(sum);
+#else
 #pragma unroll
   for (int offset = 32; offset > 0; offset >>= 1) {
     sum += __shfl_xor(sum, offset);
   }
+#endif
 
   __shared__ float red[16];
   int wave_id = tid >> 6;

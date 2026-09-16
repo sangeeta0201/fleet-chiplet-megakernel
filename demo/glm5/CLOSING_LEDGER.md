@@ -1008,10 +1008,41 @@ already the largest phase at 19.52 us/layer. So this is a genuine trade, not a
 free win, and it must be priced at 1024/1024 -- never at the short shape that
 produced the stale verdict.
 
-**NOT YET MEASURED.** The 16/32/48 sweep was launched and abandoned: the
-control arm wedged at `[ITER] n=1` on a box still poisoned by SIGKILLing a
-deadlocked run (see COLL_FUSE_BLOCKED_ON_HOIST.md). Re-run from a verified-idle
-box (`rocm-smi --showpids` empty, VRAM < 8 GB, GPU use 0%).
+##### MEASURED 2026-09-15 — **-1.328 ms, the largest single win on this model**
+
+| arm | decode_min | decode_avg | G1 | distinct | Δ vs control |
+|---|---:|---:|---|---:|---:|
+| `c16` (shipping) | 12.691 | 13.981 | PASS | 0.155 | — |
+| **`GLM_MLA_NUM_KV_CHUNKS=32`** | **11.363** | **11.883** | PASS | 0.196 | **-1.328 ms** |
+
+1024/1024, one `-D` apart, coherent text on both arms. The control reproduces
+the canonical band (12.642-12.788, and 12.732/12.753 measured the same day), and
+**-1.328 ms is 60x the control's own run-to-run spread of 0.021 ms**, so this is
+not a noise draw. `decode_avg` moves with `decode_min` (13.981 -> 11.883), so it
+is not a min-statistic artifact either.
+
+This is the seq<=128 staleness, priced. The `+0.157 ms` that closed this lever
+was measured where the decode loop is single-trip and widening could only add
+fixed cost; at 1024/1024 the loop is 8-trip and widening deletes serial work.
+The merge does grow with the partial count, as predicted -- it just loses the
+trade badly.
+
+**Do not read this as "the cap should be 32."** It is the first point off a
+stale constant, not a tuned one. `min(16, _kv_tiles)` should become a function
+of the live KV, and 48/64 are unmeasured (48 wedged once and was auto-retried;
+see the watchdog note below).
+
+**Watchdog prerequisite, fixed in the same change.** Two earlier attempts at
+this sweep were lost because `stall_watchdog.sh` derived liveness from HBM
+`mem_busy`, on the stated assumption that "a barrier deadlock is 100% shader /
+0% HBM". A spin-wait polls a flag, so mem_busy stays >2%, `quiet` resets
+forever, and only the `stall*10` = 4000 s hard cap would ever reap it -- so the
+`RETRIES=8` loop in `run_latency_1k1k.sh` never got its turn and one bad draw
+ate the whole run. Log growth cannot separate the cases either: GLM defers
+`[FWD_PASS]` until `mpk()` returns and `[ITER]` prints once, so a HEALTHY run is
+silent too. Duration does separate them, and `MPK_POST_ENTER_CAP` (default
+600 s, vs ~30-120 s healthy) now reaps a wedge into the retry loop. The `c48`
+arm exercised it on the first run: `attempt 1 rc=124`, auto-retried.
 
 ---
 
