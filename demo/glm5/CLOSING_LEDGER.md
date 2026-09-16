@@ -1050,15 +1050,26 @@ tiles/XCD and still hangs") was measuring the wrong phase: widening the decode
 to 48 leaves it at 24, still under q_b's 32, so the dispatch width does not
 change and the wedge is NOT a simple tiles-per-worker overflow.
 
-Two live hypotheses, neither tested:
-  1. `merge_dim_splits` tracks the chunk count (8 -> 32 observed), so at 48/64
-     the MERGE tile space is what overflows, not the decode.
-  2. The wedge is the same pre-existing ~1-in-3 iteration-1 hang, and 2/2 is
-     simply an unlucky pair -- section 6e's own warning. 48/64 were never
-     retried past the cap.
+Both hypotheses tested and **both are dead**:
 
-Distinguish them before touching geometry: re-run 48 with `RETRIES=3` and read
-`merge_dim_splits` out of its `[CFG]` line.
+  1. *merge overflow* — **no.** At `kv_chunks=48` the `[CFG]` line still reads
+     `merge_dim_splits=32`; it is capped, not tracking the chunk count. Merge
+     tiles/XCD stay `4*32/8 = 16`.
+  2. *unlucky draw* — **no.** `RETRIES=3` gave `attempt 1/2/3 rc=124`, i.e.
+     **5/5 failures** across sessions. At the box's ~1/3 wedge rate a
+     5-in-a-row fluke is ~0.4%.
+
+So at 48 every width is inside the ceiling — decode 24, merge 16, q_b 32, max
+unchanged at 32 — and it still hangs. **The 48 wedge is therefore not a
+dispatch-width problem at all**, and raising `MPK_NUM_WORKERS` will not fix it.
+The remaining suspect is divisibility: 16 and 32 divide the 2048-token KV
+evenly (128 and 64 tokens per chunk, both whole multiples of the 16-token
+`KV_TILE`), while 48 gives 42.67 -> a ragged 43, and 64 gives 32 tokens/chunk
+but 256 total tiles against a 240-worker pool. Next probe is a power-of-two-only
+sweep that keeps `seq % (chunks*KV_TILE) == 0`, not a worker-count change.
+
+**Practical conclusion: 32 is the shipped maximum**, and it is the best of the
+legal values, not merely the first that worked.
 
 **Watchdog prerequisite, fixed in the same change.** Two earlier attempts at
 this sweep were lost because `stall_watchdog.sh` derived liveness from HBM
