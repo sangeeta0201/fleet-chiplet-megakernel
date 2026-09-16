@@ -1071,6 +1071,45 @@ sweep that keeps `seq % (chunks*KV_TILE) == 0`, not a worker-count change.
 **Practical conclusion: 32 is the shipped maximum**, and it is the best of the
 legal values, not merely the first that worked.
 
+##### The memory-stall census, re-read at the shipped geometry — 2026-09-16
+
+`isa_outstanding.py` on today's image. `carry` is overlap across the backedge;
+the tool's rule is starved at `carry <= 2`, flat-part at `carry >= 8`:
+
+| loop | insns | loads | carry | peak | drains | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| W13 tile | 73 | 12 | **12** | 12 | 0 | flat-part |
+| W2 tile | 51 | 8 | **8** | 8 | 1 | flat-part |
+| **MLA decode** | 436 | 10 | **0** | 9 | 2 | **starved** |
+| GEMV (UK/UV/o) | 217 | 16 | **0** | 8 | 2 | **starved** |
+| KV latent write | 156 | 7 | **0** | 4 | 3 | **starved** |
+
+W13 and W2 are the two loops that already received the counted-`vmcnt` handoff
+(`MPK_W13_T0_COUNTED_HANDOFF`, gpt-oss pattern 2) and they are exactly the two
+that are clean. The decode never got it. Its kernel body:
+
+```
+124 loads (72 dwordx4, 44 dwordx2, 8 dword)   104 v_mfma   456 ds_read
+26 x s_waitcnt vmcnt(0)      <- FULL drains
+ 6 x vmcnt(1)  2 x vmcnt(7)  2 x vmcnt(5)     <- only 10 counted
+```
+
+26 of 36 waits retire every outstanding load, i.e. full exposed memory latency,
+in the phase that already owns the makespan.
+
+**WHY THIS IS NEWLY ACTIONABLE.** The 2026-09-02 amendment closed decode
+pipelining as "true and unactionable, because the loop is SINGLE-TRIP at this
+benchmark shape" -- there is no next trip to hoist into at seq <= 128, which is
+also why `MPK_MLA_DECODE_DBLBUF` measured +0.08 ms and its note says do not
+build it. That precondition is gone: at the shipped 1024/1024 geometry with
+`kv_chunks=32`, `chunk_len` is 64 tokens and `ntiles = 64/16 = 4`. The loop goes
+round. Counted `vmcnt` and cross-iteration hoisting are back on the table, and
+they are pointed at the phase whose participants set the max.
+
+Do not re-read `MPK_MLA_DECODE_DBLBUF`'s +0.08 ms as a refutation of this: it
+bought a second register buffer for a loop that never went round. Re-price it,
+and the counted-handoff form, at 1024/1024.
+
 **Watchdog prerequisite, fixed in the same change.** Two earlier attempts at
 this sweep were lost because `stall_watchdog.sh` derived liveness from HBM
 `mem_busy`, on the stated assumption that "a barrier deadlock is 100% shader /
