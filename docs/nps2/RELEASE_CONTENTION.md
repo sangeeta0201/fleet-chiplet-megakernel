@@ -238,3 +238,86 @@ any of the timing results here are treated as final.
 - **`[MAP]` probes only the first 64 MiB at offset 0**, so for a multi-BO tensor
   its `aid=`/`skew=` describes the first chunk, not the tensor. It reported
   `aid=1 skew +95` for a tensor the driver counters prove is split 50/50.
+
+## 8. Slot 8 decomposed: it is VARIANCE, not bandwidth
+
+Slot 8 (`moe w13+swiglu+w2`) is the second-largest NPS2 excess after the waits
+(MoE-only ranks: 10224 ns/layer in NPS1 against 18397 in NPS2). Four separate
+memory-system explanations were tested and all failed, so the phase was
+decomposed with the tree's own `MPK_MOE_INNER_TIMING=1`.
+
+Same instrument, same sample count (n=3132 per arm), mode the only variable.
+These runs carry printf overhead (7.0 / 7.6 ms end to end), so the **ratios** are
+the result, not the absolute us:
+
+| sub-phase | NPS1 | NPS2 | delta | ratio |
+|---|---|---|---|---|
+| W13 `dec` | 0.45 | 0.35 | -0.10 | - |
+| **W13 `compute`** | 6.89 | 9.42 | **+2.53** | **1.37x** |
+| W13 `arrive` | 0.60 | 0.39 | -0.21 | - |
+| W2 `dec` | 0.50 | 0.33 | -0.17 | - |
+| W2 `prep` | 2.53 | 2.74 | +0.21 | 1.08x |
+| **W2 `barrier`** | 6.30 | **15.21** | **+8.91** | **2.41x** |
+| **W2 `compute`** | 2.30 | 4.60 | **+2.30** | **2.00x** |
+| **MoE total** | **19.57** | **33.05** | **+13.48** | **1.69x** |
+
+`dec`, `arrive` and `prep` are flat or *better* in NPS2. The cost is the W2
+`barrier` (+8.91, i.e. 66% of the whole MoE delta) and then real compute
+(W13 +2.53, W2 +2.30).
+
+**The load-bearing observation is the mismatch between two of those rows.**
+W13's own total grows by only +2.22 us, but the barrier that waits on W13 grows
+**+8.91 us** -- four times as much. That barrier waits for the **last** W13 tile,
+so it bills *max over tiles*, not the mean. The dominant term is therefore the
+**spread across W13 tiles widening in NPS2**, not W13 getting slower on average.
+It also explains why narrowing that barrier's poll was neutral
+(`MPK_NARROW_MOE_BAR_POLL`): there is no contention to remove, the tiles
+genuinely arrive further apart.
+
+So the residual NPS2 gap is a **variance** problem, which is consistent with the
+rest of this document: the `[XCDSPIN]` straggler asymmetry, and slots 5 and 7
+absorbing skew rather than containing a cause.
+
+### What was ruled out for slot 8, and how
+
+| hypothesis | test | result |
+|---|---|---|
+| MoE weights are MTYPE_NC in NPS2, RW in NPS1 | `mtypebw.cpp`: same pages, same AID, NC vs RW streaming read | **+4.2%** (3168 vs 3302 GB/s) -- cannot explain 1.8x |
+| W13->W2 barrier poll contention | `MPK_NARROW_MOE_BAR_POLL` | **neutral-to-worse** (2.794 vs 2.767 ms; slot 8 up) |
+| AID0 VRAM clamp / weight placement | driver balance patch | **neutral** (3.418 vs 3.422 ms) |
+| live cross-XCD `swiglu_out` handoff | `handoff2.cpp` | **+19%** for far-side XCDs -- real, but a fraction of one sub-phase |
+
+`mtypebw.cpp` is self-checking: the AID0 buffer is faster from XCD0-3 and the
+AID1 buffer from XCD4-7 (~14%), and plain `hipMalloc` is AID0-fast, which
+independently confirms the range-0 clamp.
+
+### `handoff2.cpp` and a trap it exposes
+
+The handoff probe writes a buffer from one XCD, publishes an epoch, and has every
+other XCD NT-read it -- which is what `gang_moe_fused_mxfp4_mi300.cuh:4741` does
+with `d_swiglu_out` ("just written by another XCD"). Consumer read time per
+round, 4 MiB, producer XCD4:
+
+| buffer | AID0 consumers | AID1 consumers | correct? |
+|---|---|---|---|
+| plain `hipMalloc` (NC) | 380k ns | 454k ns (**+19%**) | yes, all 8 |
+| `alloc_in_aid(0)` (RW) | 347k ns | **111k ns** | **NO -- stale on 3-4 XCDs** |
+| `alloc_in_aid(1)` (RW) | **112k ns** | 349k ns | **NO -- stale on 3-4 XCDs** |
+
+**Do not "optimize" `swiglu_out` onto an AID-local RW buffer.** It looks like a
+3.1x win and is silently wrong for half the XCDs: the first version of this probe
+had no data check and reported exactly that fake speedup. Every fast number above
+is a consumer that never observed the producer's writes. Plain NC is correct for
+all 8 consumers, which is why the kernel uses it.
+
+Probe caveat: the NC arm with producer XCD0 times out reproducibly (a rendezvous
+artifact in the probe, not a hardware result). The XCD4-producer arm is the clean
+one.
+
+### Next
+
+1. **W13 tile skew.** The barrier bills the slowest tile, so measure the per-tile
+   W13 completion spread directly -- `MPK_MOE_INNER_WIDE` widens the sample from
+   tile 0 to every 37th tile, which is the instrument for exactly this.
+2. **W2 `compute` doubling** (2.30 -> 4.60). It reads `swiglu_out` (+19%
+   far-side) and the W2 weights (+4%), which do not add up to 2x.

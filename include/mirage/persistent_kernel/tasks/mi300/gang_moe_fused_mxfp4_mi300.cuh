@@ -4682,6 +4682,33 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     MPK_WS_WAVE_CLEAR(warp_id);
     int _obs;
     int _spins = 0;
+#ifdef MPK_NARROW_MOE_BAR_POLL
+    // One thread polls the W13->W2 release for the block instead of all 256.
+    //
+    // Same contention argument that made MPK_NARROW_GATE_POLL worth 16.5%: at
+    // `sc0 sc1` every polling wave is a real trip to the coherency point, and
+    // ~/nps1/relobs3.sh measured a shared line going 5.0 us at 64 pollers ->
+    // 26.6 at 128 -> 40.1 at 192. Unlike MPK_NARROW_HIER_POLL (measured
+    // neutral) the waiters here are about to do W2 work, not already idle,
+    // which is the case that paid.
+    //
+    // The cost is what the comment below describes: the per-thread poll lets
+    // waves leave independently and start their own FP8 quant, so narrowing
+    // trades that pipelining for 4x fewer pollers. Which wins is a
+    // measurement, not an argument. Safe to add __syncthreads: the block
+    // already reconverges unconditionally a few lines later.
+    //
+    // MEASURED NEUTRAL-TO-WORSE, left off. On top of MPK_NARROW_GATE_POLL=1:
+    // 2.818 / 2.770 with it against 2.773 / 2.761 without, and MoE-only slot 8
+    // went UP (19735 vs 18397 ns/layer). The pipelining loss cancels the
+    // polling saving, so the per-thread poll below is the right default and the
+    // "deliberately divergent" note is correct. Taken together with
+    // MPK_NARROW_HIER_POLL (also neutral) and MPK_NARROW_GATE_POLL (-16.5%):
+    // narrowing a poll pays only where the line is contended exactly when it is
+    // written AND the waiters are about to do work. Poller count alone predicts
+    // nothing.
+    if (tid == 0)
+#endif
     while ((_obs = MPK_LD_GATE2(&d_barrier_rel[base + xcd_id * MOE_BAR_LINE])) <
            expected) {
       MPK_WS_WAIT_TICK(_obs, _spins);
@@ -4717,6 +4744,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       __builtin_amdgcn_s_sleep(1);
 #endif
     }
+#ifdef MPK_NARROW_MOE_BAR_POLL
+    __syncthreads();
+#endif
     // This wave's threads all cleared the release. Record it: the poll is
     // per-thread with no __syncthreads, so waves leave independently and a
     // block can be split across the barrier.
