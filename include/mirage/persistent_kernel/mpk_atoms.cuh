@@ -424,6 +424,96 @@ __device__ __forceinline__ void
 }
 
 // Same, addressing by raw int index rather than 64 B slot.
+// 64-bit form, for the (epoch, expert) record the early-routing path writes at
+// [(1+x)*16+2]. Alignment holds by construction: that index is 64*(1+x)+8 bytes
+// from the family base, and the base offset is itself 8-byte aligned.
+__device__ __forceinline__ void mpk_aid_publish_at_u64(void *shared_base,
+                                                       int idx,
+                                                       unsigned long long val,
+                                                       int off_ints) {
+  int *a = g_aid_flag_rep[0];
+  int *b = g_aid_flag_rep[1];
+  if (a != nullptr && b != nullptr) {
+    st_wt_u64((void *)&a[off_ints + idx], val);
+    st_wt_u64((void *)&b[off_ints + idx], val);
+  } else {
+    st_wt_u64((void *)&((int *)shared_base)[idx], val);
+  }
+}
+
+// ?? AID-local copy of the O-proj output row ???????????????????????????????
+// The row lives at the same [batch][output_stride] offsets inside each AID
+// replica, so an index computed for the shared buffer indexes the replica too.
+//
+// 256 KiB into the 2 MiB replica, clear of the routing family at 32768 ints.
+// The bound is checked identically on the write and the read side: if the row
+// does not fit, BOTH fall back to the shared buffer. They must never disagree
+// -- a publisher writing the replica while a consumer reads the shared copy is
+// a silently stale read, not a hang.
+// AID-local copy of attn_out. 1.25 MiB into the 2 MiB replica, past the
+// O-proj row region (65536 ints + 1 MiB). Indexed exactly like the shared
+// buffer, in 32-bit units: element e of the row lives at int index
+// MPK_AID_ATTNOUT_BASE_INTS + e/2, and every slice base is even.
+constexpr int MPK_AID_ATTNOUT_BASE_INTS = 327680;
+constexpr int MPK_AID_ATTNOUT_MAX_BYTES = 512 * 1024;
+
+__device__ __forceinline__ bool mpk_aid_attnout_live() {
+  return g_aid_flag_rep[0] != nullptr && g_aid_flag_rep[1] != nullptr;
+}
+
+// Reader: the attn_out base homed in this XCD's own memory range.
+__device__ __forceinline__ void const *
+    mpk_aid_attnout_base(void const *shared, int xcd_id) {
+  if (!mpk_aid_attnout_live()) {
+    return shared;
+  }
+  return (void const *)(g_aid_flag_rep[xcd_id >> 2] +
+                        MPK_AID_ATTNOUT_BASE_INTS);
+}
+
+// Writer: mirror one 32-bit pair of bf16 elements into both replicas.
+__device__ __forceinline__ void mpk_aid_attnout_publish32(int dw,
+                                                          unsigned val) {
+  if (!mpk_aid_attnout_live()) {
+    return;
+  }
+  st_wt_u32((void *)&g_aid_flag_rep[0][MPK_AID_ATTNOUT_BASE_INTS + dw], val);
+  st_wt_u32((void *)&g_aid_flag_rep[1][MPK_AID_ATTNOUT_BASE_INTS + dw], val);
+}
+
+constexpr int MPK_AID_OUT_BASE_INTS = 65536;
+constexpr int MPK_AID_OUT_MAX_BYTES = 1024 * 1024;
+
+__device__ __forceinline__ bool mpk_aid_out_fits(int bytes) {
+  return bytes <= MPK_AID_OUT_MAX_BYTES && g_aid_flag_rep[0] != nullptr &&
+         g_aid_flag_rep[1] != nullptr;
+}
+
+// Reader: the row base homed in this XCD's own memory range.
+__device__ __forceinline__ void const *
+    mpk_aid_out_base(void const *shared, int xcd_id, int bytes) {
+  if (!mpk_aid_out_fits(bytes)) {
+    return shared;
+  }
+  return (void const *)(g_aid_flag_rep[xcd_id >> 2] + MPK_AID_OUT_BASE_INTS);
+}
+
+// Writer: mirror one packed-4-bf16 payload into both replicas. `idx` is in
+// bf16 elements and is a multiple of 4, and the region base is 256 KiB
+// aligned, so the 8-byte store stays aligned.
+__device__ __forceinline__ void
+    mpk_aid_out_publish(int idx, unsigned long long val, int bytes) {
+  if (!mpk_aid_out_fits(bytes)) {
+    return;
+  }
+  unsigned short *a =
+      (unsigned short *)(g_aid_flag_rep[0] + MPK_AID_OUT_BASE_INTS);
+  unsigned short *b =
+      (unsigned short *)(g_aid_flag_rep[1] + MPK_AID_OUT_BASE_INTS);
+  st_wt_u64((void *)&a[idx], val);
+  st_wt_u64((void *)&b[idx], val);
+}
+
 __device__ __forceinline__ void mpk_aid_publish_at(int *shared_base,
                                                    int idx,
                                                    unsigned int val,

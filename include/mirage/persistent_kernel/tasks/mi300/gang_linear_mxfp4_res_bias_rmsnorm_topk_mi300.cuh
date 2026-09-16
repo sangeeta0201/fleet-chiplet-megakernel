@@ -388,7 +388,15 @@ __device__ __attribute__((noinline)) void
   constexpr int TOK_REGION = TOK_ROWS * TOK_ROW_STRIDE;
   constexpr int SC_REGION = TOK_ROWS * SC_STRIDE;
 
+#if defined(MPK_AID_SPLIT_ATTNOUT) && defined(MPK_AID_SPLIT_FLAGS)
+  static_assert((size_t)BATCH_SIZE * REDUCTION_SIZE * 2 <=
+                    MPK_AID_ATTNOUT_MAX_BYTES,
+                "attn_out does not fit the AID replica region");
+  unsigned short const *A = (unsigned short const *)mpk_aid_attnout_base(
+      input_ptr, tile_idx / tiles_per_xcd);
+#else
   unsigned short const *A = (unsigned short const *)input_ptr;
+#endif
   uint8_t const *W = (uint8_t const *)weight_ptr;
   unsigned short const *d_residual = (unsigned short const *)residual_ptr;
   unsigned short const *d_bias = (unsigned short const *)bias_ptr;
@@ -1023,6 +1031,10 @@ __device__ __attribute__((noinline)) void
               (unsigned long long)o0 | ((unsigned long long)o1 << 16) |
               ((unsigned long long)o2 << 32) | ((unsigned long long)o3 << 48);
           st_wt_u64(&d_output[out_idx_base], out64);
+#if defined(MPK_AID_SPLIT_OUT) && defined(MPK_AID_SPLIT_FLAGS)
+          mpk_aid_out_publish(out_idx_base, out64,
+                              BATCH_SIZE * output_stride * 2);
+#endif
         }
       }
     } else {
@@ -1413,6 +1425,10 @@ __device__ __attribute__((noinline)) void
             (unsigned long long)o0 | ((unsigned long long)o1 << 16) |
             ((unsigned long long)o2 << 32) | ((unsigned long long)o3 << 48);
         st_wt_u64(&d_output[out_idx_base], out64);
+#if defined(MPK_AID_SPLIT_OUT) && defined(MPK_AID_SPLIT_FLAGS)
+        mpk_aid_out_publish(out_idx_base, out64,
+                            BATCH_SIZE * output_stride * 2);
+#endif
       }
     }
   }
@@ -1879,7 +1895,14 @@ oproj_barrier :
 
   {
     using bf16 = __hip_bfloat16;
+#if defined(MPK_AID_SPLIT_OUT) && defined(MPK_AID_SPLIT_FLAGS)
+    // Read the copy homed in this XCD's own range. Same bound as the publish,
+    // so writer and reader can only ever agree on which buffer is live.
+    bf16 const *__restrict__ d_hidden = static_cast<bf16 const *>(
+        mpk_aid_out_base(output_ptr, xcd_id, BATCH_SIZE * output_stride * 2));
+#else
     bf16 const *__restrict__ d_hidden = static_cast<bf16 const *>(output_ptr);
+#endif
     bf16 const *__restrict__ d_gamma =
         static_cast<bf16 const *>(norm_weight_ptr);
     bf16 *__restrict__ d_normed = static_cast<bf16 *>(norm_output_ptr);
@@ -2797,7 +2820,13 @@ topk_barrier :
     // store to routing_ready_ptr[0] before any of these eight flags issue.
     rr_epoch = __builtin_amdgcn_readfirstlane(rr_epoch);
     if (rr_epoch != 0 && tid < 8) {
+#ifdef MPK_AID_SPLIT_ROUTING
+      // Both replicas: a reader in the other AID polls the other copy.
+      mpk_aid_publish_at(routing_ready_ptr, (1 + tid) * 16,
+                         (unsigned)rr_epoch, MPK_AID_ROUTING_BASE_INTS);
+#else
       st_wt_u32((void *)&routing_ready_ptr[(1 + tid) * 16], (unsigned)rr_epoch);
+#endif
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
 #endif
