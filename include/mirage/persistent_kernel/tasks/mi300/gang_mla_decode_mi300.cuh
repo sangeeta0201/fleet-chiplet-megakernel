@@ -209,6 +209,28 @@
 #define MPK_MLA_DECODE_DBLBUF 0
 #endif
 
+// MPK_MLA_DECODE_BAR_LDS: HIP __syncthreads() is
+//   s_waitcnt vmcnt(0) ; s_barrier ; s_waitcnt vmcnt(0)
+// and that is 16 of the decode kernel's 26 full vmcnt(0) drains (8 s_barrier
+// in the image). The tile loop only needs an LDS barrier: the first wait is
+// "KV rows are in lds_kv" (ds_write, lgkmcnt), the second is "every lane is
+// done with QK/PV ds_reads" (also lgkmcnt). Draining vmcnt at those points
+// is what made MPK_MLA_DECODE_DBLBUF a null -- tile t+1's global loads cannot
+// live across the backedge if the barrier retires them. gpt-oss's counted
+// vmcnt pattern is the same idea: do not wait on a payload you will not use
+// yet. Default OFF. Compile-time; every rank must agree.
+#ifndef MPK_MLA_DECODE_BAR_LDS
+#define MPK_MLA_DECODE_BAR_LDS 0
+#endif
+#if MPK_MLA_DECODE_BAR_LDS
+__device__ __forceinline__ void mla_tile_bar() {
+  asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+  __builtin_amdgcn_s_barrier();
+}
+#else
+__device__ __forceinline__ void mla_tile_bar() { __syncthreads(); }
+#endif
+
 // __mfma_qk_hd64 / __mfma_pv_hd64 / __fast_exp2_hd64 / __load_bf16x4_to_fp16 /
 // __load_bf16x4_raw / __cvt_bf16x4_to_fp16 live here. They are tiling-agnostic
 // despite the hd64 name.
@@ -837,7 +859,7 @@ __device__ __noinline__ void
       }
     }
     asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
-    __syncthreads();
+    mla_tile_bar();
 
     {
       mla_qk_acc32_zero();
@@ -931,7 +953,7 @@ __device__ __noinline__ void
     _d_compute += _d_b - _d_a;
 #endif
     // Next trip overwrites LDS; wait for every lane's QK/PV reads.
-    __syncthreads();
+    mla_tile_bar();
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     _d_refill += __builtin_amdgcn_s_memrealtime() - _d_b;
 #endif

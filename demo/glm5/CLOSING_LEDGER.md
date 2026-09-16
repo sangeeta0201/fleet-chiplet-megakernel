@@ -1071,6 +1071,29 @@ sweep that keeps `seq % (chunks*KV_TILE) == 0`, not a worker-count change.
 **Practical conclusion: 32 is the shipped maximum**, and it is the best of the
 legal values, not merely the first that worked.
 
+##### gpt-oss counted-vmcnt on the decode, priced at 1k/1k — 2026-09-16
+
+`MPK_MLA_DECODE_BAR_LDS` replaces the tile loop's `__syncthreads()` (which is
+`vmcnt(0); s_barrier; vmcnt(0)`) with `lgkmcnt(0)+s_barrier`. Combined with
+`MPK_MLA_DECODE_DBLBUF` that is the gpt-oss handoff applied to MLA: keep the
+next tile's global loads in flight across the LDS barrier.
+
+1024/1024, chunks=32 shipping default, GPUs 4-7, G1 PASS on both variant arms.
+The control arm of this campaign wedged 4/4 (`rc=124`), so the comparison is
+against today's control band (11.245-11.363, mean 11.30):
+
+| arm | decode_min | vs band |
+|---|---:|---|
+| BAR_LDS | 11.314 | inside |
+| BAR_LDS + DBLBUF | 11.261 | inside |
+
+**NULL.** The mechanism is real (decode ISA has 26 `vmcnt(0)` vs 8 `s_barrier`)
+and the code is correct, but it does not move the 1k/1k wall. Default OFF.
+
+The leftover ATOM gap at this shape is ~0.75 ms (11.30 vs 10.55) and is not
+this drain. Next: `MPK_RMSNORM_DPP` (gpt-oss ssq-off-LDS) and next-layer
+`MPK_QKVA_PF_KB` (idle-worker weight prefetch; earlier A/B died on wedges).
+
 ##### The memory-stall census, re-read at the shipped geometry — 2026-09-16
 
 `isa_outstanding.py` on today's image. `carry` is overlap across the backedge;
@@ -1107,8 +1130,11 @@ round. Counted `vmcnt` and cross-iteration hoisting are back on the table, and
 they are pointed at the phase whose participants set the max.
 
 Do not re-read `MPK_MLA_DECODE_DBLBUF`'s +0.08 ms as a refutation of this: it
-bought a second register buffer for a loop that never went round. Re-price it,
-and the counted-handoff form, at 1024/1024.
+bought a second register buffer for a loop that never went round. Re-priced at
+1024/1024 with `MPK_MLA_DECODE_BAR_LDS` (LDS-only barrier so the prefetch
+survives): BAR_LDS 11.314, BAR_LDS+DBLBUF 11.261, both inside the 11.245-11.363
+control band. **NULL at the scored shape too.** The drain is real; hiding it
+does not move the wall.
 
 **Watchdog prerequisite, fixed in the same change.** Two earlier attempts at
 this sweep were lost because `stall_watchdog.sh` derived liveness from HBM

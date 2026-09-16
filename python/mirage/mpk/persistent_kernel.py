@@ -1454,6 +1454,7 @@ def get_compile_command(
             # kv_pre_odd in gang_mla_decode_mi300.cuh. Compile-time, so every
             # rank must agree.
             "MPK_MLA_DECODE_DBLBUF",
+            "MPK_MLA_DECODE_BAR_LDS",
         ):
             _x = os.environ.get(_v)
             if _x is not None:
