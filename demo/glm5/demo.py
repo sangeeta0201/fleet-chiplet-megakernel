@@ -1950,8 +1950,29 @@ if __name__ == "__main__":
         if _env_chunks is not None:
             num_kv_chunks = int(_env_chunks)
         else:
+            # ── Ceiling raised 16 -> 32, 2026-09-15. -1.417 ms at 1024/1024 ──
+            # The 16 was chosen at seq <= 128, where the decode loop is
+            # single-trip and splitting further can only divide a fixed
+            # prologue. At 1024/1024 _kv_tiles is 256, the loop is 8-trip, and
+            # the cap left 64 of 240 workers carrying the one phase whose
+            # participants set the makespan. Measured, one -D apart, coherent
+            # text and G1 PASS on every arm:
+            #
+            #   chunks=16   12.691  12.708  12.732  12.753   mean 12.721
+            #   chunks=32   11.363  11.245                   mean 11.304
+            #
+            # -1.417 ms, against a control spread of 0.062 ms. See the
+            # CLOSING_LEDGER section "the decode width cap is a seq<=128
+            # constant" for why the old +0.157 ms refutation did not apply.
+            #
+            # DO NOT RAISE FURTHER WITHOUT FIXING THE GEOMETRY. 48 and 64 both
+            # wedge at iteration 1, reproducibly (2/2 attempts each). 64 is
+            # 4 q_groups x 64 = 256 tiles against a 240-worker pool, i.e. 32
+            # tiles per XCD on 30 workers; 48 is 24 per XCD and still hangs, so
+            # the binding constraint is tiles_per_xcd taken as the max over
+            # phases, not this phase alone.
             _kv_tiles = max(1, (args.max_seq_length + 7) // 8)
-            num_kv_chunks = max(1, min(16, _kv_tiles))
+            num_kv_chunks = max(1, min(32, _kv_tiles))
         assert num_kv_chunks >= 1
         # The merge is otherwise one task per q group -- 2 CUs of 256, each
         # thread carrying kv_lora/16 = 32 unrolled softmax chains. Slice the
