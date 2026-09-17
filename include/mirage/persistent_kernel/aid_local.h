@@ -313,6 +313,11 @@ static inline void *
     printf("[AID] hipImportExternalMemory failed\n");
     return nullptr;
   }
+  // HIP holds its own reference after a successful import, so the PRIME fd
+  // can be released here. Without this every alloc_in_aid leaks one fd and
+  // relocating a few slots across 36 layers hits the 1024 limit
+  // ("Too many open files") after the placement has already succeeded.
+  close(prime.fd);
   hipExternalMemoryBufferDesc bd = {};
   bd.offset = 0;
   bd.size = bytes;

@@ -1448,6 +1448,24 @@ def get_compile_command(
             flags = flags + ["-DMPK_AID_SPLIT_ROUTING"]
         if int(os.environ.get("MPK_AID_SPLIT_OUT", "0")) == 1:
             flags = flags + ["-DMPK_AID_SPLIT_OUT"]
+        if int(os.environ.get("MPK_AID_EVCTR", "0")) == 1:
+            flags = flags + ["-DMPK_AID_EVCTR"]
+        if int(os.environ.get("MPK_HIER_WAIT_TIMER", "0")) == 1:
+            flags = flags + ["-DMPK_HIER_WAIT_TIMER"]
+        if int(os.environ.get("MPK_TOPK_HIER", "0")) == 1:
+            flags = flags + ["-DMPK_TOPK_HIER"]
+        _p7skip = int(os.environ.get("MPK_P7_SKIP", "0"))
+        if _p7skip != 0:
+            flags = flags + ["-DMPK_P7_SKIP=%d" % _p7skip]
+        if int(os.environ.get("MPK_AID_EVTIER", "0")) == 1:
+            flags = flags + ["-DMPK_AID_EVTIER"]
+        if int(os.environ.get("MPK_AID_SPLIT_HIER_LOCAL", "0")) == 1:
+            flags = flags + ["-DMPK_AID_SPLIT_HIER_LOCAL"]
+        _only_op = os.environ.get("MPK_ONLY_OP", "")
+        if _only_op != "":
+            flags = flags + ["-DMPK_ONLY_OP=" + str(int(_only_op))]
+        if int(os.environ.get("MPK_AID_SPLIT_QKV", "0")) == 1:
+            flags = flags + ["-DMPK_AID_SPLIT_QKV"]
         if int(os.environ.get("MPK_AID_SPLIT_ATTNOUT", "0")) == 1:
             flags = flags + ["-DMPK_AID_SPLIT_ATTNOUT"]
         if int(os.environ.get("MPK_NARROW_MOE_BAR_POLL", "0")) == 1:
@@ -1494,6 +1512,8 @@ def get_compile_command(
             # Hash e86d7dc all six. A/B −6 / −33 / +7 µs; only pair 2 clears
             # 10 us, and C2 1.758 looks like a control spike.
             flags = flags + ["-DMPK_OPROJ_AMAX_DPP"]
+        if int(os.environ.get("MPK_OPROJ_AID_AGG", "0")) == 1:
+            flags = flags + ["-DMPK_OPROJ_AID_AGG"]
         if _opt("MPK_NARROW_OPROJ_HIER"):
             # One tid polls the O-proj hierarchical release; the acquire
             # __syncthreads already below carries the other 255. Unlike

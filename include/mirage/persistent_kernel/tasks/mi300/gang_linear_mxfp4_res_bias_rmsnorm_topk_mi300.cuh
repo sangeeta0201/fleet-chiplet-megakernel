@@ -49,6 +49,17 @@
 #include "tasks/mi300/gang_moe_linear_mxfp4_mi300.cuh"    // FP4xFP8 helpers
 #include "tasks/mi300/gang_rmsnorm_linear_bias_mi300.cuh" // topk_noinline
 
+// MPK_P7_SKIP bisection: remove one class of wait at a time. Releases are
+// never removed, so nothing can deadlock; results are garbage by design and
+// only the timing is meaningful.
+#ifdef MPK_P7_SKIP
+#define MPK_P7_SK(bit) (((MPK_P7_SKIP) & (bit)) != 0)
+#else
+#define MPK_P7_SK(bit) false
+#endif
+
+
+
 namespace kernel {
 
 // ── O-proj LDS layout, shared with the Phase-6 weight DMA ─────────────────
@@ -132,7 +143,7 @@ __device__ __forceinline__ void
   constexpr int kScale = 128;
   constexpr int kSlice = 512;
   constexpr int kTps = kScale / kElem;
-  while (ld_sys_s32(rel) < layer_epoch) {
+  while (!MPK_P7_SK(1) && ld_sys_s32(rel) < layer_epoch) {
     __builtin_amdgcn_s_sleep(1);
   }
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
@@ -424,7 +435,14 @@ __device__ __attribute__((noinline)) void
   // FULL_LAYER_CHUNK_BARRIER_SLOT), and the tail counters this file's fused
   // caller pins are at 44..47. The buffer is sized well past 36 lines by
   // demo.py's counter_size, so this needs no allocation change.
+#if defined(MPK_AID_SPLIT_HIER_LOCAL) && defined(MPK_AID_SPLIT_FLAGS)
+  // Arrival tree on this AID's replica. XCD-private, so the atomic and every
+  // read of it stay on the same die and cannot straddle replicas.
+  int *hier_local = mpk_aid_flags_hw(hier_barrier + 28 * HIER_STRIDE,
+                                     MPK_AID_REGION_HIER_LOCAL);
+#else
   int *hier_local = hier_barrier + 28 * HIER_STRIDE;
+#endif
 #ifdef MPK_ROUTER_XCD_FOLD
 #ifndef MPK_OPROJ_TREE_BARRIER
 #error "MPK_ROUTER_XCD_FOLD publishes from the tree-barrier local-last"
@@ -609,7 +627,7 @@ __device__ __attribute__((noinline)) void
                     "split-slice wait assumes 32 lanes cover one 512-elem XCD");
       for (int sl = 0; sl < 2; sl++) {
         int *rel = sl == 0 ? rel0 : rel1;
-        while (ld_sys_s32(rel) < layer_epoch) {
+        while (!MPK_P7_SK(1) && ld_sys_s32(rel) < layer_epoch) {
           __builtin_amdgcn_s_sleep(1);
         }
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
@@ -677,13 +695,14 @@ __device__ __attribute__((noinline)) void
       int s0, s1;
       do {
         ld_sys_s32x2(rel0, rel1, s0, s1);
-        if (s0 >= layer_epoch && s1 >= layer_epoch) {
+        if (MPK_P7_SK(1) || (s0 >= layer_epoch && s1 >= layer_epoch)) {
           break;
         }
         __builtin_amdgcn_s_sleep(1);
       } while (true);
 #else
-      while (ld_sys_s32(rel0) < layer_epoch || ld_sys_s32(rel1) < layer_epoch) {
+      while (!MPK_P7_SK(1) &&
+             (ld_sys_s32(rel0) < layer_epoch || ld_sys_s32(rel1) < layer_epoch)) {
 #ifndef MPK_SLICE_BUSY_POLL
         __builtin_amdgcn_s_sleep(1);
 #endif
@@ -1649,11 +1668,30 @@ oproj_barrier :
 #endif
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 #endif
+#ifdef MPK_OPROJ_AID_AGG
+        // Aggregate inside the AID first, so only one atomic per AID reaches
+        // the shared counter and exactly ONE crosses the boundary. Slots 26
+        // and 27 are free in the hier_barrier map (0-7 release, 8 counter,
+        // 9 topk_counter, 28 hier_local) and are separate lines, so the two
+        // AIDs do not contend with each other.
+        int const _agg_aid = xcd_id >> 2;
+        int const _agg_prev = atom_add_release_gpu_s32(
+            &hier_barrier[(26 + _agg_aid) * HIER_STRIDE], 1);
+        if ((_agg_prev % 4) == 3) {
+          // Last of this AID's four XCDs.
+          int const prev_global =
+              atom_add_release_gpu_s32(&hier_barrier[8 * HIER_STRIDE], 1);
+          if ((prev_global % 2) == 1) {
+            oproj_rel_epoch = oproj_release_expected;
+          }
+        }
+#else
         int const prev_global =
             atom_add_release_gpu_s32(&hier_barrier[8 * HIER_STRIDE], 1);
         if ((prev_global % 8) == 7) {
           oproj_rel_epoch = oproj_release_expected;
         }
+#endif
       }
 #else
       // Single global arrival (all workers increment one counter)
@@ -1779,7 +1817,8 @@ oproj_barrier :
     // other 255 threads do not need their own sc0 sc1 reads of this line.
     if (tid == 0)
 #endif
-      while (MPK_LD_GATE2(&hier_release[xcd_id * HIER_STRIDE]) <
+      while (!MPK_P7_SK(2) &&
+             MPK_LD_GATE2(&hier_release[xcd_id * HIER_STRIDE]) <
              oproj_release_expected) {
         __builtin_amdgcn_s_sleep(1);
       }
@@ -2036,11 +2075,13 @@ oproj_barrier :
         // Adjacent XCDs' 368-col slices share a 128 B line (736 % 128 != 0).
         // Waiting for x+1 before reading x keeps that line from tearing.
         // All 256 threads poll so there is no per-slice syncthreads.
-        while (MPK_LD_GATE(&oproj_xcd_ready[x * 16]) < slice_epoch) {
+        while (!MPK_P7_SK(4) &&
+               MPK_LD_GATE(&oproj_xcd_ready[x * 16]) < slice_epoch) {
           __builtin_amdgcn_s_sleep(1);
         }
         if (x < 7) {
-          while (MPK_LD_GATE(&oproj_xcd_ready[(x + 1) * 16]) < slice_epoch) {
+          while (!MPK_P7_SK(4) &&
+                 MPK_LD_GATE(&oproj_xcd_ready[(x + 1) * 16]) < slice_epoch) {
             __builtin_amdgcn_s_sleep(1);
           }
         }
@@ -2631,7 +2672,20 @@ topk_barrier :
 
   __shared__ int s_topk_done;
   if (tid == 0) {
+#if defined(MPK_TOPK_HIER) && defined(MPK_AID_SPLIT_FLAGS)
+    // Two-level: accumulate on this AID's RW replica, and let only this
+    // XCD's last participant add router_tile_n to the shared counter. The
+    // global total, and therefore which worker runs top-k, is unchanged.
+    int *topk_local =
+        mpk_aid_flags_hw(hier_barrier, MPK_AID_REGION_TOPK);
+    int const v = atom_add_xcd_local_s32(&topk_local[xcd_id * HIER_STRIDE], 1) + 1;
+    s_topk_done = 0;
+    if (v == router_tile_n * layer_epoch) {
+      s_topk_done = atomicAdd(topk_counter, router_tile_n) + router_tile_n;
+    }
+#else
     s_topk_done = atomicAdd(topk_counter, 1) + 1;
+#endif
   }
   __syncthreads();
 

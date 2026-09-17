@@ -68,6 +68,20 @@ constexpr int MPK_AID_REGION_OPROJ_READY = 2; // MPK_ROUTER_XCD_FOLD only
 // XCD-local tree at [28*16] stay shared: they are atomics, and those are
 // XCD-L2-bound rather than AID-bound, so placement does nothing for them.
 constexpr int MPK_AID_REGION_HIER_RELEASE = 3;
+// qkv_epoch's eight per-XCD slots. Unlike the release families this one is
+// never read across the AID boundary: the arrival and both polls all address
+// `[xcd_id * 16]`, so only the AID running that XCD ever wants the value.
+// Hence a single replica write rather than a dual publish, and the arrival
+// atomic lands on a line homed in the AID performing it.
+constexpr int MPK_AID_REGION_QKV_EPOCH = 4;
+// The O-proj barrier's per-XCD ARRIVAL tree. Like qkv_epoch this is never read
+// across the AID boundary -- the file calls level 1 "XCD-private, written and
+// read only at [xcd_id]" -- so one replica write, read locally, no dual
+// publish. Regions 0..5 use 6*128 = 768 ints, still under MPK_AID_MOE_BASE_INTS.
+constexpr int MPK_AID_REGION_HIER_LOCAL = 5;
+// Per-XCD arrival counters for the top-k barrier. Region 6 keeps
+// 7*128 = 896 ints, still below MPK_AID_MOE_BASE_INTS (1024).
+constexpr int MPK_AID_REGION_TOPK = 6;
 
 // The MoE fused barrier is per-expert (MOE_BAR_STRIDE ints each), so at 128
 // experts it needs ~20k ints rather than the eight lines the families above
@@ -454,6 +468,103 @@ __device__ __forceinline__ void mpk_aid_publish_at_u64(void *shared_base,
 // O-proj row region (65536 ints + 1 MiB). Indexed exactly like the shared
 // buffer, in 32-bit units: element e of the row lives at int index
 // MPK_AID_ATTNOUT_BASE_INTS + e/2, and every slice base is even.
+// AID-local mirrors of the scheduler's event counters. 1.75 MiB into the 2 MiB
+// replica, past the attn_out region, leaving room for 8192 u64 counters against
+// the ~42 this model builds. The shared counter stays authoritative; these are
+// published copies that only the dependency POLL reads.
+constexpr int MPK_AID_EVCTR_BASE_INTS = 458752;
+constexpr int MPK_AID_EVCTR_MAX = 8192;
+
+// Per-AID event accumulator: the middle tier between the per-XCD counters and
+// the global one. Each AID replica holds its OWN array, so indexing it through
+// this XCD's replica selects that AID's counter and the atomic stays local.
+constexpr int MPK_AID_EVTIER_BASE_INTS = 475136;  // past the EVCTR mirrors
+constexpr int MPK_AID_XCDS_PER_AID = 4;
+
+__device__ __forceinline__ unsigned long long *mpk_aid_evtier_ptr() {
+  unsigned x;
+  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID)" : "=s"(x));
+  int *r = g_aid_flag_rep[(x & 0x7) >> 2];
+  return r ? (unsigned long long *)(r + MPK_AID_EVTIER_BASE_INTS) : nullptr;
+}
+
+// Post-increment count for this AID; sets *out_ok to 0 if the tier is
+// unavailable, in which case the caller takes the original global path.
+__device__ __forceinline__ unsigned long long
+    mpk_aid_evtier_add(int idx, unsigned long long *out_ok) {
+  unsigned long long *p = mpk_aid_evtier_ptr();
+  if (p == nullptr || idx >= MPK_AID_EVCTR_MAX) {
+    *out_ok = 0;
+    return 0;
+  }
+  *out_ok = 1;
+  return atomicAdd(&p[idx], 1ULL) + 1ULL;
+}
+
+__device__ __forceinline__ unsigned long long *mpk_aid_evctr_rep(int aid) {
+  int *r = g_aid_flag_rep[aid];
+  return r ? (unsigned long long *)(r + MPK_AID_EVCTR_BASE_INTS) : nullptr;
+}
+
+// atomicMax, not a store: increments from different XCDs retire out of order,
+// and a plain store could move a mirror BACKWARDS past a threshold a reader is
+// already waiting on, stalling it forever. Max is monotone.
+__device__ __forceinline__ void mpk_aid_evctr_pub(int idx,
+                                                  unsigned long long v) {
+  if (idx >= MPK_AID_EVCTR_MAX) {
+    return;
+  }
+  unsigned long long *a = mpk_aid_evctr_rep(0);
+  unsigned long long *b = mpk_aid_evctr_rep(1);
+  if (a == nullptr || b == nullptr) {
+    return;
+  }
+  // Write-through, NOT atomicMax. A cross-AID atomic on an MTYPE_RW line is
+  // not visible -- RW is coherent only inside its own AID -- which is what
+  // hung v2. A write-through store from either AID does reach both replicas,
+  // the same mechanism the flag replicas rely on. It is not monotone, so the
+  // poll below re-reads the shared counter periodically to recover.
+  st_wt_u64((void *)&a[idx], v);
+  st_wt_u64((void *)&b[idx], v);
+}
+
+__device__ __forceinline__ unsigned long long
+    mpk_aid_evctr_load(void *shared_base, int idx) {
+  unsigned long long *sh = (unsigned long long *)shared_base;
+  if (idx >= MPK_AID_EVCTR_MAX) {
+    return MPK_LD_EVENT(&sh[idx]);
+  }
+  unsigned x;
+  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID)" : "=s"(x));
+  unsigned long long *m = mpk_aid_evctr_rep((x & 0xf) >> 2);
+  if (m == nullptr) {
+    return MPK_LD_EVENT(&sh[idx]);
+  }
+  return MPK_LD_EVENT(&m[idx]);
+}
+
+// Poll-form read: the mirror on all but every 64th spin, the authoritative
+// shared counter on those, so a mirror left stale or regressed by an
+// out-of-order write-through can delay a worker but can never deadlock it.
+__device__ __forceinline__ unsigned long long
+    mpk_aid_evctr_poll(void *shared_base, int idx, unsigned it) {
+  unsigned long long *sh = (unsigned long long *)shared_base;
+  if ((it & 63u) == 63u) {
+    return MPK_LD_EVENT(&sh[idx]);
+  }
+  return mpk_aid_evctr_load(shared_base, idx);
+}
+
+// Expression-form read, so the call site needs no preprocessor block and keeps
+// its own semicolon.
+#if defined(MPK_AID_EVCTR) && defined(MPK_AID_SPLIT_FLAGS)
+#define MPK_EVCTR_READ(base, idx) mpk_aid_evctr_load((base), (idx))
+#define MPK_EVCTR_POLL(base, idx, it) mpk_aid_evctr_poll((base), (idx), (it))
+#else
+#define MPK_EVCTR_READ(base, idx) MPK_LD_EVENT(&(base)[idx])
+#define MPK_EVCTR_POLL(base, idx, it) MPK_LD_EVENT(&(base)[idx])
+#endif
+
 constexpr int MPK_AID_ATTNOUT_BASE_INTS = 327680;
 constexpr int MPK_AID_ATTNOUT_MAX_BYTES = 512 * 1024;
 

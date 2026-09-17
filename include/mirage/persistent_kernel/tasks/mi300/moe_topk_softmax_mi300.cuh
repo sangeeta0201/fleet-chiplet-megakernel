@@ -374,10 +374,19 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
           unsigned long long const record =
               (unsigned long long)early_routing_epoch |
               ((unsigned long long)(unsigned)expert << 32);
+#ifdef MPK_AID_SPLIT_ROUTING
+          mpk_aid_publish_at_u64((void *)early_routing_ready,
+                                 (1 + k_idx * 2) * 16 + 2, record,
+                                 MPK_AID_ROUTING_BASE_INTS);
+          mpk_aid_publish_at_u64((void *)early_routing_ready,
+                                 (1 + k_idx * 2 + 1) * 16 + 2, record,
+                                 MPK_AID_ROUTING_BASE_INTS);
+#else
           st_wt_u64((void *)&early_routing_ready[(1 + k_idx * 2) * 16 + 2],
                     record);
           st_wt_u64((void *)&early_routing_ready[(1 + k_idx * 2 + 1) * 16 + 2],
                     record);
+#endif
           if (active_expert_ids != nullptr) {
             st_wt_u32((void *)&active_expert_ids[k_idx], (unsigned)expert);
           }
@@ -394,7 +403,13 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
               (unsigned long long)early_routing_epoch |
               ((unsigned long long)(unsigned)expert << 32);
           for (int x = 0; x < 8; x++) {
+#ifdef MPK_AID_SPLIT_ROUTING
+            mpk_aid_publish_at_u64((void *)early_routing_ready,
+                                   (1 + x) * 16 + 2, record,
+                                   MPK_AID_ROUTING_BASE_INTS);
+#else
             st_wt_u64((void *)&early_routing_ready[(1 + x) * 16 + 2], record);
+#endif
           }
         }
 #endif

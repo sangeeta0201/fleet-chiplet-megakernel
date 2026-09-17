@@ -549,7 +549,16 @@ __device__ __noinline__ void
 
   int *oproj_counters_base = static_cast<int *>(input_ptrs[16]);
   int *attn_global = oproj_counters_base + FULL_LAYER_ATTN_GLOBAL_COUNTER_SLOT;
-  int *qkv_epoch = oproj_counters_base + FULL_LAYER_QKV_EPOCH_SLOT;
+  int *qkv_epoch_shared = oproj_counters_base + FULL_LAYER_QKV_EPOCH_SLOT;
+#if defined(MPK_AID_SPLIT_QKV) && defined(MPK_AID_SPLIT_FLAGS)
+  // Arrival and both polls are confined to this XCD's own slot, so redirecting
+  // the base is the whole change: producer and consumer are on the same die and
+  // therefore in the same AID, and cannot end up on different buffers.
+  int *qkv_epoch =
+      mpk_aid_flags(qkv_epoch_shared, xcd_id, MPK_AID_REGION_QKV_EPOCH);
+#else
+  int *qkv_epoch = qkv_epoch_shared;
+#endif
   int *chunk_barrier = oproj_counters_base + FULL_LAYER_CHUNK_BARRIER_SLOT;
   int *routing_ready = oproj_counters_base + 10 * 16;
   int *attn_release_shared =
@@ -666,6 +675,7 @@ __device__ __noinline__ void
 #else
     int const qkv_tile = qkv_attn_rank;
 #endif
+#if !defined(MPK_ONLY_OP) || (MPK_ONLY_OP & (1 << 1))
     gang_resaddf32_rmsnorm_linear_mxfp4_bias_kvupd_kernel<QKV_BATCH_SIZE,
                                                           QKV_OUTPUT_PER_WG,
                                                           QKV_REDUCTION_SIZE,
@@ -712,6 +722,7 @@ __device__ __noinline__ void
         qkv_k_part
 #endif
     );
+#endif
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
     _fused_t0a = __builtin_amdgcn_s_memrealtime();
@@ -858,6 +869,7 @@ __device__ __noinline__ void
 #ifdef MPK_ATTN_SETPRIO
       asm volatile("s_setprio 1");
 #endif
+#if !defined(MPK_ONLY_OP) || (MPK_ONLY_OP & (1 << 3))
       paged_attention_ck_fmha_split_kv_impl<bfloat16,
                                             NUM_Q_PER_KV,
                                             HEAD_DIM,
@@ -883,6 +895,7 @@ __device__ __noinline__ void
           attn_scale,
           SLIDING_WINDOW,
           nullptr); // no sinks per-chunk
+#endif
 #ifdef MPK_ATTN_SETPRIO
       asm volatile("s_setprio 0");
 #endif
@@ -1022,6 +1035,7 @@ __device__ __noinline__ void
         MPK_WS_PHASE(50, qkv_epoch_expected, xcd_id);
         // WRITE_THROUGH=true: merge writes bf16 output directly via st_wt,
         // eliminating the separate __syncthreads + readback + flush pass.
+#if !defined(MPK_ONLY_OP) || (MPK_ONLY_OP & (1 << 5))
         merge_splitkv_ck_fmha<__hip_bfloat16,
                               NUM_Q_PER_KV,
                               NUM_KV_HEADS,
@@ -1040,6 +1054,7 @@ __device__ __noinline__ void
                 output_ptrs[4]), // attn_out (bf16)
             /*kv_head_idx=*/xcd_id,
             HAS_SINKS ? input_ptrs[6] : nullptr); // sinks applied here
+#endif
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
         _merge_done = __builtin_amdgcn_s_memrealtime();
@@ -1197,6 +1212,7 @@ __device__ __noinline__ void
         void const *offset_v =
             reinterpret_cast<bf16_t const *>(output_ptrs[2]) +
             static_cast<size_t>(xcd_id) * HEAD_DIM;
+#if !defined(MPK_ONLY_OP) || (MPK_ONLY_OP & (1 << 3))
         paged_attention_ck_fmha_split_kv_impl<bfloat16,
                                               NUM_Q_PER_KV,
                                               HEAD_DIM,
@@ -1223,6 +1239,7 @@ __device__ __noinline__ void
             SLIDING_WINDOW,
             nullptr,
             /*split_part=*/1);
+#endif
       }
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       __syncthreads();
@@ -1464,6 +1481,7 @@ __device__ __noinline__ void
           reinterpret_cast<__hip_bfloat16 const *>(output_ptrs[0]) +
           static_cast<size_t>(xcd_id) * oproj_n_wgs_per_xcd *
               OPROJ_OUTPUT_PER_WG;
+#if !defined(MPK_ONLY_OP) || (MPK_ONLY_OP & (1 << 7))
       gang_linear_mxfp4_res_bias_rmsnorm_topk_kernel<QKV_BATCH_SIZE,
                                                      OPROJ_OUTPUT_PER_WG,
                                                      OPROJ_REDUCTION_SIZE,
@@ -1512,6 +1530,7 @@ __device__ __noinline__ void
           nullptr
 #endif
       );
+#endif
     }
   }
   MPK_PHASE_MARK(_pslot_w, 6);
@@ -1645,18 +1664,26 @@ __device__ __noinline__ void
     int _obs;
     int _spins = 0;
     unsigned long long _rec = 0;
+#ifdef MPK_AID_SPLIT_ROUTING
+    // Poll this AID's replica of the (epoch, expert) record rather than the
+    // shared NC line; see MPK_AID_ROUTING_BASE_INTS in mpk_atoms.cuh.
+    int *const _rr = mpk_aid_flags_at(routing_ready, xcd_id,
+                                      MPK_AID_ROUTING_BASE_INTS);
+#else
+    int *const _rr = routing_ready;
+#endif
 #ifdef MPK_NARROW_GATE_POLL
     if (tid == 0)
 #endif
       do {
-        _rec = ld_sys_u64(&routing_ready[(1 + xcd_id) * 16 + 2]);
+        _rec = ld_sys_u64(&_rr[(1 + xcd_id) * 16 + 2]);
         _obs = (int)_rec;
         MPK_WS_WAIT_TICK(_obs, _spins);
         _spins++;
       } while (_obs < routing_expected);
 #ifdef MPK_NARROW_GATE_POLL
     __syncthreads();
-    _rec = ld_sys_u64(&routing_ready[(1 + xcd_id) * 16 + 2]);
+    _rec = ld_sys_u64(&_rr[(1 + xcd_id) * 16 + 2]);
 #endif
     routed_expert0 = (int)(_rec >> 32);
 #else
@@ -1790,6 +1817,7 @@ __device__ __noinline__ void
 #endif
     MPK_TW_SUB(80, moe_t);
     MPK_WS_PHASE(80, qkv_epoch_expected, xcd_id);
+#if !defined(MPK_ONLY_OP) || (MPK_ONLY_OP & (1 << 8))
     gang_moe_fused_mxfp4_kernel_mi300<QKV_BATCH_SIZE,
                                       MOE_INTERMEDIATE_SIZE,
                                       MOE_HIDDEN_SIZE,
@@ -1825,6 +1853,7 @@ __device__ __noinline__ void
                                                             routing_expected
 #endif
     );
+#endif
   }
   MPK_PHASE_MARK(_pslot_w, 8);
 
@@ -2680,6 +2709,9 @@ __device__ __noinline__ void
   }
 #endif
   MPK_PHASE_MARK(_pslot_w, 11);
+  // Back-to-back with slot 11 and nothing in between, so the span reported
+  // for slot 12 is the cost of one mark -- the recorder measuring itself.
+  MPK_PHASE_MARK(_pslot_w, 12);
   MPK_TW_SUB(90, tile_idx);
   MPK_WS_PHASE(90, qkv_epoch_expected, xcd_id);
 }

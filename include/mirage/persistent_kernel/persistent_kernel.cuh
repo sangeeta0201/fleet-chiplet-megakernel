@@ -138,17 +138,23 @@ __device__ unsigned long long g_il_n;
 //   9  Phase 9 arrival done
 //   10 Phase 9 gate cleared
 //   11 layer exit
-#define MPK_PHASE_SLOT_COUNT 12
+#define MPK_PHASE_SLOT_COUNT 13
+// Per-worker stride padded to a full 128 B line. The arrays are indexed
+// by STRIDE and iterated by COUNT, so only the spacing changes.
+#define MPK_PHASE_SLOT_STRIDE 16
+#define MPK_PHASE_PAD_INT 32   /* 32 * 4 B = 128 B */
+#define MPK_PHASE_PAD_U64 16   /* 16 * 8 B = 128 B */
 #define MPK_PHASE_MAX_WORKERS 256
 __device__ unsigned long long
-    g_phase_ts[MPK_PHASE_MAX_WORKERS * MPK_PHASE_SLOT_COUNT];
+    g_phase_ts[MPK_PHASE_MAX_WORKERS * MPK_PHASE_SLOT_STRIDE];
 // Accumulated per-slot-pair spans, so the reduction is over every layer of
 // every decode iteration rather than whichever layer happened to be last in
 // the buffer. Accumulating rather than sampling one captured layer is
 // strictly more robust and costs one atomic per slot.
 __device__ unsigned long long
-    g_phase_span[MPK_PHASE_MAX_WORKERS * MPK_PHASE_SLOT_COUNT];
-__device__ unsigned long long g_phase_n[MPK_PHASE_MAX_WORKERS];
+    g_phase_span[MPK_PHASE_MAX_WORKERS * MPK_PHASE_SLOT_STRIDE];
+__device__ unsigned long long
+    g_phase_n[MPK_PHASE_MAX_WORKERS * MPK_PHASE_PAD_U64];
 // Only sample steady-state decode.
 //
 // `volatile` is load-bearing, not decoration. The whole layer body is inlined
@@ -175,7 +181,7 @@ __device__ volatile int g_phase_arm;
 // late slots only, yet still bumps g_phase_n at slot 11 -- every early-slot
 // mean would then be divided by one layer too many. Set at slot 0, required by
 // every other slot.
-__device__ int g_phase_live[MPK_PHASE_MAX_WORKERS];
+__device__ int g_phase_live[MPK_PHASE_MAX_WORKERS * MPK_PHASE_PAD_INT];
 
 __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
   if (threadIdx.x != 0 || worker >= MPK_PHASE_MAX_WORKERS) {
@@ -185,14 +191,14 @@ __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
     if (!g_phase_arm) {
       return;
     }
-    g_phase_live[worker] = 1;
-  } else if (!g_phase_live[worker]) {
+    g_phase_live[(worker) * MPK_PHASE_PAD_INT] = 1;
+  } else if (!g_phase_live[(worker) * MPK_PHASE_PAD_INT]) {
     return;
   }
   asm volatile("" ::: "memory");
   unsigned long long const t = __builtin_amdgcn_s_memrealtime();
   asm volatile("" ::: "memory");
-  int const base = worker * MPK_PHASE_SLOT_COUNT;
+  int const base = worker * MPK_PHASE_SLOT_STRIDE;
   // Slot 0 accumulates the *inter-layer* span: last layer's slot 11 to this
   // layer's slot 0. It used to record only a timestamp, which left everything
   // between two layers outside the trace -- and that hole is not small. At
@@ -216,8 +222,8 @@ __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
     g_phase_span[base + slot] += (t - prev) * 10; // 100 MHz -> ns
   }
   if (slot == MPK_PHASE_SLOT_COUNT - 1) {
-    g_phase_n[worker]++;
-    g_phase_live[worker] = 0;
+    g_phase_n[(worker) * MPK_PHASE_PAD_U64]++;
+    g_phase_live[(worker) * MPK_PHASE_PAD_INT] = 0;
   }
 }
 #define MPK_PHASE_MARK(worker, slot) mpk_phase_mark((worker), (slot))
@@ -790,6 +796,19 @@ __global__ void init_kernel(RuntimeConfig config) {
     }
 #endif
   }
+}
+
+// Increment an event counter and publish the new value into both AID mirrors.
+// Returns the PREVIOUS value, exactly like atom_add_release_gpu_u64, so every
+// `count + amount == expected` test at the call sites is unchanged.
+__device__ __forceinline__ unsigned long long
+    mpk_evctr_add(EventCounter *base, int idx, unsigned long long amt) {
+  unsigned long long old = atom_add_release_gpu_u64(
+      reinterpret_cast<unsigned long long *>(&base[idx]), amt);
+#if defined(MPK_AID_EVCTR) && defined(MPK_AID_SPLIT_FLAGS)
+  mpk_aid_evctr_pub(idx, old + amt);
+#endif
+  return old;
 }
 
 __global__ void prepare_kernel(RuntimeConfig config,
@@ -1890,9 +1909,16 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                                __ATOMIC_RELAXED);
             }
 #endif
-            while (actual_counts < needed_counts) {
-              actual_counts =
-                  MPK_LD_EVENT(&config.all_event_counters[event_index]);
+            unsigned _ev_spin = 0;
+#ifdef MPK_P7_SKIP
+            // bit 8: skip the dependency wait entirely (timing probe)
+            bool const _dep_skip = ((MPK_P7_SKIP) & 8) != 0;
+#else
+            bool const _dep_skip = false;
+#endif
+            while (!_dep_skip && actual_counts < needed_counts) {
+              actual_counts = MPK_EVCTR_POLL(
+                  config.all_event_counters, event_index, _ev_spin++);
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
               __builtin_amdgcn_s_sleep(1);
 #endif
@@ -2753,11 +2779,32 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                     static_cast<EventCounter>(xcd_thresh) *
                     get_task_iteration_num(ml_tid);
                 if (local_cnt == needed_local) {
-                  atom_add_release_gpu_u64(&config.all_event_counters[ev_idx],
-                                           1);
+#if defined(MPK_AID_EVTIER) && defined(MPK_AID_SPLIT_FLAGS)
+                  // AID tier. The four XCDs of one AID accumulate in an AID-local line,
+                  // and only the last of them crosses the boundary -- adding 4, so the
+                  // global total and every `count == num_triggers * iter` test are
+                  // unchanged while boundary-crossing atomics drop from 8 to 2.
+                  // Gang events only: num_triggers == 8 is one flush per XCD, hence
+                  // exactly 4 per AID per iteration. For any other contributor count the
+                  // per-AID total is not a multiple of 4, which would leave the global
+                  // permanently short, so those keep the original single increment.
+                  int _nt = MPK_LD_EVCFG(&config.all_event_num_triggers[ev_idx]);
+                  unsigned long long _ok = 0, _n = 0;
+                  if (_nt == 2 * MPK_AID_XCDS_PER_AID) {
+                    _n = mpk_aid_evtier_add((int)ev_idx, &_ok);
+                  }
+                  if (!_ok) {
+                    mpk_evctr_add(config.all_event_counters, ev_idx, 1);
+                  } else if ((_n % MPK_AID_XCDS_PER_AID) == 0) {
+                    mpk_evctr_add(config.all_event_counters, ev_idx,
+                                  MPK_AID_XCDS_PER_AID);
+                  }
+#else
+                  mpk_evctr_add(config.all_event_counters, ev_idx, 1);
+#endif
                 }
               } else {
-                atom_add_release_gpu_u64(&config.all_event_counters[ev_idx], 1);
+                mpk_evctr_add(config.all_event_counters, ev_idx, 1);
               }
             }
 
@@ -2832,13 +2879,33 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                       get_task_iteration_num(task_ids[queue_pos]);
                   if (local_cnt == needed_local) {
                     threadfence_gpu();
-                    atom_add_release_gpu_u64(&config.all_event_counters[ev_idx],
-                                             1);
+#if defined(MPK_AID_EVTIER) && defined(MPK_AID_SPLIT_FLAGS)
+                    // AID tier. The four XCDs of one AID accumulate in an AID-local line,
+                    // and only the last of them crosses the boundary -- adding 4, so the
+                    // global total and every `count == num_triggers * iter` test are
+                    // unchanged while boundary-crossing atomics drop from 8 to 2.
+                    // Gang events only: num_triggers == 8 is one flush per XCD, hence
+                    // exactly 4 per AID per iteration. For any other contributor count the
+                    // per-AID total is not a multiple of 4, which would leave the global
+                    // permanently short, so those keep the original single increment.
+                    int _nt = num_triggers;
+                    unsigned long long _ok = 0, _n = 0;
+                    if (_nt == 2 * MPK_AID_XCDS_PER_AID) {
+                      _n = mpk_aid_evtier_add((int)ev_idx, &_ok);
+                    }
+                    if (!_ok) {
+                      mpk_evctr_add(config.all_event_counters, ev_idx, 1);
+                    } else if ((_n % MPK_AID_XCDS_PER_AID) == 0) {
+                      mpk_evctr_add(config.all_event_counters, ev_idx,
+                                    MPK_AID_XCDS_PER_AID);
+                    }
+#else
+                    mpk_evctr_add(config.all_event_counters, ev_idx, 1);
+#endif
                   }
                 } else {
                   threadfence_gpu();
-                  atom_add_release_gpu_u64(&config.all_event_counters[ev_idx],
-                                           1);
+                  mpk_evctr_add(config.all_event_counters, ev_idx, 1);
                 }
               }
 
@@ -3245,8 +3312,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               // Gang: flush 1 (one task done). Non-gang: flush xcd_threshold.
               int flush_amount =
                   is_gang_task_type(task_desc->task_type) ? 1 : xcd_threshold;
-              count = atom_add_release_gpu_u64(
-                  &config.all_event_counters[event_index], flush_amount);
+              count = mpk_evctr_add(config.all_event_counters, event_index, flush_amount);
               event_fired = (count + flush_amount) ==
                             static_cast<EventCounter>(num_triggers) *
                                 get_task_iteration_num(task_ids[queue_pos]);
@@ -3266,8 +3332,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 
           if (local_count == needed_local) {
             threadfence_gpu();
-            count = atom_add_release_gpu_u64(
-                &config.all_event_counters[event_index], xcd_threshold);
+            count = mpk_evctr_add(config.all_event_counters, event_index, xcd_threshold);
             event_fired = (count + xcd_threshold) ==
                           static_cast<EventCounter>(num_triggers) *
                               get_task_iteration_num(task_ids[queue_pos]);
@@ -3280,8 +3345,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
           // Fallback: per-task fence + global atomic (NVIDIA, or uncounted
           // events)
           threadfence_gpu();
-          count = atom_add_release_gpu_u64(
-              &config.all_event_counters[event_index], 1);
+          count = mpk_evctr_add(config.all_event_counters, event_index, 1);
           event_fired =
               (count + 1) == static_cast<EventCounter>(num_triggers) *
                                  get_task_iteration_num(task_ids[queue_pos]);
@@ -3777,7 +3841,7 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                    g_fwdpass_total_iters,
                    MPK_PHASE_START_ITER);
             for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
-              unsigned long long n = g_phase_n[w];
+              unsigned long long n = g_phase_n[w * MPK_PHASE_PAD_U64];
               if (n == 0) {
                 continue;
               }
@@ -3787,7 +3851,7 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
               printf("[PSLOTW] w=%d n=%llu", w, n);
               for (int s = 0; s < MPK_PHASE_SLOT_COUNT; s++) {
                 printf(" %llu",
-                       g_phase_span[w * MPK_PHASE_SLOT_COUNT + s] / n);
+                       g_phase_span[w * MPK_PHASE_SLOT_STRIDE + s] / n);
               }
               printf("\n");
             }

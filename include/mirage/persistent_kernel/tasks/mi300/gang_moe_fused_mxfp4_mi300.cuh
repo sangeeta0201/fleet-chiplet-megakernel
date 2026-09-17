@@ -824,7 +824,13 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     expert_id_raw = carried_expert_id;
   } else {
     if (early_routing_ready != nullptr) {
+#ifdef MPK_AID_SPLIT_ROUTING
+      int *final_release =
+          &mpk_aid_flags_at(early_routing_ready, xcd_id,
+                            MPK_AID_ROUTING_BASE_INTS)[(1 + xcd_id) * 16];
+#else
       int *final_release = &early_routing_ready[(1 + xcd_id) * 16];
+#endif
       while (ld_sys_s32(final_release) < routing_expected) {
         __builtin_amdgcn_s_sleep(1);
       }

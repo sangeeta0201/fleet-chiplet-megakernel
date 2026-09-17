@@ -1,0 +1,169 @@
+# SPX+NPS2: the barrier release flags are the whole story
+
+Measured on mi355x-thor-2, gpt-oss-120b decode, patched amdgpu with
+`aid_local_spx_nps2=1` and the 2 MiB VRAM interleave.
+
+## Headline
+
+Fleet's own barrier, extracted standalone at 184 blocks, 200 iterations:
+
+| release path | NPS2 median | vs NPS1 |
+|---|---:|---|
+| shared spanning-NC flags | **3374 ns** | 1.93x |
+| **AID-replicated, dual-published** | **1728 ns** | **0.99x** |
+| NPS1 reference (same binary) | 1747 ns | -- |
+
+**Replicating the release flags per AID takes the barrier from 1.93x of NPS1
+to marginally faster than NPS1.** Nothing else in the barrier matters:
+AID-homing the arrival counters and reducing the cross-AID atomics from 8 to 2
+contributed nothing measurable on top (`fleetbar4`, three changes at once:
+1948 ns -- *worse* than flags alone).
+
+Harnesses: `fleetbar.cpp` (fleet's shape + skew knob), `fleetbar2.cpp` (flag
+A/B), `fleetbar4.cpp` (per-level isolation + store-drain sweep).
+
+## What this refutes
+
+**Arrival skew is NOT the mechanism.** `fleetbar.cpp` injects per-XCD arrival
+skew from 0 to 2000 ns. The NPS2-NPS1 delta is **constant at ~+1600 ns at
+every skew level** -- 0 ns skew gives 1747 vs 3343, and 2000 ns skew gives
+9944 vs 11325. The slopes are identical, so NPS2 does not amplify arrival
+spread. Any explanation built on "the barrier bills the slowest die and NPS2
+widens the spread" is wrong.
+
+**The store drain is NOT the mechanism.** Fleet's `bar` spans `t1`->`t2`,
+which includes `s_waitcnt vmcnt(0)` over each worker's O-proj output stores
+into the shared row. Sweeping that from 0 to 4096 B per block moves the
+barrier by 390 ns (3377 -> 3767), and by a similar 17% under AID placement.
+Fleet's actual stores are far smaller. Negligible.
+
+**Isolated collective benchmarks cannot see this.** `policy.cpp` measures the
+*NPS2-aware* policies (HIER/DUAL/PEER), so it looked healthy in NPS2 and the
+NPS1 column was never run. It also carries ~3 us of harness overhead -- its
+`null` policy costs 3034 ns in NPS1, more than fleet's entire barrier -- so
+its absolute numbers were never comparable to fleet's.
+
+## Barrier policy matrix (192 workers, ns, same binary both modes)
+
+| policy | NPS1 | NPS2 |
+|---|---:|---:|
+| FLAT | 3090 | **13224** |
+| HIERW | **2425** | 17315 |
+| HIER | 2677 | 2493 |
+| PEER | 2808 | **2421** |
+| null (harness floor) | 3034 | 2995 |
+| fleet's own barrier | **1747** | 3343 |
+
+Three things follow. **FLAT scales fine in NPS1** (1101 -> 3858 over 8 -> 256
+workers) and only collapses in NPS2 (1057 -> 15527), so HIER/PEER are repairs
+for an NPS2-specific collapse rather than better barriers -- in NPS1 they are
+*slower* than FLAT at low width. **Fleet's barrier at 1747 ns beats every
+policy in NPS1**, so fleet's shape is already well tuned for NPS1 and swapping
+in PEER would regress it. And **best-in-mode is a dead tie** (NPS1 HIERW 2823
+vs NPS2 PEER 2788 at 256 workers), so the policies reach parity, never better.
+
+## In-fleet result
+
+`MPK_OPROJ_INNER_TIMING` splits Phase 7 into `mfma` / `bar` / `rmsnorm_router`
+/ `topk` (us per layer per XCD, 25056 samples per arm, identical printf
+perturbation in both modes):
+
+| component | NPS1 | NPS2 ctl | NPS2 best | ratio |
+|---|---:|---:|---:|---|
+| mfma (O-proj GEMM) | 2.16 | 2.20 | -- | 1.02x |
+| rmsnorm+router | 1.72 | 1.76 | -- | 1.02x |
+| **bar** | **2.40** | **3.16** | **2.52** | **1.05x** |
+| topk | 0.76 | 0.80 | -- | 1.05x |
+| **Phase 7 total** | **7.12** | **7.96** | **7.28** | **1.02x** |
+
+Compute is at parity; the barrier carried the whole inner gap and is now
+within 5%. Best arm is `MPK_AID_SPLIT_HIER_LOCAL=1 MPK_OPROJ_AID_AGG=1` on
+top of `MPK_AID_SPLIT_FLAGS`.
+
+**Partial application measures as noise.** Individually: `hier_local` alone
+3.20, `AID_AGG` alone 2.80, narrow+`hier_local` 3.52, all against a 3.16
+control. One remaining remote access on the path costs as much as all of them.
+`MPK_NARROW_OPROJ_HIER` alone is 2.60 but **conflicts** with the combination
+(2.92 together).
+
+## Where the end-to-end gap actually is
+
+Per-stage increments via `MPK_ONLY_OP`, ms/token:
+
+| stage | NPS1 | NPS2 | gap | share |
+|---|---:|---:|---:|---|
+| op 7 + all sync (mask 128) | 0.795 | 1.034 | +0.239 | 32% |
+| MoE adds (mask 384) | 0.594 | **1.088** | **+0.494** | **66%** |
+| QKV + attention + merge add | 0.367 | 0.380 | +0.013 | 2% |
+| **full model** | **1.756** | **2.502** | **+0.746** | |
+
+QKV, attention and merge are at parity (1.04x). **MoE is 1.83x and carries
+66% of the gap.** Phase 7's inner span is only 28% of mask-128's time, so the
+barrier win above is ~0.024 ms end-to-end -- real, but under the noise floor.
+The remaining 0.206 ms of op-7's gap is waits *outside* Phase 7: the
+inter-layer span, QKV epoch barrier, and Phase 9 gate.
+
+## Closed avenues -- do not re-run
+
+**MoE weight placement.** Slots 17/18 read at 386 ns with `local=0/8`, and
+AID placement makes it *worse*: replicate-both 5.420 ms, single-replica 6.981,
+against a 2.502 baseline. Cause: routing is dynamic so every XCD reads the
+whole weight, and pinning a 2260 MiB/layer streaming weight to one range caps
+it at that range's HBM stacks (3529 vs 6346 GB/s). The interleave is correct
+for these buffers. Confirms `ab69213` and the 97% L2-hit finding.
+
+**Small intermediates.** The slot map shows `residual`, `workspace_f32`,
+`swiglu_out`, `norm_weight` and the biases all at **+-1.5 ns skew**. Only
+`o_acc_f32` (-28.6) and `moe_barrier` (-10.1) show anything, and 28 ns against
+a 7.5% noise floor is unmeasurable. The note predicting these carry the AID
+gradient is wrong.
+
+## Measurement methodology
+
+**`MPK_ONLY_OP` is a BITMASK, not an op index.** `(MPK_ONLY_OP & (1 << n))`
+per op: 1 QKV, 3 attention, 5 merge, 7 O-proj, 8 MoE.
+- `128` = op 7 only
+- `384` = op 7 + MoE
+- `426` = every op (same as omitting it)
+- **Any mask without bit 7 hangs.** The router/TopK is fused into op 7's
+  kernel and publishes `routing_indices` / `active_expert_ids` /
+  `routing_ready`; without it every MoE worker waits forever. `0`, `7` and
+  `99` all hang for this reason. A zero-op build is therefore impossible.
+
+**The noise floor in SPX+NPS2 is 7.5%.** Three reps of the identical build:
+1.191 / 1.283 / 1.208 ms. Any single-shot claim below ~8% is unmeasurable.
+Require >= 3 paired reps with arms alternated, and report the control's own
+spread.
+
+**The noise is fleet's, not NPS2's.** MoE bench spreads 0.7-3.7% in NPS2 and
+0.9-4.3% in NPS1; fleet spreads 1.6% in NPS1 and 7.5% in NPS2. Only that one
+cell is noisy, which rules out every memory-side explanation.
+
+**Use `bar` from `MPK_OPROJ_INNER_TIMING`, not `avg_ms`, for barrier work.**
+25k samples per run makes it tight, and every arm carries the same printf
+perturbation (which inflates the run ~12x -- avg_ms 30.6 vs a real 0.795).
+
+## Traps hit, all real
+
+- **Aliasing in my own harness.** `cnt[xcd*16]` and `rel[xcd*16]` on the same
+  base are the SAME word, so the arrival counter overwrote the release flag.
+  It completed at 50 iters and deadlocked at 200, and reported a 2190 ns
+  baseline against the true 3377. Give every structure a distinct region.
+- **Block-buffered stdout loses everything on timeout.** `grep`/`cut` in a
+  pipe re-buffer, so a hung run appears to have printed nothing. Write to a
+  file, or `stdbuf -o0`.
+- **`pgrep -c` prints `0` AND exits non-zero**, so `$(pgrep -c -f x || echo 0)`
+  yields `"0 0"` and a `= "0"` test never fires -- an infinite wait loop.
+- **Barriers need all blocks co-resident.** At 256 threads/block a 184-block
+  barrier deadlocks: spinning blocks hold the CUs unscheduled blocks need. The
+  barrier state was provably complete (23/23 per XCD, global 8/8, release set)
+  while 23 blocks never observed it. Launch bounds are a correctness
+  constraint here, not tuning.
+- **`my_xcd()` must read `HW_REG_XCC_ID`**, not assume `blockIdx.x % 8`. A
+  probe that counted the assumption validated nothing (it reported a perfect
+  23-per-XCD split tautologically). The assumption happens to hold here --
+  0 of 184 workgroups disagree -- but verify, don't assert.
+- **A Slurm handoff resets the driver to stock.** All `aid_local_*` params
+  vanish and all 8 dies return to SPX/NPS1 while `uptime` still shows days.
+  Re-run `~/nps1/spx_nps2.sh` before measuring.
+
