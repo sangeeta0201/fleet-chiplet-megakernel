@@ -805,7 +805,11 @@ __device__ __forceinline__ unsigned long long
     mpk_evctr_add(EventCounter *base, int idx, unsigned long long amt) {
   unsigned long long old = atom_add_release_gpu_u64(
       reinterpret_cast<unsigned long long *>(&base[idx]), amt);
-#if defined(MPK_AID_EVCTR) && defined(MPK_AID_SPLIT_FLAGS)
+#if defined(MPK_AID_EVCTR2) && defined(MPK_AID_SPLIT_FLAGS)
+  // Monotone per-XCD slot; falls back to the shared counter only if the
+  // replicas are unavailable.
+  (void)mpk_aid_evctr2_pub(idx, amt);
+#elif defined(MPK_AID_EVCTR) && defined(MPK_AID_SPLIT_FLAGS)
   mpk_aid_evctr_pub(idx, old + amt);
 #endif
   return old;

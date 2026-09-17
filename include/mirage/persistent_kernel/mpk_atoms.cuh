@@ -501,6 +501,80 @@ __device__ __forceinline__ unsigned long long
   return atomicAdd(&p[idx], 1ULL) + 1ULL;
 }
 
+// ---------------------------------------------------------------------------
+// MPK_AID_EVCTR2: monotone per-XCD mirror slots.
+//
+// The single-slot mirror above is written by all eight XCDs with unordered
+// write-through stores, so it is NOT monotone -- a late store from an earlier
+// XCD can move it backwards past a threshold a reader is waiting on. That is
+// why the poll has to re-read the authoritative counter periodically, and why
+// the saving nets to zero: the mandatory truth reads cost what the cheap
+// mirror reads save.
+//
+// Here each XCD owns one slot, so every slot has exactly ONE writer and can
+// only increase. A reader sums the eight slots from the replica homed in its
+// own AID and never touches the shared counter.
+//
+// Layout: MPK_AID_EVCTR_BASE_INTS + (idx * 8 + xcd) * 2 ints.
+constexpr int MPK_AID_EVCTR2_MAX = 512; // events; 512 * 8 * 8 B = 32 KiB
+
+__device__ __forceinline__ int mpk_aid_evctr2_xcd() {
+  unsigned x;
+  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID)" : "=s"(x));
+  return (int)(x & 0xfu);
+}
+
+__device__ __forceinline__ unsigned long long *
+    mpk_aid_evctr2_rep(int aid) {
+  int *r = g_aid_flag_rep[aid];
+  return r ? (unsigned long long *)(r + MPK_AID_EVCTR_BASE_INTS) : nullptr;
+}
+
+// Publish this XCD's cumulative contribution. Returns false if unavailable,
+// in which case the caller keeps the shared-counter path.
+__device__ __forceinline__ bool mpk_aid_evctr2_pub(int idx,
+                                                   unsigned long long amt) {
+  if (idx >= MPK_AID_EVCTR2_MAX) {
+    return false;
+  }
+  int const xcd = mpk_aid_evctr2_xcd() & 7;
+  int const aid = xcd >> 2;
+  unsigned long long *near_ = mpk_aid_evctr2_rep(aid);
+  unsigned long long *far_ = mpk_aid_evctr2_rep(1 - aid);
+  if (near_ == nullptr || far_ == nullptr) {
+    return false;
+  }
+  int const slot = idx * 8 + xcd;
+  // Same-AID atomic: coherent inside this AID, and this XCD is the only
+  // writer of this slot, so the value is monotone.
+  unsigned long long const mine = atomicAdd(&near_[slot], amt) + amt;
+  // Cross the boundary with a write-through store -- an atomic would not be
+  // visible. Still a single writer, so the far copy is monotone too.
+  st_wt_u64((void *)&far_[slot], mine);
+  return true;
+}
+
+// Sum the eight per-XCD slots from this AID's replica. All reads local.
+__device__ __forceinline__ unsigned long long
+    mpk_aid_evctr2_sum(void *shared_base, int idx) {
+  unsigned long long *sh = (unsigned long long *)shared_base;
+  if (idx >= MPK_AID_EVCTR2_MAX) {
+    return MPK_LD_EVENT(&sh[idx]);
+  }
+  int const xcd = mpk_aid_evctr2_xcd() & 7;
+  unsigned long long *m = mpk_aid_evctr2_rep(xcd >> 2);
+  if (m == nullptr) {
+    return MPK_LD_EVENT(&sh[idx]);
+  }
+  unsigned long long t = 0;
+  int const base = idx * 8;
+#pragma unroll
+  for (int x = 0; x < 8; x++) {
+    t += MPK_LD_EVENT(&m[base + x]);
+  }
+  return t;
+}
+
 __device__ __forceinline__ unsigned long long *mpk_aid_evctr_rep(int aid) {
   int *r = g_aid_flag_rep[aid];
   return r ? (unsigned long long *)(r + MPK_AID_EVCTR_BASE_INTS) : nullptr;
@@ -557,7 +631,12 @@ __device__ __forceinline__ unsigned long long
 
 // Expression-form read, so the call site needs no preprocessor block and keeps
 // its own semicolon.
-#if defined(MPK_AID_EVCTR) && defined(MPK_AID_SPLIT_FLAGS)
+#if defined(MPK_AID_EVCTR2) && defined(MPK_AID_SPLIT_FLAGS)
+// Monotone per-XCD slots: no fallback needed, so the poll ignores the spin
+// counter entirely.
+#define MPK_EVCTR_READ(base, idx) mpk_aid_evctr2_sum((base), (idx))
+#define MPK_EVCTR_POLL(base, idx, it) mpk_aid_evctr2_sum((base), (idx))
+#elif defined(MPK_AID_EVCTR) && defined(MPK_AID_SPLIT_FLAGS)
 #define MPK_EVCTR_READ(base, idx) mpk_aid_evctr_load((base), (idx))
 #define MPK_EVCTR_POLL(base, idx, it) mpk_aid_evctr_poll((base), (idx), (it))
 #else

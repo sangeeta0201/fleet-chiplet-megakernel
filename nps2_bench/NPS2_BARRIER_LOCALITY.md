@@ -1,4 +1,84 @@
-# SPX+NPS2: the barrier release flags are the whole story
+# SPX+NPS2: synchronization cost in Phase 7
+
+> **Read this first.** Three separate synchronization designs were measured to
+> win 3-10x in isolation and **none of them moved fleet**. Phase 7 sits at
+> 1.05x of NPS1 and has ~0.03 ms/token left in it, which is inside the 7.5%
+> noise floor. The end-to-end gap is elsewhere: MoE, +0.494 ms, 66% of the
+> total. Sections below are kept because the mechanisms and the measurement
+> traps are real, but do not read the standalone numbers as available wins.
+
+## Corrections to earlier claims in this file
+
+| claim | status |
+|---|---|
+| AID-replicated flags take the barrier to 0.99x of NPS1 | true **standalone**; in fleet Phase 7 went 1.16x -> 1.05x, worth ~0.024 ms/token |
+| `MPK_OPROJ_AID_AGG` helps | **unproven.** Sign flips with instrumentation load: `bar` 2.60 with one printf, 2.80-2.88 with another, and 1.80 vs 1.60 on the leanest build |
+| `MPK_AID_EVCTR` is worth -6.83% on op 7 | **does not reproduce.** 3 paired reps give t = 0.92 |
+| `MPK_AID_EVCTR2` (monotone mirror) fixes the event wait | **1,085 ns standalone (9.6x better than shared, 1.5x faster than NPS1) but NEUTRAL in fleet**: t = 0.94, and ATT total stall 2.25x vs 2.22x unchanged |
+| the event wait is producer arrival, not the read | **wrong.** ATT `Idle` is ZERO at every wait site; per-spin stall is 24x worse in NPS2, so it is read latency |
+| `bar` is 83% of op 7's gap | that was 83% of the **inner** gap. Phase 7 inner is 28% of mask-128's time, so `bar` is ~3.6% of the total |
+
+## The measurement that actually characterises it
+
+ATT, clean builds, `MPK_ONLY_OP=128`, same flags, both modes
+(NPS1 0.817 ms, NPS2 1.016 ms):
+
+| | NPS1 | NPS2 | NPS2 + EVCTR2 |
+|---|---:|---:|---:|
+| total stall | 486M | 1,078M (2.22x) | 1,092M (2.25x) |
+| `s_waitcnt` stall | 175M | 652M | 697M |
+| `s_waitcnt` cyc/hit | **156** | **559** | 525 |
+| `s_barrier` stall | 267M | 381M | 352M |
+| `buffer_load_dwordx4` (MFMA weights) | 15.2M | 16.3M | 4.8M |
+
+`s_waitcnt` and `s_barrier` are 81% and 19% of the increase; the weight stream
+is unchanged, which is why every placement lever measured neutral. The single
+hottest instruction (`s_waitcnt vmcnt(0) lgkmcnt(0)`, the event-dependency
+poll) is 46x worse, but the **population average is 3.6x** -- and the
+population is what sets runtime. Quoting the hottest site overstates it.
+
+Per dependency check (74 checks in each trace):
+
+| | NPS1 | NPS2 |
+|---|---:|---:|
+| spins per check | 631 | 349 |
+| stall per check | 569,847 | 7,581,098 |
+| **stall per spin** | **903** | **21,723** (24x) |
+| idle per check | 35,615 | 15,837 |
+
+NPS2 spins *fewer* times and still costs 13x more per check, with no idle. So
+the cost is per-access latency on the polled line, not loop count and not
+waiting for a producer.
+
+## Why the monotone mirror does not help fleet
+
+`evwait.cpp` / `evwait2.cpp`, SPX/NPS2, 184 blocks, and this is the cleanest
+result in the file:
+
+| design | wait | spins/iter |
+|---|---:|---:|
+| shared counter only | 10,457 ns | 1.2 |
+| mirror + 1/64 fallback (fleet today) | 3,456 ns | 10.9 |
+| **per-XCD monotone slots, no fallback** | **1,085 ns** | 2.2 |
+| NPS1, shared counter | 1,586 ns | 2.1 |
+
+Today's mirror has EIGHT XCDs publishing a running total to ONE slot with
+unordered write-through stores, so a late store from an earlier XCD moves it
+BACKWARDS; progress then depends on the periodic shared read, which is the
+expensive one, and the saving cancels. Proof: stretching the fallback to
+1/1024 costs 16,771 ns and 1/65536 costs 1,536,807 ns with 7,712 spins -- the
+mirror is stale, not slow.
+
+Giving each XCD its own slot makes every slot single-writer and therefore
+monotone, and the fallback disappears: **1,085 ns, faster than NPS1 itself.**
+
+It still does nothing in fleet (t = 0.94; ATT stall unchanged; `s_sleep`
+triples from the extra spinning to sum eight slots). The isolation benchmark
+makes every worker wait every iteration, which is not fleet's regime, and that
+is the lesson: **an isolation benchmark can prove a mechanism and still
+mispredict the system by an order of magnitude.**
+
+## Original finding (standalone, still valid on its own terms)
 
 Measured on mi355x-thor-2, gpt-oss-120b decode, patched amdgpu with
 `aid_local_spx_nps2=1` and the 2 MiB VRAM interleave.

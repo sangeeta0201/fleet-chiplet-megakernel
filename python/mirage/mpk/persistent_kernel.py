@@ -1448,6 +1448,8 @@ def get_compile_command(
             flags = flags + ["-DMPK_AID_SPLIT_ROUTING"]
         if int(os.environ.get("MPK_AID_SPLIT_OUT", "0")) == 1:
             flags = flags + ["-DMPK_AID_SPLIT_OUT"]
+        if int(os.environ.get("MPK_AID_EVCTR2", "0")) == 1:
+            flags = flags + ["-DMPK_AID_EVCTR2"]
         if int(os.environ.get("MPK_AID_EVCTR", "0")) == 1:
             flags = flags + ["-DMPK_AID_EVCTR"]
         if int(os.environ.get("MPK_HIER_WAIT_TIMER", "0")) == 1:
@@ -1960,6 +1962,10 @@ def get_compile_command(
             # than fixing it. See the correctness note at the post-arrival
             # site in gang_full_layer_fused_mi300.cuh.
             flags = flags + ["-DMPK_DRAIN_OVERLAP"]
+        if int(os.environ.get("MPK_BAR_SPLIT", "0")) == 1:
+            flags = flags + ["-DMPK_BAR_SPLIT"]
+        if int(os.environ.get("MPK_BAR_SPLIT_ONLY", "0")) == 1:
+            flags = flags + ["-DMPK_BAR_SPLIT_ONLY"]
         if int(os.environ.get("MPK_OPROJ_INNER_TIMING", "0")) == 1:
             flags = flags + ["-DMPK_OPROJ_INNER_TIMING"]
         if int(os.environ.get("MPK_MOE_INNER_TIMING", "0")) == 1:

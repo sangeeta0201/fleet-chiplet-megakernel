@@ -12,6 +12,8 @@ binary in both memory partition modes so the comparison is like-for-like.
 | `rt_selftest.cpp` | barrier gate for `aid_rt.h` |
 | `mem_selftest.cpp` | per-consumer placement gate |
 | `moe_layer.cpp` | MoE parity placement + data-directed dispatch prototype |
+| `evwait.cpp` | the event-dependency wait: shared vs AID mirror, plus a skew knob |
+| `evwait2.cpp` | monotone per-XCD mirror slots vs today's single-slot mirror |
 | `parity_map.cpp` | exhaustive coverage check for the parity dispatch map |
 
 Build (needs the patched driver for the AID allocator):
