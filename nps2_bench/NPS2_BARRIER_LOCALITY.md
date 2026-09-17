@@ -7,6 +7,45 @@
 > total. Sections below are kept because the mechanisms and the measurement
 > traps are real, but do not read the standalone numbers as available wins.
 
+## THE ARCHITECTURAL RESULT: NPS2 is not slower. SPANNING is.
+
+`onaid.cpp`, SPX/NPS2, 184 blocks, event-counter wait:
+
+| configuration | NPS2 | blocks | XCDs |
+|---|---:|---:|---:|
+| 8 XCDs, spanning line (**what fleet runs**) | **10,898 ns** | 184 | 8 |
+| 4 XCDs 0-3, counter in AID0 (local) | 843 | 92 | 4 |
+| 4 XCDs 4-7, counter in AID1 (local) | 837 | 92 | 4 |
+| **8 XCDs, two independent per-AID groups** | **842** | **184** | **8** |
+| NPS1, 8 XCDs, same code | 1,613 - 1,661 | 184 | 8 |
+
+**Splitting the rendezvous into two 4-XCD groups, each synchronising only
+within its own AID, gives 842 ns at FULL occupancy -- 12.9x better than the
+spanning configuration and 1.9x faster than NPS1.** Verified by the counter
+dump: each AID's counter reaches exactly 4 x iters and each XCD's arrival slot
+exactly 23 x iters, with each AID's four slots populated and the other four
+untouched.
+
+Poller count explains only part of it: NPS1 also improves 8 -> 4 XCDs
+(1,613 -> 841, 1.9x), so of NPS2's 12.9x, about 1.9x is fewer pollers and the
+remaining ~6.8x is purely that the line stopped spanning.
+
+**A cross-AID read of an AID-local MTYPE_RW line never completes** -- 242 ms
+and 1.6M polls against a spin cap, not slow but broken, because RW is coherent
+only inside its own AID. That is the hazard that forces spanning NC for
+anything genuinely shared, and it is why "just make it AID-local" cannot be
+applied to an 8-way gang barrier.
+
+So the constraint for any redesign is structural, not placement: **the 8-XCD
+gang rendezvous fleet is built around is the thing that cannot work in NPS2.**
+Two independent 4-XCD groups with one explicit cross-AID handoff per layer is
+the shape that does.
+
+**Not yet demonstrated in fleet.** This is a microbenchmark where every block
+waits every iteration. Three earlier standalone wins (AID-replicated barrier
+flags, `MPK_OPROJ_AID_AGG`, `MPK_AID_EVCTR2`) all failed to transfer, so treat
+842 ns as a reason to attempt the restructuring, not as an expected outcome.
+
 ## Corrections to earlier claims in this file
 
 | claim | status |
@@ -246,4 +285,3 @@ perturbation (which inflates the run ~12x -- avg_ms 30.6 vs a real 0.795).
 - **A Slurm handoff resets the driver to stock.** All `aid_local_*` params
   vanish and all 8 dies return to SPX/NPS1 while `uptime` still shows days.
   Re-run `~/nps1/spx_nps2.sh` before measuring.
-
