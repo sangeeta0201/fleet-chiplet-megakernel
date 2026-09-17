@@ -34,6 +34,17 @@
 // directly, saving ~272 bytes of stack frame per thread.
 
 #pragma once
+
+// MPK_WAIT_SKIP: same bisection discipline as MPK_P7_SKIP -- remove one class
+// of WAIT at a time, never a release, so nothing can deadlock. Results are
+// garbage by design; the timing delta against the control is the cost of the
+// waits that were removed.
+#ifdef MPK_WAIT_SKIP
+#define MPK_WS_SK(bit) (((MPK_WAIT_SKIP) & (bit)) != 0)
+#else
+#define MPK_WS_SK(bit) false
+#endif
+
 #include "tasks/mi300/gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh"
 #include "tasks/mi300/gang_moe_fused_mxfp4_mi300.cuh"
 #include "tasks/mi300/gang_rmsnorm_linear_mxfp4_bias_mi300.cuh"
@@ -795,7 +806,7 @@ __device__ __noinline__ void
     if (tid == 0) {
       int _obs;
       int _spins = 0;
-      while ((_obs = __atomic_load_n(&qkv_epoch[xcd_id * 16],
+      while (!MPK_WS_SK(1) && (_obs = __atomic_load_n(&qkv_epoch[xcd_id * 16],
                                      __ATOMIC_RELAXED)) < qkv_epoch_expected) {
         MPK_WS_WAIT_TICK(_obs, _spins);
         _spins++;
@@ -911,7 +922,7 @@ __device__ __noinline__ void
             &chunk_barrier[(xcd_id * NUM_REQS + attn_req) * 16 + 1 +
                            kv_chunk_idx];
         if (tid == 0) {
-          while (MPK_LD_GATE(split_flag) < qkv_epoch_expected) {
+          while (!MPK_WS_SK(2) && MPK_LD_GATE(split_flag) < qkv_epoch_expected) {
             __builtin_amdgcn_s_sleep(1);
           }
         }
@@ -1198,7 +1209,7 @@ __device__ __noinline__ void
       // Idle rank 23+c: high half of chunk c. Consumer of Q — wait for the
       // epoch without arriving (arrival count stays QKV+attn prefix).
       if (tid == 0) {
-        while (MPK_LD_GATE(&qkv_epoch[xcd_id * 16]) < qkv_epoch_expected) {
+        while (!MPK_WS_SK(1) && MPK_LD_GATE(&qkv_epoch[xcd_id * 16]) < qkv_epoch_expected) {
           __builtin_amdgcn_s_sleep(1);
         }
       }
@@ -1390,7 +1401,7 @@ __device__ __noinline__ void
     // buffer_inv is per-wave.
     if (tid == 0)
 #endif
-      while ((_obs = MPK_LD_GATE(&attn_release[xcd_id * 16])) <
+      while (!MPK_WS_SK(4) && (_obs = MPK_LD_GATE(&attn_release[xcd_id * 16])) <
              attn_release_expected) {
         MPK_WS_WAIT_TICK(_obs, _spins);
         _spins++;

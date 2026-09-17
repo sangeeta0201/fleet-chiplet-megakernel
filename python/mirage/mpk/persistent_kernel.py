@@ -1455,6 +1455,9 @@ def get_compile_command(
         if int(os.environ.get("MPK_TOPK_HIER", "0")) == 1:
             flags = flags + ["-DMPK_TOPK_HIER"]
         _p7skip = int(os.environ.get("MPK_P7_SKIP", "0"))
+        _wskip = int(os.environ.get("MPK_WAIT_SKIP", "0"))
+        if _wskip != 0:
+            flags = flags + ["-DMPK_WAIT_SKIP=%d" % _wskip]
         if _p7skip != 0:
             flags = flags + ["-DMPK_P7_SKIP=%d" % _p7skip]
         if int(os.environ.get("MPK_AID_EVTIER", "0")) == 1:
