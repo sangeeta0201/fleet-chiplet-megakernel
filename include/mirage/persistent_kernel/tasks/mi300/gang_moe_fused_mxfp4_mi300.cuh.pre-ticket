@@ -4376,12 +4376,29 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       // the per-XCD slots of one expert held *different* epochs, which is
       // impossible if the eight stores from one producer all survived.
       // COUNTER_OFF puts the counter on the next line.
-      // Ticket barrier: one counter, and each arrival learns which 46-run it
-      // belongs to. No layer epoch is involved.
-      int prev_global = atom_add_release_gpu_s32(
-          &d_barrier[base + MOE_BAR_COUNTER_SLOT * MOE_BAR_LINE], 1);
-      (void)atomicMax(&d_barrier[base + 13 * MOE_BAR_LINE + phase_tile],
-                      prev_global / W13_TILES + 1);
+      // Per-layer arrival record: stamp THIS group's own int with the
+      // arriving block's layer epoch, so a later layer does not look like an
+      // earlier one (the old cumulative OR could not tell them apart).
+      {
+        constexpr int _LI_OFF = mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
+                                mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END;
+        int const _my_epoch =
+            *reinterpret_cast<int *>(&_fused_smem[_LI_OFF]) + 1;
+        (void)atomicMax(&d_barrier[base + 13 * MOE_BAR_LINE + phase_tile],
+                        _my_epoch);
+      }
+      // Per-epoch arrival counter: a 46-run must not mix layers.
+      constexpr int kEpochRing = 4;
+      int _arr_epoch;
+      {
+        constexpr int _LI = mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
+                            mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END;
+        _arr_epoch = *reinterpret_cast<int *>(&_fused_smem[_LI]) + 1;
+      }
+      int const _ctr_slot = 14 + (_arr_epoch & (kEpochRing - 1));
+      int prev_global =
+          atom_add_release_gpu_s32(&d_barrier[base + _ctr_slot * MOE_BAR_LINE],
+                                   1);
       // Exact only if every tile counted by W13_TILES arrives here. Under
       // packing W13_TILES == W13_WGS and no tile returns between the decode
       // and this line, so it is. The pre-packing decode had a token axis and
@@ -4398,9 +4415,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END;
         int layer_idx =
             *reinterpret_cast<int *>(&_fused_smem[LAYER_IDX_SMEM_OFF]);
-        // The W2 side now waits on the ticket barrier (its own run's
-        // completion), so this flag is informational. Publish the run number.
-        int release_val = prev_global / W13_TILES + 1;
+        // The arrivals in this run all belong to _arr_epoch by construction,
+        // so publish that rather than re-reading this block's layer.
+        int release_val = _arr_epoch;
         (void)layer_idx;
         // Write ALL slots, not just [0, MPK_NUM_XCDS): the extra ones are
         // unread, and this removes any dependence on the consumer's slot index
@@ -4732,11 +4749,6 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     MPK_WS_WAVE_CLEAR(warp_id);
     int _obs;
     int _spins = 0;
-    // My group's W13 recorded its run in stamp[group]; wait for that run to
-    // complete. The same block issued that W13, so the stamp is already set.
-    int const _my_run = ld_sys_s32(&d_barrier[base + 13 * MOE_BAR_LINE +
-                                              phase_tile]);
-    int const _run_target = _my_run * W13_TILES;
 #ifdef MPK_NARROW_MOE_BAR_POLL
     // One thread polls the W13->W2 release for the block instead of all 256.
     //
@@ -4769,9 +4781,18 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     // to hold different values), and slot 0 is the one observed to receive it:
     // with 4 XCDs, slots 1-3 read 0 under both st_wt_u32 and atomicMax while
     // slot 0 reads the published epoch.
-    while ((_obs = ld_sys_s32(
-                &d_barrier[base + MOE_BAR_COUNTER_SLOT * MOE_BAR_LINE])) <
-           _run_target) {
+    // All W13 groups of this expert must have a stamp >= my epoch. Immune to
+    // the layer skew that breaks a shared modulo counter.
+    auto _stamps_ready = [&]() -> int {
+      int n = 0;
+      for (int g = 0; g < W13_TILES; g++) {
+        if (ld_sys_s32(&d_barrier[base + 13 * MOE_BAR_LINE + g]) >= expected) {
+          n++;
+        }
+      }
+      return n;
+    };
+    while ((_obs = _stamps_ready()) < W13_TILES) {
       MPK_WS_WAIT_TICK(_obs, _spins);
       // Refresh the discriminating values on the same cadence as the tick:
       // the raw arrival counter (whether it sits on a multiple of W13_TILES
@@ -4807,16 +4828,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             _n_arr++;
           }
         }
-        int _miss = -1, _nok = 0;
-        for (int _g = 0; _g < W13_TILES; _g++) {
-          int _st = ld_sys_s32(&d_barrier[base + 13 * MOE_BAR_LINE + _g]);
-          if (_st >= _my_run) {
-            _nok++;
-          } else if (_miss < 0) {
-            _miss = _g;
-          }
-        }
-        MPK_WS_WAIT_AUX(_nok, _miss, _my_run, phase_tile);
+        MPK_WS_WAIT_AUX(
+            ld_sys_s32(&d_barrier[base + MOE_BAR_COUNTER_SLOT * MOE_BAR_LINE]),
+            _n_arr, expected, xcd_id);
       }
       _spins++;
 #ifndef MPK_MOE_BAR_BUSY_POLL

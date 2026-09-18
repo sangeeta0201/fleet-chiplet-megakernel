@@ -1,11 +1,5 @@
 import torch
 import os
-
-# Number of XCDs that take part in a run. 8 = whole GPU in SPX.
-# Smaller confines fleet to XCDs [0, N) so a run fits in one AID
-# without touching the partition mode. Workers on the other XCDs
-# retire immediately (see MPK_NUM_XCDS in persistent_kernel.cuh).
-_MPK_NX = int(os.environ.get('MPK_NUM_XCDS', '8'))
 import os as _os_pad
 import tempfile
 import subprocess
@@ -1120,7 +1114,7 @@ def get_compile_command(
             # The same transform at the W13 tile_iter=1 site. Unlike W2,
             # turning it off loses: 1.719→1.731, 1.712→1.736, 1.736→1.753
             # (+12 / +24 / +17 µs), hash e86d7dc all six. Keep default ON.
-            flags = flags + (["-DMPK_W13_T1_LINEAR_LOAD"] if _MPK_NX == 8 else [])
+            flags = flags + ["-DMPK_W13_T1_LINEAR_LOAD"]
         if _opt("MPK_W13_T1_EARLY_SCALE_LOAD"):
             # Hoist the W13 tile-1 block-scale global reads up beside the
             # tile-1 data loads, holding them in VGPRs across the tile-0 SwiGLU
@@ -1129,7 +1123,7 @@ def get_compile_command(
             # the scale reads after the data drain, serializing two HBM round
             # trips. Worth roughly 0.06 ms/token, the second-largest of the
             # six scheduling flags in this group.
-            flags = flags + (["-DMPK_W13_T1_EARLY_SCALE_LOAD"] if _MPK_NX == 8 else [])
+            flags = flags + ["-DMPK_W13_T1_EARLY_SCALE_LOAD"]
         if _opt("MPK_QKV_PREFETCH_SCALES"):
             # DMA the QKV block scales straight to LDS in the prefetch helper
             # instead of reading them into VGPRs after the data drain and
@@ -1151,7 +1145,7 @@ def get_compile_command(
             # 1.815/1.819/1.819 -> 1.767/1.768/1.763 ms, three alternating
             # pairs, identical generated text (Paris). Five ctx-4096
             # repeats matched the control token dump. Batch-1 only.
-            flags = flags + (["-DMPK_W13_KMAJOR_RECYCLE"] if _MPK_NX == 8 else [])
+            flags = flags + ["-DMPK_W13_KMAJOR_RECYCLE"]
         if int(os.environ.get("MPK_W13_RECYCLE_EAGER_DRAIN", "0")) == 1:
             # Opt-in ISA probe: replace tile-1's progressive vmcnt(22..0)
             # fragment waits with one vmcnt(0) before its MFMA loop. This
@@ -1358,23 +1352,6 @@ def get_compile_command(
             # Worth roughly 0.036 ms/token.
             flags = flags + ["-DMPK_W13_T1_SPLIT_LDS_STAGE"]
         # Level, not a boolean: 2 is the shipped default, 0 restores `nt`.
-        if os.environ.get("MPK_AID_LOCAL_SLOTS", "") != "":
-            flags = flags + ["-DMPK_AID_LOCAL"]
-        # Keep the device-side count in step with the host-side _MPK_NX.
-        flags = flags + ["-DMPK_NUM_XCDS=%d" % _MPK_NX]
-        if os.environ.get("MPK_AID_SPLIT_FLAGS", "0") == "1":
-            # SPX+NPS2 only. Hold the eight per-XCD attention release flags in
-            # two COHERENT AID-local replicas instead of one spanning buffer,
-            # and have each XCD poll the copy homed in its own AID. A spanning
-            # hipMalloc is MTYPE_NC in NPS2 -- local to neither range -- so
-            # every poll costs 182 ns near / 279 ns far against 97 ns for an
-            # AID-local line, and the O-proj slice wait polls these ~184 times
-            # a layer. phase7-bench measured slicewait 14.16 -> 0.36 us with
-            # this, exact SPX+NPS1 parity.
-            #
-            # Inert on a stock driver or in NPS1: the allocator reports
-            # unavailable and every guarded site uses the shared buffer.
-            flags = flags + ["-DMPK_AID_SPLIT_FLAGS"]
         _sp = int(os.environ.get("MPK_SYS_POLL_LOAD", "2"))
         if _sp >= 1:
             # Poll the inter-XCD release flags with `global_load_dword sc0 sc1`
@@ -1441,7 +1418,7 @@ def get_compile_command(
             # Requires MPK_ROUTER_FUSED_DP (it publishes from that flag's
             # elected writer) and BATCH_SIZE == 1 (the publication is one row,
             # not a per-token gather). Both are enforced in the kernel.
-            flags = flags + (["-DMPK_W13_PREQUANT"] if _MPK_NX == 8 else [])
+            flags = flags + ["-DMPK_W13_PREQUANT"]
         if int(os.environ.get("MPK_NARROW_GATE_POLL", "0")) == 1:
             # TESTED AND NOT ADOPTED (mixed/neutral). One thread per block
             # polls Phase 6 / Phase 7b instead of all 256, then
@@ -1450,39 +1427,6 @@ def get_compile_command(
             # 1.826/1.820 -- one loss, one tie, one small win. The extra
             # barrier pays back the contention it removes on this path.
             flags = flags + ["-DMPK_NARROW_GATE_POLL"]
-        if int(os.environ.get("MPK_NARROW_HIER_POLL", "0")) == 1:
-            flags = flags + ["-DMPK_NARROW_HIER_POLL"]
-        if int(os.environ.get("MPK_AID_SPLIT_ROUTING", "0")) == 1:
-            flags = flags + ["-DMPK_AID_SPLIT_ROUTING"]
-        if int(os.environ.get("MPK_AID_SPLIT_OUT", "0")) == 1:
-            flags = flags + ["-DMPK_AID_SPLIT_OUT"]
-        if int(os.environ.get("MPK_AID_EVCTR2", "0")) == 1:
-            flags = flags + ["-DMPK_AID_EVCTR2"]
-        if int(os.environ.get("MPK_AID_EVCTR", "0")) == 1:
-            flags = flags + ["-DMPK_AID_EVCTR"]
-        if int(os.environ.get("MPK_HIER_WAIT_TIMER", "0")) == 1:
-            flags = flags + ["-DMPK_HIER_WAIT_TIMER"]
-        if int(os.environ.get("MPK_TOPK_HIER", "0")) == 1:
-            flags = flags + ["-DMPK_TOPK_HIER"]
-        _p7skip = int(os.environ.get("MPK_P7_SKIP", "0"))
-        _wskip = int(os.environ.get("MPK_WAIT_SKIP", "0"))
-        if _wskip != 0:
-            flags = flags + ["-DMPK_WAIT_SKIP=%d" % _wskip]
-        if _p7skip != 0:
-            flags = flags + ["-DMPK_P7_SKIP=%d" % _p7skip]
-        if int(os.environ.get("MPK_AID_EVTIER", "0")) == 1:
-            flags = flags + ["-DMPK_AID_EVTIER"]
-        if int(os.environ.get("MPK_AID_SPLIT_HIER_LOCAL", "0")) == 1:
-            flags = flags + ["-DMPK_AID_SPLIT_HIER_LOCAL"]
-        _only_op = os.environ.get("MPK_ONLY_OP", "")
-        if _only_op != "":
-            flags = flags + ["-DMPK_ONLY_OP=" + str(int(_only_op))]
-        if int(os.environ.get("MPK_AID_SPLIT_QKV", "0")) == 1:
-            flags = flags + ["-DMPK_AID_SPLIT_QKV"]
-        if int(os.environ.get("MPK_AID_SPLIT_ATTNOUT", "0")) == 1:
-            flags = flags + ["-DMPK_AID_SPLIT_ATTNOUT"]
-        if int(os.environ.get("MPK_NARROW_MOE_BAR_POLL", "0")) == 1:
-            flags = flags + ["-DMPK_NARROW_MOE_BAR_POLL"]
         if int(os.environ.get("MPK_LAYER_GATE_BUSY_POLL", "0")) == 1:
             # Drop s_sleep(1) from the Phase 9 layer-gate spin only.
             # A/B 2026-08-30: −12 / −13 / +3 µs, hash e86d7dc all six. Two of
@@ -1525,8 +1469,6 @@ def get_compile_command(
             # Hash e86d7dc all six. A/B −6 / −33 / +7 µs; only pair 2 clears
             # 10 us, and C2 1.758 looks like a control spike.
             flags = flags + ["-DMPK_OPROJ_AMAX_DPP"]
-        if int(os.environ.get("MPK_OPROJ_AID_AGG", "0")) == 1:
-            flags = flags + ["-DMPK_OPROJ_AID_AGG"]
         if _opt("MPK_NARROW_OPROJ_HIER"):
             # One tid polls the O-proj hierarchical release; the acquire
             # __syncthreads already below carries the other 255. Unlike
@@ -1584,7 +1526,7 @@ def get_compile_command(
             #
             # 1.865 -> 1.840 ms, three alternating pairs, every pair a win and
             # the generated text unchanged in all six runs.
-            flags = flags + (["-DMPK_W13_T0_COUNTED_HANDOFF"] if _MPK_NX == 8 else [])
+            flags = flags + ["-DMPK_W13_T0_COUNTED_HANDOFF"]
         if _opt("MPK_W13_BIAS_PREFETCH"):
             # Hoist the W13 tile-0 SwiGLU bias to one global_load_dwordx2
             # issued above the MFMA block, and pack the epilogue's two bf16
@@ -1597,7 +1539,7 @@ def get_compile_command(
             # the 15 younger tile-1 data/scale requests too. Keep those in
             # flight with vmcnt(15): 1.824 -> 1.819, 1.829 -> 1.828, and
             # 1.822 -> 1.815 ms in three alternating pairs, text unchanged.
-            flags = flags + (["-DMPK_W13_BIAS_COUNTED_WAIT"] if _MPK_NX == 8 else [])
+            flags = flags + ["-DMPK_W13_BIAS_COUNTED_WAIT"]
         if _opt("MPK_W2_ONLY_ARRIVE"):
             # Narrow the Phase 9 arrival to the workers that actually ran a W2
             # tile. The barrier orders this layer's W2 stores against the next
@@ -1635,7 +1577,7 @@ def get_compile_command(
             # the required recycle/bias flags.
             # Ablation 2026-08-30 (=0): +4 / +27 / +3 µs, hash e86d7dc;
             # keep default ON.
-            flags = flags + (["-DMPK_W13_T1_BIAS_EARLY"] if _MPK_NX == 8 else [])
+            flags = flags + ["-DMPK_W13_T1_BIAS_EARLY"]
         if _opt("MPK_ROUTER_FUSED_DP"):
             # Fold the router dot product into the RMSNorm's ssq pass. irms is
             # a scalar uniform over the row, so it can be applied once to the
@@ -1970,10 +1912,6 @@ def get_compile_command(
             # than fixing it. See the correctness note at the post-arrival
             # site in gang_full_layer_fused_mi300.cuh.
             flags = flags + ["-DMPK_DRAIN_OVERLAP"]
-        if int(os.environ.get("MPK_BAR_SPLIT", "0")) == 1:
-            flags = flags + ["-DMPK_BAR_SPLIT"]
-        if int(os.environ.get("MPK_BAR_SPLIT_ONLY", "0")) == 1:
-            flags = flags + ["-DMPK_BAR_SPLIT_ONLY"]
         if int(os.environ.get("MPK_OPROJ_INNER_TIMING", "0")) == 1:
             flags = flags + ["-DMPK_OPROJ_INNER_TIMING"]
         if int(os.environ.get("MPK_MOE_INNER_TIMING", "0")) == 1:
@@ -2040,12 +1978,6 @@ def get_compile_command(
             # the nil-address memory fault. Off by default: the per-layer
             # writes cost a little and only matter while chasing that bug.
             flags = flags + ["-DMPK_NIL_TRIPWIRE"]
-        if int(os.environ.get("MPK_TERM_RECHECK", "0")) == 1:
-            flags = flags + ["-DMPK_TERM_RECHECK"]
-        if int(os.environ.get("MPK_EVCTR_HOST", "0")) == 1:
-            flags = flags + ["-DMPK_EVCTR_HOST"]
-        if int(os.environ.get("MPK_NPS2_EVENT_POLL", "0")) == 1:
-            flags = flags + ["-DMPK_NPS2_EVENT_POLL"]
         if int(os.environ.get("MPK_NPS2_L2_ACQUIRE", "0")) == 1:
             # Unconditional layer-boundary `buffer_inv sc0 sc1`. Required in
             # SPX+NPS2, where plain hipMalloc is MTYPE_NC and nothing keeps L2
@@ -3314,7 +3246,7 @@ class PersistentKernel:
         m_tiles = max(1, batch_size // 16)
         tiles_per_expert = m_tiles * n_tiles
         total_tiles_all = num_experts * tiles_per_expert
-        total_tiles_per_xcd = (total_tiles_all + _MPK_NX - 1) // _MPK_NX
+        total_tiles_per_xcd = (total_tiles_all + 7) // 8
         assert total_tiles_per_xcd <= 65535, \
             f"total_tiles_per_xcd={total_tiles_per_xcd} exceeds uint16_t (bs={batch_size})"
 
@@ -3367,7 +3299,7 @@ class PersistentKernel:
         # W2: one token at a time, so tiles_per_expert = n_tiles * batch_size
         tiles_per_expert = n_tiles * batch_size
         total_tiles_all = num_experts * tiles_per_expert
-        total_tiles_per_xcd = (total_tiles_all + _MPK_NX - 1) // _MPK_NX
+        total_tiles_per_xcd = (total_tiles_all + 7) // 8
         assert total_tiles_per_xcd <= 65535, \
             f"total_tiles_per_xcd={total_tiles_per_xcd} exceeds uint16_t (bs={batch_size})"
 
@@ -3423,7 +3355,7 @@ class PersistentKernel:
         num_topk = output.dim(1)  # topk dimension from output shape
         max_activated = min(num_topk * batch_size, num_experts)
         total_tiles_all = max_activated * tiles_per_expert
-        total_tiles_per_xcd = (total_tiles_all + _MPK_NX - 1) // _MPK_NX
+        total_tiles_per_xcd = (total_tiles_all + 7) // 8
         assert total_tiles_per_xcd <= 65535, \
             f"total_tiles_per_xcd={total_tiles_per_xcd} exceeds uint16_t"
 
@@ -3478,7 +3410,7 @@ class PersistentKernel:
         num_topk = output.dim(1)
         max_activated = min(num_topk * batch_size, num_experts)
         total_tiles_all = max_activated * tiles_per_expert
-        total_tiles_per_xcd = (total_tiles_all + _MPK_NX - 1) // _MPK_NX
+        total_tiles_per_xcd = (total_tiles_all + 7) // 8
         assert total_tiles_per_xcd <= 65535, \
             f"total_tiles_per_xcd={total_tiles_per_xcd} exceeds uint16_t"
 
@@ -3529,7 +3461,7 @@ class PersistentKernel:
         num_topk = input.dim(1)  # topk dimension from input shape
         max_activated = min(num_topk * batch_size, num_experts)
         total_tiles_all = max_activated * tiles_per_expert
-        total_tiles_per_xcd = (total_tiles_all + _MPK_NX - 1) // _MPK_NX
+        total_tiles_per_xcd = (total_tiles_all + 7) // 8
         assert total_tiles_per_xcd <= 65535, \
             f"total_tiles_per_xcd={total_tiles_per_xcd} exceeds uint16_t"
 
@@ -3630,14 +3562,14 @@ class PersistentKernel:
         # W13->W2 barrier that 240's straggler pattern was hiding. Worth
         # chasing on its own; not worth shipping for 0.01 ms.
         if int(_os_pad.environ.get("MPK_MOE_PAD_ROUND", "0")) == 1:
-            PAD_MULTIPLE = _MPK_NX * mpk_workers_per_xcd()
+            PAD_MULTIPLE = 8 * mpk_workers_per_xcd()
         else:
             PAD_MULTIPLE = 240
         total_w13_real = max_activated * w13_tiles
         total_w13_padded = ((total_w13_real + PAD_MULTIPLE - 1) // PAD_MULTIPLE) * PAD_MULTIPLE
         total_w2 = max_activated * w2_tiles
         total_tiles_all = total_w13_padded + total_w2
-        total_tiles_per_xcd = (total_tiles_all + _MPK_NX - 1) // _MPK_NX
+        total_tiles_per_xcd = (total_tiles_all + 7) // 8
         assert total_tiles_per_xcd <= 65535, \
             f"total_tiles_per_xcd={total_tiles_per_xcd} exceeds uint16_t"
 
@@ -3702,7 +3634,7 @@ class PersistentKernel:
         num_topk = w13_output.dim(1)
         max_activated = min(num_topk * batch_size, num_experts)
         total_tiles_all = max_activated * tiles_per_expert
-        total_tiles_per_xcd = (total_tiles_all + _MPK_NX - 1) // _MPK_NX
+        total_tiles_per_xcd = (total_tiles_all + 7) // 8
         assert total_tiles_per_xcd <= 65535, \
             f"total_tiles_per_xcd={total_tiles_per_xcd} exceeds uint16_t"
 
@@ -3788,7 +3720,7 @@ class PersistentKernel:
         output: DTensor,
         tile_n: int,
         output_stride: int,
-        k_splits: int = _MPK_NX,
+        k_splits: int = 8,
         block_dim: tuple = (256, 1, 1),
     ):
         """Cross-XCD K-split linear with residual (SKXCCM-style).
@@ -3800,7 +3732,7 @@ class PersistentKernel:
         reduction_size = weight.dim(1) if weight.num_dims == 2 else input.dim(1)
         assert reduction_size % k_splits == 0
         n_tiles = output_size // tile_n
-        n_cols_per_xcd = output_size // _MPK_NX
+        n_cols_per_xcd = output_size // 8
 
         # Phase 1: K-split GEMM — each XCD reads full input+weight, writes to workspace
         grid_dim = (8, 1, 1)
@@ -4122,7 +4054,7 @@ class PersistentKernel:
         assert batch_size % m_tiles == 0
         m_per_tile = batch_size // m_tiles
         total_tiles_per_xcd = n_tiles_per_xcd * m_tiles
-        total_gang_tiles = total_tiles_per_xcd * _MPK_NX  # one slot per XCD
+        total_gang_tiles = total_tiles_per_xcd * 8  # 8 XCDs on MI300X
         grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         # 7 inputs
@@ -4190,7 +4122,7 @@ class PersistentKernel:
         batch_size = self.max_num_batched_tokens
         n_wgs = mxfp4_weight.dim(0)
         assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
-        n_wgs_per_xcd = n_wgs // _MPK_NX
+        n_wgs_per_xcd = n_wgs // 8
         total_tiles_per_xcd = batch_size * n_wgs_per_xcd
         grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
@@ -4245,10 +4177,10 @@ class PersistentKernel:
         assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
         n_wgs = mxfp4_weight.dim(0)
         assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
-        n_wgs_per_xcd = n_wgs // _MPK_NX
+        n_wgs_per_xcd = n_wgs // 8
         workers_per_xcd = self.num_workers // 8
         total_tiles_per_xcd = workers_per_xcd
-        grid_dim = (_MPK_NX, 1, 1)
+        grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(norm_input, (-1, -1, -1), 1, True)
         tb_graph.new_input(norm_weight, (-1, -1, -1), 0, True)
@@ -4317,7 +4249,7 @@ class PersistentKernel:
         batch_size = self.max_num_batched_tokens
         n_wgs = mxfp4_weight.dim(0)
         assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
-        n_wgs_per_xcd = n_wgs // _MPK_NX
+        n_wgs_per_xcd = n_wgs // 8
         total_tiles_per_xcd = batch_size * n_wgs_per_xcd
         grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
@@ -4374,7 +4306,7 @@ class PersistentKernel:
         batch_size = self.max_num_batched_tokens
         n_wgs = mxfp4_weight.dim(0)
         assert n_wgs % 8 == 0
-        n_wgs_per_xcd = n_wgs // _MPK_NX
+        n_wgs_per_xcd = n_wgs // 8
         total_tiles_per_xcd = batch_size * n_wgs_per_xcd
         grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
@@ -4439,7 +4371,7 @@ class PersistentKernel:
         batch_size = self.max_num_batched_tokens
         n_wgs = mxfp4_weight.dim(0)
         assert n_wgs % 8 == 0
-        n_wgs_per_xcd = n_wgs // _MPK_NX
+        n_wgs_per_xcd = n_wgs // 8
         total_tiles_per_xcd = batch_size * n_wgs_per_xcd
         grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
@@ -4500,7 +4432,7 @@ class PersistentKernel:
         batch_size = self.max_num_batched_tokens
         n_wgs = mxfp4_weight.dim(0)
         assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
-        n_wgs_per_xcd = n_wgs // _MPK_NX
+        n_wgs_per_xcd = n_wgs // 8
         total_tiles_per_xcd = batch_size * n_wgs_per_xcd
         grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
@@ -4563,7 +4495,7 @@ class PersistentKernel:
         n_bblk = (batch_size + 15) // 16
         n_wgs = mxfp4_weight.dim(0)
         assert n_wgs % 8 == 0
-        n_wgs_per_xcd = n_wgs // _MPK_NX
+        n_wgs_per_xcd = n_wgs // 8
         total_tiles_per_xcd = n_bblk * n_wgs_per_xcd
         grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
@@ -4639,7 +4571,7 @@ class PersistentKernel:
         n_bblk = (batch_size + 15) // 16
         n_wgs = mxfp4_weight.dim(0)
         assert n_wgs % 8 == 0
-        n_wgs_per_xcd = n_wgs // _MPK_NX
+        n_wgs_per_xcd = n_wgs // 8
         total_qkv_tiles_per_xcd = n_bblk * n_wgs_per_xcd
 
         has_sinks = 1 if sinks is not None else 0
@@ -4733,7 +4665,7 @@ class PersistentKernel:
         batch_size = self.max_num_batched_tokens
         n_wgs = mxfp4_weight.dim(0)
         assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
-        n_wgs_per_xcd = n_wgs // _MPK_NX
+        n_wgs_per_xcd = n_wgs // 8
         total_tiles_per_xcd = batch_size * n_wgs_per_xcd
         grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
@@ -4801,21 +4733,20 @@ class PersistentKernel:
         # O-PROJ tiling
         n_wgs = mxfp4_weight.dim(0)
         assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
-        n_wgs_per_xcd = n_wgs // _MPK_NX
+        n_wgs_per_xcd = n_wgs // 8
         oproj_tiles_per_xcd = n_bblk * n_wgs_per_xcd
 
         # TopK tiling (one expert per worker)
         router_output_size = router_weight.dim(0)
-        assert router_output_size % _MPK_NX == 0
-        router_tile_n = router_output_size // _MPK_NX  # chunk_N per XCD
+        assert router_output_size % 8 == 0
+        router_tile_n = router_output_size // 8  # chunk_N per XCD
         topk_tiles_per_xcd = router_tile_n  # 1 tile per expert
-        total_topk_tiles = min(topk_tiles_per_xcd,
-                              self.num_workers // 8) * _MPK_NX
+        total_topk_tiles = topk_tiles_per_xcd * 8
 
         # Gang dispatch uses max of both tile counts
         total_tiles_per_xcd = max(oproj_tiles_per_xcd, topk_tiles_per_xcd)
         # All dispatched workers enter the oproj barrier, not just oproj workers
-        total_oproj_tiles = total_tiles_per_xcd * _MPK_NX
+        total_oproj_tiles = total_tiles_per_xcd * 8
 
         grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
@@ -4912,17 +4843,16 @@ class PersistentKernel:
         # O-PROJ tiling (same as task 213)
         n_wgs = oproj_weight.dim(0)
         assert n_wgs % 8 == 0
-        n_wgs_per_xcd = n_wgs // _MPK_NX
+        n_wgs_per_xcd = n_wgs // 8
         oproj_tiles_per_xcd = n_bblk * n_wgs_per_xcd
 
         # TopK tiling (same as task 213)
         router_output_size = router_weight.dim(0)
-        assert router_output_size % _MPK_NX == 0
-        router_tile_n = router_output_size // _MPK_NX
+        assert router_output_size % 8 == 0
+        router_tile_n = router_output_size // 8
         topk_tiles_per_xcd = router_tile_n
-        total_topk_tiles = min(topk_tiles_per_xcd,
-                              self.num_workers // 8) * _MPK_NX
-        total_oproj_tiles = max(oproj_tiles_per_xcd, topk_tiles_per_xcd) * _MPK_NX
+        total_topk_tiles = topk_tiles_per_xcd * 8
+        total_oproj_tiles = max(oproj_tiles_per_xcd, topk_tiles_per_xcd) * 8
 
         # MoE dimensions from tensors
         # hidden_size for MoE = norm_output dimension (PADDED_HIDDEN_SIZE),
@@ -4951,7 +4881,7 @@ class PersistentKernel:
         # W13->W2 barrier that 240's straggler pattern was hiding. Worth
         # chasing on its own; not worth shipping for 0.01 ms.
         if int(_os_pad.environ.get("MPK_MOE_PAD_ROUND", "0")) == 1:
-            PAD_MULTIPLE = _MPK_NX * mpk_workers_per_xcd()
+            PAD_MULTIPLE = 8 * mpk_workers_per_xcd()
         else:
             PAD_MULTIPLE = 240
 
@@ -4966,7 +4896,7 @@ class PersistentKernel:
         total_w13_padded = ((total_w13_real + PAD_MULTIPLE - 1) // PAD_MULTIPLE) * PAD_MULTIPLE
         total_w2 = max_activated * w2_tiles
         total_tiles_all = total_w13_padded + total_w2
-        moe_total_tiles_per_xcd = (total_tiles_all + _MPK_NX - 1) // _MPK_NX
+        moe_total_tiles_per_xcd = (total_tiles_all + 7) // 8
         import os as _os
         if _os.environ.get("MPK_MOE_TILE_DEBUG"):
             print(f"[MOETILE] max_activated={max_activated} n_bblk={n_bblk} "
@@ -4979,7 +4909,7 @@ class PersistentKernel:
 
         reduction_size = input.dim(1)
 
-        grid_dim = (_MPK_NX, 1, 1)
+        grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         # 16 inputs
         tb_graph.new_input(input, (-1, -1, -1), 1, True)            # [0] attn_out
@@ -5108,7 +5038,7 @@ class PersistentKernel:
         # QKV tiling (from type 214)
         qkv_n_wgs = qkv_weight.dim(0)
         assert qkv_n_wgs % 8 == 0
-        qkv_n_wgs_per_xcd = qkv_n_wgs // _MPK_NX
+        qkv_n_wgs_per_xcd = qkv_n_wgs // 8
         total_qkv_tiles_per_xcd = n_bblk * qkv_n_wgs_per_xcd
 
         has_sinks = 1 if sinks is not None else 0
@@ -5118,17 +5048,16 @@ class PersistentKernel:
         # O-PROJ tiling (from type 215)
         oproj_n_wgs = oproj_weight.dim(0)
         assert oproj_n_wgs % 8 == 0
-        oproj_n_wgs_per_xcd = oproj_n_wgs // _MPK_NX
+        oproj_n_wgs_per_xcd = oproj_n_wgs // 8
         oproj_tiles_per_xcd = n_bblk * oproj_n_wgs_per_xcd
         oproj_output_stride = norm_scratch_post.dim(1)
 
         # TopK tiling
         router_output_size = router_weight.dim(0)
-        assert router_output_size % _MPK_NX == 0
-        router_tile_n = router_output_size // _MPK_NX
-        total_topk_tiles = min(router_tile_n,
-                              self.num_workers // 8) * _MPK_NX
-        total_oproj_tiles = max(oproj_tiles_per_xcd, router_tile_n) * _MPK_NX
+        assert router_output_size % 8 == 0
+        router_tile_n = router_output_size // 8
+        total_topk_tiles = router_tile_n * 8
+        total_oproj_tiles = max(oproj_tiles_per_xcd, router_tile_n) * 8
 
         # MoE tiling (from type 187/215)
         moe_num_experts = gate_up_weight.dim(0)
@@ -5151,7 +5080,7 @@ class PersistentKernel:
         # W13->W2 barrier that 240's straggler pattern was hiding. Worth
         # chasing on its own; not worth shipping for 0.01 ms.
         if int(_os_pad.environ.get("MPK_MOE_PAD_ROUND", "0")) == 1:
-            PAD_MULTIPLE = _MPK_NX * mpk_workers_per_xcd()
+            PAD_MULTIPLE = 8 * mpk_workers_per_xcd()
         else:
             PAD_MULTIPLE = 240
 
@@ -5168,7 +5097,7 @@ class PersistentKernel:
         total_w13_padded = ((total_w13_real + PAD_MULTIPLE - 1) // PAD_MULTIPLE) * PAD_MULTIPLE
         total_w2 = max_activated * w2_tiles
         total_tiles_all = total_w13_padded + total_w2
-        moe_total_tiles_per_xcd = (total_tiles_all + _MPK_NX - 1) // _MPK_NX
+        moe_total_tiles_per_xcd = (total_tiles_all + 7) // 8
         import os as _os
         if _os.environ.get("MPK_MOE_TILE_DEBUG"):
             print(f"[MOETILE2] max_activated={max_activated} n_bblk={n_bblk} "
@@ -5178,7 +5107,7 @@ class PersistentKernel:
 
         workers_per_xcd = self.num_workers // 8  # 30
 
-        grid_dim = (_MPK_NX, 1, 1)
+        grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         # 24 inputs
         tb_graph.new_input(workspace_f32, (-1, -1, -1), 1, True)         # [0]
@@ -5333,7 +5262,7 @@ class PersistentKernel:
         # QKV tiling
         qkv_n_wgs = qkv_weight.dim(0)
         assert qkv_n_wgs % 8 == 0
-        qkv_n_wgs_per_xcd = qkv_n_wgs // _MPK_NX
+        qkv_n_wgs_per_xcd = qkv_n_wgs // 8
         total_qkv_tiles_per_xcd = n_bblk * qkv_n_wgs_per_xcd
 
         has_sinks = 1 if sinks is not None else 0
@@ -5343,16 +5272,15 @@ class PersistentKernel:
         # O-PROJ tiling
         oproj_n_wgs = oproj_weight.dim(0)
         assert oproj_n_wgs % 8 == 0
-        oproj_tiles_per_xcd = n_bblk * (oproj_n_wgs // _MPK_NX)
+        oproj_tiles_per_xcd = n_bblk * (oproj_n_wgs // 8)
         oproj_output_stride = norm_scratch_post.dim(1)
 
         # TopK tiling
         router_output_size = router_weight.dim(0)
-        assert router_output_size % _MPK_NX == 0
-        router_tile_n = router_output_size // _MPK_NX
-        total_topk_tiles = min(router_tile_n,
-                              self.num_workers // 8) * _MPK_NX
-        total_oproj_tiles = max(oproj_tiles_per_xcd, router_tile_n) * _MPK_NX
+        assert router_output_size % 8 == 0
+        router_tile_n = router_output_size // 8
+        total_topk_tiles = router_tile_n * 8
+        total_oproj_tiles = max(oproj_tiles_per_xcd, router_tile_n) * 8
 
         # MoE tiling
         moe_num_experts = gate_up_weight.dim(0)
@@ -5375,7 +5303,7 @@ class PersistentKernel:
         # W13->W2 barrier that 240's straggler pattern was hiding. Worth
         # chasing on its own; not worth shipping for 0.01 ms.
         if int(_os_pad.environ.get("MPK_MOE_PAD_ROUND", "0")) == 1:
-            PAD_MULTIPLE = _MPK_NX * mpk_workers_per_xcd()
+            PAD_MULTIPLE = 8 * mpk_workers_per_xcd()
         else:
             PAD_MULTIPLE = 240
 
@@ -5392,7 +5320,7 @@ class PersistentKernel:
         total_w13_padded = ((total_w13_real + PAD_MULTIPLE - 1) // PAD_MULTIPLE) * PAD_MULTIPLE
         total_w2 = max_activated * w2_tiles
         total_tiles_all = total_w13_padded + total_w2
-        moe_total_tiles_per_xcd = (total_tiles_all + _MPK_NX - 1) // _MPK_NX
+        moe_total_tiles_per_xcd = (total_tiles_all + 7) // 8
         import os as _os
         if _os.environ.get("MPK_MOE_TILE_DEBUG"):
             print(f"[MOETILE2] max_activated={max_activated} n_bblk={n_bblk} "
@@ -5405,9 +5333,9 @@ class PersistentKernel:
         # LM head tiling
         lm_n_wgs = lm_mxfp4_weight.dim(0)
         assert lm_n_wgs % 8 == 0
-        lm_n_wgs_per_xcd = lm_n_wgs // _MPK_NX
+        lm_n_wgs_per_xcd = lm_n_wgs // 8
 
-        grid_dim = (_MPK_NX, 1, 1)
+        grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         # 24 base inputs (same as type 216)
         tb_graph.new_input(workspace_f32, (-1, -1, -1), 1, True)         # [0]

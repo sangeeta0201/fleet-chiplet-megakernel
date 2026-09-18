@@ -1120,7 +1120,7 @@ def get_compile_command(
             # The same transform at the W13 tile_iter=1 site. Unlike W2,
             # turning it off loses: 1.719→1.731, 1.712→1.736, 1.736→1.753
             # (+12 / +24 / +17 µs), hash e86d7dc all six. Keep default ON.
-            flags = flags + (["-DMPK_W13_T1_LINEAR_LOAD"] if _MPK_NX == 8 else [])
+            flags = flags + ["-DMPK_W13_T1_LINEAR_LOAD"]
         if _opt("MPK_W13_T1_EARLY_SCALE_LOAD"):
             # Hoist the W13 tile-1 block-scale global reads up beside the
             # tile-1 data loads, holding them in VGPRs across the tile-0 SwiGLU
@@ -1129,7 +1129,7 @@ def get_compile_command(
             # the scale reads after the data drain, serializing two HBM round
             # trips. Worth roughly 0.06 ms/token, the second-largest of the
             # six scheduling flags in this group.
-            flags = flags + (["-DMPK_W13_T1_EARLY_SCALE_LOAD"] if _MPK_NX == 8 else [])
+            flags = flags + ["-DMPK_W13_T1_EARLY_SCALE_LOAD"]
         if _opt("MPK_QKV_PREFETCH_SCALES"):
             # DMA the QKV block scales straight to LDS in the prefetch helper
             # instead of reading them into VGPRs after the data drain and
@@ -1151,7 +1151,7 @@ def get_compile_command(
             # 1.815/1.819/1.819 -> 1.767/1.768/1.763 ms, three alternating
             # pairs, identical generated text (Paris). Five ctx-4096
             # repeats matched the control token dump. Batch-1 only.
-            flags = flags + (["-DMPK_W13_KMAJOR_RECYCLE"] if _MPK_NX == 8 else [])
+            flags = flags + ["-DMPK_W13_KMAJOR_RECYCLE"]
         if int(os.environ.get("MPK_W13_RECYCLE_EAGER_DRAIN", "0")) == 1:
             # Opt-in ISA probe: replace tile-1's progressive vmcnt(22..0)
             # fragment waits with one vmcnt(0) before its MFMA loop. This
@@ -1441,7 +1441,7 @@ def get_compile_command(
             # Requires MPK_ROUTER_FUSED_DP (it publishes from that flag's
             # elected writer) and BATCH_SIZE == 1 (the publication is one row,
             # not a per-token gather). Both are enforced in the kernel.
-            flags = flags + (["-DMPK_W13_PREQUANT"] if _MPK_NX == 8 else [])
+            flags = flags + ["-DMPK_W13_PREQUANT"]
         if int(os.environ.get("MPK_NARROW_GATE_POLL", "0")) == 1:
             # TESTED AND NOT ADOPTED (mixed/neutral). One thread per block
             # polls Phase 6 / Phase 7b instead of all 256, then
@@ -1584,7 +1584,7 @@ def get_compile_command(
             #
             # 1.865 -> 1.840 ms, three alternating pairs, every pair a win and
             # the generated text unchanged in all six runs.
-            flags = flags + (["-DMPK_W13_T0_COUNTED_HANDOFF"] if _MPK_NX == 8 else [])
+            flags = flags + ["-DMPK_W13_T0_COUNTED_HANDOFF"]
         if _opt("MPK_W13_BIAS_PREFETCH"):
             # Hoist the W13 tile-0 SwiGLU bias to one global_load_dwordx2
             # issued above the MFMA block, and pack the epilogue's two bf16
@@ -1597,7 +1597,7 @@ def get_compile_command(
             # the 15 younger tile-1 data/scale requests too. Keep those in
             # flight with vmcnt(15): 1.824 -> 1.819, 1.829 -> 1.828, and
             # 1.822 -> 1.815 ms in three alternating pairs, text unchanged.
-            flags = flags + (["-DMPK_W13_BIAS_COUNTED_WAIT"] if _MPK_NX == 8 else [])
+            flags = flags + ["-DMPK_W13_BIAS_COUNTED_WAIT"]
         if _opt("MPK_W2_ONLY_ARRIVE"):
             # Narrow the Phase 9 arrival to the workers that actually ran a W2
             # tile. The barrier orders this layer's W2 stores against the next
@@ -1635,7 +1635,7 @@ def get_compile_command(
             # the required recycle/bias flags.
             # Ablation 2026-08-30 (=0): +4 / +27 / +3 µs, hash e86d7dc;
             # keep default ON.
-            flags = flags + (["-DMPK_W13_T1_BIAS_EARLY"] if _MPK_NX == 8 else [])
+            flags = flags + ["-DMPK_W13_T1_BIAS_EARLY"]
         if _opt("MPK_ROUTER_FUSED_DP"):
             # Fold the router dot product into the RMSNorm's ssq pass. irms is
             # a scalar uniform over the row, so it can be applied once to the
@@ -4122,7 +4122,7 @@ class PersistentKernel:
         assert batch_size % m_tiles == 0
         m_per_tile = batch_size // m_tiles
         total_tiles_per_xcd = n_tiles_per_xcd * m_tiles
-        total_gang_tiles = total_tiles_per_xcd * _MPK_NX  # one slot per XCD
+        total_gang_tiles = total_tiles_per_xcd * 8  # 8 XCDs on MI300X
         grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         # 7 inputs
@@ -4809,8 +4809,7 @@ class PersistentKernel:
         assert router_output_size % _MPK_NX == 0
         router_tile_n = router_output_size // _MPK_NX  # chunk_N per XCD
         topk_tiles_per_xcd = router_tile_n  # 1 tile per expert
-        total_topk_tiles = min(topk_tiles_per_xcd,
-                              self.num_workers // 8) * _MPK_NX
+        total_topk_tiles = topk_tiles_per_xcd * _MPK_NX
 
         # Gang dispatch uses max of both tile counts
         total_tiles_per_xcd = max(oproj_tiles_per_xcd, topk_tiles_per_xcd)
@@ -4920,8 +4919,7 @@ class PersistentKernel:
         assert router_output_size % _MPK_NX == 0
         router_tile_n = router_output_size // _MPK_NX
         topk_tiles_per_xcd = router_tile_n
-        total_topk_tiles = min(topk_tiles_per_xcd,
-                              self.num_workers // 8) * _MPK_NX
+        total_topk_tiles = topk_tiles_per_xcd * _MPK_NX
         total_oproj_tiles = max(oproj_tiles_per_xcd, topk_tiles_per_xcd) * _MPK_NX
 
         # MoE dimensions from tensors
@@ -5126,8 +5124,7 @@ class PersistentKernel:
         router_output_size = router_weight.dim(0)
         assert router_output_size % _MPK_NX == 0
         router_tile_n = router_output_size // _MPK_NX
-        total_topk_tiles = min(router_tile_n,
-                              self.num_workers // 8) * _MPK_NX
+        total_topk_tiles = router_tile_n * _MPK_NX
         total_oproj_tiles = max(oproj_tiles_per_xcd, router_tile_n) * _MPK_NX
 
         # MoE tiling (from type 187/215)
@@ -5350,8 +5347,7 @@ class PersistentKernel:
         router_output_size = router_weight.dim(0)
         assert router_output_size % _MPK_NX == 0
         router_tile_n = router_output_size // _MPK_NX
-        total_topk_tiles = min(router_tile_n,
-                              self.num_workers // 8) * _MPK_NX
+        total_topk_tiles = router_tile_n * _MPK_NX
         total_oproj_tiles = max(oproj_tiles_per_xcd, router_tile_n) * _MPK_NX
 
         # MoE tiling
