@@ -442,22 +442,73 @@ class GptOssPreTrainedModel(PreTrainedModel):
             module.bias.data.normal_(mean=0.0, std=std)
 
 
+_KV_KEEPALIVE = []
+
+
+def _kv_alloc(shape, name):
+    """KV cache in UNCACHED (MTYPE_NC) device VRAM when MPK_UNCACHED_KV=1.
+
+    In DPX+NPS2 an XCP maps onto one NPS range, so plain VRAM is MTYPE_RW:
+    cached, but coherent only within an AID, while a device's 4 XCDs span two.
+    The KV cache is the one attention input written by a different task than
+    the one that reads it, so it is exposed to that -- and it is the last
+    written buffer that does not go through demo.py's make_tensor, so it
+    cannot be moved to NC from there.
+
+    Needs the driver's aid_local_uncached_mtype=1, which maps an
+    UNCACHED-marked BO to MTYPE_NC rather than upstream's MTYPE_UC (UC drops
+    the coherence point device-scope atomics resolve at).
+    """
+    import os
+    if os.environ.get("MPK_UNCACHED_KV", "0") != "1":
+        return torch.empty(shape, dtype=torch.bfloat16, device="cuda")
+    import ctypes
+    import functools
+    import operator
+    n = functools.reduce(operator.mul, shape, 1)
+    nbytes = n * 2
+    try:
+        hip = ctypes.CDLL("libamdhip64.so")
+        ptr = ctypes.c_void_p()
+        rc = hip.hipExtMallocWithFlags(
+            ctypes.byref(ptr), ctypes.c_size_t(nbytes), ctypes.c_uint(3))
+        if rc != 0 or not ptr.value:
+            print(f"[UNCACHED] {name}: hipExtMallocWithFlags rc={rc}, "
+                  f"falling back", flush=True)
+            return torch.empty(shape, dtype=torch.bfloat16, device="cuda")
+        hip.hipMemset(ptr, 0, ctypes.c_size_t(nbytes))
+        _KV_KEEPALIVE.append((hip, ptr))
+
+        class _CAI:
+            pass
+
+        cai = _CAI()
+        cai.__cuda_array_interface__ = {
+            "shape": tuple(int(d) for d in shape),
+            "typestr": "<u2",
+            "data": (ptr.value, False),
+            "version": 2,
+            "strides": None,
+        }
+        t = torch.as_tensor(cai, device="cuda").view(torch.bfloat16)
+        print(f"[UNCACHED] {name} in uncached device VRAM "
+              f"@ 0x{t.data_ptr():x} ({nbytes} B)", flush=True)
+        return t
+    except Exception as _e:
+        print(f"[UNCACHED] {name}: failed ({_e}), falling back", flush=True)
+        return torch.empty(shape, dtype=torch.bfloat16, device="cuda")
+
+
 class GptOssModel(GptOssPreTrainedModel):
     def __init__(self, config: GptOssConfig, world_size: int, max_num_pages: int, page_size: int):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        key_cache = torch.empty(
-            (config.num_hidden_layers, max_num_pages, page_size,
-             config.num_key_value_heads // world_size, config.head_dim),
-            dtype=torch.bfloat16, device="cuda",
-        )
-        value_cache = torch.empty(
-            (config.num_hidden_layers, max_num_pages, page_size,
-             config.num_key_value_heads // world_size, config.head_dim),
-            dtype=torch.bfloat16, device="cuda",
-        )
+        _kv_shape = (config.num_hidden_layers, max_num_pages, page_size,
+                     config.num_key_value_heads // world_size, config.head_dim)
+        key_cache = _kv_alloc(_kv_shape, "key_cache")
+        value_cache = _kv_alloc(_kv_shape, "value_cache")
         self.kv_cache = (key_cache, value_cache)
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)

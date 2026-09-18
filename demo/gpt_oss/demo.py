@@ -317,7 +317,11 @@ def quantize_bf16_to_mxfp4(weight: torch.Tensor,
     num_blocks = in_dim // 32
 
     # Work in float32
-    w = weight.float().reshape(out_dim, num_blocks, 32)
+    print(f">>> quantize enter {tuple(weight.shape)} {weight.dtype} {weight.device}", flush=True)
+    w = weight.float()
+    print(">>> quantize float32", flush=True)
+    w = w.reshape(out_dim, num_blocks, 32)
+    print(">>> quantize reshape", flush=True)
 
     # Per-block max absolute value
     max_abs = w.abs().amax(dim=2)  # [out_dim, num_blocks]
@@ -342,16 +346,15 @@ def quantize_bf16_to_mxfp4(weight: torch.Tensor,
 
     # Round to nearest FP4 using midpoint thresholds
     # FP4 values: 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0
-    nibble = torch.zeros_like(w_abs, dtype=torch.uint8)
-    nibble[w_abs >= 0.25] = 1   # 0.5
-    nibble[w_abs >= 0.75] = 2   # 1.0
-    nibble[w_abs >= 1.25] = 3   # 1.5
-    nibble[w_abs >= 1.75] = 4   # 2.0
-    nibble[w_abs >= 2.50] = 5   # 3.0
-    nibble[w_abs >= 3.50] = 6   # 4.0
-    nibble[w_abs >= 5.00] = 7   # 6.0
-    # Set sign bit (bit 3) for negative values
-    nibble[w_sign < 0] |= 8
+    # Vectorized: 8 boolean-index writes on ~6e8 elements deadlock/starve HIP
+    # when the 120B model already occupies VRAM (measured hang >40 min).
+    print(">>> quantize nibble-bucketize", flush=True)
+    _thr = torch.tensor(
+        [0.25, 0.75, 1.25, 1.75, 2.50, 3.50, 5.00],
+        device=w_abs.device, dtype=w_abs.dtype)
+    nibble = torch.bucketize(w_abs, _thr, right=True).to(torch.uint8)
+    nibble = nibble | ((w_sign < 0).to(torch.uint8) << 3)
+    print(">>> quantize nibble-done", flush=True)
 
     # Pack pairs of nibbles into bytes: byte = lo_nibble | (hi_nibble << 4)
     even = nibble[:, :, 0::2]  # [out_dim, num_blocks, 16]
@@ -1466,6 +1469,7 @@ if __name__ == "__main__":
     print(f"Padding: hidden {hidden_size} -> {PADDED_HIDDEN_SIZE}, "
           f"intermediate {intermediate_size} -> {PADDED_INTERMEDIATE_SIZE}")
     print(f"RMSNorm scale factor: {rmsnorm_scale_factor:.6f}")
+    print(">>> after RMSNorm, about to enter use_mirage", flush=True)
 
     # === Triton kernels MoE setup (vLLM's fast MXFP4 path) ===
     if args.use_triton:
@@ -1922,8 +1926,12 @@ if __name__ == "__main__":
         print(f"  Patched {num_layers} layers with AITER MoE + profiled forward\n")
 
     if args.use_mirage:
+        print(">>> importing mirage", flush=True)
         import mirage as mi
+        print(">>> mirage imported", flush=True)
         from mirage.utils import mpk_w13_prequant
+        print(">>> starting lm_head pack", flush=True)
+        print(f">>> lm_head {tuple(model.lm_head.weight.shape)} {model.lm_head.weight.device} {model.lm_head.weight.dtype}", flush=True)
 
         # Gang dispatch is required for MXFP4 MoE kernels on MI300/MI350
         os.environ.setdefault("USE_GANG", "1")
@@ -1934,7 +1942,7 @@ if __name__ == "__main__":
         lm_head_weight = torch.cat(
             (
                 # Pad lm_head output_dim (hidden_size -> PADDED_HIDDEN_SIZE)
-                pad_weight_2d(model.lm_head.weight, target_cols=PADDED_HIDDEN_SIZE),
+                (print(">>> pad_weight_2d", flush=True) or pad_weight_2d(model.lm_head.weight, target_cols=PADDED_HIDDEN_SIZE)),
                 torch.zeros(
                     (padded_vocab_size - config.vocab_size, PADDED_HIDDEN_SIZE),
                     device="cuda",
@@ -1948,7 +1956,9 @@ if __name__ == "__main__":
         # Quantize LM head to MXFP4 for FP4×FP8 MFMA (3.7x less HBM traffic)
         # OPW must be >= 64 (4 waves × 16 rows/MFMA tile = 64 minimum)
         lm_head_output_per_wg = 64
+        print(">>> cat done, quantize", flush=True)
         lm_blocks, lm_scales = quantize_bf16_to_mxfp4(lm_head_weight)
+        print(">>> quantize done, pack", flush=True)
         lm_head_packed = pack_mxfp4_workgroup(
             lm_blocks, lm_scales, output_per_wg=lm_head_output_per_wg,
         ).squeeze(0)  # [n_wgs, wg_bytes]
@@ -1989,7 +1999,9 @@ if __name__ == "__main__":
         # occupancy-driven split-K decision vLLM makes (partition only when the
         # machine is not already full), just expressed as a compile-time shape.
         _nw, _ = mi.get_configurations_from_gpu(rank)
-        _workers_per_xcd = _nw // 8  # 240/8 = 30 on MI350
+        _nx = int(os.environ.get("MPK_NUM_XCDS", "8"))
+        print(f"[DPX] MPK_NUM_XCDS={_nx} workers={_nw} wpx={_nw // _nx} sm-derived")
+        _workers_per_xcd = _nw // _nx
         MAX_KV_CHUNKS = _workers_per_xcd // args.max_num_batched_requests
         assert MAX_KV_CHUNKS >= 1, (
             f"max_num_batched_requests={args.max_num_batched_requests} exceeds "
@@ -2098,8 +2110,129 @@ if __name__ == "__main__":
         # megakernel internal memory aliasing that causes wrong output.
         verify_tensors = {}
         _tensor_refs = {}  # prevent GC of backing tensors
+        # MPK_HOST_BARRIERS: put the cross-XCD sync flags in pinned host
+        # memory instead of device VRAM.
+        #
+        # A DPX device is 4 XCDs, and under NPS2 those 4 XCDs span two AIDs.
+        # Plain device VRAM there is MTYPE_RW, which is coherent only *within*
+        # an AID -- so a release published by one die is never observed by the
+        # two XCDs on the other AID. Measured signature: three workers reading
+        # the same four flags at the same moment report [8,7,7,7], [7,7,7,8]
+        # and [8,7,7,8], and every stall splits the four XCDs 2-vs-2. Pinned
+        # host memory is system-coherent, so all four XCDs agree.
+        _host_barriers = os.environ.get("MPK_HOST_BARRIERS", "0") == "1"
+        # Every activation into system-coherent memory.
+        #
+        # Under DPX+NPS2 a device's XCP maps onto a single NPS2 memory range,
+        # so plain device VRAM is MTYPE_RW: cacheable, but coherent only
+        # within one AID. The activations here are read cross-XCD with plain
+        # cached loads -- the post-attention RMSNorm reads the whole O-proj
+        # row, the MoE reads the routing output -- so a reader on the far AID
+        # sees a stale line. Measured: rmsnorm_out_moe came back with 1436 of
+        # 2944 elements written, almost exactly half, and values at 1e30.
+        #
+        # At batch size 1 the whole set is ~130 KB, so correctness costs a
+        # PCIe round trip per access and nothing in footprint.
+        _host_acts = os.environ.get("MPK_HOST_ACTIVATIONS", "0") == "1"
+        _host_barrier_names = ("oproj_topk_counters", "qkv_attn_barrier",
+                               "moe_fused_barrier", "router_topk_counter")
+        # MPK_UNCACHED_BARRIERS: the sync flags in UNCACHED DEVICE VRAM rather
+        # than pinned host memory.
+        #
+        # Host memory is coherent but every cross-XCD poll becomes a PCIe round
+        # trip: measured 21.3 ms/iter against 3.9 in DPX+NPS1 with the same
+        # binary, and the barriers are the whole of that gap (pinning the
+        # activations on top costs a further 6.4 and buys nothing).
+        #
+        # Uncached VRAM is coherent for the same reason SPX+NPS2's MTYPE_NC
+        # was -- no line is ever held in an AID's L2, so every access goes to
+        # memory and is unconditionally fresh -- but stays on the device. It
+        # also leaves the bulk (weights, activations) on MTYPE_RW, which is the
+        # thing DPX+NPS2 uniquely offers: VRAM that is both AID-local AND
+        # cacheable. SPX+NPS2 never had that, which is why it sat at 8.5 ms.
+        _uncached_barriers = os.environ.get("MPK_UNCACHED_BARRIERS", "0") == "1"
+        # MPK_UNCACHED_ACTS: every activation AND flag on NC, weights left RW.
+        #
+        # This is the split the hardware actually wants in DPX+NPS2. The
+        # weights are ~155 GB and read-only, so they can never go stale and
+        # they are the only thing that benefits from being cached (the O-proj
+        # weight runs at a 97% L2 hit rate). Everything written cross-XCD is
+        # ~130 KB at batch size 1. Forcing mtype_local=NC globally is correct
+        # but uncaches the weights too, which is the whole 10.6-vs-3.9 gap.
+        _uncached_acts = os.environ.get("MPK_UNCACHED_ACTS", "0") == "1"
+        _uncached_keepalive = []
+        # bfloat16 has no numpy typestr, so it is wrapped as uint16 of the same
+        # width and viewed back -- __cuda_array_interface__ only needs to agree
+        # on the byte layout.
+        _UNC_TYPESTR = {
+            torch.int32: ("<i4", 4, None),
+            torch.float32: ("<f4", 4, None),
+            torch.float16: ("<f2", 2, None),
+            torch.bfloat16: ("<u2", 2, torch.bfloat16),
+            torch.int64: ("<i8", 8, None),
+        }
+
+        def _alloc_uncached(dims, torch_dtype, name):
+            spec = _UNC_TYPESTR.get(torch_dtype)
+            if spec is None:
+                return None
+            typestr, itemsize, view_as = spec
+            import ctypes
+            n = 1
+            for d in dims:
+                n *= int(d)
+            nbytes = n * itemsize
+            try:
+                hip = ctypes.CDLL("libamdhip64.so")
+                ptr = ctypes.c_void_p()
+                # hipDeviceMallocUncached == 0x3 (Default 0, Finegrained 1,
+                # SignalMemory 2) per hip_runtime_api.h.
+                rc = hip.hipExtMallocWithFlags(
+                    ctypes.byref(ptr), ctypes.c_size_t(nbytes), ctypes.c_uint(3))
+                if rc != 0 or not ptr.value:
+                    print(f"[UNCACHED] {name}: hipExtMallocWithFlags rc={rc}",
+                          flush=True)
+                    return None
+                hip.hipMemset(ptr, 0, ctypes.c_size_t(nbytes))
+                _uncached_keepalive.append((hip, ptr))
+
+                class _CAI:
+                    pass
+
+                cai = _CAI()
+                cai.__cuda_array_interface__ = {
+                    "shape": tuple(int(d) for d in dims),
+                    "typestr": typestr,
+                    "data": (ptr.value, False),
+                    "version": 2,
+                    "strides": None,
+                }
+                t = torch.as_tensor(cai, device="cuda")
+                if view_as is not None:
+                    t = t.view(view_as)
+                print(f"[UNCACHED] {name} in uncached device VRAM "
+                      f"@ 0x{t.data_ptr():x} ({nbytes} B)", flush=True)
+                return t
+            except Exception as _e:
+                print(f"[UNCACHED] {name}: failed ({_e}), falling back",
+                      flush=True)
+                return None
+
         def make_tensor(name, dims, torch_dtype=torch.bfloat16):
-            t = torch.zeros(dims, dtype=torch_dtype, device="cuda")
+            if _uncached_acts or (_uncached_barriers
+                                  and name in _host_barrier_names):
+                t = _alloc_uncached(dims, torch_dtype, name)
+                if t is not None:
+                    _tensor_refs[name] = t
+                    if args.verify:
+                        verify_tensors[name] = t
+                    return mpk.attach_input(torch_tensor=t, name=name)
+            if _host_acts or (_host_barriers and name in _host_barrier_names):
+                t = torch.zeros(dims, dtype=torch_dtype).pin_memory()
+                print(f"[HOSTBAR] {name} in pinned host memory "
+                      f"@ 0x{t.data_ptr():x}", flush=True)
+            else:
+                t = torch.zeros(dims, dtype=torch_dtype, device="cuda")
             _tensor_refs[name] = t
             if args.verify:
                 verify_tensors[name] = t
@@ -2110,16 +2243,28 @@ if __name__ == "__main__":
         # CK FMHA workspaces
         num_qo_per_kv = num_local_q_heads // num_local_kv_heads
         q_ws_stride = num_local_q_heads * head_dim
-        ck_fmha_q_ws_tensor = torch.zeros(
-            bs, q_ws_stride, dtype=torch.bfloat16, device="cuda")
+        # The CK FMHA workspaces are the only written buffers that never went
+        # through make_tensor, so they stayed on MTYPE_RW while everything else
+        # moved to NC -- and RW is coherent only within an AID. Route them the
+        # same way; they are a few tens of KB.
+        def _dev_or_unc(dims, torch_dtype, name):
+            if _uncached_acts:
+                t = _alloc_uncached(dims, torch_dtype, name)
+                if t is not None:
+                    _tensor_refs[name] = t
+                    return t
+            return torch.zeros(dims, dtype=torch_dtype, device="cuda")
+
+        ck_fmha_q_ws_tensor = _dev_or_unc(
+            (bs, q_ws_stride), torch.bfloat16, "ck_fmha_q_workspace")
         ck_fmha_q_ws = mpk.attach_input(
             torch_tensor=ck_fmha_q_ws_tensor, name="ck_fmha_q_workspace")
         lse_dim1 = num_local_kv_heads * ck_fmha_num_kv_chunks * num_qo_per_kv
         # Always 2x: MPK_ATTN_SPLIT_CHUNK helper partials live in the second
         # half (offset +LSE_S). Unused when the flag is off.
         lse_dim1 = lse_dim1 * 2
-        ck_fmha_lse_acc_tensor = torch.zeros(
-            bs, lse_dim1, dtype=torch.float32, device="cuda")
+        ck_fmha_lse_acc_tensor = _dev_or_unc(
+            (bs, lse_dim1), torch.float32, "ck_fmha_lse_acc")
         ck_fmha_lse_acc = mpk.attach_input(
             torch_tensor=ck_fmha_lse_acc_tensor, name="ck_fmha_lse_acc")
         if args.verify:
@@ -2131,8 +2276,8 @@ if __name__ == "__main__":
         # partials into ck_fmha_o_acc; merge step combines them into attn_out.
         if use_split_attn_chunks or fuse_full_layer:
             o_acc_dim1 = num_local_kv_heads * ck_fmha_num_kv_chunks * num_qo_per_kv * head_dim * 2
-            ck_fmha_o_acc_tensor = torch.zeros(
-                bs, o_acc_dim1, dtype=torch.float32, device="cuda")
+            ck_fmha_o_acc_tensor = _dev_or_unc(
+                (bs, o_acc_dim1), torch.float32, "ck_fmha_o_acc")
             ck_fmha_o_acc = mpk.attach_input(
                 torch_tensor=ck_fmha_o_acc_tensor, name="ck_fmha_o_acc")
             if args.verify:
@@ -3705,11 +3850,12 @@ if __name__ == "__main__":
                 # `n_last = ((n_ppl - 1) % bt) + 1` of them.
                 n_last = ((n_ppl - 1) % bt) + 1
                 last_base = n_ppl - n_last + 1
-                wpx = mpk.num_workers // 8               # workers per XCD
-                nwg = (vocab_size // lm_head_output_per_wg) // 8
+                _nx = int(os.environ.get("MPK_NUM_XCDS", "8"))
+                wpx = mpk.num_workers // _nx
+                nwg = (vocab_size // lm_head_output_per_wg) // _nx
                 # Column sets are token-independent -- build them once.
                 col_sets = []
-                for p in range(8):
+                for p in range(int(os.environ.get("MPK_NUM_XCDS", "8"))):
                     pstart = p * nwg * lm_head_output_per_wg
                     for r in range(wpx):
                         col_sets.append(torch.cat([
@@ -4037,11 +4183,42 @@ if __name__ == "__main__":
             print("VERIFICATION: Comparing Mirage intermediates with PyTorch reference")
             print("=" * 80)
             torch.cuda.synchronize()
+            # MPK_HOST_ACTIVATIONS puts the activations in pinned host memory,
+            # which the kernel reads fine but which every comparison below
+            # would hit as a cuda-vs-cpu device mismatch. Snapshot to device
+            # after the run so the harness is unchanged.
+            for _vk in list(verify_tensors):
+                _vv = verify_tensors[_vk]
+                if hasattr(_vv, "is_cuda") and not _vv.is_cuda:
+                    verify_tensors[_vk] = _vv.cuda()
 
             # Debug: check q_workspace and k_cache values
             q_ws_nz = (ck_fmha_q_ws_tensor.abs() > 1e-6).sum().item()
             print(f"  [DEBUG] q_workspace non-zero: {q_ws_nz} / {ck_fmha_q_ws_tensor.numel()}")
             print(f"  [DEBUG] q_workspace[:8]: {ck_fmha_q_ws_tensor[0, :8].float().tolist()}")
+            # Which slices of each cross-XCD buffer actually got written.
+            # An aggregate non-zero count cannot distinguish "half the heads
+            # are missing" from "every head is half sparse", and those point
+            # at completely different partitioning bugs.
+            def _slice_nz(tag, ten, group):
+                try:
+                    f = ten.detach().cpu().reshape(-1).float()
+                    n = (f.numel() // group) * group
+                    m = (f[:n].abs() > 1e-9).reshape(-1, group).sum(1).tolist()
+                    empt = [i for i, c in enumerate(m) if c == 0]
+                    print(f"  [SLICE] {tag}: {len(m)} groups of {group}, "
+                          f"{len(empt)} all-zero -> {empt[:24]}", flush=True)
+                    print(f"  [SLICE] {tag} counts: {m[:40]}", flush=True)
+                except Exception as _e:
+                    print(f"  [SLICE] {tag}: FAILED {_e}", flush=True)
+            _slice_nz("q_workspace(64 heads x 64)", ck_fmha_q_ws_tensor, 64)
+            for _nm, _g in (("attn_out", 64), ("attn_proj_out", 16),
+                            ("rmsnorm_out_moe", 16), ("embed_out", 16),
+                            ("moe_gate_out", 8), ("swiglu_out", 64),
+                            ("moe_workspace_f32", 64)):
+                _t2 = verify_tensors.get(_nm)
+                if _t2 is not None:
+                    _slice_nz(_nm, _t2, _g)
             k_cache_t = model.model.kv_cache[0][0]
             v_cache_t = model.model.kv_cache[1][0]
             k_nz = (k_cache_t[:, 0, :].abs() > 1e-6).sum().item()
