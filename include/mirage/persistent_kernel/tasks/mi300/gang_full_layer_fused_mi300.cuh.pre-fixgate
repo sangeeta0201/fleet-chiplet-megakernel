@@ -1832,13 +1832,8 @@ __device__ __noinline__ void
   // One group per tile execution: the dispatcher already loops this XCD's
   // workers over all kMoeGroups tiles, so an inner sweep would count each
   // layer's arrivals twice over.
-  // This tile's index within this XCD's list for this layer. The list is
-  // moe_total_tiles_per_xcd long (the max over phases), NOT kMoeGroups, so
-  // taking the modulus by the group count would wrap several times per layer
-  // and admit the same group more than once.
-  int const _moe_pos =
-      (moe_total_tiles_per_xcd > 0) ? (tile_idx % moe_total_tiles_per_xcd)
-                                    : tile_idx;
+  // This tile's position in the XCD's list, 0..kMoeGroups-1.
+  int const _moe_pos = tile_idx % kMoeGroups;
   // Only the first workers_per_xcd positions run the MoE phase; each sweeps
   // the groups it owns. Running it on every position would count each layer's
   // arrivals more than once.

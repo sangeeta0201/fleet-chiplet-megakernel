@@ -1829,23 +1829,11 @@ __device__ __noinline__ void
   // exactly one selection and 46 / members groups of it.
   constexpr int kMoeMembers = MPK_NUM_XCDS / TOPK_K;
   constexpr int kMoeGroups = 46 / (kMoeMembers > 0 ? kMoeMembers : 1);
-  // One group per tile execution: the dispatcher already loops this XCD's
-  // workers over all kMoeGroups tiles, so an inner sweep would count each
-  // layer's arrivals twice over.
-  // This tile's index within this XCD's list for this layer. The list is
-  // moe_total_tiles_per_xcd long (the max over phases), NOT kMoeGroups, so
-  // taking the modulus by the group count would wrap several times per layer
-  // and admit the same group more than once.
-  int const _moe_pos =
-      (moe_total_tiles_per_xcd > 0) ? (tile_idx % moe_total_tiles_per_xcd)
-                                    : tile_idx;
-  // Only the first workers_per_xcd positions run the MoE phase; each sweeps
-  // the groups it owns. Running it on every position would count each layer's
-  // arrivals more than once.
   int const kMoeSweeps =
       (kMoeGroups + workers_per_xcd - 1) / workers_per_xcd;
   int const moe_begin = 0;
-  int const moe_end = (_moe_pos < workers_per_xcd) ? (2 * kMoeSweeps) : 0;
+  // All W13 sweeps first, then all W2 sweeps.
+  int const moe_end = 2 * kMoeSweeps;
   int const moe_step = 1;
 #else
   int const moe_begin = xcd_rank;
@@ -1856,13 +1844,11 @@ __device__ __noinline__ void
 #ifdef MPK_MOE_XCD_PAIR
     // moe_i enumerates (phase, sweep): the first kMoeSweeps iterations are
     // W13, the rest W2, so every W13 arrival is issued before any W2 waits.
-    // All W13 sweeps first, then all W2 sweeps, so every W13 arrival of this
-    // layer is issued before this worker waits on any of them.
     int const _phase = (moe_i >= kMoeSweeps) ? 1 : 0;
     int const _sweep = moe_i - _phase * kMoeSweeps;
-    int const _grp = _moe_pos + _sweep * workers_per_xcd;
+    int const _grp = xcd_rank + _sweep * workers_per_xcd;
     if (_grp >= kMoeGroups) {
-      continue; // this position owns no group in this sweep
+      continue; // this rank owns no group in this sweep
     }
     // This XCD's own selection, and the expert it names.
     int const _sel_idx = xcd_id / (kMoeMembers > 0 ? kMoeMembers : 1);
