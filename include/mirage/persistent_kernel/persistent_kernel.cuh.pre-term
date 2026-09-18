@@ -14,25 +14,12 @@
  */
 
 #include "profiler.h"
-
-// Number of XCDs that TAKE PART in a run. 8 is the whole GPU in SPX and
-// the default; a smaller value confines fleet to XCDs [0, N) so a run can
-// be held inside a single AID without changing the partition mode.
-// Must be defined before its first use (the worker early-exit), since an
-// undefined name is 0 in #if and would retire every worker.
-#ifndef MPK_NUM_XCDS
-#define MPK_NUM_XCDS 8
-#endif
 #include "tasks/common/copy_sm80.cuh"
 #ifdef MPK_ENABLE_TMA
 #include "tma.cuh"
 #endif
 #include "mpk_atoms.cuh"
 #include "runtime_header.h"
-
-#if defined(MPK_AID_LOCAL) || defined(MPK_AID_SPLIT_FLAGS)
-#include "aid_local.h"
-#endif
 #ifdef USE_NVSHMEM
 #include <mpi.h>
 #include <nvshmem.h>
@@ -147,23 +134,17 @@ __device__ unsigned long long g_il_n;
 //   9  Phase 9 arrival done
 //   10 Phase 9 gate cleared
 //   11 layer exit
-#define MPK_PHASE_SLOT_COUNT 13
-// Per-worker stride padded to a full 128 B line. The arrays are indexed
-// by STRIDE and iterated by COUNT, so only the spacing changes.
-#define MPK_PHASE_SLOT_STRIDE 16
-#define MPK_PHASE_PAD_INT 32   /* 32 * 4 B = 128 B */
-#define MPK_PHASE_PAD_U64 16   /* 16 * 8 B = 128 B */
+#define MPK_PHASE_SLOT_COUNT 12
 #define MPK_PHASE_MAX_WORKERS 256
 __device__ unsigned long long
-    g_phase_ts[MPK_PHASE_MAX_WORKERS * MPK_PHASE_SLOT_STRIDE];
+    g_phase_ts[MPK_PHASE_MAX_WORKERS * MPK_PHASE_SLOT_COUNT];
 // Accumulated per-slot-pair spans, so the reduction is over every layer of
 // every decode iteration rather than whichever layer happened to be last in
 // the buffer. Accumulating rather than sampling one captured layer is
 // strictly more robust and costs one atomic per slot.
 __device__ unsigned long long
-    g_phase_span[MPK_PHASE_MAX_WORKERS * MPK_PHASE_SLOT_STRIDE];
-__device__ unsigned long long
-    g_phase_n[MPK_PHASE_MAX_WORKERS * MPK_PHASE_PAD_U64];
+    g_phase_span[MPK_PHASE_MAX_WORKERS * MPK_PHASE_SLOT_COUNT];
+__device__ unsigned long long g_phase_n[MPK_PHASE_MAX_WORKERS];
 // Only sample steady-state decode.
 //
 // `volatile` is load-bearing, not decoration. The whole layer body is inlined
@@ -190,7 +171,7 @@ __device__ volatile int g_phase_arm;
 // late slots only, yet still bumps g_phase_n at slot 11 -- every early-slot
 // mean would then be divided by one layer too many. Set at slot 0, required by
 // every other slot.
-__device__ int g_phase_live[MPK_PHASE_MAX_WORKERS * MPK_PHASE_PAD_INT];
+__device__ int g_phase_live[MPK_PHASE_MAX_WORKERS];
 
 __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
   if (threadIdx.x != 0 || worker >= MPK_PHASE_MAX_WORKERS) {
@@ -200,14 +181,14 @@ __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
     if (!g_phase_arm) {
       return;
     }
-    g_phase_live[(worker) * MPK_PHASE_PAD_INT] = 1;
-  } else if (!g_phase_live[(worker) * MPK_PHASE_PAD_INT]) {
+    g_phase_live[worker] = 1;
+  } else if (!g_phase_live[worker]) {
     return;
   }
   asm volatile("" ::: "memory");
   unsigned long long const t = __builtin_amdgcn_s_memrealtime();
   asm volatile("" ::: "memory");
-  int const base = worker * MPK_PHASE_SLOT_STRIDE;
+  int const base = worker * MPK_PHASE_SLOT_COUNT;
   // Slot 0 accumulates the *inter-layer* span: last layer's slot 11 to this
   // layer's slot 0. It used to record only a timestamp, which left everything
   // between two layers outside the trace -- and that hole is not small. At
@@ -231,8 +212,8 @@ __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
     g_phase_span[base + slot] += (t - prev) * 10; // 100 MHz -> ns
   }
   if (slot == MPK_PHASE_SLOT_COUNT - 1) {
-    g_phase_n[(worker) * MPK_PHASE_PAD_U64]++;
-    g_phase_live[(worker) * MPK_PHASE_PAD_INT] = 0;
+    g_phase_n[worker]++;
+    g_phase_live[worker] = 0;
   }
 }
 #define MPK_PHASE_MARK(worker, slot) mpk_phase_mark((worker), (slot))
@@ -805,23 +786,6 @@ __global__ void init_kernel(RuntimeConfig config) {
     }
 #endif
   }
-}
-
-// Increment an event counter and publish the new value into both AID mirrors.
-// Returns the PREVIOUS value, exactly like atom_add_release_gpu_u64, so every
-// `count + amount == expected` test at the call sites is unchanged.
-__device__ __forceinline__ unsigned long long
-    mpk_evctr_add(EventCounter *base, int idx, unsigned long long amt) {
-  unsigned long long old = atom_add_release_gpu_u64(
-      reinterpret_cast<unsigned long long *>(&base[idx]), amt);
-#if defined(MPK_AID_EVCTR2) && defined(MPK_AID_SPLIT_FLAGS)
-  // Monotone per-XCD slot; falls back to the shared counter only if the
-  // replicas are unavailable.
-  (void)mpk_aid_evctr2_pub(idx, amt);
-#elif defined(MPK_AID_EVCTR) && defined(MPK_AID_SPLIT_FLAGS)
-  mpk_aid_evctr_pub(idx, old + amt);
-#endif
-  return old;
 }
 
 __global__ void prepare_kernel(RuntimeConfig config,
@@ -1504,31 +1468,6 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 
   int const xcd_id = block_xcd_id;
   int const is_xcd_leader = block_is_xcd_leader;
-#if MPK_NUM_XCDS < 8
-  // Confine the run to XCDs [0, MPK_NUM_XCDS). These blocks never claim
-  // a rank, so the per-XCD rank counters stay dense for the XCDs that do
-  // take part, and every barrier threshold is sized for the subset.
-  if (xcd_id >= MPK_NUM_XCDS) {
-    return;
-  }
-#endif
-
-#ifdef MPK_AID_SPLIT_FLAGS
-  // Read the ml pointer tables out of this XCD's own AID. Indexing is
-  // unchanged -- each replica is a full copy, so only the base moves. Falls
-  // back to the shared table when the allocator was unavailable.
-  void **const ml_in_tab = (g_aid_ml_in[xcd_id >> 2] != nullptr)
-                               ? g_aid_ml_in[xcd_id >> 2]
-                               : config.ml_input_table;
-  void **const ml_out_tab = (g_aid_ml_out[xcd_id >> 2] != nullptr)
-                                ? g_aid_ml_out[xcd_id >> 2]
-                                : config.ml_output_table;
-#else
-  void **const ml_in_tab = config.ml_input_table;
-  void **const ml_out_tab = config.ml_output_table;
-#endif
-  (void)ml_in_tab;
-  (void)ml_out_tab;
 
 #ifdef MPK_ENABLE_GANG_TASKS
   // XCD-local rank for gang tasks: computed lazily on first gang task.
@@ -1659,19 +1598,6 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
           }
           __builtin_amdgcn_s_sleep(1);
         }
-#ifdef MPK_TERM_RECHECK
-        // The terminate path bumps precomp_iter_ready specifically to release
-        // workers parked in the loop above, so a worker whose condition is
-        // satisfied by that bump can leave without ever evaluating the check
-        // inside it. It then loads tasks for an iteration that will never be
-        // produced and blocks forever in the dependency wait, which has no
-        // terminate check of its own. Re-test here, where the existing
-        // pc_terminated exit below can still catch it.
-        if (!pc_terminated &&
-            __atomic_load_n(config.precomp_terminate, __ATOMIC_RELAXED)) {
-          pc_terminated = 1;
-        }
-#endif
       }
       __syncthreads();
       if (pc_terminated) {
@@ -1930,16 +1856,9 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                                __ATOMIC_RELAXED);
             }
 #endif
-            unsigned _ev_spin = 0;
-#ifdef MPK_P7_SKIP
-            // bit 8: skip the dependency wait entirely (timing probe)
-            bool const _dep_skip = ((MPK_P7_SKIP) & 8) != 0;
-#else
-            bool const _dep_skip = false;
-#endif
-            while (!_dep_skip && actual_counts < needed_counts) {
-              actual_counts = MPK_EVCTR_POLL(
-                  config.all_event_counters, event_index, _ev_spin++);
+            while (actual_counts < needed_counts) {
+              actual_counts =
+                  MPK_LD_EVENT(&config.all_event_counters[event_index]);
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
               __builtin_amdgcn_s_sleep(1);
 #endif
@@ -2466,12 +2385,12 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
             if (_pf_ok) {
               int _pf_base = (xcd_id * config.ml_num_layers + 1);
               if ((int)threadIdx.x < MAX_INPUTS_PER_TASK) {
-                _pf_in = ml_in_tab[_pf_base * MAX_INPUTS_PER_TASK +
+                _pf_in = config.ml_input_table[_pf_base * MAX_INPUTS_PER_TASK +
                                                threadIdx.x];
               }
               if ((int)threadIdx.x < MAX_OUTPUTS_PER_TASK) {
                 _pf_out =
-                    ml_out_tab[_pf_base * MAX_OUTPUTS_PER_TASK +
+                    config.ml_output_table[_pf_base * MAX_OUTPUTS_PER_TASK +
                                            threadIdx.x];
               }
             }
@@ -2516,12 +2435,12 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                   if (_nl < config.ml_num_layers) {
                     int _nb = (xcd_id * config.ml_num_layers + _nl);
                     if ((int)threadIdx.x < MAX_INPUTS_PER_TASK) {
-                      _pf_in = ml_in_tab[_nb * MAX_INPUTS_PER_TASK +
+                      _pf_in = config.ml_input_table[_nb * MAX_INPUTS_PER_TASK +
                                                      threadIdx.x];
                     }
                     if ((int)threadIdx.x < MAX_OUTPUTS_PER_TASK) {
                       _pf_out =
-                          ml_out_tab[_nb * MAX_OUTPUTS_PER_TASK +
+                          config.ml_output_table[_nb * MAX_OUTPUTS_PER_TASK +
                                                  threadIdx.x];
                     }
                   }
@@ -2531,12 +2450,12 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                   for (int i = threadIdx.x; i < MAX_INPUTS_PER_TASK;
                        i += blockDim.x) {
                     task_desc->input_ptrs[i] =
-                        ml_in_tab[ml_in_base + i];
+                        config.ml_input_table[ml_in_base + i];
                   }
                   for (int i = threadIdx.x; i < MAX_OUTPUTS_PER_TASK;
                        i += blockDim.x) {
                     task_desc->output_ptrs[i] =
-                        ml_out_tab[ml_out_base + i];
+                        config.ml_output_table[ml_out_base + i];
                   }
                 }
                 if (threadIdx.x == 0) {
@@ -2640,7 +2559,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                 int const next_ml = ml + 1;
                 task_desc->input_ptrs[24] =
                     (next_ml < config.ml_num_layers)
-                        ? ml_in_tab[(xcd_id * config.ml_num_layers +
+                        ? config.ml_input_table[(xcd_id * config.ml_num_layers +
                                                  next_ml) *
                                                     MAX_INPUTS_PER_TASK +
                                                 4]
@@ -2800,32 +2719,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                     static_cast<EventCounter>(xcd_thresh) *
                     get_task_iteration_num(ml_tid);
                 if (local_cnt == needed_local) {
-#if defined(MPK_AID_EVTIER) && defined(MPK_AID_SPLIT_FLAGS)
-                  // AID tier. The four XCDs of one AID accumulate in an AID-local line,
-                  // and only the last of them crosses the boundary -- adding 4, so the
-                  // global total and every `count == num_triggers * iter` test are
-                  // unchanged while boundary-crossing atomics drop from 8 to 2.
-                  // Gang events only: num_triggers == 8 is one flush per XCD, hence
-                  // exactly 4 per AID per iteration. For any other contributor count the
-                  // per-AID total is not a multiple of 4, which would leave the global
-                  // permanently short, so those keep the original single increment.
-                  int _nt = MPK_LD_EVCFG(&config.all_event_num_triggers[ev_idx]);
-                  unsigned long long _ok = 0, _n = 0;
-                  if (_nt == 2 * MPK_AID_XCDS_PER_AID) {
-                    _n = mpk_aid_evtier_add((int)ev_idx, &_ok);
-                  }
-                  if (!_ok) {
-                    mpk_evctr_add(config.all_event_counters, ev_idx, 1);
-                  } else if ((_n % MPK_AID_XCDS_PER_AID) == 0) {
-                    mpk_evctr_add(config.all_event_counters, ev_idx,
-                                  MPK_AID_XCDS_PER_AID);
-                  }
-#else
-                  mpk_evctr_add(config.all_event_counters, ev_idx, 1);
-#endif
+                  atom_add_release_gpu_u64(&config.all_event_counters[ev_idx],
+                                           1);
                 }
               } else {
-                mpk_evctr_add(config.all_event_counters, ev_idx, 1);
+                atom_add_release_gpu_u64(&config.all_event_counters[ev_idx], 1);
               }
             }
 
@@ -2900,33 +2798,13 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                       get_task_iteration_num(task_ids[queue_pos]);
                   if (local_cnt == needed_local) {
                     threadfence_gpu();
-#if defined(MPK_AID_EVTIER) && defined(MPK_AID_SPLIT_FLAGS)
-                    // AID tier. The four XCDs of one AID accumulate in an AID-local line,
-                    // and only the last of them crosses the boundary -- adding 4, so the
-                    // global total and every `count == num_triggers * iter` test are
-                    // unchanged while boundary-crossing atomics drop from 8 to 2.
-                    // Gang events only: num_triggers == 8 is one flush per XCD, hence
-                    // exactly 4 per AID per iteration. For any other contributor count the
-                    // per-AID total is not a multiple of 4, which would leave the global
-                    // permanently short, so those keep the original single increment.
-                    int _nt = num_triggers;
-                    unsigned long long _ok = 0, _n = 0;
-                    if (_nt == 2 * MPK_AID_XCDS_PER_AID) {
-                      _n = mpk_aid_evtier_add((int)ev_idx, &_ok);
-                    }
-                    if (!_ok) {
-                      mpk_evctr_add(config.all_event_counters, ev_idx, 1);
-                    } else if ((_n % MPK_AID_XCDS_PER_AID) == 0) {
-                      mpk_evctr_add(config.all_event_counters, ev_idx,
-                                    MPK_AID_XCDS_PER_AID);
-                    }
-#else
-                    mpk_evctr_add(config.all_event_counters, ev_idx, 1);
-#endif
+                    atom_add_release_gpu_u64(&config.all_event_counters[ev_idx],
+                                             1);
                   }
                 } else {
                   threadfence_gpu();
-                  mpk_evctr_add(config.all_event_counters, ev_idx, 1);
+                  atom_add_release_gpu_u64(&config.all_event_counters[ev_idx],
+                                           1);
                 }
               }
 
@@ -3333,7 +3211,8 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               // Gang: flush 1 (one task done). Non-gang: flush xcd_threshold.
               int flush_amount =
                   is_gang_task_type(task_desc->task_type) ? 1 : xcd_threshold;
-              count = mpk_evctr_add(config.all_event_counters, event_index, flush_amount);
+              count = atom_add_release_gpu_u64(
+                  &config.all_event_counters[event_index], flush_amount);
               event_fired = (count + flush_amount) ==
                             static_cast<EventCounter>(num_triggers) *
                                 get_task_iteration_num(task_ids[queue_pos]);
@@ -3353,7 +3232,8 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 
           if (local_count == needed_local) {
             threadfence_gpu();
-            count = mpk_evctr_add(config.all_event_counters, event_index, xcd_threshold);
+            count = atom_add_release_gpu_u64(
+                &config.all_event_counters[event_index], xcd_threshold);
             event_fired = (count + xcd_threshold) ==
                           static_cast<EventCounter>(num_triggers) *
                               get_task_iteration_num(task_ids[queue_pos]);
@@ -3366,7 +3246,8 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
           // Fallback: per-task fence + global atomic (NVIDIA, or uncounted
           // events)
           threadfence_gpu();
-          count = mpk_evctr_add(config.all_event_counters, event_index, 1);
+          count = atom_add_release_gpu_u64(
+              &config.all_event_counters[event_index], 1);
           event_fired =
               (count + 1) == static_cast<EventCounter>(num_triggers) *
                                  get_task_iteration_num(task_ids[queue_pos]);
@@ -3542,15 +3423,8 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
       // Wait for all workers to report their XCD IDs
       if (config.worker_xcd_map != nullptr) {
-        // Only workers on participating XCDs ever register, so waiting for
-        // num_workers hangs whenever the run is confined to a subset.
-        int _ready_expect = config.num_workers;
-#if MPK_NUM_XCDS < 8
-        _ready_expect = config.precomp_workers_per_xcd > 0
-                            ? config.precomp_workers_per_xcd * MPK_NUM_XCDS
-                            : config.num_workers * MPK_NUM_XCDS / 8;
-#endif
-        while (atomicAdd(config.worker_xcd_ready_count, 0) < _ready_expect) {
+        while (atomicAdd(config.worker_xcd_ready_count, 0) <
+               config.num_workers) {
           __nanosleep(100);
         }
         // Fence ensures we see all worker_xcd_map writes
@@ -3869,7 +3743,7 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                    g_fwdpass_total_iters,
                    MPK_PHASE_START_ITER);
             for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
-              unsigned long long n = g_phase_n[w * MPK_PHASE_PAD_U64];
+              unsigned long long n = g_phase_n[w];
               if (n == 0) {
                 continue;
               }
@@ -3879,7 +3753,7 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
               printf("[PSLOTW] w=%d n=%llu", w, n);
               for (int s = 0; s < MPK_PHASE_SLOT_COUNT; s++) {
                 printf(" %llu",
-                       g_phase_span[w * MPK_PHASE_SLOT_STRIDE + s] / n);
+                       g_phase_span[w * MPK_PHASE_SLOT_COUNT + s] / n);
               }
               printf("\n");
             }
@@ -4262,21 +4136,6 @@ __global__ __launch_bounds__(WORKER_NUM_THREADS,
   __shared__ int my_role; // 0 = worker, 1 = scheduler
   __shared__ int my_id;   // worker_id or sched_id
 
-#if MPK_NUM_XCDS < 8
-  // Confine the run to XCDs [0, MPK_NUM_XCDS). These blocks take NO part:
-  // they claim no scheduler slot, take no worker id and never register in
-  // worker_xcd_map, so the participating XCDs see a dense worker set and every
-  // threshold is sized for the subset. The whole block leaves together, so the
-  // __syncthreads() below are still uniform.
-  __shared__ int sub_xcd;
-  if (threadIdx.x == 0) {
-    sub_xcd = get_current_xcd_id();
-  }
-  __syncthreads();
-  if (sub_xcd >= MPK_NUM_XCDS) {
-    return;
-  }
-#endif
   if (threadIdx.x == 0) {
     int my_xcd = get_current_xcd_id();
     // Try to claim this XCD as scheduler
@@ -4768,10 +4627,7 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   // =========================================================================
 #ifdef MPK_FUSED_LAYER_BATCHING
   {
-    // One task per PARTICIPATING XCD per fused layer, so this is the
-    // logical XCD count -- not 8. With a stride of 8 at 4 XCDs the scan
-    // pairs up two real layers into each "layer" and finds half of them.
-    constexpr int NUM_XCDS_ML = MPK_NUM_XCDS;
+    constexpr int NUM_XCDS_ML = 8;
     // Must cover every slot the fused layer kernels read, not just the ones
     // the plain variant uses. The LM-head variant
     // (TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300, FUSE_TAIL=1) reads
@@ -4815,15 +4671,6 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
 
     if (ml_layers > 1) {
       // Build per-XCD pointer tables from all layers BEFORE compaction
-#ifdef MPK_AID_LOCAL
-      // Move the XCD-sliced weight tensors named by MPK_AID_LOCAL_SLOTS
-      // into AID-local VRAM before the pointer tables are built.
-      // all_tasks is still pre-compaction here, so fused_layer_positions[L]
-      // + xcd is XCD xcd's descriptor for layer L; the table below is built
-      // from all_tasks, so one rewrite covers layer 0 and layers 1+.
-      mirage::aid::relocate_xcd_sliced_inputs(
-          all_tasks, fused_layer_positions, ML_N_IN);
-#endif
       std::vector<void *> h_input_table(NUM_XCDS_ML * ml_layers * ML_N_IN);
       std::vector<void *> h_output_table(NUM_XCDS_ML * ml_layers * ML_N_OUT);
       std::vector<EventId> h_trigger_events(ml_layers);
@@ -5129,13 +4976,8 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   {
     int n_tasks = (int)all_tasks.size();
     int n_events = (int)all_events.size();
-    constexpr int NUM_XCDS_PC = MPK_NUM_XCDS;
-    // Physical divisor: the grid round-robins over all 8 hardware XCDs
-    // regardless of how many take part, so the number of blocks that
-    // actually land on one active XCD is num_workers/8, not
-    // num_workers/NUM_XCDS_PC. Using the logical count here would make
-    // the host expect twice the arrivals that exist and hang.
-    int workers_per_xcd = num_workers / 8;
+    constexpr int NUM_XCDS_PC = 8;
+    int workers_per_xcd = num_workers / NUM_XCDS_PC;
     int max_tpw = 512;
 
     // Template queues: indexed by [xcd_slot][rank][task_index]
@@ -5801,108 +5643,6 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
 // TODO: change launch config
 extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
   fprintf(stderr, "[HOST_DBG] launch_persistent_kernel ENTER\n");
-#ifdef MPK_AID_SPLIT_FLAGS
-  // Every replicated flag family also lives in oproj_topk_counters, which
-  // demo.py clears wholesale in reset_device_barriers() between launches. The
-  // replicas must mirror that exactly: clear them here, per launch, before
-  // the kernel starts -- never between layers of one launch.
-  //
-  // Both directions of divergence hang. A layer-derived target like
-  // attn_release would find a stale high flag already satisfying this
-  // launch's early gates; a snapshot target like layer_release would snapshot
-  // the previous launch's terminal value and then wait for a bump that the
-  // freshly-zeroed epoch counter never reaches.
-  {
-    static void *s_rep[2] = {nullptr, nullptr};
-    static bool s_tried = false;
-    if (!s_tried) {
-      s_tried = true;
-      if (mirage::aid::alloc_flag_replicas(s_rep)) {
-        int *dev[2] = {static_cast<int *>(s_rep[0]),
-                       static_cast<int *>(s_rep[1])};
-        // Async-on-default_stream + synchronize, for the same reason as the
-        // clear below: the plain form lands on the NULL stream, which does not
-        // synchronize with the hipStreamNonBlocking streams this kernel runs
-        // on. If that write raced the launch, some workgroups would read
-        // g_aid_flag_rep as null and fall back to the shared buffer while
-        // others read the replica -- publisher and consumer split across two
-        // different buffers, which deadlocks instead of merely being slow.
-        if (hipMemcpyToSymbolAsync(HIP_SYMBOL(g_aid_flag_rep),
-                                   dev,
-                                   sizeof dev,
-                                   0,
-                                   hipMemcpyHostToDevice,
-                                   default_stream) != hipSuccess ||
-            hipStreamSynchronize(default_stream) != hipSuccess) {
-          fprintf(stderr,
-                  "[AID] split flags: hipMemcpyToSymbol failed, falling "
-                  "back to the shared buffer\n");
-          s_rep[0] = s_rep[1] = nullptr;
-        }
-      }
-    }
-    // On `default_stream`, then synchronized, rather than a bare hipMemset.
-    // hipMemset lands on the NULL stream, and every stream this kernel uses is
-    // created hipStreamNonBlocking -- which by definition does NOT synchronize
-    // with the NULL stream. The clear could therefore still be in flight when
-    // the megakernel starts, and zero a flag that had already been published:
-    // a lost release, i.e. a hang rather than a wrong answer, on whichever
-    // fraction of runs the timing happened to overlap.
-    for (int i = 0; i < 2; i++) {
-      if (s_rep[i] != nullptr) {
-        (void)hipMemsetAsync(
-            s_rep[i], 0, mirage::aid::kFlagRepBytes, default_stream);
-      }
-    }
-    (void)hipStreamSynchronize(default_stream);
-  }
-  // Per-AID copies of the ml pointer tables. Read-only after setup, so plain
-  // AID_LOCAL (MTYPE_RW) is enough -- no COHERENT, and therefore no DF-CS
-  // directory pressure. Done once; nothing rewrites them between launches.
-  {
-    static bool s_ml_tried = false;
-    if (!s_ml_tried) {
-      s_ml_tried = true;
-      int const nl = global_runtime_config.ml_num_layers;
-      if (nl > 0 && global_runtime_config.ml_input_table != nullptr) {
-        size_t const in_b = (size_t)8 * nl * MAX_INPUTS_PER_TASK * sizeof(void *);
-        size_t const out_b =
-            (size_t)8 * nl * MAX_OUTPUTS_PER_TASK * sizeof(void *);
-        void *ml[2][2] = {{nullptr, nullptr}, {nullptr, nullptr}};
-        bool ok = true;
-        for (int aid = 0; aid < 2 && ok; aid++) {
-          ml[aid][0] = mirage::aid::alloc_in_aid(in_b, aid);
-          ml[aid][1] = mirage::aid::alloc_in_aid(out_b, aid);
-          ok = ml[aid][0] != nullptr && ml[aid][1] != nullptr;
-          if (ok) {
-            ok = hipMemcpy(ml[aid][0],
-                           global_runtime_config.ml_input_table,
-                           in_b,
-                           hipMemcpyDeviceToDevice) == hipSuccess &&
-                 hipMemcpy(ml[aid][1],
-                           global_runtime_config.ml_output_table,
-                           out_b,
-                           hipMemcpyDeviceToDevice) == hipSuccess;
-          }
-        }
-        if (ok) {
-          void *in_p[2] = {ml[0][0], ml[1][0]};
-          void *out_p[2] = {ml[0][1], ml[1][1]};
-          ok = hipMemcpyToSymbol(HIP_SYMBOL(g_aid_ml_in),
-                                 in_p,
-                                 sizeof in_p) == hipSuccess &&
-               hipMemcpyToSymbol(HIP_SYMBOL(g_aid_ml_out),
-                                 out_p,
-                                 sizeof out_p) == hipSuccess;
-        }
-        printf("[AID] ml tables: %s (%zu + %zu B per AID)\n",
-               ok ? "replicated per AID" : "unavailable, using shared",
-               in_b,
-               out_b);
-      }
-    }
-  }
-#endif
   // Progress is per-launch, so clear it before the kernel starts rather than
   // after it ends: a streaming reader polling from another thread must never
   // see the previous request's count and emit tokens that do not exist yet.
@@ -6375,8 +6115,7 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                 int a3 = __atomic_load_n(&a[3], __ATOMIC_RELAXED);
                 fprintf(stderr,
                         "    >>> w%d IN TASK: phase=%d (%s xcd=%d epoch=%d) "
-                        "watch[bid=%d obs=%d exp=%d spins=%d] "
-                        "aux[mask_lo=0x%08x mask_hi=0x%08x counter=%d xcd=%d]\n",
+                        "watch[bid=%d obs=%d exp=%d spins=%d]\n",
                         w,
                         wphase,
                         pn,
@@ -6385,16 +6124,7 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                         bid,
                         obs,
                         exp_,
-                        spins,
-                        a0,
-                        a1,
-                        (a2 >> 0) & 0xff,
-                        (a2 >> 8) & 0xff,
-                        (a2 >> 16) & 0xff,
-                        (a2 >> 24) & 0xff,
-                        (a3 >> 16) & 0xffff,
-                        (a3 >> 8) & 0xff,
-                        a3 & 0xff);
+                        spins);
                 // Per-wave exit mask for the MoE W13->W2 poll. That poll is
                 // thread-divergent by construction (each thread tests the
                 // release flag on its own, no __syncthreads), so waves of one

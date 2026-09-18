@@ -547,7 +547,7 @@ __device__ __forceinline__ bool mpk_aid_evctr2_pub(int idx,
   if (near_ == nullptr || far_ == nullptr) {
     return false;
   }
-  int const slot = idx * MPK_NUM_XCDS + xcd;
+  int const slot = idx * 8 + xcd;
   // Same-AID atomic: coherent inside this AID, and this XCD is the only
   // writer of this slot, so the value is monotone.
   unsigned long long const mine = atomicAdd(&near_[slot], amt) + amt;
@@ -991,12 +991,3 @@ __device__ __forceinline__ unsigned long long int
                        unsigned long long int val) {
   return atomicCAS(addr, cmp, val);
 }
-
-// MPK_EVCTR fallback for builds without AID replicas.
-// The definitions above live inside `#ifdef MPK_AID_SPLIT_FLAGS`, so in a
-// default build nothing defines these at all and the event-dependency poll
-// fails to compile. Poll the shared counter directly instead.
-#ifndef MPK_EVCTR_POLL
-#define MPK_EVCTR_READ(base, idx) MPK_LD_EVENT(&(base)[idx])
-#define MPK_EVCTR_POLL(base, idx, it) MPK_LD_EVENT(&(base)[idx])
-#endif

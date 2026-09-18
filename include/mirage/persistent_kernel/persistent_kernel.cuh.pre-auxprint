@@ -6375,8 +6375,7 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                 int a3 = __atomic_load_n(&a[3], __ATOMIC_RELAXED);
                 fprintf(stderr,
                         "    >>> w%d IN TASK: phase=%d (%s xcd=%d epoch=%d) "
-                        "watch[bid=%d obs=%d exp=%d spins=%d] "
-                        "aux[mask_lo=0x%08x mask_hi=0x%08x counter=%d xcd=%d]\n",
+                        "watch[bid=%d obs=%d exp=%d spins=%d]\n",
                         w,
                         wphase,
                         pn,
@@ -6385,16 +6384,7 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                         bid,
                         obs,
                         exp_,
-                        spins,
-                        a0,
-                        a1,
-                        (a2 >> 0) & 0xff,
-                        (a2 >> 8) & 0xff,
-                        (a2 >> 16) & 0xff,
-                        (a2 >> 24) & 0xff,
-                        (a3 >> 16) & 0xffff,
-                        (a3 >> 8) & 0xff,
-                        a3 & 0xff);
+                        spins);
                 // Per-wave exit mask for the MoE W13->W2 poll. That poll is
                 // thread-divergent by construction (each thread tests the
                 // release flag on its own, no __syncthreads), so waves of one

@@ -1,6 +1,3 @@
-#ifndef MPK_NUM_XCDS
-#define MPK_NUM_XCDS 8
-#endif
 /* Copyright 2025 CMU
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -623,10 +620,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #error "MPK_MOE_XCD_PAIR requires MPK_EARLY_ROUTING (carried expert in tile_idx[15:8])"
 #endif
 #ifdef MPK_EARLY_ROUTING
-  // Mask to 8 bits: the selection index now rides in [23:16], and an unmasked
-  // shift would fold it into the expert id.
-  int const carried_expert_id = ((tile_idx >> 8) & 0xff) - 1;
-  int const carried_sel_idx = (tile_idx >> 16) & 0xff;
+  int const carried_expert_id = (tile_idx >> 8) - 1;
   tile_idx &= 0xff;
 #endif
 
@@ -744,45 +738,30 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // after the EARLY_ROUTING mask: [6:0] phase_rank, [7] is_w2. Ranks 23+
   // never call this helper. 46 arrivals per expert, no 240-tile pad.
   static_assert(BATCH_SIZE == 1, "MPK_MOE_XCD_PAIR is conc1 only");
-  static_assert(NUM_TOPK == 4, "MPK_MOE_XCD_PAIR is written for top-4");
-  static_assert(MPK_NUM_XCDS % 2 == 0,
-                "MPK_MOE_XCD_PAIR needs an even XCD count to form pairs");
+  static_assert(NUM_TOPK == 4, "MPK_MOE_XCD_PAIR maps 4 experts onto 8 XCDs");
   static_assert(W13_TILES == 46 && W2_TILES == 46,
                 "MPK_MOE_XCD_PAIR splits 46 groups as 23+23 across an XCD pair");
-  // How many XCDs share one expert, and therefore how many of its 46 groups
-  // each of them owns. 2 x 23 at 8 XCDs; 1 x 46 at 4.
-  constexpr int kMembersPerExpert = MPK_NUM_XCDS / NUM_TOPK;
-  static_assert(kMembersPerExpert >= 1,
-                "MoE expert map needs at least one XCD per selected expert");
-  constexpr int kGroupsPerPairMember = W13_TILES / kMembersPerExpert;
+  constexpr int kGroupsPerPairMember = 23;
   bool const is_w2 = (tile_idx >> 7) & 1;
   int const phase_rank = tile_idx & 0x7f;
   if (phase_rank >= kGroupsPerPairMember) {
     MPK_WS_MARK(8100, tile_idx);
     return;
   }
-  // Which SELECTION this tile is for, as told by the caller. Deriving it as
-  // `xcd_id >> 1` assumed one pick per pair, i.e. exactly 8 XCDs.
-  int expert_idx = carried_sel_idx;
-  // Which member of this expert's group this XCD is. With one member per
-  // expert the offset is zero and phase_rank spans all 46 groups.
-  int const member = (kMembersPerExpert > 1) ? (xcd_id % kMembersPerExpert) : 0;
-  int phase_tile = member * kGroupsPerPairMember + phase_rank;
+  int expert_idx = xcd_id >> 1;
+  int phase_tile = (xcd_id & 1) * kGroupsPerPairMember + phase_rank;
   int global_tile = is_w2 ? (TOTAL_W13 + expert_idx * W2_TILES + phase_tile)
                           : (expert_idx * W13_TILES + phase_tile);
 #else
 #ifdef MPK_MOE_XCD_STRIPE_ROT
   int global_tile =
-      tile_idx * MPK_NUM_XCDS +
-      ((xcd_id + (MPK_MOE_XCD_STRIPE_ROT)) & (MPK_NUM_XCDS - 1));
+      tile_idx * 8 + ((xcd_id + (MPK_MOE_XCD_STRIPE_ROT)) & 7);
 #elif defined(MPK_MOE_XCD_STRIPE_LAYER)
-  int global_tile =
-      tile_idx * MPK_NUM_XCDS + ((xcd_id + layer_idx) & (MPK_NUM_XCDS - 1));
+  int global_tile = tile_idx * 8 + ((xcd_id + layer_idx) & 7);
 #elif defined(MPK_MOE_XCD_STRIPE_TILE)
-  int global_tile =
-      tile_idx * MPK_NUM_XCDS + ((xcd_id + tile_idx) & (MPK_NUM_XCDS - 1));
+  int global_tile = tile_idx * 8 + ((xcd_id + tile_idx) & 7);
 #else
-  int global_tile = tile_idx * MPK_NUM_XCDS + xcd_id;
+  int global_tile = tile_idx * 8 + xcd_id;
 #endif
   if (global_tile >= TOTAL_TILES) {
     MPK_WS_MARK(8100, global_tile); // exit: past end of tile range
@@ -845,13 +824,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     expert_id_raw = carried_expert_id;
   } else {
     if (early_routing_ready != nullptr) {
-#ifdef MPK_AID_SPLIT_ROUTING
-      int *final_release =
-          &mpk_aid_flags_at(early_routing_ready, xcd_id,
-                            MPK_AID_ROUTING_BASE_INTS)[(1 + xcd_id) * 16];
-#else
       int *final_release = &early_routing_ready[(1 + xcd_id) * 16];
-#endif
       while (ld_sys_s32(final_release) < routing_expected) {
         __builtin_amdgcn_s_sleep(1);
       }
@@ -4368,15 +4341,6 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       // the per-XCD slots of one expert held *different* epochs, which is
       // impossible if the eight stores from one producer all survived.
       // COUNTER_OFF puts the counter on the next line.
-      // Arrival bitmask: slots 11/12 hold bits for phase_tile 0..45, so a
-      // missing bit names the group that never arrived.
-      if (phase_tile < 32) {
-        (void)atomicOr(&d_barrier[base + 11 * MOE_BAR_LINE],
-                       1 << phase_tile);
-      } else {
-        (void)atomicOr(&d_barrier[base + 12 * MOE_BAR_LINE],
-                       1 << (phase_tile - 32));
-      }
       int prev_global = atom_add_release_gpu_s32(
           &d_barrier[base + MOE_BAR_COUNTER_SLOT * MOE_BAR_LINE], 1);
       // Exact only if every tile counted by W13_TILES arrives here. Under
@@ -4386,9 +4350,6 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       // short by the number of unrouted (expert, token) pairs -- and the W2
       // workers below spun forever waiting for a release that never fired.
       if ((prev_global % W13_TILES) == W13_TILES - 1) {
-        // Witness: slot 10 is unused (0-7 flags, 8 counter) and counts how
-        // many times this expert's release actually executed.
-        (void)atom_add_release_gpu_s32(&d_barrier[base + 10 * MOE_BAR_LINE], 1);
         // Last W13 arrival: write per-XCD release = layer_idx + 1
         constexpr int LAYER_IDX_SMEM_OFF =
             mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
@@ -4396,20 +4357,15 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         int layer_idx =
             *reinterpret_cast<int *>(&_fused_smem[LAYER_IDX_SMEM_OFF]);
         int release_val = layer_idx + 1;
-        // Write ALL slots, not just [0, MPK_NUM_XCDS): the extra ones are
-        // unread, and this removes any dependence on the consumer's slot index
-        // matching the producer's loop bound.
-        for (int x = 0; x < MOE_BAR_COUNTER_SLOT; x++) {
+        for (int x = 0; x < 8; x++) {
 #ifdef MPK_AID_SPLIT_FLAGS
           mpk_aid_publish_at(d_barrier,
                              base + x * MOE_BAR_LINE,
                              (unsigned)release_val,
                              MPK_AID_MOE_BASE_INTS);
 #else
-          // Atomic, not st_wt: the witness in this same block is observed
-          // while the write-through stores are not. Monotone so a late
-          // publication cannot regress a slot a reader already passed.
-          (void)atomicMax(&d_barrier[base + x * MOE_BAR_LINE], release_val);
+          st_wt_u32((void *)&d_barrier[base + x * MOE_BAR_LINE],
+                    (unsigned)release_val);
 #endif
         }
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
@@ -4753,12 +4709,8 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     // nothing.
     if (tid == 0)
 #endif
-    // Read slot 0 rather than slot xcd_id. All slots carry the SAME
-    // release_val (the per-XCD spread exists to reduce poller contention, not
-    // to hold different values), and slot 0 is the one observed to receive it:
-    // with 4 XCDs, slots 1-3 read 0 under both st_wt_u32 and atomicMax while
-    // slot 0 reads the published epoch.
-    while ((_obs = MPK_LD_GATE2(&d_barrier_rel[base])) < expected) {
+    while ((_obs = MPK_LD_GATE2(&d_barrier_rel[base + xcd_id * MOE_BAR_LINE])) <
+           expected) {
       MPK_WS_WAIT_TICK(_obs, _spins);
       // Refresh the discriminating values on the same cadence as the tick:
       // the raw arrival counter (whether it sits on a multiple of W13_TILES
@@ -4767,14 +4719,8 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       // producer in one loop, so any spread means releases are being lost.
       if ((_spins & (MPK_WS_WAIT_REFRESH - 1)) == 0) {
         int _n_ok = 0, _mn = 0x7fffffff, _mx = -0x7fffffff;
-        int _packed = 0;
-        for (int _x = 0; _x < MPK_NUM_XCDS; _x++) {
-          // Same load the wait uses: an nt load never observes a
-          // release, so it cannot be used to judge one.
-          int _v = MPK_LD_GATE2(&d_barrier_rel[base + _x * MOE_BAR_LINE]);
-          if (_x < 4) {
-            _packed |= (_v & 0xff) << (_x * 8);
-          }
+        for (int _x = 0; _x < 8; _x++) {
+          int _v = ld_nt_s32(&d_barrier_rel[base + _x * MOE_BAR_LINE]);
           if (_v >= expected) {
             _n_ok++;
           }
@@ -4788,10 +4734,10 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         // a3 is now the per-wave exit mask (MPK_WS_WAVE_EXIT), so fold _mn
         // into a2 instead of overwriting it.
         MPK_WS_WAIT_AUX(
-            ld_sys_s32(&d_barrier[base + 11 * MOE_BAR_LINE]),
-            ld_sys_s32(&d_barrier[base + 12 * MOE_BAR_LINE]),
-            ld_sys_s32(&d_barrier[base + MOE_BAR_COUNTER_SLOT * MOE_BAR_LINE]),
-            xcd_id);
+            ld_nt_s32(&d_barrier[base + MOE_BAR_COUNTER_SLOT * MOE_BAR_LINE]),
+            expert_id,
+            _n_ok * 1000000 + (_mx - _mn),
+            -1);
       }
       _spins++;
 #ifndef MPK_MOE_BAR_BUSY_POLL

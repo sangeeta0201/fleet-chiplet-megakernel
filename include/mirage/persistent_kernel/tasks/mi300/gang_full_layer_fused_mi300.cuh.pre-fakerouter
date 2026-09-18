@@ -1,6 +1,3 @@
-#ifndef MPK_NUM_XCDS
-#define MPK_NUM_XCDS 8
-#endif
 /* Copyright 2025 CMU
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -37,17 +34,6 @@
 // directly, saving ~272 bytes of stack frame per thread.
 
 #pragma once
-
-// MPK_WAIT_SKIP: same bisection discipline as MPK_P7_SKIP -- remove one class
-// of WAIT at a time, never a release, so nothing can deadlock. Results are
-// garbage by design; the timing delta against the control is the cost of the
-// waits that were removed.
-#ifdef MPK_WAIT_SKIP
-#define MPK_WS_SK(bit) (((MPK_WAIT_SKIP) & (bit)) != 0)
-#else
-#define MPK_WS_SK(bit) false
-#endif
-
 #include "tasks/mi300/gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh"
 #include "tasks/mi300/gang_moe_fused_mxfp4_mi300.cuh"
 #include "tasks/mi300/gang_rmsnorm_linear_mxfp4_bias_mi300.cuh"
@@ -250,15 +236,8 @@ __device__ __noinline__ void
   // Kept, behind the flag, because it is correct and because that trade could
   // invert at a geometry where the no-Phase-7 block and the no-second-tile
   // block stop coinciding.
-  int const _oproj_topk_want =
+  int const oproj_topk_ranks =
       oproj_tiles_per_xcd > router_tile_n ? oproj_tiles_per_xcd : router_tile_n;
-  // Never ask for more arrivals than there are workers on the XCD. With fewer
-  // XCDs than the tile space assumes, the want exceeds the supply (46 vs 31 at
-  // 4 XCDs) and the barrier could never be satisfied; the surplus groups are
-  // swept by the workers that do exist (see the sweep in the O-proj kernel).
-  int const oproj_topk_ranks = _oproj_topk_want < workers_per_xcd
-                                   ? _oproj_topk_want
-                                   : workers_per_xcd;
 #ifdef MPK_ROTATE_QKV_ATTN_RANKS
 #ifdef MPK_QKV_ROT_OVERRIDE
   // Diagnostic only: pick the rotation distance by hand. Used to separate
@@ -816,7 +795,7 @@ __device__ __noinline__ void
     if (tid == 0) {
       int _obs;
       int _spins = 0;
-      while (!MPK_WS_SK(1) && (_obs = __atomic_load_n(&qkv_epoch[xcd_id * 16],
+      while ((_obs = __atomic_load_n(&qkv_epoch[xcd_id * 16],
                                      __ATOMIC_RELAXED)) < qkv_epoch_expected) {
         MPK_WS_WAIT_TICK(_obs, _spins);
         _spins++;
@@ -932,7 +911,7 @@ __device__ __noinline__ void
             &chunk_barrier[(xcd_id * NUM_REQS + attn_req) * 16 + 1 +
                            kv_chunk_idx];
         if (tid == 0) {
-          while (!MPK_WS_SK(2) && MPK_LD_GATE(split_flag) < qkv_epoch_expected) {
+          while (MPK_LD_GATE(split_flag) < qkv_epoch_expected) {
             __builtin_amdgcn_s_sleep(1);
           }
         }
@@ -1187,8 +1166,7 @@ __device__ __noinline__ void
           // every NUM_REQS -- unlike `(v | (ATTN_ARRIVALS-1)) + 1`, which only
           // rounds to a power of two and released early at NUM_REQS in
           // {3,5,6,7}.
-          // One arrival per PARTICIPATING XCD.
-          constexpr int ATTN_ARRIVALS = MPK_NUM_XCDS * NUM_REQS;
+          constexpr int ATTN_ARRIVALS = 8 * NUM_REQS;
           int prev = atom_add_release_gpu_s32(attn_global, 1);
           if ((prev % ATTN_ARRIVALS) == ATTN_ARRIVALS - 1) {
             // LAST XCD to arrive: fan out per-XCD release flags via st_wt
@@ -1196,7 +1174,7 @@ __device__ __noinline__ void
             // This eliminates the cross-XCD poll of attn_global, which hangs
             // because ld_nt/relaxed loads read stale L2 cached values.
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-            for (int x = 0; x < MPK_NUM_XCDS; x++) {
+            for (int x = 0; x < 8; x++) {
 #ifdef MPK_AID_SPLIT_FLAGS
               mpk_aid_publish(attn_release_shared,
                               x,
@@ -1220,7 +1198,7 @@ __device__ __noinline__ void
       // Idle rank 23+c: high half of chunk c. Consumer of Q — wait for the
       // epoch without arriving (arrival count stays QKV+attn prefix).
       if (tid == 0) {
-        while (!MPK_WS_SK(1) && MPK_LD_GATE(&qkv_epoch[xcd_id * 16]) < qkv_epoch_expected) {
+        while (MPK_LD_GATE(&qkv_epoch[xcd_id * 16]) < qkv_epoch_expected) {
           __builtin_amdgcn_s_sleep(1);
         }
       }
@@ -1412,7 +1390,7 @@ __device__ __noinline__ void
     // buffer_inv is per-wave.
     if (tid == 0)
 #endif
-      while (!MPK_WS_SK(4) && (_obs = MPK_LD_GATE(&attn_release[xcd_id * 16])) <
+      while ((_obs = MPK_LD_GATE(&attn_release[xcd_id * 16])) <
              attn_release_expected) {
         MPK_WS_WAIT_TICK(_obs, _spins);
         _spins++;
@@ -1822,18 +1800,8 @@ __device__ __noinline__ void
   // Two packed tiles per rank 0..22: W13 (bit7=0) then W2 (bit7=1). Ranks
   // 23..30 have no pair-map work; they still join Phase 9.
   constexpr int kMoePairRanks = 23;
-  // One pair per two XCDs, so with fewer XCDs a pair owns several picks. Each
-  // pick still costs two tiles (W13 then W2), and phase_rank stays < 23, so no
-  // worker sweep is needed here.
-  // One expert per group of (MPK_NUM_XCDS / TOPK_K) XCDs, so this XCD owns
-  // exactly one selection and 46 / members groups of it.
-  constexpr int kMoeMembers = MPK_NUM_XCDS / TOPK_K;
-  constexpr int kMoeGroups = 46 / (kMoeMembers > 0 ? kMoeMembers : 1);
-  int const kMoeSweeps =
-      (kMoeGroups + workers_per_xcd - 1) / workers_per_xcd;
   int const moe_begin = 0;
-  // All W13 sweeps first, then all W2 sweeps.
-  int const moe_end = 2 * kMoeSweeps;
+  int const moe_end = (xcd_rank < kMoePairRanks) ? 2 : 0;
   int const moe_step = 1;
 #else
   int const moe_begin = xcd_rank;
@@ -1842,18 +1810,8 @@ __device__ __noinline__ void
 #endif
   for (int moe_i = moe_begin; moe_i < moe_end; moe_i += moe_step) {
 #ifdef MPK_MOE_XCD_PAIR
-    // moe_i enumerates (phase, sweep): the first kMoeSweeps iterations are
-    // W13, the rest W2, so every W13 arrival is issued before any W2 waits.
-    int const _phase = (moe_i >= kMoeSweeps) ? 1 : 0;
-    int const _sweep = moe_i - _phase * kMoeSweeps;
-    int const _grp = xcd_rank + _sweep * workers_per_xcd;
-    if (_grp >= kMoeGroups) {
-      continue; // this rank owns no group in this sweep
-    }
-    // This XCD's own selection, and the expert it names.
-    int const _sel_idx = xcd_id / (kMoeMembers > 0 ? kMoeMembers : 1);
-    int const moe_t = _grp | (_phase << 7) |
-                      ((routed_expert0 + 1) << 8) | (_sel_idx << 16);
+    int const moe_t =
+        xcd_rank | (moe_i << 7) | ((routed_expert0 + 1) << 8);
 #else
     int const moe_t = moe_i;
 #endif
@@ -2303,7 +2261,7 @@ __device__ __noinline__ void
       // Net effect: the arrival is one read-modify-write with no dependent
       // load in front of it.
       int const lean_layers_done = local_prev / arrivers_per_xcd;
-      s_layer_rel_prev = MPK_NUM_XCDS * lean_layers_done;
+      s_layer_rel_prev = 8 * lean_layers_done;
       bool const lean_is_last_local =
           (local_prev - lean_layers_done * arrivers_per_xcd) ==
           arrivers_per_xcd - 1;
@@ -2325,9 +2283,7 @@ __device__ __noinline__ void
         // Last worker on this XCD: this XCD's MoE stores are all retired, so
         // publish one arrival on behalf of the whole die.
         int global_expected =
-            (__atomic_load_n(layer_global, __ATOMIC_RELAXED) / MPK_NUM_XCDS +
-             1) *
-            MPK_NUM_XCDS;
+            (__atomic_load_n(layer_global, __ATOMIC_RELAXED) / 8 + 1) * 8;
         int global_prev = atom_add_release_gpu_s32(layer_global, 1);
         bool const is_last_global = (global_prev == global_expected - 1);
 #endif
@@ -2363,7 +2319,7 @@ __device__ __noinline__ void
     // value from the first active lane.
     lean_rel_epoch = __builtin_amdgcn_readfirstlane(lean_rel_epoch);
     if (lean_rel_epoch != 0) {
-      if (tid < MPK_NUM_XCDS) {
+      if (tid < 8) {
 #ifdef MPK_AID_SPLIT_FLAGS
         mpk_aid_publish(layer_release_shared,
                         tid,

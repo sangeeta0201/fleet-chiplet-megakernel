@@ -547,7 +547,7 @@ __device__ __forceinline__ bool mpk_aid_evctr2_pub(int idx,
   if (near_ == nullptr || far_ == nullptr) {
     return false;
   }
-  int const slot = idx * MPK_NUM_XCDS + xcd;
+  int const slot = idx * 8 + xcd;
   // Same-AID atomic: coherent inside this AID, and this XCD is the only
   // writer of this slot, so the value is monotone.
   unsigned long long const mine = atomicAdd(&near_[slot], amt) + amt;

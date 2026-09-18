@@ -4368,15 +4368,6 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       // the per-XCD slots of one expert held *different* epochs, which is
       // impossible if the eight stores from one producer all survived.
       // COUNTER_OFF puts the counter on the next line.
-      // Arrival bitmask: slots 11/12 hold bits for phase_tile 0..45, so a
-      // missing bit names the group that never arrived.
-      if (phase_tile < 32) {
-        (void)atomicOr(&d_barrier[base + 11 * MOE_BAR_LINE],
-                       1 << phase_tile);
-      } else {
-        (void)atomicOr(&d_barrier[base + 12 * MOE_BAR_LINE],
-                       1 << (phase_tile - 32));
-      }
       int prev_global = atom_add_release_gpu_s32(
           &d_barrier[base + MOE_BAR_COUNTER_SLOT * MOE_BAR_LINE], 1);
       // Exact only if every tile counted by W13_TILES arrives here. Under
@@ -4406,10 +4397,8 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                              (unsigned)release_val,
                              MPK_AID_MOE_BASE_INTS);
 #else
-          // Atomic, not st_wt: the witness in this same block is observed
-          // while the write-through stores are not. Monotone so a late
-          // publication cannot regress a slot a reader already passed.
-          (void)atomicMax(&d_barrier[base + x * MOE_BAR_LINE], release_val);
+          st_wt_u32((void *)&d_barrier[base + x * MOE_BAR_LINE],
+                    (unsigned)release_val);
 #endif
         }
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
@@ -4753,12 +4742,8 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     // nothing.
     if (tid == 0)
 #endif
-    // Read slot 0 rather than slot xcd_id. All slots carry the SAME
-    // release_val (the per-XCD spread exists to reduce poller contention, not
-    // to hold different values), and slot 0 is the one observed to receive it:
-    // with 4 XCDs, slots 1-3 read 0 under both st_wt_u32 and atomicMax while
-    // slot 0 reads the published epoch.
-    while ((_obs = MPK_LD_GATE2(&d_barrier_rel[base])) < expected) {
+    while ((_obs = MPK_LD_GATE2(&d_barrier_rel[base + xcd_id * MOE_BAR_LINE])) <
+           expected) {
       MPK_WS_WAIT_TICK(_obs, _spins);
       // Refresh the discriminating values on the same cadence as the tick:
       // the raw arrival counter (whether it sits on a multiple of W13_TILES
@@ -4788,10 +4773,10 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         // a3 is now the per-wave exit mask (MPK_WS_WAVE_EXIT), so fold _mn
         // into a2 instead of overwriting it.
         MPK_WS_WAIT_AUX(
-            ld_sys_s32(&d_barrier[base + 11 * MOE_BAR_LINE]),
-            ld_sys_s32(&d_barrier[base + 12 * MOE_BAR_LINE]),
             ld_sys_s32(&d_barrier[base + MOE_BAR_COUNTER_SLOT * MOE_BAR_LINE]),
-            xcd_id);
+            ld_sys_s32(&d_barrier[base + 10 * MOE_BAR_LINE]),
+            _packed,
+            (expected << 16) | ((xcd_id & 0xff) << 8) | (expert_idx & 0xff));
       }
       _spins++;
 #ifndef MPK_MOE_BAR_BUSY_POLL

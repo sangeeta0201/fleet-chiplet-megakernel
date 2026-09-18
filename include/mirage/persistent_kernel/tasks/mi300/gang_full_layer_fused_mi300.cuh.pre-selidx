@@ -1825,15 +1825,11 @@ __device__ __noinline__ void
   // One pair per two XCDs, so with fewer XCDs a pair owns several picks. Each
   // pick still costs two tiles (W13 then W2), and phase_rank stays < 23, so no
   // worker sweep is needed here.
-  // One expert per group of (MPK_NUM_XCDS / TOPK_K) XCDs, so this XCD owns
-  // exactly one selection and 46 / members groups of it.
-  constexpr int kMoeMembers = MPK_NUM_XCDS / TOPK_K;
-  constexpr int kMoeGroups = 46 / (kMoeMembers > 0 ? kMoeMembers : 1);
-  int const kMoeSweeps =
-      (kMoeGroups + workers_per_xcd - 1) / workers_per_xcd;
+  constexpr int kMoeNPairs = MPK_NUM_XCDS / 2;
+  constexpr int kMoePicksPerPair = (TOPK_K + kMoeNPairs - 1) / kMoeNPairs;
   int const moe_begin = 0;
-  // All W13 sweeps first, then all W2 sweeps.
-  int const moe_end = 2 * kMoeSweeps;
+  int const moe_end =
+      (xcd_rank < kMoePairRanks) ? 2 * kMoePicksPerPair : 0;
   int const moe_step = 1;
 #else
   int const moe_begin = xcd_rank;
@@ -1842,18 +1838,28 @@ __device__ __noinline__ void
 #endif
   for (int moe_i = moe_begin; moe_i < moe_end; moe_i += moe_step) {
 #ifdef MPK_MOE_XCD_PAIR
-    // moe_i enumerates (phase, sweep): the first kMoeSweeps iterations are
-    // W13, the rest W2, so every W13 arrival is issued before any W2 waits.
-    int const _phase = (moe_i >= kMoeSweeps) ? 1 : 0;
-    int const _sweep = moe_i - _phase * kMoeSweeps;
-    int const _grp = xcd_rank + _sweep * workers_per_xcd;
-    if (_grp >= kMoeGroups) {
-      continue; // this rank owns no group in this sweep
+    // moe_i enumerates (pick, phase): pick = moe_i >> 1, phase = moe_i & 1.
+    int const _pick = moe_i >> 1;
+    int const _phase = moe_i & 1;
+    int _pick_expert = routed_expert0;
+    if (_pick > 0) {
+      // Picks are published in k order, so pair p's second pick lands after
+      // its first. Observing the first says nothing about the second -- wait
+      // for this record's own epoch before believing its expert id.
+#ifdef MPK_AID_SPLIT_ROUTING
+      int *const _rr_m = mpk_aid_flags_at(routing_ready, xcd_id,
+                                          MPK_AID_ROUTING_BASE_INTS);
+#else
+      int *const _rr_m = routing_ready;
+#endif
+      unsigned long long _r2 = 0;
+      do {
+        _r2 = ld_sys_u64(&_rr_m[(1 + xcd_id) * 16 + 2 + _pick * 4]);
+      } while ((int)(unsigned)_r2 < routing_expected);
+      _pick_expert = (int)(_r2 >> 32);
     }
-    // This XCD's own selection, and the expert it names.
-    int const _sel_idx = xcd_id / (kMoeMembers > 0 ? kMoeMembers : 1);
-    int const moe_t = _grp | (_phase << 7) |
-                      ((routed_expert0 + 1) << 8) | (_sel_idx << 16);
+    int const moe_t =
+        xcd_rank | (_phase << 7) | ((_pick_expert + 1) << 8);
 #else
     int const moe_t = moe_i;
 #endif

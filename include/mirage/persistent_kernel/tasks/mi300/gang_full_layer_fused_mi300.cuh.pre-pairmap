@@ -1822,18 +1822,8 @@ __device__ __noinline__ void
   // Two packed tiles per rank 0..22: W13 (bit7=0) then W2 (bit7=1). Ranks
   // 23..30 have no pair-map work; they still join Phase 9.
   constexpr int kMoePairRanks = 23;
-  // One pair per two XCDs, so with fewer XCDs a pair owns several picks. Each
-  // pick still costs two tiles (W13 then W2), and phase_rank stays < 23, so no
-  // worker sweep is needed here.
-  // One expert per group of (MPK_NUM_XCDS / TOPK_K) XCDs, so this XCD owns
-  // exactly one selection and 46 / members groups of it.
-  constexpr int kMoeMembers = MPK_NUM_XCDS / TOPK_K;
-  constexpr int kMoeGroups = 46 / (kMoeMembers > 0 ? kMoeMembers : 1);
-  int const kMoeSweeps =
-      (kMoeGroups + workers_per_xcd - 1) / workers_per_xcd;
   int const moe_begin = 0;
-  // All W13 sweeps first, then all W2 sweeps.
-  int const moe_end = 2 * kMoeSweeps;
+  int const moe_end = (xcd_rank < kMoePairRanks) ? 2 : 0;
   int const moe_step = 1;
 #else
   int const moe_begin = xcd_rank;
@@ -1842,18 +1832,8 @@ __device__ __noinline__ void
 #endif
   for (int moe_i = moe_begin; moe_i < moe_end; moe_i += moe_step) {
 #ifdef MPK_MOE_XCD_PAIR
-    // moe_i enumerates (phase, sweep): the first kMoeSweeps iterations are
-    // W13, the rest W2, so every W13 arrival is issued before any W2 waits.
-    int const _phase = (moe_i >= kMoeSweeps) ? 1 : 0;
-    int const _sweep = moe_i - _phase * kMoeSweeps;
-    int const _grp = xcd_rank + _sweep * workers_per_xcd;
-    if (_grp >= kMoeGroups) {
-      continue; // this rank owns no group in this sweep
-    }
-    // This XCD's own selection, and the expert it names.
-    int const _sel_idx = xcd_id / (kMoeMembers > 0 ? kMoeMembers : 1);
-    int const moe_t = _grp | (_phase << 7) |
-                      ((routed_expert0 + 1) << 8) | (_sel_idx << 16);
+    int const moe_t =
+        xcd_rank | (moe_i << 7) | ((routed_expert0 + 1) << 8);
 #else
     int const moe_t = moe_i;
 #endif

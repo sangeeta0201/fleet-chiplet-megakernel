@@ -4753,12 +4753,8 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     // nothing.
     if (tid == 0)
 #endif
-    // Read slot 0 rather than slot xcd_id. All slots carry the SAME
-    // release_val (the per-XCD spread exists to reduce poller contention, not
-    // to hold different values), and slot 0 is the one observed to receive it:
-    // with 4 XCDs, slots 1-3 read 0 under both st_wt_u32 and atomicMax while
-    // slot 0 reads the published epoch.
-    while ((_obs = MPK_LD_GATE2(&d_barrier_rel[base])) < expected) {
+    while ((_obs = MPK_LD_GATE2(&d_barrier_rel[base + xcd_id * MOE_BAR_LINE])) <
+           expected) {
       MPK_WS_WAIT_TICK(_obs, _spins);
       // Refresh the discriminating values on the same cadence as the tick:
       // the raw arrival counter (whether it sits on a multiple of W13_TILES

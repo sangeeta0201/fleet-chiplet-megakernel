@@ -516,7 +516,7 @@ __device__ __attribute__((noinline)) void
   // the token axis moved into the MFMA's N dimension, so the host emits
   // n_bblk * n_wgs_per_xcd tiles rather than batch_size * n_wgs_per_xcd.
   int bblk = local_tile / n_wgs_per_xcd;
-  int const wg_first = local_tile % n_wgs_per_xcd;
+  int wg_idx = local_tile % n_wgs_per_xcd;
   // At TOK_ROWS == 1 there is exactly one column block, so every tile that
   // survives the guard below has bblk == 0 and the base is a literal zero.
   // The compiler cannot derive that from `batch_count - bblk*16 > 0`, and
@@ -541,11 +541,7 @@ __device__ __attribute__((noinline)) void
     goto oproj_barrier;
   }
 
-  // One iteration per weight group this worker owns. tiles_per_xcd is the
-  // participating rank count, so the groups partition exactly across workers
-  // and every column of the row still gets computed.
-  for (int wg_idx = wg_first; wg_idx < n_wgs_per_xcd;
-       wg_idx += tiles_per_xcd) {
+  {
     uint8_t const *wg_data = W + static_cast<int64_t>(wg_idx) * WG_BYTES;
     uint8_t const *wg_scales = wg_data + WG_DATA_BYTES;
 

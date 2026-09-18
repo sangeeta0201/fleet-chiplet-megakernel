@@ -1,6 +1,3 @@
-#ifndef MPK_NUM_XCDS
-#define MPK_NUM_XCDS 8
-#endif
 /* Copyright 2025 CMU
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -121,9 +118,6 @@ __device__ __forceinline__ float _oproj_amax8_dpp(float amax) {
 }
 #endif
 
-#if defined(MPK_OPROJ_PIPE_SLICE_MFMA) && MPK_NUM_XCDS != 8
-#error "MPK_OPROJ_PIPE_SLICE_MFMA assumes 2 slices per wave (8 XCDs)"
-#endif
 #ifdef MPK_OPROJ_PIPE_SLICE_MFMA
 #ifndef MPK_ATTN_SLICE_RELEASE
 #error "MPK_OPROJ_PIPE_SLICE_MFMA requires MPK_ATTN_SLICE_RELEASE"
@@ -385,7 +379,7 @@ __device__ __attribute__((noinline)) void
   // arm is derived for; every other instantiation of this kernel (the
   // standalone O-proj wrapper, the N-parallel shape) keeps the shared
   // block-wide quantizer, so this needs no second implementation.
-  constexpr int ATTN_SLICE = REDUCTION_SIZE / MPK_NUM_XCDS;
+  constexpr int ATTN_SLICE = REDUCTION_SIZE / 8;
   constexpr int ELEMENTS_PER_THREAD = REDUCTION_SIZE / 256;
   constexpr int ELEMENTS_PER_SCALE = 128;
 #if defined(MPK_ATTN_SLICE_RELEASE)
@@ -516,7 +510,7 @@ __device__ __attribute__((noinline)) void
   // the token axis moved into the MFMA's N dimension, so the host emits
   // n_bblk * n_wgs_per_xcd tiles rather than batch_size * n_wgs_per_xcd.
   int bblk = local_tile / n_wgs_per_xcd;
-  int const wg_first = local_tile % n_wgs_per_xcd;
+  int wg_idx = local_tile % n_wgs_per_xcd;
   // At TOK_ROWS == 1 there is exactly one column block, so every tile that
   // survives the guard below has bblk == 0 and the base is a literal zero.
   // The compiler cannot derive that from `batch_count - bblk*16 > 0`, and
@@ -541,11 +535,7 @@ __device__ __attribute__((noinline)) void
     goto oproj_barrier;
   }
 
-  // One iteration per weight group this worker owns. tiles_per_xcd is the
-  // participating rank count, so the groups partition exactly across workers
-  // and every column of the row still gets computed.
-  for (int wg_idx = wg_first; wg_idx < n_wgs_per_xcd;
-       wg_idx += tiles_per_xcd) {
+  {
     uint8_t const *wg_data = W + static_cast<int64_t>(wg_idx) * WG_BYTES;
     uint8_t const *wg_scales = wg_data + WG_DATA_BYTES;
 
@@ -582,15 +572,9 @@ __device__ __attribute__((noinline)) void
       // load-balanced split further down (KP_EXTRA waves get one extra iter)
       // degenerate to the same even split. If it ever fails, the staging
       // range and the MFMA range stop agreeing and the arm is wrong.
-      static_assert(MPK_NUM_XCDS % NUM_WAVES == 0,
-                    "the wave->slice map needs the published slices to divide "
-                    "evenly across the waves");
       static_assert(MFMA_ITERS % NUM_WAVES == 0 &&
-                        (MFMA_ITERS / NUM_WAVES) * K_PER_MFMA ==
-                            (MPK_NUM_XCDS / NUM_WAVES) * ATTN_SLICE,
-                    "wave w must cover exactly its MPK_NUM_XCDS/NUM_WAVES "
-                    "slices; ATTN_SLICE widens as the XCD count falls, so the "
-                    "count per wave falls with it");
+                        (MFMA_ITERS / NUM_WAVES) * K_PER_MFMA == 2 * ATTN_SLICE,
+                    "wave w must cover exactly slices 2w and 2w+1");
 
       // The weight DMA is the one thing here that still needs the whole
       // block: the caller's buffer_load_lds slices are issued per wave and
@@ -618,17 +602,11 @@ __device__ __attribute__((noinline)) void
                                    tid,
                                    layer_epoch);
 #else
-      // 2 slices per wave at 8 XCDs, 1 at 4.
-      constexpr int SLICES_PER_WAVE = MPK_NUM_XCDS / NUM_WAVES;
-      int const first_xcd = warp_id * SLICES_PER_WAVE;
+      int const first_xcd = warp_id * 2;
       // ld_sys_s32 takes a mutable pointer only because every other caller
       // hands it one; the load itself is read-only.
       int *rel0 = const_cast<int *>(attn_slice_release) + first_xcd * 16;
-      // At one slice per wave this aliases rel0 on purpose: the polls below
-      // then read the same slot twice instead of reading a slot that belongs
-      // to a different wave.
-      int *rel1 = const_cast<int *>(attn_slice_release) +
-                  (first_xcd + (SLICES_PER_WAVE > 1 ? 1 : 0)) * 16;
+      int *rel1 = const_cast<int *>(attn_slice_release) + (first_xcd + 1) * 16;
       constexpr int THREADS_PER_SCALE =
           ELEMENTS_PER_SCALE / ELEMENTS_PER_THREAD;
       int const scale_block = tid / THREADS_PER_SCALE;
@@ -1690,30 +1668,11 @@ oproj_barrier :
 #endif
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 #endif
-#ifdef MPK_OPROJ_AID_AGG
-        // Aggregate inside the AID first, so only one atomic per AID reaches
-        // the shared counter and exactly ONE crosses the boundary. Slots 26
-        // and 27 are free in the hier_barrier map (0-7 release, 8 counter,
-        // 9 topk_counter, 28 hier_local) and are separate lines, so the two
-        // AIDs do not contend with each other.
-        int const _agg_aid = xcd_id >> 2;
-        int const _agg_prev = atom_add_release_gpu_s32(
-            &hier_barrier[(26 + _agg_aid) * HIER_STRIDE], 1);
-        if ((_agg_prev % 4) == 3) {
-          // Last of this AID's four XCDs.
-          int const prev_global =
-              atom_add_release_gpu_s32(&hier_barrier[8 * HIER_STRIDE], 1);
-          if ((prev_global % 2) == 1) {
-            oproj_rel_epoch = oproj_release_expected;
-          }
-        }
-#else
         int const prev_global =
             atom_add_release_gpu_s32(&hier_barrier[8 * HIER_STRIDE], 1);
-        if ((prev_global % MPK_NUM_XCDS) == MPK_NUM_XCDS - 1) {
+        if ((prev_global % 8) == 7) {
           oproj_rel_epoch = oproj_release_expected;
         }
-#endif
       }
 #else
       // Single global arrival (all workers increment one counter)
@@ -1730,7 +1689,7 @@ oproj_barrier :
     // why 0 is a safe "not the releaser" sentinel.
     oproj_rel_epoch = __builtin_amdgcn_readfirstlane(oproj_rel_epoch);
     if (oproj_rel_epoch != 0) {
-      if (tid < MPK_NUM_XCDS) {
+      if (tid < 8) {
 #ifdef MPK_AID_SPLIT_FLAGS
         mpk_aid_publish(hier_barrier,
                         tid,
@@ -2093,7 +2052,7 @@ oproj_barrier :
       // matches the unfolder.
       int const cols_per_xcd = OUTPUT_PER_WG * n_wgs_per_xcd;
       int const slice_epoch = layer_epoch > 0 ? layer_epoch : 1;
-      for (int x = 0; x < MPK_NUM_XCDS; x++) {
+      for (int x = 0; x < 8; x++) {
         // Adjacent XCDs' 368-col slices share a 128 B line (736 % 128 != 0).
         // Waiting for x+1 before reading x keeps that line from tearing.
         // All 256 threads poll so there is no per-slice syncthreads.
@@ -2836,7 +2795,7 @@ topk_barrier :
 #ifdef MPK_ROUTING_LANE_RELEASE
         rr_epoch = epoch;
 #else
-        for (int x = 0; x < MPK_NUM_XCDS; x++) {
+        for (int x = 0; x < 8; x++) {
 #ifdef MPK_AID_SPLIT_ROUTING
           // Must hit BOTH replicas: a reader in the other AID polls the other
           // copy, and missing it is a hang, not a slowdown.
@@ -2895,7 +2854,7 @@ topk_barrier :
     // inside tid 0's block retires both the routing data and its aggregate
     // store to routing_ready_ptr[0] before any of these eight flags issue.
     rr_epoch = __builtin_amdgcn_readfirstlane(rr_epoch);
-    if (rr_epoch != 0 && tid < MPK_NUM_XCDS) {
+    if (rr_epoch != 0 && tid < 8) {
 #ifdef MPK_AID_SPLIT_ROUTING
       // Both replicas: a reader in the other AID polls the other copy.
       mpk_aid_publish_at(routing_ready_ptr, (1 + tid) * 16,

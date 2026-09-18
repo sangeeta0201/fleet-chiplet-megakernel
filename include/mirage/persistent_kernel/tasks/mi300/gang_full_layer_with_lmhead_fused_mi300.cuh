@@ -1,3 +1,6 @@
+#ifndef MPK_NUM_XCDS
+#define MPK_NUM_XCDS 8
+#endif
 /* Copyright 2025 CMU
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -565,7 +568,7 @@ __device__ __noinline__ void
   if (xcd_id == 0 && xcd_rank == 0 && tid == 0) {
     float best_val = -1e30f;
     long long best_idx = -1;
-    for (int x = 0; x < 8; x++) {
+    for (int x = 0; x < MPK_NUM_XCDS; x++) {
       unsigned long long packed =
           reinterpret_cast<unsigned long long *>(&argmax_packed_base[x * 4])[0];
       int val_bits = static_cast<int>(packed & 0xFFFFFFFF);

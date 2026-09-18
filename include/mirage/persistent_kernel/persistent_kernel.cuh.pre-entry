@@ -3542,15 +3542,8 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
       // Wait for all workers to report their XCD IDs
       if (config.worker_xcd_map != nullptr) {
-        // Only workers on participating XCDs ever register, so waiting for
-        // num_workers hangs whenever the run is confined to a subset.
-        int _ready_expect = config.num_workers;
-#if MPK_NUM_XCDS < 8
-        _ready_expect = config.precomp_workers_per_xcd > 0
-                            ? config.precomp_workers_per_xcd * MPK_NUM_XCDS
-                            : config.num_workers * MPK_NUM_XCDS / 8;
-#endif
-        while (atomicAdd(config.worker_xcd_ready_count, 0) < _ready_expect) {
+        while (atomicAdd(config.worker_xcd_ready_count, 0) <
+               config.num_workers) {
           __nanosleep(100);
         }
         // Fence ensures we see all worker_xcd_map writes
@@ -4262,21 +4255,6 @@ __global__ __launch_bounds__(WORKER_NUM_THREADS,
   __shared__ int my_role; // 0 = worker, 1 = scheduler
   __shared__ int my_id;   // worker_id or sched_id
 
-#if MPK_NUM_XCDS < 8
-  // Confine the run to XCDs [0, MPK_NUM_XCDS). These blocks take NO part:
-  // they claim no scheduler slot, take no worker id and never register in
-  // worker_xcd_map, so the participating XCDs see a dense worker set and every
-  // threshold is sized for the subset. The whole block leaves together, so the
-  // __syncthreads() below are still uniform.
-  __shared__ int sub_xcd;
-  if (threadIdx.x == 0) {
-    sub_xcd = get_current_xcd_id();
-  }
-  __syncthreads();
-  if (sub_xcd >= MPK_NUM_XCDS) {
-    return;
-  }
-#endif
   if (threadIdx.x == 0) {
     int my_xcd = get_current_xcd_id();
     // Try to claim this XCD as scheduler
@@ -6375,8 +6353,7 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                 int a3 = __atomic_load_n(&a[3], __ATOMIC_RELAXED);
                 fprintf(stderr,
                         "    >>> w%d IN TASK: phase=%d (%s xcd=%d epoch=%d) "
-                        "watch[bid=%d obs=%d exp=%d spins=%d] "
-                        "aux[mask_lo=0x%08x mask_hi=0x%08x counter=%d xcd=%d]\n",
+                        "watch[bid=%d obs=%d exp=%d spins=%d]\n",
                         w,
                         wphase,
                         pn,
@@ -6385,16 +6362,7 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                         bid,
                         obs,
                         exp_,
-                        spins,
-                        a0,
-                        a1,
-                        (a2 >> 0) & 0xff,
-                        (a2 >> 8) & 0xff,
-                        (a2 >> 16) & 0xff,
-                        (a2 >> 24) & 0xff,
-                        (a3 >> 16) & 0xffff,
-                        (a3 >> 8) & 0xff,
-                        a3 & 0xff);
+                        spins);
                 // Per-wave exit mask for the MoE W13->W2 poll. That poll is
                 // thread-divergent by construction (each thread tests the
                 // release flag on its own, no __syncthreads), so waves of one

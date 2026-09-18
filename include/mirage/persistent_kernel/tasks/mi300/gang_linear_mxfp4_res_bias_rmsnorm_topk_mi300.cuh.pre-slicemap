@@ -121,9 +121,6 @@ __device__ __forceinline__ float _oproj_amax8_dpp(float amax) {
 }
 #endif
 
-#if defined(MPK_OPROJ_PIPE_SLICE_MFMA) && MPK_NUM_XCDS != 8
-#error "MPK_OPROJ_PIPE_SLICE_MFMA assumes 2 slices per wave (8 XCDs)"
-#endif
 #ifdef MPK_OPROJ_PIPE_SLICE_MFMA
 #ifndef MPK_ATTN_SLICE_RELEASE
 #error "MPK_OPROJ_PIPE_SLICE_MFMA requires MPK_ATTN_SLICE_RELEASE"
@@ -516,7 +513,7 @@ __device__ __attribute__((noinline)) void
   // the token axis moved into the MFMA's N dimension, so the host emits
   // n_bblk * n_wgs_per_xcd tiles rather than batch_size * n_wgs_per_xcd.
   int bblk = local_tile / n_wgs_per_xcd;
-  int const wg_first = local_tile % n_wgs_per_xcd;
+  int wg_idx = local_tile % n_wgs_per_xcd;
   // At TOK_ROWS == 1 there is exactly one column block, so every tile that
   // survives the guard below has bblk == 0 and the base is a literal zero.
   // The compiler cannot derive that from `batch_count - bblk*16 > 0`, and
@@ -541,11 +538,7 @@ __device__ __attribute__((noinline)) void
     goto oproj_barrier;
   }
 
-  // One iteration per weight group this worker owns. tiles_per_xcd is the
-  // participating rank count, so the groups partition exactly across workers
-  // and every column of the row still gets computed.
-  for (int wg_idx = wg_first; wg_idx < n_wgs_per_xcd;
-       wg_idx += tiles_per_xcd) {
+  {
     uint8_t const *wg_data = W + static_cast<int64_t>(wg_idx) * WG_BYTES;
     uint8_t const *wg_scales = wg_data + WG_DATA_BYTES;
 
@@ -582,15 +575,9 @@ __device__ __attribute__((noinline)) void
       // load-balanced split further down (KP_EXTRA waves get one extra iter)
       // degenerate to the same even split. If it ever fails, the staging
       // range and the MFMA range stop agreeing and the arm is wrong.
-      static_assert(MPK_NUM_XCDS % NUM_WAVES == 0,
-                    "the wave->slice map needs the published slices to divide "
-                    "evenly across the waves");
       static_assert(MFMA_ITERS % NUM_WAVES == 0 &&
-                        (MFMA_ITERS / NUM_WAVES) * K_PER_MFMA ==
-                            (MPK_NUM_XCDS / NUM_WAVES) * ATTN_SLICE,
-                    "wave w must cover exactly its MPK_NUM_XCDS/NUM_WAVES "
-                    "slices; ATTN_SLICE widens as the XCD count falls, so the "
-                    "count per wave falls with it");
+                        (MFMA_ITERS / NUM_WAVES) * K_PER_MFMA == 2 * ATTN_SLICE,
+                    "wave w must cover exactly slices 2w and 2w+1");
 
       // The weight DMA is the one thing here that still needs the whole
       // block: the caller's buffer_load_lds slices are issued per wave and
@@ -618,17 +605,11 @@ __device__ __attribute__((noinline)) void
                                    tid,
                                    layer_epoch);
 #else
-      // 2 slices per wave at 8 XCDs, 1 at 4.
-      constexpr int SLICES_PER_WAVE = MPK_NUM_XCDS / NUM_WAVES;
-      int const first_xcd = warp_id * SLICES_PER_WAVE;
+      int const first_xcd = warp_id * 2;
       // ld_sys_s32 takes a mutable pointer only because every other caller
       // hands it one; the load itself is read-only.
       int *rel0 = const_cast<int *>(attn_slice_release) + first_xcd * 16;
-      // At one slice per wave this aliases rel0 on purpose: the polls below
-      // then read the same slot twice instead of reading a slot that belongs
-      // to a different wave.
-      int *rel1 = const_cast<int *>(attn_slice_release) +
-                  (first_xcd + (SLICES_PER_WAVE > 1 ? 1 : 0)) * 16;
+      int *rel1 = const_cast<int *>(attn_slice_release) + (first_xcd + 1) * 16;
       constexpr int THREADS_PER_SCALE =
           ELEMENTS_PER_SCALE / ELEMENTS_PER_THREAD;
       int const scale_block = tid / THREADS_PER_SCALE;

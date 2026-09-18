@@ -381,14 +381,11 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
           // than picks, that pair's later picks go in further record slots of
           // the same 16-int line. Addressing k*2 directly would send picks
           // past the last pair to XCDs that do not exist.
-          // Expert k is owned by the members [k*m, (k+1)*m) where m is the
-          // number of XCDs per expert. At 8 XCDs m=2 (the pair 2k, 2k+1); at
-          // 4 XCDs m=1 (XCD k alone). One record slot per XCD is enough again,
-          // because no XCD owns two experts.
-          int const _m = MPK_NUM_XCDS / k; // k is this kernel's top-k count
-          int const _rec_off = 2;
-          int const _xa = 1 + k_idx * _m;
-          int const _xb = (_m > 1) ? (_xa + 1) : _xa;
+          int const _n_pairs = MPK_NUM_XCDS / 2;
+          int const _pair = k_idx % _n_pairs;
+          int const _rec_off = 2 + (k_idx / _n_pairs) * 4;
+          int const _xa = 1 + _pair * 2;
+          int const _xb = _xa + 1;
 #ifdef MPK_AID_SPLIT_ROUTING
           mpk_aid_publish_at_u64((void *)early_routing_ready,
                                  _xa * 16 + _rec_off, record,
