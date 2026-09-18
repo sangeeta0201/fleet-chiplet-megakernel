@@ -285,7 +285,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
   // argmax_part_* are [batch, num_workers], XCD-partitioned along dim 1, so
   // the pointer already points at this XCD's worker slice while the row
   // stride is still the full worker count.
-  int const argmax_row_stride = workers_per_xcd * 8;
+  int const argmax_row_stride = workers_per_xcd * MPK_NUM_XCDS;
 
   // ── Step 1: RMSNorm ─────────────────────────────────────────────────────
   // DO NOT add a __syncthreads() to this loop body. Measured at bs=2: without

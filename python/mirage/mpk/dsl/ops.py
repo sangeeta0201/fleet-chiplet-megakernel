@@ -227,7 +227,7 @@ def _linear_gang_coop(g, mpk, input, weight, output, residual,
     m_per_tile = 16
     m_tiles = math.ceil(bs / m_per_tile)
     padded = m_tiles * m_per_tile
-    chunk_n = N // 8
+    chunk_n = N // int(__import__("os").environ.get("MPK_NUM_XCDS", "8"))
     n_tiles = chunk_n // 64
 
     ks = k_splits or select_k_splits(K, m_tiles)
@@ -254,7 +254,7 @@ def _linear_gang_coop(g, mpk, input, weight, output, residual,
 def _linear_gang_splitk(g, mpk, input, weight, output, residual,
                          N, K, bs, stride, k_splits):
     """Gang split-K linear (per-XCD weight partition + K-splitting)."""
-    chunk_n = N // 8
+    chunk_n = N // int(__import__("os").environ.get("MPK_NUM_XCDS", "8"))
     n_tiles = chunk_n // 64
 
     ks = k_splits or select_k_splits(K, n_tiles)

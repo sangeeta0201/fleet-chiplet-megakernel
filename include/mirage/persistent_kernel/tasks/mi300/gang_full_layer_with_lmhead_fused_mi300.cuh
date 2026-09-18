@@ -171,7 +171,7 @@ __device__ __noinline__ void
   asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)" : "=s"(xcd_id));
   int xcd_rank = tile_idx % workers_per_xcd;
   int tid = threadIdx.x;
-  int total_workers = workers_per_xcd * 8;
+  int total_workers = workers_per_xcd * MPK_NUM_XCDS;
 
   int *oproj_counters_base = static_cast<int *>(input_ptrs[16]);
   int *moe_done_global = oproj_counters_base + FUSED_TAIL_MOE_DONE_SLOT;

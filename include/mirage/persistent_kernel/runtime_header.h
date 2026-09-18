@@ -447,14 +447,6 @@ struct RuntimeConfig {
   // so breadcrumbs survive the abort that a memory fault triggers. Null
   // unless built with MPK_NIL_TRIPWIRE. See persistent_kernel.cuh.
   unsigned long long *tripwire;
-  // Decode progress, published to *pinned host* memory once per iteration by
-  // the scheduler. The megakernel runs a whole request inside one blocking
-  // launch, so device memory tells the host nothing until that launch returns
-  // -- which is too late for a server that has to stream tokens as they are
-  // produced. Writes here land in host RAM over PCIe as they happen, the same
-  // property the nil tripwire relies on. Null unless the host allocated it.
-  //   [r] = token position reached by batch slot r (reset per launch)
-  int *progress_host;
   // Cross-XCD gang barrier: workers sync before executing gang tasks with
   // internal barriers
   unsigned long long
@@ -470,7 +462,12 @@ struct RuntimeConfig {
   int precomp_workers_per_xcd;   // num_workers / 8
   int *precomp_dbg_gang_phase;   // [num_workers] host-mapped: gang kernel phase
                                  // tracking
-  // Multi-layer all-fused execution: one task processes all transformer layers
+#endif
+#ifdef MPK_FUSED_LAYER_BATCHING
+  // Multi-layer all-fused execution: one task processes all transformer layers.
+  // Independent of MPK_PRECOMPUTED_DISPATCH: the worker loop and pointer
+  // tables are the fused-layer recipe; precomputed dispatch only changes how
+  // that one task reaches the worker.
   void **ml_input_table;      // [ml_num_layers * 24] per-layer input pointers
   void **ml_output_table;     // [ml_num_layers * 11] per-layer output pointers
   EventId *ml_trigger_events; // [ml_num_layers] per-layer trigger events
@@ -483,6 +480,16 @@ struct RuntimeConfig {
   int ml_num_layers;          // 0 = disabled, 36 = enabled
   int ml_workers_per_xcd;     // workers per XCD for barrier threshold
 #endif
+  // Decode progress, published to *pinned host* memory once per iteration by
+  // the scheduler. Independent of MPK_PRECOMPUTED_DISPATCH: the scheduler's
+  // EVENT_END_OF_TASK_GRAPH path and the host poll APIs both exist in either
+  // dispatch mode. The megakernel runs a whole request inside one blocking
+  // launch, so device memory tells the host nothing until that launch returns
+  // -- which is too late for a server that has to stream tokens as they are
+  // produced. Writes here land in host RAM over PCIe as they happen. Null
+  // unless the host allocated it.
+  //   [r] = token position reached by batch slot r (reset per launch)
+  int *progress_host;
 #ifdef MIRAGE_BACKEND_USE_ROCM
   hipStream_t worker_stream, scheduler_stream;
   hipEvent_t prepare_done_event;

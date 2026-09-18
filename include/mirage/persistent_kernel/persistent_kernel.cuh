@@ -650,14 +650,17 @@ using namespace kernel;
 // =============================================================================
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
 
-// Number of XCDs on MI300X
-constexpr int MI300X_NUM_XCDS = 8;
+#ifndef MPK_NUM_XCDS
+#define MPK_NUM_XCDS 8
+#endif
+constexpr int MI300X_NUM_XCDS = MPK_NUM_XCDS;
 
-// Get the XCD (XCC) ID for the current thread
+// Physical XCC_ID is 0-7 even in DPX. Fold into the local 0..N-1 index
+// (DPX partition 1 is XCCs 4-7 -> 0-3).
 __device__ __forceinline__ int get_current_xcd_id() {
   int xcd_id;
   asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)" : "=s"(xcd_id));
-  return xcd_id;
+  return xcd_id % MPK_NUM_XCDS;
 }
 
 // Per-block shared state for XCD info (computed once at block start)
@@ -890,7 +893,7 @@ __global__ void prepare_kernel(RuntimeConfig config,
   // Per-XCD release flags mirror iter_ready and are polled with ld_nt, so a
   // stale non-zero here would release iteration 1 before it is ready.
   if (config.precomp_iter_xcd_release != nullptr) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < 8 * 16;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < MPK_NUM_XCDS * 16;
          i += blockDim.x * gridDim.x) {
       config.precomp_iter_xcd_release[i] = 0;
     }
@@ -1597,6 +1600,21 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
             break;
           }
           __builtin_amdgcn_s_sleep(1);
+        }
+        // Re-test after the loop, not only inside it.
+        //
+        // The terminate path bumps `precomp_iter_ready` deliberately, to
+        // release workers parked at this gate. A worker whose loop condition
+        // is satisfied by that very bump leaves without ever evaluating the
+        // check above, loads tasks for an iteration that will never be
+        // produced, and then blocks forever in the dependency wait below,
+        // which has no terminate check at all.
+        //
+        // Safe unconditionally: the scheduler sets `precomp_terminate` only on
+        // the last END_OF_TASK_GRAPH, so once it reads 1 no further iteration
+        // exists and a worker leaving here has no legitimate work to skip.
+        if (__atomic_load_n(config.precomp_terminate, __ATOMIC_RELAXED)) {
+          pc_terminated = 1;
         }
       }
       __syncthreads();
@@ -2347,11 +2365,17 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
         }
 #endif
 
-#if defined(MPK_PRECOMPUTED_DISPATCH) && defined(MPK_FUSED_LAYER_BATCHING)
+#if defined(MPK_FUSED_LAYER_BATCHING)
         // ===== Fused-layer batching fast path =====
         if (task_desc->task_type == TASK_GANG_FULL_LAYER_FUSED_MI300 ||
             task_desc->task_type ==
                 TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300) {
+
+#ifdef MPK_PRECOMPUTED_DISPATCH
+          size_t const flb_iter = pc_iter;
+#else
+          size_t const flb_iter = get_task_iteration_num(task_ids[queue_pos]);
+#endif
 
           if (config.ml_num_layers > 0) {
             // ===== Multi-layer all-fused: one task executes all layers =====
@@ -2608,7 +2632,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                 // pass" from "faults after hundreds of clean ones". The host
                 // only sees that it died within a second of launch, which at
                 // ~2.5 ms/iter is anywhere in the first few hundred.
-                b[6] = (unsigned long long)pc_iter;
+                b[6] = (unsigned long long)flb_iter;
               }
 #endif
 
@@ -2636,7 +2660,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               // visible to the whole block before any worker enters the task.
               if (threadIdx.x == 0) {
                 task_desc->task_metadata._linear_reserved =
-                    (int32_t)((pc_iter - 1) * config.ml_num_layers + ml);
+                    (int32_t)((flb_iter - 1) * config.ml_num_layers + ml);
               }
               __syncthreads();
 
@@ -2651,10 +2675,12 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               // which layer they were actually stuck in -- the counter could
               // not distinguish a worker on layer 0 from one on layer 35.
               // Encoding the layer makes the dump localize the stall.
+#ifdef MPK_PRECOMPUTED_DISPATCH
               if (threadIdx.x == 0 && MPK_WS_ON(config)) {
                 int *ws = config.precomp_dbg_worker_state + worker_id * 4;
                 __atomic_store_n(&ws[3], 40000 + ml, __ATOMIC_RELAXED);
               }
+#endif
               for (int t = block_xcd_local_rank; t < ml_n_tile_count;
                    t += block_workers_on_xcd) {
 #ifdef MPK_NIL_TRIPWIRE
@@ -2712,7 +2738,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                                    : 0;
               if (xcd_thresh > 0) {
                 TaskId ml_tid =
-                    compute_task_id(pc_iter, config.ml_task_positions[0]);
+                    compute_task_id(flb_iter, config.ml_task_positions[0]);
                 EventCounter local_cnt =
                     atom_add_local_u64(
                         reinterpret_cast<unsigned long long int *>(
@@ -2769,7 +2795,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               // on this path, so the layer term is 0.
               if (threadIdx.x == 0) {
                 task_desc->task_metadata._linear_reserved =
-                    (int32_t)(pc_iter - 1);
+                    (int32_t)(flb_iter - 1);
               }
               __syncthreads();
               int n_tile_start = (int)task_desc->task_metadata.n_tile_start;
@@ -2814,6 +2840,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 
               int next_qp = queue_pos + 1;
               if (next_qp >= queue_len) {
+#ifdef MPK_PRECOMPUTED_DISPATCH
                 int remaining = pc_my_len - pc_pos;
                 if (remaining <= 0) {
                   break;
@@ -2822,7 +2849,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                 __syncthreads();
                 if (threadIdx.x < num_to_load) {
                   task_ids[threadIdx.x] = compute_task_id(
-                      pc_iter, pc_my_queue[pc_pos + threadIdx.x]);
+                      flb_iter, pc_my_queue[pc_pos + threadIdx.x]);
                 }
                 __syncthreads();
                 if (threadIdx.x == 0) {
@@ -2844,6 +2871,9 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                 queue_pos = 0;
                 queue_len = num_to_load;
                 next_qp = 0;
+#else
+                break;
+#endif
               }
 
               TaskDesc *next_td = task_descs + next_qp;
@@ -3807,7 +3837,7 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
           {
             unsigned long long new_val = *config.precomp_iter_ready;
             int *rel = config.precomp_iter_xcd_release;
-            for (int x = 0; x < 8; x++) {
+            for (int x = 0; x < MPK_NUM_XCDS; x++) {
               st_wt_u32((void *)&rel[x * 16], (unsigned)new_val);
             }
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
@@ -3827,7 +3857,7 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
           {
             unsigned long long new_val = *config.precomp_iter_ready;
             int *rel = config.precomp_iter_xcd_release;
-            for (int x = 0; x < 8; x++) {
+            for (int x = 0; x < MPK_NUM_XCDS; x++) {
               st_wt_u32((void *)&rel[x * 16], (unsigned)new_val);
             }
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
@@ -4196,12 +4226,76 @@ __global__ void scheduler_kernel(RuntimeConfig config) {
 }
 #pragma clang diagnostic pop
 
+// Allocator for state that several XCDs read and write.
+//
+// Under DPX+NPS2 a device is 4 XCDs spanning two AIDs, and device VRAM there
+// is coherent only within one AID -- so a counter incremented on one die is
+// never observed by the two XCDs on the other. Host memory is system-coherent,
+// so every XCD sees the same value. The buffers routed here are a few KB of
+// counters polled in spin loops, not bandwidth-bound data.
+//
+// MPK_UNCACHED_SYNC prefers UNCACHED DEVICE VRAM over host memory. It needs
+// the driver's aid_local_uncached_mtype=1, which maps an UNCACHED-marked BO to
+// MTYPE_NC instead of upstream's MTYPE_UC -- NC is the one MTYPE this
+// protocol was measured correct on, and UC drops the coherence point
+// device-scope atomics resolve at, so these counters' atomicAdd would never
+// land. Staying on the device avoids a PCIe round trip per poll, which is
+// what made the host-memory arm 21.3 ms/token against 3.9 in DPX+NPS1.
+template <typename DT>
+DT *mpk_sync_malloc(size_t size) {
+  static bool const use_uncached = (getenv("MPK_UNCACHED_SYNC") != nullptr &&
+                                    atoi(getenv("MPK_UNCACHED_SYNC")) != 0);
+  static bool const use_host = (getenv("MPK_HOST_EVCTR") != nullptr &&
+                                atoi(getenv("MPK_HOST_EVCTR")) != 0);
+  void *dst_ptr = nullptr;
+  if (use_uncached) {
+    if (hipExtMallocWithFlags(&dst_ptr, size, hipDeviceMallocUncached) ==
+        hipSuccess) {
+      (void)hipMemset(dst_ptr, 0, size);
+      fprintf(stderr, "[SYNCMEM] %zu bytes uncached VRAM @ %p\n", size,
+              dst_ptr);
+      return static_cast<DT *>(dst_ptr);
+    }
+    fprintf(stderr, "[SYNCMEM] hipExtMallocWithFlags failed\n");
+  }
+  if (use_host) {
+    if (hipHostMalloc(&dst_ptr, size,
+                      hipHostMallocMapped | hipHostMallocCoherent) ==
+        hipSuccess) {
+      memset(dst_ptr, 0, size);
+      fprintf(stderr, "[SYNCMEM] %zu bytes host-coherent @ %p\n", size,
+              dst_ptr);
+      return static_cast<DT *>(dst_ptr);
+    }
+    fprintf(stderr, "[SYNCMEM] hipHostMalloc failed, falling back to VRAM\n");
+  }
+  (void)cudaMalloc(&dst_ptr, size);
+  return static_cast<DT *>(dst_ptr);
+}
+
 template <typename DT>
 DT *gpu_malloc(size_t size) {
   void *dst_ptr;
 #ifdef USE_NVSHMEM
   dst_ptr = nvshmem_malloc(size);
 #else
+  // MPK_UNCACHED_ALL routes every runtime allocation -- task descriptors,
+  // the per-worker queues, the multi-layer pointer tables -- to NC as well.
+  // A worker reads its queue entry before it can enter its first task, and
+  // the multi-layer refresh WRITES task_desc->input_ptrs from the kernel, so
+  // this state is not merely host-uploaded and read-only. Blunt on purpose:
+  // it leaves only the torch-owned weights and KV cache on RW, which is the
+  // bisect that says whether anything outside the weights still needs NC.
+  static bool const unc = (getenv("MPK_UNCACHED_ALL") != nullptr &&
+                           atoi(getenv("MPK_UNCACHED_ALL")) != 0);
+  if (unc) {
+    dst_ptr = nullptr;
+    if (hipExtMallocWithFlags(&dst_ptr, size, hipDeviceMallocUncached) ==
+        hipSuccess) {
+      (void)hipMemset(dst_ptr, 0, size);
+      return static_cast<DT *>(dst_ptr);
+    }
+  }
   (void)cudaMalloc(&dst_ptr, size);
 #endif
   return static_cast<DT *>(dst_ptr);
@@ -4231,8 +4325,6 @@ static unsigned long long *g_dbg_h_tasks_done =
 static int *g_dbg_h_worker_state =
     nullptr; // [num_workers*4] host-mapped debug state
 static int g_dbg_num_workers = 0;
-// Host-side view of the decode-progress counter (pinned, device-mapped).
-static int *g_progress_host = nullptr;
 static EventCounter *g_dbg_h_event_counters =
     nullptr; // host-mapped event counters
 static EventCounter *g_dbg_h_xcd_local_counters =
@@ -4241,6 +4333,10 @@ static int *g_dbg_h_xcd_event_thresholds = nullptr; // host copy of thresholds
 static int g_dbg_num_events = 0;
 static int g_dbg_num_xcds = 0;
 #endif
+// Host-side view of the decode-progress counter (pinned, device-mapped).
+// Not gated on MPK_PRECOMPUTED_DISPATCH: reset_decode_progress /
+// get_decode_progress / launch_persistent_kernel all compile in either mode.
+static int *g_progress_host = nullptr;
 
 #ifdef MPK_NIL_TRIPWIRE
 // ── Tripwire for the nil-address GPU memory fault ────────────────────────
@@ -4595,16 +4691,16 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
     }
   }
 
-#ifdef MPK_PRECOMPUTED_DISPATCH
   // =========================================================================
   // Multi-layer fusion: build pointer table from all 36 layers, then compact
   // the task graph by removing redundant layers 1..35 (280 tasks, 35 events).
   // Must happen BEFORE template queue building so the template uses compacted
-  // indices.
+  // indices. Not gated on MPK_PRECOMPUTED_DISPATCH: the fused task graph is
+  // the same either way; precomputed dispatch only fills per-worker queues.
   // =========================================================================
 #ifdef MPK_FUSED_LAYER_BATCHING
   {
-    constexpr int NUM_XCDS_ML = 8;
+    constexpr int NUM_XCDS_ML = MPK_NUM_XCDS;
     // Must cover every slot the fused layer kernels read, not just the ones
     // the plain variant uses. The LM-head variant
     // (TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300, FUSE_TAIL=1) reads
@@ -4660,6 +4756,18 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
           int base = (xcd * ml_layers + L) * ML_N_IN;
           for (int i = 0; i < ML_N_IN; i++) {
             h_input_table[base + i] = td_xcd.input_ptrs[i];
+          }
+          if (L == 0 && getenv("MPK_DBG_XCD_PTRS")) {
+            printf("[XCDPTR] L0 xcd=%d qkv_w=%p oproj_w=%p router_w=%p "
+                   "resid=%p w13=%p w2=%p\n",
+                   xcd,
+                   td_xcd.input_ptrs[4],
+                   td_xcd.input_ptrs[9],
+                   td_xcd.input_ptrs[13],
+                   td_xcd.input_ptrs[1],
+                   td_xcd.input_ptrs[17],
+                   td_xcd.input_ptrs[18]);
+            fflush(stdout);
           }
           int obase = (xcd * ml_layers + L) * ML_N_OUT;
           for (int i = 0; i < ML_N_OUT; i++) {
@@ -4909,22 +5017,26 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
                        ml_layers * sizeof(unsigned),
                        cudaMemcpyHostToDevice);
 
-      // Barrier counters (zeroed)
+      // Barrier counters (zeroed). This is the cross-XCD layer rendezvous, so
+      // it goes through mpk_sync_malloc: in DPX+NPS2 plain VRAM is MTYPE_RW,
+      // coherent only within an AID, and a device's 4 XCDs span two -- an
+      // arrival published by one pair is never observed by the other, which
+      // parks the run at the first layer boundary with zero forward passes.
       global_runtime_config.ml_barrier_arrive =
-          gpu_malloc<int>(8 * 16 * sizeof(int));
+          mpk_sync_malloc<int>(MPK_NUM_XCDS * 16 * sizeof(int));
       (void)cudaMemset(
-          global_runtime_config.ml_barrier_arrive, 0, 8 * 16 * sizeof(int));
+          global_runtime_config.ml_barrier_arrive, 0, MPK_NUM_XCDS * 16 * sizeof(int));
       global_runtime_config.ml_barrier_global =
-          gpu_malloc<int>(16 * sizeof(int));
+          mpk_sync_malloc<int>(16 * sizeof(int));
       (void)cudaMemset(
           global_runtime_config.ml_barrier_global, 0, 16 * sizeof(int));
       global_runtime_config.ml_barrier_release =
-          gpu_malloc<int>(8 * 16 * sizeof(int));
+          mpk_sync_malloc<int>(MPK_NUM_XCDS * 16 * sizeof(int));
       (void)cudaMemset(
-          global_runtime_config.ml_barrier_release, 0, 8 * 16 * sizeof(int));
+          global_runtime_config.ml_barrier_release, 0, MPK_NUM_XCDS * 16 * sizeof(int));
 
       global_runtime_config.ml_num_layers = ml_layers;
-      // ml_workers_per_xcd set later after workers_per_xcd is computed
+      global_runtime_config.ml_workers_per_xcd = num_workers / NUM_XCDS_ML;
 
       printf(
           "[MPK] Multi-layer table: %d fused layers, pointer tables uploaded\n",
@@ -4937,10 +5049,9 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
       fflush(stdout);
     }
   }
-#else
-  global_runtime_config.ml_num_layers = 0;
 #endif // MPK_FUSED_LAYER_BATCHING
 
+#ifdef MPK_PRECOMPUTED_DISPATCH
   // =========================================================================
   // Build per-XCD-slot template queues on host.
   // At runtime, workers discover their hardware XCD via get_current_xcd_id(),
@@ -4953,7 +5064,7 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   {
     int n_tasks = (int)all_tasks.size();
     int n_events = (int)all_events.size();
-    constexpr int NUM_XCDS_PC = 8;
+    constexpr int NUM_XCDS_PC = MPK_NUM_XCDS;
     int workers_per_xcd = num_workers / NUM_XCDS_PC;
     int max_tpw = 512;
 
@@ -5126,21 +5237,22 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
     // Use device memory for iter_ready and terminate (GPU-only polling)
     {
       global_runtime_config.precomp_iter_ready =
-          gpu_malloc<unsigned long long>(sizeof(unsigned long long));
+          mpk_sync_malloc<unsigned long long>(sizeof(unsigned long long));
       (void)cudaMemset(global_runtime_config.precomp_iter_ready,
                        0,
                        sizeof(unsigned long long));
 
-      global_runtime_config.precomp_terminate = gpu_malloc<int>(sizeof(int));
+      global_runtime_config.precomp_terminate =
+          mpk_sync_malloc<int>(sizeof(int));
       (void)cudaMemset(global_runtime_config.precomp_terminate, 0, sizeof(int));
 
       // Per-XCD release flags for fast cross-XCD iteration barrier
       // [8*16 ints] padded to cache lines to avoid false sharing
       global_runtime_config.precomp_iter_xcd_release =
-          gpu_malloc<int>(8 * 16 * sizeof(int));
+          gpu_malloc<int>(MPK_NUM_XCDS * 16 * sizeof(int));
       (void)cudaMemset(global_runtime_config.precomp_iter_xcd_release,
                        0,
-                       8 * 16 * sizeof(int));
+                       MPK_NUM_XCDS * 16 * sizeof(int));
 
       // Debug task counter — device memory, read via cudaMemcpy in debug loop
       global_runtime_config.precomp_dbg_tasks_done =
@@ -5222,40 +5334,6 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
 #else
       global_runtime_config.tripwire = nullptr;
 #endif
-
-      // Decode-progress counters in pinned host memory, one per batch slot.
-      // Always allocated (one page, one store per slot per iteration); the
-      // serving path reads them to stream tokens while the launch is still
-      // running, and nothing else touches them.
-      //
-      // Per-slot, not a single counter: a batch coalesces requests with
-      // different prompt lengths, so slot r's first *output* token lands at a
-      // different absolute position than slot 0's. One shared counter would
-      // make every request in the batch inherit request 0's schedule and
-      // report the wrong TTFT for all the others.
-      {
-        int *pg_host = nullptr;
-        if (hipHostMalloc(reinterpret_cast<void **>(&pg_host),
-                          sizeof(int) * MPK_MAX_NUM_BATCHED_REQUESTS,
-                          hipHostMallocMapped | hipHostMallocNonCoherent) ==
-                hipSuccess &&
-            pg_host != nullptr) {
-          for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
-            pg_host[i] = 0;
-          }
-          g_progress_host = pg_host;
-          int *pg_dev = nullptr;
-          if (hipHostGetDevicePointer(
-                  reinterpret_cast<void **>(&pg_dev), pg_host, 0) ==
-              hipSuccess) {
-            global_runtime_config.progress_host = pg_dev;
-          } else {
-            (void)hipHostFree(pg_host);
-            g_progress_host = nullptr;
-            global_runtime_config.progress_host = nullptr;
-          }
-        }
-      }
 
       // Clear host debug pointers (no longer host-mapped)
       g_dbg_h_iter_ready = nullptr;
@@ -5375,7 +5453,7 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
                      cudaMemcpyHostToDevice);
     // Also need xcd_local_event_counters for two-level counting
     global_runtime_config.xcd_local_event_counters =
-        gpu_malloc<EventCounter>(NUM_XCDS_PC * n_events * sizeof(EventCounter));
+        mpk_sync_malloc<EventCounter>(NUM_XCDS_PC * n_events * sizeof(EventCounter));
     (void)cudaMemset(global_runtime_config.xcd_local_event_counters,
                      0,
                      NUM_XCDS_PC * n_events * sizeof(EventCounter));
@@ -5383,8 +5461,48 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
 
     // Set ml_workers_per_xcd (pointer tables uploaded earlier, before
     // compaction)
+#ifdef MPK_FUSED_LAYER_BATCHING
     if (global_runtime_config.ml_num_layers > 0) {
       global_runtime_config.ml_workers_per_xcd = workers_per_xcd;
+    }
+#endif
+  }
+#endif
+
+  // Decode-progress counters in pinned host memory, one per batch slot.
+  // Always allocated (one page, one store per slot per iteration); the
+  // serving path reads them to stream tokens while the launch is still
+  // running, and nothing else touches them. Not gated on
+  // MPK_PRECOMPUTED_DISPATCH: the scheduler publishes from the shared
+  // EVENT_END_OF_TASK_GRAPH path.
+  //
+  // Per-slot, not a single counter: a batch coalesces requests with
+  // different prompt lengths, so slot r's first *output* token lands at a
+  // different absolute position than slot 0's. One shared counter would
+  // make every request in the batch inherit request 0's schedule and
+  // report the wrong TTFT for all the others.
+#if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
+  {
+    int *pg_host = nullptr;
+    if (hipHostMalloc(reinterpret_cast<void **>(&pg_host),
+                      sizeof(int) * MPK_MAX_NUM_BATCHED_REQUESTS,
+                      hipHostMallocMapped | hipHostMallocNonCoherent) ==
+            hipSuccess &&
+        pg_host != nullptr) {
+      for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
+        pg_host[i] = 0;
+      }
+      g_progress_host = pg_host;
+      int *pg_dev = nullptr;
+      if (hipHostGetDevicePointer(reinterpret_cast<void **>(&pg_dev),
+                                 pg_host,
+                                 0) == hipSuccess) {
+        global_runtime_config.progress_host = pg_dev;
+      } else {
+        (void)hipHostFree(pg_host);
+        g_progress_host = nullptr;
+        global_runtime_config.progress_host = nullptr;
+      }
     }
   }
 #endif
@@ -5425,7 +5543,7 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   //            cudaMemcpyHostToDevice);
   //  Initialize all event counters
   global_runtime_config.all_event_counters =
-      gpu_malloc<EventCounter>(all_events.size() * sizeof(EventCounter));
+      mpk_sync_malloc<EventCounter>(all_events.size() * sizeof(EventCounter));
 #ifdef MPK_PRECOMPUTED_DISPATCH
   g_dbg_num_events = (int)all_events.size();
 #endif
@@ -5448,11 +5566,11 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   // Initialize per-XCD local event counters for hierarchical polling
   // This reduces cross-XCD atomic contention by having leaders poll global
   // and other workers poll XCD-local counters
-  constexpr int NUM_XCDS_INIT = 8; // MI300X has 8 XCDs
+  constexpr int NUM_XCDS_INIT = MPK_NUM_XCDS;
   global_runtime_config.num_xcds = NUM_XCDS_INIT;
   // xcd_local_event_counters may already be allocated by precomputed dispatch
   if (global_runtime_config.xcd_local_event_counters == nullptr) {
-    global_runtime_config.xcd_local_event_counters = gpu_malloc<EventCounter>(
+    global_runtime_config.xcd_local_event_counters = mpk_sync_malloc<EventCounter>(
         NUM_XCDS_INIT * all_events.size() * sizeof(EventCounter));
     // Initialize to 0 (same initial state as global counters)
     (void)cudaMemset(global_runtime_config.xcd_local_event_counters,

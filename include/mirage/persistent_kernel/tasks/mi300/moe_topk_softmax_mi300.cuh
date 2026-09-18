@@ -374,10 +374,15 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
           unsigned long long const record =
               (unsigned long long)early_routing_epoch |
               ((unsigned long long)(unsigned)expert << 32);
+#if MPK_NUM_XCDS == 4
+          st_wt_u64((void *)&early_routing_ready[(1 + k_idx) * 16 + 2],
+                    record);
+#else
           st_wt_u64((void *)&early_routing_ready[(1 + k_idx * 2) * 16 + 2],
                     record);
           st_wt_u64((void *)&early_routing_ready[(1 + k_idx * 2 + 1) * 16 + 2],
                     record);
+#endif
           if (active_expert_ids != nullptr) {
             st_wt_u32((void *)&active_expert_ids[k_idx], (unsigned)expert);
           }

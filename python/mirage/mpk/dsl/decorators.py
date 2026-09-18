@@ -97,7 +97,9 @@ class distribute:
             return linear(x, w_qkv, output, **kw)
     """
 
-    def __init__(self, dim=0, num_xcds=8):
+    def __init__(self, dim=0, num_xcds=None):
+        if num_xcds is None:
+            num_xcds = int(__import__("os").environ.get("MPK_NUM_XCDS", "8"))
         self.dim = dim
         self.num_xcds = num_xcds
 

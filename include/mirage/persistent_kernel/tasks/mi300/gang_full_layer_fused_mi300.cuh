@@ -98,7 +98,7 @@ static constexpr int FULL_LAYER_OPROJ_XCD_READY_SLOT(int num_reqs) {
 // grepping every access to the counter):
 //
 //   Phase 2  input_ptrs[7][xcd_id] and qkv_epoch[xcd_id * 16]
-//   Phase 4  chunk_barrier[(xcd_id * NUM_REQS + attn_req) * 16]
+//   Phase 4  chunk_barrier[(attn_kv_head * NUM_REQS + attn_req) * 16]
 //   Phase 9  layer_local[xcd_id * 16]   (layer_global stays sc0 sc1)
 //
 // The releases are untouched: those really are cross-XCD and keep their st_wt
@@ -276,9 +276,26 @@ __device__ __noinline__ void
   // early-returns on that *inside itself* -- so a padded slot still arrives at
   // the chunk barrier below. Keeping the participant set fixed is what makes
   // every modulus here independent of how many requests happen to be live.
-  constexpr int ATTN_PARTICIPANTS = NUM_REQS * NUM_KV_CHUNKS;
-  int const attn_req = qkv_attn_rank / NUM_KV_CHUNKS;
+  // kv_head was bound to the XCD (kv_head_idx = xcd_id). That is only a
+  // tiling when there is one kv head per XCD. At MPK_NUM_XCDS=4 (DPX) with
+  // NUM_KV_HEADS=8 it silently drops heads 4..7: they are never computed, so
+  // half of the OPROJ_REDUCTION_SIZE-wide reduction reads whatever the
+  // previous layer left behind, and the attention arrival count no longer
+  // matches the number of merges issued -- which is the Phase 6 barrier
+  // hanging one arrival short rather than any memory-ordering bug.
+  //
+  // So the rank decomposition grows a kv-head axis. Barriers below are keyed
+  // by the GLOBAL kv head rather than by xcd_id, which keeps every array that
+  // was sized NUM_KV_HEADS-wide correct and is a no-op when the two coincide.
+  constexpr int KV_HEADS_PER_XCD = NUM_KV_HEADS / MPK_NUM_XCDS;
+  static_assert(NUM_KV_HEADS % MPK_NUM_XCDS == 0,
+                "kv heads must divide evenly across XCDs");
+  constexpr int ATTN_PARTICIPANTS =
+      NUM_REQS * NUM_KV_CHUNKS * KV_HEADS_PER_XCD;
+  int const attn_kvh_local = qkv_attn_rank / (NUM_REQS * NUM_KV_CHUNKS);
+  int const attn_req = (qkv_attn_rank / NUM_KV_CHUNKS) % NUM_REQS;
   int const attn_chunk = qkv_attn_rank % NUM_KV_CHUNKS;
+  int const attn_kv_head = xcd_id * KV_HEADS_PER_XCD + attn_kvh_local;
 #ifdef MPK_ATTN_SPLIT_CHUNK
   static_assert(NUM_REQS == 1,
                 "MPK_ATTN_SPLIT_CHUNK maps one idle rank per chunk");
@@ -823,9 +840,9 @@ __device__ __noinline__ void
       int kv_chunk_idx = attn_chunk;
       using bf16_t = __hip_bfloat16;
       void const *offset_k = reinterpret_cast<bf16_t const *>(output_ptrs[1]) +
-                             static_cast<size_t>(xcd_id) * HEAD_DIM;
+                             static_cast<size_t>(attn_kv_head) * HEAD_DIM;
       void const *offset_v = reinterpret_cast<bf16_t const *>(output_ptrs[2]) +
-                             static_cast<size_t>(xcd_id) * HEAD_DIM;
+                             static_cast<size_t>(attn_kv_head) * HEAD_DIM;
 
       // Write float32 partials to o_acc_f32 (input_ptrs[23])
       // Write LSE to lse_acc (input_ptrs[8])
@@ -853,7 +870,7 @@ __device__ __noinline__ void
           kv_indices,
           kv_last_page_len,
           /*request_id=*/attn_req,
-          /*kv_head_idx=*/xcd_id,
+          /*kv_head_idx=*/attn_kv_head,
           kv_chunk_idx,
           attn_scale,
           SLIDING_WINDOW,
@@ -870,7 +887,7 @@ __device__ __noinline__ void
       // primary slot before the 8-way merge so NUM_KV_CHUNKS stays 8.
       {
         int *split_flag =
-            &chunk_barrier[(xcd_id * NUM_REQS + attn_req) * 16 + 1 +
+            &chunk_barrier[(attn_kv_head * NUM_REQS + attn_req) * 16 + 1 +
                            kv_chunk_idx];
         if (tid == 0) {
           while (MPK_LD_GATE(split_flag) < qkv_epoch_expected) {
@@ -968,7 +985,7 @@ __device__ __noinline__ void
         // `xcd_id`, and its only reader is the `% NUM_KV_CHUNKS` test right
         // below on the same XCD. See MPK_XCD_LOCAL_BARRIER at the top.
         s_chunk_prev = MPK_XCD_LOCAL_ATOM_ADD(
-            &chunk_barrier[(xcd_id * NUM_REQS + attn_req) * 16], 1);
+            &chunk_barrier[(attn_kv_head * NUM_REQS + attn_req) * 16], 1);
       }
       __syncthreads();
 
@@ -1013,7 +1030,7 @@ __device__ __noinline__ void
             /*request_id=*/attn_req,
             reinterpret_cast<__hip_bfloat16 *>(
                 output_ptrs[4]), // attn_out (bf16)
-            /*kv_head_idx=*/xcd_id,
+            /*kv_head_idx=*/attn_kv_head,
             HAS_SINKS ? input_ptrs[6] : nullptr); // sinks applied here
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
@@ -1046,7 +1063,7 @@ __device__ __noinline__ void
         // than pre-parked, and this releaser is not on anyone's critical path
         // for the seven store-issues it saves. Left serial.
 #ifdef MPK_ATTN_SLICE_RELEASE
-        // ── Per-XCD slice release ────────────────────────────────────────
+        // ── Per-kv-head slice release ────────────────────────────────────
         //
         // This XCD's merge just finished, and what it finished is exactly the
         // 512-element K slice [xcd_id*512, xcd_id*512+512) of attn_out: the
@@ -1074,7 +1091,15 @@ __device__ __noinline__ void
         // release after the first. The static_assert is at the top of the
         // MPK_ATTN_SLICE_RELEASE block in Phase 6.
         if (tid == 0) {
-          st_wt_u32((void *)&attn_release[xcd_id * 16],
+          // One flag per KV HEAD, not per XCD. The slice this merge just
+          // produced is NUM_Q_PER_KV * HEAD_DIM wide and is identified by its
+          // kv head, so there are NUM_KV_HEADS slices however many XCDs are
+          // running. Publishing per XCD only wrote MPK_NUM_XCDS flags, so at
+          // 4 XCDs slices 4..7 were never released and the Phase 7 consumer --
+          // which maps wave w to slices 2w and 2w+1 -- waited forever on them.
+          // Keying by kv head leaves that consumer mapping correct unchanged
+          // and is identical to the old code when kv_head == xcd_id.
+          st_rel_max_u32((void *)&attn_release[attn_kv_head * 16],
                     (unsigned)attn_release_expected);
           asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         }
@@ -1119,7 +1144,7 @@ __device__ __noinline__ void
           // every NUM_REQS -- unlike `(v | (ATTN_ARRIVALS-1)) + 1`, which only
           // rounds to a power of two and released early at NUM_REQS in
           // {3,5,6,7}.
-          constexpr int ATTN_ARRIVALS = 8 * NUM_REQS;
+          constexpr int ATTN_ARRIVALS = NUM_KV_HEADS * NUM_REQS;
           int prev = atom_add_release_gpu_s32(attn_global, 1);
           if ((prev % ATTN_ARRIVALS) == ATTN_ARRIVALS - 1) {
             // LAST XCD to arrive: fan out per-XCD release flags via st_wt
@@ -1127,8 +1152,16 @@ __device__ __noinline__ void
             // This eliminates the cross-XCD poll of attn_global, which hangs
             // because ld_nt/relaxed loads read stale L2 cached values.
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-            for (int x = 0; x < 8; x++) {
-              st_wt_u32((void *)&attn_release[x * 16],
+            // One flag per KV head, not per XCD. The consumer waits on
+            // attn_release[xcd_id * KV_HEADS_PER_XCD], so at 4 XCDs
+            // (KV_HEADS_PER_XCD == 2) XCDs 2 and 3 read slots 4 and 6 -- past
+            // the end of an MPK_NUM_XCDS-wide fan-out. They then gated on
+            // whatever else in the counter buffer aliases those slots, which
+            // is why the skew was nondeterministic and why `observed` tracked
+            // near the epoch instead of sitting at zero. The slice-release arm
+            // above already keys by KV head for the same reason.
+            for (int x = 0; x < MPK_NUM_XCDS * KV_HEADS_PER_XCD; x++) {
+              st_rel_max_u32((void *)&attn_release[x * 16],
                         (unsigned)attn_release_expected);
             }
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
@@ -1219,28 +1252,8 @@ __device__ __noinline__ void
   int oproj_topk_tiles_per_xcd = oproj_topk_ranks;
 
   {
-    constexpr int OPROJ_WG_DATA =
-        OPROJ_OUTPUT_PER_WG * (OPROJ_REDUCTION_SIZE / 2);
-    constexpr int OPROJ_NUM_B32 = OPROJ_REDUCTION_SIZE / 32;
-    constexpr int OPROJ_WG_SCALE = OPROJ_OUTPUT_PER_WG * OPROJ_NUM_B32;
-    constexpr int OPROJ_WG_BYTES = OPROJ_WG_DATA + OPROJ_WG_SCALE;
-    constexpr int OPROJ_N16_DATA = OPROJ_WG_DATA / 16;
-    constexpr int OPROJ_LPT = (OPROJ_N16_DATA + 255) / 256;
-    constexpr int OPROJ_DATA_PAD = OPROJ_LPT * 256 * 16;
-    constexpr int OPROJ_N16_SCALE = (OPROJ_WG_SCALE + 15) / 16;
-    constexpr int OPROJ_SLPT = (OPROJ_N16_SCALE + 255) / 256;
-    constexpr int OPROJ_SCALE_PAD = OPROJ_SLPT * 256 * 16;
-
-    // Weight region base. This must agree byte-for-byte with the O-proj
-    // kernel's own OPROJ_LDS_OFF -- the DMA below writes where this says and
-    // the MFMA reads where that says, and a mismatch is silent wrong
-    // numerics. Both derive it from the same constexpr function.
-    constexpr int OPROJ_LDS_W_OFF =
-        oproj_lds_w_off(QKV_BATCH_SIZE, OPROJ_REDUCTION_SIZE);
-
     extern __shared__ char _oproj_pf_smem[];
 
-    int oproj_tile_idx_pf = xcd_id * oproj_topk_tiles_per_xcd + oproj_local;
     // Tile space is (column block, weight group) now, matching the O-proj
     // kernel's decode. The weight group is what selects the DMA source; the
     // column block only decides whether this tile has any live token at all.
@@ -1248,46 +1261,19 @@ __device__ __noinline__ void
     int oproj_wg_pf = oproj_local % oproj_n_wgs_per_xcd;
 
     if (does_oproj && oproj_bblk_pf * 16 < num_active_tokens) {
-      uint8_t const *oproj_W = (uint8_t const *)input_ptrs[9];
-      uint32_t oproj_buf_range =
-          static_cast<uint32_t>(oproj_n_wgs_per_xcd) * OPROJ_WG_BYTES;
-      i32x4_t oproj_rsrc = make_w_buffer_rsrc(oproj_W, oproj_buf_range);
-      uint32_t oproj_wg_voff =
-          static_cast<uint32_t>(oproj_wg_pf) * OPROJ_WG_BYTES;
-
-      auto *oproj_lds_base = (__attribute__((address_space(3)))
-                              uint32_t *)(_oproj_pf_smem + OPROJ_LDS_W_OFF);
-      // buffer_load_lds writes to M0 + lane_id*16.  Each wave fills 1024 bytes.
-      // Must offset by warp_id*1024 so 4 waves write to distinct slices.
-      int const pf_warp_id = tid >> 6;
-
-#pragma unroll
-      for (int j = 0; j < OPROJ_LPT; j++) {
-        int idx = tid + j * 256;
-        int clamped = idx < OPROJ_N16_DATA ? idx : OPROJ_N16_DATA - 1;
-        uint32_t voff = oproj_wg_voff + static_cast<uint32_t>(clamped) * 16;
-        auto *lds_dst =
-            (__attribute__((address_space(3)))
-             uint32_t *)((uint8_t
-                          __attribute__((address_space(3))) *)oproj_lds_base +
-                         j * 4096 + pf_warp_id * 1024);
-        __llvm_amdgcn_raw_buffer_load_lds(
-            oproj_rsrc, lds_dst, 16, static_cast<int>(voff), 0, 0, 3);
-      }
-#pragma unroll
-      for (int j = 0; j < OPROJ_SLPT; j++) {
-        int idx = tid + j * 256;
-        int clamped = idx < OPROJ_N16_SCALE ? idx : OPROJ_N16_SCALE - 1;
-        uint32_t voff =
-            oproj_wg_voff + OPROJ_WG_DATA + static_cast<uint32_t>(clamped) * 16;
-        auto *lds_dst =
-            (__attribute__((address_space(3)))
-             uint32_t *)((uint8_t
-                          __attribute__((address_space(3))) *)oproj_lds_base +
-                         OPROJ_DATA_PAD + j * 4096 + pf_warp_id * 1024);
-        __llvm_amdgcn_raw_buffer_load_lds(
-            oproj_rsrc, lds_dst, 16, static_cast<int>(voff), 0, 0, 3);
-      }
+      // Only this worker's FIRST tile. Workers that own more than one tile
+      // re-stage from inside the kernel's tile-stride pass, which is the same
+      // helper -- the LDS layout and the weight region base have to agree
+      // byte-for-byte with the MFMA that reads them, so there is one copy of
+      // this code and one formula (oproj_lds_w_off) rather than two.
+      oproj_stage_weight_lds<QKV_BATCH_SIZE,
+                             OPROJ_OUTPUT_PER_WG,
+                             OPROJ_REDUCTION_SIZE>(
+          (uint8_t const *)input_ptrs[9],
+          oproj_n_wgs_per_xcd,
+          oproj_wg_pf,
+          tid,
+          _oproj_pf_smem);
     }
   }
 
@@ -1298,10 +1284,12 @@ __device__ __noinline__ void
                 "merge, but with NUM_REQS > 1 an XCD's attn_out slice is only "
                 "complete after all of its requests have merged. Use the "
                 "attn_global rendezvous at more than one request.");
-  static_assert(OPROJ_REDUCTION_SIZE == 8 * NUM_Q_PER_KV * HEAD_DIM,
-                "the eight per-XCD merge slices must tile the O-proj "
-                "reduction exactly -- the consumer maps wave w to XCDs 2w and "
-                "2w+1 on that assumption");
+  static_assert(OPROJ_REDUCTION_SIZE == NUM_KV_HEADS * NUM_Q_PER_KV * HEAD_DIM,
+                "the per-kv-head merge slices must tile the O-proj reduction "
+                "exactly. This said 8 and read as a per-XCD count, so it still "
+                "passed at MPK_NUM_XCDS=4 while heads 4..7 went uncomputed.");
+  static_assert(MPK_NUM_XCDS * KV_HEADS_PER_XCD == NUM_KV_HEADS,
+                "every kv head must be owned by exactly one XCD");
   // The O-proj/TopK workers do not wait here at all. They are the only
   // consumers of attn_out, and each of their waves waits for just the two
   // slices its own K interval reads, inside the Phase 7 kernel. Waiting for
@@ -1334,7 +1322,13 @@ __device__ __noinline__ void
     // buffer_inv is per-wave.
     if (tid == 0)
 #endif
-      while ((_obs = MPK_LD_GATE(&attn_release[xcd_id * 16])) <
+      // Flags are keyed by kv head, so this XCD owns slices
+      // [xcd_id*KV_HEADS_PER_XCD, +KV_HEADS_PER_XCD). Wait on the first of
+      // them to keep the original intent -- a flag this XCD itself publishes
+      // -- rather than on slice xcd_id, which at 4 XCDs belongs to a
+      // different XCD. Identical when kv_head == xcd_id.
+      while ((_obs = MPK_LD_GATE(
+                  &attn_release[(xcd_id * KV_HEADS_PER_XCD) * 16])) <
              attn_release_expected) {
         MPK_WS_WAIT_TICK(_obs, _spins);
         _spins++;
@@ -1391,7 +1385,15 @@ __device__ __noinline__ void
   // and neither an extra invalidate nor a system-scope fence on either side
   // changed anything.
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#if MPK_NUM_XCDS == 4
+  // 4 XCDs span two AIDs, and attn_out is read in full here while each XCD
+  // only produced its own KV heads' columns. Half the producers are on the far
+  // die, whose lines this reader's L2 holds from before the barrier; unscoped
+  // buffer_inv is an architectural NOP on gfx950 and does not drop them.
+  asm volatile("buffer_inv sc1" ::: "memory");
+#else
   asm volatile("buffer_inv" ::: "memory");
+#endif
   // Publish the Phase 6 O-proj weight DMA to the whole block.
   //
   // buffer_load_lds retires on vmcnt, and the drain above is per-wave -- it
@@ -1659,7 +1661,13 @@ __device__ __noinline__ void
   // arms at ctx 512 being: unconditional flush at this site 2.196, selective
   // by rank 1.997, selective + batch-gated 1.940. It was correct (0/360 at
   // bs=2) but only at the site that happened to reproduce.
+#if MPK_NUM_XCDS == 4
+  // Routing data is published by one XCD and read by all four, two of which
+  // are on the far AID. See the attn_out acquire above.
+  asm volatile("buffer_inv sc1" ::: "memory");
+#else
   asm volatile("buffer_inv" ::: "memory");
+#endif
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
   unsigned long long _fused_t3 = __builtin_amdgcn_s_memrealtime();
@@ -1686,21 +1694,28 @@ __device__ __noinline__ void
 #ifdef MPK_MOE_XCD_PAIR
   // Two packed tiles per rank 0..22: W13 (bit7=0) then W2 (bit7=1). Ranks
   // 23..30 have no pair-map work; they still join Phase 9.
+#if MPK_NUM_XCDS == 4
+  constexpr int kMoePairRanks = 46;
+#else
   constexpr int kMoePairRanks = 23;
-  int const moe_begin = 0;
-  int const moe_end = (xcd_rank < kMoePairRanks) ? 2 : 0;
-  int const moe_step = 1;
+#endif
+
 #else
   int const moe_begin = xcd_rank;
   int const moe_end = moe_total_tiles_per_xcd;
   int const moe_step = workers_per_xcd;
 #endif
-  for (int moe_i = moe_begin; moe_i < moe_end; moe_i += moe_step) {
 #ifdef MPK_MOE_XCD_PAIR
-    int const moe_t =
-        xcd_rank | (moe_i << 7) | ((routed_expert0 + 1) << 8);
+  // 46 W13 tiles/expert (W13_TILES) must arrive before W2. At 4 XCDs there
+  // is no partner die, so this XCD owns all 46 pair-ranks with 31 workers:
+  // finish every leftover W13 (moe_i==0) before any W2 (moe_i==1).
+  for (int moe_i = 0; moe_i < 2; ++moe_i) {
+    for (int pair = xcd_rank; pair < kMoePairRanks; pair += workers_per_xcd) {
+      int const moe_t =
+          pair | (moe_i << 7) | ((routed_expert0 + 1) << 8);
 #else
-    int const moe_t = moe_i;
+  for (int moe_i = moe_begin; moe_i < moe_end; moe_i += moe_step) {
+      int const moe_t = moe_i;
 #endif
     MPK_TW_SUB(80, moe_t);
     MPK_WS_PHASE(80, qkv_epoch_expected, xcd_id);
@@ -1740,7 +1755,11 @@ __device__ __noinline__ void
 #endif
     );
   }
+#ifdef MPK_MOE_XCD_PAIR
+  } // W13-all then W2-all
+#endif
   MPK_PHASE_MARK(_pslot_w, 8);
+  MPK_WS_PHASE(90, qkv_epoch_expected, xcd_id);
 
   // ══════════════════════════════════════════════════════════════════
   // Phase 9: Layer-boundary GLOBAL barrier
@@ -1796,9 +1815,22 @@ __device__ __noinline__ void
     // is the one that will do that read). Everyone still *arrives* either way
     // -- the arrival tree is what publishes the release, so narrowing it would
     // deadlock; this narrows only the wait.
-#ifdef MPK_W2_CONSUMER_GATE
+#if defined(MPK_W2_CONSUMER_GATE) &&                                           \
+    (MPK_NUM_XCDS != 4 || defined(MPK_FORCE_NARROW_LAYER_GATE))
+    // MPK_FORCE_NARROW_LAYER_GATE restores the 8-XCD narrow wait at 4 XCDs.
+    //
+    // Worth trying because this gate is the single most expensive phase in
+    // DPX+NPS2: slot 10 measures 15.4 us/layer in NPS1 against 134.1 in NPS2,
+    // an 8.7x blowup, and the arm below multiplies an already-expensive NC
+    // poll by all 31 workers per XCD instead of just the QKV ranks. The
+    // hazard the `#else` documents is real, so this is opt-in and has to be
+    // checked against the known-good text, not just against the clock.
     bool const MPK_LAYER_GATE_JOINS = qkv_does_qkv;
 #else
+    // 4 XCDs: every rank produces at least one W2 tile (46 groups / 31
+    // workers). CONSUMER_GATE would let ranks 20-30 skip Phase 9 and start
+    // the next layer's W13 on the same arrival counter the leftover W2 is
+    // still waiting on.
     bool const MPK_LAYER_GATE_JOINS = true;
 #endif
 
@@ -1857,7 +1889,8 @@ __device__ __noinline__ void
     // nobody left to exclude, so this degenerates to the default arrival.
 #ifdef MPK_MOE_XCD_PAIR
     // Pair map: ranks 0..22 each produce one W2 tile (23 groups × 2 XCDs).
-    int const n_w2_workers_per_xcd = 23;
+    int const n_w2_workers_per_xcd =
+        kMoePairRanks > workers_per_xcd ? workers_per_xcd : kMoePairRanks;
 #else
     int const n_w2_workers_per_xcd =
         moe_total_tiles_per_xcd > workers_per_xcd
@@ -2134,7 +2167,7 @@ __device__ __noinline__ void
       // Net effect: the arrival is one read-modify-write with no dependent
       // load in front of it.
       int const lean_layers_done = local_prev / arrivers_per_xcd;
-      s_layer_rel_prev = 8 * lean_layers_done;
+      s_layer_rel_prev = MPK_NUM_XCDS * lean_layers_done;
       bool const lean_is_last_local =
           (local_prev - lean_layers_done * arrivers_per_xcd) ==
           arrivers_per_xcd - 1;
@@ -2147,7 +2180,7 @@ __device__ __noinline__ void
         // so the last XCD is the one whose pre-increment value is 7 mod 8 and
         // the release it publishes is its post-increment value.
         int global_expected = global_prev + 1;
-        bool const is_last_global = (global_prev & 7) == 7;
+        bool const is_last_global = (global_prev & (MPK_NUM_XCDS - 1)) == (MPK_NUM_XCDS - 1);
 #else
 #ifdef MPK_DRAIN_STATS
       s_was_last_local = (local_prev == local_expected - 1);
@@ -2156,7 +2189,7 @@ __device__ __noinline__ void
         // Last worker on this XCD: this XCD's MoE stores are all retired, so
         // publish one arrival on behalf of the whole die.
         int global_expected =
-            (__atomic_load_n(layer_global, __ATOMIC_RELAXED) / 8 + 1) * 8;
+            (__atomic_load_n(layer_global, __ATOMIC_RELAXED) / MPK_NUM_XCDS + 1) * MPK_NUM_XCDS;
         int global_prev = atom_add_release_gpu_s32(layer_global, 1);
         bool const is_last_global = (global_prev == global_expected - 1);
 #endif
@@ -2180,6 +2213,13 @@ __device__ __noinline__ void
           asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
           lean_rel_epoch = global_expected;
         }
+#if MPK_NUM_XCDS == 4
+        // 4 XCDs: publish this XCD's own flag as soon as its 31 workers
+        // arrived. A last-global fan-out to all 4 lines lets two fast XCDs
+        // release the two still in MoE.
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        lean_rel_epoch = qkv_epoch_expected;
+#endif
       }
 #ifdef MPK_DRAIN_STATS
       s_dr3 = __builtin_amdgcn_s_memrealtime();
@@ -2192,9 +2232,16 @@ __device__ __noinline__ void
     // value from the first active lane.
     lean_rel_epoch = __builtin_amdgcn_readfirstlane(lean_rel_epoch);
     if (lean_rel_epoch != 0) {
-      if (tid < 8) {
-        st_wt_u32((void *)&layer_release[tid * 16], (unsigned)lean_rel_epoch);
+#if MPK_NUM_XCDS == 4
+      if (tid == 0) {
+        st_rel_max_u32((void *)&layer_release[xcd_id * 16],
+                  (unsigned)lean_rel_epoch);
       }
+#else
+      if (tid < MPK_NUM_XCDS) {
+        st_rel_max_u32((void *)&layer_release[tid * 16], (unsigned)lean_rel_epoch);
+      }
+#endif
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
 
@@ -2352,11 +2399,53 @@ __device__ __noinline__ void
     // not waiting, so folding it in overstates the gate.
     MPK_PHASE_MARK(_pslot_w, 9);
     if (tid == 0 && MPK_LAYER_GATE_JOINS) {
+#if MPK_NUM_XCDS == 4
+      // Every XCD publishes only its own flag, so the gate reads all four.
+      // The reported `observed` packs which flags are short in bits 0..3 and
+      // the minimum epoch seen above bit 8.
+      MPK_WS_WAIT_BEGIN(90, qkv_epoch_expected);
+      int _lg_spins = 0;
+      for (;;) {
+        // Invalidate L2 before re-reading. These flags live in plain
+        // hipMalloc VRAM, which is MTYPE_NC under NPS2 -- cacheable but NOT
+        // coherent across XCDs -- so a reader can hold a line indefinitely
+        // and never observe another die's write-through publish. Measured on
+        // this part: `buffer_inv sc1` is the only acquire that reaches zero
+        // stale reads; a bare `buffer_inv` is an architectural NOP on gfx950
+        // and invalidates nothing.
+        asm volatile("buffer_inv sc1" ::: "memory");
+        int _f0 = MPK_LD_GATE(&layer_release[0 * 16]);
+        int _f1 = MPK_LD_GATE(&layer_release[1 * 16]);
+        int _f2 = MPK_LD_GATE(&layer_release[2 * 16]);
+        int _f3 = MPK_LD_GATE(&layer_release[3 * 16]);
+        int _lo01 = _f0 < _f1 ? _f0 : _f1;
+        int _lo23 = _f2 < _f3 ? _f2 : _f3;
+        int _lo = _lo01 < _lo23 ? _lo01 : _lo23;
+        if (_lo >= qkv_epoch_expected) {
+          break;
+        }
+        int _sm = (_f0 < qkv_epoch_expected ? 1 : 0) |
+                  (_f1 < qkv_epoch_expected ? 2 : 0) |
+                  (_f2 < qkv_epoch_expected ? 4 : 0) |
+                  (_f3 < qkv_epoch_expected ? 8 : 0);
+        (void)_sm;
+        MPK_WS_WAIT_TICK((_f0 & 0xf) | ((_f1 & 0xf) << 4) |
+                             ((_f2 & 0xf) << 8) | ((_f3 & 0xf) << 12) |
+                             ((arrivers_per_xcd & 0xff) << 16) |
+                             ((MPK_LD_GATE(&layer_global[0]) & 0xff) << 24),
+                         _lg_spins);
+        _lg_spins++;
+#ifndef MPK_LAYER_GATE_BUSY_POLL
+        __builtin_amdgcn_s_sleep(1);
+#endif
+      }
+#else
       while (MPK_LD_GATE(&layer_release[xcd_id * 16]) <= s_layer_rel_prev) {
 #ifndef MPK_LAYER_GATE_BUSY_POLL
         __builtin_amdgcn_s_sleep(1);
 #endif
       }
+#endif
 #ifndef MPK_W2_CONSUMER_GATE
       __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
 #endif

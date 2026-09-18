@@ -1026,6 +1026,27 @@ __device__ __forceinline__ int _kvupd_get_xcd_id() {
 #endif
 }
 
+// Splits wg_idx into the KV head it belongs to and the role within that head's
+// group of NUM_Q_PER_KV + 2 tiles. At 8 XCDs a partition owns exactly one group
+// and wg_idx is itself the role; with fewer XCDs it owns several consecutive
+// groups, so the head cannot come from the XCD id alone.
+__device__ __forceinline__ void _kvupd_head_role(int wg_idx,
+                                                 int n_wgs_per_xcd,
+                                                 int num_q_per_kv,
+                                                 int &kv_head,
+                                                 int &kv_role) {
+  int const per_group = num_q_per_kv + 2;
+  int const groups = n_wgs_per_xcd / per_group;
+  int const xcd = _kvupd_get_xcd_id();
+  if (groups <= 1) {
+    kv_head = xcd;
+    kv_role = wg_idx;
+  } else {
+    kv_head = xcd * groups + wg_idx / per_group;
+    kv_role = wg_idx - (wg_idx / per_group) * per_group;
+  }
+}
+
 // ── Inline RoPE epilogue helper ─────────────────────────────────────────
 // Writes MFMA accumulator to LDS, applies RoPE via cross-wave communication,
 // then writes the result to `dst`.
@@ -1369,7 +1390,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_kvupd_kernel(
       }
     }
     // ── Step 4: Fused KV_UPD epilogue ──────────────────────────────────
-    int kv_head = _kvupd_get_xcd_id();
+    int kv_head, kv_role;
+    _kvupd_head_role(wg_idx, n_wgs_per_xcd, NUM_Q_PER_KV, kv_head, kv_role);
     int request_id = 0;
     while (qo_indptr[request_id + 1] <= tok_idx) {
       request_id++;
@@ -1386,8 +1408,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_kvupd_kernel(
     unsigned short const *sin_row =
         (unsigned short const *)sin_ptr + global_pos * HEAD_DIM;
     unsigned short *s_rope = (unsigned short *)_rnlm_smem;
-    if (wg_idx < NUM_Q_PER_KV) {
-      int q_head_global = kv_head * NUM_Q_PER_KV + wg_idx;
+    if (kv_role < NUM_Q_PER_KV) {
+      int q_head_global = kv_head * NUM_Q_PER_KV + kv_role;
       _kvupd_rope_epilogue<HEAD_DIM>((float const *)&acc,
                                      d_bias,
                                      wg_idx,
@@ -1403,7 +1425,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_kvupd_kernel(
                                      q_head_global * HEAD_DIM,
                                      OUTPUT_PER_WG,
                                      s_rope);
-    } else if (wg_idx == NUM_Q_PER_KV) {
+    } else if (kv_role == NUM_Q_PER_KV) {
       int page_num = global_pos / PAGE_SIZE;
       int page_offset = global_pos % PAGE_SIZE;
       int page_idx = kv_indices[first_page + page_num];
@@ -1750,7 +1772,8 @@ __device__ __noinline__ void
       }
     }
     // ── Step 4: Fused KV_UPD epilogue ──────────────────────────────────
-    int kv_head = _kvupd_get_xcd_id();
+    int kv_head, kv_role;
+    _kvupd_head_role(wg_idx, n_wgs_per_xcd, NUM_Q_PER_KV, kv_head, kv_role);
     int request_id = 0;
     while (qo_indptr[request_id + 1] <= tok_idx) {
       request_id++;
@@ -1767,8 +1790,8 @@ __device__ __noinline__ void
     unsigned short const *sin_row =
         (unsigned short const *)sin_ptr + global_pos * HEAD_DIM;
     unsigned short *s_rope = (unsigned short *)_rnlm_smem;
-    if (wg_idx < NUM_Q_PER_KV) {
-      int q_head_global = kv_head * NUM_Q_PER_KV + wg_idx;
+    if (kv_role < NUM_Q_PER_KV) {
+      int q_head_global = kv_head * NUM_Q_PER_KV + kv_role;
       _kvupd_rope_epilogue<HEAD_DIM>((float const *)&acc,
                                      d_bias,
                                      wg_idx,
@@ -1784,7 +1807,7 @@ __device__ __noinline__ void
                                      q_head_global * HEAD_DIM,
                                      OUTPUT_PER_WG,
                                      s_rope);
-    } else if (wg_idx == NUM_Q_PER_KV) {
+    } else if (kv_role == NUM_Q_PER_KV) {
       int page_num = global_pos / PAGE_SIZE;
       int page_offset = global_pos % PAGE_SIZE;
       int page_idx = kv_indices[first_page + page_num];
@@ -3520,12 +3543,13 @@ __device__ __noinline__ void
 #else
       __syncthreads();
 #endif
-      int kv_head = _kvupd_get_xcd_id();
+      int kv_head, kv_role;
+      _kvupd_head_role(wg_idx, n_wgs_per_xcd, NUM_Q_PER_KV, kv_head, kv_role);
       unsigned short const *cos_base = (unsigned short const *)cos_ptr;
       unsigned short const *sin_base = (unsigned short const *)sin_ptr;
       unsigned short *s_rope = (unsigned short *)s_tok_fp8;
-      if (wg_idx < NUM_Q_PER_KV) {
-        int q_head_global = kv_head * NUM_Q_PER_KV + wg_idx;
+      if (kv_role < NUM_Q_PER_KV) {
+        int q_head_global = kv_head * NUM_Q_PER_KV + kv_role;
         _kvupd_rope_epilogue_packed<HEAD_DIM, TOK_ROWS>(
             (float const *)&acc,
             d_bias,
@@ -3545,7 +3569,7 @@ __device__ __noinline__ void
             q_head_global * HEAD_DIM,
             OUTPUT_PER_WG,
             s_rope);
-      } else if (wg_idx == NUM_Q_PER_KV) {
+      } else if (kv_role == NUM_Q_PER_KV) {
         // K: bias + RoPE, then scatter to the paged cache. Same three steps as
         // the Q path but the destination row is a page slot, so it cannot go
         // through the shared helper's contiguous store.

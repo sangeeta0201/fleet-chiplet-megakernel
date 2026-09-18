@@ -729,30 +729,39 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // after the EARLY_ROUTING mask: [6:0] phase_rank, [7] is_w2. Ranks 23+
   // never call this helper. 46 arrivals per expert, no 240-tile pad.
   static_assert(BATCH_SIZE == 1, "MPK_MOE_XCD_PAIR is conc1 only");
-  static_assert(NUM_TOPK == 4, "MPK_MOE_XCD_PAIR maps 4 experts onto 8 XCDs");
+  static_assert(NUM_TOPK == 4, "MPK_MOE_XCD_PAIR maps 4 experts onto MPK_NUM_XCDS XCDs");
   static_assert(W13_TILES == 46 && W2_TILES == 46,
-                "MPK_MOE_XCD_PAIR splits 46 groups as 23+23 across an XCD pair");
+                "MPK_MOE_XCD_PAIR W13/W2 tile counts");
+#if MPK_NUM_XCDS == 4
+  constexpr int kGroupsPerPairMember = 46;
+#else
   constexpr int kGroupsPerPairMember = 23;
+#endif
   bool const is_w2 = (tile_idx >> 7) & 1;
   int const phase_rank = tile_idx & 0x7f;
   if (phase_rank >= kGroupsPerPairMember) {
     MPK_WS_MARK(8100, tile_idx);
     return;
   }
+#if MPK_NUM_XCDS == 4
+  int expert_idx = xcd_id;
+  int phase_tile = phase_rank;
+#else
   int expert_idx = xcd_id >> 1;
   int phase_tile = (xcd_id & 1) * kGroupsPerPairMember + phase_rank;
+#endif
   int global_tile = is_w2 ? (TOTAL_W13 + expert_idx * W2_TILES + phase_tile)
                           : (expert_idx * W13_TILES + phase_tile);
 #else
 #ifdef MPK_MOE_XCD_STRIPE_ROT
   int global_tile =
-      tile_idx * 8 + ((xcd_id + (MPK_MOE_XCD_STRIPE_ROT)) & 7);
+      tile_idx * MPK_NUM_XCDS + ((xcd_id + (MPK_MOE_XCD_STRIPE_ROT)) & (MPK_NUM_XCDS - 1));
 #elif defined(MPK_MOE_XCD_STRIPE_LAYER)
-  int global_tile = tile_idx * 8 + ((xcd_id + layer_idx) & 7);
+  int global_tile = tile_idx * MPK_NUM_XCDS + ((xcd_id + layer_idx) & (MPK_NUM_XCDS - 1));
 #elif defined(MPK_MOE_XCD_STRIPE_TILE)
-  int global_tile = tile_idx * 8 + ((xcd_id + tile_idx) & 7);
+  int global_tile = tile_idx * MPK_NUM_XCDS + ((xcd_id + tile_idx) & (MPK_NUM_XCDS - 1));
 #else
-  int global_tile = tile_idx * 8 + xcd_id;
+  int global_tile = tile_idx * MPK_NUM_XCDS + xcd_id;
 #endif
   if (global_tile >= TOTAL_TILES) {
     MPK_WS_MARK(8100, global_tile); // exit: past end of tile range
@@ -4348,7 +4357,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         int layer_idx =
             *reinterpret_cast<int *>(&_fused_smem[LAYER_IDX_SMEM_OFF]);
         int release_val = layer_idx + 1;
-        for (int x = 0; x < 8; x++) {
+        for (int x = 0; x < MPK_NUM_XCDS; x++) {
           st_wt_u32((void *)&d_barrier[base + x * MOE_BAR_LINE],
                     (unsigned)release_val);
         }
@@ -4676,7 +4685,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       // producer in one loop, so any spread means releases are being lost.
       if ((_spins & (MPK_WS_WAIT_REFRESH - 1)) == 0) {
         int _n_ok = 0, _mn = 0x7fffffff, _mx = -0x7fffffff;
-        for (int _x = 0; _x < 8; _x++) {
+        for (int _x = 0; _x < MPK_NUM_XCDS; _x++) {
           int _v = ld_nt_s32(&d_barrier[base + _x * MOE_BAR_LINE]);
           if (_v >= expected) {
             _n_ok++;

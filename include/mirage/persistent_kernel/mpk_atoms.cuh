@@ -86,6 +86,33 @@ __device__ __forceinline__ unsigned long long int
 }
 
 // Non-temporal 32-bit load (bypasses cache, reads from memory)
+// Publish a release flag: write-through, and raise-only by construction.
+//
+// It must be write-through. These counters are plain hipMalloc VRAM, which is
+// MTYPE_NC under SPX/DPX+NPS2 -- non-coherent across XCDs. An atomic (even at
+// system scope) can settle in the publishing XCD's L2, while every poller
+// reads the flag with ld_sys_s32, an `sc0 sc1` load that goes past L2 to
+// memory. The publisher then sees its own value and nobody else does: measured
+// as O-proj flags [8,8,7,8] read from two dies while the die owning flag 2 had
+// already moved past that same barrier.
+//
+// Monotonicity therefore cannot come from an atomic max, and does not need to:
+// each flag has a single writer (its own XCD's last arrival), which publishes
+// once per layer in increasing epoch order, drained by s_waitcnt before the
+// store. A blind store only moves a flag backwards when several workgroups
+// broadcast into the same flag, which the per-XCD publish removes.
+__device__ __forceinline__ void st_rel_max_u32(void *addr, unsigned val) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  asm volatile("global_store_dword %0, %1, off sc0 sc1"
+               :
+               : "v"(addr), "v"(val)
+               : "memory");
+#else
+  *reinterpret_cast<unsigned int volatile *>(addr) = val;
+#endif
+}
+
 __device__ __forceinline__ int ld_nt_s32(int *addr) {
 #if defined(__HIP_DEVICE_COMPILE__) &&                                         \
     (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))

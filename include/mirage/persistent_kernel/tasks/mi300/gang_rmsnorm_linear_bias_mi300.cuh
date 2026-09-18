@@ -325,7 +325,7 @@ __device__ __attribute__((noinline)) void
                   int num_active_tokens,
                   int *early_routing_ready = nullptr,
                   unsigned int early_routing_epoch = 0) {
-  constexpr int CHUNK_N = NUM_EXPERTS / 8;
+  constexpr int CHUNK_N = NUM_EXPERTS / MPK_NUM_XCDS;
   int xcd_id = get_xcd_id();
   void *logits_base = static_cast<T *>(logits_scratch_ptr) -
                       static_cast<int64_t>(xcd_id) * CHUNK_N;
