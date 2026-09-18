@@ -4387,18 +4387,8 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         (void)atomicMax(&d_barrier[base + 13 * MOE_BAR_LINE + phase_tile],
                         _my_epoch);
       }
-      // Per-epoch arrival counter: a 46-run must not mix layers.
-      constexpr int kEpochRing = 4;
-      int _arr_epoch;
-      {
-        constexpr int _LI = mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
-                            mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END;
-        _arr_epoch = *reinterpret_cast<int *>(&_fused_smem[_LI]) + 1;
-      }
-      int const _ctr_slot = 14 + (_arr_epoch & (kEpochRing - 1));
-      int prev_global =
-          atom_add_release_gpu_s32(&d_barrier[base + _ctr_slot * MOE_BAR_LINE],
-                                   1);
+      int prev_global = atom_add_release_gpu_s32(
+          &d_barrier[base + MOE_BAR_COUNTER_SLOT * MOE_BAR_LINE], 1);
       // Exact only if every tile counted by W13_TILES arrives here. Under
       // packing W13_TILES == W13_WGS and no tile returns between the decode
       // and this line, so it is. The pre-packing decode had a token axis and
@@ -4415,10 +4405,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END;
         int layer_idx =
             *reinterpret_cast<int *>(&_fused_smem[LAYER_IDX_SMEM_OFF]);
-        // The arrivals in this run all belong to _arr_epoch by construction,
-        // so publish that rather than re-reading this block's layer.
-        int release_val = _arr_epoch;
-        (void)layer_idx;
+        int release_val = layer_idx + 1;
         // Write ALL slots, not just [0, MPK_NUM_XCDS): the extra ones are
         // unread, and this removes any dependence on the consumer's slot index
         // matching the producer's loop bound.
@@ -4781,18 +4768,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     // to hold different values), and slot 0 is the one observed to receive it:
     // with 4 XCDs, slots 1-3 read 0 under both st_wt_u32 and atomicMax while
     // slot 0 reads the published epoch.
-    // All W13 groups of this expert must have a stamp >= my epoch. Immune to
-    // the layer skew that breaks a shared modulo counter.
-    auto _stamps_ready = [&]() -> int {
-      int n = 0;
-      for (int g = 0; g < W13_TILES; g++) {
-        if (ld_sys_s32(&d_barrier[base + 13 * MOE_BAR_LINE + g]) >= expected) {
-          n++;
-        }
-      }
-      return n;
-    };
-    while ((_obs = _stamps_ready()) < W13_TILES) {
+    while ((_obs = MPK_LD_GATE2(&d_barrier_rel[base])) < expected) {
       MPK_WS_WAIT_TICK(_obs, _spins);
       // Refresh the discriminating values on the same cadence as the tick:
       // the raw arrival counter (whether it sits on a multiple of W13_TILES

@@ -1832,12 +1832,20 @@ __device__ __noinline__ void
   // One group per tile execution: the dispatcher already loops this XCD's
   // workers over all kMoeGroups tiles, so an inner sweep would count each
   // layer's arrivals twice over.
-  // Roles this XCD must play for its expert: 1 when the expert is shared with
-  // another XCD (8 XCDs), 2 when this XCD owns it alone (4 XCDs).
-  constexpr int kMoeRoles = (kMoeMembers > 1) ? 1 : 2;
-  // 23 ranks carry the groups of one role, exactly as at 8 XCDs.
+  // This tile's index within this XCD's list for this layer. The list is
+  // moe_total_tiles_per_xcd long (the max over phases), NOT kMoeGroups, so
+  // taking the modulus by the group count would wrap several times per layer
+  // and admit the same group more than once.
+  int const _moe_pos =
+      (moe_total_tiles_per_xcd > 0) ? (tile_idx % moe_total_tiles_per_xcd)
+                                    : tile_idx;
+  // Only the first workers_per_xcd positions run the MoE phase; each sweeps
+  // the groups it owns. Running it on every position would count each layer's
+  // arrivals more than once.
+  int const kMoeSweeps =
+      (kMoeGroups + workers_per_xcd - 1) / workers_per_xcd;
   int const moe_begin = 0;
-  int const moe_end = (xcd_rank < kMoePairRanks) ? (2 * kMoeRoles) : 0;
+  int const moe_end = (_moe_pos < workers_per_xcd) ? (2 * kMoeSweeps) : 0;
   int const moe_step = 1;
 #else
   int const moe_begin = xcd_rank;
@@ -1848,16 +1856,18 @@ __device__ __noinline__ void
 #ifdef MPK_MOE_XCD_PAIR
     // moe_i enumerates (phase, sweep): the first kMoeSweeps iterations are
     // W13, the rest W2, so every W13 arrival is issued before any W2 waits.
-    // Both roles' W13 first, then both roles' W2, so a worker never waits on
-    // an arrival it still owes.
-    int const _phase = (moe_i >= kMoeRoles) ? 1 : 0;
-    int const _role = moe_i - _phase * kMoeRoles;
-    int const _grp = xcd_rank; // rank carries one group of this role
+    // All W13 sweeps first, then all W2 sweeps, so every W13 arrival of this
+    // layer is issued before this worker waits on any of them.
+    int const _phase = (moe_i >= kMoeSweeps) ? 1 : 0;
+    int const _sweep = moe_i - _phase * kMoeSweeps;
+    int const _grp = _moe_pos + _sweep * workers_per_xcd;
+    if (_grp >= kMoeGroups) {
+      continue; // this position owns no group in this sweep
+    }
     // This XCD's own selection, and the expert it names.
     int const _sel_idx = xcd_id / (kMoeMembers > 0 ? kMoeMembers : 1);
     int const moe_t = _grp | (_phase << 7) |
-                      ((routed_expert0 + 1) << 8) | (_sel_idx << 16) |
-                      (_role << 24);
+                      ((routed_expert0 + 1) << 8) | (_sel_idx << 16);
 #else
     int const moe_t = moe_i;
 #endif

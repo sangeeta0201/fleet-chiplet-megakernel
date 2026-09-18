@@ -6376,7 +6376,7 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                 fprintf(stderr,
                         "    >>> w%d IN TASK: phase=%d (%s xcd=%d epoch=%d) "
                         "watch[bid=%d obs=%d exp=%d spins=%d] "
-                        "aux[mask_lo=0x%08x mask_hi=0x%08x counter=%d xcd=%d]\n",
+                        "aux[counter=%d arrived=%d/46 epoch=%d xcd=%d]\n",
                         w,
                         wphase,
                         pn,

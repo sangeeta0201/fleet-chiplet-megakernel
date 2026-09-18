@@ -627,7 +627,6 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // shift would fold it into the expert id.
   int const carried_expert_id = ((tile_idx >> 8) & 0xff) - 1;
   int const carried_sel_idx = (tile_idx >> 16) & 0xff;
-  int const carried_role = (tile_idx >> 24) & 1;
   tile_idx &= 0xff;
 #endif
 
@@ -752,13 +751,10 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                 "MPK_MOE_XCD_PAIR splits 46 groups as 23+23 across an XCD pair");
   // How many XCDs share one expert, and therefore how many of its 46 groups
   // each of them owns. 2 x 23 at 8 XCDs; 1 x 46 at 4.
-  // Always two member roles of 23 groups, exactly as at 8 XCDs. What changes
-  // with fewer XCDs is only WHO plays the roles, not how the 46 groups split.
   constexpr int kMembersPerExpert = MPK_NUM_XCDS / NUM_TOPK;
   static_assert(kMembersPerExpert >= 1,
                 "MoE expert map needs at least one XCD per selected expert");
-  constexpr int kRolesPerExpert = 2;
-  constexpr int kGroupsPerPairMember = W13_TILES / kRolesPerExpert;
+  constexpr int kGroupsPerPairMember = W13_TILES / kMembersPerExpert;
   bool const is_w2 = (tile_idx >> 7) & 1;
   int const phase_rank = tile_idx & 0x7f;
   if (phase_rank >= kGroupsPerPairMember) {
@@ -770,11 +766,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   int expert_idx = carried_sel_idx;
   // Which member of this expert's group this XCD is. With one member per
   // expert the offset is zero and phase_rank spans all 46 groups.
-  // Which of the expert's two roles this tile is for. With two XCDs per
-  // expert it is the XCD's parity (the 8-XCD behaviour); with one XCD per
-  // expert that XCD plays both roles and the caller says which in bit 24.
-  int const member = (kMembersPerExpert > 1) ? (xcd_id & 1)
-                                             : carried_role;
+  int const member = (kMembersPerExpert > 1) ? (xcd_id % kMembersPerExpert) : 0;
   int phase_tile = member * kGroupsPerPairMember + phase_rank;
   int global_tile = is_w2 ? (TOTAL_W13 + expert_idx * W2_TILES + phase_tile)
                           : (expert_idx * W13_TILES + phase_tile);
@@ -4376,29 +4368,17 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       // the per-XCD slots of one expert held *different* epochs, which is
       // impossible if the eight stores from one producer all survived.
       // COUNTER_OFF puts the counter on the next line.
-      // Per-layer arrival record: stamp THIS group's own int with the
-      // arriving block's layer epoch, so a later layer does not look like an
-      // earlier one (the old cumulative OR could not tell them apart).
-      {
-        constexpr int _LI_OFF = mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
-                                mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END;
-        int const _my_epoch =
-            *reinterpret_cast<int *>(&_fused_smem[_LI_OFF]) + 1;
-        (void)atomicMax(&d_barrier[base + 13 * MOE_BAR_LINE + phase_tile],
-                        _my_epoch);
+      // Arrival bitmask: slots 11/12 hold bits for phase_tile 0..45, so a
+      // missing bit names the group that never arrived.
+      if (phase_tile < 32) {
+        (void)atomicOr(&d_barrier[base + 11 * MOE_BAR_LINE],
+                       1 << phase_tile);
+      } else {
+        (void)atomicOr(&d_barrier[base + 12 * MOE_BAR_LINE],
+                       1 << (phase_tile - 32));
       }
-      // Per-epoch arrival counter: a 46-run must not mix layers.
-      constexpr int kEpochRing = 4;
-      int _arr_epoch;
-      {
-        constexpr int _LI = mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
-                            mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END;
-        _arr_epoch = *reinterpret_cast<int *>(&_fused_smem[_LI]) + 1;
-      }
-      int const _ctr_slot = 14 + (_arr_epoch & (kEpochRing - 1));
-      int prev_global =
-          atom_add_release_gpu_s32(&d_barrier[base + _ctr_slot * MOE_BAR_LINE],
-                                   1);
+      int prev_global = atom_add_release_gpu_s32(
+          &d_barrier[base + MOE_BAR_COUNTER_SLOT * MOE_BAR_LINE], 1);
       // Exact only if every tile counted by W13_TILES arrives here. Under
       // packing W13_TILES == W13_WGS and no tile returns between the decode
       // and this line, so it is. The pre-packing decode had a token axis and
@@ -4415,10 +4395,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END;
         int layer_idx =
             *reinterpret_cast<int *>(&_fused_smem[LAYER_IDX_SMEM_OFF]);
-        // The arrivals in this run all belong to _arr_epoch by construction,
-        // so publish that rather than re-reading this block's layer.
-        int release_val = _arr_epoch;
-        (void)layer_idx;
+        int release_val = layer_idx + 1;
         // Write ALL slots, not just [0, MPK_NUM_XCDS): the extra ones are
         // unread, and this removes any dependence on the consumer's slot index
         // matching the producer's loop bound.
@@ -4781,18 +4758,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     // to hold different values), and slot 0 is the one observed to receive it:
     // with 4 XCDs, slots 1-3 read 0 under both st_wt_u32 and atomicMax while
     // slot 0 reads the published epoch.
-    // All W13 groups of this expert must have a stamp >= my epoch. Immune to
-    // the layer skew that breaks a shared modulo counter.
-    auto _stamps_ready = [&]() -> int {
-      int n = 0;
-      for (int g = 0; g < W13_TILES; g++) {
-        if (ld_sys_s32(&d_barrier[base + 13 * MOE_BAR_LINE + g]) >= expected) {
-          n++;
-        }
-      }
-      return n;
-    };
-    while ((_obs = _stamps_ready()) < W13_TILES) {
+    while ((_obs = MPK_LD_GATE2(&d_barrier_rel[base])) < expected) {
       MPK_WS_WAIT_TICK(_obs, _spins);
       // Refresh the discriminating values on the same cadence as the tick:
       // the raw arrival counter (whether it sits on a multiple of W13_TILES
@@ -4821,16 +4787,11 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         }
         // a3 is now the per-wave exit mask (MPK_WS_WAVE_EXIT), so fold _mn
         // into a2 instead of overwriting it.
-        int _n_arr = 0;
-        for (int _g = 0; _g < W13_TILES; _g++) {
-          if (ld_sys_s32(&d_barrier[base + 13 * MOE_BAR_LINE + _g]) >=
-              expected) {
-            _n_arr++;
-          }
-        }
         MPK_WS_WAIT_AUX(
+            ld_sys_s32(&d_barrier[base + 11 * MOE_BAR_LINE]),
+            ld_sys_s32(&d_barrier[base + 12 * MOE_BAR_LINE]),
             ld_sys_s32(&d_barrier[base + MOE_BAR_COUNTER_SLOT * MOE_BAR_LINE]),
-            _n_arr, expected, xcd_id);
+            xcd_id);
       }
       _spins++;
 #ifndef MPK_MOE_BAR_BUSY_POLL

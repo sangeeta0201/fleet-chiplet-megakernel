@@ -4781,18 +4781,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     // to hold different values), and slot 0 is the one observed to receive it:
     // with 4 XCDs, slots 1-3 read 0 under both st_wt_u32 and atomicMax while
     // slot 0 reads the published epoch.
-    // All W13 groups of this expert must have a stamp >= my epoch. Immune to
-    // the layer skew that breaks a shared modulo counter.
-    auto _stamps_ready = [&]() -> int {
-      int n = 0;
-      for (int g = 0; g < W13_TILES; g++) {
-        if (ld_sys_s32(&d_barrier[base + 13 * MOE_BAR_LINE + g]) >= expected) {
-          n++;
-        }
-      }
-      return n;
-    };
-    while ((_obs = _stamps_ready()) < W13_TILES) {
+    while ((_obs = MPK_LD_GATE2(&d_barrier_rel[base])) < expected) {
       MPK_WS_WAIT_TICK(_obs, _spins);
       // Refresh the discriminating values on the same cadence as the tick:
       // the raw arrival counter (whether it sits on a multiple of W13_TILES
