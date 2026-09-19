@@ -1991,6 +1991,14 @@ def get_compile_command(
         # dispatch: same fused task graph, only the queue vs scheduler changes.
         flags = flags + ["-DMPK_FUSED_LAYER_BATCHING"]
         flags = flags + [f"-DMPK_NUM_XCDS={mpk_num_xcds()}"]
+        # SPX only: confine workers to physical XCDs [0, MPK_NUM_XCDS) so they
+        # all sit close to one NPS2 memory range. DPX needs nothing here --
+        # its dies are already a single partition.
+        if os.environ.get("MPK_XCD_SUBSET", "0") == "1":
+            flags = flags + ["-DMPK_XCD_SUBSET"]
+            _base = int(os.environ.get("MPK_XCD_BASE", "0"))
+            if _base:
+                flags = flags + [f"-DMPK_XCD_BASE={_base}"]
         flags = flags + [f"-DMPK_OPROJ_MAX_RANKS={mpk_workers_per_xcd()}"]
         if int(os.environ.get("PRECOMPUTED_DISPATCH", "1")) == 1:
             flags = flags + ["-DMPK_PRECOMPUTED_DISPATCH"]
@@ -2138,7 +2146,35 @@ class PersistentKernel:
             f"Tasks for this layer: {supported_tasks}."
         )
 
+    def _maybe_aid_local(self, torch_tensor, name):
+        """Copy a read-only weight into an AID_LOCAL BO so it gets MTYPE_RW.
+
+        In SPX+NPS2 plain VRAM is MTYPE_NC because the single XCP spans both
+        memory ranges. Measured on this box, cacheable VRAM is worth 1.85x
+        (9.115 -> 4.920 ms/token) -- but only read-only data may take it:
+        MTYPE_RW is coherent within one hardware AID, so anything written
+        during the kernel must stay NC.
+        """
+        import os
+
+        if os.environ.get("MPK_AID_LOCAL", "0") != "1":
+            return torch_tensor
+        pats = os.environ.get("MPK_AID_LOCAL_W", "gate_up_proj,down_proj")
+        pats = [p for p in pats.split(",") if p]
+        if not any(p in (name or "") for p in pats):
+            return torch_tensor
+        if any(bad in (name or "") for bad in ("k_cache", "v_cache")):
+            return torch_tensor
+        try:
+            from . import aid_hbm
+
+            return aid_hbm.local_tensor(torch_tensor)
+        except Exception as e:  # placement is an optimisation, never a gate
+            print(f"[AID_LOCAL] {name}: falling back to default VRAM ({e})", flush=True)
+            return torch_tensor
+
     def attach_input(self, torch_tensor: torch.Tensor, name: str = None) -> DTensor:
+        torch_tensor = self._maybe_aid_local(torch_tensor, name)
         dims = tuple([d for d in torch_tensor.shape])
         strides = tuple([s for s in torch_tensor.stride()])
         # Assert a row-major layout

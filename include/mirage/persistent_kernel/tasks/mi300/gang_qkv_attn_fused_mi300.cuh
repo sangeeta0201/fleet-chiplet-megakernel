@@ -92,6 +92,10 @@ __device__ __noinline__ void gang_qkv_attn_fused_kernel_mi300(
     int tile_idx) {
   int xcd_id;
   asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)" : "=s"(xcd_id));
+  // HW gives the PHYSICAL die (0-7) even when only a subset runs. Every
+  // per-XCD array here is sized for MPK_NUM_XCDS, so fold it. Identity
+  // in the default 8-XCD build.
+  xcd_id %= MPK_NUM_XCDS;
 
   int *d_barrier = static_cast<int *>(barrier_ptr);
 

@@ -145,6 +145,10 @@ def _so() -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_void_p),
     ]
     lib.aid_hbm_alloc_hostmap.restype = ctypes.c_void_p
+    lib.aid_hbm_alloc_uncached.argtypes = [
+        ctypes.c_int, ctypes.c_ulonglong, ctypes.c_uint,
+    ]
+    lib.aid_hbm_alloc_uncached.restype = ctypes.c_void_p
     lib.aid_hbm_alloc_striped.argtypes = [
         ctypes.c_int, ctypes.c_ulonglong,
     ]
@@ -703,3 +707,114 @@ def replicate_full(tensor, hip_dev: int = 0, drop_src: bool = True):
     elif drop_src:
         tensor.untyped_storage().resize_(0)
     return p0, p1
+
+
+# ---------------------------------------------------------------------------
+# Single-range AID_LOCAL placement for READ-ONLY weights.
+#
+# split_dim0_halves/replicate_full above place a tensor for an 8-XCD run that
+# uses both ranges. The 4-XCD subset runs entirely on one range, so it wants
+# the simpler thing: the whole tensor in that range, flagged AID_LOCAL so the
+# driver gives it MTYPE_RW instead of the spanning default MTYPE_NC.
+# ---------------------------------------------------------------------------
+_LOCAL_ARENA = {"ptr": 0, "off": 0, "cap": 0, "range": -1}
+_LOCAL_ARENA_BYTES = 8 << 30
+_LOCAL_LOG = []
+
+
+def local_range(hip_dev: int = 0) -> int:
+    """The NPS range that XCDs 0-3 are close to, honouring MPK_AID_POLARITY."""
+    r0, _r1 = worker_ranges(hip_dev=hip_dev)
+    return r0
+
+
+def _local_arena_take(nbytes: int, hip_dev: int = 0) -> int:
+    nbytes = (nbytes + (2 << 20) - 1) & ~((2 << 20) - 1)
+    a = _LOCAL_ARENA
+    if a["ptr"] == 0 or a["off"] + nbytes > a["cap"]:
+        cap = max(_LOCAL_ARENA_BYTES, nbytes)
+        rng = local_range(hip_dev)
+        a["ptr"] = alloc_bytes(cap, rng, hip_dev)
+        a["off"] = 0
+        a["cap"] = cap
+        a["range"] = rng
+        print(f"[AID_LOCAL] arena {cap >> 30} GiB in range {rng}", flush=True)
+    p = a["ptr"] + a["off"]
+    a["off"] += nbytes
+    return p
+
+
+def local_tensor(tensor, hip_dev: int = 0, drop_src: bool = False):
+    """Return a tensor of the same shape/dtype backed by AID_LOCAL VRAM.
+
+    Only safe for tensors the megakernel never writes. The import goes through
+    __cuda_array_interface__ as raw bytes and is then viewed back to the
+    original dtype, because bfloat16 has no CAI typestr.
+    """
+    import torch
+
+    assert tensor.is_contiguous(), "AID_LOCAL copy needs a contiguous source"
+    nbytes = tensor.nbytes
+    dst = _local_arena_take(nbytes, hip_dev)
+    memcpy_d2d(dst, int(tensor.data_ptr()), nbytes)
+
+    class _CAI:
+        pass
+
+    w = _CAI()
+    w.__cuda_array_interface__ = {
+        "data": (dst, False),
+        "shape": (nbytes,),
+        "typestr": "|u1",
+        "strides": None,
+        "version": 2,
+    }
+    flat = torch.as_tensor(w, device=f"cuda:{hip_dev}")
+    out = flat.view(tensor.dtype).reshape(tensor.shape)
+    _LOCAL_LOG.append((tuple(tensor.shape), nbytes))
+    print(
+        f"[AID_LOCAL] weight {tuple(tensor.shape)} {nbytes / (1 << 20):.1f} MiB "
+        f"-> range {_LOCAL_ARENA['range']} @ {hex(dst)}",
+        flush=True,
+    )
+    if drop_src:
+        tensor.untyped_storage().resize_(0)
+    return out
+
+
+def local_summary() -> str:
+    tot = sum(n for _s, n in _LOCAL_LOG)
+    return f"{len(_LOCAL_LOG)} tensors, {tot / (1 << 30):.2f} GiB AID_LOCAL"
+
+
+# ---------------------------------------------------------------------------
+# Uncached (MTYPE_NC) VRAM arena for the shared, written buffers.
+# ---------------------------------------------------------------------------
+_UNC_ARENA = {"ptr": 0, "off": 0, "cap": 0, "range": -1}
+_UNC_ARENA_BYTES = 64 << 20   # whole shared set is ~130 KB at batch 1
+
+
+def uncached_take(nbytes: int, hip_dev: int = 0, range_idx: int | None = None) -> int:
+    """Suballocate MTYPE_NC VRAM. One BO, because hipImportExternalMemory
+    OOMs after about a dozen external mappings."""
+    a = _UNC_ARENA
+    nbytes = (nbytes + 255) & ~255
+    if a["ptr"] == 0:
+        rng = local_range(hip_dev) if range_idx is None else range_idx
+        cap = max(_UNC_ARENA_BYTES, nbytes)
+        p = _so().aid_hbm_alloc_uncached(hip_dev, cap, rng)
+        if not p:
+            raise RuntimeError(
+                f"uncached VRAM alloc failed ({cap} B, range {rng}); "
+                "needs the patched amdgpu and aid_local_uncached_mtype=1"
+            )
+        a["ptr"], a["off"], a["cap"], a["range"] = int(p), 0, cap, rng
+        _KEEP.append(p)
+        memset_d(a["ptr"], 0, cap)
+        print(f"[UNCACHED] arena {cap >> 20} MiB MTYPE_NC VRAM range {rng} "
+              f"@ {hex(a['ptr'])}", flush=True)
+    if a["off"] + nbytes > a["cap"]:
+        raise RuntimeError("uncached arena exhausted")
+    p = a["ptr"] + a["off"]
+    a["off"] += nbytes
+    return p

@@ -653,6 +653,23 @@ using namespace kernel;
 #ifndef MPK_NUM_XCDS
 #define MPK_NUM_XCDS 8
 #endif
+// Physical XCDs on an SPX agent, independent of how many we choose to use.
+#define MPK_XCD_HW 8
+// First physical XCD of the subset. 0 = the dies close to memory range 0,
+// 4 = those close to range 1.
+#ifndef MPK_XCD_BASE
+#define MPK_XCD_BASE 0
+#endif
+#ifdef MPK_XCD_SUBSET
+// Dense per-die worker-rank counters, zeroed by prepare_kernel each launch.
+__device__ int g_xcd_subset_rank[MPK_XCD_HW];
+__device__ int g_xcd_sched_rank[MPK_XCD_HW];
+#endif
+#ifdef MPK_XCD_SUBSET
+#define MPK_XCD_OVERSUB (2 * MPK_XCD_HW / MPK_NUM_XCDS)
+#else
+#define MPK_XCD_OVERSUB 1
+#endif
 constexpr int MI300X_NUM_XCDS = MPK_NUM_XCDS;
 
 // Physical XCC_ID is 0-7 even in DPX. Fold into the local 0..N-1 index
@@ -909,6 +926,12 @@ __global__ void prepare_kernel(RuntimeConfig config,
       threadIdx.x == 0) {
     *config.dynamic_worker_id_counter = 0;
   }
+#ifdef MPK_XCD_SUBSET
+  if (blockIdx.x == 0 && threadIdx.x < MPK_XCD_HW) {
+    g_xcd_subset_rank[threadIdx.x] = 0;
+    g_xcd_sched_rank[threadIdx.x] = 0;
+  }
+#endif
 #endif
 
   // Send event to scheduler[0]
@@ -1240,7 +1263,7 @@ __device__ __forceinline__ void worker_checker(RuntimeConfig config) {
   // int num_schedulers =
   //    config.num_local_schedulers + config.num_remote_schedulers;
 
-  assert(gridDim.x == config.num_workers);
+  assert(gridDim.x == config.num_workers * MPK_XCD_OVERSUB);
   assert(config.num_workers <= MAX_NUM_WORKERS);
   // We will reinterpret TaskDesc as an array of integers to
   // collectively load it from device to shared memory
@@ -4217,12 +4240,68 @@ __global__ __launch_bounds__(WORKER_NUM_THREADS,
 __global__ __launch_bounds__(WORKER_NUM_THREADS,
                              1) void worker_kernel(RuntimeConfig config) {
   worker_checker(config);
+#ifdef MPK_XCD_SUBSET
+  // Elect by hardware die, never by blockIdx: this gate retires most of the
+  // grid at once, the freed CUs are refilled out of round-robin order, and a
+  // block's index then says nothing about where it ran. Each surviving block
+  // claims a dense rank on its own die, so the participating XCDs see exactly
+  // workers_per_xcd workers however the dispatcher placed them.
+  __shared__ int s_subset_wid;
+  if (threadIdx.x == 0) {
+    int phys;
+    asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)" : "=s"(phys));
+    s_subset_wid = -1;
+    // get_current_xcd_id() folds with %MPK_NUM_XCDS, which only agrees with
+    // (phys - MPK_XCD_BASE) when the base is a whole number of subsets in.
+    static_assert(MPK_XCD_BASE % MPK_NUM_XCDS == 0,
+                  "MPK_XCD_BASE must be a multiple of MPK_NUM_XCDS");
+    int const lx = phys - MPK_XCD_BASE;
+    if (lx >= 0 && lx < MPK_NUM_XCDS) {
+      int const wpx = config.precomp_workers_per_xcd > 0
+                          ? config.precomp_workers_per_xcd
+                          : config.num_workers / MPK_NUM_XCDS;
+      int const rank = atomicAdd(&g_xcd_subset_rank[lx], 1);
+      if (rank < wpx) {
+        s_subset_wid = rank * MPK_NUM_XCDS + lx;
+      }
+    }
+  }
+  __syncthreads();
+  if (s_subset_wid < 0) {
+    return;
+  }
+  execute_worker(config, s_subset_wid);
+#else
   execute_worker(config);
+#endif
 }
 
 __global__ void scheduler_kernel(RuntimeConfig config) {
   scheduler_checker(config);
+#ifdef MPK_XCD_SUBSET
+  // One scheduler per participating die, claimed by the first block to land
+  // there. The whole block leaves together, so the syncthreads stays uniform
+  // -- and it must happen before the return, because execute_scheduler runs
+  // thread 0 only and cannot be entered divergently.
+  __shared__ int s_sched_id;
+  if (threadIdx.x == 0) {
+    int phys;
+    asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)" : "=s"(phys));
+    s_sched_id = -1;
+    int const lx = phys - MPK_XCD_BASE;
+    if (lx >= 0 && lx < MPK_NUM_XCDS &&
+        atomicAdd(&g_xcd_sched_rank[lx], 1) == 0) {
+      s_sched_id = lx;
+    }
+  }
+  __syncthreads();
+  if (s_sched_id < 0) {
+    return;
+  }
+  execute_scheduler(config, 0, s_sched_id);
+#else
   execute_scheduler(config, 0);
+#endif
 }
 #pragma clang diagnostic pop
 
@@ -5740,12 +5819,17 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
     // The split kernel does not support NVSHMEM because
     // nvshmemx_collective_launch launches kernels sequentially, which blocks
     // the interaction between the worker kernel and the scheduler kernel
-    worker_kernel<<<dim3(global_runtime_config.num_workers, 1, 1),
+    worker_kernel<<<dim3(global_runtime_config.num_workers * MPK_XCD_OVERSUB,
+                         1,
+                         1),
                     dim3(WORKER_NUM_THREADS, 1, 1),
                     MAX_DYNAMIC_SHARED_MEMORY_SIZE /*smem*/,
                     global_runtime_config.worker_stream>>>(
         global_runtime_config);
-    scheduler_kernel<<<dim3(global_runtime_config.num_local_schedulers, 1, 1),
+    scheduler_kernel<<<dim3(global_runtime_config.num_local_schedulers *
+                             MPK_XCD_OVERSUB,
+                         1,
+                         1),
                        dim3(128, 1, 1),
                        0 /*smem*/,
                        global_runtime_config.scheduler_stream>>>(

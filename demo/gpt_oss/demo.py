@@ -2183,18 +2183,18 @@ if __name__ == "__main__":
                 n *= int(d)
             nbytes = n * itemsize
             try:
-                hip = ctypes.CDLL("libamdhip64.so")
-                ptr = ctypes.c_void_p()
-                # hipDeviceMallocUncached == 0x3 (Default 0, Finegrained 1,
-                # SignalMemory 2) per hip_runtime_api.h.
-                rc = hip.hipExtMallocWithFlags(
-                    ctypes.byref(ptr), ctypes.c_size_t(nbytes), ctypes.c_uint(3))
-                if rc != 0 or not ptr.value:
-                    print(f"[UNCACHED] {name}: hipExtMallocWithFlags rc={rc}",
+                # hipExtMallocWithFlags(hipDeviceMallocUncached) returns
+                # HOST memory on this ROCm -- the driver reports the BO as
+                # is_vram=0 -- so every cross-XCD access became a PCIe round
+                # trip and no iteration ever completed. A GEM BO with
+                # AMDGPU_GEM_CREATE_UNCACHED stays in VRAM and still takes
+                # MTYPE_NC, which is what these buffers need.
+                from mirage.mpk import aid_hbm as _aid
+                ptr = ctypes.c_void_p(_aid.uncached_take(nbytes))
+                if not ptr.value:
+                    print(f"[UNCACHED] {name}: uncached VRAM alloc failed",
                           flush=True)
                     return None
-                hip.hipMemset(ptr, 0, ctypes.c_size_t(nbytes))
-                _uncached_keepalive.append((hip, ptr))
 
                 class _CAI:
                     pass

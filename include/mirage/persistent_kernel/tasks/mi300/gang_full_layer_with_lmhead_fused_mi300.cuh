@@ -169,6 +169,10 @@ __device__ __noinline__ void
 
   int xcd_id;
   asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)" : "=s"(xcd_id));
+  // HW gives the PHYSICAL die (0-7) even when only a subset runs. Every
+  // per-XCD array here is sized for MPK_NUM_XCDS, so fold it. Identity
+  // in the default 8-XCD build.
+  xcd_id %= MPK_NUM_XCDS;
   int xcd_rank = tile_idx % workers_per_xcd;
   int tid = threadIdx.x;
   int total_workers = workers_per_xcd * MPK_NUM_XCDS;

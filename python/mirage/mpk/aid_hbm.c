@@ -62,6 +62,10 @@ static int open_render_for_hip_dev(int hip_dev)
 	return -1;
 }
 
+#ifndef AMDGPU_GEM_CREATE_UNCACHED
+#define AMDGPU_GEM_CREATE_UNCACHED (1ULL << 14)
+#endif
+
 #ifndef AMDGPU_GEM_CREATE_EXT_COHERENT
 #define AMDGPU_GEM_CREATE_EXT_COHERENT (1ULL << 15)
 #endif
@@ -181,6 +185,21 @@ void *aid_hbm_alloc_hostmap(int hip_dev, unsigned long long bytes,
 		return 0;
 	*cpu_out = 0;
 	return gem_import(hip_dev, bytes, flags, 2ULL << 20, cpu_out);
+}
+
+/* VRAM BO with MTYPE_NC, pinned to `range`.
+ *
+ * gmc_v9_0 tests `uncached` before `is_local`, so UNCACHED wins the mtype
+ * while AID_LOCAL still chooses the range. Needs the driver's
+ * aid_local_uncached_mtype=1, otherwise an UNCACHED BO maps to MTYPE_UC --
+ * which has no device coherency point, so the barriers' atomics never land.
+ */
+void *aid_hbm_alloc_uncached(int hip_dev, unsigned long long bytes,
+			     unsigned range)
+{
+	return gem_import(hip_dev, bytes,
+			  range_flags(range) | AMDGPU_GEM_CREATE_UNCACHED,
+			  2ULL << 20, 0);
 }
 
 void *aid_hbm_alloc_striped(int hip_dev, unsigned long long bytes)
