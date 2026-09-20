@@ -1994,6 +1994,11 @@ def get_compile_command(
         # SPX only: confine workers to physical XCDs [0, MPK_NUM_XCDS) so they
         # all sit close to one NPS2 memory range. DPX needs nothing here --
         # its dies are already a single partition.
+        # Any non-empty MPK_AID_LOCAL_SLOTS turns on the relocator; the
+        # variable itself is read on the host at run time, not baked in.
+        if (os.environ.get("MPK_AID_LOCAL_SLOTS", "") != ""
+                or os.environ.get("MPK_AID_LOCAL_MAP", "") != ""):
+            flags = flags + ["-DMPK_AID_LOCAL"]
         if os.environ.get("MPK_XCD_SUBSET", "0") == "1":
             flags = flags + ["-DMPK_XCD_SUBSET"]
             _base = int(os.environ.get("MPK_XCD_BASE", "0"))

@@ -4305,6 +4305,10 @@ __global__ void scheduler_kernel(RuntimeConfig config) {
 }
 #pragma clang diagnostic pop
 
+#ifdef MPK_AID_LOCAL
+#include "aid_local.h"
+#endif
+
 // Allocator for state that several XCDs read and write.
 //
 // Under DPX+NPS2 a device is 4 XCDs spanning two AIDs, and device VRAM there
@@ -4823,6 +4827,15 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
 
     if (ml_layers > 1) {
       // Build per-XCD pointer tables from all layers BEFORE compaction
+#ifdef MPK_AID_LOCAL
+      // Move the XCD-sliced weight tensors named by MPK_AID_LOCAL_SLOTS into
+      // the memory range of the XCD that consumes them, before the pointer
+      // tables are built. all_tasks is still pre-compaction here, so
+      // fused_layer_positions[L] + xcd is XCD xcd's descriptor for layer L,
+      // and one rewrite covers layer 0 and layers 1+.
+      mirage::aid::relocate_xcd_sliced_inputs(
+          all_tasks, fused_layer_positions, ML_N_IN);
+#endif
       std::vector<void *> h_input_table(NUM_XCDS_ML * ml_layers * ML_N_IN);
       std::vector<void *> h_output_table(NUM_XCDS_ML * ml_layers * ML_N_OUT);
       std::vector<EventId> h_trigger_events(ml_layers);
