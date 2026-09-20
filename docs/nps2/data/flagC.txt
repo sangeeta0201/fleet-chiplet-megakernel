@@ -1,0 +1,4 @@
+flagC_1: HANG  |  
+flagC_2: HANG  |  
+flagC_3: 3.881  |  analysisWe have a user asking: "The capital of France is
+DONE

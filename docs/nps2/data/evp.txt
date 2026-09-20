@@ -1,0 +1,3 @@
+evp_1: 3.386  |  analysisThe user asks: "The capital of France". Likely t
+evp_2: 3.421  |  analysisWe need to answer: "The capital of France". The 
+DONE

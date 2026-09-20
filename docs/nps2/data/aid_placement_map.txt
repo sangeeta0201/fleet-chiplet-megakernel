@@ -1,0 +1,27 @@
+[AID] aid_aperture range 0: fpfn 0x0 lpfn 0x23fffff size 144.0 GiB
+[AID] aid_aperture range 1: fpfn 0x2400000 lpfn 0x47fefff size 144.0 GiB
+[AID] boundary pfn 0x23ff800: AID0 -> range 0 (144 GiB, fpfn 0x0), AID1 -> range 1 (144 GiB, fpfn 0x2400000)
+[MAP] ==== NPS2 baseline placement map: 24 input slots, layer 0 of 36 fused layers ====
+[MAP] range AID0 = index 0, 144 GiB
+[MAP] range AID1 = index 1, 144 GiB
+[MAP] slot=0 name=workspace_f32 kind=shared alloc_mib=2.00 off_mib=1.78 lo_ns=107.9 hi_ns=110.7 skew_ns=-2.8 aid=0 placeable=0 local=0/8
+[MAP] slot=1 name=residual kind=shared alloc_mib=2.00 off_mib=1.88 lo_ns=101.8 hi_ns=102.1 skew_ns=-0.3 aid=0 placeable=0 local=6/8
+[MAP] slot=2 name=norm_weight_pre kind=shared alloc_mib=2.00 off_mib=1.84 lo_ns=102.2 hi_ns=102.7 skew_ns=-0.5 aid=0 placeable=0 local=4/8
+[MAP] slot=3 name=norm_scratch_pre kind=shared alloc_mib=2.00 off_mib=1.92 lo_ns=103.6 hi_ns=99.4 skew_ns=+4.2 aid=1 placeable=0 local=3/8
+[MAP] slot=4 name=qkv_weight kind=sliced alloc_mib=32.00 off_mib=23.00 lo_ns=136.3 hi_ns=180.1 skew_ns=-43.8 aid=0 placeable=1 local=3/8
+[MAP] slot=5 name=qkv_bias kind=sliced alloc_mib=2.00 off_mib=1.89 lo_ns=102.1 hi_ns=102.3 skew_ns=-0.2 aid=0 placeable=0 local=5/8
+[MAP] slot=6 name=sinks kind=shared alloc_mib=2.00 off_mib=0.02 lo_ns=101.9 hi_ns=101.2 skew_ns=+0.7 aid=1 placeable=0 local=5/8
+[MAP] slot=9 name=oproj_weight kind=sliced alloc_mib=64.00 off_mib=57.50 lo_ns=110.6 hi_ns=125.0 skew_ns=-14.4 aid=0 placeable=0 local=1/8
+[MAP] slot=10 name=oproj_bias kind=sliced alloc_mib=2.00 off_mib=1.90 lo_ns=101.4 hi_ns=102.8 skew_ns=-1.4 aid=0 placeable=0 local=4/8
+[MAP] slot=11 name=norm_weight_post kind=shared alloc_mib=2.00 off_mib=1.90 lo_ns=101.5 hi_ns=102.7 skew_ns=-1.2 aid=0 placeable=0 local=6/8
+[MAP] slot=13 name=router_weight kind=sliced alloc_mib=2.00 off_mib=0.00 lo_ns=125.9 hi_ns=126.6 skew_ns=-0.7 aid=0 placeable=0 local=3/8
+[MAP] slot=14 name=router_bias kind=sliced alloc_mib=2.00 off_mib=0.02 lo_ns=103.5 hi_ns=104.8 skew_ns=-1.3 aid=0 placeable=0 local=4/8
+[MAP] slot=15 name=logits_scratch kind=sliced alloc_mib=2.00 off_mib=1.89 lo_ns=102.8 hi_ns=102.5 skew_ns=+0.3 aid=1 placeable=0 local=7/8
+[MAP] slot=17 name=gate_up_weight kind=shared alloc_mib=2260.00 off_mib=0.00 lo_ns=335.5 hi_ns=433.4 skew_ns=-97.9 aid=0 placeable=1 local=0/8
+[MAP] slot=18 name=down_weight kind=shared alloc_mib=2260.00 off_mib=0.00 lo_ns=333.5 hi_ns=433.3 skew_ns=-99.8 aid=0 placeable=1 local=5/8
+[MAP] slot=19 name=w13_bias kind=shared alloc_mib=1014.00 off_mib=1012.50 lo_ns=139.0 hi_ns=155.2 skew_ns=-16.2 aid=0 placeable=0 local=2/8
+[MAP] slot=20 name=w2_bias kind=shared alloc_mib=2.00 off_mib=0.00 lo_ns=102.2 hi_ns=103.1 skew_ns=-0.9 aid=0 placeable=0 local=3/8
+[MAP] slot=21 name=moe_barrier kind=shared alloc_mib=2.00 off_mib=1.66 lo_ns=128.3 hi_ns=138.3 skew_ns=-10.0 aid=0 placeable=0 local=4/8
+[MAP] slot=22 name=swiglu_out kind=shared alloc_mib=2.00 off_mib=1.73 lo_ns=102.0 hi_ns=103.2 skew_ns=-1.1 aid=0 placeable=0 local=3/8
+[MAP] slot=23 name=o_acc_f32 kind=shared alloc_mib=2.00 off_mib=1.41 lo_ns=172.4 hi_ns=201.9 skew_ns=-29.5 aid=0 placeable=1 local=3/8
+[MAP] ==== end map ====

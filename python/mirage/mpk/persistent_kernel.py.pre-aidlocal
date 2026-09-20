@@ -1352,21 +1352,6 @@ def get_compile_command(
             # Worth roughly 0.036 ms/token.
             flags = flags + ["-DMPK_W13_T1_SPLIT_LDS_STAGE"]
         # Level, not a boolean: 2 is the shipped default, 0 restores `nt`.
-        if os.environ.get("MPK_AID_LOCAL_SLOTS", "") != "":
-            flags = flags + ["-DMPK_AID_LOCAL"]
-        if os.environ.get("MPK_AID_SPLIT_FLAGS", "0") == "1":
-            # SPX+NPS2 only. Hold the eight per-XCD attention release flags in
-            # two COHERENT AID-local replicas instead of one spanning buffer,
-            # and have each XCD poll the copy homed in its own AID. A spanning
-            # hipMalloc is MTYPE_NC in NPS2 -- local to neither range -- so
-            # every poll costs 182 ns near / 279 ns far against 97 ns for an
-            # AID-local line, and the O-proj slice wait polls these ~184 times
-            # a layer. phase7-bench measured slicewait 14.16 -> 0.36 us with
-            # this, exact SPX+NPS1 parity.
-            #
-            # Inert on a stock driver or in NPS1: the allocator reports
-            # unavailable and every guarded site uses the shared buffer.
-            flags = flags + ["-DMPK_AID_SPLIT_FLAGS"]
         _sp = int(os.environ.get("MPK_SYS_POLL_LOAD", "2"))
         if _sp >= 1:
             # Poll the inter-XCD release flags with `global_load_dword sc0 sc1`
@@ -1442,39 +1427,6 @@ def get_compile_command(
             # 1.826/1.820 -- one loss, one tie, one small win. The extra
             # barrier pays back the contention it removes on this path.
             flags = flags + ["-DMPK_NARROW_GATE_POLL"]
-        if int(os.environ.get("MPK_NARROW_HIER_POLL", "0")) == 1:
-            flags = flags + ["-DMPK_NARROW_HIER_POLL"]
-        if int(os.environ.get("MPK_AID_SPLIT_ROUTING", "0")) == 1:
-            flags = flags + ["-DMPK_AID_SPLIT_ROUTING"]
-        if int(os.environ.get("MPK_AID_SPLIT_OUT", "0")) == 1:
-            flags = flags + ["-DMPK_AID_SPLIT_OUT"]
-        if int(os.environ.get("MPK_AID_EVCTR2", "0")) == 1:
-            flags = flags + ["-DMPK_AID_EVCTR2"]
-        if int(os.environ.get("MPK_AID_EVCTR", "0")) == 1:
-            flags = flags + ["-DMPK_AID_EVCTR"]
-        if int(os.environ.get("MPK_HIER_WAIT_TIMER", "0")) == 1:
-            flags = flags + ["-DMPK_HIER_WAIT_TIMER"]
-        if int(os.environ.get("MPK_TOPK_HIER", "0")) == 1:
-            flags = flags + ["-DMPK_TOPK_HIER"]
-        _p7skip = int(os.environ.get("MPK_P7_SKIP", "0"))
-        _wskip = int(os.environ.get("MPK_WAIT_SKIP", "0"))
-        if _wskip != 0:
-            flags = flags + ["-DMPK_WAIT_SKIP=%d" % _wskip]
-        if _p7skip != 0:
-            flags = flags + ["-DMPK_P7_SKIP=%d" % _p7skip]
-        if int(os.environ.get("MPK_AID_EVTIER", "0")) == 1:
-            flags = flags + ["-DMPK_AID_EVTIER"]
-        if int(os.environ.get("MPK_AID_SPLIT_HIER_LOCAL", "0")) == 1:
-            flags = flags + ["-DMPK_AID_SPLIT_HIER_LOCAL"]
-        _only_op = os.environ.get("MPK_ONLY_OP", "")
-        if _only_op != "":
-            flags = flags + ["-DMPK_ONLY_OP=" + str(int(_only_op))]
-        if int(os.environ.get("MPK_AID_SPLIT_QKV", "0")) == 1:
-            flags = flags + ["-DMPK_AID_SPLIT_QKV"]
-        if int(os.environ.get("MPK_AID_SPLIT_ATTNOUT", "0")) == 1:
-            flags = flags + ["-DMPK_AID_SPLIT_ATTNOUT"]
-        if int(os.environ.get("MPK_NARROW_MOE_BAR_POLL", "0")) == 1:
-            flags = flags + ["-DMPK_NARROW_MOE_BAR_POLL"]
         if int(os.environ.get("MPK_LAYER_GATE_BUSY_POLL", "0")) == 1:
             # Drop s_sleep(1) from the Phase 9 layer-gate spin only.
             # A/B 2026-08-30: −12 / −13 / +3 µs, hash e86d7dc all six. Two of
@@ -1517,8 +1469,6 @@ def get_compile_command(
             # Hash e86d7dc all six. A/B −6 / −33 / +7 µs; only pair 2 clears
             # 10 us, and C2 1.758 looks like a control spike.
             flags = flags + ["-DMPK_OPROJ_AMAX_DPP"]
-        if int(os.environ.get("MPK_OPROJ_AID_AGG", "0")) == 1:
-            flags = flags + ["-DMPK_OPROJ_AID_AGG"]
         if _opt("MPK_NARROW_OPROJ_HIER"):
             # One tid polls the O-proj hierarchical release; the acquire
             # __syncthreads already below carries the other 255. Unlike
@@ -1976,10 +1926,6 @@ def get_compile_command(
             # than fixing it. See the correctness note at the post-arrival
             # site in gang_full_layer_fused_mi300.cuh.
             flags = flags + ["-DMPK_DRAIN_OVERLAP"]
-        if int(os.environ.get("MPK_BAR_SPLIT", "0")) == 1:
-            flags = flags + ["-DMPK_BAR_SPLIT"]
-        if int(os.environ.get("MPK_BAR_SPLIT_ONLY", "0")) == 1:
-            flags = flags + ["-DMPK_BAR_SPLIT_ONLY"]
         if int(os.environ.get("MPK_OPROJ_INNER_TIMING", "0")) == 1:
             flags = flags + ["-DMPK_OPROJ_INNER_TIMING"]
         if int(os.environ.get("MPK_MOE_INNER_TIMING", "0")) == 1:
@@ -2048,11 +1994,6 @@ def get_compile_command(
         # SPX only: confine workers to physical XCDs [0, MPK_NUM_XCDS) so they
         # all sit close to one NPS2 memory range. DPX needs nothing here --
         # its dies are already a single partition.
-        # Any non-empty MPK_AID_LOCAL_SLOTS turns on the relocator; the
-        # variable itself is read on the host at run time, not baked in.
-        if (os.environ.get("MPK_AID_LOCAL_SLOTS", "") != ""
-                or os.environ.get("MPK_AID_LOCAL_MAP", "") != ""):
-            flags = flags + ["-DMPK_AID_LOCAL"]
         if os.environ.get("MPK_XCD_SUBSET", "0") == "1":
             flags = flags + ["-DMPK_XCD_SUBSET"]
             _base = int(os.environ.get("MPK_XCD_BASE", "0"))
@@ -2066,20 +2007,6 @@ def get_compile_command(
             # the nil-address memory fault. Off by default: the per-layer
             # writes cost a little and only matter while chasing that bug.
             flags = flags + ["-DMPK_NIL_TRIPWIRE"]
-        if int(os.environ.get("MPK_TERM_RECHECK", "0")) == 1:
-            flags = flags + ["-DMPK_TERM_RECHECK"]
-        if int(os.environ.get("MPK_EVCTR_HOST", "0")) == 1:
-            flags = flags + ["-DMPK_EVCTR_HOST"]
-        if int(os.environ.get("MPK_NPS2_EVENT_POLL", "0")) == 1:
-            flags = flags + ["-DMPK_NPS2_EVENT_POLL"]
-        if int(os.environ.get("MPK_NPS2_L2_ACQUIRE", "0")) == 1:
-            # Unconditional layer-boundary `buffer_inv sc0 sc1`. Required in
-            # SPX+NPS2, where plain hipMalloc is MTYPE_NC and nothing keeps L2
-            # coherent across XCDs; the batch-1 path otherwise acquires nothing
-            # at all. Off by default: in NPS1 the acquire is redundant (MTYPE_RW
-            # is hardware-coherent) and dropping L2 per layer costs ~0.26
-            # ms/token by this file's own ablation.
-            flags = flags + ["-DMPK_NPS2_L2_ACQUIRE"]
         if int(os.environ.get("MPK_WORKER_STATE", "0")) == 1:
             # Per-phase worker-state breadcrumbs: which phase/barrier each
             # worker is in, dumped on a hang. This is how the fused-layer

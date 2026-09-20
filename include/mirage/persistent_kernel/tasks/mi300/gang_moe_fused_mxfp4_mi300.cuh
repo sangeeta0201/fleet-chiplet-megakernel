@@ -648,6 +648,15 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #endif
 
   int xcd_id = _gang_moe_get_xcd_id();
+#ifdef MPK_AID_SPLIT_FLAGS
+  // Replica view for the per-XCD release flags only. The arrival counter at
+  // MOE_BAR_COUNTER_SLOT stays on `d_barrier`: it is a device-scope atomic,
+  // and those serialize at the XCD L2 boundary regardless of where they live.
+  int *d_barrier_rel =
+      mpk_aid_flags_at(d_barrier, xcd_id, MPK_AID_MOE_BASE_INTS);
+#else
+  int *d_barrier_rel = d_barrier;
+#endif
   // Marker 1000: about to read the routing mask. Everything downstream --
   // expert_id, the weight base pointers, the barrier slot -- derives from it.
   MOE_DBG_ENTRY(1000, (unsigned long long)tile_idx);
@@ -824,7 +833,13 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     expert_id_raw = carried_expert_id;
   } else {
     if (early_routing_ready != nullptr) {
+#ifdef MPK_AID_SPLIT_ROUTING
+      int *final_release =
+          &mpk_aid_flags_at(early_routing_ready, xcd_id,
+                            MPK_AID_ROUTING_BASE_INTS)[(1 + xcd_id) * 16];
+#else
       int *final_release = &early_routing_ready[(1 + xcd_id) * 16];
+#endif
       while (ld_sys_s32(final_release) < routing_expected) {
         __builtin_amdgcn_s_sleep(1);
       }
@@ -4357,9 +4372,16 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         int layer_idx =
             *reinterpret_cast<int *>(&_fused_smem[LAYER_IDX_SMEM_OFF]);
         int release_val = layer_idx + 1;
-        for (int x = 0; x < MPK_NUM_XCDS; x++) {
+        for (int x = 0; x < 8; x++) {
+#ifdef MPK_AID_SPLIT_FLAGS
+          mpk_aid_publish_at(d_barrier,
+                             base + x * MOE_BAR_LINE,
+                             (unsigned)release_val,
+                             MPK_AID_MOE_BASE_INTS);
+#else
           st_wt_u32((void *)&d_barrier[base + x * MOE_BAR_LINE],
                     (unsigned)release_val);
+#endif
         }
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       }
@@ -4675,7 +4697,34 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     MPK_WS_WAVE_CLEAR(warp_id);
     int _obs;
     int _spins = 0;
-    while ((_obs = MPK_LD_GATE2(&d_barrier[base + xcd_id * MOE_BAR_LINE])) <
+#ifdef MPK_NARROW_MOE_BAR_POLL
+    // One thread polls the W13->W2 release for the block instead of all 256.
+    //
+    // Same contention argument that made MPK_NARROW_GATE_POLL worth 16.5%: at
+    // `sc0 sc1` every polling wave is a real trip to the coherency point, and
+    // ~/nps1/relobs3.sh measured a shared line going 5.0 us at 64 pollers ->
+    // 26.6 at 128 -> 40.1 at 192. Unlike MPK_NARROW_HIER_POLL (measured
+    // neutral) the waiters here are about to do W2 work, not already idle,
+    // which is the case that paid.
+    //
+    // The cost is what the comment below describes: the per-thread poll lets
+    // waves leave independently and start their own FP8 quant, so narrowing
+    // trades that pipelining for 4x fewer pollers. Which wins is a
+    // measurement, not an argument. Safe to add __syncthreads: the block
+    // already reconverges unconditionally a few lines later.
+    //
+    // MEASURED NEUTRAL-TO-WORSE, left off. On top of MPK_NARROW_GATE_POLL=1:
+    // 2.818 / 2.770 with it against 2.773 / 2.761 without, and MoE-only slot 8
+    // went UP (19735 vs 18397 ns/layer). The pipelining loss cancels the
+    // polling saving, so the per-thread poll below is the right default and the
+    // "deliberately divergent" note is correct. Taken together with
+    // MPK_NARROW_HIER_POLL (also neutral) and MPK_NARROW_GATE_POLL (-16.5%):
+    // narrowing a poll pays only where the line is contended exactly when it is
+    // written AND the waiters are about to do work. Poller count alone predicts
+    // nothing.
+    if (tid == 0)
+#endif
+    while ((_obs = MPK_LD_GATE2(&d_barrier_rel[base + xcd_id * MOE_BAR_LINE])) <
            expected) {
       MPK_WS_WAIT_TICK(_obs, _spins);
       // Refresh the discriminating values on the same cadence as the tick:
@@ -4685,8 +4734,8 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       // producer in one loop, so any spread means releases are being lost.
       if ((_spins & (MPK_WS_WAIT_REFRESH - 1)) == 0) {
         int _n_ok = 0, _mn = 0x7fffffff, _mx = -0x7fffffff;
-        for (int _x = 0; _x < MPK_NUM_XCDS; _x++) {
-          int _v = ld_nt_s32(&d_barrier[base + _x * MOE_BAR_LINE]);
+        for (int _x = 0; _x < 8; _x++) {
+          int _v = ld_nt_s32(&d_barrier_rel[base + _x * MOE_BAR_LINE]);
           if (_v >= expected) {
             _n_ok++;
           }
@@ -4710,6 +4759,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       __builtin_amdgcn_s_sleep(1);
 #endif
     }
+#ifdef MPK_NARROW_MOE_BAR_POLL
+    __syncthreads();
+#endif
     // This wave's threads all cleared the release. Record it: the poll is
     // per-thread with no __syncthreads, so waves leave independently and a
     // block can be split across the barrier.
