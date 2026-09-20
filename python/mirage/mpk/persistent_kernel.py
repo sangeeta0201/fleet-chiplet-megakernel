@@ -2053,6 +2053,8 @@ def get_compile_command(
         if (os.environ.get("MPK_AID_LOCAL_SLOTS", "") != ""
                 or os.environ.get("MPK_AID_LOCAL_MAP", "") != ""):
             flags = flags + ["-DMPK_AID_LOCAL"]
+        if os.environ.get("MPK_MOE_REPLICA", "0") == "1":
+            flags = flags + ["-DMPK_MOE_REPLICA"]
         if os.environ.get("MPK_XCD_SUBSET", "0") == "1":
             flags = flags + ["-DMPK_XCD_SUBSET"]
             _base = int(os.environ.get("MPK_XCD_BASE", "0"))

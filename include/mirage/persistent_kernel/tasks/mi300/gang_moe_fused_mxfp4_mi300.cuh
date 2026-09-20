@@ -855,6 +855,16 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // Clamp before it reaches any pointer arithmetic: the sentinel is -1, and the
   // weight/routing base pointers are built unconditionally below.
   int expert_id = is_padding_slot ? 0 : expert_id_raw;
+#ifdef MPK_MOE_REPLICA
+  // Read the copy of the weights homed in this die's own memory range. The
+  // tensor is [2*NUM_EXPERTS, wgs, bytes] with the upper half a duplicate, and
+  // the driver's halves placement puts that upper half in range 1. Routing is
+  // untouched -- only which physical copy this XCD loads from.
+  int const expert_id_rep =
+      expert_id + ((xcd_id >= (MPK_NUM_XCDS / 2)) ? NUM_EXPERTS : 0);
+#else
+  int const expert_id_rep = expert_id;
+#endif
   if (is_padding_slot) {
     MPK_WS_MARK(is_w2 ? 8105 : 8101, global_tile); // padding tile (runs empty)
   }
@@ -1062,7 +1072,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 
     // Weight pointers
     uint8_t const *expert_weight =
-        W_gate_up + static_cast<int64_t>(expert_id) * W13_EXPERT_BYTES;
+        W_gate_up + static_cast<int64_t>(expert_id_rep) * W13_EXPERT_BYTES;
     uint8_t const *wg_data =
         expert_weight + static_cast<int64_t>(wg_idx) * W13_WG_BYTES;
     uint8_t const *wg_scales = wg_data + W13_WG_DATA;
@@ -4455,7 +4465,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   MPK_WS_MARK(8300, global_tile); // W2 entry
   // Weight pointers — depend only on expert_id/wg_idx, available before barrier
   uint8_t const *expert_weight =
-      W_down + static_cast<int64_t>(expert_id) * W2_EXPERT_BYTES;
+      W_down + static_cast<int64_t>(expert_id_rep) * W2_EXPERT_BYTES;
   uint8_t const *wg_data =
       expert_weight + static_cast<int64_t>(wg_idx) * W2_WG_BYTES;
   uint8_t const *wg_scales = wg_data + W2_WG_DATA;

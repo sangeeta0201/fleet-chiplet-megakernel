@@ -2518,6 +2518,20 @@ if __name__ == "__main__":
         print(f"  Packed {num_layers} layers: gate_up {list(moe_gate_up_proj_weights[0].shape)}, "
               f"down {list(moe_down_proj_weights[0].shape)}")
 
+        # MPK_MOE_REPLICA: a full copy of the MoE weights per memory range.
+        # Duplicating along the expert axis makes the tensor [2E, wgs, bytes];
+        # the driver's halves placement puts [0,E) in range 0 and [E,2E) in
+        # range 1, and the kernel shifts expert_id by NUM_EXPERTS on XCDs 4-7.
+        # Read-only, so no coherence is needed and the MTYPE stays NC.
+        if os.environ.get("MPK_MOE_REPLICA", "0") == "1":
+            for _l in range(len(moe_gate_up_proj_weights)):
+                moe_gate_up_proj_weights[_l] = torch.cat(
+                    [moe_gate_up_proj_weights[_l]] * 2, dim=0).contiguous()
+                moe_down_proj_weights[_l] = torch.cat(
+                    [moe_down_proj_weights[_l]] * 2, dim=0).contiguous()
+            print(f"[MOE_REPLICA] gate_up {list(moe_gate_up_proj_weights[0].shape)} "
+                  f"down {list(moe_down_proj_weights[0].shape)}", flush=True)
+
         # --- Build task graph ---
         # Embed layer
         embed_weight = pad_weight_2d(
