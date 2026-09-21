@@ -3897,6 +3897,20 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
               }
               printf("\n");
             }
+            // Raw per-slot timestamps of the last armed layer, so one layer's
+            // timeline can be reconstructed per worker (worker % 8 == XCD) and
+            // exported as a Perfetto trace. The span table above is a mean and
+            // cannot show ordering or overlap; this can.
+            for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+              if (g_phase_n[w * MPK_PHASE_PAD_U64] == 0) {
+                continue;
+              }
+              printf("[PHASETS] w=%d", w);
+              for (int s = 0; s < MPK_PHASE_SLOT_COUNT; s++) {
+                printf(" %llu", g_phase_ts[w * MPK_PHASE_SLOT_STRIDE + s]);
+              }
+              printf("\n");
+            }
           }
 #endif
 #ifdef MPK_INTERLAYER_SPLIT
