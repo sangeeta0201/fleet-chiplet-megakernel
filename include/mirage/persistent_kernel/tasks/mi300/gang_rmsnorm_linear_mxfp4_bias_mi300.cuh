@@ -2032,7 +2032,15 @@ __device__ __noinline__ void gang_resaddf32_rmsnorm_linear_mxfp4_bias_kernel(
   // Reads f32 workspace (pre-accumulated by W2 atomicAdd), adds bf16 residual,
   // zeros workspace, computes SSQ for RMSNorm — all in a single pass.
   {
+#ifdef MPK_WSF32_AID
+    float *d_ws = (float *)workspace_f32_ptr +
+                  ((int)(kernel::mpk_prenorm_xcc() & 0x7) >=
+                           (MPK_NUM_XCDS / 2)
+                       ? MOE_WS_SLOTS * REDUCTION_SIZE
+                       : 0);
+#else
     float *d_ws = (float *)workspace_f32_ptr;
+#endif
     unsigned short const *d_residual = (unsigned short const *)residual_ptr;
     unsigned short *d_x_out = (unsigned short *)x_output_ptr;
     unsigned short const *d_norm_w = (unsigned short const *)norm_weight_ptr;
@@ -2685,7 +2693,15 @@ __device__ __noinline__ void
 #endif
   // ── Step 0+1 FUSED: ResAddF32 + RMSNorm ───────────────────────────────
   {
+#ifdef MPK_WSF32_AID
+    float *d_ws = (float *)workspace_f32_ptr +
+                  ((int)(kernel::mpk_prenorm_xcc() & 0x7) >=
+                           (MPK_NUM_XCDS / 2)
+                       ? MOE_WS_SLOTS * REDUCTION_SIZE
+                       : 0);
+#else
     float *d_ws = (float *)workspace_f32_ptr;
+#endif
     unsigned short const *d_residual = (unsigned short const *)residual_ptr;
     unsigned short *d_x_out = (unsigned short *)x_output_ptr;
     unsigned short const *d_norm_w = (unsigned short const *)norm_weight_ptr;

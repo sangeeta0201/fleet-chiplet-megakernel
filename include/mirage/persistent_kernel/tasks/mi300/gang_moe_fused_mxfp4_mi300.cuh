@@ -5560,6 +5560,12 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                      (acc[2] + bv2) * pf_rw,
                      (acc[3] + bv3) * pf_rw};
         st_wt_f32x4(&d_workspace_f32[ws_base], wv);
+        #ifdef MPK_WSF32_AID
+        // Mirror into the other range's copy. Writers own disjoint
+        // columns, so each AID cannot rebuild the row alone.
+        st_wt_f32x4(&d_workspace_f32[ws_base +
+                                    MOE_WS_SLOTS * HIDDEN_SIZE], wv);
+        #endif
       }
     }
 
@@ -5831,6 +5837,12 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                        (acc[2] + bv2) * pf_rw,
                        (acc[3] + bv3) * pf_rw};
           st_wt_f32x4(&d_workspace_f32[ws_base], wv);
+          #ifdef MPK_WSF32_AID
+          // Mirror into the other range's copy. Writers own disjoint
+          // columns, so each AID cannot rebuild the row alone.
+          st_wt_f32x4(&d_workspace_f32[ws_base +
+                                      MOE_WS_SLOTS * HIDDEN_SIZE], wv);
+          #endif
         }
       }
     }

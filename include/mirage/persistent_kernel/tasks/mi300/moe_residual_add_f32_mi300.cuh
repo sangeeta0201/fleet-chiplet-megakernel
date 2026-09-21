@@ -103,11 +103,23 @@ __device__ __forceinline__ void moe_residual_add_f32_mi300_impl(
       float4 ws4;
       __builtin_memcpy(&ws4, ws_row + off, 16);
       st_wt_zero128(ws_row + off);
+      #ifdef MPK_WSF32_AID
+      // This task runs on ONE XCD but the next iteration's layer 0 reads the
+      // workspace on all 8, so with a copy per range BOTH must be zeroed or
+      // the other AID double-counts the last layer's MoE output.
+      st_wt_zero128((ws_row + off) + MOE_WS_SLOTS * OUTPUT_STRIDE);
+      #endif
 #pragma unroll
       for (int s = 1; s < MOE_WS_SLOTS; s++) {
         float4 slot4;
         __builtin_memcpy(&slot4, ws_row + s * OUTPUT_STRIDE + off, 16);
         st_wt_zero128(ws_row + s * OUTPUT_STRIDE + off);
+        #ifdef MPK_WSF32_AID
+        // This task runs on ONE XCD but the next iteration's layer 0 reads the
+        // workspace on all 8, so with a copy per range BOTH must be zeroed or
+        // the other AID double-counts the last layer's MoE output.
+        st_wt_zero128((ws_row + s * OUTPUT_STRIDE + off) + MOE_WS_SLOTS * OUTPUT_STRIDE);
+        #endif
         ws4.x += slot4.x;
         ws4.y += slot4.y;
         ws4.z += slot4.z;

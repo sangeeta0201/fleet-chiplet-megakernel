@@ -2416,7 +2416,9 @@ if __name__ == "__main__":
         # deterministic -- W2 stores (no atomicAdd) and the consumer sums the
         # slots of its own row in fixed order. See moe_ws_layout.cuh, whose
         # MOE_WS_SLOTS must equal num_experts_per_tok.
-        moe_workspace_f32 = make_tensor("moe_workspace_f32", (bs, num_experts_per_tok * PADDED_HIDDEN_SIZE), torch_dtype=torch.float32)
+        # MPK_WSF32_AID: one MoE f32 workspace per memory range.
+        _ws_mul = 2 if os.environ.get("MPK_WSF32_AID", "0") == "1" else 1
+        moe_workspace_f32 = make_tensor("moe_workspace_f32", (bs, _ws_mul * num_experts_per_tok * PADDED_HIDDEN_SIZE), torch_dtype=torch.float32)
         mlp_weighted_sum_out = make_tensor("mlp_weighted_sum_out", (bs, PADDED_HIDDEN_SIZE))
         mlp_final = make_tensor("mlp_final", (bs, PADDED_HIDDEN_SIZE))
         # Argmax — fused into LM head GEMM (type 218, norm-once):
