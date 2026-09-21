@@ -255,6 +255,20 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
 #endif
 
   uint8_t const *W = (uint8_t const *)weight_ptr;
+#ifdef MPK_LMNORM_AID
+  // One normalized-row copy per memory range. Every worker writes the same
+  // values, so no publish is needed: each AID's workers fill and read their
+  // own copy, halving both the write and the read fan-in and keeping both
+  // local. BATCH_SIZE rows per copy.
+  unsigned x_lmn;
+  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID)" : "=s"(x_lmn));
+  long long const lmnorm_aid_off =
+      ((int)(x_lmn & 0x7) >= (MPK_NUM_XCDS / 2))
+          ? (long long)MPK_MAX_NUM_BATCHED_TOKENS * REDUCTION_SIZE
+          : 0;
+#else
+  long long const lmnorm_aid_off = 0;
+#endif
   unsigned short const *d_bias = (unsigned short const *)bias_ptr;
 
   extern __shared__ char _rnlm_smem[];
@@ -299,7 +313,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
     unsigned short const *row_in =
         (unsigned short const *)norm_input_ptr + (long long)b * REDUCTION_SIZE;
     unsigned short *row_out =
-        (unsigned short *)norm_output_ptr + (long long)b * REDUCTION_SIZE;
+        (unsigned short *)norm_output_ptr + lmnorm_aid_off +
+        (long long)b * REDUCTION_SIZE;
     gang_rmsnorm_detail::rmsnorm_inline_amd<REDUCTION_SIZE, ACTUAL_HIDDEN_DIM>(
         row_in, norm_weight_ptr, row_out);
   }
@@ -334,7 +349,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
     // ── Step 2: FP8 quant of this block's token rows ──────────────────────
     _gang_multirow_fp8_quant<REDUCTION_SIZE, TOK_ROWS, BATCH_SIZE,
                              TOK_ROW_STRIDE, SC_STRIDE>(
-        (unsigned short const *)norm_output_ptr, REDUCTION_SIZE, bblk * MFMA_N,
+        (unsigned short const *)norm_output_ptr + lmnorm_aid_off,
+        REDUCTION_SIZE, bblk * MFMA_N,
         TOK_ROWS, s_tok_fp8, s_tok_scales);
 
     // Each lane owns exactly one token (N column `col`), so the running

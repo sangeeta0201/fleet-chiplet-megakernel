@@ -1452,6 +1452,8 @@ def get_compile_command(
             flags = flags + ["-DMPK_AID_EVCTR2"]
         if int(os.environ.get("MPK_SWIGLU_AID", "0")) == 1:
             flags = flags + ["-DMPK_SWIGLU_AID"]
+        if int(os.environ.get("MPK_LMNORM_AID", "0")) == 1:
+            flags = flags + ["-DMPK_LMNORM_AID"]
         if int(os.environ.get("MPK_AID_EVCTR", "0")) == 1:
             flags = flags + ["-DMPK_AID_EVCTR"]
         if int(os.environ.get("MPK_HIER_WAIT_TIMER", "0")) == 1:

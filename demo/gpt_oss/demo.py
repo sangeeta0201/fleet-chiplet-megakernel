@@ -2238,7 +2238,13 @@ if __name__ == "__main__":
                 verify_tensors[name] = t
             return mpk.attach_input(torch_tensor=t, name=name)
         y = make_tensor("embed_out", (bs, PADDED_HIDDEN_SIZE))
-        rmsnorm_out = make_tensor("rmsnorm_out", (bs, PADDED_HIDDEN_SIZE))
+        # MPK_LMNORM_AID: the LM head keeps one normalized-row copy per
+        # memory range in this buffer. Doubling the row count gives it the
+        # second copy; the layer's norm_scratch_pre use touches only the
+        # first rows and is unaffected.
+        _lmn_mul = 2 if os.environ.get("MPK_LMNORM_AID", "0") == "1" else 1
+        rmsnorm_out = make_tensor("rmsnorm_out",
+                                  (bs * _lmn_mul, PADDED_HIDDEN_SIZE))
         attn_in = make_tensor("attn_in", (bs, fused_qkv_dim))
         # CK FMHA workspaces
         num_qo_per_kv = num_local_q_heads // num_local_kv_heads
