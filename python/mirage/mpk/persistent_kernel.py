@@ -1474,6 +1474,8 @@ def get_compile_command(
             flags = flags + ["-DMPK_LM_INNER"]
         if int(os.environ.get("MPK_LM_HW_XCC2", "0")) == 1:
             flags = flags + ["-DMPK_LM_HW_XCC2"]
+        if int(os.environ.get("MPK_LM_WEIGHT_AID", "0")) == 1:
+            flags = flags + ["-DMPK_LM_WEIGHT_AID"]
         if int(os.environ.get("MPK_AID_EVCTR", "0")) == 1:
             flags = flags + ["-DMPK_AID_EVCTR"]
         if int(os.environ.get("MPK_HIER_WAIT_TIMER", "0")) == 1:

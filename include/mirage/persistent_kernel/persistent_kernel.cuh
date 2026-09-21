@@ -21,7 +21,8 @@
 #include "mpk_atoms.cuh"
 #include "runtime_header.h"
 
-#if defined(MPK_AID_LOCAL) || defined(MPK_AID_SPLIT_FLAGS)
+#if defined(MPK_AID_LOCAL) || defined(MPK_AID_SPLIT_FLAGS) ||                 \
+    defined(MPK_LM_WEIGHT_AID)
 #include "aid_local.h"
 #endif
 #ifdef USE_NVSHMEM
@@ -4841,6 +4842,19 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
     }
     all_tasks.push_back(task_desc);
   }
+
+#ifdef MPK_LM_WEIGHT_AID
+  // Task 218 input 3 is a static dim-0 bijection: descriptor x owns exactly
+  // one eighth of the vocabulary weight. Give each consumer its own local RW
+  // BO; do not replicate the 315 MiB weight.
+  if (!mirage::aid::relocate_gang_sliced_input(
+          all_tasks,
+          (int)TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300,
+          3)) {
+    fprintf(stderr, "[AID LM] fatal: LM-head split did not complete\n");
+    abort();
+  }
+#endif
 
   // Dump task graph for dispatch benchmark
   {

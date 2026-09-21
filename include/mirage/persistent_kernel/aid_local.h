@@ -1368,6 +1368,74 @@ inline void relocate_xcd_sliced_inputs(std::vector<TaskDescT> &all_tasks,
   fflush(stdout);
 }
 
+// Split one dim-0 gang input into one RW BO per consumer XCD. Unlike an
+// AID-level replica, each source byte is copied exactly once and every task
+// keeps its original slice geometry. This is the placement shape required by
+// static bijections such as the LM-head vocabulary partition.
+template <typename TaskDescT>
+inline bool relocate_gang_sliced_input(std::vector<TaskDescT> &all_tasks,
+                                        int task_type,
+                                        int slot) {
+  for (size_t pos = 0; pos + kNumXcds <= all_tasks.size(); pos++) {
+    if ((int)all_tasks[pos].task_type != task_type) {
+      continue;
+    }
+    bool group = true;
+    for (int xcd = 1; xcd < kNumXcds; xcd++) {
+      group &= (int)all_tasks[pos + xcd].task_type == task_type;
+    }
+    if (!group) {
+      continue;
+    }
+
+    char *p0 = static_cast<char *>(all_tasks[pos].input_ptrs[slot]);
+    char *p1 = static_cast<char *>(all_tasks[pos + 1].input_ptrs[slot]);
+    if (p0 == nullptr || p1 == nullptr) {
+      printf("[AID LM] task %d slot %d is null\n", task_type, slot);
+      return false;
+    }
+    ptrdiff_t const stride = p1 - p0;
+    if (stride <= 0) {
+      printf("[AID LM] task %d slot %d has no positive XCD stride\n",
+             task_type, slot);
+      return false;
+    }
+    for (int xcd = 2; xcd < kNumXcds; xcd++) {
+      char *px = static_cast<char *>(all_tasks[pos + xcd].input_ptrs[slot]);
+      if (px != p0 + stride * xcd) {
+        printf("[AID LM] task %d slot %d stride is non-uniform at XCD%d\n",
+               task_type, slot, xcd);
+        return false;
+      }
+    }
+
+    char const *map = std::getenv("MPK_LM_WEIGHT_AID_MAP");
+    bool const mapped = map != nullptr && strlen(map) >= kNumXcds;
+    for (int xcd = 0; xcd < kNumXcds; xcd++) {
+      int const aid = mapped ? (map[xcd] == '1' ? 1 : 0) : aid_of_xcd(xcd);
+      void *dst = alloc_in_aid((size_t)stride, aid);
+      if (dst == nullptr ||
+          hipMemcpy(dst, p0 + stride * xcd, (size_t)stride,
+                    hipMemcpyDeviceToDevice) != hipSuccess) {
+        printf("[AID LM] split failed at XCD%d; abort this run\n", xcd);
+        return false;
+      }
+      all_tasks[pos + xcd].input_ptrs[slot] = dst;
+    }
+    if (hipDeviceSynchronize() != hipSuccess) {
+      printf("[AID LM] seed-copy synchronization failed\n");
+      return false;
+    }
+    printf("[AID LM] split task=%d slot=%d: 8 x %.2f MiB RW BOs, map=%s\n",
+           task_type, slot, stride / 1048576.0,
+           mapped ? map : "00001111");
+    fflush(stdout);
+    return true;
+  }
+  printf("[AID LM] task type %d was not found\n", task_type);
+  return false;
+}
+
 } // namespace aid
 } // namespace mirage
 
