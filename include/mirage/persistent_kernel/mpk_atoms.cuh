@@ -123,6 +123,15 @@ constexpr int MPK_AID_MOE_BASE_INTS = 1024;
 // three flag families were already replicated.
 constexpr int MPK_AID_ROUTING_BASE_INTS = 32768;
 
+// The fused-tail barriers of the LM head task (moe_done, resadd_done,
+// lmhead_done). Own offset past routing; the 2 MiB replica is 524k ints and
+// the per-launch memset clears it, so these mirrors start at 0 every launch.
+// One line each so they never share a cache line.
+constexpr int MPK_AID_LMTAIL_BASE_INTS = 40960;
+constexpr int MPK_AID_LMTAIL_MOE = 0;
+constexpr int MPK_AID_LMTAIL_RESADD = 16;
+constexpr int MPK_AID_LMTAIL_LMHEAD = 32;
+
 // Replica view at a raw int offset, for families too big for a region slot.
 __device__ __forceinline__ int *
     mpk_aid_flags_at(int *shared_base, int xcd_id, int off_ints) {

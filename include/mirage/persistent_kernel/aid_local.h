@@ -671,7 +671,7 @@ static inline void probe_buffer_home(char const *tag, void *buf, size_t bytes) {
 
 // Fused-layer input slot names, in the order gang_full_layer_fused_layer()
 // declares them in persistent_kernel.py (24 inputs). Only used for the map.
-static char const *kSlotNames[24] = {
+static char const *kSlotNames[28] = {
     "workspace_f32",     "residual",       "norm_weight_pre",
     "norm_scratch_pre",  "qkv_weight",     "qkv_bias",
     "sinks",             "qkv_barrier",    "lse_acc",
@@ -679,7 +679,10 @@ static char const *kSlotNames[24] = {
     "norm_scratch_post", "router_weight",  "router_bias",
     "logits_scratch",    "oproj_counters", "gate_up_weight",
     "down_weight",       "w13_bias",       "w2_bias",
-    "moe_barrier",       "swiglu_out",     "o_acc_f32"};
+    "moe_barrier",       "swiglu_out",     "o_acc_f32",
+    // 24-27 exist only on the with-lmhead tail task
+    "lm_norm_weight",    "lm_norm_input",  "lm_head_weight",
+    "lm_head_bias"};
 
 // Dump, for every input the fused layer reads, what it is, how large its backing
 // allocation is, whether the eight XCDs share one pointer or take a slice each,
@@ -699,7 +702,7 @@ static inline void dump_baseline_map(std::vector<TaskDescT> &all_tasks,
     printf("[MAP] AID-local unavailable; cannot map placement\n");
     return;
   }
-  int const n = n_in < 24 ? n_in : 24;
+  int const n = n_in < 28 ? n_in : 28;
   printf("[MAP] ==== NPS2 baseline placement map: %d input slots, layer 0 of "
          "%zu fused layers ====\n",
          n,
@@ -926,6 +929,14 @@ inline void relocate_xcd_sliced_inputs(std::vector<TaskDescT> &all_tasks,
   // to see all 24 allocations, not only the ones already chosen for relocation.
   if (std::getenv("MPK_AID_LOCAL_MAP") != nullptr && !positions.empty()) {
     dump_baseline_map(all_tasks, positions, n_in);
+    // positions.back() is the with-lmhead tail task, whose slots 24-27 carry
+    // the LM head weight -- ~300 MB streamed once per token, the single
+    // largest read outside the MoE, and never probed before.
+    if (positions.size() > 1) {
+      printf("[MAP] ==== TAIL TASK (with-lmhead), slots 24-27 ====\n");
+      std::vector<size_t> tail_only(1, positions.back());
+      dump_baseline_map(all_tasks, tail_only, n_in);
+    }
   }
   if (std::getenv("MPK_AID_LOCAL_DRY_RUN") != nullptr) {
     printf("[AID] DRY_RUN: nothing allocated or repointed\n");

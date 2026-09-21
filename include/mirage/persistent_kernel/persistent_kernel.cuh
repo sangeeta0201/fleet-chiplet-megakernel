@@ -4960,6 +4960,25 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
       mirage::aid::relocate_xcd_sliced_inputs(
           all_tasks, fused_layer_positions, ML_N_IN);
 #endif
+      if (getenv("MPK_DBG_XCD_PTRS")) {
+        // Which descriptors actually carry the LM head weight (slot 26)?
+        int shown = 0;
+        for (size_t t = 0; t < all_tasks.size() && shown < 24; t++) {
+          if (all_tasks[t].input_ptrs[26] != nullptr) {
+            printf("[LMSCAN] idx=%zu task_type=%d lm_W=%p lm_bias=%p "
+                   "norm_w=%p norm_in=%p\n",
+                   t,
+                   (int)all_tasks[t].task_type,
+                   all_tasks[t].input_ptrs[26],
+                   all_tasks[t].input_ptrs[27],
+                   all_tasks[t].input_ptrs[24],
+                   all_tasks[t].input_ptrs[25]);
+            shown++;
+          }
+        }
+        printf("[LMSCAN] total_tasks=%zu with_slot26=%d\n",
+               all_tasks.size(), shown);
+      }
       std::vector<void *> h_input_table(NUM_XCDS_ML * ml_layers * ML_N_IN);
       std::vector<void *> h_output_table(NUM_XCDS_ML * ml_layers * ML_N_OUT);
       std::vector<EventId> h_trigger_events(ml_layers);
@@ -4972,6 +4991,20 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
           int base = (xcd * ml_layers + L) * ML_N_IN;
           for (int i = 0; i < ML_N_IN; i++) {
             h_input_table[base + i] = td_xcd.input_ptrs[i];
+          }
+          // LM head pointers live on the TAIL layer, not layer 0, and in
+          // slots 24-27 which no existing dump covers. Eight distinct,
+          // uniformly-strided values here == a real per-XCD bijection;
+          // eight identical values == every XCD reading the same weight.
+          if (L == ml_layers - 1 && getenv("MPK_DBG_XCD_PTRS")) {
+            printf("[LMPTR] tail L=%d xcd=%d norm_w=%p norm_in=%p "
+                   "lm_W=%p lm_bias=%p\n",
+                   L,
+                   xcd,
+                   td_xcd.input_ptrs[24],
+                   td_xcd.input_ptrs[25],
+                   td_xcd.input_ptrs[26],
+                   td_xcd.input_ptrs[27]);
           }
           if (L == 0 && getenv("MPK_DBG_XCD_PTRS")) {
             printf("[XCDPTR] L0 xcd=%d qkv_w=%p oproj_w=%p router_w=%p "

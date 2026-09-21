@@ -1462,6 +1462,18 @@ def get_compile_command(
             flags = flags + ["-DMPK_GAMMA_AID"]
         if int(os.environ.get("MPK_WSF32_AID", "0")) == 1:
             flags = flags + ["-DMPK_WSF32_AID"]
+        if int(os.environ.get("MPK_LMHEAD_DEDICATED", "0")) == 1:
+            flags = flags + ["-DMPK_LMHEAD_DEDICATED"]
+        if int(os.environ.get("MPK_AID_LMBAR", "0")) == 1:
+            flags = flags + ["-DMPK_AID_LMBAR"]
+        if int(os.environ.get("MPK_LM_XCC", "0")) == 1:
+            flags = flags + ["-DMPK_LM_XCC"]
+        if int(os.environ.get("MPK_LM_HW_XCC", "0")) == 1:
+            flags = flags + ["-DMPK_LM_HW_XCC"]
+        if int(os.environ.get("MPK_LM_INNER", "0")) == 1:
+            flags = flags + ["-DMPK_LM_INNER"]
+        if int(os.environ.get("MPK_LM_HW_XCC2", "0")) == 1:
+            flags = flags + ["-DMPK_LM_HW_XCC2"]
         if int(os.environ.get("MPK_AID_EVCTR", "0")) == 1:
             flags = flags + ["-DMPK_AID_EVCTR"]
         if int(os.environ.get("MPK_HIER_WAIT_TIMER", "0")) == 1:

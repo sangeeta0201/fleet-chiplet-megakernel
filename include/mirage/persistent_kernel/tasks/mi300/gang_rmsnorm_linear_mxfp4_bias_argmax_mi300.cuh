@@ -295,6 +295,22 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
       (num_active_tokens < BATCH_SIZE) ? num_active_tokens : BATCH_SIZE;
   int partition_index = tile_idx / workers_per_xcd; // logical XCD (0..7)
   int worker_rank = tile_idx % workers_per_xcd;     // 0..workers_per_xcd-1
+#ifdef MPK_LM_HW_XCC2
+  // Bind the weight slice to the PHYSICAL XCC. partition_index above is the
+  // LOGICAL id and the imap handed this worker slice `partition_index`, but
+  // block b runs on physical xcd (b-1)%8, so without this the 315 MB vocab
+  // stream is homed in a neighbouring AID -- while MPK_LMNORM_AID above
+  // already binds its norm copy to the hardware id. Same kernel, two
+  // different bindings.
+  {
+    unsigned _x_hw;
+    asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID)" : "=s"(_x_hw));
+    int const _hw = (int)(_x_hw & (unsigned)(MPK_NUM_XCDS - 1));
+    W += (int64_t)((_hw - partition_index) & (MPK_NUM_XCDS - 1)) *
+         (int64_t)n_wgs_per_xcd * (int64_t)WG_BYTES;
+    partition_index = _hw;
+  }
+#endif
   int partition_start = partition_index * n_wgs_per_xcd * OUTPUT_PER_WG;
   // argmax_part_* are [batch, num_workers], XCD-partitioned along dim 1, so
   // the pointer already points at this XCD's worker slice while the row

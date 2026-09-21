@@ -173,6 +173,12 @@ __device__ __noinline__ void
   // per-XCD array here is sized for MPK_NUM_XCDS, so fold it. Identity
   // in the default 8-XCD build.
   xcd_id %= MPK_NUM_XCDS;
+#ifdef MPK_LM_INNER
+  if (threadIdx.x == 0 && blockIdx.x < 8) {
+    printf("[LM_ENTRY] kernel reached, xcd=%d block=%d\n",
+           xcd_id, (int)blockIdx.x);
+  }
+#endif
   int xcd_rank = tile_idx % workers_per_xcd;
   int tid = threadIdx.x;
   int total_workers = workers_per_xcd * MPK_NUM_XCDS;
@@ -214,12 +220,40 @@ __device__ __noinline__ void
   // ══════════════════════════════════════════════════════════════════
   __syncthreads();
   if (tid == 0) {
+    #ifdef MPK_AID_LMBAR
+    // Atomic stays shared (device-scope atomics serialize at the
+    // coherency point wherever homed); publish the post-increment
+    // value so every poller can read its own AID's mirror.
+    mpk_aid_publish_at(oproj_counters_base,
+                       MPK_AID_LMTAIL_MOE,
+                       (unsigned)(atom_add_release_gpu_s32(moe_done_global, 1) + 1),
+                       MPK_AID_LMTAIL_BASE_INTS);
+    #else
     atom_add_release_gpu_s32(moe_done_global, 1);
+    #endif
   }
   if (tid == 0) {
+    #ifdef MPK_AID_LMBAR
+    {
+      // Poll the mirror homed in this XCD's own range. A write-through
+      // publish is not monotone across XCDs, so a late smaller value can
+      // regress the mirror; re-read the authoritative counter every 64th
+      // spin so that costs one slow poll rather than a hang.
+      int const *_mir =
+          mpk_aid_flags_at(oproj_counters_base, xcd_id,
+                           MPK_AID_LMTAIL_BASE_INTS) + MPK_AID_LMTAIL_MOE;
+      int _s = 0;
+      while (((++_s & 63) == 0
+                  ? __atomic_load_n(moe_done_global, __ATOMIC_RELAXED)
+                  : __atomic_load_n(_mir, __ATOMIC_RELAXED)) < moe_expected) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+    #else
     while (__atomic_load_n(moe_done_global, __ATOMIC_RELAXED) < moe_expected) {
       __builtin_amdgcn_s_sleep(1);
     }
+    #endif
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
   }
   __syncthreads();
@@ -252,7 +286,17 @@ __device__ __noinline__ void
     __syncthreads();
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     if (tid == 0) {
+      #ifdef MPK_AID_LMBAR
+      // Atomic stays shared (device-scope atomics serialize at the
+      // coherency point wherever homed); publish the post-increment
+      // value so every poller can read its own AID's mirror.
+      mpk_aid_publish_at(oproj_counters_base,
+                         MPK_AID_LMTAIL_RESADD,
+                         (unsigned)(atom_add_release_gpu_s32(resadd_done, 1) + 1),
+                         MPK_AID_LMTAIL_BASE_INTS);
+      #else
       atom_add_release_gpu_s32(resadd_done, 1);
+      #endif
     }
   }
 
@@ -261,9 +305,27 @@ __device__ __noinline__ void
   // All workers wait for resadd to complete.
   // ══════════════════════════════════════════════════════════════════
   if (tid == 0) {
+    #ifdef MPK_AID_LMBAR
+    {
+      // Poll the mirror homed in this XCD's own range. A write-through
+      // publish is not monotone across XCDs, so a late smaller value can
+      // regress the mirror; re-read the authoritative counter every 64th
+      // spin so that costs one slow poll rather than a hang.
+      int const *_mir =
+          mpk_aid_flags_at(oproj_counters_base, xcd_id,
+                           MPK_AID_LMTAIL_BASE_INTS) + MPK_AID_LMTAIL_RESADD;
+      int _s = 0;
+      while (((++_s & 63) == 0
+                  ? __atomic_load_n(resadd_done, __ATOMIC_RELAXED)
+                  : __atomic_load_n(_mir, __ATOMIC_RELAXED)) < resadd_expected) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+    #else
     while (__atomic_load_n(resadd_done, __ATOMIC_RELAXED) < resadd_expected) {
       __builtin_amdgcn_s_sleep(1);
     }
+    #endif
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
   }
   __syncthreads();
@@ -288,6 +350,13 @@ __device__ __noinline__ void
   }
 #endif
 
+#ifdef MPK_LM_INNER
+  // Function scope on purpose: t1 and t2 are read from other blocks.
+  uint64_t _lmi_t0 = 0, _lmi_t1 = 0, _lmi_t2 = 0;
+  if (tid == 0) {
+    asm volatile("s_memrealtime %0" : "=s"(_lmi_t0));
+  }
+#endif
   float *argmax_packed_base = reinterpret_cast<float *>(
       oproj_counters_base + FUSED_TAIL_ARGMAX_PACKED_SLOT);
 
@@ -347,7 +416,31 @@ __device__ __noinline__ void
     uint8_t *s_tok_fp8 = (uint8_t *)_rnlm_smem;
     uint8_t *s_tok_scales = s_tok_fp8 + LM_REDUCTION_SIZE;
 
+#ifdef MPK_LM_INNER
+    // Boundary: norm + fp8 quant done, the 315 MB weight stream starts here.
+    if (tid == 0) {
+      asm volatile("s_memrealtime %0" : "=s"(_lmi_t1));
+    }
+#endif
     uint8_t const *lm_W = (uint8_t const *)input_ptrs[26];
+    // NOTE: mutable on purpose -- MPK_LM_HW_XCC re-bases it onto the
+    // physical XCC's own slice below.
+#ifdef MPK_LM_XCC
+    // Is the slice this worker was HANDED homed in the AID of the XCC it is
+    // actually RUNNING on? imap gives gang index x the rows for slice x; that
+    // gang index matching the physical XCC is an assumption, not a guarantee.
+    if (tid == 0) {
+      unsigned _xcc_hw;
+      asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)"
+                   : "=s"(_xcc_hw));
+      printf("[LM_XCC] derived=%d hw_xcc=%u rank=%d lm_W=%p %s\n",
+             xcd_id,
+             (_xcc_hw & 7u),
+             xcd_rank,
+             (void *)lm_W,
+             (xcd_id == (int)(_xcc_hw & 7u)) ? "MATCH" : "MISMATCH");
+    }
+#endif
     unsigned short const *lm_bias = (unsigned short const *)input_ptrs[27];
 
     int const warp_id = tid >> 6;
@@ -357,7 +450,22 @@ __device__ __noinline__ void
 
     float thread_max = -1e30f;
     long long thread_max_idx = -1;
+#ifdef MPK_LM_HW_XCC
+    // Re-index onto the PHYSICAL XCC. Block b runs on xcd (b-1)%8, but the
+    // imap handed it slice b, so without this every worker reads a slice
+    // homed in a neighbouring AID.
+    int _lm_xcd = xcd_id;
+    {
+      unsigned _hw;
+      asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)" : "=s"(_hw));
+      _lm_xcd = (int)(_hw & (unsigned)(MPK_NUM_XCDS - 1));
+      int const _shift = ((_lm_xcd - xcd_id) & (MPK_NUM_XCDS - 1));
+      lm_W += (int64_t)_shift * (int64_t)lm_n_wgs_per_xcd * LM_WG_BYTES;
+    }
+    int partition_start = _lm_xcd * lm_n_wgs_per_xcd * LM_OUTPUT_PER_WG;
+#else
     int partition_start = xcd_id * lm_n_wgs_per_xcd * LM_OUTPUT_PER_WG;
+#endif
 
     int lm_total_tiles_per_xcd = lm_n_wgs_per_xcd * num_active_tokens;
     for (int lm_t = xcd_rank; lm_t < lm_total_tiles_per_xcd;
@@ -550,19 +658,56 @@ __device__ __noinline__ void
   // ══════════════════════════════════════════════════════════════════
   __syncthreads();
   if (tid == 0) {
+    #ifdef MPK_AID_LMBAR
+    // Atomic stays shared (device-scope atomics serialize at the
+    // coherency point wherever homed); publish the post-increment
+    // value so every poller can read its own AID's mirror.
+    mpk_aid_publish_at(oproj_counters_base,
+                       MPK_AID_LMTAIL_LMHEAD,
+                       (unsigned)(atom_add_release_gpu_s32(lmhead_done_global, 1) + 1),
+                       MPK_AID_LMTAIL_BASE_INTS);
+    #else
     atom_add_release_gpu_s32(lmhead_done_global, 1);
+    #endif
   }
   if (tid == 0) {
+    #ifdef MPK_AID_LMBAR
+    {
+      // Poll the mirror homed in this XCD's own range. A write-through
+      // publish is not monotone across XCDs, so a late smaller value can
+      // regress the mirror; re-read the authoritative counter every 64th
+      // spin so that costs one slow poll rather than a hang.
+      int const *_mir =
+          mpk_aid_flags_at(oproj_counters_base, xcd_id,
+                           MPK_AID_LMTAIL_BASE_INTS) + MPK_AID_LMTAIL_LMHEAD;
+      int _s = 0;
+      while (((++_s & 63) == 0
+                  ? __atomic_load_n(lmhead_done_global, __ATOMIC_RELAXED)
+                  : __atomic_load_n(_mir, __ATOMIC_RELAXED)) < lmhead_expected) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+    #else
     while (__atomic_load_n(lmhead_done_global, __ATOMIC_RELAXED) <
            lmhead_expected) {
       __builtin_amdgcn_s_sleep(1);
     }
+    #endif
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
   }
   __syncthreads();
   asm volatile("buffer_inv" ::: "memory");
 
   // ══════════════════════════════════════════════════════════════════
+#ifdef MPK_LM_INNER
+  if (tid == 0) {
+    asm volatile("s_memrealtime %0" : "=s"(_lmi_t2));
+    printf("[LM_INNER] w=%d normquant=%llu weight=%llu\n",
+           (int)(xcd_id * 1000 + xcd_rank),
+           (unsigned long long)(_lmi_t1 - _lmi_t0),
+           (unsigned long long)(_lmi_t2 - _lmi_t1));
+  }
+#endif
   // Phase 11: Cross-XCD argmax reduce
   // Worker 0 on XCD 0 reads 8 per-XCD packed (val, idx) and writes final.
   // ══════════════════════════════════════════════════════════════════
