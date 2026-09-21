@@ -40,6 +40,13 @@
 #include "tasks/mi300/moe_ws_layout.cuh" // MOE_WS_SLOTS, moe_ws_offset()
 
 namespace kernel {
+// MPK_PRENORM_AID reads the physical XCD where xcd_id is not in scope.
+__device__ __forceinline__ unsigned mpk_prenorm_xcc() {
+  unsigned x;
+  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID)" : "=s"(x));
+  return x;
+}
+
 
 // Native vector types for address-space-qualified loads. HIP's float4/uint2 are
 // class templates (HIP_vector_type), so they cannot be copy-constructed through
@@ -310,9 +317,25 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_kernel(
     unsigned short const *row_in =
         (unsigned short const *)norm_input_ptr + b * REDUCTION_SIZE;
     unsigned short *row_out =
+        #ifdef MPK_PRENORM_AID
+        #define PRENORM_AID_OFF ((int)(kernel::mpk_prenorm_xcc() & 0x7) >= (MPK_NUM_XCDS / 2) ? (long long)BATCH_SIZE * REDUCTION_SIZE : 0)
+        (unsigned short *)norm_output_ptr + PRENORM_AID_OFF + b * REDUCTION_SIZE;
+        #undef PRENORM_AID_OFF
+        #else
         (unsigned short *)norm_output_ptr + b * REDUCTION_SIZE;
+        #endif
     gang_rmsnorm_detail::rmsnorm_inline_amd<REDUCTION_SIZE, ACTUAL_HIDDEN_DIM>(
-        row_in, norm_weight_ptr, row_out);
+        row_in,
+#ifdef MPK_GAMMA_AID
+        (void const *)((unsigned short const *)norm_weight_ptr +
+                       ((int)(kernel::mpk_prenorm_xcc() & 0x7) >=
+                                (MPK_NUM_XCDS / 2)
+                            ? REDUCTION_SIZE
+                            : 0)),
+#else
+        norm_weight_ptr,
+#endif
+        row_out);
   }
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
@@ -334,7 +357,13 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_kernel(
 
   // ── Step 2: Quantize BF16 normalized input -> FP4/FP8 in LDS ────────────
   unsigned short const *input_row =
+      #ifdef MPK_PRENORM_AID
+      #define PRENORM_AID_OFF ((int)(kernel::mpk_prenorm_xcc() & 0x7) >= (MPK_NUM_XCDS / 2) ? (long long)BATCH_SIZE * REDUCTION_SIZE : 0)
+      (unsigned short const *)norm_output_ptr + PRENORM_AID_OFF + tok_idx * REDUCTION_SIZE;
+      #undef PRENORM_AID_OFF
+      #else
       (unsigned short const *)norm_output_ptr + tok_idx * REDUCTION_SIZE;
+      #endif
 
   _gang_wave_parallel_fp8_quant<REDUCTION_SIZE>(
       input_row, s_tok_fp8, s_tok_scales);
@@ -1299,9 +1328,25 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_kvupd_kernel(
     unsigned short const *row_in =
         (unsigned short const *)norm_input_ptr + b * REDUCTION_SIZE;
     unsigned short *row_out =
+        #ifdef MPK_PRENORM_AID
+        #define PRENORM_AID_OFF ((int)(kernel::mpk_prenorm_xcc() & 0x7) >= (MPK_NUM_XCDS / 2) ? (long long)BATCH_SIZE * REDUCTION_SIZE : 0)
+        (unsigned short *)norm_output_ptr + PRENORM_AID_OFF + b * REDUCTION_SIZE;
+        #undef PRENORM_AID_OFF
+        #else
         (unsigned short *)norm_output_ptr + b * REDUCTION_SIZE;
+        #endif
     gang_rmsnorm_detail::rmsnorm_inline_amd<REDUCTION_SIZE, ACTUAL_HIDDEN_DIM>(
-        row_in, norm_weight_ptr, row_out);
+        row_in,
+#ifdef MPK_GAMMA_AID
+        (void const *)((unsigned short const *)norm_weight_ptr +
+                       ((int)(kernel::mpk_prenorm_xcc() & 0x7) >=
+                                (MPK_NUM_XCDS / 2)
+                            ? REDUCTION_SIZE
+                            : 0)),
+#else
+        norm_weight_ptr,
+#endif
+        row_out);
   }
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
@@ -1322,7 +1367,13 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_kvupd_kernel(
   // ── Step 2: Quantize/copy normalized input to LDS ────────────────────
   {
     unsigned short const *input_row =
+        #ifdef MPK_PRENORM_AID
+        #define PRENORM_AID_OFF ((int)(kernel::mpk_prenorm_xcc() & 0x7) >= (MPK_NUM_XCDS / 2) ? (long long)BATCH_SIZE * REDUCTION_SIZE : 0)
+        (unsigned short const *)norm_output_ptr + PRENORM_AID_OFF + tok_idx * REDUCTION_SIZE;
+        #undef PRENORM_AID_OFF
+        #else
         (unsigned short const *)norm_output_ptr + tok_idx * REDUCTION_SIZE;
+        #endif
     _gang_wave_parallel_fp8_quant<REDUCTION_SIZE>(
         input_row, s_tok_fp8, s_tok_scales);
   }

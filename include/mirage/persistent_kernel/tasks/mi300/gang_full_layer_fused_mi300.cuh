@@ -1825,6 +1825,17 @@ __device__ __noinline__ void
 #endif
     MPK_TW_SUB(80, moe_t);
     MPK_WS_PHASE(80, qkv_epoch_expected, xcd_id);
+#ifdef MPK_MOENORM_AID
+    // Read the normed-row copy homed in this XCD's own range (see
+    // MPK_MOENORM_AID in gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh).
+    void const *const moe_norm_in =
+        (void const *)((unsigned short const *)input_ptrs[12] +
+                       ((xcd_id >= (MPK_NUM_XCDS / 2))
+                            ? (long long)QKV_BATCH_SIZE * oproj_output_stride
+                            : 0));
+#else
+    void const *const moe_norm_in = input_ptrs[12];
+#endif
 #if !defined(MPK_ONLY_OP) || (MPK_ONLY_OP & (1 << 8))
     gang_moe_fused_mxfp4_kernel_mi300<QKV_BATCH_SIZE,
                                       MOE_INTERMEDIATE_SIZE,
@@ -1832,7 +1843,7 @@ __device__ __noinline__ void
                                       NUM_EXPERTS,
                                       TOPK_K,
                                       MOE_W13_OUTPUT_PER_WG,
-                                      MOE_W2_OUTPUT_PER_WG>(input_ptrs[12],
+                                      MOE_W2_OUTPUT_PER_WG>(moe_norm_in,
                                                             input_ptrs[17],
                                                             input_ptrs[18],
                                                             output_ptrs[7],

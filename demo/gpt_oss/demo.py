@@ -2242,7 +2242,8 @@ if __name__ == "__main__":
         # memory range in this buffer. Doubling the row count gives it the
         # second copy; the layer's norm_scratch_pre use touches only the
         # first rows and is unaffected.
-        _lmn_mul = 2 if os.environ.get("MPK_LMNORM_AID", "0") == "1" else 1
+        _lmn_mul = 2 if (os.environ.get("MPK_LMNORM_AID", "0") == "1"
+                         or os.environ.get("MPK_PRENORM_AID", "0") == "1") else 1
         rmsnorm_out = make_tensor("rmsnorm_out",
                                   (bs * _lmn_mul, PADDED_HIDDEN_SIZE))
         attn_in = make_tensor("attn_in", (bs, fused_qkv_dim))
@@ -2307,7 +2308,10 @@ if __name__ == "__main__":
         else:
             allreduce_buf = make_tensor("all_reduce_buf", (world_size, bs, PADDED_HIDDEN_SIZE))
             attn_allreduce_out = make_tensor("attn_allreduce_out", (bs, PADDED_HIDDEN_SIZE))
-        rmsnorm_out_moe = make_tensor("rmsnorm_out_moe", (bs, PADDED_HIDDEN_SIZE))
+        # MPK_MOENORM_AID: one post-attention normed row per memory range.
+        _mnn_mul = 2 if os.environ.get("MPK_MOENORM_AID", "0") == "1" else 1
+        rmsnorm_out_moe = make_tensor("rmsnorm_out_moe",
+                                      (bs * _mnn_mul, PADDED_HIDDEN_SIZE))
         moe_gate_out = make_tensor("moe_gate_out", (bs, num_experts))
         moe_routing_indices = make_tensor("moe_routing_indices", (num_experts, bs), torch_dtype=torch.int32)
         moe_mask = make_tensor("moe_mask", (num_experts + 1,), torch_dtype=torch.int32)
@@ -2595,6 +2599,11 @@ if __name__ == "__main__":
                 layer.input_layernorm.weight,
                 PADDED_HIDDEN_SIZE, pad_value=0.0
             )
+            # MPK_GAMMA_AID: one gamma copy per memory range (read-only,
+            # so the copies are identical and need no publish).
+            if os.environ.get("MPK_GAMMA_AID", "0") == "1":
+                norm_w_padded = torch.cat([norm_w_padded, norm_w_padded],
+                                          dim=0).contiguous()
             w_norm = _attach_input_keep(
                 norm_w_padded,
                 f"layer_{i}_input_layernorm",
@@ -2715,6 +2724,11 @@ if __name__ == "__main__":
                         layer.post_attention_layernorm.weight,
                         PADDED_HIDDEN_SIZE, pad_value=0.0
                     )
+                    # MPK_GAMMA_AID: one gamma copy per memory range.
+                    if os.environ.get("MPK_GAMMA_AID", "0") == "1":
+                        post_norm_w_padded = torch.cat(
+                            [post_norm_w_padded, post_norm_w_padded],
+                            dim=0).contiguous()
                     w_norm_moe = _attach_input_keep(
                         post_norm_w_padded, f"layer_{i}_post_attn_layernorm",
                     )

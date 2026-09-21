@@ -2062,9 +2062,28 @@ router_tile_pass:;
 #else
     bf16 const *__restrict__ d_hidden = static_cast<bf16 const *>(output_ptr);
 #endif
+#ifdef MPK_GAMMA_AID
+    // output_stride, not ACTUAL_HIDDEN_DIM: the gamma is padded and
+    // ACTUAL_HIDDEN_DIM is the unpadded width.
+    bf16 const *__restrict__ d_gamma =
+        static_cast<bf16 const *>(norm_weight_ptr) +
+        ((xcd_id >= (MPK_NUM_XCDS / 2)) ? output_stride : 0);
+#else
     bf16 const *__restrict__ d_gamma =
         static_cast<bf16 const *>(norm_weight_ptr);
+#endif
+#ifdef MPK_MOENORM_AID
+    // One normed-row copy per memory range. Writers are already
+    // redundant (one WG per XCD stores the whole row), so each AID
+    // simply fills its own copy -- no publish needed.
+    bf16 *__restrict__ d_normed =
+        static_cast<bf16 *>(norm_output_ptr) +
+        ((xcd_id >= (MPK_NUM_XCDS / 2))
+             ? (long long)BATCH_SIZE * output_stride
+             : 0);
+#else
     bf16 *__restrict__ d_normed = static_cast<bf16 *>(norm_output_ptr);
+#endif
     bf16 const *__restrict__ d_gate_w =
         static_cast<bf16 const *>(router_weight_ptr);
     bf16 const *__restrict__ d_rbias =
