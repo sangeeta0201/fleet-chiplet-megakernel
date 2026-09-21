@@ -2394,7 +2394,10 @@ if __name__ == "__main__":
                     _t.zero_()
         # W13+SwiGLU fused output: [bs, top_k, padded_intermediate]
         # (SwiGLU is fused into W13 epilogue — no separate mlp_mid buffer)
-        swiglu_out = make_tensor("swiglu_out", (bs, num_experts_per_tok, PADDED_INTERMEDIATE_SIZE))
+        # MPK_SWIGLU_AID: one copy per memory range (doubled along dim 0, so
+        # copy c starts at c * bs * topk * PADDED_INTERMEDIATE_SIZE).
+        _sw_bs = bs * 2 if os.environ.get("MPK_SWIGLU_AID", "0") == "1" else bs
+        swiglu_out = make_tensor("swiglu_out", (_sw_bs, num_experts_per_tok, PADDED_INTERMEDIATE_SIZE))
         # W2 output: [bs, top_k, padded_hidden]
         mlp_out = make_tensor("mlp_out", (bs, num_experts_per_tok, PADDED_HIDDEN_SIZE))
         # F32 workspace for W2 output: one private slab per (token, topk slot),

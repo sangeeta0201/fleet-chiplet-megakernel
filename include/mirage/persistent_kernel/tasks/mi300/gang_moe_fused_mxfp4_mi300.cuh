@@ -598,6 +598,12 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // SwiGLU intermediate is always BF16 (avoids broken FP8 intermediate from
   // commit 89c4f70)
   unsigned short *d_swiglu_out = (unsigned short *)swiglu_out_ptr;
+#ifdef MPK_SWIGLU_AID
+  // One copy per memory range, laid out end to end: copy c starts at
+  // c * swiglu_aid_half. W13 writes both; each W2 tile reads its own.
+  int const swiglu_aid_half =
+      MPK_MAX_NUM_BATCHED_TOKENS * NUM_TOPK * INTERMEDIATE_SIZE;
+#endif
   float *d_workspace_f32 = (float *)workspace_f32_ptr;
   int *d_barrier = (int *)barrier_ptr;
 
@@ -3195,6 +3201,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         if (tok_active) {
           if (do_packed_store) {
             st_wt_u32((void *)&d_swiglu_out[packed_out_idx], packed_swiglu);
+            #ifdef MPK_SWIGLU_AID
+            st_wt_u32((void *)&d_swiglu_out[swiglu_aid_half + packed_out_idx], packed_swiglu);
+            #endif
           } else if (do_tail_store) {
             // Tail: the packed store would run past W13_OUTPUT_SIZE, so fall
             // back to the per-element path for the one or two lanes that fit.
@@ -3217,6 +3226,10 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                               topk_slot * ACT_STRIDE + out_n / 2;
                 st_wt_u16(&d_swiglu_out[out_idx],
                           _gang_float_to_bf16(activated));
+                #ifdef MPK_SWIGLU_AID
+                st_wt_u16(&d_swiglu_out[swiglu_aid_half + out_idx],
+                          _gang_float_to_bf16(activated));
+                #endif
               }
             }
           }
@@ -3243,6 +3256,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
               int out_idx = my_tok * (NUM_TOPK * ACT_STRIDE) +
                             topk_slot * ACT_STRIDE + act_n;
               st_wt_u16(&d_swiglu_out[out_idx], _gang_float_to_bf16(activated));
+              #ifdef MPK_SWIGLU_AID
+              st_wt_u16(&d_swiglu_out[swiglu_aid_half + out_idx], _gang_float_to_bf16(activated));
+              #endif
             }
           }
         }
@@ -4080,6 +4096,10 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                                   topk_slot * ACT_STRIDE + act_n;
               st_wt_u32((void *)&d_swiglu_out[out_idx],
                         (unsigned)a0 | ((unsigned)a1 << 16));
+              #ifdef MPK_SWIGLU_AID
+              st_wt_u32((void *)&d_swiglu_out[swiglu_aid_half + out_idx],
+                        (unsigned)a0 | ((unsigned)a1 << 16));
+              #endif
             } else
 #endif
             for (int i = 0; i < 4; i += 2) {
@@ -4104,6 +4124,10 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                               topk_slot * ACT_STRIDE + act_n;
                 st_wt_u16(&d_swiglu_out[out_idx],
                           _gang_float_to_bf16(activated));
+                #ifdef MPK_SWIGLU_AID
+                st_wt_u16(&d_swiglu_out[swiglu_aid_half + out_idx],
+                          _gang_float_to_bf16(activated));
+                #endif
               }
             }
           }
@@ -4322,6 +4346,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             int out_idx = my_tok * (NUM_TOPK * ACT_STRIDE) +
                           topk_slot * ACT_STRIDE + act_n;
             st_wt_u16(&d_swiglu_out[out_idx], _gang_float_to_bf16(activated));
+            #ifdef MPK_SWIGLU_AID
+            st_wt_u16(&d_swiglu_out[swiglu_aid_half + out_idx], _gang_float_to_bf16(activated));
+            #endif
           }
         }
       }
@@ -4799,9 +4826,17 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                                       W2_SC_STRIDE, /*NT_LOAD=*/true>(
           d_swiglu_out, s_row_off, n_tok, s_tok_fp8, s_tok_scales);
     } else {
+      #ifdef MPK_SWIGLU_AID
+      // Read the copy homed in this XCD's own range. W13 published both.
+      unsigned short const *w2_input_base =
+          d_swiglu_out +
+          ((xcd_id >= (MPK_NUM_XCDS / 2)) ? swiglu_aid_half : 0) + my_tok * (NUM_TOPK * INTERMEDIATE_SIZE) +
+          topk_slot * INTERMEDIATE_SIZE;
+      #else
       unsigned short const *w2_input_base =
           d_swiglu_out + my_tok * (NUM_TOPK * INTERMEDIATE_SIZE) +
           topk_slot * INTERMEDIATE_SIZE;
+      #endif
 #ifdef MPK_WIDE_FP8_QUANT
       _gang_wave_parallel_fp8_quant_nt_wide<W2_K>(
           w2_input_base, s_tok_fp8, s_tok_scales);
