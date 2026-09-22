@@ -94,3 +94,18 @@ tests/standalone/test_mfma_pipeline_hazards
 # -fgpu-rdc adds these
 *-hip-amdgcn-amd-amdhsa-*
 *-hip-amdgcn-amd-amdhsa.mcin
+# AM / FFM-Lite run droppings (the models write these into $CWD)
+hierarchy_runtime_params.conf
+out_runtime_params.conf
+runtime_params.conf
+model.conf.pp
+params.txt.pp
+gclog_params.json
+perf*_counters*.txt
+perf*_counters*.csv
+utcl2_seed
+TestMain.*
+draw.log
+msg.log
+tests/mi450/b[0-9].txt
+tests/mi450/bld.txt
