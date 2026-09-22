@@ -1743,11 +1743,6 @@ def get_compile_command(
             # Publish one W13->W2 release slot per AID instead of eight.
             # Targets the measured 6.88us `arrive` on the last-arriving tile.
             flags = flags + ["-DMPK_MOE_NARROW_RELEASE"]
-        if int(os.environ.get("MPK_SWIGLU_AIDREP", "0")) == 1:
-            # swiglu's two copies in real per-AID BOs (reusing the split-flag
-            # replicas) instead of two halves of one single-range tensor.
-            # Targets MoE's largest ATT site: the nt gather at 6188 cyc/hit.
-            flags = flags + ["-DMPK_SWIGLU_AIDREP"]
         if int(os.environ.get("MPK_MOE_AID_EXPERT_W13", "0")) == 1:
             # Bisection: AID-own the W13 region only, W2 on the stock stripe.
             # Implies MPK_MOE_AID_EXPERT (it edits that block).

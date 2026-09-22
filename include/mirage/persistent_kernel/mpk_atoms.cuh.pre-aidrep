@@ -128,11 +128,6 @@ constexpr int MPK_AID_ROUTING_BASE_INTS = 32768;
 // the per-launch memset clears it, so these mirrors start at 0 every launch.
 // One line each so they never share a cache line.
 constexpr int MPK_AID_LMTAIL_BASE_INTS = 40960;
-
-// swiglu_out's two copies, inside the same per-AID replicas the split flags
-// use. 5888 ints each (NUM_TOPK * PADDED_INTERMEDIATE_SIZE shorts), clear of
-// the flag regions below 1024, LMTAIL at 40960 and EVCTR at 458752.
-constexpr int MPK_AID_SWIGLU_BASE_INTS = 200704;
 constexpr int MPK_AID_LMTAIL_MOE = 0;
 constexpr int MPK_AID_LMTAIL_RESADD = 16;
 constexpr int MPK_AID_LMTAIL_LMHEAD = 32;

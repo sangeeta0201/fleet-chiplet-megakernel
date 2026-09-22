@@ -598,22 +598,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // SwiGLU intermediate is always BF16 (avoids broken FP8 intermediate from
   // commit 89c4f70)
   unsigned short *d_swiglu_out = (unsigned short *)swiglu_out_ptr;
-#ifdef MPK_SWIGLU_AIDREP
-  // Genuinely per-AID copies: the replicas are separate BOs pinned one per
-  // memory range (alloc_in_aid), unlike the torch tensor which is a 47 KB
-  // suballocation wholly inside one range. Falls back to the tensor if
-  // placement failed, exactly as mpk_aid_flags_at does.
-  long long swiglu_aid_half =
-      (long long)MPK_MAX_NUM_BATCHED_TOKENS * NUM_TOPK * INTERMEDIATE_SIZE;
-  if (g_aid_flag_rep[0] != nullptr && g_aid_flag_rep[1] != nullptr) {
-    unsigned short *sw0 =
-        (unsigned short *)(g_aid_flag_rep[0] + MPK_AID_SWIGLU_BASE_INTS);
-    unsigned short *sw1 =
-        (unsigned short *)(g_aid_flag_rep[1] + MPK_AID_SWIGLU_BASE_INTS);
-    d_swiglu_out = sw0;
-    swiglu_aid_half = (long long)(sw1 - sw0);
-  }
-#elif defined(MPK_SWIGLU_AID)
+#ifdef MPK_SWIGLU_AID
   // One copy per memory range, laid out end to end: copy c starts at
   // c * swiglu_aid_half. W13 writes both; each W2 tile reads its own.
   int const swiglu_aid_half =
