@@ -182,3 +182,77 @@ Buffers that are read many-to-one and are **not** yet in per-AID replicas:
 
 And the largest open item is not MoE at all: **`worker_kernel` is 3.96x** and
 +129.0M of the +246.2M gap, versus MoE's +58.6M. Nothing has looked at it.
+
+---
+
+## MoE is now FASTER than NPS1: 0.742x (25.8% faster)
+
+Measured with the op isolation, against the same-build NPS1 reference taken on
+thor-3 (stock driver, all 8 dies SPX+NPS1):
+
+| arm | NPS2 (both fixes) | NPS1 ref | ratio |
+|---|---|---|---|
+| base | 2.056 | 1.880 | 1.094x |
+| op7 + op8 (`MPK_ONLY_OP=384`) | 1.702 | 1.557 | 1.093x |
+| op7 alone (`MPK_ONLY_OP=128`) | 1.177 | 0.849 | **1.386x** |
+| **MoE by subtraction** | **0.525** | **0.708** | **0.742x** |
+
+MoE went 0.941 -> 0.525 ms across the two fixes: from 1.329x SLOWER than NPS1
+to 25.8% faster, a 1.79x swing on that op.
+
+**This relocates the problem.** Decomposing the base gap:
+
+| contribution | ms |
+|---|---|
+| MoE | **-0.183** (a credit) |
+| op 7 (O-proj + router) | **+0.328** |
+| everything else | +0.031 |
+| total | +0.176 -> 2.056 vs 1.880 |
+
+**Op 7 alone is now larger than the entire remaining gap.** If it merely
+reached parity, decode would land near 1.73 ms -- below NPS1 -- because MoE's
+credit would carry it. And op 7's ATT region ratio is only 1.12x against a
+1.386x timing ratio, so most of its cost is in the wrapper that brackets it,
+not in `gang_linear` itself.
+
+## REJECTED: `MPK_ITER_XCD_POLL` -- per-token slack is not per-layer traffic
+
+MoE-isolated ATT made `worker_kernel` the largest single gap (43.6 -> 172.6M,
+**3.96x**), concentrated in two adjacent sites:
+
+```
+0x2F104  s_waitcnt vmcnt(0) lgkmcnt(0)   59.1M   3,708 hits   15,929 cyc/hit
+0x2F170  s_barrier                       70.4M     252 hits  279,557 cyc/hit
+```
+
+The disassembly identified them as the iteration-boundary gate at
+`persistent_kernel.cuh:1664` -- a single u64 load of `precomp_iter_ready`
+compared against `pc_iter`, under `if (threadIdx.x == 0)`, so all 248 worker
+blocks poll ONE spanning-NC line while the other 255 threads of each block sit
+at the `__syncthreads()` below. Textbook contention shape.
+
+A per-XCD mirror already existed and the loop ignored it: the scheduler
+publishes `st_wt_u32` into `precomp_iter_xcd_release[x*16]` right after bumping
+the counter, and `prepare_kernel` zeroes it. Pointing the wait at that mirror
+(read with `MPK_LD_GATE2` = `ld_sys_s32`, never `ld_nt_s32`, which never
+observes an `st_wt` publish) measured:
+
+  control 2.134 / 2.062 / 2.102   mean 2.0993
+  variant 2.074 / 2.123 / 2.024   mean 2.0737
+  **-1.22%, paired t = -0.59**, 2/3 wins, hash green 7/7, no timeouts
+
+**Why a 3.96x ATT site yielded nothing, and the rule to take from it:**
+
+1. **Check the hit counts before believing a cyc/hit.** The barrier fires 252
+   times and the poll 3,708 times in the whole run -- the gate runs once per
+   TOKEN, so it has 1/36 the leverage of anything inside the layer loop. A huge
+   per-hit cost on a rare site is a small share of wall time.
+2. **That wait is slack, not waste.** Workers are waiting for the previous
+   iteration to genuinely finish (the comment says orphan tasks would corrupt
+   activation buffers otherwise). Removing poll contention cannot make the
+   previous iteration finish sooner. This is the same ~5% ceiling already
+   recorded for all barrier/poll work.
+
+The two wins removed **real traffic on a per-layer path**; this removed
+contention from a **per-token dependency**, and there was nothing to remove.
+Kept default-off.

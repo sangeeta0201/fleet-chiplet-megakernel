@@ -1748,11 +1748,6 @@ def get_compile_command(
             # replicas) instead of two halves of one single-range tensor.
             # Targets MoE's largest ATT site: the nt gather at 6188 cyc/hit.
             flags = flags + ["-DMPK_SWIGLU_AIDREP"]
-        if int(os.environ.get("MPK_ITER_XCD_POLL", "0")) == 1:
-            # Poll the per-XCD mirror of iter_ready at the iteration boundary
-            # instead of the shared spanning-NC counter. Targets the largest
-            # NPS1->NPS2 gap: worker_kernel at 3.96x.
-            flags = flags + ["-DMPK_ITER_XCD_POLL"]
         if int(os.environ.get("MPK_MOE_AID_EXPERT_W13", "0")) == 1:
             # Bisection: AID-own the W13 region only, W2 on the stock stripe.
             # Implies MPK_MOE_AID_EXPERT (it edits that block).

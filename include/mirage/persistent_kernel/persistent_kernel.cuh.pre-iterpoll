@@ -1661,31 +1661,6 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
         // All workers must wait at iteration boundary because orphan tasks
         // (e.g., embed) have no dependency event and would execute immediately,
         // corrupting activation buffers if the previous iteration isn't done.
-#ifdef MPK_ITER_XCD_POLL
-        // 248 worker blocks polling one spanning-NC u64 is the measured
-        // contention cliff (2426 ns at 1 poller -> 52251 at 256). The
-        // scheduler already mirrors iter_ready into a per-XCD line right after
-        // bumping it; read that instead so the pollers spread over eight
-        // lines. All eight slots hold the same value, so which one a worker
-        // reads cannot affect correctness -- it only changes contention, which
-        // matters because the worker->XCD map is rotated by one.
-        // Lags the counter by one store: can delay a release, never grant one
-        // early. MPK_LD_GATE2 is ld_sys_s32 (sc0 sc1, past L2); an nt load
-        // would never observe the st_wt publish at all.
-        int *_itrel = config.precomp_iter_xcd_release;
-        if (_itrel != nullptr) {
-          unsigned _xcc;
-          asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID)" : "=s"(_xcc));
-          int *_slot = _itrel + (int)(_xcc & (MPK_NUM_XCDS - 1)) * 16;
-          while ((unsigned)MPK_LD_GATE2(_slot) < (unsigned)pc_iter) {
-            if (__atomic_load_n(config.precomp_terminate, __ATOMIC_RELAXED)) {
-              pc_terminated = 1;
-              break;
-            }
-            __builtin_amdgcn_s_sleep(1);
-          }
-        } else
-#endif
         while (__atomic_load_n(config.precomp_iter_ready, __ATOMIC_RELAXED) <
                pc_iter) {
           if (__atomic_load_n(config.precomp_terminate, __ATOMIC_RELAXED)) {
