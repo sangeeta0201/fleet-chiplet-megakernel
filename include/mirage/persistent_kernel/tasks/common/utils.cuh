@@ -103,8 +103,26 @@ __forceinline__ __device__ float ptx_log2(float x) {
 }
 
 static __device__ __forceinline__ int lane_id() {
-#if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
-  // AMD: use native 64-thread wavefront
+  // Keyed off the compiler's own __gfx1250__, NOT mirage's MIRAGE_ARCH_GFX1250:
+  // that macro is defined in arch_traits.cuh, which this header does not
+  // include, so a guard spelled that way would compile cleanly and never fire
+  // -- leaving the wave64 mask in place while looking fixed.
+#if defined(__gfx1250__)
+  // gfx1250 is wave32. The 0x3f mask below is not merely imprecise here, it is
+  // wrong in a way that produces a plausible answer: `lane_id() == 0` is the
+  // predicate that elects one thread per wave to write cross-wave reduction
+  // scratch, and at wave32 it elects only threads 0, 64, 128, 192 -- one per
+  // TWO waves. The odd waves' partials are never written, and the slots are
+  // read back as whatever was in LDS.
+  //
+  // Measured, not inferred: with a 256-thread argmax over 1024 logits and the
+  // true maximum placed at an index owned by thread 33 (wave 1), the block
+  // reduction returned 16 instead of 1000. argmax is the last task in the
+  // model -- it picks the emitted token -- so this is a wrong-output bug, not
+  // a numerical one.
+  return threadIdx.x & 0x1f;
+#elif defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
+  // AMD gfx9: native 64-thread wavefront
   return threadIdx.x & 0x3f; // 64-thread wavefront
 #else
   // CUDA: 32-thread warp

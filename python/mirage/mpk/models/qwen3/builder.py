@@ -281,6 +281,18 @@ class Qwen3Builder(GraphBuilder):
             self.qkv_zero_res = self.mpk.attach_input(
                 torch_tensor=self.qkv_zero_res_tensor, name="qkv_zero_residual")
         # CK FMHA batch-independent attention workspace
+        #
+        # The (94, 95) literal here is deliberate and must NOT be widened to
+        # mpk.AMD_CCS. Every other `target_cc in (94, 95)` in the codebase meant
+        # "is this AMD" and became AMD_CCS when gfx1250 was added; this one
+        # means "does CK's FMHA support this target", and gfx1250 is the case
+        # where those two questions diverge. CK routes WMMA through
+        # __builtin_amdgcn_wmma_*_w32_gfx12, which requires target feature
+        # wmma-128b-insts; gfx1250 does not have that feature and its WMMA
+        # builtins are a disjoint set with different tile shapes, so CK FMHA is
+        # a rewrite rather than a patch. MI450 uses the native WMMA decode
+        # kernel (tasks/mi450/paged_attention_wmma_decode_hd64_mi450.cuh)
+        # instead, so this must stay False even when USE_CK_FMHA=1 is exported.
         self.use_ck_fmha = (target_cc in (94, 95) and int(os.environ.get("USE_CK_FMHA", "0")) == 1)
         if self.use_ck_fmha:
             print(f"[CK FMHA] Batch-independent attention enabled (target_cc={target_cc})")

@@ -15,6 +15,7 @@
  *      hidden=2880 to STORAGE_DIM=3072 for tile alignment).
  */
 #pragma once
+#include "arch_traits.cuh" // wave_reduce_sum, wave_of/lane_of, xcd_id, inv_l2
 #include "gang_linear_mi300.cuh"
 #include "moe_topk_softmax_mi300.cuh"
 #include <hip/hip_bf16.h>
@@ -88,18 +89,20 @@ __device__ __forceinline__ void rmsnorm_inline_amd(void const *input_ptr,
     sum += val * val;
   }
 
-// ── Phase 2: wavefront reduction (AMD wavefront = 64 lanes) ──
-#pragma unroll
-  for (int offset = 32; offset > 0; offset >>= 1) {
-    sum += __shfl_xor(sum, offset);
-  }
+  // ── Phase 2: wavefront reduction (width from arch_traits, not 64) ──
+  // The butterfly must start at WAVE_SIZE/2: starting at 32 on a wave32 part
+  // makes the first __shfl_xor a no-op self-shuffle, so every lane keeps its
+  // own partial and the "reduced" sum is silently a 1-lane sum.
+  sum = mirage::arch::wave_reduce_sum(sum);
 
   // ── Phase 3: cross-wavefront reduction via shared memory ──
   // Use a static __shared__ array — independent of CK pipeline's dynamic LDS.
-  __shared__ float red[16]; // up to 16 wavefronts (1024 threads)
-  int wave_id = tid >> 6;
-  int lane_id = tid & 63;
-  int num_waves = nthreads >> 6;
+  // Sized for the worst case at this wave width (32 waves of 32 lanes), since
+  // 256 threads is 8 wave32s where it was 4 wave64s.
+  __shared__ float red[mirage::arch::MAX_WAVES_PER_BLOCK];
+  int wave_id = mirage::arch::wave_of(tid);
+  int lane_id = mirage::arch::lane_of(tid);
+  int num_waves = mirage::arch::waves_in(nthreads);
 
   if (lane_id == 0) {
     red[wave_id] = sum;
@@ -225,9 +228,9 @@ using bf16_t = __hip_bfloat16;
 
 __device__ __forceinline__ int get_xcd_id() {
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
-  int xcd_id;
-  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)" : "=s"(xcd_id));
-  return xcd_id;
+  // gfx1250 has no HW_REG_XCC_ID; arch_traits::xcd_id() picks the right
+  // mechanism per target (and honours MIRAGE_XCD_ID_FALLBACK).
+  return mirage::arch::xcd_id();
 #else
   return 0;
 #endif
@@ -268,7 +271,8 @@ __device__ __attribute__((noinline)) void
   // token is simply routed through the wrong experts. The signature to watch
   // for is moe_routing_indices / moe_mask differing between runs while
   // attention is bit-identical.
-  asm volatile("buffer_inv" ::: "memory");
+  // gfx1250 spells this global_inv; buffer_inv is a gfx9-only mnemonic.
+  mirage::arch::inv_l2();
 
   topk_softmax_mi300_task_impl<T,
                                /*VPT=*/8,
@@ -337,9 +341,14 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   bf16 *__restrict__ d_logits = static_cast<bf16 *>(logits_scratch_ptr);
 
   int const tid = threadIdx.x;
-  int const lane = tid & 63;
-  int const wave = tid >> 6;
-  constexpr int NUM_WAVES = 4; // 256 threads / 64 lanes
+  int const lane = mirage::arch::lane_of(tid);
+  int const wave = mirage::arch::wave_of(tid);
+  // Wave count is a property of the launch, not a constant: 256 threads is
+  // 4 wave64s on gfx950 but 8 wave32s on gfx1250. Hardcoding 4 makes the
+  // cross-wave sums below read only the first half of the partials, which
+  // loses half of every RMS and every gate dot product -- a wrong number, not
+  // a crash. Derived from blockDim so one binary is right at either width.
+  int const num_waves = mirage::arch::waves_in((int)blockDim.x);
 
   // ═══ Step 1: RMSNorm — compute irms from hidden state ═══
   // All 256 threads collaborate. Vectorized 4-wide bf16 loads.
@@ -361,11 +370,10 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     }
   }
 
-// Wave-level reduction (64 lanes)
-#pragma unroll
-  for (int off = 32; off > 0; off >>= 1) {
-    ssq += __shfl_xor(ssq, off);
-  }
+  // Wave-level reduction. Width comes from arch_traits: a butterfly that
+  // starts at offset 32 on a wave32 part begins with a self-shuffle, so each
+  // lane keeps only its own partial.
+  ssq = mirage::arch::wave_reduce_sum(ssq);
 
   // Cross-wave reduction via LDS.
   //
@@ -377,8 +385,8 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   // the full failure analysis in
   // gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh, which is where this
   // pipeline was copied from.
-  __shared__ float red[16];
-  __shared__ float red_dp[16];
+  __shared__ float red[mirage::arch::MAX_WAVES_PER_BLOCK];
+  __shared__ float red_dp[mirage::arch::MAX_WAVES_PER_BLOCK];
   if (lane == 0) {
     red[wave] = ssq;
   }
@@ -387,7 +395,7 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   float irms;
   if (tid == 0) {
     float tot = 0.0f;
-    for (int w = 0; w < NUM_WAVES; w++) {
+    for (int w = 0; w < num_waves; w++) {
       tot += red[w];
     }
     red[0] = MPK_RMS_RCP(tot, ACTUAL_HIDDEN_DIM, 1e-5f);
@@ -448,11 +456,8 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     }
   }
 
-// Wave-level reduction for dp
-#pragma unroll
-  for (int off = 32; off > 0; off >>= 1) {
-    dp += __shfl_xor(dp, off);
-  }
+  // Wave-level reduction for dp (same width caveat as the ssq reduce above).
+  dp = mirage::arch::wave_reduce_sum(dp);
 
   // Cross-wave LDS reduce. Into red_dp, not red: red[0] is still the irms
   // broadcast that step 2 above reads.
@@ -464,7 +469,7 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   // tid==0 writes logit + bias via write-through store
   if (tid == 0) {
     float s = 0.0f;
-    for (int w = 0; w < NUM_WAVES; w++) {
+    for (int w = 0; w < num_waves; w++) {
       s += red_dp[w];
     }
     if (d_bias) {
@@ -478,7 +483,10 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   // Write-through stores (sc0 sc1) bypass L2 → HBM. s_waitcnt ensures
   // stores are globally visible before incrementing counter.
   __syncthreads();
-  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  // gfx12 splits gfx9's vmcnt into loadcnt/storecnt. These are write-through
+  // *stores* being made visible before the counter increment, so dropping the
+  // storecnt half would release the barrier before the data landed.
+  mirage::arch::wait_vmem();
 
   __shared__ int s_completed;
   if (tid == 0) {

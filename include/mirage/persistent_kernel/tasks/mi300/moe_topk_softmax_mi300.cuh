@@ -22,11 +22,17 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
 
-#include "mpk_atoms.cuh" // st_wt_u16, st_wt_u32
+#include "arch_traits.cuh" // WAVE_SIZE, lane_mask_t, ballot
+#include "mpk_atoms.cuh"   // st_wt_u16, st_wt_u32
 
 namespace kernel {
 
-static constexpr int MI300_WARP_SIZE = 64; // AMD wavefront size
+// AMD wavefront size. Not 64 unconditionally any more: gfx1250 (MI450) runs
+// wave32, and every use below -- the row-to-lane mapping, the ballot mask
+// width, and the expert compaction stride -- has to follow the real width or
+// the kernel silently processes the wrong rows. mirage::arch::WAVE_SIZE is a
+// constant expression (unlike HIP's warpSize), so it can size the mapping math.
+static constexpr int MI300_WARP_SIZE = mirage::arch::WAVE_SIZE;
 
 // Fused TopK softmax kernel for AMD MI300/MI350.
 // Uses wave-level reductions with __shfl_xor for max/sum across experts.
@@ -219,62 +225,41 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
 
     for (int k_idx = 0; k_idx < k; ++k_idx) {
       // ── Step 1: Branchless local argmax over VPT=8 elements ──
-      float max_val;
-      int expert;
-      asm volatile("v_mov_b32 %[mv], %[r0]\n"
-                   "v_mov_b32 %[ex], %[c0]\n"
-                   "v_cmp_gt_f32 vcc, %[r1], %[mv]\n"
-                   "v_cndmask_b32 %[mv], %[mv], %[r1], vcc\n"
-                   "v_cndmask_b32 %[ex], %[ex], %[c1], vcc\n"
-                   "v_cmp_gt_f32 vcc, %[r2], %[mv]\n"
-                   "v_cndmask_b32 %[mv], %[mv], %[r2], vcc\n"
-                   "v_cndmask_b32 %[ex], %[ex], %[c2], vcc\n"
-                   "v_cmp_gt_f32 vcc, %[r3], %[mv]\n"
-                   "v_cndmask_b32 %[mv], %[mv], %[r3], vcc\n"
-                   "v_cndmask_b32 %[ex], %[ex], %[c3], vcc\n"
-                   "v_cmp_gt_f32 vcc, %[r4], %[mv]\n"
-                   "v_cndmask_b32 %[mv], %[mv], %[r4], vcc\n"
-                   "v_cndmask_b32 %[ex], %[ex], %[c4], vcc\n"
-                   "v_cmp_gt_f32 vcc, %[r5], %[mv]\n"
-                   "v_cndmask_b32 %[mv], %[mv], %[r5], vcc\n"
-                   "v_cndmask_b32 %[ex], %[ex], %[c5], vcc\n"
-                   "v_cmp_gt_f32 vcc, %[r6], %[mv]\n"
-                   "v_cndmask_b32 %[mv], %[mv], %[r6], vcc\n"
-                   "v_cndmask_b32 %[ex], %[ex], %[c6], vcc\n"
-                   "v_cmp_gt_f32 vcc, %[r7], %[mv]\n"
-                   "v_cndmask_b32 %[mv], %[mv], %[r7], vcc\n"
-                   "v_cndmask_b32 %[ex], %[ex], %[c7], vcc\n"
-                   : [mv] "=&v"(max_val), [ex] "=&v"(expert)
-                   : [r0] "v"(row_chunk[0]),
-                     [r1] "v"(row_chunk[1]),
-                     [r2] "v"(row_chunk[2]),
-                     [r3] "v"(row_chunk[3]),
-                     [r4] "v"(row_chunk[4]),
-                     [r5] "v"(row_chunk[5]),
-                     [r6] "v"(row_chunk[6]),
-                     [r7] "v"(row_chunk[7]),
-                     [c0] "v"(col[0]),
-                     [c1] "v"(col[1]),
-                     [c2] "v"(col[2]),
-                     [c3] "v"(col[3]),
-                     [c4] "v"(col[4]),
-                     [c5] "v"(col[5]),
-                     [c6] "v"(col[6]),
-                     [c7] "v"(col[7])
-                   : "vcc");
+      // Portable form of what used to be a hand-written v_cmp/v_cndmask
+      // chain. The asm existed to guarantee branchless select rather than an
+      // s_and_saveexec diverge-and-rejoin; a ternary on a scalar float lowers
+      // to exactly v_cmp_gt_f32 + v_cndmask_b32 on both gfx950 and gfx1250, so
+      // the codegen is unchanged and the wave-width assumption baked into the
+      // literal `vcc` operand is gone. (`vcc` is 64-bit on gfx9 and 32-bit on
+      // gfx12; naming it explicitly is exactly the kind of thing that would
+      // have silently mismatched at wave32.)
+      //
+      // Ties: strict `>` keeps the lowest index, matching the original.
+      float max_val = row_chunk[0];
+      int expert = col[0];
+#pragma unroll
+      for (int i = 1; i < VPT; ++i) {
+        bool const gt = row_chunk[i] > max_val;
+        expert = gt ? col[i] : expert;
+        max_val = gt ? row_chunk[i] : max_val;
+      }
 
       // ── Step 2: Branchless argmax reduce across subgroup ──
-      // Uses __shfl_xor for cross-lane communication, inline asm for
-      // branchless compare+select (eliminates s_and_saveexec divergence).
+      // Butterfly over THREADS_PER_ROW lanes. The compare+select was hand
+      // written asm to keep it branchless rather than an s_and_saveexec
+      // diverge-and-rejoin; two ternaries on the same predicate lower to the
+      // identical v_cmp_gt_f32 + two v_cndmask_b32 on gfx950 and gfx1250, so
+      // the codegen is unchanged and the explicit `vcc` operand -- 64-bit on
+      // gfx9, 32-bit on gfx12 -- is gone.
+      //
+      // Ties: `>` keeps the *current* lane's expert, so the winner is the
+      // lowest-numbered lane holding the max, exactly as before.
       for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
-        float other_max = __shfl_xor(max_val, mask, THREADS_PER_ROW);
-        int other_expert = __shfl_xor(expert, mask, THREADS_PER_ROW);
-        asm volatile("v_cmp_gt_f32 vcc, %[om], %[mv]\n"
-                     "v_cndmask_b32 %[mv], %[mv], %[om], vcc\n"
-                     "v_cndmask_b32 %[ex], %[ex], %[oe], vcc\n"
-                     : [mv] "+v"(max_val), [ex] "+v"(expert)
-                     : [om] "v"(other_max), [oe] "v"(other_expert)
-                     : "vcc");
+        float const other_max = __shfl_xor(max_val, mask, THREADS_PER_ROW);
+        int const other_expert = __shfl_xor(expert, mask, THREADS_PER_ROW);
+        bool const gt = other_max > max_val;
+        expert = gt ? other_expert : expert;
+        max_val = gt ? other_max : max_val;
       }
 
       // ── Step 3: Write top-k result ──
@@ -304,13 +289,13 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
       // expert == col[i] matches exactly one thread + one element.
       if (k_idx + 1 < k) {
         float const neg_inf = -10000.f;
+        // Was v_cmp_eq_u32 + v_cndmask_b32 by hand, for the same
+        // branchless-select reason as Steps 1 and 2. The ternary lowers to the
+        // same pair on both targets without naming the wave-width-dependent
+        // `vcc` register.
 #pragma unroll
         for (int i = 0; i < VPT; ++i) {
-          asm volatile("v_cmp_eq_u32 vcc, %[ex], %[ci]\n"
-                       "v_cndmask_b32 %[rc], %[rc], %[ni], vcc\n"
-                       : [rc] "+v"(row_chunk[i])
-                       : [ex] "v"(expert), [ci] "v"(col[i]), [ni] "v"(neg_inf)
-                       : "vcc");
+          row_chunk[i] = (expert == col[i]) ? neg_inf : row_chunk[i];
         }
       }
     }
@@ -338,14 +323,23 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
   // [0, count) or index by tile.
   if (active_expert_ids != nullptr && threadIdx.x < MI300_WARP_SIZE) {
     int const lane = threadIdx.x;
-    unsigned long long const lane_mask = (1ULL << lane) - 1ULL;
+    // Width-correct prefix mask. `1ULL << lane` was safe only because lane was
+    // known to be < 64; at wave32 the mask type shrinks with the wave, and
+    // lane_mask_t/FULL_WAVE_MASK keep the two in step. Note __ballot returns
+    // 64 bits on both targets (the upper half is simply zero at wave32), so
+    // the AND with lane_mask is what actually bounds the popcount.
+    using mask_t = mirage::arch::lane_mask_t;
+    mask_t const lane_mask =
+        (mask_t)((lane == 0) ? 0 : (mirage::arch::FULL_WAVE_MASK >>
+                                    (mirage::arch::WAVE_SIZE - lane)));
     int count = 0;
     for (int base = 0; base < NUM_EXPERTS; base += MI300_WARP_SIZE) {
       int const e = base + lane;
       bool const hit = (e < NUM_EXPERTS) && (s_hit[e] != 0);
       unsigned long long const ballot = __ballot(hit);
       if (hit) {
-        int const pos = count + __popcll(ballot & lane_mask);
+        int const pos =
+            count + __popcll(ballot & (unsigned long long)lane_mask);
         st_wt_u32((void *)&active_expert_ids[pos], (unsigned)(start_expert + e));
       }
       count += __popcll(ballot);

@@ -81,7 +81,7 @@ __device__ __forceinline__ void moe_residual_add_f32_mi300_impl(
   //
   // See the layer-boundary acquire at the top of
   // gang_full_layer_fused_mi300.cuh for the full ablation.
-  asm volatile("buffer_inv sc1" ::: "memory");
+  mirage::arch::inv_l2(); // gfx950: buffer_inv sc1 / gfx1250: global_inv SCOPE_DEV
 
   for (int row = 0; row < BATCH_SIZE; ++row) {
     float *ws_row = d_ws + moe_ws_offset(row, 0, OUTPUT_STRIDE);

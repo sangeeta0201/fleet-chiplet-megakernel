@@ -37,7 +37,25 @@
 #include "tasks/mi300/gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh"
 #include "tasks/mi300/gang_moe_fused_mxfp4_mi300.cuh"
 #include "tasks/mi300/gang_rmsnorm_linear_mxfp4_bias_mi300.cuh"
+#if !defined(MIRAGE_AMD_MI450)
+// This include is unconditional on every other target because this file calls
+// paged_attention_ck_fmha_split_kv_impl directly (phase 3, below).
+//
+// It has to be skipped on gfx1250, and skipping it is not merely an
+// optimization. CK's WMMA path needs the wmma-128b-insts target feature, which
+// gfx1250 does not have, so this header cannot compile for MI450 at all. And
+// tasks/mi450/task_header.cuh #defines paged_attention_ck_fmha_split_kv_impl to
+// the gfx1250 WMMA dispatch wrapper, which means the macro rewrites CK's own
+// declaration below into a second declaration of the mi450 template -- the
+// error is "redefinition of default argument" at the sliding_window parameter,
+// which points at CK's file and reads like a bug in CK rather than a name
+// collision.
+//
+// The call site needs no #if: the macro makes the name resolve to
+// ::kernel::mi450::paged_attention_wmma_split_kv_impl, whose template list and
+// signature match CK's position for position.
 #include "tasks/mi300/paged_attention_ck_fmha_split_kv_mi300.cuh"
+#endif
 
 namespace kernel {
 

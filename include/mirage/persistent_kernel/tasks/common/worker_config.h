@@ -17,7 +17,26 @@
 
 // NUM_THREADS: The number of threads used for loop strides in kernels
 // Must match the actual thread count used when launching kernels
-#if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
+#if defined(__gfx1250__)
+// MI450 (gfx1250) is wave32, not wave64.
+//
+// Keyed off the compiler's __gfx1250__ rather than MIRAGE_AMD_MI450: this
+// header is included by host translation units too, and the value has to track
+// the *device* wave width in the device pass. Note the consequence -- in a host
+// pass __gfx1250__ is absent, so an mi450 host build still sees 64 here. That
+// is intentional and matches arch_traits.cuh's own comment: host-side code uses
+// this only for launch math, never for lane arithmetic.
+//
+// This is not cosmetic. NUM_THREADS_PER_WARP feeds warp_id() in utils.cuh and
+// the butterfly width in argmax_mi300.cuh's warp_reduce_max_idx. At 64 on a
+// 32-lane wave, warp_id() reports 4 waves where there are 8, and the argmax
+// block reduction drops the partials of every odd wave -- measured returning
+// 16 where the true maximum was 1000. Since argmax emits the output token,
+// that is a wrong answer rather than a slow one.
+constexpr int NUM_THREADS = 256;
+constexpr int NUM_THREADS_PER_WARP = 32;
+constexpr int NUM_WARPS = 8; // 256 / 32
+#elif defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
 // AMD MI300 uses 256 threads with native 64-thread wavefronts
 constexpr int NUM_THREADS = 256;
 constexpr int NUM_THREADS_PER_WARP = 64; // Native AMD wavefront size

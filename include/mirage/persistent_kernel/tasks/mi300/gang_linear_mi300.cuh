@@ -15,6 +15,23 @@
 
 #pragma once
 #include "linear_ck_mi300.cuh"
+// For mirage::arch::realtime_ticks() under MPK_ENABLE_DEVICE_TASK_TIMING:
+// s_memrealtime does not exist on gfx1250.
+#include "mirage/persistent_kernel/arch_traits.cuh"
+
+// Which GEMM the gang wrappers call.
+//
+// The HipKittens Algorithm 1 windowed traversal below is arch-independent --
+// it is pure tile-index arithmetic. The only gfx9 dependency in this file is
+// the inner GEMM. CK's pipeline cannot be instantiated for gfx1250: the header
+// parses, but instantiating linear_kernel_ck dies in the backend with
+// "Cannot select: intrinsic %llvm.amdgcn.s.waitcnt" (verified, not assumed --
+// which is why the include above can stay unguarded and only the call needs to
+// change). tasks/mi450/task_header.cuh defines this to the WMMA replacement,
+// whose signature is identical by construction.
+#ifndef MPK_LINEAR_KERNEL
+#define MPK_LINEAR_KERNEL linear_kernel_ck
+#endif
 
 namespace kernel {
 
@@ -99,9 +116,9 @@ __device__ __forceinline__ void gang_linear_kernel(
                                    : nullptr;
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
-  unsigned long long _t0 = __builtin_amdgcn_s_memrealtime();
+  unsigned long long _t0 = mirage::arch::realtime_ticks();
 #endif
-  linear_kernel_ck<T, BATCH_SIZE, REDUCTION_SIZE>(tile_input,
+  MPK_LINEAR_KERNEL<T, BATCH_SIZE, REDUCTION_SIZE>(tile_input,
                                                   tile_weight,
                                                   nullptr,
                                                   tile_output,
@@ -113,7 +130,7 @@ __device__ __forceinline__ void gang_linear_kernel(
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
   __syncthreads();
   if (threadIdx.x == 0 && blockIdx.x == 0) {
-    unsigned long long _dur = (__builtin_amdgcn_s_memrealtime() - _t0) * 10;
+    unsigned long long _dur = (mirage::arch::realtime_ticks() - _t0) * 10;
     printf("[GANG_LINEAR] ostride=%d tile=%d dur_us=%.1f\n",
            o_stride,
            tile_idx,
@@ -180,9 +197,9 @@ __device__ __forceinline__ void gang_linear_residual_kernel(
                                    : nullptr;
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
-  unsigned long long _t0 = __builtin_amdgcn_s_memrealtime();
+  unsigned long long _t0 = mirage::arch::realtime_ticks();
 #endif
-  linear_kernel_ck<T, BATCH_SIZE, REDUCTION_SIZE>(tile_input,
+  MPK_LINEAR_KERNEL<T, BATCH_SIZE, REDUCTION_SIZE>(tile_input,
                                                   tile_weight,
                                                   tile_residual,
                                                   tile_output,
@@ -194,7 +211,7 @@ __device__ __forceinline__ void gang_linear_residual_kernel(
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
   __syncthreads();
   if (threadIdx.x == 0 && blockIdx.x == 0) {
-    unsigned long long _dur = (__builtin_amdgcn_s_memrealtime() - _t0) * 10;
+    unsigned long long _dur = (mirage::arch::realtime_ticks() - _t0) * 10;
     printf("[GANG_LINEAR_RES] ostride=%d tile=%d dur_us=%.1f\n",
            o_stride,
            tile_idx,

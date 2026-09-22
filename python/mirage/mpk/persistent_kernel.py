@@ -14,6 +14,22 @@ from .speculative import (
 )
 from typing import Optional
 
+# Every AMD compute-capability code this file knows how to emit for.
+#
+# `target_cc in AMD_CCS` reads throughout as "is this an AMD target", which is
+# what the ~47 call sites below actually mean -- they were spelled
+# `target_cc in (94, 95)` because those were the only two AMD codes that had
+# ever existed. Adding gfx1250 as a third literal at each site is the same edit
+# 47 times with 47 chances to miss one, and the failure mode of a miss is
+# silent: an MI450 build takes the NVIDIA branch, emits PTX-shaped code, and
+# fails somewhere far from the cause. A named constant makes the next
+# architecture a one-line change.
+#
+#   94  = gfx942  (MI300,  64KB LDS)
+#   95  = gfx950  (MI350/MI355, 160KB LDS)
+#   125 = gfx1250 (MI450,  wave32 + WMMA)
+AMD_CCS = (94, 95, 125)
+
 HARD_CODE = """
 #include <Python.h>
 
@@ -269,7 +285,7 @@ def get_compile_command(
             "-DMPK_ENABLE_TMA",
             "-DMIRAGE_GRACE_BLACKWELL",
         ]
-    elif target_cc in (94, 95):
+    elif target_cc in AMD_CCS:
         # MI300/MI350 ROCm: use HIP. specific_cmd set below with ROCm-specific args.
         specific_cmd = []
     else:
@@ -277,7 +293,7 @@ def get_compile_command(
             "-arch=native",
         ]
 
-    if target_cc in (94, 95):
+    if target_cc in AMD_CCS:
         # ROCm/MI300/MI350 compile path: hipcc, ROCm includes/libs
         rocm_home = os.environ.get("ROCM_PATH", "/opt/rocm")
         rocm_include = os.path.join(rocm_home, "include")
@@ -331,6 +347,14 @@ def get_compile_command(
             "-o",
             py_so_path,
         ]
+        if target_cc == 125:
+            # MI450 selects tasks/mi450/task_header.cuh at
+            # persistent_kernel.cuh:332. Note MIRAGE_AMD_MI300 stays defined
+            # above and is NOT an error: ~30 sites use that macro to mean
+            # "AMD, not NVIDIA", and the mi450 branch is tested first, so the
+            # two coexist. Undefining it would reroute all thirty to the CUDA
+            # path.
+            flags = flags + ["-DMIRAGE_AMD_MI450"]
         if mpk.mode == "offline":
             flags = flags + ["-DMODE_OFFLINE"]
         elif mpk.mode == "online":
@@ -499,7 +523,16 @@ class PersistentKernel:
         if self.is_rocm:
             # Detect AMD GPU generation from offload-arch target
             amdgpu_target = os.environ.get("AMDGPU_TARGETS", "gfx950")
-            if "gfx950" in amdgpu_target:
+            if "gfx1250" in amdgpu_target:
+                # MI450 (gfx1250). Tested first: it is the only one of the
+                # three whose name does not contain "gfx95"/"gfx94", but
+                # ordering it last would still be fine -- what matters is that
+                # it precedes the bare `else`, which used to silently claim
+                # every unrecognised target as MI300 and would therefore have
+                # compiled an MI450 build with 64KB of LDS and MFMA task
+                # headers.
+                self.target_cc = 125
+            elif "gfx950" in amdgpu_target:
                 self.target_cc = 95  # MI350 (gfx950): 160KB LDS
             else:
                 self.target_cc = 94  # MI300 (gfx942): 64KB LDS
@@ -981,7 +1014,7 @@ class PersistentKernel:
         )
         if self.target_cc == 100:
             self.kn_graph.register_task(tb_graph, "paged_attention_split_kv_sm100", params)
-        elif self.target_cc in (94, 95):
+        elif self.target_cc in AMD_CCS:
             self.kn_graph.register_task(tb_graph, "paged_attention_split_kv_mi300", params)
         elif self.target_cc == 90:
             self.kn_graph.register_task(tb_graph, "paged_attention_split_kv_hopper", params)
@@ -1026,7 +1059,7 @@ class PersistentKernel:
         )
         if self.target_cc == 100 or self.target_cc == 90:
             self.kn_graph.register_task(tb_graph, "paged_attention_split_kv_merge_sm100", params)
-        elif self.target_cc in (94, 95):
+        elif self.target_cc in AMD_CCS:
             self.kn_graph.register_task(tb_graph, "paged_attention_split_kv_merge_mi300", params)
         else:
             raise ValueError(f"Unsupported target CC: {self.target_cc}")
@@ -1253,7 +1286,7 @@ class PersistentKernel:
         assert input.num_dims == 2
         assert k_cache.num_dims == 4
         assert v_cache.num_dims == 4
-        assert self.target_cc in (94, 95), "Gang attention only supported on MI300X"
+        assert self.target_cc in AMD_CCS, "Gang attention only supported on MI300X"
 
         head_dim = k_cache.dim(3)
         num_kv_heads = k_cache.dim(2)
@@ -1319,7 +1352,7 @@ class PersistentKernel:
         assert lse.num_dims == 3
         assert output_tmp.num_dims == 3
         assert output.num_dims == 2
-        assert self.target_cc in (94, 95), "Gang attention only supported on MI300X"
+        assert self.target_cc in AMD_CCS, "Gang attention only supported on MI300X"
 
         num_q_heads = attention_params[0]
         head_dim = attention_params[1]
@@ -1391,7 +1424,7 @@ class PersistentKernel:
         tb_graph.new_input(moe_masks, (-1, -1, -1), -1, True)
         self.kn_graph.customized([input, moe_topk_weight, moe_routing_indices, moe_masks], tb_graph)
 
-        if self.target_cc in (94, 95):
+        if self.target_cc in AMD_CCS:
             self.kn_graph.register_task(tb_graph, "moe_topk_softmax_mi300")
         else:
             self.kn_graph.register_task(tb_graph, "moe_topk_softmax_sm100")
@@ -1425,7 +1458,7 @@ class PersistentKernel:
 
         if self.target_cc == 100:
             self.kn_graph.register_task(tb_graph, "moe_w13_linear_sm100")
-        elif self.target_cc in (94, 95):
+        elif self.target_cc in AMD_CCS:
             self.kn_graph.register_task(tb_graph, "moe_w13_linear_mi300")
         elif self.target_cc == 90:
             self.kn_graph.register_task(tb_graph, "moe_w13_linear_sm90")
@@ -1495,7 +1528,7 @@ class PersistentKernel:
 
         if self.target_cc == 100:
             self.kn_graph.register_task(tb_graph, "moe_w2_linear_sm100")
-        elif self.target_cc in (94, 95):
+        elif self.target_cc in AMD_CCS:
             self.kn_graph.register_task(tb_graph, "moe_w2_linear_mi300")
         elif self.target_cc == 90:
             self.kn_graph.register_task(tb_graph, "moe_w2_linear_sm90")
@@ -1652,7 +1685,7 @@ class PersistentKernel:
         assert moe_mask.num_dims == 1  # [num_experts + 1]
         assert bias.num_dims == 2  # [num_experts, output_stride]
         assert output.num_dims == 3  # [batch, topk, 2*intermediate]
-        assert self.target_cc in (94, 95), "Gang MoE linear only supported on MI300/MI350"
+        assert self.target_cc in AMD_CCS, "Gang MoE linear only supported on MI300/MI350"
 
         batch_size = self.max_num_batched_tokens
         num_experts = weight.dim(0)
@@ -1705,7 +1738,7 @@ class PersistentKernel:
         assert moe_mask.num_dims == 1  # [num_experts + 1]
         assert bias.num_dims == 2  # [num_experts, output_stride]
         assert output.num_dims == 3  # [batch, topk, hidden_size]
-        assert self.target_cc in (94, 95), "Gang MoE linear only supported on MI300/MI350"
+        assert self.target_cc in AMD_CCS, "Gang MoE linear only supported on MI300/MI350"
 
         batch_size = self.max_num_batched_tokens
         num_experts = weight.dim(0)
@@ -1759,7 +1792,7 @@ class PersistentKernel:
         assert moe_mask.num_dims == 1
         assert bias.num_dims == 2    # [E, output_stride]
         assert output.num_dims == 3  # [batch, topk, output_size]
-        assert self.target_cc in (94, 95), "Gang MoE MXFP4 only supported on MI300/MI350"
+        assert self.target_cc in AMD_CCS, "Gang MoE MXFP4 only supported on MI300/MI350"
 
         batch_size = self.max_num_batched_tokens
         num_experts = weight.dim(0)
@@ -1819,7 +1852,7 @@ class PersistentKernel:
         assert moe_mask.num_dims == 1
         assert bias.num_dims == 2    # [E, 2*intermediate]
         assert output.num_dims == 3  # [batch, topk, intermediate]
-        assert self.target_cc in (94, 95), "Gang MoE MXFP4 only supported on MI300/MI350"
+        assert self.target_cc in AMD_CCS, "Gang MoE MXFP4 only supported on MI300/MI350"
 
         batch_size = self.max_num_batched_tokens
         num_experts = weight.dim(0)
@@ -1870,7 +1903,7 @@ class PersistentKernel:
         assert moe_mask.num_dims == 1
         assert bias.num_dims == 2    # [E, output_stride]
         assert output.num_dims == 3  # [batch, topk, hidden_size]
-        assert self.target_cc in (94, 95), "Gang MoE MXFP4 only supported on MI300/MI350"
+        assert self.target_cc in AMD_CCS, "Gang MoE MXFP4 only supported on MI300/MI350"
 
         batch_size = self.max_num_batched_tokens
         num_experts = weight.dim(0)
@@ -1940,7 +1973,7 @@ class PersistentKernel:
         assert swiglu_out.num_dims == 3      # [batch, topk, intermediate]
         assert workspace_f32.num_dims == 2   # [batch, hidden] f32
         assert barrier.num_dims == 1         # [2*E]
-        assert self.target_cc in (94, 95), "Fused MoE MXFP4 only supported on MI300/MI350"
+        assert self.target_cc in AMD_CCS, "Fused MoE MXFP4 only supported on MI300/MI350"
 
         batch_size = self.max_num_batched_tokens
         # Tokens ride the MFMA's N axis (16 columns), not the tile axis, so a
@@ -2028,7 +2061,7 @@ class PersistentKernel:
         assert moe_mask.num_dims == 1
         assert bias.num_dims == 2         # [E, output_stride]
         assert output.num_dims == 3       # [batch, topk, hidden_size]
-        assert self.target_cc in (94, 95), "Gang MoE MXFP4 only supported on MI300/MI350"
+        assert self.target_cc in AMD_CCS, "Gang MoE MXFP4 only supported on MI300/MI350"
 
         batch_size = self.max_num_batched_tokens
         num_experts = weight.dim(0)
@@ -2079,7 +2112,7 @@ class PersistentKernel:
         tb_graph.new_input(output, (0, 1, -1), -1, True)
         self.kn_graph.customized([input, weight, residual, output], tb_graph)
 
-        if self.target_cc in (94, 95):
+        if self.target_cc in AMD_CCS:
             self.kn_graph.register_task(tb_graph, "moe_mul_sum_add_mi300")
         else:
             self.kn_graph.register_task(tb_graph, "moe_mul_sum_add_sm100")
@@ -2099,7 +2132,7 @@ class PersistentKernel:
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, 1, -1), 1, True)
         tb_graph.new_input(weight, (0, 1, -1), 1, True)
-        if self.target_cc in (94, 95):
+        if self.target_cc in AMD_CCS:
             # MI300X: workspace output partitioned by grid_dim.x (N) and grid_dim.y (K-splits)
             tb_graph.new_input(output, (1, 0, -1), -1, True)
         else:
@@ -2108,7 +2141,7 @@ class PersistentKernel:
 
         if self.target_cc == 100:
             self.kn_graph.register_task(tb_graph, "splitk_linear_sm100")
-        elif self.target_cc in (94, 95):
+        elif self.target_cc in AMD_CCS:
             self.kn_graph.register_task(tb_graph, "splitk_linear_mi300")
         elif self.target_cc == 90:
             self.kn_graph.register_task(tb_graph, "splitk_linear_swapAB_hopper")
@@ -2130,7 +2163,7 @@ class PersistentKernel:
         """Cross-XCD K-split linear with residual (SKXCCM-style).
         Phase 1: 8 gang tasks, each XCD handles K/8 for ALL N-tiles.
         Phase 2: 8 gang tasks, each XCD finalizes its N-partition."""
-        assert self.target_cc in (94, 95)
+        assert self.target_cc in AMD_CCS
         batch_size = self.max_num_batched_tokens
         output_size = weight.dim(0)
         reduction_size = weight.dim(1) if weight.num_dims == 2 else input.dim(1)
@@ -2177,7 +2210,7 @@ class PersistentKernel:
         """Gang split-K linear with residual: splits K within XCD for better utilization.
         8 tasks (1 per XCD), each with n_tiles × k_splits total tiles.
         Uses XCD-local atomics for merge (cheaper than GPU-scope)."""
-        assert self.target_cc in (94, 95)
+        assert self.target_cc in AMD_CCS
         batch_size = self.max_num_batched_tokens
         output_size = weight.dim(0)
         assert output_size % 8 == 0
@@ -2209,7 +2242,7 @@ class PersistentKernel:
     ):
         """Gang RMSNorm: 8 tasks (1 per XCD), each computes same RMSNorm.
         Enables XCD-local event counting to avoid cross-XCD barrier."""
-        assert self.target_cc in (94, 95), "Gang RMSNorm only supported on MI300X"
+        assert self.target_cc in AMD_CCS, "Gang RMSNorm only supported on MI300X"
         grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, -1, -1), 1, True)
@@ -2239,7 +2272,7 @@ class PersistentKernel:
         assert input.num_dims == 2
         assert weight.num_dims == 2
         assert output.num_dims == 2
-        assert self.target_cc in (94, 95), "Gang linear only supported on MI300X"
+        assert self.target_cc in AMD_CCS, "Gang linear only supported on MI300X"
         batch_size = self.max_num_batched_tokens
         output_size = weight.dim(0)
         assert output_size % 8 == 0, f"Output size {output_size} must be divisible by 8"
@@ -2282,7 +2315,7 @@ class PersistentKernel:
         assert weight.num_dims == 2
         assert residual.num_dims == 2
         assert output.num_dims == 2
-        assert self.target_cc in (94, 95), "Gang linear only supported on MI300X"
+        assert self.target_cc in AMD_CCS, "Gang linear only supported on MI300X"
         batch_size = self.max_num_batched_tokens
         output_size = weight.dim(0)
         assert output_size % 8 == 0
@@ -2328,7 +2361,7 @@ class PersistentKernel:
         assert input.num_dims == 2
         assert weight.num_dims == 2
         assert output.num_dims == 2
-        assert self.target_cc in (94, 95), "Gang linear only supported on MI300X"
+        assert self.target_cc in AMD_CCS, "Gang linear only supported on MI300X"
         batch_size = self.max_num_batched_tokens
         output_size = weight.dim(0)
         assert output_size % 8 == 0
@@ -2384,7 +2417,7 @@ class PersistentKernel:
         assert norm_input.num_dims == 2
         assert linear_weight.num_dims == 2
         assert output.num_dims == 2
-        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+        assert self.target_cc in AMD_CCS, "Only supported on MI300/MI350"
         batch_size = self.max_num_batched_tokens
         output_size = linear_weight.dim(0)
         assert output_size % 8 == 0
@@ -2447,7 +2480,7 @@ class PersistentKernel:
         assert norm_input.num_dims == 2
         assert linear_weight.num_dims == 2
         assert logits_scratch.num_dims == 2
-        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+        assert self.target_cc in AMD_CCS, "Only supported on MI300/MI350"
         batch_size = self.max_num_batched_tokens
         num_experts = output_stride  # router output width = num_experts
         output_size = linear_weight.dim(0)
@@ -2522,7 +2555,7 @@ class PersistentKernel:
         assert norm_input.num_dims == 2
         assert mxfp4_weight.num_dims == 2
         assert output.num_dims == 2
-        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+        assert self.target_cc in AMD_CCS, "Only supported on MI300/MI350"
         batch_size = self.max_num_batched_tokens
         n_wgs = mxfp4_weight.dim(0)
         assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
@@ -2578,7 +2611,7 @@ class PersistentKernel:
         """
         assert norm_input.num_dims == 2
         assert mxfp4_weight.num_dims == 2
-        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+        assert self.target_cc in AMD_CCS, "Only supported on MI300/MI350"
         n_wgs = mxfp4_weight.dim(0)
         assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
         n_wgs_per_xcd = n_wgs // 8
@@ -2645,7 +2678,7 @@ class PersistentKernel:
         assert routing_weight.num_dims == 2  # (batch, topk)
         assert residual.num_dims == 2  # (batch, hidden)
         assert mxfp4_weight.num_dims == 2
-        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+        assert self.target_cc in AMD_CCS, "Only supported on MI300/MI350"
 
         if input_stride < 0:
             input_stride = residual.dim(1)
@@ -2705,7 +2738,7 @@ class PersistentKernel:
         """
         assert norm_input.num_dims == 2
         assert mxfp4_weight.num_dims == 2
-        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+        assert self.target_cc in AMD_CCS, "Only supported on MI300/MI350"
 
         batch_size = self.max_num_batched_tokens
         n_wgs = mxfp4_weight.dim(0)
@@ -2767,7 +2800,7 @@ class PersistentKernel:
         assert routing_weight.num_dims == 2
         assert residual.num_dims == 2
         assert mxfp4_weight.num_dims == 2
-        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+        assert self.target_cc in AMD_CCS, "Only supported on MI300/MI350"
 
         if input_stride < 0:
             input_stride = residual.dim(1)
@@ -2831,7 +2864,7 @@ class PersistentKernel:
         assert workspace_f32.num_dims == 2   # (batch, hidden) f32
         assert residual.num_dims == 2        # (batch, hidden) bf16
         assert mxfp4_weight.num_dims == 2
-        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+        assert self.target_cc in AMD_CCS, "Only supported on MI300/MI350"
 
         batch_size = self.max_num_batched_tokens
         n_wgs = mxfp4_weight.dim(0)
@@ -2888,7 +2921,7 @@ class PersistentKernel:
         assert workspace_f32.num_dims == 2
         assert residual.num_dims == 2
         assert mxfp4_weight.num_dims == 2
-        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+        assert self.target_cc in AMD_CCS, "Only supported on MI300/MI350"
 
         batch_size = self.max_num_batched_tokens
         # Tokens ride the MFMA's N axis (16 columns), not the tile axis, so a
@@ -2964,7 +2997,7 @@ class PersistentKernel:
         assert workspace_f32.num_dims == 2
         assert residual.num_dims == 2
         assert mxfp4_weight.num_dims == 2
-        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+        assert self.target_cc in AMD_CCS, "Only supported on MI300/MI350"
 
         batch_size = self.max_num_batched_tokens
         # Tokens ride the MFMA's N axis (16 columns), not the tile axis, so a
@@ -3065,7 +3098,7 @@ class PersistentKernel:
         assert input.num_dims == 2
         assert mxfp4_weight.num_dims == 2
         assert output.num_dims == 2
-        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+        assert self.target_cc in AMD_CCS, "Only supported on MI300/MI350"
         batch_size = self.max_num_batched_tokens
         n_wgs = mxfp4_weight.dim(0)
         assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
@@ -3125,7 +3158,7 @@ class PersistentKernel:
         assert input.num_dims == 2
         assert mxfp4_weight.num_dims == 2
         assert output.num_dims == 2
-        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+        assert self.target_cc in AMD_CCS, "Only supported on MI300/MI350"
         batch_size = self.max_num_batched_tokens
         # Tokens ride the MFMA's N axis (16 columns), not the tile axis, so a
         # phase needs one tile block per 16 tokens rather than one per token.
@@ -3234,7 +3267,7 @@ class PersistentKernel:
         assert oproj_weight.num_dims == 2
         assert gate_up_weight.num_dims == 3
         assert down_weight.num_dims == 3
-        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+        assert self.target_cc in AMD_CCS, "Only supported on MI300/MI350"
 
         batch_size = self.max_num_batched_tokens
         # Tokens ride the MFMA's N axis (16 columns), not the tile axis, so a
@@ -3413,7 +3446,7 @@ class PersistentKernel:
         assert oproj_weight.num_dims == 2
         assert gate_up_weight.num_dims == 3
         assert down_weight.num_dims == 3
-        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+        assert self.target_cc in AMD_CCS, "Only supported on MI300/MI350"
 
         batch_size = self.max_num_batched_tokens
         # Tokens ride the MFMA's N axis (16 columns), not the tile axis, so a
@@ -3619,7 +3652,7 @@ class PersistentKernel:
         28 inputs, 13 outputs, 33 params.
         """
         assert residual.num_dims == 2
-        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+        assert self.target_cc in AMD_CCS, "Only supported on MI300/MI350"
 
         batch_size = self.max_num_batched_tokens
         # Tokens ride the MFMA's N axis (16 columns), not the tile axis, so a
@@ -3784,7 +3817,7 @@ class PersistentKernel:
     ):
         """Gang split-K linear with residual + fused bias_add in epilogue.
         5 inputs (input, weight, residual, workspace, bias), 1 output."""
-        assert self.target_cc in (94, 95)
+        assert self.target_cc in AMD_CCS
         batch_size = self.max_num_batched_tokens
         output_size = weight.dim(0)
         assert output_size % 8 == 0
@@ -3813,7 +3846,7 @@ class PersistentKernel:
         tile_n=64, m_tiles=1, wgm=0, block_dim=(256, 1, 1)):
         """CU-task linear with fused SiLU+mul. Same kernel as gang version."""
         assert input.num_dims == 2 and weight.num_dims == 2 and output.num_dims == 2
-        assert self.target_cc in (94, 95)
+        assert self.target_cc in AMD_CCS
         batch_size = self.max_num_batched_tokens
         gate_up_size = weight.dim(0)
         n_weight_tiles = gate_up_size // tile_n
@@ -3851,7 +3884,7 @@ class PersistentKernel:
         assert input.num_dims == 2
         assert weight.num_dims == 2
         assert output.num_dims == 2
-        assert self.target_cc in (94, 95), "Gang linear SiLU only supported on MI300X"
+        assert self.target_cc in AMD_CCS, "Gang linear SiLU only supported on MI300X"
         batch_size = self.max_num_batched_tokens
         gate_up_size = weight.dim(0)
         assert gate_up_size % 8 == 0
@@ -4048,7 +4081,7 @@ class PersistentKernel:
                 # self.kn_graph.register_task(tb_graph, "linear_cutlass_hopper")
             else:
                 self.kn_graph.register_task(tb_graph, "linear_swapAB_hopper")
-        elif self.target_cc == 80 or self.target_cc in (94, 95):
+        elif self.target_cc == 80 or self.target_cc in AMD_CCS:
             # 94: MI300/ROCm – use sm_80-style "linear" (base PTX path)
             self.kn_graph.register_task(tb_graph, "linear")
         else:
@@ -4083,7 +4116,7 @@ class PersistentKernel:
                 self.kn_graph.register_task(tb_graph, "linear_swapAB_with_residual_hopper")
             else:
                 self.kn_graph.register_task(tb_graph, "linear_swapAB_with_residual_hopper")
-        elif self.target_cc == 80 or self.target_cc in (94, 95):
+        elif self.target_cc == 80 or self.target_cc in AMD_CCS:
             # 94: MI300/ROCm – use sm_80-style "linear_with_residual"
             self.kn_graph.register_task(tb_graph, "linear_with_residual")
         else:
@@ -4430,7 +4463,7 @@ class PersistentKernel:
 
         # Event fusion DISABLED to match NVIDIA implementation
         # Original event fusion code (AMD only) reduced events but didn't improve performance
-        # if self.target_cc in (94, 95):  # AMD MI300
+        # if self.target_cc in AMD_CCS:  # AMD MI300
         #     from .event_fusion import fuse_events
         #     import json
         #     with open(json_file_path, "r") as f:
@@ -4450,7 +4483,7 @@ class PersistentKernel:
             shutil.copy(cuda_code_path, os.path.join(output_dir, f"test_rank{self.mpi_rank}.cu"))
             shutil.copy(json_file_path, os.path.join(output_dir, f"task_graph_rank{self.mpi_rank}.json"))
 
-        if self.target_cc in (94, 95):
+        if self.target_cc in AMD_CCS:
             rocm_home = os.environ.get("ROCM_PATH", "/opt/rocm")
             cc = shutil.which("hipcc") or os.path.join(rocm_home, "bin", "hipcc")
             if not cc or not os.path.isfile(cc):

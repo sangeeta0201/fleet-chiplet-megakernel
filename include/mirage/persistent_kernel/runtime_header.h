@@ -43,7 +43,18 @@ constexpr int LAYER_IDX_SMEM_OFFSET_FROM_END = 4;
 // AMD LDS limits per GPU generation:
 // - MI300 (gfx942): 64KB LDS per workgroup, use conservative 60KB
 // - MI350 (gfx950): 160KB LDS per workgroup, use 155KB for LDS-resident weights
-#if (MPK_TARGET_CC == 95)
+// - MI450 (gfx1250): up to 320KB, but LDS shares a 384KB physical array with
+//   the GL0 cache and is handed out in 64KB segments, so asking for more than
+//   we use costs cache rather than being free. 155KB is deliberately the same
+//   number as gfx950 -- every ported kernel's tile math and its
+//   MAX_DYNAMIC_SHARED_MEMORY_SIZE static_asserts then hold unchanged, which is
+//   what we want while the port is being validated. It rounds up to a 192KB
+//   segment allocation, leaving GL0 the 192KB remainder. Raising this to 256KB
+//   is a separate, measurable tuning decision and needs silicon to justify.
+#if (MPK_TARGET_CC == 125)
+constexpr int MAX_DYNAMIC_SHARED_MEMORY_SIZE =
+    155 * 1024 - WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE;
+#elif (MPK_TARGET_CC == 95)
 constexpr int MAX_DYNAMIC_SHARED_MEMORY_SIZE =
     155 * 1024 - WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE;
 #elif defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300) ||            \

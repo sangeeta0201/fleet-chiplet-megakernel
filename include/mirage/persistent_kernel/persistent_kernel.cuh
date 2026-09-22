@@ -324,6 +324,13 @@ __device__ __forceinline__ void mpk_ws_mark(int code, int aux, int tid) {
 #include "tasks/hopper/task_header.cuh"
 #elif defined(MIRAGE_GRACE_BLACKWELL)
 #include "tasks/blackwell/task_header.cuh"
+// MI450 must be tested before the MI300 branch below. MIRAGE_AMD_MI300 stays
+// defined on an MI450 build -- ~30 sites in this file use it to mean "AMD, not
+// NVIDIA" (hipMalloc aliases, XCD logic, gang dispatch), so undefining it would
+// silently route MI450 down the NVIDIA path. MIRAGE_AMD_MI450 selects the task
+// library only.
+#elif defined(MIRAGE_AMD_MI450)
+#include "tasks/mi450/task_header.cuh"
 #elif defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
 #include "tasks/mi300/task_header.cuh"
 #else
@@ -426,6 +433,29 @@ using namespace kernel;
 #endif
 #endif
 
+#ifdef MPK_HOST_BREADCRUMB
+// Host-mapped breadcrumb array; see the use sites in persistent_kernel(),
+// execute_worker() and execute_scheduler(). Slot meanings are documented at
+// the persistent_kernel() use site.
+__device__ unsigned long long *g_mpk_breadcrumb;
+// System scope, relaxed: the host reads the same physical page, and these are
+// liveness counters, not synchronisation edges -- a release here would mask a
+// missing release in the runtime being debugged.
+#define MPK_CRUMB(slot)                                                        \
+  do {                                                                         \
+    if (threadIdx.x == 0 && g_mpk_breadcrumb != nullptr) {                     \
+      __hip_atomic_fetch_add(&g_mpk_breadcrumb[(slot)],                        \
+                             1ull,                                             \
+                             __ATOMIC_RELAXED,                                 \
+                             __HIP_MEMORY_SCOPE_SYSTEM);                       \
+    }                                                                          \
+  } while (0)
+#else
+#define MPK_CRUMB(slot)                                                        \
+  do {                                                                         \
+  } while (0)
+#endif
+
 #if defined(MIRAGE_GRACE_HOPPER)
 #define WORKER_NUM_THREADS 256
 #define SINGLE_KERNEL_NUM_THREADS 256
@@ -485,11 +515,21 @@ using namespace kernel;
 // Number of XCDs on MI300X
 constexpr int MI300X_NUM_XCDS = 8;
 
-// Get the XCD (XCC) ID for the current thread
+// Get the XCD (XCC) ID for the current thread.
+//
+// gfx1250 rejects hwreg(HW_REG_XCC_ID) outright ("invalid hardware register:
+// not supported on this GPU"), so the per-arch spelling lives in
+// mirage::arch::xcd_id() -- which also carries the warning that the gfx1250
+// replacement (s_sendmsg_rtn) is expensive per-wave and unvalidated, and the
+// MIRAGE_XCD_ID_FALLBACK=1 escape hatch that FFM runs use.
 __device__ __forceinline__ int get_current_xcd_id() {
+#if defined(MIRAGE_ARCH_GFX1250)
+  return mirage::arch::xcd_id();
+#else
   int xcd_id;
   asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)" : "=s"(xcd_id));
   return xcd_id;
+#endif
 }
 
 // Per-block shared state for XCD info (computed once at block start)
@@ -1210,6 +1250,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
       // Fence ensures map write is visible before incrementing ready counter
       threadfence_gpu();
       atomicAdd(config.worker_xcd_ready_count, 1);
+      MPK_CRUMB(7);
     }
     // Elect leader: first worker on each XCD becomes leader
     // Leader polls global counter, others poll local counter
@@ -1332,7 +1373,10 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
   int fused_count = 0;
 #endif
 
+  MPK_CRUMB(3);
+
   while (true) {
+    MPK_CRUMB(4);
     // fetch next task from a task queue if task_descs is empty
     if (queue_pos == queue_len) {
 #ifdef MPK_PRECOMPUTED_DISPATCH
@@ -3019,10 +3063,12 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
       // Wait for all workers to report their XCD IDs
       if (config.worker_xcd_map != nullptr) {
+        MPK_CRUMB(8);
         while (atomicAdd(config.worker_xcd_ready_count, 0) <
                config.num_workers) {
           __nanosleep(100);
         }
+        MPK_CRUMB(9);
         // Fence ensures we see all worker_xcd_map writes
         threadfence_gpu();
         // Read this scheduler's XCD and collect ALL matching workers
@@ -3071,7 +3117,10 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
     unsigned long long last_dep_dispatch_end_ns = 0;
 #endif
 
+    MPK_CRUMB(5);
+
     while (true) {
+      MPK_CRUMB(6);
       int poll_count = 0;
       while (cur_event_pos[queue_idx] == last_event_pos[queue_idx]) {
         // queue_idx 0 = own scheduler queue (XCD-local), 1 = broadcast
@@ -3248,7 +3297,7 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
             for (int x = 0; x < 8; x++) {
               st_wt_u32((void *)&rel[x * 16], (unsigned)new_val);
             }
-            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+            mirage::arch::wait_vmem(); // stores above must land: loadcnt+storecnt
           }
 #endif
           terminate_schedulers(config);
@@ -3268,7 +3317,7 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
             for (int x = 0; x < 8; x++) {
               st_wt_u32((void *)&rel[x * 16], (unsigned)new_val);
             }
-            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+            mirage::arch::wait_vmem(); // stores above must land: loadcnt+storecnt
           }
 #else
           // Launch task 1 (begin_task_graph) for the next iteration (same XCD)
@@ -3616,6 +3665,25 @@ __global__ __launch_bounds__(WORKER_NUM_THREADS,
   }
   __syncthreads();
 
+  // Bring-up aid for targets with no debugger and no usable device printf
+  // (printf only flushes when the kernel exits, which is precisely what does
+  // not happen when the megakernel wedges). g_mpk_breadcrumb points at
+  // host-mapped memory, so a host thread can watch these advance in real time.
+  // Slot map, shared with execute_worker/execute_scheduler:
+  //   [0] blocks that finished role election
+  //   [1] blocks that took the worker branch
+  //   [2] blocks that took the scheduler branch
+  //   [3] workers that reached the main dispatch loop (past all init)
+  //   [4] worker main-loop iterations
+  //   [5] schedulers that reached their main loop
+  //   [6] scheduler main-loop iterations
+  //   [7] workers that published their XCD id and bumped the ready count
+  //   [8] schedulers that entered the "wait for all workers to report" spin
+  //   [9] schedulers that left that spin
+  // Compiles away entirely without -DMPK_HOST_BREADCRUMB.
+  MPK_CRUMB(0);
+  MPK_CRUMB(my_role == 0 ? 1 : 2);
+
   if (my_role == 0) {
     execute_worker(config, my_id);
   } else {
@@ -3870,6 +3938,47 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
       static_cast<int *>(meta_tensors[9]);
   global_runtime_config.rope_cos_ptr = nullptr;
   global_runtime_config.rope_sin_ptr = nullptr;
+#ifdef MPK_MAX_RESIDENT_BLOCKS
+  // A persistent megakernel's blocks never retire, so every worker and every
+  // scheduler must be *co-resident* -- execute_scheduler's first act is to spin
+  // on worker_xcd_ready_count until all num_workers have reported. Any block
+  // the hardware (or model) declines to dispatch is therefore waited on
+  // forever, with zero task dispatches and no diagnostic output.
+  //
+  // AMD's FFM-Lite functional model has such a ceiling. An empty 256-thread
+  // kernel gets 64 blocks co-resident (measured with a rendezvous probe;
+  // independent of block size and of dynamic LDS up to 155 KB). persistent_kernel
+  // itself gets only 9, because it compiles to ~12.5 KB/lane of scratch --
+  // 3.2 MB per 256-thread block -- and scratch, not LDS, is what FFM runs out
+  // of. Ordinary throughput tests never expose any of this, because there
+  // blocks retire and free their slots.
+  //
+  // Silicon has no such ceiling, so this clamp exists purely so an
+  // over-subscribed FFM run degrades into a smaller *correct* run instead of a
+  // silent hang with no diagnostic. It is measured per build, not a constant of
+  // the model: raising the value after a scratch reduction is legitimate, and
+  // it must be left undefined for hardware builds.
+  {
+    int const scheds = num_local_schedulers + num_remote_schedulers;
+    int const total = num_workers + scheds;
+    if (total > MPK_MAX_RESIDENT_BLOCKS) {
+      int const clamped = MPK_MAX_RESIDENT_BLOCKS - scheds;
+      printf("[MPK] WARN: %d workers + %d schedulers = %d blocks exceeds "
+             "MPK_MAX_RESIDENT_BLOCKS=%d; clamping workers to %d. A persistent "
+             "kernel deadlocks if any block is not co-resident.\n",
+             num_workers,
+             scheds,
+             total,
+             (int)MPK_MAX_RESIDENT_BLOCKS,
+             clamped);
+      // Below 1 worker there is nothing to clamp to -- fail loudly rather than
+      // launch a configuration that cannot make progress.
+      assert(clamped >= 1 && "MPK_MAX_RESIDENT_BLOCKS leaves no room for any "
+                             "worker; reduce the scheduler count");
+      num_workers = clamped;
+    }
+  }
+#endif
   global_runtime_config.num_workers = num_workers;
   global_runtime_config.num_local_schedulers = num_local_schedulers;
   global_runtime_config.num_remote_schedulers = num_remote_schedulers;
@@ -3916,7 +4025,17 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   // Note: rocprofv3 --pmc serializes kernel dispatches and deadlocks split
   // mode, but --profiling (Perfetto trace) works fine since profiler writes are
   // worker-only.
+#if defined(MIRAGE_AMD_MI450)
+  // MI450 bring-up runs under FFM-Lite, which executes workgroups serially in
+  // ascending blockIdx unless HSA_MODEL_ARGS="ffm_enable_time_slicing" is set.
+  // Time slicing is known to handle a single dispatch containing both workers
+  // and schedulers; two co-resident dispatches are not something FFM models, so
+  // split mode has no way to make forward progress there. Keep everything in
+  // one launch on mi450.
+  global_runtime_config.split_worker_scheduler = false;
+#else
   global_runtime_config.split_worker_scheduler = true;
+#endif
 
   std::vector<FullTaskDesc> all_fulltasks;
   std::vector<EventDesc> all_events;

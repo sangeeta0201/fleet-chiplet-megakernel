@@ -35,6 +35,49 @@
 #include <atomic>
 #endif
 
+#include "arch_traits.cuh"
+
+// True on an AMD *device* pass. Every asm block below is gated on this; the
+// gfx1250 sub-branch inside each is gated on MIRAGE_ARCH_GFX1250 (set by
+// arch_traits.cuh from __gfx1250__).
+#define MPK_AMD_DEVICE                                                         \
+  (defined(__HIP_DEVICE_COMPILE__) &&                                          \
+   (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)))
+
+// ---------------------------------------------------------------------------
+// gfx1250 (MI450) note for everything in this file
+// ---------------------------------------------------------------------------
+//
+// The gfx950 implementations below are hand-written asm for two reasons: to
+// pin the exact cache-bypass bits (nt, sc0, sc1), and to keep the compiler
+// from inserting its own buffer_wbl2/buffer_inv around atomics. Neither
+// mnemonic nor modifier survives to gfx1250 -- `s_waitcnt`, `buffer_inv`,
+// `global_load_dwordx2`, and `flat_atomic_add ... sc0 sc1` are all rejected by
+// the gfx1250 assembler.
+//
+// Rather than transliterate the asm, the gfx1250 paths use compiler
+// intrinsics, because on this target they lower to exactly what we want and
+// the compiler gets the split wait-counter domains right by construction
+// (verified by reading the emitted ISA):
+//
+//   __builtin_nontemporal_{load,store}   -> th:TH_{LOAD,STORE}_NT
+//   __hip_atomic_* at _AGENT scope       -> global_atomic_* scope:SCOPE_DEV
+//                                           plus global_inv / global_wb
+//
+// The cache-bypass *intent* differs subtly and deliberately. On MI300X/MI350
+// L2 is not coherent across XCDs, so the cross-XCD protocol is built on NT and
+// write-through stores that push data past L2 to HBM. On gfx1250 the same
+// guarantee is expressed as scoped atomics and global_inv/global_wb, which is
+// both the supported spelling and the one the memory model actually defines.
+// The write-through (st_wt_*) helpers therefore become device-scope release
+// stores rather than sc0/sc1 stores: same ordering guarantee, expressed in the
+// vocabulary gfx1250 has.
+//
+// NOT VALIDATED ON SILICON. FFM-Lite is functional-only and runs workgroups
+// serially or time-sliced, so it cannot observe a missing writeback or a
+// too-narrow wait. These paths are correct by construction and by reading ISA;
+// they are not correct by experiment.
+
 // =============================================================================
 // Non-Temporal (NT) Load/Store for MI300X
 // =============================================================================
@@ -70,8 +113,11 @@
 // Non-temporal load (bypasses cache, reads from memory)
 __device__ __forceinline__ unsigned long long int
     ld_nt_u64(unsigned long long int *addr) {
-#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
-    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#if MPK_AMD_DEVICE && defined(MIRAGE_ARCH_GFX1250)
+  // -> global_load_b64 ... th:TH_LOAD_NT, with the compiler's own
+  // s_wait_loadcnt before the use.
+  return __builtin_nontemporal_load(addr);
+#elif MPK_AMD_DEVICE
   unsigned long long int val;
   asm volatile("global_load_dwordx2 %0, %1, off nt\n"
                "s_waitcnt vmcnt(0)"
@@ -87,8 +133,9 @@ __device__ __forceinline__ unsigned long long int
 
 // Non-temporal 32-bit load (bypasses cache, reads from memory)
 __device__ __forceinline__ int ld_nt_s32(int *addr) {
-#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
-    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#if MPK_AMD_DEVICE && defined(MIRAGE_ARCH_GFX1250)
+  return __builtin_nontemporal_load(addr); // -> global_load_b32 th:TH_LOAD_NT
+#elif MPK_AMD_DEVICE
   int val;
   asm volatile("global_load_dword %0, %1, off nt\n"
                "s_waitcnt vmcnt(0)"
@@ -104,8 +151,13 @@ __device__ __forceinline__ int ld_nt_s32(int *addr) {
 // Non-temporal store (bypasses cache, writes to memory)
 __device__ __forceinline__ void st_nt_u64(unsigned long long int *addr,
                                           unsigned long long int val) {
-#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
-    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#if MPK_AMD_DEVICE && defined(MIRAGE_ARCH_GFX1250)
+  // -> global_store_b64 ... th:TH_STORE_NT. The gfx950 asm waits vmcnt(0)
+  // inline; here the wait is explicit and covers stores (storecnt), which a
+  // bare loadcnt wait would not -- see mirage::arch::wait_vmem().
+  __builtin_nontemporal_store(val, addr);
+  mirage::arch::wait_vmem();
+#elif MPK_AMD_DEVICE
   asm volatile("global_store_dwordx2 %0, %1, off nt\n"
                "s_waitcnt vmcnt(0)"
                :
@@ -128,8 +180,14 @@ __device__ __forceinline__ void st_nt_u64(unsigned long long int *addr,
 // Write-through 64-bit store (4x bf16 or 2x float)
 __device__ __forceinline__ void st_wt_u64(void *addr,
                                           unsigned long long int val) {
-#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
-    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#if MPK_AMD_DEVICE && defined(MIRAGE_ARCH_GFX1250)
+  // Device-scope release store: the gfx1250 spelling of "make this visible
+  // outside our own cache". -> global_store_b64 ... scope:SCOPE_DEV.
+  __hip_atomic_store(reinterpret_cast<unsigned long long int *>(addr),
+                     val,
+                     __ATOMIC_RELEASE,
+                     __HIP_MEMORY_SCOPE_AGENT);
+#elif MPK_AMD_DEVICE
   asm volatile("global_store_dwordx2 %0, %1, off sc0 sc1"
                :
                : "v"(addr), "v"(val)
@@ -142,8 +200,16 @@ __device__ __forceinline__ void st_wt_u64(void *addr,
 // Write-through 128-bit zero store (4x dword = 16 bytes, sc0 sc1).
 // Uses global_store_dwordx4 for 4x fewer store instructions vs st_wt_u32.
 __device__ __forceinline__ void st_wt_zero128(void *addr) {
-#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
-    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#if MPK_AMD_DEVICE && defined(MIRAGE_ARCH_GFX1250)
+  // No 128-bit atomic store exists; emit the wide store and follow it with a
+  // device-scope writeback, which gives the same "visible past our cache"
+  // guarantee that sc0 sc1 gave on gfx950.
+  typedef unsigned int v4u32 __attribute__((ext_vector_type(4)));
+  v4u32 zero = {0u, 0u, 0u, 0u};
+  *reinterpret_cast<v4u32 *>(addr) = zero;
+  mirage::arch::wait_vmem();
+  mirage::arch::wb_l2();
+#elif MPK_AMD_DEVICE
   typedef unsigned int v4u32 __attribute__((ext_vector_type(4)));
   v4u32 zero = {0u, 0u, 0u, 0u};
   asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1"
@@ -165,8 +231,14 @@ __device__ __forceinline__ void st_wt_zero128(void *addr) {
 // threadfence_gpu below), so the consumer reads whatever its own L2 holds.
 // `addr` must be 16-byte aligned.
 __device__ __forceinline__ void st_wt_f32x4(void *addr, float4 val) {
-#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
-    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#if MPK_AMD_DEVICE && defined(MIRAGE_ARCH_GFX1250)
+  typedef unsigned int v4u32 __attribute__((ext_vector_type(4)));
+  v4u32 v;
+  __builtin_memcpy(&v, &val, 16);
+  *reinterpret_cast<v4u32 *>(addr) = v;
+  mirage::arch::wait_vmem();
+  mirage::arch::wb_l2();
+#elif MPK_AMD_DEVICE
   typedef unsigned int v4u32 __attribute__((ext_vector_type(4)));
   v4u32 v;
   __builtin_memcpy(&v, &val, 16);
@@ -187,8 +259,12 @@ __device__ __forceinline__ void st_wt_f32x4(void *addr, float4 val) {
 
 // Write-through 32-bit store (1x float or 2x bf16)
 __device__ __forceinline__ void st_wt_u32(void *addr, unsigned int val) {
-#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
-    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#if MPK_AMD_DEVICE && defined(MIRAGE_ARCH_GFX1250)
+  __hip_atomic_store(reinterpret_cast<unsigned int *>(addr),
+                     val,
+                     __ATOMIC_RELEASE,
+                     __HIP_MEMORY_SCOPE_AGENT);
+#elif MPK_AMD_DEVICE
   asm volatile("global_store_dword %0, %1, off sc0 sc1"
                :
                : "v"(addr), "v"(val)
@@ -200,8 +276,12 @@ __device__ __forceinline__ void st_wt_u32(void *addr, unsigned int val) {
 
 // Write-through 16-bit store (1x bf16)
 __device__ __forceinline__ void st_wt_u16(void *addr, unsigned short val) {
-#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
-    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#if MPK_AMD_DEVICE && defined(MIRAGE_ARCH_GFX1250)
+  __hip_atomic_store(reinterpret_cast<unsigned short *>(addr),
+                     val,
+                     __ATOMIC_RELEASE,
+                     __HIP_MEMORY_SCOPE_AGENT);
+#elif MPK_AMD_DEVICE
   asm volatile("global_store_short %0, %1, off sc0 sc1"
                :
                : "v"(addr), "v"(val)
@@ -213,8 +293,12 @@ __device__ __forceinline__ void st_wt_u16(void *addr, unsigned short val) {
 
 // Write-through 8-bit store (1x byte)
 __device__ __forceinline__ void st_wt_u8(void *addr, uint8_t val) {
-#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
-    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#if MPK_AMD_DEVICE && defined(MIRAGE_ARCH_GFX1250)
+  __hip_atomic_store(reinterpret_cast<uint8_t *>(addr),
+                     val,
+                     __ATOMIC_RELEASE,
+                     __HIP_MEMORY_SCOPE_AGENT);
+#elif MPK_AMD_DEVICE
   asm volatile("global_store_byte %0, %1, off sc0 sc1"
                :
                : "v"(addr), "v"((unsigned)val)
@@ -225,8 +309,12 @@ __device__ __forceinline__ void st_wt_u8(void *addr, uint8_t val) {
 }
 
 __device__ __forceinline__ int atom_add_release_gpu_s32(int *addr, int val) {
-#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
-    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#if MPK_AMD_DEVICE && defined(MIRAGE_ARCH_GFX1250)
+  // -> global_atomic_add_u32 ... th:TH_ATOMIC_RETURN scope:SCOPE_DEV, with the
+  // release writeback and the correct split waits emitted by the compiler.
+  return __hip_atomic_fetch_add(
+      addr, val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+#elif MPK_AMD_DEVICE
   // Inline asm: no compiler-generated buffer_wbl2/buffer_inv around atomic.
   // Ordering provided by explicit threadfence_gpu() before this call.
   // sc0 sc1 required on GFX942 for cross-CU atomic visibility.
@@ -250,8 +338,10 @@ __device__ __forceinline__ int atom_add_release_gpu_s32(int *addr, int val) {
 __device__ __forceinline__ unsigned long long int
     atom_add_release_gpu_u64(unsigned long long int *addr,
                              unsigned long long int val) {
-#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
-    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#if MPK_AMD_DEVICE && defined(MIRAGE_ARCH_GFX1250)
+  return __hip_atomic_fetch_add(
+      addr, val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+#elif MPK_AMD_DEVICE
   // Inline asm: no compiler-generated buffer_wbl2/buffer_inv around atomic.
   // Ordering provided by explicit threadfence_gpu() before this call.
   // sc0 sc1 required on GFX942 for cross-CU atomic visibility.
@@ -276,8 +366,21 @@ __device__ __forceinline__ unsigned long long int
     atom_cas_release_gpu_u64(unsigned long long int *addr,
                              unsigned long long int cmp,
                              unsigned long long int val) {
-#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
-    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#if MPK_AMD_DEVICE && defined(MIRAGE_ARCH_GFX1250)
+  // __hip_atomic_compare_exchange_strong takes `expected` by pointer and
+  // OVERWRITES it with the observed value on failure -- so pass a local copy,
+  // not the caller's `cmp`, and return that copy. On success it is left equal
+  // to cmp, which is also what the gfx950 asm returns (the old value). Callers
+  // compare the result against cmp to detect success, so both paths agree.
+  unsigned long long int observed = cmp;
+  __hip_atomic_compare_exchange_strong(addr,
+                                       &observed,
+                                       val,
+                                       __ATOMIC_RELEASE,
+                                       __ATOMIC_RELAXED,
+                                       __HIP_MEMORY_SCOPE_AGENT);
+  return observed;
+#elif MPK_AMD_DEVICE
   // Inline asm: no compiler-generated buffer_wbl2/buffer_inv around atomic.
   // Ordering provided by explicit threadfence_gpu() before this call.
   // sc0 sc1 required on GFX942 for cross-CU atomic visibility.
