@@ -28,6 +28,16 @@ SYSROOT="${SYSROOT:-/home/claudeuser/noble-sysroot}"
 # shellcheck disable=SC1091
 source "$FFM_PKG/ffmlite_env.sh"
 
+# Time slicing is mandatory for anything persistent-kernel shaped. Without it
+# FFM runs workgroups strictly serially in ascending blockIdx, so MPK's very
+# first rendezvous -- execute_scheduler spinning on worker_xcd_ready_count --
+# waits on workers that will not be dispatched until it exits. The breadcrumb
+# signature is unmistakable: elect=1, s_spin_in=1, s_spin_out=0, disp=0 forever.
+# ffmlite_env.sh only mentions this in a comment, so set it here rather than
+# relying on every caller to remember. Export-if-unset so a caller can still
+# override (e.g. to reproduce the serial behaviour deliberately).
+export HSA_MODEL_ARGS="${HSA_MODEL_ARGS:-ffm_enable_time_slicing}"
+
 LD="$SYSROOT/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
 LP="$SYSROOT/lib/x86_64-linux-gnu:$SYSROOT/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
 
