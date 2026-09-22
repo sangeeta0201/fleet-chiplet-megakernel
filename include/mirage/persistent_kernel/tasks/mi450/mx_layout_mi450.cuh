@@ -96,6 +96,22 @@
 namespace kernel {
 namespace mi450 {
 
+// --- MX format constants ----------------------------------------------------
+//
+// Outside the MIRAGE_ARCH_GFX1250 guard on purpose. These describe the OCP MX
+// data format, not the instruction set, and host code -- LDS sizing helpers,
+// host-side packers, test references -- needs them on the host pass too, where
+// __gfx1250__ is not defined. Everything below the guard is device-only
+// because it emits WMMA-specific addressing or builtins.
+constexpr int MX_K_PER_TILE = 128;
+constexpr int MX_K_PER_SCALE_BLOCK = 32;
+constexpr int MX_SCALES_PER_TILE = MX_K_PER_TILE / MX_K_PER_SCALE_BLOCK; // 4
+
+// Only the low 32 bytes (= 64 nibbles) of the i32x16 operand are consumed for
+// FP4, so a packer only ever needs to fill 8 dwords.
+constexpr int MX_FP4_LIVE_DWORDS = 8;
+constexpr int MX_FP4_LIVE_BYTES = 32;
+
 #if defined(MIRAGE_ARCH_GFX1250)
 
 // --- Accumulator addressing -------------------------------------------------
@@ -145,13 +161,8 @@ __device__ __host__ __forceinline__ constexpr int mx_nibble_of_k(int k) {
   return 32 * (k / 64) + (k % 32);
 }
 
-// Only the low 32 bytes (= 64 nibbles) of the i32x16 operand are consumed for
-// FP4, so a packer only ever needs to fill 8 dwords.
-constexpr int MX_FP4_LIVE_DWORDS = 8;
-constexpr int MX_FP4_LIVE_BYTES = 32;
-constexpr int MX_K_PER_TILE = 128;
-constexpr int MX_K_PER_SCALE_BLOCK = 32;
-constexpr int MX_SCALES_PER_TILE = MX_K_PER_TILE / MX_K_PER_SCALE_BLOCK; // 4
+// (MX format constants are declared above the arch guard: host code needs
+// them, and they describe the data format rather than the ISA.)
 
 // --- Packing ----------------------------------------------------------------
 //
@@ -263,6 +274,93 @@ __device__ __forceinline__ void
   mx_global_u8 *src = base + (size_t)row * (k_stride / 2) + k / 2;
   __builtin_amdgcn_global_prefetch(
       (__attribute__((address_space(1))) void const *)src, 0);
+}
+
+// --- FP8 operand ------------------------------------------------------------
+//
+// The MX kernels in tasks/mi300 (gang_rmsnorm_linear_mxfp4_bias,
+// gang_moe_fused_mxfp4) multiply FP4 weights by FP8 E4M3 *tokens*, so they
+// need a B-operand loader in a format the FP4 helpers above do not cover.
+//
+// THE FP8 K-ORDER IS NOT THE FP4 K-ORDER. This is measured, and the natural
+// assumption is wrong.
+//
+// The tempting inference -- same 16x16x128 tile, same 64 operand elements per
+// lane, so just reread "nibble index" as "byte index" -- was written, tested,
+// and falsified: all 256 outputs mismatched
+// (tests/mi450/test_mx_fp8_layout.hip). tests/mi450/probe_fp8_pairing.hip then
+// measured the pairing directly, with no assumption on either side: light up
+// one A nibble, fill B so every (lane, byte) names itself, and read which B
+// byte the hardware contracted it against. All 128 pairs, both lane halves.
+//
+// Result. The A side is unchanged -- every measured pair agrees with
+// mx_src_k_base(), so mx_load_operand_fp4() was right and is reused as is:
+//
+//     A: k = 32*h + 16*(c&1) + 64*(c>>1) + i        h = lane>>4, c = chunk
+//     B: k = 32*c + 16*h     + i                    <-- different shape
+//
+// Both are bijections onto K = 0..127 (checked exhaustively), and B's scale
+// byte index is exactly its chunk index, so mx_pack_scales() needs no change.
+//
+// The practical difference: for FP4 the lane half selects a 32-wide K block
+// and the chunk selects a 16-wide slice within a 64-wide span; for FP8 the
+// chunk selects the 32-wide block and the lane half picks which 16 of it. So
+// the two halves of an FP8 chunk are 16 K apart, not 32.
+//
+// A NOTE ON THE PROBE, because it bit twice: pass all four E8M0 scale bytes
+// (0x7F7F7F7F), not a bare 127. A bare 127 sets byte 0 only, and bytes 1..3
+// then read as E8M0 0 = 2^-127, which flushes K >= 32 to zero. The first run
+// of the probe did that and reported a bogus "the record is only 32 K wide".
+//
+// 16 FP8 values = 16 bytes = 4 dwords per chunk (vs 2 for FP4), so unlike the
+// FP4 form all 16 dwords of the operand are live.
+//
+// Deliberately a separate function from mx_src_k_base rather than a parameter
+// on it: the two rules are unrelated, and a caller that picks the wrong one
+// compiles fine and produces plausible-looking garbage.
+__device__ __forceinline__ int mx_src_k_base_fp8(int lane, int chunk) {
+  return 32 * chunk + 16 * (lane >> 4);
+}
+
+__device__ __forceinline__ mx_i32x16_t
+    mx_load_operand_fp8(uint8_t const *base, int row, int k0, int k_stride) {
+  mx_i32x16_t out;
+  int lane = threadIdx.x & 31;
+#pragma unroll
+  for (int chunk = 0; chunk < 4; ++chunk) {
+    int k = k0 + mx_src_k_base_fp8(lane, chunk);
+    // One byte per K element, so the row stride is k_stride (not k_stride/2)
+    // and the element offset is k (not k/2). Getting either of those halved
+    // is the single easiest way to mis-port this from the FP4 form.
+    uint8_t const *src = base + (size_t)row * k_stride + k;
+    int4 v = *(int4 const *)src;
+    out[chunk * 4 + 0] = v.x;
+    out[chunk * 4 + 1] = v.y;
+    out[chunk * 4 + 2] = v.z;
+    out[chunk * 4 + 3] = v.w;
+  }
+  return out;
+}
+
+// Global-address-space form. See the mx_load_operand_fp4_global comment for
+// why the address-space cast matters (FLAT vs GLOBAL issue cost).
+__device__ __forceinline__ mx_i32x16_t
+    mx_load_operand_fp8_global(mx_global_u8 *base, int row, int k0,
+                               int k_stride) {
+  using g_int4 = __attribute__((address_space(1))) int4 const;
+  mx_i32x16_t out;
+  int lane = threadIdx.x & 31;
+#pragma unroll
+  for (int chunk = 0; chunk < 4; ++chunk) {
+    int k = k0 + mx_src_k_base_fp8(lane, chunk);
+    mx_global_u8 *src = base + (size_t)row * k_stride + k;
+    int4 v = *(g_int4 *)src;
+    out[chunk * 4 + 0] = v.x;
+    out[chunk * 4 + 1] = v.y;
+    out[chunk * 4 + 2] = v.z;
+    out[chunk * 4 + 3] = v.w;
+  }
+  return out;
 }
 
 // Build the per-lane scale operand from 4 consecutive E8M0 bytes.
