@@ -118,12 +118,29 @@ int main() {
   // output quantization alone is ~2^-8 relative, so 3% leaves headroom for
   // accumulation-order differences without admitting a layout error.
   int bad = 0;
+  int nonfinite = 0;
   float worst = 0.f;
   int worst_m = -1, worst_n = -1;
   for (int m = 0; m < M; ++m) {
     for (int n = 0; n < N; ++n) {
       float got = bf16_to_f32(hO[m * N + n]);
       float want = ref[m * N + n];
+      // Finiteness is checked BEFORE the tolerance, and counted separately.
+      // `rel > 0.03f` is false when rel is NaN, so a kernel that emitted NaN
+      // for every element would otherwise fall through with bad == 0 and a
+      // reported worst error of exactly 0.0 -- reading as an unusually clean
+      // pass rather than total failure. (Observed for real in
+      // tests/mi450/test_kv_cache_update.hip, where it let a wave64 mutant
+      // survive.) `continue` matters too: letting a NaN reach the worst-error
+      // comparison below would leave `worst` at 0 and hide it in the summary.
+      if (!std::isfinite(got) || !std::isfinite(want)) {
+        if (nonfinite < 8) {
+          printf("  NON-FINITE [%2d,%2d] got %f want %f\n", m, n, got, want);
+        }
+        ++nonfinite;
+        ++bad;
+        continue;
+      }
       float denom = fmaxf(fabsf(want), 1.0f);
       float rel = fabsf(got - want) / denom;
       if (rel > worst) {
@@ -141,7 +158,13 @@ int main() {
     }
   }
 
-  printf("worst rel err %.4f at [%d,%d]\n", worst, worst_m, worst_n);
+  printf("worst rel err %.4f at [%d,%d] (%d non-finite)\n", worst, worst_m,
+         worst_n, nonfinite);
+  if (nonfinite) {
+    printf("FAIL: %d/%d elements are not finite -- a tolerance check alone "
+           "cannot detect this\n", nonfinite, M * N);
+    return 1;
+  }
   if (bad) {
     printf("FAIL: %d/%d elements outside tolerance\n", bad, M * N);
     printf("  -> most likely the per-lane fragment layout in "

@@ -470,6 +470,23 @@ static int run_shape() {
     b.u = ((unsigned)bias[r]) << 16;
     ref += b.f;
 
+    // Finiteness before tolerance. `eN > tol` is false when eN is NaN, so a
+    // kernel emitting NaN for every row would report mismatches=0 and
+    // worst_err=0 for both variants and pass. The naive-vs-pipelined equality
+    // check below is NaN-safe in the wrong direction: NaN != NaN, so it would
+    // fire -- but it reports a *difference between the two kernels*, which
+    // reads as a pipelining bug rather than as both being broken.
+    if (!std::isfinite(gotN[r]) || !std::isfinite(gotP[r]) ||
+        !std::isfinite(ref)) {
+      if (badN < 3) {
+        printf("  NON-FINITE out[%3d] naive=%f pipe=%f ref=%f -- a tolerance "
+               "check cannot detect this\n", r, gotN[r], gotP[r], ref);
+      }
+      ++badN;
+      ++badP;
+      continue;
+    }
+
     double eN = std::fabs(gotN[r] - ref), eP = std::fabs(gotP[r] - ref);
     worstN = fmax(worstN, eN);
     worstP = fmax(worstP, eP);
