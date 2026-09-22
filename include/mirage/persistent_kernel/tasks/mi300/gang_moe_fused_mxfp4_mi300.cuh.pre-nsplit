@@ -775,35 +775,6 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   int global_tile = tile_idx * MPK_NUM_XCDS + ((xcd_id + layer_idx) & (MPK_NUM_XCDS - 1));
 #elif defined(MPK_MOE_XCD_STRIPE_TILE)
   int global_tile = tile_idx * MPK_NUM_XCDS + ((xcd_id + tile_idx) & (MPK_NUM_XCDS - 1));
-#elif defined(MPK_MOE_AID_NSPLIT)
-  // N-split both GEMMs across the AIDs, confining neither expert to a die.
-  // For every slot: tiles 0..22 -> AID0's XCDs, tiles 23..45 -> AID1's.
-  // Every expert stays live on both AIDs, so slot s's W2 tiles still read
-  // BOTH swiglu copies and the per-copy reader fan-in stays at ~23.
-  static_assert(MPK_NUM_XCDS == 8, "MPK_MOE_AID_NSPLIT assumes 8 XCDs / 2 AIDs");
-  static_assert(MAX_ACTIVATED == 4, "MPK_MOE_AID_NSPLIT assumes 4 routing slots");
-  static_assert(W13_TILES == 46 && W2_TILES == 46, "tile counts");
-  constexpr int kHalfTiles = W13_TILES / 2;                              // 23
-  constexpr int kNsW13 = MAX_ACTIVATED * kHalfTiles;                     // 92
-  constexpr int kNsPad = (TOTAL_W13 - MAX_ACTIVATED * W13_TILES) / 2;    // 28
-  int const aid_half = xcd_id >> 2;
-  int const aid_lane = xcd_id & 3;
-  int const j = tile_idx * 4 + aid_lane;
-  int global_tile;
-  if (j < kNsW13) {
-    global_tile = (j / kHalfTiles) * W13_TILES + aid_half * kHalfTiles
-                + (j % kHalfTiles);
-  } else if (j < kNsW13 + kNsPad) {
-    global_tile =
-        MAX_ACTIVATED * W13_TILES + kNsPad * aid_half + (j - kNsW13);
-  } else if (j < kNsW13 + kNsPad + kNsW13) {
-    int const jj = j - kNsW13 - kNsPad;
-    global_tile = TOTAL_W13 + (jj / kHalfTiles) * W2_TILES
-                + aid_half * kHalfTiles + (jj % kHalfTiles);
-  } else {
-    MPK_WS_MARK(8100, j); // exit: past this AID's share of the tile space
-    return;
-  }
 #elif defined(MPK_MOE_AID_EXPERT)
   // Expert parallelism by routing SLOT: AID0's dies own slots 0,1 and AID1's
   // own slots 2,3, so a slot's W13 producers and W2 consumers sit on the same
@@ -4481,20 +4452,6 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         int layer_idx =
             *reinterpret_cast<int *>(&_fused_smem[LAYER_IDX_SMEM_OFF]);
         int release_val = layer_idx + 1;
-#ifdef MPK_MOE_NARROW_RELEASE
-        // One slot per AID instead of eight. Every XCD of an AID polls slot 0
-        // of its own replica, so the 16-store fan-out collapses to 2.
-        {
-#ifdef MPK_AID_SPLIT_FLAGS
-          mpk_aid_publish_at(d_barrier,
-                             base,
-                             (unsigned)release_val,
-                             MPK_AID_MOE_BASE_INTS);
-#else
-          st_wt_u32((void *)&d_barrier[base], (unsigned)release_val);
-#endif
-        }
-#else
         for (int x = 0; x < 8; x++) {
 #ifdef MPK_AID_SPLIT_FLAGS
           mpk_aid_publish_at(d_barrier,
@@ -4506,7 +4463,6 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                     (unsigned)release_val);
 #endif
         }
-#endif
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       }
     }
@@ -4855,14 +4811,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     // nothing.
     if (tid == 0)
 #endif
-#ifdef MPK_MOE_NARROW_RELEASE
-    while (!kMoeBarSkip &&
-           (_obs = MPK_LD_GATE2(&d_barrier_rel[base])) < expected) {
-#else
     while (!kMoeBarSkip &&
            (_obs = MPK_LD_GATE2(&d_barrier_rel[base + xcd_id * MOE_BAR_LINE])) <
                expected) {
-#endif
       MPK_WS_WAIT_TICK(_obs, _spins);
       // Refresh the discriminating values on the same cadence as the tick:
       // the raw arrival counter (whether it sits on a multiple of W13_TILES

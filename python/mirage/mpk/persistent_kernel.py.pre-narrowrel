@@ -1739,10 +1739,6 @@ def get_compile_command(
             # N-split both MoE GEMMs across the AIDs without confining any
             # expert to a die: per slot, tiles 0..22 -> AID0, 23..45 -> AID1.
             flags = flags + ["-DMPK_MOE_AID_NSPLIT"]
-        if int(os.environ.get("MPK_MOE_NARROW_RELEASE", "0")) == 1:
-            # Publish one W13->W2 release slot per AID instead of eight.
-            # Targets the measured 6.88us `arrive` on the last-arriving tile.
-            flags = flags + ["-DMPK_MOE_NARROW_RELEASE"]
         if int(os.environ.get("MPK_MOE_AID_EXPERT_W13", "0")) == 1:
             # Bisection: AID-own the W13 region only, W2 on the stock stripe.
             # Implies MPK_MOE_AID_EXPERT (it edits that block).

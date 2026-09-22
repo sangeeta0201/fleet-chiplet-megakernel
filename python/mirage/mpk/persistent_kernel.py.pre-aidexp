@@ -1729,29 +1729,6 @@ def get_compile_command(
             # first-selected expert; also d_routing[carried] can miss the
             # pick-time st_wt. Do not default-on. Use MPK_MOE_XCD_PAIR.
             flags = flags + ["-DMPK_EARLY_ROUTING"]
-        if int(os.environ.get("MPK_MOE_AID_EXPERT", "0")) == 1:
-            # Expert parallelism by routing slot: AID0's dies own slots 0,1
-            # and AID1's own slots 2,3, so a slot's W13 producers and W2
-            # consumers share four XCDs and its barrier stays inside one AID.
-            # Permutation of the existing tile space -> bit-identical output.
-            flags = flags + ["-DMPK_MOE_AID_EXPERT"]
-        if int(os.environ.get("MPK_MOE_AID_NSPLIT", "0")) == 1:
-            # N-split both MoE GEMMs across the AIDs without confining any
-            # expert to a die: per slot, tiles 0..22 -> AID0, 23..45 -> AID1.
-            flags = flags + ["-DMPK_MOE_AID_NSPLIT"]
-        if int(os.environ.get("MPK_MOE_NARROW_RELEASE", "0")) == 1:
-            # Publish one W13->W2 release slot per AID instead of eight.
-            # Targets the measured 6.88us `arrive` on the last-arriving tile.
-            flags = flags + ["-DMPK_MOE_NARROW_RELEASE"]
-        if int(os.environ.get("MPK_MOE_AID_EXPERT_W13", "0")) == 1:
-            # Bisection: AID-own the W13 region only, W2 on the stock stripe.
-            # Implies MPK_MOE_AID_EXPERT (it edits that block).
-            flags = flags + ["-DMPK_MOE_AID_EXPERT", "-DMPK_MOE_AID_EXPERT_W13"]
-        if int(os.environ.get("MPK_MOE_SKIP_BAR", "0")) == 1:
-            # TIMING PROBE ONLY -- deletes the W13->W2 wait (keeps the
-            # release). Output is garbage by design; the delta against the
-            # control is the upper bound on removing the barrier.
-            flags = flags + ["-DMPK_MOE_SKIP_BAR"]
         # The same transform on the LM head's g-group argmax: two `__shfl_xor`
         # steps carrying a (value, index) pair become one interleaved
         # permlane16_swap / permlane32_swap chain. Four ds_bpermute and two

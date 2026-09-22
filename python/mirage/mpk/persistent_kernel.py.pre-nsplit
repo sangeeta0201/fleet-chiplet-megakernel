@@ -1735,14 +1735,6 @@ def get_compile_command(
             # consumers share four XCDs and its barrier stays inside one AID.
             # Permutation of the existing tile space -> bit-identical output.
             flags = flags + ["-DMPK_MOE_AID_EXPERT"]
-        if int(os.environ.get("MPK_MOE_AID_NSPLIT", "0")) == 1:
-            # N-split both MoE GEMMs across the AIDs without confining any
-            # expert to a die: per slot, tiles 0..22 -> AID0, 23..45 -> AID1.
-            flags = flags + ["-DMPK_MOE_AID_NSPLIT"]
-        if int(os.environ.get("MPK_MOE_NARROW_RELEASE", "0")) == 1:
-            # Publish one W13->W2 release slot per AID instead of eight.
-            # Targets the measured 6.88us `arrive` on the last-arriving tile.
-            flags = flags + ["-DMPK_MOE_NARROW_RELEASE"]
         if int(os.environ.get("MPK_MOE_AID_EXPERT_W13", "0")) == 1:
             # Bisection: AID-own the W13 region only, W2 on the stock stripe.
             # Implies MPK_MOE_AID_EXPERT (it edits that block).

@@ -4481,20 +4481,6 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         int layer_idx =
             *reinterpret_cast<int *>(&_fused_smem[LAYER_IDX_SMEM_OFF]);
         int release_val = layer_idx + 1;
-#ifdef MPK_MOE_NARROW_RELEASE
-        // One slot per AID instead of eight. Every XCD of an AID polls slot 0
-        // of its own replica, so the 16-store fan-out collapses to 2.
-        {
-#ifdef MPK_AID_SPLIT_FLAGS
-          mpk_aid_publish_at(d_barrier,
-                             base,
-                             (unsigned)release_val,
-                             MPK_AID_MOE_BASE_INTS);
-#else
-          st_wt_u32((void *)&d_barrier[base], (unsigned)release_val);
-#endif
-        }
-#else
         for (int x = 0; x < 8; x++) {
 #ifdef MPK_AID_SPLIT_FLAGS
           mpk_aid_publish_at(d_barrier,
@@ -4506,7 +4492,6 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                     (unsigned)release_val);
 #endif
         }
-#endif
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       }
     }
@@ -4855,14 +4840,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     // nothing.
     if (tid == 0)
 #endif
-#ifdef MPK_MOE_NARROW_RELEASE
-    while (!kMoeBarSkip &&
-           (_obs = MPK_LD_GATE2(&d_barrier_rel[base])) < expected) {
-#else
     while (!kMoeBarSkip &&
            (_obs = MPK_LD_GATE2(&d_barrier_rel[base + xcd_id * MOE_BAR_LINE])) <
                expected) {
-#endif
       MPK_WS_WAIT_TICK(_obs, _spins);
       // Refresh the discriminating values on the same cadence as the tick:
       // the raw arrival counter (whether it sits on a multiple of W13_TILES
