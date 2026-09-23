@@ -1517,6 +1517,8 @@ def get_compile_command(
             flags = flags + ["-DMPK_SCHED_ONE_FENCE"]
         if int(os.environ.get("MPK_W13_HOF_AIDREP", "0")) == 1:
             flags = flags + ["-DMPK_W13_HOF_AIDREP"]
+        if int(os.environ.get("MPK_W13_HOF_XCDREP", "0")) == 1:
+            flags = flags + ["-DMPK_W13_HOF_XCDREP"]
         if int(os.environ.get("MPK_P9_LEADER_INV", "0")) == 1:
             flags = flags + ["-DMPK_P9_LEADER_INV"]
         if int(os.environ.get("MPK_P9_PREINV", "0")) == 1:

@@ -187,10 +187,28 @@ constexpr int MPK_AID_W13HOF_BASE_INTS = 262144;
 #ifndef MPK_AID_SPLIT_FLAGS
 #error "MPK_W13_HOF_AIDREP needs the MPK_AID_SPLIT_FLAGS replicas"
 #endif
+#ifdef MPK_W13_HOF_XCDREP
+// Each die writes and reads only its own copy: plain stores stay in
+// its L2, where its W13 tiles find them.
+#define MPK_HOF_STORE_MOD ""
+#else
 #define MPK_HOF_STORE_MOD " sc0 sc1"
+#endif
 #else
 #define MPK_HOF_STORE_MOD ""
 #endif
+// Offset of this die's private copy under MPK_W13_HOF_XCDREP (8 KiB per
+// die, four dies per AID replica: 262144..270336, clear of L2CLEAN).
+constexpr int MPK_AID_W13HOF_COPY_INTS = 2048;
+__device__ __forceinline__ int mpk_hof_copy_ints() {
+#ifdef MPK_W13_HOF_XCDREP
+  int x;
+  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)" : "=s"(x));
+  return (x & 3) * MPK_AID_W13HOF_COPY_INTS;
+#else
+  return 0;
+#endif
+}
 // AID of the physical die; the producer and the consumers must agree.
 __device__ __forceinline__ int mpk_hof_aid() {
   int x;
@@ -201,7 +219,7 @@ __device__ __forceinline__ int mpk_hof_aid() {
 #define MPK_MOE_HOF_IN(torch_in)                                               \
   ((g_aid_flag_rep[0] != nullptr && g_aid_flag_rep[1] != nullptr)              \
        ? (void const *)(g_aid_flag_rep[mpk_hof_aid()] +                        \
-                        MPK_AID_W13HOF_BASE_INTS)                              \
+                        MPK_AID_W13HOF_BASE_INTS + mpk_hof_copy_ints())        \
        : (void const *)(torch_in))
 #else
 #define MPK_MOE_HOF_IN(torch_in) (torch_in)

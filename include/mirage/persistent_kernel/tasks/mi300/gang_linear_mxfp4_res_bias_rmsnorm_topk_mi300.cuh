@@ -2251,7 +2251,7 @@ router_tile_pass:;
       // per AID fetch the same lines from one channel.
       if (g_aid_flag_rep[0] != nullptr && g_aid_flag_rep[1] != nullptr) {
         n_base = (char *)(g_aid_flag_rep[mpk_hof_aid()] +
-                          MPK_AID_W13HOF_BASE_INTS) +
+                          MPK_AID_W13HOF_BASE_INTS + mpk_hof_copy_ints()) +
                  (int64_t)b * output_stride * 2;
       }
 #endif
