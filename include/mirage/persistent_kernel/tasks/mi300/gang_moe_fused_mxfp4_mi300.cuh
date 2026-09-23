@@ -624,7 +624,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 
   extern __shared__ char _fused_smem[];
 
-#ifdef MPK_MOE_INNER_TIMING
+#if defined(MPK_MOE_INNER_TIMING) || defined(MPK_MOE_LDS)
   // Entry stamp, before the tile decode. The decode is not free and is not
   // covered by _mt0: it is two *dependent* loads that both miss (d_mask, then
   // d_routing indexed by what d_mask returned), and every worker pays it on
@@ -669,6 +669,15 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #endif
 
   int xcd_id = _gang_moe_get_xcd_id();
+#ifdef MPK_MOE_BIAS_REP
+  // [2E, n] biases whose upper copy is homed in range 1 (MPK_MOE_REPLICA's
+  // layout): the upper AID's XCDs read that copy. Moving the two bases once
+  // covers every expert_id-indexed read below.
+  if (xcd_id >= MPK_NUM_XCDS / 2) {
+    d_w13_bias += NUM_EXPERTS * W13_OUTPUT_SIZE;
+    d_w2_bias += NUM_EXPERTS * W2_OUTPUT_SIZE;
+  }
+#endif
 #ifdef MPK_AID_SPLIT_FLAGS
   // Replica view for the per-XCD release flags only. The arrival counter at
   // MOE_BAR_COUNTER_SLOT stays on `d_barrier`: it is a device-scope atomic,
@@ -1125,7 +1134,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   g_subphase_scratch[0] = __builtin_amdgcn_s_memrealtime();
 #endif
 
-#ifdef MPK_MOE_INNER_TIMING
+#if defined(MPK_MOE_INNER_TIMING) || defined(MPK_MOE_LDS)
   // Inner split of Phase 8, on the same pattern as MPK_OPROJ_INNER_TIMING.
   // Not MPK_ENABLE_MOE_SUBPHASE: that mechanism writes g_subphase_scratch,
   // one global slot shared by all 240 workers, so its deltas come out
@@ -4476,7 +4485,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 
     } // end W13 compute region
   w13_arrive:
-#ifdef MPK_MOE_INNER_TIMING
+#if defined(MPK_MOE_INNER_TIMING) || defined(MPK_MOE_LDS)
     // Declared at the label, not before the goto: a jump may not cross an
     // initialization, and the empty-slot path jumps straight here.
     unsigned long long _mt1 = __builtin_amdgcn_s_memrealtime();
@@ -4559,6 +4568,15 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     // Raw timestamps in scratch[0..4] — deltas computed by scheduler
 #endif
 
+#if defined(MPK_MOE_LDS) && defined(MPK_PHASE_LDS)
+    if (tid == 0 && MPK_MOE_ARMED()) {
+      unsigned long long const _ml2 = __builtin_amdgcn_s_memrealtime();
+      s_moe_acc[0] += (_mt0 - _mtE) * 10;
+      s_moe_acc[1] += (_mt1 - _mt0) * 10;
+      s_moe_acc[2] += (_ml2 - _mt1) * 10;
+      s_moe_n[0]++;
+    }
+#endif
 #ifdef MPK_MOE_INNER_TIMING
     // W13 arm. `arrive` is the fence + arrival atomic + (on the last arrival)
     // the eight-slot release fan-out, which is why it is worth separating from
@@ -4845,7 +4863,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     }
   }
 
-#ifdef MPK_MOE_INNER_TIMING
+#if defined(MPK_MOE_INNER_TIMING) || defined(MPK_MOE_LDS)
   // Taken after the weight prefetch is issued and before the poll, so `prefetch`
   // below is issue cost only -- the HBM latency it hides lands in `barrier`.
   unsigned long long _mt1 = __builtin_amdgcn_s_memrealtime();
@@ -4949,7 +4967,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   }
   MOE_DBG_SUBPHASE(3002);
   MPK_WS_MARK(8302, global_tile); // W2: cleared W13->W2 barrier
-#ifdef MPK_MOE_INNER_TIMING
+#if defined(MPK_MOE_INNER_TIMING) || defined(MPK_MOE_LDS)
   unsigned long long _mt2 = __builtin_amdgcn_s_memrealtime();
 #endif
 
@@ -6021,6 +6039,16 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     }
 #endif
 
+#if defined(MPK_MOE_LDS) && defined(MPK_PHASE_LDS)
+  if (tid == 0 && MPK_MOE_ARMED()) {
+    unsigned long long const _ml3 = __builtin_amdgcn_s_memrealtime();
+    s_moe_acc[3] += (_mt0 - _mtE) * 10;
+    s_moe_acc[4] += (_mt1 - _mt0) * 10;
+    s_moe_acc[5] += (_mt2 - _mt1) * 10;
+    s_moe_acc[6] += (_ml3 - _mt2) * 10;
+    s_moe_n[1]++;
+  }
+#endif
 #ifdef MPK_MOE_INNER_TIMING
   // W2 arm. `prep` covers the decode, the weight-prefetch issue and the scale
   // staging; `barrier` is the wait on the W13 release, which is where the

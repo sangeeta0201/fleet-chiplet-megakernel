@@ -435,6 +435,10 @@ def get_compile_command(
         # termination -- no printf on the hot path, unlike MPK_DEVICE_TIMING.
         if int(os.environ.get("MPK_OPROJ_LDS", "0")) == 1:
             flags = flags + ["-DMPK_OPROJ_LDS"]
+        if int(os.environ.get("MPK_MOE_BIAS_REP", "0")) == 1:
+            flags = flags + ["-DMPK_MOE_BIAS_REP"]
+        if int(os.environ.get("MPK_MOE_LDS", "0")) == 1:
+            flags = flags + ["-DMPK_MOE_LDS"]
         if int(os.environ.get("MPK_PHASE_LDS", "0")) == 1:
             # LDS-resident phase recorder; needs MPK_PHASE_SLOTS.
             flags = flags + ["-DMPK_PHASE_LDS"]

@@ -249,6 +249,17 @@ __device__ __forceinline__ void mpk_sub_mark(int k) {
 #else
 #define MPK_SUB_MARK(k) do {} while (0)
 #endif
+#ifdef MPK_MOE_LDS
+// Per-worker MoE split, summed over every armed tile: W13 dec/compute/arrive
+// and W2 dec/prep/barrier/compute (ns). Copied out with the phase spans.
+__shared__ unsigned int s_moe_acc[7];
+__shared__ unsigned int s_moe_n[2];
+__device__ unsigned int g_moe_acc[MPK_PHASE_MAX_WORKERS * 7];
+__device__ unsigned int g_moe_n[MPK_PHASE_MAX_WORKERS * 2];
+#define MPK_MOE_ARMED()                                                        \
+  (s_phase_layers >=                                                         \
+   (unsigned int)(MPK_PHASE_START_ITER * MPK_PHASE_LAYERS_PER_ITER))
+#endif
 __device__ __forceinline__ void mpk_phase_lds_init() {
   if (threadIdx.x == 0) {
     for (int s = 0; s < MPK_PHASE_SLOT_COUNT; s++) {
@@ -270,6 +281,11 @@ __device__ __forceinline__ void mpk_phase_lds_init() {
 #endif
     s_phase_layers = 0;
     s_phase_n = 0;
+#ifdef MPK_MOE_LDS
+    for (int k = 0; k < 7; k++) s_moe_acc[k] = 0;
+    s_moe_n[0] = 0;
+    s_moe_n[1] = 0;
+#endif
   }
 }
 
@@ -347,6 +363,11 @@ __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
     g_sub_last_n[worker] = s_sub_last_n;
     for (int k = 0; k < 3; k++) g_tk_span[worker * 3 + k] = s_tk_span[k];
     g_tk_n[worker] = s_tk_n;
+#endif
+#ifdef MPK_MOE_LDS
+    for (int k = 0; k < 7; k++) g_moe_acc[worker * 7 + k] = s_moe_acc[k];
+    g_moe_n[worker * 2] = s_moe_n[0];
+    g_moe_n[worker * 2 + 1] = s_moe_n[1];
 #endif
     g_phase_n[worker * MPK_PHASE_PAD_U64] = n;
   }
@@ -4136,6 +4157,20 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                 printf("[PSUBL] w=%d nl=%u last=%llu\n", w, g_sub_last_n[w],
                        g_sub_last[w] / g_sub_last_n[w]);
               }
+            }
+#endif
+#ifdef MPK_MOE_LDS
+            for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+              unsigned int const a = g_moe_n[w * 2], b = g_moe_n[w * 2 + 1];
+              if (a == 0 && b == 0) {
+                continue;
+              }
+              unsigned int const *m = &g_moe_acc[w * 7];
+              printf("[MSUBW] w=%d n13=%u dec=%u cmp=%u arr=%u n2=%u "
+                     "dec=%u prep=%u bar=%u cmp=%u\n",
+                     w, a, a ? m[0] / a : 0, a ? m[1] / a : 0, a ? m[2] / a : 0,
+                     b, b ? m[3] / b : 0, b ? m[4] / b : 0, b ? m[5] / b : 0,
+                     b ? m[6] / b : 0);
             }
 #endif
             // Raw per-slot timestamps of the last armed layer, so one layer's

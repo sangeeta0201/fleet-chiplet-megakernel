@@ -12,7 +12,7 @@ if [ "${KEEP_BUILD:-0}" != "1" ]; then
   rm -rf permanent_output_dir permanent_output_dir_rank*
 fi
 
-python demo.py --use-mirage \
+${MPK_WRAP:-} python demo.py --use-mirage \
   --max-seq-length "${MAX_SEQ_LENGTH:-128}" \
   --max-new-tokens "${MAX_NEW_TOKENS:-16}" \
   --ignore-eos \

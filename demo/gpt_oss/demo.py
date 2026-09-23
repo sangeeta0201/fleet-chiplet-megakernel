@@ -2602,6 +2602,17 @@ if __name__ == "__main__":
         print(f"  Packed {num_layers} layers: gate_up {list(moe_gate_up_proj_weights[0].shape)}, "
               f"down {list(moe_down_proj_weights[0].shape)}")
 
+        if os.environ.get("MPK_MOE_BIAS_REP", "0") == "1":
+            # [2E, n] per bias; with MPK_OWN_BO_PAT=...,gate_up_bias,down_bias
+            # and MPK_OWN_BO_ALIGN=1 the upper copy lands in range 1, and the
+            # kernel reads it from XCDs 4-7 (see gang_moe_fused_mxfp4_mi300.cuh).
+            for _l in range(len(moe_gate_up_proj_biases)):
+                moe_gate_up_proj_biases[_l] = torch.cat(
+                    [moe_gate_up_proj_biases[_l]] * 2, dim=0).contiguous()
+                moe_down_proj_biases[_l] = torch.cat(
+                    [moe_down_proj_biases[_l]] * 2, dim=0).contiguous()
+            print(f"[MOE_BIAS_REP] biases {list(moe_gate_up_proj_biases[0].shape)} "
+                  f"{list(moe_down_proj_biases[0].shape)}", flush=True)
         # MPK_MOE_REPLICA: a full copy of the MoE weights per memory range.
         # Duplicating along the expert axis makes the tensor [2E, wgs, bytes];
         # the driver's halves placement puts [0,E) in range 0 and [E,2E) in
