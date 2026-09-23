@@ -678,6 +678,20 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #else
   int *d_barrier_rel = d_barrier;
 #endif
+#ifdef MPK_PAIR_LOCAL_PUB
+#if !defined(MPK_MOE_XCD_PAIR) || !defined(MPK_SWIGLU_AIDREP) || \
+    !defined(MPK_MOE_NARROW_RELEASE) || !defined(MPK_AID_SPLIT_FLAGS)
+#error "MPK_PAIR_LOCAL_PUB needs MOE_XCD_PAIR, SWIGLU_AIDREP, MOE_NARROW_RELEASE, AID_SPLIT_FLAGS"
+#endif
+  // Pairing keeps an expert's W13 producers and W2 consumers on one AID:
+  // aim both swiglu stores at this AID's copy, which is what W2 reads.
+  if (g_aid_flag_rep[0] != nullptr && g_aid_flag_rep[1] != nullptr) {
+    if (xcd_id >= MPK_NUM_XCDS / 2) {
+      d_swiglu_out += swiglu_aid_half;
+    }
+    swiglu_aid_half = 0;
+  }
+#endif
   // Marker 1000: about to read the routing mask. Everything downstream --
   // expert_id, the weight base pointers, the barrier slot -- derives from it.
   MOE_DBG_ENTRY(1000, (unsigned long long)tile_idx);
@@ -4511,7 +4525,10 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         // One slot per AID instead of eight. Every XCD of an AID polls slot 0
         // of its own replica, so the 16-store fan-out collapses to 2.
         {
-#ifdef MPK_AID_SPLIT_FLAGS
+#if defined(MPK_PAIR_LOCAL_PUB)
+          // Every W2 consumer of this expert polls this AID's replica.
+          st_wt_u32((void *)&d_barrier_rel[base], (unsigned)release_val);
+#elif defined(MPK_AID_SPLIT_FLAGS)
           mpk_aid_publish_at(d_barrier,
                              base,
                              (unsigned)release_val,
