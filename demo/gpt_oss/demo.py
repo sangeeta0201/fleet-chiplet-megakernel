@@ -532,7 +532,16 @@ def _own_bo_maybe(t, name):
     if not copy:
         return t
     ptr = _ct.c_void_p()
-    rc = hip.hipMalloc(_ct.byref(ptr), _ct.c_size_t(n))
+    if os.environ.get("MPK_OWN_BO_ALIGN", "0") == "1":
+        # Midpoint on the halves cut: BO of 2*ALIGN_UP(n/2, 2 MiB), tensor
+        # offset so that off + n/2 == size/2 (to 256 B).
+        chunk = 2 << 20
+        half = -(-((n + 1) // 2) // chunk) * chunk
+        bo_n = 2 * half
+        off_in = ((half - n // 2) // 256) * 256
+    else:
+        bo_n, off_in = n, 0
+    rc = hip.hipMalloc(_ct.byref(ptr), _ct.c_size_t(bo_n))
     if rc != 0 or not ptr.value:
         print(f"[BOMAP] {name}: hipMalloc rc={rc}, keeping original", flush=True)
         return t
@@ -542,11 +551,16 @@ def _own_bo_maybe(t, name):
 
     cai = _CAI()
     cai.__cuda_array_interface__ = {"shape": (n,), "typestr": "|u1",
-                                    "data": (ptr.value, False), "version": 2,
+                                    "data": (ptr.value + off_in, False),
+                                    "version": 2,
                                     "strides": None}
     own = torch.as_tensor(cai, device="cuda").view(t.dtype).view(t.shape)
     own.copy_(t)
     torch.cuda.synchronize()
+    if bomap:
+        b2, s2, off2, f2 = where(own)
+        print(f"[BOMAP] {name}(own BO) n={n} bo=+{s2} off={off2} "
+              f"in_first_half={f2:.3f}", flush=True)
     _OWN_BO_KEEPALIVE.append((hip, ptr, own))
     return own
 
