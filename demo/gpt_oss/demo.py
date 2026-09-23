@@ -497,6 +497,60 @@ def shuffle_oproj_workgroups_kmajor(packed: torch.Tensor,
 LM_HEAD_KMAJOR = os.environ.get("MPK_LM_HEAD_KMAJOR", "0") == "1"
 
 
+_OWN_BO_KEEPALIVE = []
+
+
+def _own_bo_maybe(t, name):
+    """[BOMAP] / own-BO copy for one attached tensor (see MPK_OWN_BO_PAT)."""
+    bomap = os.environ.get("MPK_BOMAP", "0") == "1"
+    pats = [p for p in os.environ.get("MPK_OWN_BO_PAT", "").split(",") if p]
+    if not (bomap or pats) or not isinstance(t, torch.Tensor) or not t.is_cuda:
+        return t
+    n = t.numel() * t.element_size()
+    if n < (1 << 20):
+        return t
+    import ctypes as _ct
+    hip = _ct.CDLL("libamdhip64.so")
+
+    def where(x):
+        base, size = _ct.c_void_p(), _ct.c_size_t()
+        hip.hipMemGetAddressRange(_ct.byref(base), _ct.byref(size),
+                                  _ct.c_void_p(x.data_ptr()))
+        p, b, s = x.data_ptr(), base.value or 0, size.value
+        cut = b + ((s >> 1) // (2 << 20)) * (2 << 20)
+        lo = max(0, min(p + n, cut) - p)
+        return b, s, p - b, lo / n
+
+    b, s, off, f = where(t)
+    # Already its own BO and cut at the midpoint: halves placement is right.
+    placed = off == 0 and s < n + (4 << 20) and abs(f - 0.5) < 0.05
+    copy = (any(p in name for p in pats) and "k_cache" not in name
+            and "v_cache" not in name and t.is_contiguous() and not placed)
+    if bomap:
+        print(f"[BOMAP] {name} n={n} bo=+{s} off={off} in_first_half={f:.3f}"
+              f"{' -> own' if copy else ''}", flush=True)
+    if not copy:
+        return t
+    ptr = _ct.c_void_p()
+    rc = hip.hipMalloc(_ct.byref(ptr), _ct.c_size_t(n))
+    if rc != 0 or not ptr.value:
+        print(f"[BOMAP] {name}: hipMalloc rc={rc}, keeping original", flush=True)
+        return t
+
+    class _CAI:
+        pass
+
+    cai = _CAI()
+    cai.__cuda_array_interface__ = {"shape": (n,), "typestr": "|u1",
+                                    "data": (ptr.value, False), "version": 2,
+                                    "strides": None}
+    own = torch.as_tensor(cai, device="cuda").view(t.dtype).view(t.shape)
+    own.copy_(t)
+    torch.cuda.synchronize()
+    _OWN_BO_KEEPALIVE.append((hip, ptr, own))
+    return own
+
+
 # Ships on for batch-1. Host permute (pack site) and kernel flag both go
 # through mpk_opt with the same batch size so they cannot desync. Narrowed
 # off at bs>1 by _BS1_ONLY_OPTS.
@@ -2588,6 +2642,7 @@ if __name__ == "__main__":
 
         def _attach_input_keep(torch_tensor, name):
             """attach_input + keep tensor alive to prevent pointer reuse."""
+            torch_tensor = _own_bo_maybe(torch_tensor, name)
             _layer_weight_refs.append(torch_tensor)
             return mpk.attach_input(torch_tensor=torch_tensor, name=name)
 
