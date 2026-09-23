@@ -305,6 +305,12 @@ __shared__ unsigned int s_moe_acc[7];
 __shared__ unsigned int s_moe_n[2];
 __device__ unsigned int g_moe_acc[MPK_PHASE_MAX_WORKERS * 7];
 __device__ unsigned int g_moe_n[MPK_PHASE_MAX_WORKERS * 2];
+#ifdef MPK_MOE_CALL_LDS
+// Caller-side ns around each MoE call (entry drain + tile + return drain)
+// and call counts: [0] W13 pass, [1] W2 pass, [2..3] counts.
+__shared__ unsigned int s_moe_call[4];
+__device__ unsigned int g_moe_call[MPK_PHASE_MAX_WORKERS * 4];
+#endif
 #define MPK_MOE_ARMED()                                                        \
   (s_phase_layers >=                                                         \
    (unsigned int)(MPK_PHASE_START_ITER * MPK_PHASE_LAYERS_PER_ITER))
@@ -345,6 +351,9 @@ __device__ __forceinline__ void mpk_phase_lds_init() {
     for (int k = 0; k < 7; k++) s_moe_acc[k] = 0;
     s_moe_n[0] = 0;
     s_moe_n[1] = 0;
+#endif
+#ifdef MPK_MOE_CALL_LDS
+    for (int k = 0; k < 4; k++) s_moe_call[k] = 0;
 #endif
   }
 }
@@ -455,6 +464,9 @@ __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
     for (int k = 0; k < 7; k++) g_moe_acc[worker * 7 + k] = s_moe_acc[k];
     g_moe_n[worker * 2] = s_moe_n[0];
     g_moe_n[worker * 2 + 1] = s_moe_n[1];
+#endif
+#ifdef MPK_MOE_CALL_LDS
+    for (int k = 0; k < 4; k++) g_moe_call[worker * 4 + k] = s_moe_call[k];
 #endif
 #ifdef MPK_IL_LDS
     for (int k = 0; k < 3; k++) g_il_acc[worker * 3 + k] = s_il_acc[k];
@@ -4290,6 +4302,16 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                      w, a, a ? m[0] / a : 0, a ? m[1] / a : 0, a ? m[2] / a : 0,
                      b, b ? m[3] / b : 0, b ? m[4] / b : 0, b ? m[5] / b : 0,
                      b ? m[6] / b : 0);
+            }
+#endif
+#ifdef MPK_MOE_CALL_LDS
+            for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+              unsigned int const *c = &g_moe_call[w * 4];
+              if (c[2] == 0 && c[3] == 0) {
+                continue;
+              }
+              printf("[MCALLW] w=%d n13=%u call13=%u n2=%u call2=%u\n", w, c[2],
+                     c[2] ? c[0] / c[2] : 0, c[3], c[3] ? c[1] / c[3] : 0);
             }
 #endif
 #ifdef MPK_PHASE_SNAP

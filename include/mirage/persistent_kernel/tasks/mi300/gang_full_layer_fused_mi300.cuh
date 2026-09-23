@@ -1886,6 +1886,12 @@ __device__ __noinline__ void
 #else
     void const *const moe_norm_in = input_ptrs[12];
 #endif
+#ifdef MPK_MOE_CALL_LDS
+#if !defined(MPK_MOE_LDS) || !defined(MPK_MOE_XCD_PAIR)
+#error "MPK_MOE_CALL_LDS needs MPK_MOE_LDS and MPK_MOE_XCD_PAIR"
+#endif
+    unsigned long long const _mc0 = __builtin_amdgcn_s_memrealtime();
+#endif
 #if !defined(MPK_ONLY_OP) || (MPK_ONLY_OP & (1 << 8))
     gang_moe_fused_mxfp4_kernel_mi300<QKV_BATCH_SIZE,
                                       MOE_INTERMEDIATE_SIZE,
@@ -1922,6 +1928,15 @@ __device__ __noinline__ void
                                                             routing_expected
 #endif
     );
+#endif
+#ifdef MPK_MOE_CALL_LDS
+    {
+      unsigned long long const _mc1 = __builtin_amdgcn_s_memrealtime();
+      if (tid == 0 && MPK_MOE_ARMED()) {
+        s_moe_call[moe_i] += (unsigned int)((_mc1 - _mc0) * 10);
+        s_moe_call[2 + moe_i] += 1;
+      }
+    }
 #endif
   }
 #ifdef MPK_MOE_XCD_PAIR
