@@ -2525,6 +2525,18 @@ router_tile_pass:;
           s += __bfloat162float(d_rbias[router_lt]);
         }
         bf16 bval = __float2bfloat16(s);
+#ifdef MPK_LOCAL_TOPK
+        if (b == 0) {
+          mpk_aid_publish_at(
+              routing_ready_ptr,
+              MPK_AID_LTK_OFF_INTS +
+                  gang_rmsnorm_topk_detail::get_xcd_id() *
+                      (NUM_EXPERTS / MPK_NUM_XCDS) + router_lt,
+              (mpk_ltk_tag(layer_epoch) << 16) |
+                  (unsigned)__builtin_bit_cast(unsigned short, bval),
+              MPK_AID_ROUTING_BASE_INTS);
+        }
+#endif
         st_wt_u16(&d_logits[(int64_t)b * NUM_EXPERTS + router_lt],
                   *reinterpret_cast<unsigned short *>(&bval));
 #endif
@@ -2852,6 +2864,18 @@ router_tile_pass:;
           s += __bfloat162float(d_rbias[router_lt]);
         }
         bf16 bval = __float2bfloat16(s);
+#ifdef MPK_LOCAL_TOPK
+        if (b == 0) {
+          mpk_aid_publish_at(
+              routing_ready_ptr,
+              MPK_AID_LTK_OFF_INTS +
+                  gang_rmsnorm_topk_detail::get_xcd_id() *
+                      (NUM_EXPERTS / MPK_NUM_XCDS) + router_lt,
+              (mpk_ltk_tag(layer_epoch) << 16) |
+                  (unsigned)__builtin_bit_cast(unsigned short, bval),
+              MPK_AID_ROUTING_BASE_INTS);
+        }
+#endif
         st_wt_u16(&d_logits[(int64_t)b * NUM_EXPERTS + router_lt],
                   *reinterpret_cast<unsigned short *>(&bval));
       }
@@ -2916,6 +2940,12 @@ topk_barrier :
   _op_t3 = __builtin_amdgcn_s_memrealtime();
 #endif
   MPK_SUB_MARK(3);
+#ifdef MPK_LOCAL_TOPK
+#if !defined(MPK_AID_SPLIT_FLAGS) || defined(MPK_EARLY_ROUTING) || defined(MPK_MOE_XCD_PAIR)
+#error "MPK_LOCAL_TOPK needs AID_SPLIT_FLAGS and excludes EARLY_ROUTING / MOE_XCD_PAIR"
+#endif
+  static_assert(BATCH_SIZE == 1, "MPK_LOCAL_TOPK is bs=1");
+#else
   // Drain BEFORE the rendezvous, not after. `s_waitcnt` is a per-wave
   // guarantee: run after __syncthreads it only retires wave 0's stores, and
   // tid 0 then publishes an arrival advertising output that waves 1..3 may
@@ -3154,6 +3184,7 @@ topk_barrier :
 #endif
   }
 
+#endif
 done :
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
 {

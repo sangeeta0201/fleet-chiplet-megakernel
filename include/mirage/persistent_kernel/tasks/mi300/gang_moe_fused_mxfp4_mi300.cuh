@@ -689,6 +689,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // ride tile_idx; the runtime count is NUM_TOPK for conc1.
 #ifdef MPK_MOE_XCD_PAIR
   int num_activated_experts = NUM_TOPK;
+#elif defined(MPK_LOCAL_TOPK)
+  static_assert(BATCH_SIZE == 1, "MPK_LOCAL_TOPK is bs=1");
+  int num_activated_experts = s_ltk_mask[NUM_EXPERTS];
 #else
   int num_activated_experts = d_mask[NUM_EXPERTS];
 #endif
@@ -939,6 +942,8 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     }
     expert_id_raw = d_mask[expert_idx];
   }
+#elif defined(MPK_LOCAL_TOPK)
+  int expert_id_raw = s_ltk_mask[expert_idx];
 #else
   int expert_id_raw = d_mask[expert_idx];
 #endif
@@ -1014,6 +1019,12 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     // visibility race -- that row is st_wt'd at pick time, but a cached line
     // from the previous layer can outlive the u64 acquire.
     int route_val = expert_idx + 1;
+#elif defined(MPK_LOCAL_TOPK)
+    int route_val = s_ltk_route[expert_id];
+    if (route_val == 0) {
+      MPK_WS_MARK(8103, global_tile); // exit: token not routed here
+      return;
+    }
 #else
     int route_val = expert_routing[0];
     if (route_val == 0) {
@@ -5037,11 +5048,19 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         float const *rw_ptr = &d_routing_weight[my_tok * NUM_TOPK + topk_slot];
         unsigned short const *bias_ptr =
             &d_w2_bias[expert_id * W2_OUTPUT_SIZE + out_n_base];
+#ifdef MPK_LOCAL_TOPK
+        pf_rw = s_ltk_w[topk_slot];
+        asm volatile("global_load_dwordx2 %0, %1, off"
+                     : "=&v"(pf_bias)
+                     : "v"(bias_ptr)
+                     : "memory");
+#else
         asm volatile("global_load_dword %0, %2, off\n"
                      "global_load_dwordx2 %1, %3, off"
                      : "=&v"(pf_rw), "=&v"(pf_bias)
                      : "v"(rw_ptr), "v"(bias_ptr)
                      : "memory");
+#endif
       }
       asm volatile("" ::: "memory");
 
@@ -5905,11 +5924,19 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
               &d_routing_weight[my_tok * NUM_TOPK + topk_slot];
           unsigned short const *bias_ptr =
               &d_w2_bias[expert_id * W2_OUTPUT_SIZE + out_n_base];
+#ifdef MPK_LOCAL_TOPK
+          pf_rw = s_ltk_w[topk_slot];
+          asm volatile("global_load_dwordx2 %0, %1, off"
+                       : "=&v"(pf_bias)
+                       : "v"(bias_ptr)
+                       : "memory");
+#else
           asm volatile("global_load_dword %0, %2, off\n"
                        "global_load_dwordx2 %1, %3, off"
                        : "=&v"(pf_rw), "=&v"(pf_bias)
                        : "v"(rw_ptr), "v"(bias_ptr)
                        : "memory");
+#endif
         }
         asm volatile("" ::: "memory");
 

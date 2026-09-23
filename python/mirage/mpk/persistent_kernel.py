@@ -1464,6 +1464,10 @@ def get_compile_command(
         if int(os.environ.get("MPK_NO_LOGIT_RESET", "0")) == 1:
             # skip the TopK logit write-through reset (opt-in here; hash-gate it).
             flags = flags + ["-DMPK_NO_LOGIT_RESET"]
+        if int(os.environ.get("MPK_LOCAL_TOPK", "0")) == 1:
+            # No serial TopK completer: every workgroup rebuilds routing
+            # from tagged logits on its AID replica (bs=1).
+            flags = flags + ["-DMPK_LOCAL_TOPK"]
         if int(os.environ.get("MPK_AID_SPLIT_ROUTING", "0")) == 1:
             flags = flags + ["-DMPK_AID_SPLIT_ROUTING"]
         if int(os.environ.get("MPK_ROUTING_NARROW_AID", "0")) == 1:

@@ -110,6 +110,18 @@ constexpr int MPK_AID_REGION_TOPK = 6;
 // MPK_OPROJ_AID_TIER: per-AID arrival count of the O-proj phase-2 barrier.
 // Slot 0 only; touched by the four XCDs of the AID that owns the replica.
 constexpr int MPK_AID_REGION_OPROJ_TIER = 7;
+#ifdef MPK_LOCAL_TOPK
+// Tagged router logits, 128 ints inside the routing region of each replica.
+constexpr int MPK_AID_LTK_OFF_INTS = 1024;
+__device__ __forceinline__ unsigned mpk_ltk_tag(int epoch) {
+  return 1u + (unsigned)epoch % 65535u;
+}
+// Per-workgroup routing, rebuilt at the Phase 7b gate (128 experts, bs=1).
+__shared__ int s_ltk_mask[129];
+__shared__ int s_ltk_route[128];
+__shared__ float s_ltk_w[8];
+__shared__ unsigned short s_ltk_logit[128];
+#endif
 
 // The MoE fused barrier is per-expert (MOE_BAR_STRIDE ints each), so at 128
 // experts it needs ~20k ints rather than the eight lines the families above

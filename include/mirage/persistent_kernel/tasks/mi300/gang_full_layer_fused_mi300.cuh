@@ -1711,6 +1711,12 @@ __device__ __noinline__ void
 #endif
     routed_expert0 = (int)(_rec >> 32);
 #else
+#ifdef MPK_LOCAL_TOPK
+    mpk_local_topk<128, 4>(
+        mpk_aid_flags_at(routing_ready, xcd_id, MPK_AID_ROUTING_BASE_INTS) +
+            MPK_AID_LTK_OFF_INTS,
+        routing_expected);
+#else
 #if defined(MPK_ROUTING_NARROW_AID)
 #if defined(MPK_ROUTING_LANE_RELEASE) || defined(MPK_AID_SPLIT_ROUTING)
 #error "MPK_ROUTING_NARROW_AID replaces the per-XCD routing flags"
@@ -1743,6 +1749,7 @@ __device__ __noinline__ void
       }
 #ifdef MPK_NARROW_GATE_POLL
     __syncthreads();
+#endif
 #endif
 #endif
   }
