@@ -200,6 +200,54 @@ __device__ int g_phase_live[MPK_PHASE_MAX_WORKERS * MPK_PHASE_PAD_INT];
 #ifndef MPK_PHASE_LAYERS_PER_ITER
 #define MPK_PHASE_LAYERS_PER_ITER 36
 #endif
+#ifdef MPK_PHASE_SNAP
+// Every slot timestamp of every worker for the layers of iteration
+// MPK_PHASE_SNAP, so the printer can take per-layer min/max over workers.
+__device__ unsigned long long g_phase_snap[MPK_PHASE_LAYERS_PER_ITER *
+                                           MPK_PHASE_MAX_WORKERS *
+                                           MPK_PHASE_SLOT_COUNT];
+#endif
+#ifdef MPK_IL_LDS
+// Low 32 bits of s_memrealtime at the ml loop's top (0) and just before the
+// tile loop (1); spans wrap-safe for anything under 42 s.
+__shared__ unsigned int s_il_ts[2];
+__shared__ unsigned int s_il_acc[3];
+__shared__ unsigned int s_il_n;
+__device__ unsigned int g_il_acc[MPK_PHASE_MAX_WORKERS * 3];
+__device__ unsigned int g_il_n[MPK_PHASE_MAX_WORKERS];
+#define MPK_IL_MARK(k)                                                         \
+  do {                                                                         \
+    if (threadIdx.x == 0)                                                      \
+      s_il_ts[(k)] = (unsigned int)__builtin_amdgcn_s_memrealtime();          \
+  } while (0)
+#endif
+#ifdef MPK_W13_SUB
+__shared__ unsigned int s_w13_prev;
+__shared__ unsigned int s_w13_acc[10];
+__shared__ unsigned int s_w13_n;
+__device__ unsigned int g_w13_acc[MPK_PHASE_MAX_WORKERS * 10];
+__device__ unsigned int g_w13_n[MPK_PHASE_MAX_WORKERS];
+#define MPK_W13_ARMED()                                                        \
+  (s_phase_layers >=                                                         \
+   (unsigned int)(MPK_PHASE_START_ITER * MPK_PHASE_LAYERS_PER_ITER))
+#define MPK_W13_START()                                                        \
+  do {                                                                         \
+    if (threadIdx.x == 0)                                                      \
+      s_w13_prev = (unsigned int)__builtin_amdgcn_s_memrealtime();            \
+  } while (0)
+#define MPK_W13_MARK(k)                                                        \
+  do {                                                                         \
+    if (threadIdx.x == 0 && MPK_W13_ARMED()) {                                 \
+      unsigned int const _w13t = (unsigned int)__builtin_amdgcn_s_memrealtime(); \
+      s_w13_acc[(k)] += (_w13t - s_w13_prev) * 10;                             \
+      s_w13_prev = _w13t;                                                      \
+    }                                                                          \
+  } while (0)
+#define MPK_W13_DONE()                                                         \
+  do {                                                                         \
+    if (threadIdx.x == 0 && MPK_W13_ARMED()) s_w13_n++;                        \
+  } while (0)
+#endif
 __shared__ unsigned long long s_phase_ts[MPK_PHASE_SLOT_COUNT];
 __shared__ unsigned long long s_phase_span[MPK_PHASE_SLOT_COUNT];
 __shared__ unsigned long long s_phase_prev_end;
@@ -281,6 +329,17 @@ __device__ __forceinline__ void mpk_phase_lds_init() {
 #endif
     s_phase_layers = 0;
     s_phase_n = 0;
+#ifdef MPK_W13_SUB
+    for (int k = 0; k < 10; k++) s_w13_acc[k] = 0;
+    s_w13_n = 0;
+    s_w13_prev = 0;
+#endif
+#ifdef MPK_IL_LDS
+    s_il_ts[0] = 0;
+    s_il_ts[1] = 0;
+    for (int k = 0; k < 3; k++) s_il_acc[k] = 0;
+    s_il_n = 0;
+#endif
 #ifdef MPK_MOE_LDS
     for (int k = 0; k < 7; k++) s_moe_acc[k] = 0;
     s_moe_n[0] = 0;
@@ -297,6 +356,20 @@ __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
   unsigned long long const t = __builtin_amdgcn_s_memrealtime();
   asm volatile("" ::: "memory");
   s_phase_ts[slot] = t;
+#ifdef MPK_PHASE_SNAP
+  {
+    // s_phase_layers still counts completed layers here, so it is the
+    // index of the layer this mark belongs to.
+    unsigned int const snap_l =
+        s_phase_layers -
+        (unsigned int)(MPK_PHASE_SNAP * MPK_PHASE_LAYERS_PER_ITER);
+    if (snap_l < (unsigned int)MPK_PHASE_LAYERS_PER_ITER) {
+      g_phase_snap[((size_t)snap_l * MPK_PHASE_MAX_WORKERS + worker) *
+                       MPK_PHASE_SLOT_COUNT +
+                   slot] = t;
+    }
+  }
+#endif
   if (slot != MPK_PHASE_SLOT_COUNT - 1) {
     return;
   }
@@ -341,6 +414,19 @@ __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
       s_phase_span[0] += d0;
     }
   }
+#ifdef MPK_IL_LDS
+  if (prev_end != 0 && (layers - 1) % MPK_PHASE_LAYERS_PER_ITER != 0) {
+    unsigned int const pe = (unsigned int)prev_end;
+    unsigned int const ta = s_il_ts[0], tb = s_il_ts[1];
+    unsigned int const tc = (unsigned int)s_phase_ts[0];
+    if ((int)(ta - pe) >= 0 && (int)(tb - ta) >= 0 && (int)(tc - tb) >= 0) {
+      s_il_acc[0] += (ta - pe) * 10;
+      s_il_acc[1] += (tb - ta) * 10;
+      s_il_acc[2] += (tc - tb) * 10;
+      s_il_n++;
+    }
+  }
+#endif
   for (int s = 1; s < MPK_PHASE_SLOT_COUNT; s++) {
     unsigned long long const a = s_phase_ts[s - 1];
     unsigned long long const b = s_phase_ts[s];
@@ -368,6 +454,14 @@ __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
     for (int k = 0; k < 7; k++) g_moe_acc[worker * 7 + k] = s_moe_acc[k];
     g_moe_n[worker * 2] = s_moe_n[0];
     g_moe_n[worker * 2 + 1] = s_moe_n[1];
+#endif
+#ifdef MPK_IL_LDS
+    for (int k = 0; k < 3; k++) g_il_acc[worker * 3 + k] = s_il_acc[k];
+    g_il_n[worker] = s_il_n;
+#endif
+#ifdef MPK_W13_SUB
+    for (int k = 0; k < 10; k++) g_w13_acc[worker * 10 + k] = s_w13_acc[k];
+    g_w13_n[worker] = s_w13_n;
 #endif
     g_phase_n[worker * MPK_PHASE_PAD_U64] = n;
   }
@@ -2732,6 +2826,9 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #ifdef MPK_DRAIN_STATS
               unsigned long long _mlt0 = __builtin_amdgcn_s_memrealtime();
 #endif
+#ifdef MPK_IL_LDS
+              MPK_IL_MARK(0);
+#endif
               // Layer 0: task_desc already loaded from precomputed dispatch
               // buffer with correct per-XCD pointers. Skip the copy.
               if (ml > 0) {
@@ -2985,6 +3082,9 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                 int *ws = config.precomp_dbg_worker_state + worker_id * 4;
                 __atomic_store_n(&ws[3], 40000 + ml, __ATOMIC_RELAXED);
               }
+#endif
+#ifdef MPK_IL_LDS
+              MPK_IL_MARK(1);
 #endif
               for (int t = block_xcd_local_rank; t < ml_n_tile_count;
                    t += block_workers_on_xcd) {
@@ -4171,6 +4271,60 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                      w, a, a ? m[0] / a : 0, a ? m[1] / a : 0, a ? m[2] / a : 0,
                      b, b ? m[3] / b : 0, b ? m[4] / b : 0, b ? m[5] / b : 0,
                      b ? m[6] / b : 0);
+            }
+#endif
+#ifdef MPK_PHASE_SNAP
+            for (int L = 0; L < MPK_PHASE_LAYERS_PER_ITER; L++) {
+              unsigned long long mn[MPK_PHASE_SLOT_COUNT];
+              unsigned long long mx[MPK_PHASE_SLOT_COUNT];
+              for (int s = 0; s < MPK_PHASE_SLOT_COUNT; s++) {
+                mn[s] = ~0ull;
+                mx[s] = 0;
+              }
+              for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+                for (int s = 0; s < MPK_PHASE_SLOT_COUNT; s++) {
+                  unsigned long long const v =
+                      g_phase_snap[((size_t)L * MPK_PHASE_MAX_WORKERS + w) *
+                                       MPK_PHASE_SLOT_COUNT +
+                                   s];
+                  if (v == 0) {
+                    continue;
+                  }
+                  mn[s] = v < mn[s] ? v : mn[s];
+                  mx[s] = v > mx[s] ? v : mx[s];
+                }
+              }
+              unsigned long long const b = mn[0];
+              printf("[PSNAP] L=%d", L);
+              for (int s = 0; s < MPK_PHASE_SLOT_COUNT; s++) {
+                printf(" %llu:%llu",
+                       (mn[s] != ~0ull && mn[s] >= b) ? (mn[s] - b) * 10 : 0,
+                       mx[s] >= b ? (mx[s] - b) * 10 : 0);
+              }
+              printf("\n");
+            }
+#endif
+#ifdef MPK_IL_LDS
+            for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+              unsigned int const n_il = g_il_n[w];
+              if (n_il == 0) {
+                continue;
+              }
+              printf("[ILSUBW] w=%d n=%u ret=%u setup=%u call=%u\n", w, n_il,
+                     g_il_acc[w * 3] / n_il, g_il_acc[w * 3 + 1] / n_il,
+                     g_il_acc[w * 3 + 2] / n_il);
+            }
+#endif
+#ifdef MPK_W13_SUB
+            for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+              unsigned int const n13 = g_w13_n[w];
+              if (n13 == 0) {
+                continue;
+              }
+              unsigned int const *a = &g_w13_acc[w * 10];
+              printf("[W13SUB] w=%d n=%u %u %u %u %u %u %u %u %u %u %u\n", w, n13,
+                     a[0] / n13, a[1] / n13, a[2] / n13, a[3] / n13, a[4] / n13,
+                     a[5] / n13, a[6] / n13, a[7] / n13, a[8] / n13, a[9] / n13);
             }
 #endif
             // Raw per-slot timestamps of the last armed layer, so one layer's

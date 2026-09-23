@@ -146,7 +146,11 @@ template <int QKV_BATCH_SIZE,
           int MOE_W2_OUTPUT_PER_WG,
           bool DECODE_ONLY = false,
           int NUM_REQS = 1>
+#ifdef MPK_INLINE_FUSED_LAYER
+__device__ __forceinline__ void
+#else
 __device__ __noinline__ void
+#endif
     gang_full_layer_fused_kernel_mi300(void *const *input_ptrs,
                                        void *const *output_ptrs,
                                        void const *cos_ptr,
@@ -2352,6 +2356,13 @@ __device__ __noinline__ void
       s_was_last_local = lean_is_last_local;
 #endif
       if (lean_is_last_local) {
+#ifdef MPK_P9_PREINV
+        // Every worker on this die has arrived, and none reads the
+        // workspace or residual again before the release, so the L2
+        // invalidate the gate consumers need can happen here, while other
+        // dies are still arriving. Drained before the arrival advertises it.
+        asm volatile("buffer_inv sc1\n s_waitcnt vmcnt(0)" ::: "memory");
+#endif
         int global_prev = atom_add_release_gpu_s32(layer_global, 1);
         // Same identity one level up: the counter takes 8 arrivals per layer,
         // so the last XCD is the one whose pre-increment value is 7 mod 8 and
@@ -2664,7 +2675,43 @@ __device__ __noinline__ void
       // guarantees every producer retired before any consumer proceeds; this
       // arm retires that guarantee, so the L2 invalidate comes back. Only the
       // gate-joining workers execute it.
+#if defined(MPK_P9_PREINV) && defined(MPK_LEAN_ARRIVE)
+      // L2 was invalidated by this die's last arriver before the release
+      // (MPK_P9_PREINV); only this CU's vL1 can still hold a stale line.
+      asm volatile("buffer_inv sc0" ::: "memory");
+#elif defined(MPK_P9_LEADER_INV) && defined(MPK_AID_SPLIT_FLAGS)
+      {
+        // One L2 invalidate per die: the L2 serializes them, and it is
+        // shared by every worker on the XCC, so the first joiner's covers
+        // the rest. Followers wait for it to retire, then drop their vL1.
+        unsigned _xcc;
+        asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)"
+                     : "=s"(_xcc));
+        _xcc &= 7;
+        int *_l2c = g_aid_flag_rep[_xcc >> 2];
+        if (_l2c == nullptr) {
+          asm volatile("buffer_inv sc1" ::: "memory");
+        } else {
+          _l2c += MPK_AID_L2CLEAN_BASE_INTS + (int)_xcc * 32;
+          if (atomicMax(_l2c, qkv_epoch_expected) < qkv_epoch_expected) {
+            asm volatile("buffer_inv sc1\n s_waitcnt vmcnt(0)" ::: "memory");
+            __hip_atomic_store(_l2c + 16, qkv_epoch_expected, __ATOMIC_RELAXED,
+                               __HIP_MEMORY_SCOPE_AGENT);
+          } else {
+            while (__hip_atomic_load(_l2c + 16, __ATOMIC_RELAXED,
+                                     __HIP_MEMORY_SCOPE_AGENT) <
+                   qkv_epoch_expected) {
+              __builtin_amdgcn_s_sleep(1);
+            }
+            asm volatile("buffer_inv sc0" ::: "memory");
+          }
+        }
+      }
+#elif defined(MPK_P9_NO_L2INV)
+      asm volatile("buffer_inv" ::: "memory");
+#else
       asm volatile("buffer_inv sc1" ::: "memory");
+#endif
 #endif
 #ifdef MPK_DRAIN_STATS
       unsigned long long _dr4 = __builtin_amdgcn_s_memrealtime();

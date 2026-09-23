@@ -174,6 +174,10 @@ constexpr int MPK_AID_LMTAIL_BASE_INTS = 40960;
 // use. 5888 ints each (NUM_TOPK * PADDED_INTERMEDIATE_SIZE shorts), clear of
 // the flag regions below 1024, LMTAIL at 40960 and EVCTR at 458752.
 constexpr int MPK_AID_SWIGLU_BASE_INTS = 200704;
+// Layer-gate L2 invalidate election (MPK_P9_LEADER_INV): per physical XCC,
+// a claim word at +xcc*32 and the published epoch at +xcc*32+16. Both
+// are touched by one XCD only, clear of SWIGLU and ATTNOUT.
+constexpr int MPK_AID_L2CLEAN_BASE_INTS = 294912;
 constexpr int MPK_AID_LMTAIL_MOE = 0;
 constexpr int MPK_AID_LMTAIL_RESADD = 16;
 constexpr int MPK_AID_LMTAIL_LMHEAD = 32;

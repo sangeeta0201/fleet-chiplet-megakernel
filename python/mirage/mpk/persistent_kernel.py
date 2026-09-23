@@ -437,6 +437,14 @@ def get_compile_command(
             flags = flags + ["-DMPK_OPROJ_LDS"]
         if int(os.environ.get("MPK_MOE_BIAS_REP", "0")) == 1:
             flags = flags + ["-DMPK_MOE_BIAS_REP"]
+        if int(os.environ.get("MPK_PHASE_SNAP", "0")) > 0:
+            flags = flags + [f"-DMPK_PHASE_SNAP={int(os.environ['MPK_PHASE_SNAP'])}"]
+        if int(os.environ.get("MPK_INLINE_FUSED_LAYER", "0")) == 1:
+            flags = flags + ["-DMPK_INLINE_FUSED_LAYER"]
+        if int(os.environ.get("MPK_W13_SUB", "0")) == 1:
+            flags = flags + ["-DMPK_W13_SUB"]
+        if int(os.environ.get("MPK_IL_LDS", "0")) == 1:
+            flags = flags + ["-DMPK_IL_LDS"]
         if int(os.environ.get("MPK_MOE_LDS", "0")) == 1:
             flags = flags + ["-DMPK_MOE_LDS"]
         if int(os.environ.get("MPK_PHASE_LDS", "0")) == 1:
@@ -1499,6 +1507,16 @@ def get_compile_command(
             flags = flags + ["-DMPK_LMNORM_AID"]
         if int(os.environ.get("MPK_MOENORM_AID", "0")) == 1:
             flags = flags + ["-DMPK_MOENORM_AID"]
+        if int(os.environ.get("MPK_W13_HANDOFF_SC1", "0")) == 1:
+            flags = flags + ["-DMPK_W13_HANDOFF_SC1"]
+        if int(os.environ.get("MPK_P9_NO_L2INV", "0")) == 1:
+            flags = flags + ["-DMPK_P9_NO_L2INV"]
+        if int(os.environ.get("MPK_P9_LEADER_INV", "0")) == 1:
+            flags = flags + ["-DMPK_P9_LEADER_INV"]
+        if int(os.environ.get("MPK_P9_PREINV", "0")) == 1:
+            flags = flags + ["-DMPK_P9_PREINV"]
+        if int(os.environ.get("MPK_WS_SYS_LOAD", "0")) == 1:
+            flags = flags + ["-DMPK_WS_SYS_LOAD", "-DMPK_P9_NO_L2INV"]
         if int(os.environ.get("MPK_PRENORM_AID", "0")) == 1:
             flags = flags + ["-DMPK_PRENORM_AID"]
         if int(os.environ.get("MPK_GAMMA_AID", "0")) == 1:

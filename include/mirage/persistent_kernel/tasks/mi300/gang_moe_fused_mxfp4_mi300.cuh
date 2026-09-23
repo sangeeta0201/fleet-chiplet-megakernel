@@ -1151,6 +1151,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   if (!is_w2) {
     MOE_DBG_SUBPHASE(2000);
     MPK_WS_MARK(8200, global_tile); // W13 compute
+#ifdef MPK_W13_SUB
+    MPK_W13_START();
+#endif
 
     // A tile with no routed token has nothing to compute, but it still has to
     // arrive -- the release fires on `% W13_TILES`, which counts every tile in
@@ -1338,6 +1341,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                   "row. The packed multi-row path gathers per token and has no "
                   "single payload to issue ahead of the weights.");
 #ifdef MPK_W13_KMAJOR_RECYCLE
+#ifdef MPK_W13_SUB
+    MPK_W13_MARK(0);
+#endif
     // Canonical handoff ordering. Waves 0..2 each issue one 1 KiB activation
     // request; wave 3 issues none. Scales use the natural tid-major split:
     // waves 0..1 issue two requests and waves 2..3 issue one.
@@ -1347,7 +1353,14 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     bool const handoff_active = warp_id < 3;
     if (handoff_active) {
       uint8_t const *prequantized = (uint8_t const *)input_base;
+#ifdef MPK_W13_HANDOFF_SC1
+      // Device scope, not system: the row was stored into this XCD's own
+      // L2 by its own router writers, so an L2 hit is the fresh copy. sc0
+      // bypasses L2 and sends all ~184 tiles to the same 24 lines in memory.
+      asm volatile("global_load_dwordx4 %0, %1, off sc1"
+#else
       asm volatile("global_load_dwordx4 %0, %1, off sc0 sc1"
+#endif
                    : "=v"(quantized_chunk)
                    : "v"(prequantized + warp_id * 1024 + lane_id * 16)
                    : "memory");
@@ -1497,6 +1510,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #endif
 #endif
 
+#ifdef MPK_W13_SUB
+    MPK_W13_MARK(1);
+#endif
     // W13 T0: direct HBM→LDS via buffer_load_dwordx4 lds:1
     // Single inline asm block to prevent compiler vmcnt serialization.
     // Without this, compiler inserts s_waitcnt vmcnt(0) between each
@@ -1711,6 +1727,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       // LDS, so the timing is a valid upper bound on what hoisting can save.
       __syncthreads();
 #elif defined(MPK_W13_PREQUANT)
+#ifdef MPK_W13_SUB
+      MPK_W13_MARK(2);
+#endif
       // ── The row arrives already quantized; copy it ─────────────────────
       //
       // The router's single norm writer per XCD published FP8 + E8M0 in the
@@ -1797,6 +1816,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #endif
 
 #ifdef MPK_W13_LDS_PREFETCH
+#ifdef MPK_W13_SUB
+    MPK_W13_MARK(3);
+#endif
     // ── Phase B: Drain tile_iter=0 HBM loads + scales concurrently ──────────
     {
 #ifdef MPK_W13_T0_COUNTED_HANDOFF
@@ -1908,6 +1930,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       uint2 w13_t1_bias_pf = {0u, 0u};
       int const t1_out_n_pf =
           wg_idx * W13_OUTPUT_PER_WG + (warp_id + NUM_WAVES) * 16 + g * 4;
+#endif
+#ifdef MPK_W13_SUB
+      MPK_W13_MARK(4);
 #endif
       // ── Phase C: MFMA from LDS ───────────────────────────────────────
       {
@@ -2988,6 +3013,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #endif
 #endif
 
+#ifdef MPK_W13_SUB
+        MPK_W13_MARK(5);
+#endif
         // ── Issue tile_iter=1 per-wave HBM→LDS loads BEFORE SwiGLU ──
         // Each wave loads only its own tile slot. The buffer_load_lds
         // writes go to [warp_id * W13_TILE_BYTES + s*1024 + j*4096]
@@ -3239,6 +3267,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #endif
         }
 
+#ifdef MPK_W13_SUB
+        MPK_W13_MARK(6);
+#endif
         // tile_iter=0 SwiGLU epilogue (tile_iter=1 HBM loads fly in background)
         //
         // Lane (g, col) holds D[m = wave_tile*16 + g*4 + i][n = col]: four
@@ -3386,6 +3417,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #endif
       }
 
+#ifdef MPK_W13_SUB
+      MPK_W13_MARK(7);
+#endif
       // ── tile_iter=1: drain per-wave loads + scales → MFMA ──────────────
       if (W13_TILES_PER_WAVE > 1) {
 #ifndef MPK_W13_KMAJOR_RECYCLE
@@ -4191,6 +4225,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             );
 #endif // MPK_W13_KMAJOR_RECYCLE
           }
+#ifdef MPK_W13_SUB
+          MPK_W13_MARK(8);
+#endif
           // tile_iter=1 SwiGLU epilogue
           if (tok_active) {
             constexpr int ACT_STRIDE = W13_OUTPUT_SIZE / 2;
@@ -4483,6 +4520,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     __asm__ __volatile__("s_waitcnt vmcnt(0)" ::: "memory");
     __syncthreads();
 
+#ifdef MPK_W13_SUB
+    MPK_W13_MARK(9); MPK_W13_DONE();
+#endif
     } // end W13 compute region
   w13_arrive:
 #if defined(MPK_MOE_INNER_TIMING) || defined(MPK_MOE_LDS)

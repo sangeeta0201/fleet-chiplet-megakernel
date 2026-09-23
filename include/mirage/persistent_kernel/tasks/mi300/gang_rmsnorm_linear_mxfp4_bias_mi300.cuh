@@ -54,7 +54,33 @@ __device__ __forceinline__ unsigned mpk_prenorm_xcc() {
 // outright. These ext_vector_types can, which is what lets the ResAdd prologue
 // issue GLOBAL rather than generic FLAT loads -- see the comment at its use.
 typedef float _gl_f32x4 __attribute__((ext_vector_type(4)));
+#ifdef MPK_WS_SYS_LOAD
+// sc0 sc1 buffer load: bypasses L1 and L2 without allocating, so the
+// workspace W2 rewrote from another XCD is never served from a stale
+// line and none is left behind for the next layer.
+__device__ __forceinline__ _gl_f32x4 mpk_ws_sys_ld(__amdgpu_buffer_rsrc_t rs,
+                                                   int elem) {
+  auto const v = __builtin_amdgcn_raw_buffer_load_b128(rs, elem * 4, 0, 17);
+  return _gl_f32x4{__builtin_bit_cast(float, v[0]), __builtin_bit_cast(float, v[1]),
+                   __builtin_bit_cast(float, v[2]), __builtin_bit_cast(float, v[3])};
+}
+#endif
 typedef unsigned int _gl_u32x2 __attribute__((ext_vector_type(2)));
+#ifdef MPK_WS_SYS_LOAD
+// A __noinline__ callee receives its pointers in VGPRs, and a buffer op
+// needs an SGPR descriptor, so without this every load gets a waterfall.
+__device__ __forceinline__ void *mpk_uniform_ptr(void *p) {
+  unsigned long long const a = (unsigned long long)p;
+  unsigned const lo = __builtin_amdgcn_readfirstlane((unsigned)a);
+  unsigned const hi = __builtin_amdgcn_readfirstlane((unsigned)(a >> 32));
+  return (void *)(((unsigned long long)hi << 32) | lo);
+}
+__device__ __forceinline__ _gl_u32x2 mpk_res_sys_ld(__amdgpu_buffer_rsrc_t rs,
+                                                    int elem) {
+  auto const v = __builtin_amdgcn_raw_buffer_load_b64(rs, elem * 2, 0, 17);
+  return _gl_u32x2{v[0], v[1]};
+}
+#endif
 
 // ── Shared QKV weight-tile LDS geometry ──────────────────────────────────
 //
@@ -2744,6 +2770,15 @@ __device__ __noinline__ void
         // the single-slab shape reads one.
         auto const *ws_base = (__attribute__((address_space(1))) float const *)(
             d_ws + moe_ws_offset(b, 0, REDUCTION_SIZE));
+#ifdef MPK_WS_SYS_LOAD
+        __amdgpu_buffer_rsrc_t const ws_rs = __builtin_amdgcn_make_buffer_rsrc(
+            mpk_uniform_ptr((void *)(d_ws + moe_ws_offset(b, 0, REDUCTION_SIZE))),
+            (short)0, MOE_WS_SLOTS * REDUCTION_SIZE * (int)sizeof(float),
+            0x00020000);
+        __amdgpu_buffer_rsrc_t const res_rs = __builtin_amdgcn_make_buffer_rsrc(
+            mpk_uniform_ptr((void *)(d_residual + b * REDUCTION_SIZE)), (short)0,
+            REDUCTION_SIZE * 2, 0x00020000);
+#endif
         auto const *res_base =
             (__attribute__((address_space(1))) unsigned short const *)(
                 d_residual + b * REDUCTION_SIZE);
@@ -2761,9 +2796,13 @@ __device__ __noinline__ void
           // is declared __host__ and rejects an address-space qualified
           // pointer, and dereferencing the AS(1) type is what makes the
           // backend pick global_load_dwordx4 over flat_load_dwordx4.
+#ifdef MPK_WS_SYS_LOAD
+          _gl_f32x4 const ws_v = mpk_ws_sys_ld(ws_rs, off);
+#else
           _gl_f32x4 const ws_v =
               *(__attribute__((address_space(1))) _gl_f32x4 const *)(ws_base +
                                                                      off);
+#endif
           float4 ws4;
           ws4.x = ws_v[0];
           ws4.y = ws_v[1];
@@ -2781,9 +2820,13 @@ __device__ __noinline__ void
 #ifndef MPK_ABLATE_WS_FOLD
 #pragma unroll
           for (int s = 1; s < MOE_WS_SLOTS; s++) {
+#ifdef MPK_WS_SYS_LOAD
+            _gl_f32x4 const sv = mpk_ws_sys_ld(ws_rs, s * REDUCTION_SIZE + off);
+#else
             _gl_f32x4 const sv =
                 *(__attribute__((address_space(1))) _gl_f32x4 const *)(
                     ws_base + s * REDUCTION_SIZE + off);
+#endif
             float4 slot4;
             slot4.x = sv[0];
             slot4.y = sv[1];
@@ -2795,9 +2838,13 @@ __device__ __noinline__ void
             ws4.w += slot4.w;
           }
 #endif
+#ifdef MPK_WS_SYS_LOAD
+          _gl_u32x2 const rv_v = mpk_res_sys_ld(res_rs, off);
+#else
           _gl_u32x2 const rv_v =
               *(__attribute__((address_space(1))) _gl_u32x2 const *)(res_base +
                                                                      off);
+#endif
           uint2 res_packed;
           res_packed.x = rv_v[0];
           res_packed.y = rv_v[1];
