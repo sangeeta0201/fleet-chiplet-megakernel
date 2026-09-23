@@ -1452,6 +1452,12 @@ def get_compile_command(
             flags = flags + ["-DMPK_AID_EVCTR2"]
         if int(os.environ.get("MPK_SWIGLU_AID", "0")) == 1:
             flags = flags + ["-DMPK_SWIGLU_AID"]
+        if int(os.environ.get("MPK_KV_HEAD_MAJOR", "0")) == 1:
+            # Head-major (H*ND) KV cache: head becomes the outer dim, so each
+            # head is contiguous and halves placement lands heads 0-3 in
+            # range 0 and 4-7 in range 1. attn_kv_head == xcd_id, so every
+            # XCD then reads only its own AID. Targets slot 1 (QKV/kvupd).
+            flags = flags + ["-DMPK_KV_HEAD_MAJOR"]
         if int(os.environ.get("MPK_LMNORM_AID", "0")) == 1:
             flags = flags + ["-DMPK_LMNORM_AID"]
         if int(os.environ.get("MPK_MOENORM_AID", "0")) == 1:
@@ -1743,6 +1749,25 @@ def get_compile_command(
             # Publish one W13->W2 release slot per AID instead of eight.
             # Targets the measured 6.88us `arrive` on the last-arriving tile.
             flags = flags + ["-DMPK_MOE_NARROW_RELEASE"]
+        # Replica-backed release polls may hit L2: the AID replicas are
+        # MTYPE_RW (hardware-coherent within their own AID), so the `sc0 sc1`
+        # full-memory read every gate inherited from the MTYPE_NC era is
+        # stronger than needed. Guarded on MPK_AID_SPLIT_FLAGS in the header.
+        # Publisher-side narrowing: these gates wrote one identical value
+        # into all eight per-XCD slots, so the fan-out was pure redundancy and
+        # every store drained under the same vmcnt. Same fix as
+        # MPK_MOE_NARROW_RELEASE. MPK_ITER_AID additionally moves the gate off
+        # a spanning-NC gpu_malloc line into the per-AID RW replicas.
+        if int(os.environ.get("MPK_QKV_SPLIT", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_SPLIT"]
+        if int(os.environ.get("MPK_OPROJ_NARROW_REL", "0")) == 1:
+            flags = flags + ["-DMPK_OPROJ_NARROW_REL"]
+        if int(os.environ.get("MPK_LAYER_NARROW_REL", "0")) == 1:
+            flags = flags + ["-DMPK_LAYER_NARROW_REL"]
+        if int(os.environ.get("MPK_ITER_AID", "0")) == 1:
+            flags = flags + ["-DMPK_ITER_AID"]
+        if int(os.environ.get("MPK_AID_GATE_CACHED", "0")) == 1:
+            flags = flags + ["-DMPK_AID_GATE_CACHED"]
         if int(os.environ.get("MPK_SWIGLU_AIDREP", "0")) == 1:
             # swiglu's two copies in real per-AID BOs (reusing the split-flag
             # replicas) instead of two halves of one single-range tensor.
@@ -2297,8 +2322,18 @@ class PersistentKernel:
         pats = [p for p in pats.split(",") if p]
         if not any(p in (name or "") for p in pats):
             return torch_tensor
-        if any(bad in (name or "") for bad in ("k_cache", "v_cache")):
-            return torch_tensor
+        # The KV cache is excluded because it is WRITTEN during the kernel
+        # and MTYPE_RW is coherent only inside one AID. That is correct for
+        # genuinely shared written data, and over-conservative for per-XCD
+        # private written data (policy: private/split -> RW ALWAYS).
+        # Whether the cache is private here depends on the kernel's internal
+        # head indexing, NOT on the imap -- the gang path attaches it with
+        # (-1,-1,-1), the same pointer for every XCD. So MPK_KV_AID is a
+        # hypothesis and the OUTPUT HASH is the arbiter: a cross-AID stale
+        # head changes the tokens.
+        if os.environ.get("MPK_KV_AID", "0") != "1":
+            if any(bad in (name or "") for bad in ("k_cache", "v_cache")):
+                return torch_tensor
         try:
             from . import aid_hbm
 
@@ -2449,8 +2484,8 @@ class PersistentKernel:
         assert output.num_dims == 2  # (batch_size, hidden_size / world_size)
         assert k_cache.num_dims == 4  # (batch_size, seq_len, kv_heads, head_dim)
         assert v_cache.num_dims == 4  # (batch_size, seq_len, kv_heads, head_dim)
-        head_dim = k_cache.dim(3)
-        num_kv_heads = k_cache.dim(2)
+        num_kv_heads, head_dim, kv_tok_stride, kv_head_axis = \
+            self._kv_geom(k_cache)
         num_q_heads = output.dim(1) // head_dim
         rotary_embed = 0
         if cos_pos_embed is not None or sin_pos_embed is not None:
@@ -2515,8 +2550,8 @@ class PersistentKernel:
         assert output.num_dims == 2  # (batch_size, hidden_size / world_size)
         assert k_cache.num_dims == 4  # (batch_size, seq_len, kv_heads, head_dim)
         assert v_cache.num_dims == 4  # (batch_size, seq_len, kv_heads, head_dim)
-        head_dim = k_cache.dim(3)
-        num_kv_heads = k_cache.dim(2)
+        num_kv_heads, head_dim, kv_tok_stride, kv_head_axis = \
+            self._kv_geom(k_cache)
         num_q_heads = output.dim(1) // head_dim # 32
         rotary_embed = 0
         output_stride = output.dim(1)
@@ -2586,12 +2621,13 @@ class PersistentKernel:
         assert output.num_dims == 2  # (num_tokens, hidden_size / world_size)
         assert k_cache.num_dims == 4  # (num_pages, page_size, kv_heads, head_dim)
         assert v_cache.num_dims == 4  # (num_pages, page_size, kv_heads, head_dim)
-        assert k_cache.dim(0) == self.max_num_pages
-        assert v_cache.dim(0) == self.max_num_pages
-        assert k_cache.dim(1) == self.page_size
-        assert v_cache.dim(1) == self.page_size
-        head_dim = k_cache.dim(3)
-        num_kv_heads = k_cache.dim(2)
+        _pg, _ps = (1, 2) if self._kv_head_major() else (0, 1)
+        assert k_cache.dim(_pg) == self.max_num_pages
+        assert v_cache.dim(_pg) == self.max_num_pages
+        assert k_cache.dim(_ps) == self.page_size
+        assert v_cache.dim(_ps) == self.page_size
+        num_kv_heads, head_dim, kv_tok_stride, kv_head_axis = \
+            self._kv_geom(k_cache)
         num_q_heads = output.dim(1) // head_dim
         rotary_embed = 0
         if cos_pos_embed is not None or sin_pos_embed is not None:
@@ -2634,8 +2670,8 @@ class PersistentKernel:
         assert grid_dim[0] == self.max_num_batched_requests
         assert grid_dim[1] == num_kv_heads
         tb_graph.new_input(input, (-1, 1, -1), -1, True)
-        tb_graph.new_input(k_cache, (-1, 2, -1), 1, True)
-        tb_graph.new_input(v_cache, (-1, 2, -1), 1, True)
+        tb_graph.new_input(k_cache, (-1, kv_head_axis, -1), 1, True)
+        tb_graph.new_input(v_cache, (-1, kv_head_axis, -1), 1, True)
         tb_graph.new_input(q_norm, (-1, -1, -1), -1, True)
         tb_graph.new_input(k_norm, (-1, -1, -1), -1, True)
         tb_graph.new_input(cos_pos_embed, (-1, -1, -1), -1, True)
@@ -2681,15 +2717,16 @@ class PersistentKernel:
         assert input.num_dims == 2  # (num_tokens, fused_outdim / world_size)
         assert k_cache.num_dims == 4  # (num_pages, page_size, kv_heads, head_dim)
         assert v_cache.num_dims == 4  # (num_pages, page_size, kv_heads, head_dim)
-        assert k_cache.dim(0) == self.max_num_pages
-        assert v_cache.dim(0) == self.max_num_pages
-        assert k_cache.dim(1) == self.page_size
-        assert v_cache.dim(1) == self.page_size
+        _pg, _ps = (1, 2) if self._kv_head_major() else (0, 1)
+        assert k_cache.dim(_pg) == self.max_num_pages
+        assert v_cache.dim(_pg) == self.max_num_pages
+        assert k_cache.dim(_ps) == self.page_size
+        assert v_cache.dim(_ps) == self.page_size
         assert output.num_dims == 3  # (num_tokens, num_kv_chunks * num_qo_per_kv * head_dim / world_size, num_kv_heads)
         assert lse.num_dims == 3  # (num_tokens, num_kv_chunks * num_qo_per_kv / world_size, num_kv_heads)
 
-        head_dim = k_cache.dim(3)
-        num_kv_heads = k_cache.dim(2)
+        num_kv_heads, head_dim, kv_tok_stride, kv_head_axis = \
+            self._kv_geom(k_cache)
         num_q_heads = attention_params[0]
         num_kv_chunks = attention_params[1]
         
@@ -2721,8 +2758,8 @@ class PersistentKernel:
         assert grid_dim[0] == self.max_num_batched_requests
         assert grid_dim[1] == num_kv_heads
         tb_graph.new_input(input, (-1, 1, -1), -1, True)
-        tb_graph.new_input(k_cache, (-1, 2, -1), 1, True)
-        tb_graph.new_input(v_cache, (-1, 2, -1), 1, True)
+        tb_graph.new_input(k_cache, (-1, kv_head_axis, -1), 1, True)
+        tb_graph.new_input(v_cache, (-1, kv_head_axis, -1), 1, True)
         tb_graph.new_input(q_norm, (-1, -1, -1), -1, True)
         tb_graph.new_input(k_norm, (-1, -1, -1), -1, True)
         tb_graph.new_input(cos_pos_embed, (-1, -1, -1), -1, True)
@@ -2795,6 +2832,25 @@ class PersistentKernel:
         else:
             raise ValueError(f"Unsupported target CC: {self.target_cc}")
 
+    @staticmethod
+    def _kv_head_major():
+        return os.environ.get("MPK_KV_HEAD_MAJOR", "0") == "1"
+
+    @classmethod
+    def _kv_geom(cls, k_cache):
+        """(num_kv_heads, head_dim, tok_stride, head_axis) for either layout.
+
+        NHD  : (pages, page_size, heads, dim) -- head axis 2, tok stride
+               heads*dim, because a token's heads sit side by side.
+        H*ND : (heads, pages, page_size, dim) -- head axis 0, tok stride dim,
+               because within one head the tokens are contiguous.
+        """
+        head_dim = k_cache.dim(3)
+        if cls._kv_head_major():
+            return k_cache.dim(0), head_dim, head_dim, 0
+        num_kv_heads = k_cache.dim(2)
+        return num_kv_heads, head_dim, num_kv_heads * head_dim, 2
+
     def kv_cache_update_layer(
         self,
         input: DTensor,
@@ -2812,8 +2868,8 @@ class PersistentKernel:
         assert k_cache.num_dims == 4  # (num_pages, page_size, kv_heads, head_dim)
         assert v_cache.num_dims == 4
         assert q_workspace.num_dims == 2  # (num_tokens, q_workspace_stride)
-        head_dim = k_cache.dim(3)
-        num_kv_heads = k_cache.dim(2)
+        num_kv_heads, head_dim, kv_tok_stride, kv_head_axis = \
+            self._kv_geom(k_cache)
         num_q_heads = q_workspace.dim(1) // head_dim
         q_workspace_stride = q_workspace.dim(1)
         rotary_embed = 1 if cos_pos_embed is not None else 0
@@ -2839,8 +2895,8 @@ class PersistentKernel:
 
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, 1, -1), -1, True)
-        tb_graph.new_input(k_cache, (-1, 2, -1), 1, True)
-        tb_graph.new_input(v_cache, (-1, 2, -1), 1, True)
+        tb_graph.new_input(k_cache, (-1, kv_head_axis, -1), 1, True)
+        tb_graph.new_input(v_cache, (-1, kv_head_axis, -1), 1, True)
         tb_graph.new_input(q_norm, (-1, -1, -1), -1, True)
         tb_graph.new_input(k_norm, (-1, -1, -1), -1, True)
         tb_graph.new_input(cos_pos_embed, (-1, -1, -1), -1, True)
@@ -2872,13 +2928,14 @@ class PersistentKernel:
         assert o_acc.num_dims == 2   # (num_tokens, kv_heads*chunks*qo_per_kv*head_dim)
         assert lse_acc.num_dims == 2 # (num_tokens, kv_heads*chunks*qo_per_kv)
 
-        head_dim = k_cache.dim(3)
-        num_kv_heads = k_cache.dim(2)
+        num_kv_heads, head_dim, kv_tok_stride, kv_head_axis = \
+            self._kv_geom(k_cache)
         num_q_heads = attention_params[0]
         num_kv_chunks = attention_params[1]
         max_num_requests = attention_params[2]
         q_workspace_stride = q_workspace.dim(1)
-        kv_cache_stride = num_kv_heads * head_dim
+        kv_cache_stride = (head_dim if self._kv_head_major()
+                           else num_kv_heads * head_dim)
 
         # params: num_q_heads, num_kv_heads, head_dim, page_size, max_seq_len,
         #         num_kv_chunks, q_workspace_stride, kv_cache_stride,
@@ -2892,8 +2949,8 @@ class PersistentKernel:
         assert grid_dim[1] == num_kv_heads
         assert grid_dim[2] == num_kv_chunks
         tb_graph.new_input(q_workspace, (-1, -1, -1), -1, True)
-        tb_graph.new_input(k_cache, (-1, 2, -1), 1, True)
-        tb_graph.new_input(v_cache, (-1, 2, -1), 1, True)
+        tb_graph.new_input(k_cache, (-1, kv_head_axis, -1), 1, True)
+        tb_graph.new_input(v_cache, (-1, kv_head_axis, -1), 1, True)
         # Optional sinks input (GPT-OSS per-head attention sinks).
         # When provided, sink correction is fused into the attention epilogue,
         # eliminating the standalone attention_sink_layer task.
@@ -3019,8 +3076,8 @@ class PersistentKernel:
         assert v_cache.num_dims == 4
         assert self.target_cc in (94, 95), "Gang attention only supported on MI300X"
 
-        head_dim = k_cache.dim(3)
-        num_kv_heads = k_cache.dim(2)
+        num_kv_heads, head_dim, kv_tok_stride, kv_head_axis = \
+            self._kv_geom(k_cache)
         num_q_heads = attention_params[0]
         num_kv_chunks = attention_params[1]
         q_workspace_stride = attention_params[2]
@@ -4759,7 +4816,8 @@ class PersistentKernel:
 
         has_sinks = 1 if sinks is not None else 0
         q_workspace_stride = q_workspace.dim(1)
-        kv_cache_stride = num_kv_heads * head_dim
+        kv_cache_stride = (head_dim if self._kv_head_major()
+                           else num_kv_heads * head_dim)
 
         grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
@@ -5228,7 +5286,8 @@ class PersistentKernel:
 
         has_sinks = 1 if sinks is not None else 0
         q_workspace_stride = q_workspace.dim(1)
-        kv_cache_stride = num_kv_heads * head_dim
+        kv_cache_stride = (head_dim if self._kv_head_major()
+                           else num_kv_heads * head_dim)
 
         # O-PROJ tiling (from type 215)
         oproj_n_wgs = oproj_weight.dim(0)
@@ -5462,7 +5521,8 @@ class PersistentKernel:
 
         has_sinks = 1 if sinks is not None else 0
         q_workspace_stride = q_workspace.dim(1)
-        kv_cache_stride = num_kv_heads * head_dim
+        kv_cache_stride = (head_dim if self._kv_head_major()
+                           else num_kv_heads * head_dim)
 
         # O-PROJ tiling
         oproj_n_wgs = oproj_weight.dim(0)

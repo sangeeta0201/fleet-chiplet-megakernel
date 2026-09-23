@@ -1517,7 +1517,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_kvupd_kernel(
       __syncthreads();
       unsigned short *d_k = (unsigned short *)k_cache_ptr;
       for (int d = tid; d < HEAD_DIM; d += 256) {
-        d_k[dst_idx * kv_stride + kv_head * HEAD_DIM + d] = s_rope[d];
+        d_k[(long long)dst_idx * MPK_KV_TOK_STRIDE(HEAD_DIM, kv_stride) +
+            MPK_KV_HEAD_OFF(kv_head, HEAD_DIM) + d] = s_rope[d];
       }
     } else {
       int page_num = global_pos / PAGE_SIZE;
@@ -1535,7 +1536,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_kvupd_kernel(
           unsigned bt = (unsigned)b4[i] << 16;
           float bv;
           __builtin_memcpy(&bv, &bt, 4);
-          d_v[dst_idx * kv_stride + kv_head * HEAD_DIM + d0 + i] =
+          d_v[(long long)dst_idx * MPK_KV_TOK_STRIDE(HEAD_DIM, kv_stride) +
+              MPK_KV_HEAD_OFF(kv_head, HEAD_DIM) + d0 + i] =
               _gang_float_to_bf16(acc[i] + bv);
         }
       }
@@ -1899,7 +1901,8 @@ __device__ __noinline__ void
       __syncthreads();
       unsigned short *d_k = (unsigned short *)k_cache_ptr;
       for (int d = tid; d < HEAD_DIM; d += 256) {
-        d_k[dst_idx * kv_stride + kv_head * HEAD_DIM + d] = s_rope[d];
+        d_k[(long long)dst_idx * MPK_KV_TOK_STRIDE(HEAD_DIM, kv_stride) +
+            MPK_KV_HEAD_OFF(kv_head, HEAD_DIM) + d] = s_rope[d];
       }
     } else {
       int page_num = global_pos / PAGE_SIZE;
@@ -1917,7 +1920,8 @@ __device__ __noinline__ void
           unsigned bt = (unsigned)b4[i] << 16;
           float bv;
           __builtin_memcpy(&bv, &bt, 4);
-          d_v[dst_idx * kv_stride + kv_head * HEAD_DIM + d0 + i] =
+          d_v[(long long)dst_idx * MPK_KV_TOK_STRIDE(HEAD_DIM, kv_stride) +
+              MPK_KV_HEAD_OFF(kv_head, HEAD_DIM) + d0 + i] =
               _gang_float_to_bf16(acc[i] + bv);
         }
       }
@@ -3691,7 +3695,8 @@ __device__ __noinline__ void
             continue;
           }
           int d = idx - t * HEAD_DIM;
-          d_k[(long long)s_dst_idx[t] * kv_stride + kv_head * HEAD_DIM + d] =
+          d_k[(long long)s_dst_idx[t] * MPK_KV_TOK_STRIDE(HEAD_DIM, kv_stride) +
+              MPK_KV_HEAD_OFF(kv_head, HEAD_DIM) + d] =
               s_rope[idx];
         }
       } else {
@@ -3703,7 +3708,8 @@ __device__ __noinline__ void
           __builtin_memcpy(&bias4, &d_bias[wg_idx * OUTPUT_PER_WG + d0], 8);
           unsigned short const *b4 = (unsigned short const *)&bias4;
           long long row_off =
-              (long long)s_dst_idx[col] * kv_stride + kv_head * HEAD_DIM;
+              (long long)s_dst_idx[col] * MPK_KV_TOK_STRIDE(HEAD_DIM, kv_stride) +
+              MPK_KV_HEAD_OFF(kv_head, HEAD_DIM);
 #pragma unroll
           for (int i = 0; i < 4; i++) {
             unsigned bt = (unsigned)b4[i] << 16;

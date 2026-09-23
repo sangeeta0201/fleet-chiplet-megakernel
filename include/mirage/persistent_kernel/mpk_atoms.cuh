@@ -61,6 +61,31 @@ __device__ void **g_aid_ml_out[2];
 // oproj_topk_counters, which demo.py clears wholesale between launches.
 constexpr int MPK_AID_REGION_INTS = 8 * 16; // eight 64 B lines
 constexpr int MPK_AID_REGION_ATTN_RELEASE = 0;
+// ---------------------------------------------------------------------------
+// KV cache layout selector.
+//
+// Default NHD: (layers, pages, page_size, kv_heads, head_dim). Heads are an
+// INNER dim, so head x is strided across the whole cache and cannot be placed
+// in one AID -- which is why the kvupd kernel calls it an "un-partitioned
+// base".
+//
+// MPK_KV_HEAD_MAJOR selects H*ND: (layers, kv_heads, pages, page_size,
+// head_dim). Head x becomes contiguous, so halves placement puts heads 0-3 in
+// range 0 and 4-7 in range 1, and since attn_kv_head == xcd_id each XCD then
+// reads only its own AID.
+//
+// Every KV address in the tree is `tok * tok_stride + head * head_stride`.
+// Only the token stride was ever a parameter; these two macros make both
+// strides explicit so one expression serves either layout.
+#define MPK_KV_TOTAL_TOKENS ((long long)MPK_MAX_NUM_PAGES * MPK_PAGE_SIZE)
+#ifdef MPK_KV_HEAD_MAJOR
+#define MPK_KV_HEAD_OFF(h, hd) ((size_t)(h) * (size_t)MPK_KV_TOTAL_TOKENS * (hd))
+#define MPK_KV_TOK_STRIDE(hd, kvs) (hd)
+#else
+#define MPK_KV_HEAD_OFF(h, hd) ((size_t)(h) * (size_t)(hd))
+#define MPK_KV_TOK_STRIDE(hd, kvs) (kvs)
+#endif
+
 constexpr int MPK_AID_REGION_LAYER_RELEASE = 1; // reserved, see slot 10 note
 constexpr int MPK_AID_REGION_OPROJ_READY = 2; // MPK_ROUTER_XCD_FOLD only
 // Only the eight per-XCD release flags of the O-proj hierarchical barrier.
@@ -337,6 +362,76 @@ __device__ __forceinline__ void ld_sys_s32x2(int *addr0, int *addr1, int &out0,
 #define MPK_LD_GATE2(p) ld_nt_s32(p)
 #endif
 
+
+// ---------------------------------------------------------------------------
+// AID-local gate load: vL1-bypassing but L2-CACHEABLE.
+//
+// ld_sys_s32 (`sc0 sc1`) goes past L2 to memory on every spin. Its stated
+// reason is that the flags are "plain hipMalloc VRAM, which is MTYPE_NC" --
+// true before MPK_AID_SPLIT_FLAGS, false after it. A replica lives in an
+// alloc_in_aid BO at mtype_local=0 = MTYPE_RW, which is hardware-coherent
+// inside its own AID, so the publisher's write-through store probes this
+// reader's L2 copy out and a cached load cannot go stale.
+//
+// SCOPE per AMD MI300 ISA tables 48/49 (MLSE "Understand cache modifiers").
+// SC1:SC0 is a two-bit SCOPE VALUE, not two independent flags:
+//   0 wave | 1 group | 2 device | 3 system
+// and the two caches are governed by DIFFERENT bits:
+//   L1 (TCP, per-CU, read-only): sc1=1 or nt=1 -> MISS_EVICT, else HIT_LRU
+//   L2 (TCC):                    sc0=1 or nt=1 -> Coherence_Cache_Bypass,
+//                                sc0=0 and nt=0 -> HIT_LRU
+// So `sc0 sc1` (system) bypasses L2 BY CONSTRUCTION -- every poll is a memory
+// round trip. `sc1` alone is device scope with L1 MISS_EVICT and L2 HIT_LRU,
+// which is the weakest scope that is still coherent across XCDs.
+// `sc0` alone is GROUP scope, weaker than device: it was tried first and HUNG
+// (0 forward passes, hash d41d8cd98f00, EXIT=137) because readers kept
+// serving a stale line.
+// `nt` is only an eviction hint and never observes a release at all.
+//
+// The MTYPE still matters independently: L2 HIT_LRU only helps if the line's
+// MTYPE gives coherent L2 at device scope, i.e. an AID-local MTYPE_RW replica
+// rather than spanning MTYPE_NC.
+__device__ __forceinline__ int ld_aid_s32(int *addr) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  int val;
+  asm volatile("global_load_dword %0, %1, off sc1\n"
+               "s_waitcnt vmcnt(0)"
+               : "=v"(val)
+               : "v"(addr)
+               : "memory");
+  return val;
+#else
+  return *reinterpret_cast<int volatile *>(addr);
+#endif
+}
+
+__device__ __forceinline__ unsigned long long ld_aid_u64(void *addr) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  unsigned long long val;
+  asm volatile("global_load_dwordx2 %0, %1, off sc1\n"
+               "s_waitcnt vmcnt(0)"
+               : "=v"(val)
+               : "v"(addr)
+               : "memory");
+  return val;
+#else
+  return *reinterpret_cast<unsigned long long volatile *>(addr);
+#endif
+}
+
+// Used ONLY at polls whose pointer came from mpk_aid_flags*. Without the
+// replicas those pointers fall back to the shared NC buffer, where a cached
+// poll would be unsound -- hence the MPK_AID_SPLIT_FLAGS guard.
+#if defined(MPK_AID_GATE_CACHED) && defined(MPK_AID_SPLIT_FLAGS)
+#define MPK_LD_GATE_AID(p) ld_aid_s32(p)
+#define MPK_LD_GATE_AID_U64(p) ld_aid_u64(p)
+#else
+#define MPK_LD_GATE_AID(p) MPK_LD_GATE(p)
+#define MPK_LD_GATE_AID_U64(p) ld_sys_u64(p)
+#endif
+
 // The scheduler's event counters are polled by a relaxed load with no
 // invalidate inside the loop -- the acquire fence runs only once it exits.
 // Sound while L2 is device-coherent (MTYPE_RW, which plain hipMalloc gives in
@@ -519,6 +614,31 @@ constexpr int MPK_AID_EVCTR_MAX = 8192;
 // Per-AID event accumulator: the middle tier between the per-XCD counters and
 // the global one. Each AID replica holds its OWN array, so indexing it through
 // this XCD's replica selects that AID's counter and the atomic stays local.
+// AID-local mirror of the iteration-boundary gate. 491520 is past EVTIER and
+// inside the 2 MiB replica (524288 ints); one line is reserved to avoid false
+// sharing. ONE slot per AID, not one per XCD: the publisher wrote the same
+// value into all eight, so they were pure redundancy.
+constexpr int MPK_AID_ITER_BASE_INTS = 491520;
+
+// Write-through into both replicas. An MTYPE_RW line is coherent only inside
+// its own AID and a write-through store is what crosses; a cross-AID atomic
+// is the hazard that hung MPK_AID_EVCTR v2.
+__device__ __forceinline__ void mpk_aid_iter_publish(unsigned int val) {
+  int *a = g_aid_flag_rep[0];
+  int *b = g_aid_flag_rep[1];
+  if (a) {
+    st_wt_u32((void *)(a + MPK_AID_ITER_BASE_INTS), val);
+  }
+  if (b) {
+    st_wt_u32((void *)(b + MPK_AID_ITER_BASE_INTS), val);
+  }
+}
+
+__device__ __forceinline__ int *mpk_aid_iter_slot(int xcd_id) {
+  int *rep = g_aid_flag_rep[xcd_id >> 2];
+  return rep ? rep + MPK_AID_ITER_BASE_INTS : nullptr;
+}
+
 constexpr int MPK_AID_EVTIER_BASE_INTS = 475136;  // past the EVCTR mirrors
 constexpr int MPK_AID_XCDS_PER_AID = 4;
 

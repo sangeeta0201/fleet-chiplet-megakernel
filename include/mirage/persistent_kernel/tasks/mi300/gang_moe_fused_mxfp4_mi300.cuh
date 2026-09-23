@@ -4872,10 +4872,10 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #endif
 #ifdef MPK_MOE_NARROW_RELEASE
     while (!kMoeBarSkip &&
-           (_obs = MPK_LD_GATE2(&d_barrier_rel[base])) < expected) {
+           (_obs = MPK_LD_GATE_AID(&d_barrier_rel[base])) < expected) {
 #else
     while (!kMoeBarSkip &&
-           (_obs = MPK_LD_GATE2(&d_barrier_rel[base + xcd_id * MOE_BAR_LINE])) <
+           (_obs = MPK_LD_GATE_AID(&d_barrier_rel[base + xcd_id * MOE_BAR_LINE])) <
                expected) {
 #endif
       MPK_WS_WAIT_TICK(_obs, _spins);

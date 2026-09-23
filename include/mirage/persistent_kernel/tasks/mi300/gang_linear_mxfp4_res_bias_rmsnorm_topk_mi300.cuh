@@ -208,7 +208,7 @@ __device__ __forceinline__ void
   constexpr int kScale = 128;
   constexpr int kSlice = 512;
   constexpr int kTps = kScale / kElem;
-  while (!MPK_P7_SK(1) && ld_sys_s32(rel) < layer_epoch) {
+  while (!MPK_P7_SK(1) && MPK_LD_GATE_AID(rel) < layer_epoch) {
     __builtin_amdgcn_s_sleep(1);
   }
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
@@ -717,7 +717,7 @@ oproj_tile_pass:;
                     "split-slice wait assumes 32 lanes cover one 512-elem XCD");
       for (int sl = 0; sl < 2; sl++) {
         int *rel = sl == 0 ? rel0 : rel1;
-        while (!MPK_P7_SK(1) && ld_sys_s32(rel) < layer_epoch) {
+        while (!MPK_P7_SK(1) && MPK_LD_GATE_AID(rel) < layer_epoch) {
           __builtin_amdgcn_s_sleep(1);
         }
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
@@ -792,7 +792,7 @@ oproj_tile_pass:;
       } while (true);
 #else
       while (!MPK_P7_SK(1) &&
-             (ld_sys_s32(rel0) < layer_epoch || ld_sys_s32(rel1) < layer_epoch)) {
+             (MPK_LD_GATE_AID(rel0) < layer_epoch || MPK_LD_GATE_AID(rel1) < layer_epoch)) {
 #ifndef MPK_SLICE_BUSY_POLL
         __builtin_amdgcn_s_sleep(1);
 #endif
@@ -1640,7 +1640,11 @@ oproj_barrier :
     // to race with.
     int const oproj_release_expected =
         layer_epoch > 0 ? layer_epoch
+#ifdef MPK_OPROJ_NARROW_REL
+                        : ld_nt_s32(&hier_release[0]) + 1;
+#else
                         : ld_nt_s32(&hier_release[xcd_id * HIER_STRIDE]) + 1;
+#endif
 
     // ── Release fan-out: one wave instruction, not eight serial stores ────
     //
@@ -1824,6 +1828,23 @@ oproj_barrier :
     // why 0 is a safe "not the releaser" sentinel.
     oproj_rel_epoch = __builtin_amdgcn_readfirstlane(oproj_rel_epoch);
     if (oproj_rel_epoch != 0) {
+#ifdef MPK_OPROJ_NARROW_REL
+      // One slot per AID instead of eight. Every slot received the identical
+      // `oproj_rel_epoch`, so the eight are pure redundancy, and all 16
+      // write-through stores drain under the one vmcnt below -- making the
+      // release cost the SLOWEST of them. This is the MoE narrow-release fix
+      // (16 -> 2 stores, -5.60%, t=-5.39) applied to the O-proj barrier.
+      if (tid == 0) {
+#ifdef MPK_AID_SPLIT_FLAGS
+        mpk_aid_publish(hier_barrier,
+                        0,
+                        (unsigned)oproj_rel_epoch,
+                        MPK_AID_REGION_HIER_RELEASE);
+#else
+        st_wt_u32((void *)&hier_barrier[0], (unsigned)oproj_rel_epoch);
+#endif
+      }
+#else
       if (tid < 8) {
 #ifdef MPK_AID_SPLIT_FLAGS
         mpk_aid_publish(hier_barrier,
@@ -1835,6 +1856,7 @@ oproj_barrier :
                   (unsigned)oproj_rel_epoch);
 #endif
       }
+#endif
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
 
@@ -1934,8 +1956,12 @@ oproj_barrier :
     if (tid == 0)
 #endif
       while (!MPK_P7_SK(2) &&
-             MPK_LD_GATE2(&hier_release[xcd_id * HIER_STRIDE]) <
+#ifdef MPK_OPROJ_NARROW_REL
+             MPK_LD_GATE_AID(&hier_release[0]) < oproj_release_expected) {
+#else
+             MPK_LD_GATE_AID(&hier_release[xcd_id * HIER_STRIDE]) <
              oproj_release_expected) {
+#endif
         __builtin_amdgcn_s_sleep(1);
       }
   }
@@ -2215,12 +2241,12 @@ router_tile_pass:;
         // Waiting for x+1 before reading x keeps that line from tearing.
         // All 256 threads poll so there is no per-slice syncthreads.
         while (!MPK_P7_SK(4) &&
-               MPK_LD_GATE(&oproj_xcd_ready[x * 16]) < slice_epoch) {
+               MPK_LD_GATE_AID(&oproj_xcd_ready[x * 16]) < slice_epoch) {
           __builtin_amdgcn_s_sleep(1);
         }
         if (x < 7) {
           while (!MPK_P7_SK(4) &&
-                 MPK_LD_GATE(&oproj_xcd_ready[(x + 1) * 16]) < slice_epoch) {
+                 MPK_LD_GATE_AID(&oproj_xcd_ready[(x + 1) * 16]) < slice_epoch) {
             __builtin_amdgcn_s_sleep(1);
           }
         }

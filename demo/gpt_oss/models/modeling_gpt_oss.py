@@ -251,6 +251,8 @@ class GptOssAttention(nn.Module):
         )
 
         # Update KV cache
+        print("[KVDBG] torch cache write layer=%d q_len=%d shape=%s" % (
+            self.layer_idx, q_len, tuple(self.key_cache.shape)), flush=True)
         if q_len > 1:
             self.key_cache[self.layer_idx, 0, :q_len] = key_states[0]
             self.value_cache[self.layer_idx, 0, :q_len] = value_states[0]
@@ -505,8 +507,18 @@ class GptOssModel(GptOssPreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        _kv_shape = (config.num_hidden_layers, max_num_pages, page_size,
-                     config.num_key_value_heads // world_size, config.head_dim)
+        # H*ND when MPK_KV_HEAD_MAJOR=1: head becomes the OUTER dim so each
+        # head is contiguous and halves placement can put heads 0-3 in range 0
+        # and 4-7 in range 1. Default NHD is unchanged.
+        import os as _os
+        if _os.environ.get("MPK_KV_HEAD_MAJOR", "0") == "1":
+            _kv_shape = (config.num_hidden_layers,
+                         config.num_key_value_heads // world_size,
+                         max_num_pages, page_size, config.head_dim)
+        else:
+            _kv_shape = (config.num_hidden_layers, max_num_pages, page_size,
+                         config.num_key_value_heads // world_size, config.head_dim)
+        print("[KVDBG] kv_shape", _kv_shape, flush=True)
         key_cache = _kv_alloc(_kv_shape, "key_cache")
         value_cache = _kv_alloc(_kv_shape, "value_cache")
         self.kv_cache = (key_cache, value_cache)

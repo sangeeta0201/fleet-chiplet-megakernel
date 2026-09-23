@@ -317,6 +317,15 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
   // stride is still the full worker count.
   int const argmax_row_stride = workers_per_xcd * MPK_NUM_XCDS;
 
+#ifdef MPK_LM_INNER
+  // Function scope on purpose: _lmi_t1/_lmi_t2 are written inside the bblk
+  // loop below and read after it.
+  unsigned long long _lmi_t0 = 0, _lmi_t1 = 0, _lmi_t2 = 0;
+  if (tid == 0) {
+    asm volatile("s_memrealtime %0" : "=s"(_lmi_t0));
+  }
+#endif
+
   // ── Step 1: RMSNorm ─────────────────────────────────────────────────────
   // DO NOT add a __syncthreads() to this loop body. Measured at bs=2: without
   // it the run completes and both requests decode correct prose; with it the
@@ -381,6 +390,12 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
         s_tok_scales + (tok_active ? col : 0) * SC_STRIDE;
 
     // ── Step 3: Internal tile loop + argmax ────────────────────────────────
+#ifdef MPK_LM_INNER
+    // Boundary: rmsnorm + FP8 quant complete, the weight stream begins here.
+    if (tid == 0 && bblk == 0) {
+      asm volatile("s_memrealtime %0" : "=s"(_lmi_t1));
+    }
+#endif
     int group_iteration = 0;
     for (int wg_idx = worker_rank; wg_idx < n_wgs_per_xcd;
          wg_idx += workers_per_xcd, ++group_iteration) {
@@ -792,6 +807,20 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
       }
     }
     } // end tile loop
+#ifdef MPK_LM_INNER
+    // Sample every 32nd worker. Emitting from all 248 x 86 iterations was
+    // ~21,300 printfs and hit the 700 s timeout; ~670 samples is ample for
+    // a p50/p95 split. Same approach MPK_MOE_INNER_TIMING uses (every 37th).
+    if (tid == 0 && bblk == 0 && (tile_idx & 31) == 0) {
+      asm volatile("s_memrealtime %0" : "=s"(_lmi_t2));
+      // s_memrealtime is the 100 MHz constant clock: 1 tick = 10 ns.
+      printf("[LM_INNER] w=%d normquant=%llu weight=%llu total=%llu\n",
+             tile_idx,
+             (unsigned long long)((_lmi_t1 - _lmi_t0) * 10ull),
+             (unsigned long long)((_lmi_t2 - _lmi_t1) * 10ull),
+             (unsigned long long)((_lmi_t2 - _lmi_t0) * 10ull));
+    }
+#endif
 
     // ── Reduce within the wave, across g only ───────────────────────────
     // NOT the full 64-lane butterfly: lanes differing in `col` hold different

@@ -515,10 +515,10 @@ __device__ __noinline__ void
       using bf16_t = __hip_bfloat16;
       char const *k_base = reinterpret_cast<char const *>(
           reinterpret_cast<bf16_t const *>(output_ptrs[1]) +
-          static_cast<size_t>(xcd_id) * HEAD_DIM);
+          MPK_KV_HEAD_OFF(xcd_id, HEAD_DIM));
       char const *v_base = reinterpret_cast<char const *>(
           reinterpret_cast<bf16_t const *>(output_ptrs[2]) +
-          static_cast<size_t>(xcd_id) * HEAD_DIM);
+          MPK_KV_HEAD_OFF(xcd_id, HEAD_DIM));
       mpk_prefetch_kv_chunk_l2<PAGE_SIZE, HEAD_DIM, NUM_KV_CHUNKS,
                                KV_CACHE_STRIDE>(k_base,
                                                 v_base,
@@ -547,6 +547,12 @@ __device__ __noinline__ void
   // per-rank bands line up across runs.
   int const _pslot_w = xcd_id * workers_per_xcd + xcd_rank;
   MPK_PHASE_MARK(_pslot_w, 0);
+#ifdef MPK_QKV_SPLIT
+  // Function scope, unconditional read: s_memrealtime is scalar and cheap,
+  // and keeping it out of divergent flow is what MPK_LM_INNER got wrong.
+  unsigned long long _qkvs_t0 = __builtin_amdgcn_s_memrealtime();
+  unsigned long long _qkvs_t1 = _qkvs_t0;
+#endif
 
 #ifdef MPK_INTERLAYER_SPLIT
   // Gated on the same arm as the phase slots, so these three segments are
@@ -698,6 +704,10 @@ __device__ __noinline__ void
   // ══════════════════════════════════════════════════════════════════
   // Phase 1: QKV GEMM
   // ══════════════════════════════════════════════════════════════════
+#ifdef MPK_QKV_SPLIT
+  // Setup and the block barrier end here; the QKV GEMM starts next.
+  _qkvs_t1 = __builtin_amdgcn_s_memrealtime();
+#endif
   MPK_TW_SUB(10, xcd_rank);
   if (qkv_does_qkv) {
 #ifdef MPK_QKV_KSPLIT
@@ -760,6 +770,14 @@ __device__ __noinline__ void
     _fused_t0a = __builtin_amdgcn_s_memrealtime();
 #endif
   } // end Phase 1: QKV GEMM
+#ifdef MPK_QKV_SPLIT
+  if (tid == 0 && g_phase_arm) {
+    unsigned long long _qkvs_t2 = __builtin_amdgcn_s_memrealtime();
+    atomicAdd(&g_qkv_setup_sum, (_qkvs_t1 - _qkvs_t0) * 10ull);
+    atomicAdd(&g_qkv_gemm_sum, (_qkvs_t2 - _qkvs_t1) * 10ull);
+    atomicAdd(&g_qkv_n, 1ull);
+  }
+#endif
   MPK_PHASE_MARK(_pslot_w, 1);
 
   // ══════════════════════════════════════════════════════════════════
@@ -891,9 +909,9 @@ __device__ __noinline__ void
       int kv_chunk_idx = attn_chunk;
       using bf16_t = __hip_bfloat16;
       void const *offset_k = reinterpret_cast<bf16_t const *>(output_ptrs[1]) +
-                             static_cast<size_t>(attn_kv_head) * HEAD_DIM;
+                             MPK_KV_HEAD_OFF(attn_kv_head, HEAD_DIM);
       void const *offset_v = reinterpret_cast<bf16_t const *>(output_ptrs[2]) +
-                             static_cast<size_t>(attn_kv_head) * HEAD_DIM;
+                             MPK_KV_HEAD_OFF(attn_kv_head, HEAD_DIM);
 
       // Write float32 partials to o_acc_f32 (input_ptrs[23])
       // Write LSE to lse_acc (input_ptrs[8])
@@ -943,7 +961,7 @@ __device__ __noinline__ void
             &chunk_barrier[(attn_kv_head * NUM_REQS + attn_req) * 16 + 1 +
                            kv_chunk_idx];
         if (tid == 0) {
-          while (!MPK_WS_SK(2) && MPK_LD_GATE(split_flag) < qkv_epoch_expected) {
+          while (!MPK_WS_SK(2) && MPK_LD_GATE_AID(split_flag) < qkv_epoch_expected) {
             __builtin_amdgcn_s_sleep(1);
           }
         }
@@ -1230,7 +1248,7 @@ __device__ __noinline__ void
       // Idle rank 23+c: high half of chunk c. Consumer of Q — wait for the
       // epoch without arriving (arrival count stays QKV+attn prefix).
       if (tid == 0) {
-        while (!MPK_WS_SK(1) && MPK_LD_GATE(&qkv_epoch[xcd_id * 16]) < qkv_epoch_expected) {
+        while (!MPK_WS_SK(1) && MPK_LD_GATE_AID(&qkv_epoch[xcd_id * 16]) < qkv_epoch_expected) {
           __builtin_amdgcn_s_sleep(1);
         }
       }
@@ -1377,7 +1395,7 @@ __device__ __noinline__ void
     // buffer_inv is per-wave.
     if (tid == 0)
 #endif
-      while (!MPK_WS_SK(4) && (_obs = MPK_LD_GATE(&attn_release[xcd_id * 16])) <
+      while (!MPK_WS_SK(4) && (_obs = MPK_LD_GATE_AID(&attn_release[xcd_id * 16])) <
              attn_release_expected) {
         MPK_WS_WAIT_TICK(_obs, _spins);
         _spins++;
@@ -1633,7 +1651,13 @@ __device__ __noinline__ void
     // to pay just because they have many pollers.
     if (tid == 0)
 #endif
-    while (MPK_LD_GATE2(&oproj_hier[xcd_id * 16]) < qkv_epoch_expected) {
+#ifdef MPK_OPROJ_NARROW_REL
+    // Third consumer of MPK_AID_REGION_HIER_RELEASE, in a different file from
+    // the publisher. Must follow the narrowed release to slot 0.
+    while (MPK_LD_GATE_AID(&oproj_hier[0]) < qkv_epoch_expected) {
+#else
+    while (MPK_LD_GATE_AID(&oproj_hier[xcd_id * 16]) < qkv_epoch_expected) {
+#endif
 #ifndef MPK_OPROJ_SKIP_GATE_BUSY_POLL
       __builtin_amdgcn_s_sleep(1);
 #endif
@@ -1671,14 +1695,14 @@ __device__ __noinline__ void
     if (tid == 0)
 #endif
       do {
-        _rec = ld_sys_u64(&_rr[(1 + xcd_id) * 16 + 2]);
+        _rec = MPK_LD_GATE_AID_U64(&_rr[(1 + xcd_id) * 16 + 2]);
         _obs = (int)_rec;
         MPK_WS_WAIT_TICK(_obs, _spins);
         _spins++;
       } while (_obs < routing_expected);
 #ifdef MPK_NARROW_GATE_POLL
     __syncthreads();
-    _rec = ld_sys_u64(&_rr[(1 + xcd_id) * 16 + 2]);
+    _rec = MPK_LD_GATE_AID_U64(&_rr[(1 + xcd_id) * 16 + 2]);
 #endif
     routed_expert0 = (int)(_rec >> 32);
 #else
@@ -1700,7 +1724,7 @@ __device__ __noinline__ void
     // says so -- so the narrowing has to supply one.
     if (tid == 0)
 #endif
-      while ((_obs = MPK_LD_GATE(my_release)) < routing_expected) {
+      while ((_obs = MPK_LD_GATE_AID(my_release)) < routing_expected) {
         MPK_WS_WAIT_TICK(_obs, _spins);
         _spins++;
         __builtin_amdgcn_s_sleep(1);
@@ -2363,6 +2387,22 @@ __device__ __noinline__ void
     // value from the first active lane.
     lean_rel_epoch = __builtin_amdgcn_readfirstlane(lean_rel_epoch);
     if (lean_rel_epoch != 0) {
+#ifdef MPK_LAYER_NARROW_REL
+      // One slot per AID instead of eight. Every slot received the identical
+      // `lean_rel_epoch`, so the eight are pure redundancy, and all 16
+      // write-through stores drain under the one vmcnt below -- the release
+      // therefore costs the slowest of them. MoE narrow release, third use.
+      if (tid == 0) {
+#ifdef MPK_AID_SPLIT_FLAGS
+        mpk_aid_publish(layer_release_shared,
+                        0,
+                        (unsigned)lean_rel_epoch,
+                        MPK_AID_REGION_LAYER_RELEASE);
+#else
+        st_wt_u32((void *)&layer_release[0], (unsigned)lean_rel_epoch);
+#endif
+      }
+#else
       if (tid < 8) {
 #ifdef MPK_AID_SPLIT_FLAGS
         mpk_aid_publish(layer_release_shared,
@@ -2373,6 +2413,7 @@ __device__ __noinline__ void
         st_wt_u32((void *)&layer_release[tid * 16], (unsigned)lean_rel_epoch);
 #endif
       }
+#endif
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
 
@@ -2545,10 +2586,10 @@ __device__ __noinline__ void
         // stale reads; a bare `buffer_inv` is an architectural NOP on gfx950
         // and invalidates nothing.
         asm volatile("buffer_inv sc1" ::: "memory");
-        int _f0 = MPK_LD_GATE(&layer_release[0 * 16]);
-        int _f1 = MPK_LD_GATE(&layer_release[1 * 16]);
-        int _f2 = MPK_LD_GATE(&layer_release[2 * 16]);
-        int _f3 = MPK_LD_GATE(&layer_release[3 * 16]);
+        int _f0 = MPK_LD_GATE_AID(&layer_release[0 * 16]);
+        int _f1 = MPK_LD_GATE_AID(&layer_release[1 * 16]);
+        int _f2 = MPK_LD_GATE_AID(&layer_release[2 * 16]);
+        int _f3 = MPK_LD_GATE_AID(&layer_release[3 * 16]);
         int _lo01 = _f0 < _f1 ? _f0 : _f1;
         int _lo23 = _f2 < _f3 ? _f2 : _f3;
         int _lo = _lo01 < _lo23 ? _lo01 : _lo23;
@@ -2571,7 +2612,11 @@ __device__ __noinline__ void
 #endif
       }
 #else
-      while (MPK_LD_GATE(&layer_release[xcd_id * 16]) <= s_layer_rel_prev) {
+#ifdef MPK_LAYER_NARROW_REL
+      while (MPK_LD_GATE_AID(&layer_release[0]) <= s_layer_rel_prev) {
+#else
+      while (MPK_LD_GATE_AID(&layer_release[xcd_id * 16]) <= s_layer_rel_prev) {
+#endif
 #ifndef MPK_LAYER_GATE_BUSY_POLL
         __builtin_amdgcn_s_sleep(1);
 #endif

@@ -298,9 +298,10 @@ __device__ __noinline__ void
     // K element address: cache[phys_page * PAGE_SIZE * kv_cache_stride +
     // page_offset * kv_cache_stride + d] Note: kv_head_idx offset is already
     // applied by the framework's tiling system
-    bf16 const *k_ptr = k_cache +
-                        (long long)phys_page * PAGE_SIZE * kv_cache_stride +
-                        page_offset * kv_cache_stride;
+    bf16 const *k_ptr =
+        k_cache +
+        ((long long)phys_page * PAGE_SIZE + page_offset) *
+            MPK_KV_TOK_STRIDE(HEAD_DIM, kv_cache_stride);
 
     // Compute Q·K^T partial dot product (each thread does Q_PER_THREAD
     // elements)
@@ -339,9 +340,10 @@ __device__ __noinline__ void
     // Add V contribution
     // Note: kv_head_idx offset is already applied by the framework's tiling
     // system
-    bf16 const *v_ptr = v_cache +
-                        (long long)phys_page * PAGE_SIZE * kv_cache_stride +
-                        page_offset * kv_cache_stride;
+    bf16 const *v_ptr =
+        v_cache +
+        ((long long)phys_page * PAGE_SIZE + page_offset) *
+            MPK_KV_TOK_STRIDE(HEAD_DIM, kv_cache_stride);
 #pragma unroll
     for (int i = 0; i < Q_PER_THREAD; i++) {
       int d = lane * Q_PER_THREAD + i;
@@ -493,7 +495,8 @@ __device__ __noinline__ void paged_attention_ck_fmha_prefill(
     const auto k = make_naive_tensor_view<address_space_enum::global>(
         data,
         make_tuple(height, (index_t)HEAD_DIM),
-        make_tuple((index_t)kv_cache_stride, (index_t)1),
+        make_tuple((index_t)MPK_KV_TOK_STRIDE(HEAD_DIM, kv_cache_stride),
+                   (index_t)1),
         number<MyPrefillPipeline::kAlignmentK>{},
         number<1>{});
     return pad_tensor_view(
@@ -504,7 +507,8 @@ __device__ __noinline__ void paged_attention_ck_fmha_prefill(
     const auto v = make_naive_tensor_view<address_space_enum::global>(
         data,
         make_tuple(length, (index_t)HEAD_DIM),
-        make_tuple((index_t)kv_cache_stride, (index_t)1),
+        make_tuple((index_t)MPK_KV_TOK_STRIDE(HEAD_DIM, kv_cache_stride),
+                   (index_t)1),
         number<MyPrefillPipeline::kAlignmentV>{},
         number<1>{});
     const auto vt = transform_tensor_view(
@@ -525,7 +529,8 @@ __device__ __noinline__ void paged_attention_ck_fmha_prefill(
 
   auto k_nav = make_page_block_navigator<const bf16_t, 0>(
       reinterpret_cast<bf16_t const *>(paged_k_cache_ptr),
-      (long_index_t)(PAGE_SIZE * kv_cache_stride),
+      (long_index_t)(PAGE_SIZE *
+                     MPK_KV_TOK_STRIDE(HEAD_DIM, kv_cache_stride)),
       (long_index_t)0,
       block_indices,
       num_blocks,
@@ -535,7 +540,8 @@ __device__ __noinline__ void paged_attention_ck_fmha_prefill(
 
   auto v_nav = make_page_block_navigator<const bf16_t, 1>(
       reinterpret_cast<bf16_t const *>(paged_v_cache_ptr),
-      (long_index_t)(PAGE_SIZE * kv_cache_stride),
+      (long_index_t)(PAGE_SIZE *
+                     MPK_KV_TOK_STRIDE(HEAD_DIM, kv_cache_stride)),
       (long_index_t)0,
       block_indices,
       num_blocks,

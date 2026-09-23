@@ -164,6 +164,13 @@ __device__ unsigned long long
 // out, every mark tests the value read on the very first iteration -- zero --
 // and the recorder silently reports nothing at all. Volatile also gets the
 // cross-XCD visibility this needs, since only worker 0 ever writes it.
+#ifdef MPK_QKV_SPLIT
+// Slot 1 split: setup+barrier vs the QKV GEMM. Same shape as the g_il_*
+// accumulators above -- atomicAdd from tid 0, printed once at the end.
+__device__ unsigned long long g_qkv_setup_sum = 0;
+__device__ unsigned long long g_qkv_gemm_sum = 0;
+__device__ unsigned long long g_qkv_n = 0;
+#endif
 __device__ volatile int g_phase_arm;
 
 // Which iteration to start on. There is no device-side signal that separates
@@ -1676,9 +1683,27 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
         if (_itrel != nullptr) {
           unsigned _xcc;
           asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID)" : "=s"(_xcc));
+#ifdef MPK_ITER_AID
+          int *_aid = mpk_aid_iter_slot((int)(_xcc & (MPK_NUM_XCDS - 1)));
+          int *_slot = _aid ? _aid
+                            : _itrel + (int)(_xcc & (MPK_NUM_XCDS - 1)) * 16;
+#else
           int *_slot = _itrel + (int)(_xcc & (MPK_NUM_XCDS - 1)) * 16;
+#endif
+          // BOTH loads must leave the spin. Redirecting only iter_ready is
+          // worthless: vmcnt(0) waits for the MAXIMUM of its outstanding
+          // loads, so one remaining sc0 sc1 terminate load pins the whole
+          // iteration (measured: v1 gave -1.22%, t=-0.59).
+          //
+          // Checking terminate every 64th trip is safe because the terminate
+          // path also bumps iter_ready to release parked workers -- so the
+          // mirror wakes us anyway -- and MPK_TERM_RECHECK re-tests it right
+          // after this loop. Worst case a terminating worker takes up to 63
+          // extra sleeps to notice.
+          unsigned _it = 0;
           while ((unsigned)MPK_LD_GATE2(_slot) < (unsigned)pc_iter) {
-            if (__atomic_load_n(config.precomp_terminate, __ATOMIC_RELAXED)) {
+            if ((_it++ & 63u) == 63u &&
+                __atomic_load_n(config.precomp_terminate, __ATOMIC_RELAXED)) {
               pc_terminated = 1;
               break;
             }
@@ -3939,6 +3964,15 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
             }
           }
 #endif
+#ifdef MPK_QKV_SPLIT
+          if (g_qkv_n > 0) {
+            printf("[QKVSPLIT] n=%llu setup=%llu gemm=%llu total=%llu\n",
+                   g_qkv_n,
+                   g_qkv_setup_sum / g_qkv_n,
+                   g_qkv_gemm_sum / g_qkv_n,
+                   (g_qkv_setup_sum + g_qkv_gemm_sum) / g_qkv_n);
+          }
+#endif
 #ifdef MPK_INTERLAYER_SPLIT
           // Accounts the part of the slot-11 -> slot-0 span that lives inside
           // the fused-layer function, which no other counter can see.
@@ -3983,9 +4017,22 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
           {
             unsigned long long new_val = *config.precomp_iter_ready;
             int *rel = config.precomp_iter_xcd_release;
+#ifdef MPK_ITER_AID
+            // Two stores, not eight, and into AID-local MTYPE_RW replicas
+            // rather than the 512 B gpu_malloc line -- which is plain
+            // spanning VRAM, i.e. MTYPE_NC wholly inside ONE range, so half
+            // the XCDs were polling it remotely AND uncached.
+            mpk_aid_iter_publish((unsigned)new_val);
+            if (mpk_aid_iter_slot(0) == nullptr) {
+              for (int x = 0; x < MPK_NUM_XCDS; x++) {
+                st_wt_u32((void *)&rel[x * 16], (unsigned)new_val);
+              }
+            }
+#else
             for (int x = 0; x < MPK_NUM_XCDS; x++) {
               st_wt_u32((void *)&rel[x * 16], (unsigned)new_val);
             }
+#endif
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
           }
 #endif
@@ -4003,9 +4050,22 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
           {
             unsigned long long new_val = *config.precomp_iter_ready;
             int *rel = config.precomp_iter_xcd_release;
+#ifdef MPK_ITER_AID
+            // Two stores, not eight, and into AID-local MTYPE_RW replicas
+            // rather than the 512 B gpu_malloc line -- which is plain
+            // spanning VRAM, i.e. MTYPE_NC wholly inside ONE range, so half
+            // the XCDs were polling it remotely AND uncached.
+            mpk_aid_iter_publish((unsigned)new_val);
+            if (mpk_aid_iter_slot(0) == nullptr) {
+              for (int x = 0; x < MPK_NUM_XCDS; x++) {
+                st_wt_u32((void *)&rel[x * 16], (unsigned)new_val);
+              }
+            }
+#else
             for (int x = 0; x < MPK_NUM_XCDS; x++) {
               st_wt_u32((void *)&rel[x * 16], (unsigned)new_val);
             }
+#endif
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
           }
 #else
