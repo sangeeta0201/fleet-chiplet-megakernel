@@ -2661,9 +2661,37 @@ if __name__ == "__main__":
             print(f"[MOE_RW] {len(_rw_pairs)} MoE weights in AID-local RW pairs, "
                   f"gate_up {list(moe_gate_up_proj_weights[0].shape)}", flush=True)
         elif os.environ.get("MPK_MOE_REPLICA", "0") == "1":
+            _rep_align = os.environ.get("MPK_MOE_REP_ALIGN", "0") == "1"
+            if _rep_align:
+                import ctypes as _ct
+                _hip = _ct.CDLL("libamdhip64.so")
             for _l in range(len(moe_gate_up_proj_weights)):
+                if _rep_align:
+                    # Copy 0 ends and copy 1 starts on the halves cut, and both
+                    # halves are 2 MiB multiples (min_block_size stays 2 MiB).
+                    _w = moe_gate_up_proj_weights[_l]
+                    _n = _w.numel() * _w.element_size()
+                    _h = -(-_n // (2 << 20)) * (2 << 20)
+                    _p = _ct.c_void_p()
+                    if _hip.hipMalloc(_ct.byref(_p), _ct.c_size_t(2 * _h)) == 0 and _p.value:
+                        class _CAI:
+                            pass
+                        _cai = _CAI()
+                        _cai.__cuda_array_interface__ = {
+                            "shape": (2 * _n,), "typestr": "|u1",
+                            "data": (_p.value + _h - _n, False),
+                            "version": 2, "strides": None}
+                        _rep = torch.as_tensor(_cai, device="cuda").view(_w.dtype)
+                        _rep = _rep.view((2 * _w.shape[0],) + tuple(_w.shape[1:]))
+                        _rep[: _w.shape[0]].copy_(_w)
+                        _rep[_w.shape[0]:].copy_(_w)
+                        torch.cuda.synchronize()
+                        moe_gate_up_proj_weights[_l] = _rep
+                        continue
+                    print(f"[MOE_REP_ALIGN] layer {_l}: hipMalloc failed, torch.cat", flush=True)
                 moe_gate_up_proj_weights[_l] = torch.cat(
                     [moe_gate_up_proj_weights[_l]] * 2, dim=0).contiguous()
+            for _l in range(len(moe_down_proj_weights)):
                 moe_down_proj_weights[_l] = torch.cat(
                     [moe_down_proj_weights[_l]] * 2, dim=0).contiguous()
             print(f"[MOE_REPLICA] gate_up {list(moe_gate_up_proj_weights[0].shape)} "

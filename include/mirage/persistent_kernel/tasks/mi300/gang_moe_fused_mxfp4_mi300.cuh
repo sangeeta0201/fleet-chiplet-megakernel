@@ -1154,6 +1154,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #ifdef MPK_W13_SUB
     MPK_W13_START();
 #endif
+#ifdef MPK_W13_PREDRAIN
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
 
     // A tile with no routed token has nothing to compute, but it still has to
     // arrive -- the release fires on `% W13_TILES`, which counts every tile in

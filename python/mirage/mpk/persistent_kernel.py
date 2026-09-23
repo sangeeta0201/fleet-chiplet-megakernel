@@ -1511,10 +1511,16 @@ def get_compile_command(
             flags = flags + ["-DMPK_W13_HANDOFF_SC1"]
         if int(os.environ.get("MPK_P9_NO_L2INV", "0")) == 1:
             flags = flags + ["-DMPK_P9_NO_L2INV"]
+        if int(os.environ.get("MPK_SCHED_WG_FENCE", "0")) == 1:
+            flags = flags + ["-DMPK_SCHED_WG_FENCE"]
+        if int(os.environ.get("MPK_SCHED_ONE_FENCE", "0")) == 1:
+            flags = flags + ["-DMPK_SCHED_ONE_FENCE"]
         if int(os.environ.get("MPK_P9_LEADER_INV", "0")) == 1:
             flags = flags + ["-DMPK_P9_LEADER_INV"]
         if int(os.environ.get("MPK_P9_PREINV", "0")) == 1:
             flags = flags + ["-DMPK_P9_PREINV"]
+        if int(os.environ.get("MPK_W13_PREDRAIN", "0")) == 1:
+            flags = flags + ["-DMPK_W13_PREDRAIN"]
         if int(os.environ.get("MPK_WS_SYS_LOAD", "0")) == 1:
             flags = flags + ["-DMPK_WS_SYS_LOAD", "-DMPK_P9_NO_L2INV"]
         if int(os.environ.get("MPK_PRENORM_AID", "0")) == 1:
