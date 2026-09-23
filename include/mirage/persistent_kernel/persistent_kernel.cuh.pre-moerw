@@ -5249,44 +5249,6 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
       mirage::aid::relocate_xcd_sliced_inputs(
           all_tasks, fused_layer_positions, ML_N_IN);
 #endif
-#ifdef MPK_MOE_RW
-      {
-        // XCDs of the upper AID read the AID1 copy of every MoE weight
-        // (slots 17 gate_up, 18 down). Rewriting all_tasks before the tables
-        // are built covers layer 0 and layers 1+.
-        std::vector<std::pair<void *, void *>> rw;
-        if (char const *m = getenv("MPK_MOE_RW_MAP")) {
-          std::string s(m);
-          size_t i = 0;
-          while (i < s.size()) {
-            size_t const c = s.find(':', i);
-            size_t e = s.find(',', i);
-            if (c == std::string::npos) break;
-            if (e == std::string::npos) e = s.size();
-            rw.push_back({(void *)strtoull(s.substr(i, c - i).c_str(), nullptr, 16),
-                          (void *)strtoull(s.substr(c + 1, e - c - 1).c_str(), nullptr, 16)});
-            i = e + 1;
-          }
-        }
-        int moved = 0;
-        for (int L = 0; L < ml_layers; L++) {
-          for (int xcd = NUM_XCDS_ML / 2; xcd < NUM_XCDS_ML; xcd++) {
-            for (int slot = 17; slot <= 18; slot++) {
-              void *&p = all_tasks[fused_layer_positions[L] + xcd].input_ptrs[slot];
-              for (auto const &pr : rw) {
-                if (pr.first == p) {
-                  p = pr.second;
-                  moved++;
-                  break;
-                }
-              }
-            }
-          }
-        }
-        printf("[MOE_RW] pairs=%zu repointed=%d (expect %d)\n", rw.size(), moved,
-               ml_layers * (NUM_XCDS_ML / 2) * 2);
-      }
-#endif
       if (getenv("MPK_DBG_XCD_PTRS")) {
         // Which descriptors actually carry the LM head weight (slot 26)?
         int shown = 0;

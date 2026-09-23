@@ -498,7 +498,6 @@ LM_HEAD_KMAJOR = os.environ.get("MPK_LM_HEAD_KMAJOR", "0") == "1"
 
 
 _OWN_BO_KEEPALIVE = []
-_MOE_RW_KEEPALIVE = []
 
 
 def _own_bo_maybe(t, name):
@@ -522,27 +521,16 @@ def _own_bo_maybe(t, name):
         lo = max(0, min(p + n, cut) - p)
         return b, s, p - b, lo / n
 
-    b, s, off, f = where(t)
-    # Already its own BO and cut at the midpoint: halves placement is right.
-    placed = off == 0 and s < n + (4 << 20) and abs(f - 0.5) < 0.05
     copy = (any(p in name for p in pats) and "k_cache" not in name
-            and "v_cache" not in name and t.is_contiguous() and not placed)
+            and "v_cache" not in name and t.is_contiguous())
     if bomap:
+        b, s, off, f = where(t)
         print(f"[BOMAP] {name} n={n} bo=+{s} off={off} in_first_half={f:.3f}"
               f"{' -> own' if copy else ''}", flush=True)
     if not copy:
         return t
     ptr = _ct.c_void_p()
-    if os.environ.get("MPK_OWN_BO_ALIGN", "0") == "1":
-        # Midpoint on the halves cut: BO of 2*ALIGN_UP(n/2, 2 MiB), tensor
-        # offset so that off + n/2 == size/2 (to 256 B).
-        chunk = 2 << 20
-        half = -(-((n + 1) // 2) // chunk) * chunk
-        bo_n = 2 * half
-        off_in = ((half - n // 2) // 256) * 256
-    else:
-        bo_n, off_in = n, 0
-    rc = hip.hipMalloc(_ct.byref(ptr), _ct.c_size_t(bo_n))
+    rc = hip.hipMalloc(_ct.byref(ptr), _ct.c_size_t(n))
     if rc != 0 or not ptr.value:
         print(f"[BOMAP] {name}: hipMalloc rc={rc}, keeping original", flush=True)
         return t
@@ -552,16 +540,11 @@ def _own_bo_maybe(t, name):
 
     cai = _CAI()
     cai.__cuda_array_interface__ = {"shape": (n,), "typestr": "|u1",
-                                    "data": (ptr.value + off_in, False),
-                                    "version": 2,
+                                    "data": (ptr.value, False), "version": 2,
                                     "strides": None}
     own = torch.as_tensor(cai, device="cuda").view(t.dtype).view(t.shape)
     own.copy_(t)
     torch.cuda.synchronize()
-    if bomap:
-        b2, s2, off2, f2 = where(own)
-        print(f"[BOMAP] {name}(own BO) n={n} bo=+{s2} off={off2} "
-              f"in_first_half={f2:.3f}", flush=True)
     _OWN_BO_KEEPALIVE.append((hip, ptr, own))
     return own
 
@@ -2607,49 +2590,7 @@ if __name__ == "__main__":
         # the driver's halves placement puts [0,E) in range 0 and [E,2E) in
         # range 1, and the kernel shifts expert_id by NUM_EXPERTS on XCDs 4-7.
         # Read-only, so no coherence is needed and the MTYPE stays NC.
-        if os.environ.get("MPK_MOE_RW", "0") == "1":
-            # One copy per AID on AID-local GEM BOs (MTYPE_RW). The halves of a
-            # spanning hipMalloc are MTYPE_NC, whose loads measured ~390 ns even
-            # from the local range vs ~100-155 ns for an AID-local BO.
-            import ctypes as _ct
-            _lib = _ct.CDLL(os.environ.get("MPK_AID_ALLOC_SO",
-                "/root/schowdha/aid-local-hbm/tools/libmpk_aid_alloc.so"))
-            _lib.mpk_aid_alloc.restype = _ct.c_void_p
-            _lib.mpk_aid_alloc.argtypes = [_ct.c_ulonglong, _ct.c_int]
-
-            def _aid_copy(t, aid):
-                n = t.numel() * t.element_size()
-                p = _lib.mpk_aid_alloc(n, aid)
-                if not p:
-                    raise RuntimeError("mpk_aid_alloc(%d, %d) failed" % (n, aid))
-
-                class _CAI:
-                    pass
-
-                cai = _CAI()
-                cai.__cuda_array_interface__ = {"shape": (n,), "typestr": "|u1",
-                                                "data": (p, False), "version": 2,
-                                                "strides": None}
-                dst = torch.as_tensor(cai, device="cuda")
-                dst.copy_(t.contiguous().view(torch.uint8).view(-1))
-                return dst.view(t.dtype).view(t.shape), p
-
-            _rw_pairs = []
-            for _l in range(len(moe_gate_up_proj_weights)):
-                for _lst in (moe_gate_up_proj_weights, moe_down_proj_weights):
-                    _c0, _p0 = _aid_copy(_lst[_l], 0)
-                    _c1, _p1 = _aid_copy(_lst[_l], 1)
-                    _MOE_RW_KEEPALIVE.append(_c1)
-                    _lst[_l] = _c0
-                    _rw_pairs.append("%x:%x" % (_p0, _p1))
-                torch.cuda.synchronize()
-                # Return this layer's freed originals to the driver before the
-                # next layer's GEM allocations.
-                torch.cuda.empty_cache()
-            os.environ["MPK_MOE_RW_MAP"] = ",".join(_rw_pairs)
-            print(f"[MOE_RW] {len(_rw_pairs)} MoE weights in AID-local RW pairs, "
-                  f"gate_up {list(moe_gate_up_proj_weights[0].shape)}", flush=True)
-        elif os.environ.get("MPK_MOE_REPLICA", "0") == "1":
+        if os.environ.get("MPK_MOE_REPLICA", "0") == "1":
             for _l in range(len(moe_gate_up_proj_weights)):
                 moe_gate_up_proj_weights[_l] = torch.cat(
                     [moe_gate_up_proj_weights[_l]] * 2, dim=0).contiguous()

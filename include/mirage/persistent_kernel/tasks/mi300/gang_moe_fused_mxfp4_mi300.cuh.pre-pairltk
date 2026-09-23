@@ -637,10 +637,10 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   int const lane_id = tid & 63;
   int const col = lane_id & 15;
   int const g = lane_id >> 4;
-#if defined(MPK_MOE_XCD_PAIR) && !defined(MPK_EARLY_ROUTING) && !defined(MPK_LOCAL_TOPK)
-#error "MPK_MOE_XCD_PAIR requires MPK_EARLY_ROUTING or MPK_LOCAL_TOPK (carried expert in tile_idx[15:8])"
+#if defined(MPK_MOE_XCD_PAIR) && !defined(MPK_EARLY_ROUTING)
+#error "MPK_MOE_XCD_PAIR requires MPK_EARLY_ROUTING (carried expert in tile_idx[15:8])"
 #endif
-#if defined(MPK_EARLY_ROUTING) || (defined(MPK_MOE_XCD_PAIR) && defined(MPK_LOCAL_TOPK))
+#ifdef MPK_EARLY_ROUTING
   int const carried_expert_id = (tile_idx >> 8) - 1;
   tile_idx &= 0xff;
 #endif
@@ -677,20 +677,6 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       mpk_aid_flags_at(d_barrier, xcd_id, MPK_AID_MOE_BASE_INTS);
 #else
   int *d_barrier_rel = d_barrier;
-#endif
-#ifdef MPK_PAIR_LOCAL_PUB
-#if !defined(MPK_MOE_XCD_PAIR) || !defined(MPK_SWIGLU_AIDREP) || \
-    !defined(MPK_MOE_NARROW_RELEASE) || !defined(MPK_AID_SPLIT_FLAGS)
-#error "MPK_PAIR_LOCAL_PUB needs MOE_XCD_PAIR, SWIGLU_AIDREP, MOE_NARROW_RELEASE, AID_SPLIT_FLAGS"
-#endif
-  // Pairing keeps an expert's W13 producers and W2 consumers on one AID:
-  // aim both swiglu stores at this AID's copy, which is what W2 reads.
-  if (g_aid_flag_rep[0] != nullptr && g_aid_flag_rep[1] != nullptr) {
-    if (xcd_id >= MPK_NUM_XCDS / 2) {
-      d_swiglu_out += swiglu_aid_half;
-    }
-    swiglu_aid_half = 0;
-  }
 #endif
   // Marker 1000: about to read the routing mask. Everything downstream --
   // expert_id, the weight base pointers, the barrier slot -- derives from it.
@@ -967,7 +953,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // Clamp before it reaches any pointer arithmetic: the sentinel is -1, and the
   // weight/routing base pointers are built unconditionally below.
   int expert_id = is_padding_slot ? 0 : expert_id_raw;
-#if defined(MPK_MOE_REPLICA) && !defined(MPK_MOE_RW)
+#ifdef MPK_MOE_REPLICA
   // Read the copy of the weights homed in this die's own memory range. The
   // tensor is [2*NUM_EXPERTS, wgs, bytes] with the upper half a duplicate, and
   // the driver's halves placement puts that upper half in range 1. Routing is
@@ -4525,10 +4511,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         // One slot per AID instead of eight. Every XCD of an AID polls slot 0
         // of its own replica, so the 16-store fan-out collapses to 2.
         {
-#if defined(MPK_PAIR_LOCAL_PUB)
-          // Every W2 consumer of this expert polls this AID's replica.
-          st_wt_u32((void *)&d_barrier_rel[base], (unsigned)release_val);
-#elif defined(MPK_AID_SPLIT_FLAGS)
+#ifdef MPK_AID_SPLIT_FLAGS
           mpk_aid_publish_at(d_barrier,
                              base,
                              (unsigned)release_val,

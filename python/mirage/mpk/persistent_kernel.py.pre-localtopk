@@ -1464,16 +1464,6 @@ def get_compile_command(
         if int(os.environ.get("MPK_NO_LOGIT_RESET", "0")) == 1:
             # skip the TopK logit write-through reset (opt-in here; hash-gate it).
             flags = flags + ["-DMPK_NO_LOGIT_RESET"]
-        if int(os.environ.get("MPK_LOCAL_TOPK", "0")) == 1:
-            # No serial TopK completer: every workgroup rebuilds routing
-            # from tagged logits on its AID replica (bs=1).
-            flags = flags + ["-DMPK_LOCAL_TOPK"]
-        if int(os.environ.get("MPK_PAIR_LOCAL_PUB", "0")) == 1:
-            # XCD pair: swiglu + W13->W2 release published to the own AID only.
-            flags = flags + ["-DMPK_PAIR_LOCAL_PUB"]
-        if int(os.environ.get("MPK_MOE_RW", "0")) == 1:
-            # MoE replicas on AID-local RW BOs; XCD 4-7 descriptors repointed.
-            flags = flags + ["-DMPK_MOE_RW"]
         if int(os.environ.get("MPK_AID_SPLIT_ROUTING", "0")) == 1:
             flags = flags + ["-DMPK_AID_SPLIT_ROUTING"]
         if int(os.environ.get("MPK_ROUTING_NARROW_AID", "0")) == 1:
@@ -1766,11 +1756,7 @@ def get_compile_command(
             # A/B 2026-08-31 GPU 3, hash 96a92716 all six:
             # C 1.711/1.703/1.704 vs V 1.647/1.621/1.658
             # (−64 / −82 / −46 µs). Keep default ON (bs=1).
-            if int(os.environ.get("MPK_LOCAL_TOPK", "0")) == 1:
-                # Local TopK hands each pair its pick in LDS; no early records.
-                flags = flags + ["-DMPK_MOE_XCD_PAIR"]
-            else:
-                flags = flags + ["-DMPK_MOE_XCD_PAIR", "-DMPK_EARLY_ROUTING"]
+            flags = flags + ["-DMPK_MOE_XCD_PAIR", "-DMPK_EARLY_ROUTING"]
         elif int(os.environ.get("MPK_EARLY_ROUTING", "0")) == 1:
             # TESTED AND NOT ADOPTED (race + loss). A/B 2026-08-31:
             # C 1.711/1.712/1.704 vs V 1.728/1.713/1.732, hashes

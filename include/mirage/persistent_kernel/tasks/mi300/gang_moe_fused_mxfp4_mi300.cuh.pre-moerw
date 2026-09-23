@@ -967,7 +967,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // Clamp before it reaches any pointer arithmetic: the sentinel is -1, and the
   // weight/routing base pointers are built unconditionally below.
   int expert_id = is_padding_slot ? 0 : expert_id_raw;
-#if defined(MPK_MOE_REPLICA) && !defined(MPK_MOE_RW)
+#ifdef MPK_MOE_REPLICA
   // Read the copy of the weights homed in this die's own memory range. The
   // tensor is [2*NUM_EXPERTS, wgs, bytes] with the upper half a duplicate, and
   // the driver's halves placement puts that upper half in range 1. Routing is

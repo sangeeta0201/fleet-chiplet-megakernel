@@ -433,11 +433,6 @@ def get_compile_command(
         # Per-worker phase slots: twelve s_memrealtime stamps per layer at
         # the phase boundaries, accumulated per worker and printed once at
         # termination -- no printf on the hot path, unlike MPK_DEVICE_TIMING.
-        if int(os.environ.get("MPK_OPROJ_LDS", "0")) == 1:
-            flags = flags + ["-DMPK_OPROJ_LDS"]
-        if int(os.environ.get("MPK_PHASE_LDS", "0")) == 1:
-            # LDS-resident phase recorder; needs MPK_PHASE_SLOTS.
-            flags = flags + ["-DMPK_PHASE_LDS"]
         if int(os.environ.get("MPK_PHASE_SLOTS", "0")) == 1:
             flags = flags + ["-DMPK_PHASE_SLOTS"]
             # Which forward-pass iteration to start recording on. There is no
@@ -894,18 +889,6 @@ def get_compile_command(
         # equality-recovered index. Bit-exact including the tie-break -- see
         # the comment at the asm block for why the equality matches are
         # visited in reverse.
-        if int(os.environ.get("MPK_TOPK_NO_ROUTING_CLEAR", "0")) == 1:
-            # Drop the routing-index clear at TopK entry: the cleared state is
-            # unreachable (see the block comment in
-            # moe_topk_softmax_mi300.cuh). Self-gated to routing_row_stride 1.
-            # A/B n=12: -0.86%, median -0.89%, t=-3.50, 10/12 pairs.
-            flags = flags + ["-DMPK_TOPK_NO_ROUTING_CLEAR"]
-        if int(os.environ.get("MPK_TOPK_DPP_REDUCE", "0")) == 1:
-            # Move the two softmax row reductions from __shfl_xor (which
-            # lowers to ds_bpermute and bumps LGKM) to DPP lane-zero ladders
-            # plus one broadcast each.
-            # A/B n=7: -0.93%, median -0.92%, t=-2.22, 5/7 pairs.
-            flags = flags + ["-DMPK_TOPK_DPP_REDUCE"]
         if _opt("MPK_TOPK_LOCAL_MAX3"):
             # Ablation 2026-08-30 (=0): +1 / −25 / +9 µs, hash e86d7dc all
             # six. Mixed (C2 1.758 spike); keep default ON.
@@ -1461,24 +1444,8 @@ def get_compile_command(
             flags = flags + ["-DMPK_NARROW_GATE_POLL"]
         if int(os.environ.get("MPK_NARROW_HIER_POLL", "0")) == 1:
             flags = flags + ["-DMPK_NARROW_HIER_POLL"]
-        if int(os.environ.get("MPK_NO_LOGIT_RESET", "0")) == 1:
-            # skip the TopK logit write-through reset (opt-in here; hash-gate it).
-            flags = flags + ["-DMPK_NO_LOGIT_RESET"]
-        if int(os.environ.get("MPK_LOCAL_TOPK", "0")) == 1:
-            # No serial TopK completer: every workgroup rebuilds routing
-            # from tagged logits on its AID replica (bs=1).
-            flags = flags + ["-DMPK_LOCAL_TOPK"]
-        if int(os.environ.get("MPK_PAIR_LOCAL_PUB", "0")) == 1:
-            # XCD pair: swiglu + W13->W2 release published to the own AID only.
-            flags = flags + ["-DMPK_PAIR_LOCAL_PUB"]
-        if int(os.environ.get("MPK_MOE_RW", "0")) == 1:
-            # MoE replicas on AID-local RW BOs; XCD 4-7 descriptors repointed.
-            flags = flags + ["-DMPK_MOE_RW"]
         if int(os.environ.get("MPK_AID_SPLIT_ROUTING", "0")) == 1:
             flags = flags + ["-DMPK_AID_SPLIT_ROUTING"]
-        if int(os.environ.get("MPK_ROUTING_NARROW_AID", "0")) == 1:
-            # Routing release: one slot per AID replica, polled locally.
-            flags = flags + ["-DMPK_ROUTING_NARROW_AID"]
         if int(os.environ.get("MPK_AID_SPLIT_OUT", "0")) == 1:
             flags = flags + ["-DMPK_AID_SPLIT_OUT"]
         if int(os.environ.get("MPK_AID_EVCTR2", "0")) == 1:
@@ -1584,13 +1551,6 @@ def get_compile_command(
             flags = flags + ["-DMPK_OPROJ_AMAX_DPP"]
         if int(os.environ.get("MPK_OPROJ_AID_AGG", "0")) == 1:
             flags = flags + ["-DMPK_OPROJ_AID_AGG"]
-        if int(os.environ.get("MPK_OPROJ_LOCAL_SLICE_PROBE", "0")) == 1:
-            # TIMING ONLY: O-proj waves read only their own AID's slices.
-            flags = flags + ["-DMPK_OPROJ_LOCAL_SLICE_PROBE"]
-        if int(os.environ.get("MPK_OPROJ_AID_TIER", "0")) == 1:
-            # Phase-2 barrier: per-AID arrival on the AID's own replica, one
-            # write-through publish per AID; no cross-AID atomic.
-            flags = flags + ["-DMPK_OPROJ_AID_TIER"]
         if _opt("MPK_NARROW_OPROJ_HIER"):
             # One tid polls the O-proj hierarchical release; the acquire
             # __syncthreads already below carries the other 255. Unlike
@@ -1766,11 +1726,7 @@ def get_compile_command(
             # A/B 2026-08-31 GPU 3, hash 96a92716 all six:
             # C 1.711/1.703/1.704 vs V 1.647/1.621/1.658
             # (−64 / −82 / −46 µs). Keep default ON (bs=1).
-            if int(os.environ.get("MPK_LOCAL_TOPK", "0")) == 1:
-                # Local TopK hands each pair its pick in LDS; no early records.
-                flags = flags + ["-DMPK_MOE_XCD_PAIR"]
-            else:
-                flags = flags + ["-DMPK_MOE_XCD_PAIR", "-DMPK_EARLY_ROUTING"]
+            flags = flags + ["-DMPK_MOE_XCD_PAIR", "-DMPK_EARLY_ROUTING"]
         elif int(os.environ.get("MPK_EARLY_ROUTING", "0")) == 1:
             # TESTED AND NOT ADOPTED (race + loss). A/B 2026-08-31:
             # C 1.711/1.712/1.704 vs V 1.728/1.713/1.732, hashes
@@ -2528,8 +2484,8 @@ class PersistentKernel:
         assert output.num_dims == 2  # (batch_size, hidden_size / world_size)
         assert k_cache.num_dims == 4  # (batch_size, seq_len, kv_heads, head_dim)
         assert v_cache.num_dims == 4  # (batch_size, seq_len, kv_heads, head_dim)
-        num_kv_heads, head_dim, kv_tok_stride, kv_head_axis = \
-            self._kv_geom(k_cache)
+        head_dim = k_cache.dim(3)
+        num_kv_heads = k_cache.dim(2)
         num_q_heads = output.dim(1) // head_dim
         rotary_embed = 0
         if cos_pos_embed is not None or sin_pos_embed is not None:
@@ -2594,8 +2550,8 @@ class PersistentKernel:
         assert output.num_dims == 2  # (batch_size, hidden_size / world_size)
         assert k_cache.num_dims == 4  # (batch_size, seq_len, kv_heads, head_dim)
         assert v_cache.num_dims == 4  # (batch_size, seq_len, kv_heads, head_dim)
-        num_kv_heads, head_dim, kv_tok_stride, kv_head_axis = \
-            self._kv_geom(k_cache)
+        head_dim = k_cache.dim(3)
+        num_kv_heads = k_cache.dim(2)
         num_q_heads = output.dim(1) // head_dim # 32
         rotary_embed = 0
         output_stride = output.dim(1)
@@ -2665,13 +2621,12 @@ class PersistentKernel:
         assert output.num_dims == 2  # (num_tokens, hidden_size / world_size)
         assert k_cache.num_dims == 4  # (num_pages, page_size, kv_heads, head_dim)
         assert v_cache.num_dims == 4  # (num_pages, page_size, kv_heads, head_dim)
-        _pg, _ps = (1, 2) if self._kv_head_major() else (0, 1)
-        assert k_cache.dim(_pg) == self.max_num_pages
-        assert v_cache.dim(_pg) == self.max_num_pages
-        assert k_cache.dim(_ps) == self.page_size
-        assert v_cache.dim(_ps) == self.page_size
-        num_kv_heads, head_dim, kv_tok_stride, kv_head_axis = \
-            self._kv_geom(k_cache)
+        assert k_cache.dim(0) == self.max_num_pages
+        assert v_cache.dim(0) == self.max_num_pages
+        assert k_cache.dim(1) == self.page_size
+        assert v_cache.dim(1) == self.page_size
+        head_dim = k_cache.dim(3)
+        num_kv_heads = k_cache.dim(2)
         num_q_heads = output.dim(1) // head_dim
         rotary_embed = 0
         if cos_pos_embed is not None or sin_pos_embed is not None:
@@ -2714,8 +2669,8 @@ class PersistentKernel:
         assert grid_dim[0] == self.max_num_batched_requests
         assert grid_dim[1] == num_kv_heads
         tb_graph.new_input(input, (-1, 1, -1), -1, True)
-        tb_graph.new_input(k_cache, (-1, kv_head_axis, -1), 1, True)
-        tb_graph.new_input(v_cache, (-1, kv_head_axis, -1), 1, True)
+        tb_graph.new_input(k_cache, (-1, 2, -1), 1, True)
+        tb_graph.new_input(v_cache, (-1, 2, -1), 1, True)
         tb_graph.new_input(q_norm, (-1, -1, -1), -1, True)
         tb_graph.new_input(k_norm, (-1, -1, -1), -1, True)
         tb_graph.new_input(cos_pos_embed, (-1, -1, -1), -1, True)
@@ -2761,16 +2716,15 @@ class PersistentKernel:
         assert input.num_dims == 2  # (num_tokens, fused_outdim / world_size)
         assert k_cache.num_dims == 4  # (num_pages, page_size, kv_heads, head_dim)
         assert v_cache.num_dims == 4  # (num_pages, page_size, kv_heads, head_dim)
-        _pg, _ps = (1, 2) if self._kv_head_major() else (0, 1)
-        assert k_cache.dim(_pg) == self.max_num_pages
-        assert v_cache.dim(_pg) == self.max_num_pages
-        assert k_cache.dim(_ps) == self.page_size
-        assert v_cache.dim(_ps) == self.page_size
+        assert k_cache.dim(0) == self.max_num_pages
+        assert v_cache.dim(0) == self.max_num_pages
+        assert k_cache.dim(1) == self.page_size
+        assert v_cache.dim(1) == self.page_size
         assert output.num_dims == 3  # (num_tokens, num_kv_chunks * num_qo_per_kv * head_dim / world_size, num_kv_heads)
         assert lse.num_dims == 3  # (num_tokens, num_kv_chunks * num_qo_per_kv / world_size, num_kv_heads)
 
-        num_kv_heads, head_dim, kv_tok_stride, kv_head_axis = \
-            self._kv_geom(k_cache)
+        head_dim = k_cache.dim(3)
+        num_kv_heads = k_cache.dim(2)
         num_q_heads = attention_params[0]
         num_kv_chunks = attention_params[1]
         
@@ -2802,8 +2756,8 @@ class PersistentKernel:
         assert grid_dim[0] == self.max_num_batched_requests
         assert grid_dim[1] == num_kv_heads
         tb_graph.new_input(input, (-1, 1, -1), -1, True)
-        tb_graph.new_input(k_cache, (-1, kv_head_axis, -1), 1, True)
-        tb_graph.new_input(v_cache, (-1, kv_head_axis, -1), 1, True)
+        tb_graph.new_input(k_cache, (-1, 2, -1), 1, True)
+        tb_graph.new_input(v_cache, (-1, 2, -1), 1, True)
         tb_graph.new_input(q_norm, (-1, -1, -1), -1, True)
         tb_graph.new_input(k_norm, (-1, -1, -1), -1, True)
         tb_graph.new_input(cos_pos_embed, (-1, -1, -1), -1, True)
@@ -2876,25 +2830,6 @@ class PersistentKernel:
         else:
             raise ValueError(f"Unsupported target CC: {self.target_cc}")
 
-    @staticmethod
-    def _kv_head_major():
-        return os.environ.get("MPK_KV_HEAD_MAJOR", "0") == "1"
-
-    @classmethod
-    def _kv_geom(cls, k_cache):
-        """(num_kv_heads, head_dim, tok_stride, head_axis) for either layout.
-
-        NHD  : (pages, page_size, heads, dim) -- head axis 2, tok stride
-               heads*dim, because a token's heads sit side by side.
-        H*ND : (heads, pages, page_size, dim) -- head axis 0, tok stride dim,
-               because within one head the tokens are contiguous.
-        """
-        head_dim = k_cache.dim(3)
-        if cls._kv_head_major():
-            return k_cache.dim(0), head_dim, head_dim, 0
-        num_kv_heads = k_cache.dim(2)
-        return num_kv_heads, head_dim, num_kv_heads * head_dim, 2
-
     def kv_cache_update_layer(
         self,
         input: DTensor,
@@ -2912,8 +2847,8 @@ class PersistentKernel:
         assert k_cache.num_dims == 4  # (num_pages, page_size, kv_heads, head_dim)
         assert v_cache.num_dims == 4
         assert q_workspace.num_dims == 2  # (num_tokens, q_workspace_stride)
-        num_kv_heads, head_dim, kv_tok_stride, kv_head_axis = \
-            self._kv_geom(k_cache)
+        head_dim = k_cache.dim(3)
+        num_kv_heads = k_cache.dim(2)
         num_q_heads = q_workspace.dim(1) // head_dim
         q_workspace_stride = q_workspace.dim(1)
         rotary_embed = 1 if cos_pos_embed is not None else 0
@@ -2939,8 +2874,8 @@ class PersistentKernel:
 
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, 1, -1), -1, True)
-        tb_graph.new_input(k_cache, (-1, kv_head_axis, -1), 1, True)
-        tb_graph.new_input(v_cache, (-1, kv_head_axis, -1), 1, True)
+        tb_graph.new_input(k_cache, (-1, 2, -1), 1, True)
+        tb_graph.new_input(v_cache, (-1, 2, -1), 1, True)
         tb_graph.new_input(q_norm, (-1, -1, -1), -1, True)
         tb_graph.new_input(k_norm, (-1, -1, -1), -1, True)
         tb_graph.new_input(cos_pos_embed, (-1, -1, -1), -1, True)
@@ -2972,14 +2907,13 @@ class PersistentKernel:
         assert o_acc.num_dims == 2   # (num_tokens, kv_heads*chunks*qo_per_kv*head_dim)
         assert lse_acc.num_dims == 2 # (num_tokens, kv_heads*chunks*qo_per_kv)
 
-        num_kv_heads, head_dim, kv_tok_stride, kv_head_axis = \
-            self._kv_geom(k_cache)
+        head_dim = k_cache.dim(3)
+        num_kv_heads = k_cache.dim(2)
         num_q_heads = attention_params[0]
         num_kv_chunks = attention_params[1]
         max_num_requests = attention_params[2]
         q_workspace_stride = q_workspace.dim(1)
-        kv_cache_stride = (head_dim if self._kv_head_major()
-                           else num_kv_heads * head_dim)
+        kv_cache_stride = num_kv_heads * head_dim
 
         # params: num_q_heads, num_kv_heads, head_dim, page_size, max_seq_len,
         #         num_kv_chunks, q_workspace_stride, kv_cache_stride,
@@ -2993,8 +2927,8 @@ class PersistentKernel:
         assert grid_dim[1] == num_kv_heads
         assert grid_dim[2] == num_kv_chunks
         tb_graph.new_input(q_workspace, (-1, -1, -1), -1, True)
-        tb_graph.new_input(k_cache, (-1, kv_head_axis, -1), 1, True)
-        tb_graph.new_input(v_cache, (-1, kv_head_axis, -1), 1, True)
+        tb_graph.new_input(k_cache, (-1, 2, -1), 1, True)
+        tb_graph.new_input(v_cache, (-1, 2, -1), 1, True)
         # Optional sinks input (GPT-OSS per-head attention sinks).
         # When provided, sink correction is fused into the attention epilogue,
         # eliminating the standalone attention_sink_layer task.
@@ -3120,8 +3054,8 @@ class PersistentKernel:
         assert v_cache.num_dims == 4
         assert self.target_cc in (94, 95), "Gang attention only supported on MI300X"
 
-        num_kv_heads, head_dim, kv_tok_stride, kv_head_axis = \
-            self._kv_geom(k_cache)
+        head_dim = k_cache.dim(3)
+        num_kv_heads = k_cache.dim(2)
         num_q_heads = attention_params[0]
         num_kv_chunks = attention_params[1]
         q_workspace_stride = attention_params[2]
@@ -4860,8 +4794,7 @@ class PersistentKernel:
 
         has_sinks = 1 if sinks is not None else 0
         q_workspace_stride = q_workspace.dim(1)
-        kv_cache_stride = (head_dim if self._kv_head_major()
-                           else num_kv_heads * head_dim)
+        kv_cache_stride = num_kv_heads * head_dim
 
         grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
@@ -5330,8 +5263,7 @@ class PersistentKernel:
 
         has_sinks = 1 if sinks is not None else 0
         q_workspace_stride = q_workspace.dim(1)
-        kv_cache_stride = (head_dim if self._kv_head_major()
-                           else num_kv_heads * head_dim)
+        kv_cache_stride = num_kv_heads * head_dim
 
         # O-PROJ tiling (from type 215)
         oproj_n_wgs = oproj_weight.dim(0)
@@ -5565,8 +5497,7 @@ class PersistentKernel:
 
         has_sinks = 1 if sinks is not None else 0
         q_workspace_stride = q_workspace.dim(1)
-        kv_cache_stride = (head_dim if self._kv_head_major()
-                           else num_kv_heads * head_dim)
+        kv_cache_stride = num_kv_heads * head_dim
 
         # O-PROJ tiling
         oproj_n_wgs = oproj_weight.dim(0)

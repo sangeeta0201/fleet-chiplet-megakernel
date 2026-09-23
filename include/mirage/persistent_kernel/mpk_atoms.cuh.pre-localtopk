@@ -1,0 +1,1175 @@
+/* Copyright 2025 CMU
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#pragma once
+
+// PERF TEST flags (uncomment to test):
+// #define MPK_DISABLE_THREADFENCE  // Disable threadfence_gpu()
+#define MPK_USE_RELAXED_ATOMICS
+#define MPK_USE_NT_MEMORY // Use non-temporal loads/stores (bypass cache, fence
+                          // for ordering)
+// #define MPK_ENABLE_TIMING  // Enable timing instrumentation
+// #define MPK_ENABLE_DEVICE_TASK_ACCUM  // Enable per-task-type wall-clock
+// accumulation #define MPK_ENABLE_SPAN_TIMING  // Enable per-stage wall-clock
+// span (first_start→last_end) #define MPK_DISABLE_LINEAR  // Disable LINEAR
+// kernel entirely
+
+// LINEAR kernel section flags (uncomment one at a time to find bottleneck):
+// #define MPK_SKIP_LOAD_INPUT   // Skip loading input from global memory
+// #define MPK_SKIP_LOAD_WEIGHT  // Skip loading weight from global memory
+// #define MPK_SKIP_MFMA         // Skip MFMA computation
+// #define MPK_SKIP_STORE_OUTPUT // Skip storing output to global memory
+
+#if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
+#include <atomic>
+#endif
+
+#ifdef MPK_AID_SPLIT_FLAGS
+// The two COHERENT AID-local flag replicas, [0] homed in AID0 and [1] in AID1,
+// each holding eight per-XCD flags one 64 B line apart. Populated once by the
+// host before the first launch (see alloc_flag_replicas in aid_local.h) and
+// re-zeroed per launch, exactly where the shared counter tensors are.
+//
+// A null pair means the allocator was unavailable, in which case every site
+// guarded by MPK_AID_SPLIT_FLAGS falls back to the shared buffer, so a build
+// with this flag on still runs correctly (just without the win) on a stock
+// driver or in NPS1.
+__device__ int *g_aid_flag_rep[2];
+
+// Per-AID copies of the multi-layer pointer tables. Every worker re-reads its
+// TaskDesc's input/output pointers out of these at every layer boundary, and
+// the tables are indexed with xcd_id outermost, so each XCD only ever touches
+// its own 1/8 of them. They are read-only after setup and total ~90 KiB, which
+// makes them the opposite profile to the MoE weights: tiny, high-fanout, and
+// squarely on the critical path at the start of every layer.
+__device__ void **g_aid_ml_in[2];
+__device__ void **g_aid_ml_out[2];
+
+// Each flag family gets its own eight lines in both replicas. All of them are
+// cleared per launch, because the shared lines they mirror all live in
+// oproj_topk_counters, which demo.py clears wholesale between launches.
+constexpr int MPK_AID_REGION_INTS = 8 * 16; // eight 64 B lines
+constexpr int MPK_AID_REGION_ATTN_RELEASE = 0;
+// ---------------------------------------------------------------------------
+// KV cache layout selector.
+//
+// Default NHD: (layers, pages, page_size, kv_heads, head_dim). Heads are an
+// INNER dim, so head x is strided across the whole cache and cannot be placed
+// in one AID -- which is why the kvupd kernel calls it an "un-partitioned
+// base".
+//
+// MPK_KV_HEAD_MAJOR selects H*ND: (layers, kv_heads, pages, page_size,
+// head_dim). Head x becomes contiguous, so halves placement puts heads 0-3 in
+// range 0 and 4-7 in range 1, and since attn_kv_head == xcd_id each XCD then
+// reads only its own AID.
+//
+// Every KV address in the tree is `tok * tok_stride + head * head_stride`.
+// Only the token stride was ever a parameter; these two macros make both
+// strides explicit so one expression serves either layout.
+#define MPK_KV_TOTAL_TOKENS ((long long)MPK_MAX_NUM_PAGES * MPK_PAGE_SIZE)
+#ifdef MPK_KV_HEAD_MAJOR
+#define MPK_KV_HEAD_OFF(h, hd) ((size_t)(h) * (size_t)MPK_KV_TOTAL_TOKENS * (hd))
+#define MPK_KV_TOK_STRIDE(hd, kvs) (hd)
+#else
+#define MPK_KV_HEAD_OFF(h, hd) ((size_t)(h) * (size_t)(hd))
+#define MPK_KV_TOK_STRIDE(hd, kvs) (kvs)
+#endif
+
+constexpr int MPK_AID_REGION_LAYER_RELEASE = 1; // reserved, see slot 10 note
+constexpr int MPK_AID_REGION_OPROJ_READY = 2; // MPK_ROUTER_XCD_FOLD only
+// Only the eight per-XCD release flags of the O-proj hierarchical barrier.
+// The global arrival counter at [8*16], topk_counter at [9*16] and the
+// XCD-local tree at [28*16] stay shared: they are atomics, and those are
+// XCD-L2-bound rather than AID-bound, so placement does nothing for them.
+constexpr int MPK_AID_REGION_HIER_RELEASE = 3;
+// qkv_epoch's eight per-XCD slots. Unlike the release families this one is
+// never read across the AID boundary: the arrival and both polls all address
+// `[xcd_id * 16]`, so only the AID running that XCD ever wants the value.
+// Hence a single replica write rather than a dual publish, and the arrival
+// atomic lands on a line homed in the AID performing it.
+constexpr int MPK_AID_REGION_QKV_EPOCH = 4;
+// The O-proj barrier's per-XCD ARRIVAL tree. Like qkv_epoch this is never read
+// across the AID boundary -- the file calls level 1 "XCD-private, written and
+// read only at [xcd_id]" -- so one replica write, read locally, no dual
+// publish. Regions 0..5 use 6*128 = 768 ints, still under MPK_AID_MOE_BASE_INTS.
+constexpr int MPK_AID_REGION_HIER_LOCAL = 5;
+// Per-XCD arrival counters for the top-k barrier. Region 6 keeps
+// 7*128 = 896 ints, still below MPK_AID_MOE_BASE_INTS (1024).
+constexpr int MPK_AID_REGION_TOPK = 6;
+// MPK_OPROJ_AID_TIER: per-AID arrival count of the O-proj phase-2 barrier.
+// Slot 0 only; touched by the four XCDs of the AID that owns the replica.
+constexpr int MPK_AID_REGION_OPROJ_TIER = 7;
+
+// The MoE fused barrier is per-expert (MOE_BAR_STRIDE ints each), so at 128
+// experts it needs ~20k ints rather than the eight lines the families above
+// use. It gets a raw offset past them instead of a region index. The 2 MiB
+// replica has room to spare.
+constexpr int MPK_AID_MOE_BASE_INTS = 1024;
+
+// routing_ready's eight per-XCD release flags. Own raw offset because the family
+// spans nine lines (an epoch counter at [0] plus [(1+x)*16] for x in 0..7), one
+// more than a region slot holds. Past the MoE family, which runs to ~21.5k ints;
+// the 2 MiB replica is 524k ints.
+//
+// ONLY the per-XCD flags move. The epoch counter at [0] stays shared: it is read
+// as `ld_nt_s32(routing_ready) + 1` to DERIVE what the poll waits for, and a
+// stale replica there yields an expected value nobody ever publishes -- the
+// MPK_LD_EPOCH hazard, a hang rather than a slowdown. Same split the MoE barrier
+// and the O-proj hier barrier already use: replicate the flags, share the
+// counter.
+//
+// Why this matters in SPX+NPS2. gang_oproj_topk_moe_fused_mi300.cuh:190 claims
+// the poll is "XCD-local (hot in L2, no cross-XCD contention)". That holds in
+// NPS1, where the line is MTYPE_RW and cacheable. In NPS2 plain hipMalloc is
+// demoted to MTYPE_NC, nothing can be shared through cache, and every poller's
+// `sc0 sc1` read goes to the coherency point and serialises. Measured with
+// ~/nps1/relobs3.cpp, last-of-7-acks against pollers on ONE line:
+//   NPS1  8->2565 ns   64->2561   128->2457   256->2446   (flat)
+//   NPS2  8->2426 ns   64->5060   128->26620  256->52251  (21x)
+// An AID-local RW replica is flat in NPS2 too (2470-2502), which is the fix.
+//
+// MEASURED: correct but end-to-end NEUTRAL, so MPK_AID_SPLIT_ROUTING ships off.
+// It does move the right numbers -- slot 7 topk_wait 11618 -> 10750, slot 6
+// 18469 -> 17334, layer total 76854 -> 75883 ns -- and it does not hang, so the
+// replication is sound. It is just ~1 us of a ~25 us gap, because this poll is
+// dominated by WAITING FOR TOPK TO COMPUTE rather than by poll serialization;
+// gang_linear_...:2757 already says so ("that 5.8 us is the TopK compute the
+// release is waiting for, not the release's own latency"). Keep it for the
+// correctness of the mechanism and as the record that the NC-poll cliff, though
+// real in isolation (21x in relobs3), is NOT what is left in fleet: the other
+// three flag families were already replicated.
+constexpr int MPK_AID_ROUTING_BASE_INTS = 32768;
+
+// The fused-tail barriers of the LM head task (moe_done, resadd_done,
+// lmhead_done). Own offset past routing; the 2 MiB replica is 524k ints and
+// the per-launch memset clears it, so these mirrors start at 0 every launch.
+// One line each so they never share a cache line.
+constexpr int MPK_AID_LMTAIL_BASE_INTS = 40960;
+
+// swiglu_out's two copies, inside the same per-AID replicas the split flags
+// use. 5888 ints each (NUM_TOPK * PADDED_INTERMEDIATE_SIZE shorts), clear of
+// the flag regions below 1024, LMTAIL at 40960 and EVCTR at 458752.
+constexpr int MPK_AID_SWIGLU_BASE_INTS = 200704;
+constexpr int MPK_AID_LMTAIL_MOE = 0;
+constexpr int MPK_AID_LMTAIL_RESADD = 16;
+constexpr int MPK_AID_LMTAIL_LMHEAD = 32;
+
+// Replica view at a raw int offset, for families too big for a region slot.
+__device__ __forceinline__ int *
+    mpk_aid_flags_at(int *shared_base, int xcd_id, int off_ints) {
+  int *rep = g_aid_flag_rep[xcd_id >> 2];
+  return rep ? rep + off_ints : shared_base;
+}
+
+// The replica this XCD should poll. SPX maps XCD x to AID x>>2.
+__device__ __forceinline__ int *
+    mpk_aid_flags(int *shared_base, int xcd_id, int region) {
+  int *rep = g_aid_flag_rep[xcd_id >> 2];
+  return rep ? rep + region * MPK_AID_REGION_INTS : shared_base;
+}
+
+// Same, but reading the physical XCC id rather than trusting a caller-derived
+// one. The O-proj kernel computes its `xcd_id` as `tile_idx / tiles_per_xcd`,
+// which is the *intended* binding rather than the hardware's -- and picking
+// the wrong replica here sends every reader to the far AID, which is a silent
+// slowdown rather than a failure. Cheap enough to just ask.
+__device__ __forceinline__ int *
+    mpk_aid_flags_hw(int *shared_base, int region) {
+  int xcc;
+  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)" : "=s"(xcc));
+  int *rep = g_aid_flag_rep[(xcc & 7) >> 2];
+  return rep ? rep + region * MPK_AID_REGION_INTS : shared_base;
+}
+#endif
+
+// =============================================================================
+// Non-Temporal (NT) Load/Store for MI300X
+// =============================================================================
+//
+// NT loads/stores bypass both L1 and L2 caches, reading/writing directly
+// to HBM memory. This avoids relying on cache coherence protocol.
+//
+// Assembly flags:
+//   global_load_dwordx2 %0, %1, off nt
+//   global_store_dwordx2 %0, %1, off nt
+//
+// On MI300X (gfx942), the 'nt' (non-temporal) flag sets:
+//   - L1: sc1=1 or NT=1 → MISS EVICT (bypasses L1)
+//   - L2: sc0=1 or NT=1 → HIT STREAM / Cache Bypass
+//
+// Why fence is still needed with NT:
+//   NT provides cache bypass but NOT memory ordering. Without fence:
+//   1. Hardware can reorder NT loads (read data before flag)
+//   2. Compiler can reorder code (asm volatile helps but isn't enough)
+//
+// The pattern is:
+//   Producer: st_nt(data) → fence → st_nt(flag)
+//   Consumer: ld_nt(flag) → fence → ld_nt(data)
+//
+// The fence (SEQ_CST) ensures:
+//   - Producer's data write completes before flag write
+//   - Consumer's flag read completes before data read
+//
+// Performance: NT + fence ≈ RELAXED atomics + fence (~17.4ms per token)
+// Both are valid approaches; NT is more explicit about bypassing cache.
+// =============================================================================
+
+// Non-temporal load (bypasses cache, reads from memory)
+__device__ __forceinline__ unsigned long long int
+    ld_nt_u64(unsigned long long int *addr) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  unsigned long long int val;
+  asm volatile("global_load_dwordx2 %0, %1, off nt\n"
+               "s_waitcnt vmcnt(0)"
+               : "=v"(val)
+               : "v"(addr)
+               : "memory");
+  return val;
+#else
+  // NVIDIA: use volatile for non-cached access
+  return *reinterpret_cast<unsigned long long int volatile *>(addr);
+#endif
+}
+
+// Non-temporal 32-bit load (bypasses cache, reads from memory)
+// Publish a release flag: write-through, and raise-only by construction.
+//
+// It must be write-through. These counters are plain hipMalloc VRAM, which is
+// MTYPE_NC under SPX/DPX+NPS2 -- non-coherent across XCDs. An atomic (even at
+// system scope) can settle in the publishing XCD's L2, while every poller
+// reads the flag with ld_sys_s32, an `sc0 sc1` load that goes past L2 to
+// memory. The publisher then sees its own value and nobody else does: measured
+// as O-proj flags [8,8,7,8] read from two dies while the die owning flag 2 had
+// already moved past that same barrier.
+//
+// Monotonicity therefore cannot come from an atomic max, and does not need to:
+// each flag has a single writer (its own XCD's last arrival), which publishes
+// once per layer in increasing epoch order, drained by s_waitcnt before the
+// store. A blind store only moves a flag backwards when several workgroups
+// broadcast into the same flag, which the per-XCD publish removes.
+__device__ __forceinline__ void st_rel_max_u32(void *addr, unsigned val) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  asm volatile("global_store_dword %0, %1, off sc0 sc1"
+               :
+               : "v"(addr), "v"(val)
+               : "memory");
+#else
+  *reinterpret_cast<unsigned int volatile *>(addr) = val;
+#endif
+}
+
+__device__ __forceinline__ int ld_nt_s32(int *addr) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  int val;
+  asm volatile("global_load_dword %0, %1, off nt\n"
+               "s_waitcnt vmcnt(0)"
+               : "=v"(val)
+               : "v"(addr)
+               : "memory");
+  return val;
+#else
+  return *reinterpret_cast<int volatile *>(addr);
+#endif
+}
+
+// System-scope 32-bit load for release polls.
+//
+// `nt` is only an eviction-policy hint: it does not force the load to miss
+// vL1, so a spin built on ld_nt_s32 keeps re-reading whatever line it already
+// has until that line happens to be evicted. `sc0 sc1` is the real
+// device-coherency read, which is what a release flag written by another XCD
+// needs. Every release gate in this kernel polls this way.
+__device__ __forceinline__ int ld_sys_s32(int *addr) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  int val;
+  asm volatile("global_load_dword %0, %1, off sc0 sc1\n"
+               "s_waitcnt vmcnt(0)"
+               : "=v"(val)
+               : "v"(addr)
+               : "memory");
+  return val;
+#else
+  return *reinterpret_cast<int volatile *>(addr);
+#endif
+}
+
+__device__ __forceinline__ unsigned long long ld_sys_u64(void *addr) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  unsigned long long val;
+  asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1\n"
+               "s_waitcnt vmcnt(0)"
+               : "=v"(val)
+               : "v"(addr)
+               : "memory");
+  return val;
+#else
+  return *reinterpret_cast<unsigned long long volatile *>(addr);
+#endif
+}
+
+// Two independent system-scope polls, one wait. `ld_sys_s32` serializes each
+// load behind its own vmcnt(0), so a two-flag spin pays two HBM round trips
+// per miss. Issue both, then one wait.
+__device__ __forceinline__ void ld_sys_s32x2(int *addr0, int *addr1, int &out0,
+                                             int &out1) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  int v0, v1;
+  asm volatile("global_load_dword %0, %2, off sc0 sc1\n"
+               "global_load_dword %1, %3, off sc0 sc1\n"
+               "s_waitcnt vmcnt(0)"
+               : "=&v"(v0), "=&v"(v1)
+               : "v"(addr0), "v"(addr1)
+               : "memory");
+  out0 = v0;
+  out1 = v1;
+#else
+  out0 = *reinterpret_cast<int volatile *>(addr0);
+  out1 = *reinterpret_cast<int volatile *>(addr1);
+#endif
+}
+
+// The poll idiom the release gates use. MPK_SYS_POLL_LOAD swaps every gate
+// from the `nt` hint to a true system-scope read in one place, so the two can
+// be compared without touching each site.
+// It is a level, not a boolean: 1 converts the three fused-layer gates
+// (qkv_epoch / attn_release / routing_ready / layer_release), 2 additionally
+// converts the two per-XCD barriers inside MoE and O-proj. The second set
+// polls a line its own XCD produced, so it is a weaker case for sc1 and worth
+// measuring apart from the first.
+#if defined(MPK_SYS_POLL_LOAD) && MPK_SYS_POLL_LOAD >= 1
+#define MPK_LD_GATE(p) ld_sys_s32(p)
+#else
+#define MPK_LD_GATE(p) ld_nt_s32(p)
+#endif
+
+#if defined(MPK_SYS_POLL_LOAD) && MPK_SYS_POLL_LOAD >= 2
+#define MPK_LD_GATE2(p) ld_sys_s32(p)
+#else
+#define MPK_LD_GATE2(p) ld_nt_s32(p)
+#endif
+
+
+// ---------------------------------------------------------------------------
+// AID-local gate load: vL1-bypassing but L2-CACHEABLE.
+//
+// ld_sys_s32 (`sc0 sc1`) goes past L2 to memory on every spin. Its stated
+// reason is that the flags are "plain hipMalloc VRAM, which is MTYPE_NC" --
+// true before MPK_AID_SPLIT_FLAGS, false after it. A replica lives in an
+// alloc_in_aid BO at mtype_local=0 = MTYPE_RW, which is hardware-coherent
+// inside its own AID, so the publisher's write-through store probes this
+// reader's L2 copy out and a cached load cannot go stale.
+//
+// SCOPE per AMD MI300 ISA tables 48/49 (MLSE "Understand cache modifiers").
+// SC1:SC0 is a two-bit SCOPE VALUE, not two independent flags:
+//   0 wave | 1 group | 2 device | 3 system
+// and the two caches are governed by DIFFERENT bits:
+//   L1 (TCP, per-CU, read-only): sc1=1 or nt=1 -> MISS_EVICT, else HIT_LRU
+//   L2 (TCC):                    sc0=1 or nt=1 -> Coherence_Cache_Bypass,
+//                                sc0=0 and nt=0 -> HIT_LRU
+// So `sc0 sc1` (system) bypasses L2 BY CONSTRUCTION -- every poll is a memory
+// round trip. `sc1` alone is device scope with L1 MISS_EVICT and L2 HIT_LRU,
+// which is the weakest scope that is still coherent across XCDs.
+// `sc0` alone is GROUP scope, weaker than device: it was tried first and HUNG
+// (0 forward passes, hash d41d8cd98f00, EXIT=137) because readers kept
+// serving a stale line.
+// `nt` is only an eviction hint and never observes a release at all.
+//
+// The MTYPE still matters independently: L2 HIT_LRU only helps if the line's
+// MTYPE gives coherent L2 at device scope, i.e. an AID-local MTYPE_RW replica
+// rather than spanning MTYPE_NC.
+// Two device-scope polls in flight at once, one wait: the min of both
+// words. Used where a waiter needs two AIDs' publishes, so detecting the
+// second costs one load latency rather than two.
+__device__ __forceinline__ int ld_aid_min2_s32(int *a, int *b) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  int x, y;
+  asm volatile("global_load_dword %0, %2, off sc1\n"
+               "global_load_dword %1, %3, off sc1\n"
+               "s_waitcnt vmcnt(0)"
+               : "=&v"(x), "=&v"(y)
+               : "v"(a), "v"(b)
+               : "memory");
+  return x < y ? x : y;
+#else
+  int x = __atomic_load_n(a, __ATOMIC_ACQUIRE);
+  int y = __atomic_load_n(b, __ATOMIC_ACQUIRE);
+  return x < y ? x : y;
+#endif
+}
+
+__device__ __forceinline__ int ld_aid_s32(int *addr) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  int val;
+  asm volatile("global_load_dword %0, %1, off sc1\n"
+               "s_waitcnt vmcnt(0)"
+               : "=v"(val)
+               : "v"(addr)
+               : "memory");
+  return val;
+#else
+  return *reinterpret_cast<int volatile *>(addr);
+#endif
+}
+
+__device__ __forceinline__ unsigned long long ld_aid_u64(void *addr) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  unsigned long long val;
+  asm volatile("global_load_dwordx2 %0, %1, off sc1\n"
+               "s_waitcnt vmcnt(0)"
+               : "=v"(val)
+               : "v"(addr)
+               : "memory");
+  return val;
+#else
+  return *reinterpret_cast<unsigned long long volatile *>(addr);
+#endif
+}
+
+// Used ONLY at polls whose pointer came from mpk_aid_flags*. Without the
+// replicas those pointers fall back to the shared NC buffer, where a cached
+// poll would be unsound -- hence the MPK_AID_SPLIT_FLAGS guard.
+#if defined(MPK_AID_GATE_CACHED) && defined(MPK_AID_SPLIT_FLAGS)
+#define MPK_LD_GATE_AID(p) ld_aid_s32(p)
+#define MPK_LD_GATE_AID_U64(p) ld_aid_u64(p)
+#else
+#define MPK_LD_GATE_AID(p) MPK_LD_GATE(p)
+#define MPK_LD_GATE_AID_U64(p) ld_sys_u64(p)
+#endif
+
+// The scheduler's event counters are polled by a relaxed load with no
+// invalidate inside the loop -- the acquire fence runs only once it exits.
+// Sound while L2 is device-coherent (MTYPE_RW, which plain hipMalloc gives in
+// NPS1), but in SPX+NPS2 a spanning BO is MTYPE_NC: cacheable and NOT coherent
+// across XCDs, so the waiter re-reads its own stale L2 copy forever and an
+// increment performed on another XCD is never observed. Measured: converting
+// this poll to sc0 sc1 did NOT clear the hang (4/6 still hung). The deadlock
+// is the termination race behind MPK_TERM_RECHECK.
+#ifdef MPK_NPS2_EVENT_POLL
+#define MPK_LD_EVENT(p) ld_sys_u64((void *)(p))
+#else
+#define MPK_LD_EVENT(p)                                                        \
+  __atomic_load_n(reinterpret_cast<unsigned long long *>(p), __ATOMIC_RELAXED)
+#endif
+
+// Scoped read of the event-accounting CONFIG (thresholds / trigger counts), as
+// opposed to MPK_LD_EVENT which reads the COUNTER. Both matter: a stale counter
+// only delays a poll, but a stale threshold makes two XCDs take different
+// branches of the two-level accounting, so the global total never reaches the
+// exact value the trigger tests for and the event never fires at all.
+#ifdef MPK_NPS2_EVENT_POLL
+#define MPK_LD_EVCFG(p) ld_sys_s32((int *)(p))
+#else
+#define MPK_LD_EVCFG(p) (*(p))
+#endif
+
+// Non-temporal store (bypasses cache, writes to memory)
+__device__ __forceinline__ void st_nt_u64(unsigned long long int *addr,
+                                          unsigned long long int val) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  asm volatile("global_store_dwordx2 %0, %1, off nt\n"
+               "s_waitcnt vmcnt(0)"
+               :
+               : "v"(addr), "v"(val)
+               : "memory");
+#else
+  // NVIDIA: use volatile for non-cached access
+  *reinterpret_cast<unsigned long long int volatile *>(addr) = val;
+#endif
+}
+
+// =============================================================================
+// Write-Through (WT) Store for MI300X
+// =============================================================================
+// sc0=1, sc1=1 on stores → "Coherent_Cache_Bypass" in L2
+// Data bypasses L2 entirely, writes directly to HBM/MALL.
+// No buffer_wbl2 needed after WT stores — data is already in memory.
+// Use s_waitcnt vmcnt(0) to ensure stores complete before signaling.
+
+// Write-through 64-bit store (4x bf16 or 2x float)
+__device__ __forceinline__ void st_wt_u64(void *addr,
+                                          unsigned long long int val) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  asm volatile("global_store_dwordx2 %0, %1, off sc0 sc1"
+               :
+               : "v"(addr), "v"(val)
+               : "memory");
+#else
+  *reinterpret_cast<unsigned long long int volatile *>(addr) = val;
+#endif
+}
+
+// Write-through 128-bit zero store (4x dword = 16 bytes, sc0 sc1).
+// Uses global_store_dwordx4 for 4x fewer store instructions vs st_wt_u32.
+__device__ __forceinline__ void st_wt_zero128(void *addr) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  typedef unsigned int v4u32 __attribute__((ext_vector_type(4)));
+  v4u32 zero = {0u, 0u, 0u, 0u};
+  asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1"
+               :
+               : "v"(addr), "v"(zero)
+               : "memory");
+#else
+  reinterpret_cast<unsigned int volatile *>(addr)[0] = 0;
+  reinterpret_cast<unsigned int volatile *>(addr)[1] = 0;
+  reinterpret_cast<unsigned int volatile *>(addr)[2] = 0;
+  reinterpret_cast<unsigned int volatile *>(addr)[3] = 0;
+#endif
+}
+
+// Write-through 128-bit store (4x float), sc0 sc1.
+// Same instruction as st_wt_zero128 but with a caller-supplied value. Needed
+// wherever one XCD produces f32 data that another XCD consumes: a plain store
+// stops in the producing XCD's L2, which is NOT coherent across XCDs (see
+// threadfence_gpu below), so the consumer reads whatever its own L2 holds.
+// `addr` must be 16-byte aligned.
+__device__ __forceinline__ void st_wt_f32x4(void *addr, float4 val) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  typedef unsigned int v4u32 __attribute__((ext_vector_type(4)));
+  v4u32 v;
+  __builtin_memcpy(&v, &val, 16);
+  asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1"
+               :
+               : "v"(addr), "v"(v)
+               : "memory");
+#else
+  // float4 has no volatile assignment operator; go component-wise.
+  float const *src = reinterpret_cast<float const *>(&val);
+  volatile float *dst = reinterpret_cast<volatile float *>(addr);
+  dst[0] = src[0];
+  dst[1] = src[1];
+  dst[2] = src[2];
+  dst[3] = src[3];
+#endif
+}
+
+// Write-through 32-bit store (1x float or 2x bf16)
+__device__ __forceinline__ void st_wt_u32(void *addr, unsigned int val) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  asm volatile("global_store_dword %0, %1, off sc0 sc1"
+               :
+               : "v"(addr), "v"(val)
+               : "memory");
+#else
+  *reinterpret_cast<unsigned int volatile *>(addr) = val;
+#endif
+}
+
+#ifdef MPK_AID_SPLIT_FLAGS
+// Publish per-XCD flag `slot` into both replicas, so a consumer in either AID
+// finds it on the copy homed in its own range. Two write-through stores
+// instead of one; the publish happens 8 times a layer while the flags are
+// polled ~184 times, which is why the trade pays.
+__device__ __forceinline__ void
+    mpk_aid_publish(int *shared_base, int slot, unsigned int val, int region) {
+  int *a = g_aid_flag_rep[0];
+  int *b = g_aid_flag_rep[1];
+  if (a != nullptr && b != nullptr) {
+    int const off = region * MPK_AID_REGION_INTS + slot * 16;
+    st_wt_u32((void *)&a[off], val);
+    st_wt_u32((void *)&b[off], val);
+  } else {
+    st_wt_u32((void *)&shared_base[slot * 16], val);
+  }
+}
+
+// Same, addressing by raw int index rather than 64 B slot.
+// 64-bit form, for the (epoch, expert) record the early-routing path writes at
+// [(1+x)*16+2]. Alignment holds by construction: that index is 64*(1+x)+8 bytes
+// from the family base, and the base offset is itself 8-byte aligned.
+__device__ __forceinline__ void mpk_aid_publish_at_u64(void *shared_base,
+                                                       int idx,
+                                                       unsigned long long val,
+                                                       int off_ints) {
+  int *a = g_aid_flag_rep[0];
+  int *b = g_aid_flag_rep[1];
+  if (a != nullptr && b != nullptr) {
+    st_wt_u64((void *)&a[off_ints + idx], val);
+    st_wt_u64((void *)&b[off_ints + idx], val);
+  } else {
+    st_wt_u64((void *)&((int *)shared_base)[idx], val);
+  }
+}
+
+// ?? AID-local copy of the O-proj output row ???????????????????????????????
+// The row lives at the same [batch][output_stride] offsets inside each AID
+// replica, so an index computed for the shared buffer indexes the replica too.
+//
+// 256 KiB into the 2 MiB replica, clear of the routing family at 32768 ints.
+// The bound is checked identically on the write and the read side: if the row
+// does not fit, BOTH fall back to the shared buffer. They must never disagree
+// -- a publisher writing the replica while a consumer reads the shared copy is
+// a silently stale read, not a hang.
+// AID-local copy of attn_out. 1.25 MiB into the 2 MiB replica, past the
+// O-proj row region (65536 ints + 1 MiB). Indexed exactly like the shared
+// buffer, in 32-bit units: element e of the row lives at int index
+// MPK_AID_ATTNOUT_BASE_INTS + e/2, and every slice base is even.
+// AID-local mirrors of the scheduler's event counters. 1.75 MiB into the 2 MiB
+// replica, past the attn_out region, leaving room for 8192 u64 counters against
+// the ~42 this model builds. The shared counter stays authoritative; these are
+// published copies that only the dependency POLL reads.
+constexpr int MPK_AID_EVCTR_BASE_INTS = 458752;
+constexpr int MPK_AID_EVCTR_MAX = 8192;
+
+// Per-AID event accumulator: the middle tier between the per-XCD counters and
+// the global one. Each AID replica holds its OWN array, so indexing it through
+// this XCD's replica selects that AID's counter and the atomic stays local.
+// AID-local mirror of the iteration-boundary gate. 491520 is past EVTIER and
+// inside the 2 MiB replica (524288 ints); one line is reserved to avoid false
+// sharing. ONE slot per AID, not one per XCD: the publisher wrote the same
+// value into all eight, so they were pure redundancy.
+constexpr int MPK_AID_ITER_BASE_INTS = 491520;
+
+// Write-through into both replicas. An MTYPE_RW line is coherent only inside
+// its own AID and a write-through store is what crosses; a cross-AID atomic
+// is the hazard that hung MPK_AID_EVCTR v2.
+__device__ __forceinline__ void mpk_aid_iter_publish(unsigned int val) {
+  int *a = g_aid_flag_rep[0];
+  int *b = g_aid_flag_rep[1];
+  if (a) {
+    st_wt_u32((void *)(a + MPK_AID_ITER_BASE_INTS), val);
+  }
+  if (b) {
+    st_wt_u32((void *)(b + MPK_AID_ITER_BASE_INTS), val);
+  }
+}
+
+__device__ __forceinline__ int *mpk_aid_iter_slot(int xcd_id) {
+  int *rep = g_aid_flag_rep[xcd_id >> 2];
+  return rep ? rep + MPK_AID_ITER_BASE_INTS : nullptr;
+}
+
+constexpr int MPK_AID_EVTIER_BASE_INTS = 475136;  // past the EVCTR mirrors
+constexpr int MPK_AID_XCDS_PER_AID = 4;
+
+__device__ __forceinline__ unsigned long long *mpk_aid_evtier_ptr() {
+  unsigned x;
+  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID)" : "=s"(x));
+  int *r = g_aid_flag_rep[(x & 0x7) >> 2];
+  return r ? (unsigned long long *)(r + MPK_AID_EVTIER_BASE_INTS) : nullptr;
+}
+
+// Post-increment count for this AID; sets *out_ok to 0 if the tier is
+// unavailable, in which case the caller takes the original global path.
+__device__ __forceinline__ unsigned long long
+    mpk_aid_evtier_add(int idx, unsigned long long *out_ok) {
+  unsigned long long *p = mpk_aid_evtier_ptr();
+  if (p == nullptr || idx >= MPK_AID_EVCTR_MAX) {
+    *out_ok = 0;
+    return 0;
+  }
+  *out_ok = 1;
+  return atomicAdd(&p[idx], 1ULL) + 1ULL;
+}
+
+// ---------------------------------------------------------------------------
+// MPK_AID_EVCTR2: monotone per-XCD mirror slots.
+//
+// The single-slot mirror above is written by all eight XCDs with unordered
+// write-through stores, so it is NOT monotone -- a late store from an earlier
+// XCD can move it backwards past a threshold a reader is waiting on. That is
+// why the poll has to re-read the authoritative counter periodically, and why
+// the saving nets to zero: the mandatory truth reads cost what the cheap
+// mirror reads save.
+//
+// Here each XCD owns one slot, so every slot has exactly ONE writer and can
+// only increase. A reader sums the eight slots from the replica homed in its
+// own AID and never touches the shared counter.
+//
+// Layout: MPK_AID_EVCTR_BASE_INTS + (idx * 8 + xcd) * 2 ints.
+constexpr int MPK_AID_EVCTR2_MAX = 512; // events; 512 * 8 * 8 B = 32 KiB
+
+__device__ __forceinline__ int mpk_aid_evctr2_xcd() {
+  unsigned x;
+  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID)" : "=s"(x));
+  return (int)(x & 0xfu);
+}
+
+__device__ __forceinline__ unsigned long long *
+    mpk_aid_evctr2_rep(int aid) {
+  int *r = g_aid_flag_rep[aid];
+  return r ? (unsigned long long *)(r + MPK_AID_EVCTR_BASE_INTS) : nullptr;
+}
+
+// Publish this XCD's cumulative contribution. Returns false if unavailable,
+// in which case the caller keeps the shared-counter path.
+__device__ __forceinline__ bool mpk_aid_evctr2_pub(int idx,
+                                                   unsigned long long amt) {
+  if (idx >= MPK_AID_EVCTR2_MAX) {
+    return false;
+  }
+  int const xcd = mpk_aid_evctr2_xcd() & 7;
+  int const aid = xcd >> 2;
+  unsigned long long *near_ = mpk_aid_evctr2_rep(aid);
+  unsigned long long *far_ = mpk_aid_evctr2_rep(1 - aid);
+  if (near_ == nullptr || far_ == nullptr) {
+    return false;
+  }
+  int const slot = idx * 8 + xcd;
+  // Same-AID atomic: coherent inside this AID, and this XCD is the only
+  // writer of this slot, so the value is monotone.
+  unsigned long long const mine = atomicAdd(&near_[slot], amt) + amt;
+  // Cross the boundary with a write-through store -- an atomic would not be
+  // visible. Still a single writer, so the far copy is monotone too.
+  st_wt_u64((void *)&far_[slot], mine);
+  return true;
+}
+
+// Sum the eight per-XCD slots from this AID's replica. All reads local.
+__device__ __forceinline__ unsigned long long
+    mpk_aid_evctr2_sum(void *shared_base, int idx) {
+  unsigned long long *sh = (unsigned long long *)shared_base;
+  if (idx >= MPK_AID_EVCTR2_MAX) {
+    return MPK_LD_EVENT(&sh[idx]);
+  }
+  int const xcd = mpk_aid_evctr2_xcd() & 7;
+  unsigned long long *m = mpk_aid_evctr2_rep(xcd >> 2);
+  if (m == nullptr) {
+    return MPK_LD_EVENT(&sh[idx]);
+  }
+  unsigned long long t = 0;
+  int const base = idx * 8;
+#pragma unroll
+  for (int x = 0; x < 8; x++) {
+    t += MPK_LD_EVENT(&m[base + x]);
+  }
+  return t;
+}
+
+__device__ __forceinline__ unsigned long long *mpk_aid_evctr_rep(int aid) {
+  int *r = g_aid_flag_rep[aid];
+  return r ? (unsigned long long *)(r + MPK_AID_EVCTR_BASE_INTS) : nullptr;
+}
+
+// atomicMax, not a store: increments from different XCDs retire out of order,
+// and a plain store could move a mirror BACKWARDS past a threshold a reader is
+// already waiting on, stalling it forever. Max is monotone.
+__device__ __forceinline__ void mpk_aid_evctr_pub(int idx,
+                                                  unsigned long long v) {
+  if (idx >= MPK_AID_EVCTR_MAX) {
+    return;
+  }
+  unsigned long long *a = mpk_aid_evctr_rep(0);
+  unsigned long long *b = mpk_aid_evctr_rep(1);
+  if (a == nullptr || b == nullptr) {
+    return;
+  }
+  // Write-through, NOT atomicMax. A cross-AID atomic on an MTYPE_RW line is
+  // not visible -- RW is coherent only inside its own AID -- which is what
+  // hung v2. A write-through store from either AID does reach both replicas,
+  // the same mechanism the flag replicas rely on. It is not monotone, so the
+  // poll below re-reads the shared counter periodically to recover.
+  st_wt_u64((void *)&a[idx], v);
+  st_wt_u64((void *)&b[idx], v);
+}
+
+__device__ __forceinline__ unsigned long long
+    mpk_aid_evctr_load(void *shared_base, int idx) {
+  unsigned long long *sh = (unsigned long long *)shared_base;
+  if (idx >= MPK_AID_EVCTR_MAX) {
+    return MPK_LD_EVENT(&sh[idx]);
+  }
+  unsigned x;
+  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID)" : "=s"(x));
+  unsigned long long *m = mpk_aid_evctr_rep((x & 0xf) >> 2);
+  if (m == nullptr) {
+    return MPK_LD_EVENT(&sh[idx]);
+  }
+  return MPK_LD_EVENT(&m[idx]);
+}
+
+// Poll-form read: the mirror on all but every 64th spin, the authoritative
+// shared counter on those, so a mirror left stale or regressed by an
+// out-of-order write-through can delay a worker but can never deadlock it.
+__device__ __forceinline__ unsigned long long
+    mpk_aid_evctr_poll(void *shared_base, int idx, unsigned it) {
+  unsigned long long *sh = (unsigned long long *)shared_base;
+  if ((it & 63u) == 63u) {
+    return MPK_LD_EVENT(&sh[idx]);
+  }
+  return mpk_aid_evctr_load(shared_base, idx);
+}
+
+// Expression-form read, so the call site needs no preprocessor block and keeps
+// its own semicolon.
+#if defined(MPK_AID_EVCTR2) && defined(MPK_AID_SPLIT_FLAGS)
+// Monotone per-XCD slots: no fallback needed, so the poll ignores the spin
+// counter entirely.
+#define MPK_EVCTR_READ(base, idx) mpk_aid_evctr2_sum((base), (idx))
+#define MPK_EVCTR_POLL(base, idx, it) mpk_aid_evctr2_sum((base), (idx))
+#elif defined(MPK_AID_EVCTR) && defined(MPK_AID_SPLIT_FLAGS)
+#define MPK_EVCTR_READ(base, idx) mpk_aid_evctr_load((base), (idx))
+#define MPK_EVCTR_POLL(base, idx, it) mpk_aid_evctr_poll((base), (idx), (it))
+#else
+#define MPK_EVCTR_READ(base, idx) MPK_LD_EVENT(&(base)[idx])
+#define MPK_EVCTR_POLL(base, idx, it) MPK_LD_EVENT(&(base)[idx])
+#endif
+
+constexpr int MPK_AID_ATTNOUT_BASE_INTS = 327680;
+constexpr int MPK_AID_ATTNOUT_MAX_BYTES = 512 * 1024;
+
+__device__ __forceinline__ bool mpk_aid_attnout_live() {
+  return g_aid_flag_rep[0] != nullptr && g_aid_flag_rep[1] != nullptr;
+}
+
+// Reader: the attn_out base homed in this XCD's own memory range.
+__device__ __forceinline__ void const *
+    mpk_aid_attnout_base(void const *shared, int xcd_id) {
+  if (!mpk_aid_attnout_live()) {
+    return shared;
+  }
+  return (void const *)(g_aid_flag_rep[xcd_id >> 2] +
+                        MPK_AID_ATTNOUT_BASE_INTS);
+}
+
+// Writer: mirror one 32-bit pair of bf16 elements into both replicas.
+__device__ __forceinline__ void mpk_aid_attnout_publish32(int dw,
+                                                          unsigned val) {
+  if (!mpk_aid_attnout_live()) {
+    return;
+  }
+  st_wt_u32((void *)&g_aid_flag_rep[0][MPK_AID_ATTNOUT_BASE_INTS + dw], val);
+  st_wt_u32((void *)&g_aid_flag_rep[1][MPK_AID_ATTNOUT_BASE_INTS + dw], val);
+}
+
+constexpr int MPK_AID_OUT_BASE_INTS = 65536;
+constexpr int MPK_AID_OUT_MAX_BYTES = 1024 * 1024;
+
+__device__ __forceinline__ bool mpk_aid_out_fits(int bytes) {
+  return bytes <= MPK_AID_OUT_MAX_BYTES && g_aid_flag_rep[0] != nullptr &&
+         g_aid_flag_rep[1] != nullptr;
+}
+
+// Reader: the row base homed in this XCD's own memory range.
+__device__ __forceinline__ void const *
+    mpk_aid_out_base(void const *shared, int xcd_id, int bytes) {
+  if (!mpk_aid_out_fits(bytes)) {
+    return shared;
+  }
+  return (void const *)(g_aid_flag_rep[xcd_id >> 2] + MPK_AID_OUT_BASE_INTS);
+}
+
+// Writer: mirror one packed-4-bf16 payload into both replicas. `idx` is in
+// bf16 elements and is a multiple of 4, and the region base is 256 KiB
+// aligned, so the 8-byte store stays aligned.
+__device__ __forceinline__ void
+    mpk_aid_out_publish(int idx, unsigned long long val, int bytes) {
+  if (!mpk_aid_out_fits(bytes)) {
+    return;
+  }
+  unsigned short *a =
+      (unsigned short *)(g_aid_flag_rep[0] + MPK_AID_OUT_BASE_INTS);
+  unsigned short *b =
+      (unsigned short *)(g_aid_flag_rep[1] + MPK_AID_OUT_BASE_INTS);
+  st_wt_u64((void *)&a[idx], val);
+  st_wt_u64((void *)&b[idx], val);
+}
+
+__device__ __forceinline__ void mpk_aid_publish_at(int *shared_base,
+                                                   int idx,
+                                                   unsigned int val,
+                                                   int off_ints) {
+  int *a = g_aid_flag_rep[0];
+  int *b = g_aid_flag_rep[1];
+  if (a != nullptr && b != nullptr) {
+    st_wt_u32((void *)&a[off_ints + idx], val);
+    st_wt_u32((void *)&b[off_ints + idx], val);
+  } else {
+    st_wt_u32((void *)&shared_base[idx], val);
+  }
+}
+#endif
+
+// Write-through 16-bit store (1x bf16)
+__device__ __forceinline__ void st_wt_u16(void *addr, unsigned short val) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  asm volatile("global_store_short %0, %1, off sc0 sc1"
+               :
+               : "v"(addr), "v"(val)
+               : "memory");
+#else
+  *reinterpret_cast<unsigned short volatile *>(addr) = val;
+#endif
+}
+
+// Write-through 8-bit store (1x byte)
+__device__ __forceinline__ void st_wt_u8(void *addr, uint8_t val) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  asm volatile("global_store_byte %0, %1, off sc0 sc1"
+               :
+               : "v"(addr), "v"((unsigned)val)
+               : "memory");
+#else
+  *reinterpret_cast<uint8_t volatile *>(addr) = val;
+#endif
+}
+
+__device__ __forceinline__ int atom_add_release_gpu_s32(int *addr, int val) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  // Inline asm: no compiler-generated buffer_wbl2/buffer_inv around atomic.
+  // Ordering provided by explicit threadfence_gpu() before this call.
+  // sc0 sc1 required on GFX942 for cross-CU atomic visibility.
+  int old_val;
+  asm volatile("flat_atomic_add %0, %1, %2 sc0 sc1\n"
+               "s_waitcnt vmcnt(0) lgkmcnt(0)"
+               : "=v"(old_val)
+               : "v"(addr), "v"(val)
+               : "memory");
+  return old_val;
+#else
+  int old_val;
+  asm volatile("atom.add.release.gpu.s32 %0,[%1],%2;"
+               : "=r"(old_val)
+               : "l"(addr), "r"(val)
+               : "memory");
+  return old_val;
+#endif
+}
+
+// XCD-local counterpart of atom_add_release_gpu_s32: `sc0` without `sc1`.
+//
+// `sc1` is what carries an atomic through the device-wide coherency point. On
+// MI350 the eight XCDs have separate, non-coherent L2s, so an `sc0 sc1` atomic
+// must leave the XCD and serialise at that point; an `sc0`-only atomic is
+// resolved in the XCD's own L2 and never crosses the die boundary. `sc0` still
+// returns the pre-op value and is still atomic against every CU on this XCD,
+// which is the whole participant set of an XCD-private barrier.
+//
+// Only correct for a counter whose writers AND readers are all on one XCD --
+// i.e. every access is indexed by that worker's own `xcd_id`. Using it on a
+// counter any other XCD touches drops the update into a private L2 where the
+// remote reader cannot see it, and the barrier hangs. `MPK_XCD_LOCAL_BARRIER`
+// gates each conversion so the pairing can be re-checked per site.
+__device__ __forceinline__ int atom_add_xcd_local_s32(int *addr, int val) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  int old_val;
+  asm volatile("flat_atomic_add %0, %1, %2 sc0\n"
+               "s_waitcnt vmcnt(0) lgkmcnt(0)"
+               : "=v"(old_val)
+               : "v"(addr), "v"(val)
+               : "memory");
+  return old_val;
+#else
+  int old_val;
+  asm volatile("atom.add.release.cta.s32 %0,[%1],%2;"
+               : "=r"(old_val)
+               : "l"(addr), "r"(val)
+               : "memory");
+  return old_val;
+#endif
+}
+
+__device__ __forceinline__ unsigned long long int
+    atom_add_release_gpu_u64(unsigned long long int *addr,
+                             unsigned long long int val) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  // Inline asm: no compiler-generated buffer_wbl2/buffer_inv around atomic.
+  // Ordering provided by explicit threadfence_gpu() before this call.
+  // sc0 sc1 required on GFX942 for cross-CU atomic visibility.
+  unsigned long long int old_val;
+  asm volatile("flat_atomic_add_x2 %0, %1, %2 sc0 sc1\n"
+               "s_waitcnt vmcnt(0) lgkmcnt(0)"
+               : "=v"(old_val)
+               : "v"(addr), "v"(val)
+               : "memory");
+  return old_val;
+#else
+  unsigned long long int old_val;
+  asm volatile("atom.add.release.gpu.u64 %0,[%1],%2;"
+               : "=l"(old_val)
+               : "l"(addr), "l"(val)
+               : "memory");
+  return old_val;
+#endif
+}
+
+__device__ __forceinline__ unsigned long long int
+    atom_cas_release_gpu_u64(unsigned long long int *addr,
+                             unsigned long long int cmp,
+                             unsigned long long int val) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  // Inline asm: no compiler-generated buffer_wbl2/buffer_inv around atomic.
+  // Ordering provided by explicit threadfence_gpu() before this call.
+  // sc0 sc1 required on GFX942 for cross-CU atomic visibility.
+  // flat_atomic_cmpswap_x2 layout: {swap[63:0], compare[63:0]} in 4 VGPRs.
+  typedef unsigned long long v2u64 __attribute__((ext_vector_type(2)));
+  v2u64 cmp_swap;
+  cmp_swap[0] = val; // swap value (low 64 bits) — new value to write
+  cmp_swap[1] = cmp; // compare value (high 64 bits) — expected old value
+  unsigned long long int old_val;
+  asm volatile("flat_atomic_cmpswap_x2 %0, %1, %2 sc0 sc1\n"
+               "s_waitcnt vmcnt(0) lgkmcnt(0)"
+               : "=v"(old_val)
+               : "v"(addr), "v"(cmp_swap)
+               : "memory");
+  return old_val;
+#else
+  unsigned long long int old_val;
+  asm volatile("atom.cas.release.gpu.b64 %0,[%1],%2,%3;"
+               : "=l"(old_val)
+               : "l"(addr), "l"(cmp), "l"(val)
+               : "memory");
+  return old_val;
+#endif
+}
+
+__device__ __forceinline__ unsigned long long int
+    ld_acquire_gpu_u64(unsigned long long int *addr) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#ifdef MPK_USE_NT_MEMORY
+  // Non-temporal load bypasses cache, reads from memory
+  return ld_nt_u64(addr);
+#elif defined(MPK_USE_RELAXED_ATOMICS)
+  return __atomic_load_n(addr, __ATOMIC_RELAXED);
+#else
+  // HIP/AMD: Use SEQ_CST for cross-XCD visibility on MI300
+  return __atomic_load_n(addr, __ATOMIC_SEQ_CST);
+#endif
+#else
+  unsigned long long int val;
+  asm volatile("ld.acquire.gpu.u64 %0, [%1];" : "=l"(val) : "l"(addr));
+  return val;
+#endif
+}
+
+__device__ __forceinline__ unsigned long long int
+    ld_acquire_sys_u64(unsigned long long int *addr) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#ifdef MPK_USE_RELAXED_ATOMICS
+  return __atomic_load_n(addr, __ATOMIC_RELAXED);
+#else
+  // HIP/AMD: Use SEQ_CST for cross-XCD visibility on MI300
+  return __atomic_load_n(addr, __ATOMIC_SEQ_CST);
+#endif
+#else
+  unsigned long long int val;
+  asm volatile("ld.acquire.sys.u64 %0, [%1];"
+               : "=l"(val)
+               : "l"(addr)
+               : "memory");
+  return val;
+#endif
+}
+
+__device__ __forceinline__ unsigned long long int
+    ld_relaxed_gpu_u64(unsigned long long int *addr) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#ifdef MPK_USE_NT_MEMORY
+  // Non-temporal load bypasses cache, reads from memory
+  return ld_nt_u64(addr);
+#else
+  // HIP/AMD: use __atomic_load_n with relaxed ordering
+  return __atomic_load_n(addr, __ATOMIC_RELAXED);
+#endif
+#else
+  unsigned long long int val;
+  asm volatile("ld.relaxed.gpu.u64 %0, [%1];" : "=l"(val) : "l"(addr));
+  return val;
+#endif
+}
+
+__device__ __forceinline__ void st_relaxed_gpu_u64(unsigned long long int *addr,
+                                                   unsigned long long int val) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#ifdef MPK_USE_NT_MEMORY
+  // Non-temporal store bypasses cache, writes to memory
+  st_nt_u64(addr, val);
+#else
+  // Use RELAXED for stores - threadfence_gpu() after provides ordering
+  __atomic_store_n(addr, val, __ATOMIC_RELAXED);
+#endif
+#else
+  asm volatile("st.relaxed.gpu.u64 [%0], %1;" : : "l"(addr), "l"(val));
+#endif
+}
+
+// Memory fence for GPU scope - ensures all previous memory operations are
+// visible Define MPK_DISABLE_THREADFENCE to disable for performance testing
+__device__ __forceinline__ void threadfence_gpu() {
+#ifdef MPK_DISABLE_THREADFENCE
+  // Disabled for performance testing - results may be incorrect
+  (void)0;
+#elif defined(__HIP_DEVICE_COMPILE__) &&                                       \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  // MI300X: L2 NOT coherent across XCDs — buffer_wbl2 required.
+  // Agent scope (sc1) sufficient — no need for system scope (sc0 sc1).
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+#else
+  __threadfence();
+#endif
+}
+
+// =========================================================================
+// Intra-XCD (same L2 partition) memory operations.
+// On MI300X, all CUs within an XCD share the same 32MB L2 cache.
+// Regular stores are immediately visible to regular loads on the same XCD.
+// No buffer_wbl2 (L2→HBM writeback) or NT loads needed.
+// =========================================================================
+
+// Regular volatile store through L2 — visible to same-XCD CUs immediately
+__device__ __forceinline__ void st_local_u64(unsigned long long int *addr,
+                                             unsigned long long int val) {
+  *((unsigned long long int volatile *)addr) = val;
+}
+
+// Regular volatile load from L2 — sees same-XCD stores immediately
+__device__ __forceinline__ unsigned long long int
+    ld_local_u64(unsigned long long int const *addr) {
+  return *((unsigned long long int const volatile *)addr);
+}
+
+// Compiler fence — ensures store ordering without buffer_wbl2.
+// L2 coherency within an XCD means no hardware fence is needed.
+__device__ __forceinline__ void fence_local() {
+  asm volatile("" ::: "memory");
+}
+
+// Device-scope atomicAdd — sufficient for intra-XCD communication.
+// No sc0/sc1 system-scope qualifiers needed.
+__device__ __forceinline__ unsigned long long int
+    atom_add_local_u64(unsigned long long int *addr,
+                       unsigned long long int val) {
+  return atomicAdd(addr, val);
+}
+
+// Device-scope atomicCAS — sufficient for intra-XCD communication.
+__device__ __forceinline__ unsigned long long int
+    atom_cas_local_u64(unsigned long long int *addr,
+                       unsigned long long int cmp,
+                       unsigned long long int val) {
+  return atomicCAS(addr, cmp, val);
+}

@@ -1468,12 +1468,6 @@ def get_compile_command(
             # No serial TopK completer: every workgroup rebuilds routing
             # from tagged logits on its AID replica (bs=1).
             flags = flags + ["-DMPK_LOCAL_TOPK"]
-        if int(os.environ.get("MPK_PAIR_LOCAL_PUB", "0")) == 1:
-            # XCD pair: swiglu + W13->W2 release published to the own AID only.
-            flags = flags + ["-DMPK_PAIR_LOCAL_PUB"]
-        if int(os.environ.get("MPK_MOE_RW", "0")) == 1:
-            # MoE replicas on AID-local RW BOs; XCD 4-7 descriptors repointed.
-            flags = flags + ["-DMPK_MOE_RW"]
         if int(os.environ.get("MPK_AID_SPLIT_ROUTING", "0")) == 1:
             flags = flags + ["-DMPK_AID_SPLIT_ROUTING"]
         if int(os.environ.get("MPK_ROUTING_NARROW_AID", "0")) == 1:

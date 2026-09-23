@@ -894,18 +894,6 @@ def get_compile_command(
         # equality-recovered index. Bit-exact including the tie-break -- see
         # the comment at the asm block for why the equality matches are
         # visited in reverse.
-        if int(os.environ.get("MPK_TOPK_NO_ROUTING_CLEAR", "0")) == 1:
-            # Drop the routing-index clear at TopK entry: the cleared state is
-            # unreachable (see the block comment in
-            # moe_topk_softmax_mi300.cuh). Self-gated to routing_row_stride 1.
-            # A/B n=12: -0.86%, median -0.89%, t=-3.50, 10/12 pairs.
-            flags = flags + ["-DMPK_TOPK_NO_ROUTING_CLEAR"]
-        if int(os.environ.get("MPK_TOPK_DPP_REDUCE", "0")) == 1:
-            # Move the two softmax row reductions from __shfl_xor (which
-            # lowers to ds_bpermute and bumps LGKM) to DPP lane-zero ladders
-            # plus one broadcast each.
-            # A/B n=7: -0.93%, median -0.92%, t=-2.22, 5/7 pairs.
-            flags = flags + ["-DMPK_TOPK_DPP_REDUCE"]
         if _opt("MPK_TOPK_LOCAL_MAX3"):
             # Ablation 2026-08-30 (=0): +1 / −25 / +9 µs, hash e86d7dc all
             # six. Mixed (C2 1.758 spike); keep default ON.
@@ -1461,24 +1449,8 @@ def get_compile_command(
             flags = flags + ["-DMPK_NARROW_GATE_POLL"]
         if int(os.environ.get("MPK_NARROW_HIER_POLL", "0")) == 1:
             flags = flags + ["-DMPK_NARROW_HIER_POLL"]
-        if int(os.environ.get("MPK_NO_LOGIT_RESET", "0")) == 1:
-            # skip the TopK logit write-through reset (opt-in here; hash-gate it).
-            flags = flags + ["-DMPK_NO_LOGIT_RESET"]
-        if int(os.environ.get("MPK_LOCAL_TOPK", "0")) == 1:
-            # No serial TopK completer: every workgroup rebuilds routing
-            # from tagged logits on its AID replica (bs=1).
-            flags = flags + ["-DMPK_LOCAL_TOPK"]
-        if int(os.environ.get("MPK_PAIR_LOCAL_PUB", "0")) == 1:
-            # XCD pair: swiglu + W13->W2 release published to the own AID only.
-            flags = flags + ["-DMPK_PAIR_LOCAL_PUB"]
-        if int(os.environ.get("MPK_MOE_RW", "0")) == 1:
-            # MoE replicas on AID-local RW BOs; XCD 4-7 descriptors repointed.
-            flags = flags + ["-DMPK_MOE_RW"]
         if int(os.environ.get("MPK_AID_SPLIT_ROUTING", "0")) == 1:
             flags = flags + ["-DMPK_AID_SPLIT_ROUTING"]
-        if int(os.environ.get("MPK_ROUTING_NARROW_AID", "0")) == 1:
-            # Routing release: one slot per AID replica, polled locally.
-            flags = flags + ["-DMPK_ROUTING_NARROW_AID"]
         if int(os.environ.get("MPK_AID_SPLIT_OUT", "0")) == 1:
             flags = flags + ["-DMPK_AID_SPLIT_OUT"]
         if int(os.environ.get("MPK_AID_EVCTR2", "0")) == 1:
@@ -1584,13 +1556,6 @@ def get_compile_command(
             flags = flags + ["-DMPK_OPROJ_AMAX_DPP"]
         if int(os.environ.get("MPK_OPROJ_AID_AGG", "0")) == 1:
             flags = flags + ["-DMPK_OPROJ_AID_AGG"]
-        if int(os.environ.get("MPK_OPROJ_LOCAL_SLICE_PROBE", "0")) == 1:
-            # TIMING ONLY: O-proj waves read only their own AID's slices.
-            flags = flags + ["-DMPK_OPROJ_LOCAL_SLICE_PROBE"]
-        if int(os.environ.get("MPK_OPROJ_AID_TIER", "0")) == 1:
-            # Phase-2 barrier: per-AID arrival on the AID's own replica, one
-            # write-through publish per AID; no cross-AID atomic.
-            flags = flags + ["-DMPK_OPROJ_AID_TIER"]
         if _opt("MPK_NARROW_OPROJ_HIER"):
             # One tid polls the O-proj hierarchical release; the acquire
             # __syncthreads already below carries the other 255. Unlike
@@ -1766,11 +1731,7 @@ def get_compile_command(
             # A/B 2026-08-31 GPU 3, hash 96a92716 all six:
             # C 1.711/1.703/1.704 vs V 1.647/1.621/1.658
             # (−64 / −82 / −46 µs). Keep default ON (bs=1).
-            if int(os.environ.get("MPK_LOCAL_TOPK", "0")) == 1:
-                # Local TopK hands each pair its pick in LDS; no early records.
-                flags = flags + ["-DMPK_MOE_XCD_PAIR"]
-            else:
-                flags = flags + ["-DMPK_MOE_XCD_PAIR", "-DMPK_EARLY_ROUTING"]
+            flags = flags + ["-DMPK_MOE_XCD_PAIR", "-DMPK_EARLY_ROUTING"]
         elif int(os.environ.get("MPK_EARLY_ROUTING", "0")) == 1:
             # TESTED AND NOT ADOPTED (race + loss). A/B 2026-08-31:
             # C 1.711/1.712/1.704 vs V 1.728/1.713/1.732, hashes
