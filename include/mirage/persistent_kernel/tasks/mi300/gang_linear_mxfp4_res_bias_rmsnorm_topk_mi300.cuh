@@ -560,6 +560,7 @@ __device__ __attribute__((noinline)) void
   unsigned long long _sp_t0 = __builtin_amdgcn_s_memrealtime();
 #endif
 
+  MPK_SUB_MARK(0);
 #ifdef MPK_OPROJ_INNER_TIMING
   // Self-contained inner split of Phase 7. The ts_base slots below are the
   // older mechanism and every caller passes nullptr for that pointer, so they
@@ -1585,6 +1586,7 @@ oproj_barrier :
 #ifdef MPK_OPROJ_INNER_TIMING
   _op_t1 = __builtin_amdgcn_s_memrealtime();
 #endif
+  MPK_SUB_MARK(1);
   // Drain BEFORE the rendezvous, not after. `s_waitcnt` is a per-wave
   // guarantee: run after __syncthreads it only retires wave 0's stores, and
   // tid 0 then publishes an arrival advertising output that waves 1..3 may
@@ -2061,6 +2063,7 @@ oproj_barrier :
 #ifdef MPK_OPROJ_INNER_TIMING
   _op_t2 = __builtin_amdgcn_s_memrealtime();
 #endif
+  MPK_SUB_MARK(2);
 
   // ════════════════════════════════════════════════════════════════════════
   // PHASE 3: RMSNorm + Router GEMV
@@ -2854,6 +2857,7 @@ topk_barrier :
 #ifdef MPK_OPROJ_INNER_TIMING
   _op_t3 = __builtin_amdgcn_s_memrealtime();
 #endif
+  MPK_SUB_MARK(3);
   // Drain BEFORE the rendezvous, not after. `s_waitcnt` is a per-wave
   // guarantee: run after __syncthreads it only retires wave 0's stores, and
   // tid 0 then publishes an arrival advertising output that waves 1..3 may

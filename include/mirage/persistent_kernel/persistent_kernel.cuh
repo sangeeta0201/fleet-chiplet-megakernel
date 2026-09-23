@@ -207,6 +207,26 @@ __shared__ unsigned long long s_phase_span_b;
 __shared__ unsigned int s_phase_layers;
 __shared__ unsigned int s_phase_n;
 
+#ifdef MPK_OPROJ_LDS
+__shared__ unsigned long long s_sub_ts[4];
+__shared__ unsigned long long s_sub_span[4];
+__shared__ unsigned int s_sub_live;
+__shared__ unsigned int s_sub_n;
+__device__ unsigned long long g_sub_span[MPK_PHASE_MAX_WORKERS * 4];
+__device__ unsigned int g_sub_n[MPK_PHASE_MAX_WORKERS];
+__device__ __forceinline__ void mpk_sub_mark(int k) {
+  if (threadIdx.x != 0) {
+    return;
+  }
+  asm volatile("" ::: "memory");
+  s_sub_ts[k] = __builtin_amdgcn_s_memrealtime();
+  asm volatile("" ::: "memory");
+  s_sub_live |= 1u << k;
+}
+#define MPK_SUB_MARK(k) mpk_sub_mark(k)
+#else
+#define MPK_SUB_MARK(k) do {} while (0)
+#endif
 __device__ __forceinline__ void mpk_phase_lds_init() {
   if (threadIdx.x == 0) {
     for (int s = 0; s < MPK_PHASE_SLOT_COUNT; s++) {
@@ -215,6 +235,11 @@ __device__ __forceinline__ void mpk_phase_lds_init() {
     }
     s_phase_prev_end = 0;
     s_phase_span_b = 0;
+#ifdef MPK_OPROJ_LDS
+    for (int k = 0; k < 4; k++) s_sub_span[k] = 0;
+    s_sub_live = 0;
+    s_sub_n = 0;
+#endif
     s_phase_layers = 0;
     s_phase_n = 0;
   }
@@ -232,11 +257,24 @@ __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
     return;
   }
   unsigned int const layers = ++s_phase_layers;
+#ifdef MPK_OPROJ_LDS
+  unsigned int const _sub_live = s_sub_live;
+  s_sub_live = 0;
+#endif
   unsigned long long const prev_end = s_phase_prev_end;
   s_phase_prev_end = t;
   if (layers <= (unsigned int)(MPK_PHASE_START_ITER * MPK_PHASE_LAYERS_PER_ITER)) {
     return;
   }
+#ifdef MPK_OPROJ_LDS
+  if (_sub_live == 0xFu && s_phase_ts[6] >= s_sub_ts[3]) {
+    s_sub_span[0] += (s_sub_ts[1] - s_sub_ts[0]) * 10;
+    s_sub_span[1] += (s_sub_ts[2] - s_sub_ts[1]) * 10;
+    s_sub_span[2] += (s_sub_ts[3] - s_sub_ts[2]) * 10;
+    s_sub_span[3] += (s_phase_ts[6] - s_sub_ts[3]) * 10;
+    s_sub_n++;
+  }
+#endif
   // Slot 0 is the inter-layer span (previous layer's last mark to this
   // layer's first), exactly as in the global recorder.
   if (prev_end != 0 && s_phase_ts[0] >= prev_end) {
@@ -262,6 +300,10 @@ __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
       g_phase_ts[base + s] = s_phase_ts[s];
     }
     g_phase_span[base + MPK_PHASE_SLOT_COUNT] = s_phase_span_b;
+#ifdef MPK_OPROJ_LDS
+    for (int k = 0; k < 4; k++) g_sub_span[worker * 4 + k] = s_sub_span[k];
+    g_sub_n[worker] = s_sub_n;
+#endif
     g_phase_n[worker * MPK_PHASE_PAD_U64] = n;
   }
 }
@@ -4031,6 +4073,17 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
               }
               printf("\n");
             }
+#ifdef MPK_OPROJ_LDS
+            for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+              unsigned int sn = g_sub_n[w];
+              if (sn == 0) {
+                continue;
+              }
+              printf("[PSUBW] w=%d n=%u %llu %llu %llu %llu\n", w, sn,
+                     g_sub_span[w * 4 + 0] / sn, g_sub_span[w * 4 + 1] / sn,
+                     g_sub_span[w * 4 + 2] / sn, g_sub_span[w * 4 + 3] / sn);
+            }
+#endif
             // Raw per-slot timestamps of the last armed layer, so one layer's
             // timeline can be reconstructed per worker (worker % 8 == XCD) and
             // exported as a Perfetto trace. The span table above is a mean and

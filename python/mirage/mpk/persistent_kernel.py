@@ -433,6 +433,8 @@ def get_compile_command(
         # Per-worker phase slots: twelve s_memrealtime stamps per layer at
         # the phase boundaries, accumulated per worker and printed once at
         # termination -- no printf on the hot path, unlike MPK_DEVICE_TIMING.
+        if int(os.environ.get("MPK_OPROJ_LDS", "0")) == 1:
+            flags = flags + ["-DMPK_OPROJ_LDS"]
         if int(os.environ.get("MPK_PHASE_LDS", "0")) == 1:
             # LDS-resident phase recorder; needs MPK_PHASE_SLOTS.
             flags = flags + ["-DMPK_PHASE_LDS"]
