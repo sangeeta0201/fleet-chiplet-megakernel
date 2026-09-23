@@ -637,10 +637,10 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   int const lane_id = tid & 63;
   int const col = lane_id & 15;
   int const g = lane_id >> 4;
-#if defined(MPK_MOE_XCD_PAIR) && !defined(MPK_EARLY_ROUTING)
-#error "MPK_MOE_XCD_PAIR requires MPK_EARLY_ROUTING (carried expert in tile_idx[15:8])"
+#if defined(MPK_MOE_XCD_PAIR) && !defined(MPK_EARLY_ROUTING) && !defined(MPK_LOCAL_TOPK)
+#error "MPK_MOE_XCD_PAIR requires MPK_EARLY_ROUTING or MPK_LOCAL_TOPK (carried expert in tile_idx[15:8])"
 #endif
-#ifdef MPK_EARLY_ROUTING
+#if defined(MPK_EARLY_ROUTING) || (defined(MPK_MOE_XCD_PAIR) && defined(MPK_LOCAL_TOPK))
   int const carried_expert_id = (tile_idx >> 8) - 1;
   tile_idx &= 0xff;
 #endif

@@ -1760,7 +1760,11 @@ def get_compile_command(
             # A/B 2026-08-31 GPU 3, hash 96a92716 all six:
             # C 1.711/1.703/1.704 vs V 1.647/1.621/1.658
             # (−64 / −82 / −46 µs). Keep default ON (bs=1).
-            flags = flags + ["-DMPK_MOE_XCD_PAIR", "-DMPK_EARLY_ROUTING"]
+            if int(os.environ.get("MPK_LOCAL_TOPK", "0")) == 1:
+                # Local TopK hands each pair its pick in LDS; no early records.
+                flags = flags + ["-DMPK_MOE_XCD_PAIR"]
+            else:
+                flags = flags + ["-DMPK_MOE_XCD_PAIR", "-DMPK_EARLY_ROUTING"]
         elif int(os.environ.get("MPK_EARLY_ROUTING", "0")) == 1:
             # TESTED AND NOT ADOPTED (race + loss). A/B 2026-08-31:
             # C 1.711/1.712/1.704 vs V 1.728/1.713/1.732, hashes

@@ -2941,8 +2941,8 @@ topk_barrier :
 #endif
   MPK_SUB_MARK(3);
 #ifdef MPK_LOCAL_TOPK
-#if !defined(MPK_AID_SPLIT_FLAGS) || defined(MPK_EARLY_ROUTING) || defined(MPK_MOE_XCD_PAIR)
-#error "MPK_LOCAL_TOPK needs AID_SPLIT_FLAGS and excludes EARLY_ROUTING / MOE_XCD_PAIR"
+#if !defined(MPK_AID_SPLIT_FLAGS) || defined(MPK_EARLY_ROUTING)
+#error "MPK_LOCAL_TOPK needs AID_SPLIT_FLAGS and excludes EARLY_ROUTING"
 #endif
   static_assert(BATCH_SIZE == 1, "MPK_LOCAL_TOPK is bs=1");
 #else

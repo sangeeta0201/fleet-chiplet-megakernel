@@ -120,6 +120,7 @@ __device__ __forceinline__ unsigned mpk_ltk_tag(int epoch) {
 __shared__ int s_ltk_mask[129];
 __shared__ int s_ltk_route[128];
 __shared__ float s_ltk_w[8];
+__shared__ int s_ltk_sel[8];  // picks in selection order
 __shared__ unsigned short s_ltk_logit[128];
 #endif
 

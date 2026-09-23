@@ -652,7 +652,7 @@ __device__ __noinline__ void
   int const routing_expected = layer_counter + 1;
   int const attn_release_expected = layer_counter + 1;
   int const qkv_epoch_expected = layer_counter + 1;
-#ifdef MPK_EARLY_ROUTING
+#if defined(MPK_EARLY_ROUTING) || (defined(MPK_MOE_XCD_PAIR) && defined(MPK_LOCAL_TOPK))
   // Packed into MoE tile_idx[15:8] as expert_id+1. 0 means "no early expert".
   int routed_expert0 = 0;
 #endif
@@ -1716,6 +1716,9 @@ __device__ __noinline__ void
         mpk_aid_flags_at(routing_ready, xcd_id, MPK_AID_ROUTING_BASE_INTS) +
             MPK_AID_LTK_OFF_INTS,
         routing_expected);
+#ifdef MPK_MOE_XCD_PAIR
+    routed_expert0 = s_ltk_sel[xcd_id >> 1];  // pair p runs rank-p pick
+#endif
 #else
 #if defined(MPK_ROUTING_NARROW_AID)
 #if defined(MPK_ROUTING_LANE_RELEASE) || defined(MPK_AID_SPLIT_ROUTING)
@@ -1837,8 +1840,8 @@ __device__ __noinline__ void
     __builtin_amdgcn_s_sleep(127);
   }
 #endif
-#if defined(MPK_MOE_XCD_PAIR) && !defined(MPK_EARLY_ROUTING)
-#error "MPK_MOE_XCD_PAIR requires MPK_EARLY_ROUTING (Phase 7b u64 wait)"
+#if defined(MPK_MOE_XCD_PAIR) && !defined(MPK_EARLY_ROUTING) && !defined(MPK_LOCAL_TOPK)
+#error "MPK_MOE_XCD_PAIR requires MPK_EARLY_ROUTING or MPK_LOCAL_TOPK"
 #endif
 #ifdef MPK_MOE_XCD_PAIR
   // Two packed tiles per rank 0..22: W13 (bit7=0) then W2 (bit7=1). Ranks

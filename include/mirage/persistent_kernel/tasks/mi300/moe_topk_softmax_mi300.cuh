@@ -773,6 +773,7 @@ __device__ __forceinline__ void mpk_local_topk(int *tags, int expected) {
         topk_vals[k_idx] = max_val;
         row_sum_for_renorm += max_val;
         s_ltk_route[expert] = k_idx + 1;
+        s_ltk_sel[k_idx] = expert;
       }
       if (k_idx + 1 < K) {
         float const neg_inf = -10000.f;
