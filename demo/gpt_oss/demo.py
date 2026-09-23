@@ -508,7 +508,7 @@ def _own_bo_maybe(t, name):
     if not (bomap or pats) or not isinstance(t, torch.Tensor) or not t.is_cuda:
         return t
     n = t.numel() * t.element_size()
-    if n < (1 << 20):
+    if n < (1 << 20) and not any(p in name for p in pats):
         return t
     import ctypes as _ct
     hip = _ct.CDLL("libamdhip64.so")
