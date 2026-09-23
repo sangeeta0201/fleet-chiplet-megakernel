@@ -107,6 +107,9 @@ constexpr int MPK_AID_REGION_HIER_LOCAL = 5;
 // Per-XCD arrival counters for the top-k barrier. Region 6 keeps
 // 7*128 = 896 ints, still below MPK_AID_MOE_BASE_INTS (1024).
 constexpr int MPK_AID_REGION_TOPK = 6;
+// MPK_OPROJ_AID_TIER: per-AID arrival count of the O-proj phase-2 barrier.
+// Slot 0 only; touched by the four XCDs of the AID that owns the replica.
+constexpr int MPK_AID_REGION_OPROJ_TIER = 7;
 
 // The MoE fused barrier is per-expert (MOE_BAR_STRIDE ints each), so at 128
 // experts it needs ~20k ints rather than the eight lines the families above
@@ -391,6 +394,27 @@ __device__ __forceinline__ void ld_sys_s32x2(int *addr0, int *addr1, int &out0,
 // The MTYPE still matters independently: L2 HIT_LRU only helps if the line's
 // MTYPE gives coherent L2 at device scope, i.e. an AID-local MTYPE_RW replica
 // rather than spanning MTYPE_NC.
+// Two device-scope polls in flight at once, one wait: the min of both
+// words. Used where a waiter needs two AIDs' publishes, so detecting the
+// second costs one load latency rather than two.
+__device__ __forceinline__ int ld_aid_min2_s32(int *a, int *b) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  int x, y;
+  asm volatile("global_load_dword %0, %2, off sc1\n"
+               "global_load_dword %1, %3, off sc1\n"
+               "s_waitcnt vmcnt(0)"
+               : "=&v"(x), "=&v"(y)
+               : "v"(a), "v"(b)
+               : "memory");
+  return x < y ? x : y;
+#else
+  int x = __atomic_load_n(a, __ATOMIC_ACQUIRE);
+  int y = __atomic_load_n(b, __ATOMIC_ACQUIRE);
+  return x < y ? x : y;
+#endif
+}
+
 __device__ __forceinline__ int ld_aid_s32(int *addr) {
 #if defined(__HIP_DEVICE_COMPILE__) &&                                         \
     (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))

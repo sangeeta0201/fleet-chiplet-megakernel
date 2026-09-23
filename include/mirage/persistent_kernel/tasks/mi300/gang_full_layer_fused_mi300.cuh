@@ -1654,7 +1654,12 @@ __device__ __noinline__ void
 #ifdef MPK_OPROJ_NARROW_REL
     // Third consumer of MPK_AID_REGION_HIER_RELEASE, in a different file from
     // the publisher. Must follow the narrowed release to slot 0.
+#ifdef MPK_OPROJ_AID_TIER
+    while (ld_aid_min2_s32(&oproj_hier[16], &oproj_hier[32]) <
+           qkv_epoch_expected) {
+#else
     while (MPK_LD_GATE_AID(&oproj_hier[0]) < qkv_epoch_expected) {
+#endif
 #else
     while (MPK_LD_GATE_AID(&oproj_hier[xcd_id * 16]) < qkv_epoch_expected) {
 #endif
@@ -1706,7 +1711,14 @@ __device__ __noinline__ void
 #endif
     routed_expert0 = (int)(_rec >> 32);
 #else
-#ifdef MPK_AID_SPLIT_ROUTING
+#if defined(MPK_ROUTING_NARROW_AID)
+#if defined(MPK_ROUTING_LANE_RELEASE) || defined(MPK_AID_SPLIT_ROUTING)
+#error "MPK_ROUTING_NARROW_AID replaces the per-XCD routing flags"
+#endif
+    // Must follow the narrowed publisher: slot 1 of this AID's replica.
+    int *my_release = &mpk_aid_flags_at(routing_ready, xcd_id,
+                                        MPK_AID_ROUTING_BASE_INTS)[1 * 16];
+#elif defined(MPK_AID_SPLIT_ROUTING)
     // Poll this AID's replica instead of the shared NC line; see
     // MPK_AID_ROUTING_BASE_INTS in mpk_atoms.cuh.
     int *my_release = &mpk_aid_flags_at(routing_ready, xcd_id,

@@ -212,6 +212,11 @@ __shared__ unsigned long long s_sub_ts[4];
 __shared__ unsigned long long s_sub_span[4];
 __shared__ unsigned int s_sub_live;
 __shared__ unsigned int s_sub_n;
+__shared__ unsigned int s_sub_pub;
+__shared__ unsigned long long s_sub_last;
+__shared__ unsigned int s_sub_last_n;
+__device__ unsigned long long g_sub_last[MPK_PHASE_MAX_WORKERS];
+__device__ unsigned int g_sub_last_n[MPK_PHASE_MAX_WORKERS];
 __device__ unsigned long long g_sub_span[MPK_PHASE_MAX_WORKERS * 4];
 __device__ unsigned int g_sub_n[MPK_PHASE_MAX_WORKERS];
 __device__ __forceinline__ void mpk_sub_mark(int k) {
@@ -224,6 +229,10 @@ __device__ __forceinline__ void mpk_sub_mark(int k) {
   s_sub_live |= 1u << k;
 }
 #define MPK_SUB_MARK(k) mpk_sub_mark(k)
+#define MPK_SUB_PUBLISHER()                                                    \
+  do {                                                                         \
+    if (threadIdx.x == 0) s_sub_pub = 1u;                                      \
+  } while (0)
 #else
 #define MPK_SUB_MARK(k) do {} while (0)
 #endif
@@ -239,6 +248,9 @@ __device__ __forceinline__ void mpk_phase_lds_init() {
     for (int k = 0; k < 4; k++) s_sub_span[k] = 0;
     s_sub_live = 0;
     s_sub_n = 0;
+    s_sub_pub = 0;
+    s_sub_last = 0;
+    s_sub_last_n = 0;
 #endif
     s_phase_layers = 0;
     s_phase_n = 0;
@@ -273,7 +285,12 @@ __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
     s_sub_span[2] += (s_sub_ts[3] - s_sub_ts[2]) * 10;
     s_sub_span[3] += (s_phase_ts[6] - s_sub_ts[3]) * 10;
     s_sub_n++;
+    if (s_sub_pub) {
+      s_sub_last += (s_sub_ts[2] - s_sub_ts[1]) * 10;
+      s_sub_last_n++;
+    }
   }
+  s_sub_pub = 0;
 #endif
   // Slot 0 is the inter-layer span (previous layer's last mark to this
   // layer's first), exactly as in the global recorder.
@@ -303,6 +320,8 @@ __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
 #ifdef MPK_OPROJ_LDS
     for (int k = 0; k < 4; k++) g_sub_span[worker * 4 + k] = s_sub_span[k];
     g_sub_n[worker] = s_sub_n;
+    g_sub_last[worker] = s_sub_last;
+    g_sub_last_n[worker] = s_sub_last_n;
 #endif
     g_phase_n[worker * MPK_PHASE_PAD_U64] = n;
   }
@@ -4082,6 +4101,10 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
               printf("[PSUBW] w=%d n=%u %llu %llu %llu %llu\n", w, sn,
                      g_sub_span[w * 4 + 0] / sn, g_sub_span[w * 4 + 1] / sn,
                      g_sub_span[w * 4 + 2] / sn, g_sub_span[w * 4 + 3] / sn);
+              if (g_sub_last_n[w] > 0) {
+                printf("[PSUBL] w=%d nl=%u last=%llu\n", w, g_sub_last_n[w],
+                       g_sub_last[w] / g_sub_last_n[w]);
+              }
             }
 #endif
             // Raw per-slot timestamps of the last armed layer, so one layer's

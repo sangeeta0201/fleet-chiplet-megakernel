@@ -49,6 +49,9 @@
 #ifndef MPK_SUB_MARK
 #define MPK_SUB_MARK(k) do {} while (0)
 #endif
+#ifndef MPK_SUB_PUBLISHER
+#define MPK_SUB_PUBLISHER() do {} while (0)
+#endif
 #include "tasks/mi300/gang_moe_linear_mxfp4_mi300.cuh"    // FP4xFP8 helpers
 #include "tasks/mi300/gang_rmsnorm_linear_bias_mi300.cuh" // topk_noinline
 
@@ -528,6 +531,26 @@ __device__ __attribute__((noinline)) void
 #else
   int *hier_local = hier_barrier + 28 * HIER_STRIDE;
 #endif
+#ifdef MPK_OPROJ_AID_TIER
+#if !defined(MPK_OPROJ_TREE_BARRIER) || !defined(MPK_AID_SPLIT_FLAGS) ||       \
+    !defined(MPK_OPROJ_NARROW_REL)
+#error "MPK_OPROJ_AID_TIER needs TREE_BARRIER, AID_SPLIT_FLAGS and OPROJ_NARROW_REL"
+#endif
+#if defined(MPK_OPROJ_AID_AGG) || defined(MPK_ROUTER_XCD_FOLD)
+#error "MPK_OPROJ_AID_TIER replaces AID_AGG and is not wired for ROUTER_XCD_FOLD"
+#endif
+  // Only this AID's four XCDs touch its tier counter, so the level-2 atomic
+  // stays inside the AID. The physical XCC picks both the replica and the
+  // publish slot: `xcd_id` here is derived from tile_idx.
+  int *oproj_tier = mpk_aid_flags_hw(hier_barrier, MPK_AID_REGION_OPROJ_TIER);
+  int oproj_aid_hw;
+  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)"
+               : "=s"(oproj_aid_hw));
+  oproj_aid_hw = (oproj_aid_hw & 7) >> 2;
+#define MPK_OPROJ_REL_SLOT (1 + oproj_aid_hw)
+#else
+#define MPK_OPROJ_REL_SLOT 0
+#endif
 #ifdef MPK_ROUTER_XCD_FOLD
 #ifndef MPK_OPROJ_TREE_BARRIER
 #error "MPK_ROUTER_XCD_FOLD publishes from the tree-barrier local-last"
@@ -696,7 +719,20 @@ oproj_tile_pass:;
                                    tid,
                                    layer_epoch);
 #else
+#ifdef MPK_OPROJ_LOCAL_SLICE_PROBE
+#ifdef MPK_OPROJ_SPLIT_SLICE_WAIT
+#error "MPK_OPROJ_LOCAL_SLICE_PROBE covers the default two-slice path only"
+#endif
+      // TIMING ONLY, wrong output: wait on and read this AID's own slices.
+      int _lsp_xcc;
+      asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)"
+                   : "=s"(_lsp_xcc));
+      int const first_xcd = ((_lsp_xcc & 7) >> 2) * 4 + (warp_id & 1) * 2;
+      int const lsp_shift = (first_xcd - warp_id * 2) * ATTN_SLICE;
+#else
       int const first_xcd = warp_id * 2;
+      constexpr int lsp_shift = 0;
+#endif
       // ld_sys_s32 takes a mutable pointer only because every other caller
       // hands it one; the load itself is read-only.
       int *rel0 = const_cast<int *>(attn_slice_release) + first_xcd * 16;
@@ -814,7 +850,7 @@ oproj_tile_pass:;
       __syncthreads();
 #endif
 
-      i32x4_t const *src = (i32x4_t const *)(A + base);
+      i32x4_t const *src = (i32x4_t const *)(A + base + lsp_shift);
       i32x4_t v0 = src[0];
       i32x4_t v1 = src[1];
 
@@ -1646,7 +1682,12 @@ oproj_barrier :
     int const oproj_release_expected =
         layer_epoch > 0 ? layer_epoch
 #ifdef MPK_OPROJ_NARROW_REL
+#ifdef MPK_OPROJ_AID_TIER
+                        : min(ld_nt_s32(&hier_release[16]),
+                              ld_nt_s32(&hier_release[32])) + 1;
+#else
                         : ld_nt_s32(&hier_release[0]) + 1;
+#endif
 #else
                         : ld_nt_s32(&hier_release[xcd_id * HIER_STRIDE]) + 1;
 #endif
@@ -1791,7 +1832,12 @@ oproj_barrier :
 #endif
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 #endif
-#ifdef MPK_OPROJ_AID_AGG
+#if defined(MPK_OPROJ_AID_TIER)
+        int const _tier_prev = atom_add_release_gpu_s32(&oproj_tier[0], 1);
+        if ((_tier_prev % 4) == 3) {
+          oproj_rel_epoch = oproj_release_expected;
+        }
+#elif defined(MPK_OPROJ_AID_AGG)
         // Aggregate inside the AID first, so only one atomic per AID reaches
         // the shared counter and exactly ONE crosses the boundary. Slots 26
         // and 27 are free in the hier_barrier map (0-7 release, 8 counter,
@@ -1833,6 +1879,7 @@ oproj_barrier :
     // why 0 is a safe "not the releaser" sentinel.
     oproj_rel_epoch = __builtin_amdgcn_readfirstlane(oproj_rel_epoch);
     if (oproj_rel_epoch != 0) {
+      MPK_SUB_PUBLISHER();
 #ifdef MPK_OPROJ_NARROW_REL
       // One slot per AID instead of eight. Every slot received the identical
       // `oproj_rel_epoch`, so the eight are pure redundancy, and all 16
@@ -1842,7 +1889,7 @@ oproj_barrier :
       if (tid == 0) {
 #ifdef MPK_AID_SPLIT_FLAGS
         mpk_aid_publish(hier_barrier,
-                        0,
+                        MPK_OPROJ_REL_SLOT,
                         (unsigned)oproj_rel_epoch,
                         MPK_AID_REGION_HIER_RELEASE);
 #else
@@ -1962,7 +2009,12 @@ oproj_barrier :
 #endif
       while (!MPK_P7_SK(2) &&
 #ifdef MPK_OPROJ_NARROW_REL
+#ifdef MPK_OPROJ_AID_TIER
+             ld_aid_min2_s32(&hier_release[16], &hier_release[32]) <
+                 oproj_release_expected) {
+#else
              MPK_LD_GATE_AID(&hier_release[0]) < oproj_release_expected) {
+#endif
 #else
              MPK_LD_GATE_AID(&hier_release[xcd_id * HIER_STRIDE]) <
              oproj_release_expected) {
@@ -3012,6 +3064,17 @@ topk_barrier :
         st_rel_max_u32((void *)routing_ready_ptr, (unsigned)epoch);
 #ifdef MPK_ROUTING_LANE_RELEASE
         rr_epoch = epoch;
+#elif defined(MPK_ROUTING_NARROW_AID)
+#ifndef MPK_AID_SPLIT_FLAGS
+#error "MPK_ROUTING_NARROW_AID publishes into the AID flag replicas"
+#endif
+#ifdef MPK_EARLY_ROUTING
+#error "MPK_ROUTING_NARROW_AID is wired for the non-early routing gate only"
+#endif
+        // One slot per AID replica instead of eight per-XCD lines on the
+        // shared buffer: every XCD received the identical epoch.
+        mpk_aid_publish_at(routing_ready_ptr, 1 * 16, (unsigned)epoch,
+                           MPK_AID_ROUTING_BASE_INTS);
 #else
         for (int x = 0; x < 8; x++) {
 #ifdef MPK_AID_SPLIT_ROUTING

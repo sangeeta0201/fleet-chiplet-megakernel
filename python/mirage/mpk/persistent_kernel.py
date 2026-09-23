@@ -1451,6 +1451,9 @@ def get_compile_command(
             flags = flags + ["-DMPK_NARROW_HIER_POLL"]
         if int(os.environ.get("MPK_AID_SPLIT_ROUTING", "0")) == 1:
             flags = flags + ["-DMPK_AID_SPLIT_ROUTING"]
+        if int(os.environ.get("MPK_ROUTING_NARROW_AID", "0")) == 1:
+            # Routing release: one slot per AID replica, polled locally.
+            flags = flags + ["-DMPK_ROUTING_NARROW_AID"]
         if int(os.environ.get("MPK_AID_SPLIT_OUT", "0")) == 1:
             flags = flags + ["-DMPK_AID_SPLIT_OUT"]
         if int(os.environ.get("MPK_AID_EVCTR2", "0")) == 1:
@@ -1556,6 +1559,13 @@ def get_compile_command(
             flags = flags + ["-DMPK_OPROJ_AMAX_DPP"]
         if int(os.environ.get("MPK_OPROJ_AID_AGG", "0")) == 1:
             flags = flags + ["-DMPK_OPROJ_AID_AGG"]
+        if int(os.environ.get("MPK_OPROJ_LOCAL_SLICE_PROBE", "0")) == 1:
+            # TIMING ONLY: O-proj waves read only their own AID's slices.
+            flags = flags + ["-DMPK_OPROJ_LOCAL_SLICE_PROBE"]
+        if int(os.environ.get("MPK_OPROJ_AID_TIER", "0")) == 1:
+            # Phase-2 barrier: per-AID arrival on the AID's own replica, one
+            # write-through publish per AID; no cross-AID atomic.
+            flags = flags + ["-DMPK_OPROJ_AID_TIER"]
         if _opt("MPK_NARROW_OPROJ_HIER"):
             # One tid polls the O-proj hierarchical release; the acquire
             # __syncthreads already below carries the other 255. Unlike
