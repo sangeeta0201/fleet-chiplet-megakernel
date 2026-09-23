@@ -1151,6 +1151,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   if (!is_w2) {
     MOE_DBG_SUBPHASE(2000);
     MPK_WS_MARK(8200, global_tile); // W13 compute
+#ifdef MPK_W13_DELAY
+    for (int _d = 0; _d < 4; _d++) __builtin_amdgcn_s_sleep(16);
+#endif
 #ifdef MPK_W13_SUB
     MPK_W13_START();
 #endif

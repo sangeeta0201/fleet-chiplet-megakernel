@@ -227,6 +227,7 @@ __shared__ unsigned int s_w13_acc[10];
 __shared__ unsigned int s_w13_n;
 __device__ unsigned int g_w13_acc[MPK_PHASE_MAX_WORKERS * 10];
 __device__ unsigned int g_w13_n[MPK_PHASE_MAX_WORKERS];
+__device__ unsigned int g_w13_hwid[MPK_PHASE_MAX_WORKERS];
 #define MPK_W13_ARMED()                                                        \
   (s_phase_layers >=                                                         \
    (unsigned int)(MPK_PHASE_START_ITER * MPK_PHASE_LAYERS_PER_ITER))
@@ -462,6 +463,11 @@ __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
 #ifdef MPK_W13_SUB
     for (int k = 0; k < 10; k++) g_w13_acc[worker * 10 + k] = s_w13_acc[k];
     g_w13_n[worker] = s_w13_n;
+    {
+      unsigned _hw;
+      asm volatile("s_getreg_b32 %0, hwreg(HW_REG_HW_ID)" : "=s"(_hw));
+      g_w13_hwid[worker] = _hw;
+    }
 #endif
     g_phase_n[worker * MPK_PHASE_PAD_U64] = n;
   }
@@ -4335,9 +4341,10 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                 continue;
               }
               unsigned int const *a = &g_w13_acc[w * 10];
-              printf("[W13SUB] w=%d n=%u %u %u %u %u %u %u %u %u %u %u\n", w, n13,
+              printf("[W13SUB] w=%d n=%u %u %u %u %u %u %u %u %u %u %u hw=0x%x\n", w, n13,
                      a[0] / n13, a[1] / n13, a[2] / n13, a[3] / n13, a[4] / n13,
-                     a[5] / n13, a[6] / n13, a[7] / n13, a[8] / n13, a[9] / n13);
+                     a[5] / n13, a[6] / n13, a[7] / n13, a[8] / n13, a[9] / n13,
+                     g_w13_hwid[w]);
             }
 #endif
             // Raw per-slot timestamps of the last armed layer, so one layer's
