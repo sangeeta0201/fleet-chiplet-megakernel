@@ -2244,6 +2244,17 @@ router_tile_pass:;
       char const *h_base =
           (char const *)(d_hidden + (int64_t)b * output_stride);
       char *n_base = (char *)(d_normed + (int64_t)b * output_stride);
+#if defined(MPK_W13_HOF_AIDREP) && defined(MPK_W13_PREQUANT)
+      // W13's handoff row in this die's AID-local RW replica (see
+      // MPK_AID_W13HOF_BASE_INTS): every W13 tile reads it with sc0 sc1,
+      // an L2 hit on RW but never on the NC torch copy, where ~92 tiles
+      // per AID fetch the same lines from one channel.
+      if (g_aid_flag_rep[0] != nullptr && g_aid_flag_rep[1] != nullptr) {
+        n_base = (char *)(g_aid_flag_rep[mpk_hof_aid()] +
+                          MPK_AID_W13HOF_BASE_INTS) +
+                 (int64_t)b * output_stride * 2;
+      }
+#endif
 
       float ssq = 0.0f;
       float dp = 0.0f;
@@ -2763,12 +2774,12 @@ router_tile_pass:;
               router_norm_writer;
 #endif
           if (pq_store) {
-            asm volatile("global_store_dword %0, %1, off" ::"v"(n_base +
+            asm volatile("global_store_dword %0, %1, off" MPK_HOF_STORE_MOD ::"v"(n_base +
                                                                 i_cur_q * 4),
                          "v"(pk_bits)
                          : "memory");
             if ((lane & 31) == 0) {
-              asm volatile("global_store_byte %0, %1, off" ::"v"(
+              asm volatile("global_store_byte %0, %1, off" MPK_HOF_STORE_MOD ::"v"(
                                n_base + output_stride + scale_block),
                            "v"((unsigned)se)
                            : "memory");
@@ -2829,7 +2840,7 @@ router_tile_pass:;
       if (router_norm_writer && (pq_my_iter <= 0)) {
         int const pad_dw = (output_stride - ACTUAL_HIDDEN_DIM) / 4;
         if ((int)tid < pad_dw) {
-          asm volatile("global_store_dword %0, %1, off" ::"v"(
+          asm volatile("global_store_dword %0, %1, off" MPK_HOF_STORE_MOD ::"v"(
                            n_base + ACTUAL_HIDDEN_DIM + (int)tid * 4),
                        "v"(0u)
                        : "memory");

@@ -223,8 +223,7 @@ __device__ __attribute__((always_inline)) void
                                       NUM_EXPERTS,
                                       TOPK_K,
                                       MOE_W13_OUTPUT_PER_WG,
-                                      MOE_W2_OUTPUT_PER_WG>(
-        norm_output_ptr,
+                                      MOE_W2_OUTPUT_PER_WG>(MPK_MOE_HOF_IN(norm_output_ptr),
         moe_gate_up_weight_ptr,
         moe_down_weight_ptr,
         routing_indices_ptr,

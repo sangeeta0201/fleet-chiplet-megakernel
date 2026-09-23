@@ -178,6 +178,34 @@ constexpr int MPK_AID_SWIGLU_BASE_INTS = 200704;
 // a claim word at +xcc*32 and the published epoch at +xcc*32+16. Both
 // are touched by one XCD only, clear of SWIGLU and ATTNOUT.
 constexpr int MPK_AID_L2CLEAN_BASE_INTS = 294912;
+// W13's prequantized activation handoff row (MPK_W13_HOF_AIDREP): one copy
+// in each AID's replica, stored write-through by the router's norm writers
+// and read with sc0 sc1 by every W13 tile on that AID. One 5888 B row at
+// bs=1, clear of SWIGLU (200704..206592) and L2CLEAN.
+constexpr int MPK_AID_W13HOF_BASE_INTS = 262144;
+#ifdef MPK_W13_HOF_AIDREP
+#ifndef MPK_AID_SPLIT_FLAGS
+#error "MPK_W13_HOF_AIDREP needs the MPK_AID_SPLIT_FLAGS replicas"
+#endif
+#define MPK_HOF_STORE_MOD " sc0 sc1"
+#else
+#define MPK_HOF_STORE_MOD ""
+#endif
+// AID of the physical die; the producer and the consumers must agree.
+__device__ __forceinline__ int mpk_hof_aid() {
+  int x;
+  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)" : "=s"(x));
+  return (x & 7) >> 2;
+}
+#if defined(MPK_W13_HOF_AIDREP) && defined(MPK_W13_PREQUANT)
+#define MPK_MOE_HOF_IN(torch_in)                                               \
+  ((g_aid_flag_rep[0] != nullptr && g_aid_flag_rep[1] != nullptr)              \
+       ? (void const *)(g_aid_flag_rep[mpk_hof_aid()] +                        \
+                        MPK_AID_W13HOF_BASE_INTS)                              \
+       : (void const *)(torch_in))
+#else
+#define MPK_MOE_HOF_IN(torch_in) (torch_in)
+#endif
 constexpr int MPK_AID_LMTAIL_MOE = 0;
 constexpr int MPK_AID_LMTAIL_RESADD = 16;
 constexpr int MPK_AID_LMTAIL_LMHEAD = 32;

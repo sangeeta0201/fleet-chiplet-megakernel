@@ -1893,7 +1893,7 @@ __device__ __noinline__ void
                                       NUM_EXPERTS,
                                       TOPK_K,
                                       MOE_W13_OUTPUT_PER_WG,
-                                      MOE_W2_OUTPUT_PER_WG>(moe_norm_in,
+                                      MOE_W2_OUTPUT_PER_WG>(MPK_MOE_HOF_IN(moe_norm_in),
                                                             input_ptrs[17],
                                                             input_ptrs[18],
                                                             output_ptrs[7],
