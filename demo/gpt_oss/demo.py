@@ -3332,6 +3332,51 @@ if __name__ == "__main__":
             w_norm = mpk.attach_input(
                 torch_tensor=final_norm_w_padded, name="model_norm_weight"
             )
+            if (os.environ.get("MPK_BOMAP", "0") == "1"
+                    or os.environ.get("MPK_LM_OWN_BO", "0") == "1"):
+                import ctypes as _ct
+                _hip = _ct.CDLL("libamdhip64.so")
+
+                def _bomap(t, what):
+                    # Halves placement cuts a BO at its own midpoint, so a
+                    # tensor carved from a bigger segment can sit in one range.
+                    base, size = _ct.c_void_p(), _ct.c_size_t()
+                    rc = _hip.hipMemGetAddressRange(
+                        _ct.byref(base), _ct.byref(size),
+                        _ct.c_void_p(t.data_ptr()))
+                    p = t.data_ptr()
+                    n = t.numel() * t.element_size()
+                    b, s = base.value or 0, size.value
+                    cut = b + ((s >> 1) // (2 << 20)) * (2 << 20)
+                    lo = max(0, min(p + n, cut) - p)
+                    print(f"[BOMAP] {what} rc={rc} tensor=0x{p:x}+{n} "
+                          f"bo=0x{b:x}+{s} off={p - b} "
+                          f"in_first_half={lo / max(n, 1):.3f}", flush=True)
+
+                _bomap(lm_head_packed, "lm_head_packed")
+                if os.environ.get("MPK_LM_OWN_BO", "0") == "1":
+                    _n = lm_head_packed.numel() * lm_head_packed.element_size()
+                    _ptr = _ct.c_void_p()
+                    _rc = _hip.hipMalloc(_ct.byref(_ptr), _ct.c_size_t(_n))
+                    assert _rc == 0 and _ptr.value, f"hipMalloc rc={_rc}"
+
+                    class _CAI:
+                        pass
+
+                    _cai = _CAI()
+                    _cai.__cuda_array_interface__ = {
+                        "shape": (_n,), "typestr": "|u1",
+                        "data": (_ptr.value, False), "version": 2,
+                        "strides": None,
+                    }
+                    _own = torch.as_tensor(_cai, device="cuda").view(
+                        lm_head_packed.dtype).view(lm_head_packed.shape)
+                    _own.copy_(lm_head_packed)
+                    torch.cuda.synchronize()
+                    globals().setdefault("_LM_OWN_KEEPALIVE", []).append(
+                        (_hip, _ptr, _own))
+                    lm_head_packed = _own
+                    _bomap(lm_head_packed, "lm_head_packed(own BO)")
             w_proj_mxfp4 = mpk.attach_input(
                 torch_tensor=lm_head_packed, name="lm_head_mxfp4")
             lm_head_zero_bias = torch.zeros(

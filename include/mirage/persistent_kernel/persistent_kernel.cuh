@@ -191,6 +191,81 @@ __device__ volatile int g_phase_arm;
 // every other slot.
 __device__ int g_phase_live[MPK_PHASE_MAX_WORKERS * MPK_PHASE_PAD_INT];
 
+#ifdef MPK_PHASE_LDS
+// LDS-resident recorder: only s_memrealtime and LDS on the hot path, so its
+// cost is the same in NPS1 and NPS2 (the global recorder below is not: its
+// per-mark g_phase_* traffic lands on MTYPE_NC lines in NPS2). A worker arms
+// itself after MPK_PHASE_START_ITER iterations of its own layers, and copies
+// the sums to the globals the printer reads once per iteration.
+#ifndef MPK_PHASE_LAYERS_PER_ITER
+#define MPK_PHASE_LAYERS_PER_ITER 36
+#endif
+__shared__ unsigned long long s_phase_ts[MPK_PHASE_SLOT_COUNT];
+__shared__ unsigned long long s_phase_span[MPK_PHASE_SLOT_COUNT];
+__shared__ unsigned long long s_phase_prev_end;
+__shared__ unsigned long long s_phase_span_b;
+__shared__ unsigned int s_phase_layers;
+__shared__ unsigned int s_phase_n;
+
+__device__ __forceinline__ void mpk_phase_lds_init() {
+  if (threadIdx.x == 0) {
+    for (int s = 0; s < MPK_PHASE_SLOT_COUNT; s++) {
+      s_phase_ts[s] = 0;
+      s_phase_span[s] = 0;
+    }
+    s_phase_prev_end = 0;
+    s_phase_span_b = 0;
+    s_phase_layers = 0;
+    s_phase_n = 0;
+  }
+}
+
+__device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
+  if (threadIdx.x != 0 || worker >= MPK_PHASE_MAX_WORKERS) {
+    return;
+  }
+  asm volatile("" ::: "memory");
+  unsigned long long const t = __builtin_amdgcn_s_memrealtime();
+  asm volatile("" ::: "memory");
+  s_phase_ts[slot] = t;
+  if (slot != MPK_PHASE_SLOT_COUNT - 1) {
+    return;
+  }
+  unsigned int const layers = ++s_phase_layers;
+  unsigned long long const prev_end = s_phase_prev_end;
+  s_phase_prev_end = t;
+  if (layers <= (unsigned int)(MPK_PHASE_START_ITER * MPK_PHASE_LAYERS_PER_ITER)) {
+    return;
+  }
+  // Slot 0 is the inter-layer span (previous layer's last mark to this
+  // layer's first), exactly as in the global recorder.
+  if (prev_end != 0 && s_phase_ts[0] >= prev_end) {
+    unsigned long long const d0 = (s_phase_ts[0] - prev_end) * 10; // ns
+    if ((layers - 1) % MPK_PHASE_LAYERS_PER_ITER == 0) {
+      s_phase_span_b += d0; // layer 0: the span between two forward passes
+    } else {
+      s_phase_span[0] += d0;
+    }
+  }
+  for (int s = 1; s < MPK_PHASE_SLOT_COUNT; s++) {
+    unsigned long long const a = s_phase_ts[s - 1];
+    unsigned long long const b = s_phase_ts[s];
+    if (b >= a) {
+      s_phase_span[s] += (b - a) * 10;
+    }
+  }
+  unsigned int const n = ++s_phase_n;
+  if (n % MPK_PHASE_LAYERS_PER_ITER == 0) {
+    int const base = worker * MPK_PHASE_SLOT_STRIDE;
+    for (int s = 0; s < MPK_PHASE_SLOT_COUNT; s++) {
+      g_phase_span[base + s] = s_phase_span[s];
+      g_phase_ts[base + s] = s_phase_ts[s];
+    }
+    g_phase_span[base + MPK_PHASE_SLOT_COUNT] = s_phase_span_b;
+    g_phase_n[worker * MPK_PHASE_PAD_U64] = n;
+  }
+}
+#else
 __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
   if (threadIdx.x != 0 || worker >= MPK_PHASE_MAX_WORKERS) {
     return;
@@ -234,6 +309,7 @@ __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
     g_phase_live[(worker) * MPK_PHASE_PAD_INT] = 0;
   }
 }
+#endif // MPK_PHASE_LDS
 #define MPK_PHASE_MARK(worker, slot) mpk_phase_mark((worker), (slot))
 #else
 #define MPK_PHASE_MARK(worker, slot)                                           \
@@ -1452,6 +1528,9 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
   __shared__ int worker_queue_ids[2];
   __shared__ size_t next_task_pos[2];
   __shared__ size_t last_task_pos[2];
+#if defined(MPK_PHASE_SLOTS) && defined(MPK_PHASE_LDS)
+  mpk_phase_lds_init();
+#endif
 
 #ifdef MPK_ENABLE_PROFILING
   PROFILER_CLOSURE_PARAMS_DECL;
@@ -3942,7 +4021,11 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
               // (see mpk_phase_mark). Emitting it is what makes the row sum
               // to the real per-layer cost instead of leaving a hole.
               printf("[PSLOTW] w=%d n=%llu", w, n);
+#ifdef MPK_PHASE_LDS
+              for (int s = 0; s <= MPK_PHASE_SLOT_COUNT; s++) {
+#else
               for (int s = 0; s < MPK_PHASE_SLOT_COUNT; s++) {
+#endif
                 printf(" %llu",
                        g_phase_span[w * MPK_PHASE_SLOT_STRIDE + s] / n);
               }
