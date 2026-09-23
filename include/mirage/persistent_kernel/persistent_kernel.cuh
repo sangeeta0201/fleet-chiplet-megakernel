@@ -215,6 +215,12 @@ __shared__ unsigned int s_sub_n;
 __shared__ unsigned int s_sub_pub;
 __shared__ unsigned long long s_sub_last;
 __shared__ unsigned int s_sub_last_n;
+__shared__ unsigned long long s_tk_ts[3];
+__shared__ unsigned long long s_tk_span[3];
+__shared__ unsigned int s_tk_live;
+__shared__ unsigned int s_tk_n;
+__device__ unsigned long long g_tk_span[MPK_PHASE_MAX_WORKERS * 3];
+__device__ unsigned int g_tk_n[MPK_PHASE_MAX_WORKERS];
 __device__ unsigned long long g_sub_last[MPK_PHASE_MAX_WORKERS];
 __device__ unsigned int g_sub_last_n[MPK_PHASE_MAX_WORKERS];
 __device__ unsigned long long g_sub_span[MPK_PHASE_MAX_WORKERS * 4];
@@ -229,6 +235,13 @@ __device__ __forceinline__ void mpk_sub_mark(int k) {
   s_sub_live |= 1u << k;
 }
 #define MPK_SUB_MARK(k) mpk_sub_mark(k)
+#define MPK_SUB_TOPK(k)                                                        \
+  do {                                                                         \
+    if (threadIdx.x == 0) {                                                    \
+      s_tk_ts[(k)] = __builtin_amdgcn_s_memrealtime();                         \
+      s_tk_live |= 1u << (k);                                                  \
+    }                                                                          \
+  } while (0)
 #define MPK_SUB_PUBLISHER()                                                    \
   do {                                                                         \
     if (threadIdx.x == 0) s_sub_pub = 1u;                                      \
@@ -251,6 +264,9 @@ __device__ __forceinline__ void mpk_phase_lds_init() {
     s_sub_pub = 0;
     s_sub_last = 0;
     s_sub_last_n = 0;
+    for (int k = 0; k < 3; k++) s_tk_span[k] = 0;
+    s_tk_live = 0;
+    s_tk_n = 0;
 #endif
     s_phase_layers = 0;
     s_phase_n = 0;
@@ -285,12 +301,19 @@ __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
     s_sub_span[2] += (s_sub_ts[3] - s_sub_ts[2]) * 10;
     s_sub_span[3] += (s_phase_ts[6] - s_sub_ts[3]) * 10;
     s_sub_n++;
+    if (s_tk_live == 0x7u && s_tk_ts[0] >= s_sub_ts[3]) {
+      s_tk_span[0] += (s_tk_ts[0] - s_sub_ts[3]) * 10;
+      s_tk_span[1] += (s_tk_ts[1] - s_tk_ts[0]) * 10;
+      s_tk_span[2] += (s_tk_ts[2] - s_tk_ts[1]) * 10;
+      s_tk_n++;
+    }
     if (s_sub_pub) {
       s_sub_last += (s_sub_ts[2] - s_sub_ts[1]) * 10;
       s_sub_last_n++;
     }
   }
   s_sub_pub = 0;
+  s_tk_live = 0;
 #endif
   // Slot 0 is the inter-layer span (previous layer's last mark to this
   // layer's first), exactly as in the global recorder.
@@ -322,6 +345,8 @@ __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
     g_sub_n[worker] = s_sub_n;
     g_sub_last[worker] = s_sub_last;
     g_sub_last_n[worker] = s_sub_last_n;
+    for (int k = 0; k < 3; k++) g_tk_span[worker * 3 + k] = s_tk_span[k];
+    g_tk_n[worker] = s_tk_n;
 #endif
     g_phase_n[worker * MPK_PHASE_PAD_U64] = n;
   }
@@ -4101,6 +4126,12 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
               printf("[PSUBW] w=%d n=%u %llu %llu %llu %llu\n", w, sn,
                      g_sub_span[w * 4 + 0] / sn, g_sub_span[w * 4 + 1] / sn,
                      g_sub_span[w * 4 + 2] / sn, g_sub_span[w * 4 + 3] / sn);
+              if (g_tk_n[w] > 0) {
+                unsigned int tn = g_tk_n[w];
+                printf("[PSUBT] w=%d n=%u %llu %llu %llu\n", w, tn,
+                       g_tk_span[w * 3 + 0] / tn, g_tk_span[w * 3 + 1] / tn,
+                       g_tk_span[w * 3 + 2] / tn);
+              }
               if (g_sub_last_n[w] > 0) {
                 printf("[PSUBL] w=%d nl=%u last=%llu\n", w, g_sub_last_n[w],
                        g_sub_last[w] / g_sub_last_n[w]);

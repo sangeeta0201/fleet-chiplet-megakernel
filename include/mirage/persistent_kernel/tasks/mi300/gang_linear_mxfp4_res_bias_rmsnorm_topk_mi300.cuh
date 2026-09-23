@@ -52,6 +52,9 @@
 #ifndef MPK_SUB_PUBLISHER
 #define MPK_SUB_PUBLISHER() do {} while (0)
 #endif
+#ifndef MPK_SUB_TOPK
+#define MPK_SUB_TOPK(k) do {} while (0)
+#endif
 #include "tasks/mi300/gang_moe_linear_mxfp4_mi300.cuh"    // FP4xFP8 helpers
 #include "tasks/mi300/gang_rmsnorm_linear_bias_mi300.cuh" // topk_noinline
 
@@ -2941,6 +2944,7 @@ topk_barrier :
   __syncthreads();
 
   if (s_topk_done == n_router_part * MPK_NUM_XCDS) {
+    MPK_SUB_TOPK(0);
 #ifdef MPK_ROUTING_LANE_RELEASE
     // Carries the release epoch from tid 0 to lanes 1..7 of wave 0 by
     // readfirstlane; see the fan-out at the end of this block. Declared here
@@ -2978,6 +2982,7 @@ topk_barrier :
     // stores first; the barrier then makes that true block-wide.
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     __syncthreads();
+    MPK_SUB_TOPK(1);
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
     if (tid == 0 && ts_base) {
       ts_base[15] =
@@ -3090,6 +3095,7 @@ topk_barrier :
       }
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
+    MPK_SUB_TOPK(2);
 #ifdef MPK_ROUTING_LANE_RELEASE
     // ── Fan the eight per-XCD flags out over lanes, not over time ─────────
     //

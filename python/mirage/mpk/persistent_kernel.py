@@ -894,13 +894,13 @@ def get_compile_command(
         # equality-recovered index. Bit-exact including the tie-break -- see
         # the comment at the asm block for why the equality matches are
         # visited in reverse.
-        if _opt("MPK_TOPK_NO_ROUTING_CLEAR"):
+        if int(os.environ.get("MPK_TOPK_NO_ROUTING_CLEAR", "0")) == 1:
             # Drop the routing-index clear at TopK entry: the cleared state is
             # unreachable (see the block comment in
             # moe_topk_softmax_mi300.cuh). Self-gated to routing_row_stride 1.
             # A/B n=12: -0.86%, median -0.89%, t=-3.50, 10/12 pairs.
             flags = flags + ["-DMPK_TOPK_NO_ROUTING_CLEAR"]
-        if _opt("MPK_TOPK_DPP_REDUCE"):
+        if int(os.environ.get("MPK_TOPK_DPP_REDUCE", "0")) == 1:
             # Move the two softmax row reductions from __shfl_xor (which
             # lowers to ds_bpermute and bumps LGKM) to DPP lane-zero ladders
             # plus one broadcast each.
@@ -1461,6 +1461,9 @@ def get_compile_command(
             flags = flags + ["-DMPK_NARROW_GATE_POLL"]
         if int(os.environ.get("MPK_NARROW_HIER_POLL", "0")) == 1:
             flags = flags + ["-DMPK_NARROW_HIER_POLL"]
+        if int(os.environ.get("MPK_NO_LOGIT_RESET", "0")) == 1:
+            # skip the TopK logit write-through reset (opt-in here; hash-gate it).
+            flags = flags + ["-DMPK_NO_LOGIT_RESET"]
         if int(os.environ.get("MPK_AID_SPLIT_ROUTING", "0")) == 1:
             flags = flags + ["-DMPK_AID_SPLIT_ROUTING"]
         if int(os.environ.get("MPK_ROUTING_NARROW_AID", "0")) == 1:
