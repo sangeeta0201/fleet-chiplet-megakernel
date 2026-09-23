@@ -46,6 +46,9 @@
 //   active_expert_ids [NUM_EXPERTS+1] int32
 
 #pragma once
+#ifndef MPK_SUB_MARK
+#define MPK_SUB_MARK(k) do {} while (0)
+#endif
 #include "tasks/mi300/gang_moe_linear_mxfp4_mi300.cuh"    // FP4xFP8 helpers
 #include "tasks/mi300/gang_rmsnorm_linear_bias_mi300.cuh" // topk_noinline
 
