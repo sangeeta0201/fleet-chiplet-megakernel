@@ -447,6 +447,8 @@ def get_compile_command(
             flags = flags + ["-DMPK_IL_LDS"]
         if int(os.environ.get("MPK_MOE_LDS", "0")) == 1:
             flags = flags + ["-DMPK_MOE_LDS"]
+        if int(os.environ.get("MPK_MOE_INLINE", "0")) == 1:
+            flags = flags + ["-DMPK_MOE_INLINE"]
         if int(os.environ.get("MPK_MOE_CALL_LDS", "0")) == 1:
             flags = flags + ["-DMPK_MOE_CALL_LDS"]
         if int(os.environ.get("MPK_PHASE_LDS", "0")) == 1:
