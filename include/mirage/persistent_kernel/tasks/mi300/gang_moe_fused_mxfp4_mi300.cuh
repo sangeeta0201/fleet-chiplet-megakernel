@@ -52,6 +52,74 @@
 #else
 #define MPK_W2_LD_MOD " sc0 nt"
 #endif
+
+// MPK_W2_KWIN: see the W2 prologue. Wait for K-step k's fragment right before
+// its A read; the unrolled body keeps k in MPK_W2_T0_SC_%= (2p+1 at pair p).
+#ifdef MPK_W2_KWIN
+#if defined(MPK_MOE_QUAD_ACCUMULATOR) || defined(MPK_W2_PF_BEFORE_WAIT) ||     \
+    !defined(MPK_W2_T0_MFMA_UNROLLED) || defined(MPK_W2_LINEAR_LOAD) ||        \
+    defined(MPK_W2_SCALE_OVERLAP) || !defined(MPK_WIDE_FP8_QUANT) ||           \
+    defined(MPK_MFMA_PINGPONG_SCHED) || !defined(MPK_W2_KWIN_TAIL)
+#error "MPK_W2_KWIN covers the single-chain unrolled W2 body with the wide gather only"
+#endif
+#define MPK_W2KS2(x) #x
+#define MPK_W2KS(x) MPK_W2KS2(x)
+#define MPK_W2_WA_STEP "0x400"
+#define MPK_W2_KW0 "s_waitcnt vmcnt(22)\n"
+#define MPK_W2_KWA \
+  ".if (22 - MPK_W2_T0_SC_%=) >= 22\n s_waitcnt vmcnt(22)\n" \
+  ".elseif (22 - MPK_W2_T0_SC_%=) == 21\n s_waitcnt vmcnt(21)\n" \
+  ".elseif (22 - MPK_W2_T0_SC_%=) == 20\n s_waitcnt vmcnt(20)\n" \
+  ".elseif (22 - MPK_W2_T0_SC_%=) == 19\n s_waitcnt vmcnt(19)\n" \
+  ".elseif (22 - MPK_W2_T0_SC_%=) == 18\n s_waitcnt vmcnt(18)\n" \
+  ".elseif (22 - MPK_W2_T0_SC_%=) == 17\n s_waitcnt vmcnt(17)\n" \
+  ".elseif (22 - MPK_W2_T0_SC_%=) == 16\n s_waitcnt vmcnt(16)\n" \
+  ".elseif (22 - MPK_W2_T0_SC_%=) == 15\n s_waitcnt vmcnt(15)\n" \
+  ".elseif (22 - MPK_W2_T0_SC_%=) == 14\n s_waitcnt vmcnt(14)\n" \
+  ".elseif (22 - MPK_W2_T0_SC_%=) == 13\n s_waitcnt vmcnt(13)\n" \
+  ".elseif (22 - MPK_W2_T0_SC_%=) == 12\n s_waitcnt vmcnt(12)\n" \
+  ".elseif (22 - MPK_W2_T0_SC_%=) == 11\n s_waitcnt vmcnt(11)\n" \
+  ".elseif (22 - MPK_W2_T0_SC_%=) == 10\n s_waitcnt vmcnt(10)\n" \
+  ".elseif (22 - MPK_W2_T0_SC_%=) == 9\n s_waitcnt vmcnt(9)\n" \
+  ".elseif (22 - MPK_W2_T0_SC_%=) == 8\n s_waitcnt vmcnt(8)\n" \
+  ".elseif (22 - MPK_W2_T0_SC_%=) == 7\n s_waitcnt vmcnt(7)\n" \
+  ".elseif (22 - MPK_W2_T0_SC_%=) == 6\n s_waitcnt vmcnt(6)\n" \
+  ".elseif (22 - MPK_W2_T0_SC_%=) == 5\n s_waitcnt vmcnt(5)\n" \
+  ".elseif (22 - MPK_W2_T0_SC_%=) == 4\n s_waitcnt vmcnt(4)\n" \
+  ".elseif (22 - MPK_W2_T0_SC_%=) == 3\n s_waitcnt vmcnt(3)\n" \
+  ".elseif (22 - MPK_W2_T0_SC_%=) == 2\n s_waitcnt vmcnt(2)\n" \
+  ".elseif (22 - MPK_W2_T0_SC_%=) == 1\n s_waitcnt vmcnt(1)\n" \
+  ".else\n s_waitcnt vmcnt(0)\n.endif\n"
+#define MPK_W2_KWB \
+  ".if (21 - MPK_W2_T0_SC_%=) >= 22\n s_waitcnt vmcnt(22)\n" \
+  ".elseif (21 - MPK_W2_T0_SC_%=) == 21\n s_waitcnt vmcnt(21)\n" \
+  ".elseif (21 - MPK_W2_T0_SC_%=) == 20\n s_waitcnt vmcnt(20)\n" \
+  ".elseif (21 - MPK_W2_T0_SC_%=) == 19\n s_waitcnt vmcnt(19)\n" \
+  ".elseif (21 - MPK_W2_T0_SC_%=) == 18\n s_waitcnt vmcnt(18)\n" \
+  ".elseif (21 - MPK_W2_T0_SC_%=) == 17\n s_waitcnt vmcnt(17)\n" \
+  ".elseif (21 - MPK_W2_T0_SC_%=) == 16\n s_waitcnt vmcnt(16)\n" \
+  ".elseif (21 - MPK_W2_T0_SC_%=) == 15\n s_waitcnt vmcnt(15)\n" \
+  ".elseif (21 - MPK_W2_T0_SC_%=) == 14\n s_waitcnt vmcnt(14)\n" \
+  ".elseif (21 - MPK_W2_T0_SC_%=) == 13\n s_waitcnt vmcnt(13)\n" \
+  ".elseif (21 - MPK_W2_T0_SC_%=) == 12\n s_waitcnt vmcnt(12)\n" \
+  ".elseif (21 - MPK_W2_T0_SC_%=) == 11\n s_waitcnt vmcnt(11)\n" \
+  ".elseif (21 - MPK_W2_T0_SC_%=) == 10\n s_waitcnt vmcnt(10)\n" \
+  ".elseif (21 - MPK_W2_T0_SC_%=) == 9\n s_waitcnt vmcnt(9)\n" \
+  ".elseif (21 - MPK_W2_T0_SC_%=) == 8\n s_waitcnt vmcnt(8)\n" \
+  ".elseif (21 - MPK_W2_T0_SC_%=) == 7\n s_waitcnt vmcnt(7)\n" \
+  ".elseif (21 - MPK_W2_T0_SC_%=) == 6\n s_waitcnt vmcnt(6)\n" \
+  ".elseif (21 - MPK_W2_T0_SC_%=) == 5\n s_waitcnt vmcnt(5)\n" \
+  ".elseif (21 - MPK_W2_T0_SC_%=) == 4\n s_waitcnt vmcnt(4)\n" \
+  ".elseif (21 - MPK_W2_T0_SC_%=) == 3\n s_waitcnt vmcnt(3)\n" \
+  ".elseif (21 - MPK_W2_T0_SC_%=) == 2\n s_waitcnt vmcnt(2)\n" \
+  ".elseif (21 - MPK_W2_T0_SC_%=) == 1\n s_waitcnt vmcnt(1)\n" \
+  ".else\n s_waitcnt vmcnt(0)\n.endif\n"
+#else
+#define MPK_W2_WA_STEP "64"
+#define MPK_W2_KW0 ""
+#define MPK_W2_KWA ""
+#define MPK_W2_KWB ""
+#endif
 #include "mpk_atoms.cuh" // ld_sys_s32 (early-routing wait)
 #include "tasks/mi300/gang_moe_linear_mxfp4_mi300.cuh" // reuse type defs + helpers
 #include "tasks/mi300/moe_ws_layout.cuh" // MOE_WS_SLOTS, moe_ws_offset()
@@ -4851,7 +4919,63 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // Issue W2 weight buffer_load_lds BEFORE barrier poll — HBM loads fly
   // during barrier wait (~3us overlap instead of serial).
   // Single inline asm block to prevent compiler vmcnt serialization.
-#ifdef MPK_W2_LINEAR_LOAD
+#if defined(MPK_W2_KWIN)
+  // Scales, then the first MPK_W2_KWIN fragments; the rest go out behind the
+  // SwiGLU gather below. One tile per wave, loaded linearly (K-major on host).
+  static_assert(MPK_W2_KWIN >= 0 && MPK_W2_KWIN <= 23 &&
+                    MPK_W2_KWIN + MPK_W2_KWIN_TAIL == 23,
+                "MPK_W2_KWIN is a fragment count 0..23, TAIL = 23 - KWIN");
+  static_assert(W2_MFMA_ITERS == 23 && W2_TILE_DATA == 23 * 1024 &&
+                    NUM_WAVES == 4 && W2_TILE_SCALE > 1024 &&
+                    W2_TILE_SCALE <= 2048 && W2_TILE_SCALE % 16 == 0,
+                "MPK_W2_KWIN hardcodes 23 x 1 KiB fragments per wave tile");
+  static_assert(!(PACK_N && !SINGLE_TOK) && W2_TILES_PER_WAVE == 1,
+                "MPK_W2_KWIN: single-token gather, one 16-row tile per wave");
+  unsigned const w2k_lds = __builtin_amdgcn_readfirstlane(
+      (unsigned)(uintptr_t)(lds_w2_base + warp_id * W2_TILE_BYTES));
+  uint32_t w2k_voff = w2_wg_voff_base +
+                      static_cast<uint32_t>(warp_id * W2_TILE_DATA) +
+                      static_cast<uint32_t>(lane_id * 16);
+  {
+    uint32_t const sc_voff = w2_wg_voff_base +
+                             static_cast<uint32_t>(W2_WG_DATA) +
+                             static_cast<uint32_t>(warp_id * W2_TILE_SCALE) +
+                             static_cast<uint32_t>(lane_id * 16);
+    unsigned const sc_lds = w2k_lds + W2_TILE_DATA_PADDED;
+    asm volatile("s_nop 4\n"
+                 "s_mov_b32 m0, %[l]\n"
+                 "s_nop 0\n"
+                 "buffer_load_dwordx4 %[v], %[r], 0 offen" MPK_W2_LD_MOD " lds\n"
+                 :
+                 : [v] "v"(sc_voff), [r] "s"(w2_rsrc), [l] "s"(sc_lds)
+                 : "memory", "m0");
+    if (lane_id < (W2_TILE_SCALE - 1024) / 16) {
+      asm volatile("s_nop 4\n"
+                   "s_mov_b32 m0, %[l]\n"
+                   "s_nop 0\n"
+                   "buffer_load_dwordx4 %[v], %[r], 0 offen" MPK_W2_LD_MOD " lds\n"
+                   :
+                   : [v] "v"(sc_voff + 1024u), [r] "s"(w2_rsrc),
+                     [l] "s"(sc_lds + 1024u)
+                   : "memory", "m0");
+    }
+  }
+  if constexpr (MPK_W2_KWIN > 0) {
+    asm volatile("s_nop 4\n"
+                 "s_mov_b32 m0, %[l]\n"
+                 "s_nop 0\n"
+                 "buffer_load_dwordx4 %[v], %[r], 0 offen" MPK_W2_LD_MOD " lds\n"
+                 ".rept " MPK_W2KS(MPK_W2_KWIN) " - 1\n"
+                 "s_addk_i32 m0, 0x400\n"
+                 "v_add_u32_e32 %[v], 0x400, %[v]\n"
+                 "buffer_load_dwordx4 %[v], %[r], 0 offen" MPK_W2_LD_MOD " lds\n"
+                 ".endr\n"
+                 "v_add_u32_e32 %[v], 0x400, %[v]\n"
+                 : [v] "+v"(w2k_voff)
+                 : [r] "s"(w2_rsrc), [l] "s"(w2k_lds)
+                 : "memory", "m0");
+  }
+#elif defined(MPK_W2_LINEAR_LOAD)
   // Linear per-wave tile load, same transform as the W13 T0 site above and
   // for the same reason: W2's geometry is identical (W2_K == W13_K == 2880,
   // so W2_LPT is also 6 and the striped cover also fetches 24 KiB for 22.5
@@ -5005,6 +5129,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   }
 #endif // MPK_W2_LINEAR_LOAD
 
+#ifndef MPK_W2_KWIN
   // Issue scale loads concurrently with buffer_load_lds
   constexpr int W2_TOTAL_SC_DW4 = (W2_TILE_SCALE * NUM_WAVES) / 16;
   constexpr int W2_SC_LPT = (W2_TOTAL_SC_DW4 + 255) / 256;
@@ -5020,6 +5145,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     }
   }
 
+#endif // !MPK_W2_KWIN
 #if defined(MPK_MOE_INNER_TIMING) || defined(MPK_MOE_LDS)
   // Taken after the weight prefetch is issued and before the poll, so `prefetch`
   // below is issue cost only -- the HBM latency it hides lands in `barrier`.
@@ -5155,7 +5281,96 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
           d_swiglu_out + my_tok * (NUM_TOPK * INTERMEDIATE_SIZE) +
           topk_slot * INTERMEDIATE_SIZE;
       #endif
-#ifdef MPK_WIDE_FP8_QUANT
+#if defined(MPK_W2_KWIN)
+      {
+        // _gang_wave_parallel_fp8_quant_nt_wide, split so the tail fragments
+        // are issued behind the gather and the gather retires before them.
+        constexpr int VPL = 16;
+        constexpr int LPS = 8;
+        static_assert(W2_K % (VPL * LPS) == 0, "wide FP8 quant needs K % 128 == 0");
+        constexpr int ACTIVE = W2_K / VPL;
+        bool const act = tid < ACTIVE;
+        int const qbase = tid * VPL;
+        // Gather, tail and wait in ONE statement, run by every lane (inactive
+        // lanes re-read lane 0's words): nothing the compiler emits may sit
+        // between a load and its wait, since it would read the destination
+        // VGPRs before the data lands.
+        uint32_t const *bp = (uint32_t const *)(w2_input_base + (act ? qbase : 0));
+        uint32_t words[8];
+        if constexpr (MPK_W2_KWIN < 23) {
+          asm volatile("global_load_dwordx4 %[w0], %[a0], off" MPK_W2_GATHER_MOD "\n"
+                       "global_load_dwordx4 %[w1], %[a1], off" MPK_W2_GATHER_MOD "\n"
+                       "s_nop 4\n"
+                       "s_mov_b32 m0, %[l]\n"
+                       "s_nop 0\n"
+                       "buffer_load_dwordx4 %[v], %[r], 0 offen" MPK_W2_LD_MOD " lds\n"
+                       ".rept 22 - " MPK_W2KS(MPK_W2_KWIN) "\n"
+                       "s_addk_i32 m0, 0x400\n"
+                       "v_add_u32_e32 %[v], 0x400, %[v]\n"
+                       "buffer_load_dwordx4 %[v], %[r], 0 offen" MPK_W2_LD_MOD " lds\n"
+                       ".endr\n"
+                       "s_waitcnt vmcnt(" MPK_W2KS(MPK_W2_KWIN_TAIL) ")\n"
+                       : [w0] "=&v"(*(i32x4_t *)&words[0]),
+                         [w1] "=&v"(*(i32x4_t *)&words[4]), [v] "+v"(w2k_voff)
+                       : [a0] "v"(bp), [a1] "v"(bp + 4), [r] "s"(w2_rsrc),
+                         [l] "s"(w2k_lds + (unsigned)(MPK_W2_KWIN * 1024))
+                       : "memory", "m0");
+        } else {
+          asm volatile("global_load_dwordx4 %[w0], %[a0], off" MPK_W2_GATHER_MOD "\n"
+                       "global_load_dwordx4 %[w1], %[a1], off" MPK_W2_GATHER_MOD "\n"
+                       "s_waitcnt vmcnt(0)\n"
+                       : [w0] "=&v"(*(i32x4_t *)&words[0]),
+                         [w1] "=&v"(*(i32x4_t *)&words[4])
+                       : [a0] "v"(bp), [a1] "v"(bp + 4)
+                       : "memory");
+        }
+        if (act) {
+          float vals[VPL];
+          float amax = 0.0f;
+#pragma unroll
+          for (int i = 0; i < VPL / 2; i++) {
+            float const lo = _gang_bf16_to_float((unsigned short)(words[i] & 0xFFFF));
+            float const hi = _gang_bf16_to_float((unsigned short)(words[i] >> 16));
+            vals[i * 2] = lo;
+            vals[i * 2 + 1] = hi;
+            amax = fmaxf(amax, fmaxf(fabsf(lo), fabsf(hi)));
+          }
+          float peer;
+          asm volatile("s_nop 1\n"
+                       "v_mov_b32_dpp %1, %0 quad_perm:[1,0,3,2] row_mask:0xf "
+                       "bank_mask:0xf\n"
+                       "v_max_f32 %0, %0, %1\n"
+                       "s_nop 1\n"
+                       "v_mov_b32_dpp %1, %0 quad_perm:[2,3,0,1] row_mask:0xf "
+                       "bank_mask:0xf\n"
+                       "v_max_f32 %0, %0, %1\n"
+                       "s_nop 1\n"
+                       "v_mov_b32_dpp %1, %0 row_half_mirror row_mask:0xf "
+                       "bank_mask:0xf\n"
+                       "v_max_f32 %0, %0, %1"
+                       : "+v"(amax), "=&v"(peer));
+          uint8_t const se = _gang_compute_e8m0_fp8(amax);
+          float scale_f = 1.0f;
+          if (se != 0) {
+            uint32_t const bits = (uint32_t)se << 23;
+            __builtin_memcpy(&scale_f, &bits, sizeof(scale_f));
+          }
+#pragma unroll
+          for (int i = 0; i < VPL; i += 4) {
+            fp8x4_t pk = {};
+            pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
+                pk, vals[i], vals[i + 1], scale_f, false);
+            pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
+                pk, vals[i + 2], vals[i + 3], scale_f, true);
+            __builtin_memcpy(s_tok_fp8 + qbase + i, &pk, sizeof(pk));
+          }
+          if ((tid & (LPS - 1)) == 0) {
+            s_tok_scales[tid / LPS] = se;
+          }
+        }
+        MPK_WS_WAVE_SYNC(tid >> 6);
+      }
+#elif defined(MPK_WIDE_FP8_QUANT)
       _gang_wave_parallel_fp8_quant_nt_wide<W2_K>(
           w2_input_base, s_tok_fp8, s_tok_scales);
 #else
@@ -5169,6 +5384,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // Weight loads were issued before barrier poll, should be done by now.
   MOE_DBG_SUBPHASE(3004);
   MPK_WS_MARK(8304, global_tile); // W2: drain HBM loads
+#if defined(MPK_W2_KWIN)
+  asm volatile("s_waitcnt lgkmcnt(0)\n s_barrier" ::: "memory");
+#else
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 #ifndef MPK_W2_SCALE_OVERLAP
   // Weights are buffer_load_lds (lgkmcnt); scales are VMEM (vmcnt). Waiting
@@ -5191,6 +5409,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   }
   asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
   __syncthreads();
+#endif // MPK_W2_KWIN
 
 #if 0 // W2 timestamp disabled — near asm block
     g_subphase_scratch[6] = __builtin_amdgcn_s_memrealtime();
@@ -5264,8 +5483,13 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       // Baseline: ~53 cycles/iter (20 wait + 32 MFMA + 1 overhead)
       // Pipelined: ~36 cycles/iter (0 wait + 32 MFMA + 4 overhead)
       {
+#if defined(MPK_W2_KWIN)
+        unsigned w2_w_addr =
+            (unsigned)(uintptr_t)(lds_w2_data + g * 256 + col * 16);
+#else
         unsigned w2_w_addr =
             (unsigned)(uintptr_t)(lds_w2_data + row_data_base + g * 16);
+#endif
         unsigned w2_ws_addr =
             (unsigned)(uintptr_t)(lds_w2_scales + row_scale_base + g);
         unsigned w2_t_addr = (unsigned)(uintptr_t)(b_tok + g * 16);
@@ -5309,6 +5533,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #endif
 
             // Pre-issue 5 reads for iteration 0 into bank 0
+            MPK_W2_KW0
             "ds_read_b128 v[22:25], %[wa]\n"
             "ds_read_u8   v7, %[wsa]\n"
             "ds_read_b128 v[8:11], %[ta]\n"
@@ -5504,7 +5729,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #endif
             // ---- consume bank 0, prefetch into bank 1 ----
 #ifdef MPK_W2_PF_BEFORE_WAIT
-            "v_add_u32_e32 %[wa], 64, %[wa]\n"
+            "v_add_u32_e32 %[wa], " MPK_W2_WA_STEP ", %[wa]\n"
             "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
             "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
 #ifdef MPK_W2_T0_MFMA_UNROLLED
@@ -5514,6 +5739,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             "v_add_u32_e32 v17, s13, %[tsa]\n"
 #endif
             "ds_read_u8   v19, v17\n"
+            MPK_W2_KWA
             "ds_read_b128 v[26:29], %[wa]\n"
             "ds_read_u8   v18, %[wsa]\n"
             "ds_read_b128 v[32:35], %[ta]\n"
@@ -5521,7 +5747,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             "s_waitcnt lgkmcnt(5)\n"
 #else
             "s_waitcnt lgkmcnt(0)\n"
-            "v_add_u32_e32 %[wa], 64, %[wa]\n"
+            "v_add_u32_e32 %[wa], " MPK_W2_WA_STEP ", %[wa]\n"
             "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
             "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
 #ifdef MPK_W2_T0_MFMA_UNROLLED
@@ -5531,6 +5757,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             "v_add_u32_e32 v17, s13, %[tsa]\n"
 #endif
             "ds_read_u8   v19, v17\n"
+            MPK_W2_KWA
             "ds_read_b128 v[26:29], %[wa]\n"
             "ds_read_u8   v18, %[wsa]\n"
             "ds_read_b128 v[32:35], %[ta]\n"
@@ -5545,7 +5772,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 
             // ---- consume bank 1, prefetch into bank 0 ----
 #ifdef MPK_W2_PF_BEFORE_WAIT
-            "v_add_u32_e32 %[wa], 64, %[wa]\n"
+            "v_add_u32_e32 %[wa], " MPK_W2_WA_STEP ", %[wa]\n"
             "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
             "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
 #ifdef MPK_W2_T0_MFMA_UNROLLED
@@ -5555,6 +5782,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             "v_add_u32_e32 v17, s13, %[tsa]\n"
 #endif
             "ds_read_u8   v16, v17\n"
+            MPK_W2_KWB
             "ds_read_b128 v[22:25], %[wa]\n"
             "ds_read_u8   v7, %[wsa]\n"
             "ds_read_b128 v[8:11], %[ta]\n"
@@ -5562,7 +5790,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             "s_waitcnt lgkmcnt(5)\n"
 #else
             "s_waitcnt lgkmcnt(0)\n"
-            "v_add_u32_e32 %[wa], 64, %[wa]\n"
+            "v_add_u32_e32 %[wa], " MPK_W2_WA_STEP ", %[wa]\n"
             "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
             "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
 #ifdef MPK_W2_T0_MFMA_UNROLLED
@@ -5572,6 +5800,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             "v_add_u32_e32 v17, s13, %[tsa]\n"
 #endif
             "ds_read_u8   v16, v17\n"
+            MPK_W2_KWB
             "ds_read_b128 v[22:25], %[wa]\n"
             "ds_read_u8   v7, %[wsa]\n"
             "ds_read_b128 v[8:11], %[ta]\n"

@@ -1545,6 +1545,10 @@ def get_compile_command(
             flags = flags + ["-DMPK_PRENORM_AID"]
         if int(os.environ.get("MPK_GAMMA_AID", "0")) == 1:
             flags = flags + ["-DMPK_GAMMA_AID"]
+        if os.environ.get("MPK_W2_KWIN") is not None:
+            _kw = int(os.environ["MPK_W2_KWIN"])
+            assert 0 <= _kw <= 23, "MPK_W2_KWIN is a W2 fragment count 0..23"
+            flags = flags + [f"-DMPK_W2_KWIN={_kw}", f"-DMPK_W2_KWIN_TAIL={23 - _kw}"]
         if int(os.environ.get("MPK_REP_ONLY", "0")) == 1:
             flags = flags + ["-DMPK_REP_ONLY"]
         if int(os.environ.get("MPK_WSF32_REP", "0")) == 1:
