@@ -2172,6 +2172,8 @@ def get_compile_command(
             flags = flags + ["-DMPK_W2_NO_NT"]
         if os.environ.get("MPK_W2_GATHER_NO_NT", "0") == "1":
             flags = flags + ["-DMPK_W2_GATHER_NO_NT"]
+        if os.environ.get("MPK_MOE_REPLICA_SWAP", "0") == "1":
+            flags = flags + ["-DMPK_MOE_REPLICA_SWAP"]
         if os.environ.get("MPK_PPROBE", "0") == "1":
             flags = flags + ["-DMPK_PPROBE"]
         if int(os.environ.get("MPK_PREFETCH_NEXT_QKV", "1")) == 1:

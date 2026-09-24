@@ -685,7 +685,11 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // [2E, n] biases whose upper copy is homed in range 1 (MPK_MOE_REPLICA's
   // layout): the upper AID's XCDs read that copy. Moving the two bases once
   // covers every expert_id-indexed read below.
+#ifdef MPK_MOE_REPLICA_SWAP
+  if (xcd_id < MPK_NUM_XCDS / 2) {
+#else
   if (xcd_id >= MPK_NUM_XCDS / 2) {
+#endif
     d_w13_bias += NUM_EXPERTS * W13_OUTPUT_SIZE;
     d_w2_bias += NUM_EXPERTS * W2_OUTPUT_SIZE;
   }
@@ -993,8 +997,13 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // tensor is [2*NUM_EXPERTS, wgs, bytes] with the upper half a duplicate, and
   // the driver's halves placement puts that upper half in range 1. Routing is
   // untouched -- only which physical copy this XCD loads from.
+#ifdef MPK_MOE_REPLICA_SWAP
+  int const expert_id_rep =
+      expert_id + ((xcd_id >= (MPK_NUM_XCDS / 2)) ? 0 : NUM_EXPERTS);
+#else
   int const expert_id_rep =
       expert_id + ((xcd_id >= (MPK_NUM_XCDS / 2)) ? NUM_EXPERTS : 0);
+#endif
 #else
   int const expert_id_rep = expert_id;
 #endif
