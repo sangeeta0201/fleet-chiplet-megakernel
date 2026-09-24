@@ -130,6 +130,11 @@ __shared__ unsigned short s_ltk_logit[128];
 // use. It gets a raw offset past them instead of a region index. The 2 MiB
 // replica has room to spare.
 constexpr int MPK_AID_MOE_BASE_INTS = 1024;
+// XCD-private barrier counters past the MoE region (~21.5k ints): QKV epoch
+// arrivals, one line per XCD (MPK_AID_QKV_ARRIVE), and split-KV chunk
+// arrivals, one line per head x request (MPK_AID_CHUNK_BAR).
+constexpr int MPK_AID_QKVARR_BASE_INTS = 24576;
+constexpr int MPK_AID_CHUNKBAR_BASE_INTS = 24832;
 
 // routing_ready's eight per-XCD release flags. Own raw offset because the family
 // spans nine lines (an epoch counter at [0] plus [(1+x)*16] for x in 0..7), one

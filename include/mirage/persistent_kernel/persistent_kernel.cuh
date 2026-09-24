@@ -224,6 +224,14 @@ __device__ unsigned int g_il_n[MPK_PHASE_MAX_WORKERS];
       s_il_ts[(k)] = (unsigned int)__builtin_amdgcn_s_memrealtime();          \
   } while (0)
 #endif
+#ifdef MPK_QKV_SUB_LDS
+// QKV epoch and chunk barrier split per worker (iterations >= 40), ns sums:
+// 0 producer drain, 1 arrival atomic, 2 epoch wait, 3 chunk drain, 4 chunk arrival.
+__shared__ unsigned int s_qs_acc[5];
+__shared__ unsigned int s_qs_n[3];  // qkv passes, chunk passes, xcd_id + 1
+__device__ unsigned int g_qs_acc[MPK_PHASE_MAX_WORKERS * 5];
+__device__ unsigned int g_qs_n[MPK_PHASE_MAX_WORKERS * 3];
+#endif
 #ifdef MPK_W13_SUB
 __shared__ unsigned int s_w13_prev;
 __shared__ unsigned int s_w13_acc[10];
@@ -350,6 +358,10 @@ __device__ __forceinline__ void mpk_phase_lds_init() {
     for (int k = 0; k < 3; k++) s_il_acc[k] = 0;
     s_il_n = 0;
 #endif
+#ifdef MPK_QKV_SUB_LDS
+    for (int k = 0; k < 5; k++) s_qs_acc[k] = 0;
+    for (int k = 0; k < 3; k++) s_qs_n[k] = 0;
+#endif
 #ifdef MPK_MOE_LDS
     for (int k = 0; k < 7; k++) s_moe_acc[k] = 0;
     s_moe_n[0] = 0;
@@ -474,6 +486,10 @@ __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
 #ifdef MPK_IL_LDS
     for (int k = 0; k < 3; k++) g_il_acc[worker * 3 + k] = s_il_acc[k];
     g_il_n[worker] = s_il_n;
+#endif
+#ifdef MPK_QKV_SUB_LDS
+    for (int k = 0; k < 5; k++) g_qs_acc[worker * 5 + k] = s_qs_acc[k];
+    for (int k = 0; k < 3; k++) g_qs_n[worker * 3 + k] = s_qs_n[k];
 #endif
 #ifdef MPK_W13_SUB
     for (int k = 0; k < 10; k++) g_w13_acc[worker * 10 + k] = s_w13_acc[k];
@@ -4357,6 +4373,20 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
               printf("[ILSUBW] w=%d n=%u ret=%u setup=%u call=%u\n", w, n_il,
                      g_il_acc[w * 3] / n_il, g_il_acc[w * 3 + 1] / n_il,
                      g_il_acc[w * 3 + 2] / n_il);
+            }
+#endif
+#ifdef MPK_QKV_SUB_LDS
+            for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+              unsigned int const nq = g_qs_n[w * 3], nc = g_qs_n[w * 3 + 1];
+              if (nq == 0 && nc == 0) {
+                continue;
+              }
+              unsigned int const *a = &g_qs_acc[w * 5];
+              printf("[QSUBW] w=%d x=%d nq=%u drain=%u arrive=%u wait=%u nc=%u "
+                     "cdrain=%u carrive=%u\n",
+                     w, (int)g_qs_n[w * 3 + 2] - 1, nq, nq ? a[0] / nq : 0,
+                     nq ? a[1] / nq : 0, nq ? a[2] / nq : 0, nc,
+                     nc ? a[3] / nc : 0, nc ? a[4] / nc : 0);
             }
 #endif
 #ifdef MPK_W13_SUB

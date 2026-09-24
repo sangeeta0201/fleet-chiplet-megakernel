@@ -824,6 +824,14 @@ __device__ __noinline__ void
 #endif
   {
     __shared__ int s_prev;
+#ifdef MPK_QKV_SUB_LDS
+    unsigned int qs_t0 = 0, qs_t1 = 0, qs_t2 = 0;
+    bool const qs_on = (qkv_epoch_expected > 1440);
+    if (tid == 0) {
+      qs_t0 = (unsigned int)__builtin_amdgcn_s_memrealtime();
+      s_qs_n[2] = xcd_id + 1;
+    }
+#endif
 #ifdef MPK_QKV_EPOCH_PRODUCER_DRAIN
     // Publish this workgroup's Q/K/V stores into this XCD's L2 before the
     // arrival atomic. Same intra-XCD pattern as the Phase 4 chunk barrier:
@@ -834,6 +842,9 @@ __device__ __noinline__ void
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     __syncthreads();
 #endif
+#ifdef MPK_QKV_SUB_LDS
+    if (tid == 0) qs_t1 = (unsigned int)__builtin_amdgcn_s_memrealtime();
+#endif
     if (tid == 0) {
       // Both counters on this barrier are XCD-private: the arrival line is
       // `[xcd_id]` and the epoch line is `[xcd_id * 16]`, and the only reader
@@ -842,10 +853,21 @@ __device__ __noinline__ void
       // atomic out to the device coherency point was buying visibility to
       // nobody. `sc0` keeps them in this XCD's L2 where every participant
       // already is.
+#if defined(MPK_AID_QKV_ARRIVE) && defined(MPK_AID_SPLIT_FLAGS)
+      int *const qkv_arr_rep = g_aid_flag_rep[xcd_id >> 2];
+      s_prev = MPK_XCD_LOCAL_ATOM_ADD(
+          qkv_arr_rep ? qkv_arr_rep + MPK_AID_QKVARR_BASE_INTS + xcd_id * 16
+                      : &static_cast<int *>(input_ptrs[7])[xcd_id],
+          1);
+#else
       s_prev = MPK_XCD_LOCAL_ATOM_ADD(
           &static_cast<int *>(input_ptrs[7])[xcd_id], 1);
+#endif
     }
     __syncthreads();
+#ifdef MPK_QKV_SUB_LDS
+    if (tid == 0) qs_t2 = (unsigned int)__builtin_amdgcn_s_memrealtime();
+#endif
 
     if ((s_prev % qkv_epoch_participants) == qkv_epoch_participants - 1) {
       // Last worker to arrive: bump epoch (no reset needed — modular check)
@@ -873,6 +895,15 @@ __device__ __noinline__ void
 #endif
     }
     __syncthreads();
+#ifdef MPK_QKV_SUB_LDS
+    if (tid == 0 && qs_on) {
+      unsigned int const qs_t3 = (unsigned int)__builtin_amdgcn_s_memrealtime();
+      s_qs_acc[0] += (qs_t1 - qs_t0) * 10;
+      s_qs_acc[1] += (qs_t2 - qs_t1) * 10;
+      s_qs_acc[2] += (qs_t3 - qs_t2) * 10;
+      s_qs_n[0]++;
+    }
+#endif
     // The agent-scope fence above is LOAD-BEARING unless the producer already
     // drained Q/K/V into this XCD's L2 before arriving (MPK_QKV_EPOCH_PRODUCER_DRAIN).
     // Do not drop it alone (MPK_QKV_GATE_NO_AGENT_FENCE): that is a ctx-4096
@@ -1064,17 +1095,42 @@ __device__ __noinline__ void
       // carries no vmcnt guarantee for the *other* waves. Draining before the
       // barrier makes the rendezvous the point at which all four waves are
       // known to have retired, which is what the arrival needs to publish.
+#ifdef MPK_QKV_SUB_LDS
+      unsigned int cs_t0 = 0, cs_t1 = 0;
+      bool const cs_on = (qkv_epoch_expected > 1440);
+      if (tid == 0) cs_t0 = (unsigned int)__builtin_amdgcn_s_memrealtime();
+#endif
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       __syncthreads();
+#ifdef MPK_QKV_SUB_LDS
+      if (tid == 0) cs_t1 = (unsigned int)__builtin_amdgcn_s_memrealtime();
+#endif
       __shared__ int s_chunk_prev;
       if (tid == 0) {
         // XCD-private counter: the line is indexed by this worker's own
         // `xcd_id`, and its only reader is the `% NUM_KV_CHUNKS` test right
         // below on the same XCD. See MPK_XCD_LOCAL_BARRIER at the top.
+#if defined(MPK_AID_CHUNK_BAR) && defined(MPK_AID_SPLIT_FLAGS)
+        int *const chunk_rep = g_aid_flag_rep[xcd_id >> 2];
+        s_chunk_prev = MPK_XCD_LOCAL_ATOM_ADD(
+            chunk_rep ? chunk_rep + MPK_AID_CHUNKBAR_BASE_INTS +
+                            (attn_kv_head * NUM_REQS + attn_req) * 16
+                      : &chunk_barrier[(attn_kv_head * NUM_REQS + attn_req) * 16],
+            1);
+#else
         s_chunk_prev = MPK_XCD_LOCAL_ATOM_ADD(
             &chunk_barrier[(attn_kv_head * NUM_REQS + attn_req) * 16], 1);
+#endif
       }
       __syncthreads();
+#ifdef MPK_QKV_SUB_LDS
+      if (tid == 0 && cs_on) {
+        unsigned int const cs_t2 = (unsigned int)__builtin_amdgcn_s_memrealtime();
+        s_qs_acc[3] += (cs_t1 - cs_t0) * 10;
+        s_qs_acc[4] += (cs_t2 - cs_t1) * 10;
+        s_qs_n[1]++;
+      }
+#endif
 
       if ((s_chunk_prev % NUM_KV_CHUNKS) == NUM_KV_CHUNKS - 1) {
         // Last chunk worker: run merge (no reset needed — modular check)

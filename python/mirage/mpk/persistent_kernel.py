@@ -445,6 +445,8 @@ def get_compile_command(
             flags = flags + ["-DMPK_W13_SUB"]
         if int(os.environ.get("MPK_IL_LDS", "0")) == 1:
             flags = flags + ["-DMPK_IL_LDS"]
+        if int(os.environ.get("MPK_QKV_SUB_LDS", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_SUB_LDS"]
         if int(os.environ.get("MPK_W13_REC_BATCH", "0")) > 1:
             flags = flags + [f"-DMPK_W13_REC_BATCH={int(os.environ['MPK_W13_REC_BATCH'])}"]
         if int(os.environ.get("MPK_W13_REC_AHEAD1", "0")) == 1:
@@ -1590,6 +1592,10 @@ def get_compile_command(
             flags = flags + ["-DMPK_ONLY_OP=" + str(int(_only_op))]
         if int(os.environ.get("MPK_AID_SPLIT_QKV", "0")) == 1:
             flags = flags + ["-DMPK_AID_SPLIT_QKV"]
+        if int(os.environ.get("MPK_AID_QKV_ARRIVE", "0")) == 1:
+            flags = flags + ["-DMPK_AID_QKV_ARRIVE"]
+        if int(os.environ.get("MPK_AID_CHUNK_BAR", "0")) == 1:
+            flags = flags + ["-DMPK_AID_CHUNK_BAR"]
         if int(os.environ.get("MPK_AID_SPLIT_ATTNOUT", "0")) == 1:
             flags = flags + ["-DMPK_AID_SPLIT_ATTNOUT"]
         if int(os.environ.get("MPK_NARROW_MOE_BAR_POLL", "0")) == 1:
