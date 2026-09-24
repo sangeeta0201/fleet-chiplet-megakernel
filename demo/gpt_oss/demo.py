@@ -501,7 +501,13 @@ _OWN_BO_KEEPALIVE = []
 _MOE_RW_KEEPALIVE = []
 
 
-def _own_bo_maybe(t, name):
+# Allocations whose used region is only the first half: the split point is at
+# a quarter of the tensor (MPK_ATTN_SPLIT_CHUNK helper partials, off by default,
+# live in the second half).
+_OWN_BO_SPLIT = {"ck_fmha_lse_acc": 0.25, "ck_fmha_o_acc": 0.25}
+
+
+def _own_bo_maybe(t, name, scratch=False):
     """[BOMAP] / own-BO copy for one attached tensor (see MPK_OWN_BO_PAT).
 
     MPK_KV_OWN_BO=1 also copies each layer's K and V cache. The copy is
@@ -513,15 +519,19 @@ def _own_bo_maybe(t, name):
     pats = [p for p in os.environ.get("MPK_OWN_BO_PAT", "").split(",") if p]
     kv = "k_cache" in name or "v_cache" in name
     kv_own = kv and os.environ.get("MPK_KV_OWN_BO", "0") == "1"
+    forced = scratch and name in os.environ.get("MPK_OWN_BO_SCRATCH", "").split(",")
+    if scratch and not forced:
+        # make_tensor buffers move only when named exactly, never by pattern.
+        return t
     if kv_own and os.environ.get("MPK_KV_HEAD_MAJOR", "0") != "1":
         # NHD keeps a token's heads side by side: its midpoint is a position
         # cut, which puts every head of the early positions in range 0.
         print(f"[KVOWN] {name}: needs MPK_KV_HEAD_MAJOR=1, not copying", flush=True)
         kv_own = False
-    if not (bomap or pats or kv_own) or not isinstance(t, torch.Tensor) or not t.is_cuda:
+    if not (bomap or pats or kv_own or forced) or not isinstance(t, torch.Tensor) or not t.is_cuda:
         return t
     n = t.numel() * t.element_size()
-    if n < (1 << 20) and not any(p in name for p in pats):
+    if n < (1 << 20) and not any(p in name for p in pats) and not forced:
         return t
     import ctypes as _ct
     hip = _ct.CDLL("libamdhip64.so")
@@ -538,7 +548,7 @@ def _own_bo_maybe(t, name):
     b, s, off, f = where(t)
     # Already its own BO and cut at the midpoint: halves placement is right.
     placed = off == 0 and s < n + (4 << 20) and abs(f - 0.5) < 0.05
-    copy = (((any(p in name for p in pats) and not kv) or kv_own)
+    copy = (((any(p in name for p in pats) and not kv) or kv_own or forced)
             and t.is_contiguous() and not placed)
     if bomap:
         print(f"[BOMAP] {name} n={n} bo=+{s} off={off} in_first_half={f:.3f}"
@@ -546,13 +556,14 @@ def _own_bo_maybe(t, name):
     if not copy:
         return t
     ptr = _ct.c_void_p()
-    if os.environ.get("MPK_OWN_BO_ALIGN", "0") == "1" or kv_own:
-        # Midpoint on the halves cut: BO of 2*ALIGN_UP(n/2, 2 MiB), tensor
-        # offset so that off + n/2 == size/2 (to 256 B).
+    if os.environ.get("MPK_OWN_BO_ALIGN", "0") == "1" or kv_own or forced:
+        # Split point on the halves cut: BO of 2*ALIGN_UP(max side, 2 MiB),
+        # tensor offset so that off + split == size/2 (to 256 B).
         chunk = 2 << 20
-        half = -(-((n + 1) // 2) // chunk) * chunk
+        split = int(n * _OWN_BO_SPLIT.get(name, 0.5)) if forced else n // 2
+        half = -(-max(split, n - split) // chunk) * chunk
         bo_n = 2 * half
-        off_in = ((half - n // 2) // 256) * 256
+        off_in = ((half - split) // 256) * 256
     else:
         bo_n, off_in = n, 0
     rc = hip.hipMalloc(_ct.byref(ptr), _ct.c_size_t(bo_n))
@@ -571,9 +582,10 @@ def _own_bo_maybe(t, name):
     own = torch.as_tensor(cai, device="cuda").view(t.dtype).view(t.shape)
     own.copy_(t)
     torch.cuda.synchronize()
-    if bomap or kv_own:
+    if bomap or kv_own or forced:
         b2, s2, off2, f2 = where(own)
-        print(f"[{'KVOWN' if kv_own else 'BOMAP'}] {name}(own BO) n={n} bo=+{s2} "
+        tag = "KVOWN" if kv_own else ("PART" if forced else "BOMAP")
+        print(f"[{tag}] {name}(own BO) n={n} bo=+{s2} "
               f"off={off2} in_first_half={f2:.3f}", flush=True)
     _OWN_BO_KEEPALIVE.append((hip, ptr, own))
     return own
@@ -2315,6 +2327,7 @@ if __name__ == "__main__":
                       f"@ 0x{t.data_ptr():x}", flush=True)
             else:
                 t = torch.zeros(dims, dtype=torch_dtype, device="cuda")
+                t = _own_bo_maybe(t, name, scratch=True)
             _tensor_refs[name] = t
             if args.verify:
                 verify_tensors[name] = t
@@ -2354,6 +2367,8 @@ if __name__ == "__main__":
         lse_dim1 = lse_dim1 * 2
         ck_fmha_lse_acc_tensor = _dev_or_unc(
             (bs, lse_dim1), torch.float32, "ck_fmha_lse_acc")
+        ck_fmha_lse_acc_tensor = _own_bo_maybe(
+            ck_fmha_lse_acc_tensor, "ck_fmha_lse_acc", scratch=True)
         ck_fmha_lse_acc = mpk.attach_input(
             torch_tensor=ck_fmha_lse_acc_tensor, name="ck_fmha_lse_acc")
         if args.verify:
@@ -2367,6 +2382,8 @@ if __name__ == "__main__":
             o_acc_dim1 = num_local_kv_heads * ck_fmha_num_kv_chunks * num_qo_per_kv * head_dim * 2
             ck_fmha_o_acc_tensor = _dev_or_unc(
                 (bs, o_acc_dim1), torch.float32, "ck_fmha_o_acc")
+            ck_fmha_o_acc_tensor = _own_bo_maybe(
+                ck_fmha_o_acc_tensor, "ck_fmha_o_acc", scratch=True)
             ck_fmha_o_acc = mpk.attach_input(
                 torch_tensor=ck_fmha_o_acc_tensor, name="ck_fmha_o_acc")
             if args.verify:
