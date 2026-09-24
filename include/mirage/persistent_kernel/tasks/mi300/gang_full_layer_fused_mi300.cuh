@@ -722,6 +722,18 @@ __device__ __noinline__ void
     int const qkv_tile = qkv_attn_rank;
 #endif
 #if !defined(MPK_ONLY_OP) || (MPK_ONLY_OP & (1 << 1))
+#ifdef MPK_RESID_REP
+#ifndef MPK_AID_SPLIT_OUT
+#error "MPK_RESID_REP reads the MPK_AID_SPLIT_OUT replica"
+#endif
+    void const *const _pro_resid =
+        (input_ptrs[1] == output_ptrs[5])
+            ? mpk_aid_out_base(input_ptrs[1], xcd_id,
+                               QKV_BATCH_SIZE * QKV_REDUCTION_SIZE * 2)
+            : input_ptrs[1];
+#else
+    void const *const _pro_resid = input_ptrs[1];
+#endif
     gang_resaddf32_rmsnorm_linear_mxfp4_bias_kvupd_kernel<QKV_BATCH_SIZE,
                                                           QKV_OUTPUT_PER_WG,
                                                           QKV_REDUCTION_SIZE,
@@ -730,7 +742,7 @@ __device__ __noinline__ void
                                                           NUM_Q_PER_KV,
                                                           PAGE_SIZE>(
         input_ptrs[0],
-        input_ptrs[1],
+        _pro_resid,
         input_ptrs[2],
         input_ptrs[3],
         input_ptrs[4],

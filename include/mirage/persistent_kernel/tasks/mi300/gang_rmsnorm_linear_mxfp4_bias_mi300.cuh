@@ -2071,6 +2071,10 @@ __device__ __noinline__ void gang_resaddf32_rmsnorm_linear_mxfp4_bias_kernel(
 #else
     float *d_ws = (float *)workspace_f32_ptr;
 #endif
+#ifdef MPK_WSF32_REP
+    if (float *wsr = mpk_wsf32_rep((int)(kernel::mpk_prenorm_xcc() & 0x7) >> 2))
+      d_ws = wsr;
+#endif
     unsigned short const *d_residual = (unsigned short const *)residual_ptr;
     unsigned short *d_x_out = (unsigned short *)x_output_ptr;
     unsigned short const *d_norm_w = (unsigned short const *)norm_weight_ptr;
@@ -2731,6 +2735,10 @@ __device__ __noinline__ void
                        : 0);
 #else
     float *d_ws = (float *)workspace_f32_ptr;
+#endif
+#ifdef MPK_WSF32_REP
+    if (float *wsr = mpk_wsf32_rep((int)(kernel::mpk_prenorm_xcc() & 0x7) >> 2))
+      d_ws = wsr;
 #endif
     unsigned short const *d_residual = (unsigned short const *)residual_ptr;
     unsigned short *d_x_out = (unsigned short *)x_output_ptr;

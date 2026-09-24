@@ -85,6 +85,15 @@ __device__ __forceinline__ void moe_residual_add_f32_mi300_impl(
 
   for (int row = 0; row < BATCH_SIZE; ++row) {
     float *ws_row = d_ws + moe_ws_offset(row, 0, OUTPUT_STRIDE);
+    float *ws_rd = ws_row;
+#ifdef MPK_WSF32_REP
+    float *ws_z0 = nullptr, *ws_z1 = nullptr;
+    if (float *wsr = mpk_wsf32_rep(mpk_hof_aid())) {
+      ws_rd = wsr + moe_ws_offset(row, 0, OUTPUT_STRIDE);
+      ws_z0 = mpk_wsf32_rep(0) + moe_ws_offset(row, 0, OUTPUT_STRIDE);
+      ws_z1 = mpk_wsf32_rep(1) + moe_ws_offset(row, 0, OUTPUT_STRIDE);
+    }
+#endif
     unsigned short const *res_row = d_res + row * OUTPUT_STRIDE;
     unsigned short *out_row = d_out + row * OUTPUT_STRIDE;
 
@@ -101,8 +110,14 @@ __device__ __forceinline__ void moe_residual_add_f32_mi300_impl(
       // and add it to the embedding, which is exactly the double-count this
       // zero pass exists to prevent.
       float4 ws4;
-      __builtin_memcpy(&ws4, ws_row + off, 16);
+      __builtin_memcpy(&ws4, ws_rd + off, 16);
       st_wt_zero128(ws_row + off);
+#ifdef MPK_WSF32_REP
+      if (ws_z0) {
+        st_wt_zero128(ws_z0 + off);
+        st_wt_zero128(ws_z1 + off);
+      }
+#endif
       #ifdef MPK_WSF32_AID
       // This task runs on ONE XCD but the next iteration's layer 0 reads the
       // workspace on all 8, so with a copy per range BOTH must be zeroed or
@@ -112,8 +127,14 @@ __device__ __forceinline__ void moe_residual_add_f32_mi300_impl(
 #pragma unroll
       for (int s = 1; s < MOE_WS_SLOTS; s++) {
         float4 slot4;
-        __builtin_memcpy(&slot4, ws_row + s * OUTPUT_STRIDE + off, 16);
+        __builtin_memcpy(&slot4, ws_rd + s * OUTPUT_STRIDE + off, 16);
         st_wt_zero128(ws_row + s * OUTPUT_STRIDE + off);
+#ifdef MPK_WSF32_REP
+        if (ws_z0) {
+          st_wt_zero128(ws_z0 + s * OUTPUT_STRIDE + off);
+          st_wt_zero128(ws_z1 + s * OUTPUT_STRIDE + off);
+        }
+#endif
         #ifdef MPK_WSF32_AID
         // This task runs on ONE XCD but the next iteration's layer 0 reads the
         // workspace on all 8, so with a copy per range BOTH must be zeroed or

@@ -530,6 +530,9 @@ __device__ __forceinline__ void
         memcpy(&lo, &v0, 2);
         memcpy(&hi, &v1, 2);
         packed = lo | ((uint32_t)hi << 16);
+#if defined(MPK_REP_ONLY) && defined(MPK_AID_SPLIT_ATTNOUT) && defined(MPK_AID_SPLIT_FLAGS)
+        if (!mpk_aid_attnout_live())
+#endif
         st_wt_u32((void *)&output_ptr[out_offset_base + i], packed);
 #if defined(MPK_AID_SPLIT_ATTNOUT) && defined(MPK_AID_SPLIT_FLAGS)
         // Mirror into both AID replicas so the O-proj reads this slice from

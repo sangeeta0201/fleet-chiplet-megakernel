@@ -5885,7 +5885,18 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                      (acc[1] + bv1) * pf_rw,
                      (acc[2] + bv2) * pf_rw,
                      (acc[3] + bv3) * pf_rw};
+        #if defined(MPK_REP_ONLY) && defined(MPK_WSF32_REP)
+        if (!mpk_wsf32_rep(0))
+        #endif
         st_wt_f32x4(&d_workspace_f32[ws_base], wv);
+        #ifdef MPK_WSF32_REP
+        static_assert(BATCH_SIZE * MOE_WS_SLOTS * HIDDEN_SIZE <= MPK_AID_WSF32_INTS,
+                      "MoE workspace exceeds its replica region");
+        if (float *wsr0 = mpk_wsf32_rep(0)) {
+          st_wt_f32x4(&wsr0[ws_base], wv);
+          st_wt_f32x4(&mpk_wsf32_rep(1)[ws_base], wv);
+        }
+        #endif
         #ifdef MPK_WSF32_AID
         // Mirror into the other range's copy. Writers own disjoint
         // columns, so each AID cannot rebuild the row alone.
@@ -6170,7 +6181,18 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                        (acc[1] + bv1) * pf_rw,
                        (acc[2] + bv2) * pf_rw,
                        (acc[3] + bv3) * pf_rw};
+          #if defined(MPK_REP_ONLY) && defined(MPK_WSF32_REP)
+          if (!mpk_wsf32_rep(0))
+          #endif
           st_wt_f32x4(&d_workspace_f32[ws_base], wv);
+          #ifdef MPK_WSF32_REP
+          static_assert(BATCH_SIZE * MOE_WS_SLOTS * HIDDEN_SIZE <= MPK_AID_WSF32_INTS,
+                        "MoE workspace exceeds its replica region");
+          if (float *wsr0 = mpk_wsf32_rep(0)) {
+            st_wt_f32x4(&wsr0[ws_base], wv);
+            st_wt_f32x4(&mpk_wsf32_rep(1)[ws_base], wv);
+          }
+          #endif
           #ifdef MPK_WSF32_AID
           // Mirror into the other range's copy. Writers own disjoint
           // columns, so each AID cannot rebuild the row alone.

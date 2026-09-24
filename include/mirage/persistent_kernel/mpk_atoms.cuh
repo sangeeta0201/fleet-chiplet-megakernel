@@ -183,6 +183,25 @@ constexpr int MPK_AID_L2CLEAN_BASE_INTS = 294912;
 // and read with sc0 sc1 by every W13 tile on that AID. One 5888 B row at
 // bs=1, clear of SWIGLU (200704..206592) and L2CLEAN.
 constexpr int MPK_AID_W13HOF_BASE_INTS = 262144;
+// MoE f32 output workspace (MPK_WSF32_REP): one copy per AID, stored
+// write-through by every W2 tile into both and read by the next layer's QKV
+// prologue from its own AID's copy, so that read needs no L2 invalidate.
+// 24576 ints (96 KiB), clear of L2CLEAN (294912 + 8 * 32) and ATTNOUT (327680).
+constexpr int MPK_AID_WSF32_BASE_INTS = 303104;
+constexpr int MPK_AID_WSF32_INTS = 24576;
+#ifdef MPK_WSF32_REP
+#ifndef MPK_AID_SPLIT_FLAGS
+#error "MPK_WSF32_REP needs the MPK_AID_SPLIT_FLAGS replicas"
+#endif
+#ifdef MPK_WSF32_AID
+#error "MPK_WSF32_REP replaces MPK_WSF32_AID's torch-doubled copy"
+#endif
+#endif
+__device__ __forceinline__ float *mpk_wsf32_rep(int aid) {
+  return (g_aid_flag_rep[0] != nullptr && g_aid_flag_rep[1] != nullptr)
+             ? (float *)(g_aid_flag_rep[aid] + MPK_AID_WSF32_BASE_INTS)
+             : nullptr;
+}
 #ifdef MPK_W13_HOF_AIDREP
 #ifndef MPK_AID_SPLIT_FLAGS
 #error "MPK_W13_HOF_AIDREP needs the MPK_AID_SPLIT_FLAGS replicas"

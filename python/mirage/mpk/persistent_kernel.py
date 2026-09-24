@@ -1499,6 +1499,8 @@ def get_compile_command(
         if int(os.environ.get("MPK_ROUTING_NARROW_AID", "0")) == 1:
             # Routing release: one slot per AID replica, polled locally.
             flags = flags + ["-DMPK_ROUTING_NARROW_AID"]
+        if int(os.environ.get("MPK_RESID_REP", "0")) == 1:
+            flags = flags + ["-DMPK_RESID_REP"]
         if int(os.environ.get("MPK_AID_SPLIT_OUT", "0")) == 1:
             flags = flags + ["-DMPK_AID_SPLIT_OUT"]
         if int(os.environ.get("MPK_AID_EVCTR2", "0")) == 1:
@@ -1543,6 +1545,10 @@ def get_compile_command(
             flags = flags + ["-DMPK_PRENORM_AID"]
         if int(os.environ.get("MPK_GAMMA_AID", "0")) == 1:
             flags = flags + ["-DMPK_GAMMA_AID"]
+        if int(os.environ.get("MPK_REP_ONLY", "0")) == 1:
+            flags = flags + ["-DMPK_REP_ONLY"]
+        if int(os.environ.get("MPK_WSF32_REP", "0")) == 1:
+            flags = flags + ["-DMPK_WSF32_REP"]
         if int(os.environ.get("MPK_WSF32_AID", "0")) == 1:
             flags = flags + ["-DMPK_WSF32_AID"]
         if int(os.environ.get("MPK_LMHEAD_DEDICATED", "0")) == 1:
