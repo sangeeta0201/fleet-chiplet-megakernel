@@ -325,7 +325,7 @@ def get_compile_command(
             cc,
             "-x", "hip",
             file_name,
-            "-O2",  # -O3 causes LLVM AMDGPU register allocator to hang on large fused kernels
+            os.environ.get("MPK_HIP_OPT", "-O2"),  # -O3 hung the AMDGPU register allocator on large fused kernels once; upstream now defaults to -O3
             "--save-temps",  # TEMP: dump assembly for v_mov analysis
             # Omit -lineinfo for ROCm: hipcc forwards it to ld.lld which treats it as -l lineinfo
             f"-I{py_include_dir}",

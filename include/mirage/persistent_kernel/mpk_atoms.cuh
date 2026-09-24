@@ -35,6 +35,31 @@
 #include <atomic>
 #endif
 
+// ---------------------------------------------------------------------------
+// KV cache layout selector.
+//
+// Default NHD: (layers, pages, page_size, kv_heads, head_dim). Heads are an
+// INNER dim, so head x is strided across the whole cache and cannot be placed
+// in one AID -- which is why the kvupd kernel calls it an "un-partitioned
+// base".
+//
+// MPK_KV_HEAD_MAJOR selects H*ND: (layers, kv_heads, pages, page_size,
+// head_dim). Head x becomes contiguous, so halves placement puts heads 0-3 in
+// range 0 and 4-7 in range 1, and since attn_kv_head == xcd_id each XCD then
+// reads only its own AID.
+//
+// Every KV address in the tree is `tok * tok_stride + head * head_stride`.
+// Only the token stride was ever a parameter; these two macros make both
+// strides explicit so one expression serves either layout.
+#define MPK_KV_TOTAL_TOKENS ((long long)MPK_MAX_NUM_PAGES * MPK_PAGE_SIZE)
+#ifdef MPK_KV_HEAD_MAJOR
+#define MPK_KV_HEAD_OFF(h, hd) ((size_t)(h) * (size_t)MPK_KV_TOTAL_TOKENS * (hd))
+#define MPK_KV_TOK_STRIDE(hd, kvs) (hd)
+#else
+#define MPK_KV_HEAD_OFF(h, hd) ((size_t)(h) * (size_t)(hd))
+#define MPK_KV_TOK_STRIDE(hd, kvs) (kvs)
+#endif
+
 #ifdef MPK_AID_SPLIT_FLAGS
 // The two COHERENT AID-local flag replicas, [0] homed in AID0 and [1] in AID1,
 // each holding eight per-XCD flags one 64 B line apart. Populated once by the
@@ -61,30 +86,6 @@ __device__ void **g_aid_ml_out[2];
 // oproj_topk_counters, which demo.py clears wholesale between launches.
 constexpr int MPK_AID_REGION_INTS = 8 * 16; // eight 64 B lines
 constexpr int MPK_AID_REGION_ATTN_RELEASE = 0;
-// ---------------------------------------------------------------------------
-// KV cache layout selector.
-//
-// Default NHD: (layers, pages, page_size, kv_heads, head_dim). Heads are an
-// INNER dim, so head x is strided across the whole cache and cannot be placed
-// in one AID -- which is why the kvupd kernel calls it an "un-partitioned
-// base".
-//
-// MPK_KV_HEAD_MAJOR selects H*ND: (layers, kv_heads, pages, page_size,
-// head_dim). Head x becomes contiguous, so halves placement puts heads 0-3 in
-// range 0 and 4-7 in range 1, and since attn_kv_head == xcd_id each XCD then
-// reads only its own AID.
-//
-// Every KV address in the tree is `tok * tok_stride + head * head_stride`.
-// Only the token stride was ever a parameter; these two macros make both
-// strides explicit so one expression serves either layout.
-#define MPK_KV_TOTAL_TOKENS ((long long)MPK_MAX_NUM_PAGES * MPK_PAGE_SIZE)
-#ifdef MPK_KV_HEAD_MAJOR
-#define MPK_KV_HEAD_OFF(h, hd) ((size_t)(h) * (size_t)MPK_KV_TOTAL_TOKENS * (hd))
-#define MPK_KV_TOK_STRIDE(hd, kvs) (hd)
-#else
-#define MPK_KV_HEAD_OFF(h, hd) ((size_t)(h) * (size_t)(hd))
-#define MPK_KV_TOK_STRIDE(hd, kvs) (kvs)
-#endif
 
 constexpr int MPK_AID_REGION_LAYER_RELEASE = 1; // reserved, see slot 10 note
 constexpr int MPK_AID_REGION_OPROJ_READY = 2; // MPK_ROUTER_XCD_FOLD only
