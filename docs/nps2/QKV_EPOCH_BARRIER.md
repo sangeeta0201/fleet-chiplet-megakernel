@@ -11,10 +11,13 @@ Both move to XCD-private 64 B slots on each AID's RW flag replica
 `MPK_AID_CHUNKBAR_BASE_INTS = 24832`). Each counter is still touched only by
 its own die, so no multi-XCD atomic lands on a replica line.
 
-MI355X, perbo driver, 16-token output hash `3d54adb71e19` on every run.
-The 5,200-token outputs are byte-identical across NPS2 without the fix, NPS2
-with it and NPS1 with it. "31 chunks" means `CK_FMHA_NUM_KV_CHUNKS=31`, the
-split a 5,200-token run compiles to, applied to a 16-token run.
+MI355X, perbo driver, 16-token output hash `3d54adb71e19` on every run; that
+hash is the correctness gate. The 5,200-token outputs are not a gate: every
+pair of long runs, including NPS2 against NPS1 on the same code, splits
+around character 900 inside a repeated "**Answer:** Paris." loop, where
+continuing or closing the turn is a near-tie. "31 chunks" means
+`CK_FMHA_NUM_KV_CHUNKS=31`, the split a 5,200-token run compiles to, applied
+to a 16-token run.
 
 ## End to end, `[FWD_PASS_TOTAL] avg_ms`
 
