@@ -447,6 +447,8 @@ def get_compile_command(
             flags = flags + ["-DMPK_IL_LDS"]
         if int(os.environ.get("MPK_W13_REC_BATCH", "0")) > 1:
             flags = flags + [f"-DMPK_W13_REC_BATCH={int(os.environ['MPK_W13_REC_BATCH'])}"]
+        if int(os.environ.get("MPK_W13_REC_AHEAD1", "0")) == 1:
+            flags = flags + ["-DMPK_W13_REC_AHEAD1"]
         if int(os.environ.get("MPK_MOE_LDS", "0")) == 1:
             flags = flags + ["-DMPK_MOE_LDS"]
         if int(os.environ.get("MPK_MOE_INLINE", "0")) == 1:

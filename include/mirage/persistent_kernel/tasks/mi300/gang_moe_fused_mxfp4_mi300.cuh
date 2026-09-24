@@ -259,6 +259,21 @@ namespace kernel {
 #define MPK_W13_REC_FLUSH                                                      \
   ".rept MPK_W13_REC_PEND_%=\n" MPK_W13_REC_ISSUE1 ".endr\n"
 #endif
+#ifdef MPK_W13_REC_AHEAD1
+#if !defined(MPK_W13_KMAJOR_RECYCLE)
+#error "MPK_W13_REC_AHEAD1 needs MPK_W13_KMAJOR_RECYCLE"
+#endif
+#if defined(MPK_W13_REC_BATCH) || defined(MPK_W13_REC_FIFO) ||                 \
+    defined(MPK_W13_RECYCLE_EARLY_ISSUE) || defined(MPK_W13_REC_POST_WAIT) ||  \
+    defined(MPK_W13_REC_DOUBLE_ISSUE) || defined(MPK_W13_REC_DRAIN_T0) ||      \
+    defined(MPK_W13_REC_NO_LOOP_WAIT) || defined(MPK_W13_REC_LOOP_VMCNT21) ||  \
+    defined(MPK_W13_REC_HEAD_VMCNT21) || defined(MPK_W13_T0_LAST_REC_EARLY) || \
+    defined(MPK_W13_T1_DS_UNDER_SWIGLU) || defined(MPK_W13_T1_WAIT_BEFORE_ACC) || \
+    defined(MPK_W13_T1_HEAD_PF_B1) || defined(MPK_W13_T1_WAIT_UNDER_STORE) ||  \
+    defined(MPK_W13_RECYCLE_EAGER_DRAIN) || defined(MPK_W13_RECYCLE_PAIR_WAIT)
+#error "MPK_W13_REC_AHEAD1 retimes the canonical recycle waits; not with other recycle/T1-head knobs"
+#endif
+#endif
 #if defined(MPK_W13_T1_HEAD_VMCNT21) && !defined(MPK_W13_KMAJOR_RECYCLE)
 #error "MPK_W13_T1_HEAD_VMCNT21 requires MPK_W13_KMAJOR_RECYCLE"
 #endif
@@ -1310,6 +1325,11 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                           mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END,
                   "W13 LDS weight tiles exceed MI350X LDS budget");
     uint8_t *lds_w13_base = (uint8_t *)_fused_smem + LDS_W13_OFF;
+#ifdef MPK_W13_REC_AHEAD1
+    static_assert(W13_TILE_DATA + 1024 <= W13_TILE_DATA_PADDED &&
+                      W13_TILE_DATA == 23 * 1024,
+                  "MPK_W13_REC_AHEAD1 needs a free 24th KiB in each wave's tile");
+#endif
 #ifdef MPK_W13_REC_FIFO
     // Two K128 T1 fragments (2 KiB) per wave, disjoint from the live T0 tile
     // so recycle of f0/f1 is not a WAR on slots T0 is still reading. T1's
@@ -2246,6 +2266,11 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
               "s_waitcnt vmcnt(0)\n"
 #elif defined(MPK_W13_REC_HEAD_VMCNT21)
               "s_waitcnt vmcnt(21)\n"
+#elif defined(MPK_W13_REC_AHEAD1)
+              "s_add_u32 m0, %[t1_lds_base], 0x5c00\n"
+              "buffer_load_dwordx4 %[t1_voff], %[t1_rsrc], 0 offen sc0 nt lds\n"
+              "v_add_u32_e32 %[t1_voff], 0x400, %[t1_voff]\n"
+              "s_waitcnt vmcnt(23)\n"
 #else
               "s_waitcnt vmcnt(22)\n"
 #endif
@@ -2447,6 +2472,8 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #if !defined(MPK_W13_REC_DRAIN_T0) && !defined(MPK_W13_REC_NO_LOOP_WAIT)
 #ifdef MPK_W13_REC_LOOP_VMCNT21
               "s_waitcnt vmcnt(21)\n"
+#elif defined(MPK_W13_REC_AHEAD1)
+              "s_waitcnt vmcnt(23)\n"
 #else
               "s_waitcnt vmcnt(22)\n"
 #endif
@@ -2531,7 +2558,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
               "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], "
               "v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
 #if !defined(MPK_W13_RECYCLE_EARLY_ISSUE) &&                                     \
-    !defined(MPK_W13_T0_LAST_REC_EARLY)
+    !defined(MPK_W13_T0_LAST_REC_EARLY) && !defined(MPK_W13_REC_AHEAD1)
 #ifdef MPK_W13_REC_BATCH
               MPK_W13_REC_FLUSH
 #endif
@@ -3700,6 +3727,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                 lds_w13_fifo + warp_id * W13_REC_FIFO_BYTES + lane_id * 16);
             unsigned t1_f2_addr = (unsigned)(uintptr_t)(lds_w13_data + 0x800 +
                                                         lane_id * 16);
+#elif defined(MPK_W13_REC_AHEAD1)
+            unsigned w_addr =
+                (unsigned)(uintptr_t)(lds_w13_data + 0x5c00 + lane_id * 16);
 #else
             unsigned w_addr =
                 (unsigned)(uintptr_t)(lds_w13_data + lane_id * 16);
@@ -3782,6 +3812,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                 "ds_read_b128 v[8:11], %[ta]\n"
                 "ds_read_b128 v[12:15], %[ta] offset:64\n"
                 "ds_read_u8   v16, %[tsa]\n"
+#ifdef MPK_W13_REC_AHEAD1
+                "v_add_u32_e32 %[wa], 0xffffa000, %[wa]\n"
+#endif
 #ifdef MPK_W13_T1_HEAD_PF_B1
                 "v_add_u32_e32 %[wa], 0x400, %[wa]\n"
                 "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
