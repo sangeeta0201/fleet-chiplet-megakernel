@@ -502,10 +502,23 @@ _MOE_RW_KEEPALIVE = []
 
 
 def _own_bo_maybe(t, name):
-    """[BOMAP] / own-BO copy for one attached tensor (see MPK_OWN_BO_PAT)."""
+    """[BOMAP] / own-BO copy for one attached tensor (see MPK_OWN_BO_PAT).
+
+    MPK_KV_OWN_BO=1 also copies each layer's K and V cache. The copy is
+    authoritative only because on the --use-mirage path the megakernel is the
+    sole reader and writer of the cache (it prefills the prompt itself);
+    model.model.kv_cache is stale afterwards, which only --verify reads.
+    """
     bomap = os.environ.get("MPK_BOMAP", "0") == "1"
     pats = [p for p in os.environ.get("MPK_OWN_BO_PAT", "").split(",") if p]
-    if not (bomap or pats) or not isinstance(t, torch.Tensor) or not t.is_cuda:
+    kv = "k_cache" in name or "v_cache" in name
+    kv_own = kv and os.environ.get("MPK_KV_OWN_BO", "0") == "1"
+    if kv_own and os.environ.get("MPK_KV_HEAD_MAJOR", "0") != "1":
+        # NHD keeps a token's heads side by side: its midpoint is a position
+        # cut, which puts every head of the early positions in range 0.
+        print(f"[KVOWN] {name}: needs MPK_KV_HEAD_MAJOR=1, not copying", flush=True)
+        kv_own = False
+    if not (bomap or pats or kv_own) or not isinstance(t, torch.Tensor) or not t.is_cuda:
         return t
     n = t.numel() * t.element_size()
     if n < (1 << 20) and not any(p in name for p in pats):
@@ -525,15 +538,15 @@ def _own_bo_maybe(t, name):
     b, s, off, f = where(t)
     # Already its own BO and cut at the midpoint: halves placement is right.
     placed = off == 0 and s < n + (4 << 20) and abs(f - 0.5) < 0.05
-    copy = (any(p in name for p in pats) and "k_cache" not in name
-            and "v_cache" not in name and t.is_contiguous() and not placed)
+    copy = (((any(p in name for p in pats) and not kv) or kv_own)
+            and t.is_contiguous() and not placed)
     if bomap:
         print(f"[BOMAP] {name} n={n} bo=+{s} off={off} in_first_half={f:.3f}"
               f"{' -> own' if copy else ''}", flush=True)
     if not copy:
         return t
     ptr = _ct.c_void_p()
-    if os.environ.get("MPK_OWN_BO_ALIGN", "0") == "1":
+    if os.environ.get("MPK_OWN_BO_ALIGN", "0") == "1" or kv_own:
         # Midpoint on the halves cut: BO of 2*ALIGN_UP(n/2, 2 MiB), tensor
         # offset so that off + n/2 == size/2 (to 256 B).
         chunk = 2 << 20
@@ -558,10 +571,10 @@ def _own_bo_maybe(t, name):
     own = torch.as_tensor(cai, device="cuda").view(t.dtype).view(t.shape)
     own.copy_(t)
     torch.cuda.synchronize()
-    if bomap:
+    if bomap or kv_own:
         b2, s2, off2, f2 = where(own)
-        print(f"[BOMAP] {name}(own BO) n={n} bo=+{s2} off={off2} "
-              f"in_first_half={f2:.3f}", flush=True)
+        print(f"[{'KVOWN' if kv_own else 'BOMAP'}] {name}(own BO) n={n} bo=+{s2} "
+              f"off={off2} in_first_half={f2:.3f}", flush=True)
     _OWN_BO_KEEPALIVE.append((hip, ptr, own))
     return own
 
