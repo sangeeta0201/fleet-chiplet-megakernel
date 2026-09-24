@@ -2772,6 +2772,23 @@ if __name__ == "__main__":
             _layer_weight_refs.append(torch_tensor)
             return mpk.attach_input(torch_tensor=torch_tensor, name=name)
 
+        # MPK_LAYER_RING: one copy per layer of the buffers a later die reads
+        # across the layer boundary, so no address is reused within a token.
+        _ring = os.environ.get("MPK_LAYER_RING", "0") == "1"
+        if _ring:
+            _ws_ring = [moe_workspace_f32] + [
+                make_tensor(f"moe_workspace_f32_r{j}",
+                            (bs, _ws_mul * num_experts_per_tok * PADDED_HIDDEN_SIZE),
+                            torch_dtype=torch.float32)
+                for j in range(1, num_layers + 1)]
+            _ao_ring = [attn_out] + [
+                make_tensor(f"attn_out_r{j}", (bs, num_local_q_heads * head_dim))
+                for j in range(1, num_layers)]
+            _apo_ring = [attn_proj_out] + [
+                make_tensor(f"attn_proj_out_r{j}", (bs, PADDED_HIDDEN_SIZE))
+                for j in range(1, num_layers)]
+            print(f"[LAYER_RING] {num_layers} layers: workspace x{len(_ws_ring)}, "
+                  f"attn_out x{len(_ao_ring)}, attn_proj_out x{len(_apo_ring)}", flush=True)
         fused_tail_done = False
         for i in range(num_layers):
             layer = model.model.layers[i]
@@ -3020,7 +3037,7 @@ if __name__ == "__main__":
                     else:
                         mpk.gang_full_layer_fused_layer(
                             # QKV+Attn inputs
-                            workspace_f32=moe_workspace_f32,
+                            workspace_f32=(_ws_ring[i] if _ring else moe_workspace_f32),
                             residual=x,
                             norm_weight_pre=w_norm,
                             norm_scratch_pre=rmsnorm_out,
@@ -3051,14 +3068,14 @@ if __name__ == "__main__":
                             k_cache=k_cache,
                             v_cache=v_cache,
                             q_workspace=ck_fmha_q_ws,
-                            o_acc=attn_out,
+                            o_acc=(_ao_ring[i] if _ring else attn_out),
                             # O-proj+TopK+MoE outputs
-                            attn_proj_out=attn_proj_out,
+                            attn_proj_out=(_apo_ring[i] if _ring else attn_proj_out),
                             topk_weight=moe_topk_weight,
                             routing_indices=moe_routing_indices,
                             active_expert_ids=moe_mask,
                             routing_weight_moe=moe_topk_weight,
-                            moe_workspace_f32=moe_workspace_f32,
+                            moe_workspace_f32=(_ws_ring[i + 1] if _ring else moe_workspace_f32),
                             # Parameters
                             actual_hidden_dim=hidden_size,
                             qkv_output_per_wg=qkv_output_per_wg,
@@ -3076,11 +3093,11 @@ if __name__ == "__main__":
                             w2_output_per_wg=w2_output_per_wg,
                             block_dim=(256, 1, 1),
                         )
-                    x = attn_proj_out
+                    x = (_apo_ring[i] if _ring else attn_proj_out)
                     # Last layer needs explicit residual add (f32→bf16)
                     if i == num_layers - 1 and not fused_tail_done:
                         mpk.moe_residual_add_f32_layer(
-                            workspace_f32=moe_workspace_f32,
+                            workspace_f32=(_ws_ring[num_layers] if _ring else moe_workspace_f32),
                             residual=x,
                             output=mlp_weighted_sum_out,
                             grid_dim=(1, 1, 1),
