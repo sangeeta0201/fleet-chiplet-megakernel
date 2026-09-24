@@ -1484,6 +1484,11 @@ def get_compile_command(
             # rank must agree.
             "MPK_MLA_DECODE_DBLBUF",
             "MPK_MLA_DECODE_BAR_LDS",
+            # MLA decode tile loop (gang_mla_decode_mi300.cuh): a float-major
+            # o_acc spill free of LDS bank conflicts, and the next KV tile by
+            # LDS DMA during the current tile's compute.
+            "MPK_MLA_OACC_INTERLEAVE",
+            "MPK_MLA_DECODE_DMA_PF",
         ):
             _x = os.environ.get(_v)
             if _x is not None:

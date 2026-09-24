@@ -219,6 +219,16 @@
 // live across the backedge if the barrier retires them. gpt-oss's counted
 // vmcnt pattern is the same idea: do not wait on a payload you will not use
 // yet. Default OFF. Compile-time; every rank must agree.
+//
+// MEASURED NULL at 1024/1024, 2026-09-24 (3 alternating pairs, G1 PASS):
+// decode median 12.064/12.053/12.071 -> 12.061/12.055/12.049 ms. The loop
+// has no load in flight at either barrier to protect (the register prefetch
+// it was written for is gone), so the vmcnt(0) it removes was already free.
+//
+// MEASURED NULL at 1024/1024, 2026-09-24 (3 alternating pairs, G1 PASS):
+// decode median 12.064/12.053/12.071 -> 12.061/12.055/12.049 ms. The loop
+// has no load in flight at either barrier to protect (the register prefetch
+// it was written for is gone), so the vmcnt(0) it removes was already free.
 #ifndef MPK_MLA_DECODE_BAR_LDS
 #define MPK_MLA_DECODE_BAR_LDS 0
 #endif
@@ -229,6 +239,36 @@ __device__ __forceinline__ void mla_tile_bar() {
 }
 #else
 __device__ __forceinline__ void mla_tile_bar() { __syncthreads(); }
+#endif
+
+// MPK_MLA_DECODE_DMA_PF: fetch the next full KV tile straight into a second
+// LDS tile buffer (buffer_load_dwordx4 ... lds) while the current tile's
+// QK/softmax/PV runs. This is the carry-neutral form
+// described above, and unlike the short-prompt shape it was priced against,
+// 1k/1k gives the loop 3-4 trips: per-token time steps up 0.76 ms at every
+// 512 tokens of KV (seqlen 513/1025/1537, flat in between), i.e. ~10 us of
+// layer makespan per serial 18 KB trip.
+//
+// Issued from inline asm on purpose: the llvm.amdgcn LDS-DMA builtin is
+// tracked as an LDS write of unknown extent, so the waitcnt pass drains it
+// before the first ds_read of the current tile and the overlap is gone. The
+// compute section issues no VMEM, so the DMA flies until the trip's trailing
+// barrier retires it.
+//
+// Requires PAGE_SIZE % KV_TILE == 0 (a tile never straddles a page, so its
+// rows are one contiguous run), KV_CACHE_STRIDE == QK_DIM (rows land in LDS
+// verbatim) and KV_LDS_BYTES more dynamic LDS past the o_acc spill. Partial
+// tiles keep the register path, which zero-fills the rows past tile_len: a
+// DMA'd stale row can hold a NaN pattern, and 0 * NaN poisons PV.
+//
+// MEASURED 2026-09-24, on top of MPK_MLA_OACC_INTERLEAVE: correct (46/46),
+// but the tile trip was never load-bound. Isolated: -0.5 us per trip at 3-4
+// trips, +0.6 us at one. 1024/1024, 3 alternating pairs, all G1 PASS:
+//   decode median  9.851/9.866/9.862 -> 9.856/9.880/9.837 ms   (null)
+//   prefill avg    9.269/9.290/9.280 -> 9.383/9.396/9.353 ms   (+0.1, loss)
+// Off.
+#ifndef MPK_MLA_DECODE_DMA_PF
+#define MPK_MLA_DECODE_DMA_PF 0
 #endif
 
 // __mfma_qk_hd64 / __mfma_pv_hd64 / __fast_exp2_hd64 / __load_bf16x4_to_fp16 /
@@ -266,6 +306,65 @@ __device__ __forceinline__ T ld_g(void const *p) {
   T const *q = static_cast<T const *>(p);
   return *(__attribute__((address_space(1))) T const *)q;
 }
+
+#if MPK_MLA_DECODE_DMA_PF
+typedef int __attribute__((ext_vector_type(4))) mla_i32x4_t;
+
+// Raw buffer V# over [base, base + range_bytes), wave-uniform.
+__device__ __forceinline__ mla_i32x4_t mla_buffer_rsrc(void const *base,
+                                                       unsigned range_bytes) {
+  unsigned long long const a = reinterpret_cast<unsigned long long>(base);
+  mla_i32x4_t r;
+  r[0] = static_cast<int>(
+      __builtin_amdgcn_readfirstlane(static_cast<unsigned>(a)));
+  r[1] = static_cast<int>(
+      __builtin_amdgcn_readfirstlane(static_cast<unsigned>(a >> 32)));
+  r[2] = static_cast<int>(range_bytes);
+  r[3] = 0x00020000;
+  return r;
+}
+
+// One 18 KB KV tile by LDS DMA: four 4 KB rounds on every wave, plus a fifth
+// on waves 0-1 for the last 2 KB. Round j, lane l copies 16 bytes from
+// rsrc + voff_l + 4096 j to LDS m0 + 16 l, with m0 = this wave's 1 KB slice
+// of round j. Default cache policy, the same as ld_g.
+//
+// Every round sits in ONE asm block. Anything the compiler places between
+// two rounds that touches VMEM -- a scratch reload under this function's
+// register pressure, as the first build showed -- arrives with a vmcnt wait,
+// and vmcnt retires in issue order, so it drains every round before it.
+#define MLA_DMA_ROUND(M, S)                                                    \
+  "s_mov_b32 m0, %[" M "]\n\t"                                                 \
+  "s_nop 0\n\t"                                                                \
+  "buffer_load_dwordx4 %[voff], %[rsrc], %[" S "] offen lds\n\t"
+__device__ __forceinline__ void mla_dma_tile(mla_i32x4_t rsrc,
+                                             unsigned m0_base, unsigned voff,
+                                             bool tail_wave) {
+  unsigned const m1 = m0_base + 4096u, m2 = m0_base + 8192u,
+                 m3 = m0_base + 12288u, m4 = m0_base + 16384u;
+  unsigned const s0 = 0u, s1 = 4096u, s2 = 8192u, s3 = 12288u, s4 = 16384u;
+  if (tail_wave) {
+    asm volatile(MLA_DMA_ROUND("m0", "s0") MLA_DMA_ROUND("m1", "s1")
+                     MLA_DMA_ROUND("m2", "s2") MLA_DMA_ROUND("m3", "s3")
+                         MLA_DMA_ROUND("m4", "s4")
+                 :
+                 : [rsrc] "s"(rsrc), [voff] "v"(voff), [m0] "s"(m0_base),
+                   [m1] "s"(m1), [m2] "s"(m2), [m3] "s"(m3), [m4] "s"(m4),
+                   [s0] "s"(s0), [s1] "s"(s1), [s2] "s"(s2), [s3] "s"(s3),
+                   [s4] "s"(s4)
+                 : "memory", "m0");
+  } else {
+    asm volatile(MLA_DMA_ROUND("m0", "s0") MLA_DMA_ROUND("m1", "s1")
+                     MLA_DMA_ROUND("m2", "s2") MLA_DMA_ROUND("m3", "s3")
+                 :
+                 : [rsrc] "s"(rsrc), [voff] "v"(voff), [m0] "s"(m0_base),
+                   [m1] "s"(m1), [m2] "s"(m2), [m3] "s"(m3), [s0] "s"(s0),
+                   [s1] "s"(s1), [s2] "s"(s2), [s3] "s"(s3)
+                 : "memory", "m0");
+  }
+}
+#undef MLA_DMA_ROUND
+#endif
 
 // Native bf16 MFMA. gfx950 runs bf16 at the same rate as fp16, so the latent
 // cache -- which is bf16 in memory -- has no reason to be widened to f32 and
@@ -309,7 +408,15 @@ __device__ __forceinline__ void mla_qk_acc32_mfma(__bf16 const *a,
   u32x4_t avu, bvu;
   __builtin_memcpy(&avu, &av, 16);
   __builtin_memcpy(&bvu, &bv, 16);
-  asm volatile("v_mfma_f32_16x16x32_bf16 a[32:35], %0, %1, a[32:35]\n"
+  // The s_nop is CDNA4 ISA Table 38: a VALU write of a VGPR followed by an
+  // MFMA read of it needs 2 wait states (no forwarding path). The hazard
+  // recognizer does not pad in front of an MFMA it cannot see inside asm, and
+  // the operands here are VALU-produced (v_accvgpr_read out of the AGPRs Q is
+  // parked in), so without it correctness depends on register allocation:
+  // one allocation put the last v_accvgpr_read one instruction ahead of this
+  // MFMA and 42 of 46 test_mla_decode cases failed.
+  asm volatile("s_nop 1\n"
+               "v_mfma_f32_16x16x32_bf16 a[32:35], %0, %1, a[32:35]\n"
                :
                : "v"(avu), "v"(bvu)
                : "a32", "a33", "a34", "a35");
@@ -365,20 +472,48 @@ __device__ __forceinline__ __mfma_hd64_fp32x4
 // __shared__ that slides extern __shared__, so tid*128+KV_BYTES from
 // 0 lands inside lds_kv and fused decode emits token 0. Standalone
 // has no static prefix, which is why the oracle still passed.
-// Base = byte address of lds_kv plus tid*128; KV_BYTES is in the
-// ds offset field (fits in 16 bits: 18432+124) so RA cannot drop it.
+// Base = byte address of lds_kv plus the lane's slot (tid*4 float-major,
+// tid*128 lane-major; see MPK_MLA_OACC_INTERLEAVE); KV_BYTES is in the ds
+// offset field so RA cannot drop it.
 constexpr int MLA_OACC_V_BLOCKS = 8;
 constexpr int MLA_OACC_FLOATS = MLA_OACC_V_BLOCKS * 4; // 32
+
+// MPK_MLA_OACC_INTERLEAVE: lay the o_acc spill out float-major, [32][256],
+// instead of lane-major, [256][32]. Lane-major puts consecutive lanes 128 B
+// = 32 dwords apart, so every o_acc ds_read_b32/ds_write_b32 -- eight per PV
+// block, eight blocks per tile trip, each behind an lgkmcnt(0) -- sends all
+// 64 lanes to one LDS bank. Float-major makes each of those instructions
+// touch 64 consecutive dwords. Same 32 KB footprint, offsets still constant
+// (max KV_BYTES + 31 * 1024 = 50176, inside the 16-bit ds offset).
+//
+// MEASURED 2026-09-24. Isolated decode (128 work items, 32 chunks): 9.5 ->
+// 3.5 us per 16-token tile trip, 53.2 -> 22.8 us at 4 tiles per chunk. At
+// 1024/1024 on GPUs 4-7, 3 alternating pairs, all G1 PASS, coherent text:
+//   decode median  12.157/12.119/12.099 -> 9.863/9.886/9.887 ms
+//   decode avg     11.896/11.856/11.861 -> 9.866/9.897/9.890 ms
+//   prefill avg    10.378/10.346/10.342 -> 9.284/9.303/9.312 ms/iter
+// The per-token staircase (one step per extra trip at seqlen 513/1025/1537)
+// went from +0.76 ms per step to +0.29.
+#ifndef MPK_MLA_OACC_INTERLEAVE
+#define MPK_MLA_OACC_INTERLEAVE 1
+#endif
+#if MPK_MLA_OACC_INTERLEAVE
+constexpr int MLA_OACC_LANE_SHIFT = 2;     // lane stride 4 B
+constexpr int MLA_OACC_ELEM_STRIDE = 1024; // float j at j * 256 * 4 B
+#else
+constexpr int MLA_OACC_LANE_SHIFT = 7;     // lane stride 128 B
+constexpr int MLA_OACC_ELEM_STRIDE = 4;
+#endif
 
 __device__ __forceinline__ unsigned mla_oacc_lds_base(int tid,
                                                      void const *lds_kv) {
   unsigned base;
   unsigned const kv =
       static_cast<unsigned>(reinterpret_cast<uintptr_t>(lds_kv));
-  asm volatile("v_lshlrev_b32 %[b], 7, %[tid]\n\t"
+  asm volatile("v_lshlrev_b32 %[b], %c[sh], %[tid]\n\t"
                "v_add_u32_e32 %[b], %[kv], %[b]"
                : [b] "=v"(base)
-               : [tid] "v"(tid), [kv] "v"(kv));
+               : [tid] "v"(tid), [kv] "v"(kv), [sh] "n"(MLA_OACC_LANE_SHIFT));
   return base;
 }
 
@@ -420,22 +555,22 @@ __device__ __forceinline__ void mla_oacc_zero_lds(unsigned &base) {
                "ds_write_b32 %[base], %[z] offset:%c[o31]\n\t"
                "s_waitcnt lgkmcnt(0)"
                : [z] "=&v"(z), [base] "+v"(base)
-               : [o0] "n"(KV_BYTES + 0), [o1] "n"(KV_BYTES + 4),
-                 [o2] "n"(KV_BYTES + 8), [o3] "n"(KV_BYTES + 12),
-                 [o4] "n"(KV_BYTES + 16), [o5] "n"(KV_BYTES + 20),
-                 [o6] "n"(KV_BYTES + 24), [o7] "n"(KV_BYTES + 28),
-                 [o8] "n"(KV_BYTES + 32), [o9] "n"(KV_BYTES + 36),
-                 [o10] "n"(KV_BYTES + 40), [o11] "n"(KV_BYTES + 44),
-                 [o12] "n"(KV_BYTES + 48), [o13] "n"(KV_BYTES + 52),
-                 [o14] "n"(KV_BYTES + 56), [o15] "n"(KV_BYTES + 60),
-                 [o16] "n"(KV_BYTES + 64), [o17] "n"(KV_BYTES + 68),
-                 [o18] "n"(KV_BYTES + 72), [o19] "n"(KV_BYTES + 76),
-                 [o20] "n"(KV_BYTES + 80), [o21] "n"(KV_BYTES + 84),
-                 [o22] "n"(KV_BYTES + 88), [o23] "n"(KV_BYTES + 92),
-                 [o24] "n"(KV_BYTES + 96), [o25] "n"(KV_BYTES + 100),
-                 [o26] "n"(KV_BYTES + 104), [o27] "n"(KV_BYTES + 108),
-                 [o28] "n"(KV_BYTES + 112), [o29] "n"(KV_BYTES + 116),
-                 [o30] "n"(KV_BYTES + 120), [o31] "n"(KV_BYTES + 124)
+               : [o0] "n"(KV_BYTES + 0 * MLA_OACC_ELEM_STRIDE), [o1] "n"(KV_BYTES + 1 * MLA_OACC_ELEM_STRIDE),
+                 [o2] "n"(KV_BYTES + 2 * MLA_OACC_ELEM_STRIDE), [o3] "n"(KV_BYTES + 3 * MLA_OACC_ELEM_STRIDE),
+                 [o4] "n"(KV_BYTES + 4 * MLA_OACC_ELEM_STRIDE), [o5] "n"(KV_BYTES + 5 * MLA_OACC_ELEM_STRIDE),
+                 [o6] "n"(KV_BYTES + 6 * MLA_OACC_ELEM_STRIDE), [o7] "n"(KV_BYTES + 7 * MLA_OACC_ELEM_STRIDE),
+                 [o8] "n"(KV_BYTES + 8 * MLA_OACC_ELEM_STRIDE), [o9] "n"(KV_BYTES + 9 * MLA_OACC_ELEM_STRIDE),
+                 [o10] "n"(KV_BYTES + 10 * MLA_OACC_ELEM_STRIDE), [o11] "n"(KV_BYTES + 11 * MLA_OACC_ELEM_STRIDE),
+                 [o12] "n"(KV_BYTES + 12 * MLA_OACC_ELEM_STRIDE), [o13] "n"(KV_BYTES + 13 * MLA_OACC_ELEM_STRIDE),
+                 [o14] "n"(KV_BYTES + 14 * MLA_OACC_ELEM_STRIDE), [o15] "n"(KV_BYTES + 15 * MLA_OACC_ELEM_STRIDE),
+                 [o16] "n"(KV_BYTES + 16 * MLA_OACC_ELEM_STRIDE), [o17] "n"(KV_BYTES + 17 * MLA_OACC_ELEM_STRIDE),
+                 [o18] "n"(KV_BYTES + 18 * MLA_OACC_ELEM_STRIDE), [o19] "n"(KV_BYTES + 19 * MLA_OACC_ELEM_STRIDE),
+                 [o20] "n"(KV_BYTES + 20 * MLA_OACC_ELEM_STRIDE), [o21] "n"(KV_BYTES + 21 * MLA_OACC_ELEM_STRIDE),
+                 [o22] "n"(KV_BYTES + 22 * MLA_OACC_ELEM_STRIDE), [o23] "n"(KV_BYTES + 23 * MLA_OACC_ELEM_STRIDE),
+                 [o24] "n"(KV_BYTES + 24 * MLA_OACC_ELEM_STRIDE), [o25] "n"(KV_BYTES + 25 * MLA_OACC_ELEM_STRIDE),
+                 [o26] "n"(KV_BYTES + 26 * MLA_OACC_ELEM_STRIDE), [o27] "n"(KV_BYTES + 27 * MLA_OACC_ELEM_STRIDE),
+                 [o28] "n"(KV_BYTES + 28 * MLA_OACC_ELEM_STRIDE), [o29] "n"(KV_BYTES + 29 * MLA_OACC_ELEM_STRIDE),
+                 [o30] "n"(KV_BYTES + 30 * MLA_OACC_ELEM_STRIDE), [o31] "n"(KV_BYTES + 31 * MLA_OACC_ELEM_STRIDE)
                : "memory");
 }
 
@@ -462,6 +597,7 @@ __device__ __forceinline__ void mla_oacc_zero_lds(unsigned &base) {
                  "v_accvgpr_write_b32 a1, %[t1]\n\t"                           \
                  "v_accvgpr_write_b32 a2, %[t2]\n\t"                           \
                  "v_accvgpr_write_b32 a3, %[t3]\n\t"                           \
+                 "s_nop 1\n\t" /* VALU write -> MFMA read: 2 waits */          \
                  "v_mfma_f32_16x16x16_bf16 a[0:3], %[va], %[pb], a[0:3]\n\t"   \
                  "s_nop 15\n\t"                                                \
                  "s_nop 15\n\t"                                                \
@@ -477,10 +613,10 @@ __device__ __forceinline__ void mla_oacc_zero_lds(unsigned &base) {
                  : [t0] "=&v"(t0), [t1] "=&v"(t1), [t2] "=&v"(t2),             \
                    [t3] "=&v"(t3), [base] "+v"(base)                           \
                  : [s] "v"(s), [va] "v"(avu), [pb] "v"(bvu),                   \
-                   [o0] "n"(KV_BYTES + (DELTA) + 0),                           \
-                   [o1] "n"(KV_BYTES + (DELTA) + 4),                           \
-                   [o2] "n"(KV_BYTES + (DELTA) + 8),                           \
-                   [o3] "n"(KV_BYTES + (DELTA) + 12)                           \
+                   [o0] "n"(KV_BYTES + ((DELTA) / 4 + 0) * MLA_OACC_ELEM_STRIDE), \
+                   [o1] "n"(KV_BYTES + ((DELTA) / 4 + 1) * MLA_OACC_ELEM_STRIDE), \
+                   [o2] "n"(KV_BYTES + ((DELTA) / 4 + 2) * MLA_OACC_ELEM_STRIDE), \
+                   [o3] "n"(KV_BYTES + ((DELTA) / 4 + 3) * MLA_OACC_ELEM_STRIDE)  \
                  : "a0", "a1", "a2", "a3", "memory");                          \
   }
 
@@ -498,7 +634,7 @@ template <int KV_BYTES, int VB>
 __device__ __forceinline__ void
     mla_oacc_load_block(unsigned &base, __mfma_hd64_fp32x4 &out) {
   float t0, t1, t2, t3;
-  constexpr int off = KV_BYTES + VB * 16;
+  constexpr int off = KV_BYTES + VB * 4 * MLA_OACC_ELEM_STRIDE;
   asm volatile("ds_read_b32 %[t0], %[base] offset:%c[o0]\n\t"
                "ds_read_b32 %[t1], %[base] offset:%c[o1]\n\t"
                "ds_read_b32 %[t2], %[base] offset:%c[o2]\n\t"
@@ -506,8 +642,10 @@ __device__ __forceinline__ void
                "s_waitcnt lgkmcnt(0)"
                : [t0] "=v"(t0), [t1] "=v"(t1), [t2] "=v"(t2), [t3] "=v"(t3),
                  [base] "+v"(base)
-               : [o0] "n"(off + 0), [o1] "n"(off + 4), [o2] "n"(off + 8),
-                 [o3] "n"(off + 12)
+               : [o0] "n"(off + 0 * MLA_OACC_ELEM_STRIDE),
+                 [o1] "n"(off + 1 * MLA_OACC_ELEM_STRIDE),
+                 [o2] "n"(off + 2 * MLA_OACC_ELEM_STRIDE),
+                 [o3] "n"(off + 3 * MLA_OACC_ELEM_STRIDE)
                : "memory");
   out[0] = t0;
   out[1] = t1;
@@ -639,7 +777,11 @@ __device__ __noinline__ void
   static_assert(KV_CACHE_STRIDE >= QK_DIM,
                 "KV cache rows must hold the latent + rope dims");
   constexpr int KV_LDS_BYTES = KV_TILE * QK_DIM * (int)sizeof(__bf16);
-  static_assert(KV_LDS_BYTES + 124 < 65536,
+  static_assert(KV_LDS_BYTES +
+                        (gang_mla_decode_detail::MLA_OACC_FLOATS - 1) *
+                            gang_mla_decode_detail::MLA_OACC_ELEM_STRIDE +
+                        4 <=
+                    65536,
                 "o_acc ds offsets must fit in the 16-bit ds offset field");
 
   int const req = request_id;
@@ -814,6 +956,24 @@ __device__ __noinline__ void
   unsigned long long _d_t2 = __builtin_amdgcn_s_memrealtime();
 #endif
 
+#if MPK_MLA_DECODE_DMA_PF
+  static_assert(PAGE_SIZE % KV_TILE == 0,
+                "a DMA'd KV tile must not straddle a page");
+  static_assert(KV_CACHE_STRIDE == QK_DIM,
+                "DMA copies cache rows into the LDS tile verbatim");
+  static_assert(KV_LDS_BYTES % 1024 == 0,
+                "an LDS-DMA round is 1 KB per wave");
+  constexpr int DMA_TAIL_WAVES = (KV_LDS_BYTES % 4096) / 1024;
+  static_assert(KV_LDS_BYTES / 4096 == 4 && DMA_TAIL_WAVES == 2,
+                "mla_dma_tile is written for an 18 KB tile (GLM's 576 dims)");
+  // Second tile buffer, past the o_acc spill so the default layout (and the
+  // o_acc ds offsets) are untouched.
+  __bf16 *const lds_kv_b = reinterpret_cast<__bf16 *>(
+      _mla_decode_smem + KV_LDS_BYTES +
+      256 * gang_mla_decode_detail::MLA_OACC_FLOATS * (int)sizeof(float));
+  bool dma_have = false; // tile t was DMA'd into its buffer by trip t - 1
+#endif
+
   // One trip at a time. The compiler otherwise pipelines tile t+1's LDS
   // stores into tile t's QK/PV reads; those stores go through a generic
   // uint64_t* and LLVM does not see them as aliasing the bf16 LDS loads.
@@ -830,43 +990,73 @@ __device__ __noinline__ void
     if (tile_len < 0) {
       tile_len = 0;
     }
-
-    // addrspace(3) so the stores are ds_write (lgkmcnt), not generic/flat
-    // (vmcnt+lgkmcnt). HIP __syncthreads is
-    //   s_waitcnt vmcnt(0) ; s_barrier ; s_waitcnt vmcnt(0)
-    // and does not wait lgkmcnt. Do not put vmcnt(0) inside the my_tok <
-    // tile_len branch: that wait is divergent on a partial tile and hangs
-    // the fused kernel from the first prefill step.
-    if (my_tok < tile_len) {
-      long const row = get_kv_row(kv_start + tile_start + my_tok);
-#pragma unroll
-      for (int r = 0; r < LDG_PER_TILE; r++) {
-        u32x2_t const v =
-            ld_g<u32x2_t>(kv_base + row + (my_dim0 + r * 64) * 2);
-        uint64_t val;
-        __builtin_memcpy(&val, &v, 8);
-        auto *dst = (__attribute__((address_space(3))) uint64_t *)&lds_kv
-                        [my_tok * QK_DIM + my_dim0 + r * 64];
-        *dst = val;
-      }
+#if MPK_MLA_DECODE_DMA_PF
+    __bf16 *const cur_kv = (t & 1) ? lds_kv_b : lds_kv;
+    if (dma_have) {
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     } else {
-      uint64_t const zero8 = 0;
+#else
+    __bf16 *const cur_kv = lds_kv;
+    {
+#endif
+
+      // addrspace(3) so the stores are ds_write (lgkmcnt), not generic/flat
+      // (vmcnt+lgkmcnt). HIP __syncthreads is
+      //   s_waitcnt vmcnt(0) ; s_barrier ; s_waitcnt vmcnt(0)
+      // and does not wait lgkmcnt. Do not put vmcnt(0) inside the my_tok <
+      // tile_len branch: that wait is divergent on a partial tile and hangs
+      // the fused kernel from the first prefill step.
+      if (my_tok < tile_len) {
+        long const row = get_kv_row(kv_start + tile_start + my_tok);
 #pragma unroll
-      for (int r = 0; r < LDG_PER_TILE; r++) {
-        auto *dst = (__attribute__((address_space(3))) uint64_t *)&lds_kv
-                        [my_tok * QK_DIM + my_dim0 + r * 64];
-        *dst = zero8;
+        for (int r = 0; r < LDG_PER_TILE; r++) {
+          u32x2_t const v =
+              ld_g<u32x2_t>(kv_base + row + (my_dim0 + r * 64) * 2);
+          uint64_t val;
+          __builtin_memcpy(&val, &v, 8);
+          auto *dst = (__attribute__((address_space(3))) uint64_t *)&cur_kv
+                          [my_tok * QK_DIM + my_dim0 + r * 64];
+          *dst = val;
+        }
+      } else {
+        uint64_t const zero8 = 0;
+#pragma unroll
+        for (int r = 0; r < LDG_PER_TILE; r++) {
+          auto *dst = (__attribute__((address_space(3))) uint64_t *)&cur_kv
+                          [my_tok * QK_DIM + my_dim0 + r * 64];
+          *dst = zero8;
+        }
       }
+      asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
     }
-    asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
     mla_tile_bar();
+
+#if MPK_MLA_DECODE_DMA_PF
+    // Every wave is past trip t - 1, so the other buffer is free. Only full
+    // tiles go by DMA; a partial one takes the register path next trip.
+    dma_have = (t + 1 < ntiles) && (effective_len - tile_start >= 2 * KV_TILE);
+    if (dma_have) {
+      long const nrow = get_kv_row(kv_start + tile_start + KV_TILE);
+      gang_mla_decode_detail::mla_i32x4_t const rsrc =
+          gang_mla_decode_detail::mla_buffer_rsrc(kv_base + nrow,
+                                                  KV_LDS_BYTES);
+      unsigned const wid = __builtin_amdgcn_readfirstlane(warp_id);
+      unsigned const m0_base = __builtin_amdgcn_readfirstlane(
+          static_cast<unsigned>(reinterpret_cast<uintptr_t>(
+              (t & 1) ? lds_kv : lds_kv_b)) +
+          wid * 1024u);
+      gang_mla_decode_detail::mla_dma_tile(
+          rsrc, m0_base, static_cast<unsigned>(tid) * 16u,
+          wid < static_cast<unsigned>(DMA_TAIL_WAVES));
+    }
+#endif
 
     {
       mla_qk_acc32_zero();
 #pragma unroll
       for (int kc = 0; kc < NUM_K32; kc++) {
         __bf16 kr[8];
-        __bf16 const *k_ptr = &lds_kv[midx * QK_DIM + kc * 32 + kgrp * 8];
+        __bf16 const *k_ptr = &cur_kv[midx * QK_DIM + kc * 32 + kgrp * 8];
 #pragma unroll
         for (int i = 0; i < 8; i++) {
           kr[i] = k_ptr[i];
@@ -920,7 +1110,7 @@ __device__ __noinline__ void
       for (int vb = 0; vb < NUM_V_BLOCKS; vb++) {
         bf16x4_t va;
         __bf16 const *v_ptr =
-            &lds_kv[(kgrp * 4) * QK_DIM + vb * 64 + warp_id * 16 + midx];
+            &cur_kv[(kgrp * 4) * QK_DIM + vb * 64 + warp_id * 16 + midx];
         va[0] = v_ptr[0 * QK_DIM];
         va[1] = v_ptr[1 * QK_DIM];
         va[2] = v_ptr[2 * QK_DIM];
@@ -952,7 +1142,12 @@ __device__ __noinline__ void
     unsigned long long _d_b = __builtin_amdgcn_s_memrealtime();
     _d_compute += _d_b - _d_a;
 #endif
-    // Next trip overwrites LDS; wait for every lane's QK/PV reads.
+    // Next trip overwrites LDS; wait for every lane's QK/PV reads. Kept under
+    // MPK_MLA_DECODE_DMA_PF too: without it test_mla_decode failed every
+    // 32-chunk case (warp 3's partials zero), single-trip ones included, for
+    // reasons not pinned down; with it all 46 pass. Its vmcnt(0) also retires
+    // the next tile's DMA, which by then has had this trip's QK/softmax/PV to
+    // land in.
     mla_tile_bar();
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     _d_refill += __builtin_amdgcn_s_memrealtime() - _d_b;

@@ -44,8 +44,9 @@ static constexpr int Q_WORKSPACE_STRIDE = NUM_Q_HEADS * QK_DIM;
 static constexpr int KV_CACHE_STRIDE = QK_DIM;
 static constexpr int NUM_Q_GROUPS = NUM_Q_HEADS / 16;
 static constexpr int BLOCK_THREADS = 256;
+// MPK_MLA_DECODE_DMA_PF adds a second KV tile buffer past the o_acc spill.
 static constexpr int LDS_BYTES =
-    16 * QK_DIM * 2 + 256 * 32 * 4;
+    16 * QK_DIM * 2 + 256 * 32 * 4 + (MPK_MLA_DECODE_DMA_PF ? 16 * QK_DIM * 2 : 0);
 
 static constexpr float LOG2E = 1.44269504088896340736f;
 
@@ -215,6 +216,11 @@ static int run_case(int seqlen) {
   hipMemcpy(d_last_page_len, h_last_page_len, 4, hipMemcpyHostToDevice);
 
   int const total_work_items = NUM_Q_GROUPS * NUM_KV_CHUNKS;
+  if (LDS_BYTES > 65536) {
+    hipFuncSetAttribute(
+        reinterpret_cast<void const *>(&mla_entry<NUM_KV_CHUNKS, WRITE_THROUGH>),
+        hipFuncAttributeMaxDynamicSharedMemorySize, LDS_BYTES);
+  }
   hipLaunchKernelGGL((mla_entry<NUM_KV_CHUNKS, WRITE_THROUGH>),
                      dim3(total_work_items),
                      dim3(BLOCK_THREADS),
@@ -353,6 +359,13 @@ static int run_suite() {
   rc |= run_case<16, WRITE_THROUGH>(225);
   rc |= run_case<16, WRITE_THROUGH>(241);
   rc |= run_case<32, WRITE_THROUGH>(257);
+  // 1k/1k decode shapes: 3-4 trips per chunk, a partial tail tile (1030,
+  // 1537) and an exact multiple (2048). Under MPK_MLA_DECODE_DMA_PF these
+  // are the cases that take the DMA path and its register-path fallback.
+  rc |= run_case<16, WRITE_THROUGH>(1000);
+  rc |= run_case<32, WRITE_THROUGH>(1030);
+  rc |= run_case<32, WRITE_THROUGH>(1537);
+  rc |= run_case<32, WRITE_THROUGH>(2048);
   return rc;
 }
 

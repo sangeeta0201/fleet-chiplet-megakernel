@@ -5045,3 +5045,14 @@ if __name__ == "__main__":
                   f"of {_fwd_total_iters} samples dropped; all-iteration "
                   f"device average {_fwd_total_avg:.3f}ms/iter")
         print("=" * 80)
+        # Diagnostic: the device per-iteration times, keyed by logical
+        # iteration (1..prefill_iterations is prefill), for time-vs-position
+        # analysis. Rank 0 only.
+        _iter_out = os.environ.get("MPK_ITER_TIMES_OUT")
+        if _iter_out and rank == 0:
+            with open(_iter_out, "w") as _f:
+                json.dump({"prompt_len": prompt_len,
+                           "prefill_iterations": prefill_iterations,
+                           "times_ms": {str(_it - 1): _t
+                                        for _it, _t in _fwd_times.items()
+                                        if _it - 1 >= 1}}, _f)
