@@ -22,11 +22,11 @@
 
 namespace mpk_pprobe {
 
-constexpr int kSamples = 8; // addresses per region, spread over it
-constexpr int kSteps = 8;   // timed loads per address
+constexpr int kSteps = 8; // timed loads per address
 
 __global__ void pprobe_kernel(unsigned long long const *__restrict addrs,
                               int nreg,
+                              int kSamples,
                               int reps,
                               unsigned *__restrict claim,
                               unsigned *__restrict out_ns) {
@@ -79,7 +79,39 @@ struct Region {
   int layer;
   int half; // 0/1 = replica half consumed by XCCs (x>>2)==half; -1 = home only
   char const *name;
+  int slot = -1; // MPK_PPROBE_ALL: descriptor slot (inputs, then outputs at 100+)
+  int desc = -1; // MPK_PPROBE_ALL: XCD descriptor index, 8 = shared by all
 };
+
+// Fused-layer input slot names (persistent_kernel.cuh / aid_local.h map).
+inline char const *slot_name(int s) {
+  static char const *const in[] = {
+      "workspace_f32", "residual",     "norm_w_pre",   "norm_scr_pre",
+      "qkv_weight",    "qkv_bias",     "sinks",        "barriers",
+      "lse_acc",       "oproj_weight", "oproj_bias",   "norm_w_post",
+      "norm_scr_post", "router_w",     "router_bias",  "logits_scr",
+      "counters",      "gate_up",      "down",         "w13_bias",
+      "w2_bias",       "moe_barrier",  "swiglu_out",   "o_acc_f32"};
+  static char buf[64][16];
+  if (s >= 0 && s < (int)(sizeof in / sizeof in[0])) {
+    return in[s];
+  }
+  int const i = (s >= 100 ? 32 + (s - 100) : s) & 63;
+  snprintf(buf[i], sizeof buf[i], s >= 100 ? "out%02d" : "in%02d", s >= 100 ? s - 100 : s);
+  return buf[i];
+}
+
+// Samples inside the 4 KB page that holds p: the buffer's size is unknown, and
+// that page is mapped whenever p is.
+inline void page_samples(std::vector<unsigned long long> &addrs, char *p, int n) {
+  unsigned long long const a = (unsigned long long)p;
+  unsigned long long const room = ((a | 4095ull) + 1ull) - a;
+  unsigned long long const step = std::max(4ull, (room / (unsigned long long)n) & ~3ull);
+  for (int s = 0; s < n; s++) {
+    unsigned long long const off = std::min(step * (unsigned long long)s, room - 4ull);
+    addrs.push_back((a + off) & ~3ull);
+  }
+}
 
 // all_tasks is still pre-compaction: positions[L] + xcd is XCD xcd's
 // descriptor for layer L. The MoE slots are shared, so XCD 0's copy suffices.
@@ -89,6 +121,8 @@ inline void run(std::vector<TaskDescT> &all_tasks,
   // gpt-oss-120b geometry, as the MoE kernel computes it: [2E, 46, 200192]
   // gate_up, [2E, 46, 100096] down, [2E, 5888] / [2E, 2944] bf16 biases.
   long long const E = env_ll("MPK_PPROBE_E", 128);
+  int const kSamples = (int)std::min(64LL, std::max(1LL, env_ll("MPK_PPROBE_SAMPLES", 8)));
+  bool const all = env_ll("MPK_PPROBE_ALL", 0) != 0;
   struct Slot {
     int slot;
     char const *name;
@@ -139,6 +173,40 @@ inline void run(std::vector<TaskDescT> &all_tasks,
         addrs.push_back((unsigned long long)(p + off));
       }
     }
+    if (!all) {
+      continue;
+    }
+    // Every other input and output slot: one home-only region per distinct
+    // pointer (a shared pointer once, a per-XCD pointer once per descriptor).
+    int const nin = (int)(sizeof(td.input_ptrs) / sizeof(td.input_ptrs[0]));
+    int const nout = (int)(sizeof(td.output_ptrs) / sizeof(td.output_ptrs[0]));
+    for (int k = 0; k < nin + nout; k++) {
+      int const slot = k < nin ? k : 100 + (k - nin);
+      if (slot == 0 || slot == 12 || (slot >= 17 && slot <= 22)) {
+        continue;
+      }
+      char *p[8];
+      bool shared = true, any = false;
+      for (int x = 0; x < 8; x++) {
+        TaskDescT const &tx = all_tasks[positions[L] + x];
+        p[x] = (char *)(k < nin ? tx.input_ptrs[k] : tx.output_ptrs[k - nin]);
+        any = any || p[x] != nullptr;
+        shared = shared && p[x] == p[0];
+      }
+      if (!any) {
+        continue;
+      }
+      for (int x = 0; x < (shared ? 1 : 8); x++) {
+        if (p[x] == nullptr) {
+          continue;
+        }
+        Region g{(int)L, -1, slot_name(slot)};
+        g.slot = slot;
+        g.desc = shared ? 8 : x;
+        regs.push_back(g);
+        page_samples(addrs, p[x], kSamples);
+      }
+    }
   }
   int const nreg = (int)regs.size();
   if (nreg == 0) {
@@ -166,6 +234,7 @@ inline void run(std::vector<TaskDescT> &all_tasks,
                      0,
                      d_addrs,
                      nreg,
+                     kSamples,
                      reps,
                      d_claim,
                      d_out);
@@ -207,6 +276,12 @@ inline void run(std::vector<TaskDescT> &all_tasks,
     tot.push_back({nm, 0, 0, 0, 0});
     return tot.back();
   };
+  struct Gen {
+    int slot, layer, desc;
+    char c;
+    char const *name;
+  };
+  std::vector<Gen> gen;
   for (int r = 0; r < nreg; r++) {
     Region const &g = regs[r];
     unsigned mean_x[8];
@@ -251,6 +326,17 @@ inline void run(std::vector<TaskDescT> &all_tasks,
         rem++;
       }
     }
+    if (g.slot >= 0) {
+      // 0/1 = homed on that AID, m = samples on both (split), c = L2 hit on
+      // every XCC (RW, home not measurable), ? = unclear.
+      char const c = hit == kSamples                 ? 'c'
+                     : home0 * 4 >= kSamples * 3     ? '0'
+                     : home1 * 4 >= kSamples * 3     ? '1'
+                     : (home0 > 0 && home1 > 0)      ? 'm'
+                                                     : '?';
+      gen.push_back({g.slot, g.layer, g.desc, c, g.name});
+      continue;
+    }
     Tot &t = tot_of(g.name);
     t.local += loc;
     t.remote += rem;
@@ -275,8 +361,31 @@ inline void run(std::vector<TaskDescT> &all_tasks,
     printf("[PPROBE] SUMMARY %-12s local=%d remote=%d unclear=%d l2hit=%d\n",
            t.name, t.local, t.remote, t.unclear, t.cached);
   }
+  // One line per (slot, layer): a shared pointer prints one home, a per-XCD
+  // pointer prints the home of descriptor 0..7's copy.
+  std::sort(gen.begin(), gen.end(), [](Gen const &a, Gen const &b) {
+    return a.slot != b.slot ? a.slot < b.slot
+                            : (a.layer != b.layer ? a.layer < b.layer : a.desc < b.desc);
+  });
+  for (size_t i = 0; i < gen.size();) {
+    size_t j = i;
+    char homes[9] = "--------";
+    bool shared = false;
+    while (j < gen.size() && gen[j].slot == gen[i].slot && gen[j].layer == gen[i].layer) {
+      if (gen[j].desc == 8) {
+        shared = true;
+        homes[0] = gen[j].c;
+        homes[1] = '\0';
+      } else {
+        homes[gen[j].desc] = gen[j].c;
+      }
+      j++;
+    }
+    printf("[PPROBE] ALL %-14s s=%3d L=%02d %s %s\n", gen[i].name, gen[i].slot,
+           gen[i].layer, shared ? "shared" : "perxcd", homes);
+    i = j;
+  }
   fflush(stdout);
 }
 
 } // namespace mpk_pprobe
-
