@@ -44,7 +44,11 @@ using bf16 = __hip_bfloat16;
 static constexpr int QO_PER_KV = 16;  // NUM_QO_HEADS_PER_KV
 static constexpr int QO_GROUPS = 4;   // NUM_QO_GROUPS
 static constexpr int HEAD_DIM = 512;  // kv_lora_rank
-static constexpr int NUM_CHUNKS = 16; // NUM_KV_CHUNKS
+// 32 is the shipping 1k/1k geometry (GLM_MLA_NUM_KV_CHUNKS=32).
+#ifndef TEST_NUM_CHUNKS
+#define TEST_NUM_CHUNKS 16
+#endif
+static constexpr int NUM_CHUNKS = TEST_NUM_CHUNKS; // NUM_KV_CHUNKS
 static constexpr int PAGE_SIZE = 4096;
 static constexpr int BLOCK_THREADS = 256;
 
@@ -191,6 +195,9 @@ int main() {
   // The shipping fused configuration is WRITE_THROUGH=true, DIM_SPLITS=32.
   // active_chunks 16 is seqlen>=241 (every chunk carries a tile); 9 and 15 are
   // the shorter sequences that decode correctly today.
+  if (NUM_CHUNKS != 16) {
+    rc |= run_case<true, 32>(NUM_CHUNKS, "wt=1 splits=32 active=all");
+  }
   rc |= run_case<false, 32>(16, "wt=0 splits=32 active=16");
   rc |= run_case<true, 32>(16, "wt=1 splits=32 active=16");
   rc |= run_case<true, 32>(15, "wt=1 splits=32 active=15");

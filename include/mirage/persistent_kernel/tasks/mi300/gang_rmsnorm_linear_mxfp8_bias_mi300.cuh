@@ -717,10 +717,14 @@ _rnlm8_pro_publish(unsigned short const *__restrict__ d_res,
   }
 
   // Block-reduce this slice's partial. rmsnorm_rcp_amd's Phase 3, verbatim.
+#if MPK_RMSNORM_DPP
+  ssq = gang_rmsnorm_detail::_mpk_wave_sum_to_lane0(ssq);
+#else
 #pragma unroll
   for (int offset = 32; offset > 0; offset >>= 1) {
     ssq += __shfl_xor(ssq, offset);
   }
+#endif
   __shared__ float pro_red[16];
   int const wave_id = tid >> 6;
   int const lane_id = tid & 63;
@@ -1211,10 +1215,14 @@ _rnlm8_resadd_norm_rcp(float const *__restrict__ d_ws,
   // Phase 3 of rmsnorm_rcp_amd, verbatim: wave reduce, then one cross-wave
   // pass through LDS. The trailing __syncthreads() publishes red[0] and, here,
   // also publishes s_x to the quantizer's different thread mapping.
+#if MPK_RMSNORM_DPP
+  ssq = gang_rmsnorm_detail::_mpk_wave_sum_to_lane0(ssq);
+#else
 #pragma unroll
   for (int offset = 32; offset > 0; offset >>= 1) {
     ssq += __shfl_xor(ssq, offset);
   }
+#endif
 
   __shared__ float red[16];
   int const wave_id = tid >> 6;
@@ -1319,10 +1327,14 @@ _rnlm8_stage_norm_rcp(unsigned short const *__restrict__ d_in,
   }
 
   // Phase 3 of rmsnorm_rcp_amd, verbatim.
+#if MPK_RMSNORM_DPP
+  ssq = gang_rmsnorm_detail::_mpk_wave_sum_to_lane0(ssq);
+#else
 #pragma unroll
   for (int offset = 32; offset > 0; offset >>= 1) {
     ssq += __shfl_xor(ssq, offset);
   }
+#endif
 
   __shared__ float red[16];
   int const wave_id = tid >> 6;

@@ -5023,6 +5023,12 @@ if __name__ == "__main__":
                   f"(avg {_decode_total / _decode_count:.3f}ms/iter)")
             print(f"  Decode per-iter range: min={min(_decode_samples):.3f}ms "
                   f"max={max(_decode_samples):.3f}ms")
+            # The median is immune to the rare multi-second barrier stall that
+            # makes the mean useless and far less noisy than the min.
+            _ds = sorted(_decode_samples)
+            print(f"  Decode per-iter median={_ds[len(_ds) // 2]:.3f}ms "
+                  f"p10={_ds[len(_ds) // 10]:.3f}ms "
+                  f"p90={_ds[(9 * len(_ds)) // 10]:.3f}ms")
             # Which iterations stalled, and where in the decode run. A single
             # multi-second outlier is a liveness bug, not a latency number, and
             # its position (first decode iter vs. random) says which.

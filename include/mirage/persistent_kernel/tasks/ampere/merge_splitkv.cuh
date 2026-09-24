@@ -57,6 +57,32 @@
 #define MPK_MERGE_GLOBAL 1
 #endif
 
+// MPK_MERGE_TWO_PASS: gpt-oss's KV-outer two-pass split-KV merge
+// (amd_mi355_gpt_oss120b f3c40ed: merge 3.11 -> 2.61 us at 31 chunks; ships
+// default ON there). The running-max form in merge_splitkv_ck_fmha is a serial
+// chain over NUM_KV_CHUNKS: chunk k's rescale needs m_global from chunk k-1.
+// Reducing the lse values to m_max first makes every weight known up front,
+// so all o loads are independent. Same result in exact arithmetic; the low
+// bits move (FMA contraction / reassociation), so the gate is numerical, not a
+// text hash. GLM ships VAL_PER_THREAD == 1 (HEAD_DIM 512, DIM_SPLITS 32), so
+// the KV-outer half's per-dim hoisting is moot here and only the chain break
+// matters.
+//
+// MEASURED NULL 2026-09-23, 1024/1024, chunks=32, GPUs 4-7, one MPK_BAR_SKEW=3
+// pair, both G1 PASS with coherent text:
+//   ISA        v_exp_f32 328 -> 200 (4 inlined merges x 32), 147022 -> 145850
+//              insns. Standalone merge<wt=1, splits=32, 32 chunks>: loads in
+//              flight before the first wait 16 -> 36, 932 -> 647 insns.
+//   merge      critical-worker busy 4.16 -> 3.80 us/layer, span 10.12 -> 9.95
+//   decode_min (instrumented) 14.588 -> 14.555 ms
+// ~0.02 ms/token, the size gpt-oss measured (-0.017). The running form was
+// already 15 loads deep, and the merge is ~4 us of a ~185 us layer. Correct:
+// tests/standalone/test_mla_merge.hip passes at 16 and 32 chunks with the
+// same max error (1.95e-3, bf16 rounding) as the running form. Kept off.
+#ifndef MPK_MERGE_TWO_PASS
+#define MPK_MERGE_TWO_PASS 0
+#endif
+
 namespace kernel {
 
 #if MPK_MERGE_GLOBAL
@@ -296,6 +322,55 @@ __device__ __forceinline__ void
 
     // Compute all VAL_PER_THREAD dimensions
     float out_vals[VAL_PER_THREAD];
+#if MPK_MERGE_TWO_PASS
+    {
+      int const lse_base0 = head_idx +
+                            (first_token_pos + token_idx) * LSE_TOKEN_STRIDE +
+                            lse_kv_offset;
+      // Pass 1: every lse, independent loads, then the max.
+      float lse_log2[NUM_KV_CHUNKS];
+#pragma unroll
+      for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
+        lse_log2[kv_idx] = lse_g[lse_base0 + kv_idx * NUM_QO_HEADS_PER_KV] *
+                           1.44269504088896340736f;
+      }
+      float m_max = -inf;
+#pragma unroll
+      for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
+        m_max = max(m_max, lse_log2[kv_idx]);
+      }
+      // Pass 2: weights known, so the o loads carry no dependency on each
+      // other. Empty chunks (lse = -1e30) get weight 0, as in the running form.
+      float d_sum = 0.f;
+      float o_sum[VAL_PER_THREAD];
+#pragma unroll
+      for (int i = 0; i < VAL_PER_THREAD; ++i) {
+        o_sum[i] = 0.f;
+      }
+#pragma unroll
+      for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
+        float const w = ptx_exp2(lse_log2[kv_idx] - m_max);
+        d_sum += w;
+        int const o_base =
+            (lse_base0 + kv_idx * NUM_QO_HEADS_PER_KV) * HEAD_DIM + dim_base +
+            thread_in_group * VAL_PER_THREAD;
+#pragma unroll
+        for (int i = 0; i < VAL_PER_THREAD; ++i) {
+          o_sum[i] += o_g[o_base + i] * w;
+        }
+      }
+#pragma unroll
+      for (int i = 0; i < VAL_PER_THREAD; ++i) {
+        float out_f = __fdividef(o_sum[i], d_sum);
+        if (sinks_ptr != nullptr) {
+          float lse_log2_tot = m_max + ptx_log2(d_sum);
+          float diff = sink_val_log2 - lse_log2_tot;
+          out_f *= __fdividef(1.0f, 1.0f + ptx_exp2(diff));
+        }
+        out_vals[i] = out_f;
+      }
+    }
+#else
 #pragma unroll
     for (int i = 0; i < VAL_PER_THREAD; ++i) {
       float m_global = -inf;
@@ -331,6 +406,7 @@ __device__ __forceinline__ void
       }
       out_vals[i] = out_f;
     }
+#endif
 
     // Write output: either write-through (st_wt) or regular global store
     if constexpr (WRITE_THROUGH) {

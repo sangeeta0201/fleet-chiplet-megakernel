@@ -93,6 +93,68 @@
 // Both are valid approaches; NT is more explicit about bypassing cache.
 // =============================================================================
 
+// MPK_POLL_LAT_PROBE (diagnostic, default off): time every spin-poll load with
+// s_memrealtime and log any single load slower than MPK_POLL_LAT_PROBE_US into
+// a host-pinned ring that the [ITER] heartbeat thread prints as [PLAT]. Tests
+// whether a 1k/1k stall is one poll load that does not return: rocgdb found a
+// worker parked for minutes at the s_waitcnt behind its flag load, spin
+// counter frozen, with the releasing value already in memory.
+#ifndef MPK_POLL_LAT_PROBE
+#define MPK_POLL_LAT_PROBE 0
+#endif
+#ifndef MPK_POLL_LAT_PROBE_US
+#define MPK_POLL_LAT_PROBE_US 50000
+#endif
+#define MPK_PLAT_RING 4096
+#define MPK_PLAT_WORDS 8
+#if MPK_POLL_LAT_PROBE && defined(__HIP_PLATFORM_AMD__)
+// [0] = records claimed; record i occupies words [8 * (i + 1), 8 * (i + 2)).
+__device__ unsigned int *g_plat_ring;
+__device__ __forceinline__ void mpk_plat_check(unsigned long long t0,
+                                               void const *addr,
+                                               unsigned long long val) {
+#if defined(__HIP_DEVICE_COMPILE__)
+  // Where the caller's load is a plain atomic rather than asm with its own
+  // wait, the compiler would otherwise read t1 before the load returns.
+  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  unsigned long long const t1 = __builtin_amdgcn_s_memrealtime();
+  if (t1 - t0 > (unsigned long long)MPK_POLL_LAT_PROBE_US * 100ull) {
+    unsigned long long pc;
+    asm volatile("s_getpc_b64 %0" : "=s"(pc));
+    unsigned int *const ring = g_plat_ring;
+    if (ring != nullptr) {
+      unsigned int const slot = __hip_atomic_fetch_add(
+          &ring[0], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      if (slot < MPK_PLAT_RING) {
+        unsigned int *const r = ring + MPK_PLAT_WORDS * (1 + slot);
+        r[1] = (unsigned int)((t1 - t0) / 100ull);
+        r[2] = (unsigned int)pc;
+        r[3] = (unsigned int)(pc >> 32);
+        r[4] = (unsigned int)(unsigned long long)addr;
+        r[5] = (unsigned int)((unsigned long long)addr >> 32);
+        r[6] = (unsigned int)val;
+        r[7] = (unsigned int)(t0 / 100000ull);
+        __hip_atomic_store(&r[0],
+                           (blockIdx.x + 1u) | (threadIdx.x << 16),
+                           __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+      }
+    }
+  }
+#endif
+}
+#define MPK_PLAT_T0()                                                          \
+  unsigned long long const _plat_t0 = __builtin_amdgcn_s_memrealtime()
+#define MPK_PLAT_T1(addr, val)                                                 \
+  mpk_plat_check(_plat_t0, (void const *)(addr), (unsigned long long)(val))
+#else
+#define MPK_PLAT_T0()                                                          \
+  do {                                                                         \
+  } while (0)
+#define MPK_PLAT_T1(addr, val)                                                 \
+  do {                                                                         \
+  } while (0)
+#endif
+
 // MPK_PEER_POLL_NT: the `nt` token on the CROSS-RANK peer poll (ld_sys_u64 and
 // ld_sys_u64_x8). Default 0 = dropped. Same mechanism and same reasoning as
 // MPK_BAR_POLL_NT below, which measured -0.367 us/barrier and -0.206 ms/token.
@@ -142,6 +204,7 @@ __device__ __forceinline__ mpk_u64x8
   mpk_u64x8 r;
 #if defined(__HIP_DEVICE_COMPILE__) &&                                         \
     (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  MPK_PLAT_T0();
 #if MPK_PEER_POLL_NT
   asm volatile(
                "global_load_dwordx2 %0, %8, off offset:0 sc0 sc1 nt\n"
@@ -176,6 +239,7 @@ __device__ __forceinline__ mpk_u64x8
                  "=v"(r.v[7])
                : "v"(base)
                : "memory");
+  MPK_PLAT_T1(base, r.v[0]);
 #else
 #pragma unroll
   for (int i = 0; i < 8; i++) {
@@ -253,6 +317,7 @@ __device__ __forceinline__ int ld_nt_s32(int *addr) {
 #if defined(__HIP_DEVICE_COMPILE__) &&                                         \
     (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
   int val;
+  MPK_PLAT_T0();
 #if MPK_BAR_POLL_NT
   asm volatile("global_load_dword %0, %1, off sc0 sc1 nt\n"
                "s_waitcnt vmcnt(0)"
@@ -266,6 +331,7 @@ __device__ __forceinline__ int ld_nt_s32(int *addr) {
                : "v"(addr)
                : "memory");
 #endif
+  MPK_PLAT_T1(addr, val);
   return val;
 #else
   return *reinterpret_cast<int volatile *>(addr);
@@ -295,6 +361,7 @@ __device__ __forceinline__ unsigned long long int
 #if defined(__HIP_DEVICE_COMPILE__) &&                                         \
     (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
   unsigned long long int val;
+  MPK_PLAT_T0();
 #if MPK_PEER_POLL_NT
   asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1 nt\n"
                "s_waitcnt vmcnt(0)"
@@ -314,6 +381,7 @@ __device__ __forceinline__ unsigned long long int
                : "v"(addr)
                : "memory");
 #endif
+  MPK_PLAT_T1(addr, val);
   return val;
 #else
   return *reinterpret_cast<unsigned long long int volatile *>(addr);
@@ -444,6 +512,24 @@ __device__ __forceinline__ void st_wt_u32(void *addr, unsigned int val) {
 #ifndef MPK_BAR_FLAG_MAX
 #define MPK_BAR_FLAG_MAX 1
 #endif
+// MPK_SIG_WBL2 (diagnostic, default off): write this XCD's L2 back after
+// every release flag and every cross-rank signal store. Tests whether the
+// multi-second 1k/1k stalls are a published value lingering in a writer's L2:
+// captures show senders that have moved on while their signal is absent from
+// the receiver's HBM, and a sender's own local copy absent from its own.
+// MEASURED NULL, 2026-09-23, 2 runs: prefill still stalled (600 and 1031
+// ms/iter, single stalls of 476 s and 518 s); decode clean at +1.2 ms median.
+#ifndef MPK_SIG_WBL2
+#define MPK_SIG_WBL2 0
+#endif
+#if MPK_SIG_WBL2
+#define MPK_SIG_FLUSH()                                                        \
+  asm volatile("buffer_wbl2 sc0 sc1\n\ts_waitcnt vmcnt(0)" ::: "memory")
+#else
+#define MPK_SIG_FLUSH()                                                        \
+  do {                                                                         \
+  } while (0)
+#endif
 __device__ __forceinline__ void st_flag_u32(void *addr, unsigned int val) {
 #if MPK_BAR_FLAG_MAX
   // Device scope: the reader may be on any XCD. RELAXED, deliberately -- the
@@ -459,6 +545,7 @@ __device__ __forceinline__ void st_flag_u32(void *addr, unsigned int val) {
 #else
   st_wt_u32(addr, val);
 #endif
+  MPK_SIG_FLUSH();
 }
 
 // Write-through 16-bit store (1x bf16)
@@ -897,41 +984,61 @@ __device__ __forceinline__ bool
 // them; what is unknown is whether they SURVIVE to the qkv_a phase, since the
 // MoE streams ~25 MB/layer/rank through the same L2.
 //
-// The pointer comes from g_ml_next_qkv_w below, not from a kernel argument:
-// input_ptrs[3] is already this XCD's own partitioned qkv_a weight slice, and
-// the multi-layer loop can read layer ml+1's copy of it out of
-// config.ml_input_table without any new plumbing through task_register.
+// The pointer is a kernel argument (next_qkv_weight_ptr), filled from
+// task_desc->input_ptrs[MPK_QKVA_PF_SLOT]. The multi-layer loop writes that
+// slot from ml_input_table[ml+1][3] -- the same qkv_a weight the next layer's
+// prologue already dereferences. A __device__ side channel (g_ml_next_qkv_w)
+// illegal-addressed at KB=1 AT=13 even after zero-init+syncthreads; cause not
+// localized. The slot-33 argument path has not faulted at KB=1.
 //
-// A worker reads [j * KB, (j+1) * KB) of the slice, j = xcd_rank - w13_live,
+// A worker reads [j * KB, (j+1) * KB) of the slice, j = xcd_rank - live,
 // and skips itself if that would leave the bounded window -- exactly the guard
-// MPK_MOE_SHADOW_KB uses, for exactly the same reason (that probe's first cut
-// faulted every rank by reading a pointer whose extent is not in scope).
+// MPK_MOE_SHADOW_KB uses.
 #ifndef MPK_QKVA_PF_KB
 #define MPK_QKVA_PF_KB 0
 #endif
-// The window a worker's dose must fit inside. qkv_a's per-XCD slice is
-// output_size_per_xcd * (K + K/32) bytes = 328 * 6336 = 2.078 MB at GLM-5's
-// 2624-wide qkv_a output, so 1.5 MB is comfortably in bounds without the
-// kernel having to derive the extent it cannot see.
+// Past every slot the fused MLA layer declares (used_in maxes at 31 under
+// EP + both un-absorptions). MAX_INPUTS_PER_TASK is 34.
+#ifndef MPK_QKVA_PF_SLOT
+#define MPK_QKVA_PF_SLOT 33
+#endif
+// 2026-09-22, 1024/1024, chunks=32, GPUs 4-7, g_ml_next_qkv_w side channel:
+//   KB=256 AT=2: 9/9 rc=124. Control 11.256 G1 PASS.
+//   KB=1  AT=2: hipErrorIllegalAddress, then after zero-init+syncthreads
+//               still 5/5 rc=124 (no HIP error -- watchdog).
+//   KB=1  AT=13: hipErrorIllegalAddress again.
+// Also AT=2 sat AFTER `if (xcd_rank >= moe_w2_tiles_per_xcd) return`, so the
+// W2-idle workers never issued the dose. Re-plumb via MPK_QKVA_PF_SLOT and
+// issue AT=2 before that return. The oproj parameter is compile-gated so the
+// KB=0 build is unchanged.
+// 2026-09-23, 1024/1024, chunks=32, GPUs 4-7, slot 33, multi-worker dose:
+//   current qkv as fused arg:      11.343 G1 PASS
+//   current qkv via slot 33:       11.353 G1 PASS
+//   next-layer KB=1:               11.366 G1 PASS (control 11.281; NULL)
+//   KB=256:                        one hipErrorIllegalAddress (rank 3), not
+//                                  localized -- the <=1.5 MB read is inside
+//                                  the 2.32 MB chunk (see the window below)
+// NOT ATTRIBUTABLE -- do not cite as variant failures: next-layer 4/4 rc=124
+// (before the heap guard), KB=256 single-worker 3/3 rc=124, and the rc=124
+// counts in the 09-22 block above. The CONTROL wedged 5 of 7 attempts in the
+// same session, including 3/3 on an ISA byte-identical (f6058fb5) to a
+// control that then passed first try. The heap guard is a no-op on this box:
+// consecutive layers' qkv_a are 18-69 GB apart, under its 256 GB bound, so
+// "guarded" and "unguarded" published the same pointer.
+// Keep 0: KB=1 is legal and NULL; KB=256 has one unexplained fault.
+// The window a worker's dose must fit inside. qkv_a is padded to 3072 rows
+// (q_lora 2048 + kv_a 576 -> 1024), so the per-XCD MXFP8 chunk is
+// 384 * (6144 + 192) = 2.32 MB and 1.5 MB is in bounds without the kernel
+// having to derive the extent it cannot see.
 #define MPK_QKVA_PF_WINDOW ((size_t)1536 * 1024)
 
 // Which idle-worker hole issues the dose. 13 = the W13-idle hole (21 of 29
 // workers, measured NEUTRAL -- W2 streams over the lines before qkv_a(L+1)
-// reads them); 2 = the W2-idle hole (17 of 29, but nothing streams between it
-// and the consumer). See the placement comment in
-// gang_oproj_router_fused_mi300.cuh.
+// reads them); 2 = the W2-idle hole (workers with no W2 tile, issued before
+// they return to the fused epilogue, concurrent with the W2 wait+tiles).
+// See the placement comment in gang_oproj_router_fused_mi300.cuh.
 #ifndef MPK_QKVA_PF_AT
 #define MPK_QKVA_PF_AT 2
-#endif
-
-#if MPK_QKVA_PF_KB > 0
-// Layer ml+1's qkv_a weight base, one slot per XCD, published by the
-// multi-layer loop in persistent_kernel.cuh before it dispatches layer ml.
-// Every block on an XCD writes the same value, and every write lands before
-// the layer-entry barrier that the reader passes, so the benign race is
-// ordered. Null on the last layer of an iteration, which turns the prefetch
-// off for that layer.
-__device__ void *g_ml_next_qkv_w[8];
 #endif
 
 // MPK_QKVA_REPS: how many times the qkv_a tile loop runs. 1 is the shipping

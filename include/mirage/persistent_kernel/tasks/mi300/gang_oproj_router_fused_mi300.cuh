@@ -260,7 +260,15 @@ __device__ __attribute__((always_inline)) void
         // locally; the rest are the per-rank lines the peers push. Element
         // NUM_EXPERTS of a line is the sum-of-squares, which rides along
         // because it reduces over the identical partition.
-        void *router_partials_ptr = nullptr) {
+        void *router_partials_ptr = nullptr
+#if MPK_QKVA_PF_KB > 0
+        ,
+        // Next layer's qkv_a weight for this XCD. Null on the last layer of
+        // a run. The fused caller passes input_ptrs[MPK_QKVA_PF_SLOT].
+        // Compile-gated only so the KB=0 build is untouched.
+        void const *next_qkv_weight_ptr = nullptr
+#endif
+        ) {
 
   int const tid = threadIdx.x;
   int const xcd_id = tile_idx / tiles_per_xcd;
@@ -708,6 +716,7 @@ __device__ __attribute__((always_inline)) void
                       (unsigned long long)wuv_expected);
           }
           asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          MPK_SIG_FLUSH();
           // All peers off one bitmask rather than in rank order, so a slow
           // link costs its own latency and not the sum.
           unsigned remaining = (1u << WUV_NPEER) - 1u;
@@ -1247,6 +1256,7 @@ __device__ __attribute__((always_inline)) void
                       (unsigned long long)oproj_expected);
           }
           asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          MPK_SIG_FLUSH();
           // Poll all peers concurrently off one bitmask rather than in rank
           // order, so a slow link costs its own latency and not the sum.
           unsigned remaining = (1u << OPROJ_NPEER) - 1u;
@@ -1886,10 +1896,10 @@ __device__ __attribute__((always_inline)) void
 //       surviving.
 #define MPK_QKVA_PF_BODY(live)                                                 \
   do {                                                                         \
-    void *const nxt_w =                                                        \
-        __atomic_load_n(&g_ml_next_qkv_w[xcd_id & 7], __ATOMIC_RELAXED);       \
+    void const *const nxt_w = next_qkv_weight_ptr;                             \
     size_t const pf_bytes = (size_t)MPK_QKVA_PF_KB * 1024;                     \
-    if (nxt_w != nullptr && xcd_rank >= (live) && (live) > 0 &&                \
+    if (nxt_w != nullptr && (((uintptr_t)nxt_w) & 15u) == 0u &&                \
+        xcd_rank >= (live) && (live) > 0 &&                                    \
         (size_t)(xcd_rank - (live) + 1) * pf_bytes <= MPK_QKVA_PF_WINDOW) {    \
       char const *base =                                                       \
           (char const *)nxt_w + (size_t)(xcd_rank - (live)) * pf_bytes;        \
@@ -1983,6 +1993,13 @@ __device__ __attribute__((always_inline)) void
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
   }
+#if MPK_QKVA_PF_KB > 0 && MPK_QKVA_PF_AT == 2
+  // BEFORE the early return. The W2-idle workers (`xcd_rank >=
+  // moe_w2_tiles_per_xcd`) leave this function without waiting, so a dose
+  // parked below that return never ran for them. Issued here, the idle set
+  // pulls next-layer qkv_a concurrently with the W2 wait+tiles.
+  MPK_QKVA_PF_BODY(moe_w2_live);
+#endif
   if (xcd_rank >= moe_w2_tiles_per_xcd) {
     return;
   }
@@ -2048,12 +2065,6 @@ __device__ __attribute__((always_inline)) void
   if (_pipe_my >= 0 && _pipe_my < _pipe_tiles) {
     MPK_PIPE_W2_TILE(_pipe_my);
   }
-#endif
-#if MPK_QKVA_PF_KB > 0 && MPK_QKVA_PF_AT == 2
-  // The W2-idle hole. Above the W2 tile loop, so a worker that owns no W2 tile
-  // issues its dose concurrently with the workers that do, and then falls
-  // through the loop with zero trips.
-  MPK_QKVA_PF_BODY(moe_w2_live);
 #endif
   for (int t = xcd_rank; t < moe_w2_live; t += tiles_per_xcd) {
     // Tiles [0, _pipe_tiles) were MOVED onto the W13-idle workers above, so

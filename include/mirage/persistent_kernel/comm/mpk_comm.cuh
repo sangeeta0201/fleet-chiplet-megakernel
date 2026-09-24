@@ -425,6 +425,47 @@ __host__ inline void mpk_shmem_init_peer_deltas(void *probe) {
   if (allocs_d) {
     (void)hipFree(allocs_d);
   }
+  // rocSHMEM's shmem_ptr is ipc_bases[pe] + (dest - ipc_bases[my_pe]) with no
+  // null check (src/ipc/context_ipc_device.cpp). A peer base that is 0 or
+  // stale comes back as a small NON-null pointer -- the object's heap offset
+  // -- which passes both tests in the kernel above: it is not null, and every
+  // object is off by the same -local_base. Every direct peer store would then
+  // land a few MiB above address 0, which is what the recurring "no-retry
+  // page fault ... address 0x...18000" lines in dmesg on GPUs 4-7 look like.
+  // Refuse to launch on it rather than fault on the first EP fold.
+  {
+    uint32_t valid_h = 0;
+    int64_t delta_h[MPK_MAX_PES] = {};
+    (void)hipMemcpyFromSymbol(&valid_h, HIP_SYMBOL(mpk_peer_heap_valid_d),
+                              sizeof(valid_h));
+    (void)hipMemcpyFromSymbol(delta_h, HIP_SYMBOL(mpk_peer_heap_delta_d),
+                              sizeof(delta_h));
+    char line[512];
+    int off = snprintf(line, sizeof(line), "[MPK] peer bases my_pe=%d valid=0x%x",
+                       my_pe, valid_h);
+    bool implausible = false;
+    for (int pe = 0; pe < n_pes && pe < MPK_MAX_PES; pe++) {
+      if (((valid_h >> pe) & 1u) == 0u) {
+        continue;
+      }
+      uintptr_t const peer =
+          reinterpret_cast<uintptr_t>(probe) + static_cast<uintptr_t>(delta_h[pe]);
+      if (off < (int)sizeof(line) - 32) {
+        off += snprintf(line + off, sizeof(line) - off, " pe%d=%#lx", pe,
+                        (unsigned long)peer);
+      }
+      if (peer < (1ull << 32)) {
+        implausible = true;
+      }
+    }
+    fprintf(stderr, "%s\n", line);
+    if (implausible) {
+      fprintf(stderr,
+              "[MPK] implausible peer base (< 4 GB): rocSHMEM ipc_bases not "
+              "populated for a peer; aborting before any peer store\n");
+      abort();
+    }
+  }
 #if MPK_EP_ASSUME_DIRECT != 0
   // The device staged fallback has been compiled down to a trap, so an
   // unmapped peer must be caught here rather than 36 layers deep. Every bit up

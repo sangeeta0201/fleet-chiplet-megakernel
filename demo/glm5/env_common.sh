@@ -159,6 +159,8 @@ MPK_FORWARD_VARS=(
   # the watchdog's SIGKILL. Runtime-only, so it does not have to match across
   # ranks, but it is in the list so every rank reports.
   MPK_BOOT_PROBE
+  # Host-only: write the compacted event/task graph to $MPK_DUMP_EVENTS.r<rank>.
+  MPK_DUMP_EVENTS
   # TaskDesc slots in execute_worker's LDS staging buffer. Compile-time, so it
   # must match across ranks; in the whitelist so every rank gets the same one.
   MPK_TASK_DESC_SLOTS
@@ -243,7 +245,7 @@ MPK_FORWARD_VARS=(
   MPK_BAR_TREE MPK_W2_KSPLIT MPK_MOE_LIVE_BOUND MPK_W2_STAGE_FULL MPK_VPROBE
   MPK_MOE_ACT_FP8
   MPK_QKV_EP_FOLD MPK_QKV_PRO_HOIST MPK_QUANT_V16 MPK_QKV_FOLD_ROWS
-  MPK_COLL_FUSE_NORM MPK_COLL_FUSE_REG MPK_RMSNORM_DPP
+  MPK_COLL_FUSE_NORM MPK_COLL_FUSE_REG MPK_RMSNORM_DPP MPK_MERGE_TWO_PASS MPK_QKVA_ENTRY_PF
   MPK_BAR_SKEW MPK_EP_FOLD_WGS MPK_EP_POLL_BATCH MPK_ML_PTR_PREFETCH
   # Not a semantic change -- both settings are coherent -- but still
   # compile-time, and an A/B is only one variable if every rank agrees.
@@ -254,7 +256,8 @@ MPK_FORWARD_VARS=(
   MPK_ML_BOUNDARY_PAD MPK_BAR_SKEW_DROP_NS MPK_WUV_IN_MERGE GLM_RESADD_UNROLL
   GLM_RESADD_BATCH GLM_RESADD_GLOBAL GLM_MLFL_LDS GLM_EP_ASSUME_DIRECT GLM_MERGE_GLOBAL
   GLM_CONST_BLOCKDIM
-  MPK_PRINT_GEOMETRY MPK_LINE_TABLES
+  MPK_PRINT_GEOMETRY MPK_LINE_TABLES MPK_HWID_PROBE MPK_SIG_WBL2 MPK_SCHED_LDS
+  MPK_POLL_LAT_PROBE MPK_POLL_LAT_PROBE_US
   MPK_PRINT_ALL_RANKS
   MPK_HOST_DBG_POLL
   # -DMPK_MAX_TOKENS_PER_REQUEST=1: pins prefill to one token per iteration so

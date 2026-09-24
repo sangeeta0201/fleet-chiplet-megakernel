@@ -58,6 +58,7 @@ __device__ int g_subphase_active;
 __device__ unsigned long long g_subphase_scratch[8];
 #endif
 
+
 #ifdef MPK_FUSED_PHASE_TIMING
 // Fused O-proj+MoE phase timing: [0]=oproj_ns, [1]=poll_ns, [2]=moe_ns,
 // [3]=count
@@ -412,6 +413,50 @@ static int g_boot_probe_slots = 0;
 static int g_boot_probe_nworkers = 0;
 static int const MAX_NUM_SCHEDULERS = 64;
 
+// MPK_HWID_PROBE (compile-time, needs MPK_BOOT_PROBE=1): where every wave was
+// placed. Lane 0 of each wave stores HW_REG_HW_ID with the XCC id in bits
+// 31:28 into pinned slot [worker_id * 4 + wave] (workers) or
+// [num_workers * 4 + sched_id] (schedulers). A scheduler wave (81 VGPRs) fits
+// beside a worker wave (384 incl. AGPRs) on one SIMD, so the question is
+// whether the workers that lag are the ones sharing a CU with a scheduler.
+#ifndef MPK_HWID_PROBE
+#define MPK_HWID_PROBE 0
+#endif
+__device__ int *g_hwid_probe;
+static int *g_hwid_probe_host = nullptr;
+
+// Dynamic LDS the scheduler grid is launched with; it uses none of it. A
+// worker block (7328 static + MAX_DYNAMIC_SHARED_MEMORY_SIZE) leaves 864 B of
+// the CU's 160 KB free and a scheduler wave (88 VGPRs) fits beside a 384-VGPR
+// worker wave, so with only its 64 B of static LDS a scheduler can share a
+// worker's CU -- at launch, or after a queue preemption restores the waves
+// elsewhere (test_coresid.hip: 5-8 of 8 schedulers co-resident). Any value
+// above 864, e.g. MPK_SCHED_LDS=4096, gives each scheduler a CU of its own --
+// and then 248 of the 256 CUs must be exclusive, which does not always place:
+// with 4096, worker 233 of 240 was never dispatched and the run hung at
+// iteration 1 (that signature: 2 of 6 launches). Default 0 = the old launch.
+// Co-residency is NOT what stalled 1k/1k: runs with the 4096 pad stalled just
+// the same, and the stalls were KFD queue evictions driven by automatic NUMA
+// balancing (demo/glm5/mpol_local.sh).
+static int mpk_sched_lds_bytes() {
+  static int const bytes = [] {
+    char const *e = getenv("MPK_SCHED_LDS");
+    return (e != nullptr) ? atoi(e) : 0;
+  }();
+  return bytes;
+}
+
+// Word layout: HW_ID bits 15:0 (wave, SIMD, pipe, CU, SH, SE), the
+// workgroup's LDS allocation (HW_REG_LDS_ALLOC bits 23:12, 256 B granules) in
+// 27:16, XCC id in 31:28.
+__device__ __forceinline__ int mpk_hwid_word() {
+  int hw, xcc, lds;
+  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_HW_ID)" : "=s"(hw));
+  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 4)" : "=s"(xcc));
+  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_LDS_ALLOC)" : "=s"(lds));
+  return (hw & 0xffff) | (((lds >> 12) & 0xfff) << 16) | (xcc << 28);
+}
+
 // Host-visible iteration heartbeat. GLM's precomputed-dispatch path defers
 // every [FWD_PASS] printf until the kernel returns, and device printf lands
 // on stdout which mpirun block-buffers, so a healthy 1k-token prefill looks
@@ -420,10 +465,16 @@ static int const MAX_NUM_SCHEDULERS = 64;
 // the scheduler stores into, a host thread that only does plain loads plus
 // fprintf(stderr). No HIP call at read time -- hipMemcpy wedges with the
 // kernel (MPK_HOST_DBG_POLL). Always on; one relaxed store per iteration
-// from scheduler 0.
-//   [0] end_of_graph_count  [1] num_active_tokens
+// from whichever scheduler dequeues END_OF_TASK_GRAPH -- not always the same
+// one, so the count is a device-wide atomic rather than that scheduler's own.
+//   [0] completed iterations  [1] num_active_tokens
 __device__ int *g_iter_hb;
+__device__ int g_iter_hb_count;
 static int *g_iter_hb_host = nullptr;
+#if MPK_POLL_LAT_PROBE
+static unsigned int *g_plat_ring_host = nullptr;
+static unsigned int g_plat_seen = 0;
+#endif
 static std::atomic<int> g_iter_hb_epoch{0};
 
 // Sentinel the host pre-stamps into every worker's phase slot before the
@@ -1931,6 +1982,13 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
     }
   }
   __syncthreads();
+#if MPK_HWID_PROBE
+  if ((threadIdx.x & 63) == 0 && g_hwid_probe != nullptr) {
+    __atomic_store_n(&g_hwid_probe[worker_id * 4 + threadIdx.x / 64],
+                     mpk_hwid_word(),
+                     __ATOMIC_RELAXED);
+  }
+#endif
 
   int const xcd_id = block_xcd_id;
   int const is_xcd_leader = block_is_xcd_leader;
@@ -2497,10 +2555,13 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
             int _term_poll = 0;
 #endif
             while (actual_counts < needed_counts) {
+              MPK_PLAT_T0();
               actual_counts =
                   __atomic_load_n(reinterpret_cast<unsigned long long *>(
                                       &config.all_event_counters[event_index]),
                                   __ATOMIC_RELAXED);
+              MPK_PLAT_T1(&config.all_event_counters[event_index],
+                          actual_counts);
 #ifdef MPK_PRECOMPUTED_DISPATCH
               if ((++_term_poll & 1023) == 0 &&
                   __atomic_load_n(config.precomp_terminate, __ATOMIC_RELAXED)) {
@@ -3073,6 +3134,22 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
             int const ml_end = config.ml_run_end != nullptr
                                    ? config.ml_run_end[ml_begin]
                                    : config.ml_num_layers;
+            // Every wave must have read the stamp before tid 0 overwrites it
+            // with the run-monotonic layer counter below. On the first layer
+            // the pointer refresh -- and its barrier -- is skipped, so without
+            // this the first barrier after the read is the one after the
+            // overwrite. A wave that reaches the read late then takes
+            // ml_begin = (pc_iter-1)*ml_num_layers, indexes ml_run_end out of
+            // bounds, runs a different number of layers than its siblings and
+            // desynchronises every __syncthreads that follows. Iteration 1
+            // writes back the stamp itself (0), so only iterations >= 2 can
+            // lose the race. Observed as the 1k/1k wedge: a later task-queue
+            // refill done by one wave only, stale TaskDescs on the others, and
+            // a dependency wait on an event of the wrong layer.
+            __syncthreads();
+#if MPK_HWID_PROBE
+            int hwid_last = 0;
+#endif
 
             // MPK_ML_PTR_PREFETCH: hold the next layer's pointer-table entries
             // in registers instead of loading them at the layer boundary.
@@ -3101,6 +3178,19 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #endif
 
             for (int ml = ml_begin; ml < ml_end; ml++) {
+#if MPK_HWID_PROBE
+              // Per wave, stored only when a queue restore has moved it.
+              if ((threadIdx.x & 63) == 0 && g_hwid_probe != nullptr) {
+                int const hw = mpk_hwid_word();
+                if (hw != hwid_last) {
+                  __atomic_store_n(
+                      &g_hwid_probe[worker_id * 4 + threadIdx.x / 64],
+                      hw,
+                      __ATOMIC_RELAXED);
+                  hwid_last = hw;
+                }
+              }
+#endif
               // Stage stamp 12: the loop boundary itself. Splits the 16.50 us
               // that S11 - S8 measures into the part below the previous
               // iteration's fence (S12 - S8: return from the fused kernel,
@@ -3274,27 +3364,35 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #endif
 
 #if MPK_QKVA_PF_KB > 0
-              // Publish layer ml+1's qkv_a weight base for this XCD so the
-              // W13-idle workers can pull it into cache during this layer's
-              // MoE phase. input_ptrs[3] is the qkv_weight slot (see the map
-              // at gang_mla_full_layer_fused_mi300.cuh's call site) and the
-              // ml_input_table is already partitioned per XCD, so this is
-              // exactly the slice this XCD's own qkv_a tiles read next layer.
-              //
-              // This runs above the dispatch and therefore above the layer's
-              // entry barrier, so every block's write is ordered before any
-              // block's read. Last layer of an iteration publishes null.
+              // Next layer's qkv_a. Slot 33 is a legal vehicle (current [3]
+              // via slot 33: 11.353 G1 PASS). The same-heap guard is purely
+              // defensive: it never fires on this box (layers' qkv_a are
+              // 18-69 GB apart), and the 4/4 hang seen before it was added
+              // is not attributable -- control wedged 5/7 that session.
+              static_assert(MPK_QKVA_PF_SLOT < MAX_INPUTS_PER_TASK,
+                            "QKVA prefetch slot must fit in TaskDesc");
               if (threadIdx.x == 0) {
                 void *nxt = nullptr;
+                void *cur = task_desc->input_ptrs[3];
                 if (ml + 1 < ml_end) {
                   nxt = config.ml_input_table[(xcd_id * config.ml_num_layers +
                                                ml + 1) *
                                                   MAX_INPUTS_PER_TASK +
                                               3];
+                  intptr_t d = (intptr_t)nxt - (intptr_t)cur;
+                  if (d < 0) {
+                    d = -d;
+                  }
+                  // ~256 GB: same-GPU heap. A host pointer or another rank's
+                  // mapping is typically many TB away.
+                  if (cur == nullptr || nxt == nullptr ||
+                      ((uintptr_t)nxt & 15u) != 0u || d >= ((intptr_t)1 << 38)) {
+                    nxt = nullptr;
+                  }
                 }
-                __atomic_store_n(&g_ml_next_qkv_w[xcd_id & 7], nxt,
-                                 __ATOMIC_RELAXED);
+                task_desc->input_ptrs[MPK_QKVA_PF_SLOT] = nxt;
               }
+              __syncthreads();
 #endif
 
               // Execute this layer
@@ -4132,6 +4230,13 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                 &g_boot_probe[g_boot_probe_nw + sched_id], 1 + _rdy,
                 __ATOMIC_RELAXED);
           }
+#if MPK_HWID_PROBE
+          if (g_hwid_probe != nullptr) {
+            __atomic_store_n(&g_hwid_probe[g_boot_probe_nw * 4 + sched_id],
+                             mpk_hwid_word(),
+                             __ATOMIC_RELAXED);
+          }
+#endif
           if (_rdy >= config.num_workers) {
             break;
           }
@@ -4247,6 +4352,9 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
 #ifdef MPK_ENABLE_DISPATCH_TIMING
     unsigned long long last_dep_dispatch_end_ns = 0;
 #endif
+#if MPK_HWID_PROBE
+    int hwid_last = 0;
+#endif
 
     while (true) {
 #ifdef MPK_WORKER_STATE
@@ -4278,6 +4386,19 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
         }
         // nanosleep to avoid overwhelming I/O
         __nanosleep(10);
+#if MPK_HWID_PROBE
+        // Only a queue preemption can move a resident wave, so this stores
+        // once at startup and then only if a restore relocated the scheduler.
+        if (g_hwid_probe != nullptr) {
+          int const hw = mpk_hwid_word();
+          if (hw != hwid_last) {
+            __atomic_store_n(&g_hwid_probe[g_boot_probe_nw * 4 + sched_id],
+                             hw,
+                             __ATOMIC_RELAXED);
+            hwid_last = hw;
+          }
+        }
+#endif
       }
       // Make sure the schedule queue is not overflow
       assert(cur_event_pos[queue_idx] + config.per_sched_queue_len >
@@ -4399,8 +4520,9 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
         }
         prev_end_of_graph_clk = iter_end_clk;
         end_of_graph_count++;
-        if (sched_id == 0 && g_iter_hb != nullptr) {
-          __atomic_store_n(&g_iter_hb[0], end_of_graph_count, __ATOMIC_RELAXED);
+        if (g_iter_hb != nullptr) {
+          int const hb_n = atomicAdd(&g_iter_hb_count, 1) + 1;
+          __atomic_store_n(&g_iter_hb[0], hb_n, __ATOMIC_RELAXED);
           __atomic_store_n(&g_iter_hb[1], num_active_tokens, __ATOMIC_RELAXED);
         }
         // Check if we want to continue
@@ -6560,6 +6682,54 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
            "non-zero xcd_event thresholds)\n",
            nonzero_xcd_evt);
     fflush(stdout);
+    // Post-compaction graph, in the indices the kernel uses. The earlier
+    // MPK_DUMP_TASK_GRAPH dump predates compaction, so its event indices do
+    // not match a counter address read off a wedged run.
+    if (char const *ev_env = getenv("MPK_DUMP_EVENTS")) {
+      char const *rank_env = getenv("OMPI_COMM_WORLD_RANK");
+      char ev_path[512];
+      snprintf(ev_path,
+               sizeof(ev_path),
+               "%s.r%s",
+               ev_env,
+               rank_env != nullptr ? rank_env : "x");
+      if (FILE *f = fopen(ev_path, "w")) {
+        for (int ev = 0; ev < n_events; ev++) {
+          fprintf(f,
+                  "E %d type=%d ntrig=%d first=%d last=%d xcd=",
+                  ev,
+                  (int)all_events[ev].event_type,
+                  all_events[ev].num_triggers,
+                  (int)(all_events[ev].first_task_id & 0xffffffff),
+                  (int)(all_events[ev].last_task_id & 0xffffffff));
+          for (int xcd = 0; xcd < NUM_XCDS_PC; xcd++) {
+            fprintf(f, "%s%d", xcd ? "," : "", h_xcd_evt[xcd * n_events + ev]);
+          }
+          fprintf(f, "\n");
+        }
+        for (int t = 0; t < n_tasks; t++) {
+          auto const &td = all_tasks[t];
+          fprintf(f,
+                  "T %d type=%d variant=%d dep=%d trig=%d gang=%d tiles=%d\n",
+                  t,
+                  (int)td.task_type,
+                  (int)td.variant_id,
+                  td.dependent_event == EVENT_INVALID_ID
+                      ? -1
+                      : (int)(td.dependent_event & 0xffffffff),
+                  td.trigger_event == EVENT_INVALID_ID
+                      ? -1
+                      : (int)(td.trigger_event & 0xffffffff),
+                  is_gang_task_type(td.task_type) ? 1 : 0,
+                  is_gang_task_type(td.task_type)
+                      ? (int)td.task_metadata.n_tile_count
+                      : 0);
+        }
+        fclose(f);
+        printf("[MPK] Dumped compacted events/tasks -> %s\n", ev_path);
+        fflush(stdout);
+      }
+    }
 
     // Allocate gang barrier counter (GPU memory, zeroed) and dispatch count
     // (GPU, pre-filled)
@@ -6711,6 +6881,19 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
         g_boot_probe_host = host_probe;
         g_boot_probe_slots = slots;
         g_boot_probe_nworkers = num_workers;
+#if MPK_HWID_PROBE
+        int const hw_slots = num_workers * 4 + MAX_NUM_SCHEDULERS;
+        int *hw_probe = nullptr;
+        if (hipHostMalloc((void **)&hw_probe,
+                          (size_t)hw_slots * sizeof(int),
+                          hipHostMallocCoherent) == hipSuccess &&
+            hw_probe != nullptr) {
+          memset(hw_probe, 0, (size_t)hw_slots * sizeof(int));
+          (void)hipMemcpyToSymbol(
+              HIP_SYMBOL(g_hwid_probe), &hw_probe, sizeof(int *));
+          g_hwid_probe_host = hw_probe;
+        }
+#endif
         fprintf(stderr,
                 "[BOOT_PROBE] armed: %d worker slots + %d scheduler slots\n",
                 num_workers,
@@ -6740,6 +6923,24 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
               hipGetErrorString(e));
     }
   }
+#if MPK_POLL_LAT_PROBE
+  if (g_plat_ring_host == nullptr) {
+    unsigned int *ring = nullptr;
+    size_t const bytes =
+        (size_t)MPK_PLAT_WORDS * (1 + MPK_PLAT_RING) * sizeof(unsigned int);
+    hipError_t e = hipHostMalloc((void **)&ring,
+                                 bytes,
+                                 hipHostMallocMapped | hipHostMallocCoherent);
+    if (e == hipSuccess && ring != nullptr) {
+      memset(ring, 0, bytes);
+      (void)hipMemcpyToSymbol(HIP_SYMBOL(g_plat_ring), &ring, sizeof(ring));
+      g_plat_ring_host = ring;
+      fprintf(stderr,
+              "[PLAT] poll-latency probe on, threshold %d us\n",
+              (int)MPK_POLL_LAT_PROBE_US);
+    }
+  }
+#endif
   // Per-XCD per-event task thresholds for two-level event counting
   // xcd_event_num_tasks may already be allocated+filled by precomputed dispatch
   if (global_runtime_config.xcd_event_num_tasks == nullptr) {
@@ -6820,8 +7021,9 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   (void)cudaFuncSetAttribute(worker_kernel,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                              MAX_DYNAMIC_SHARED_MEMORY_SIZE);
-  (void)cudaFuncSetAttribute(
-      scheduler_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 1024);
+  (void)cudaFuncSetAttribute(scheduler_kernel,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             std::max(1024, mpk_sched_lds_bytes()));
   (void)cudaFuncSetAttribute(persistent_kernel,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                              MAX_DYNAMIC_SHARED_MEMORY_SIZE);
@@ -6948,9 +7150,9 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
     // The margin is one CU per XCD. Blocks are assigned to XCDs round-robin by
     // block index, so at the shipping 240 workers + 8 local schedulers each of
     // the 8 XCDs must host 30 worker blocks + 1 scheduler block = 31 of its 32
-    // CUs. The worker image is LDS-locked to 1 block/CU
-    // (MAX_DYNAMIC_SHARED_MEMORY_SIZE out of 160 KB), so a scheduler block
-    // cannot share a CU with a worker -- it needs a CU of its own. Launching
+    // CUs. A worker block leaves 864 B of LDS free, so a scheduler launched
+    // with the default 0 B of dynamic LDS can share a worker's CU; with
+    // MPK_SCHED_LDS above 864 it needs a CU of its own. Launching
     // the 240-block worker grid FIRST lets it claim CUs the 8 schedulers then
     // cannot get, and the run wedges. CAVEAT on how that was diagnosed: the
     // "ZERO `[SCHED_XCD]` lines" half of the signature is worthless. EVERY
@@ -6975,7 +7177,7 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
     if (_sched_first) {
       scheduler_kernel<<<dim3(global_runtime_config.num_local_schedulers, 1, 1),
                          dim3(128, 1, 1),
-                         0 /*smem*/,
+                         mpk_sched_lds_bytes() /*smem*/,
                          global_runtime_config.scheduler_stream>>>(
           global_runtime_config);
     }
@@ -6987,7 +7189,7 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
     if (!_sched_first) {
       scheduler_kernel<<<dim3(global_runtime_config.num_local_schedulers, 1, 1),
                          dim3(128, 1, 1),
-                         0 /*smem*/,
+                         mpk_sched_lds_bytes() /*smem*/,
                          global_runtime_config.scheduler_stream>>>(
           global_runtime_config);
     }
@@ -7059,7 +7261,107 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                     last_missing,
                     xbuf,
                     sbuf);
+#if MPK_HWID_PROBE
+            // HW_REG_HW_ID (gfx9): SIMD [5:4], CU [11:8], SH [12], SE [14:13];
+            // bits 31:28 carry the XCC id.
+            if (sample == 0 && g_hwid_probe_host != nullptr) {
+              int const *hw = g_hwid_probe_host;
+              auto cu_key = [](int v) {
+                return (int)(((unsigned)v >> 28) << 8 | ((v >> 13) & 3) << 6 |
+                             ((v >> 12) & 1) << 5 | ((v >> 8) & 15));
+              };
+              for (int s = 0; s < nsched; s++) {
+                int const sv = __atomic_load_n(&hw[nw * 4 + s], __ATOMIC_RELAXED);
+                if (sv == 0) {
+                  continue;
+                }
+                char wbuf[512];
+                int wo = 0;
+                for (int w = 0; w < nw && wo < (int)sizeof(wbuf) - 24; w++) {
+                  for (int wv = 0; wv < 4; wv++) {
+                    int const v =
+                        __atomic_load_n(&hw[w * 4 + wv], __ATOMIC_RELAXED);
+                    if (v != 0 && cu_key(v) == cu_key(sv)) {
+                      wo += snprintf(wbuf + wo, sizeof(wbuf) - wo,
+                                     " w%d.%d(lds=%d)%s", w, wv,
+                                     (v >> 16) & 0xfff,
+                                     ((v >> 4) & 3) == ((sv >> 4) & 3)
+                                         ? "(same SIMD)"
+                                         : "");
+                    }
+                  }
+                }
+                fprintf(stderr,
+                        "[HWID] sched %d xcc=%d se=%d sh=%d cu=%d simd=%d "
+                        "lds=%d shares CU with:%s\n",
+                        s, (unsigned)sv >> 28, (sv >> 13) & 3, (sv >> 12) & 1,
+                        (sv >> 8) & 15, (sv >> 4) & 3, (sv >> 16) & 0xfff,
+                        wo ? wbuf : " none");
+              }
+            }
+#endif
           }
+#if MPK_HWID_PROBE
+          // Placement only changes when a queue preemption restores a wave
+          // somewhere else. Log every move with its time so it can be lined up
+          // against the [ITER] heartbeat's stalls.
+          if (g_hwid_probe_host != nullptr) {
+            int const *hw = g_hwid_probe_host;
+            int const nslots = nw * 4 + nsched;
+            std::vector<int> prev(nslots);
+            for (int i = 0; i < nslots; i++) {
+              prev[i] = __atomic_load_n(&hw[i], __ATOMIC_RELAXED);
+            }
+            auto fmt = [](int v, char *buf, size_t n) {
+              snprintf(buf, n, "x%u/se%d/sh%d/cu%d/simd%d/slot%d",
+                       (unsigned)v >> 28, (v >> 13) & 3, (v >> 12) & 1,
+                       (v >> 8) & 15, (v >> 4) & 3, v & 15);
+            };
+            for (int t = 21;; t++) {
+              std::this_thread::sleep_for(std::chrono::seconds(1));
+              int moved = 0;
+              for (int i = 0; i < nslots; i++) {
+                int const v = __atomic_load_n(&hw[i], __ATOMIC_RELAXED);
+                if (v == prev[i]) {
+                  continue;
+                }
+                if (moved < 16) {
+                  char a[64], b[64];
+                  fmt(prev[i], a, sizeof(a));
+                  fmt(v, b, sizeof(b));
+                  if (i < nw * 4) {
+                    fprintf(stderr, "[HWID] t=%ds w%d.%d moved %s -> %s\n", t,
+                            i / 4, i % 4, a, b);
+                  } else {
+                    fprintf(stderr, "[HWID] t=%ds sched %d moved %s -> %s\n",
+                            t, i - nw * 4, a, b);
+                  }
+                }
+                moved++;
+                prev[i] = v;
+              }
+              if (moved > 0) {
+                auto cu_of = [](int v) {
+                  return (int)(((unsigned)v >> 28) << 8 | ((v >> 13) & 3) << 6 |
+                               ((v >> 12) & 1) << 5 | ((v >> 8) & 15));
+                };
+                int shared = 0;
+                for (int s = 0; s < nsched; s++) {
+                  int const sv = prev[nw * 4 + s];
+                  for (int i = 0; sv != 0 && i < nw * 4; i++) {
+                    if (prev[i] != 0 && cu_of(prev[i]) == cu_of(sv)) {
+                      shared++;
+                    }
+                  }
+                }
+                fprintf(stderr,
+                        "[HWID] t=%ds %d slots moved, %d worker waves now share "
+                        "a CU with a scheduler\n",
+                        t, moved, shared);
+              }
+            }
+          }
+#endif
         }).detach();
       }
     }
@@ -7070,6 +7372,7 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
       int *hb = g_iter_hb_host;
       std::thread([hb, epoch]() {
         int last = -1;
+        auto const t0 = std::chrono::steady_clock::now();
         while (g_iter_hb_epoch.load(std::memory_order_relaxed) == epoch) {
           std::this_thread::sleep_for(std::chrono::seconds(2));
           if (g_iter_hb_epoch.load(std::memory_order_relaxed) != epoch) {
@@ -7078,9 +7381,38 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
           int const n = __atomic_load_n(&hb[0], __ATOMIC_RELAXED);
           int const nat = __atomic_load_n(&hb[1], __ATOMIC_RELAXED);
           if (n != last) {
-            fprintf(stderr, "[ITER] n=%d nat=%d\n", n, nat);
+            double const t = std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - t0)
+                                 .count();
+            fprintf(stderr, "[ITER] n=%d nat=%d t=%.0fs\n", n, nat, t);
             last = n;
           }
+#if MPK_POLL_LAT_PROBE
+          if (g_plat_ring_host != nullptr) {
+            unsigned int const *ring = g_plat_ring_host;
+            unsigned int const claimed =
+                __atomic_load_n(&ring[0], __ATOMIC_ACQUIRE);
+            unsigned int const lim =
+                claimed < MPK_PLAT_RING ? claimed : MPK_PLAT_RING;
+            double const t = std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - t0)
+                                 .count();
+            while (g_plat_seen < lim) {
+              unsigned int const *r =
+                  ring + MPK_PLAT_WORDS * (1 + g_plat_seen);
+              unsigned int const who = __atomic_load_n(&r[0], __ATOMIC_ACQUIRE);
+              if (who == 0) {
+                break;
+              }
+              fprintf(stderr,
+                      "[PLAT] blk=%u tid=%u lat_us=%u pc=0x%x%08x "
+                      "addr=0x%x%08x val=%d t0_ms=%u t=%.0fs\n",
+                      (who & 0xffff) - 1, who >> 16, r[1], r[3], r[2], r[5],
+                      r[4], (int)r[6], r[7], t);
+              g_plat_seen++;
+            }
+          }
+#endif
         }
       }).detach();
     }

@@ -622,6 +622,32 @@ def get_compile_command(
         # it paid. See MPK_MERGE_GLOBAL in merge_splitkv.cuh for the samples.
         _mrg = int(os.environ.get("GLM_MERGE_GLOBAL", "1"))
         flags = flags + ["-DMPK_MERGE_GLOBAL=%d" % _mrg]
+        # gpt-oss's two-pass split-KV merge. Off until priced at 1k/1k; see
+        # MPK_MERGE_TWO_PASS in merge_splitkv.cuh.
+        if int(os.environ.get("MPK_MERGE_TWO_PASS", "0")) == 1:
+            flags = flags + ["-DMPK_MERGE_TWO_PASS=1"]
+        # Diagnostic: record every wave's hardware placement (see
+        # MPK_HWID_PROBE in persistent_kernel.cuh). Needs MPK_BOOT_PROBE=1.
+        if int(os.environ.get("MPK_HWID_PROBE", "0")) == 1:
+            flags = flags + ["-DMPK_HWID_PROBE=1"]
+        # Diagnostic: L2 writeback after every release flag and cross-rank
+        # signal (MPK_SIG_WBL2 in mpk_atoms.cuh). Costs latency; never ship.
+        if int(os.environ.get("MPK_SIG_WBL2", "0")) == 1:
+            flags = flags + ["-DMPK_SIG_WBL2=1"]
+        # Diagnostic: log any single spin-poll load slower than
+        # MPK_POLL_LAT_PROBE_US as a [PLAT] line (mpk_atoms.cuh). Never ship.
+        if int(os.environ.get("MPK_POLL_LAT_PROBE", "0")) == 1:
+            flags = flags + ["-DMPK_POLL_LAT_PROBE=1"]
+            _plat_us = os.environ.get("MPK_POLL_LAT_PROBE_US")
+            if _plat_us is not None:
+                flags = flags + [f"-DMPK_POLL_LAT_PROBE_US={int(_plat_us)}"]
+        # gpt-oss's next-qkv weight prefetch into the layer-barrier spin, at
+        # GLM's layer-entry barrier. Off until priced at 1k/1k; see
+        # MPK_QKVA_ENTRY_PF in gang_mla_full_layer_fused_mi300.cuh.
+        _qkva_entry_pf = int(os.environ.get("MPK_QKVA_ENTRY_PF", "0"))
+        if _qkva_entry_pf > 0:
+            assert _qkva_entry_pf in (1, 2), "MPK_QKVA_ENTRY_PF is 1 or 2"
+            flags = flags + ["-DMPK_QKVA_ENTRY_PF=%d" % _qkva_entry_pf]
         # Replace blockDim.x with the compile-time NUM_THREADS in every task
         # kernel's grid-stride loop. blockDim.x is not a register on gfx9 -- it
         # is a dispatch-packet read (global_load_ushort + s_waitcnt vmcnt(0), a
@@ -874,7 +900,10 @@ def get_compile_command(
             # ds_bpermute, six LDS round trips on the dependency path of every
             # RMSNorm. gpt-oss measured this exact swap at 1.851 -> 1.835 ms.
             # Bit-identical for lane 0, which is the only lane the caller
-            # reads. Long note at the define in
+            # reads. Covers rmsnorm_rcp_amd, rmsnorm_inline_amd, the fused
+            # gate ssq, and the shipping mxfp8 LDS-prologue rcps
+            # (_rnlm8_stage_norm_rcp / _rnlm8_resadd_norm_rcp /
+            # _rnlm8_pro_publish). Long note at the define in
             # gang_rmsnorm_linear_bias_mi300.cuh.
             flags = flags + ["-DMPK_RMSNORM_DPP=1"]
         if int(os.environ.get("MPK_QKV_FOLD_ROWS", "0")) == 1:

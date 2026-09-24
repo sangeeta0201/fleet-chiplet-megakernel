@@ -175,9 +175,23 @@ MPK_MPI_BIND="${MPK_MPI_BIND:---map-by ppr:$((NP / 2)):numa --bind-to numa}"
 # word-splits; expanded by THIS shell, so it needs no -x forwarding.
 MPK_RANK_WRAPPER="${MPK_RANK_WRAPPER:-}"
 
+# Exempt the ranks from automatic NUMA balancing whenever the host has it on;
+# see mpol_local.sh for the mechanism. With it on and no exemption, every
+# 1k/1k run stalled for tens to hundreds of seconds. MPK_NUMA_EXEMPT=0 turns
+# the exemption off. It covers only our own ranks: runs still stalled while
+# other GPU jobs on the host were starting up. The host-wide fix is
+# kernel.numa_balancing=0, which made this a no-op and left 9 of 9 runs clean
+# alongside 21 GPT-OSS job starts.
+MPK_NUMA_WRAP=""
+if [ "${MPK_NUMA_EXEMPT:-1}" = "1" ] &&
+   [ "$(cat /proc/sys/kernel/numa_balancing 2>/dev/null || echo 0)" != "0" ]; then
+  MPK_NUMA_WRAP="$(pwd)/mpol_local.sh"
+fi
+
 mpirun -np "$NP" --tag-output --allow-run-as-root \
   $MPK_MPI_BIND \
   $(mpk_x_args) \
+  $MPK_NUMA_WRAP \
   $MPK_RANK_WRAPPER \
   stdbuf -oL -eL python3 demo.py $MIRAGE_FLAG \
     --max-seq-length "${MAX_SEQ_LENGTH:-128}" \

@@ -233,6 +233,31 @@ static constexpr int FULL_LAYER_ENTRY_SLOT = 71;
 #endif
 static constexpr int FULL_LAYER_EP_FOLDERS = 8 * MPK_EP_FOLD_WGS;
 
+// MPK_QKVA_ENTRY_PF: gpt-oss's MPK_PREFETCH_NEXT_QKV (amd_mi355_gpt_oss120b
+// f3c40ed, 2.482 -> 2.456 ms there), placed at GLM's layer-entry barrier.
+// Every worker that owns a qkv_a tile issues its own slab into L2 while it
+// spins on the release. See the site in the entry barrier below.
+//
+// Level 1, one MPK_BAR_SKEW=3 pair at 1024/1024, chunks=32, GPUs 4-7, both
+// G1 PASS with coherent text (2026-09-23):
+//   qkv_a span 15.01 -> 13.37 us/layer; tile-owner busy p50 9.20 -> 6.92
+//   every later layer marker 1.3-2.1 us earlier, on all four ranks
+//   cross-rank EP fold done (S1) 13.14 -> 13.02: folders unaffected
+//   decode_min (instrumented) 14.604 -> 14.603: a single pair cannot resolve
+//   the ~0.09 ms/token the markers imply
+// The 8 folders (one per XCD) are then exactly the 8-worker tail that sets
+// the qkv_a max on every rank (8.0-8.3 us against a 6.9 us bulk); level 2
+// targets that.
+//
+// MEASURED NULL at wall (2026-09-24, 1024/1024, 3 interleaved reps per arm,
+// all stall-free, G1 PASS, coherent text), decode median / avg in ms:
+//   control 12.072 / 11.837   level 1 12.077 / 11.835   level 2 12.094 / 11.855
+// The ~0.09 ms/token the markers implied is not there: qkv_a is not on the
+// token's critical path. Off.
+#ifndef MPK_QKVA_ENTRY_PF
+#define MPK_QKVA_ENTRY_PF 0
+#endif
+
 static constexpr int FULL_LAYER_MLA_EP_RELEASE_SLOT = 80;
 static constexpr int FULL_LAYER_MLA_EP_FOLD_DONE_SLOT = 88;
 // Phase 8b's W_UV -> o_proj barrier, un-absorbed kv_b_v only: per-XCD release
@@ -780,6 +805,70 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
         }
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       }
+#if MPK_QKVA_ENTRY_PF
+    }
+    // The task desc already holds THIS layer's pointers, so input_ptrs[3] is
+    // the qkv_a weight Phase 1 reads, and xcd_rank is the tile this worker
+    // runs there (one grid-stride round). Issued after tid 0's arrival: the
+    // last arriver's fan-out drains vmcnt, so a DMA ahead of it would delay
+    // the release for everyone. The closing __syncthreads drains it, so it
+    // runs inside this worker's spin. EP folders are skipped: right after the
+    // release they publish this rank's MoE partial to every peer, so a delay
+    // there is cross-rank. aux = sc0 without nt, as the o_proj prefetch:
+    // the point is for Phase 1 to hit the slab in L2.
+    //
+    // Level 2 gives the folders a proxy: the first worker past the qkv_a
+    // tiles on the same XCD pulls the folder's slab into the shared L2. At
+    // level 1 the 8 folders were exactly the 8-worker tail that set the qkv_a
+    // max on every rank (8.0-8.3 us against a 6.9 us bulk).
+    int qpf_tile = -1;
+    if (xcd_rank < qkv_n_wgs_per_xcd) {
+      if (EP_WORLD_SIZE == 1 || xcd_rank >= MPK_EP_FOLD_WGS) {
+        qpf_tile = xcd_rank;
+      }
+    }
+#if MPK_QKVA_ENTRY_PF >= 2
+    else if (EP_WORLD_SIZE > 1 &&
+             xcd_rank - qkv_n_wgs_per_xcd < MPK_EP_FOLD_WGS) {
+      qpf_tile = xcd_rank - qkv_n_wgs_per_xcd;
+    }
+#endif
+    if (qpf_tile >= 0) {
+      constexpr int QPF_WG_BYTES =
+          QKV_OUTPUT_PER_WG * QKV_REDUCTION_SIZE +
+          QKV_OUTPUT_PER_WG * (QKV_REDUCTION_SIZE / 32);
+      constexpr int QPF_N16 = (QPF_WG_BYTES + 15) / 16;
+      constexpr int QPF_LPT = (QPF_N16 + 255) / 256;
+      // The o_proj prefetch's window. Nothing else touches LDS inside this
+      // barrier, and every DMA into it retires before the barrier exits.
+      constexpr int QPF_LDS_OFF =
+          ((int)(sizeof(unsigned short) * BATCH_SIZE * OPROJ_REDUCTION_SIZE) +
+           255) /
+          256 * 256;
+      static_assert(QPF_LDS_OFF + 4096 <=
+                        mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE,
+                    "the qkv_a prefetch window has to fit in dynamic LDS");
+      extern __shared__ char _fused_smem[];
+      i32x4_t const qpf_rsrc = make_w_buffer_rsrc(
+          input_ptrs[3],
+          static_cast<uint32_t>(qkv_n_wgs_per_xcd) * QPF_WG_BYTES);
+      auto *qpf_dst =
+          (__attribute__((address_space(3)))
+           uint32_t *)(_fused_smem + QPF_LDS_OFF + (tid >> 6) * 1024);
+      int const qpf_wg_voff = qpf_tile * QPF_WG_BYTES;
+      int qpf_voff = qpf_wg_voff + tid * 16;
+      int const qpf_last = qpf_wg_voff + (QPF_N16 - 1) * 16;
+#pragma unroll
+      for (int j = 0; j < QPF_LPT; j++) {
+        int const voff = qpf_voff < qpf_last ? qpf_voff : qpf_last;
+        qpf_voff += 4096;
+        __llvm_amdgcn_raw_buffer_load_lds(qpf_rsrc, qpf_dst, 16, voff, 0, 0, 1);
+        // One offset register, back-to-back loads; see the o_proj prefetch.
+        asm volatile("" : "+v"(qpf_voff) : : "memory");
+      }
+    }
+    if (tid == 0) {
+#endif
       int *const my_flag = &entry_bar[xcd_id * HIER_STRIDE];
       MPK_WS_WAIT_BEGIN(761, entry_expected);
       int _spins = 0;
@@ -1176,6 +1265,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
                                                FULL_LAYER_EP_SIGNAL_STRIDE),
                       (unsigned long long)ep_sig_expected);
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+            MPK_SIG_FLUSH();
           }
         }
       } else {
@@ -2282,7 +2372,12 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       /*router_weight_t=*/
       (ROUTER_FOLD && ml_mode) ? input_ptrs[FL_ROUTER_WT_IN] : nullptr,
       /*router_partials=*/
-      (ROUTER_FOLD && ml_mode) ? input_ptrs[FL_ROUTER_PARTS_IN] : nullptr);
+      (ROUTER_FOLD && ml_mode) ? input_ptrs[FL_ROUTER_PARTS_IN] : nullptr
+#if MPK_QKVA_PF_KB > 0
+      ,
+      /*next_qkv_weight=*/input_ptrs[MPK_QKVA_PF_SLOT]
+#endif
+  );
   // Stages 4-6: the MoE half's buffers. `hidden` and `norm_output` are both
   // published before the routing barrier every worker passes, and the swiglu
   // scratch before the W13 -> W2 one, so none of the three is still being

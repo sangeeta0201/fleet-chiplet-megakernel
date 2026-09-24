@@ -1251,6 +1251,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
                 (unsigned long long)qb_expected);
           }
           asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          MPK_SIG_FLUSH();
           // Poll all peers off one bitmask rather than in rank order, so a
           // slow link costs its own latency and not the sum.
           unsigned remaining = (1u << QB_NPEER) - 1u;

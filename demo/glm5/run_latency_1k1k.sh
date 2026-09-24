@@ -62,6 +62,11 @@ for attempt in $(seq 0 "$RETRIES"); do
     echo "[1k1k] rc=0 but no dump, retrying" | tee -a "$log"
     rc=1
   fi
+  # The next attempt truncates the log, so keep this one and surface the two
+  # instruments that survive a wedge.
+  cp -f "$log" "${log}.a$((attempt + 1))" 2>/dev/null
+  grep -h -E '\[BOOT_PROBE\] t=|\[MPK\] peer bases|implausible peer|illegal memory' \
+    "$log" 2>/dev/null | head -12
   echo "[1k1k] attempt $((attempt + 1)) rc=$rc, retrying"
 done
 
@@ -86,7 +91,7 @@ ids = entries[0]["token_ids"]
 dist = (len(set(ids)) / len(ids)) if ids else 0.0
 # G1: all ranks identical
 g1 = all(e["token_ids"] == entries[0]["token_ids"] for e in entries)
-decode_avg = decode_min = None
+decode_avg = decode_min = decode_med = None
 prefill_avg = None
 gen_tok = None
 for line in open(log, errors="replace"):
@@ -96,13 +101,16 @@ for line in open(log, errors="replace"):
     m = re.search(r"Decode per-iter range: min=([0-9.]+)ms", line)
     if m:
         decode_min = float(m.group(1))
+    m = re.search(r"Decode per-iter median=([0-9.]+)ms", line)
+    if m:
+        decode_med = float(m.group(1))
     m = re.search(r"Prefill: .*avg ([0-9.]+)ms/iter", line)
     if m:
         prefill_avg = float(m.group(1))
 print(f"ISL={isl} OSL={osl} dumped_osl={n[0]} ranks={len(entries)}")
 print(f"G1_cross_rank={'PASS' if g1 else 'FAIL'}")
 print(f"G2_distinct={dist:.3f}  dumped_text_chars={len(text)}")
-print(f"prefill_avg_ms={prefill_avg}  decode_avg_ms={decode_avg}  decode_min_ms={decode_min}  decode_tokens={gen_tok}")
+print(f"prefill_avg_ms={prefill_avg}  decode_avg_ms={decode_avg}  decode_min_ms={decode_min}  decode_med_ms={decode_med}  decode_tokens={gen_tok}")
 print("TEXT_HEAD:", text[:240].replace("\n", " | "))
 print("TEXT_TAIL:", text[-240:].replace("\n", " | "))
 if n[0] != osl:

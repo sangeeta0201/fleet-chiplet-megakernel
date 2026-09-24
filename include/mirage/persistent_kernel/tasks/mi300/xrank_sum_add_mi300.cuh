@@ -154,6 +154,7 @@ __device__ __forceinline__ void
       }
     }
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    MPK_SIG_FLUSH();
   }
   __syncthreads();
 

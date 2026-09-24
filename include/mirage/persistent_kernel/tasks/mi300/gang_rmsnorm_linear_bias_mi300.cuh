@@ -75,6 +75,19 @@ using bf16 = __hip_bfloat16;
 // unported here -- 514 ds_bpermute against 8 cross-lane VALU ops in the whole
 // code object.
 //
+// COVERAGE. The first cut only swapped rmsnorm_rcp_amd. That is the
+// LDS_PROLOGUE=false fallback. GLM-5.2 ships LDS_PROLOGUE=true, so the live
+// ssq is _rnlm8_stage_norm_rcp / _rnlm8_resadd_norm_rcp (mxfp8 qkv/o_proj)
+// plus rmsnorm_inline_amd and the fused-gate ssq in this file. All of those
+// store only lane 0, so the same helper is legal at each.
+//
+// 2026-09-16, 1024/1024, chunks=32, GPUs 4-7. Complete coverage compiled
+// (ds_bpermute 514 -> 430, permlane32 4 -> 18, mov_dpp 0 -> 56) and is
+// NOT bit-identical on this path: decode_min 11.318 inside the 11.25-11.36
+// band, G1 PASS, but G2_distinct 0.502 and TEXT_TAIL is garbage against the
+// Boulter attractor. Keep OFF. Do not default on until an isolated site
+// reproduces the gpt-oss 2ee5278 hash.
+//
 // BIT-IDENTICAL, and that is checkable rather than hopeful: the only lane this
 // reduction's caller reads is lane 0 (`if (lane_id == 0) red[wave_id] = sum`),
 // and for lane 0 `xor-N` and `shr-N` name the same source lane, since
@@ -309,10 +322,14 @@ __device__ __forceinline__ void rmsnorm_inline_amd(void const *input_ptr,
   }
 
 // ── Phase 2: wavefront reduction (AMD wavefront = 64 lanes) ──
+#if MPK_RMSNORM_DPP
+  sum = _mpk_wave_sum_to_lane0(sum);
+#else
 #pragma unroll
   for (int offset = 32; offset > 0; offset >>= 1) {
     sum += __shfl_xor(sum, offset);
   }
+#endif
 
   // ── Phase 3: cross-wavefront reduction via shared memory ──
   // Use a static __shared__ array — independent of CK pipeline's dynamic LDS.
@@ -1100,10 +1117,14 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
 #pragma unroll
     for (int m = 0; m < BATCH_SIZE; m++) {
       float v = ssq[m];
+#if MPK_RMSNORM_DPP
+      v = gang_rmsnorm_detail::_mpk_wave_sum_to_lane0(v);
+#else
 #pragma unroll
       for (int off = 32; off > 0; off >>= 1) {
         v += __shfl_xor(v, off);
       }
+#endif
       // Cross-wave reduction via LDS
       if (lane == 0) {
         red[m * NUM_WAVES + wave] = v;
