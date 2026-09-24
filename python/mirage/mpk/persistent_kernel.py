@@ -2168,6 +2168,12 @@ def get_compile_command(
             flags = flags + ["-DMPK_W13_LDS_WEIGHTS"]
         if int(os.environ.get("W13_LDS_PREFETCH", "1")) == 1:
             flags = flags + ["-DMPK_W13_LDS_PREFETCH"]
+        if os.environ.get("MPK_W2_NO_NT", "0") == "1":
+            flags = flags + ["-DMPK_W2_NO_NT"]
+        if os.environ.get("MPK_W2_GATHER_NO_NT", "0") == "1":
+            flags = flags + ["-DMPK_W2_GATHER_NO_NT"]
+        if os.environ.get("MPK_PPROBE", "0") == "1":
+            flags = flags + ["-DMPK_PPROBE"]
         if int(os.environ.get("MPK_PREFETCH_NEXT_QKV", "1")) == 1:
             # Issue the next layer's QKV weight HBM->LDS DMA during the Phase 9
             # layer-barrier spin, where the memory system is otherwise idle for

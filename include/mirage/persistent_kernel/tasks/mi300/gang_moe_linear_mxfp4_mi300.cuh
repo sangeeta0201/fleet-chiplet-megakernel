@@ -623,6 +623,11 @@ __device__ __forceinline__ void
 // The "=&v" early-clobber is load-bearing for the same reason spelled out at
 // length in _gang_wave_parallel_fp8_quant_nt above: without it the allocator
 // puts the first load's destination on top of the second's address operand.
+#ifdef MPK_W2_GATHER_NO_NT
+#define MPK_W2_GATHER_MOD " sc0 sc1"
+#else
+#define MPK_W2_GATHER_MOD " sc0 sc1 nt"
+#endif
 template <int REDUCTION_SIZE>
 __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_nt_wide(
     unsigned short const *__restrict__ src_bf16,
@@ -640,8 +645,8 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_nt_wide(
     int const base = tid * VALUES_PER_LANE;
     uint32_t const *base_ptr = (uint32_t const *)(src_bf16 + base);
     uint32_t words[8];
-    asm volatile("global_load_dwordx4 %0, %2, off sc0 sc1 nt\n"
-                 "global_load_dwordx4 %1, %3, off sc0 sc1 nt"
+    asm volatile("global_load_dwordx4 %0, %2, off" MPK_W2_GATHER_MOD "\n"
+                 "global_load_dwordx4 %1, %3, off" MPK_W2_GATHER_MOD
                  : "=&v"(*(i32x4_t *)&words[0]), "=&v"(*(i32x4_t *)&words[4])
                  : "v"(base_ptr), "v"(base_ptr + 4)
                  : "memory");

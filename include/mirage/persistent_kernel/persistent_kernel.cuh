@@ -20,6 +20,9 @@
 #endif
 #include "mpk_atoms.cuh"
 #include "runtime_header.h"
+#ifdef MPK_PPROBE
+#include "pprobe.h"
+#endif
 
 #if defined(MPK_AID_LOCAL) || defined(MPK_AID_SPLIT_FLAGS) ||                 \
     defined(MPK_LM_WEIGHT_AID)
@@ -5479,6 +5482,9 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
       // from all_tasks, so one rewrite covers layer 0 and layers 1+.
       mirage::aid::relocate_xcd_sliced_inputs(
           all_tasks, fused_layer_positions, ML_N_IN);
+#endif
+#ifdef MPK_PPROBE
+      mpk_pprobe::run(all_tasks, fused_layer_positions);
 #endif
 #ifdef MPK_MOE_RW
       {
