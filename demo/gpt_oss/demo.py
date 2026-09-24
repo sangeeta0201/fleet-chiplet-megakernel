@@ -4031,6 +4031,13 @@ if __name__ == "__main__":
             r"\[FWD_PASS\] iter=(\d+) time_ms=([\d.]+)", _captured
         ):
             _fwd_times[int(_m.group(1))] = float(_m.group(2))
+        # Long runs: emit the per-iteration trace (latency vs context), 250 per line.
+        if len(_fwd_times) >= 2000:
+            _it = sorted(_fwd_times.items())
+            for _c in range(0, len(_it), 250):
+                print("[FWDTRACE] " + " ".join(
+                    f"{_k}:{_v:.3f}" for _k, _v in _it[_c:_c + 250]))
+            sys.stdout.flush()
 
         # The device-side per-iter ring holds FWDPASS_LOG_MAX (8192) samples.
         # Longer runs drop the tail, and since per-iter latency grows with
