@@ -1877,10 +1877,18 @@ __device__ __noinline__ void
   // 46 W13 tiles/expert (W13_TILES) must arrive before W2. At 4 XCDs there
   // is no partner die, so this XCD owns all 46 pair-ranks with 31 workers:
   // finish every leftover W13 (moe_i==0) before any W2 (moe_i==1).
+#if MPK_NUM_XCDS == 8 && !defined(MPK_MULTI_PASS_8XCD)
+  for (int moe_i = 0; moe_i < (xcd_rank < kMoePairRanks ? 2 : 0); ++moe_i) {
+    {
+      int const pair = xcd_rank;
+      int const moe_t =
+          pair | (moe_i << 7) | ((routed_expert0 + 1) << 8);
+#else
   for (int moe_i = 0; moe_i < 2; ++moe_i) {
     for (int pair = xcd_rank; pair < kMoePairRanks; pair += workers_per_xcd) {
       int const moe_t =
           pair | (moe_i << 7) | ((routed_expert0 + 1) << 8);
+#endif
 #else
   for (int moe_i = moe_begin; moe_i < moe_end; moe_i += moe_step) {
       int const moe_t = moe_i;
@@ -2097,8 +2105,12 @@ __device__ __noinline__ void
     // nobody left to exclude, so this degenerates to the default arrival.
 #ifdef MPK_MOE_XCD_PAIR
     // Pair map: ranks 0..22 each produce one W2 tile (23 groups × 2 XCDs).
+#if MPK_NUM_XCDS == 8 && !defined(MPK_MULTI_PASS_8XCD)
+    constexpr int n_w2_workers_per_xcd = kMoePairRanks;
+#else
     int const n_w2_workers_per_xcd =
         kMoePairRanks > workers_per_xcd ? workers_per_xcd : kMoePairRanks;
+#endif
 #else
     int const n_w2_workers_per_xcd =
         moe_total_tiles_per_xcd > workers_per_xcd

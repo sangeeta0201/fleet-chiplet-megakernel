@@ -2235,6 +2235,11 @@ def get_compile_command(
         # dispatch: same fused task graph, only the queue vs scheduler changes.
         flags = flags + ["-DMPK_FUSED_LAYER_BATCHING"]
         flags = flags + [f"-DMPK_NUM_XCDS={mpk_num_xcds()}"]
+        # The 4-XCD second-pass loops never iterate at 8 XCDs, but compiled in they
+        # push the O-proj kernel from 86 to 248 VGPRs and 16 to 288 B of scratch.
+        # They are compiled out at 8 XCDs; this puts them back for A/B only.
+        if os.environ.get("MPK_MULTI_PASS_8XCD", "0") == "1":
+            flags = flags + ["-DMPK_MULTI_PASS_8XCD"]
         # SPX only: confine workers to physical XCDs [0, MPK_NUM_XCDS) so they
         # all sit close to one NPS2 memory range. DPX needs nothing here --
         # its dies are already a single partition.

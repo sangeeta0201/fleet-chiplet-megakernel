@@ -628,7 +628,9 @@ __device__ __attribute__((noinline)) void
   int const n_oproj_part =
       tiles_per_xcd < MPK_OPROJ_MAX_RANKS ? tiles_per_xcd : MPK_OPROJ_MAX_RANKS;
   int oproj_lt = local_tile;
+#if MPK_NUM_XCDS != 8 || defined(MPK_MULTI_PASS_8XCD)
 oproj_tile_pass:;
+#endif
   int bblk = oproj_lt / n_wgs_per_xcd;
   int wg_idx = oproj_lt % n_wgs_per_xcd;
   // At TOK_ROWS == 1 there is exactly one column block, so every tile that
@@ -1587,6 +1589,7 @@ oproj_tile_pass:;
 
   // Next tile owned by this worker. The syncthreads is required: the pass
   // below re-stages weights into the same LDS the pass above just read.
+#if MPK_NUM_XCDS != 8 || defined(MPK_MULTI_PASS_8XCD)
   oproj_lt += n_oproj_part;
   if (oproj_lt < tiles_per_xcd) {
     __syncthreads();
@@ -1603,6 +1606,7 @@ oproj_tile_pass:;
     __syncthreads();
     goto oproj_tile_pass;
   }
+#endif
 
 oproj_barrier :
   // ════════════════════════════════════════════════════════════════════════
@@ -2138,7 +2142,9 @@ oproj_barrier :
     goto done;
   }
 
+#if MPK_NUM_XCDS != 8 || defined(MPK_MULTI_PASS_8XCD)
 router_tile_pass:;
+#endif
   {
     using bf16 = __hip_bfloat16;
 #if defined(MPK_AID_SPLIT_OUT) && defined(MPK_AID_SPLIT_FLAGS)
@@ -2900,6 +2906,7 @@ router_tile_pass:;
       }
     }
   }
+#if MPK_NUM_XCDS != 8 || defined(MPK_MULTI_PASS_8XCD)
   router_lt += n_router_part;
   if (router_lt < router_tile_n) {
     __syncthreads();
@@ -2927,6 +2934,7 @@ router_tile_pass:;
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     goto router_tile_pass;
   }
+#endif
 
 topk_barrier :
   // ════════════════════════════════════════════════════════════════════════
