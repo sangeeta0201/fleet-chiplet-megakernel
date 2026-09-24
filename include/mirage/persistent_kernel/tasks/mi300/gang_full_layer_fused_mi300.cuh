@@ -2371,7 +2371,7 @@ __device__ __noinline__ void
       s_was_last_local = lean_is_last_local;
 #endif
       if (lean_is_last_local) {
-#ifdef MPK_P9_PREINV
+#if defined(MPK_P9_PREINV) && !defined(MPK_P9_PREINV_SKIP)
         // Every worker on this die has arrived, and none reads the
         // workspace or residual again before the release, so the L2
         // invalidate the gate consumers need can happen here, while other

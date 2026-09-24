@@ -1527,6 +1527,8 @@ def get_compile_command(
             flags = flags + ["-DMPK_P9_LEADER_INV"]
         if int(os.environ.get("MPK_P9_PREINV", "0")) == 1:
             flags = flags + ["-DMPK_P9_PREINV"]
+        if int(os.environ.get("MPK_P9_PREINV_SKIP", "0")) == 1:
+            flags = flags + ["-DMPK_P9_PREINV_SKIP"]
         if int(os.environ.get("MPK_W13_PREDRAIN", "0")) == 1:
             flags = flags + ["-DMPK_W13_PREDRAIN"]
         if int(os.environ.get("MPK_W13_DELAY", "0")) == 1:
