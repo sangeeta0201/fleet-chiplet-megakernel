@@ -217,6 +217,48 @@ namespace kernel {
 #if defined(MPK_W2_T1_DURING_EPI) && defined(MPK_W2_T1_LINEAR_LOAD)
 #error "MPK_W2_T1_DURING_EPI uses the default 24-chunk T1 stripe; not with T1_LINEAR"
 #endif
+#ifdef MPK_W13_REC_BATCH
+#if !defined(MPK_W13_KMAJOR_RECYCLE) || MPK_W13_REC_BATCH < 2 || MPK_W13_REC_BATCH > 8
+#error "MPK_W13_REC_BATCH needs MPK_W13_KMAJOR_RECYCLE and 2 <= B <= 8"
+#endif
+#if defined(MPK_W13_RECYCLE_EARLY_ISSUE) || defined(MPK_W13_REC_POST_WAIT) || \
+    defined(MPK_W13_REC_DOUBLE_ISSUE) || defined(MPK_W13_REC_FIFO) ||         \
+    defined(MPK_W13_REC_NO_NT) || defined(MPK_W13_REC_DRAIN_T0) ||            \
+    defined(MPK_W13_REC_NO_LOOP_WAIT) || defined(MPK_W13_REC_LOOP_VMCNT21) || \
+    defined(MPK_W13_T0_LAST_REC_EARLY)
+#error "MPK_W13_REC_BATCH replaces the recycle issue/wait schedule; not with other recycle knobs"
+#endif
+#define MPK_W13RB_STR_(x) #x
+#define MPK_W13RB_STR(x) MPK_W13RB_STR_(x)
+// One recycled tile-1 fragment into the next LDS slot.
+#define MPK_W13_REC_ISSUE1                                                     \
+  "buffer_load_dwordx4 %[t1_voff], %[t1_rsrc], 0 offen sc0 nt lds\n"          \
+  "s_addk_i32 m0, 0x400\n"                                                     \
+  "v_add_u32_e32 %[t1_voff], 0x400, %[t1_voff]\n"
+// Defer one refill; emit the batch once B are pending.
+#define MPK_W13_REC_DEFER                                                      \
+  ".set MPK_W13_REC_PEND_%=, MPK_W13_REC_PEND_%= + 1\n"                        \
+  ".if MPK_W13_REC_PEND_%= == " MPK_W13RB_STR(MPK_W13_REC_BATCH) "\n"          \
+  ".rept " MPK_W13RB_STR(MPK_W13_REC_BATCH) "\n" MPK_W13_REC_ISSUE1 ".endr\n"  \
+  ".set MPK_W13_REC_PEND_%=, 0\n"                                              \
+  ".endif\n"
+// The original vmcnt(22) assumes every consumed fragment is already replaced;
+// each still-pending refill is one request fewer in flight.
+#define MPK_W13_REC_WAIT                                                       \
+  ".if MPK_W13_REC_PEND_%= == 0\n" "s_waitcnt vmcnt(22)\n"                     \
+  ".elseif MPK_W13_REC_PEND_%= == 1\n" "s_waitcnt vmcnt(21)\n"                 \
+  ".elseif MPK_W13_REC_PEND_%= == 2\n" "s_waitcnt vmcnt(20)\n"                 \
+  ".elseif MPK_W13_REC_PEND_%= == 3\n" "s_waitcnt vmcnt(19)\n"                 \
+  ".elseif MPK_W13_REC_PEND_%= == 4\n" "s_waitcnt vmcnt(18)\n"                 \
+  ".elseif MPK_W13_REC_PEND_%= == 5\n" "s_waitcnt vmcnt(17)\n"                 \
+  ".elseif MPK_W13_REC_PEND_%= == 6\n" "s_waitcnt vmcnt(16)\n"                 \
+  ".elseif MPK_W13_REC_PEND_%= == 7\n" "s_waitcnt vmcnt(15)\n"                 \
+  ".else\n" ".error \"MPK_W13_REC_BATCH pending count out of range\"\n"        \
+  ".endif\n"
+// Before the last fragment: the pending refills, in order, then the last one.
+#define MPK_W13_REC_FLUSH                                                      \
+  ".rept MPK_W13_REC_PEND_%=\n" MPK_W13_REC_ISSUE1 ".endr\n"
+#endif
 #if defined(MPK_W13_T1_HEAD_VMCNT21) && !defined(MPK_W13_KMAJOR_RECYCLE)
 #error "MPK_W13_T1_HEAD_VMCNT21 requires MPK_W13_KMAJOR_RECYCLE"
 #endif
@@ -2266,6 +2308,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #endif
 #endif
               ".set MPK_W13_REC_SC_%=, 1\n"
+#ifdef MPK_W13_REC_BATCH
+              ".set MPK_W13_REC_PEND_%=, 0\n"
+#endif
 #ifdef MPK_W13_T0_B0_WAIT_SHIFT
               ".set MPK_W13_T0_SKIP_B0W_%=, 1\n"
 #endif
@@ -2312,6 +2357,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
               "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], "
               "v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
 #if !defined(MPK_W13_RECYCLE_EARLY_ISSUE) && !defined(MPK_W13_REC_POST_WAIT)
+#ifdef MPK_W13_REC_BATCH
+              MPK_W13_REC_DEFER
+#else
               "buffer_load_dwordx4 %[t1_voff], %[t1_rsrc], 0 offen sc0 "
 #ifdef MPK_W13_REC_NO_NT
               "lds\n"
@@ -2320,6 +2368,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #endif
               "s_addk_i32 m0, 0x400\n"
               "v_add_u32_e32 %[t1_voff], 0x400, %[t1_voff]\n"
+#endif
 #ifdef MPK_W13_REC_DOUBLE_ISSUE
               "buffer_load_dwordx4 %[t1_voff], %[t1_rsrc], 0 offen sc0 "
 #ifdef MPK_W13_REC_NO_NT
@@ -2372,6 +2421,10 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #endif
               "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[26:29], "
               "v[32:39], a[4:7], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+#ifdef MPK_W13_REC_BATCH
+              MPK_W13_REC_DEFER
+              MPK_W13_REC_WAIT
+#else
 #if !defined(MPK_W13_RECYCLE_EARLY_ISSUE) && !defined(MPK_W13_REC_POST_WAIT) && \
     !defined(MPK_W13_REC_DOUBLE_ISSUE)
               "buffer_load_dwordx4 %[t1_voff], %[t1_rsrc], 0 offen sc0 "
@@ -2396,6 +2449,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
               "s_waitcnt vmcnt(21)\n"
 #else
               "s_waitcnt vmcnt(22)\n"
+#endif
 #endif
 #endif
 #ifdef MPK_W13_B0_ADDR_AFTER_DS
@@ -2478,6 +2532,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
               "v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
 #if !defined(MPK_W13_RECYCLE_EARLY_ISSUE) &&                                     \
     !defined(MPK_W13_T0_LAST_REC_EARLY)
+#ifdef MPK_W13_REC_BATCH
+              MPK_W13_REC_FLUSH
+#endif
               "buffer_load_dwordx4 %[t1_voff], %[t1_rsrc], 0 offen sc0 "
 #ifdef MPK_W13_REC_NO_NT
               "lds\n"
