@@ -512,6 +512,12 @@ def get_compile_command(
         # computes QK on all four waves and barriers twice per 16-token tile.
         if int(os.environ.get("MPK_ATTN_NO_WAVE_LOCAL", "0")) == 1:
             flags = flags + ["-DMPK_ATTN_NO_WAVE_LOCAL"]
+        if int(os.environ.get("MPK_KV_CHUNKS_ADAPTIVE", "0")) == 1:
+            # Split-KV chunks used follow the live context (compile-time rule
+            # applied at runtime); the merge reads 8 / 16 / all partials.
+            flags = flags + ["-DMPK_KV_CHUNKS_ADAPTIVE"]
+        if int(os.environ.get("MPK_KV_SW_IDLE", "0")) == 1:
+            flags = flags + ["-DMPK_KV_SW_IDLE"]
         if _opt("MPK_GATE_ATTN_JOIN"):
             # Attention chunk workers wait at the Phase 9 layer gate. Without
             # it, MPK_W2_CONSUMER_GATE lets ranks >= total_qkv_tiles_per_xcd

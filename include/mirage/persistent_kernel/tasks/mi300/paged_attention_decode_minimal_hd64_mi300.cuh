@@ -54,6 +54,36 @@ __device__ __forceinline__ void mpk_hd64_load_k8(_Float16 *dst,
 }
 #endif
 
+// Split-KV chunks actually used for a window of ntiles 16-token tiles. With
+// MPK_KV_CHUNKS_ADAPTIVE this is demo.py's compile-time rule on the live
+// window (64-token groups are 4 tiles); otherwise all NUM_KV_CHUNKS.
+template <int NUM_KV_CHUNKS>
+__device__ __forceinline__ int mpk_kv_chunks_eff(int ntiles) {
+#ifdef MPK_KV_CHUNKS_ADAPTIVE
+  int n = ((ntiles + 3) / 4) / 2;
+  if (n < 8) {
+    n = 8;
+  }
+  return n < NUM_KV_CHUNKS ? n : NUM_KV_CHUNKS;
+#else
+  (void)ntiles;
+  return NUM_KV_CHUNKS;
+#endif
+}
+
+// With MPK_KV_CHUNKS_ADAPTIVE the HD64 decode returns the number of chunks
+// holding at least one tile, so the merger bounds its loop without
+// re-reading the paged-KV metadata.
+#ifndef MPK_ATTN_RET_T
+#ifdef MPK_KV_CHUNKS_ADAPTIVE
+#define MPK_ATTN_RET_T int
+#define MPK_ATTN_RETURN(v) return (v)
+#else
+#define MPK_ATTN_RET_T void
+#define MPK_ATTN_RETURN(v) return
+#endif
+#endif
+
 using _mpk_kv_u32x2 = uint32_t __attribute__((ext_vector_type(2)));
 using _mpk_kv_i32x4 = int __attribute__((ext_vector_type(4)));
 // Raw buffer over a layer's KV base for the LDS-DMA scan (same descriptor
@@ -946,7 +976,7 @@ __device__ __noinline__ void
                  : [vo0] "v"(dma_vo0), [vo1] "v"(dma_vo1),
                    [kr] "s"(k_rsrc), [vr] "s"(v_rsrc), [so] "s"(soff),
                    [mk] "s"(mk), [mv] "s"(mv)
-                 : "memory", "m0");
+                 : "memory", "m0", "scc");
   };
   // Nothing but ring DMAs is issued in the loop, and vmcnt retires in issue
   // order, so tile t has landed once at most 4 * n_after loads remain, n_after
@@ -1195,7 +1225,7 @@ template <typename T,
           int Q_WORKSPACE_STRIDE,
           int KV_CACHE_STRIDE,
           int NUM_KV_HEADS>
-__device__ __noinline__ void
+__device__ __noinline__ MPK_ATTN_RET_T
     paged_attention_minimal_decode_hd64(void const *q_workspace_ptr,
                                         void *paged_k_cache_ptr,
                                         void *paged_v_cache_ptr,
@@ -1221,7 +1251,7 @@ __device__ __noinline__ void
   int const req = request_id;
   int const query_start = qo_indptr[req];
   if (query_start == qo_indptr[req + 1]) {
-    return;
+    MPK_ATTN_RETURN(NUM_KV_CHUNKS);
   }
 
   int const first_page = kv_indptr[req];
@@ -1313,8 +1343,13 @@ __device__ __noinline__ void
   // the LSE slot does not contaminate the global softmax).
   int chunk_first_tile = 0;
   int chunk_last_tile = ntiles;
+  int mpk_live = 1;
   if constexpr (NUM_KV_CHUNKS > 1) {
-    int tiles_per_chunk = (ntiles + NUM_KV_CHUNKS - 1) / NUM_KV_CHUNKS;
+    int const n_eff = mpk_kv_chunks_eff<NUM_KV_CHUNKS>(ntiles);
+    int tiles_per_chunk = (ntiles + n_eff - 1) / n_eff;
+    mpk_live = tiles_per_chunk > 0
+                   ? (ntiles + tiles_per_chunk - 1) / tiles_per_chunk
+                   : NUM_KV_CHUNKS;
     chunk_first_tile = kv_chunk_idx * tiles_per_chunk;
     chunk_last_tile = chunk_first_tile + tiles_per_chunk;
     if (chunk_last_tile > ntiles) {
@@ -1333,7 +1368,7 @@ __device__ __noinline__ void
                          kv_chunk_idx * NUM_QO_PER_KV + midx;
         *lse_out = -1e30f;
       }
-      return;
+      MPK_ATTN_RETURN(mpk_live);
     }
     kv_start += chunk_first_tile * KV_TILE;
     effective_len = (chunk_last_tile - chunk_first_tile) * KV_TILE;
@@ -1384,7 +1419,7 @@ __device__ __noinline__ void
       *lse_out = -1e30f;
     }
 #endif
-    return;
+    MPK_ATTN_RETURN(mpk_live);
   }
 
   // Long-context path. Eligibility is deliberately conservative:
@@ -1452,7 +1487,7 @@ __device__ __noinline__ void
                                                 effective_len,
                                                 ntiles,
                                                 split_part);
-      return;
+      MPK_ATTN_RETURN(mpk_live);
     }
   }
 #endif
@@ -2271,6 +2306,9 @@ __device__ __noinline__ void
       *lse_out = lse_val;
     }
   }
+#ifdef MPK_KV_CHUNKS_ADAPTIVE
+  return mpk_live;
+#endif
 }
 
 #ifdef MPK_ATTN_SPLIT_CHUNK

@@ -165,7 +165,8 @@ template <typename T,
           int NUM_KV_CHUNKS,
           int KV_CHUNK_SIZE = 128,
           int PAGE_SIZE = 4096,
-          bool WRITE_THROUGH = false>
+          bool WRITE_THROUGH = false,
+          int LOOP_CHUNKS = NUM_KV_CHUNKS>
 __device__ __forceinline__ void
     merge_splitkv_ck_fmha(float const *lse_ptr,
                           float const *o_ptr,
@@ -187,7 +188,10 @@ __device__ __forceinline__ void
   // Use NUM_KV_CHUNKS (template param) as the chunk count — the CK FMHA
   // pipeline processes exactly NUM_KV_CHUNKS chunks worth of data into
   // o_acc/lse_acc
-  constexpr int num_chunks = NUM_KV_CHUNKS;
+  // Chunks merged: the first LOOP_CHUNKS slots (the caller guarantees the
+  // rest are empty, weight 0). A compile-time bound keeps the loads batched.
+  constexpr int num_chunks =
+      LOOP_CHUNKS < NUM_KV_CHUNKS ? LOOP_CHUNKS : NUM_KV_CHUNKS;
 
   // Full token stride matches CK FMHA's LSE_STRIDE = NUM_KV_HEADS *
   // NUM_KV_CHUNKS * QO_PER_KV

@@ -722,7 +722,16 @@ template <typename T,
           int KV_CACHE_STRIDE_T,
           int NUM_KV_HEADS_T,
           bool DECODE_ONLY = false>
-__device__ __forceinline__ void paged_attention_ck_fmha_split_kv_impl(
+#ifndef MPK_ATTN_RET_T
+#ifdef MPK_KV_CHUNKS_ADAPTIVE
+#define MPK_ATTN_RET_T int
+#define MPK_ATTN_RETURN(v) return (v)
+#else
+#define MPK_ATTN_RET_T void
+#define MPK_ATTN_RETURN(v) return
+#endif
+#endif
+__device__ __forceinline__ MPK_ATTN_RET_T paged_attention_ck_fmha_split_kv_impl(
     void const *q_workspace_ptr,
     void *paged_k_cache_ptr,
     void *paged_v_cache_ptr,
@@ -744,7 +753,7 @@ __device__ __forceinline__ void paged_attention_ck_fmha_split_kv_impl(
   const ck_tile::index_t query_start = qo_indptr_buffer_ptr[req];
   const ck_tile::index_t query_end = qo_indptr_buffer_ptr[req + 1];
   if (query_start == query_end) {
-    return;
+    MPK_ATTN_RETURN(NUM_KV_CHUNKS);
   }
 
   ck_tile::index_t seqlen_q = query_end - query_start;
@@ -752,7 +761,7 @@ __device__ __forceinline__ void paged_attention_ck_fmha_split_kv_impl(
   if (seqlen_q == 1) {
     if constexpr (HEAD_DIM == 64) {
       // Fast MFMA decode path for HD=64 (GPT-OSS 120B).
-      paged_attention_minimal_decode_hd64<T,
+      return paged_attention_minimal_decode_hd64<T,
                                           NUM_QO_PER_KV,
                                           HEAD_DIM,
                                           PAGE_SIZE,
@@ -831,6 +840,9 @@ __device__ __forceinline__ void paged_attention_ck_fmha_split_kv_impl(
           sinks_ptr);
     }
   }
+#ifdef MPK_KV_CHUNKS_ADAPTIVE
+  return NUM_KV_CHUNKS;
+#endif
 }
 
 } // namespace kernel

@@ -4,9 +4,11 @@
 ~300 vs ~16k tokens of context. Full-attention layers: attention chunks +
 merge 5.86 -> 18.72 us, every other phase within +-0.3 us; layer 39.60 ->
 52.49 us. Sliding-window layers +1.0 us in total. 18 x 12.9 us is the whole
-latency growth from 250 to 16k tokens (1.497 -> 1.755 ms/token). Every rank
-group's own chunk time grows the same, so it is the per-worker scan, not a
-straggler: each worker streams its ~135 KB of die-local K/V at ~10 GB/s per CU.
+latency growth from 250 to 16k tokens (1.497 -> 1.755 ms/token). Each worker
+streams its ~135 KB of die-local K/V at ~10 GB/s per CU. (An earlier version
+of this note grouped `[PSLOTW]` rows by `w % 31` to argue there is no
+straggler. That grouping is not the role rank -- in precomputed dispatch a
+worker claims its rank with an atomic at start -- so the claim is withdrawn.)
 
 **Load schedule of the wave-local scan** (all opt-in, bit-exact: 16k decode
 text identical over 51190 chars in every arm):
@@ -35,3 +37,49 @@ unconditionally. The DMA ring avoids all three by construction (explicit
 
 `MPK_ATTN_PAGE_CACHE` (default-scan only): reload the page id only at a page
 crossing. Token-identical across the 4096-token page boundary (5k prompt).
+
+## Split-KV chunk count from the live window (2026-09-25)
+
+`NUM_KV_CHUNKS` is compiled from max_seq_length, so every long decode builds 31
+chunks and pays for them at every context: the merge reads 31 partials and 31
+workers per die join the QKV epoch and the chunk barrier, most of them with no
+tiles. 400-token decode: 8 chunks compiled 1.459-1.463 ms, 31 chunks 1.500-1.506.
+
+- `MPK_KV_CHUNKS_ADAPTIVE=1`: the HD64 decode applies demo.py's rule to the
+  live window at run time (`max(8, min(NUM_KV_CHUNKS, ceil(ntiles / 4) / 2))`
+  chunks of 16-token tiles) and returns the number of chunks holding tiles. The
+  merger is always one of the chunk workers, so it takes that value from its
+  own attention call and dispatches the merge onto a compile-time loop of 8, 16
+  or NUM_KV_CHUNKS partials (a run-time loop bound serialized the partial
+  loads). Up to ~1k tokens of context tiling and merge order are exactly an
+  8-chunk build's. A first version re-read kv_indptr / kv_last_page_len after
+  the QKV epoch and kept only 0.006 ms of the gain: two serialized flat-load
+  round trips per attention worker per layer.
+- `MPK_KV_SW_IDLE=1` (with the above): a 128-token sliding window spans at most
+  9 tiles, which the rule never splits over more than 8 chunks, so in sliding
+  layers chunk workers >= 8 skip the QKV-epoch poll and the attention call.
+  They still arrive at both barriers, which count a fixed participant set.
+
+NPS2, recipe + `MPK_ATTN_WL_DMA=4`:
+
+| | 31 chunks | + adaptive | + idle skip |
+|---|---|---|---|
+| 400-token decode, 31 chunks (A/B/A/B/A) | 1.500 / 1.502 / 1.506 | 1.486 / 1.486 | 1.481 / 1.480 (A 1.484-1.486) |
+| 16k decode, context 250 / 1k / 2k | 1.505 / 1.533 / 1.565 | 1.496 / 1.525 / 1.544 | 1.490 / 1.522 / 1.539 |
+| 16k decode, context 4k / 8k / 16k | 1.570 / 1.618 / 1.703 | 1.566 / 1.620 / 1.704 | 1.563 / 1.607 / 1.700 |
+
+Gates: 16-token hash unchanged; the 400-token decode is byte-identical to an
+8-chunk build; 1k prompt at 31 chunks == the 8-chunk output (== torch); 3k
+prompt at 24 chunks == the 24- and 8-chunk outputs; 16k decodes deterministic.
+What remains of the 31-chunk cost at short context (phase snapshot, ~390
+tokens): QKV-epoch wait +0.3 us and attention + merge +0.3 us per layer.
+
+## SCC and inline asm
+
+`s_addk_i32` writes SCC. The attention DMA issue advances M0 with it and now
+declares `"scc"` in its clobbers. Without the clobber the compiler may keep an
+SCC value live across the statement; a benchmark that copied this asm did
+exactly that (`s_cmp` before it, `s_cselect` after it) and silently skipped a
+store. Fleet's ISA had no such case (all 16 sites checked), and the 16k decode
+is byte-identical with the clobber. The MoE and LM-head asm use the same
+instruction without it; scan the build's `.s` after changing any of them.

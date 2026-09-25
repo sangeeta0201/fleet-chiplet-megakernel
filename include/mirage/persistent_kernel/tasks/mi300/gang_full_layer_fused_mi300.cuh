@@ -314,6 +314,15 @@ __device__ __noinline__ void
   int const attn_kvh_local = qkv_attn_rank / (NUM_REQS * NUM_KV_CHUNKS);
   int const attn_req = (qkv_attn_rank / NUM_KV_CHUNKS) % NUM_REQS;
   int const attn_chunk = qkv_attn_rank % NUM_KV_CHUNKS;
+#if defined(MPK_KV_SW_IDLE) && defined(MPK_KV_CHUNKS_ADAPTIVE)
+  // A sliding window spans at most (W + 30) / 16 tiles; at <= 64 tiles the
+  // adaptive split uses 8 chunks, so workers >= 8 hold no tiles.
+  bool const attn_idle = (SLIDING_WINDOW > 0) &&
+                         ((SLIDING_WINDOW + 30) / 16 <= 64) &&
+                         (NUM_KV_CHUNKS > 8) && (attn_chunk >= 8);
+#else
+  constexpr bool attn_idle = false;
+#endif
   int const attn_kv_head = xcd_id * KV_HEADS_PER_XCD + attn_kvh_local;
 #ifdef MPK_ATTN_SPLIT_CHUNK
   static_assert(NUM_REQS == 1,
@@ -892,7 +901,7 @@ __device__ __noinline__ void
     // that need this barrier, so there is no longer a subset that arrives only
     // to carry ordering for someone else.
     MPK_WS_WAIT_BEGIN(20, qkv_epoch_expected);
-    if (tid == 0) {
+    if (tid == 0 && !attn_idle) {
       int _obs;
       int _spins = 0;
       int *const _qp = qkv_dir ? qkv_dir : &qkv_epoch[xcd_id * 16];
@@ -969,6 +978,11 @@ __device__ __noinline__ void
   {
     if (qkv_attn_rank < ATTN_PARTICIPANTS) {
       int kv_chunk_idx = attn_chunk;
+#ifdef MPK_KV_CHUNKS_ADAPTIVE
+      // Set by this worker's own attention call; the merger is always one
+      // of the chunk workers.
+      int attn_live_chunks = attn_idle ? 8 : NUM_KV_CHUNKS;
+#endif
       using bf16_t = __hip_bfloat16;
       void const *offset_k = reinterpret_cast<bf16_t const *>(output_ptrs[1]) +
                              MPK_KV_HEAD_OFF(attn_kv_head, HEAD_DIM);
@@ -982,6 +996,10 @@ __device__ __noinline__ void
       asm volatile("s_setprio 1");
 #endif
 #if !defined(MPK_ONLY_OP) || (MPK_ONLY_OP & (1 << 3))
+      if (!attn_idle)
+#ifdef MPK_KV_CHUNKS_ADAPTIVE
+      attn_live_chunks =
+#endif
       paged_attention_ck_fmha_split_kv_impl<bfloat16,
                                             NUM_Q_PER_KV,
                                             HEAD_DIM,
@@ -1173,6 +1191,37 @@ __device__ __noinline__ void
         // WRITE_THROUGH=true: merge writes bf16 output directly via st_wt,
         // eliminating the separate __syncthreads + readback + flush pass.
 #if !defined(MPK_ONLY_OP) || (MPK_ONLY_OP & (1 << 5))
+#ifdef MPK_KV_CHUNKS_ADAPTIVE
+#define MPK_MERGE_BUCKET(LOOP)                                                 \
+  merge_splitkv_ck_fmha<__hip_bfloat16, NUM_Q_PER_KV, NUM_KV_HEADS, HEAD_DIM,   \
+                        NUM_KV_CHUNKS, 128, 4096, /*WRITE_THROUGH=*/true,       \
+                        (LOOP)>(                                                \
+      reinterpret_cast<float const *>(input_ptrs[8]),                           \
+      reinterpret_cast<float const *>(input_ptrs[23]), qo_indptr, kv_indptr,    \
+      kv_last_page_len, /*request_id=*/attn_req,                                \
+      reinterpret_cast<__hip_bfloat16 *>(output_ptrs[4]),                       \
+      /*kv_head_idx=*/attn_kv_head, HAS_SINKS ? input_ptrs[6] : nullptr)
+        // One uniform branch onto a compile-time loop count: a runtime bound
+        // inside the merge serialized its loads.
+        if constexpr (NUM_KV_CHUNKS > 16) {
+          if (attn_live_chunks <= 8) {
+            MPK_MERGE_BUCKET(8);
+          } else if (attn_live_chunks <= 16) {
+            MPK_MERGE_BUCKET(16);
+          } else {
+            MPK_MERGE_BUCKET(NUM_KV_CHUNKS);
+          }
+        } else if constexpr (NUM_KV_CHUNKS > 8) {
+          if (attn_live_chunks <= 8) {
+            MPK_MERGE_BUCKET(8);
+          } else {
+            MPK_MERGE_BUCKET(NUM_KV_CHUNKS);
+          }
+        } else {
+          MPK_MERGE_BUCKET(NUM_KV_CHUNKS);
+        }
+#undef MPK_MERGE_BUCKET
+#else
         merge_splitkv_ck_fmha<__hip_bfloat16,
                               NUM_Q_PER_KV,
                               NUM_KV_HEADS,
@@ -1191,6 +1240,7 @@ __device__ __noinline__ void
                 output_ptrs[4]), // attn_out (bf16)
             /*kv_head_idx=*/attn_kv_head,
             HAS_SINKS ? input_ptrs[6] : nullptr); // sinks applied here
+#endif
 #endif
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
