@@ -506,6 +506,21 @@ _MOE_RW_KEEPALIVE = []
 # live in the second half).
 _OWN_BO_SPLIT = {"ck_fmha_lse_acc": 0.25, "ck_fmha_o_acc": 0.25}
 
+# MPK_OWN_BO_RINGS=ws,ao,apo: every copy of these MPK_LAYER_RING buffers gets
+# its own BO cut at its midpoint, which is where the writers change AID
+# (workspace expert slots 0-1 | 2-3 under MPK_MOE_XCD_PAIR, attn_out heads
+# 0-3 | 4-7, residual columns of dies 0-3 | 4-7).
+_OWN_BO_RINGS = {"ws": "moe_workspace_f32", "ao": "attn_out", "apo": "attn_proj_out"}
+
+
+def _own_bo_ring(name):
+    for key in os.environ.get("MPK_OWN_BO_RINGS", "").split(","):
+        base = _OWN_BO_RINGS.get(key.strip())
+        if base and (name == base or (name.startswith(base + "_r")
+                                      and name[len(base) + 2:].isdigit())):
+            return True
+    return False
+
 
 def _own_bo_maybe(t, name, scratch=False):
     """[BOMAP] / own-BO copy for one attached tensor (see MPK_OWN_BO_PAT).
@@ -519,7 +534,8 @@ def _own_bo_maybe(t, name, scratch=False):
     pats = [p for p in os.environ.get("MPK_OWN_BO_PAT", "").split(",") if p]
     kv = "k_cache" in name or "v_cache" in name
     kv_own = kv and os.environ.get("MPK_KV_OWN_BO", "0") == "1"
-    forced = scratch and name in os.environ.get("MPK_OWN_BO_SCRATCH", "").split(",")
+    forced = scratch and (name in os.environ.get("MPK_OWN_BO_SCRATCH", "").split(",")
+                          or _own_bo_ring(name))
     if scratch and not forced:
         # make_tensor buffers move only when named exactly, never by pattern.
         return t
