@@ -693,6 +693,14 @@ def get_compile_command(
             flags = flags + ["-DMPK_ATTN_LHEAD_FMA"]
         # Tiles-per-chunk threshold for the wave-local scan (default 8; 4 is
         # faster but fails the perplexity gate -- see the header comment).
+        _wl_dma = os.environ.get("MPK_ATTN_WL_DMA", "")
+        if _wl_dma != "":
+            # LDS-DMA ring depth for the wave-local scan (default 0: registers).
+            flags = flags + [f"-DMPK_ATTN_WL_DMA={int(_wl_dma)}"]
+        _wl_ring = os.environ.get("MPK_ATTN_WL_RING", "")
+        if _wl_ring != "":
+            # K/V tiles in flight per wave in the wave-local scan (default 1).
+            flags = flags + [f"-DMPK_ATTN_WL_RING={int(_wl_ring)}"]
         _wl_min = os.environ.get("MPK_ATTN_WAVE_LOCAL_MIN_TILES")
         if _wl_min is not None:
             flags = flags + [f"-DMPK_ATTN_WAVE_LOCAL_MIN_TILES={int(_wl_min)}"]
@@ -1881,6 +1889,8 @@ def get_compile_command(
             flags = flags + ["-DMPK_P9_FLAT"]
         if int(os.environ.get("MPK_OPROJ_FLAT", "0")) == 1:
             flags = flags + ["-DMPK_OPROJ_FLAT"]
+        if int(os.environ.get("MPK_ATTN_PAGE_CACHE", "0")) == 1:
+            flags = flags + ["-DMPK_ATTN_PAGE_CACHE"]
         if int(os.environ.get("MPK_ITER_AID", "0")) == 1:
             flags = flags + ["-DMPK_ITER_AID"]
         if int(os.environ.get("MPK_AID_GATE_CACHED", "0")) == 1:
