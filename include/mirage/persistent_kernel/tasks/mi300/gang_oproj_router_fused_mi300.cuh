@@ -260,7 +260,10 @@ __device__ __attribute__((always_inline)) void
         // locally; the rest are the per-rank lines the peers push. Element
         // NUM_EXPERTS of a line is the sum-of-squares, which rides along
         // because it reduces over the identical partition.
-        void *router_partials_ptr = nullptr
+        void *router_partials_ptr = nullptr,
+        // MPK_BAR_TAGGED slot arrays (mpk_atoms.cuh). Null on the standalone
+        // dispatch and outside ml_mode, which keeps every site on Mechanism C.
+        int *bar_tags = nullptr
 #if MPK_QKVA_PF_KB > 0
         ,
         // Next layer's qkv_a weight for this XCD. Null on the last layer of
@@ -1961,7 +1964,13 @@ __device__ __attribute__((always_inline)) void
   // instead of spinning, which is the same trade Phase 2 makes for o_proj.
   __syncthreads();
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-  if (tid == 0) {
+  bool const w13_tagged = (MPK_BAR_TAGGED & MPK_TAGBAR_W13) != 0 &&
+                          !MPK_W13_EARLY_REL_ON && bar_tags != nullptr;
+  int *const w13_tags =
+      w13_tagged ? bar_tags + MPK_TAGBAR_IDX_W13 * MPK_TAGBAR_SLOTS : nullptr;
+  if (tid == 0 && w13_tagged) {
+    tag_bar_arrive(w13_tags, xcd_id * tiles_per_xcd + xcd_rank, w13_expected);
+  } else if (tid == 0) {
     int const arrivals = tiles_per_xcd * 8;
     // MPK_W13_EARLY_REL needs the raw modular position, not just "am I last",
     // so this site keeps the flat arrival whenever the ceiling probe is on.
@@ -2003,7 +2012,10 @@ __device__ __attribute__((always_inline)) void
   if (xcd_rank >= moe_w2_tiles_per_xcd) {
     return;
   }
-  if (tid == 0) {
+  if (w13_tagged) {
+    tag_bar_wait_site(w13_tags, tiles_per_xcd * 8, w13_expected, tid, xcd_id,
+                      xcd_rank);
+  } else if (tid == 0) {
     int *my_flag = &w13_barrier[xcd_id * HIER_STRIDE];
     // Self-heal, see MPK_FL_REPUBLISH_SPINS in
     // gang_mla_full_layer_fused_mi300.cuh. The counter just above is the

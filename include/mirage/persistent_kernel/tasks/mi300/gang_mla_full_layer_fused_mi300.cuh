@@ -442,12 +442,40 @@ static constexpr int FULL_LAYER_NULL_PHASE_STRIDE = 24;
 #ifndef MPK_NULL_TILES
 #define MPK_NULL_TILES 0
 #endif
+// MPK_NULL_TAGGED: the same null rendezvous, built the way TileRT's layer
+// kernel synchronizes (no atomics, no release fan-out, no elected last
+// arriver). Every worker writes the epoch into its OWN slot with a
+// write-through store, and every worker polls the whole slot array -- 240
+// int32, one dwordx4 per lane of one wave -- until all of them carry the
+// epoch. What it removes against Mechanism C is exactly the half the
+// MPK_BAR_TREE null measured as the whole cost: the last arriver's atomic
+// round trip, its eight flag stores, and the cross-XCD observation of a line
+// written by one thread. CORRECT OUTPUT, like MPK_NULL_PHASES itself.
+#ifndef MPK_NULL_TAGGED
+#define MPK_NULL_TAGGED 0
+#endif
 static_assert(MPK_NULL_PHASES >= 0 &&
                   MPK_NULL_PHASES <= FULL_LAYER_MAX_NULL_PHASES,
               "MPK_NULL_PHASES must be 0..4; the counter buffer sizes for 4");
-static constexpr int FULL_LAYER_COUNTER_SLOTS =
+// One 1 KB slot array (256 int32) per null rendezvous, after the null lines.
+static constexpr int FULL_LAYER_NULL_TAG_SLOT =
     FULL_LAYER_NULL_PHASE_SLOT +
     FULL_LAYER_MAX_NULL_PHASES * FULL_LAYER_NULL_PHASE_STRIDE;
+static constexpr int FULL_LAYER_NULL_TAG_LINES = 16;
+// MPK_BAR_TAGGED's slot arrays (mpk_atoms.cuh), one per converted rendezvous.
+static constexpr int FULL_LAYER_BAR_TAG_SLOT =
+    FULL_LAYER_NULL_TAG_SLOT +
+    FULL_LAYER_MAX_NULL_PHASES * FULL_LAYER_NULL_TAG_LINES;
+static constexpr int FULL_LAYER_BAR_TAG_LINES =
+    MPK_TAGBAR_ARRAYS * MPK_TAGBAR_SLOTS / 16;
+static constexpr int FULL_LAYER_COUNTER_SLOTS =
+    FULL_LAYER_BAR_TAG_SLOT + FULL_LAYER_BAR_TAG_LINES;
+// The entry rendezvous stays Mechanism C under two builds: MPK_BAR_SKEW's
+// stage stamps are referenced to its elected last arriver, which a tagged
+// entry does not have, and MPK_QKVA_ENTRY_PF's DMA sits between its arrival
+// and its poll.
+#define FULL_LAYER_TAGGED_ENTRY                                                \
+  ((MPK_BAR_TAGGED & MPK_TAGBAR_ENTRY) && !MPK_BAR_SKEW && !MPK_QKVA_ENTRY_PF)
 
 // Self-heal gate for the Mechanism-C flag polls.
 //
@@ -750,6 +778,10 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
   // Multi-layer mode: the scheduler is running every layer inside one task,
   // so the per-layer event boundary the snapshot below depends on is gone.
   bool const ml_mode = ml_num_layers > 0;
+  // MPK_BAR_TAGGED's slot arrays; null outside ml_mode, where the release
+  // values are not task_layer_idx + 1 and a tagged site falls back.
+  int *const bar_tags =
+      ml_mode ? counters + FULL_LAYER_BAR_TAG_SLOT * HIER_STRIDE : nullptr;
 
   // ── layer-entry barrier (multi-layer mode only) ──────────────────────────
   // Phase 1 resolves the residual stream, which the *previous* layer's MoE W2
@@ -795,6 +827,18 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     if (tid == 0) {
       mpk_stage_stamp(9);
     }
+#if FULL_LAYER_TAGGED_ENTRY
+    {
+      int *const tags = bar_tags + MPK_TAGBAR_IDX_ENTRY * MPK_TAGBAR_SLOTS;
+      (void)entry_tree;
+      if (tid == 0) {
+        tag_bar_arrive(tags, xcd_id * tiles_per_xcd + xcd_rank,
+                       entry_expected);
+      }
+      tag_bar_wait_site(tags, arrivals, entry_expected, tid, xcd_id,
+                        xcd_rank);
+    }
+#else
     if (tid == 0) {
       if (hier_barrier_arrive(entry_bar, HIER_STRIDE, arrivals, tiles_per_xcd,
                               xcd_id, entry_tree, /*skew_slot=*/0)) {
@@ -900,6 +944,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
         __builtin_amdgcn_s_sleep(1);
       }
     }
+#endif // FULL_LAYER_TAGGED_ENTRY
     __syncthreads();
     // Same reasoning as Phase 8: plain buffer_inv, not an agent-scope acquire.
     asm volatile("buffer_inv" ::: "memory");
@@ -936,6 +981,48 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
 #endif
       __syncthreads();
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#if MPK_NULL_TAGGED
+      {
+        int *const tags =
+            counters +
+            (FULL_LAYER_NULL_TAG_SLOT + k * FULL_LAYER_NULL_TAG_LINES) *
+                HIER_STRIDE;
+        if (arrivals > FULL_LAYER_NULL_TAG_LINES * HIER_STRIDE) {
+          __builtin_trap();
+        }
+        if (tid == 0) {
+          st_wt_u32((void *)&tags[xcd_id * tiles_per_xcd + xcd_rank],
+                    (unsigned)entry_expected);
+        }
+        if (tid < 64) {
+          // Every lane runs the same trip count, so __all sees all 64.
+          int const nchunk = (arrivals + 255) / 256;
+          for (int c = 0; c < nchunk; c++) {
+            int const base = c * 256 + tid * 4;
+            bool const live = base < arrivals;
+            int4 v = make_int4(0, 0, 0, 0);
+            for (;;) {
+              if (live) {
+                asm volatile("global_load_dwordx4 %0, %1, off sc0 sc1\n"
+                             "s_waitcnt vmcnt(0)"
+                             : "=v"(v)
+                             : "v"(&tags[base])
+                             : "memory");
+              }
+              bool const ok =
+                  !live || ((v.x >= entry_expected) &&
+                            (base + 1 >= arrivals || v.y >= entry_expected) &&
+                            (base + 2 >= arrivals || v.z >= entry_expected) &&
+                            (base + 3 >= arrivals || v.w >= entry_expected));
+              if (__all(ok)) {
+                break;
+              }
+              __builtin_amdgcn_s_sleep(1);
+            }
+          }
+        }
+      }
+#else
       if (tid == 0) {
         bool release;
         if (MPK_NULL_TREE) {
@@ -981,6 +1068,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
           __builtin_amdgcn_s_sleep(1);
         }
       }
+#endif // MPK_NULL_TAGGED
       __syncthreads();
       asm volatile("buffer_inv" ::: "memory");
     }
@@ -1652,7 +1740,8 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       // local counter otherwise -- and a local counter's value is not the
       // value a peer would publish. Slot 2 of the per-PE line; see
       // QB_EP_SIGNAL_SLOT in gang_mla_attn_fused_mi300.cuh.
-      /*ep_signal=*/(EP_WORLD_SIZE > 1 && ml_mode) ? input_ptrs[28] : nullptr);
+      /*ep_signal=*/(EP_WORLD_SIZE > 1 && ml_mode) ? input_ptrs[28] : nullptr,
+      bar_tags);
 
   MPK_WS_PHASE(60, task_layer_idx, xcd_id);
   // Stage 0: the residual stream this layer consumed -- and READ IT AS
@@ -1941,7 +2030,15 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     _b_t0 = __builtin_amdgcn_s_memrealtime();
 #endif
     bool const rel_tree = MPK_BAR_TREE && (arrivals == tiles_per_xcd * 8);
-    if (tid == 0) {
+    bool const attn_tagged =
+        (MPK_BAR_TAGGED & MPK_TAGBAR_ATTN) != 0 && bar_tags != nullptr;
+    int *const attn_tags =
+        attn_tagged ? bar_tags + MPK_TAGBAR_IDX_ATTN * MPK_TAGBAR_SLOTS
+                    : nullptr;
+    if (tid == 0 && attn_tagged) {
+      tag_bar_arrive(attn_tags, xcd_id * tiles_per_xcd + xcd_rank,
+                     attn_release_expected);
+    } else if (tid == 0) {
       bool const _owes = hier_barrier_arrive(attn_release, HIER_STRIDE,
                                              arrivals, tiles_per_xcd, xcd_id,
                                              rel_tree, /*skew_slot=*/1);
@@ -2158,7 +2255,10 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     // o_proj then reads whatever v_out happens to hold. Timing only.
     (void)attn_release_expected;
 #else
-    if (tid == 0) {
+    if (attn_tagged) {
+      tag_bar_wait_site(attn_tags, arrivals, attn_release_expected, tid,
+                        xcd_id, xcd_rank);
+    } else if (tid == 0) {
       int *const my_flag = &attn_release[xcd_id * HIER_STRIDE];
       // Watch this poll. a0 is the raw global arrival counter: it is
       // monotonic at `arrivals` per fused layer, so a0 >= arrivals *
@@ -2372,7 +2472,8 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       /*router_weight_t=*/
       (ROUTER_FOLD && ml_mode) ? input_ptrs[FL_ROUTER_WT_IN] : nullptr,
       /*router_partials=*/
-      (ROUTER_FOLD && ml_mode) ? input_ptrs[FL_ROUTER_PARTS_IN] : nullptr
+      (ROUTER_FOLD && ml_mode) ? input_ptrs[FL_ROUTER_PARTS_IN] : nullptr,
+      bar_tags
 #if MPK_QKVA_PF_KB > 0
       ,
       /*next_qkv_weight=*/input_ptrs[MPK_QKVA_PF_SLOT]

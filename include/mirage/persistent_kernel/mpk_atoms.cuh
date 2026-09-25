@@ -1647,6 +1647,158 @@ __device__ __forceinline__ void mpk_ml_boundary_pad() {}
 #ifndef MPK_BAR_TREE
 #define MPK_BAR_TREE 0
 #endif
+
+// MPK_BAR_TAGGED: a bitmask of GLM fused-layer rendezvous to run as tag
+// arrays instead of Mechanism C. Each arriving worker stores the epoch into
+// its own int32 slot with a write-through store; each waiting worker's wave 0
+// polls every slot (one system-scope dwordx4 per lane) until all of them
+// carry the epoch. No arrival atomic, no elected last arriver, no eight-flag
+// fan-out, no self-heal -- there is no single store whose loss wedges a
+// round. The fences either side are the call site's and are unchanged.
+//
+// Priced first as a null rendezvous (MPK_NULL_TAGGED), 1024/1024, NP=4,
+// 2 alternating reps, decode median, all G1 PASS:
+//   control 9.857   +4 Mechanism-C nulls 10.931   +4 tagged nulls 10.471
+//   i.e. 3.44 vs 1.97 us per rendezvous over 4 x 78 added.
+//
+// At the five real sites (mask 31, MPK_BAR_TAGGED_HIER=1), 1024/1024, NP=4,
+// 3 alternating reps, all G1 PASS, no overlap between arms:
+//   decode median  control 9.869 9.861 9.840   tagged 9.742 9.717 9.688
+//   mean 9.857 -> 9.716 ms (-0.141), prefill 9.264 -> 9.138 ms/iter
+// About 0.36 us per rendezvous, a quarter of what the null probe priced.
+// Gates green with it on: standalone 46/46 + 6/6 + 4/4, ppl512 2.5723 (4
+// ranks identical), ppl128 ratio 1.153 vs torch, longseq 256/512/1024 G1.
+//
+// Only legal where every epoch is task_layer_idx + 1 (ml_mode): a site whose
+// release value is snapshotted off its own Mechanism-C flag would never see
+// that flag advance once the site stops writing it. Outside ml_mode the
+// fused layer passes no slot arrays and every site stays Mechanism C.
+#ifndef MPK_BAR_TAGGED
+#define MPK_BAR_TAGGED 31
+#endif
+#define MPK_TAGBAR_ENTRY 1
+#define MPK_TAGBAR_QKV 2
+#define MPK_TAGBAR_DECODE 4
+#define MPK_TAGBAR_ATTN 8
+#define MPK_TAGBAR_W13 16
+// One region per rendezvous, in the order below: 256 int32 slots, then eight
+// 128-byte per-XCD release lines (MPK_BAR_TAGGED_HIER).
+#define MPK_TAGBAR_SLOTS 512
+#define MPK_TAGBAR_XFLAG_OFF 256
+// MPK_BAR_TAGGED_HIER: who polls the slot array.
+//   0  every waiting worker's wave 0. MEASURED WORSE than Mechanism C at the
+//      five real sites (1024/1024, 3 alternating reps, decode median
+//      9.846 -> 10.269 ms, all G1 PASS), though it won the null probe: at a
+//      real rendezvous the early arrivers poll 1 KB each, continuously, into
+//      the same eight lines while the stragglers they wait for are still
+//      streaming, where Mechanism C polls one 4-byte flag from one lane.
+//   1  one worker per XCD (xcd_rank 0) polls the slot array, then publishes
+//      the epoch to its XCD's line with a plain store, which lands in that
+//      XCD's L2; everyone else polls that line with an nt load (L1 miss, L2
+//      hit). Eight memory pollers instead of 240, and no cross-XCD fan-out.
+#ifndef MPK_BAR_TAGGED_HIER
+#define MPK_BAR_TAGGED_HIER 1
+#endif
+enum {
+  MPK_TAGBAR_IDX_ENTRY = 0,
+  MPK_TAGBAR_IDX_QKV = 1,
+  MPK_TAGBAR_IDX_DECODE = 2,
+  MPK_TAGBAR_IDX_ATTN = 3,
+  MPK_TAGBAR_IDX_W13 = 4,
+  MPK_TAGBAR_ARRAYS = 8
+};
+
+// Caller: tid 0, after the site's own __syncthreads + s_waitcnt vmcnt(0).
+__device__ __forceinline__ void tag_bar_arrive(int *tags, int slot, int epoch) {
+  st_wt_u32((void *)&tags[slot], (unsigned)epoch);
+}
+
+// Caller: the 64 lanes of wave 0, all of them. Returns once slots
+// [0, arrivals) all hold >= epoch.
+__device__ __forceinline__ void tag_bar_wait(int *tags, int arrivals,
+                                             int epoch, int lane) {
+  int const nchunk = (arrivals + 4 * 64 - 1) / (4 * 64);
+  for (int c = 0; c < nchunk; c++) {
+    int const base = c * 4 * 64 + lane * 4;
+    bool const live = base < arrivals;
+    int4 v = make_int4(0, 0, 0, 0);
+    for (;;) {
+      if (live) {
+        asm volatile("global_load_dwordx4 %0, %1, off sc0 sc1\n"
+                     "s_waitcnt vmcnt(0)"
+                     : "=v"(v)
+                     : "v"(&tags[base])
+                     : "memory");
+      }
+      bool const ok = !live || ((v.x >= epoch) &&
+                                (base + 1 >= arrivals || v.y >= epoch) &&
+                                (base + 2 >= arrivals || v.z >= epoch) &&
+                                (base + 3 >= arrivals || v.w >= epoch));
+      if (__all(ok)) {
+        break;
+      }
+      __builtin_amdgcn_s_sleep(1);
+    }
+  }
+}
+
+// What a converted site calls, from every thread of the workgroup, between
+// its tag_bar_arrive and its own trailing __syncthreads + buffer_inv.
+// `region` is the rendezvous' MPK_TAGBAR_SLOTS-int region.
+__device__ __forceinline__ void tag_bar_wait_site(int *region, int arrivals,
+                                                  int epoch, int tid,
+                                                  int xcd_id, int xcd_rank) {
+#if MPK_BAR_TAGGED_HIER
+  // 128 B apart: one L2 line per XCD, so no two XCDs' L2s hold the same line.
+  int *const xflag = region + MPK_TAGBAR_XFLAG_OFF + xcd_id * 32;
+  if (tid == 0) {
+    // The release line is only coherent through the L2 of the XCD that owns
+    // it, so a gang tile whose xcd_id is not the XCD it runs on would poll a
+    // line nobody on its own L2 ever writes and spin forever. Fail loudly.
+    int hw;
+    asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 4)" : "=s"(hw));
+    if (hw != xcd_id) {
+      __builtin_trap();
+    }
+  }
+  if (xcd_rank == 0) {
+    if (tid < 64) {
+      tag_bar_wait(region, arrivals, epoch, tid);
+    }
+    if (tid == 0) {
+      asm volatile("global_store_dword %0, %1, off"
+                   :
+                   : "v"(xflag), "v"(epoch)
+                   : "memory");
+    }
+  } else if (tid == 0) {
+    int v;
+    for (;;) {
+      // `nt`, NOT `sc0`: a group-scope load may HIT in the CU's L1 (the ISA
+      // load table's Group row is "Hit LRU" there), so a poller on another CU
+      // re-reads its own stale copy forever. Measured standalone, 240 x 256
+      // on one MI350X: plain store + sc0 poll, 232 of 232 cross-CU pollers
+      // timed out; plain store + nt poll, 232 of 232 saw it.
+      asm volatile("global_load_dword %0, %1, off nt\n"
+                   "s_waitcnt vmcnt(0)"
+                   : "=v"(v)
+                   : "v"(xflag)
+                   : "memory");
+      if (v >= epoch) {
+        break;
+      }
+      __builtin_amdgcn_s_sleep(1);
+    }
+  }
+#else
+  (void)xcd_id;
+  (void)xcd_rank;
+  if (tid < 64) {
+    tag_bar_wait(region, arrivals, epoch, tid);
+  }
+#endif
+}
+
 // Offset, in HIER_STRIDE slots, from a barrier's own base to its block of
 // eight per-XCD arrival counters. One uniform offset works for every barrier
 // because the closest two bases in the GLM counter map are 11 slots apart and

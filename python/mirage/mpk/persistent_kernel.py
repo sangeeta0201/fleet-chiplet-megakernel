@@ -1084,6 +1084,21 @@ def get_compile_command(
             # form only vectorized to dwordx2 because the addrspace(1) cast
             # hides the real 16-byte alignment. Bit-identical arithmetic.
             flags = flags + ["-DMPK_QUANT_V16=1"]
+        _bar_tagged = os.environ.get("MPK_BAR_TAGGED")
+        if _bar_tagged is not None:
+            # Bitmask of GLM fused-layer rendezvous run as per-worker tag
+            # arrays instead of Mechanism C: 1 entry, 2 qkv_a->q_b,
+            # 4 decode->merge, 8 attention->o_proj, 16 W13->W2. Correct
+            # output; see MPK_BAR_TAGGED in mpk_atoms.cuh. Default 31 (all
+            # five); passed whenever set, so 0 puts them back on Mechanism C.
+            assert 0 <= int(_bar_tagged) <= 31, "MPK_BAR_TAGGED is a 5-bit mask"
+            flags = flags + [f"-DMPK_BAR_TAGGED={int(_bar_tagged)}"]
+        _hier = os.environ.get("MPK_BAR_TAGGED_HIER")
+        if _hier is not None:
+            # 1 (default): one slot-array poller per XCD plus an L2-local
+            # release line; 0: every waiter polls the slot array.
+            assert _hier in ("0", "1"), "MPK_BAR_TAGGED_HIER is 0 or 1"
+            flags = flags + [f"-DMPK_BAR_TAGGED_HIER={_hier}"]
         _null_phases = int(os.environ.get("MPK_NULL_PHASES", "0"))
         if _null_phases:
             # Insert N extra GPU-wide rendezvous at the head of every layer,
@@ -1098,6 +1113,11 @@ def get_compile_command(
                 # one line. The controlled A/B for "is the barrier cost just
                 # serialized atomics on a single line?".
                 flags = flags + ["-DMPK_NULL_TREE=1"]
+            if int(os.environ.get("MPK_NULL_TAGGED", "0")) == 1:
+                # Same null rendezvous as a per-worker tag array: every worker
+                # stores the epoch to its own slot and polls all of them. No
+                # atomic, no elected releaser, no eight-flag fan-out.
+                flags = flags + ["-DMPK_NULL_TAGGED=1"]
             _null_tiles = int(os.environ.get("MPK_NULL_TILES", "0"))
             if _null_tiles:
                 # Put an empty grid-stride tile loop in front of each null

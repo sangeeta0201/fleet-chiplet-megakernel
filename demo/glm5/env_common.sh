@@ -239,7 +239,8 @@ MPK_FORWARD_VARS=(
   # Correct-output pricing probe for item 2's dependency half.
   MPK_QKVA_REPS MPK_W13_REPS
   # Correct-output pricing probe, but compile-time all the same.
-  MPK_NULL_PHASES MPK_NULL_TREE MPK_NULL_TILES
+  MPK_NULL_PHASES MPK_NULL_TREE MPK_NULL_TILES MPK_NULL_TAGGED MPK_BAR_TAGGED
+  MPK_BAR_TAGGED_HIER
   # Real changes, not probes, but compile-time: every rank must build them or
   # the arrival counters (BAR_TREE) / the W2 tile space (W2_KSPLIT) disagree
   # with the host loop bound and the layer barriers wedge.

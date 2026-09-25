@@ -219,7 +219,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     // Phase-9 EP fold and the o_proj all-gather use, at slot 2 of this PE's
     // 64-byte line. Null on the standalone dispatch, and null is also what
     // disables the head shard.
-    void *ep_signal_ptr = nullptr) {
+    void *ep_signal_ptr = nullptr,
+    // MPK_BAR_TAGGED slot arrays (mpk_atoms.cuh). Null on the standalone
+    // dispatch and outside ml_mode, which keeps every site on Mechanism C.
+    int *bar_tags = nullptr) {
 
   int const tid = threadIdx.x;
   int const xcd_id = tile_idx / tiles_per_xcd;
@@ -742,7 +745,15 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     _sp_t0 = _t;
   }
 #endif
-  if (tid == 0) {
+  bool const qkv_tagged =
+      (MPK_BAR_TAGGED & MPK_TAGBAR_QKV) != 0 && bar_tags != nullptr;
+  if (qkv_tagged) {
+    int *const tags = bar_tags + MPK_TAGBAR_IDX_QKV * MPK_TAGBAR_SLOTS;
+    if (tid == 0) {
+      tag_bar_arrive(tags, xcd_id * tiles_per_xcd + xcd_rank, qkv_expected);
+    }
+    tag_bar_wait_site(tags, arrivals, qkv_expected, tid, xcd_id, xcd_rank);
+  } else if (tid == 0) {
     // Modular test rather than a reset: the counter is monotonic for the
     // whole run, so no worker from the next layer can observe a zeroed one.
     if (hier_barrier_arrive(qkv_barrier, HIER_STRIDE, arrivals, tiles_per_xcd,
@@ -1425,7 +1436,15 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // task makes at its W13 -> W2 barrier.
   __syncthreads();
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-  if (tid == 0) {
+  bool const dec_tagged = (MPK_BAR_TAGGED & MPK_TAGBAR_DECODE) != 0 &&
+                          !PAIR_MERGE && bar_tags != nullptr;
+  int *const dec_tags =
+      dec_tagged ? bar_tags + MPK_TAGBAR_IDX_DECODE * MPK_TAGBAR_SLOTS
+                 : nullptr;
+  if (tid == 0 && dec_tagged) {
+    tag_bar_arrive(dec_tags, xcd_id * tiles_per_xcd + xcd_rank,
+                   decode_expected);
+  } else if (tid == 0) {
     bool _dec_owes;
     if (dec_tree) {
       _dec_owes = hier_barrier_arrive(decode_barrier, HIER_STRIDE, dec_arrivals,
@@ -1457,7 +1476,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   if (xcd_rank >= merge_tiles_per_xcd) {
     return;
   }
-  if (tid == 0) {
+  if (dec_tagged) {
+    tag_bar_wait_site(dec_tags, dec_arrivals, decode_expected, tid, xcd_id,
+                      xcd_rank);
+  } else if (tid == 0) {
     // Self-heal, see MPK_FL_REPUBLISH_SPINS. Note the arrival above is
     // unconditional but this wait is merge-ranks-only, so the counter still
     // advances by the full `dec_arrivals` per layer and the quota test holds.
