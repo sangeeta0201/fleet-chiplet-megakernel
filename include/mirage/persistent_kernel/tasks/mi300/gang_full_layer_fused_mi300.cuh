@@ -2100,7 +2100,22 @@ __device__ __noinline__ void
     // poll by all 31 workers per XCD instead of just the QKV ranks. The
     // hazard the `#else` documents is real, so this is opt-in and has to be
     // checked against the known-good text, not just against the clock.
+#ifdef MPK_GATE_ATTN_JOIN
+#if defined(MPK_ROTATE_QKV_ATTN_RANKS) || defined(MPK_QKV_KSPLIT)
+#error "MPK_GATE_ATTN_JOIN widens the waiter set; extend this branch's arrival count first"
+#endif
+    // The premise below ("what keeps the non-consumers in line is Phase 6")
+    // holds only for workers with no Phase 1-5 work. Once NUM_KV_CHUNKS
+    // exceeds total_qkv_tiles_per_xcd, ranks [T, NUM_KV_CHUNKS) run attention
+    // chunks in the next layer without having waited here, and long prompts
+    // at 24-31 chunks decode differently on every run (1k prompt, 31 chunks:
+    // 0/16 tokens match torch; with this, 16/16 and bit-identical reruns).
+    // At NUM_KV_CHUNKS <= T the waiter set is unchanged.
+    bool const MPK_LAYER_GATE_JOINS =
+        qkv_does_qkv || (qkv_attn_rank < ATTN_PARTICIPANTS);
+#else
     bool const MPK_LAYER_GATE_JOINS = qkv_does_qkv;
+#endif
 #else
     // 4 XCDs: every rank produces at least one W2 tile (46 groups / 31
     // workers). CONSUMER_GATE would let ranks 20-30 skip Phase 9 and start
@@ -2260,9 +2275,18 @@ __device__ __noinline__ void
 #else
     // Unrotated: the waiters are the prefix [0, T), which the producer
     // prefix already covers at every shipped geometry.
+#ifdef MPK_GATE_ATTN_JOIN
+    int const n_waiters_want = qkv_work_slots > ATTN_PARTICIPANTS
+                                   ? qkv_work_slots
+                                   : ATTN_PARTICIPANTS;
+    int const n_waiters_unrot = n_waiters_want < workers_per_xcd
+                                    ? n_waiters_want
+                                    : workers_per_xcd;
+#else
     int const n_waiters_unrot = qkv_work_slots < workers_per_xcd
                                     ? qkv_work_slots
                                     : workers_per_xcd;
+#endif
     int const arrivers_per_xcd =
         n_w2_arrivers > n_waiters_unrot ? n_w2_arrivers : n_waiters_unrot;
     bool const MPK_LAYER_GATE_ARRIVES = (xcd_rank < arrivers_per_xcd);

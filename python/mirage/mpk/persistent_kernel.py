@@ -512,6 +512,13 @@ def get_compile_command(
         # computes QK on all four waves and barriers twice per 16-token tile.
         if int(os.environ.get("MPK_ATTN_NO_WAVE_LOCAL", "0")) == 1:
             flags = flags + ["-DMPK_ATTN_NO_WAVE_LOCAL"]
+        if _opt("MPK_GATE_ATTN_JOIN"):
+            # Attention chunk workers wait at the Phase 9 layer gate. Without
+            # it, MPK_W2_CONSUMER_GATE lets ranks >= total_qkv_tiles_per_xcd
+            # skip the gate while holding live attention chunks, which they do
+            # once NUM_KV_CHUNKS > 10 (max_seq_length > ~1344): long prompts
+            # then decode differently on every run. No-op at <= 10 chunks.
+            flags = flags + ["-DMPK_GATE_ATTN_JOIN"]
         # Opt-in: at ntiles=4 (ctx512 full-attn, 8 chunks × 64 tokens) enter
         # the wave-local scan as 2 waves × 2 sequential tiles, not the
         # shared-LDS loop. 4 waves × 1 tile failed PPL; T=8 (2 tiles/wave)
