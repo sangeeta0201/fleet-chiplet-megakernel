@@ -1594,6 +1594,8 @@ def get_compile_command(
             flags = flags + ["-DMPK_AID_SPLIT_QKV"]
         if int(os.environ.get("MPK_AID_QKV_ARRIVE", "0")) == 1:
             flags = flags + ["-DMPK_AID_QKV_ARRIVE"]
+        if int(os.environ.get("MPK_QKV_EPOCH_DIRECT", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_EPOCH_DIRECT"]
         if int(os.environ.get("MPK_AID_CHUNK_BAR", "0")) == 1:
             flags = flags + ["-DMPK_AID_CHUNK_BAR"]
         if int(os.environ.get("MPK_AID_SPLIT_ATTNOUT", "0")) == 1:
@@ -1868,6 +1870,10 @@ def get_compile_command(
             flags = flags + ["-DMPK_OPROJ_NARROW_REL"]
         if int(os.environ.get("MPK_LAYER_NARROW_REL", "0")) == 1:
             flags = flags + ["-DMPK_LAYER_NARROW_REL"]
+        if int(os.environ.get("MPK_P9_FLAT", "0")) == 1:
+            flags = flags + ["-DMPK_P9_FLAT"]
+        if int(os.environ.get("MPK_OPROJ_FLAT", "0")) == 1:
+            flags = flags + ["-DMPK_OPROJ_FLAT"]
         if int(os.environ.get("MPK_ITER_AID", "0")) == 1:
             flags = flags + ["-DMPK_ITER_AID"]
         if int(os.environ.get("MPK_AID_GATE_CACHED", "0")) == 1:

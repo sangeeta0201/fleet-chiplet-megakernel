@@ -533,6 +533,48 @@ __device__ __forceinline__ unsigned long long ld_aid_u64(void *addr) {
 #endif
 }
 
+// Minimum of eight 64 B-strided flags in one round trip: all eight loads are
+// issued before the single wait (ld_aid_s32 waits inside its own asm, so eight
+// calls would serialise into eight round trips per poll).
+#if defined(MPK_AID_GATE_CACHED)
+#define MPK_MIN8_SC "sc1"
+#else
+#define MPK_MIN8_SC "sc0 sc1"
+#endif
+__device__ __forceinline__ int ld_aid_min8_s32(int *base) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  int v0, v1, v2, v3, v4, v5, v6, v7;
+  asm volatile("global_load_dword %0, %8, off " MPK_MIN8_SC "\n"
+               "global_load_dword %1, %8, off offset:64 " MPK_MIN8_SC "\n"
+               "global_load_dword %2, %8, off offset:128 " MPK_MIN8_SC "\n"
+               "global_load_dword %3, %8, off offset:192 " MPK_MIN8_SC "\n"
+               "global_load_dword %4, %8, off offset:256 " MPK_MIN8_SC "\n"
+               "global_load_dword %5, %8, off offset:320 " MPK_MIN8_SC "\n"
+               "global_load_dword %6, %8, off offset:384 " MPK_MIN8_SC "\n"
+               "global_load_dword %7, %8, off offset:448 " MPK_MIN8_SC "\n"
+               "s_waitcnt vmcnt(0)"
+               : "=&v"(v0), "=&v"(v1), "=&v"(v2), "=&v"(v3), "=&v"(v4),
+                 "=&v"(v5), "=&v"(v6), "=&v"(v7)
+               : "v"(base)
+               : "memory");
+  int a = v0 < v1 ? v0 : v1;
+  int b = v2 < v3 ? v2 : v3;
+  int c = v4 < v5 ? v4 : v5;
+  int d = v6 < v7 ? v6 : v7;
+  a = a < b ? a : b;
+  c = c < d ? c : d;
+  return a < c ? a : c;
+#else
+  int m = reinterpret_cast<int volatile *>(base)[0];
+  for (int i = 1; i < 8; ++i) {
+    int v = reinterpret_cast<int volatile *>(base)[i * 16];
+    m = v < m ? v : m;
+  }
+  return m;
+#endif
+}
+
 // Used ONLY at polls whose pointer came from mpk_aid_flags*. Without the
 // replicas those pointers fall back to the shared NC buffer, where a cached
 // poll would be unsound -- hence the MPK_AID_SPLIT_FLAGS guard.

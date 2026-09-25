@@ -824,6 +824,18 @@ __device__ __noinline__ void
 #endif
   {
     __shared__ int s_prev;
+#if defined(MPK_QKV_EPOCH_DIRECT) && defined(MPK_AID_QKV_ARRIVE) && \
+    defined(MPK_AID_SPLIT_FLAGS)
+#ifdef MPK_ATTN_SPLIT_CHUNK
+#error "MPK_QKV_EPOCH_DIRECT: split helpers poll qkv_epoch without arriving"
+#endif
+    int *const qkv_dir = g_aid_flag_rep[xcd_id >> 2]
+                             ? g_aid_flag_rep[xcd_id >> 2] +
+                                   MPK_AID_QKVARR_BASE_INTS + xcd_id * 16
+                             : nullptr;
+#else
+    int *const qkv_dir = nullptr;
+#endif
 #ifdef MPK_QKV_SUB_LDS
     unsigned int qs_t0 = 0, qs_t1 = 0, qs_t2 = 0;
     bool const qs_on = (qkv_epoch_expected > 1440);
@@ -871,7 +883,7 @@ __device__ __noinline__ void
 
     if ((s_prev % qkv_epoch_participants) == qkv_epoch_participants - 1) {
       // Last worker to arrive: bump epoch (no reset needed — modular check)
-      if (tid == 0) {
+      if (tid == 0 && qkv_dir == nullptr) {
         MPK_XCD_LOCAL_ATOM_ADD(&qkv_epoch[xcd_id * 16], 1);
       }
     }
@@ -883,8 +895,11 @@ __device__ __noinline__ void
     if (tid == 0) {
       int _obs;
       int _spins = 0;
-      while (!MPK_WS_SK(1) && (_obs = __atomic_load_n(&qkv_epoch[xcd_id * 16],
-                                     __ATOMIC_RELAXED)) < qkv_epoch_expected) {
+      int *const _qp = qkv_dir ? qkv_dir : &qkv_epoch[xcd_id * 16];
+      int const _qt = qkv_dir ? qkv_epoch_participants * qkv_epoch_expected
+                              : qkv_epoch_expected;
+      while (!MPK_WS_SK(1) &&
+             (_obs = __atomic_load_n(_qp, __ATOMIC_RELAXED)) < _qt) {
         MPK_WS_WAIT_TICK(_obs, _spins);
         _spins++;
         __builtin_amdgcn_s_sleep(1);
@@ -2112,6 +2127,11 @@ __device__ __noinline__ void
     int *layer_local =
         oproj_counters_base + FULL_LAYER_LAYER_BARRIER_SLOT(NUM_REQS);
     int *layer_global = layer_local + 8 * 16;
+#if defined(MPK_P9_FLAT) &&                                                    \
+    (MPK_NUM_XCDS != 8 || !defined(MPK_LEAN_ARRIVE) ||                         \
+     !defined(MPK_AID_SPLIT_FLAGS) || defined(MPK_LAYER_NARROW_REL))
+#error "MPK_P9_FLAT needs 8 XCDs, MPK_LEAN_ARRIVE, MPK_AID_SPLIT_FLAGS and no MPK_LAYER_NARROW_REL"
+#endif
     int *layer_release_shared = layer_global + 16;
 #ifdef MPK_AID_SPLIT_FLAGS
     // Fan-out shape: one XCD publishes all eight slots, rather than each XCD
@@ -2458,12 +2478,19 @@ __device__ __noinline__ void
         // dies are still arriving. Drained before the arrival advertises it.
         asm volatile("buffer_inv sc1\n s_waitcnt vmcnt(0)" ::: "memory");
 #endif
+#ifdef MPK_P9_FLAT
+        // Flat: every XCD publishes its own slot as soon as its own workers
+        // are in; the gate takes the minimum over all eight.
+        int global_expected = MPK_NUM_XCDS * (lean_layers_done + 1);
+        bool const is_last_global = true;
+#else
         int global_prev = atom_add_release_gpu_s32(layer_global, 1);
         // Same identity one level up: the counter takes 8 arrivals per layer,
         // so the last XCD is the one whose pre-increment value is 7 mod 8 and
         // the release it publishes is its post-increment value.
         int global_expected = global_prev + 1;
         bool const is_last_global = (global_prev & (MPK_NUM_XCDS - 1)) == (MPK_NUM_XCDS - 1);
+#endif
 #else
 #ifdef MPK_DRAIN_STATS
       s_was_last_local = (local_prev == local_expected - 1);
@@ -2531,10 +2558,18 @@ __device__ __noinline__ void
 #endif
       }
 #else
+#ifdef MPK_P9_FLAT
+      if (tid == 0) {
+#else
       if (tid < 8) {
+#endif
 #ifdef MPK_AID_SPLIT_FLAGS
         mpk_aid_publish(layer_release_shared,
+#ifdef MPK_P9_FLAT
+                        xcd_id,
+#else
                         tid,
+#endif
                         (unsigned)lean_rel_epoch,
                         MPK_AID_REGION_LAYER_RELEASE);
 #else
@@ -2743,7 +2778,11 @@ __device__ __noinline__ void
 #ifdef MPK_LAYER_NARROW_REL
       while (MPK_LD_GATE_AID(&layer_release[0]) <= s_layer_rel_prev) {
 #else
+#if defined(MPK_P9_FLAT)
+      while (ld_aid_min8_s32(layer_release) <= s_layer_rel_prev) {
+#else
       while (MPK_LD_GATE_AID(&layer_release[xcd_id * 16]) <= s_layer_rel_prev) {
+#endif
 #endif
 #ifndef MPK_LAYER_GATE_BUSY_POLL
         __builtin_amdgcn_s_sleep(1);

@@ -554,6 +554,13 @@ __device__ __attribute__((noinline)) void
 #else
 #define MPK_OPROJ_REL_SLOT 0
 #endif
+#if defined(MPK_OPROJ_FLAT) &&                                                 \
+    (MPK_NUM_XCDS != 8 || !defined(MPK_OPROJ_TREE_BARRIER) ||                  \
+     !defined(MPK_OPROJ_NARROW_REL) || !defined(MPK_AID_SPLIT_FLAGS) ||         \
+     defined(MPK_OPROJ_AID_TIER) || defined(MPK_OPROJ_AID_AGG) ||              \
+     defined(MPK_ROUTER_XCD_FOLD))
+#error "MPK_OPROJ_FLAT needs 8 XCDs, MPK_OPROJ_TREE_BARRIER, MPK_OPROJ_NARROW_REL and MPK_AID_SPLIT_FLAGS"
+#endif
 #ifdef MPK_ROUTER_XCD_FOLD
 #ifndef MPK_OPROJ_TREE_BARRIER
 #error "MPK_ROUTER_XCD_FOLD publishes from the tree-barrier local-last"
@@ -1692,6 +1699,8 @@ oproj_barrier :
 #ifdef MPK_OPROJ_AID_TIER
                         : min(ld_nt_s32(&hier_release[16]),
                               ld_nt_s32(&hier_release[32])) + 1;
+#elif defined(MPK_OPROJ_FLAT)
+                        : ld_aid_min8_s32(hier_release) + 1;
 #else
                         : ld_nt_s32(&hier_release[0]) + 1;
 #endif
@@ -1861,6 +1870,10 @@ oproj_barrier :
             oproj_rel_epoch = oproj_release_expected;
           }
         }
+#elif defined(MPK_OPROJ_FLAT)
+        // Flat: this XCD publishes its own slot; the gate takes the
+        // minimum over all eight.
+        oproj_rel_epoch = oproj_release_expected;
 #else
         int const prev_global =
             atom_add_release_gpu_s32(&hier_barrier[8 * HIER_STRIDE], 1);
@@ -1896,7 +1909,11 @@ oproj_barrier :
       if (tid == 0) {
 #ifdef MPK_AID_SPLIT_FLAGS
         mpk_aid_publish(hier_barrier,
+#ifdef MPK_OPROJ_FLAT
+                        xcd_id,
+#else
                         MPK_OPROJ_REL_SLOT,
+#endif
                         (unsigned)oproj_rel_epoch,
                         MPK_AID_REGION_HIER_RELEASE);
 #else
@@ -2019,6 +2036,8 @@ oproj_barrier :
 #ifdef MPK_OPROJ_AID_TIER
              ld_aid_min2_s32(&hier_release[16], &hier_release[32]) <
                  oproj_release_expected) {
+#elif defined(MPK_OPROJ_FLAT)
+             ld_aid_min8_s32(hier_release) < oproj_release_expected) {
 #else
              MPK_LD_GATE_AID(&hier_release[0]) < oproj_release_expected) {
 #endif

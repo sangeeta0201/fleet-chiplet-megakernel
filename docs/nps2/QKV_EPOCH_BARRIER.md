@@ -49,3 +49,36 @@ Recorder: `MPK_QKV_SUB_LDS=1` with `MPK_PHASE_SLOTS=1 MPK_PHASE_LDS=1` prints
 one `[QSUBW]` line per worker with drain / arrive / wait per QKV-epoch pass
 and drain / arrive per chunk-barrier pass.
 
+
+## Follow-ups: direct poll and flat tree barriers
+
+Code: the commit after `c77ed24`. All opt-in; the recipe now adds
+`MPK_QKV_EPOCH_DIRECT=1 MPK_P9_FLAT=1 MPK_OPROJ_FLAT=1` to the three flags above.
+
+- `MPK_QKV_EPOCH_DIRECT`: waiters poll the replica arrival counter for
+  participants x epoch, and the last arriver no longer bumps the epoch.
+- `MPK_P9_FLAT`: each die's last Phase 9 arriver publishes 8 x layer into its
+  own slot of both AID replicas; the gate waits for the minimum over the eight
+  slots (`ld_aid_min8_s32`: eight loads, one wait). The cross-die `layer_global`
+  atomic and the last-die relay store are gone.
+- `MPK_OPROJ_FLAT`: the same for the O-proj phase-2 barrier (no level-2
+  `hier_barrier[8*16]` atomic).
+
+| arm (NPS2, 16 tokens) | runs | mean | vs previous |
+|---|---|---|---|
+| 21be579 flags | 1.444 / 1.441 / 1.441 | 1.442 | |
+| + direct poll | 1.432 / 1.435 / 1.430 | 1.432 | -0.67%, t=-5.2, 3/3 |
+| + direct (new session) | 1.439 / 1.438 / 1.434 | 1.437 | |
+| + direct + P9_FLAT | 1.434 / 1.428 / 1.433 | 1.432 | -0.37%, t=-2.05, 3/3 |
+| + direct + P9_FLAT + OPROJ_FLAT | 1.427 / 1.431 / 1.427 | **1.428** | -0.60%, t=-5.2, 3/3 |
+| same, after an NPS1 round trip | 1.430 / 1.426 / 1.429 | 1.428 | |
+
+Last-worker critical path per layer: 52.39 -> 52.03 us (O-proj + router
+-0.11, Phase 9 arrival -0.06). At 31 chunks the direct poll is null (the wait
+there is arrival spread); 5,200-token decode 1.554 (21be579) / 1.562 (direct) /
+1.559 (all three), one run each.
+
+NPS1, same code, 16 tokens: 1.530 / 1.513 / 1.502 -> 1.459 / 1.516 / 1.519
+(t=-0.63, noise); its lines are hardware-coherent, so the removed hops cost it
+less. NPS1 5,200-token decode with all three: 1.708, a uniform +0.12 ms at every
+context against the earlier fix-only run -- one run each, unresolved.
