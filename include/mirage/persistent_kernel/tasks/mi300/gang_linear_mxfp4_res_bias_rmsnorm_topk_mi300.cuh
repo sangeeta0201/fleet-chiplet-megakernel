@@ -531,6 +531,13 @@ __device__ __attribute__((noinline)) void
   // read of it stay on the same die and cannot straddle replicas.
   int *hier_local = mpk_aid_flags_hw(hier_barrier + 28 * HIER_STRIDE,
                                      MPK_AID_REGION_HIER_LOCAL);
+#elif defined(MPK_OPROJ_HIER_NC)
+#if !defined(MPK_AID_NC_REP)
+#error "MPK_OPROJ_HIER_NC needs MPK_AID_NC_REP"
+#endif
+  // XCD-private counter, memory-side atomic in this die's own AID.
+  int *hier_local =
+      mpk_aid_nc_hw(hier_barrier + 28 * HIER_STRIDE, MPK_NC_OPROJ_INTS);
 #else
   int *hier_local = hier_barrier + 28 * HIER_STRIDE;
 #endif

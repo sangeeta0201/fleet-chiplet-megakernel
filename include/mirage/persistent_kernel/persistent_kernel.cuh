@@ -23,6 +23,9 @@
 #ifdef MPK_PPROBE
 #include "pprobe.h"
 #endif
+#ifdef MPK_NC_PROBE
+#include "ncprobe.h"
+#endif
 
 #if defined(MPK_AID_LOCAL) || defined(MPK_AID_SPLIT_FLAGS) ||                 \
     defined(MPK_LM_WEIGHT_AID)
@@ -203,6 +206,9 @@ __device__ int g_phase_live[MPK_PHASE_MAX_WORKERS * MPK_PHASE_PAD_INT];
 #ifndef MPK_PHASE_LAYERS_PER_ITER
 #define MPK_PHASE_LAYERS_PER_ITER 36
 #endif
+#ifndef MPK_PSNAPD_WPD
+#define MPK_PSNAPD_WPD 31
+#endif
 #ifdef MPK_PHASE_SNAP
 // Every slot timestamp of every worker for the layers of iteration
 // MPK_PHASE_SNAP, so the printer can take per-layer min/max over workers.
@@ -314,6 +320,12 @@ __device__ __forceinline__ void mpk_sub_mark(int k) {
 // and W2 dec/prep/barrier/compute (ns). Copied out with the phase spans.
 __shared__ unsigned int s_moe_acc[7];
 __shared__ unsigned int s_moe_n[2];
+#ifdef MPK_MOE_LDS_MAX
+// [0] max W13 arrival ns, [1] arrivals > 1 us, [2] max W2 barrier ns,
+// [3] W2 barrier waits > 1 us.
+__shared__ unsigned int s_moe_x[4];
+__device__ unsigned int g_moe_x[MPK_PHASE_MAX_WORKERS * 4];
+#endif
 __device__ unsigned int g_moe_acc[MPK_PHASE_MAX_WORKERS * 7];
 __device__ unsigned int g_moe_n[MPK_PHASE_MAX_WORKERS * 2];
 #ifdef MPK_MOE_CALL_LDS
@@ -366,6 +378,9 @@ __device__ __forceinline__ void mpk_phase_lds_init() {
     for (int k = 0; k < 7; k++) s_moe_acc[k] = 0;
     s_moe_n[0] = 0;
     s_moe_n[1] = 0;
+#ifdef MPK_MOE_LDS_MAX
+    for (int k = 0; k < 4; k++) s_moe_x[k] = 0;
+#endif
 #endif
 #ifdef MPK_MOE_CALL_LDS
     for (int k = 0; k < 4; k++) s_moe_call[k] = 0;
@@ -479,6 +494,9 @@ __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
     for (int k = 0; k < 7; k++) g_moe_acc[worker * 7 + k] = s_moe_acc[k];
     g_moe_n[worker * 2] = s_moe_n[0];
     g_moe_n[worker * 2 + 1] = s_moe_n[1];
+#ifdef MPK_MOE_LDS_MAX
+    for (int k = 0; k < 4; k++) g_moe_x[worker * 4 + k] = s_moe_x[k];
+#endif
 #endif
 #ifdef MPK_MOE_CALL_LDS
     for (int k = 0; k < 4; k++) g_moe_call[worker * 4 + k] = s_moe_call[k];
@@ -4322,6 +4340,17 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                      b, b ? m[3] / b : 0, b ? m[4] / b : 0, b ? m[5] / b : 0,
                      b ? m[6] / b : 0);
             }
+#ifdef MPK_MOE_LDS_MAX
+            for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+              unsigned int const a = g_moe_n[w * 2], b = g_moe_n[w * 2 + 1];
+              if (a == 0 && b == 0) {
+                continue;
+              }
+              unsigned int const *x = &g_moe_x[w * 4];
+              printf("[MSUBX] w=%d n13=%u arrmax=%u arr1us=%u n2=%u barmax=%u bar1us=%u\n",
+                     w, a, x[0], x[1], b, x[2], x[3]);
+            }
+#endif
 #endif
 #ifdef MPK_MOE_CALL_LDS
             for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
@@ -4362,6 +4391,62 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                        mx[s] >= b ? (mx[s] - b) * 10 : 0);
               }
               printf("\n");
+            }
+            {
+              // Per die: the die's last worker at slots 7 / 8 / 9, ns after the
+              // layer's first entry, mean over layers; and how often the die
+              // was last to finish the MoE (slot 8) / arrive at Phase 9 (slot 9).
+              constexpr int kWpd = MPK_PHASE_MAX_WORKERS / 8;
+              int const wpd = (int)(MPK_PSNAPD_WPD);
+              unsigned long long sum[8][3] = {};
+              int last8[8] = {}, last9[8] = {}, nl = 0;
+              for (int L = 0; L < MPK_PHASE_LAYERS_PER_ITER; L++) {
+                unsigned long long b = ~0ull;
+                for (int w = 0; w < 8 * wpd && w < MPK_PHASE_MAX_WORKERS; w++) {
+                  unsigned long long const v =
+                      g_phase_snap[((size_t)L * MPK_PHASE_MAX_WORKERS + w) *
+                                   MPK_PHASE_SLOT_COUNT];
+                  if (v != 0 && v < b) {
+                    b = v;
+                  }
+                }
+                if (b == ~0ull) {
+                  continue;
+                }
+                unsigned long long dmx[8][3] = {};
+                for (int d = 0; d < 8; d++) {
+                  for (int r = 0; r < wpd; r++) {
+                    int const w = d * wpd + r;
+                    for (int k = 0; k < 3; k++) {
+                      unsigned long long const v =
+                          g_phase_snap[((size_t)L * MPK_PHASE_MAX_WORKERS + w) *
+                                           MPK_PHASE_SLOT_COUNT +
+                                       7 + k];
+                      if (v > dmx[d][k]) {
+                        dmx[d][k] = v;
+                      }
+                    }
+                  }
+                }
+                int a8 = 0, a9 = 0;
+                for (int d = 0; d < 8; d++) {
+                  for (int k = 0; k < 3; k++) {
+                    sum[d][k] += dmx[d][k] >= b ? (dmx[d][k] - b) * 10 : 0;
+                  }
+                  a8 = dmx[d][1] > dmx[a8][1] ? d : a8;
+                  a9 = dmx[d][2] > dmx[a9][2] ? d : a9;
+                }
+                last8[a8]++;
+                last9[a9]++;
+                nl++;
+              }
+              (void)kWpd;
+              for (int d = 0; d < 8 && nl > 0; d++) {
+                printf("[PSNAPD] die=%d moe_start_last=%llu moe_end_last=%llu "
+                       "p9_arrive_last=%llu last_moe_end=%d last_p9=%d of %d\n",
+                       d, sum[d][0] / nl, sum[d][1] / nl, sum[d][2] / nl,
+                       last8[d], last9[d], nl);
+              }
             }
 #endif
 #ifdef MPK_IL_LDS
@@ -6636,6 +6721,72 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
     }
     (void)hipStreamSynchronize(default_stream);
   }
+#if defined(MPK_AID_NC_REP) && defined(MPK_AID_SPLIT_FLAGS)
+  // AID-local NC scratch: one plain allocation, large enough to be its own
+  // BO, so halves placement puts its first half in AID0 and its second in
+  // AID1. Counters there take device-scope atomics at local memory. Cleared
+  // per launch on default_stream, like the replicas.
+  {
+    static char *s_nc = nullptr;
+    static bool s_nc_tried = false;
+    constexpr size_t kNcBytes = 64ull << 20;
+    if (!s_nc_tried) {
+      s_nc_tried = true;
+      if (hipMalloc(reinterpret_cast<void **>(&s_nc), kNcBytes) == hipSuccess) {
+        int *dev[2] = {reinterpret_cast<int *>(s_nc),
+                       reinterpret_cast<int *>(s_nc + kNcBytes / 2)};
+        // MPK_AID_NC_REP_NULL: the no-op arm -- allocate and clear, but
+        // leave the pointers null so every counter keeps its old address.
+        if (getenv("MPK_AID_NC_REP_NULL") != nullptr) {
+          dev[0] = nullptr;
+          dev[1] = nullptr;
+          printf("[AID] nc scratch: MPK_AID_NC_REP_NULL, pointers left null\n");
+        }
+        if (hipMemcpyToSymbolAsync(HIP_SYMBOL(g_aid_nc_rep), dev, sizeof dev, 0,
+                                   hipMemcpyHostToDevice,
+                                   default_stream) != hipSuccess ||
+            hipStreamSynchronize(default_stream) != hipSuccess) {
+          fprintf(stderr, "[AID] nc scratch: hipMemcpyToSymbol failed\n");
+          s_nc = nullptr;
+        } else {
+          printf("[AID] nc scratch at %p (AID0 half) and %p (AID1 half)\n",
+                 (void *)dev[0], (void *)dev[1]);
+#ifdef MPK_NC_PROBE
+          {
+            auto probe_buf = [](char const *tag, char *p, size_t bytes, int n) {
+              void *rb = nullptr;
+              size_t rs = 0;
+              hipMemGetAddressRange((hipDeviceptr_t *)&rb, &rs,
+                                    (hipDeviceptr_t)p);
+              printf("[NCPROBE] %s ptr %p: allocation range base %p size %zu MiB\n",
+                     tag, (void *)p, rb, rs >> 20);
+              std::vector<unsigned long long> a;
+              for (int k = 0; k < n; k++) {
+                a.push_back((unsigned long long)p + (bytes / n) * k + 4096);
+              }
+              mpk_ncprobe::probe_list(tag, a, (unsigned long long)p);
+            };
+            probe_buf("nc64", s_nc, kNcBytes, 32);
+            char *t256 = nullptr;
+            if (hipMalloc(reinterpret_cast<void **>(&t256), 256ull << 20) ==
+                hipSuccess) {
+              probe_buf("tmp256", t256, 256ull << 20, 16);
+              hipFree(t256);
+            }
+          }
+#endif
+        }
+      } else {
+        s_nc = nullptr;
+      }
+    }
+    if (s_nc != nullptr) {
+      (void)hipMemsetAsync(s_nc, 0, 64 << 10, default_stream);
+      (void)hipMemsetAsync(s_nc + kNcBytes / 2, 0, 64 << 10, default_stream);
+      (void)hipStreamSynchronize(default_stream);
+    }
+  }
+#endif
   // Per-AID copies of the ml pointer tables. Read-only after setup, so plain
   // AID_LOCAL (MTYPE_RW) is enough -- no COHERENT, and therefore no DF-CS
   // directory pressure. Done once; nothing rewrites them between launches.

@@ -712,6 +712,35 @@ def get_compile_command(
         if int(os.environ.get("MPK_ATTN_WL_NT", "0")) == 1:
             # sc0 nt on the wave-local scan's K/V DMA loads.
             flags = flags + ["-DMPK_ATTN_WL_NT=1"]
+        if int(os.environ.get("MPK_ATTN_WL_BF16", "0")) == 1:
+            # bf16 MFMAs in the lean DMA scan (needs MPK_ATTN_WL_LEAN).
+            flags = flags + ["-DMPK_ATTN_WL_BF16=1"]
+        if os.environ.get("MPK_MOE_NOPS"):
+            # code-layout probe: s_nop count at MoE entry
+            flags = flags + [f"-DMPK_MOE_NOPS={int(os.environ['MPK_MOE_NOPS'])}"]
+        for _f in ("MPK_AID_NC_REP", "MPK_MOE_NCLOCAL", "MPK_AID_P9_NC", "MPK_NC_PROBE", "MPK_OPROJ_HIER_NC", "MPK_MOE_LDS_MAX"):
+            # AID-local NC scratch for counters, and the counters placed there.
+            if int(os.environ.get(_f, "0")) == 1:
+                flags = flags + [f"-D{_f}=1"]
+        if int(os.environ.get("MPK_AID_P9_LOCAL", "0")) == 1:
+            # Phase 9 per-die arrival counter on the local AID replica (needs MPK_P9_FLAT).
+            flags = flags + ["-DMPK_AID_P9_LOCAL=1"]
+        if int(os.environ.get("MPK_P9_ARRREC", "0")) == 1:
+            # Timing only: Phase 9 arrival atomic per physical die ([P9ARR]).
+            flags = flags + ["-DMPK_P9_ARRREC=1"]
+        if int(os.environ.get("MPK_MOE_FLAT", "0")) == 1:
+            # MoE W13->W2 barrier kept inside the pair's AID (per-die counters + done slots).
+            flags = flags + ["-DMPK_MOE_FLAT=1"]
+        if int(os.environ.get("MPK_MOE_ARRREC", "0")) == 1:
+            # Timing only: MoE arrival and W2 wait per physical die ([MARR]).
+            flags = flags + ["-DMPK_MOE_ARRREC=1"]
+        if int(os.environ.get("MPK_ATTN_WAITREC", "0")) == 1:
+            # Timing only: ring-wait vs loop time of long scans ([ASCAN]).
+            flags = flags + ["-DMPK_ATTN_WAITREC=1"]
+        if int(os.environ.get("MPK_ATTN_WL_DUAL", "0")) in (1, 2):
+            # Two softmax chains per wave in the lean DMA scan (needs MPK_ATTN_WL_LEAN);
+            # 2 issues the two tiles of a pair stage by stage.
+            flags = flags + ["-DMPK_ATTN_WL_DUAL=" + os.environ["MPK_ATTN_WL_DUAL"]]
         if int(os.environ.get("MPK_ATTN_WL_LEAN", "0")) == 1:
             # DMA scan without per-tile bookkeeping (needs MPK_ATTN_WL_DMA >= 2).
             flags = flags + ["-DMPK_ATTN_WL_LEAN=1"]

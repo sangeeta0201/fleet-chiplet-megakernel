@@ -61,6 +61,20 @@
 #ifndef MPK_ATTN_PROBE
 #define MPK_ATTN_PROBE 0
 #endif
+// Two online-softmax chains per wave in the lean DMA scan (even / odd tiles).
+#ifndef MPK_ATTN_WL_DUAL
+#define MPK_ATTN_WL_DUAL 0
+#endif
+// bf16 MFMAs in the lean DMA scan, operands straight from the bf16 cache.
+#ifndef MPK_ATTN_WL_BF16
+#define MPK_ATTN_WL_BF16 0
+#endif
+#if MPK_ATTN_WL_BF16 && (!MPK_ATTN_WL_LEAN || MPK_ATTN_WL_DUAL == 2)
+#error "MPK_ATTN_WL_BF16 needs MPK_ATTN_WL_LEAN and not MPK_ATTN_WL_DUAL=2"
+#endif
+#if MPK_ATTN_WL_DUAL && !MPK_ATTN_WL_LEAN
+#error "MPK_ATTN_WL_DUAL needs MPK_ATTN_WL_LEAN"
+#endif
 #if MPK_ATTN_WL_LEAN && (MPK_ATTN_WL_DMA < 2 || MPK_ATTN_WL_PIPE)
 #error "MPK_ATTN_WL_LEAN needs MPK_ATTN_WL_DMA >= 2 and not MPK_ATTN_WL_PIPE"
 #endif
@@ -351,6 +365,90 @@ __device__ __forceinline__ float __fast_exp2_hd64(float x) {
   return r;
 }
 
+#ifndef MPK_ATTN_WAITREC
+#define MPK_ATTN_WAITREC 0
+#endif
+#if MPK_ATTN_WAITREC
+#ifndef MPK_ATTN_WAITREC_MIN
+#define MPK_ATTN_WAITREC_MIN 8
+#endif
+#ifndef MPK_ATTN_WAITREC_N
+#define MPK_ATTN_WAITREC_N 400
+#endif
+__device__ unsigned long long g_attn_waitrec[8 * 32 * 4][10];
+
+// Loop part, recorded inside the scan.
+__device__ __noinline__ void mpk_attn_waitrec(int chunk_tiles, int ntiles,
+                                              unsigned long long tot,
+                                              unsigned long long w0,
+                                              unsigned long long ws,
+                                              unsigned long long cal,
+                                              unsigned long long entry,
+                                              int head, int chunk, int wave) {
+  if (chunk_tiles < 4 * MPK_ATTN_WAITREC_MIN || head >= 8 || chunk >= 32) {
+    return;
+  }
+  unsigned long long *r = g_attn_waitrec[(head * 32 + chunk) * 4 + wave];
+  r[0] += 1;
+  r[1] += tot;
+  r[2] += w0;
+  r[3] += ws;
+  r[4] += static_cast<unsigned long long>(ntiles);
+  r[5] += cal;
+  r[9] += entry;
+}
+
+// Call-site part: task entry -> scan call, and the whole scan call. Prints.
+__device__ __noinline__ void mpk_attn_waitrec_call(int chunk_tiles,
+                                                   unsigned long long pre,
+                                                   unsigned long long scan,
+                                                   int head, int chunk,
+                                                   int wave) {
+  if (chunk_tiles < 4 * MPK_ATTN_WAITREC_MIN || head >= 8 || chunk >= 32) {
+    return;
+  }
+  unsigned long long *r = g_attn_waitrec[(head * 32 + chunk) * 4 + wave];
+  r[6] += pre;
+  r[7] += scan;
+  unsigned long long const n = r[8] + 1;
+  r[8] = n;
+  if (n == MPK_ATTN_WAITREC_N) {
+    printf("[ASCAN] h=%d c=%d w=%d n=%llu tot=%llu w0=%llu ws=%llu tiles=%llu "
+           "cal=%llu pre=%llu entry=%llu scan=%llu\n",
+           head, chunk, wave, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[9],
+           r[7]);
+  }
+}
+#endif
+
+#if MPK_ATTN_WL_BF16
+using __mfma_hd64_bf16x8 = __attribute__((ext_vector_type(8))) __bf16;
+using __mfma_hd64_i16x4 = __attribute__((ext_vector_type(4))) short;
+using __mfma_hd64_u32x4 = __attribute__((ext_vector_type(4))) unsigned;
+using __mfma_hd64_u32x2 = __attribute__((ext_vector_type(2))) unsigned;
+
+__device__ __forceinline__ __mfma_hd64_fp32x4 __mfma_qk_bf16_hd64(
+    __mfma_hd64_fp32x4 c, __mfma_hd64_u32x4 a, __mfma_hd64_u32x4 b) {
+  return __builtin_amdgcn_mfma_f32_16x16x32_bf16(
+      __builtin_bit_cast(__mfma_hd64_bf16x8, a),
+      __builtin_bit_cast(__mfma_hd64_bf16x8, b), c, 0, 0, 0);
+}
+
+__device__ __forceinline__ __mfma_hd64_fp32x4 __mfma_pv_bf16_hd64(
+    __mfma_hd64_fp32x4 c, __mfma_hd64_u32x2 a, __mfma_hd64_u32x2 b) {
+  return __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
+      __builtin_bit_cast(__mfma_hd64_i16x4, a),
+      __builtin_bit_cast(__mfma_hd64_i16x4, b), c, 0, 0, 0);
+}
+
+// Two f32 -> one packed bf16 pair, round to nearest even (lo in bits 15:0).
+__device__ __forceinline__ unsigned __cvt_pk_bf16_hd64(float lo, float hi) {
+  unsigned r;
+  asm("v_cvt_pk_bf16_f32 %0, %1, %2" : "=v"(r) : "v"(lo), "v"(hi));
+  return r;
+}
+#endif
+
 // Vectorized bf16 load + convert to fp16 (uint4 = 8 bf16 → 8 fp16).
 __device__ __forceinline__ void
     __load_bf16x4_to_fp16(_Float16 *__restrict__ dst,
@@ -450,6 +548,9 @@ __device__ __noinline__ void
                                 int effective_len,
                                 int ntiles,
                                 int split_part = 0) {
+#if MPK_ATTN_WAITREC
+  unsigned long long const wr_se = __builtin_amdgcn_s_memrealtime();
+#endif
   constexpr int KV_TILE = 16;
   constexpr int NUM_K32 = HEAD_DIM / 32; // 2
   constexpr int WAVES = 4;
@@ -476,6 +577,9 @@ __device__ __noinline__ void
 
   // Q is wave-invariant; every wave loads the same 8 heads.
   _Float16 qr[NUM_K32][8];
+#if MPK_ATTN_WL_BF16
+  __mfma_hd64_u32x4 qb[NUM_K32];
+#endif
   {
     int q_midx = (midx < NUM_QO_PER_KV) ? midx : 0;
     char const *q_ptr =
@@ -487,6 +591,9 @@ __device__ __noinline__ void
     for (int kc = 0; kc < NUM_K32; kc++) {
       int dim_off = kc * 32 + kgrp * 8;
       uint4 raw = *reinterpret_cast<uint4 const *>(q_ptr + dim_off * 2);
+#if MPK_ATTN_WL_BF16
+      qb[kc] = (__mfma_hd64_u32x4){raw.x, raw.y, raw.z, raw.w};
+#endif
       unsigned words[4] = {raw.x, raw.y, raw.z, raw.w};
 #pragma unroll
       for (int i = 0; i < 4; i++) {
@@ -1178,7 +1285,8 @@ __device__ __noinline__ void
     default: asm volatile("s_waitcnt vmcnt(20)" ::: "memory"); break;
     }
   };
-  auto wl_tile = [&](int t, bool full) {
+  auto wl_tile_s = [&](int t, bool full, float &m_st, float (&l_st)[4],
+                       __mfma_hd64_fp32x4 (&o_st)[DBLK]) {
     int tile_len = KV_TILE;
     if (!full) {
       tile_len = wl_len_s - t * KV_TILE;
@@ -1188,6 +1296,36 @@ __device__ __noinline__ void
     }
     char const *const sk = dma_slots + (t % WLD) * DMA_SLOT;
     char const *const sv = sk + 2048;
+#if MPK_ATTN_WL_BF16
+    __mfma_hd64_u32x4 kb[NUM_K32];
+#pragma unroll
+    for (int kc = 0; kc < NUM_K32; kc++) {
+      kb[kc] = *reinterpret_cast<__mfma_hd64_u32x4 const *>(
+          sk + (midx * HEAD_DIM + kc * 32 + kgrp * 8) * 2);
+    }
+    // Padding rows of a partial tile may hold anything; zero them (their
+    // scores are -inf, but 0 * NaN would not vanish).
+    __mfma_hd64_u32x2 vb[DBLK];
+#pragma unroll
+    for (int d = 0; d < DBLK; d++) {
+      unsigned short const *const vp =
+          reinterpret_cast<unsigned short const *>(sv) +
+          (kgrp * 4) * HEAD_DIM + d * 16 + midx;
+      unsigned e[4];
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        e[j] = (full || kgrp * 4 + j < tile_len)
+                   ? static_cast<unsigned>(vp[j * HEAD_DIM])
+                   : 0u;
+      }
+      vb[d] = (__mfma_hd64_u32x2){e[0] | (e[1] << 16), e[2] | (e[3] << 16)};
+    }
+    __mfma_hd64_fp32x4 scores = {0, 0, 0, 0};
+#pragma unroll
+    for (int kc = 0; kc < NUM_K32; kc++) {
+      scores = __mfma_qk_bf16_hd64(scores, kb[kc], qb[kc]);
+    }
+#else
     _Float16 kr[NUM_K32][8];
 #pragma unroll
     for (int kc = 0; kc < NUM_K32; kc++) {
@@ -1218,6 +1356,7 @@ __device__ __noinline__ void
     for (int kc = 0; kc < NUM_K32; kc++) {
       scores = __mfma_qk_hd64(scores, kr[kc], qr[kc]);
     }
+#endif
     scores[0] *= scale_s;
     scores[1] *= scale_s;
     scores[2] *= scale_s;
@@ -1243,28 +1382,36 @@ __device__ __noinline__ void
                    : "+v"(a), "+v"(b));
       tile_max = fmaxf(a, b);
     }
-    float const new_max = fmaxf(m_running, tile_max);
-    float const rescale = (m_running == -INFINITY)
+    float const new_max = fmaxf(m_st, tile_max);
+    float const rescale = (m_st == -INFINITY)
                               ? 0.0f
-                              : __fast_exp2_hd64(m_running - new_max);
+                              : __fast_exp2_hd64(m_st - new_max);
     if (__builtin_amdgcn_ballot_w64(rescale != 1.0f) != 0) {
 #pragma unroll
       for (int d = 0; d < DBLK; d++) {
-        o_acc[d][0] *= rescale;
-        o_acc[d][1] *= rescale;
-        o_acc[d][2] *= rescale;
-        o_acc[d][3] *= rescale;
+        o_st[d][0] *= rescale;
+        o_st[d][1] *= rescale;
+        o_st[d][2] *= rescale;
+        o_st[d][3] *= rescale;
       }
     }
     float const w0 = __fast_exp2_hd64(scores[0] - new_max);
     float const w1 = __fast_exp2_hd64(scores[1] - new_max);
     float const w2 = __fast_exp2_hd64(scores[2] - new_max);
     float const w3 = __fast_exp2_hd64(scores[3] - new_max);
-    l_head[0] = l_head[0] * rescale + w0;
-    l_head[1] = l_head[1] * rescale + w1;
-    l_head[2] = l_head[2] * rescale + w2;
-    l_head[3] = l_head[3] * rescale + w3;
-    m_running = new_max;
+    l_st[0] = l_st[0] * rescale + w0;
+    l_st[1] = l_st[1] * rescale + w1;
+    l_st[2] = l_st[2] * rescale + w2;
+    l_st[3] = l_st[3] * rescale + w3;
+    m_st = new_max;
+#if MPK_ATTN_WL_BF16
+    __mfma_hd64_u32x2 const pbb = {__cvt_pk_bf16_hd64(w0, w1),
+                                   __cvt_pk_bf16_hd64(w2, w3)};
+#pragma unroll
+    for (int d = 0; d < DBLK; d++) {
+      o_st[d] = __mfma_pv_bf16_hd64(o_st[d], vb[d], pbb);
+    }
+#else
     __mfma_hd64_fp16x4 pb;
     pb[0] = (_Float16)w0;
     pb[1] = (_Float16)w1;
@@ -1272,10 +1419,243 @@ __device__ __noinline__ void
     pb[3] = (_Float16)w3;
 #pragma unroll
     for (int d = 0; d < DBLK; d++) {
+      o_st[d] = __mfma_pv_hd64(
+          o_st[d], (_Float16 const *)&va[d], (_Float16 const *)&pb);
+    }
+#endif
+  };
+  auto wl_tile = [&](int t, bool full) {
+    wl_tile_s(t, full, m_running, l_head, o_acc);
+  };
+#if MPK_ATTN_WL_DUAL
+  // Chain 1 holds the odd tiles; chain 0 is the captured state (even tiles).
+  float m1_st = -INFINITY;
+  float l1_st[4] = {0, 0, 0, 0};
+  __mfma_hd64_fp32x4 o1_st[DBLK];
+#pragma unroll
+  for (int d = 0; d < DBLK; d++) {
+    o1_st[d] = {0, 0, 0, 0};
+  }
+#if MPK_ATTN_WL_DUAL == 2
+  // Two full tiles, stage by stage: the same per-chain arithmetic as two
+  // wl_tile_s calls, issued side by side. A rescale by exactly 1.0f is the
+  // identity, so rescaling both chains when either needs it changes nothing.
+  auto wl_pair = [&](int t) {
+    char const *const sk0 = dma_slots + (t % WLD) * DMA_SLOT;
+    char const *const sk1 = dma_slots + ((t + 1) % WLD) * DMA_SLOT;
+    char const *const sv0 = sk0 + 2048;
+    char const *const sv1 = sk1 + 2048;
+    _Float16 kr0[NUM_K32][8];
+    _Float16 kr1[NUM_K32][8];
+#pragma unroll
+    for (int kc = 0; kc < NUM_K32; kc++) {
+      uint4 const raw0 = *reinterpret_cast<uint4 const *>(
+          sk0 + (midx * HEAD_DIM + kc * 32 + kgrp * 8) * 2);
+      uint4 const raw1 = *reinterpret_cast<uint4 const *>(
+          sk1 + (midx * HEAD_DIM + kc * 32 + kgrp * 8) * 2);
+      __cvt_bf16x4_to_fp16(&kr0[kc][0], make_uint2(raw0.x, raw0.y));
+      __cvt_bf16x4_to_fp16(&kr0[kc][4], make_uint2(raw0.z, raw0.w));
+      __cvt_bf16x4_to_fp16(&kr1[kc][0], make_uint2(raw1.x, raw1.y));
+      __cvt_bf16x4_to_fp16(&kr1[kc][4], make_uint2(raw1.z, raw1.w));
+    }
+    __mfma_hd64_fp16x4 va0[DBLK];
+    __mfma_hd64_fp16x4 va1[DBLK];
+#pragma unroll
+    for (int d = 0; d < DBLK; d++) {
+      unsigned short const *const vp0 =
+          reinterpret_cast<unsigned short const *>(sv0) +
+          (kgrp * 4) * HEAD_DIM + d * 16 + midx;
+      unsigned short const *const vp1 =
+          reinterpret_cast<unsigned short const *>(sv1) +
+          (kgrp * 4) * HEAD_DIM + d * 16 + midx;
+      _Float16 vf0[4];
+      _Float16 vf1[4];
+      __cvt_bf16x4_to_fp16(
+          vf0, make_uint2(static_cast<unsigned>(vp0[0]) |
+                              (static_cast<unsigned>(vp0[HEAD_DIM]) << 16),
+                          static_cast<unsigned>(vp0[2 * HEAD_DIM]) |
+                              (static_cast<unsigned>(vp0[3 * HEAD_DIM]) << 16)));
+      __cvt_bf16x4_to_fp16(
+          vf1, make_uint2(static_cast<unsigned>(vp1[0]) |
+                              (static_cast<unsigned>(vp1[HEAD_DIM]) << 16),
+                          static_cast<unsigned>(vp1[2 * HEAD_DIM]) |
+                              (static_cast<unsigned>(vp1[3 * HEAD_DIM]) << 16)));
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        va0[d][j] = vf0[j];
+        va1[d][j] = vf1[j];
+      }
+    }
+    __mfma_hd64_fp32x4 sc0 = {0, 0, 0, 0};
+    __mfma_hd64_fp32x4 sc1 = {0, 0, 0, 0};
+#pragma unroll
+    for (int kc = 0; kc < NUM_K32; kc++) {
+      sc0 = __mfma_qk_hd64(sc0, kr0[kc], qr[kc]);
+      sc1 = __mfma_qk_hd64(sc1, kr1[kc], qr[kc]);
+    }
+    sc0[0] *= scale_s;
+    sc1[0] *= scale_s;
+    sc0[1] *= scale_s;
+    sc1[1] *= scale_s;
+    sc0[2] *= scale_s;
+    sc1[2] *= scale_s;
+    sc0[3] *= scale_s;
+    sc1[3] *= scale_s;
+    float tm0 = fmaxf(fmaxf(sc0[0], sc0[1]), fmaxf(sc0[2], sc0[3]));
+    float tm1 = fmaxf(fmaxf(sc1[0], sc1[1]), fmaxf(sc1[2], sc1[3]));
+    {
+      float a0 = tm0, b0 = tm0, a1 = tm1, b1 = tm1;
+      asm volatile(MPK_HD64_PERM_PREFIX "v_permlane32_swap_b32_e32 %0, %1"
+                   : "+v"(a0), "+v"(b0));
+      asm volatile(MPK_HD64_PERM_PREFIX "v_permlane32_swap_b32_e32 %0, %1"
+                   : "+v"(a1), "+v"(b1));
+      tm0 = fmaxf(a0, b0);
+      tm1 = fmaxf(a1, b1);
+      a0 = tm0;
+      b0 = tm0;
+      a1 = tm1;
+      b1 = tm1;
+      asm volatile(MPK_HD64_PERM_PREFIX "v_permlane16_swap_b32_e32 %0, %1"
+                   : "+v"(a0), "+v"(b0));
+      asm volatile(MPK_HD64_PERM_PREFIX "v_permlane16_swap_b32_e32 %0, %1"
+                   : "+v"(a1), "+v"(b1));
+      tm0 = fmaxf(a0, b0);
+      tm1 = fmaxf(a1, b1);
+    }
+    float const nm0 = fmaxf(m_running, tm0);
+    float const nm1 = fmaxf(m1_st, tm1);
+    float const rs0 = (m_running == -INFINITY)
+                          ? 0.0f
+                          : __fast_exp2_hd64(m_running - nm0);
+    float const rs1 =
+        (m1_st == -INFINITY) ? 0.0f : __fast_exp2_hd64(m1_st - nm1);
+    if (__builtin_amdgcn_ballot_w64(rs0 != 1.0f || rs1 != 1.0f) != 0) {
+#pragma unroll
+      for (int d = 0; d < DBLK; d++) {
+        o_acc[d][0] *= rs0;
+        o_acc[d][1] *= rs0;
+        o_acc[d][2] *= rs0;
+        o_acc[d][3] *= rs0;
+        o1_st[d][0] *= rs1;
+        o1_st[d][1] *= rs1;
+        o1_st[d][2] *= rs1;
+        o1_st[d][3] *= rs1;
+      }
+    }
+    float const w00 = __fast_exp2_hd64(sc0[0] - nm0);
+    float const w10 = __fast_exp2_hd64(sc1[0] - nm1);
+    float const w01 = __fast_exp2_hd64(sc0[1] - nm0);
+    float const w11 = __fast_exp2_hd64(sc1[1] - nm1);
+    float const w02 = __fast_exp2_hd64(sc0[2] - nm0);
+    float const w12 = __fast_exp2_hd64(sc1[2] - nm1);
+    float const w03 = __fast_exp2_hd64(sc0[3] - nm0);
+    float const w13 = __fast_exp2_hd64(sc1[3] - nm1);
+    l_head[0] = l_head[0] * rs0 + w00;
+    l1_st[0] = l1_st[0] * rs1 + w10;
+    l_head[1] = l_head[1] * rs0 + w01;
+    l1_st[1] = l1_st[1] * rs1 + w11;
+    l_head[2] = l_head[2] * rs0 + w02;
+    l1_st[2] = l1_st[2] * rs1 + w12;
+    l_head[3] = l_head[3] * rs0 + w03;
+    l1_st[3] = l1_st[3] * rs1 + w13;
+    m_running = nm0;
+    m1_st = nm1;
+    __mfma_hd64_fp16x4 pb0;
+    __mfma_hd64_fp16x4 pb1;
+    pb0[0] = (_Float16)w00;
+    pb0[1] = (_Float16)w01;
+    pb0[2] = (_Float16)w02;
+    pb0[3] = (_Float16)w03;
+    pb1[0] = (_Float16)w10;
+    pb1[1] = (_Float16)w11;
+    pb1[2] = (_Float16)w12;
+    pb1[3] = (_Float16)w13;
+#pragma unroll
+    for (int d = 0; d < DBLK; d++) {
       o_acc[d] = __mfma_pv_hd64(
-          o_acc[d], (_Float16 const *)&va[d], (_Float16 const *)&pb);
+          o_acc[d], (_Float16 const *)&va0[d], (_Float16 const *)&pb0);
+      o1_st[d] = __mfma_pv_hd64(
+          o1_st[d], (_Float16 const *)&va1[d], (_Float16 const *)&pb1);
     }
   };
+#endif
+  // A pair puts tile t in chain 0 and tile t + 1 in chain 1; single tiles go
+  // to chain 0. Both forms of the pair use this loop structure.
+  auto wl_do_pair = [&](int t) {
+#if MPK_ATTN_WL_DUAL == 2
+    wl_pair(t);
+#else
+    wl_tile_s(t, true, m_running, l_head, o_acc);
+    wl_tile_s(t + 1, true, m1_st, l1_st, o1_st);
+#endif
+  };
+  int t = 0;
+  // Pairs with refills: tiles t and t+1 landed once WLD - 2 tiles remain
+  // behind t+1.
+  for (; t + 1 + WLD < wl_n; t += 2) {
+    if constexpr (WLD == 2) {
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    } else if constexpr (WLD == 3) {
+      asm volatile("s_waitcnt vmcnt(4)" ::: "memory");
+    } else if constexpr (WLD == 4) {
+      asm volatile("s_waitcnt vmcnt(8)" ::: "memory");
+    } else if constexpr (WLD == 5) {
+      asm volatile("s_waitcnt vmcnt(12)" ::: "memory");
+    } else {
+      asm volatile("s_waitcnt vmcnt(16)" ::: "memory");
+    }
+    wl_do_pair(t);
+    asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+    dma_issue(t + WLD);
+    dma_issue(t + 1 + WLD);
+  }
+  // At most one single with a refill, when an odd tile count is left.
+  for (; t + WLD < wl_n; t++) {
+    if constexpr (WLD == 2) {
+      asm volatile("s_waitcnt vmcnt(4)" ::: "memory");
+    } else if constexpr (WLD == 3) {
+      asm volatile("s_waitcnt vmcnt(8)" ::: "memory");
+    } else if constexpr (WLD == 4) {
+      asm volatile("s_waitcnt vmcnt(12)" ::: "memory");
+    } else if constexpr (WLD == 5) {
+      asm volatile("s_waitcnt vmcnt(16)" ::: "memory");
+    } else {
+      asm volatile("s_waitcnt vmcnt(20)" ::: "memory");
+    }
+    wl_tile_s(t, true, m_running, l_head, o_acc);
+    asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+    dma_issue(t + WLD);
+  }
+  // Tail, no refills: pairs of full tiles, then the rest one at a time (the
+  // last tile may be partial).
+  for (; t + 2 < wl_n; t += 2) {
+    wl_wait(wl_n - 2 - t);
+    wl_do_pair(t);
+  }
+  for (; t < wl_n; t++) {
+    wl_wait(wl_n - 1 - t);
+    wl_tile_s(t, t + 1 < wl_n, m_running, l_head, o_acc);
+  }
+  // Combine chain 1 into chain 0 (same form as the cross-wave merge).
+  {
+    float const m = fmaxf(m_running, m1_st);
+    float const s0 =
+        (m_running == -INFINITY) ? 0.0f : __fast_exp2_hd64(m_running - m);
+    float const s1 = (m1_st == -INFINITY) ? 0.0f : __fast_exp2_hd64(m1_st - m);
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      l_head[i] = l_head[i] * s0 + l1_st[i] * s1;
+    }
+#pragma unroll
+    for (int d = 0; d < DBLK; d++) {
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        o_acc[d][i] = o_acc[d][i] * s0 + o1_st[d][i] * s1;
+      }
+    }
+    m_running = m;
+  }
+#else
   int t = 0;
   for (; t + WLD < wl_n; t++) {
     // WLD - 1 tiles were issued behind tile t, and it is not the last tile.
@@ -1306,14 +1686,34 @@ __device__ __noinline__ void
     wl_tile(t, t + 1 < wl_n);
 #endif
   }
+#endif // MPK_ATTN_WL_DUAL
 #else
+#if MPK_ATTN_WAITREC
+  unsigned long long const wr_c0 = __builtin_amdgcn_s_memrealtime();
+  unsigned long long const wr_cal = __builtin_amdgcn_s_memrealtime() - wr_c0;
+  unsigned long long const wr_t0 = __builtin_amdgcn_s_memrealtime();
+  unsigned long long wr_w0 = 0, wr_ws = 0;
+#endif
   for (int t = 0; t < w_ntiles; t++) {
     int const tile_start = t * KV_TILE;
     int tile_len = w_len - tile_start;
     if (tile_len > KV_TILE) {
       tile_len = KV_TILE;
     }
+#if MPK_ATTN_WAITREC
+    unsigned long long const wr_a = __builtin_amdgcn_s_memrealtime();
+#endif
     dma_wait(t);
+#if MPK_ATTN_WAITREC
+    {
+      unsigned long long const wr_d = __builtin_amdgcn_s_memrealtime() - wr_a;
+      if (t == 0) {
+        wr_w0 += wr_d;
+      } else {
+        wr_ws += wr_d;
+      }
+    }
+#endif
     char const *const sk = dma_slots + (t % WLD) * DMA_SLOT;
     char const *const sv = sk + 2048;
 
@@ -1422,6 +1822,14 @@ __device__ __noinline__ void
       dma_issue(t + WLD);
     }
   }
+#if MPK_ATTN_WAITREC
+  if (lane == 0) {
+    mpk_attn_waitrec(ntiles, w_ntiles,
+                     __builtin_amdgcn_s_memrealtime() - wr_t0, wr_w0,
+                     wr_ws, wr_cal, wr_t0 - wr_se, kv_head_idx,
+                     kv_chunk_idx, wave_id);
+  }
+#endif
 #endif // MPK_ATTN_WL_PIPE
 #endif // MPK_ATTN_WL_DMA
 
@@ -1555,6 +1963,9 @@ __device__ __noinline__ MPK_ATTN_RET_T
   (void)split_part;
 #endif
 
+#if MPK_ATTN_WAITREC
+  unsigned long long const wr_te = __builtin_amdgcn_s_memrealtime();
+#endif
   int const req = request_id;
   int const query_start = qo_indptr[req];
   if (query_start == qo_indptr[req + 1]) {
@@ -1773,6 +2184,9 @@ __device__ __noinline__ MPK_ATTN_RET_T
 #endif
     if (ntiles >= wl_min && sliding_window == 0 &&
         sinks_ptr == nullptr) {
+#if MPK_ATTN_WAITREC
+      unsigned long long const wr_s0 = __builtin_amdgcn_s_memrealtime();
+#endif
       __attn_wave_local_scan_hd64<NUM_QO_PER_KV,
                                   HEAD_DIM,
                                   PAGE_SIZE,
@@ -1794,6 +2208,13 @@ __device__ __noinline__ MPK_ATTN_RET_T
                                                 effective_len,
                                                 ntiles,
                                                 split_part);
+#if MPK_ATTN_WAITREC
+      if (lane == 0) {
+        mpk_attn_waitrec_call(ntiles, wr_s0 - wr_te,
+                              __builtin_amdgcn_s_memrealtime() - wr_s0,
+                              kv_head_idx, kv_chunk_idx, warp_id);
+      }
+#endif
       MPK_ATTN_RETURN(mpk_live);
     }
   }

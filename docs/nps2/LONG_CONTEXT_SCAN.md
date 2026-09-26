@@ -128,3 +128,20 @@ identical). From ~4k tokens every chunk is live, so it is neutral there
 (16k decode, one run: 250 / 1k / 2k / 4k / 8k / 12k / 16k = 1.481 / 1.498 /
 1.519 / 1.543 / 1.575 / 1.603 / 1.634 vs 1.484 / 1.504 / 1.519 / 1.541 /
 1.573 / 1.600 / 1.630 ms).
+
+## Scan experiments after the nt loads (2026-09-26, opt-in)
+
+- `MPK_ATTN_WAITREC` (timing only): in-kernel accounting of the wave-local
+  scan. At ~14.5k tokens of context (8 tiles per wave), NPS2: 0.683 us per
+  16-token tile = 0.569 us of instructions + 0.114 us waiting on the ring
+  (~5.8 TB/s while the loop runs -- effectively bandwidth-bound). NPS2 vs
+  NPS1 per chunk: entry -> loop 1.13 vs 1.65 us, loop 5.58 vs 6.41-6.53 us
+  (0.70 vs 0.81 us per tile, -14%); the rest of the chunk is mode-neutral.
+- `MPK_ATTN_WL_DUAL`: two online-softmax chains per wave. =1 (two tile calls)
+  16k -0.5% (one run) but +0.2-0.4% at 1k-4k; =2 (the pair issued stage by
+  stage) pushes the scan to 248 VGPR + 40 AGPR, the fused layer's frame
+  16 -> 96 B, +1.8% at every context. Dropped.
+- `MPK_ATTN_WL_BF16`: bf16 MFMAs instead of converting Q/K/V to f16 (scan 132
+  VGPR + 20 AGPR, no scratch). 16-token hash green, but the 1k / 31-chunk
+  gate generated no tokens: an integration bug. Parked, since the loop is
+  bandwidth-bound and fewer instructions cannot buy much.

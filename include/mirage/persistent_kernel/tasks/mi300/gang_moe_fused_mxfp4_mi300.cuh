@@ -473,6 +473,70 @@ namespace kernel {
 //   [xcd * MOE_BAR_LINE]         per-XCD release flag  (st_wt, HBM)
 //   [MOE_BAR_COUNTER_SLOT * ..]  global arrival count  (atomic, L2)
 constexpr int MOE_BAR_LINE = 16;        // int32 per cache line
+#if defined(MPK_MOE_NCLOCAL) && (defined(MPK_MOE_FLAT) || !defined(MPK_AID_NC_REP) || !defined(MPK_MOE_XCD_PAIR))
+#error "MPK_MOE_NCLOCAL needs MPK_AID_NC_REP and MPK_MOE_XCD_PAIR, and replaces MPK_MOE_FLAT"
+#endif
+#if defined(MPK_MOE_FLAT)
+#if !defined(MPK_MOE_XCD_PAIR) || !defined(MPK_AID_SPLIT_FLAGS) || MPK_NUM_XCDS != 8
+#error "MPK_MOE_FLAT needs MPK_MOE_XCD_PAIR, MPK_AID_SPLIT_FLAGS and 8 XCDs"
+#endif
+// In each AID replica: 8 XCD-private arrival counters (expert slot x pair
+// member, one line each), then the 8 done slots. Between the chunk barrier
+// (24832 + 16 * 8 * requests) and the routing region (32768).
+constexpr int MPK_AID_MOEFLAT_BASE_INTS = 28672;
+// One 256 B line per slot: no two dies share an L2 line (RW lines are
+// coherent inside the AID, so a shared line ping-pongs between L2s).
+constexpr int MPK_AID_MOEFLAT_STRIDE = 64;
+constexpr int MPK_AID_MOEFLAT_DONE_INTS =
+    MPK_AID_MOEFLAT_BASE_INTS + 8 * MPK_AID_MOEFLAT_STRIDE;
+static_assert(MPK_AID_MOEFLAT_DONE_INTS + 8 * MPK_AID_MOEFLAT_STRIDE <= 29696,
+              "MoE flat region overlaps the Phase 9 local counters");
+// XCD-private counter on an RW replica line: returns the old value.
+__device__ __forceinline__ int mpk_moe_flat_add(int *addr) {
+  int old_val;
+  asm volatile("global_atomic_add %0, %1, %2, off sc0\n"
+               "s_waitcnt vmcnt(0)"
+               : "=v"(old_val)
+               : "v"(addr), "v"(1)
+               : "memory");
+  return old_val;
+}
+// Both done slots of a pair (256 B apart), issued together, one wait.
+__device__ __forceinline__ int mpk_moe_flat_min2(int *base) {
+  int v0, v1;
+  asm volatile("global_load_dword %0, %2, off sc1\n"
+               "global_load_dword %1, %2, off offset:256 sc1\n"
+               "s_waitcnt vmcnt(0)"
+               : "=&v"(v0), "=&v"(v1)
+               : "v"(base)
+               : "memory");
+  return v0 < v1 ? v0 : v1;
+}
+#endif
+#ifdef MPK_MOE_ARRREC
+#ifdef MPK_NARROW_MOE_BAR_POLL
+#error "MPK_MOE_ARRREC times the per-thread W2 poll; drop MPK_NARROW_MOE_BAR_POLL"
+#endif
+#ifndef MPK_MOE_ARRREC_N
+#define MPK_MOE_ARRREC_N 20000
+#endif
+// [die][0] arrivals, [1] arrival ticks, [2] waits, [3] wait ticks (10 ns).
+__device__ unsigned long long g_moe_arrrec[8][4];
+__device__ __noinline__ void mpk_moe_arrrec(int die, int which,
+                                            unsigned long long ticks) {
+  if (die < 0 || die >= 8) {
+    return;
+  }
+  atomicAdd(&g_moe_arrrec[die][2 * which + 1], ticks);
+  unsigned long long const n = atomicAdd(&g_moe_arrrec[die][2 * which], 1ULL) + 1;
+  if (which == 0 && n == MPK_MOE_ARRREC_N) {
+    unsigned long long const wn = g_moe_arrrec[die][2];
+    printf("[MARR] die=%d arrivals=%llu arrive_ns=%llu waits=%llu wait_ns=%llu\n",
+           die, n, g_moe_arrrec[die][1] * 10 / n, wn,
+           wn ? g_moe_arrrec[die][3] * 10 / wn : 0ULL);
+  }
+}
+#endif
 constexpr int MOE_BAR_COUNTER_SLOT = 8; // line index of the arrival counter
 constexpr int MOE_BAR_SLOTS = 10;       // lines reserved per expert
 constexpr int MOE_BAR_STRIDE = MOE_BAR_SLOTS * MOE_BAR_LINE; // ints per expert
@@ -827,6 +891,21 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       mpk_aid_flags_at(d_barrier, xcd_id, MPK_AID_MOE_BASE_INTS);
 #else
   int *d_barrier_rel = d_barrier;
+#endif
+#ifdef MPK_MOE_NOPS
+#ifndef MPK_STR
+#define MPK_STR_(x) #x
+#define MPK_STR(x) MPK_STR_(x)
+#endif
+  asm volatile(".rept " MPK_STR(MPK_MOE_NOPS) "\n s_nop 0\n .endr");
+#endif
+#if defined(MPK_MOE_NCLOCAL)
+  // Loaded once per call: at the arrival, every asm "memory" clobber
+  // forced a reload onto the atomic's critical path.
+  int *const moe_nc_base = g_aid_nc_rep[xcd_id >> 2];
+#endif
+#if defined(MPK_MOE_FLAT)
+  int *const moe_flat_rep = g_aid_flag_rep[xcd_id >> 2];
 #endif
 #ifdef MPK_PAIR_LOCAL_PUB
 #if !defined(MPK_MOE_XCD_PAIR) || !defined(MPK_SWIGLU_AIDREP) || \
@@ -4739,8 +4818,37 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       // the per-XCD slots of one expert held *different* epochs, which is
       // impossible if the eight stores from one producer all survived.
       // COUNTER_OFF puts the counter on the next line.
+#ifdef MPK_MOE_ARRREC
+      unsigned long long const mr_a0 = __builtin_amdgcn_s_memrealtime();
+#endif
+#if defined(MPK_MOE_FLAT)
+      // XCD-private counter in this die's AID replica: 23 arrivals per layer.
+      int *const mf_rep = moe_flat_rep;
+      int const mf_slot = (expert_idx * 2 + (xcd_id & 1)) * MPK_AID_MOEFLAT_STRIDE;
+      int const mf_prev =
+          mpk_moe_flat_add(mf_rep + MPK_AID_MOEFLAT_BASE_INTS + mf_slot);
+      if ((mf_prev % 23) == 22) {
+        constexpr int LAYER_IDX_SMEM_OFF =
+            mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
+            mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END;
+        int const mf_layer =
+            *reinterpret_cast<int *>(&_fused_smem[LAYER_IDX_SMEM_OFF]);
+        st_wt_u32((void *)(mf_rep + MPK_AID_MOEFLAT_DONE_INTS + mf_slot),
+                  (unsigned)(mf_layer + 1));
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      }
+#else
+#if defined(MPK_MOE_NCLOCAL)
+      // The pair's AID half of the NC scratch, one 256 B line per expert slot.
+      int *const mnc = moe_nc_base;
+      int prev_global = atom_add_release_gpu_s32(
+          mnc ? mnc + MPK_NC_MOE_INTS + expert_idx * 64
+              : &d_barrier[base + MOE_BAR_COUNTER_SLOT * MOE_BAR_LINE],
+          1);
+#else
       int prev_global = atom_add_release_gpu_s32(
           &d_barrier[base + MOE_BAR_COUNTER_SLOT * MOE_BAR_LINE], 1);
+#endif
       // Exact only if every tile counted by W13_TILES arrives here. Under
       // packing W13_TILES == W13_WGS and no tile returns between the decode
       // and this line, so it is. The pre-packing decode had a token axis and
@@ -4786,6 +4894,13 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #endif
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       }
+#endif // MPK_MOE_FLAT
+#ifdef MPK_MOE_ARRREC
+      {
+        unsigned long long const mr_a1 = __builtin_amdgcn_s_memrealtime();
+        mpk_moe_arrrec(xcd_id, 0, mr_a1 - mr_a0);
+      }
+#endif
     }
 
 #ifdef MPK_ENABLE_MOE_SUBPHASE
@@ -4799,6 +4914,13 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       s_moe_acc[0] += (_mt0 - _mtE) * 10;
       s_moe_acc[1] += (_mt1 - _mt0) * 10;
       s_moe_acc[2] += (_ml2 - _mt1) * 10;
+#ifdef MPK_MOE_LDS_MAX
+      {
+        unsigned const _xa = (unsigned)((_ml2 - _mt1) * 10);
+        s_moe_x[0] = _xa > s_moe_x[0] ? _xa : s_moe_x[0];
+        s_moe_x[1] += _xa > 1000u ? 1u : 0u;
+      }
+#endif
       s_moe_n[0]++;
     }
 #endif
@@ -5199,7 +5321,16 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     // nothing.
     if (tid == 0)
 #endif
-#ifdef MPK_MOE_NARROW_RELEASE
+#ifdef MPK_MOE_ARRREC
+    unsigned long long const mr_w0 = __builtin_amdgcn_s_memrealtime();
+#endif
+#if defined(MPK_MOE_FLAT)
+    while (!kMoeBarSkip &&
+           (_obs = mpk_moe_flat_min2(
+                &moe_flat_rep[MPK_AID_MOEFLAT_DONE_INTS +
+                                             expert_idx * 2 * MPK_AID_MOEFLAT_STRIDE])) <
+               expected) {
+#elif defined(MPK_MOE_NARROW_RELEASE)
     while (!kMoeBarSkip &&
            (_obs = MPK_LD_GATE_AID(&d_barrier_rel[base])) < expected) {
 #else
@@ -5242,6 +5373,11 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     }
 #ifdef MPK_NARROW_MOE_BAR_POLL
     __syncthreads();
+#endif
+#ifdef MPK_MOE_ARRREC
+    if (tid == 0) {
+      mpk_moe_arrrec(xcd_id, 1, __builtin_amdgcn_s_memrealtime() - mr_w0);
+    }
 #endif
     // This wave's threads all cleared the release. Record it: the poll is
     // per-thread with no __syncthreads, so waves leave independently and a
@@ -6453,6 +6589,13 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     s_moe_acc[3] += (_mt0 - _mtE) * 10;
     s_moe_acc[4] += (_mt1 - _mt0) * 10;
     s_moe_acc[5] += (_mt2 - _mt1) * 10;
+#ifdef MPK_MOE_LDS_MAX
+    {
+      unsigned const _xb = (unsigned)((_mt2 - _mt1) * 10);
+      s_moe_x[2] = _xb > s_moe_x[2] ? _xb : s_moe_x[2];
+      s_moe_x[3] += _xb > 1000u ? 1u : 0u;
+    }
+#endif
     s_moe_acc[6] += (_ml3 - _mt2) * 10;
     s_moe_n[1]++;
   }

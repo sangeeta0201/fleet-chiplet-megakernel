@@ -117,6 +117,9 @@ static constexpr int FULL_LAYER_OPROJ_XCD_READY_SLOT(int num_reqs) {
 // what, so the ordering argument at each site is unaffected.
 #ifdef MPK_XCD_LOCAL_BARRIER
 #define MPK_XCD_LOCAL_ATOM_ADD(addr, val) atom_add_xcd_local_s32((addr), (val))
+#ifdef MPK_P9_ARRREC
+__device__ unsigned long long g_p9_arrrec[8][2];
+#endif
 #else
 #define MPK_XCD_LOCAL_ATOM_ADD(addr, val)                                      \
   atom_add_release_gpu_s32((addr), (val))
@@ -619,6 +622,13 @@ __device__ __noinline__ void
   MPK_TW_SUB(1, tile_idx);
 
   int *oproj_counters_base = static_cast<int *>(input_ptrs[16]);
+#if defined(MPK_AID_P9_NC)
+  // Phase 9's counter base, loaded at entry: next to the arrival every
+  // asm "memory" clobber forced a reload onto its critical path.
+  int *const p9n_base = g_aid_nc_rep[xcd_id >> 2];
+#elif defined(MPK_AID_P9_LOCAL)
+  int *const p9_rep_base = g_aid_flag_rep[xcd_id >> 2];
+#endif
   int *attn_global = oproj_counters_base + FULL_LAYER_ATTN_GLOBAL_COUNTER_SLOT;
   int *qkv_epoch_shared = oproj_counters_base + FULL_LAYER_QKV_EPOCH_SLOT;
 #if defined(MPK_AID_SPLIT_QKV) && defined(MPK_AID_SPLIT_FLAGS)
@@ -2237,6 +2247,12 @@ __device__ __noinline__ void
      !defined(MPK_AID_SPLIT_FLAGS) || defined(MPK_LAYER_NARROW_REL))
 #error "MPK_P9_FLAT needs 8 XCDs, MPK_LEAN_ARRIVE, MPK_AID_SPLIT_FLAGS and no MPK_LAYER_NARROW_REL"
 #endif
+#if defined(MPK_AID_P9_NC) && (!defined(MPK_P9_FLAT) || !defined(MPK_AID_NC_REP))
+#error "MPK_AID_P9_NC needs MPK_P9_FLAT and MPK_AID_NC_REP"
+#endif
+#if defined(MPK_AID_P9_LOCAL) && !defined(MPK_P9_FLAT)
+#error "MPK_AID_P9_LOCAL needs MPK_P9_FLAT (epochs derived from the per-launch counter)"
+#endif
     int *layer_release_shared = layer_global + 16;
 #ifdef MPK_AID_SPLIT_FLAGS
     // Fan-out shape: one XCD publishes all eight slots, rather than each XCD
@@ -2550,8 +2566,42 @@ __device__ __noinline__ void
       // atomic does not weaken the release: the XCD leader elected here still
       // executes `atom_add_release_gpu_s32(layer_global)` after every one of
       // its XCD's workers has both drained and arrived.
+#ifdef MPK_P9_ARRREC
+      unsigned long long const p9r_t0 = __builtin_amdgcn_s_memrealtime();
+#endif
+#if defined(MPK_AID_P9_LOCAL)
+      // In the replica of this die's own AID (physical XCC id), past the MoE
+      // flat barrier's region; one 256 B line per die so no two dies share an
+      // L2 line (RW lines are coherent inside the AID). Cleared per launch.
+      int *const p9_rep = p9_rep_base;
+      int local_prev = MPK_XCD_LOCAL_ATOM_ADD(
+          p9_rep ? p9_rep + 29696 + xcd_id * 64 : &layer_local[xcd_id * 16], 1);
+#elif defined(MPK_AID_P9_NC)
+      // The die's AID half of the NC scratch (physical XCC id), 256 B apart.
+      int *const p9n = p9n_base;
+      int local_prev = MPK_XCD_LOCAL_ATOM_ADD(
+          p9n ? p9n + MPK_NC_P9_INTS + xcd_id * 64 : &layer_local[xcd_id * 16], 1);
+#else
       int local_prev =
           MPK_XCD_LOCAL_ATOM_ADD(&layer_local[xcd_id * 16], 1);
+#endif
+#ifdef MPK_P9_ARRREC
+      {
+        if (local_prev == 0x7fffffff) {
+          __builtin_amdgcn_s_sleep(0);
+        }
+        unsigned long long const p9r_dt = __builtin_amdgcn_s_memrealtime() - p9r_t0;
+        int p9r_xcc;
+        asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)" : "=s"(p9r_xcc));
+        p9r_xcc &= 7;
+        atomicAdd(&g_p9_arrrec[p9r_xcc][1], p9r_dt);
+        unsigned long long const p9r_n = atomicAdd(&g_p9_arrrec[p9r_xcc][0], 1ULL) + 1;
+        if (p9r_n == 20000) {
+          printf("[P9ARR] die=%d arrivals=%llu arrive_ns=%llu\n", p9r_xcc, p9r_n,
+                 g_p9_arrrec[p9r_xcc][1] * 10 / p9r_n);
+        }
+      }
+#endif
 
 #ifdef MPK_LEAN_ARRIVE
       // ── Everything the two removed loads carried, recovered from local_prev

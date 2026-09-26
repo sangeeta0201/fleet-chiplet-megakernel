@@ -71,6 +71,27 @@
 // with this flag on still runs correctly (just without the win) on a stock
 // driver or in NPS1.
 __device__ int *g_aid_flag_rep[2];
+// AID-local NC scratch for counters: [0] in AID0, [1] in AID1 (halves of
+// one plain allocation). Null unless MPK_AID_NC_REP set it up.
+__device__ int *g_aid_nc_rep[2];
+// Layout of each AID half of the NC scratch, in ints. The first 64 KB
+// (16384 ints) are cleared per launch.
+constexpr int MPK_NC_MOE_INTS = 0;      // one 256 B line per expert id (128)
+constexpr int MPK_NC_P9_INTS = 8192;    // Phase 9, one 256 B line per die
+constexpr int MPK_NC_OPROJ_INTS = 9216; // O-proj hier_local, HIER_STRIDE per die
+static_assert(MPK_NC_MOE_INTS + 128 * 64 <= MPK_NC_P9_INTS &&
+                  MPK_NC_P9_INTS + 8 * 64 <= MPK_NC_OPROJ_INTS &&
+                  MPK_NC_OPROJ_INTS + 8 * 16 <= 16384,
+              "NC scratch regions overlap or leave the per-launch clear");
+
+// This die's AID half of the NC scratch at a raw int offset, picked by the
+// physical XCC id; falls back to shared_base when the scratch is absent.
+__device__ __forceinline__ int *mpk_aid_nc_hw(int *shared_base, int off_ints) {
+  int xcc;
+  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)" : "=s"(xcc));
+  int *rep = g_aid_nc_rep[(xcc & 7) >> 2];
+  return rep ? rep + off_ints : shared_base;
+}
 
 // Per-AID copies of the multi-layer pointer tables. Every worker re-reads its
 // TaskDesc's input/output pointers out of these at every layer boundary, and

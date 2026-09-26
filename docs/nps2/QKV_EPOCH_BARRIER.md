@@ -82,3 +82,43 @@ NPS1, same code, 16 tokens: 1.530 / 1.513 / 1.502 -> 1.459 / 1.516 / 1.519
 (t=-0.63, noise); its lines are hardware-coherent, so the removed hops cost it
 less. NPS1 5,200-token decode with all three: 1.708, a uniform +0.12 ms at every
 context against the earlier fix-only run -- one run each, unresolved.
+
+## Per-die arrival counters on AID-local NC memory (2026-09-26, opt-in)
+
+Every WAIT in the recipe polls an AID-local replica, but three per-die
+ARRIVAL counters still sat in AID0-homed torch tensors: the MoE W13->W2
+per-expert counter (device-scope atomic, once per W13 tile), Phase 9's
+`layer_local` and the O-proj tree barrier's `hier_local` (die-private,
+no sc1). Measured per physical die (LDS recorder `MPK_MOE_LDS`,
+`MPK_P9_ARRREC`, 16 tokens): arrivals from dies 4-7 cost ~90 ns more (MoE
+354 vs 445 ns, Phase 9 237-265 vs 319-358 ns).
+
+What did not work, and why:
+- Counters on the AID-local RW replicas (`MPK_MOE_FLAT`, `MPK_AID_P9_LOCAL`):
+  an atomic on an RW replica line costs ~350 ns from every die of its AID
+  (RW lines are kept coherent inside the AID). 64 B vs 256 B slot spacing
+  measured the same, so it is not false sharing.
+- The first NC-local attempt read each counter's base pointer from a
+  `__device__` array at the arrival. Every asm "memory" clobber forces that
+  load again: a dependent ~80-120 ns load in front of the atomic. Base
+  pointers are now loaded once per call.
+
+`MPK_AID_NC_REP=1` allocates one 64 MiB hipMalloc; halves placement puts its
+first 32 MiB in AID0 and the rest in AID1 (verified with `MPK_NC_PROBE`:
+`sc0 sc1` load latency from every physical XCC at every 2 MiB step, 140-175
+ns near vs 245-280 ns far, cut exactly at 32 MiB). `MPK_MOE_NCLOCAL`,
+`MPK_AID_P9_NC` and `MPK_OPROJ_HIER_NC` put the counters in the die's own
+half (`MPK_NC_*_INTS` in mpk_atoms.cuh). Per die: MoE 375 / 376 ns, Phase 9
+250-279 / 248-269 ns -- the AID1 penalty is gone.
+
+Timing (NPS2, 16 tokens, A/B/A/B/A): Phase 9 alone 1.425 / 1.425 vs 1.426 /
+1.430 / 1.428 ms (-0.21%, just outside the control range); Phase 9 + O-proj
+1.425 / 1.425 vs 1.427 / 1.425 / 1.426, no result. That is the expected
+size: each counter saves <= ~80 ns per layer, and only when an AID1 die is
+the last arriver, i.e. <= 0.2% of the token. The MoE build is ~0.8% SLOWER,
+but a run of the same binary with the counters left in place
+(`MPK_AID_NC_REP_NULL=1`) is just as slow (1.445 vs 1.428), and padding the
+unchanged MoE kernel with 8-32 `s_nop` at entry (`MPK_MOE_NOPS`) costs the
+same 1.3% at every size: the MoE kernel is sensitive to code changes near its
+entry, not to where the counter lives. Screen MoE code changes against a
+padded no-op build. All flags are opt-in; the default build is unchanged.
