@@ -34,6 +34,12 @@
 // directly, saving ~272 bytes of stack frame per thread.
 
 #pragma once
+#ifdef MPK_ML_TABLE_INLAYER
+// Layers per token and ml-table widths for the in-layer row handoff.
+#define MPK_MLT_LAYERS 36
+#define MPK_MLT_NIN (mirage::runtime::MAX_INPUTS_PER_TASK)
+#define MPK_MLT_NOUT (mirage::runtime::MAX_OUTPUTS_PER_TASK)
+#endif
 #ifdef MPK_GATE_DEFER
 #ifndef MPK_GD_LAYERS
 #define MPK_GD_LAYERS 36
@@ -704,6 +710,14 @@ __device__ __noinline__ void
   // Because they are all the same per-layer count, all three expected values
   // are the same number.
   int const layer_counter = task_layer_idx;
+#ifdef MPK_ML_TABLE_INLAYER
+  // Next layer's ml-table entry for this wave-1 lane (Phase 9 -> end).
+  unsigned long long mlt_v;
+  int const mlt_ml = task_layer_idx % MPK_MLT_LAYERS;
+  bool const mlt_go = g_aid_ml_in[xcd_id >> 2] != nullptr &&
+                      g_aid_ml_out[xcd_id >> 2] != nullptr &&
+                      mlt_ml + 1 < MPK_MLT_LAYERS;
+#endif
   int const routing_expected = layer_counter + 1;
   int const attn_release_expected = layer_counter + 1;
   int const qkv_epoch_expected = layer_counter + 1;
@@ -2561,6 +2575,31 @@ __device__ __noinline__ void
 #else
     int s_layer_rel_prev = -1;
 #endif
+#ifdef MPK_ML_TABLE_INLAYER
+    // Layer ml+1's row from this AID's table copy, loaded by wave 1:
+    // wave 0 carries the arrival, whose release drain would wait for
+    // these. Typed AS(1), so no FLAT access disturbs wait counting.
+    mlt_v = 0;
+    {
+      int const mlt_i = tid - 64;
+      if (mlt_go && mlt_i >= 0 && mlt_i <= MPK_MLT_NIN + MPK_MLT_NOUT) {
+        int const row = xcd_id * MPK_MLT_LAYERS + mlt_ml + 1;
+        auto const *in_t =
+            (__attribute__((address_space(1))) unsigned long long const *)
+                g_aid_ml_in[xcd_id >> 2];
+        auto const *out_t =
+            (__attribute__((address_space(1))) unsigned long long const *)
+                g_aid_ml_out[xcd_id >> 2];
+        if (mlt_i < MPK_MLT_NIN) {
+          mlt_v = in_t[row * MPK_MLT_NIN + mlt_i];
+        } else if (mlt_i < MPK_MLT_NIN + MPK_MLT_NOUT) {
+          mlt_v = out_t[row * MPK_MLT_NOUT + (mlt_i - MPK_MLT_NIN)];
+        } else if (mlt_ml + 2 < MPK_MLT_LAYERS) {
+          mlt_v = in_t[(row + 1) * MPK_MLT_NIN + 4];  // slot 24
+        }
+      }
+    }
+#endif
     // Seeded for the workers that do NOT arrive. `s_layer_rel_prev` is written
     // only under `tid == 0 && MPK_LAYER_GATE_ARRIVES`, but the wait below is
     // joined by every worker for which MPK_LAYER_GATE_JOINS holds. Those two
@@ -3372,6 +3411,26 @@ __device__ __noinline__ void
            merge_only,
            flush_sig,
            wait_others);
+  }
+#endif
+#ifdef MPK_ML_TABLE_INLAYER
+  if (mlt_go) {
+    __syncthreads();  // every wave is done with this layer's pointers
+    int const mlt_i = tid - 64;
+    void **const in_w = const_cast<void **>(input_ptrs);
+    void **const out_w = const_cast<void **>(output_ptrs);
+    if (mlt_i >= 0 && mlt_i < MPK_MLT_NIN) {
+      if (mlt_i != 24 && mlt_i != 25) {
+        in_w[mlt_i] = (void *)mlt_v;
+      }
+      if (mlt_i == 4) {
+        in_w[25] = (void *)mlt_v;  // next layer's own QKV weight
+      }
+    } else if (mlt_i >= MPK_MLT_NIN && mlt_i < MPK_MLT_NIN + MPK_MLT_NOUT) {
+      out_w[mlt_i - MPK_MLT_NIN] = (void *)mlt_v;
+    } else if (mlt_i == MPK_MLT_NIN + MPK_MLT_NOUT) {
+      in_w[24] = (void *)mlt_v;  // layer ml+2's QKV weight, or null
+    }
   }
 #endif
   MPK_PHASE_MARK(_pslot_w, 11);

@@ -445,6 +445,8 @@ def get_compile_command(
             flags = flags + ["-DMPK_W13_SUB"]
         if int(os.environ.get("MPK_IL_LDS", "0")) == 1:
             flags = flags + ["-DMPK_IL_LDS"]
+        if int(os.environ.get("MPK_ML_TABLE_INLAYER", "0")) == 1:
+            flags = flags + ["-DMPK_ML_TABLE_INLAYER"]
         if int(os.environ.get("MPK_QKV_EPI_PF", "0")) == 1:
             flags = flags + ["-DMPK_QKV_EPI_PF"]
         if int(os.environ.get("MPK_QKV_POS_CACHE", "0")) == 1:

@@ -2949,6 +2949,17 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               }
             }
 #endif
+#ifdef MPK_ML_TABLE_INLAYER
+            // Layers 1.. get their row written by the previous layer (same
+            // condition as the fused layer's mlt_go); only the variant id is
+            // read here, one layer ahead so its load retires under the call.
+            bool const _mlt_on = g_aid_ml_in[xcd_id >> 2] != nullptr &&
+                                 g_aid_ml_out[xcd_id >> 2] != nullptr &&
+                                 config.ml_num_layers == MPK_MLT_LAYERS;
+            int _mlt_var = config.ml_num_layers > 1
+                               ? (int)config.ml_variant_ids[1]
+                               : 0;
+#endif
             for (int ml = 0; ml < config.ml_num_layers; ml++) {
 #ifdef MPK_DRAIN_STATS
               unsigned long long _mlt0 = __builtin_amdgcn_s_memrealtime();
@@ -2958,6 +2969,16 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #endif
               // Layer 0: task_desc already loaded from precomputed dispatch
               // buffer with correct per-XCD pointers. Skip the copy.
+#ifdef MPK_ML_TABLE_INLAYER
+              if (_mlt_on && ml > 0) {
+                if (threadIdx.x == 0) {
+                  task_desc->variant_id = _mlt_var;
+                }
+                _mlt_var = (ml + 1 < config.ml_num_layers)
+                               ? (int)config.ml_variant_ids[ml + 1]
+                               : 0;
+              } else
+#endif
               if (ml > 0) {
                 // Widths must match the host-side ML_N_IN / ML_N_OUT that
                 // built these tables (see the multi-layer scan), or the
@@ -3094,6 +3115,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               // the second __syncthreads -- slot 25 is thread 4's own
               // register too, so both stores come from the one thread that
               // owns the value and the block rendezvouses once, not twice.
+#ifdef MPK_ML_TABLE_INLAYER
+              if (_mlt_on && ml > 0) {
+                // slots 24 / 25 were written by the previous layer
+              } else
+#endif
               if (task_desc->task_type == TASK_GANG_FULL_LAYER_FUSED_MI300 &&
                   _pf_ok) {
                 if (threadIdx.x == 4) {

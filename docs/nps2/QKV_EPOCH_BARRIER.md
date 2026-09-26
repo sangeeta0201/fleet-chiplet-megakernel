@@ -271,3 +271,23 @@ both modes and is gone on the current build (1453-1463 vs 1453-1466 ns).
 Long-context gates for the DPP flags + `MPK_QKV_PRO_FAST`: 1k prompt at 31
 KV chunks equals torch 16/16, 3k at 24 chunks equals 3k at 8 chunks.
 
+
+### Inter-layer table handoff and the static LDS cliff (2026-09-26)
+
+The ml loop's setup stores slot 24 from a table load issued in the same setup,
+and every noinline callee begins with `s_waitcnt vmcnt(0) lgkmcnt(0)`, so the
+"prefetched" row (and the generated call's `qo_indptr[MAX]` argument load) is
+drained at the fused layer's entry. `MPK_ML_TABLE_INLAYER` (opt-in) moves the
+row load into the layer: wave 1 loads layer ml+1's row from the AID-local
+table copy at Phase 9 and, after one `__syncthreads` at the end of the layer,
+writes it into its own input_ptrs / output_ptrs (slots 24 / 25 included); the
+setup only sets the variant id, prefetched a layer ahead. Correct (hash
+green) but a loss: A 1.343 / 1.347 / 1.346 vs B 1.353 / 1.356, +0.68%. The
+end-of-layer barrier costs more than the setup wait it removes.
+
+The first version staged the row in 344 B of new static LDS and ran +80%
+slower with the hash green. Plain padding reproduces it: `MPK_LDS_PAD=376`
+(static LDS 7768 -> 8144 B, nothing else changed) 2.413 ms vs 1.343. Dynamic
+LDS is 152 KB, so 7768 B of static leaves 424 B under the 160 KB limit and
+8144 B leaves 48 B. Do not grow the worker kernel's static LDS; check
+`.group_segment_fixed_size` whenever a change adds `__shared__` state.
