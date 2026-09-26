@@ -46,6 +46,10 @@
 //   active_expert_ids [NUM_EXPERTS+1] int32
 
 #pragma once
+// MPK_LTK_SNAP fallback
+#ifndef MPK_LTK_MARK
+#define MPK_LTK_MARK(k) do {} while (0)
+#endif
 #ifndef MPK_SUB_MARK
 #define MPK_SUB_MARK(k) do {} while (0)
 #endif
@@ -169,6 +173,23 @@ __device__ __forceinline__ void oproj_stage_weight_lds(uint8_t const *W,
         rsrc, lds_dst, 16, static_cast<int>(voff), 0, 0, 3);
   }
 }
+
+#ifdef MPK_PQ_AMAX_DPP
+// 16-lane all-reduce max for non-negative values on DPP. A source lane
+// that is out of range or inactive reads 0, which cannot raise an amax.
+__device__ __forceinline__ float _mpk_amax16_dpp(float a) {
+  int v = __float_as_int(a);
+  v = __float_as_int(fmaxf(__int_as_float(v), __int_as_float(
+      __builtin_amdgcn_update_dpp(0, v, 0xB1, 0xF, 0xF, true))));
+  v = __float_as_int(fmaxf(__int_as_float(v), __int_as_float(
+      __builtin_amdgcn_update_dpp(0, v, 0x4E, 0xF, 0xF, true))));
+  v = __float_as_int(fmaxf(__int_as_float(v), __int_as_float(
+      __builtin_amdgcn_update_dpp(0, v, 0x141, 0xF, 0xF, true))));
+  v = __float_as_int(fmaxf(__int_as_float(v), __int_as_float(
+      __builtin_amdgcn_update_dpp(0, v, 0x140, 0xF, 0xF, true))));
+  return __int_as_float(v);
+}
+#endif
 
 #ifdef MPK_OPROJ_AMAX_DPP
 // 8-lane amax butterfly (xor 1/2/4) via DPP, matching
@@ -2578,6 +2599,7 @@ router_tile_pass:;
               (mpk_ltk_tag(layer_epoch) << 16) |
                   (unsigned)__builtin_bit_cast(unsigned short, bval),
               MPK_AID_ROUTING_BASE_INTS);
+          MPK_LTK_MARK(0);
         }
 #endif
         st_wt_u16(&d_logits[(int64_t)b * NUM_EXPERTS + router_lt],
@@ -2773,10 +2795,14 @@ router_tile_pass:;
           // Butterfly over the 16-lane DPP row, then across the two rows of
           // the half-wave. Every lane in the domain ends up holding the full
           // amax, so no separate broadcast pass is needed.
+#ifdef MPK_PQ_AMAX_DPP
+          amax = _mpk_amax16_dpp(amax);
+#else
           amax = fmaxf(amax, __shfl_xor(amax, 8));
           amax = fmaxf(amax, __shfl_xor(amax, 4));
           amax = fmaxf(amax, __shfl_xor(amax, 2));
           amax = fmaxf(amax, __shfl_xor(amax, 1));
+#endif
           if (scale_block != last_block) {
             amax = fmaxf(amax, __shfl_xor(amax, 16));
           }
@@ -2917,6 +2943,7 @@ router_tile_pass:;
               (mpk_ltk_tag(layer_epoch) << 16) |
                   (unsigned)__builtin_bit_cast(unsigned short, bval),
               MPK_AID_ROUTING_BASE_INTS);
+          MPK_LTK_MARK(0);
         }
 #endif
         st_wt_u16(&d_logits[(int64_t)b * NUM_EXPERTS + router_lt],

@@ -238,6 +238,30 @@ __shared__ unsigned int s_qs_n[3];  // qkv passes, chunk passes, xcd_id + 1
 __device__ unsigned int g_qs_acc[MPK_PHASE_MAX_WORKERS * 5];
 __device__ unsigned int g_qs_n[MPK_PHASE_MAX_WORKERS * 3];
 #endif
+#ifdef MPK_QKVK_LDS
+// QKV kernel stages per worker, ns sums over armed layers:
+// 0 fold + RMSNorm, 1 quant + weight DMA drain, 2 MFMA setup,
+// 3 MFMA + RoPE / KV epilogue.
+__shared__ unsigned int s_qk_ts[5];
+__shared__ unsigned int s_qk_acc[4];
+__shared__ unsigned int s_qk_n;
+__device__ unsigned int g_qk_acc[MPK_PHASE_MAX_WORKERS * 4];
+__device__ unsigned int g_qk_n[MPK_PHASE_MAX_WORKERS];
+#define MPK_QKVK_MARK(k)                                                      \
+  do {                                                                        \
+    if (threadIdx.x == 0) {                                                   \
+      s_qk_ts[(k)] = (unsigned int)__builtin_amdgcn_s_memrealtime();         \
+      if ((k) == 4 &&                                                         \
+          s_phase_layers >= (unsigned int)(MPK_PHASE_START_ITER *              \
+                                           MPK_PHASE_LAYERS_PER_ITER)) {       \
+        for (int _q = 0; _q < 4; _q++) {                                      \
+          s_qk_acc[_q] += (s_qk_ts[_q + 1] - s_qk_ts[_q]) * 10;               \
+        }                                                                     \
+        s_qk_n++;                                                             \
+      }                                                                       \
+    }                                                                         \
+  } while (0)
+#endif
 #ifdef MPK_W13_SUB
 __shared__ unsigned int s_w13_prev;
 __shared__ unsigned int s_w13_acc[10];
@@ -271,6 +295,28 @@ __shared__ unsigned long long s_phase_span[MPK_PHASE_SLOT_COUNT];
 __shared__ unsigned long long s_phase_prev_end;
 __shared__ unsigned long long s_phase_span_b;
 __shared__ unsigned int s_phase_layers;
+#if defined(MPK_LTK_SNAP) && defined(MPK_PHASE_SNAP)
+// Local-TopK propagation stamps for the layers of iteration
+// MPK_PHASE_SNAP: [0] router logit publish, [1] poll start,
+// [2] poll success, [3] TopK end. Worker id from the slot-0 mark.
+__device__ unsigned long long
+    g_ltk_snap[MPK_PHASE_LAYERS_PER_ITER * MPK_PHASE_MAX_WORKERS * 4];
+__shared__ int s_ltk_worker;
+#define MPK_LTK_MARK(k)                                                        \
+  do {                                                                         \
+    if (threadIdx.x == 0) {                                                    \
+      unsigned int const _ltk_l =                                              \
+          s_phase_layers -                                                     \
+          (unsigned int)(MPK_PHASE_SNAP * MPK_PHASE_LAYERS_PER_ITER);          \
+      if (_ltk_l < (unsigned int)MPK_PHASE_LAYERS_PER_ITER &&                  \
+          (unsigned int)s_ltk_worker < (unsigned int)MPK_PHASE_MAX_WORKERS) {  \
+        g_ltk_snap[((size_t)_ltk_l * MPK_PHASE_MAX_WORKERS + s_ltk_worker) *   \
+                       4 +                                                     \
+                   (k)] = __builtin_amdgcn_s_memrealtime();                    \
+      }                                                                        \
+    }                                                                          \
+  } while (0)
+#endif
 __shared__ unsigned int s_phase_n;
 
 #ifdef MPK_OPROJ_LDS
@@ -374,6 +420,10 @@ __device__ __forceinline__ void mpk_phase_lds_init() {
     for (int k = 0; k < 5; k++) s_qs_acc[k] = 0;
     for (int k = 0; k < 3; k++) s_qs_n[k] = 0;
 #endif
+#ifdef MPK_QKVK_LDS
+    for (int k = 0; k < 4; k++) s_qk_acc[k] = 0;
+    s_qk_n = 0;
+#endif
 #ifdef MPK_MOE_LDS
     for (int k = 0; k < 7; k++) s_moe_acc[k] = 0;
     s_moe_n[0] = 0;
@@ -396,6 +446,11 @@ __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
   unsigned long long const t = __builtin_amdgcn_s_memrealtime();
   asm volatile("" ::: "memory");
   s_phase_ts[slot] = t;
+#if defined(MPK_LTK_SNAP) && defined(MPK_PHASE_SNAP)
+  if (slot == 0) {
+    s_ltk_worker = worker;
+  }
+#endif
 #ifdef MPK_PHASE_SNAP
   {
     // s_phase_layers still counts completed layers here, so it is the
@@ -508,6 +563,10 @@ __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
 #ifdef MPK_QKV_SUB_LDS
     for (int k = 0; k < 5; k++) g_qs_acc[worker * 5 + k] = s_qs_acc[k];
     for (int k = 0; k < 3; k++) g_qs_n[worker * 3 + k] = s_qs_n[k];
+#endif
+#ifdef MPK_QKVK_LDS
+    for (int k = 0; k < 4; k++) g_qk_acc[worker * 4 + k] = s_qk_acc[k];
+    g_qk_n[worker] = s_qk_n;
 #endif
 #ifdef MPK_W13_SUB
     for (int k = 0; k < 10; k++) g_w13_acc[worker * 10 + k] = s_w13_acc[k];
@@ -4474,6 +4533,17 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                      nc ? a[3] / nc : 0, nc ? a[4] / nc : 0);
             }
 #endif
+#ifdef MPK_QKVK_LDS
+            for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+              unsigned int const n = g_qk_n[w];
+              if (n == 0) {
+                continue;
+              }
+              unsigned int const *a = &g_qk_acc[w * 4];
+              printf("[QKVKW] w=%d n=%u foldnorm=%u ready=%u setup=%u mfma_epi=%u\n",
+                     w, n, a[0] / n, a[1] / n, a[2] / n, a[3] / n);
+            }
+#endif
 #ifdef MPK_W13_SUB
             for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
               unsigned int const n13 = g_w13_n[w];
@@ -4501,6 +4571,43 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
               }
               printf("\n");
             }
+#if defined(MPK_LTK_SNAP) && defined(MPK_PHASE_SNAP)
+            for (int L = 0; L < MPK_PHASE_LAYERS_PER_ITER; L++) {
+              unsigned long long pub[2] = {0, 0}, okmin[2] = {~0ull, ~0ull};
+              unsigned long long okmax[2] = {0, 0}, p0min = ~0ull;
+              unsigned long long endmin = ~0ull, endmax = 0, oksum = 0;
+              int pubn = 0, okn = 0, pubw = -1;
+              for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+                unsigned long long const *v =
+                    &g_ltk_snap[((size_t)L * MPK_PHASE_MAX_WORKERS + w) * 4];
+                int const a = (w / MPK_PSNAPD_WPD) >= 4 ? 1 : 0;
+                if (v[0]) {
+                  if (v[0] > pub[a]) pub[a] = v[0];
+                  if (v[0] >= pub[0] && v[0] >= pub[1]) pubw = w;
+                  pubn++;
+                }
+                if (v[1] && v[1] < p0min) p0min = v[1];
+                if (v[2]) {
+                  if (v[2] < okmin[a]) okmin[a] = v[2];
+                  if (v[2] > okmax[a]) okmax[a] = v[2];
+                  oksum += v[2];
+                  okn++;
+                }
+                if (v[3]) {
+                  if (v[3] < endmin) endmin = v[3];
+                  if (v[3] > endmax) endmax = v[3];
+                }
+              }
+              if (pubn == 0 || okn == 0) {
+                continue;
+              }
+              printf("[LTKSNAP] L=%d pubn=%d pubw=%d pub0=%llu pub1=%llu p0min=%llu "
+                     "okmin0=%llu okmin1=%llu okmax0=%llu okmax1=%llu okmean=%llu "
+                     "endmin=%llu endmax=%llu okn=%d\n",
+                     L, pubn, pubw, pub[0], pub[1], p0min, okmin[0], okmin[1],
+                     okmax[0], okmax[1], oksum / okn, endmin, endmax, okn);
+            }
+#endif
           }
 #endif
 #ifdef MPK_QKV_SPLIT

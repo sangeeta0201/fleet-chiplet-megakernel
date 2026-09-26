@@ -34,6 +34,24 @@
 // QKV compute: ~26us -> ~8us per layer.
 
 #pragma once
+
+// x_out store. MPK_XOUT_GLOBAL_ST types it AS(1): a generic-pointer store
+// is flat_store_dwordx2, and a pending FLAT access makes every later wait
+// vmcnt(0), splitting the next fold iteration into two round trips.
+#ifdef MPK_XOUT_GLOBAL_ST
+#define MPK_XOUT_STORE(dst, packed)                                           \
+  do {                                                                        \
+    _gl_u32x2 _xo_v;                                                          \
+    _xo_v[0] = (packed).x;                                                    \
+    _xo_v[1] = (packed).y;                                                    \
+    *(__attribute__((address_space(1))) _gl_u32x2 *)(dst) = _xo_v;            \
+  } while (0)
+#else
+#define MPK_XOUT_STORE(dst, packed) __builtin_memcpy((dst), &(packed), 8)
+#endif
+#ifndef MPK_QKVK_MARK
+#define MPK_QKVK_MARK(k) do {} while (0)  // MPK_QKVK_LDS off
+#endif
 #include "mpk_atoms.cuh" // st_wt_*, ld_sys_s32 (QKV K-split handshake)
 #include "tasks/mi300/gang_moe_linear_mxfp4_mi300.cuh" // FP4xFP8 type defs + helpers
 #include "tasks/mi300/gang_rmsnorm_linear_bias_mi300.cuh" // RMSNorm prologue
@@ -1242,7 +1260,16 @@ __device__ __forceinline__ void _kvupd_rope_epilogue_packed(
     int tok_row_base,               // first token row of this column block
     int head_offset,                // head offset within dst row
     int output_per_wg,              // OUTPUT_PER_WG
-    unsigned short *s_rope)         // LDS buffer [TOK_ROWS][HEAD_DIM] bf16
+    unsigned short *s_rope          // LDS buffer [TOK_ROWS][HEAD_DIM] bf16
+#ifdef MPK_QKV_EPI_PF
+    ,
+    bool have_pf = false,           // bias / cos / sin below are loaded
+    unsigned bias_lo = 0,
+    unsigned bias_hi = 0,
+    unsigned short cos_pf = 0,
+    unsigned short sin_pf = 0
+#endif
+    )
 {
   // Step 1: each lane writes its own token's slice.
   //
@@ -1254,6 +1281,11 @@ __device__ __forceinline__ void _kvupd_rope_epilogue_packed(
   if (tok_active) {
     int d0 = wave_tile * 16 + g * 4;
     uint64_t bias4;
+#ifdef MPK_QKV_EPI_PF
+    if (have_pf) {
+      bias4 = (uint64_t)bias_lo | ((uint64_t)bias_hi << 32);
+    } else
+#endif
     __builtin_memcpy(&bias4, &bias[wg_idx * output_per_wg + d0], 8);
     unsigned short const *b4 = (unsigned short const *)&bias4;
 #pragma unroll
@@ -1285,8 +1317,19 @@ __device__ __forceinline__ void _kvupd_rope_epilogue_packed(
     __builtin_memcpy(&v0, &v0_bits, 4);
     __builtin_memcpy(&v1, &v1_bits, 4);
 
+#ifdef MPK_QKV_EPI_PF
+    unsigned c_bits, s_bits;
+    if (have_pf) {
+      c_bits = (unsigned)cos_pf << 16;
+      s_bits = (unsigned)sin_pf << 16;
+    } else {
+      c_bits = (unsigned)cos_data[d] << 16;
+      s_bits = (unsigned)sin_data[d] << 16;
+    }
+#else
     unsigned c_bits = (unsigned)cos_data[d] << 16;
     unsigned s_bits = (unsigned)sin_data[d] << 16;
+#endif
     float c, s;
     __builtin_memcpy(&c, &c_bits, 4);
     __builtin_memcpy(&s, &s_bits, 4);
@@ -2222,7 +2265,7 @@ __device__ __noinline__ void gang_resaddf32_rmsnorm_linear_mxfp4_bias_kernel(
           uint2 out_packed;
           out_packed.x = (unsigned)o0 | ((unsigned)o1 << 16);
           out_packed.y = (unsigned)o2 | ((unsigned)o3 << 16);
-          __builtin_memcpy(xout_base + off, &out_packed, 8);
+          MPK_XOUT_STORE(xout_base + off, out_packed);
         }
       }
 
@@ -2566,6 +2609,15 @@ __device__ __noinline__ void
         // barrier spin. Defaulted so the standalone generated variant and the
         // layer-0 / world_size>1 caller need no change.
         bool weights_preloaded = false
+#ifdef MPK_QKV_POS_CACHE
+#ifdef MPK_QKV_KSPLIT
+#error "MPK_QKV_POS_CACHE: not wired for MPK_QKV_KSPLIT"
+#endif
+        // 0: compute the KV slot; 1: compute and keep it (a token's first
+        // layer); 2: reuse the kept one (its other layers).
+        ,
+        int pos_cache = 0
+#endif
 #ifdef MPK_QKV_KSPLIT
         // 0 = K-lo (iters [0, K_LO)), 1 = K-hi (iters [K_LO, MFMA_ITERS)).
         // Default 0 so callers that have not opted in keep the full K-range.
@@ -2654,6 +2706,7 @@ __device__ __noinline__ void
     _sp_t0 = __builtin_amdgcn_s_memrealtime();
   }
 #endif
+  MPK_QKVK_MARK(0);
   int batch_count =
       (num_active_tokens < BATCH_SIZE) ? num_active_tokens : BATCH_SIZE;
 
@@ -2664,6 +2717,15 @@ __device__ __noinline__ void
   int wg_idx = tile_idx % n_wgs_per_xcd;
   int tok_row_base = bblk * MFMA_N;
   int tok_row = tok_row_base + col;
+#ifdef MPK_QKV_EPI_PF
+  static_assert(TILES_PER_WAVE == 1, "MPK_QKV_EPI_PF: one output tile per wave");
+  // This lane's epilogue bias quad (d0 = warp_id * 16 + g * 4), issued now so
+  // it lands during the fold. Typed AS(1): a generic load is FLAT and would
+  // turn every fold wait into vmcnt(0).
+  _gl_u32x2 const epi_bias_pf =
+      *(__attribute__((address_space(1))) _gl_u32x2 const *)(
+          d_bias + wg_idx * OUTPUT_PER_WG + warp_id * 16 + g * 4);
+#endif
 
   uint8_t const *wg_data = W + static_cast<int64_t>(wg_idx) * WG_BYTES;
   uint8_t const *wg_scales = wg_data + WG_DATA_BYTES;
@@ -2811,6 +2873,21 @@ __device__ __noinline__ void
       // the issue loop below the pass-1 body for why.
       uint64_t prefetched_norm_weights[_MAX_ITERS];
       int n_cached = 0;
+#ifdef MPK_QKV_PRO_FAST
+      // Static gamma: issue before the fold so it lands during it.
+#pragma unroll
+      for (int iter = 0; iter < _MAX_ITERS; ++iter) {
+        int const off = tid * _VEC + iter * _BLOCK_VEC;
+        if (off < REDUCTION_SIZE) {
+          uint64_t value;
+          asm volatile("global_load_dwordx2 %0, %1, off"
+                       : "=v"(value)
+                       : "v"(d_norm_w + off)
+                       : "memory");
+          prefetched_norm_weights[iter] = value;
+        }
+      }
+#endif
       {
         constexpr int VEC = 4;
         constexpr int BLOCK_VEC = 256 * VEC;
@@ -2851,6 +2928,78 @@ __device__ __noinline__ void
         float const fc_ssq0 = ssq;  // MPK_WSFC_V4
         int const fc_nc0 = n_cached;
 #endif
+#ifdef MPK_FOLD_PIPE
+#if defined(MPK_WS_SYS_LOAD) || defined(MPK_WS_FARCOPY) || defined(MPK_ABLATE_WS_FOLD)
+#error "MPK_FOLD_PIPE replaces the plain fold loop only"
+#endif
+        // All loads first, then the unchanged arithmetic in the same order.
+        // The plain loop's x_out store may alias its sources as far as the
+        // compiler knows, so it never hoisted the next iteration's loads.
+        _gl_f32x4 fp_ws[_MAX_ITERS][MOE_WS_SLOTS];
+        _gl_u32x2 fp_rv[_MAX_ITERS];
+#pragma unroll
+        for (int it = 0; it < _MAX_ITERS; it++) {
+          int const off_raw = tid * VEC + it * BLOCK_VEC;
+          int const off =
+              off_raw < REDUCTION_SIZE ? off_raw : REDUCTION_SIZE - VEC;
+#pragma unroll
+          for (int s = 0; s < MOE_WS_SLOTS; s++) {
+            fp_ws[it][s] =
+                *(__attribute__((address_space(1))) _gl_f32x4 const *)(
+                    ws_base + MPK_WSLP_SLOT(s) * REDUCTION_SIZE + off);
+          }
+          fp_rv[it] = *(__attribute__((address_space(1))) _gl_u32x2 const *)(
+              res_base + off);
+        }
+#pragma unroll
+        for (int it = 0; it < _MAX_ITERS; it++) {
+          int const off = tid * VEC + it * BLOCK_VEC;
+          if (off < REDUCTION_SIZE) {
+            float4 ws4;
+            ws4.x = fp_ws[it][0][0];
+            ws4.y = fp_ws[it][0][1];
+            ws4.z = fp_ws[it][0][2];
+            ws4.w = fp_ws[it][0][3];
+#pragma unroll
+            for (int s = 1; s < MOE_WS_SLOTS; s++) {
+              ws4.x += fp_ws[it][s][0];
+              ws4.y += fp_ws[it][s][1];
+              ws4.z += fp_ws[it][s][2];
+              ws4.w += fp_ws[it][s][3];
+            }
+            unsigned r0 = (fp_rv[it][0] & 0xFFFFu) << 16;
+            unsigned r1 = fp_rv[it][0] & 0xFFFF0000u;
+            unsigned r2 = (fp_rv[it][1] & 0xFFFFu) << 16;
+            unsigned r3 = fp_rv[it][1] & 0xFFFF0000u;
+            float rv0, rv1, rv2, rv3;
+            __builtin_memcpy(&rv0, &r0, 4);
+            __builtin_memcpy(&rv1, &r1, 4);
+            __builtin_memcpy(&rv2, &r2, 4);
+            __builtin_memcpy(&rv3, &r3, 4);
+            float s0 = ws4.x + rv0;
+            float s1 = ws4.y + rv1;
+            float s2 = ws4.z + rv2;
+            float s3 = ws4.w + rv3;
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s0));
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s1));
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s2));
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s3));
+            s_cache[n_cached + 0] = s0;
+            s_cache[n_cached + 1] = s1;
+            s_cache[n_cached + 2] = s2;
+            s_cache[n_cached + 3] = s3;
+            n_cached += _VEC;
+            unsigned short o0 = _gang_float_to_bf16(s0);
+            unsigned short o1 = _gang_float_to_bf16(s1);
+            unsigned short o2 = _gang_float_to_bf16(s2);
+            unsigned short o3 = _gang_float_to_bf16(s3);
+            uint2 out_packed;
+            out_packed.x = (unsigned)o0 | ((unsigned)o1 << 16);
+            out_packed.y = (unsigned)o2 | ((unsigned)o3 << 16);
+            MPK_XOUT_STORE(xout_base + off, out_packed);
+          }
+        }
+#else
 #pragma unroll
         for (int off = tid * VEC; off < REDUCTION_SIZE; off += BLOCK_VEC) {
           // Sum the MoE expert contributions here, in fixed slot order, rather
@@ -2931,10 +3080,17 @@ __device__ __noinline__ void
           float s2 = ws4.z + rv2;
           float s3 = ws4.w + rv3;
 
+#ifdef MPK_QKV_PRO_FAST
+          ssq = __builtin_fmaf(s0, s0, ssq);
+          ssq = __builtin_fmaf(s1, s1, ssq);
+          ssq = __builtin_fmaf(s2, s2, ssq);
+          ssq = __builtin_fmaf(s3, s3, ssq);
+#else
           asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s0));
           asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s1));
           asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s2));
           asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s3));
+#endif
 
           // Cache resadd sums in registers for Pass 2 (avoid re-reading x_out)
           s_cache[n_cached + 0] = s0;
@@ -2950,8 +3106,36 @@ __device__ __noinline__ void
           uint2 out_packed;
           out_packed.x = (unsigned)o0 | ((unsigned)o1 << 16);
           out_packed.y = (unsigned)o2 | ((unsigned)o3 << 16);
-          __builtin_memcpy(xout_base + off, &out_packed, 8);
+#ifndef MPK_XOUT_SLICE_WRITER
+          MPK_XOUT_STORE(xout_base + off, out_packed);
+#endif
         }
+#endif  // MPK_FOLD_PIPE
+#ifdef MPK_XOUT_SLICE_WRITER
+#if defined(MPK_FOLD_PIPE) || defined(MPK_WS_FARCOPY)
+#error "MPK_XOUT_SLICE_WRITER covers the plain fold loop only"
+#endif
+        // One writer per XCD, its own O-proj residual slice only.
+        if (wg_idx == 0) {
+          int const xo_lo =
+              _kvupd_get_xcd_id() * (REDUCTION_SIZE / MPK_NUM_XCDS);
+          int const xo_hi = xo_lo + REDUCTION_SIZE / MPK_NUM_XCDS;
+#pragma unroll
+          for (int it = 0; it < _MAX_ITERS; it++) {
+            int const off = tid * VEC + it * BLOCK_VEC;
+            if (off < REDUCTION_SIZE && off >= xo_lo && off < xo_hi) {
+              unsigned short o0 = _gang_float_to_bf16(s_cache[it * VEC + 0]);
+              unsigned short o1 = _gang_float_to_bf16(s_cache[it * VEC + 1]);
+              unsigned short o2 = _gang_float_to_bf16(s_cache[it * VEC + 2]);
+              unsigned short o3 = _gang_float_to_bf16(s_cache[it * VEC + 3]);
+              uint2 out_packed;
+              out_packed.x = (unsigned)o0 | ((unsigned)o1 << 16);
+              out_packed.y = (unsigned)o2 | ((unsigned)o3 << 16);
+              MPK_XOUT_STORE(xout_base + off, out_packed);
+            }
+          }
+        }
+#endif
 #ifdef MPK_WS_FARCOPY
         // MPK_WSFC_V4: a far slot of this AID's copy was still poisoned
         // (NaN reached ssq). Redo this thread's elements with every slot
@@ -3040,7 +3224,7 @@ __device__ __noinline__ void
             uint2 out_packed;
             out_packed.x = (unsigned)o0 | ((unsigned)o1 << 16);
             out_packed.y = (unsigned)o2 | ((unsigned)o3 << 16);
-            __builtin_memcpy(xout_base + off, &out_packed, 8);
+            MPK_XOUT_STORE(xout_base + off, out_packed);
           }
 #undef MPK_FC_ADJ
         }
@@ -3063,6 +3247,7 @@ __device__ __noinline__ void
       // `s_waitcnt lgkmcnt(0)` in the reduction (there is one, for the LDS
       // s_red write) would drain these too and collapse the overlap this
       // exists to create. GLOBAL touches vmcnt only.
+#ifndef MPK_QKV_PRO_FAST
 #pragma unroll
       for (int iter = 0; iter < _MAX_ITERS; ++iter) {
         int const off = tid * _VEC + iter * _BLOCK_VEC;
@@ -3075,6 +3260,7 @@ __device__ __noinline__ void
           prefetched_norm_weights[iter] = value;
         }
       }
+#endif
 
       #ifdef MPK_RMSNORM_DPP_REDUCE
       // Same 32/16/8/4/2/1 tree, no LDS. Valid in lane 0 only, which is
@@ -3100,9 +3286,17 @@ __device__ __noinline__ void
       float rms_rcp;
       if (_wave_id == 0) {
         ssq = (_lane_id < _num_waves) ? s_red[_lane_id] : 0.0f;
+#ifdef MPK_QKV_PRO_FAST
+        static_assert(256 / 64 == 4, "4 waves: xor 2 then xor 1");
+        ssq += __int_as_float(__builtin_amdgcn_mov_dpp(
+            __float_as_int(ssq), 0x4E, 0xF, 0xF, false));  // lane ^ 2
+        ssq += __int_as_float(__builtin_amdgcn_mov_dpp(
+            __float_as_int(ssq), 0xB1, 0xF, 0xF, false));  // lane ^ 1
+#else
         for (int offset = _num_waves >> 1; offset > 0; offset >>= 1) {
           ssq += __shfl_xor(ssq, offset);
         }
+#endif
         if (_lane_id == 0) {
           s_red[0] = rsqrtf(ssq / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
         }
@@ -3164,6 +3358,7 @@ __device__ __noinline__ void
     _sp_t2 = _sp_t1;
   }
 #endif
+  MPK_QKVK_MARK(1);
 
   // ── Step 2: Prepare activation in LDS ──────────────────────────────────
 
@@ -3251,6 +3446,7 @@ __device__ __noinline__ void
   // Individual inactive lanes within a live block must NOT return here -- they
   // still have to issue their ds_reads and their share of the MFMA, and they
   // participate in the __syncthreads inside the RoPE epilogue.
+  MPK_QKVK_MARK(2);
   int const n_valid_tok = batch_count - tok_row_base;
   if (n_valid_tok <= 0) {
     return;
@@ -3301,7 +3497,21 @@ __device__ __noinline__ void
   };
 
   if constexpr (TOK_ROWS == 1) {
+#ifdef MPK_QKV_POS_CACHE
+    __shared__ int s_qkv_pos_cache[2];
+    if (pos_cache == 2) {
+      _priv_global_pos[0] = s_qkv_pos_cache[0];
+      _priv_dst_idx[0] = s_qkv_pos_cache[1];
+    } else {
+      compute_pos(0, _priv_global_pos[0], _priv_dst_idx[0]);
+      if (pos_cache == 1 && tid == 0) {
+        s_qkv_pos_cache[0] = _priv_global_pos[0];
+        s_qkv_pos_cache[1] = _priv_dst_idx[0];
+      }
+    }
+#else
     compute_pos(0, _priv_global_pos[0], _priv_dst_idx[0]);
+#endif
     s_global_pos = _priv_global_pos;
     s_dst_idx = _priv_dst_idx;
   } else {
@@ -3321,6 +3531,21 @@ __device__ __noinline__ void
     _sp_t3 = __builtin_amdgcn_s_memrealtime();
   }
 #endif
+#ifdef MPK_QKV_EPI_PF
+  // RoPE pair for lane d = tid (the epilogue's only iteration when
+  // TOK_ROWS == 1), issued before the MFMA so it lands under it.
+  unsigned short epi_cos_pf = 0, epi_sin_pf = 0;
+  if constexpr (TOK_ROWS == 1) {
+    if (tid < HEAD_DIM / 2) {
+      long long const rp = (long long)s_global_pos[0] * HEAD_DIM + tid;
+      epi_cos_pf =
+          ((__attribute__((address_space(1))) unsigned short const *)cos_ptr)[rp];
+      epi_sin_pf =
+          ((__attribute__((address_space(1))) unsigned short const *)sin_ptr)[rp];
+    }
+  }
+#endif
+  MPK_QKVK_MARK(3);
 
   // ── MFMA + KV Update epilogue ─────────────────────────────────────────
   // ── QKV asm MFMA loop (weights already in LDS from Phase A/B) ──
@@ -3850,7 +4075,16 @@ __device__ __noinline__ void
             tok_row_base,
             q_head_global * HEAD_DIM,
             OUTPUT_PER_WG,
-            s_rope);
+            s_rope
+#ifdef MPK_QKV_EPI_PF
+            ,
+            TOK_ROWS == 1,
+            epi_bias_pf[0],
+            epi_bias_pf[1],
+            epi_cos_pf,
+            epi_sin_pf
+#endif
+            );
       } else if (kv_role == NUM_Q_PER_KV) {
         // K: bias + RoPE, then scatter to the paged cache. Same three steps as
         // the Q path but the destination row is a page slot, so it cannot go
@@ -3859,6 +4093,11 @@ __device__ __noinline__ void
         if (tok_active) {
           int d0 = wave_tile * 16 + g * 4;
           uint64_t bias4;
+#ifdef MPK_QKV_EPI_PF
+          if constexpr (TOK_ROWS == 1) {
+            bias4 = (uint64_t)epi_bias_pf[0] | ((uint64_t)epi_bias_pf[1] << 32);
+          } else
+#endif
           __builtin_memcpy(&bias4, &d_bias[wg_idx * OUTPUT_PER_WG + d0], 8);
           unsigned short const *b4 = (unsigned short const *)&bias4;
 #pragma unroll
@@ -3886,8 +4125,19 @@ __device__ __noinline__ void
           float v0, v1;
           __builtin_memcpy(&v0, &v0b, 4);
           __builtin_memcpy(&v1, &v1b, 4);
+#ifdef MPK_QKV_EPI_PF
+          unsigned cb, sb_r;
+          if constexpr (TOK_ROWS == 1) {
+            cb = (unsigned)epi_cos_pf << 16;
+            sb_r = (unsigned)epi_sin_pf << 16;
+          } else {
+            cb = (unsigned)cos_row[d] << 16;
+            sb_r = (unsigned)sin_row[d] << 16;
+          }
+#else
           unsigned cb = (unsigned)cos_row[d] << 16;
           unsigned sb_r = (unsigned)sin_row[d] << 16;
+#endif
           float c, s;
           __builtin_memcpy(&c, &cb, 4);
           __builtin_memcpy(&s, &sb_r, 4);
@@ -3912,6 +4162,11 @@ __device__ __noinline__ void
         if (tok_active) {
           int d0 = wave_tile * 16 + g * 4;
           uint64_t bias4;
+#ifdef MPK_QKV_EPI_PF
+          if constexpr (TOK_ROWS == 1) {
+            bias4 = (uint64_t)epi_bias_pf[0] | ((uint64_t)epi_bias_pf[1] << 32);
+          } else
+#endif
           __builtin_memcpy(&bias4, &d_bias[wg_idx * OUTPUT_PER_WG + d0], 8);
           unsigned short const *b4 = (unsigned short const *)&bias4;
           long long row_off =
@@ -3956,6 +4211,7 @@ __device__ __noinline__ void
   }
 #endif
   __syncthreads();
+  MPK_QKVK_MARK(4);
 }
 
 } // namespace kernel

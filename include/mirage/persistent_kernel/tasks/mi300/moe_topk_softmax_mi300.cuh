@@ -607,7 +607,41 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
 }
 
 
+// MPK_LTK_SNAP fallback
+#ifndef MPK_LTK_MARK
+#define MPK_LTK_MARK(k) do {} while (0)
+#endif
 #ifdef MPK_LOCAL_TOPK
+#ifdef MPK_LTK_DPP
+// __shfl_xor(v, m, 16) for m in {1, 2, 4, 8} on the VALU. Each ds_bpermute
+// is a round trip through the LDS crossbar and the TopK below chains 24 of
+// them; a DPP move reads the same partner lane, so every max, sum and
+// tie-break is unchanged. row_ror's direction comes from the hardware
+// (x4_rr4 = "row_ror:4 reads lane ^ 4"), not from an assumption.
+__device__ __forceinline__ int mpk_ltk_x16(int v, int mask, bool x4_rr4) {
+  switch (mask) {
+  case 1:
+    return __builtin_amdgcn_mov_dpp(v, 0xB1, 0xF, 0xF, false);  // qp [1,0,3,2]
+  case 2:
+    return __builtin_amdgcn_mov_dpp(v, 0x4E, 0xF, 0xF, false);  // qp [2,3,0,1]
+  case 8:
+    return __builtin_amdgcn_mov_dpp(v, 0x128, 0xF, 0xF, false);  // row_ror:8
+  default: {
+    int const a = __builtin_amdgcn_mov_dpp(v, 0x124, 0xF, 0xF, false);
+    int const b = __builtin_amdgcn_mov_dpp(v, 0x12C, 0xF, 0xF, false);
+    return x4_rr4 ? a : b;
+  }
+  }
+}
+__device__ __forceinline__ float mpk_ltk_x16f(float v, int mask, bool x4_rr4) {
+  return __int_as_float(mpk_ltk_x16(__float_as_int(v), mask, x4_rr4));
+}
+#define MPK_LTK_XOR(v, m) mpk_ltk_x16f((v), (m), ltk_x4_rr4)
+#define MPK_LTK_XORI(v, m) mpk_ltk_x16((v), (m), ltk_x4_rr4)
+#else
+#define MPK_LTK_XOR(v, m) __shfl_xor((v), (m), 16)
+#define MPK_LTK_XORI(v, m) __shfl_xor((v), (m), 16)
+#endif
 // Every workgroup rebuilds routing from the tagged logits on its own AID's
 // replica. The row arithmetic below is topk_softmax_mi300_task_impl's for one
 // row, line for line (16 lanes x 8 values, same reductions, same asm
@@ -629,6 +663,7 @@ __device__ __forceinline__ void mpk_local_topk(int *tags, int expected) {
 #endif
   if (tid < 64) {
     unsigned long long v;
+    MPK_LTK_MARK(1);
     while (true) {
       asm volatile("global_load_dwordx2 %0, %1, off sc1\n"
                    "s_waitcnt vmcnt(0)"
@@ -648,6 +683,7 @@ __device__ __forceinline__ void mpk_local_topk(int *tags, int expected) {
 #endif
       __builtin_amdgcn_s_sleep(1);
     }
+    MPK_LTK_MARK(2);
     s_ltk_logit[2 * tid] = (unsigned short)(v & 0xFFFFu);
     s_ltk_logit[2 * tid + 1] = (unsigned short)((v >> 32) & 0xFFFFu);
   }
@@ -657,6 +693,10 @@ __device__ __forceinline__ void mpk_local_topk(int *tags, int expected) {
   __syncthreads();
   if (tid < THREADS_PER_ROW) {
     float row_chunk[VPT];
+#ifdef MPK_LTK_DPP
+    bool const ltk_x4_rr4 =
+        __builtin_amdgcn_mov_dpp(tid, 0x124, 0xF, 0xF, false) == (tid ^ 4);
+#endif
     for (int e = 0; e < VPT; ++e) {
       // bf16 -> f32 is exact: the bf16 bits are the float's top half.
       row_chunk[e] =
@@ -670,8 +710,9 @@ __device__ __forceinline__ void mpk_local_topk(int *tags, int expected) {
     thread_max = topk_dpp_row_max_to_lane_zero(thread_max);
     thread_max = __shfl(thread_max, 0, THREADS_PER_ROW);
 #else
+#pragma unroll
     for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
-      float other = __shfl_xor(thread_max, mask, THREADS_PER_ROW);
+      float other = MPK_LTK_XOR(thread_max, mask);
       thread_max = fmaxf(thread_max, other);
     }
 #endif
@@ -685,8 +726,9 @@ __device__ __forceinline__ void mpk_local_topk(int *tags, int expected) {
     row_sum = topk_dpp_row_sum_to_lane_zero(row_sum);
     row_sum = __shfl(row_sum, 0, THREADS_PER_ROW);
 #else
+#pragma unroll
     for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
-      row_sum += __shfl_xor(row_sum, mask, THREADS_PER_ROW);
+      row_sum += MPK_LTK_XOR(row_sum, mask);
     }
 #endif
     float const inv_sum = 1.f / row_sum;
@@ -771,9 +813,10 @@ __device__ __forceinline__ void mpk_local_topk(int *tags, int expected) {
                      [c6] "v"(col[6]), [c7] "v"(col[7])
                    : "vcc");
 #endif
+#pragma unroll
       for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
-        float other_max = __shfl_xor(max_val, mask, THREADS_PER_ROW);
-        int other_expert = __shfl_xor(expert, mask, THREADS_PER_ROW);
+        float other_max = MPK_LTK_XOR(max_val, mask);
+        int other_expert = MPK_LTK_XORI(expert, mask);
         asm volatile("v_cmp_gt_f32 vcc, %[om], %[mv]\n"
                      "v_cndmask_b32 %[mv], %[mv], %[om], vcc\n"
                      "v_cndmask_b32 %[ex], %[ex], %[oe], vcc\n"
@@ -828,6 +871,7 @@ __device__ __forceinline__ void mpk_local_topk(int *tags, int expected) {
     }
   }
   __syncthreads();
+  MPK_LTK_MARK(3);
 }
 #endif
 

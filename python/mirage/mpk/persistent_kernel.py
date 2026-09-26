@@ -445,6 +445,36 @@ def get_compile_command(
             flags = flags + ["-DMPK_W13_SUB"]
         if int(os.environ.get("MPK_IL_LDS", "0")) == 1:
             flags = flags + ["-DMPK_IL_LDS"]
+        if int(os.environ.get("MPK_QKV_EPI_PF", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_EPI_PF"]
+        if int(os.environ.get("MPK_QKV_POS_CACHE", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_POS_CACHE"]
+        if int(os.environ.get("MPK_XOUT_GLOBAL_ST", "0")) == 1:
+            flags = flags + ["-DMPK_XOUT_GLOBAL_ST"]
+        if int(os.environ.get("MPK_RET_WARM", "0")) == 1:
+            flags = flags + ["-DMPK_RET_WARM"]
+        if int(os.environ.get("MPK_QKV_PRO_FAST", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_PRO_FAST"]
+        if int(os.environ.get("MPK_XOUT_SLICE_WRITER", "0")) == 1:
+            flags = flags + ["-DMPK_XOUT_SLICE_WRITER"]
+        if int(os.environ.get("MPK_QKVK_LDS", "0")) == 1:
+            flags = flags + ["-DMPK_QKVK_LDS"]
+        if int(os.environ.get("MPK_GATE_DEFER", "0")) == 1:
+            flags = flags + ["-DMPK_GATE_DEFER"]
+        if int(os.environ.get("MPK_QKV_PF_ABLATE", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_PF_ABLATE"]
+        if int(os.environ.get("MPK_QKV_L2PF", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_L2PF"]
+        if int(os.environ.get("MPK_GATE_DEFER_PF_LATE", "0")) == 1:
+            flags = flags + ["-DMPK_GATE_DEFER_PF_LATE"]
+        if int(os.environ.get("MPK_FOLD_PIPE", "0")) == 1:
+            flags = flags + ["-DMPK_FOLD_PIPE"]
+        if int(os.environ.get("MPK_PQ_AMAX_DPP", "0")) == 1:
+            flags = flags + ["-DMPK_PQ_AMAX_DPP"]
+        if int(os.environ.get("MPK_LTK_DPP", "0")) == 1:
+            flags = flags + ["-DMPK_LTK_DPP"]
+        if int(os.environ.get("MPK_LTK_SNAP", "0")) == 1:
+            flags = flags + ["-DMPK_LTK_SNAP"]
         if int(os.environ.get("MPK_QKV_SUB_LDS", "0")) == 1:
             flags = flags + ["-DMPK_QKV_SUB_LDS"]
         if int(os.environ.get("MPK_W13_REC_BATCH", "0")) > 1:

@@ -34,6 +34,13 @@
 // directly, saving ~272 bytes of stack frame per thread.
 
 #pragma once
+#ifdef MPK_GATE_DEFER
+#ifndef MPK_GD_LAYERS
+#define MPK_GD_LAYERS 36
+#endif
+// Layer L's gate threshold, carried by tid 0 into layer L+1's call.
+__shared__ int s_gd_prev;
+#endif
 
 // MPK_WAIT_SKIP: same bisection discipline as MPK_P7_SKIP -- remove one class
 // of WAIT at a time, never a release, so nothing can deadlock. Results are
@@ -756,6 +763,45 @@ __device__ __noinline__ void
   // Setup and the block barrier end here; the QKV GEMM starts next.
   _qkvs_t1 = __builtin_amdgcn_s_memrealtime();
 #endif
+#ifdef MPK_GATE_DEFER
+#if !defined(MPK_P9_FLAT) || !defined(MPK_W2_CONSUMER_GATE) ||              \
+    !defined(MPK_PREFETCH_NEXT_QKV) || !defined(MPK_AID_SPLIT_FLAGS) ||       \
+    !defined(MPK_P9_PREINV) || !defined(MPK_LEAN_ARRIVE) ||                   \
+    defined(MPK_QKV_KSPLIT) || defined(MPK_QKV_PF_WAVE_SPLIT) ||              \
+    MPK_NUM_XCDS != 8
+#error "MPK_GATE_DEFER supports the shipped recipe's Phase 9 only"
+#endif
+  // Layer L-1 deferred its gate: prefetch this layer's QKV weights, then
+  // wait for the gate before anything reads what layer L-1 wrote.
+  if ((task_layer_idx % MPK_GD_LAYERS) != 0) {
+#ifdef MPK_GATE_ATTN_JOIN
+    bool const gd_joins =
+        qkv_does_qkv || (qkv_attn_rank < ATTN_PARTICIPANTS);
+#else
+    bool const gd_joins = qkv_does_qkv;
+#endif
+#ifdef MPK_GATE_DEFER_PF_LATE
+    if (qkv_does_qkv && input_ptrs[4] != nullptr &&
+        input_ptrs[25] == input_ptrs[4]) {
+      qkv_prefetch_weights_lds<QKV_BATCH_SIZE,
+                               QKV_OUTPUT_PER_WG,
+                               QKV_REDUCTION_SIZE>(
+          input_ptrs[4], qkv_n_wgs_per_xcd, qkv_attn_rank);
+    }
+#endif
+    if (tid == 0 && gd_joins) {
+      int *const gd_rel = mpk_aid_flags(
+          oproj_counters_base + FULL_LAYER_LAYER_BARRIER_SLOT(NUM_REQS) +
+              8 * 16 + 16,
+          xcd_id, MPK_AID_REGION_LAYER_RELEASE);
+      while (ld_aid_min8_s32(gd_rel) <= s_gd_prev) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+      asm volatile("buffer_inv sc0" ::: "memory");
+    }
+    __syncthreads();
+  }
+#endif
   MPK_TW_SUB(10, xcd_rank);
   if (qkv_does_qkv) {
 #ifdef MPK_QKV_KSPLIT
@@ -832,6 +878,11 @@ __device__ __noinline__ void
 #ifdef MPK_QKV_KSPLIT
         ,
         qkv_k_part
+#endif
+#ifdef MPK_QKV_POS_CACHE
+        // 36 layers per token (as MPK_GD_LAYERS / MPK_RESID_RING_LAYERS).
+        ,
+        /*pos_cache=*/(task_layer_idx % 36 == 0) ? 1 : 2
 #endif
     );
 #endif
@@ -1816,6 +1867,27 @@ __device__ __noinline__ void
   // ablation flag and compare inside one build.
 #ifndef MPK_NO_OPROJ_SKIP_GATE
   if (!does_oproj) {
+#if defined(MPK_QKV_L2PF)
+#if !defined(MPK_MOE_XCD_PAIR) || !defined(MPK_PREFETCH_NEXT_QKV) ||        \
+    MPK_NUM_XCDS != 8 || defined(MPK_QKV_KSPLIT)
+#error "MPK_QKV_L2PF: 8 XCDs, MPK_MOE_XCD_PAIR, MPK_PREFETCH_NEXT_QKV"
+#endif
+    // No MoE tile on this rank: warm this XCD's L2 with the next
+    // layer's QKV weights while HBM is quiet, so the QKV workers'
+    // Phase 9 prefetch of the same lines is served from L2.
+    {
+      constexpr int kL2pfFirst = 23;
+      if (xcd_rank >= kL2pfFirst && input_ptrs[24] != nullptr) {
+        for (int t = xcd_rank - kL2pfFirst; t < qkv_n_wgs_per_xcd;
+             t += workers_per_xcd - kL2pfFirst) {
+          qkv_prefetch_weights_lds<QKV_BATCH_SIZE,
+                                   QKV_OUTPUT_PER_WG,
+                                   QKV_REDUCTION_SIZE>(
+              input_ptrs[24], qkv_n_wgs_per_xcd, t);
+        }
+      }
+    }
+#endif
     int *oproj_hier_shared = static_cast<int *>(input_ptrs[16]);
 #ifdef MPK_AID_SPLIT_FLAGS
     // Second consumer of the O-proj release flags, in a different file from
@@ -2870,8 +2942,21 @@ __device__ __noinline__ void
     // input_ptrs[24] is null on the last layer of the iteration -- see the
     // publish site in persistent_kernel.cuh for why nothing may be staged
     // across the iteration boundary.
+#ifdef MPK_RET_WARM
+    // The epilogue restores v41 from the frame slot at s33+0, written by
+    // the prologue before the MoE stream evicted it: touch it now so the
+    // restore hits L2. a31 is caller-saved and unused here; the
+    // epilogue's vmcnt(0) retires this load before the return.
+    asm volatile("scratch_load_dword a31, off, s33" ::: "a31");
+#endif
     if (input_ptrs[24] != nullptr &&
         qkv_does_qkv
+#if defined(MPK_GATE_DEFER) && defined(MPK_GATE_DEFER_PF_LATE)
+        && false  // prefetched at the top of the next layer instead
+#endif
+#ifdef MPK_QKV_PF_ABLATE
+        && false  // TIMING ONLY: no QKV weight DMA for layers 1..35
+#endif
 #ifdef MPK_QKV_PF_WAVE_SPLIT
         // ── Keep the poller's wave out of the pre-gate DMA ─────────────────
         //
@@ -2971,7 +3056,16 @@ __device__ __noinline__ void
     // like-for-like wait span: the pre-gate half is release-publishing work,
     // not waiting, so folding it in overstates the gate.
     MPK_PHASE_MARK(_pslot_w, 9);
+#ifdef MPK_GATE_DEFER
+    bool const gd_defer =
+        (task_layer_idx % MPK_GD_LAYERS) != MPK_GD_LAYERS - 1;
+    if (tid == 0 && MPK_LAYER_GATE_JOINS && gd_defer) {
+      s_gd_prev = s_layer_rel_prev;
+    }
+    if (tid == 0 && MPK_LAYER_GATE_JOINS && !gd_defer) {
+#else
     if (tid == 0 && MPK_LAYER_GATE_JOINS) {
+#endif
 #if MPK_NUM_XCDS == 4
       // Every XCD publishes only its own flag, so the gate reads all four.
       // The reported `observed` packs which flags are short in bits 0..3 and

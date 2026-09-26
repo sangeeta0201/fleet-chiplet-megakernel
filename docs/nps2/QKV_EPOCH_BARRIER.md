@@ -194,3 +194,80 @@ prefetch issue (it held waves 1-3's prefetch share behind wave 0's publish
 drain). Timing probes kept opt-in: `MPK_TOPK_OWN_AID_PROBE` (TopK waits on
 own-AID logits only, <= -0.4%), `MPK_QKV_WS_LOCAL_PROBE`, and the ablation
 switches `MPK_WSFC_READ_PRODUCER` / `MPK_WSFC_NO_WRITERS`.
+
+## Serial latency on the critical chain (2026-09-26)
+
+Per-rank phase slots, NPS1 vs NPS2 on the same build, show where the NPS2
+lead comes from and why it is ~4-5% end to end while local streaming
+benchmarks gain 15-20%. The ~37 us per-layer critical chain runs through
+ranks 0-9 (QKV -> attention -> O-proj -> router -> TopK -> MoE, serially).
+Rank 0, ns per layer, NPS1 / NPS2: inter-layer 2383 / 2405, QKV 5251 / 5251,
+attention 2783 / 2803, TopK 3365 / 3336, O-proj + router 7771 / 7036 (-9.5%),
+MoE 12134 / 11702 (-3.6%), epoch + release + P9 + gate 4989 / 4334 (-13%).
+About 14 us of the chain is ALU, LDS, call overhead and dependent L2-hit
+latency, identical in both modes; the MoE's W13 already streams at the HBM
+bandwidth both modes share. Locality pays only in the latency-bound local
+accesses and the sync segments, which is where the lead is.
+
+Everything below is mode-neutral latency on that chain. All flags opt-in,
+all bit-exact, the 16-token hash green on every run; A/B/A/B/A, NPS2.
+
+* `MPK_LTK_DPP`: the local TopK's 24 dependent `__shfl_xor` steps (40
+  `ds_bpermute`, one LDS round trip each) become DPP moves reading the same
+  partner lanes (quad_perm for xor 1/2, row_ror:8 for xor 8, row_ror 4 or 12
+  chosen per lane for xor 4). A 1.377 / 1.380 / 1.377 vs B 1.357 / 1.355,
+  -1.60%. The TopK end moves from 3.1 to 2.5 us after the last router logit.
+* `MPK_OPROJ_AMAX_DPP` (existing) + `MPK_PQ_AMAX_DPP` (router pass-2
+  prequant): 16-lane amax on DPP, O-proj kernel `ds_bpermute` 18 -> 3.
+  A 1.359 / 1.356 / 1.359 vs B 1.350 / 1.354, -0.44%. Max reductions are
+  exact under any pairing; sums only with the same partner lanes.
+* `MPK_QKV_PRO_FAST`: the RMSNorm gamma loads go out before the fold, the
+  fold's sum of squares uses `__builtin_fmaf` instead of
+  `asm volatile v_fmac_f32` (same FMA, same order, but the asm was a
+  scheduling barrier), and wave 0's cross-wave reduce uses quad_perm DPP.
+  A 1.353 / 1.354 / 1.353 vs B 1.344 / 1.347, -0.58%.
+* `MPK_QKV_POS_CACHE`: `compute_pos` (qo_indptr -> kv_indptr /
+  kv_last_page_len -> kv_indices, three dependent round trips per QKV worker
+  per layer) runs once per token; layers 1-35 read the result from a static
+  LDS slot. A 1.347 / 1.346 / 1.352 vs B 1.340 / 1.347, -0.36%, no result.
+* `MPK_QKV_EPI_PF`: the epilogue's bias quad is loaded at kernel entry and
+  the RoPE cos/sin pair right after `compute_pos`, instead of two serial
+  round trips after the MFMA (the bias load was generic, i.e. FLAT). QKV kernel
+  100 -> 104 VGPRs, scratch unchanged. A 1.348 / 1.351 / 1.350 vs B 1.344 /
+  1.345, -0.38%.
+* MPK_XOUT_GLOBAL_ST + MPK_QKV_POS_CACHE + MPK_QKV_EPI_PF together: QKV
+  kernel 116 VGPRs and 16 B scratch (one more callee-saved spill in this
+  noinline callee), B 1.353 vs A 1.349 / 1.349 -- worse than EPI_PF alone.
+  Watch .num_vgpr / private_seg_size of the kvupd kernel on every change.
+
+No result or loss, kept opt-in:
+
+* `MPK_XOUT_GLOBAL_ST`: the fold's x_out store was a `flat_store_dwordx2`,
+  and a pending FLAT access turns every later wait into `vmcnt(0)`, splitting
+  fold iterations 2 and 3 into two round trips each. Typed AS(1) store:
+  A 1.356 / 1.348 / 1.353 vs B 1.350 / 1.349, -0.21%, no result. The fold's
+  loads mostly hit in L2/MALL, so a round trip there is short.
+* `MPK_XOUT_SLICE_WRITER` (one x_out writer per XCD, only its own O-proj
+  slice): +0.14% alone, +0.90% on top of `MPK_QKV_PRO_FAST`.
+* `MPK_QKV_L2PF` (ranks 23-30 warm this XCD's L2 with the next layer's QKV
+  weights): +0.15%. The warm-up runs before the MoE streams through L2, and
+  the Phase 9 DMA loads are `sc0 nt`, which refetch anyway.
+* `MPK_FOLD_PIPE` (all 15 fold loads first): +0.33%, QKV function 98 -> 150
+  VGPRs and 12 -> 80 B scratch (callee-saved spills in a noinline callee).
+* `MPK_GATE_DEFER` (Phase 9 gate moved to the next layer's top): +1.99%; the
+  QKV weight prefetch then lands too late.
+* `MPK_RET_WARM` (touch the fused layer's frame slot before its epilogue so
+  the v41 restore hits L2): inter-layer "ret" -55 ns on MoE and idle ranks,
+  unchanged on QKV ranks. Not worth a flag.
+
+Instrument note: `MPK_IL_LDS`'s "ret" starts at the slot-12 mark, and that
+mark does the span bookkeeping (13-slot accumulation, periodic global
+writes) after taking its timestamp, so ~1 us of the 1.45 us "ret" is the
+recorder itself (recorder builds run ~0.035 ms/token slower). The real
+return is a few hundred ns; setup (0.64 us) and call (0.38 us) are real.
+The Sep-23 1.68 vs 1.86 us "NPS2-only return" carried the same overhead in
+both modes and is gone on the current build (1453-1463 vs 1453-1466 ns).
+
+Long-context gates for the DPP flags + `MPK_QKV_PRO_FAST`: 1k prompt at 31
+KV chunks equals torch 16/16, 3k at 24 chunks equals 3k at 8 chunks.
+
