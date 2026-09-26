@@ -317,9 +317,29 @@ __device__ __noinline__ void
 #if defined(MPK_KV_SW_IDLE) && defined(MPK_KV_CHUNKS_ADAPTIVE)
   // A sliding window spans at most (W + 30) / 16 tiles; at <= 64 tiles the
   // adaptive split uses 8 chunks, so workers >= 8 hold no tiles.
-  bool const attn_idle = (SLIDING_WINDOW > 0) &&
-                         ((SLIDING_WINDOW + 30) / 16 <= 64) &&
-                         (NUM_KV_CHUNKS > 8) && (attn_chunk >= 8);
+  bool const attn_idle_sw = (SLIDING_WINDOW > 0) &&
+                            ((SLIDING_WINDOW + 30) / 16 <= 64) &&
+                            (NUM_KV_CHUNKS > 8) && (attn_chunk >= 8);
+#ifdef MPK_KV_FULL_IDLE
+  // Full-attention layers: the adaptive chunk count for one token more than
+  // the metadata reports. Read before the QKV epoch, the metadata lags the
+  // current token by at most one and the count is monotone in the context,
+  // so a worker at or above it holds no tiles.
+  int attn_ne_up = NUM_KV_CHUNKS;
+  if constexpr (SLIDING_WINDOW == 0 && NUM_KV_CHUNKS > 8) {
+    if (qkv_attn_rank < ATTN_PARTICIPANTS && attn_chunk >= 8) {
+      int const np = kv_indptr[attn_req + 1] - kv_indptr[attn_req];
+      int const seq = (np - 1) * PAGE_SIZE + kv_last_page_len[attn_req] + 1;
+      attn_ne_up = mpk_kv_chunks_eff<NUM_KV_CHUNKS>((seq + 15) / 16);
+    }
+  }
+  bool const attn_idle_full = (SLIDING_WINDOW == 0) && (NUM_KV_CHUNKS > 8) &&
+                              (attn_chunk >= attn_ne_up);
+#else
+  constexpr bool attn_idle_full = false;
+  constexpr int attn_ne_up = NUM_KV_CHUNKS;
+#endif
+  bool const attn_idle = attn_idle_sw || attn_idle_full;
 #else
   constexpr bool attn_idle = false;
 #endif
@@ -981,7 +1001,12 @@ __device__ __noinline__ void
 #ifdef MPK_KV_CHUNKS_ADAPTIVE
       // Set by this worker's own attention call; the merger is always one
       // of the chunk workers.
+#if defined(MPK_KV_SW_IDLE)
+      int attn_live_chunks =
+          attn_idle ? (attn_idle_full ? attn_ne_up : 8) : NUM_KV_CHUNKS;
+#else
       int attn_live_chunks = attn_idle ? 8 : NUM_KV_CHUNKS;
+#endif
 #endif
       using bf16_t = __hip_bfloat16;
       void const *offset_k = reinterpret_cast<bf16_t const *>(output_ptrs[1]) +
@@ -1025,6 +1050,21 @@ __device__ __noinline__ void
           attn_scale,
           SLIDING_WINDOW,
           nullptr); // no sinks per-chunk
+#endif
+#if defined(MPK_KV_FULL_IDLE) && defined(MPK_KV_SW_IDLE)
+      // Inside the merge's loop bound an idle worker's slot still needs the
+      // empty-chunk LSE the attention call would have stamped.
+      if (attn_idle_full) {
+        int const bucket =
+            attn_ne_up <= 8 ? 8 : (attn_ne_up <= 16 ? 16 : NUM_KV_CHUNKS);
+        if (attn_chunk < bucket && tid < NUM_Q_PER_KV) {
+          constexpr int LSE_STRIDE = NUM_KV_HEADS * NUM_KV_CHUNKS * NUM_Q_PER_KV;
+          reinterpret_cast<float *>(input_ptrs[8])
+              [qo_indptr[attn_req] * LSE_STRIDE +
+               attn_kv_head * NUM_KV_CHUNKS * NUM_Q_PER_KV +
+               attn_chunk * NUM_Q_PER_KV + tid] = -1e30f;
+        }
+      }
 #endif
 #ifdef MPK_ATTN_SETPRIO
       asm volatile("s_setprio 0");

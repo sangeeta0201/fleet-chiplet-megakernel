@@ -106,3 +106,25 @@ instruction without it; scan the build's `.s` after changing any of them.
 - At long context the attention critical path is the slowest chunk (the one
   crossing a KV page boundary) plus the merge run by the die's last arriver
   (~3.5 us per full layer at 16k, both modes).
+
+## Full-attention idle chunk workers: `MPK_KV_FULL_IDLE` (2026-09-26)
+
+With `MPK_KV_CHUNKS_ADAPTIVE` a full-attention layer below ~4k tokens of
+context has fewer live chunks than compiled ones (8 up to ~1k tokens, 16 at
+~2k, of 31). The workers of the empty chunks still polled the QKV epoch and
+made an attention call that found no tiles. `MPK_KV_FULL_IDLE=1` (needs
+ADAPTIVE) has each chunk worker derive the live count from `kv_indptr` /
+`kv_last_page_len` before the epoch and skip the poll and the call when its
+chunk is past it, as `MPK_KV_SW_IDLE` does for sliding layers. Skipped
+workers still arrive at both counters. When the merge bucket covers a
+skipped chunk (live 9-15 read by the 16-chunk loop), its worker stamps the
+chunk's lse slots with -1e30 so the merge weights it 0.
+
+NPS2, 400-token decode compiled at 31 chunks, A/B/A/B/A: 1.479 / 1.477 /
+1.483 ms without, 1.468 / 1.465 with (-0.9%, both B below the A range).
+Bit-exact: 16-token hash, the 400-token text vs the 8-chunk build, 1k at 31
+chunks and 3k at 24 vs their references, and a 16k decode (43,433 chars
+identical). From ~4k tokens every chunk is live, so it is neutral there
+(16k decode, one run: 250 / 1k / 2k / 4k / 8k / 12k / 16k = 1.481 / 1.498 /
+1.519 / 1.543 / 1.575 / 1.603 / 1.634 vs 1.484 / 1.504 / 1.519 / 1.541 /
+1.573 / 1.600 / 1.630 ms).
