@@ -83,3 +83,26 @@ exactly that (`s_cmp` before it, `s_cselect` after it) and silently skipped a
 store. Fleet's ISA had no such case (all 16 sites checked), and the 16k decode
 is byte-identical with the clobber. The MoE and LM-head asm use the same
 instruction without it; scan the build's `.s` after changing any of them.
+
+## Streaming K/V loads and the scan's bound (2026-09-26)
+
+- `MPK_ATTN_WL_NT=1`: the DMA scan's K/V loads carry `sc0 nt` (KV is read once
+  per token per layer), as the weight streams do. Bit-exact. NPS2 16k decode,
+  A/B/A/B/A: average 1.599 / 1.601 / 1.603 -> 1.560 / 1.561 (-2.5%); 1k -0.9%,
+  4k -1.3%, 8k -2.6%, 12k -3.5%, 16k -4.2% (1.693 -> 1.622); text identical.
+  The attention-shaped benchmark (`attn_lat`, 31 WGs/die, pure stream) shows
+  why: `sc0 nt` lifts a local stream from ~4.1 to ~4.8 TB/s and does nothing
+  for a remote one.
+- What bounds the long scan (timing-only `MPK_ATTN_PROBE`, lean loop, 16k):
+  no KV traffic 1.643, no tile compute 1.636, both 1.689 -- compute and KV
+  streaming each ~0.16 ms/token, partly overlapped.
+- Null, kept opt-in: `MPK_ATTN_WL_LEAN` (scalar loop control, full-tile steady
+  state, rescale skipped when every factor is exactly 1.0f: 278 -> 219
+  instructions per tile, bit-exact, 1.599 vs 1.601) and `MPK_ATTN_WL_PIPE`
+  (tile t+1's QK next to tile t's softmax/PV, bit-exact, 1.604-1.607 vs
+  1.607). Neither issue slots nor a single dependency chain bound the loop.
+- `MPK_CHAT_DATE=YYYY-MM-DD` (demo.py) pins the chat template's date line so
+  outputs and torch references compare across days.
+- At long context the attention critical path is the slowest chunk (the one
+  crossing a KV page boundary) plus the merge run by the die's last arriver
+  (~3.5 us per full layer at 16k, both modes).

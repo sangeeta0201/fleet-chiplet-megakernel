@@ -1490,8 +1490,13 @@ if __name__ == "__main__":
             """Tokenize one prompt, applying the chat template if there is one."""
             if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template:
                 messages = [{"role": "user", "content": text}]
+                # The template dates the system message with strftime_now();
+                # a render variable of that name overrides it.
+                _chat_kw = ({"strftime_now": (lambda fmt: os.environ["MPK_CHAT_DATE"])}
+                            if os.environ.get("MPK_CHAT_DATE") else {})
                 formatted = tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True)
+                    messages, tokenize=False, add_generation_prompt=True,
+                    **_chat_kw)
                 enc = tokenizer([formatted], return_tensors="pt",
                                 add_special_tokens=False).to("cuda")
             else:

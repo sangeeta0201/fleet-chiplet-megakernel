@@ -38,6 +38,32 @@
 #if MPK_ATTN_WL_DMA > 0 && MPK_ATTN_WL_RING > 1
 #error "MPK_ATTN_WL_DMA replaces MPK_ATTN_WL_RING; set one"
 #endif
+// Software-pipelined DMA scan: tile t+1's QK next to tile t's softmax/PV.
+#ifndef MPK_ATTN_WL_PIPE
+#define MPK_ATTN_WL_PIPE 0
+#endif
+#if MPK_ATTN_WL_PIPE && MPK_ATTN_WL_DMA < 2
+#error "MPK_ATTN_WL_PIPE needs MPK_ATTN_WL_DMA >= 2"
+#endif
+// DMA scan loop with scalar loop control, full-tile steady state and a
+// rescale skipped when every head's factor is exactly 1.0f.
+#ifndef MPK_ATTN_WL_LEAN
+#define MPK_ATTN_WL_LEAN 0
+#endif
+// Streaming (sc0 nt) K/V DMA loads in the wave-local scan.
+#if defined(MPK_ATTN_WL_NT) && MPK_ATTN_WL_NT
+#define MPK_ATTN_DMA_MOD "sc0 nt "
+#else
+#define MPK_ATTN_DMA_MOD ""
+#endif
+// Timing-only probes of the lean scan (wrong output): 1 = no KV traffic,
+// 2 = no per-tile compute.
+#ifndef MPK_ATTN_PROBE
+#define MPK_ATTN_PROBE 0
+#endif
+#if MPK_ATTN_WL_LEAN && (MPK_ATTN_WL_DMA < 2 || MPK_ATTN_WL_PIPE)
+#error "MPK_ATTN_WL_LEAN needs MPK_ATTN_WL_DMA >= 2 and not MPK_ATTN_WL_PIPE"
+#endif
 #if MPK_ATTN_WL_RING > 1 && !MPK_ATTN_SCALAR_PAGE
 #error "MPK_ATTN_WL_RING > 1 needs MPK_ATTN_SCALAR_PAGE"
 #endif
@@ -962,16 +988,16 @@ __device__ __noinline__ void
     asm volatile("s_nop 4\n"
                  "s_mov_b32 m0, %[mk]\n"
                  "s_nop 0\n"
-                 "buffer_load_dwordx4 %[vo0], %[kr], %[so] offen lds\n"
+                 "buffer_load_dwordx4 %[vo0], %[kr], %[so] offen " MPK_ATTN_DMA_MOD "lds\n"
                  "s_addk_i32 m0, 0x400\n"
                  "s_nop 0\n"
-                 "buffer_load_dwordx4 %[vo1], %[kr], %[so] offen lds\n"
+                 "buffer_load_dwordx4 %[vo1], %[kr], %[so] offen " MPK_ATTN_DMA_MOD "lds\n"
                  "s_mov_b32 m0, %[mv]\n"
                  "s_nop 0\n"
-                 "buffer_load_dwordx4 %[vo0], %[vr], %[so] offen lds\n"
+                 "buffer_load_dwordx4 %[vo0], %[vr], %[so] offen " MPK_ATTN_DMA_MOD "lds\n"
                  "s_addk_i32 m0, 0x400\n"
                  "s_nop 0\n"
-                 "buffer_load_dwordx4 %[vo1], %[vr], %[so] offen lds\n"
+                 "buffer_load_dwordx4 %[vo1], %[vr], %[so] offen " MPK_ATTN_DMA_MOD "lds\n"
                  :
                  : [vo0] "v"(dma_vo0), [vo1] "v"(dma_vo1),
                    [kr] "s"(k_rsrc), [vr] "s"(v_rsrc), [so] "s"(soff),
@@ -1001,6 +1027,286 @@ __device__ __noinline__ void
     }
   }
 
+#if MPK_ATTN_WL_PIPE
+  // Tile t+1's LDS reads, K/V conversion, QK MFMAs and max reduction depend
+  // only on Q and its own slot, not on tile t's online-softmax state, so
+  // iteration t issues them next to tile t's rescale, exp and PV MFMAs and the
+  // scheduler fills each chain's latency with the other. Tile t's slot was read
+  // into registers one iteration earlier, so it is refilled first and the ring
+  // keeps WLD - 1 tiles in flight behind the one being read.
+  auto wl_len = [&](int t) -> int {
+    int const len = w_len - t * KV_TILE;
+    return len > KV_TILE ? KV_TILE : len;
+  };
+  auto wl_qk = [&](int t, __mfma_hd64_fp32x4 &sc, float &tmax) {
+    int const tlen = wl_len(t);
+    char const *const sk = dma_slots + (t % WLD) * DMA_SLOT;
+    _Float16 kr[NUM_K32][8];
+#pragma unroll
+    for (int kc = 0; kc < NUM_K32; kc++) {
+      uint4 const raw = *reinterpret_cast<uint4 const *>(
+          sk + (midx * HEAD_DIM + kc * 32 + kgrp * 8) * 2);
+      __cvt_bf16x4_to_fp16(&kr[kc][0], make_uint2(raw.x, raw.y));
+      __cvt_bf16x4_to_fp16(&kr[kc][4], make_uint2(raw.z, raw.w));
+    }
+    sc = {0, 0, 0, 0};
+#pragma unroll
+    for (int kc = 0; kc < NUM_K32; kc++) {
+      sc = __mfma_qk_hd64(sc, kr[kc], qr[kc]);
+    }
+    sc[0] *= scale_s;
+    sc[1] *= scale_s;
+    sc[2] *= scale_s;
+    sc[3] *= scale_s;
+#pragma unroll
+    for (int h = 0; h < 4; h++) {
+      if (kgrp * 4 + h >= tlen) {
+        sc[h] = -INFINITY;
+      }
+    }
+    float m = fmaxf(fmaxf(sc[0], sc[1]), fmaxf(sc[2], sc[3]));
+    {
+      float a = m, b = m;
+      asm volatile(MPK_HD64_PERM_PREFIX "v_permlane32_swap_b32_e32 %0, %1"
+                   : "+v"(a), "+v"(b));
+      m = fmaxf(a, b);
+      a = m;
+      b = m;
+      asm volatile(MPK_HD64_PERM_PREFIX "v_permlane16_swap_b32_e32 %0, %1"
+                   : "+v"(a), "+v"(b));
+      m = fmaxf(a, b);
+    }
+    tmax = m;
+  };
+  auto wl_v = [&](int t, __mfma_hd64_fp16x4 (&va)[DBLK]) {
+    int const tlen = wl_len(t);
+    char const *const sv = dma_slots + (t % WLD) * DMA_SLOT + 2048;
+#pragma unroll
+    for (int d = 0; d < DBLK; d++) {
+      unsigned short const *const vp =
+          reinterpret_cast<unsigned short const *>(sv) +
+          (kgrp * 4) * HEAD_DIM + d * 16 + midx;
+      _Float16 vf[4];
+      __cvt_bf16x4_to_fp16(
+          vf, make_uint2(static_cast<unsigned>(vp[0]) |
+                             (static_cast<unsigned>(vp[HEAD_DIM]) << 16),
+                         static_cast<unsigned>(vp[2 * HEAD_DIM]) |
+                             (static_cast<unsigned>(vp[3 * HEAD_DIM]) << 16)));
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        va[d][j] = (kgrp * 4 + j < tlen) ? vf[j] : (_Float16)0.0f;
+      }
+    }
+  };
+  auto wl_pv = [&](__mfma_hd64_fp32x4 const &sc, float tmax,
+                   __mfma_hd64_fp16x4 const (&va)[DBLK]) {
+    float const new_max = fmaxf(m_running, tmax);
+    float const rescale = (m_running == -INFINITY)
+                              ? 0.0f
+                              : __fast_exp2_hd64(m_running - new_max);
+#pragma unroll
+    for (int d = 0; d < DBLK; d++) {
+      o_acc[d][0] *= rescale;
+      o_acc[d][1] *= rescale;
+      o_acc[d][2] *= rescale;
+      o_acc[d][3] *= rescale;
+    }
+    float const w0 = __fast_exp2_hd64(sc[0] - new_max);
+    float const w1 = __fast_exp2_hd64(sc[1] - new_max);
+    float const w2 = __fast_exp2_hd64(sc[2] - new_max);
+    float const w3 = __fast_exp2_hd64(sc[3] - new_max);
+    l_head[0] = l_head[0] * rescale + w0;
+    l_head[1] = l_head[1] * rescale + w1;
+    l_head[2] = l_head[2] * rescale + w2;
+    l_head[3] = l_head[3] * rescale + w3;
+    m_running = new_max;
+    __mfma_hd64_fp16x4 pb;
+    pb[0] = (_Float16)w0;
+    pb[1] = (_Float16)w1;
+    pb[2] = (_Float16)w2;
+    pb[3] = (_Float16)w3;
+#pragma unroll
+    for (int d = 0; d < DBLK; d++) {
+      o_acc[d] = __mfma_pv_hd64(
+          o_acc[d], (_Float16 const *)&va[d], (_Float16 const *)&pb);
+    }
+  };
+  if (w_ntiles > 0) {
+    __mfma_hd64_fp32x4 sc_cur;
+    float tm_cur;
+    __mfma_hd64_fp16x4 va_cur[DBLK];
+    dma_wait(0);
+    wl_qk(0, sc_cur, tm_cur);
+    wl_v(0, va_cur);
+    for (int t = 0; t + 1 < w_ntiles; t++) {
+      if (t + WLD < w_ntiles) {
+        asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+        dma_issue(t + WLD);
+      }
+      dma_wait(t + 1);
+      __mfma_hd64_fp32x4 sc_nxt;
+      float tm_nxt;
+      __mfma_hd64_fp16x4 va_nxt[DBLK];
+      wl_qk(t + 1, sc_nxt, tm_nxt);
+      wl_v(t + 1, va_nxt);
+      wl_pv(sc_cur, tm_cur, va_cur);
+      sc_cur = sc_nxt;
+      tm_cur = tm_nxt;
+#pragma unroll
+      for (int d = 0; d < DBLK; d++) {
+        va_cur[d] = va_nxt[d];
+      }
+    }
+    wl_pv(sc_cur, tm_cur, va_cur);
+  }
+#elif MPK_ATTN_WL_LEAN
+  // The tile count is wave-uniform, so loop control and the ring wait are
+  // scalar and the steady state waits on one constant vmcnt. Every tile but a
+  // wave's last is full, so padding masks and selects exist only in the tail.
+  // o_acc lives in the MFMA accumulators (AGPRs) and the per-tile rescale runs
+  // in VGPRs; it is applied only when some head's factor is not exactly 1.0f
+  // (a multiply by 1.0f is the identity, so skipping it is bit-exact).
+  int const wl_n = __builtin_amdgcn_readfirstlane(w_ntiles);
+  int const wl_len_s = __builtin_amdgcn_readfirstlane(w_len);
+  auto wl_wait = [&](int n_after) {
+    switch (n_after) {
+    case 0: asm volatile("s_waitcnt vmcnt(0)" ::: "memory"); break;
+    case 1: asm volatile("s_waitcnt vmcnt(4)" ::: "memory"); break;
+    case 2: asm volatile("s_waitcnt vmcnt(8)" ::: "memory"); break;
+    case 3: asm volatile("s_waitcnt vmcnt(12)" ::: "memory"); break;
+    case 4: asm volatile("s_waitcnt vmcnt(16)" ::: "memory"); break;
+    default: asm volatile("s_waitcnt vmcnt(20)" ::: "memory"); break;
+    }
+  };
+  auto wl_tile = [&](int t, bool full) {
+    int tile_len = KV_TILE;
+    if (!full) {
+      tile_len = wl_len_s - t * KV_TILE;
+      if (tile_len > KV_TILE) {
+        tile_len = KV_TILE;
+      }
+    }
+    char const *const sk = dma_slots + (t % WLD) * DMA_SLOT;
+    char const *const sv = sk + 2048;
+    _Float16 kr[NUM_K32][8];
+#pragma unroll
+    for (int kc = 0; kc < NUM_K32; kc++) {
+      uint4 const raw = *reinterpret_cast<uint4 const *>(
+          sk + (midx * HEAD_DIM + kc * 32 + kgrp * 8) * 2);
+      __cvt_bf16x4_to_fp16(&kr[kc][0], make_uint2(raw.x, raw.y));
+      __cvt_bf16x4_to_fp16(&kr[kc][4], make_uint2(raw.z, raw.w));
+    }
+    __mfma_hd64_fp16x4 va[DBLK];
+#pragma unroll
+    for (int d = 0; d < DBLK; d++) {
+      unsigned short const *const vp =
+          reinterpret_cast<unsigned short const *>(sv) +
+          (kgrp * 4) * HEAD_DIM + d * 16 + midx;
+      _Float16 vf[4];
+      __cvt_bf16x4_to_fp16(
+          vf, make_uint2(static_cast<unsigned>(vp[0]) |
+                             (static_cast<unsigned>(vp[HEAD_DIM]) << 16),
+                         static_cast<unsigned>(vp[2 * HEAD_DIM]) |
+                             (static_cast<unsigned>(vp[3 * HEAD_DIM]) << 16)));
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        va[d][j] = (full || kgrp * 4 + j < tile_len) ? vf[j] : (_Float16)0.0f;
+      }
+    }
+    __mfma_hd64_fp32x4 scores = {0, 0, 0, 0};
+#pragma unroll
+    for (int kc = 0; kc < NUM_K32; kc++) {
+      scores = __mfma_qk_hd64(scores, kr[kc], qr[kc]);
+    }
+    scores[0] *= scale_s;
+    scores[1] *= scale_s;
+    scores[2] *= scale_s;
+    scores[3] *= scale_s;
+    if (!full) {
+#pragma unroll
+      for (int h = 0; h < 4; h++) {
+        if (kgrp * 4 + h >= tile_len) {
+          scores[h] = -INFINITY;
+        }
+      }
+    }
+    float tile_max =
+        fmaxf(fmaxf(scores[0], scores[1]), fmaxf(scores[2], scores[3]));
+    {
+      float a = tile_max, b = tile_max;
+      asm volatile(MPK_HD64_PERM_PREFIX "v_permlane32_swap_b32_e32 %0, %1"
+                   : "+v"(a), "+v"(b));
+      tile_max = fmaxf(a, b);
+      a = tile_max;
+      b = tile_max;
+      asm volatile(MPK_HD64_PERM_PREFIX "v_permlane16_swap_b32_e32 %0, %1"
+                   : "+v"(a), "+v"(b));
+      tile_max = fmaxf(a, b);
+    }
+    float const new_max = fmaxf(m_running, tile_max);
+    float const rescale = (m_running == -INFINITY)
+                              ? 0.0f
+                              : __fast_exp2_hd64(m_running - new_max);
+    if (__builtin_amdgcn_ballot_w64(rescale != 1.0f) != 0) {
+#pragma unroll
+      for (int d = 0; d < DBLK; d++) {
+        o_acc[d][0] *= rescale;
+        o_acc[d][1] *= rescale;
+        o_acc[d][2] *= rescale;
+        o_acc[d][3] *= rescale;
+      }
+    }
+    float const w0 = __fast_exp2_hd64(scores[0] - new_max);
+    float const w1 = __fast_exp2_hd64(scores[1] - new_max);
+    float const w2 = __fast_exp2_hd64(scores[2] - new_max);
+    float const w3 = __fast_exp2_hd64(scores[3] - new_max);
+    l_head[0] = l_head[0] * rescale + w0;
+    l_head[1] = l_head[1] * rescale + w1;
+    l_head[2] = l_head[2] * rescale + w2;
+    l_head[3] = l_head[3] * rescale + w3;
+    m_running = new_max;
+    __mfma_hd64_fp16x4 pb;
+    pb[0] = (_Float16)w0;
+    pb[1] = (_Float16)w1;
+    pb[2] = (_Float16)w2;
+    pb[3] = (_Float16)w3;
+#pragma unroll
+    for (int d = 0; d < DBLK; d++) {
+      o_acc[d] = __mfma_pv_hd64(
+          o_acc[d], (_Float16 const *)&va[d], (_Float16 const *)&pb);
+    }
+  };
+  int t = 0;
+  for (; t + WLD < wl_n; t++) {
+    // WLD - 1 tiles were issued behind tile t, and it is not the last tile.
+    if constexpr (WLD == 2) {
+      asm volatile("s_waitcnt vmcnt(4)" ::: "memory");
+    } else if constexpr (WLD == 3) {
+      asm volatile("s_waitcnt vmcnt(8)" ::: "memory");
+    } else if constexpr (WLD == 4) {
+      asm volatile("s_waitcnt vmcnt(12)" ::: "memory");
+    } else if constexpr (WLD == 5) {
+      asm volatile("s_waitcnt vmcnt(16)" ::: "memory");
+    } else {
+      asm volatile("s_waitcnt vmcnt(20)" ::: "memory");
+    }
+#if MPK_ATTN_PROBE != 2
+    wl_tile(t, true);
+#endif
+    asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+#if MPK_ATTN_PROBE == 1
+    dma_issue((t + WLD) % WLD);
+#else
+    dma_issue(t + WLD);
+#endif
+  }
+  for (; t < wl_n; t++) {
+    wl_wait(wl_n - 1 - t);
+#if MPK_ATTN_PROBE != 2
+    wl_tile(t, t + 1 < wl_n);
+#endif
+  }
+#else
   for (int t = 0; t < w_ntiles; t++) {
     int const tile_start = t * KV_TILE;
     int tile_len = w_len - tile_start;
@@ -1116,6 +1422,7 @@ __device__ __noinline__ void
       dma_issue(t + WLD);
     }
   }
+#endif // MPK_ATTN_WL_PIPE
 #endif // MPK_ATTN_WL_DMA
 
   // ===== Cross-wave merge: once per chunk, not once per tile =====

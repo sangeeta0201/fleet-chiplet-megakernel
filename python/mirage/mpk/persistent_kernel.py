@@ -703,6 +703,18 @@ def get_compile_command(
         if _wl_dma != "":
             # LDS-DMA ring depth for the wave-local scan (default 0: registers).
             flags = flags + [f"-DMPK_ATTN_WL_DMA={int(_wl_dma)}"]
+        if os.environ.get("MPK_ATTN_PROBE", "") != "":
+            # Timing-only scan probes (wrong output): 1 no KV traffic, 2 no compute.
+            flags = flags + [f"-DMPK_ATTN_PROBE={int(os.environ['MPK_ATTN_PROBE'])}"]
+        if int(os.environ.get("MPK_ATTN_WL_NT", "0")) == 1:
+            # sc0 nt on the wave-local scan's K/V DMA loads.
+            flags = flags + ["-DMPK_ATTN_WL_NT=1"]
+        if int(os.environ.get("MPK_ATTN_WL_LEAN", "0")) == 1:
+            # DMA scan without per-tile bookkeeping (needs MPK_ATTN_WL_DMA >= 2).
+            flags = flags + ["-DMPK_ATTN_WL_LEAN=1"]
+        if int(os.environ.get("MPK_ATTN_WL_PIPE", "0")) == 1:
+            # Software-pipelined DMA scan (needs MPK_ATTN_WL_DMA >= 2).
+            flags = flags + ["-DMPK_ATTN_WL_PIPE=1"]
         _wl_ring = os.environ.get("MPK_ATTN_WL_RING", "")
         if _wl_ring != "":
             # K/V tiles in flight per wave in the wave-local scan (default 1).
