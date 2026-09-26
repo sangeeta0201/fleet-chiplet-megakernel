@@ -38,6 +38,15 @@
 #include "tasks/mi300/gang_moe_linear_mxfp4_mi300.cuh" // FP4xFP8 type defs + helpers
 #include "tasks/mi300/gang_rmsnorm_linear_bias_mi300.cuh" // RMSNorm prologue
 #include "tasks/mi300/moe_ws_layout.cuh" // MOE_WS_SLOTS, moe_ws_offset()
+#if defined(MPK_WSFC_READ_PRODUCER)
+#define MPK_WSLP_SLOT(s) ((s) + MOE_WS_SLOTS * ((s) >> 1))
+#elif defined(MPK_QKV_WS_LOCAL_PROBE)
+// TIMING ONLY: fold this AID's two ring slots twice (all local reads).
+#define MPK_WSLP_SLOT(s) \
+  (((s) & 1) + ((int)((kernel::mpk_prenorm_xcc() & 0x7) >> 2) << 1))
+#else
+#define MPK_WSLP_SLOT(s) (s)
+#endif
 
 namespace kernel {
 // MPK_PRENORM_AID reads the physical XCD where xcd_id is not in scope.
@@ -54,6 +63,38 @@ __device__ __forceinline__ unsigned mpk_prenorm_xcc() {
 // outright. These ext_vector_types can, which is what lets the ResAdd prologue
 // issue GLOBAL rather than generic FLAT loads -- see the comment at its use.
 typedef float _gl_f32x4 __attribute__((ext_vector_type(4)));
+#ifdef MPK_WS_FARCOPY
+// MPK_WSFC_V2 slow path: a slot of this AID's copy is still poisoned (its
+// far copy has not landed). Re-read all four slots past L2 from their
+// producer copies (slot s lives in copy s >> 1, never poisoned), in one
+// round -- the baseline fold's cost. Same slot order: bit-exact.
+__device__ __noinline__ float4 mpk_ws_farcopy_fold(float const *own,
+                                                   float const *prim0,
+                                                   int h, int off) {
+  (void)own;
+  static_assert(MOE_WS_SLOTS == 4, "four-slot fold");
+#ifdef MPK_WSFC_STATS
+  mpk_wsfc_stat(0, off);
+#endif
+  float4 v0, v1, v2, v3;
+  mpk_fc_ld16x4(prim0 + 0 * h + off, prim0 + 1 * h + off,
+                prim0 + MOE_WS_SLOTS * h + 2 * h + off,
+                prim0 + MOE_WS_SLOTS * h + 3 * h + off, v0, v1, v2, v3);
+  v0.x += v1.x;
+  v0.y += v1.y;
+  v0.z += v1.z;
+  v0.w += v1.w;
+  v0.x += v2.x;
+  v0.y += v2.y;
+  v0.z += v2.z;
+  v0.w += v2.w;
+  v0.x += v3.x;
+  v0.y += v3.y;
+  v0.z += v3.z;
+  v0.w += v3.w;
+  return v0;
+}
+#endif
 #ifdef MPK_WS_SYS_LOAD
 // sc0 sc1 buffer load: bypasses L1 and L2 without allocating, so the
 // workspace W2 rewrote from another XCD is never served from a stale
@@ -2129,6 +2170,17 @@ __device__ __noinline__ void gang_resaddf32_rmsnorm_linear_mxfp4_bias_kernel(
             ws4.w += slot4.w;
           }
 #endif
+#ifdef MPK_WS_FARCOPY
+          // A poisoned slot makes the sum NaN: four self-compares on the
+          // fast path, the validated fold only when one trips.
+          if (__builtin_expect((ws4.x != ws4.x) | (ws4.y != ws4.y) |
+                                   (ws4.z != ws4.z) | (ws4.w != ws4.w),
+                               0)) {
+            ws4 = mpk_ws_farcopy_fold((float const *)ws_base,
+                                      (float const *)workspace_f32_ptr,
+                                      REDUCTION_SIZE, off);
+          }
+#endif
 
           // Vectorized load: 4 bf16 from residual as uint2 (flat_load_dwordx2)
           uint2 res_packed;
@@ -2727,7 +2779,7 @@ __device__ __noinline__ void
 #endif
   // ── Step 0+1 FUSED: ResAddF32 + RMSNorm ───────────────────────────────
   {
-#ifdef MPK_WSF32_AID
+#if defined(MPK_WSF32_AID) && !defined(MPK_WSFC_READ_PRODUCER)
     float *d_ws = (float *)workspace_f32_ptr +
                   ((int)(kernel::mpk_prenorm_xcc() & 0x7) >=
                            (MPK_NUM_XCDS / 2)
@@ -2792,6 +2844,13 @@ __device__ __noinline__ void
                 d_residual + b * REDUCTION_SIZE);
         unsigned short *xout_base = d_x_out + b * REDUCTION_SIZE;
 
+#ifdef MPK_WS_FARCOPY
+#ifdef MPK_WS_SYS_LOAD
+#error "MPK_WS_FARCOPY's redo loop does not handle MPK_WS_SYS_LOAD"
+#endif
+        float const fc_ssq0 = ssq;  // MPK_WSFC_V4
+        int const fc_nc0 = n_cached;
+#endif
 #pragma unroll
         for (int off = tid * VEC; off < REDUCTION_SIZE; off += BLOCK_VEC) {
           // Sum the MoE expert contributions here, in fixed slot order, rather
@@ -2808,8 +2867,8 @@ __device__ __noinline__ void
           _gl_f32x4 const ws_v = mpk_ws_sys_ld(ws_rs, off);
 #else
           _gl_f32x4 const ws_v =
-              *(__attribute__((address_space(1))) _gl_f32x4 const *)(ws_base +
-                                                                     off);
+              *(__attribute__((address_space(1))) _gl_f32x4 const *)(
+                  ws_base + MPK_WSLP_SLOT(0) * REDUCTION_SIZE + off);
 #endif
           float4 ws4;
           ws4.x = ws_v[0];
@@ -2833,7 +2892,7 @@ __device__ __noinline__ void
 #else
             _gl_f32x4 const sv =
                 *(__attribute__((address_space(1))) _gl_f32x4 const *)(
-                    ws_base + s * REDUCTION_SIZE + off);
+                    ws_base + MPK_WSLP_SLOT(s) * REDUCTION_SIZE + off);
 #endif
             float4 slot4;
             slot4.x = sv[0];
@@ -2893,6 +2952,99 @@ __device__ __noinline__ void
           out_packed.y = (unsigned)o2 | ((unsigned)o3 << 16);
           __builtin_memcpy(xout_base + off, &out_packed, 8);
         }
+#ifdef MPK_WS_FARCOPY
+        // MPK_WSFC_V4: a far slot of this AID's copy was still poisoned
+        // (NaN reached ssq). Redo this thread's elements with every slot
+        // read from its producer's copy, in the same order.
+        if (__builtin_expect(ssq != ssq, 0)) {
+          ssq = fc_ssq0;
+          n_cached = fc_nc0;
+          int const fc_a = (int)(kernel::mpk_prenorm_xcc() & 0x7) >> 2;
+#define MPK_FC_ADJ(s) ((((s) >> 1) - fc_a) * MOE_WS_SLOTS * REDUCTION_SIZE)
+#pragma unroll
+          for (int off = tid * VEC; off < REDUCTION_SIZE; off += BLOCK_VEC) {
+#ifdef MPK_WS_SYS_LOAD
+            _gl_f32x4 const ws_v = mpk_ws_sys_ld(ws_rs, off);
+#else
+            _gl_f32x4 const ws_v =
+                *(__attribute__((address_space(1))) _gl_f32x4 const *)(
+                    ws_base + MPK_WSLP_SLOT(0) * REDUCTION_SIZE + off + MPK_FC_ADJ(0));
+#endif
+            float4 ws4;
+            ws4.x = ws_v[0];
+            ws4.y = ws_v[1];
+            ws4.z = ws_v[2];
+            ws4.w = ws_v[3];
+#ifndef MPK_ABLATE_WS_FOLD
+#pragma unroll
+            for (int s = 1; s < MOE_WS_SLOTS; s++) {
+#ifdef MPK_WS_SYS_LOAD
+              _gl_f32x4 const sv = mpk_ws_sys_ld(ws_rs, s * REDUCTION_SIZE + off);
+#else
+              _gl_f32x4 const sv =
+                  *(__attribute__((address_space(1))) _gl_f32x4 const *)(
+                      ws_base + MPK_WSLP_SLOT(s) * REDUCTION_SIZE + off + MPK_FC_ADJ(s));
+#endif
+              float4 slot4;
+              slot4.x = sv[0];
+              slot4.y = sv[1];
+              slot4.z = sv[2];
+              slot4.w = sv[3];
+              ws4.x += slot4.x;
+              ws4.y += slot4.y;
+              ws4.z += slot4.z;
+              ws4.w += slot4.w;
+            }
+#endif
+#ifdef MPK_WS_SYS_LOAD
+            _gl_u32x2 const rv_v = mpk_res_sys_ld(res_rs, off);
+#else
+            _gl_u32x2 const rv_v =
+                *(__attribute__((address_space(1))) _gl_u32x2 const *)(res_base +
+                                                                       off);
+#endif
+            uint2 res_packed;
+            res_packed.x = rv_v[0];
+            res_packed.y = rv_v[1];
+
+            unsigned r0 = (res_packed.x & 0xFFFFu) << 16;
+            unsigned r1 = res_packed.x & 0xFFFF0000u;
+            unsigned r2 = (res_packed.y & 0xFFFFu) << 16;
+            unsigned r3 = res_packed.y & 0xFFFF0000u;
+            float rv0, rv1, rv2, rv3;
+            __builtin_memcpy(&rv0, &r0, 4);
+            __builtin_memcpy(&rv1, &r1, 4);
+            __builtin_memcpy(&rv2, &r2, 4);
+            __builtin_memcpy(&rv3, &r3, 4);
+
+            float s0 = ws4.x + rv0;
+            float s1 = ws4.y + rv1;
+            float s2 = ws4.z + rv2;
+            float s3 = ws4.w + rv3;
+
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s0));
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s1));
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s2));
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s3));
+
+            s_cache[n_cached + 0] = s0;
+            s_cache[n_cached + 1] = s1;
+            s_cache[n_cached + 2] = s2;
+            s_cache[n_cached + 3] = s3;
+            n_cached += _VEC;
+
+            unsigned short o0 = _gang_float_to_bf16(s0);
+            unsigned short o1 = _gang_float_to_bf16(s1);
+            unsigned short o2 = _gang_float_to_bf16(s2);
+            unsigned short o3 = _gang_float_to_bf16(s3);
+            uint2 out_packed;
+            out_packed.x = (unsigned)o0 | ((unsigned)o1 << 16);
+            out_packed.y = (unsigned)o2 | ((unsigned)o3 << 16);
+            __builtin_memcpy(xout_base + off, &out_packed, 8);
+          }
+#undef MPK_FC_ADJ
+        }
+#endif
       }
 
       // ── Pass 2's norm weights, issued here rather than at their use ──────

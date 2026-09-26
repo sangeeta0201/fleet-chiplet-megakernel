@@ -703,6 +703,63 @@ __device__ __forceinline__ void st_wt_zero128(void *addr) {
 // stops in the producing XCD's L2, which is NOT coherent across XCDs (see
 // threadfence_gpu below), so the consumer reads whatever its own L2 holds.
 // `addr` must be 16-byte aligned.
+#ifdef MPK_WS_FARCOPY
+// Marks a workspace slot the other AID's Phase 9 helper has not copied
+// yet: a signalling-NaN payload, which arithmetic never produces.
+constexpr unsigned MPK_WS_POISON = 0x7FBADBADu;
+// MPK_WSFC_V2: the W2 tile's 16 float4 outputs, handed from the MoE
+// epilogue to the fused layer's post-arrival far store.
+__shared__ float4 g_wsfc_val[16];
+__shared__ int g_wsfc_cnt;
+__shared__ int g_wsfc_base;
+#ifdef MPK_WSFC_STATS
+__device__ unsigned g_wsfc_stat[3];
+__device__ __noinline__ void mpk_wsfc_stat(int k, int v) {
+  unsigned n = atomicAdd(&g_wsfc_stat[k], 1u) + 1u;
+  if ((n & (n - 1u)) == 0u || (k == 2 && n <= 8u)) {
+    printf("[WSFC] %s=%u v=%d\n",
+           k == 0 ? "slow" : (k == 1 ? "copied" : "skipped"), n, v);
+  }
+}
+#endif
+#ifndef MPK_WS_FC_LAYERS
+#define MPK_WS_FC_LAYERS 36
+#endif
+typedef float mpk_fc_f4 __attribute__((ext_vector_type(4)));
+__device__ __forceinline__ float4 mpk_fc_ld16(float const *p) {
+  mpk_fc_f4 v;
+  asm volatile("global_load_dwordx4 %0, %1, off sc0 sc1\n\t"
+               "s_waitcnt vmcnt(0)"
+               : "=v"(v)
+               : "v"(p)
+               : "memory");
+  return make_float4(v[0], v[1], v[2], v[3]);
+}
+__device__ __forceinline__ void mpk_fc_ld16x4(float const *p0, float const *p1,
+                                              float const *p2, float const *p3,
+                                              float4 &r0, float4 &r1,
+                                              float4 &r2, float4 &r3) {
+  mpk_fc_f4 a, b, c, d;
+  asm volatile("global_load_dwordx4 %0, %4, off sc0 sc1\n\t"
+               "global_load_dwordx4 %1, %5, off sc0 sc1\n\t"
+               "global_load_dwordx4 %2, %6, off sc0 sc1\n\t"
+               "global_load_dwordx4 %3, %7, off sc0 sc1\n\t"
+               "s_waitcnt vmcnt(0)"
+               : "=&v"(a), "=&v"(b), "=&v"(c), "=&v"(d)
+               : "v"(p0), "v"(p1), "v"(p2), "v"(p3)
+               : "memory");
+  r0 = make_float4(a[0], a[1], a[2], a[3]);
+  r1 = make_float4(b[0], b[1], b[2], b[3]);
+  r2 = make_float4(c[0], c[1], c[2], c[3]);
+  r3 = make_float4(d[0], d[1], d[2], d[3]);
+}
+__device__ __forceinline__ bool mpk_fc_poisoned(float4 v) {
+  return __float_as_uint(v.x) == MPK_WS_POISON ||
+         __float_as_uint(v.y) == MPK_WS_POISON ||
+         __float_as_uint(v.z) == MPK_WS_POISON ||
+         __float_as_uint(v.w) == MPK_WS_POISON;
+}
+#endif
 __device__ __forceinline__ void st_wt_f32x4(void *addr, float4 val) {
 #if defined(__HIP_DEVICE_COMPILE__) &&                                         \
     (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))

@@ -127,7 +127,14 @@ __device__ __forceinline__ void moe_residual_add_f32_mi300_impl(
 #pragma unroll
       for (int s = 1; s < MOE_WS_SLOTS; s++) {
         float4 slot4;
+#ifdef MPK_WS_FARCOPY
+        // W2 writes only its own AID's copy, so slots 2-3 live in the AID1
+        // copy; the helper's copy into AID0 is not ordered against this task.
+        __builtin_memcpy(&slot4, ws_rd + (s >= 2 ? MOE_WS_SLOTS * OUTPUT_STRIDE : 0) +
+                                     s * OUTPUT_STRIDE + off, 16);
+#else
         __builtin_memcpy(&slot4, ws_rd + s * OUTPUT_STRIDE + off, 16);
+#endif
         st_wt_zero128(ws_row + s * OUTPUT_STRIDE + off);
 #ifdef MPK_WSF32_REP
         if (ws_z0) {

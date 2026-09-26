@@ -2835,6 +2835,17 @@ if __name__ == "__main__":
             _apo_ring = [attn_proj_out] + [
                 make_tensor(f"attn_proj_out_r{j}", (bs, PADDED_HIDDEN_SIZE))
                 for j in range(1, num_layers)]
+            if os.environ.get("MPK_WS_FARCOPY", "0") == "1":
+                # Slots a Phase 9 helper copies (the other AID's pairs, in each
+                # AID's copy) start poisoned; the reader waits for the copy.
+                # W[0] (layer 0 reads it) and W[L] (task 212) stay zero.
+                assert _ws_mul == 2, "MPK_WS_FARCOPY needs MPK_WSF32_AID=1"
+                _H = PADDED_HIDDEN_SIZE
+                for _j in range(1, num_layers):
+                    _t = _tensor_refs[f"moe_workspace_f32_r{_j}"]
+                    _t.view(torch.int32)[:, 2 * _H:6 * _H] = 0x7FBADBAD
+                torch.cuda.synchronize()
+                print(f"[WS_FARCOPY] poisoned {num_layers - 1} ring copies", flush=True)
             print(f"[LAYER_RING] {num_layers} layers: workspace x{len(_ws_ring)}, "
                   f"attn_out x{len(_ao_ring)}, attn_proj_out x{len(_apo_ring)}", flush=True)
         fused_tail_done = False

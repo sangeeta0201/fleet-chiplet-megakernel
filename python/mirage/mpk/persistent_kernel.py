@@ -718,6 +718,8 @@ def get_compile_command(
         if os.environ.get("MPK_MOE_NOPS"):
             # code-layout probe: s_nop count at MoE entry
             flags = flags + [f"-DMPK_MOE_NOPS={int(os.environ['MPK_MOE_NOPS'])}"]
+        if int(os.environ.get("MPK_TOPK_OWN_AID_PROBE", "0")) == 1:
+            flags = flags + ["-DMPK_TOPK_OWN_AID_PROBE=1"]  # timing only
         if int(os.environ.get("MPK_W2_NO_REFRESH", "0")) == 1:
             flags = flags + ["-DMPK_W2_NO_REFRESH=1"]
         if _opt("MPK_AID_REP_CONST"):
@@ -1574,6 +1576,8 @@ def get_compile_command(
             flags = flags + ["-DMPK_ROUTING_NARROW_AID"]
         if int(os.environ.get("MPK_RESID_REP", "0")) == 1:
             flags = flags + ["-DMPK_RESID_REP"]
+        if int(os.environ.get("MPK_RESID_REP_RING", "0")) == 1:
+            flags = flags + ["-DMPK_RESID_REP_RING"]
         if int(os.environ.get("MPK_AID_SPLIT_OUT", "0")) == 1:
             flags = flags + ["-DMPK_AID_SPLIT_OUT"]
         if int(os.environ.get("MPK_AID_EVCTR2", "0")) == 1:
@@ -1628,6 +1632,15 @@ def get_compile_command(
             flags = flags + ["-DMPK_WSF32_REP"]
         if int(os.environ.get("MPK_WSF32_AID", "0")) == 1:
             flags = flags + ["-DMPK_WSF32_AID"]
+        if int(os.environ.get("MPK_WSFC_READ_PRODUCER", "0")) == 1:
+            flags = flags + ["-DMPK_WSFC_READ_PRODUCER"]
+        if int(os.environ.get("MPK_WSFC_NO_WRITERS", "0")) == 1:
+            flags = flags + ["-DMPK_WSFC_NO_WRITERS"]
+        if int(os.environ.get("MPK_WSFC_STATS", "0")) == 1:
+            flags = flags + ["-DMPK_WSFC_STATS"]
+        if int(os.environ.get("MPK_WS_FARCOPY", "0")) == 1:
+            # own-AID workspace fold; needs MPK_WSF32_AID + ring + P9 flat
+            flags = flags + ["-DMPK_WS_FARCOPY"]
         if int(os.environ.get("MPK_LMHEAD_DEDICATED", "0")) == 1:
             flags = flags + ["-DMPK_LMHEAD_DEDICATED"]
         if int(os.environ.get("MPK_AID_LMBAR", "0")) == 1:
@@ -2296,6 +2309,8 @@ def get_compile_command(
         # Timing-only, and wrong by three quarters of the MoE output: drops the
         # MOE_WS_SLOTS-1 extra workspace slabs the QKV prologue folds. Bounds
         # what moving that fold out of QKV's serial window could recover.
+        if int(os.environ.get("MPK_QKV_WS_LOCAL_PROBE", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_WS_LOCAL_PROBE"]  # timing only
         if int(os.environ.get("MPK_ABLATE_WS_FOLD", "0")) == 1:
             flags = flags + ["-DMPK_ABLATE_WS_FOLD"]
         if int(os.environ.get("MPK_GAP_TIMING", "0")) == 1:

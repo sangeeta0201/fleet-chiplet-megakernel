@@ -208,6 +208,11 @@ __device__ __noinline__ void
 
   int xcd_rank = tile_idx % workers_per_xcd;
   int tid = threadIdx.x;
+#ifdef MPK_WS_FARCOPY
+  // MPK_WSFC_V2: this layer's W2 epilogue counts into the mailbox; the
+  // MoE's internal barriers order this reset before it.
+  if (tid == 0) g_wsfc_cnt = 0;
+#endif
 
   // ── Optional: rotate QKV/attention ownership off the O-proj ranks ─────────
   //
@@ -765,8 +770,18 @@ __device__ __noinline__ void
 #ifndef MPK_AID_SPLIT_OUT
 #error "MPK_RESID_REP reads the MPK_AID_SPLIT_OUT replica"
 #endif
+#if defined(MPK_RESID_REP_RING)
+#ifndef MPK_RESID_RING_LAYERS
+#define MPK_RESID_RING_LAYERS 36
+#endif
+    // Ring: layer L > 0 of a token reads the previous layer's O-proj row
+    // (ring copy L-1), which is what this AID's replica holds.
+    void const *const _pro_resid =
+        (task_layer_idx % MPK_RESID_RING_LAYERS != 0)
+#else
     void const *const _pro_resid =
         (input_ptrs[1] == output_ptrs[5])
+#endif
             ? mpk_aid_out_base(input_ptrs[1], xcd_id,
                                QKV_BATCH_SIZE * QKV_REDUCTION_SIZE * 2)
             : input_ptrs[1];
@@ -2743,6 +2758,65 @@ __device__ __noinline__ void
 #endif
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
+
+#ifdef MPK_WS_FARCOPY
+#if !defined(MPK_WSF32_AID) || !defined(MPK_P9_FLAT)
+#error "MPK_WS_FARCOPY needs MPK_WSF32_AID and MPK_P9_FLAT"
+#endif
+#if defined(MPK_W2_CONSUMER_GATE) && \
+    (defined(MPK_ROTATE_QKV_ATTN_RANKS) || defined(MPK_QKV_KSPLIT))
+#error "MPK_WS_FARCOPY picks its re-poisoner as the highest rank of a prefix arriver set"
+#endif
+    // MPK_WSFC_V2 MoE workspace far copy. W2 wrote only its own AID's copy of
+    // this layer's ring buffer, and its stores retired before the MoE call
+    // returned. Right after this worker's own arrival, 16 lanes of wave 1
+    // store its tile (the LDS mailbox) into the other AID's copy: wave 0's
+    // arrival and gate poll never wait on those stores, and the gate barrier
+    // needs lgkmcnt only. The highest arriving rank also re-poisons the other
+    // AID's slots of the ring this layer READ in its own AID's copy: every
+    // die's QKV prologue of this layer finished before any worker reached
+    // Phase 9 (the MoE needs TopK, TopK every die's O-proj).
+    {
+      static_assert(QKV_REDUCTION_SIZE == MOE_HIDDEN_SIZE,
+                    "workspace slot stride differs between W2 and QKV");
+      static_assert(QKV_BATCH_SIZE == 1, "MPK_WS_FARCOPY is bs=1");
+      constexpr int FC_H = QKV_REDUCTION_SIZE;
+      constexpr int FC_COPY = MOE_WS_SLOTS * FC_H;
+      static_assert(FC_H % 8 == 0, "a die's quarter must be whole float4s");
+      int const fc_a = xcd_id >> 2;
+#ifndef MPK_WSFC_NO_WRITERS
+      // MPK_WSFC_V5: no barrier here -- it held waves 1-3's QKV weight
+      // prefetch behind wave 0's arrival and publish drain. The barriers
+      // after the MoE call already order the mailbox writes.
+#ifdef MPK_WSFC_STATS
+      if (tid == 64 && g_wsfc_cnt > 0) {
+        mpk_wsfc_stat(g_wsfc_cnt == 16 ? 1 : 2, g_wsfc_cnt);
+      }
+#endif
+      if (g_wsfc_cnt == 16 && tid >= 64 && tid < 80) {
+        float *const fc_ring = (float *)output_ptrs[10];
+        int const i = tid - 64;
+        st_wt_f32x4((void *)(fc_ring + (1 - fc_a) * FC_COPY + g_wsfc_base + 4 * i),
+                    g_wsfc_val[i]);
+      }
+      if (MPK_LAYER_GATE_ARRIVES && xcd_rank == arrivers_per_xcd - 1 &&
+          task_layer_idx % MPK_WS_FC_LAYERS != 0 && tid >= 64) {
+        float *const fc_in = (float *)input_ptrs[0];
+        float *pz = fc_in + fc_a * FC_COPY + 2 * (1 - fc_a) * FC_H +
+                    (xcd_id & 3) * (FC_H / 2);
+        float4 const pv = make_float4(__uint_as_float(MPK_WS_POISON),
+                                      __uint_as_float(MPK_WS_POISON),
+                                      __uint_as_float(MPK_WS_POISON),
+                                      __uint_as_float(MPK_WS_POISON));
+        for (int i = tid - 64; i < FC_H / 8; i += (int)blockDim.x - 64) {
+          st_wt_f32x4((void *)(pz + 4 * i), pv);
+        }
+      }
+#else
+      (void)fc_a;
+#endif  // MPK_WSFC_NO_WRITERS
+    }
+#endif
 
 #ifdef MPK_DRAIN_OVERLAP
     // ── Drain overlapped with the barrier spin (measurement arm) ──────────

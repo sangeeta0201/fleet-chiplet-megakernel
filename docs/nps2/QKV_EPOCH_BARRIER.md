@@ -152,3 +152,45 @@ NC-local counter build was +0.8% for the same reason. With the pointers
 `__constant__` both are null (1.376 vs 1.376-1.379). `MPK_AID_REP_CONST=0`
 restores the old declarations for A/B. `MPK_W2_NO_REFRESH` (opt-in) drops
 the W2 poll's diagnostic 8-load refresh; measured null.
+
+## QKV prologue fold made fully local: correct, NOT faster (2026-09-26)
+
+The QKV prologue sums the MoE workspace's four slots (writer-split ring:
+slots 0-1 homed on AID0, 2-3 on AID1) plus the residual row, so half its
+reads cross the die in both modes, and QKV is the one critical-path segment
+where NPS2 does not lead (4.90 vs 4.86 us/layer). All opt-in, all bit-exact
+(16-token hash, 1k prompt at 31 chunks == torch, 3k at 24 == 3k at 8):
+
+* `MPK_WS_FARCOPY` (needs `MPK_WSF32_AID`, `MPK_P9_FLAT`, `MPK_LAYER_RING`,
+  `MPK_OWN_BO_RINGS=ws`; bs=1): W2 writes only its own AID's copy of the ring
+  buffer and drops its 16 float4 into an LDS mailbox; after its own Phase 9
+  arrival the worker's wave 1 stores them into the other AID's copy; the
+  highest arriving rank re-poisons (0x7FBADBAD) the other AID's slots of the
+  ring the layer read. The fold reads its own copy; a poisoned slot makes the
+  per-thread sum of squares NaN, and that thread redoes its elements from the
+  producer copies (a verbatim copy of the loop). `MPK_WSFC_STATS` counts
+  copies (every W2 tile) and slow paths (~0.01% of fold iterations).
+* `MPK_RESID_REP_RING`: `MPK_RESID_REP` switches to the O-proj's AID replica
+  only when `input_ptrs[1] == output_ptrs[5]`, which is never true under
+  `MPK_LAYER_RING` (residual = apo copy L-1, output = copy L) -- the flag has
+  been INACTIVE since the ring shipped. RING uses the replica for every layer
+  but a token's first.
+
+Measured (A/B/A/B/A, NPS2, 16 tokens): far copy with a per-iteration poison
+branch in the fold loop +2.3-2.8%; branch moved out of the loop +1.3%;
+post-arrival barrier removed = parity (A 1.378 / 1.379 / 1.379 vs 1.381 /
+1.384); far copy + residual replica, i.e. every fold load local, +0.4%
+(A 1.381 / 1.378 / 1.378 vs 1.385 / 1.384). Fold locality does not buy time.
+The earlier timing oracles (all-local -1.0%, one slab -1.3%) read FEWER
+DISTINCT slots, which is what they measured. Per-die phase slots and the
+inter-layer split (ret 1466 vs 1460 ns, dies 0-3 vs 4-7) show NPS2 is now
+symmetric across dies.
+
+Two rules this cost a run each to learn: never put a data-dependent branch
+inside an unrolled load loop on a critical path (it waits for the loads
+before the next ones issue; accumulate a flag and fix up afterwards), and
+add no barrier between the Phase 9 arrival and the next layer's QKV weight
+prefetch issue (it held waves 1-3's prefetch share behind wave 0's publish
+drain). Timing probes kept opt-in: `MPK_TOPK_OWN_AID_PROBE` (TopK waits on
+own-AID logits only, <= -0.4%), `MPK_QKV_WS_LOCAL_PROBE`, and the ablation
+switches `MPK_WSFC_READ_PRODUCER` / `MPK_WSFC_NO_WRITERS`.

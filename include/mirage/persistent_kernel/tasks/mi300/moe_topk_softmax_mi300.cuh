@@ -621,6 +621,12 @@ __device__ __forceinline__ void mpk_local_topk(int *tags, int expected) {
   static_assert(THREADS_PER_ROW == 16, "one 16-lane row");
   int const tid = threadIdx.x;
   unsigned const want = mpk_ltk_tag(expected);
+#ifdef MPK_TOPK_OWN_AID_PROBE
+  // TIMING ONLY: wait just for the logits this AID produced.
+  int ltk_xcc;
+  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)" : "=s"(ltk_xcc));
+  bool const ltk_mine = ((2 * tid) >> 6) == ((ltk_xcc & 7) >> 2);
+#endif
   if (tid < 64) {
     unsigned long long v;
     while (true) {
@@ -631,9 +637,15 @@ __device__ __forceinline__ void mpk_local_topk(int *tags, int expected) {
                    : "memory");
       bool const ok = (((unsigned)(v >> 16)) & 0xFFFFu) == want &&
                       (((unsigned)(v >> 48)) & 0xFFFFu) == want;
+#ifdef MPK_TOPK_OWN_AID_PROBE
+      if (__all(ok || !ltk_mine)) {
+        break;
+      }
+#else
       if (__all(ok)) {
         break;
       }
+#endif
       __builtin_amdgcn_s_sleep(1);
     }
     s_ltk_logit[2 * tid] = (unsigned short)(v & 0xFFFFu);
