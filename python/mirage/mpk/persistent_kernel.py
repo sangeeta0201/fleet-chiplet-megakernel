@@ -718,6 +718,12 @@ def get_compile_command(
         if os.environ.get("MPK_MOE_NOPS"):
             # code-layout probe: s_nop count at MoE entry
             flags = flags + [f"-DMPK_MOE_NOPS={int(os.environ['MPK_MOE_NOPS'])}"]
+        if int(os.environ.get("MPK_W2_NO_REFRESH", "0")) == 1:
+            flags = flags + ["-DMPK_W2_NO_REFRESH=1"]
+        if _opt("MPK_AID_REP_CONST"):
+            # Replica / ml-table pointer arrays as __constant__: scalar loads,
+            # so their waits cannot drain in-flight asm DMA loads.
+            flags = flags + ["-DMPK_AID_REP_CONST=1"]
         for _f in ("MPK_AID_NC_REP", "MPK_MOE_NCLOCAL", "MPK_AID_P9_NC", "MPK_NC_PROBE", "MPK_OPROJ_HIER_NC", "MPK_MOE_LDS_MAX"):
             # AID-local NC scratch for counters, and the counters placed there.
             if int(os.environ.get(_f, "0")) == 1:

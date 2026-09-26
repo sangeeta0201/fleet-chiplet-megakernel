@@ -70,10 +70,17 @@
 // guarded by MPK_AID_SPLIT_FLAGS falls back to the shared buffer, so a build
 // with this flag on still runs correctly (just without the win) on a stock
 // driver or in NPS1.
-__device__ int *g_aid_flag_rep[2];
+#ifdef MPK_AID_REP_CONST
+// Host-filled before launch, read-only on the device: __constant__ makes
+// the loads scalar (lgkmcnt), so their waits cannot drain asm DMA loads.
+#define MPK_AID_REP_SPACE __constant__
+#else
+#define MPK_AID_REP_SPACE __device__
+#endif
+MPK_AID_REP_SPACE int *g_aid_flag_rep[2];
 // AID-local NC scratch for counters: [0] in AID0, [1] in AID1 (halves of
 // one plain allocation). Null unless MPK_AID_NC_REP set it up.
-__device__ int *g_aid_nc_rep[2];
+MPK_AID_REP_SPACE int *g_aid_nc_rep[2];
 // Layout of each AID half of the NC scratch, in ints. The first 64 KB
 // (16384 ints) are cleared per launch.
 constexpr int MPK_NC_MOE_INTS = 0;      // one 256 B line per expert id (128)
@@ -99,8 +106,8 @@ __device__ __forceinline__ int *mpk_aid_nc_hw(int *shared_base, int off_ints) {
 // its own 1/8 of them. They are read-only after setup and total ~90 KiB, which
 // makes them the opposite profile to the MoE weights: tiny, high-fanout, and
 // squarely on the critical path at the start of every layer.
-__device__ void **g_aid_ml_in[2];
-__device__ void **g_aid_ml_out[2];
+MPK_AID_REP_SPACE void **g_aid_ml_in[2];
+MPK_AID_REP_SPACE void **g_aid_ml_out[2];
 
 // Each flag family gets its own eight lines in both replicas. All of them are
 // cleared per launch, because the shared lines they mirror all live in

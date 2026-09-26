@@ -5344,6 +5344,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       // separates "release fired but was lost" from "arrivals never landed"),
       // and how many of the 8 per-XCD slots agree. All 8 are written by one
       // producer in one loop, so any spread means releases are being lost.
+#if defined(MPK_WORKER_STATE) || !defined(MPK_W2_NO_REFRESH)
       if ((_spins & (MPK_WS_WAIT_REFRESH - 1)) == 0) {
         int _n_ok = 0, _mn = 0x7fffffff, _mx = -0x7fffffff;
         for (int _x = 0; _x < 8; _x++) {
@@ -5366,6 +5367,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             _n_ok * 1000000 + (_mx - _mn),
             -1);
       }
+#endif // MPK_W2_NO_REFRESH: diagnostics only, and its asm loads drain the W2 prefetch
       _spins++;
 #ifndef MPK_MOE_BAR_BUSY_POLL
       __builtin_amdgcn_s_sleep(1);

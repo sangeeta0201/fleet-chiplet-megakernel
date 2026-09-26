@@ -122,3 +122,33 @@ unchanged MoE kernel with 8-32 `s_nop` at entry (`MPK_MOE_NOPS`) costs the
 same 1.3% at every size: the MoE kernel is sensitive to code changes near its
 entry, not to where the counter lives. Screen MoE code changes against a
 padded no-op build. All flags are opt-in; the default build is unchanged.
+
+## Replica pointers as `__constant__`: `MPK_AID_REP_CONST` (default on, 2026-09-26)
+
+`g_aid_flag_rep`, `g_aid_nc_rep`, `g_aid_ml_in` and `g_aid_ml_out` are filled
+by the host before launch and only read on the device. Declared `__device__`,
+the compiler reads them with VECTOR loads (it cannot prove them unclobbered
+past the kernel's atomics and asm "memory" clobbers), and each read gets a
+compiler-inserted `s_waitcnt vmcnt(0)`. The compiler cannot count loads issued
+from inline asm, so that full wait also drains whatever asm DMA / prefetch is
+in flight -- e.g. in the MoE's W2 prologue the replica-pointer arithmetic
+drained the two scale DMA loads before the weight prefetch (~1,070 cycles per
+call by ATT). As `__constant__` they become `s_load`s waited on lgkmcnt.
+Static count: vector pointer loads in the fused layer 18 -> 0, O-proj 2 -> 0,
+MoE 1 -> 0; full vmcnt(0) waits fused layer 100 -> 86, worker loop
+558 -> 544, O-proj 26 -> 20, MoE 14 -> 12.
+
+Measured (A/B/A/B/A, 16 tokens, NPS2): 1.431 / 1.429 / 1.426 -> 1.376 / 1.381
+ms (-3.5%), hash green; 1k prompt at 31 chunks == torch 16/16, 3k at 24 ==
+3k at 8; 16k decode 1.562 -> 1.514 ms with the text identical over all
+43,433 chars. NPS1 (same build, single runs): 16 tokens 1.520 / 1.469 ->
+1.445, 16k decode 1.675 -> 1.586. With it in both modes NPS2 leads by
+4.4-4.8% at every context from 250 to 16k tokens and 4.6% at 16 tokens.
+
+It also explains the MoE kernel's "code sensitivity": 8-32 `s_nop` at MoE
+entry cost +1.3% (the asm block moved the compiler's pointer-load wait onto
+the tile-0 weight burst: a `vmcnt(0)` of 2,229 cycles by ATT), and the MoE
+NC-local counter build was +0.8% for the same reason. With the pointers
+`__constant__` both are null (1.376 vs 1.376-1.379). `MPK_AID_REP_CONST=0`
+restores the old declarations for A/B. `MPK_W2_NO_REFRESH` (opt-in) drops
+the W2 poll's diagnostic 8-load refresh; measured null.
