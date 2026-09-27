@@ -140,17 +140,16 @@ constexpr int MPK_AID_REGION_TOPK = 6;
 // Slot 0 only; touched by the four XCDs of the AID that owns the replica.
 constexpr int MPK_AID_REGION_OPROJ_TIER = 7;
 #ifdef MPK_LOCAL_TOPK
+#ifndef MPK_MOE_XCD_PAIR
+#error "MPK_LOCAL_TOPK needs MPK_MOE_XCD_PAIR (the TopK publishes picks, not the per-expert mask)"
+#endif
 // Tagged router logits, 128 ints inside the routing region of each replica.
+// mpk_ltk_tag() and the per-workgroup s_ltk_* state are declared with the
+// local-TopK slot layout further down.
 constexpr int MPK_AID_LTK_OFF_INTS = 1024;
-__device__ __forceinline__ unsigned mpk_ltk_tag(int epoch) {
-  return 1u + (unsigned)epoch % 65535u;
-}
-// Per-workgroup routing, rebuilt at the Phase 7b gate (128 experts, bs=1).
-__shared__ int s_ltk_mask[129];
-__shared__ int s_ltk_route[128];
-__shared__ float s_ltk_w[8];
-__shared__ int s_ltk_sel[8];  // picks in selection order
-__shared__ unsigned short s_ltk_logit[128];
+// MPK_LTK_EARLY_TAG: per-XCD normed-row flags (32 ints per hardware XCD),
+// written and polled only in that XCD's own AID replica.
+constexpr int MPK_AID_LTK_NORM_OFF_INTS = MPK_AID_LTK_OFF_INTS + 128;
 #endif
 
 // The MoE fused barrier is per-expert (MOE_BAR_STRIDE ints each), so at 128
@@ -423,6 +422,50 @@ __device__ __forceinline__ int ld_sys_s32(int *addr) {
   return *reinterpret_cast<int volatile *>(addr);
 #endif
 }
+
+#ifdef MPK_POLL_PIPE
+// Waits until *p >= target with two system-scope loads in flight, issued
+// about half a round trip apart, so a release is seen up to half a trip
+// sooner than with one load per trip. The first check is not delayed: the
+// first load's round trip is longer than the stagger.
+__device__ __forceinline__ void mpk_poll_ge_s32(int *p, int target) {
+  int a = __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  __builtin_amdgcn_s_sleep(10);
+  int b = __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  while (true) {
+    if (a >= target) {
+      return;
+    }
+    a = __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    if (b >= target) {
+      return;
+    }
+    b = __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  }
+}
+
+// Same for two monotonic flags that must both reach `target`: each sample
+// reads both, and two samples are in flight.
+__device__ __forceinline__ void mpk_poll_ge2_s32(int *p0, int *p1, int target) {
+  int a0 = __hip_atomic_load(p0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  int a1 = __hip_atomic_load(p1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  __builtin_amdgcn_s_sleep(10);
+  int b0 = __hip_atomic_load(p0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  int b1 = __hip_atomic_load(p1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  while (true) {
+    if (a0 >= target && a1 >= target) {
+      return;
+    }
+    a0 = __hip_atomic_load(p0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    a1 = __hip_atomic_load(p1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    if (b0 >= target && b1 >= target) {
+      return;
+    }
+    b0 = __hip_atomic_load(p0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    b1 = __hip_atomic_load(p1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  }
+}
+#endif
 
 __device__ __forceinline__ unsigned long long ld_sys_u64(void *addr) {
 #if defined(__HIP_DEVICE_COMPILE__) &&                                         \
@@ -1388,3 +1431,87 @@ __device__ __forceinline__ unsigned long long int
                        unsigned long long int val) {
   return atomicCAS(addr, cmp, val);
 }
+
+#ifdef MPK_LOCAL_TOPK
+// MPK_LOCAL_TOPK (bs=1, 128 experts, XCD-pair MoE map): each router tile
+// publishes its logit as one epoch-tagged word, (tag << 16) | bf16 bits, and
+// every workgroup rebuilds the routing at the Phase 7b gate instead of waiting
+// for a serial TopK completer.
+//
+// The 128 tag words live at this int offset in the oproj_topk_counters block
+// (demo.py grows the block to MPK_LTK_TAG_SLOT + 128 under the flag), and
+// routing_ready sits at 10 * 16 in the same block.
+constexpr int MPK_LTK_TAG_SLOT = 2048;
+constexpr int MPK_LTK_ROUTING_REL = MPK_LTK_TAG_SLOT - 10 * 16;
+#ifdef MPK_LTK_EARLY_TAG
+// One 128 B line per hardware XCD after the tags: normed-row writer t sets
+// word t to mpk_ltk_tag(epoch) once its write-through row stores drained.
+// demo.py grows the block to MPK_LTK_NORM_SLOT + 8 * 32 under the flag.
+constexpr int MPK_LTK_NORM_SLOT = MPK_LTK_TAG_SLOT + 128;
+constexpr int MPK_LTK_NORM_REL = MPK_LTK_NORM_SLOT - 10 * 16;
+#endif
+// Never 0, so the zero-initialized block cannot satisfy a poll, and
+// consecutive layers always differ.
+__device__ __forceinline__ unsigned mpk_ltk_tag(int epoch) {
+  return 1u + (unsigned)epoch % 65535u;
+}
+// Selection-order picks and renormalized weights: what the completer carries
+// to XCD pair k in its u64 record, and what it writes to topk_weight[k].
+__shared__ int s_ltk_sel[8];
+__shared__ float s_ltk_w[8];
+__shared__ unsigned short s_ltk_logit[128];
+#endif
+
+#ifdef MPK_OPROJ_TILE_FLAGS
+#if defined(MPK_OPROJ_ARRIVE_ONLY) || defined(MPK_ROUTER_XCD_FOLD)
+#error "MPK_OPROJ_TILE_FLAGS replaces the O-proj release that these flags modify"
+#endif
+// One ready word per O-proj tile (the layer epoch), after the LTK tag and
+// normed-row words. demo.py grows the block to MPK_OPROJ_TILE_FLAG_SLOT + 256
+// under the flag.
+constexpr int MPK_OPROJ_TILE_FLAG_SLOT = 2048 + 128 + 8 * 32;
+// Called by one full wave. Each lane checks up to three words per trip, all
+// three loads in flight together.
+__device__ __forceinline__ void mpk_oproj_tile_flag_poll(int *flags, int n,
+                                                         int expected) {
+  int const lane = threadIdx.x & 63;
+  if (n > 192) {
+    for (int j = lane; j < n; j += 64) {
+      while (ld_sys_s32(flags + j) < expected) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+    return;
+  }
+  int *const p0 = flags + (lane < n ? lane : 0);
+  int *const p1 = flags + (lane + 64 < n ? lane + 64 : 0);
+  int *const p2 = flags + (lane + 128 < n ? lane + 128 : 0);
+  while (true) {
+    int a, b, c;
+    asm volatile("global_load_dword %0, %3, off sc0 sc1\n"
+                 "global_load_dword %1, %4, off sc0 sc1\n"
+                 "global_load_dword %2, %5, off sc0 sc1\n"
+                 "s_waitcnt vmcnt(0)"
+                 : "=&v"(a), "=&v"(b), "=&v"(c)
+                 : "v"(p0), "v"(p1), "v"(p2)
+                 : "memory");
+    bool const ok = a >= expected && b >= expected && c >= expected;
+    if (__builtin_amdgcn_ballot_w64(!ok) == 0) {
+      break;
+    }
+    __builtin_amdgcn_s_sleep(1);
+  }
+}
+#endif
+
+// Without MPK_AID_SPLIT_FLAGS the replica helpers are not built; these read
+// the shared buffers directly (upstream's behaviour).
+#ifndef MPK_MOE_HOF_IN
+#define MPK_MOE_HOF_IN(torch_in) (torch_in)
+#endif
+#ifndef MPK_EVCTR_READ
+#define MPK_EVCTR_READ(base, idx) MPK_LD_EVENT(&(base)[idx])
+#endif
+#ifndef MPK_EVCTR_POLL
+#define MPK_EVCTR_POLL(base, idx, it) MPK_LD_EVENT(&(base)[idx])
+#endif

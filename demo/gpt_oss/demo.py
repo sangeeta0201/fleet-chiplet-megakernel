@@ -647,29 +647,32 @@ def shuffle_w13_workgroups_kmajor(packed: torch.Tensor,
     return torch.cat((data, packed[..., data_bytes:]), dim=-1).contiguous()
 
 
-
 def shuffle_w2_workgroups_kmajor(packed: torch.Tensor,
                                  output_per_wg: int = 64) -> torch.Tensor:
     """MPK_W2_KWIN: W2 (down_proj) records into lane-contiguous K128 fragments.
 
-    The W13 permutation applied to W2: within each 16-row tile the data prefix
-    goes from ``[row, k128, quarter, byte]`` to ``[k128, quarter, row, byte]``,
-    so 1 KiB fragment k of a wave's tile is MFMA K-step k. Scales stay
-    row-major. A permutation, bit-exact.
+    Within each 16-row tile the data prefix goes from
+    ``[row, k128, quarter, byte]`` to ``[k128, quarter, row, byte]``, so 1 KiB
+    fragment k of a wave's tile is MFMA K-step k. Scales stay row-major.
+    A permutation, bit-exact.
     """
     if packed.ndim != 3:
-        raise ValueError(f"expected [experts, workgroups, bytes] W2 weights, got {tuple(packed.shape)}")
+        raise ValueError(
+            f"expected [experts, workgroups, bytes] W2 weights, got {tuple(packed.shape)}")
     experts, workgroups, wg_bytes = packed.shape
     reduction = (wg_bytes * 32) // (output_per_wg * 17)
     data_bytes = output_per_wg * (reduction // 2)
     if reduction % 128 != 0 or output_per_wg % 16 != 0 or \
             data_bytes + output_per_wg * (reduction // 32) != wg_bytes:
-        raise ValueError(f"invalid W2 MXFP4 record width {wg_bytes} for {output_per_wg} rows")
+        raise ValueError(
+            f"invalid W2 MXFP4 record width {wg_bytes} for {output_per_wg} rows")
     tiles = output_per_wg // 16
     data = packed[..., :data_bytes].reshape(
         experts, workgroups, tiles, 16, reduction // 128, 4, 16)
-    data = data.permute(0, 1, 2, 4, 5, 3, 6).reshape(experts, workgroups, data_bytes)
+    data = data.permute(0, 1, 2, 4, 5, 3, 6).reshape(
+        experts, workgroups, data_bytes)
     return torch.cat((data, packed[..., data_bytes:]), dim=-1).contiguous()
+
 
 def shuffle_lm_head_record_kmajor(packed: torch.Tensor,
                                   output_per_wg: int = 64) -> torch.Tensor:
@@ -1494,6 +1497,10 @@ if __name__ == "__main__":
                 # a render variable of that name overrides it.
                 _chat_kw = ({"strftime_now": (lambda fmt: os.environ["MPK_CHAT_DATE"])}
                             if os.environ.get("MPK_CHAT_DATE") else {})
+                _fixed_date = os.environ.get("MPK_FIXED_DATE")
+                if _fixed_date and 'strftime_now("%Y-%m-%d")' in tokenizer.chat_template:
+                    tokenizer.chat_template = tokenizer.chat_template.replace(
+                        'strftime_now("%Y-%m-%d")', repr(_fixed_date))
                 formatted = tokenizer.apply_chat_template(
                     messages, tokenize=False, add_generation_prompt=True,
                     **_chat_kw)
@@ -2421,6 +2428,10 @@ if __name__ == "__main__":
             verify_tensors["ck_fmha_q_workspace"] = ck_fmha_q_ws_tensor
 
         attn_out = make_tensor("attn_out", (bs, num_local_q_heads * head_dim))
+        if os.environ.get("MPK_OPROJ_DATA_POLL", "0") == "1":
+            # The O-proj polls attn_out for data: every word holds 0xFFFFFFFF
+            # until the layer's merge writes it.
+            _tensor_refs["attn_out"].view(torch.int16).fill_(-1)
         # When CK_FMHA_NUM_KV_CHUNKS > 1 the decode kernel writes per-chunk float
         # partials into ck_fmha_o_acc; merge step combines them into attn_out.
         if use_split_attn_chunks or fuse_full_layer:
@@ -2496,6 +2507,22 @@ if __name__ == "__main__":
             # +128 ints: 8 per-XCD O-proj slice-ready flags (MPK_ROUTER_XCD_FOLD).
             # See FULL_LAYER_OPROJ_XCD_READY_SLOT in gang_full_layer_fused_mi300.cuh.
             counter_size = 768 + 128 * args.max_num_batched_requests + 272 + 128
+            # MPK_LTK_COUNTERS_COMPACT: keep the pre-merge block size. With live
+            # AID replicas the tags and norm flags live in the replicas, not here.
+            if (os.environ.get("MPK_LOCAL_TOPK", "0") == "1"
+                    and os.environ.get("MPK_LTK_COUNTERS_COMPACT", "0") != "1"):
+                # +128 ints: epoch-tagged router logits at MPK_LTK_TAG_SLOT
+                # (mpk_atoms.cuh).
+                counter_size = max(counter_size, 2048 + 128)
+                if os.environ.get("MPK_LTK_EARLY_TAG", "0") == "1":
+                    # +8 x 32 ints: per-XCD normed-row ready words (MPK_LTK_NORM_SLOT).
+                    counter_size = max(counter_size, 2048 + 128 + 8 * 32)
+            if os.environ.get("MPK_OPROJ_TILE_FLAGS", "0") == "1":
+                # +256 ints: per-tile O-proj ready words (MPK_OPROJ_TILE_FLAG_SLOT).
+                counter_size = max(counter_size, 2048 + 128 + 8 * 32 + 256)
+            if os.environ.get("MPK_ATTN_Q_EPOCH", "0") == "1":
+                # +256 ints: per-XCD Q-only arrival and release lines (MPK_ATTN_QEPOCH_SLOT).
+                counter_size = max(counter_size, 2048 + 128 + 8 * 32 + 256 + 256)
             oproj_topk_counters = make_tensor("oproj_topk_counters", (counter_size,), torch_dtype=torch.int32)
         # Hierarchical barrier for fused QKV+Attention kernel [16 int32]:
         # [0..7]: per-XCD QKV arrival counters, [8]: global leader count
@@ -2563,6 +2590,12 @@ if __name__ == "__main__":
         # MPK_WSF32_AID: one MoE f32 workspace per memory range.
         _ws_mul = 2 if os.environ.get("MPK_WSF32_AID", "0") == "1" else 1
         moe_workspace_f32 = make_tensor("moe_workspace_f32", (bs, _ws_mul * num_experts_per_tok * PADDED_HIDDEN_SIZE), torch_dtype=torch.float32)
+        # MPK_LM_RESADD: the LM head adds the last layer's MoE slabs to the
+        # residual itself, so layer 0 reads a workspace that is always zero
+        # instead of one the final residual-add task clears.
+        _lm_resadd = os.environ.get("MPK_LM_RESADD", "0") == "1"
+        moe_ws_zero = (make_tensor("moe_ws_zero", (bs, num_experts_per_tok * PADDED_HIDDEN_SIZE),
+                                   torch_dtype=torch.float32) if _lm_resadd else None)
         mlp_weighted_sum_out = make_tensor("mlp_weighted_sum_out", (bs, PADDED_HIDDEN_SIZE))
         mlp_final = make_tensor("mlp_final", (bs, PADDED_HIDDEN_SIZE))
         # Argmax — fused into LM head GEMM (type 218, norm-once):
@@ -2823,6 +2856,8 @@ if __name__ == "__main__":
         # MPK_LAYER_RING: one copy per layer of the buffers a later die reads
         # across the layer boundary, so no address is reused within a token.
         _ring = os.environ.get("MPK_LAYER_RING", "0") == "1"
+        assert not (_ring and _lm_resadd), \
+            "MPK_LAYER_RING and MPK_LM_RESADD both own the layer-0 workspace"
         if _ring:
             _ws_ring = [moe_workspace_f32] + [
                 make_tensor(f"moe_workspace_f32_r{j}",
@@ -2832,6 +2867,10 @@ if __name__ == "__main__":
             _ao_ring = [attn_out] + [
                 make_tensor(f"attn_out_r{j}", (bs, num_local_q_heads * head_dim))
                 for j in range(1, num_layers)]
+            if os.environ.get("MPK_OPROJ_DATA_POLL", "0") == "1":
+                # Every ring copy starts at the value the O-proj polls for.
+                for j in range(1, num_layers):
+                    _tensor_refs[f"attn_out_r{j}"].view(torch.int16).fill_(-1)
             _apo_ring = [attn_proj_out] + [
                 make_tensor(f"attn_proj_out_r{j}", (bs, PADDED_HIDDEN_SIZE))
                 for j in range(1, num_layers)]
@@ -2887,10 +2926,29 @@ if __name__ == "__main__":
             )
             # Interleave Q/K/V by KV groups (same layout as shuffle_tensors)
             q_per_kv = num_local_q_heads // num_local_kv_heads
+            # MPK_KV_SPREAD: each K head's rows ordered so every 16-row block
+            # holds 8 RoPE pairs (d, d + head_dim/2); the kernel writes them
+            # back to their own dims.
+            kv_spread = int(os.environ.get("MPK_KV_SPREAD", "0")) == 1
+            # MPK_QKV_ROPE_REG: the same order for every Q head too, so each
+            # wave's 16 rows hold whole RoPE pairs.
+            rope_reg = int(os.environ.get("MPK_QKV_ROPE_REG", "0")) == 1
+            if rope_reg:
+                kv_spread = True
+            if kv_spread:
+                assert head_dim == 64 and q_per_kv == 8
+                k_perm = torch.tensor(
+                    [b * 8 + h * 32 + j for b in range(4) for h in range(2)
+                     for j in range(8)], device=w_k.device)
             qkv_chunks = []
             for g in range(num_local_kv_heads):
-                qkv_chunks.append(w_q[g*q_per_kv*head_dim:(g+1)*q_per_kv*head_dim])
-                qkv_chunks.append(w_k[g*head_dim:(g+1)*head_dim])
+                w_q_g = w_q[g*q_per_kv*head_dim:(g+1)*q_per_kv*head_dim]
+                if rope_reg:
+                    w_q_g = w_q_g.reshape(q_per_kv, head_dim, -1)[:, k_perm].reshape(
+                        q_per_kv * head_dim, -1)
+                qkv_chunks.append(w_q_g)
+                w_k_g = w_k[g*head_dim:(g+1)*head_dim]
+                qkv_chunks.append(w_k_g[k_perm] if kv_spread else w_k_g)
                 qkv_chunks.append(w_v[g*head_dim:(g+1)*head_dim])
             w_qkv_shuffled = torch.cat(qkv_chunks, dim=0).contiguous()
             qkv_out_size = w_qkv_shuffled.shape[0]  # fused_qkv_dim
@@ -2907,7 +2965,13 @@ if __name__ == "__main__":
             k_bias = layer.self_attn.k_proj.bias.data.to("cuda")
             v_bias = layer.self_attn.v_proj.bias.data.to("cuda")
             q_bias_grouped = q_bias.reshape(num_local_kv_heads, q_per_kv * head_dim)
+            if rope_reg:
+                q_bias_grouped = q_bias_grouped.reshape(
+                    num_local_kv_heads, q_per_kv, head_dim)[:, :, k_perm.to(q_bias_grouped.device)].reshape(
+                    num_local_kv_heads, q_per_kv * head_dim)
             k_bias_grouped = k_bias.reshape(num_local_kv_heads, head_dim)
+            if kv_spread:
+                k_bias_grouped = k_bias_grouped[:, k_perm.to(k_bias_grouped.device)]
             v_bias_grouped = v_bias.reshape(num_local_kv_heads, head_dim)
             qkv_bias = torch.cat([q_bias_grouped, k_bias_grouped, v_bias_grouped], dim=1)
             qkv_bias = qkv_bias.reshape(1, -1).contiguous()  # [1, fused_qkv_dim]
@@ -3096,7 +3160,8 @@ if __name__ == "__main__":
                     else:
                         mpk.gang_full_layer_fused_layer(
                             # QKV+Attn inputs
-                            workspace_f32=(_ws_ring[i] if _ring else moe_workspace_f32),
+                            workspace_f32=(moe_ws_zero if (_lm_resadd and i == 0)
+                                           else (_ws_ring[i] if _ring else moe_workspace_f32)),
                             residual=x,
                             norm_weight_pre=w_norm,
                             norm_scratch_pre=rmsnorm_out,
@@ -3154,7 +3219,7 @@ if __name__ == "__main__":
                         )
                     x = (_apo_ring[i] if _ring else attn_proj_out)
                     # Last layer needs explicit residual add (f32→bf16)
-                    if i == num_layers - 1 and not fused_tail_done:
+                    if i == num_layers - 1 and not fused_tail_done and not _lm_resadd:
                         mpk.moe_residual_add_f32_layer(
                             workspace_f32=(_ws_ring[num_layers] if _ring else moe_workspace_f32),
                             residual=x,
@@ -3643,6 +3708,7 @@ if __name__ == "__main__":
             # Fused LM head GEMM + argmax (type 218): each tile writes
             # per-tile (max_val, rel_idx) instead of logits to HBM.
             # Eliminates 393KB logits write + 393KB logits read.
+            assert not (_lm_resadd and ppl_logits is not None), "MPK_LM_RESADD carries the workspace in the logits slot"
             mpk.gang_rmsnorm_linear_mxfp4_bias_argmax_layer(
                 norm_input=x,
                 norm_weight=w_norm,
@@ -3655,7 +3721,7 @@ if __name__ == "__main__":
                 output_per_wg=lm_head_output_per_wg,
                 output_stride=vocab_size,
                 block_dim=(256, 1, 1),
-                ppl_logits=ppl_logits,
+                ppl_logits=(moe_workspace_f32 if _lm_resadd else ppl_logits),
             )
             mpk.argmax_reduce_layer(
                 input=(argmax_part_value, argmax_part_index),

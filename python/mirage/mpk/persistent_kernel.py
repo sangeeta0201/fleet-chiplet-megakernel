@@ -325,7 +325,10 @@ def get_compile_command(
             cc,
             "-x", "hip",
             file_name,
-            os.environ.get("MPK_HIP_OPT", "-O2"),  # -O3 hung the AMDGPU register allocator on large fused kernels once; upstream now defaults to -O3
+            os.environ.get("MPK_HIP_OPT", "-O3"),  # default -O3; MPK_HIP_OPT=-O2 restores the old path
+            # Measured 2026-09-21 on gfx950 gpt-oss-120b: -O3 compiles and is token-identical
+            # across 3 reps (1.686/1.680/1.716 ms). The previous -O2 pin was leftover from an
+            # allocator hang that no longer reproduces on this kernel.
             "--save-temps",  # TEMP: dump assembly for v_mov analysis
             # Omit -lineinfo for ROCm: hipcc forwards it to ld.lld which treats it as -l lineinfo
             f"-I{py_include_dir}",
@@ -435,6 +438,16 @@ def get_compile_command(
         # termination -- no printf on the hot path, unlike MPK_DEVICE_TIMING.
         if int(os.environ.get("MPK_OPROJ_LDS", "0")) == 1:
             flags = flags + ["-DMPK_OPROJ_LDS"]
+        if int(os.environ.get("MPK_OPROJ_NUDGE", "0")) > 0:
+            flags = flags + [
+                f"-DMPK_OPROJ_NUDGE={int(os.environ['MPK_OPROJ_NUDGE'])}",
+                f"-DMPK_OPROJ_NUDGE_KIND={int(os.environ.get('MPK_OPROJ_NUDGE_KIND', '2'))}"]
+        if int(os.environ.get("MPK_LDS_PAD", "0")) > 0:
+            flags = flags + [f"-DMPK_LDS_PAD={int(os.environ['MPK_LDS_PAD'])}"]
+        if int(os.environ.get("MPK_HWID_MAP", "0")) == 1:
+            flags = flags + ["-DMPK_HWID_MAP"]
+        if int(os.environ.get("MPK_SCHED_LDS", "0")) > 0:
+            flags = flags + [f"-DMPK_SCHED_LDS={int(os.environ['MPK_SCHED_LDS'])}"]
         if int(os.environ.get("MPK_MOE_BIAS_REP", "0")) == 1:
             flags = flags + ["-DMPK_MOE_BIAS_REP"]
         if int(os.environ.get("MPK_PHASE_SNAP", "0")) > 0:
@@ -619,6 +632,33 @@ def get_compile_command(
             # A/B 2026-08-30: −19 / −28 / +6 µs. V1 hash 1ca7e851 vs e86d7dc;
             # V2–V3 matched. Do not promote. Stays opt-in.
             flags = flags + ["-DMPK_ATTN_O_VEC_STORE"]
+        if int(os.environ.get("MPK_ATTN_META_EARLY", "0")) == 1:
+            flags = flags + ["-DMPK_ATTN_META_EARLY"]
+        if int(os.environ.get("MPK_QKV_KV_L2WARM", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_KV_L2WARM"]
+        if int(os.environ.get("MPK_QKV_KV_PF_PLAIN", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_KV_PF_PLAIN"]
+        if int(os.environ.get("MPK_OPROJ_DATA_POLL", "0")) == 1:
+            flags = flags + ["-DMPK_OPROJ_DATA_POLL"]
+        if int(os.environ.get("MPK_MERGE_META_PRE", "0")) == 1:
+            flags = flags + ["-DMPK_MERGE_META_PRE"]
+        if int(os.environ.get("MPK_QKV_KV_RANK_SWAP", "0")) > 0:
+            flags = flags + ["-DMPK_QKV_KV_RANK_SWAP="
+                             + str(int(os.environ["MPK_QKV_KV_RANK_SWAP"]))]
+        if int(os.environ.get("MPK_QKV_EPOCH_POLL_ARRIVE", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_EPOCH_POLL_ARRIVE"]
+        if int(os.environ.get("MPK_ATTN_Q_AFTER_WL", "0")) == 1:
+            flags = flags + ["-DMPK_ATTN_Q_AFTER_WL"]
+        if int(os.environ.get("MPK_ATTN_SL_OVERLAP", "0")) == 1:
+            flags = flags + ["-DMPK_ATTN_SL_OVERLAP"]
+        if int(os.environ.get("MPK_ATTN_EPI_UNROLL", "0")) == 1:
+            flags = flags + ["-DMPK_ATTN_EPI_UNROLL"]
+        if int(os.environ.get("MPK_ATTN_KV_EARLY", "0")) == 1:
+            flags = flags + ["-DMPK_ATTN_KV_EARLY"]
+        if int(os.environ.get("MPK_ATTN_KV_EARLY2", "0")) == 1:
+            flags = flags + ["-DMPK_ATTN_KV_EARLY2"]
+        if int(os.environ.get("MPK_ATTN_PTR_EARLY", "0")) == 1:
+            flags = flags + ["-DMPK_ATTN_PTR_EARLY"]
         if int(os.environ.get("MPK_ATTN_LSE_DPP", "0")) == 1:
             # TESTED AND NOT ADOPTED (mixed). l_sum permlane16 then 32 vs
             # __shfl_xor. Hash e86d7dc all six. A/B +18 / −18 / +1 µs.
@@ -1002,6 +1042,137 @@ def get_compile_command(
         # removes were never the thing being waited on.
         if int(os.environ.get("MPK_EMBED_WIDE", "0")) == 1:
             flags = flags + ["-DMPK_EMBED_WIDE"]
+        if int(os.environ.get("MPK_EMBED_PIPE", "0")) == 1:
+            flags = flags + ["-DMPK_EMBED_PIPE"]
+        if int(os.environ.get("MPK_W2SUB", "0")) == 1:
+            flags = flags + ["-DMPK_W2SUB"]
+        if int(os.environ.get("MPK_QKV_PF_EARLY", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_PF_EARLY"]
+        if int(os.environ.get("MPK_LTK_SELLOGIT", "0")) == 1:
+            if int(os.environ.get("MPK_LOCAL_TOPK", "0")) != 1:
+                raise RuntimeError("MPK_LTK_SELLOGIT requires MPK_LOCAL_TOPK=1")
+            flags = flags + ["-DMPK_LTK_SELLOGIT"]
+        if int(os.environ.get("MPK_MOE_W2_REMAP", "0")) == 1:
+            if int(os.environ.get("MPK_MOE_XCD_PAIR", "1")) != 1:
+                raise RuntimeError("MPK_MOE_W2_REMAP needs MPK_MOE_XCD_PAIR")
+            flags = flags + ["-DMPK_MOE_W2_REMAP"]
+            if int(os.environ.get("MPK_MOE_W2_REMAP2", "0")) == 1:
+                flags = flags + ["-DMPK_MOE_W2_REMAP2"]
+            if int(os.environ.get("MPK_MOE_W2_REMAP3", "0")) == 1:
+                flags = flags + ["-DMPK_MOE_W2_REMAP3"]
+            if int(os.environ.get("MPK_MOE_W2_REMAP3_R0", "0")) > 0:
+                flags = flags + ["-DMPK_MOE_W2_REMAP3_R0="
+                                 + str(int(os.environ["MPK_MOE_W2_REMAP3_R0"]))]
+            if int(os.environ.get("MPK_MOE_W2_REMAP3_NODELAY89", "0")) == 1:
+                flags = flags + ["-DMPK_MOE_W2_REMAP3_NODELAY89"]
+            if int(os.environ.get("MPK_MOE_W2_REMAP2_NODELAY", "0")) == 1:
+                flags = flags + ["-DMPK_MOE_W2_REMAP2_NODELAY"]
+            if int(os.environ.get("MPK_MOE_W2_REMAP_DELAY_US", "0")) > 0:
+                flags = flags + [
+                    "-DMPK_MOE_W2_REMAP_DELAY_US="
+                    + str(int(os.environ["MPK_MOE_W2_REMAP_DELAY_US"]))
+                ]
+        _w2warm = int(os.environ.get("MPK_W2_L2_WARM", "0"))
+        if _w2warm in (1, 2, 3):
+            flags = flags + ["-DMPK_W2_L2_WARM"]
+        if int(os.environ.get("MPK_W2_WARM_NT", "0")) == 1:
+            flags = flags + ["-DMPK_W2_WARM_NT"]
+        if _w2warm == 3 or int(os.environ.get("MPK_W2_DMA_SC1", "0")) == 1:
+            flags = flags + ["-DMPK_W2_DMA_SC1"]
+        if _w2warm == 1 or int(os.environ.get("MPK_W2_PLAIN_DMA", "0")) == 1:
+            flags = flags + ["-DMPK_W2_PLAIN_DMA"]
+        if int(os.environ.get("MPK_W2_L2_WARM_DELAY_US", "0")) > 0:
+            flags = flags + [
+                "-DMPK_W2_L2_WARM_DELAY_US="
+                + str(int(os.environ["MPK_W2_L2_WARM_DELAY_US"]))
+            ]
+        if int(os.environ.get("MPK_P9_DEFER", "0")) == 1:
+            flags = flags + ["-DMPK_P9_DEFER"]
+        if int(os.environ.get("MPK_POLL_PIPE", "0")) == 1:
+            flags = flags + ["-DMPK_POLL_PIPE"]
+        if int(os.environ.get("MPK_QKV_PF_PAGE_LATE", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_PF_PAGE_LATE"]
+        if int(os.environ.get("MPK_QKV_GAMMA_NORMREG", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_GAMMA_NORMREG", "-DMPK_QKV_GAMMA_LDS"]
+        if int(os.environ.get("MPK_QKV_GAMMA_LDS", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_GAMMA_LDS"]
+        if int(os.environ.get("MPK_QKV_WDMA_AFTER_SLAB", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_WDMA_AFTER_SLAB"]
+        if os.environ.get("MPK_QKV_LDS_POISON_HI"):
+            flags = flags + ["-DMPK_QKV_LDS_POISON_LO=" + str(int(os.environ.get("MPK_QKV_LDS_POISON_LO", "0"))),
+                             "-DMPK_QKV_LDS_POISON_HI=" + str(int(os.environ["MPK_QKV_LDS_POISON_HI"]))]
+        if int(os.environ.get("MPK_ATTN_PID_ONCE", "0")) == 1:
+            flags = flags + ["-DMPK_ATTN_PID_ONCE"]
+        if int(os.environ.get("MPK_QKV_RED_LDS_BAR", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_RED_LDS_BAR"]
+        if int(os.environ.get("MPK_QKV_SLAB_LDS", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_SLAB_LDS"]
+        if int(os.environ.get("MPK_QKV_SLAB_LDS_SHADOW", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_SLAB_LDS_SHADOW"]
+        if os.environ.get("MPK_QKV_SLAB_LDS_AUX"):
+            flags = flags + ["-DMPK_QKV_SLAB_LDS_AUX=" + str(int(os.environ["MPK_QKV_SLAB_LDS_AUX"]))]
+        if int(os.environ.get("MPK_QKV_SLAB_LDS_NODMA", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_SLAB_LDS_NODMA"]
+        if int(os.environ.get("MPK_QKV_SLAB_LDS_FLATSTORE", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_SLAB_LDS_FLATSTORE"]
+        if int(os.environ.get("MPK_QKV_ROPE_REG", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_ROPE_REG"]
+        if int(os.environ.get("MPK_QKV_EPI_PRELOAD", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_EPI_PRELOAD"]
+        if int(os.environ.get("MPK_QKV_SLAB_HOIST", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_SLAB_HOIST"]
+        if int(os.environ.get("MPK_ABLATE_QKV_HALF_WAVES", "0")) == 1:
+            flags = flags + ["-DMPK_ABLATE_QKV_HALF_WAVES"]
+        if int(os.environ.get("MPK_QKV_PF3", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_PF3"]
+        if int(os.environ.get("MPK_ABLATE_QKV_KMAJOR_ADDR", "0")) == 1:
+            flags = flags + ["-DMPK_ABLATE_QKV_KMAJOR_ADDR"]
+        if int(os.environ.get("MPK_KV_SPREAD_A2REG", "0")) == 1:
+            flags = flags + ["-DMPK_KV_SPREAD_A2REG"]
+        if int(os.environ.get("MPK_QKV_B_MASK", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_B_MASK"]
+        if int(os.environ.get("MPK_KV_SPREAD", "0")) == 1:
+            flags = flags + ["-DMPK_KV_SPREAD"]
+        if int(os.environ.get("MPK_ABLATE_KV_EXTRA", "0")) == 1:
+            flags = flags + ["-DMPK_ABLATE_KV_EXTRA"]
+        if int(os.environ.get("MPK_ABLATE_KV_TILES", "0")) == 1:
+            flags = flags + ["-DMPK_ABLATE_KV_TILES"]
+        if int(os.environ.get("MPK_QKV_DMA_IN_SLAB", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_DMA_IN_SLAB"]
+        if int(os.environ.get("MPK_ATTN_WL_PF2", "0")) == 1:
+            flags = flags + ["-DMPK_ATTN_WL_PF2"]
+        if int(os.environ.get("MPK_TASK_FENCE_DRAIN", "0")) == 1:
+            flags = flags + ["-DMPK_TASK_FENCE_DRAIN"]
+        if int(os.environ.get("MPK_ATTSUB", "0")) == 1:
+            flags = flags + ["-DMPK_ATTSUB"]
+        if int(os.environ.get("MPK_ATTSUB_SLIDING", "0")) == 1:
+            flags = flags + ["-DMPK_ATTSUB_SLIDING"]
+        if int(os.environ.get("MPK_ATTSCAN", "0")) == 1:
+            flags = flags + ["-DMPK_ATTSCAN"]
+        if int(os.environ.get("MPK_ATTN_Q_EPOCH", "0")) == 1:
+            flags = flags + ["-DMPK_ATTN_Q_EPOCH"]
+        if int(os.environ.get("MPK_P9_DEFER_INV_L1", "0")) == 1:
+            flags = flags + ["-DMPK_P9_DEFER_INV_L1"]
+        if int(os.environ.get("MPK_MOE_BAR_NO_REFRESH", "0")) == 1:
+            flags = flags + ["-DMPK_MOE_BAR_NO_REFRESH"]
+        if int(os.environ.get("MPK_QKV_PF_SKIP_W2", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_PF_SKIP_W2"]
+        if int(os.environ.get("MPK_OPROJ_TILE_FLAGS", "0")) == 1:
+            flags = flags + ["-DMPK_OPROJ_TILE_FLAGS"]
+        if int(os.environ.get("MPK_LM_STAMPS", "0")) == 1:
+            flags = flags + ["-DMPK_LM_STAMPS"]
+        if int(os.environ.get("MPK_EMB_FIRST", "0")) == 1:
+            flags = flags + ["-DMPK_EMB_FIRST"]
+        if int(os.environ.get("MPK_LM_RESADD", "0")) == 1:
+            flags = flags + ["-DMPK_LM_RESADD"]
+        if int(os.environ.get("MPK_LTK_SEL64", "0")) == 1:
+            flags = flags + ["-DMPK_LTK_SEL64"]
+        if int(os.environ.get("MPK_LM_NORM_LDS", "0")) == 1:
+            flags = flags + ["-DMPK_LM_NORM_LDS"]
+        if int(os.environ.get("MPK_ARGMAX_IDX_PF", "0")) == 1:
+            flags = flags + ["-DMPK_ARGMAX_IDX_PF"]
+        if int(os.environ.get("MPK_EVT_FAST", "0")) == 1:
+            flags = flags + ["-DMPK_EVT_FAST"]
         # Keep the QKV RMSNorm result in LDS instead of round-tripping it
         # through the global norm scratch. Every block computes the same norm
         # and reads it back itself, so the write carried no information
@@ -1021,13 +1192,13 @@ def get_compile_command(
         # equality-recovered index. Bit-exact including the tie-break -- see
         # the comment at the asm block for why the equality matches are
         # visited in reverse.
-        if int(os.environ.get("MPK_TOPK_NO_ROUTING_CLEAR", "0")) == 1:
+        if _opt("MPK_TOPK_NO_ROUTING_CLEAR"):
             # Drop the routing-index clear at TopK entry: the cleared state is
             # unreachable (see the block comment in
             # moe_topk_softmax_mi300.cuh). Self-gated to routing_row_stride 1.
             # A/B n=12: -0.86%, median -0.89%, t=-3.50, 10/12 pairs.
             flags = flags + ["-DMPK_TOPK_NO_ROUTING_CLEAR"]
-        if int(os.environ.get("MPK_TOPK_DPP_REDUCE", "0")) == 1:
+        if _opt("MPK_TOPK_DPP_REDUCE"):
             # Move the two softmax row reductions from __shfl_xor (which
             # lowers to ds_bpermute and bumps LGKM) to DPP lane-zero ladders
             # plus one broadcast each.
@@ -1945,8 +2116,10 @@ def get_compile_command(
             # C 1.711/1.703/1.704 vs V 1.647/1.621/1.658
             # (−64 / −82 / −46 µs). Keep default ON (bs=1).
             if int(os.environ.get("MPK_LOCAL_TOPK", "0")) == 1:
-                # Local TopK hands each pair its pick in LDS; no early records.
-                flags = flags + ["-DMPK_MOE_XCD_PAIR"]
+                # No serial TopK completer and no early records: every
+                # workgroup rebuilds routing from epoch-tagged router
+                # logits and the XCD pair takes its pick from LDS (bs=1).
+                flags = flags + ["-DMPK_MOE_XCD_PAIR", "-DMPK_LOCAL_TOPK"]
             else:
                 flags = flags + ["-DMPK_MOE_XCD_PAIR", "-DMPK_EARLY_ROUTING"]
         elif int(os.environ.get("MPK_EARLY_ROUTING", "0")) == 1:
@@ -2015,6 +2188,9 @@ def get_compile_command(
             # release). Output is garbage by design; the delta against the
             # control is the upper bound on removing the barrier.
             flags = flags + ["-DMPK_MOE_SKIP_BAR"]
+        if int(os.environ.get("MPK_TERM_RECHECK", "0")) == 1:
+            # Re-test terminate after the iteration-boundary wait.
+            flags = flags + ["-DMPK_TERM_RECHECK"]
         # The same transform on the LM head's g-group argmax: two `__shfl_xor`
         # steps carrying a (value, index) pair become one interleaved
         # permlane16_swap / permlane32_swap chain. Four ds_bpermute and two
@@ -2252,6 +2428,18 @@ def get_compile_command(
             # Kept as a separate knob rather than folded into
             # MPK_W13_LINEAR_LOAD, which is a win on its own.
             flags = flags + ["-DMPK_W2_LINEAR_LOAD"]
+        if os.environ.get("MPK_W2_KWIN") is not None:
+            _kw = int(os.environ["MPK_W2_KWIN"])
+            assert 0 <= _kw <= 23, "MPK_W2_KWIN is a W2 fragment count 0..23"
+            flags = flags + [f"-DMPK_W2_KWIN={_kw}",
+                             f"-DMPK_W2_KWIN_TAIL={23 - _kw}"]
+        if int(os.environ.get("MPK_W2_GATHER_NO_NT", "0")) == 1:
+            flags = flags + ["-DMPK_W2_GATHER_NO_NT"]
+        if os.environ.get("MPK_W2_KWIN_MOVER") is not None:
+            _kwm = int(os.environ["MPK_W2_KWIN_MOVER"])
+            assert 0 <= _kwm <= 23, "MPK_W2_KWIN_MOVER is a W2 fragment count 0..23"
+            flags = flags + [f"-DMPK_W2_KWIN_MOVER={_kwm}",
+                             f"-DMPK_W2_KWIN_MOVER_TAIL={23 - _kwm}"]
         if int(os.environ.get("MPK_W2_T1_LINEAR_LOAD", "0")) == 1:
             # TESTED AND NOT ADOPTED (mixed). Linear 23-chunk W2 T1 reload.
             # Hash e86d7dc all six. A/B +7 / −29 / −4 µs. Only pair 2 >10 µs
@@ -2296,6 +2484,58 @@ def get_compile_command(
             flags = flags + ["-DMPK_OPROJ_INNER_TIMING"]
         if int(os.environ.get("MPK_MOE_INNER_TIMING", "0")) == 1:
             flags = flags + ["-DMPK_MOE_INNER_TIMING"]
+        if int(os.environ.get("MPK_LTK_DPP", "0")) == 1:
+            flags = flags + ["-DMPK_LTK_DPP"]
+        if int(os.environ.get("MPK_IL_FAST", "0")) == 1:
+            # Intermittent multi-second stalls: the per-iteration qo_indptr[1]
+            # cache can go stale (fleet_best.sh record 114). Kept for reference.
+            raise RuntimeError("MPK_IL_FAST is disabled: intermittent stalls")
+        if int(os.environ.get("MPK_LTK_NO_LOGIT_STORE", "0")) == 1:
+            flags = flags + ["-DMPK_LTK_NO_LOGIT_STORE"]
+        if int(os.environ.get("MPK_FUSED_INLINE", "0")) == 1:
+            flags = flags + ["-DMPK_FUSED_INLINE"]
+        if int(os.environ.get("MPK_ROUTER_BIAS_PF", "0")) == 1:
+            flags = flags + ["-DMPK_ROUTER_BIAS_PF"]
+        if int(os.environ.get("MPK_LTK_EARLY_TAG", "0")) == 1:
+            if int(os.environ.get("MPK_LOCAL_TOPK", "0")) != 1:
+                raise RuntimeError("MPK_LTK_EARLY_TAG requires MPK_LOCAL_TOPK=1")
+            flags = flags + ["-DMPK_LTK_EARLY_TAG"]
+        if int(os.environ.get("MPK_SUBKERNEL_INLINE", "0")) == 1:
+            flags = flags + ["-DMPK_SUBKERNEL_INLINE"]
+        if int(os.environ.get("MPK_LTK_POLL_SC1", "0")) == 1:
+            flags = flags + ["-DMPK_LTK_POLL_SC1"]
+        if int(os.environ.get("MPK_LMHEAD_INLINE", "0")) == 1:
+            flags = flags + ["-DMPK_LMHEAD_INLINE"]
+        if int(os.environ.get("MPK_OPROJ_INLINE", "0")) == 1:
+            flags = flags + ["-DMPK_OPROJ_INLINE"]
+        if int(os.environ.get("MPK_MOE_INLINE", "0")) == 1:
+            flags = flags + ["-DMPK_MOE_INLINE"]
+        if int(os.environ.get("MPK_ROUTER_BIAS_PF3", "0")) == 1:
+            flags = flags + ["-DMPK_ROUTER_BIAS_PF3"]
+        if int(os.environ.get("MPK_IL_CACHE2", "0")) == 1:
+            flags = flags + ["-DMPK_IL_CACHE2"]
+        if int(os.environ.get("MPK_P9_POLL_GLOBAL", "0")) == 1:
+            flags = flags + ["-DMPK_P9_POLL_GLOBAL"]
+        if int(os.environ.get("MPK_OPROJ_POLL_GLOBAL", "0")) == 1:
+            flags = flags + ["-DMPK_OPROJ_POLL_GLOBAL"]
+        if int(os.environ.get("MPK_MOE_POLL_COUNTER", "0")) == 1:
+            flags = flags + ["-DMPK_MOE_POLL_COUNTER"]
+        if int(os.environ.get("MPK_QKV_EPOCH_POLL_SC1", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_EPOCH_POLL_SC1"]
+        if int(os.environ.get("MPK_P9_POLL_GLOBAL2", "0")) == 1:
+            flags = flags + ["-DMPK_P9_POLL_GLOBAL2"]
+        if int(os.environ.get("MPK_QKV_SUBSTAMPS", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_SUBSTAMPS"]
+        if int(os.environ.get("MPK_ILSUB", "0")) == 1:
+            flags = flags + ["-DMPK_ILSUB"]
+        if int(os.environ.get("MPK_ILPER", "0")) == 1:
+            flags = flags + ["-DMPK_ILPER"]
+        if os.environ.get("MPK_ILSUB_L0"):
+            flags = flags + ["-DMPK_ILSUB_L0=%d" % int(os.environ["MPK_ILSUB_L0"])]
+        if int(os.environ.get("MPK_QKV_INLINE", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_INLINE"]
+        if int(os.environ.get("MPK_QKV_POS_PREFETCH", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_POS_PREFETCH"]
         if int(os.environ.get("MPK_SUBPHASE_TIMING", "0")) == 1:
             flags = flags + ["-DMPK_ENABLE_SUBPHASE_TIMING"]
         if int(os.environ.get("MPK_MOE_SUBPHASE", "0")) == 1:
@@ -6588,8 +6828,58 @@ class PersistentKernel:
         #     with open(json_file_path, "w") as f:
         #         json.dump(fused_graph, f)
 
+        cuda_code = results["cuda_code"]
+        if int(os.environ.get("MPK_IL_FAST", "0")) == 1:
+            # The fused-layer dispatch reloads qo_indptr[1] before every
+            # layer call; read the per-iteration LDS copy instead.
+            _key = "kernel::gang_full_layer_fused_kernel_mi300<"
+            _arg = "runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS],"
+            _parts, _pos, _n = [], 0, 0
+            while True:
+                _i = cuda_code.find(_key, _pos)
+                if _i < 0:
+                    break
+                _j = cuda_code.find(_arg, _i)
+                _k = cuda_code.find(_key, _i + len(_key))
+                if _j < 0 or (_k >= 0 and _j > _k):
+                    raise RuntimeError("MPK_IL_FAST: fused-layer call without the qo_indptr argument")
+                _parts += [cuda_code[_pos:_j], "mpk_ml_qo_len(),"]
+                _pos, _n = _j + len(_arg), _n + 1
+            cuda_code = "".join(_parts) + cuda_code[_pos:]
+            if _n == 0:
+                raise RuntimeError("MPK_IL_FAST: no fused-layer call found")
+            print(f"MPK_IL_FAST: {_n} fused-layer calls read qo_len from LDS")
+        if int(os.environ.get("MPK_FUSED_INLINE", "0")) == 1:
+            # ml-loop-only copy of the dispatch whose fused-layer calls inline.
+            _hdr = "__device__ __forceinline__\nvoid _execute_gang_task(TaskDesc const* task_desc,"
+            _i = cuda_code.find(_hdr)
+            if _i < 0:
+                raise RuntimeError("MPK_FUSED_INLINE: _execute_gang_task definition not found")
+            _j, _depth = cuda_code.find("{", _i), 0
+            while True:
+                _c = cuda_code[_j]
+                if _c == "{":
+                    _depth += 1
+                elif _c == "}":
+                    _depth -= 1
+                    if _depth == 0:
+                        break
+                _j += 1
+            _ml = cuda_code[_i:_j + 1].replace(
+                "void _execute_gang_task(", "void _execute_gang_task_ml(", 1).replace(
+                "kernel::gang_full_layer_fused_kernel_mi300<",
+                "kernel::gang_full_layer_fused_kernel_mi300_inl<")
+            if int(os.environ.get("MPK_IL_CACHE2", "0")) == 1:
+                _ml = _ml.replace("int tile_idx) {", "int tile_idx, int ml_qo_len) {", 1)
+                _ml = _ml.replace(
+                    "runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS]", "ml_qo_len")
+            _n = _ml.count("gang_full_layer_fused_kernel_mi300_inl<")
+            if _n == 0:
+                raise RuntimeError("MPK_FUSED_INLINE: no fused-layer call in the dispatch")
+            cuda_code = cuda_code[:_j + 1] + "\n\n" + _ml + cuda_code[_j + 1:]
+            print(f"MPK_FUSED_INLINE: ml dispatch with {_n} inlined fused-layer calls")
         with open(cuda_code_path, "w") as f:
-            f.write(results["cuda_code"] + HARD_CODE)
+            f.write(cuda_code + HARD_CODE)
 
         if output_dir is not None:
             os.makedirs(output_dir, exist_ok=True)
@@ -6802,13 +7092,13 @@ class PersistentKernel:
             else:
                 trace_name = f"mirage_{self.mpi_rank}.perfetto-trace"
 
-            export_to_perfetto_trace(
-                self.profiler_tensor, trace_name
-            )
             # Also save raw profiler tensor for programmatic analysis
             raw_path = trace_name.replace(".perfetto-trace", ".pt")
             torch.save(self.profiler_tensor.cpu(), raw_path)
             print(f"Saved raw profiler tensor to {raw_path}")
+            export_to_perfetto_trace(
+                self.profiler_tensor, trace_name
+            )
 
     def __del__(self):
         if not self.__finalized__:

@@ -607,47 +607,41 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
 }
 
 
-// MPK_LTK_SNAP fallback
-#ifndef MPK_LTK_MARK
-#define MPK_LTK_MARK(k) do {} while (0)
-#endif
 #ifdef MPK_LOCAL_TOPK
-#ifdef MPK_LTK_DPP
-// __shfl_xor(v, m, 16) for m in {1, 2, 4, 8} on the VALU. Each ds_bpermute
-// is a round trip through the LDS crossbar and the TopK below chains 24 of
-// them; a DPP move reads the same partner lane, so every max, sum and
-// tie-break is unchanged. row_ror's direction comes from the hardware
-// (x4_rr4 = "row_ror:4 reads lane ^ 4"), not from an assumption.
-__device__ __forceinline__ int mpk_ltk_x16(int v, int mask, bool x4_rr4) {
-  switch (mask) {
-  case 1:
-    return __builtin_amdgcn_mov_dpp(v, 0xB1, 0xF, 0xF, false);  // qp [1,0,3,2]
-  case 2:
-    return __builtin_amdgcn_mov_dpp(v, 0x4E, 0xF, 0xF, false);  // qp [2,3,0,1]
-  case 8:
-    return __builtin_amdgcn_mov_dpp(v, 0x128, 0xF, 0xF, false);  // row_ror:8
-  default: {
-    int const a = __builtin_amdgcn_mov_dpp(v, 0x124, 0xF, 0xF, false);
-    int const b = __builtin_amdgcn_mov_dpp(v, 0x12C, 0xF, 0xF, false);
-    return x4_rr4 ? a : b;
-  }
-  }
+// Every workgroup rebuilds this layer's routing from the 128 epoch-tagged
+// router logits. The row arithmetic is topk_softmax_mi300_task_impl's for one
+// row, line for line -- 16 lanes x 8 contiguous columns, the same max / exp2 /
+// sum reductions, the same asm argmax and tie-break, the same
+// renormalization -- so every workgroup reproduces the completer's picks and
+// weights bit for bit.
+#ifdef MPK_LTK_SEL64
+// Wave-wide float max, broadcast from lane 63. Lanes a DPP step does not write
+// keep their own value, which max leaves unchanged.
+__device__ __forceinline__ float ltk_wave_max(float v) {
+  int x = __float_as_int(v);
+#define LTK_WMAX_STEP(CTRL, ROW_MASK)                                         \
+  x = __float_as_int(fmaxf(__int_as_float(x),                                 \
+                           __int_as_float(__builtin_amdgcn_update_dpp(         \
+                               x, x, CTRL, ROW_MASK, 0xF, false))))
+  LTK_WMAX_STEP(0xB1, 0xF);  // quad_perm [1,0,3,2]
+  LTK_WMAX_STEP(0x4E, 0xF);  // quad_perm [2,3,0,1]
+  LTK_WMAX_STEP(0x124, 0xF); // row_ror:4
+  LTK_WMAX_STEP(0x128, 0xF); // row_ror:8
+  LTK_WMAX_STEP(0x142, 0xA); // row_bcast:15 into rows 1 and 3
+  LTK_WMAX_STEP(0x143, 0xC); // row_bcast:31 into rows 2 and 3
+#undef LTK_WMAX_STEP
+  return __int_as_float(__builtin_amdgcn_readlane(x, 63));
 }
-__device__ __forceinline__ float mpk_ltk_x16f(float v, int mask, bool x4_rr4) {
-  return __int_as_float(mpk_ltk_x16(__float_as_int(v), mask, x4_rr4));
+
+__device__ __forceinline__ int ltk_bitrev4(int r) {
+  return ((r & 1) << 3) | ((r & 2) << 1) | ((r & 4) >> 1) | ((r & 8) >> 3);
 }
-#define MPK_LTK_XOR(v, m) mpk_ltk_x16f((v), (m), ltk_x4_rr4)
-#define MPK_LTK_XORI(v, m) mpk_ltk_x16((v), (m), ltk_x4_rr4)
-#else
-#define MPK_LTK_XOR(v, m) __shfl_xor((v), (m), 16)
-#define MPK_LTK_XORI(v, m) __shfl_xor((v), (m), 16)
 #endif
-// Every workgroup rebuilds routing from the tagged logits on its own AID's
-// replica. The row arithmetic below is topk_softmax_mi300_task_impl's for one
-// row, line for line (16 lanes x 8 values, same reductions, same asm
-// tie-breaks, same renormalization), so all workgroups agree bit for bit.
+
 template <int NUM_EXPERTS, int K>
-__device__ __forceinline__ void mpk_local_topk(int *tags, int expected) {
+__device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
+                                               int const *norm_flags = nullptr,
+                                               int n_norm = 0) {
   static_assert(NUM_EXPERTS == 128, "MPK_LOCAL_TOPK: s_ltk_* sized for 128");
   static_assert(K <= 8, "MPK_LOCAL_TOPK: topk_vals holds 8");
   constexpr int VPT = 8;
@@ -655,52 +649,123 @@ __device__ __forceinline__ void mpk_local_topk(int *tags, int expected) {
   static_assert(THREADS_PER_ROW == 16, "one 16-lane row");
   int const tid = threadIdx.x;
   unsigned const want = mpk_ltk_tag(expected);
-#ifdef MPK_TOPK_OWN_AID_PROBE
-  // TIMING ONLY: wait just for the logits this AID produced.
-  int ltk_xcc;
-  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)" : "=s"(ltk_xcc));
-  bool const ltk_mine = ((2 * tid) >> 6) == ((ltk_xcc & 7) >> 2);
-#endif
   if (tid < 64) {
+    // One wave reads all 128 words, two per lane, at the same system scope as
+    // the routing_ready poll this replaces. Each word is a single
+    // write-through store, so a matching tag carries its own logit.
     unsigned long long v;
-    MPK_LTK_MARK(1);
+#ifdef MPK_ILSUB
+    unsigned long long ilsub_miss = 0, ilsub_iters = 0;
+#endif
+#if defined(MPK_POLL_PIPE) && !defined(MPK_LTK_POLL_SC1)
+    {
+      // Two samples in flight, half a round trip apart.
+      unsigned long long *tp = reinterpret_cast<unsigned long long *>(
+          const_cast<int *>(tags) + 2 * tid);
+      auto ltk_ready = [&](unsigned long long x) {
+        return (((unsigned)(x >> 16)) & 0xFFFFu) == want &&
+               (((unsigned)(x >> 48)) & 0xFFFFu) == want;
+      };
+      unsigned long long va =
+          __hip_atomic_load(tp, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      __builtin_amdgcn_s_sleep(8);
+      unsigned long long vb =
+          __hip_atomic_load(tp, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      while (true) {
+#ifdef MPK_ILSUB
+        ilsub_iters++;
+#endif
+        if (__all(ltk_ready(va))) {
+          v = va;
+          break;
+        }
+        va = __hip_atomic_load(tp, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+#ifdef MPK_ILSUB
+        ilsub_iters++;
+#endif
+        if (__all(ltk_ready(vb))) {
+          v = vb;
+          break;
+        }
+        vb = __hip_atomic_load(tp, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      }
+    }
+    while (false) {
+#else
     while (true) {
-      asm volatile("global_load_dwordx2 %0, %1, off sc1\n"
-                   "s_waitcnt vmcnt(0)"
+#endif
+#ifdef MPK_LTK_POLL_SC1
+      asm volatile("global_load_dwordx2 %0, %1, off sc1\n\ts_waitcnt vmcnt(0)"
                    : "=v"(v)
                    : "v"(tags + 2 * tid)
                    : "memory");
+#else
+      v = ld_sys_u64((void *)(tags + 2 * tid));
+#endif
       bool const ok = (((unsigned)(v >> 16)) & 0xFFFFu) == want &&
                       (((unsigned)(v >> 48)) & 0xFFFFu) == want;
-#ifdef MPK_TOPK_OWN_AID_PROBE
-      if (__all(ok || !ltk_mine)) {
-        break;
+#ifdef MPK_ILSUB
+      unsigned long long const ilsub_m = __ballot(!ok);
+      ilsub_iters++;
+      if (ilsub_m) {
+        ilsub_miss = ilsub_m;
       }
-#else
+#endif
       if (__all(ok)) {
         break;
       }
-#endif
       __builtin_amdgcn_s_sleep(1);
     }
-    MPK_LTK_MARK(2);
+    MPK_ILSTAMP(18, s_ilsub_ml == MPK_ILSUB_L0 + 1);
+#ifdef MPK_ILSUB
+    // 30: lanes (tag pairs 2l, 2l+1) still missing on the last failed poll;
+    // 31: poll iterations.
+    if (tid == 0 && s_ilsub_ml == MPK_ILSUB_L0 + 1) {
+      g_ilsub[blockIdx.x * 32 + 30] = ilsub_miss;
+      g_ilsub[blockIdx.x * 32 + 31] = ilsub_iters;
+    }
+#endif
     s_ltk_logit[2 * tid] = (unsigned short)(v & 0xFFFFu);
     s_ltk_logit[2 * tid + 1] = (unsigned short)((v >> 32) & 0xFFFFu);
   }
-  for (int e = tid; e < NUM_EXPERTS; e += blockDim.x) {
-    s_ltk_route[e] = 0;
-  }
   __syncthreads();
-  if (tid < THREADS_PER_ROW) {
-    float row_chunk[VPT];
-#ifdef MPK_LTK_DPP
-    bool const ltk_x4_rr4 =
-        __builtin_amdgcn_mov_dpp(tid, 0x124, 0xF, 0xF, false) == (tid ^ 4);
+#ifdef MPK_LTK_EARLY_TAG
+  if (n_norm > 0 && tid >= 64 && tid < 128) {
+    // Wave 1 waits for this XCD's normed row while wave 0 runs the TopK.
+    int const w = tid - 64 < n_norm ? tid - 64 : n_norm - 1;
+    unsigned f;
+    while (true) {
+      asm volatile("global_load_dword %0, %1, off sc1\n\ts_waitcnt vmcnt(0)"
+                   : "=v"(f)
+                   : "v"(norm_flags + w)
+                   : "memory");
+      if (__all(f == want)) {
+        break;
+      }
+      __builtin_amdgcn_s_sleep(1);
+    }
+#ifdef MPK_ILSUB
+    if (tid == 64 && s_ilsub_ml == MPK_ILSUB_L0 + 1) {
+      g_ilsub[blockIdx.x * 32 + 29] = __builtin_amdgcn_s_memrealtime();
+    }
 #endif
+  }
+#endif
+  MPK_ILSTAMP(24, s_ilsub_ml == MPK_ILSUB_L0 + 1);
+#ifdef MPK_LTK_SEL64
+  float ltk_m = 0.f, ltk_i = 0.f;
+#endif
+#ifdef MPK_LTK_SELLOGIT
+#ifdef MPK_LTK_SEL64
+#error "MPK_LTK_SELLOGIT replaces the 16-lane softmax that MPK_LTK_SEL64 builds on"
+#endif
+  if (tid >= 128 && tid < 128 + THREADS_PER_ROW) {
+    // The original softmax statistics, on wave 2's first row.
+    int const sl = tid - 128;
+    float row_chunk[VPT];
     for (int e = 0; e < VPT; ++e) {
-      // bf16 -> f32 is exact: the bf16 bits are the float's top half.
       row_chunk[e] =
-          __uint_as_float(((unsigned)s_ltk_logit[tid * VPT + e]) << 16);
+          __uint_as_float(((unsigned)s_ltk_logit[sl * VPT + e]) << 16);
     }
     float thread_max = row_chunk[0];
     for (int ii = 1; ii < VPT; ++ii) {
@@ -708,11 +773,14 @@ __device__ __forceinline__ void mpk_local_topk(int *tags, int expected) {
     }
 #ifdef MPK_TOPK_DPP_REDUCE
     thread_max = topk_dpp_row_max_to_lane_zero(thread_max);
-    thread_max = __shfl(thread_max, 0, THREADS_PER_ROW);
+#ifdef MPK_LTK_DPP
+    thread_max = __int_as_float(__builtin_amdgcn_readfirstlane(__float_as_int(thread_max)));
 #else
-#pragma unroll
+    thread_max = __shfl(thread_max, 0, THREADS_PER_ROW);
+#endif
+#else
     for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
-      float other = MPK_LTK_XOR(thread_max, mask);
+      float other = __shfl_xor(thread_max, mask, THREADS_PER_ROW);
       thread_max = fmaxf(thread_max, other);
     }
 #endif
@@ -724,17 +792,76 @@ __device__ __forceinline__ void mpk_local_topk(int *tags, int expected) {
     }
 #ifdef MPK_TOPK_DPP_REDUCE
     row_sum = topk_dpp_row_sum_to_lane_zero(row_sum);
-    row_sum = __shfl(row_sum, 0, THREADS_PER_ROW);
+#ifdef MPK_LTK_DPP
+    row_sum = __int_as_float(__builtin_amdgcn_readfirstlane(__float_as_int(row_sum)));
 #else
-#pragma unroll
+    row_sum = __shfl(row_sum, 0, THREADS_PER_ROW);
+#endif
+#else
     for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
-      row_sum += MPK_LTK_XOR(row_sum, mask);
+      row_sum += __shfl_xor(row_sum, mask, THREADS_PER_ROW);
+    }
+#endif
+    float const inv_sum = 1.f / row_sum;
+    if (sl == 0) {
+      s_ltk_w[4] = thread_max;
+      s_ltk_w[5] = inv_sum;
+    }
+  }
+#endif
+  if (tid < THREADS_PER_ROW) {
+    float row_chunk[VPT];
+    for (int e = 0; e < VPT; ++e) {
+      // bf16 -> f32 is exact: the bf16 bits are the float's top half.
+      row_chunk[e] =
+          __uint_as_float(((unsigned)s_ltk_logit[tid * VPT + e]) << 16);
+    }
+#ifndef MPK_LTK_SELLOGIT
+    float thread_max = row_chunk[0];
+    for (int ii = 1; ii < VPT; ++ii) {
+      thread_max = fmaxf(thread_max, row_chunk[ii]);
+    }
+#ifdef MPK_TOPK_DPP_REDUCE
+    thread_max = topk_dpp_row_max_to_lane_zero(thread_max);
+#ifdef MPK_LTK_DPP
+    thread_max = __int_as_float(__builtin_amdgcn_readfirstlane(__float_as_int(thread_max)));
+#else
+    thread_max = __shfl(thread_max, 0, THREADS_PER_ROW);
+#endif
+#else
+    for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
+      float other = __shfl_xor(thread_max, mask, THREADS_PER_ROW);
+      thread_max = fmaxf(thread_max, other);
+    }
+#endif
+    float row_sum = 0.f;
+    for (int ii = 0; ii < VPT; ++ii) {
+      row_chunk[ii] = __builtin_amdgcn_exp2f((row_chunk[ii] - thread_max) *
+                                             1.4426950408889634f);
+      row_sum += row_chunk[ii];
+    }
+#ifdef MPK_TOPK_DPP_REDUCE
+    row_sum = topk_dpp_row_sum_to_lane_zero(row_sum);
+#ifdef MPK_LTK_DPP
+    row_sum = __int_as_float(__builtin_amdgcn_readfirstlane(__float_as_int(row_sum)));
+#else
+    row_sum = __shfl(row_sum, 0, THREADS_PER_ROW);
+#endif
+#else
+    for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
+      row_sum += __shfl_xor(row_sum, mask, THREADS_PER_ROW);
     }
 #endif
     float const inv_sum = 1.f / row_sum;
     for (int ii = 0; ii < VPT; ++ii) {
       row_chunk[ii] *= inv_sum;
     }
+#endif
+    MPK_ILSTAMP(25, s_ilsub_ml == MPK_ILSUB_L0 + 1);
+#ifdef MPK_LTK_SEL64
+    ltk_m = thread_max;
+    ltk_i = inv_sum;
+#else
     int const start_col = tid * VPT;
     float row_sum_for_renorm = 0.f;
     float topk_vals[8];
@@ -813,10 +940,41 @@ __device__ __forceinline__ void mpk_local_topk(int *tags, int expected) {
                      [c6] "v"(col[6]), [c7] "v"(col[7])
                    : "vcc");
 #endif
-#pragma unroll
+#ifdef MPK_LTK_DPP
+      {
+        // xor 8 = row_ror:8; xor 4 = row_shl:4 for lanes with bit 2 clear, row_shr:4
+        // for the rest; xor 2 / xor 1 = quad_perm [2,3,0,1] / [1,0,3,2].
+        bool const ltk_hi4 = (tid & 4) != 0;
+#define MPK_LTK_STEP(OM, OE)                                              \
+        do {                                                                    \
+          float const other_max = __int_as_float(OM);                           \
+          int const other_expert = (OE);                                        \
+          asm volatile("v_cmp_gt_f32 vcc, %[om], %[mv]\n"                        \
+                       "v_cndmask_b32 %[mv], %[mv], %[om], vcc\n"                \
+                       "v_cndmask_b32 %[ex], %[ex], %[oe], vcc\n"                \
+                       : [mv] "+v"(max_val), [ex] "+v"(expert)                  \
+                       : [om] "v"(other_max), [oe] "v"(other_expert)            \
+                       : "vcc");                                                 \
+        } while (0)
+        MPK_LTK_STEP(__builtin_amdgcn_update_dpp(0, __float_as_int(max_val), 0x128, 0xF, 0xF, false),
+                     __builtin_amdgcn_update_dpp(0, expert, 0x128, 0xF, 0xF, false));
+        {
+          int const mv_lo = __builtin_amdgcn_update_dpp(0, __float_as_int(max_val), 0x104, 0xF, 0xF, false);
+          int const mv_hi = __builtin_amdgcn_update_dpp(0, __float_as_int(max_val), 0x114, 0xF, 0xF, false);
+          int const ex_lo = __builtin_amdgcn_update_dpp(0, expert, 0x104, 0xF, 0xF, false);
+          int const ex_hi = __builtin_amdgcn_update_dpp(0, expert, 0x114, 0xF, 0xF, false);
+          MPK_LTK_STEP(ltk_hi4 ? mv_hi : mv_lo, ltk_hi4 ? ex_hi : ex_lo);
+        }
+        MPK_LTK_STEP(__builtin_amdgcn_update_dpp(0, __float_as_int(max_val), 0x4E, 0xF, 0xF, false),
+                     __builtin_amdgcn_update_dpp(0, expert, 0x4E, 0xF, 0xF, false));
+        MPK_LTK_STEP(__builtin_amdgcn_update_dpp(0, __float_as_int(max_val), 0xB1, 0xF, 0xF, false),
+                     __builtin_amdgcn_update_dpp(0, expert, 0xB1, 0xF, 0xF, false));
+#undef MPK_LTK_STEP
+      }
+#else
       for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
-        float other_max = MPK_LTK_XOR(max_val, mask);
-        int other_expert = MPK_LTK_XORI(expert, mask);
+        float other_max = __shfl_xor(max_val, mask, THREADS_PER_ROW);
+        int other_expert = __shfl_xor(expert, mask, THREADS_PER_ROW);
         asm volatile("v_cmp_gt_f32 vcc, %[om], %[mv]\n"
                      "v_cndmask_b32 %[mv], %[mv], %[om], vcc\n"
                      "v_cndmask_b32 %[ex], %[ex], %[oe], vcc\n"
@@ -824,14 +982,18 @@ __device__ __forceinline__ void mpk_local_topk(int *tags, int expected) {
                      : [om] "v"(other_max), [oe] "v"(other_expert)
                      : "vcc");
       }
+#endif
       if (tid == 0) {
         topk_vals[k_idx] = max_val;
         row_sum_for_renorm += max_val;
-        s_ltk_route[expert] = k_idx + 1;
         s_ltk_sel[k_idx] = expert;
       }
       if (k_idx + 1 < K) {
+#ifdef MPK_LTK_SELLOGIT
+        float const neg_inf = __int_as_float(0xff800000);
+#else
         float const neg_inf = -10000.f;
+#endif
 #pragma unroll
         for (int i = 0; i < VPT; ++i) {
           asm volatile("v_cmp_eq_u32 vcc, %[ex], %[ci]\n"
@@ -842,36 +1004,106 @@ __device__ __forceinline__ void mpk_local_topk(int *tags, int expected) {
         }
       }
     }
+#ifdef MPK_LTK_SELLOGIT
+    (void)row_sum_for_renorm;
+    if (tid == 0) {
+      for (int k_idx = 0; k_idx < K; ++k_idx) {
+        s_ltk_w[k_idx] = topk_vals[k_idx];
+      }
+    }
+#else
     if (tid == 0) {
       float inv = 1.f / row_sum_for_renorm;
       for (int k_idx = 0; k_idx < K; ++k_idx) {
         s_ltk_w[k_idx] = topk_vals[k_idx] * inv;
       }
     }
+#endif
+#endif
   }
-  __syncthreads();
+#ifdef MPK_LTK_SEL64
   if (tid < 64) {
-    int const lane = tid;
-    unsigned long long const lane_mask = (1ULL << lane) - 1ULL;
-    int count = 0;
-    for (int base = 0; base < NUM_EXPERTS; base += 64) {
-      int const e = base + lane;
-      bool const hit = s_ltk_route[e] != 0;
-      unsigned long long const ballot = __ballot(hit);
-      if (hit) {
-        s_ltk_mask[count + __popcll(ballot & lane_mask)] = e;
+    float const m =
+        __int_as_float(__builtin_amdgcn_readlane(__float_as_int(ltk_m), 0));
+    float const inv =
+        __int_as_float(__builtin_amdgcn_readlane(__float_as_int(ltk_i), 0));
+    int const e0 = 2 * tid;
+    float p0 = __builtin_amdgcn_exp2f(
+        (__uint_as_float(((unsigned)s_ltk_logit[e0]) << 16) - m) *
+        1.4426950408889634f);
+    float p1 = __builtin_amdgcn_exp2f(
+        (__uint_as_float(((unsigned)s_ltk_logit[e0 + 1]) << 16) - m) *
+        1.4426950408889634f);
+    p0 *= inv;
+    p1 *= inv;
+    float row_sum_for_renorm = 0.f;
+    float topk_vals[8];
+    for (int k_idx = 0; k_idx < K; ++k_idx) {
+      bool const hi = p1 > p0;
+      float const lmax = hi ? p1 : p0;
+      int const lexp = hi ? e0 + 1 : e0;
+      float const gmax = ltk_wave_max(lmax);
+      bool const tied = lmax == gmax;
+      unsigned long long const tmask = __ballot(tied);
+      int jsel;
+      if ((tmask & (tmask - 1)) == 0) {
+        jsel = __builtin_ctzll(tmask);
+      } else {
+        jsel = 0;
+        for (int r = 15; r >= 0; --r) {
+          int const g = ltk_bitrev4(r);
+          unsigned const bits = (unsigned)(tmask >> (4 * g)) & 0xFu;
+          if (bits) {
+            jsel = 4 * g + __builtin_ctz(bits);
+          }
+        }
       }
-      count += __popcll(ballot);
+      int const sel = __builtin_amdgcn_readlane(lexp, jsel);
+      if (tid == 0) {
+        topk_vals[k_idx] = gmax;
+        row_sum_for_renorm += gmax;
+        s_ltk_sel[k_idx] = sel;
+      }
+      if (k_idx + 1 < K) {
+        unsigned const grp = (unsigned)(tmask >> (tid & ~3)) & 0xFu;
+        if (tied && (grp & ((1u << (tid & 3)) - 1u)) == 0u) {
+          if (hi) {
+            p1 = -10000.f;
+          } else {
+            p0 = -10000.f;
+          }
+        }
+      }
     }
-    for (int e = count + lane; e < NUM_EXPERTS; e += 64) {
-      s_ltk_mask[e] = -1;
-    }
-    if (lane == 0) {
-      s_ltk_mask[NUM_EXPERTS] = count;
+    if (tid == 0) {
+      float const inv_r = 1.f / row_sum_for_renorm;
+      for (int k_idx = 0; k_idx < K; ++k_idx) {
+        s_ltk_w[k_idx] = topk_vals[k_idx] * inv_r;
+      }
     }
   }
+#endif
+  MPK_ILSTAMP(19, s_ilsub_ml == MPK_ILSUB_L0 + 1);
   __syncthreads();
-  MPK_LTK_MARK(3);
+#ifdef MPK_LTK_SELLOGIT
+  if (tid == 128) {
+    // Read only by W2, behind the MoE's own barriers.
+    float const m = s_ltk_w[4];
+    float const inv_sum = s_ltk_w[5];
+    float p[K];
+    float row_sum_for_renorm = 0.f;
+    for (int k_idx = 0; k_idx < K; ++k_idx) {
+      p[k_idx] = __builtin_amdgcn_exp2f((s_ltk_w[k_idx] - m) *
+                                        1.4426950408889634f);
+      p[k_idx] *= inv_sum;
+      row_sum_for_renorm += p[k_idx];
+    }
+    float const inv = 1.f / row_sum_for_renorm;
+    for (int k_idx = 0; k_idx < K; ++k_idx) {
+      s_ltk_w[k_idx] = p[k_idx] * inv;
+    }
+  }
+#endif
 }
 #endif
 

@@ -53,14 +53,26 @@
 #define MPK_W2_LD_MOD " sc0 nt"
 #endif
 
-// MPK_W2_KWIN: see the W2 prologue. Wait for K-step k's fragment right before
-// its A read; the unrolled body keeps k in MPK_W2_T0_SC_%= (2p+1 at pair p).
+// MPK_W2_KWIN=D: the W2 weight tile goes out as a request window (D 1 KiB
+// fragments before the W13->W2 poll, the other 23 - D behind the SwiGLU
+// gather) and is consumed fragment by fragment: K-step k waits vmcnt(22 - k)
+// right before its A read. The unrolled body keeps k in MPK_W2_T0_SC_%=
+// (2p+1 at pair p). down_proj is stored K-major on the host, so fragment k is
+// K-step k.
 #ifdef MPK_W2_KWIN
-#if defined(MPK_MOE_QUAD_ACCUMULATOR) || defined(MPK_W2_PF_BEFORE_WAIT) ||     \
-    !defined(MPK_W2_T0_MFMA_UNROLLED) || defined(MPK_W2_LINEAR_LOAD) ||        \
-    defined(MPK_W2_SCALE_OVERLAP) || !defined(MPK_WIDE_FP8_QUANT) ||           \
-    defined(MPK_MFMA_PINGPONG_SCHED) || !defined(MPK_W2_KWIN_TAIL)
+#if defined(MPK_W2_QUAD_ACC) || defined(MPK_MOE_QUAD_ACCUMULATOR) ||         \
+    defined(MPK_W2_PF_BEFORE_WAIT) || !defined(MPK_W2_T0_MFMA_UNROLLED) ||    \
+    defined(MPK_W2_LINEAR_LOAD) || defined(MPK_W2_SCALE_OVERLAP) ||           \
+    !defined(MPK_WIDE_FP8_QUANT) || defined(MPK_MFMA_PINGPONG_SCHED) ||       \
+    !defined(MPK_W2_KWIN_TAIL)
 #error "MPK_W2_KWIN covers the single-chain unrolled W2 body with the wide gather only"
+#endif
+// The SwiGLU row was written by another XCD: same modifiers as
+// _gang_wave_parallel_fp8_quant_nt_wide.
+#ifdef MPK_W2_GATHER_NO_NT
+#define MPK_W2_GATHER_MOD " sc0 sc1"
+#else
+#define MPK_W2_GATHER_MOD " sc0 sc1 nt"
 #endif
 #define MPK_W2KS2(x) #x
 #define MPK_W2KS(x) MPK_W2KS2(x)
@@ -114,11 +126,67 @@
   ".elseif (21 - MPK_W2_T0_SC_%=) == 2\n s_waitcnt vmcnt(2)\n" \
   ".elseif (21 - MPK_W2_T0_SC_%=) == 1\n s_waitcnt vmcnt(1)\n" \
   ".else\n s_waitcnt vmcnt(0)\n.endif\n"
+// Early fragments (before the poll) and gather + tail, for a window of D.
+#define MPK_W2K_EARLY_ASM(D)                                                   \
+  asm volatile("s_nop 4\n"                                                     \
+               "s_mov_b32 m0, %[l]\n"                                          \
+               "s_nop 0\n"                                                     \
+               "buffer_load_dwordx4 %[v], %[r], 0 offen " MPK_W2_DMA_MOD       \
+               " lds\n"                                                        \
+               ".rept " MPK_W2KS(D) " - 1\n"                                   \
+               "s_addk_i32 m0, 0x400\n"                                        \
+               "v_add_u32_e32 %[v], 0x400, %[v]\n"                             \
+               "buffer_load_dwordx4 %[v], %[r], 0 offen " MPK_W2_DMA_MOD       \
+               " lds\n"                                                        \
+               ".endr\n"                                                       \
+               "v_add_u32_e32 %[v], 0x400, %[v]\n"                             \
+               : [v] "+v"(w2k_voff)                                            \
+               : [r] "s"(w2_rsrc), [l] "s"(w2k_lds)                            \
+               : "memory", "m0")
+#define MPK_W2K_GATHER_TAIL_ASM(D, TAIL)                                       \
+  asm volatile("global_load_dwordx4 %[w0], %[a0], off" MPK_W2_GATHER_MOD "\n"  \
+               "global_load_dwordx4 %[w1], %[a1], off" MPK_W2_GATHER_MOD "\n"  \
+               "s_nop 4\n"                                                     \
+               "s_mov_b32 m0, %[l]\n"                                          \
+               "s_nop 0\n"                                                     \
+               "buffer_load_dwordx4 %[v], %[r], 0 offen " MPK_W2_DMA_MOD       \
+               " lds\n"                                                        \
+               ".rept 22 - " MPK_W2KS(D) "\n"                                  \
+               "s_addk_i32 m0, 0x400\n"                                        \
+               "v_add_u32_e32 %[v], 0x400, %[v]\n"                             \
+               "buffer_load_dwordx4 %[v], %[r], 0 offen " MPK_W2_DMA_MOD       \
+               " lds\n"                                                        \
+               ".endr\n"                                                       \
+               "s_waitcnt vmcnt(" MPK_W2KS(TAIL) ")\n"                         \
+               : [w0] "=&v"(*(i32x4_t *)&words[0]),                            \
+                 [w1] "=&v"(*(i32x4_t *)&words[4]), [v] "+v"(w2k_voff)         \
+               : [a0] "v"(bp), [a1] "v"(bp + 4), [r] "s"(w2_rsrc),             \
+                 [l] "s"(w2k_lds + (unsigned)((D) * 1024))                     \
+               : "memory", "m0")
+#define MPK_W2K_GATHER_ONLY_ASM()                                              \
+  asm volatile("global_load_dwordx4 %[w0], %[a0], off" MPK_W2_GATHER_MOD "\n"  \
+               "global_load_dwordx4 %[w1], %[a1], off" MPK_W2_GATHER_MOD "\n"  \
+               "s_waitcnt vmcnt(0)\n"                                          \
+               : [w0] "=&v"(*(i32x4_t *)&words[0]),                            \
+                 [w1] "=&v"(*(i32x4_t *)&words[4])                             \
+               : [a0] "v"(bp), [a1] "v"(bp + 4)                                \
+               : "memory")
+#ifdef MPK_W2_KWIN_MOVER
+#if !defined(MPK_W2_KWIN_MOVER_TAIL) || !defined(MPK_MOE_W2_REMAP) ||          \
+    !(defined(MPK_EARLY_ROUTING) || defined(MPK_LOCAL_TOPK))
+#error "MPK_W2_KWIN_MOVER needs its TAIL, MPK_MOE_W2_REMAP and a carried expert"
+#endif
+// Bit 20 of the MoE tile argument: this W2 call is a mover's.
+#define MPK_W2K_MOVER_BIT(c) ((c) ? (1 << 20) : 0)
+#else
+#define MPK_W2K_MOVER_BIT(c) 0
+#endif
 #else
 #define MPK_W2_WA_STEP "64"
 #define MPK_W2_KW0 ""
 #define MPK_W2_KWA ""
 #define MPK_W2_KWB ""
+#define MPK_W2K_MOVER_BIT(c) 0
 #endif
 #include "mpk_atoms.cuh" // ld_sys_s32 (early-routing wait)
 #include "tasks/mi300/gang_moe_linear_mxfp4_mi300.cuh" // reuse type defs + helpers
@@ -548,11 +616,12 @@ template <int BATCH_SIZE,
           int NUM_TOPK,
           int W13_OUTPUT_PER_WG,
           int W2_OUTPUT_PER_WG>
-#ifdef MPK_MOE_INLINE
-__device__ __forceinline__ void gang_moe_fused_mxfp4_kernel_mi300(
+#if defined(MPK_SUBKERNEL_INLINE) || defined(MPK_MOE_INLINE)
+__device__ __forceinline__ void
 #else
-__device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
+__device__ __noinline__ void
 #endif
+gang_moe_fused_mxfp4_kernel_mi300(
     void const *input_ptr,          // [batch, hidden] BF16
     void const *gate_up_weight_ptr, // [E, W13_WGS, wg_bytes] MXFP4 (interleaved
                                     // gate/up)
@@ -841,8 +910,13 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #if defined(MPK_MOE_XCD_PAIR) && !defined(MPK_EARLY_ROUTING) && !defined(MPK_LOCAL_TOPK)
 #error "MPK_MOE_XCD_PAIR requires MPK_EARLY_ROUTING or MPK_LOCAL_TOPK (carried expert in tile_idx[15:8])"
 #endif
-#if defined(MPK_EARLY_ROUTING) || (defined(MPK_MOE_XCD_PAIR) && defined(MPK_LOCAL_TOPK))
+#if defined(MPK_EARLY_ROUTING) || defined(MPK_LOCAL_TOPK)
+#ifdef MPK_W2_KWIN_MOVER
+  bool const w2k_mover = (tile_idx >> 20) & 1;
+  int const carried_expert_id = ((tile_idx >> 8) & 0xfff) - 1;
+#else
   int const carried_expert_id = (tile_idx >> 8) - 1;
+#endif
   tile_idx &= 0xff;
 #endif
 
@@ -4821,6 +4895,10 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #ifdef MPK_MOE_ARRREC
       unsigned long long const mr_a0 = __builtin_amdgcn_s_memrealtime();
 #endif
+#if defined(MPK_MOE_POLL_COUNTER) &&                                          \
+    (defined(MPK_MOE_FLAT) || defined(MPK_MOE_NCLOCAL))
+#error "MPK_MOE_POLL_COUNTER polls the shared d_barrier counter"
+#endif
 #if defined(MPK_MOE_FLAT)
       // XCD-private counter in this die's AID replica: 23 arrivals per layer.
       int *const mf_rep = moe_flat_rep;
@@ -4845,6 +4923,14 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
           mnc ? mnc + MPK_NC_MOE_INTS + expert_idx * 64
               : &d_barrier[base + MOE_BAR_COUNTER_SLOT * MOE_BAR_LINE],
           1);
+#elif defined(MPK_MOE_POLL_COUNTER)
+      // The W2 waves poll this counter itself; nobody needs the old value,
+      // and 0 keeps the release branch below from firing.
+      asm volatile("flat_atomic_add %0, %1 sc1" ::"v"(
+                       &d_barrier[base + MOE_BAR_COUNTER_SLOT * MOE_BAR_LINE]),
+                   "v"(1)
+                   : "memory");
+      int const prev_global = 0;
 #else
       int prev_global = atom_add_release_gpu_s32(
           &d_barrier[base + MOE_BAR_COUNTER_SLOT * MOE_BAR_LINE], 1);
@@ -4983,7 +5069,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       s_tok_scales +
       (TOK_ROWS == 1 ? 0 : (tok_active ? col : 0) * W2_SC_STRIDE);
 
-  MOE_DBG_SUBPHASE(3000);
+  MOE_DBG_SUBPHASE(3000); MPK_W2STAMP(0);
   MPK_WS_MARK(8300, global_tile); // W2 entry
   // Weight pointers — depend only on expert_id/wg_idx, available before barrier
   uint8_t const *expert_weight =
@@ -5021,7 +5107,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                 "W2 LDS weight tiles exceed MI350X LDS budget");
   uint8_t *lds_w2_base = (uint8_t *)_fused_smem + LDS_W2_OFF;
 
-  MOE_DBG_SUBPHASE(3001);
+  MOE_DBG_SUBPHASE(3001); MPK_W2STAMP(1);
   // All threads independently read layer_idx from LDS (uniform value).
   // Eliminates shared variable and __syncthreads broadcast.
   // Indexed by *slot*, not expert_id: the id comes from the shared mask and
@@ -5041,6 +5127,20 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // Issue W2 weight buffer_load_lds BEFORE barrier poll — HBM loads fly
   // during barrier wait (~3us overlap instead of serial).
   // Single inline asm block to prevent compiler vmcnt serialization.
+#if defined(MPK_W2_DMA_SC1)
+// Device scope: bypasses L1 like nt, but L2 stays HIT_LRU, so a line
+// MPK_W2_L2_WARM pulled into L2 is a hit.
+#define MPK_W2_DMA_MOD "sc1"
+#elif defined(MPK_W2_PLAIN_DMA)
+// Plain W2 weight DMA, so a line MPK_W2_L2_WARM pulled into L2 is a hit;
+// an nt load drops a cached line and refetches it.
+#define MPK_W2_DMA_MOD ""
+#elif defined(MPK_W2_NO_NT)
+// MPK_W2_NO_NT: keep the stream policy (sc0) without nt.
+#define MPK_W2_DMA_MOD "sc0"
+#else
+#define MPK_W2_DMA_MOD "sc0 nt"
+#endif
 #if defined(MPK_W2_KWIN)
   // Scales, then the first MPK_W2_KWIN fragments; the rest go out behind the
   // SwiGLU gather below. One tile per wave, loaded linearly (K-major on host).
@@ -5067,7 +5167,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     asm volatile("s_nop 4\n"
                  "s_mov_b32 m0, %[l]\n"
                  "s_nop 0\n"
-                 "buffer_load_dwordx4 %[v], %[r], 0 offen" MPK_W2_LD_MOD " lds\n"
+                 "buffer_load_dwordx4 %[v], %[r], 0 offen " MPK_W2_DMA_MOD " lds\n"
                  :
                  : [v] "v"(sc_voff), [r] "s"(w2_rsrc), [l] "s"(sc_lds)
                  : "memory", "m0");
@@ -5075,27 +5175,24 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       asm volatile("s_nop 4\n"
                    "s_mov_b32 m0, %[l]\n"
                    "s_nop 0\n"
-                   "buffer_load_dwordx4 %[v], %[r], 0 offen" MPK_W2_LD_MOD " lds\n"
+                   "buffer_load_dwordx4 %[v], %[r], 0 offen " MPK_W2_DMA_MOD " lds\n"
                    :
                    : [v] "v"(sc_voff + 1024u), [r] "s"(w2_rsrc),
                      [l] "s"(sc_lds + 1024u)
                    : "memory", "m0");
     }
   }
-  if constexpr (MPK_W2_KWIN > 0) {
-    asm volatile("s_nop 4\n"
-                 "s_mov_b32 m0, %[l]\n"
-                 "s_nop 0\n"
-                 "buffer_load_dwordx4 %[v], %[r], 0 offen" MPK_W2_LD_MOD " lds\n"
-                 ".rept " MPK_W2KS(MPK_W2_KWIN) " - 1\n"
-                 "s_addk_i32 m0, 0x400\n"
-                 "v_add_u32_e32 %[v], 0x400, %[v]\n"
-                 "buffer_load_dwordx4 %[v], %[r], 0 offen" MPK_W2_LD_MOD " lds\n"
-                 ".endr\n"
-                 "v_add_u32_e32 %[v], 0x400, %[v]\n"
-                 : [v] "+v"(w2k_voff)
-                 : [r] "s"(w2_rsrc), [l] "s"(w2k_lds)
-                 : "memory", "m0");
+#ifdef MPK_W2_KWIN_MOVER
+  if (w2k_mover) {
+    if constexpr (MPK_W2_KWIN_MOVER > 0) {
+      MPK_W2K_EARLY_ASM(MPK_W2_KWIN_MOVER);
+    }
+  } else
+#endif
+  {
+    if constexpr (MPK_W2_KWIN > 0) {
+      MPK_W2K_EARLY_ASM(MPK_W2_KWIN);
+    }
   }
 #elif defined(MPK_W2_LINEAR_LOAD)
   // Linear per-wave tile load, same transform as the W13 T0 site above and
@@ -5121,11 +5218,11 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         "s_nop 4\n"
         "s_mov_b32 m0, %[lds_base]\n"
         "s_nop 0\n"
-        "buffer_load_dwordx4 %[voff], %[rsrc], 0 offen" MPK_W2_LD_MOD " lds\n"
+        "buffer_load_dwordx4 %[voff], %[rsrc], 0 offen " MPK_W2_DMA_MOD " lds\n"
         ".rept 22\n"
         "s_addk_i32 m0, 0x400\n"
         "v_add_u32_e32 %[voff], 0x400, %[voff]\n"
-        "buffer_load_dwordx4 %[voff], %[rsrc], 0 offen" MPK_W2_LD_MOD " lds\n"
+        "buffer_load_dwordx4 %[voff], %[rsrc], 0 offen " MPK_W2_DMA_MOD " lds\n"
         ".endr\n"
         : [voff] "+v"(w2_voff)
         : [rsrc] "s"(w2_rsrc), [lds_base] "s"(lds_w2_t0_base)
@@ -5150,53 +5247,53 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       }
     }
     asm volatile("s_mov_b32 m0, %[m0]\n  buffer_load_dwordx4 %[v0],  %[rsrc], "
-                 "0 offen" MPK_W2_LD_MOD " lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m1]\n  buffer_load_dwordx4 %[v1],  %[rsrc], "
-                 "0 offen" MPK_W2_LD_MOD " lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m2]\n  buffer_load_dwordx4 %[v2],  %[rsrc], "
-                 "0 offen" MPK_W2_LD_MOD " lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m3]\n  buffer_load_dwordx4 %[v3],  %[rsrc], "
-                 "0 offen" MPK_W2_LD_MOD " lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m4]\n  buffer_load_dwordx4 %[v4],  %[rsrc], "
-                 "0 offen" MPK_W2_LD_MOD " lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m5]\n  buffer_load_dwordx4 %[v5],  %[rsrc], "
-                 "0 offen" MPK_W2_LD_MOD " lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m6]\n  buffer_load_dwordx4 %[v6],  %[rsrc], "
-                 "0 offen" MPK_W2_LD_MOD " lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m7]\n  buffer_load_dwordx4 %[v7],  %[rsrc], "
-                 "0 offen" MPK_W2_LD_MOD " lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m8]\n  buffer_load_dwordx4 %[v8],  %[rsrc], "
-                 "0 offen" MPK_W2_LD_MOD " lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m9]\n  buffer_load_dwordx4 %[v9],  %[rsrc], "
-                 "0 offen" MPK_W2_LD_MOD " lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m10]\n buffer_load_dwordx4 %[v10], %[rsrc], "
-                 "0 offen" MPK_W2_LD_MOD " lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m11]\n buffer_load_dwordx4 %[v11], %[rsrc], "
-                 "0 offen" MPK_W2_LD_MOD " lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m12]\n buffer_load_dwordx4 %[v12], %[rsrc], "
-                 "0 offen" MPK_W2_LD_MOD " lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m13]\n buffer_load_dwordx4 %[v13], %[rsrc], "
-                 "0 offen" MPK_W2_LD_MOD " lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m14]\n buffer_load_dwordx4 %[v14], %[rsrc], "
-                 "0 offen" MPK_W2_LD_MOD " lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m15]\n buffer_load_dwordx4 %[v15], %[rsrc], "
-                 "0 offen" MPK_W2_LD_MOD " lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m16]\n buffer_load_dwordx4 %[v16], %[rsrc], "
-                 "0 offen" MPK_W2_LD_MOD " lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m17]\n buffer_load_dwordx4 %[v17], %[rsrc], "
-                 "0 offen" MPK_W2_LD_MOD " lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m18]\n buffer_load_dwordx4 %[v18], %[rsrc], "
-                 "0 offen" MPK_W2_LD_MOD " lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m19]\n buffer_load_dwordx4 %[v19], %[rsrc], "
-                 "0 offen" MPK_W2_LD_MOD " lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m20]\n buffer_load_dwordx4 %[v20], %[rsrc], "
-                 "0 offen" MPK_W2_LD_MOD " lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m21]\n buffer_load_dwordx4 %[v21], %[rsrc], "
-                 "0 offen" MPK_W2_LD_MOD " lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m22]\n buffer_load_dwordx4 %[v22], %[rsrc], "
-                 "0 offen" MPK_W2_LD_MOD " lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m23]\n buffer_load_dwordx4 %[v23], %[rsrc], "
-                 "0 offen" MPK_W2_LD_MOD " lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  :
                  : [rsrc] "s"(w2_rsrc),
                    [v0] "v"(w2v[0]),
@@ -5266,8 +5363,8 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       }
     }
   }
-
 #endif // !MPK_W2_KWIN
+
 #if defined(MPK_MOE_INNER_TIMING) || defined(MPK_MOE_LDS)
   // Taken after the weight prefetch is issued and before the poll, so `prefetch`
   // below is issue cost only -- the HBM latency it hides lands in `barrier`.
@@ -5330,6 +5427,18 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                 &moe_flat_rep[MPK_AID_MOEFLAT_DONE_INTS +
                                              expert_idx * 2 * MPK_AID_MOEFLAT_STRIDE])) <
                expected) {
+#elif defined(MPK_MOE_POLL_COUNTER) || defined(MPK_POLL_PIPE)
+#ifdef MPK_AID_SPLIT_FLAGS
+#error "MPK_MOE_POLL_COUNTER / MPK_POLL_PIPE poll the shared d_barrier lines"
+#endif
+#ifdef MPK_MOE_POLL_COUNTER
+    while ((_obs = MPK_LD_GATE2(
+                &d_barrier[base + MOE_BAR_COUNTER_SLOT * MOE_BAR_LINE])) <
+           W13_TILES * expected) {
+#else
+    mpk_poll_ge_s32(&d_barrier[base + xcd_id * MOE_BAR_LINE], expected);
+    while (false) {
+#endif
 #elif defined(MPK_MOE_NARROW_RELEASE)
     while (!kMoeBarSkip &&
            (_obs = MPK_LD_GATE_AID(&d_barrier_rel[base])) < expected) {
@@ -5344,8 +5453,12 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       // separates "release fired but was lost" from "arrivals never landed"),
       // and how many of the 8 per-XCD slots agree. All 8 are written by one
       // producer in one loop, so any spread means releases are being lost.
-#if defined(MPK_WORKER_STATE) || !defined(MPK_W2_NO_REFRESH)
+#if defined(MPK_WORKER_STATE) ||                                          \
+    !(defined(MPK_W2_NO_REFRESH) || defined(MPK_MOE_BAR_NO_REFRESH))
       if ((_spins & (MPK_WS_WAIT_REFRESH - 1)) == 0) {
+#else
+      if (false) {
+#endif
         int _n_ok = 0, _mn = 0x7fffffff, _mx = -0x7fffffff;
         for (int _x = 0; _x < 8; _x++) {
           int _v = ld_nt_s32(&d_barrier_rel[base + _x * MOE_BAR_LINE]);
@@ -5367,7 +5480,6 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             _n_ok * 1000000 + (_mx - _mn),
             -1);
       }
-#endif // MPK_W2_NO_REFRESH: diagnostics only, and its asm loads drain the W2 prefetch
       _spins++;
 #ifndef MPK_MOE_BAR_BUSY_POLL
       __builtin_amdgcn_s_sleep(1);
@@ -5386,7 +5498,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     // block can be split across the barrier.
     MPK_WS_WAVE_EXIT(warp_id);
   }
-  MOE_DBG_SUBPHASE(3002);
+  MOE_DBG_SUBPHASE(3002); MPK_W2STAMP(2);
   MPK_WS_MARK(8302, global_tile); // W2: cleared W13->W2 barrier
 #if defined(MPK_MOE_INNER_TIMING) || defined(MPK_MOE_LDS)
   unsigned long long _mt2 = __builtin_amdgcn_s_memrealtime();
@@ -5396,7 +5508,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 
   // FP8 quant of SwiGLU output — writes to LDS[0..W2_K+scales]
   // buffer_load_lds writes to LDS[W2_OFF..] — no conflict, both in flight.
-  MOE_DBG_SUBPHASE(3003);
+  MOE_DBG_SUBPHASE(3003); MPK_W2STAMP(3);
   MPK_WS_MARK(8303, global_tile); // W2: FP8 quant of SwiGLU output
   {
     if constexpr (PACK_N && !SINGLE_TOK) {
@@ -5435,32 +5547,21 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         // VGPRs before the data lands.
         uint32_t const *bp = (uint32_t const *)(w2_input_base + (act ? qbase : 0));
         uint32_t words[8];
-        if constexpr (MPK_W2_KWIN < 23) {
-          asm volatile("global_load_dwordx4 %[w0], %[a0], off" MPK_W2_GATHER_MOD "\n"
-                       "global_load_dwordx4 %[w1], %[a1], off" MPK_W2_GATHER_MOD "\n"
-                       "s_nop 4\n"
-                       "s_mov_b32 m0, %[l]\n"
-                       "s_nop 0\n"
-                       "buffer_load_dwordx4 %[v], %[r], 0 offen" MPK_W2_LD_MOD " lds\n"
-                       ".rept 22 - " MPK_W2KS(MPK_W2_KWIN) "\n"
-                       "s_addk_i32 m0, 0x400\n"
-                       "v_add_u32_e32 %[v], 0x400, %[v]\n"
-                       "buffer_load_dwordx4 %[v], %[r], 0 offen" MPK_W2_LD_MOD " lds\n"
-                       ".endr\n"
-                       "s_waitcnt vmcnt(" MPK_W2KS(MPK_W2_KWIN_TAIL) ")\n"
-                       : [w0] "=&v"(*(i32x4_t *)&words[0]),
-                         [w1] "=&v"(*(i32x4_t *)&words[4]), [v] "+v"(w2k_voff)
-                       : [a0] "v"(bp), [a1] "v"(bp + 4), [r] "s"(w2_rsrc),
-                         [l] "s"(w2k_lds + (unsigned)(MPK_W2_KWIN * 1024))
-                       : "memory", "m0");
-        } else {
-          asm volatile("global_load_dwordx4 %[w0], %[a0], off" MPK_W2_GATHER_MOD "\n"
-                       "global_load_dwordx4 %[w1], %[a1], off" MPK_W2_GATHER_MOD "\n"
-                       "s_waitcnt vmcnt(0)\n"
-                       : [w0] "=&v"(*(i32x4_t *)&words[0]),
-                         [w1] "=&v"(*(i32x4_t *)&words[4])
-                       : [a0] "v"(bp), [a1] "v"(bp + 4)
-                       : "memory");
+#ifdef MPK_W2_KWIN_MOVER
+        if (w2k_mover) {
+          if constexpr (MPK_W2_KWIN_MOVER < 23) {
+            MPK_W2K_GATHER_TAIL_ASM(MPK_W2_KWIN_MOVER, MPK_W2_KWIN_MOVER_TAIL);
+          } else {
+            MPK_W2K_GATHER_ONLY_ASM();
+          }
+        } else
+#endif
+        {
+          if constexpr (MPK_W2_KWIN < 23) {
+            MPK_W2K_GATHER_TAIL_ASM(MPK_W2_KWIN, MPK_W2_KWIN_TAIL);
+          } else {
+            MPK_W2K_GATHER_ONLY_ASM();
+          }
         }
         if (act) {
           float vals[VPL];
@@ -5520,9 +5621,11 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 
   // Drain ALL pending HBM loads: buffer_load_lds (weight) + scale loads
   // Weight loads were issued before barrier poll, should be done by now.
-  MOE_DBG_SUBPHASE(3004);
+  MOE_DBG_SUBPHASE(3004); MPK_W2STAMP(4);
   MPK_WS_MARK(8304, global_tile); // W2: drain HBM loads
 #if defined(MPK_W2_KWIN)
+  // Every wave waits for its own fragments (vmcnt per K-step); only
+  // the quantized row is shared across the workgroup.
   asm volatile("s_waitcnt lgkmcnt(0)\n s_barrier" ::: "memory");
 #else
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
@@ -5552,7 +5655,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #if 0 // W2 timestamp disabled — near asm block
     g_subphase_scratch[6] = __builtin_amdgcn_s_memrealtime();
 #endif
-  MOE_DBG_SUBPHASE(3005);
+  MOE_DBG_SUBPHASE(3005); MPK_W2STAMP(5);
   MPK_WS_MARK(8305, global_tile); // W2: MFMA loop
   // LDS-based MFMA loop: weights already in LDS, compiler pipelines ds_reads.
   // Assembly shows lgkmcnt(7)/lgkmcnt(1) interleaving — much better than
@@ -5598,6 +5701,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         unsigned short const *bias_ptr =
             &d_w2_bias[expert_id * W2_OUTPUT_SIZE + out_n_base];
 #ifdef MPK_LOCAL_TOPK
+        (void)rw_ptr;
         pf_rw = s_ltk_w[topk_slot];
         asm volatile("global_load_dwordx2 %0, %1, off"
                      : "=&v"(pf_bias)
@@ -6212,7 +6316,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       }
 #endif
 
-      MOE_DBG_SUBPHASE(3006);
+      MOE_DBG_SUBPHASE(3006); MPK_W2STAMP(6);
       MPK_WS_MARK(8306, global_tile); // W2: epilogue
 #ifdef MPK_W2_T1_DURING_EPI
       if (W2_TILES_PER_WAVE > 1) {
@@ -6508,6 +6612,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
           unsigned short const *bias_ptr =
               &d_w2_bias[expert_id * W2_OUTPUT_SIZE + out_n_base];
 #ifdef MPK_LOCAL_TOPK
+          (void)rw_ptr;
           pf_rw = s_ltk_w[topk_slot];
           asm volatile("global_load_dwordx2 %0, %1, off"
                        : "=&v"(pf_bias)

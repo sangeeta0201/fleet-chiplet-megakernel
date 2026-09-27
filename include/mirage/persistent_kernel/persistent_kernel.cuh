@@ -62,6 +62,156 @@ __device__ int g_subphase_active;
 __device__ unsigned long long g_subphase_scratch[8];
 #endif
 
+#ifdef MPK_QKV_SUBSTAMPS
+// Per-worker boundary times inside the Phase 1 QKV kernel for the last
+// armed layer: entry, slab pass consumed, RMSNorm, FP8 quant, MFMA, end.
+__device__ unsigned long long g_qkvsub[1024 * 8];
+#define MPK_QKVSUB(k)                                                  \
+  do {                                                                 \
+    if (threadIdx.x == 0) {                                            \
+      asm volatile("" ::: "memory");                                    \
+      g_qkvsub[blockIdx.x * 8 + (k)] = __builtin_amdgcn_s_memrealtime(); \
+      asm volatile("" ::: "memory");                                    \
+    }                                                                  \
+  } while (0)
+#else
+#define MPK_QKVSUB(k) \
+  do {             \
+  } while (0)
+#endif
+
+#ifdef MPK_ATTSUB
+__device__ unsigned long long g_attsub[1024 * 8];
+#define MPK_ATSTAMP(k)                                                  \
+  do {                                                                  \
+    if (threadIdx.x == 0) {                                             \
+      asm volatile("" ::: "memory");                                     \
+      g_attsub[blockIdx.x * 8 + (k)] = __builtin_amdgcn_s_memrealtime(); \
+      asm volatile("" ::: "memory");                                     \
+    }                                                                   \
+  } while (0)
+#define MPK_ATVALUE(k, v)                                               \
+  do {                                                                  \
+    if (threadIdx.x == 0) {                                             \
+      g_attsub[blockIdx.x * 8 + (k)] = (unsigned long long)(v);          \
+    }                                                                   \
+  } while (0)
+#else
+#define MPK_ATSTAMP(k) \
+  do {             \
+  } while (0)
+#define MPK_ATVALUE(k, v) \
+  do {                \
+  } while (0)
+#endif
+#ifdef MPK_ATTSCAN
+__device__ unsigned long long g_attscan[1024 * 8];
+#define MPK_ASSTAMP(k)                                                   \
+  do {                                                                   \
+    if (threadIdx.x == 0) {                                              \
+      asm volatile("" ::: "memory");                                      \
+      g_attscan[blockIdx.x * 8 + (k)] = __builtin_amdgcn_s_memrealtime(); \
+      asm volatile("" ::: "memory");                                      \
+    }                                                                    \
+  } while (0)
+#define MPK_ASVALUE(k, v)                                                \
+  do {                                                                   \
+    if (threadIdx.x == 0) {                                              \
+      g_attscan[blockIdx.x * 8 + (k)] = (unsigned long long)(v);          \
+    }                                                                    \
+  } while (0)
+#else
+#define MPK_ASSTAMP(k) \
+  do {             \
+  } while (0)
+#define MPK_ASVALUE(k, v) \
+  do {                \
+  } while (0)
+#endif
+#ifdef MPK_W2SUB
+__device__ unsigned long long g_w2sub[1024 * 8];
+#define MPK_W2STAMP(k)                                                 \
+  do {                                                                 \
+    if (threadIdx.x == 0) {                                            \
+      asm volatile("" ::: "memory");                                    \
+      g_w2sub[blockIdx.x * 8 + (k)] = __builtin_amdgcn_s_memrealtime(); \
+      asm volatile("" ::: "memory");                                    \
+    }                                                                  \
+  } while (0)
+#else
+#define MPK_W2STAMP(k) \
+  do {             \
+  } while (0)
+#endif
+
+// Dynamic LDS for each scheduler block. A worker takes all but ~4.5 KB of a
+// CU's 160 KB, so a scheduler asking for more than what is left can never be
+// dispatched next to a worker: it takes the grid's spare CU instead. At 0 the
+// dispatcher is free to put a spinning scheduler on a worker's CU (7 of 8
+// did so in one SPX/NPS2 launch), and that worker runs slower for the whole
+// launch.
+#ifndef MPK_SCHED_LDS
+#define MPK_SCHED_LDS 0
+#endif
+
+#ifdef MPK_HWID_MAP
+// Where each worker and scheduler block landed: XCC_ID << 32 | HW_ID, taken
+// once at kernel entry. A scheduler that shares a CU with a worker steals
+// that worker's issue slots for the whole launch.
+__device__ unsigned long long g_hwid_w[1024];
+__device__ unsigned long long g_hwid_s[64];
+__device__ __forceinline__ unsigned long long mpk_hwid_now() {
+  unsigned hw, xcc;
+  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_HW_ID)" : "=s"(hw));
+  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)" : "=s"(xcc));
+  return ((unsigned long long)xcc << 32) | hw;
+}
+#endif
+
+#ifdef MPK_ILSUB
+// Inter-layer path timestamps for the transition MPK_ILSUB_L0 -> L0 + 1;
+// see ilsub_patch.py for the stamp map.
+#ifndef MPK_ILSUB_L0
+#define MPK_ILSUB_L0 20
+#endif
+__device__ unsigned long long g_ilsub[1024 * 32];
+#ifdef MPK_ILPER
+__device__ unsigned long long g_ilper[1024 * 128];
+#endif
+__shared__ int s_ilsub_ml;
+#define MPK_ILSTAMP(k, cond)                                            \
+  do {                                                                \
+    if (threadIdx.x == 0 && (cond)) {                                 \
+      asm volatile("" ::: "memory");                                   \
+      g_ilsub[blockIdx.x * 32 + (k)] = __builtin_amdgcn_s_memrealtime(); \
+      asm volatile("" ::: "memory");                                   \
+    }                                                                 \
+  } while (0)
+#else
+#define MPK_ILSTAMP(k, cond) \
+  do {                  \
+  } while (0)
+#endif
+
+#ifdef MPK_IL_FAST
+// Per-iteration copies of values the inter-layer window used to load from
+// global memory every layer. See the ml-loop prologue.
+// One 16-byte-aligned block whose size is a multiple of 16: the dynamic LDS
+// region starts right after static LDS, and an 8-byte-aligned end measured
+// the whole kernel ~2x slower (misaligned 16-byte LDS traffic).
+struct alignas(16) MpkIlFastLds {
+  int qo_len[4];
+  int variant[64];
+  void *qkvw[64];
+};
+static_assert(sizeof(MpkIlFastLds) % 16 == 0, "keep static LDS 16-byte sized");
+__shared__ MpkIlFastLds s_ilf;
+#define s_ml_qo_len (s_ilf.qo_len[0])
+#define s_ml_variant (s_ilf.variant)
+#define s_ml_qkvw (s_ilf.qkvw)
+__device__ __forceinline__ int mpk_ml_qo_len() { return s_ml_qo_len; }
+#endif
+
 #ifdef MPK_DRAIN_STATS
 // Phase 9 barrier segment attribution: how much of the layer-boundary wait is
 // store drain (s_waitcnt vmcnt(0)) vs rendezvous vs spinning on other XCDs.
@@ -1122,6 +1272,17 @@ __device__ __forceinline__ void
     _execute_gang_task(TaskDesc const *task_desc,
                        RuntimeConfig const &runtime_config,
                        int tile_idx);
+#ifdef MPK_FUSED_INLINE
+// Generated next to _execute_gang_task; its fused-layer calls inline.
+__device__ __forceinline__ void
+    _execute_gang_task_ml(TaskDesc const *task_desc,
+                          RuntimeConfig const &runtime_config,
+#ifdef MPK_IL_CACHE2
+                          int tile_idx, int ml_qo_len);
+#else
+                          int tile_idx);
+#endif
+#endif
 
 // Helper: check if a task type is a gang task
 __device__ __host__ __forceinline__ bool is_gang_task_type(TaskType t) {
@@ -2003,10 +2164,21 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
     int tmpl_len = config.precomp_xcd_template_len[tmpl_flat];
     size_t *tmpl_src =
         config.precomp_xcd_template + tmpl_flat * config.precomp_max_tpw;
+#ifdef MPK_EMB_FIRST
+    // The graph-begin marker carries no data: run the embedding it gates
+    // first on this worker; its wait on the marker is skipped at dispatch.
+    bool const pc_swap =
+        tmpl_len >= 2 && tmpl_src[0] == 1 &&
+        config.all_tasks[tmpl_src[1]].task_type == TASK_EMBEDDING;
+    for (int i = threadIdx.x; i < tmpl_len; i += blockDim.x) {
+      pc_my_queue[pc_swap && i < 2 ? 1 - i : i] = tmpl_src[i];
+    }
+#else
     // Parallel copy: each thread copies a chunk
     for (int i = threadIdx.x; i < tmpl_len; i += blockDim.x) {
       pc_my_queue[i] = tmpl_src[i];
     }
+#endif
     __syncthreads();
     if (threadIdx.x == 0) {
       config.precomp_queue_len[worker_id] = tmpl_len;
@@ -2018,6 +2190,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
       pc_has_begin = (tmpl_len > 0 && tmpl_src[0] == 1)
                          ? 1
                          : 0; // position 1 = begin_task_graph
+#ifdef MPK_EMB_FIRST
+      if (pc_swap) {
+        pc_has_begin = 2; // embedding moved ahead of the marker
+      }
+#endif
       if (worker_id < 8) {
         printf("[PC_INIT] worker=%d xcd=%d rank=%d tmpl_len=%d\n",
                worker_id,
@@ -2333,6 +2510,13 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                          (int)get_task_position_index(task_ids[queue_pos]),
                          __ATOMIC_RELAXED);
       }
+#endif
+#ifdef MPK_EMB_FIRST
+      if (pc_has_begin == 2 && task_desc->task_type == TASK_EMBEDDING) {
+        // Its only dependency is the graph-begin marker, now queued behind
+        // it. Keep the acquire the wait would have ended with.
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+      } else
 #endif
       if (task_desc->dependent_event != EVENT_INVALID_ID) {
         EventId event_id = task_desc->dependent_event;
@@ -2933,11 +3117,24 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
             void *_pf_in = nullptr;
             void *_pf_out = nullptr;
             void *_pf_cur = nullptr;
+#ifdef MPK_IL_CACHE2
+#if !defined(MPK_FUSED_INLINE)
+#error "MPK_IL_CACHE2 needs MPK_FUSED_INLINE (the ml-only dispatch carries qo_len)"
+#endif
+            int _pf_var = 0;      // variant id of layer ml+1, read during layer ml
+            int _pf_var_cur = 0;
+            int ml_qo_len = 0;    // qo_indptr_buffer[1], read at layer 0
+#endif
             bool const _pf_ok =
                 (blockDim.x >= (unsigned)MAX_INPUTS_PER_TASK) &&
                 config.ml_num_layers > 1;
             if (_pf_ok) {
               int _pf_base = (xcd_id * config.ml_num_layers + 1);
+#ifdef MPK_IL_CACHE2
+              if (threadIdx.x == 0) {
+                _pf_var = config.ml_variant_ids[1];
+              }
+#endif
               if ((int)threadIdx.x < MAX_INPUTS_PER_TASK) {
                 _pf_in = ml_in_tab[_pf_base * MAX_INPUTS_PER_TASK +
                                                threadIdx.x];
@@ -2948,6 +3145,9 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                                            threadIdx.x];
               }
             }
+#endif
+#if defined(MPK_ML_TABLE_INLAYER) && defined(MPK_IL_FAST)
+#error "MPK_ML_TABLE_INLAYER and MPK_IL_FAST both replace the per-layer table reads"
 #endif
 #ifdef MPK_ML_TABLE_INLAYER
             // Layers 1.. get their row written by the previous layer (same
@@ -2960,7 +3160,24 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                                ? (int)config.ml_variant_ids[1]
                                : 0;
 #endif
+#ifdef MPK_IL_FAST
+            if (config.ml_num_layers > 64) {
+              __builtin_trap();
+            }
+            if (threadIdx.x == 0) {
+              s_ml_qo_len = config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS];
+            }
+            if ((int)threadIdx.x < config.ml_num_layers) {
+              s_ml_variant[threadIdx.x] = config.ml_variant_ids[threadIdx.x];
+              s_ml_qkvw[threadIdx.x] = config.ml_input_table
+                  [(xcd_id * config.ml_num_layers + (int)threadIdx.x) *
+                       MAX_INPUTS_PER_TASK +
+                   4];
+            }
+            __syncthreads();
+#endif
             for (int ml = 0; ml < config.ml_num_layers; ml++) {
+              MPK_ILSTAMP(2, ml == MPK_ILSUB_L0 + 1);
 #ifdef MPK_DRAIN_STATS
               unsigned long long _mlt0 = __builtin_amdgcn_s_memrealtime();
 #endif
@@ -3010,6 +3227,14 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                   // out of the task descriptor.
                   _pf_cur = _pf_in;
                   int _nl = ml + 1;
+#ifdef MPK_IL_CACHE2
+                  if (threadIdx.x == 0) {
+                    _pf_var_cur = _pf_var;
+                    if (_nl < config.ml_num_layers) {
+                      _pf_var = config.ml_variant_ids[_nl];
+                    }
+                  }
+#endif
                   if (_nl < config.ml_num_layers) {
                     int _nb = (xcd_id * config.ml_num_layers + _nl);
                     if ((int)threadIdx.x < MAX_INPUTS_PER_TASK) {
@@ -3037,7 +3262,14 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                   }
                 }
                 if (threadIdx.x == 0) {
+#ifdef MPK_IL_FAST
+                  task_desc->variant_id = s_ml_variant[ml];
+#elif defined(MPK_IL_CACHE2)
+                  task_desc->variant_id =
+                      _pf_ok ? _pf_var_cur : config.ml_variant_ids[ml];
+#else
                   task_desc->variant_id = config.ml_variant_ids[ml];
+#endif
                 }
 #ifdef MPK_DRAIN_STATS
                 // Before the first __syncthreads: isolates the table read from
@@ -3062,6 +3294,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                   __syncthreads();
               }
 
+              MPK_ILSTAMP(3, ml == MPK_ILSUB_L0 + 1);
 #ifdef MPK_PREFETCH_NEXT_QKV
               // Publish the NEXT layer's QKV weight pointer so the fused task
               // can start its HBM->LDS weight DMA during the Phase 9 barrier
@@ -3128,7 +3361,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                   // be suppressed -- same "null on the last layer" rule as the
                   // non-prefetch path, for the same reason.
                   task_desc->input_ptrs[24] =
+#ifdef MPK_IL_FAST
+                      (ml + 1 < config.ml_num_layers) ? s_ml_qkvw[ml + 1] : nullptr;
+#else
                       (ml + 1 < config.ml_num_layers) ? _pf_in : nullptr;
+#endif
                   // _pf_cur is this layer's slot 4, held from before the
                   // re-issue, so this needs no read of input_ptrs[4] and
                   // therefore no rendezvous with the thread that wrote it.
@@ -3152,6 +3389,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               }
               __syncthreads();
 #endif
+              MPK_ILSTAMP(4, ml == MPK_ILSUB_L0 + 1);
 #ifdef MPK_DRAIN_STATS
               // The inter-layer prologue: the ml_input_table / ml_output_table
               // copy plus the two __syncthreads that publish it. This runs
@@ -3216,8 +3454,12 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               if (threadIdx.x == 0) {
                 task_desc->task_metadata._linear_reserved =
                     (int32_t)((flb_iter - 1) * config.ml_num_layers + ml);
+#ifdef MPK_ILSUB
+                s_ilsub_ml = ml;
+#endif
               }
               __syncthreads();
+              MPK_ILSTAMP(5, ml == MPK_ILSUB_L0 + 1);
 
               // Execute this layer
               int my_tiles = 0;
@@ -3249,12 +3491,22 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                   b[1] = 200; // phase: inside gang tile execution
                 }
 #endif
+#if defined(MPK_FUSED_INLINE) && defined(MPK_IL_CACHE2)
+                if (ml == 0) {
+                  ml_qo_len = config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS];
+                }
+                _execute_gang_task_ml(task_desc, config, ml_n_tile_start + t, ml_qo_len);
+#elif defined(MPK_FUSED_INLINE)
+                _execute_gang_task_ml(task_desc, config, ml_n_tile_start + t);
+#else
                 _execute_gang_task(task_desc, config, ml_n_tile_start + t);
+#endif
                 my_tiles++;
               }
               if (threadIdx.x == 0) {
                 gang_tiles_executed = my_tiles;
               }
+              MPK_ILSTAMP(0, ml == MPK_ILSUB_L0);
 
               // Inter-layer sync: threadfence_gpu flushes L2 write buffer so
               // next layer's buffer_inv + QKV epoch barrier sees fresh data.
@@ -3281,13 +3533,18 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #endif
                 __syncthreads();
               }
+              MPK_ILSTAMP(1, ml == MPK_ILSUB_L0);
             }
 
             // Deferred event signal: after compaction, layer 0's trigger_event
             // points to the last layer's event (gates FUSE_TAIL). Signal via
             // the two-level path since this task is in the queue.
             if (threadIdx.x == 0) {
+#ifdef MPK_TASK_FENCE_DRAIN
+              asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#else
               threadfence_gpu();
+#endif
               EventId ev_id = config.ml_trigger_events[0];
               size_t ev_idx = get_event_position_index(ev_id);
               int xcd_slot = xcd_id * config.num_events + (int)ev_idx;
@@ -3406,7 +3663,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                       static_cast<EventCounter>(xcd_thresh) *
                       get_task_iteration_num(task_ids[queue_pos]);
                   if (local_cnt == needed_local) {
+#ifdef MPK_TASK_FENCE_DRAIN
+                    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#else
                     threadfence_gpu();
+#endif
 #if defined(MPK_AID_EVTIER) && defined(MPK_AID_SPLIT_FLAGS)
                     // AID tier. The four XCDs of one AID accumulate in an AID-local line,
                     // and only the last of them crosses the boundary -- adding 4, so the
@@ -3432,7 +3693,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #endif
                   }
                 } else {
+#ifdef MPK_TASK_FENCE_DRAIN
+                  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#else
                   threadfence_gpu();
+#endif
                   mpk_evctr_add(config.all_event_counters, ev_idx, 1);
                 }
               }
@@ -3797,6 +4062,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
         assert(gpu_id == config.my_gpu_id);
         // Case 1: Trigger a local non-nvshmem event
         int num_triggers = MPK_LD_EVCFG(&config.all_event_num_triggers[event_index]);
+#ifdef MPK_EVT_FAST
+        // Read-only and host-built: issued with the counter metadata so its
+        // latency overlaps theirs instead of following both atomics.
+        EventDesc const evt_fast_desc = config.all_events[event_index];
+#endif
         EventCounter count = 0;
         bool event_fired = false;
 
@@ -3828,6 +4098,21 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                                       ? gang_tiles_executed
                                       : 1;
 #endif
+#ifdef MPK_EVT_FAST
+            EventCounter needed_local =
+                static_cast<EventCounter>(xcd_threshold) *
+                get_task_iteration_num(task_ids[queue_pos]);
+            // A sole contributor on its XCD is always the last one; the
+            // returning L2 atomic would only confirm it.
+            EventCounter local_count =
+                (xcd_threshold == 1 && event_increment == 1)
+                    ? needed_local
+                    : atom_add_local_u64(
+                          reinterpret_cast<unsigned long long int *>(
+                              &config.xcd_local_event_counters[xcd_slot]),
+                          event_increment) +
+                          event_increment;
+#else
             EventCounter local_count =
                 atom_add_local_u64(
                     reinterpret_cast<unsigned long long int *>(
@@ -3837,10 +4122,20 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
             EventCounter needed_local =
                 static_cast<EventCounter>(xcd_threshold) *
                 get_task_iteration_num(task_ids[queue_pos]);
+#endif
 
             if (local_count == needed_local) {
               // Last worker/task on this XCD — flush + signal global
+#ifdef MPK_EVT_FAST
+              // The graph-begin marker writes no data, so it has nothing to
+              // publish.
+              if (task_desc->task_type != TASK_BEGIN_TASK_GRAPH)
+#endif
+#ifdef MPK_TASK_FENCE_DRAIN
+              asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#else
               threadfence_gpu();
+#endif
               // Gang: flush 1 (one task done). Non-gang: flush xcd_threshold.
               int flush_amount =
                   is_gang_task_type(task_desc->task_type) ? 1 : xcd_threshold;
@@ -3863,7 +4158,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               get_task_iteration_num(task_ids[queue_pos]);
 
           if (local_count == needed_local) {
+#ifdef MPK_TASK_FENCE_DRAIN
+            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#else
             threadfence_gpu();
+#endif
             count = mpk_evctr_add(config.all_event_counters, event_index, xcd_threshold);
             event_fired = (count + xcd_threshold) ==
                           static_cast<EventCounter>(num_triggers) *
@@ -3876,7 +4175,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
         {
           // Fallback: per-task fence + global atomic (NVIDIA, or uncounted
           // events)
+#ifdef MPK_TASK_FENCE_DRAIN
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#else
           threadfence_gpu();
+#endif
           count = mpk_evctr_add(config.all_event_counters, event_index, 1);
           event_fired =
               (count + 1) == static_cast<EventCounter>(num_triggers) *
@@ -3924,7 +4227,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #ifdef MPK_ENABLE_PROFILING
           PROFILER_EVENT_START(TASK_SCHD_EVENTS, task_counter);
 #endif
+#ifdef MPK_EVT_FAST
+          EventDesc event_desc = evt_fast_desc;
+#else
           EventDesc event_desc = config.all_events[event_index];
+#endif
           if (event_desc.event_type == EVENT_EMPTY) {
             // Do nothing for empty event
           }
@@ -4390,6 +4697,41 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                        g_phase_span[w * MPK_PHASE_SLOT_STRIDE + s] / n);
               }
               printf("\n");
+              // Raw s_memrealtime ticks (10 ns) of each slot boundary for the
+              // last armed layer: a one-layer snapshot of every worker.
+              printf("[PHASETS] w=%d", w);
+              for (int s = 0; s < MPK_PHASE_SLOT_COUNT; s++) {
+                printf(" %llu", g_phase_ts[w * MPK_PHASE_SLOT_COUNT + s]);
+              }
+              printf("\n");
+#ifdef MPK_QKV_SUBSTAMPS
+              printf("[QKVSUB] w=%d", w);
+              for (int s = 0; s < 8; s++) {
+                printf(" %llu", g_qkvsub[w * 8 + s]);
+              }
+              printf("\n");
+#endif
+#ifdef MPK_ATTSUB
+              printf("[ATTSUB] w=%d", w);
+              for (int s = 0; s < 8; s++) {
+                printf(" %llu", g_attsub[w * 8 + s]);
+              }
+              printf("\n");
+#endif
+#ifdef MPK_ATTSCAN
+              printf("[ATTSCAN] w=%d", w);
+              for (int s = 0; s < 8; s++) {
+                printf(" %llu", g_attscan[w * 8 + s]);
+              }
+              printf("\n");
+#endif
+#ifdef MPK_W2SUB
+              printf("[W2SUB] w=%d", w);
+              for (int s = 0; s < 8; s++) {
+                printf(" %llu", g_w2sub[w * 8 + s]);
+              }
+              printf("\n");
+#endif
             }
 #ifdef MPK_OPROJ_LDS
             for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
@@ -4657,6 +4999,47 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                    g_il_binv_sum / n,
                    g_il_post_sum / n,
                    (g_il_fnpre_sum + g_il_binv_sum + g_il_post_sum) / n);
+          }
+#endif
+#ifdef MPK_ILSUB
+          for (int w = 0; w < 1024; w++) {
+            if (g_ilsub[w * 32 + 10] == 0) {
+              continue;
+            }
+            printf("[ILSUB] b=%d", w);
+            for (int s = 0; s < 32; s++) {
+              printf(" %llu", g_ilsub[w * 32 + s]);
+            }
+            printf("\n");
+          }
+#ifdef MPK_ILPER
+          for (int w = 0; w < 1024; w++) {
+            if (g_ilsub[w * 32 + 10] == 0) {
+              continue;
+            }
+            printf("[ILPER] b=%d %llu", w, g_ilsub[w * 32 + 10]);
+            for (int s = 0; s < 36; s++) {
+              printf(" %llu", g_ilper[w * 128 + s]);
+            }
+            for (int s = 0; s < 36; s++) {
+              printf(" %llu", g_ilper[w * 128 + 64 + s]);
+            }
+            printf("\n");
+          }
+#endif
+#endif
+#ifdef MPK_HWID_MAP
+          for (int w = 0; w < 1024; w++) {
+            if (g_hwid_w[w] != 0) {
+              printf("[HWID] w b=%d xcc=%u hw=%x\n", w,
+                     (unsigned)(g_hwid_w[w] >> 32), (unsigned)g_hwid_w[w]);
+            }
+          }
+          for (int s = 0; s < 64; s++) {
+            if (g_hwid_s[s] != 0) {
+              printf("[HWID] s b=%d xcc=%u hw=%x\n", s,
+                     (unsigned)(g_hwid_s[s] >> 32), (unsigned)g_hwid_s[s]);
+            }
           }
 #endif
 #ifdef MPK_ENABLE_MOE_SUBPHASE
@@ -5095,6 +5478,17 @@ __global__ __launch_bounds__(WORKER_NUM_THREADS,
 __global__ __launch_bounds__(WORKER_NUM_THREADS,
                              1) void worker_kernel(RuntimeConfig config) {
   worker_checker(config);
+#ifdef MPK_LDS_PAD
+  // Static LDS pad of MPK_LDS_PAD bytes: shifts every later LDS offset
+  // (and the dynamic base) without adding any work. The asm keeps it live.
+  __shared__ unsigned char s_mpk_lds_pad[MPK_LDS_PAD];
+  asm volatile("" ::"v"((unsigned)(size_t)s_mpk_lds_pad));
+#endif
+#ifdef MPK_HWID_MAP
+  if (threadIdx.x == 0 && blockIdx.x < 1024) {
+    g_hwid_w[blockIdx.x] = mpk_hwid_now();
+  }
+#endif
 #ifdef MPK_XCD_SUBSET
   // Elect by hardware die, never by blockIdx: this gate retires most of the
   // grid at once, the freed CUs are refilled out of round-robin order, and a
@@ -5133,6 +5527,11 @@ __global__ __launch_bounds__(WORKER_NUM_THREADS,
 
 __global__ void scheduler_kernel(RuntimeConfig config) {
   scheduler_checker(config);
+#ifdef MPK_HWID_MAP
+  if (threadIdx.x == 0 && blockIdx.x < 64) {
+    g_hwid_s[blockIdx.x] = mpk_hwid_now();
+  }
+#endif
 #ifdef MPK_XCD_SUBSET
   // One scheduler per participating die, claimed by the first block to land
   // there. The whole block leaves together, so the syncthreads stays uniform
@@ -6770,8 +7169,9 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   (void)cudaFuncSetAttribute(worker_kernel,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                              MAX_DYNAMIC_SHARED_MEMORY_SIZE);
-  (void)cudaFuncSetAttribute(
-      scheduler_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 1024);
+  (void)cudaFuncSetAttribute(scheduler_kernel,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             MPK_SCHED_LDS > 1024 ? MPK_SCHED_LDS : 1024);
   (void)cudaFuncSetAttribute(persistent_kernel,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                              MAX_DYNAMIC_SHARED_MEMORY_SIZE);
@@ -7014,7 +7414,7 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                          1,
                          1),
                        dim3(128, 1, 1),
-                       0 /*smem*/,
+                       MPK_SCHED_LDS /*smem*/,
                        global_runtime_config.scheduler_stream>>>(
         global_runtime_config);
 

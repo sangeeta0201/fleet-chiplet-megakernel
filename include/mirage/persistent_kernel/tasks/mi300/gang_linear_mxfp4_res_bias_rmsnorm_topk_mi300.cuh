@@ -50,6 +50,27 @@
 #ifndef MPK_LTK_MARK
 #define MPK_LTK_MARK(k) do {} while (0)
 #endif
+#if !defined(MPK_SUB_MARK) && defined(MPK_OPROJ_NUDGE)
+// Experiment: reproduce what MPK_OPROJ_LDS's sub-span marks do to this kernel
+// without the recorder. MPK_OPROJ_NUDGE is a mask of the marks 0..3 to keep.
+// KIND 1: compiler memory fence only (tests instruction scheduling).
+// KIND 2: tid 0 also reads s_memrealtime into LDS, as the mark does (tests
+// the delay on wave 0).
+#ifndef MPK_OPROJ_NUDGE_KIND
+#define MPK_OPROJ_NUDGE_KIND 2
+#endif
+__shared__ unsigned long long s_oproj_nudge[4];
+#define MPK_SUB_MARK(k)                                                        \
+  do {                                                                         \
+    if ((MPK_OPROJ_NUDGE >> (k)) & 1) {                                        \
+      if (MPK_OPROJ_NUDGE_KIND == 2 && threadIdx.x == 0) {                     \
+        asm volatile("" ::: "memory");                                         \
+        s_oproj_nudge[(k)] = __builtin_amdgcn_s_memrealtime();                 \
+      }                                                                        \
+      asm volatile("" ::: "memory");                                           \
+    }                                                                          \
+  } while (0)
+#endif
 #ifndef MPK_SUB_MARK
 #define MPK_SUB_MARK(k) do {} while (0)
 #endif
@@ -407,7 +428,11 @@ template <int BATCH_SIZE,
           int ACTUAL_HIDDEN_DIM,
           int NUM_EXPERTS,
           int K>
+#if defined(MPK_SUBKERNEL_INLINE) || defined(MPK_OPROJ_INLINE)
+__device__ __forceinline__ void
+#else
 __device__ __attribute__((noinline)) void
+#endif
     gang_linear_mxfp4_res_bias_rmsnorm_topk_kernel(
         // O-PROJ inputs
         void const *input_ptr,    // input_ptrs[0]
@@ -639,6 +664,7 @@ __device__ __attribute__((noinline)) void
   unsigned long long _op_t0 = __builtin_amdgcn_s_memrealtime();
   unsigned long long _op_t1 = _op_t0, _op_t2 = _op_t0, _op_t3 = _op_t0;
 #endif
+  MPK_ILSTAMP(23, s_ilsub_ml == MPK_ILSUB_L0 + 1);
 
   int batch_count =
       (num_active_tokens < BATCH_SIZE) ? num_active_tokens : BATCH_SIZE;
@@ -647,6 +673,30 @@ __device__ __attribute__((noinline)) void
   // tile_idx = xcd_id * tiles_per_xcd + local_tile
   int xcd_id = tile_idx / tiles_per_xcd;
   int local_tile = tile_idx % tiles_per_xcd;
+#ifdef MPK_LOCAL_TOPK
+  // This router tile's epoch-tagged logit, published at the TopK barrier
+  // once every wave's stores have drained.
+  unsigned ltk_word = 0u;
+#endif
+#ifdef MPK_LTK_EARLY_TAG
+#if !(defined(MPK_LOCAL_TOPK) && defined(MPK_ROUTER_FUSED_DP) && \
+      defined(MPK_W13_PREQUANT) && defined(MPK_ONE_NORM_WRITER))
+#error "MPK_LTK_EARLY_TAG is wired for LOCAL_TOPK + ROUTER_FUSED_DP + W13_PREQUANT + ONE_NORM_WRITER"
+#endif
+  // >= 0: this tile writes that share of the normed row and releases it.
+  int ltk_norm_slot = -1;
+#define MPK_NORMROW_SC " sc0 sc1"
+#else
+#define MPK_NORMROW_SC ""
+#endif
+// Pre-quantized row stores: write-through if either the early-tag release or
+// the AID-replicated W13 handoff needs it (never both modifiers twice).
+#if defined(MPK_LTK_EARLY_TAG) ||                                              \
+    (defined(MPK_W13_HOF_AIDREP) && !defined(MPK_W13_HOF_XCDREP))
+#define MPK_PQROW_SC " sc0 sc1"
+#else
+#define MPK_PQROW_SC ""
+#endif
   int xcd_output_col_offset = xcd_id * n_wgs_per_xcd * OUTPUT_PER_WG;
 
   // ════════════════════════════════════════════════════════════════════════
@@ -858,6 +908,51 @@ oproj_tile_pass:;
       asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
       __builtin_amdgcn_wave_barrier();
 #else
+#ifdef MPK_OPROJ_DATA_POLL
+#if defined(MPK_SLICE_DUAL_POLL) || defined(MPK_POLL_PIPE) ||                  \
+    defined(MPK_OPROJ_POLL_BEFORE_DRAIN) || !defined(MPK_ATTN_SLICE_RELEASE)
+#error "MPK_OPROJ_DATA_POLL replaces the default two-slice release poll"
+#endif
+      // attn_out holds 0xFFFFFFFF in every word until this layer's merge
+      // overwrites it. Lanes 0 and 32 poll the first word of their slice,
+      // then every lane loads its 32 bytes, retrying while any word still
+      // holds the reset value.
+      i32x4_t v0, v1;
+      {
+        int const dp_lane = tid & 63;
+        uint32_t const *dp_ptr = (uint32_t const *)(A + base);
+        while (true) {
+          uint32_t dp_w = 0u;
+          if ((dp_lane & 31) == 0) {
+            asm volatile("global_load_dword %0, %1, off sc0 sc1\n"
+                         "s_waitcnt vmcnt(0)"
+                         : "=v"(dp_w)
+                         : "v"(dp_ptr)
+                         : "memory");
+          }
+          if (__builtin_amdgcn_ballot_w64((dp_lane & 31) == 0 &&
+                                          dp_w == 0xFFFFFFFFu) == 0) {
+            break;
+          }
+          __builtin_amdgcn_s_sleep(1);
+        }
+        while (true) {
+          asm volatile("global_load_dwordx4 %0, %2, off sc0 sc1\n"
+                       "global_load_dwordx4 %1, %2, off offset:16 sc0 sc1\n"
+                       "s_waitcnt vmcnt(0)"
+                       : "=&v"(v0), "=&v"(v1)
+                       : "v"(dp_ptr)
+                       : "memory");
+          bool const dp_stale = v0[0] == -1 || v0[1] == -1 || v0[2] == -1 ||
+                                v0[3] == -1 || v1[0] == -1 || v1[1] == -1 ||
+                                v1[2] == -1 || v1[3] == -1;
+          if (__builtin_amdgcn_ballot_w64(dp_stale) == 0) {
+            break;
+          }
+          __builtin_amdgcn_s_sleep(1);
+        }
+      }
+#else
 #ifdef MPK_SLICE_DUAL_POLL
       // Wave w waits on XCDs 2w and 2w+1. The serial form issues load-wait
       // twice, so a miss always pays two coherency round trips even though
@@ -871,12 +966,16 @@ oproj_tile_pass:;
         __builtin_amdgcn_s_sleep(1);
       } while (true);
 #else
+#ifdef MPK_POLL_PIPE
+      mpk_poll_ge2_s32(rel0, rel1, layer_epoch);
+#else
       while (!MPK_P7_SK(1) &&
              (MPK_LD_GATE_AID(rel0) < layer_epoch || MPK_LD_GATE_AID(rel1) < layer_epoch)) {
 #ifndef MPK_SLICE_BUSY_POLL
         __builtin_amdgcn_s_sleep(1);
 #endif
       }
+#endif
 #endif
       // Cross-XCD acquire, per wave, placed at this wave's observation. The
       // caller's Phase 6 `buffer_inv` runs before any flag has been seen on
@@ -893,6 +992,7 @@ oproj_tile_pass:;
       i32x4_t const *src = (i32x4_t const *)(A + base + lsp_shift);
       i32x4_t v0 = src[0];
       i32x4_t v1 = src[1];
+#endif // MPK_OPROJ_DATA_POLL
 
       float vals[ELEMENTS_PER_THREAD];
       float amax = 0.0f;
@@ -1668,6 +1768,7 @@ oproj_barrier :
   _op_t1 = __builtin_amdgcn_s_memrealtime();
 #endif
   MPK_SUB_MARK(1);
+  MPK_ILSTAMP(21, s_ilsub_ml == MPK_ILSUB_L0 + 1);
   // Drain BEFORE the rendezvous, not after. `s_waitcnt` is a per-wave
   // guarantee: run after __syncthreads it only retires wave 0's stores, and
   // tid 0 then publishes an arrival advertising output that waves 1..3 may
@@ -1686,6 +1787,12 @@ oproj_barrier :
 
   i32x2_pf_t g_pf_buf[MAX_ITERS_PF];
   i32x2_pf_t w_pf_buf[MAX_ITERS_PF];
+#ifdef MPK_ROUTER_BIAS_PF3
+  unsigned rbias_pf3 = 0;
+#endif
+#ifdef MPK_ROUTER_BIAS_PF
+  unsigned rbias_pf = 0;
+#endif
 
   {
     // Mechanism C: single global arrive + per-XCD release flags.
@@ -1760,7 +1867,19 @@ oproj_barrier :
     int oproj_rel_epoch = 0;
     // This worker's own round at this barrier, from its own arrival index.
     int oproj_my_round = -1;
+#ifdef MPK_OPROJ_TILE_FLAGS
+    bool const mpk_tf = layer_epoch > 0;
+    if (tid == 0 && mpk_tf) {
+#ifndef MPK_OPROJ_NO_WB
+      threadfence_gpu();
+#endif
+      st_wt_u32((void *)&hier_barrier[MPK_OPROJ_TILE_FLAG_SLOT + tile_idx],
+                (unsigned)layer_epoch);
+    }
+    if (tid == 0 && !mpk_tf) {
+#else
     if (tid == 0) {
+#endif
       // GPU-scope release fence before the arrival.
       //
       // atom_add_release_gpu_s32 is not a release on AMD -- its own definition
@@ -1903,11 +2022,22 @@ oproj_barrier :
         // minimum over all eight.
         oproj_rel_epoch = oproj_release_expected;
 #else
-        int const prev_global =
-            atom_add_release_gpu_s32(&hier_barrier[8 * HIER_STRIDE], 1);
-        MPK_WS_MARK(7020, (unsigned)prev_global);
-        if ((prev_global % MPK_NUM_XCDS) == (MPK_NUM_XCDS - 1)) {
-          oproj_rel_epoch = oproj_release_expected;
+#ifdef MPK_OPROJ_POLL_GLOBAL
+        if (layer_epoch > 0) {
+          // The gates poll this counter itself; nobody needs the old value.
+          asm volatile("flat_atomic_add %0, %1 sc1" ::"v"(
+                           &hier_barrier[8 * HIER_STRIDE]),
+                       "v"(1)
+                       : "memory");
+        } else
+#endif
+        {
+          int const prev_global =
+              atom_add_release_gpu_s32(&hier_barrier[8 * HIER_STRIDE], 1);
+          MPK_WS_MARK(7020, (unsigned)prev_global);
+          if ((prev_global % MPK_NUM_XCDS) == (MPK_NUM_XCDS - 1)) {
+            oproj_rel_epoch = oproj_release_expected;
+          }
         }
 #endif
       }
@@ -1986,10 +2116,26 @@ oproj_barrier :
                      : "v"(w_base_pf + byte_off)
                      : "memory");
       }
+#ifdef MPK_ROUTER_BIAS_PF3
+      {
+        unsigned short const *rb = router_bias_ptr
+            ? static_cast<unsigned short const *>(router_bias_ptr) + local_tile
+            : static_cast<unsigned short const *>(norm_weight_ptr);
+        rbias_pf3 = *rb;
+      }
+#endif
     }
 
     // All threads poll per-XCD release flag independently.
     // ld_nt coalesces across waves, so no extra HBM traffic.
+#ifdef MPK_OPROJ_TILE_FLAGS
+    if (mpk_tf) {
+      if (tid < 64) {
+        mpk_oproj_tile_flag_poll(&hier_barrier[MPK_OPROJ_TILE_FLAG_SLOT],
+                                 total_oproj_tiles, oproj_release_expected);
+      }
+    } else
+#endif
 #ifdef MPK_OPROJ_ARRIVE_ONLY
     // ── TESTED AND REJECTED: incorrect. Kept for the reasoning. ──────────
     //
@@ -2059,6 +2205,26 @@ oproj_barrier :
     // other 255 threads do not need their own sc0 sc1 reads of this line.
     if (tid == 0)
 #endif
+#if defined(MPK_OPROJ_POLL_GLOBAL) || defined(MPK_POLL_PIPE)
+#if defined(MPK_AID_SPLIT_FLAGS) || defined(MPK_OPROJ_NARROW_REL) ||           \
+    defined(MPK_OPROJ_AID_TIER) || defined(MPK_OPROJ_FLAT)
+#error "MPK_OPROJ_POLL_GLOBAL / MPK_POLL_PIPE poll the shared hier_barrier lines"
+#endif
+#endif
+#ifdef MPK_OPROJ_POLL_GLOBAL
+#ifndef MPK_OPROJ_TREE_BARRIER
+#error "MPK_OPROJ_POLL_GLOBAL relies on the tree barrier's 8 arrivals per layer"
+#endif
+      while (layer_epoch > 0
+                 ? MPK_LD_GATE2(&hier_barrier[8 * HIER_STRIDE]) <
+                       8 * oproj_release_expected
+                 : MPK_LD_GATE2(&hier_barrier[xcd_id * HIER_STRIDE]) <
+                       oproj_release_expected) {
+#elif defined(MPK_POLL_PIPE)
+      mpk_poll_ge_s32(&hier_barrier[xcd_id * HIER_STRIDE],
+                      oproj_release_expected);
+      while (false) {
+#else
       while (!MPK_P7_SK(2) &&
 #ifdef MPK_OPROJ_NARROW_REL
 #ifdef MPK_OPROJ_AID_TIER
@@ -2072,6 +2238,7 @@ oproj_barrier :
 #else
              MPK_LD_GATE_AID(&hier_release[xcd_id * HIER_STRIDE]) <
              oproj_release_expected) {
+#endif
 #endif
         __builtin_amdgcn_s_sleep(1);
       }
@@ -2173,6 +2340,7 @@ oproj_barrier :
   _op_t2 = __builtin_amdgcn_s_memrealtime();
 #endif
   MPK_SUB_MARK(2);
+  MPK_ILSTAMP(22, s_ilsub_ml == MPK_ILSUB_L0 + 1);
 
   // ════════════════════════════════════════════════════════════════════════
   // PHASE 3: RMSNorm + Router GEMV
@@ -2292,6 +2460,15 @@ router_tile_pass:;
     //
     // At BATCH_SIZE == 1 the bound is a compile-time 1 and the loop vanishes.
     int const n_tok_router = BATCH_SIZE == 1 ? 1 : batch_count;
+#ifdef MPK_ROUTER_BIAS_PF
+    // Ahead of the pass-1 hidden loads: vmcnt retires in order, so their
+    // counted waits still cover them, and it lands before tid 0 needs it.
+    asm volatile("global_load_ushort %0, %1, off"
+                 : "=v"(rbias_pf)
+                 : "v"(d_rbias ? (char const *)(d_rbias + local_tile)
+                                 : (char const *)d_gamma)
+                 : "memory");
+#endif
 
     for (int b = 0; b < n_tok_router; b++) {
       char const *h_base =
@@ -2532,6 +2709,7 @@ router_tile_pass:;
       }
 #endif
 
+      MPK_ILSTAMP(26, s_ilsub_ml == MPK_ILSUB_L0 + 1);
 #if defined(MPK_ROUTER_FUSED_DP) && defined(MPK_ROUTER_DUAL_REDUCE)
       // Both partials are complete here, so they reduce together through one
       // interleaved permlane/DPP chain rather than two shuffle butterflies.
@@ -2566,6 +2744,7 @@ router_tile_pass:;
 #endif
       }
       __syncthreads();
+      MPK_ILSTAMP(27, s_ilsub_ml == MPK_ILSUB_L0 + 1);
 
       float irms;
       if (tid == 0) {
@@ -2586,24 +2765,47 @@ router_tile_pass:;
         }
         s *= irms_t0;
         if (d_rbias) {
+#if (defined(MPK_ROUTER_BIAS_PF3) || defined(MPK_ROUTER_BIAS_PF)) &&          \
+    (MPK_NUM_XCDS != 8 || defined(MPK_MULTI_PASS_8XCD))
+#error "MPK_ROUTER_BIAS_PF* prefetch the first pass's bias only"
+#endif
+#if defined(MPK_ROUTER_BIAS_PF3)
+          s += __uint_as_float(rbias_pf3 << 16);
+#elif defined(MPK_ROUTER_BIAS_PF)
+          s += __uint_as_float(rbias_pf << 16);
+#else
           s += __bfloat162float(d_rbias[router_lt]);
+#endif
         }
         bf16 bval = __float2bfloat16(s);
 #ifdef MPK_LOCAL_TOPK
         if (b == 0) {
-          mpk_aid_publish_at(
-              routing_ready_ptr,
-              MPK_AID_LTK_OFF_INTS +
-                  gang_rmsnorm_topk_detail::get_xcd_id() *
-                      (NUM_EXPERTS / MPK_NUM_XCDS) + router_lt,
-              (mpk_ltk_tag(layer_epoch) << 16) |
-                  (unsigned)__builtin_bit_cast(unsigned short, bval),
-              MPK_AID_ROUTING_BASE_INTS);
-          MPK_LTK_MARK(0);
+          ltk_word = (mpk_ltk_tag(layer_epoch) << 16) |
+                     (unsigned)__builtin_bit_cast(unsigned short, bval);
+#ifdef MPK_LTK_EARLY_TAG
+          // The tag carries only the logit; the normed row has its own flag.
+          MPK_ILSTAMP(20, s_ilsub_ml == MPK_ILSUB_L0 + 1);
+#ifdef MPK_AID_SPLIT_FLAGS
+          mpk_aid_publish_at(routing_ready_ptr,
+                             MPK_AID_LTK_OFF_INTS +
+                                 gang_rmsnorm_topk_detail::get_xcd_id() *
+                                     (NUM_EXPERTS / MPK_NUM_XCDS) +
+                                 router_lt,
+                             ltk_word, MPK_AID_ROUTING_BASE_INTS);
+#else
+          st_wt_u32((void *)&routing_ready_ptr[MPK_LTK_ROUTING_REL +
+                                               gang_rmsnorm_topk_detail::get_xcd_id() *
+                                                   (NUM_EXPERTS / 8) +
+                                               local_tile],
+                    ltk_word);
+#endif
+#endif
         }
 #endif
+#if !(defined(MPK_LOCAL_TOPK) && defined(MPK_LTK_NO_LOGIT_STORE))
         st_wt_u16(&d_logits[(int64_t)b * NUM_EXPERTS + router_lt],
                   *reinterpret_cast<unsigned short *>(&bval));
+#endif
 #endif
         red[0] = irms_t0;
       }
@@ -2654,6 +2856,11 @@ router_tile_pass:;
       bool const router_norm_writer =
           pq_split ? (local_tile < MAX_ITERS) : (local_tile == 0);
       int const pq_my_iter = pq_split ? local_tile : -1;
+#ifdef MPK_LTK_EARLY_TAG
+      if (router_norm_writer) {
+        ltk_norm_slot = pq_split ? local_tile : 0;
+      }
+#endif
 #elif defined(MPK_ONE_NORM_WRITER)
       bool const router_norm_writer = (local_tile == 0);
 #ifdef MPK_W13_PREQUANT
@@ -2832,12 +3039,12 @@ router_tile_pass:;
               router_norm_writer;
 #endif
           if (pq_store) {
-            asm volatile("global_store_dword %0, %1, off" MPK_HOF_STORE_MOD ::"v"(n_base +
+            asm volatile("global_store_dword %0, %1, off" MPK_PQROW_SC ::"v"(n_base +
                                                                 i_cur_q * 4),
                          "v"(pk_bits)
                          : "memory");
             if ((lane & 31) == 0) {
-              asm volatile("global_store_byte %0, %1, off" MPK_HOF_STORE_MOD ::"v"(
+              asm volatile("global_store_byte %0, %1, off" MPK_PQROW_SC ::"v"(
                                n_base + output_stride + scale_block),
                            "v"((unsigned)se)
                            : "memory");
@@ -2898,7 +3105,7 @@ router_tile_pass:;
       if (router_norm_writer && (pq_my_iter <= 0)) {
         int const pad_dw = (output_stride - ACTUAL_HIDDEN_DIM) / 4;
         if ((int)tid < pad_dw) {
-          asm volatile("global_store_dword %0, %1, off" MPK_HOF_STORE_MOD ::"v"(
+          asm volatile("global_store_dword %0, %1, off" MPK_PQROW_SC ::"v"(
                            n_base + ACTUAL_HIDDEN_DIM + (int)tid * 4),
                        "v"(0u)
                        : "memory");
@@ -2935,19 +3142,14 @@ router_tile_pass:;
         bf16 bval = __float2bfloat16(s);
 #ifdef MPK_LOCAL_TOPK
         if (b == 0) {
-          mpk_aid_publish_at(
-              routing_ready_ptr,
-              MPK_AID_LTK_OFF_INTS +
-                  gang_rmsnorm_topk_detail::get_xcd_id() *
-                      (NUM_EXPERTS / MPK_NUM_XCDS) + router_lt,
-              (mpk_ltk_tag(layer_epoch) << 16) |
-                  (unsigned)__builtin_bit_cast(unsigned short, bval),
-              MPK_AID_ROUTING_BASE_INTS);
-          MPK_LTK_MARK(0);
+          ltk_word = (mpk_ltk_tag(layer_epoch) << 16) |
+                     (unsigned)__builtin_bit_cast(unsigned short, bval);
         }
 #endif
+#if !(defined(MPK_LOCAL_TOPK) && defined(MPK_LTK_NO_LOGIT_STORE))
         st_wt_u16(&d_logits[(int64_t)b * NUM_EXPERTS + router_lt],
                   *reinterpret_cast<unsigned short *>(&bval));
+#endif
       }
 #endif // !MPK_ROUTER_FUSED_DP
 
@@ -3012,20 +3214,77 @@ topk_barrier :
   _op_t3 = __builtin_amdgcn_s_memrealtime();
 #endif
   MPK_SUB_MARK(3);
-#ifdef MPK_LOCAL_TOPK
-#if !defined(MPK_AID_SPLIT_FLAGS) || defined(MPK_EARLY_ROUTING)
-#error "MPK_LOCAL_TOPK needs AID_SPLIT_FLAGS and excludes EARLY_ROUTING"
-#endif
-  static_assert(BATCH_SIZE == 1, "MPK_LOCAL_TOPK is bs=1");
-#else
   // Drain BEFORE the rendezvous, not after. `s_waitcnt` is a per-wave
   // guarantee: run after __syncthreads it only retires wave 0's stores, and
   // tid 0 then publishes an arrival advertising output that waves 1..3 may
   // still have in flight. Draining first makes every wave's stores retire,
   // and the barrier then makes that true block-wide.
-  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-  __syncthreads();
+#if defined(MPK_LOCAL_TOPK) && defined(MPK_LTK_EARLY_TAG)
+  // The tag is already out; only a normed-row writer still has a release
+  // (its row flag) to order behind its stores. ltk_norm_slot is uniform.
+  if (ltk_norm_slot >= 0)
+#endif
+  {
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    __syncthreads();
+  }
 
+#ifdef MPK_LOCAL_TOPK
+#if defined(MPK_EARLY_ROUTING) || !defined(MPK_MOE_XCD_PAIR)
+#error "MPK_LOCAL_TOPK replaces EARLY_ROUTING and is wired for the MOE_XCD_PAIR map"
+#endif
+#if MPK_NUM_XCDS != 8 || defined(MPK_MULTI_PASS_8XCD)
+#error "MPK_LOCAL_TOPK publishes one router tile per worker; no multi-pass router"
+#endif
+  static_assert(BATCH_SIZE == 1, "MPK_LOCAL_TOPK is bs=1");
+  static_assert(NUM_EXPERTS == 128, "MPK_LOCAL_TOPK: 128 tag words");
+  // No rendezvous and no serial completer: publish this tile's tagged
+  // logit. The drain above retired every wave's stores, including this
+  // XCD's norm row and pre-quantized row -- which MPK_ROUTER_FUSED_DP
+  // writes AFTER the logit -- so a consumer that has seen all 128 tags
+  // also sees them. The expert index undoes the logits pre-offset exactly
+  // as topk_noinline does (hardware XCC id * NUM_EXPERTS / 8).
+#ifdef MPK_LTK_EARLY_TAG
+  // Tag already out. The drain above retired this tile's write-through row
+  // stores; the flag is read only through this XCD's L2 (sc1 poll).
+  MPK_ILSTAMP(28, ltk_norm_slot >= 0 && s_ilsub_ml == MPK_ILSUB_L0 + 1);
+  if (tid == 0 && ltk_norm_slot >= 0) {
+    int const ltk_hw = gang_rmsnorm_topk_detail::get_xcd_id();
+#ifdef MPK_AID_SPLIT_FLAGS
+    // This XCD's own AID replica (RW): its readers are this XCD's workers,
+    // whose sc1 poll hits the line this plain store left in their L2. The
+    // shared block is MTYPE NC in NPS2, where that poll bypasses L2.
+    int *const ltk_flag =
+        mpk_aid_flags_at(routing_ready_ptr, ltk_hw, MPK_AID_ROUTING_BASE_INTS) +
+        MPK_AID_LTK_NORM_OFF_INTS + ltk_hw * 32 + ltk_norm_slot;
+#else
+    int *const ltk_flag =
+        &routing_ready_ptr[MPK_LTK_NORM_REL + ltk_hw * 32 + ltk_norm_slot];
+#endif
+    asm volatile("global_store_dword %0, %1, off" ::"v"(ltk_flag),
+                 "v"(mpk_ltk_tag(layer_epoch))
+                 : "memory");
+  }
+#else
+  MPK_ILSTAMP(20, s_ilsub_ml == MPK_ILSUB_L0 + 1);
+  if (tid == 0) {
+#ifdef MPK_AID_SPLIT_FLAGS
+    mpk_aid_publish_at(routing_ready_ptr,
+                       MPK_AID_LTK_OFF_INTS +
+                           gang_rmsnorm_topk_detail::get_xcd_id() *
+                               (NUM_EXPERTS / MPK_NUM_XCDS) +
+                           local_tile,
+                       ltk_word, MPK_AID_ROUTING_BASE_INTS);
+#else
+    st_wt_u32((void *)&routing_ready_ptr[MPK_LTK_ROUTING_REL +
+                                         gang_rmsnorm_topk_detail::get_xcd_id() *
+                                             (NUM_EXPERTS / 8) +
+                                         local_tile],
+              ltk_word);
+#endif
+  }
+#endif
+#else
   __shared__ int s_topk_done;
   if (tid == 0) {
 #if defined(MPK_TOPK_HIER) && defined(MPK_AID_SPLIT_FLAGS)
@@ -3255,8 +3514,8 @@ topk_barrier :
     }
 #endif
   }
+#endif // MPK_LOCAL_TOPK
 
-#endif
 done :
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
 {
