@@ -803,6 +803,11 @@ def get_compile_command(
             # or in the collective". It is not a perf probe; the additive
             # rule in glm-additive-probes-overprice-deletions applies.
             flags = flags + ["-DMPK_WUV_SKIP_PEER_WAIT"]
+        if int(os.environ.get("MPK_OPROJ_SKIP_PEER_WAIT", "0")) == 1:
+            # The o_proj twin: keep the column shard, delete its all-gather
+            # (per-tile peer pushes + the elected thread's signal and poll).
+            # WRONG OUTPUT by construction; a ceiling, not a correctness arm.
+            flags = flags + ["-DMPK_OPROJ_SKIP_PEER_WAIT"]
         _ksplit_ceil = int(os.environ.get("MPK_OPROJ_KSPLIT_CEIL", "0"))
         if _ksplit_ceil:
             # CEILING PROBE for the o_proj N-split -> K-split rewrite.

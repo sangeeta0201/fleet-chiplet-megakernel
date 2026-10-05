@@ -1236,6 +1236,15 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
       // the rendezvous AND its producer set). The number that decides that
       // rewrite is NOT how much leaves S19->S20 -- it is how much survives at
       // the wall after S22 and S28 re-absorb the freed skew.
+      //
+      // Re-measured 2026-09-25 at NP=4, 1024/1024, tagged barriers on, 2
+      // alternating reps, decode median: control 9.748 -> 9.557 ms (-0.191).
+      // With the W_UV all-gather and the EP fold exchange deleted as well:
+      // 9.243 (-0.505). That is the ceiling for deleting three of the four
+      // cross-GPU exchanges outright; the rest of their stamped wait is
+      // inter-rank skew, which moves to the exchange that remains. Deleting
+      // the fourth too (MPK_OPROJ_SKIP_PEER_WAIT) takes the paired control
+      // 9.689 -> 8.743 (-0.946): the whole cross-GPU cost, skew included.
 #ifndef MPK_QB_SKIP_PEER_WAIT
       if (qb_tp) {
         int64_t d[QB_NPEER];

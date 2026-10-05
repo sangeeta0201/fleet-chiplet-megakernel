@@ -132,7 +132,7 @@ MPK_FORWARD_VARS=(
   # compile-time, so every rank has to see them or the ranks build different
   # megakernels and the layer barriers deadlock.
   MPK_MLA_SKIP_DECODE MPK_ATTN_HALFK MPK_W13_EARLY_REL MPK_QB_SKIP_PEER_WAIT
-  MPK_WUV_SKIP_PEER_WAIT
+  MPK_WUV_SKIP_PEER_WAIT MPK_OPROJ_SKIP_PEER_WAIT
   # o_proj N-split -> K-split ceiling probe. Deletes the 767 and Phase 8
   # local-flag waits. Compile-time, so an unforwarded rank builds a different
   # megakernel and the layer barriers deadlock rather than error.

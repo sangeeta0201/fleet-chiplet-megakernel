@@ -531,7 +531,9 @@ __device__ __attribute__((always_inline)) void
     }
     // MPK_WUV_SKIP_PEER_WAIT keeps the shard and deletes only the all-gather.
     // WRONG OUTPUT by construction -- see persistent_kernel.py for why it
-    // exists.
+    // exists. As a ceiling, 2026-09-25, NP=4, 1024/1024, 2 alternating reps,
+    // decode median: control 9.748 -> 9.518 ms (-0.230). All three
+    // cross-GPU deletions together: see MPK_QB_SKIP_PEER_WAIT.
 #ifdef MPK_WUV_SKIP_PEER_WAIT
     (void)wuv_all_mapped;
     bool const wuv_push = false;
@@ -947,7 +949,20 @@ __device__ __attribute__((always_inline)) void
         }
       }
     }
+    // MPK_OPROJ_SKIP_PEER_WAIT, the o_proj twin of MPK_WUV_SKIP_PEER_WAIT:
+    // keep the column shard, delete the all-gather -- the per-tile pushes into
+    // the peers' rows and the elected thread's signal + poll. WRONG OUTPUT by
+    // construction: 3/4 of the hidden row keeps the peers' previous columns.
+    // With the router fold off (the default) nothing else keys off the push.
+    // 2026-09-25, NP=4, 1024/1024, 2 alternating reps, decode median: control
+    // 9.689 -> 9.511 ms (-0.178); with q_b's, W_UV's and the EP fold's
+    // exchanges deleted too, all four gone, 8.743 (-0.946).
+#ifdef MPK_OPROJ_SKIP_PEER_WAIT
+    (void)oproj_all_mapped;
+    bool const oproj_push = false;
+#else
     bool const oproj_push = oproj_tp && oproj_all_mapped;
+#endif
     // The fold rides the same shard: it is exactly the o_proj column slice
     // that makes each rank's share of the two contractions well defined, so
     // there is no fold without the push. Both pointers null is the opt-out,

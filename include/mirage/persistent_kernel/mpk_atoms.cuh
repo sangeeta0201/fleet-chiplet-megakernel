@@ -411,6 +411,17 @@ __device__ __forceinline__ void st_nt_u64(unsigned long long int *addr,
 // Data bypasses L2 entirely, writes directly to HBM/MALL.
 // No buffer_wbl2 needed after WT stores — data is already in memory.
 // Use s_waitcnt vmcnt(0) to ensure stores complete before signaling.
+//
+// What a cross-GPU handoff costs, measured 2026-09-25 by ping-pong between
+// one 512-thread workgroup on each of two idle MI350X (GPUs 4-5 and 4-7
+// agree), one-way:
+//   8-byte epoch store into the peer, peer polls its own memory  0.80-0.88 us
+//   1536 B of payload via st_wt into the peer, s_waitcnt vmcnt(0),
+//     then the epoch store (this codebase's push + drain + signal)  1.74-1.84 us
+//   the same payload as 384 {data, epoch} 8-byte pairs, no drain,
+//     the peer polling the pairs themselves (TileRT's one-shot push) 0.96-1.04 us
+// So data-as-signal saves ~0.8 us per exchange; the multi-microsecond peer
+// waits in the stage stamps are skew between the ranks, not transport.
 
 // Write-through 64-bit store (4x bf16 or 2x float)
 __device__ __forceinline__ void st_wt_u64(void *addr,
@@ -1241,6 +1252,19 @@ __device__ __forceinline__ bool
 // W13 -> W2 is the widest idle margin whose successor can resolve at all;
 // decode -> merge has 27 of 29 idle but merge is ~13 us/layer total, entirely
 // under the floor. There is no better pair to retry with.
+//
+// ── RE-MEASURED 2026-10-02 AT NP=4, GLM-5.2, 1024/1024: WORSE, NOT BETTER. ──
+// 2 alternating reps, decode median, all G1 PASS (arm 2 text garbage):
+//
+//   arm 0  shipping                     9.727  9.744   mean 9.736
+//   arm 1  permutation, below barrier   9.716  9.697   mean 9.706
+//   arm 2  permutation, above barrier   9.892  9.865   mean 9.878
+//
+//   arm2 - arm1 = +0.172 ms. At four ranks each one owns 2-4 experts, so
+// only the W13-idle workers' share of W2 moves (all 12 tiles at 2 experts,
+// 6 of 18 at 3, none at 4+), and those tiles then compete with the W13
+// stragglers for HBM. This is the ceiling of TileRT-style stage streaming
+// for the layer's biggest phase pair here, and it is negative.
 //
 // Kept at 0, which is a strict no-op: _pipe_tiles folds to 0 and the Phase 7
 // skip disappears. Arm 0 measured 10.244 against the 10.25 batch baseline.

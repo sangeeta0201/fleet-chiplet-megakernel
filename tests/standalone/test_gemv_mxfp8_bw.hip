@@ -57,6 +57,23 @@
  * kernel G at 240 blocks moves 1741 GB/s against 128 blocks' 1244, because
  * per-WG efficiency falls more slowly than the block count rises.
  *
+ * Nor is it occupancy (2026-10-02, MI350X, GLM-5.2 era). TileRT's layer
+ * kernel runs 512-thread workgroups at 2 waves/SIMD where our 374-register
+ * worker gets 1. Same G shape (one tile per block per round, global barrier),
+ * all 256 CUs, phase makespan per round:
+ *
+ *                                  K=4096     K=8192
+ *     1 block/CU, 8-row tile        5.75 us    7.9 us    (half the bytes)
+ *     2 blocks/CU, 8-row tiles      8.36 us   13.4 us    (2 waves/SIMD)
+ *     1 block/CU, 16-row tile       7.5 us    12.9 us    (same bytes, 1 wave)
+ *
+ * A second wave overlaps some of the work, but one wave on a tile twice as
+ * tall is as fast or faster; the per-CU limit is per-tile fixed cost
+ * (activation staging, ramp, the straggler tail), not waves in flight. The
+ * makespan runs ~3 us over the median tile (7.5 vs 4.5 us at K=4096) -- start
+ * skew after the release plus the tail -- which is what streaming stages
+ * instead of re-synchronising them would remove.
+ *
  * Build: ./build.sh
  * Run:   ./test_gemv_mxfp8_bw
  */

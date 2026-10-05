@@ -173,6 +173,13 @@
 //      transport is inside the 4.768, so a slow signal is a visibility
 //      problem, not a bandwidth one.
 //
+// GLM-5.2, 2026-09-25, NP=4, 1024/1024, 2 alternating reps, decode median:
+// =1 moves 9.748 -> 9.617 ms (-0.130), though the stamps put 6.9-11.6 us of
+// every layer in the peer-signal wait on every rank (S3->S4, median worker).
+// The wait is mostly skew between the ranks' MoE finishes, not transport:
+// a one-workgroup XGMI ping-pong measures the whole push + drain + signal
+// handoff at 1.74-1.84 us one-way (see st_wt_u64 in mpk_atoms.cuh).
+//
 // Same knob and same meaning as gang_full_layer_fused's. The two monoliths
 // share a translation unit, so the guard is #ifndef, not a redefinition.
 // Same default as gang_full_layer_fused_mi300.cuh, repeated because this
