@@ -271,6 +271,62 @@ __device__ __forceinline__ void mla_tile_bar() { __syncthreads(); }
 #define MPK_MLA_DECODE_DMA_PF 0
 #endif
 
+// MPK_MLA_OACC_VGPR: keep the 32 loop-carried o_acc floats in VGPRs and issue
+// the trip's eight PV MFMAs back to back with VGPR accumulators, instead of
+// the LDS spill below (ds_read, lgkmcnt(0), v_accvgpr_write, MFMA, 32 nops,
+// v_accvgpr_read, ds_write, lgkmcnt(0) -- eight serial rounds per trip). The
+// spill was introduced for a fused ntiles>=2 collapse blamed on RA; the
+// allocation-dependent VALU->MFMA hazard fixed in a013ffd fits that symptom
+// too, and mla_pv8_vgpr pads both hazards itself.
+//
+// Deletion probes on the isolated decode (128 items, 32 chunks, 256 threads
+// at the megakernel's 512-register budget -- without __launch_bounds__(256,1)
+// the bench spills and the comparison inverts), us per 16-token trip:
+//   shipped 3.45   no QK 2.53   no PV 1.77   no KV load ~3.1
+//   OACC_VGPR 1.85 (PV 1.68 -> ~0.1, QK 0.92 -> 0.41); one-trip launch
+//   10.09 -> 8.69 us. test_mla_decode 46/46 at both register budgets.
+//
+// MEASURED 2026-10-02, NP=8 GPUs 0-7, 1024/1024, 2 alternating pairs, G1 PASS,
+// coherent text: decode median 9.613/9.580 -> 9.288/9.318 ms (-0.294).
+// Gates (NP=4): ppl512 2.6148, ppl128 2.9048 (torch 2.4073, ratio 1.207),
+// longseq 256/512/1024 G1 PASS, test_mla_merge and test_st_wt PASS. Default 1.
+#ifndef MPK_MLA_OACC_VGPR
+#define MPK_MLA_OACC_VGPR 1
+#endif
+
+// Two smaller trip levers on top of MPK_MLA_OACC_VGPR, same isolated bench,
+// us per trip: OACC_VGPR 1.875; + QK_2ACC 1.77; + DECODE_BATCH=4 1.57; both
+// 1.38. 46/46 at both register budgets for each.
+//
+// MEASURED 2026-10-02, NP=8 GPUs 0-7, 1024/1024, decode median, G1 PASS:
+//   OACC_VGPR (4 runs)   9.277 9.307 9.344 9.279   mean 9.302
+//   + QK_2ACC            9.210 9.276               mean 9.243  (-0.06)
+//   + DECODE_BATCH=4     9.242 9.253               mean 9.248  (-0.05)
+// Both inside the control spread at n=2, as the bench predicts (-0.1 and
+// -0.3 us/trip at ~3.5 trips). Off. Every run pair, controls included, first
+// diverges at token 92-126, so off-topic tails are not evidence either way.
+//
+// MPK_MLA_QK_2ACC: split the 18-step QK MFMA chain over a[32:35] (even k32
+// steps) and a[36:39] (odd), so consecutive MFMAs are independent.
+//
+// MPK_MLA_DECODE_BATCH=NB: land up to NB KV tiles in NB LDS buffers at once
+// (full tiles by LDS DMA, the partial tail by the register path), so a chunk
+// pays the global latency once per batch, and the trips inside a batch run
+// with no barrier. The buffers start at lds_kv and cover the o_acc spill, so
+// it needs OACC_VGPR; NB * 18 KB of dynamic LDS.
+#ifndef MPK_MLA_QK_2ACC
+#define MPK_MLA_QK_2ACC 0
+#endif
+#ifndef MPK_MLA_DECODE_BATCH
+#define MPK_MLA_DECODE_BATCH 0
+#endif
+#if MPK_MLA_DECODE_BATCH && !MPK_MLA_OACC_VGPR
+#error "MPK_MLA_DECODE_BATCH lays its tile buffers over the o_acc spill, so it needs MPK_MLA_OACC_VGPR"
+#endif
+#if MPK_MLA_DECODE_BATCH && MPK_MLA_DECODE_DMA_PF
+#error "MPK_MLA_DECODE_BATCH and MPK_MLA_DECODE_DMA_PF both own the KV tile buffers"
+#endif
+
 // __mfma_qk_hd64 / __mfma_pv_hd64 / __fast_exp2_hd64 / __load_bf16x4_to_fp16 /
 // __load_bf16x4_raw / __cvt_bf16x4_to_fp16 live here. They are tiling-agnostic
 // despite the hd64 name.
@@ -307,7 +363,7 @@ __device__ __forceinline__ T ld_g(void const *p) {
   return *(__attribute__((address_space(1))) T const *)q;
 }
 
-#if MPK_MLA_DECODE_DMA_PF
+#if MPK_MLA_DECODE_DMA_PF || MPK_MLA_DECODE_BATCH
 typedef int __attribute__((ext_vector_type(4))) mla_i32x4_t;
 
 // Raw buffer V# over [base, base + range_bytes), wave-uniform.
@@ -420,6 +476,74 @@ __device__ __forceinline__ void mla_qk_acc32_mfma(__bf16 const *a,
                :
                : "v"(avu), "v"(bvu)
                : "a32", "a33", "a34", "a35");
+}
+
+// MPK_MLA_QK_2ACC chains. The AGPRs are named in the asm, so RA can never
+// copy them between steps.
+__device__ __forceinline__ void mla_qk_acc2_zero() {
+  asm volatile("v_accvgpr_write_b32 a32, 0\n"
+               "v_accvgpr_write_b32 a33, 0\n"
+               "v_accvgpr_write_b32 a34, 0\n"
+               "v_accvgpr_write_b32 a35, 0\n"
+               "v_accvgpr_write_b32 a36, 0\n"
+               "v_accvgpr_write_b32 a37, 0\n"
+               "v_accvgpr_write_b32 a38, 0\n"
+               "v_accvgpr_write_b32 a39, 0\n"
+               :
+               :
+               : "a32", "a33", "a34", "a35", "a36", "a37", "a38", "a39");
+}
+
+template <int ODD>
+__device__ __forceinline__ void mla_qk_acc2_mfma(__bf16 const *a,
+                                                __bf16 const *b) {
+  bf16x8_t av, bv;
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    av[i] = a[i];
+    bv[i] = b[i];
+  }
+  u32x4_t avu, bvu;
+  __builtin_memcpy(&avu, &av, 16);
+  __builtin_memcpy(&bvu, &bv, 16);
+  // s_nop 1: VALU-produced operands, as in mla_qk_acc32_mfma.
+  if constexpr (ODD) {
+    asm volatile("s_nop 1\n"
+                 "v_mfma_f32_16x16x32_bf16 a[36:39], %0, %1, a[36:39]\n"
+                 :
+                 : "v"(avu), "v"(bvu)
+                 : "a36", "a37", "a38", "a39");
+  } else {
+    asm volatile("s_nop 1\n"
+                 "v_mfma_f32_16x16x32_bf16 a[32:35], %0, %1, a[32:35]\n"
+                 :
+                 : "v"(avu), "v"(bvu)
+                 : "a32", "a33", "a34", "a35");
+  }
+}
+
+__device__ __forceinline__ __mfma_hd64_fp32x4 mla_qk_acc2_read() {
+  float s0, s1, s2, s3, t0, t1, t2, t3;
+  asm volatile("s_nop 15\n"
+               "s_nop 15\n"
+               "v_accvgpr_read_b32 %0, a32\n"
+               "v_accvgpr_read_b32 %1, a33\n"
+               "v_accvgpr_read_b32 %2, a34\n"
+               "v_accvgpr_read_b32 %3, a35\n"
+               "v_accvgpr_read_b32 %4, a36\n"
+               "v_accvgpr_read_b32 %5, a37\n"
+               "v_accvgpr_read_b32 %6, a38\n"
+               "v_accvgpr_read_b32 %7, a39\n"
+               : "=v"(s0), "=v"(s1), "=v"(s2), "=v"(s3), "=v"(t0), "=v"(t1),
+                 "=v"(t2), "=v"(t3)
+               :
+               : "a32", "a33", "a34", "a35", "a36", "a37", "a38", "a39");
+  __mfma_hd64_fp32x4 r;
+  r[0] = s0 + t0;
+  r[1] = s1 + t1;
+  r[2] = s2 + t2;
+  r[3] = s3 + t3;
+  return r;
 }
 
 __device__ __forceinline__ __mfma_hd64_fp32x4 mla_qk_acc32_read() {
@@ -629,6 +753,31 @@ MLA_DEF_PV_BLOCK(mla_flash_pv_b5, 80)
 MLA_DEF_PV_BLOCK(mla_flash_pv_b6, 96)
 MLA_DEF_PV_BLOCK(mla_flash_pv_b7, 112)
 #undef MLA_DEF_PV_BLOCK
+
+// The eight PV blocks of one tile trip with o_acc in VGPRs. LLVM's hazard
+// recognizer cannot see inside the asm, so it pads both sides: s_nop 1 for
+// VALU-written srcA/B/C (2 wait states), s_nop 15 for XDL write -> VALU/VMEM/
+// LDS read of the accumulators (11 for an 8-pass MFMA).
+__device__ __forceinline__ void mla_pv8_vgpr(__mfma_hd64_fp32x4 (&acc)[8],
+                                             u32x2_t const (&va)[8],
+                                             u32x2_t pb) {
+  asm volatile("s_nop 1\n\t"
+               "v_mfma_f32_16x16x16_bf16 %[c0], %[a0], %[pb], %[c0]\n\t"
+               "v_mfma_f32_16x16x16_bf16 %[c1], %[a1], %[pb], %[c1]\n\t"
+               "v_mfma_f32_16x16x16_bf16 %[c2], %[a2], %[pb], %[c2]\n\t"
+               "v_mfma_f32_16x16x16_bf16 %[c3], %[a3], %[pb], %[c3]\n\t"
+               "v_mfma_f32_16x16x16_bf16 %[c4], %[a4], %[pb], %[c4]\n\t"
+               "v_mfma_f32_16x16x16_bf16 %[c5], %[a5], %[pb], %[c5]\n\t"
+               "v_mfma_f32_16x16x16_bf16 %[c6], %[a6], %[pb], %[c6]\n\t"
+               "v_mfma_f32_16x16x16_bf16 %[c7], %[a7], %[pb], %[c7]\n\t"
+               "s_nop 15"
+               : [c0] "+v"(acc[0]), [c1] "+v"(acc[1]), [c2] "+v"(acc[2]),
+                 [c3] "+v"(acc[3]), [c4] "+v"(acc[4]), [c5] "+v"(acc[5]),
+                 [c6] "+v"(acc[6]), [c7] "+v"(acc[7])
+               : [a0] "v"(va[0]), [a1] "v"(va[1]), [a2] "v"(va[2]),
+                 [a3] "v"(va[3]), [a4] "v"(va[4]), [a5] "v"(va[5]),
+                 [a6] "v"(va[6]), [a7] "v"(va[7]), [pb] "v"(pb));
+}
 
 template <int KV_BYTES, int VB>
 __device__ __forceinline__ void
@@ -948,7 +1097,15 @@ __device__ __noinline__ void
   }
 
   // ===== MAIN LOOP =====
+#if MPK_MLA_OACC_VGPR
+  __mfma_hd64_fp32x4 o_acc_r[NUM_V_BLOCKS];
+#pragma unroll
+  for (int vb = 0; vb < NUM_V_BLOCKS; vb++) {
+    o_acc_r[vb] = __mfma_hd64_fp32x4{0.0f, 0.0f, 0.0f, 0.0f};
+  }
+#else
   mla_oacc_zero_lds<KV_LDS_BYTES>(oacc_base);
+#endif
   float m_running = -INFINITY;
   float l_head[4] = {0, 0, 0, 0};
 
@@ -990,6 +1147,63 @@ __device__ __noinline__ void
     if (tile_len < 0) {
       tile_len = 0;
     }
+#if MPK_MLA_DECODE_BATCH
+    constexpr int NB = MPK_MLA_DECODE_BATCH;
+    static_assert(PAGE_SIZE % KV_TILE == 0,
+                  "a DMA'd KV tile must not straddle a page");
+    static_assert(KV_CACHE_STRIDE == QK_DIM,
+                  "DMA copies cache rows into the LDS tile verbatim");
+    static_assert(KV_LDS_BYTES / 4096 == 4 && (KV_LDS_BYTES % 4096) / 1024 == 2,
+                  "mla_dma_tile is written for an 18 KB tile (GLM's 576 dims)");
+    int const bslot = t % NB;
+    __bf16 *const cur_kv = lds_kv + bslot * (KV_TILE * QK_DIM);
+    if (bslot == 0) {
+      int const nb = (ntiles - t < NB) ? (ntiles - t) : NB;
+      unsigned const wid = __builtin_amdgcn_readfirstlane(warp_id);
+      for (int b = 0; b < nb; b++) {
+        int const bstart = tile_start + b * KV_TILE;
+        int blen = effective_len - bstart;
+        if (blen > KV_TILE) {
+          blen = KV_TILE;
+        }
+        __bf16 *const bkv = lds_kv + b * (KV_TILE * QK_DIM);
+        if (blen == KV_TILE) {
+          long const brow = get_kv_row(kv_start + bstart);
+          gang_mla_decode_detail::mla_i32x4_t const rsrc =
+              gang_mla_decode_detail::mla_buffer_rsrc(kv_base + brow,
+                                                      KV_LDS_BYTES);
+          unsigned const m0_base =
+              __builtin_amdgcn_readfirstlane(static_cast<unsigned>(
+                  reinterpret_cast<uintptr_t>(bkv))) +
+              wid * 1024u;
+          gang_mla_decode_detail::mla_dma_tile(
+              rsrc, m0_base, static_cast<unsigned>(tid) * 16u, wid < 2u);
+        } else if (my_tok < blen) {
+          long const row = get_kv_row(kv_start + bstart + my_tok);
+#pragma unroll
+          for (int r = 0; r < LDG_PER_TILE; r++) {
+            u32x2_t const v =
+                ld_g<u32x2_t>(kv_base + row + (my_dim0 + r * 64) * 2);
+            uint64_t val;
+            __builtin_memcpy(&val, &v, 8);
+            auto *dst = (__attribute__((address_space(3))) uint64_t *)&bkv
+                            [my_tok * QK_DIM + my_dim0 + r * 64];
+            *dst = val;
+          }
+        } else {
+          uint64_t const zero8 = 0;
+#pragma unroll
+          for (int r = 0; r < LDG_PER_TILE; r++) {
+            auto *dst = (__attribute__((address_space(3))) uint64_t *)&bkv
+                            [my_tok * QK_DIM + my_dim0 + r * 64];
+            *dst = zero8;
+          }
+        }
+      }
+      asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)" ::: "memory");
+      mla_tile_bar();
+    }
+#else
 #if MPK_MLA_DECODE_DMA_PF
     __bf16 *const cur_kv = (t & 1) ? lds_kv_b : lds_kv;
     if (dma_have) {
@@ -1030,6 +1244,7 @@ __device__ __noinline__ void
       asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
     }
     mla_tile_bar();
+#endif
 
 #if MPK_MLA_DECODE_DMA_PF
     // Every wave is past trip t - 1, so the other buffer is free. Only full
@@ -1052,6 +1267,23 @@ __device__ __noinline__ void
 #endif
 
     {
+#if MPK_MLA_QK_2ACC
+      static_assert(NUM_K32 % 2 == 0, "QK splits into two equal chains");
+      gang_mla_decode_detail::mla_qk_acc2_zero();
+#pragma unroll
+      for (int kc = 0; kc < NUM_K32; kc += 2) {
+        __bf16 kr0[8], kr1[8];
+        __bf16 const *k_ptr = &cur_kv[midx * QK_DIM + kc * 32 + kgrp * 8];
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+          kr0[i] = k_ptr[i];
+          kr1[i] = k_ptr[32 + i];
+        }
+        gang_mla_decode_detail::mla_qk_acc2_mfma<0>(kr0, qr[kc]);
+        gang_mla_decode_detail::mla_qk_acc2_mfma<1>(kr1, qr[kc + 1]);
+      }
+      __mfma_hd64_fp32x4 scores = gang_mla_decode_detail::mla_qk_acc2_read();
+#else
       mla_qk_acc32_zero();
 #pragma unroll
       for (int kc = 0; kc < NUM_K32; kc++) {
@@ -1064,6 +1296,7 @@ __device__ __noinline__ void
         mla_qk_acc32_mfma(kr, qr[kc]);
       }
       __mfma_hd64_fp32x4 scores = mla_qk_acc32_read();
+#endif
       scores[0] *= scale_s;
       scores[1] *= scale_s;
       scores[2] *= scale_s;
@@ -1106,6 +1339,26 @@ __device__ __noinline__ void
       pb[1] = (__bf16)w1;
       pb[2] = (__bf16)w2;
       pb[3] = (__bf16)w3;
+#if MPK_MLA_OACC_VGPR
+      {
+        u32x2_t vau[NUM_V_BLOCKS];
+#pragma unroll
+        for (int vb = 0; vb < NUM_V_BLOCKS; vb++) {
+          bf16x4_t va;
+          __bf16 const *v_ptr =
+              &cur_kv[(kgrp * 4) * QK_DIM + vb * 64 + warp_id * 16 + midx];
+          va[0] = v_ptr[0 * QK_DIM];
+          va[1] = v_ptr[1 * QK_DIM];
+          va[2] = v_ptr[2 * QK_DIM];
+          va[3] = v_ptr[3 * QK_DIM];
+          __builtin_memcpy(&vau[vb], &va, 8);
+          o_acc_r[vb] *= rescale;
+        }
+        u32x2_t pbu;
+        __builtin_memcpy(&pbu, &pb, 8);
+        gang_mla_decode_detail::mla_pv8_vgpr(o_acc_r, vau, pbu);
+      }
+#else
 #pragma unroll
       for (int vb = 0; vb < NUM_V_BLOCKS; vb++) {
         bf16x4_t va;
@@ -1133,6 +1386,7 @@ __device__ __noinline__ void
           mla_flash_pv_b7<KV_LDS_BYTES>(oacc_base, rescale, va, pb);
         }
       }
+#endif
     }
 
     // The QK and PV steps both read the whole LDS tile, so the refill has to
@@ -1147,8 +1401,14 @@ __device__ __noinline__ void
     // 32-chunk case (warp 3's partials zero), single-trip ones included, for
     // reasons not pinned down; with it all 46 pass. Its vmcnt(0) also retires
     // the next tile's DMA, which by then has had this trip's QK/softmax/PV to
-    // land in.
+    // land in. Under MPK_MLA_DECODE_BATCH only the batch's last trip refills.
+#if MPK_MLA_DECODE_BATCH
+    if (bslot == MPK_MLA_DECODE_BATCH - 1 || t == ntiles - 1) {
+      mla_tile_bar();
+    }
+#else
     mla_tile_bar();
+#endif
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     _d_refill += __builtin_amdgcn_s_memrealtime() - _d_b;
 #endif
@@ -1168,7 +1428,14 @@ __device__ __noinline__ void
   int const q_head_local = midx;
 
   __mfma_hd64_fp32x4 o_acc[NUM_V_BLOCKS];
+#if MPK_MLA_OACC_VGPR
+#pragma unroll
+  for (int vb = 0; vb < NUM_V_BLOCKS; vb++) {
+    o_acc[vb] = o_acc_r[vb];
+  }
+#else
   mla_oacc_from_lds<KV_LDS_BYTES>(oacc_base, o_acc);
+#endif
 
   if constexpr (NUM_KV_CHUNKS == 1) {
     constexpr int OUT_STRIDE = NUM_Q_HEADS * KV_LORA_RANK;

@@ -957,6 +957,10 @@ __device__ __attribute__((always_inline)) void
     // 2026-09-25, NP=4, 1024/1024, 2 alternating reps, decode median: control
     // 9.689 -> 9.511 ms (-0.178); with q_b's, W_UV's and the EP fold's
     // exchanges deleted too, all four gone, 8.743 (-0.946).
+    // NP=8 (GPUs 0-7), same build: control 9.633 / 9.617, all four gone
+    // 8.414 / 8.370 (-1.23). With no cross-GPU cost at all the layer still
+    // takes ~108 us per GPU, against TileRT's 37 us for one TP8 rank's layer
+    // on the same hardware: the gap is inside the GPU, not between them.
 #ifdef MPK_OPROJ_SKIP_PEER_WAIT
     (void)oproj_all_mapped;
     bool const oproj_push = false;
@@ -2145,7 +2149,27 @@ __device__ __attribute__((always_inline)) void
   // and both are linear, so a partial K sum is just another addend. The bias
   // is the one addend that is not, and K_SPLITS > 1 here routes it through
   // the existing add_bias gate, landing it on rank 0 only.
-  for (int t = xcd_rank; t < moe_w2_shared_live; t += tiles_per_xcd) {
+  //
+  // Shared tile s runs on xcd_rank (moe_w2_live + s) mod pool, i.e. first on
+  // the workers the routed loop above left idle, so the two classes share one
+  // round instead of the routed workers running both back to back. The pool
+  // is the workers that passed the W13 -> W2 barrier; the rest returned there.
+  //
+  // MEASURED 2026-10-02, NP=8 GPUs 0-7, 1024/1024, decode median, G1 PASS,
+  // KSHARD=4 against KSHARD=0 (OACC_VGPR on in both):
+  //   starting at xcd_rank 0   9.277 9.307 -> 9.593 9.583   (+0.296)
+  //   this placement           9.267 9.324 -> 9.246 9.291   (-0.027, neutral)
+  // So the placement was the whole of the loss, and without it the shard is
+  // still not a win at NP=8 even though rank 0 leaves MoE ~5.5 us/layer late
+  // there: the ranks that take a slice pay what rank 0 stops paying.
+  int const w2_pool = moe_w2_tiles_per_xcd < tiles_per_xcd
+                          ? moe_w2_tiles_per_xcd
+                          : tiles_per_xcd;
+  int w2_sh_first = (xcd_rank - moe_w2_live) % w2_pool;
+  if (w2_sh_first < 0) {
+    w2_sh_first += w2_pool;
+  }
+  for (int t = w2_sh_first; t < moe_w2_shared_live; t += w2_pool) {
     gang_moe_w2_linear_mxfp8_kernel<BATCH_SIZE,
                                     HIDDEN_SIZE,
                                     HIDDEN_SIZE,

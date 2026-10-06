@@ -45,8 +45,12 @@ static constexpr int KV_CACHE_STRIDE = QK_DIM;
 static constexpr int NUM_Q_GROUPS = NUM_Q_HEADS / 16;
 static constexpr int BLOCK_THREADS = 256;
 // MPK_MLA_DECODE_DMA_PF adds a second KV tile buffer past the o_acc spill.
-static constexpr int LDS_BYTES =
+// MPK_MLA_DECODE_BATCH lays NB tiles over the same region instead.
+static constexpr int LDS_BASE_BYTES =
     16 * QK_DIM * 2 + 256 * 32 * 4 + (MPK_MLA_DECODE_DMA_PF ? 16 * QK_DIM * 2 : 0);
+static constexpr int LDS_BATCH_BYTES = MPK_MLA_DECODE_BATCH * 16 * QK_DIM * 2;
+static constexpr int LDS_BYTES =
+    LDS_BATCH_BYTES > LDS_BASE_BYTES ? LDS_BATCH_BYTES : LDS_BASE_BYTES;
 
 static constexpr float LOG2E = 1.44269504088896340736f;
 

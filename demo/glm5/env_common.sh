@@ -194,7 +194,8 @@ MPK_FORWARD_VARS=(
   # only wins at GROUPS >= 6 (standalone: ping-pong is 10.11 us/tile at 4,
   # against the copying form's 9.71, but 8.43 at 6 and 7.82 at 8). Compile-time.
   MPK_MOE_PF_DBUF_W13 MPK_MOE_PF_DBUF_W2 MPK_MLA_DECODE_DBLBUF MPK_MLA_DECODE_BAR_LDS
-  MPK_MLA_OACC_INTERLEAVE MPK_MLA_DECODE_DMA_PF
+  MPK_MLA_OACC_INTERLEAVE MPK_MLA_DECODE_DMA_PF MPK_MLA_OACC_VGPR
+  MPK_MLA_QK_2ACC MPK_MLA_DECODE_BATCH MPK_MLA_HEAD_LOCAL
   MPK_MOE_PF_GROUPS_W13 MPK_MOE_PF_GROUPS_W2
   # Counted s_waitcnt vmcnt(N) in the MoE deep k-loop (gpt-oss W13 T0
   # handoff analog). Compile-time; a rank that misses it is a different

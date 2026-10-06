@@ -441,6 +441,38 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // per-XCD offset the replicated form already used.
   int const qb_head_base = qb_tp ? EP_MY_PE * QB_TP_HEADS : 0;
 
+  // ── MPK_MLA_HEAD_LOCAL: decode and merge only this rank's heads ─────────
+  // W_UV is rank-sharded on the same heads as q_b (v rows [p * 2048, +2048)
+  // at NP=8 are heads [8p, 8p+8)), so of the 64 heads every rank decodes and
+  // merges, only its own are ever read. Decoding just the 16-head group that
+  // holds them makes the query all-gather unnecessary: no peer push in Phase
+  // 3b, no peer wait in Phase 4, which becomes a GPU-local barrier. Below 16
+  // heads per rank the group also holds a partner rank's heads, whose query
+  // rows are then stale; QK, softmax and PV are all row-independent, so those
+  // rows produce unread garbage and cannot reach this rank's heads.
+  //
+  // MEASURED 2026-10-02, NP=8 GPUs 0-7, 1024/1024, decode median, G1 PASS,
+  // coherent text: 9.267 9.324 -> 8.846 8.830 ms (-0.458). Stage stamps:
+  // q_b->decode barrier 7.48 -> 3.95 us/layer, q_b + W_UK 7.59 -> 6.85;
+  // the router's o_proj gather wait takes back ~2 of it. Four more pairs:
+  // 8.846 8.844 8.851 8.871 against 9.331 9.330. Gates: NP=4 ppl512 2.6047,
+  // ppl128 2.9430, longseq 256/512/1024 G1 PASS; NP=8 ppl512, n=6 each,
+  // control mean 2.5633 (2.51-2.65) vs head-local 2.5681 (2.51-2.63). Every
+  // run pair, either arm, first diverges at token 92-126. Default 1.
+#ifndef MPK_MLA_HEAD_LOCAL
+#define MPK_MLA_HEAD_LOCAL 1
+#endif
+  constexpr int HL_GROUPS = (QB_TP_HEADS >= 16) ? QB_TP_HEADS / 16 : 1;
+  bool const head_local =
+      MPK_MLA_HEAD_LOCAL && qb_tp && !PAIR_MERGE && BATCH_SIZE == 1;
+  int const hl_g0 = qb_head_base / 16;
+  // Items per XCD round up: short-sequence builds use chunk counts like 17,
+  // and the tail XCDs skip the indices past the end.
+  constexpr int HL_DEC_ITEMS = HL_GROUPS * NUM_KV_CHUNKS;
+  constexpr int HL_MRG_ITEMS = HL_GROUPS * MERGE_DIM_SPLITS;
+  int const dec_tiles = head_local ? (HL_DEC_ITEMS + 7) / 8 : mla_tiles_per_xcd;
+  int const mrg_tiles = head_local ? (HL_MRG_ITEMS + 7) / 8 : merge_tiles_per_xcd;
+
   // ── deferred rope ───────────────────────────────────────────────────────
   // Sharded, q_b's makespan is one tile: four of them per XCD against 29
   // workers. Narrowing the tile is the whole remaining lever there, and the
@@ -1031,7 +1063,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         }
       }
     }
-    bool const qb_push = qb_tp && qb_all_mapped;
+    bool const qb_push = qb_tp && qb_all_mapped && !head_local;
 
     // Rows this task actually carries. BATCH_SIZE is the compile-time width of
     // every scratch row; num_tokens is how many of them hold a live token, and
@@ -1246,7 +1278,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
       // the fourth too (MPK_OPROJ_SKIP_PEER_WAIT) takes the paired control
       // 9.689 -> 8.743 (-0.946): the whole cross-GPU cost, skew included.
 #ifndef MPK_QB_SKIP_PEER_WAIT
-      if (qb_tp) {
+      if (qb_tp && !head_local) {
         int64_t d[QB_NPEER];
         bool mapped = true;
 #pragma unroll
@@ -1309,7 +1341,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // Only the decode ranks need what this barrier protects. Everyone else
   // falls through to the decode barrier's arrival, which is what orders them
   // against the merge.
-  if (xcd_rank < mla_tiles_per_xcd) {
+  if (xcd_rank < dec_tiles) {
     if (tid == 0) {
       // Self-heal, see MPK_FL_REPUBLISH_SPINS.
       int *const _qb_flag = &qb_barrier[xcd_id * HIER_STRIDE];
@@ -1381,13 +1413,21 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     // attribution is wrong the same way the W13->W2 barrier's was, and
     // widening the decode (more kv chunks, more q groups) cannot pay.
 #ifndef MPK_MLA_SKIP_DECODE
-    for (int t = xcd_rank; t < mla_tiles_per_xcd; t += tiles_per_xcd) {
+    for (int t = xcd_rank; t < dec_tiles; t += tiles_per_xcd) {
       // Under PAIR_MERGE this XCD owns chunks [pair_half * mla_tiles_per_xcd,
       // +mla_tiles_per_xcd) of q_group pair_id, and the decode kernel wants
       // chunk * NUM_Q_GROUPS + q_group. Still a bijection onto
-      // [0, NUM_Q_GROUPS * NUM_KV_CHUNKS), just a different one.
+      // [0, NUM_Q_GROUPS * NUM_KV_CHUNKS), just a different one. Head-local,
+      // local item i covers chunk i / HL_GROUPS of local group i % HL_GROUPS.
+      int const hl_item = xcd_id * dec_tiles + t;
+      if (head_local && hl_item >= HL_DEC_ITEMS) {
+        continue;
+      }
       int const decode_item =
-          PAIR_MERGE
+          head_local
+              ? (hl_item / HL_GROUPS) * NUM_Q_GROUPS + hl_g0 +
+                    hl_item % HL_GROUPS
+          : PAIR_MERGE
               ? (pair_half * mla_tiles_per_xcd + t) * NUM_Q_GROUPS + pair_id
               : xcd_id * mla_tiles_per_xcd + t;
       // PAIR_MERGE's remap is a bijection onto [0, NUM_Q_GROUPS *
@@ -1482,7 +1522,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
   }
-  if (xcd_rank >= merge_tiles_per_xcd) {
+  if (xcd_rank >= mrg_tiles) {
     return;
   }
   if (dec_tagged) {
@@ -1553,7 +1593,15 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // bid.y of a (requests, 32, 1) grid -- there is no bid.y in a gang task, so
   // it comes from the worker's own coordinates instead. NUM_Q_GROUPS is
   // declared up with the pair-merge block, which needs it far earlier.
-  for (int t = xcd_rank; t < merge_tiles_per_xcd; t += tiles_per_xcd) {
+  for (int t = xcd_rank; t < mrg_tiles; t += tiles_per_xcd) {
+    int const mrg_item = xcd_id * mrg_tiles + t;
+    if (head_local && mrg_item >= HL_MRG_ITEMS) {
+      continue;
+    }
+    int const merge_offset =
+        head_local ? (hl_g0 + mrg_item / MERGE_DIM_SPLITS) * MERGE_DIM_SPLITS +
+                         mrg_item % MERGE_DIM_SPLITS
+                   : mrg_item;
     merge_splitkv_ck_fmha<bfloat16,
                           /*NUM_QO_HEADS_PER_KV=*/16,
                           NUM_Q_GROUPS,
@@ -1570,7 +1618,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         kv_last_page_len,
         request_id,
         reinterpret_cast<bfloat16 *>(attn_out_ptr),
-        xcd_id * merge_tiles_per_xcd + t);
+        merge_offset);
   }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   {

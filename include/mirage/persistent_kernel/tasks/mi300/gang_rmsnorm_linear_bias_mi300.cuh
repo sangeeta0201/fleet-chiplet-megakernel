@@ -705,6 +705,11 @@ __device__ __attribute__((noinline)) void
     }
   }
   MPK_WS_MARK(778, xcd_id);
+  // Stage stamp 35: routing published, by the one elected block. S34 (max)
+  // -> S35 is the serial TopK tail; S35 -> S5 is the routing poll seeing it.
+  if (threadIdx.x == 0) {
+    mpk_stage_stamp(35);
+  }
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   if (threadIdx.x == 0 && g_subphase_active) {
@@ -1020,6 +1025,11 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     // Drain the prefetch. nt loads bypass L2 and are unaffected by the inv.
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     MPK_WS_MARK(771, tile_idx);
+    // Stage stamp 33: o_proj all-gather observed (router workers). S31 -> S33
+    // is the o_proj rendezvous as the router sees it, S33 -> S34 its work.
+    if (tid == 0) {
+      mpk_stage_stamp(33);
+    }
   }
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
@@ -1484,6 +1494,11 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   __syncthreads();
   int completed = s_completed;
   MPK_WS_MARK(773, completed);
+  // Stage stamp 34: this router tile's logits are stored and it has arrived.
+  // The max over workers is the last arrival, where the TopK tail starts.
+  if (tid == 0) {
+    mpk_stage_stamp(34);
+  }
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   unsigned long long _rt_t3 = __builtin_amdgcn_s_memrealtime();

@@ -1510,15 +1510,27 @@ def get_compile_command(
             "MPK_MLA_DECODE_DBLBUF",
             "MPK_MLA_DECODE_BAR_LDS",
             # MLA decode tile loop (gang_mla_decode_mi300.cuh): a float-major
-            # o_acc spill free of LDS bank conflicts, and the next KV tile by
-            # LDS DMA during the current tile's compute.
+            # o_acc spill free of LDS bank conflicts, the next KV tile by
+            # LDS DMA during the current tile's compute, and o_acc kept in
+            # VGPRs instead of spilled to LDS.
             "MPK_MLA_OACC_INTERLEAVE",
             "MPK_MLA_DECODE_DMA_PF",
+            "MPK_MLA_OACC_VGPR",
+            "MPK_MLA_QK_2ACC",
+            # Decode and merge only this rank's q_b head shard, and drop the
+            # query all-gather (gang_mla_attn_fused_mi300.cuh).
+            "MPK_MLA_HEAD_LOCAL",
         ):
             _x = os.environ.get(_v)
             if _x is not None:
                 assert _x in ("0", "1"), f"{_v} is 0 or 1"
                 flags = flags + [f"-D{_v}={_x}"]
+        # KV tiles landed per batch in the MLA decode (0 = per trip). Needs
+        # MPK_MLA_OACC_VGPR=1; the header refuses the combination otherwise.
+        _mb = os.environ.get("MPK_MLA_DECODE_BATCH")
+        if _mb is not None:
+            assert _mb in ("0", "2", "4"), "MPK_MLA_DECODE_BATCH is 0, 2 or 4"
+            flags = flags + [f"-DMPK_MLA_DECODE_BATCH={_mb}"]
         for _v in (
             "MPK_MOE_PF_GROUPS_W13",
             "MPK_MOE_PF_GROUPS_W2",
