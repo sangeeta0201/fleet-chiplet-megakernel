@@ -150,10 +150,13 @@ namespace kernel {
 //
 // MEASURED 2026-10-06, NP=8 GPUs 0-7, 1024/1024, decode median, n=3 each in
 // one batch, G1 PASS: EP 8.584 -> TP 8.317 ms (-0.267) at W2 OPW 64, which is
-// TP's default in demo.py; at OPW 128 (6 tiles/XCD) TP is +0.098. Gates at
-// NP=8: ppl512 2.6347 (deterministic) against EP 2.526-2.549 in the same
-// batch and 2.49-2.64 across EP configs; longseq 256/512/1024 G1 PASS. On by
-// default from demo.py at 8 ranks, one row, MXFP4; this define stays 0
+// TP's default in demo.py; at OPW 128 (6 tiles/XCD) TP is +0.098. Stage
+// stamps then showed the EP fold down 15.11 -> 6.95 us/layer but W13 up 2.7
+// and W2 up 1.3, both codegen: the W13 k-loop lost its prefetch to a value
+// held across it, and the W2 segment offsets went to scratch. With both fixed
+// (notes at _gang_tp_quant_seg_nt and _gang_moe_kloop_seg), same setup:
+// EP 8.581 (8.576 8.589 8.577) -> TP 8.020 (8.028 8.028 8.003), -0.561.
+// On by default from demo.py at 8 ranks, one row, MXFP4; this define stays 0
 // because the host must pack the weights to match.
 #ifndef MPK_MOE_TP
 #define MPK_MOE_TP 0
@@ -2059,16 +2062,14 @@ __device__ __attribute__((always_inline)) void
                                      MPK_MOE_TP ? 0 : EP_SHARED_PE,
                                      /*EMIT_FP8=*/MPK_MOE_ACT_FP8 != 0,
                                      MPK_MOE_SHARED_KSHARD,
-                                     /*SHARED_MODE=*/SH_EARLY ? 1 : 0,
-                                     /*ROUTE_SCALE=*/(bool)MPK_MOE_TP>(
+                                     /*SHARED_MODE=*/SH_EARLY ? 1 : 0>(
         norm_output_ptr,
         moe_gate_up_weight_ptr,
         routing_indices_ptr,
         active_expert_ids_ptr,
         moe_w13_bias_ptr,
         moe_swiglu_out_ptr,
-        t,
-        topk_weight_ptr);
+        t);
   }
 
 #if MPK_MOE_SHADOW_KB > 0
@@ -2427,7 +2428,8 @@ __device__ __attribute__((always_inline)) void
                                                 routing_indices_ptr,
                                                 active_expert_ids_ptr,
                                                 moe_workspace_f32_ptr,
-                                                t);
+                                                t,
+                                                topk_weight_ptr);
 #else
     gang_moe_w2_linear_mxfp8_kernel<BATCH_SIZE,
                                     HIDDEN_SIZE,

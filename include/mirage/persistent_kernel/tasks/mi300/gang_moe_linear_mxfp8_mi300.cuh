@@ -2131,13 +2131,7 @@ template <int BATCH_SIZE,
           // expert, tile_idx = its workgroup, with no routing read at all --
           // its slot (NUM_TOPK - 1, after the routed ones) and token are
           // fixed, which is what lets it run before the TopK.
-          int SHARED_MODE = 0,
-          // MPK_MOE_TP: multiply the SwiGLU result by its slot's routing
-          // weight before it is stored, so the fused-experts W2 tile (which
-          // sums every expert into one accumulator) needs no per-expert
-          // scale. The TopK publishes the weights before routing_ready, the
-          // same release this kernel's routing reads already rely on.
-          bool ROUTE_SCALE = false>
+          int SHARED_MODE = 0>
 __device__ __noinline__ void
     gang_moe_w13_linear_mxfp8_kernel(void const *input_ptr,
                                      void const *weight_ptr,
@@ -2145,8 +2139,7 @@ __device__ __noinline__ void
                                      void const *mask_ptr,
                                      void const *bias_ptr,
                                      void *output_ptr,
-                                     int tile_idx,
-                                     void const *routing_weight_ptr = nullptr) {
+                                     int tile_idx) {
   // CLOSED 2026-08-21: this assert is why W13 tile narrowing has no middle
   // point left. GLM_MOE_W13_OPW already defaults to 64, so 16 -- the measured
   // -1.34 ms (95a044a) -- was the ONLY legal value below the default. 32 is
@@ -2233,13 +2226,6 @@ __device__ __noinline__ void
                  &topk_slot)) {
     return;
   }
-  static_assert(!ROUTE_SCALE || (FUSE_SWIGLU && SHARED_MODE == 0),
-                "the routing weight scales a SwiGLU activation, and only the "
-                "routed decode knows its slot");
-  float const route_w =
-      ROUTE_SCALE ? ((float const *)routing_weight_ptr)[tok_idx * NUM_TOPK +
-                                                       topk_slot]
-                  : 1.0f;
 
   uint8_t const *wg_data = W + static_cast<int64_t>(local_eid) * EXPERT_BYTES +
                            static_cast<int64_t>(wg_idx) * WG_BYTES;
@@ -2427,7 +2413,7 @@ __device__ __noinline__ void
           float const gate = acc[2 * p] + _gang_bf16_to_float(bias_row[out_n]);
           float const up =
               acc[2 * p + 1] + _gang_bf16_to_float(bias_row[out_n + 1]);
-          s_act[act_local + p] = fast_silu(gate) * up * route_w;
+          s_act[act_local + p] = fast_silu(gate) * up;
         }
         return;
       }
@@ -2439,7 +2425,7 @@ __device__ __noinline__ void
           float const gate = acc[2 * p] + _gang_bf16_to_float(bias_row[out_n]);
           float const up =
               acc[2 * p + 1] + _gang_bf16_to_float(bias_row[out_n + 1]);
-          act[p] = _gang_float_to_bf16(fast_silu(gate) * up * route_w);
+          act[p] = _gang_float_to_bf16(fast_silu(gate) * up);
         }
       }
       if constexpr (WRITE_THROUGH) {
@@ -3278,36 +3264,40 @@ __device__ __noinline__ void
 // minimum, so this tile does not run one expert. It runs one output row block
 // of ALL the activated experts as a single reduction over NSEG segments of
 // I_LOCAL, segment s read from expert e_s's weight block. The routing weight
-// already rides in h_s (W13's ROUTE_SCALE), so the epilogue is one atomicAdd
-// per row. Segments past the activated count pad the reduction to whole
+// is applied to h_s as it is staged, so the epilogue is one atomicAdd per
+// row. Segments past the activated count pad the reduction to whole
 // depth-GROUPS blocks: they re-read segment 0's weight block, which is an L2
 // hit, against a zero activation.
 
-// a[i] for a wave-uniform runtime i. A runtime index into a register array is
-// lowered to scratch; this is N-1 selects and no memory.
-template <int N>
-__device__ __forceinline__ uint32_t _gang_pick_u32(uint32_t const (&a)[N],
-                                                   int i) {
-  uint32_t r = a[0];
-#pragma unroll
-  for (int j = 1; j < N; j++) {
-    r = (i == j) ? a[j] : r;
-  }
-  return r;
-}
+// MPK_MOE_TP_W2_PF=1: issue the fused tile's whole reduction up front instead
+// of one depth-GROUPS block ahead; see the branch in _gang_moe_kloop_seg.
+#ifndef MPK_MOE_TP_W2_PF
+#define MPK_MOE_TP_W2_PF 0
+#endif
 
 // _gang_moe_kloop_deep over a reduction of NSEG segments of SEG_KT k-tiles.
-// Segment s sits seg_off[s] bytes past BOTH w_data_row and wg_scales: it is the
-// expert stride, and every expert block carries its own scale half at the same
-// place. Same prefetch shape as the deep loop -- the whole next block in
+// Segment s sits s_seg_off[s] bytes past BOTH w_data_row and wg_scales: it is
+// the expert stride, and every expert block carries its own scale half at the
+// same place. Same prefetch shape as the deep loop -- the whole next block in
 // flight across the current block's MFMAs, block loop rolled, last block
-// peeled -- with the block's segment offsets picked out of seg_off.
+// peeled -- with the block's segment offsets read as it is issued.
+//
+// The offsets live in LDS because the block loop is rolled, so a block's
+// segment index is a runtime value. A register array indexed at runtime goes
+// to scratch -- including a select chain over it, which LLVM folds straight
+// back into the indexed load -- and a scratch load is a VMEM op: waiting for
+// it is an in-order vmcnt wait that drains the prefetch the loop just issued
+// (measured in the image as vmcnt(0) mid-block). A ds_read waits on lgkmcnt
+// and leaves the weight loads in flight. The pointer is typed addrspace(3)
+// for the same reason: as a generic pointer it compiles to a flat load, which
+// counts on vmcnt too and brought the vmcnt(0) straight back.
+using _gang_lds_u32 = __attribute__((address_space(3))) uint32_t const *;
 template <bool WEIGHT_FP4, int GROUPS, int NSEG, int SEG_KT>
 __device__ __forceinline__ f32x4_t
     _gang_moe_kloop_seg(uint8_t const *w_data_row,
                         uint8_t const *wg_scales,
                         int row_scale_base,
-                        uint32_t const (&seg_off)[NSEG],
+                        _gang_lds_u32 s_seg_off,
                         uint8_t const *s_tok_fp8,
                         uint8_t const *s_tok_scales,
                         int g) {
@@ -3339,7 +3329,7 @@ __device__ __forceinline__ f32x4_t
       constexpr int SEG_PER_BLK = GROUPS / SEG_KT;
 #pragma unroll
       for (int q = 0; q < SEG_PER_BLK; q++) {
-        uint32_t const off = _gang_pick_u32(seg_off, blk * SEG_PER_BLK + q);
+        uint32_t const off = s_seg_off[blk * SEG_PER_BLK + q];
 #pragma unroll
         for (int kin = 0; kin < SEG_KT; kin++) {
           load_one(off, kin, A[q * SEG_KT + kin], S[q * SEG_KT + kin]);
@@ -3347,7 +3337,7 @@ __device__ __forceinline__ f32x4_t
       }
     } else {
       constexpr int BLK_PER_SEG = SEG_KT / GROUPS;
-      uint32_t const off = _gang_pick_u32(seg_off, blk / BLK_PER_SEG);
+      uint32_t const off = s_seg_off[blk / BLK_PER_SEG];
       int const kin0 = (blk % BLK_PER_SEG) * GROUPS;
 #pragma unroll
       for (int j = 0; j < GROUPS; j++) {
@@ -3369,38 +3359,71 @@ __device__ __forceinline__ f32x4_t
     }
   };
 
-  i32x8_t A[GROUPS];
-  int S[GROUPS];
-  load_blk(0, A, S);
+  if constexpr (MPK_MOE_TP_W2_PF && KI_END <= 32) {
+    // Every k-tile of the reduction in flight at once, then consumed in
+    // order: straight-line code, so k-tile k's MFMA waits for exactly its own
+    // load (vmcnt counting down from KI_END - 1) and the tile pays one memory
+    // latency instead of one per block. KI_END is 20 at GLM's 8-rank shape --
+    // 20 A tiles (4 VGPRs each at MXFP4) and 20 scale bytes; wider slices keep
+    // the rolled loop.
+    i32x8_t AF[KI_END];
+    int SF[KI_END];
+#pragma unroll
+    for (int s = 0; s < NSEG; s++) {
+      uint32_t const off = s_seg_off[s];
+#pragma unroll
+      for (int kin = 0; kin < SEG_KT; kin++) {
+        load_one(off, kin, AF[s * SEG_KT + kin], SF[s * SEG_KT + kin]);
+      }
+    }
+#pragma unroll
+    for (int k = 0; k < KI_END; k++) {
+      i32x8_t const B = _gang_load_fp8_mfma_b(s_tok_fp8, k * K_PER_MFMA, g);
+      acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(AF[k], B, acc, SF[k],
+                                          (int)s_tok_scales[k]);
+    }
+    return acc;
+  } else {
+    i32x8_t A[GROUPS];
+    int S[GROUPS];
+    load_blk(0, A, S);
 // IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation; see the deep loop.
 #pragma unroll 1
-  for (int blk = 0; blk < NBLK - 1; blk++) {
-    i32x8_t N[GROUPS];
-    int NS[GROUPS];
-    load_blk(blk + 1, N, NS);
-    consume(blk * GROUPS, A, S);
+    for (int blk = 0; blk < NBLK - 1; blk++) {
+      i32x8_t N[GROUPS];
+      int NS[GROUPS];
+      load_blk(blk + 1, N, NS);
+      consume(blk * GROUPS, A, S);
 #pragma unroll
-    for (int j = 0; j < GROUPS; j++) {
-      A[j] = N[j];
-      S[j] = NS[j];
+      for (int j = 0; j < GROUPS; j++) {
+        A[j] = N[j];
+        S[j] = NS[j];
+      }
     }
+    consume((NBLK - 1) * GROUPS, A, S);
+    return acc;
   }
-  consume((NBLK - 1) * GROUPS, A, S);
-  return acc;
 }
 
 // The activation half of the fused tile: NSEG gathered SEG_LEN-wide bf16 slabs
 // quantized into one contiguous E4M3 run in LDS with one E8M0 per 128 --
 // _gang_wave_parallel_fp8_quant_nt's math, except that each 32-element
-// sub-block reads its own segment's slab. Every sub-block of every segment is
-// in flight at once (80 threads at 10 x 256); the single-slab quantizer per
-// segment would serialise ten load latencies and ten barriers. A segment at or
-// past n_live is zero, which quantizes to scale byte 0 over zero data.
+// sub-block reads its own segment's slab and scales it by that slot's routing
+// weight first, since the one accumulator the tile keeps sums every expert.
+// Every sub-block of every segment is in flight at once (80 threads at
+// 10 x 256); the single-slab quantizer per segment would serialise ten load
+// latencies and ten barriers. A segment at or past n_live is zero, which
+// quantizes to scale byte 0 over zero data.
+//
+// The weight is applied here and not in W13's epilogue: held live across
+// W13's k-loop it cost that loop its prefetch (a full vmcnt(0) at the top of
+// every block instead of vmcnt(6)) and W13 +2.7 us/layer.
 template <int BATCH_SIZE, int NUM_TOPK, int NSEG, int SEG_LEN>
 __device__ __forceinline__ void
     _gang_tp_quant_seg_nt(unsigned short const *__restrict__ act,
                           int const *__restrict__ d_mask,
                           int const *__restrict__ d_routing,
+                          float const *__restrict__ d_routing_weight,
                           int tok_idx,
                           int n_live,
                           uint8_t *__restrict__ s_tok_fp8,
@@ -3419,9 +3442,11 @@ __device__ __forceinline__ void
     int const super_blk = sb / 4;
     int const sub_idx = sb & 3;
     uint32_t dw[16];
+    float rw = 0.0f;
     if (seg < n_live) {
       int const e = d_mask[seg];
       int const slot = d_routing[e * BATCH_SIZE + tok_idx] - 1;
+      rw = d_routing_weight[tok_idx * NUM_TOPK + slot];
       uint32_t const *p =
           (uint32_t const *)(act + slot * SEG_LEN +
                              (sb % SB_PER_SEG) * SUB_BLOCK);
@@ -3448,8 +3473,8 @@ __device__ __forceinline__ void
     float amax = 0.0f;
 #pragma unroll
     for (int j = 0; j < 16; j++) {
-      float lo = _gang_bf16_to_float((unsigned short)(dw[j] & 0xFFFF));
-      float hi = _gang_bf16_to_float((unsigned short)(dw[j] >> 16));
+      float lo = _gang_bf16_to_float((unsigned short)(dw[j] & 0xFFFF)) * rw;
+      float hi = _gang_bf16_to_float((unsigned short)(dw[j] >> 16)) * rw;
       vals[j * 2] = lo;
       vals[j * 2 + 1] = hi;
       amax = fmaxf(amax, fmaxf(fabsf(lo), fabsf(hi)));
@@ -3491,8 +3516,9 @@ __device__ __forceinline__ void
 // experts. tile_idx is the per-XCD index, as everywhere in the gang MoE; the
 // row block is tile_idx * 8 + xcd. Weight: [NUM_EXPERTS][OUTPUT_SIZE/OPW]
 // packed MXFP workgroups of this rank's I_LOCAL K-columns. Input: W13's
-// [BATCH][NUM_TOPK][I_LOCAL] bf16 activation, already routing-weighted.
-// Output: atomicAdd into the [BATCH][OUTPUT_SIZE] f32 workspace.
+// [BATCH][NUM_TOPK][I_LOCAL] bf16 activation and the [BATCH][NUM_TOPK] f32
+// routing weights. Output: atomicAdd into the [BATCH][OUTPUT_SIZE] f32
+// workspace.
 template <int BATCH_SIZE,
           int OUTPUT_SIZE,
           int I_LOCAL,
@@ -3507,7 +3533,8 @@ __device__ __noinline__ void
                                        void const *routing_ptr,
                                        void const *mask_ptr,
                                        void *output_ptr,
-                                       int tile_idx) {
+                                       int tile_idx,
+                                       void const *routing_weight_ptr) {
   static_assert(BATCH_SIZE == 1,
                 "the segments are one token's experts; more rows would need "
                 "a per-row segment list");
@@ -3545,15 +3572,8 @@ __device__ __noinline__ void
   if (n_live > NSEG) {
     __builtin_trap();
   }
-  uint32_t seg_off[NSEG];
-  int const e_pad = (n_live > 0) ? d_mask[0] : 0;
-#pragma unroll
-  for (int s = 0; s < NSEG; s++) {
-    int const e = (s < n_live) ? d_mask[s] : e_pad;
-    seg_off[s] = static_cast<uint32_t>(e) * static_cast<uint32_t>(EXPERT_BYTES);
-  }
 
-  // Expert 0's block for this row tile; seg_off adds the expert.
+  // Expert 0's block for this row tile; the segment offset adds the expert.
   uint8_t const *wg_data =
       (uint8_t const *)weight_ptr + static_cast<int64_t>(wg_idx) * WG_BYTES;
   uint8_t const *wg_scales = wg_data + WG_DATA_BYTES;
@@ -3561,12 +3581,22 @@ __device__ __noinline__ void
   extern __shared__ char _gang_moe_mxfp8_smem[];
   uint8_t *s_tok_fp8 = (uint8_t *)_gang_moe_mxfp8_smem;
   uint8_t *s_tok_scales = s_tok_fp8 + NSEG * I_LOCAL;
+  constexpr int SEG_OFF_LDS = (NSEG * I_LOCAL + NSEG * I_LOCAL / 128 + 3) & ~3;
+  uint32_t *s_seg_off = (uint32_t *)(_gang_moe_mxfp8_smem + SEG_OFF_LDS);
+  // Published by the barrier the quantizer below ends with.
+  if (threadIdx.x < NSEG) {
+    int const s = threadIdx.x;
+    int const e = (s < n_live) ? d_mask[s] : ((n_live > 0) ? d_mask[0] : 0);
+    s_seg_off[s] =
+        static_cast<uint32_t>(e) * static_cast<uint32_t>(EXPERT_BYTES);
+  }
 
   _gang_tp_quant_seg_nt<BATCH_SIZE, NUM_TOPK, NSEG, I_LOCAL>(
       (unsigned short const *)input_ptr +
           static_cast<size_t>(tok_idx) * (NUM_TOPK * I_LOCAL),
       d_mask,
       d_routing,
+      (float const *)routing_weight_ptr,
       tok_idx,
       n_live,
       s_tok_fp8,
@@ -3592,8 +3622,8 @@ __device__ __noinline__ void
             ? (w_row / 16) * (16 * NUM_BLOCKS_32) + (w_row % 16) * 4
             : w_row * NUM_BLOCKS_32;
     f32x4_t acc = _gang_moe_kloop_seg<WEIGHT_FP4, GR, NSEG, SEG_KT>(
-        w_data_row, wg_scales, row_scale_base, seg_off, s_tok_fp8,
-        s_tok_scales, g);
+        w_data_row, wg_scales, row_scale_base, (_gang_lds_u32)s_seg_off,
+        s_tok_fp8, s_tok_scales, g);
     if (col == 0) {
       float *ws = d_workspace + static_cast<size_t>(tok_idx) * OUTPUT_SIZE +
                   wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4;

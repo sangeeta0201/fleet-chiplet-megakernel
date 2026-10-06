@@ -127,7 +127,7 @@ MPK_FORWARD_VARS=(
   # other three deadlock at the layer barrier. MPK_EP_WAIT_AT_USE was on the
   # gpt-oss list and missing here, which is why it has never been re-priced
   # at the NP=4 point.
-  MPK_EP_WAIT_AT_USE MPK_MOE_NOPAD MPK_MOE_SHARED_KSHARD MPK_MOE_SHARED_EARLY MPK_MOE_TP
+  MPK_EP_WAIT_AT_USE MPK_MOE_NOPAD MPK_MOE_SHARED_KSHARD MPK_MOE_SHARED_EARLY MPK_MOE_TP MPK_MOE_TP_W2_PF
   # Ceiling probes. All are WRONG OUTPUT by construction and all are
   # compile-time, so every rank has to see them or the ranks build different
   # megakernels and the layer barriers deadlock.

@@ -91,10 +91,11 @@ __global__ void __launch_bounds__(256, 1)
               void const *weight,
               void const *routing,
               void const *mask,
-              void *out) {
+              void *out,
+              void const *routing_weight) {
   gang_moe_w2_tp_linear_mxfp8_kernel<1, HIDDEN, I_LOCAL, NUM_EXPERTS, NUM_TOPK,
                                      OPW, /*WEIGHT_FP4=*/true, NSEG>(
-      input, weight, routing, mask, out, blockIdx.x);
+      input, weight, routing, mask, out, blockIdx.x, routing_weight);
 }
 
 template <int OPW, int I_LOCAL, int NSEG>
@@ -157,6 +158,13 @@ static bool run_case(int n_live, uint32_t seed) {
   }
   mask[NUM_EXPERTS] = n_live;
 
+  // Routing weight per slot, a distinct power of two each so a slot mix-up
+  // shows and weighted activations stay exact in E4M3.
+  std::vector<float> rw(NUM_TOPK);
+  for (int k = 0; k < NUM_TOPK; k++) {
+    rw[k] = ldexpf(1.0f, k - 4);
+  }
+
   // Activation slabs [NUM_TOPK][I_LOCAL], +-2^j.
   std::vector<float> act((size_t)NUM_TOPK * I_LOCAL);
   std::vector<unsigned short> act_bf16(act.size());
@@ -177,14 +185,17 @@ static bool run_case(int n_live, uint32_t seed) {
         size_t const row = (size_t)e * HIDDEN + n;
         double const w = (double)e2m1(nib[row * ROW_BYTES + k / 2]) *
                          ldexp(1.0, (int)sc[row * BLK32 + k / 32] - 127);
-        double const p = w * (double)act[(size_t)slot * I_LOCAL + k];
+        double const p =
+            w * (double)act[(size_t)slot * I_LOCAL + k] * (double)rw[slot];
         ref[n] += p;
         mag[n] += fabs(p);
       }
     }
   }
 
-  void *d_in, *d_w, *d_route, *d_mask, *d_out;
+  void *d_in, *d_w, *d_route, *d_mask, *d_out, *d_rw;
+  HIP_CHECK(hipMalloc(&d_rw, rw.size() * 4));
+  HIP_CHECK(hipMemcpy(d_rw, rw.data(), rw.size() * 4, hipMemcpyHostToDevice));
   HIP_CHECK(hipMalloc(&d_in, act_bf16.size() * 2));
   HIP_CHECK(hipMalloc(&d_w, packed.size()));
   HIP_CHECK(hipMalloc(&d_route, routing.size() * 4));
@@ -212,8 +223,8 @@ static bool run_case(int n_live, uint32_t seed) {
   HIP_CHECK(hipMemset(d_out, 0, HIDDEN * 4));
 
   constexpr int SMEM = NSEG * I_LOCAL + NSEG * I_LOCAL / 128 + 256;
-  run_w2_tp<OPW, I_LOCAL, NSEG><<<dim3((WGS + 7) / 8, 8), 256, SMEM>>>(d_in, d_w, d_route,
-                                                         d_mask, d_out);
+  run_w2_tp<OPW, I_LOCAL, NSEG><<<dim3((WGS + 7) / 8, 8), 256, SMEM>>>(
+      d_in, d_w, d_route, d_mask, d_out, d_rw);
   HIP_CHECK(hipGetLastError());
   HIP_CHECK(hipDeviceSynchronize());
   std::vector<float> out(HIDDEN);
@@ -241,6 +252,7 @@ static bool run_case(int n_live, uint32_t seed) {
   HIP_CHECK(hipFree(d_route));
   HIP_CHECK(hipFree(d_mask));
   HIP_CHECK(hipFree(d_out));
+  HIP_CHECK(hipFree(d_rw));
   return pass;
 }
 

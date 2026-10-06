@@ -1526,6 +1526,9 @@ def get_compile_command(
             # Decode and merge only this rank's q_b head shard, and drop the
             # query all-gather (gang_mla_attn_fused_mi300.cuh).
             "MPK_MLA_HEAD_LOCAL",
+            # MPK_MOE_TP's fused W2 tile issues its whole reduction up front
+            # (gang_moe_linear_mxfp8_mi300.cuh).
+            "MPK_MOE_TP_W2_PF",
         ):
             _x = os.environ.get(_v)
             if _x is not None:

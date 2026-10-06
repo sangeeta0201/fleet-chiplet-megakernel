@@ -1160,7 +1160,8 @@ if __name__ == "__main__":
     # ranks, so moe_ep stays on; only the expert weights change shape.
     #
     # Default on where it was measured and gated: 8 ranks, one row per step,
-    # an MXFP4 checkpoint (-0.267 ms at NP=8; numbers at MOE_W2_OPW below).
+    # an MXFP4 checkpoint (-0.561 ms at NP=8; numbers at the MPK_MOE_TP
+    # define in gang_oproj_router_fused_mi300.cuh).
     # The format test is the loader's own auto-detect, done early because the
     # slicing happens during the load.
     def _ckpt_is_mxfp4():
@@ -1747,7 +1748,8 @@ if __name__ == "__main__":
         # (K = 10 x 256), and the tile count no longer depends on the routing:
         # 6144/OPW per rank. 128 leaves 6 tiles/XCD on 29 workers; 64 halves
         # each tile and doubles the count. MEASURED 2026-10-06, NP=8 1024/1024,
-        # n=3 each, same batch, G1 PASS, deterministic identical text:
+        # n=3 each, same batch, G1 PASS, deterministic identical text, before
+        # the two TP codegen fixes (TP is now 8.020; see MPK_MOE_TP):
         #   EP ctl 8.584 (8.556 8.600 8.595)
         #   TP 128 8.682 (8.656 8.677 8.712)   +0.098
         #   TP  64 8.317 (8.328 8.325 8.298)   -0.267
