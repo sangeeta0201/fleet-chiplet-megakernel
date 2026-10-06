@@ -1644,9 +1644,10 @@ def get_compile_command(
         _se = os.environ.get("MPK_MOE_SHARED_EARLY")
         if _se is not None:
             # EP_SHARED_PE runs the shared expert's W13 during the router
-            # instead of in the W13 round. Note at the define in
+            # instead of in the W13 round (1), and its W2 beside the routed
+            # W13 instead of in the W2 round (2). Note at the define in
             # gang_oproj_router_fused_mi300.cuh. Compile-time, every rank.
-            assert _se in ("0", "1"), "MPK_MOE_SHARED_EARLY is 0 or 1"
+            assert _se in ("0", "1", "2"), "MPK_MOE_SHARED_EARLY is 0, 1 or 2"
             flags = flags + [f"-DMPK_MOE_SHARED_EARLY={_se}"]
         _moe_afp8 = os.environ.get("MPK_MOE_ACT_FP8")
         if _moe_afp8 is not None:

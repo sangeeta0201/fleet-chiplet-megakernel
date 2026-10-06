@@ -2770,7 +2770,12 @@ template <int BATCH_SIZE,
           // tile class, because the two classes disagree on the reduction
           // length and that is a template argument. 1 is the routed tiles at
           // the full reduction, 2 is the shared expert at window EP_MY_PE.
-          int TILE_CLASS = 0>
+          int TILE_CLASS = 0,
+          // MPK_MOE_SHARED_EARLY=2, as on W13: 1 skips the shared expert
+          // (already run), 2 is one shared tile with tile_idx = its output
+          // workgroup and its constant routing weight, 1.0, read from no
+          // buffer -- the TopK writes exactly that for the shared slot.
+          int SHARED_MODE = 0>
 __device__ __noinline__ void
     gang_moe_w2_linear_mxfp8_kernel(void const *input_ptr,
                                     void const *weight_ptr,
@@ -2911,25 +2916,36 @@ __device__ __noinline__ void
   // is the HIGH digit so that consecutive tiles -- which land on consecutive
   // workers -- cover different output rows, keeping the weight stream spread
   // rather than three neighbours hammering the same 64 rows.
-  if (!_gang_moe_mxfp8_tile<BATCH_SIZE,
-                            NUM_EXPERTS,
-                            TILES_PER_EXPERT * TILE_MULT,
-                            EXPERT_WGS * TILE_MULT,
-                            EP_WORLD_SIZE,
-                            EP_MY_PE,
-                            EP_NUM_ROUTED,
-                            EP_SHARED_PE,
-                            /*DUP_SHARED=*/0,
-                            SHARED_KSHARD,
-                            /*SHARED_WG_DIV=*/1,
-                            TILE_CLASS>(tile_idx,
-                                          (int const *)mask_ptr,
-                                          (int const *)routing_ptr,
-                                          &expert_id,
-                                          &local_eid,
-                                          &tok_idx,
-                                          &wg_idx,
-                                          &topk_slot)) {
+  if constexpr (SHARED_MODE == 2) {
+    static_assert(EP_WORLD_SIZE > 1 && SHARED_KSHARD == 0 && K_SPLITS == 1 &&
+                      BATCH_SIZE == 1 && FUSE_MULSUMADD,
+                  "the early shared tile is the EP, one-row, unsplit case");
+    expert_id = EP_NUM_ROUTED;
+    local_eid = EP_NUM_ROUTED / EP_WORLD_SIZE;
+    tok_idx = 0;
+    wg_idx = tile_idx;
+    topk_slot = NUM_TOPK - 1;
+  } else if (!_gang_moe_mxfp8_tile<BATCH_SIZE,
+                                   NUM_EXPERTS,
+                                   TILES_PER_EXPERT * TILE_MULT,
+                                   EXPERT_WGS * TILE_MULT,
+                                   EP_WORLD_SIZE,
+                                   EP_MY_PE,
+                                   EP_NUM_ROUTED,
+                                   EP_SHARED_PE,
+                                   /*DUP_SHARED=*/0,
+                                   SHARED_KSHARD,
+                                   /*SHARED_WG_DIV=*/1,
+                                   TILE_CLASS,
+                                   /*SKIP_SHARED=*/(SHARED_MODE == 1)>(
+                 tile_idx,
+                 (int const *)mask_ptr,
+                 (int const *)routing_ptr,
+                 &expert_id,
+                 &local_eid,
+                 &tok_idx,
+                 &wg_idx,
+                 &topk_slot)) {
     return;
   }
   // The shared class reads its window from the rank, so its wg_idx is already
@@ -3016,7 +3032,9 @@ __device__ __noinline__ void
 #endif
 
   float rw = 0.0f;
-  if constexpr (FUSE_MULSUMADD) {
+  if constexpr (FUSE_MULSUMADD && SHARED_MODE == 2) {
+    rw = 1.0f;
+  } else if constexpr (FUSE_MULSUMADD) {
     rw = d_routing_weight[tok_idx * NUM_TOPK + topk_slot];
   }
 

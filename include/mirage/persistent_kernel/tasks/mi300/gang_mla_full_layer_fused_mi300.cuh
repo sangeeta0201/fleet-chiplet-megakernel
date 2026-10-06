@@ -221,6 +221,9 @@ static constexpr int FULL_LAYER_ENTRY_SLOT = 71;
 //
 // [88] is the arrival counter the eight folding work-groups bump.
 //
+// [89] and [90] are MPK_MOE_SHARED_EARLY=2's shared-expert W13 arrival counter
+// and its release flag, lines 49 and 50 of the MoE half's block at [40].
+//
 // MLA_ prefix, not the bare FULL_LAYER_EP_* gpt-oss uses: both monoliths are
 // included into the same translation unit and share this namespace, and its
 // slot map is its own (its EP barriers live at [48..85] of a 1216-int buffer).

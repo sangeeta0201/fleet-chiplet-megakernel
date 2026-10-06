@@ -119,6 +119,13 @@ namespace kernel {
 // A first version normed with a strided 2-byte loop (~15 us of exposed
 // latency per tile) and was neutral (-0.017). Gated together with the
 // 64-chunk head-local decode (see GLM_MLA_HL_CHUNK_CAP in demo.py). Default 1.
+//
+// =2 also moves the shared W2 (MEASURED NEUTRAL, 2026-10-06, same setup):
+// 8.632 8.636 -> 8.622 8.673 ms. It does what it says -- rank 0's MoE end
+// moves 131.6 -> 129.4 us (instrumented), 2.6 us AHEAD of ranks 1-7, and its
+// own EP-fold wait grows by the same -- so rank 0 is no longer the rank the
+// fold waits for, and the other seven, whose W2 spans are now level at
+// 8.9-9.7 us, set it instead. Kept for that reading; default stays 1.
 #ifndef MPK_MOE_SHARED_EARLY
 #define MPK_MOE_SHARED_EARLY 1
 #endif
@@ -317,6 +324,13 @@ __device__ __attribute__((always_inline)) void
   static_assert(!SH_EARLY || MOE_NUM_TOPK == TOPK_K + 1,
                 "the early shared tile writes slot MOE_NUM_TOPK - 1, which is "
                 "the shared expert's only when there is exactly one");
+  // MPK_MOE_SHARED_EARLY=2 also moves the shared expert's W2: the early W13
+  // tiles count themselves in at counter line 49 of this task's block (89 in
+  // the full-layer map) and the 64th publishes the layer epoch at line 50
+  // (90); the early W2 tiles wait for that, not for the W13 -> W2 barrier.
+  constexpr bool SH_EARLY_W2 = SH_EARLY && MPK_MOE_SHARED_EARLY >= 2;
+  constexpr int SH_W13_CNT_LINE = 49;
+  constexpr int SH_W13_FLAG_LINE = 50;
 
   // Mechanism C barrier layout, HIER_STRIDE int32 (one cache line) per slot.
   constexpr int HIER_STRIDE = 16;
@@ -1593,6 +1607,21 @@ __device__ __attribute__((always_inline)) void
             moe_w13_bias_ptr,
             moe_swiglu_out_ptr,
             s * 8 + xcd_id);
+        if constexpr (SH_EARLY_W2) {
+          // The tile's SwiGLU stores are write-through; retire them, then
+          // count in. Modular election, as the monotonic barriers here do.
+          __syncthreads();
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          if (tid == 0) {
+            int const prev = atom_add_release_gpu_s32(
+                &hier_barrier[SH_W13_CNT_LINE * HIER_STRIDE], 1);
+            if ((prev % (SH_TILES * 8)) == SH_TILES * 8 - 1) {
+              st_flag_u32((void *)&hier_barrier[SH_W13_FLAG_LINE * HIER_STRIDE],
+                          (unsigned)oproj_expected);
+              asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+            }
+          }
+        }
       }
     }
   }
@@ -1740,6 +1769,9 @@ __device__ __attribute__((always_inline)) void
     // folds the shared expert in on EP_SHARED_PE alone.
     int owned_routed = 0;
     int shared_act = 0;
+    // The shared expert, if this rank owns it: what MPK_MOE_SHARED_EARLY=2
+    // takes back out of the W2 bound.
+    int owned_shared = 0;
     if constexpr (EP_WORLD_SIZE > 1) {
       constexpr int EP_LOCAL_ROUTED = NUM_EXPERTS / EP_WORLD_SIZE;
       constexpr int EP_BASE = EP_MY_PE * EP_LOCAL_ROUTED;
@@ -1843,6 +1875,7 @@ __device__ __attribute__((always_inline)) void
                 ? (EP_MY_PE == EP_SHARED_PE)
                 : (cand >= EP_BASE && cand < EP_BASE + EP_LOCAL_ROUTED);
         owned += is_owned ? 1 : 0;
+        owned_shared += (is_owned && cand >= NUM_EXPERTS) ? 1 : 0;
         // Gated on holding a slice, not merely on the expert being live: at a
         // slice count below the world size the high ranks skip it entirely.
         shared_act += (cand >= NUM_EXPERTS &&
@@ -1891,7 +1924,10 @@ __device__ __attribute__((always_inline)) void
     int const w2_live = (owned_routed * MOE_W2_TILES_PER_EXPERT + 7) / 8;
 #else
     int const w13_live = (owned_w13 * MOE_W13_TILES_PER_EXPERT + 7) / 8;
-    int const w2_live = (owned * MOE_W2_TILES_PER_EXPERT + 7) / 8;
+    int const w2_live =
+        ((owned - (SH_EARLY_W2 ? owned_shared : 0)) * MOE_W2_TILES_PER_EXPERT +
+         7) /
+        8;
 #endif
     if (w13_live < moe_w13_live) {
       moe_w13_live = w13_live;
@@ -2196,6 +2232,60 @@ __device__ __attribute__((always_inline)) void
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
   }
+#if MPK_MOE_SHARED_EARLY
+  // ── MPK_MOE_SHARED_EARLY=2: the shared expert's W2, off the W2 round ─────
+  // After this worker's W13 -> W2 arrival and before its wait, so the routed
+  // W2 never waits on it. Needs every early W13 tile on every XCD -- W2
+  // reduces over the whole intermediate -- which is the flag the 64th of
+  // them published; the workspace zero it accumulates into retired before the
+  // o_proj release those tiles waited for.
+  if constexpr (SH_EARLY_W2 && EP_MY_PE == EP_SHARED_PE) {
+    static_assert(MOE_W2_TILES_PER_EXPERT % 8 == 0,
+                  "the shared expert's W2 workgroups split evenly over XCDs");
+    constexpr int SH_W2_TILES = MOE_W2_TILES_PER_EXPERT / 8;
+    int const sh_pool2 = tiles_per_xcd - router_tile_n;
+    int const sh_first2 = xcd_rank - router_tile_n;
+    if (sh_first2 >= 0 && sh_first2 < SH_W2_TILES) {
+      if (tid == 0) {
+        while (ld_nt_s32(&hier_barrier[SH_W13_FLAG_LINE * HIER_STRIDE]) <
+               oproj_expected) {
+          __builtin_amdgcn_s_sleep(1);
+        }
+      }
+      __syncthreads();
+      asm volatile("buffer_inv" ::: "memory");
+      for (int s = sh_first2; s < SH_W2_TILES; s += sh_pool2) {
+        gang_moe_w2_linear_mxfp8_kernel<BATCH_SIZE,
+                                        HIDDEN_SIZE,
+                                        HIDDEN_SIZE,
+                                        MOE_INTERMEDIATE,
+                                        MOE_NUM_EXPERTS,
+                                        MOE_NUM_TOPK,
+                                        MOE_W2_TILES_PER_EXPERT,
+                                        MOE_W2_OPW,
+                                        /*FUSE_MULSUMADD=*/true,
+                                        MOE_WEIGHT_FP4,
+                                        EP_WORLD_SIZE,
+                                        EP_MY_PE,
+                                        /*EP_NUM_ROUTED=*/NUM_EXPERTS,
+                                        EP_SHARED_PE,
+                                        MPK_W2_KSPLIT,
+                                        /*INPUT_FP8=*/MPK_MOE_ACT_FP8 != 0,
+                                        MPK_MOE_SHARED_KSHARD,
+                                        /*TILE_CLASS=*/0,
+                                        /*SHARED_MODE=*/2>(
+            moe_swiglu_out_ptr,
+            moe_down_weight_ptr,
+            routing_indices_ptr,
+            active_expert_ids_ptr,
+            moe_w2_bias_ptr,
+            moe_workspace_f32_ptr,
+            s * 8 + xcd_id,
+            topk_weight_ptr);
+      }
+    }
+  }
+#endif
 #if MPK_QKVA_PF_KB > 0 && MPK_QKVA_PF_AT == 2
   // BEFORE the early return. The W2-idle workers (`xcd_rank >=
   // moe_w2_tiles_per_xcd`) leave this function without waiting, so a dose
@@ -2298,7 +2388,8 @@ __device__ __attribute__((always_inline)) void
                                     MPK_MOE_SHARED_KSHARD,
                                     /*TILE_CLASS=*/(MPK_MOE_SHARED_KSHARD > 0
                                                         ? 1
-                                                        : 0)>(
+                                                        : 0),
+                                    /*SHARED_MODE=*/SH_EARLY_W2 ? 1 : 0>(
         moe_swiglu_out_ptr,
         moe_down_weight_ptr,
         routing_indices_ptr,
