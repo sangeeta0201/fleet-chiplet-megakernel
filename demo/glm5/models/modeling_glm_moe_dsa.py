@@ -560,6 +560,10 @@ class GlmMoE(nn.Module):
         # mirrors what the megakernel's EP fold does, and it is the only way
         # the 744B model has a torch leg at all -- 256 experts x 76 layers do
         # not fit on one GPU in any format.
+        if getattr(self, "tp_slice", None) is not None:
+            raise NotImplementedError(
+                "experts were loaded as MPK_MOE_TP slices; only the "
+                "megakernel can run them")
         sharded = self.ep_local != self.config.n_routed_experts
         if sharded and not dist.is_initialized():
             raise NotImplementedError(
@@ -811,7 +815,11 @@ class GlmMoeDsaForCausalLM(GlmPreTrainedModel):
                         max_num_pages=16, page_size=4096, num_layers=None,
                         random_weights=False, ep_rank=0, ep_world=1,
                         mxfp4_experts=False, num_mtp_layers=0, verbose=True,
-                        **kwargs):
+                        moe_tp=None, **kwargs):
+        """moe_tp=(rank, world): keep every routed expert, but only rank's
+        1/world slice of its intermediate -- gate/up rows, down K-columns --
+        for MPK_MOE_TP. Needs ep_world=1 and mxfp4_experts. The torch forward
+        cannot run on the slices."""
         import glob
 
         from safetensors import safe_open
@@ -901,6 +909,12 @@ class GlmMoeDsaForCausalLM(GlmPreTrainedModel):
 
         ep_local = config.n_routed_experts // ep_world
         ep_base = ep_rank * ep_local
+        if moe_tp is not None:
+            assert ep_world == 1 and mxfp4_experts, (
+                "moe_tp slices the MXFP4 experts of an unsharded module")
+            for l in model.model.layers:
+                if l.is_moe:
+                    l.mlp.tp_slice = moe_tp
 
         # Pair `weight` with `weight_scale_inv` before assigning; they can land
         # in the same shard but nothing guarantees it.
@@ -936,7 +950,27 @@ class GlmMoeDsaForCausalLM(GlmPreTrainedModel):
                     return True                  # another rank owns it
                 store = model.model.layers[layer_i].mlp.expert_mxfp4
                 pair = store[glob_e - ep_base].setdefault(proj, [None, None])
-                pair[slot] = fh.get_tensor(name).cuda(non_blocking=True)
+                if moe_tp is None:
+                    t = fh.get_tensor(name)
+                else:
+                    # This rank's slice. Blocks and scales are both [rows,
+                    # K-units]; gate/up slice rows (the intermediate), down
+                    # slices columns (its K). The slice comes back as a VIEW
+                    # of the whole tensor -- materialized on the GPU already
+                    # under the caller's torch.device("cuda") -- so it is
+                    # cloned, or every expert keeps all eight slices resident.
+                    tp_r, tp_w = moe_tp
+                    sl = fh.get_slice(name)
+                    rows, cols = sl.get_shape()
+                    if proj == "down_proj":
+                        assert cols % tp_w == 0, (name, cols, tp_w)
+                        c = cols // tp_w
+                        t = sl[:, tp_r * c:(tp_r + 1) * c].clone()
+                    else:
+                        assert rows % tp_w == 0, (name, rows, tp_w)
+                        r_ = rows // tp_w
+                        t = sl[tp_r * r_:(tp_r + 1) * r_].clone()
+                pair[slot] = t.cuda(non_blocking=True)
                 return True
             return False
 

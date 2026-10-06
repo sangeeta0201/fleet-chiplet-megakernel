@@ -135,6 +135,33 @@ namespace kernel {
 #if MPK_MOE_SHARED_EARLY && !MPK_MOE_LIVE_BOUND
 #error "MPK_MOE_SHARED_EARLY drops the shared expert from the live W13 bound, which needs MPK_MOE_LIVE_BOUND"
 #endif
+// MPK_MOE_TP: tensor-parallel experts. Every rank holds the same 1/W slice of
+// every expert's intermediate (shared included) instead of whole experts, so
+// every rank runs W13 for all activated experts at OUTPUT_SIZE = 2 *
+// MOE_INTERMEDIATE (the slice) and one fused-experts W2 tile per output row
+// block; see gang_moe_w2_tp_linear_mxfp8_kernel. The EP fold sums the ranks'
+// partials exactly as it sums EP partials. The shared expert is just the last
+// activated slot, so MPK_MOE_SHARED_EARLY does not apply.
+//
+// Every output row then gets exactly one W2 atomicAdd per rank, so the MoE
+// output is deterministic: repeated runs generate identical tokens, where EP's
+// several experts per row race. Against EP it diverges where EP diverges from
+// itself (token 92-112 of 1024).
+//
+// MEASURED 2026-10-06, NP=8 GPUs 0-7, 1024/1024, decode median, n=3 each in
+// one batch, G1 PASS: EP 8.584 -> TP 8.317 ms (-0.267) at W2 OPW 64, which is
+// TP's default in demo.py; at OPW 128 (6 tiles/XCD) TP is +0.098. Gates at
+// NP=8: ppl512 2.6347 (deterministic) against EP 2.526-2.549 in the same
+// batch and 2.49-2.64 across EP configs; longseq 256/512/1024 G1 PASS. On by
+// default from demo.py at 8 ranks, one row, MXFP4; this define stays 0
+// because the host must pack the weights to match.
+#ifndef MPK_MOE_TP
+#define MPK_MOE_TP 0
+#endif
+#if MPK_MOE_TP && (MPK_MOE_SHARED_KSHARD > 0 || MPK_SHARED_DUP || \
+                   MPK_ABL_PIPE_W13W2 || !MPK_MOE_LIVE_BOUND)
+#error "MPK_MOE_TP replaces the EP tile spaces that KSHARD, SHARED_DUP and the W13/W2 pipe probe rewrite, and sizes its loops in the live-bound block"
+#endif
 // One boolean for "the W13 ceiling probe forced the flat arrival", so the
 // self-heal's quota and the arrival cannot disagree across the #ifdef.
 #ifdef MPK_W13_EARLY_REL
@@ -319,8 +346,9 @@ __device__ __attribute__((always_inline)) void
 #endif
 
   // MPK_MOE_SHARED_EARLY applies when there is a shared expert, one row and EP.
-  constexpr bool SH_EARLY = MPK_MOE_SHARED_EARLY && EP_WORLD_SIZE > 1 &&
-                            BATCH_SIZE == 1 && MOE_NUM_EXPERTS > NUM_EXPERTS;
+  constexpr bool SH_EARLY = MPK_MOE_SHARED_EARLY && !MPK_MOE_TP &&
+                            EP_WORLD_SIZE > 1 && BATCH_SIZE == 1 &&
+                            MOE_NUM_EXPERTS > NUM_EXPERTS;
   static_assert(!SH_EARLY || MOE_NUM_TOPK == TOPK_K + 1,
                 "the early shared tile writes slot MOE_NUM_TOPK - 1, which is "
                 "the shared expert's only when there is exactly one");
@@ -1772,7 +1800,7 @@ __device__ __attribute__((always_inline)) void
     // The shared expert, if this rank owns it: what MPK_MOE_SHARED_EARLY=2
     // takes back out of the W2 bound.
     int owned_shared = 0;
-    if constexpr (EP_WORLD_SIZE > 1) {
+    if constexpr (EP_WORLD_SIZE > 1 && !MPK_MOE_TP) {
       constexpr int EP_LOCAL_ROUTED = NUM_EXPERTS / EP_WORLD_SIZE;
       constexpr int EP_BASE = EP_MY_PE * EP_LOCAL_ROUTED;
       owned = 0;
@@ -1924,10 +1952,15 @@ __device__ __attribute__((always_inline)) void
     int const w2_live = (owned_routed * MOE_W2_TILES_PER_EXPERT + 7) / 8;
 #else
     int const w13_live = (owned_w13 * MOE_W13_TILES_PER_EXPERT + 7) / 8;
+    // Under MPK_MOE_TP a W2 tile is a row block over every expert, so its
+    // count does not depend on the routing.
     int const w2_live =
-        ((owned - (SH_EARLY_W2 ? owned_shared : 0)) * MOE_W2_TILES_PER_EXPERT +
-         7) /
-        8;
+        MPK_MOE_TP
+            ? (HIDDEN_SIZE / MOE_W2_OPW + 7) / 8
+            : ((owned - (SH_EARLY_W2 ? owned_shared : 0)) *
+                   MOE_W2_TILES_PER_EXPERT +
+               7) /
+                  8;
 #endif
     if (w13_live < moe_w13_live) {
       moe_w13_live = w13_live;
@@ -2018,20 +2051,24 @@ __device__ __attribute__((always_inline)) void
                                      /*FUSE_SWIGLU=*/true,
                                      /*WRITE_THROUGH=*/true,
                                      MOE_WEIGHT_FP4,
-                                     EP_WORLD_SIZE,
-                                     EP_MY_PE,
+                                     // TP holds every expert, indexed by its
+                                     // global id: the non-EP decode.
+                                     MPK_MOE_TP ? 1 : EP_WORLD_SIZE,
+                                     MPK_MOE_TP ? 0 : EP_MY_PE,
                                      /*EP_NUM_ROUTED=*/NUM_EXPERTS,
-                                     EP_SHARED_PE,
+                                     MPK_MOE_TP ? 0 : EP_SHARED_PE,
                                      /*EMIT_FP8=*/MPK_MOE_ACT_FP8 != 0,
                                      MPK_MOE_SHARED_KSHARD,
-                                     /*SHARED_MODE=*/SH_EARLY ? 1 : 0>(
+                                     /*SHARED_MODE=*/SH_EARLY ? 1 : 0,
+                                     /*ROUTE_SCALE=*/(bool)MPK_MOE_TP>(
         norm_output_ptr,
         moe_gate_up_weight_ptr,
         routing_indices_ptr,
         active_expert_ids_ptr,
         moe_w13_bias_ptr,
         moe_swiglu_out_ptr,
-        t);
+        t,
+        topk_weight_ptr);
   }
 
 #if MPK_MOE_SHADOW_KB > 0
@@ -2369,6 +2406,29 @@ __device__ __attribute__((always_inline)) void
     if (t < _pipe_tiles) {
       continue;
     }
+#if MPK_MOE_TP
+    // Segments: every activated slot, padded so the reduction is whole
+    // depth-4 blocks of whole segments (10 x 256 at GLM's 9 slots and 8 ranks).
+    constexpr int TP_SEG_KT = MOE_INTERMEDIATE / 128;
+    constexpr int TP_SEG_ROUND = (TP_SEG_KT % 4 == 0)   ? 1
+                                 : (TP_SEG_KT % 2 == 0) ? 2
+                                                        : 4;
+    constexpr int TP_NSEG =
+        (MOE_NUM_TOPK + TP_SEG_ROUND - 1) / TP_SEG_ROUND * TP_SEG_ROUND;
+    gang_moe_w2_tp_linear_mxfp8_kernel<BATCH_SIZE,
+                                       HIDDEN_SIZE,
+                                       MOE_INTERMEDIATE,
+                                       MOE_NUM_EXPERTS,
+                                       MOE_NUM_TOPK,
+                                       MOE_W2_OPW,
+                                       MOE_WEIGHT_FP4,
+                                       TP_NSEG>(moe_swiglu_out_ptr,
+                                                moe_down_weight_ptr,
+                                                routing_indices_ptr,
+                                                active_expert_ids_ptr,
+                                                moe_workspace_f32_ptr,
+                                                t);
+#else
     gang_moe_w2_linear_mxfp8_kernel<BATCH_SIZE,
                                     HIDDEN_SIZE,
                                     HIDDEN_SIZE,
@@ -2398,6 +2458,7 @@ __device__ __attribute__((always_inline)) void
         moe_workspace_f32_ptr,
         t,
         topk_weight_ptr);
+#endif
   }
 
 #if MPK_MOE_SHARED_KSHARD > 0

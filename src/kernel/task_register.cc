@@ -4452,9 +4452,15 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
   int moe_num_experts = num_experts + num_shared_experts;
   assert(num_experts % ep_world_size == 0 &&
          "ep_slice needs the routed expert count to divide by the world size");
+  // MPK_MOE_TP: the rank holds a slice of EVERY expert rather than an id
+  // slice of whole ones; see the define in gang_oproj_router_fused_mi300.cuh.
+  char const *moe_tp_env = std::getenv("MPK_MOE_TP");
+  bool const moe_tp = moe_tp_env != nullptr && std::string(moe_tp_env) == "1";
   assert(moe_num_local_experts ==
-             num_experts / ep_world_size + num_shared_experts &&
-         "the expert weight tensor is not this rank's ep_slice");
+             (moe_tp ? num_experts : num_experts / ep_world_size) +
+                 num_shared_experts &&
+         "the expert weight tensor is not this rank's ep_slice (or, under "
+         "MPK_MOE_TP, every expert)");
   assert(input_ops[23]->output_tensors[0].dim[0] == moe_num_local_experts);
   assert(input_ops[24]->output_tensors[0].num_dims == 2);
   assert(input_ops[24]->output_tensors[0].dim[0] == moe_num_local_experts);

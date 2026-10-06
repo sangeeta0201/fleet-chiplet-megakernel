@@ -1655,6 +1655,11 @@ def get_compile_command(
             # gang_oproj_router_fused_mi300.cuh. Compile-time, every rank.
             assert _se in ("0", "1", "2"), "MPK_MOE_SHARED_EARLY is 0, 1 or 2"
             flags = flags + [f"-DMPK_MOE_SHARED_EARLY={_se}"]
+        # Tensor-parallel experts (note at the define in
+        # gang_oproj_router_fused_mi300.cuh). The demo packs the weights to
+        # match, so the host reads the same variable.
+        if os.environ.get("MPK_MOE_TP", "0") == "1":
+            flags = flags + ["-DMPK_MOE_TP=1"]
         _moe_afp8 = os.environ.get("MPK_MOE_ACT_FP8")
         if _moe_afp8 is not None:
             # W13 emits the SwiGLU result as MXFP8 (E4M3 + one E8M0 per 32) and
@@ -3590,11 +3595,15 @@ class PersistentKernel:
             f"ep_slice needs {num_experts} routed experts to divide by "
             f"world_size {ep_ws}")
         assert moe_down_weight.dim(0) == moe_num_local_experts
-        assert moe_num_local_experts == \
-            num_experts // ep_ws + num_shared_experts, (
-                f"expert weights hold {moe_num_local_experts} experts; this "
-                f"rank's ep_slice is {num_experts // ep_ws} routed + "
-                f"{num_shared_experts} shared")
+        # MPK_MOE_TP: every rank holds a slice of every expert, not an id
+        # slice of whole ones.
+        moe_tp = os.environ.get("MPK_MOE_TP", "0") == "1"
+        assert not moe_tp or ep_inline, "MPK_MOE_TP sums ranks in the EP fold"
+        _held = (num_experts if moe_tp else num_experts // ep_ws)
+        assert moe_num_local_experts == _held + num_shared_experts, (
+            f"expert weights hold {moe_num_local_experts} experts; this "
+            f"rank's {'TP slice' if moe_tp else 'ep_slice'} is {_held} "
+            f"routed + {num_shared_experts} shared")
         moe_w13_width = moe_gate_up_weight.dim(1) * moe_w13_output_per_wg
         assert moe_w13_bias.dim(1) == moe_w13_width
         assert moe_down_weight.dim(1) * moe_w2_output_per_wg == hidden_size
@@ -3604,8 +3613,11 @@ class PersistentKernel:
         assert moe_swiglu_out.dim(1) == num_experts_per_tok + num_shared_experts
         assert hidden_size % 512 == 0, \
             f"MXFP8 W13 K={hidden_size} not divisible by 512"
-        assert moe_intermediate % 512 == 0, \
-            f"MXFP8 W2 K={moe_intermediate} not divisible by 512"
+        # The fused-experts W2 reduces over all slots' slices at once, so
+        # only whole k-tiles are needed per slice.
+        _w2_k_div = 128 if moe_tp else 512
+        assert moe_intermediate % _w2_k_div == 0, \
+            f"MXFP8 W2 K={moe_intermediate} not divisible by {_w2_k_div}"
 
         def _moe_wg_bytes(opw, k, fp4):
             return opw * ((k // 2 if fp4 else k) + k // 32)
@@ -3635,6 +3647,10 @@ class PersistentKernel:
         moe_w2_tiles_per_xcd = (
             moe_max_activated * batch_size * moe_down_weight.dim(1)
             * int(os.environ.get("MPK_W2_KSPLIT", "1")) + 7) // 8
+        if moe_tp:
+            # One fused-experts tile per output row block.
+            assert batch_size == 1, "the fused-experts W2 tile is one row"
+            moe_w2_tiles_per_xcd = (moe_down_weight.dim(1) + 7) // 8
 
         oproj_topk_tiles_per_xcd = max(oproj_tiles_per_xcd, router_tile_n)
 

@@ -1154,6 +1154,33 @@ if __name__ == "__main__":
     # model construction, and `ep_base` below becomes an offset into a list
     # that already starts at this rank's first expert.
     moe_ep = world_size > 1 and os.environ.get("MOE_EP", "1") == "1"
+    # MPK_MOE_TP: instead of an id slice of whole experts, every rank loads
+    # its 1/world_size slice of EVERY expert's intermediate (note at the
+    # define in gang_oproj_router_fused_mi300.cuh). The EP fold still sums the
+    # ranks, so moe_ep stays on; only the expert weights change shape.
+    #
+    # Default on where it was measured and gated: 8 ranks, one row per step,
+    # an MXFP4 checkpoint (-0.267 ms at NP=8; numbers at MOE_W2_OPW below).
+    # The format test is the loader's own auto-detect, done early because the
+    # slicing happens during the load.
+    def _ckpt_is_mxfp4():
+        if args.mxfp4_checkpoint is not None:
+            return bool(args.mxfp4_checkpoint)
+        idx_f = os.path.join(args.model_path, "model.safetensors.index.json")
+        if args.random_weights or not os.path.exists(idx_f):
+            return False
+        with open(idx_f) as fh:
+            return any(k.endswith(".mxfp4_blocks")
+                       for k in json.load(fh)["weight_map"])
+
+    if (moe_ep and world_size == 8 and args.max_num_batched_tokens == 1
+            and _ckpt_is_mxfp4()):
+        os.environ.setdefault("MPK_MOE_TP", "1")
+    MOE_TP = os.environ.get("MPK_MOE_TP", "0") == "1"
+    # The MXFP4-checkpoint half of the precondition is checked in the loader,
+    # after it has auto-detected the format.
+    assert not MOE_TP or moe_ep, (
+        "MPK_MOE_TP needs the EP fold (MOE_EP=1, world_size > 1)")
 
     print("Input arguments:", args)
     print(f"world_size({world_size}) rank({rank})")
@@ -1168,10 +1195,11 @@ if __name__ == "__main__":
             args.model_path, world_size=attn_ws,
             max_num_pages=args.max_num_pages, page_size=args.page_size,
             num_layers=args.max_layers, random_weights=args.random_weights,
-            ep_rank=(rank if moe_ep else 0),
-            ep_world=(world_size if moe_ep else 1),
+            ep_rank=(rank if moe_ep and not MOE_TP else 0),
+            ep_world=(world_size if moe_ep and not MOE_TP else 1),
             mxfp4_experts=args.mxfp4_checkpoint,
             num_mtp_layers=args.mtp,
+            moe_tp=((rank, world_size) if MOE_TP else None),
         ).to(dtype=torch.bfloat16, device="cuda")
         # A partially-fetched checkpoint (config + shard index only, which is
         # how the 744B geometry is brought up on one GPU) carries no tokenizer
@@ -1464,6 +1492,12 @@ if __name__ == "__main__":
         assert shared_inter == moe_inter, (shared_inter, moe_inter)
         num_experts_total = num_experts + num_shared
         topk_total = topk + num_shared
+        # The intermediate this rank's expert weights cover: all of it under
+        # EP, its 1/world_size slice under MPK_MOE_TP. The expert stacks, the
+        # SwiGLU scratch and the MoE zero biases are sized off this one.
+        if MOE_TP:
+            assert moe_inter % (128 * world_size) == 0, (moe_inter, world_size)
+        moe_inter_k = moe_inter // world_size if MOE_TP else moe_inter
 
         assert hidden_size % GANG_OUT_ALIGN == 0, hidden_size
         assert hidden_size % GANG_RED_ALIGN == 0, hidden_size
@@ -1570,6 +1604,9 @@ if __name__ == "__main__":
         else:
             ep_local = num_experts
             ep_base = 0
+        # Routed experts in this rank's weight stack, ahead of the shared one:
+        # every one of them under MPK_MOE_TP, the id slice under EP.
+        moe_held = num_experts if MOE_TP else ep_local
 
         # Where this rank's slice starts *in the list the model holds*. When
         # construction was already EP-aware the list begins at ep_base, so the
@@ -1605,9 +1642,16 @@ if __name__ == "__main__":
                 "multi-layer layer counter")
             assert os.environ.get("MPK_ML_REPLAY", "1") == "1", (
                 "MOE_EP needs the multi-layer replay path (MPK_ML_REPLAY=1)")
-            print(f"[MOE_EP] rank {rank} owns routed experts "
-                  f"[{ep_base}, {ep_base + ep_local}) of {num_experts}; "
-                  f"shared expert and residual fold on rank {ep_fold_rank}")
+            if MOE_TP:
+                print(f"[MOE_TP] rank {rank} holds intermediate "
+                      f"[{rank * moe_inter_k}, {(rank + 1) * moe_inter_k}) "
+                      f"of all {num_experts} routed + shared experts; "
+                      f"residual fold on rank {ep_fold_rank}")
+            else:
+                print(f"[MOE_EP] rank {rank} owns routed experts "
+                      f"[{ep_base}, {ep_base + ep_local}) of {num_experts}; "
+                      f"shared expert and residual fold on rank "
+                      f"{ep_fold_rank}")
 
         # Output rows per MoE workgroup, and so the tile count. The default is
         # the N-parallel width; 16 selects the kernel's K-parallel branch, all
@@ -1699,7 +1743,16 @@ if __name__ == "__main__":
         # whose W2 twin measured -1.34 ms. W13 width is closed in both
         # directions at NP=4.
         MOE_W13_OPW = int(os.environ.get("GLM_MOE_W13_OPW", "64"))
-        MOE_W2_OPW = int(os.environ.get("GLM_MOE_W2_OPW", "128"))
+        # Under MPK_MOE_TP a W2 tile is one row block over all nine slots
+        # (K = 10 x 256), and the tile count no longer depends on the routing:
+        # 6144/OPW per rank. 128 leaves 6 tiles/XCD on 29 workers; 64 halves
+        # each tile and doubles the count. MEASURED 2026-10-06, NP=8 1024/1024,
+        # n=3 each, same batch, G1 PASS, deterministic identical text:
+        #   EP ctl 8.584 (8.556 8.600 8.595)
+        #   TP 128 8.682 (8.656 8.677 8.712)   +0.098
+        #   TP  64 8.317 (8.328 8.325 8.298)   -0.267
+        MOE_W2_OPW = int(os.environ.get("GLM_MOE_W2_OPW",
+                                        "64" if MOE_TP else "128"))
         # Experts per router call. The router is one worker per expert, so
         # GLM-5's 256 experts are 32 tiles per XCD against 29 workers: two
         # grid-stride rounds for a mean of 1.10 calls, and the second round
@@ -1765,13 +1818,15 @@ if __name__ == "__main__":
             # tail guard, so a partial final group would compute k-tiles that
             # do not exist.
             assert hidden_size % 512 == 0, hidden_size
-            assert moe_inter % 512 == 0, moe_inter
-            assert (2 * moe_inter) % MOE_W13_OPW == 0
+            # Under MPK_MOE_TP the W2 reduction is all slots' slices at once
+            # (the fused-experts tile), so a slice only needs whole k-tiles.
+            assert moe_inter_k % (128 if MOE_TP else 512) == 0, moe_inter_k
+            assert (2 * moe_inter_k) % MOE_W13_OPW == 0
             assert hidden_size % MOE_W2_OPW == 0
             # The K-parallel branch emits exactly 16 rows per workgroup and
             # splits MFMA_ITERS four ways, one group of four k-tiles minimum.
             for _nm, _opw, _k in (("W13", MOE_W13_OPW, hidden_size),
-                                  ("W2", MOE_W2_OPW, moe_inter)):
+                                  ("W2", MOE_W2_OPW, moe_inter_k)):
                 assert _opw % 64 == 0 or _opw == 16, \
                     f"MoE {_nm} OPW {_opw} is neither N- nor K-parallel"
                 if _opw == 16:
@@ -2942,8 +2997,8 @@ if __name__ == "__main__":
                     name="router_partials",
                     io_category="nvshmem_tensor",
                 )
-        moe_mid = make_tensor("moe_mid", (bs, topk_total, 2 * moe_inter))
-        moe_act = make_tensor("moe_act", (bs, topk_total, moe_inter))
+        moe_mid = make_tensor("moe_mid", (bs, topk_total, 2 * moe_inter_k))
+        moe_act = make_tensor("moe_act", (bs, topk_total, moe_inter_k))
         moe_out = make_tensor("moe_out", (bs, topk_total, hidden_size))
         # atomicAdd target for the fused W2 epilogue. Zero-initialised here
         # and re-zeroed by moe_residual_add_f32 as it consumes each layer.
@@ -3019,7 +3074,7 @@ if __name__ == "__main__":
                 # tensor, indexed by the same local_eid as gate_up/down, and
                 # the registrar asserts dim[0] == the weight tensor's dim[0].
                 # Off EP the two counts coincide.
-                t = torch.zeros(ep_local + num_shared, size,
+                t = torch.zeros(moe_held + num_shared, size,
                                 dtype=torch.bfloat16, device="cuda")
                 _tensor_refs[f"zero_moe_bias_{size}"] = t
                 _moe_bias_cache[size] = mpk.attach_input(
@@ -4000,8 +4055,8 @@ if __name__ == "__main__":
 
                 def _pack_one(gb, gs, ub, us, db, ds):
                     if FUSE_MOE_SWIGLU:
-                        gu_b = interleave_gate_up(gb, ub, moe_inter)
-                        gu_s = interleave_gate_up(gs, us, moe_inter)
+                        gu_b = interleave_gate_up(gb, ub, moe_inter_k)
+                        gu_s = interleave_gate_up(gs, us, moe_inter_k)
                     else:
                         gu_b = torch.cat([gb, ub], dim=0)
                         gu_s = torch.cat([gs, us], dim=0)
@@ -4026,9 +4081,20 @@ if __name__ == "__main__":
                     gu, dn = _pack_one(gb, gs, ub, us, db, ds)
                     gu_parts.append(gu)
                     down_parts.append(dn)
-                sg, sgs = quantize_mxfp4(shared.gate_proj.weight.data)
-                su, sus = quantize_mxfp4(shared.up_proj.weight.data)
-                sd, sds = quantize_mxfp4(shared.down_proj.weight.data)
+                s_gate = shared.gate_proj.weight.data
+                s_up = shared.up_proj.weight.data
+                s_down = shared.down_proj.weight.data
+                if MOE_TP:
+                    # The routed experts' slice, taken before quantization:
+                    # the slice edges are multiples of 32, so every MXFP4
+                    # block is the one the full-width quantizer would make.
+                    _lo, _hi = rank * moe_inter_k, (rank + 1) * moe_inter_k
+                    s_gate = s_gate[_lo:_hi]
+                    s_up = s_up[_lo:_hi]
+                    s_down = s_down[:, _lo:_hi].contiguous()
+                sg, sgs = quantize_mxfp4(s_gate)
+                su, sus = quantize_mxfp4(s_up)
+                sd, sds = quantize_mxfp4(s_down)
                 gu, dn = _pack_one(sg, sgs, su, sus, sd, sds)
                 gu_parts.append(gu)
                 down_parts.append(dn)
@@ -4128,7 +4194,7 @@ if __name__ == "__main__":
                     logits_scratch=moe_gate_out,
                     moe_gate_up_weight=w_moe_gu,
                     moe_down_weight=w_moe_down,
-                    moe_w13_bias=zero_moe_bias(2 * moe_inter),
+                    moe_w13_bias=zero_moe_bias(2 * moe_inter_k),
                     moe_w2_bias=zero_moe_bias(hidden_size),
                     moe_swiglu_out=moe_act,
                     qkv_a_out=qkv_a_out,
@@ -4201,7 +4267,7 @@ if __name__ == "__main__":
                     oproj_counters=oproj_router_counter,
                     moe_gate_up_weight=w_moe_gu,
                     moe_down_weight=w_moe_down,
-                    moe_w13_bias=zero_moe_bias(2 * moe_inter),
+                    moe_w13_bias=zero_moe_bias(2 * moe_inter_k),
                     moe_w2_bias=zero_moe_bias(hidden_size),
                     moe_swiglu_out=moe_act,
                     hidden=attn_proj_out,
@@ -4250,7 +4316,7 @@ if __name__ == "__main__":
                     weight=w_moe_gu,
                     moe_routing_indices=moe_routing_indices,
                     moe_mask=moe_mask,
-                    bias=zero_moe_bias(2 * moe_inter),
+                    bias=zero_moe_bias(2 * moe_inter_k),
                     output=moe_act if FUSE_MOE_SWIGLU else moe_mid,
                     fuse_swiglu=FUSE_MOE_SWIGLU,
                     block_dim=(256, 1, 1),

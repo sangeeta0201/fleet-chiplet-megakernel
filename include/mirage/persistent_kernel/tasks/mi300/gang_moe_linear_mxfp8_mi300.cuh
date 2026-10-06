@@ -2131,7 +2131,13 @@ template <int BATCH_SIZE,
           // expert, tile_idx = its workgroup, with no routing read at all --
           // its slot (NUM_TOPK - 1, after the routed ones) and token are
           // fixed, which is what lets it run before the TopK.
-          int SHARED_MODE = 0>
+          int SHARED_MODE = 0,
+          // MPK_MOE_TP: multiply the SwiGLU result by its slot's routing
+          // weight before it is stored, so the fused-experts W2 tile (which
+          // sums every expert into one accumulator) needs no per-expert
+          // scale. The TopK publishes the weights before routing_ready, the
+          // same release this kernel's routing reads already rely on.
+          bool ROUTE_SCALE = false>
 __device__ __noinline__ void
     gang_moe_w13_linear_mxfp8_kernel(void const *input_ptr,
                                      void const *weight_ptr,
@@ -2139,7 +2145,8 @@ __device__ __noinline__ void
                                      void const *mask_ptr,
                                      void const *bias_ptr,
                                      void *output_ptr,
-                                     int tile_idx) {
+                                     int tile_idx,
+                                     void const *routing_weight_ptr = nullptr) {
   // CLOSED 2026-08-21: this assert is why W13 tile narrowing has no middle
   // point left. GLM_MOE_W13_OPW already defaults to 64, so 16 -- the measured
   // -1.34 ms (95a044a) -- was the ONLY legal value below the default. 32 is
@@ -2226,6 +2233,13 @@ __device__ __noinline__ void
                  &topk_slot)) {
     return;
   }
+  static_assert(!ROUTE_SCALE || (FUSE_SWIGLU && SHARED_MODE == 0),
+                "the routing weight scales a SwiGLU activation, and only the "
+                "routed decode knows its slot");
+  float const route_w =
+      ROUTE_SCALE ? ((float const *)routing_weight_ptr)[tok_idx * NUM_TOPK +
+                                                       topk_slot]
+                  : 1.0f;
 
   uint8_t const *wg_data = W + static_cast<int64_t>(local_eid) * EXPERT_BYTES +
                            static_cast<int64_t>(wg_idx) * WG_BYTES;
@@ -2413,7 +2427,7 @@ __device__ __noinline__ void
           float const gate = acc[2 * p] + _gang_bf16_to_float(bias_row[out_n]);
           float const up =
               acc[2 * p + 1] + _gang_bf16_to_float(bias_row[out_n + 1]);
-          s_act[act_local + p] = fast_silu(gate) * up;
+          s_act[act_local + p] = fast_silu(gate) * up * route_w;
         }
         return;
       }
@@ -2425,7 +2439,7 @@ __device__ __noinline__ void
           float const gate = acc[2 * p] + _gang_bf16_to_float(bias_row[out_n]);
           float const up =
               acc[2 * p + 1] + _gang_bf16_to_float(bias_row[out_n + 1]);
-          act[p] = _gang_float_to_bf16(fast_silu(gate) * up);
+          act[p] = _gang_float_to_bf16(fast_silu(gate) * up * route_w);
         }
       }
       if constexpr (WRITE_THROUGH) {
@@ -3243,6 +3257,353 @@ __device__ __noinline__ void
               (__builtin_amdgcn_s_memrealtime() - _sp_q1) * 10);
   }
 #endif
+}
+
+// ── MPK_MOE_TP: tensor-parallel MoE, fused-experts W2 ──────────────────────
+//
+// Expert parallelism gives a rank whole experts, so at top-8 of 256 with ~1
+// routed expert live per rank the MoE's makespan is whichever rank drew the
+// most, plus the shared expert on one rank. Tensor parallelism gives every
+// rank the same 1/W slice of EVERY expert instead: rank r keeps W13 rows
+// [2*I_LOCAL*r, 2*I_LOCAL*(r+1)) of the gate/up-interleaved weight -- the
+// intermediate columns [I_LOCAL*r, I_LOCAL*(r+1)) -- and the matching W2
+// K-columns, for all experts including the shared one. W13 then runs as the
+// non-EP kernel at OUTPUT_SIZE = 2*I_LOCAL, and the rank's share of the MoE is
+//
+//     y_r = sum_s  W2[e_s][:, slice r] @ (rw_s * h_s[slice r])
+//
+// which the EP fold already sums over ranks.
+//
+// I_LOCAL = 2048/8 = 256 is two k-tiles, under the per-expert loop's depth-4
+// minimum, so this tile does not run one expert. It runs one output row block
+// of ALL the activated experts as a single reduction over NSEG segments of
+// I_LOCAL, segment s read from expert e_s's weight block. The routing weight
+// already rides in h_s (W13's ROUTE_SCALE), so the epilogue is one atomicAdd
+// per row. Segments past the activated count pad the reduction to whole
+// depth-GROUPS blocks: they re-read segment 0's weight block, which is an L2
+// hit, against a zero activation.
+
+// a[i] for a wave-uniform runtime i. A runtime index into a register array is
+// lowered to scratch; this is N-1 selects and no memory.
+template <int N>
+__device__ __forceinline__ uint32_t _gang_pick_u32(uint32_t const (&a)[N],
+                                                   int i) {
+  uint32_t r = a[0];
+#pragma unroll
+  for (int j = 1; j < N; j++) {
+    r = (i == j) ? a[j] : r;
+  }
+  return r;
+}
+
+// _gang_moe_kloop_deep over a reduction of NSEG segments of SEG_KT k-tiles.
+// Segment s sits seg_off[s] bytes past BOTH w_data_row and wg_scales: it is the
+// expert stride, and every expert block carries its own scale half at the same
+// place. Same prefetch shape as the deep loop -- the whole next block in
+// flight across the current block's MFMAs, block loop rolled, last block
+// peeled -- with the block's segment offsets picked out of seg_off.
+template <bool WEIGHT_FP4, int GROUPS, int NSEG, int SEG_KT>
+__device__ __forceinline__ f32x4_t
+    _gang_moe_kloop_seg(uint8_t const *w_data_row,
+                        uint8_t const *wg_scales,
+                        int row_scale_base,
+                        uint32_t const (&seg_off)[NSEG],
+                        uint8_t const *s_tok_fp8,
+                        uint8_t const *s_tok_scales,
+                        int g) {
+  constexpr int K_PER_MFMA = 128;
+  constexpr int KI_END = NSEG * SEG_KT;
+  // Either a block covers whole segments (GLM at 8 ranks: 2-tile segments,
+  // depth 4) or a segment covers whole blocks (wider slices).
+  constexpr bool BLK_HAS_SEGS = (SEG_KT <= GROUPS);
+  static_assert(KI_END % GROUPS == 0 &&
+                    (BLK_HAS_SEGS ? GROUPS % SEG_KT == 0
+                                  : SEG_KT % GROUPS == 0),
+                "prefetch blocks and segments must nest");
+  constexpr int NBLK = KI_END / GROUPS;
+  constexpr int W_KS = _gang_moe_w_kstride<WEIGHT_FP4>();
+  constexpr int SC_KS = _gang_moe_sc_kstride();
+  f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
+  _gang_gp8 const wdr_g = (_gang_gp8)w_data_row;
+  _gang_gp8 const wsc_g = (_gang_gp8)wg_scales + (row_scale_base + g);
+  auto load_one = [&](uint32_t off, int kin, i32x8_t &a, int &s) {
+    a = _gang_load_w_mfma_a_at_gp<WEIGHT_FP4>(wdr_g + off, kin * W_KS, g);
+#if MPK_MOE_STREAM_NT
+    s = (int)__builtin_nontemporal_load(wsc_g + off + kin * SC_KS);
+#else
+    s = (int)wsc_g[off + kin * SC_KS];
+#endif
+  };
+  auto load_blk = [&](int blk, i32x8_t *A, int *S) {
+    if constexpr (BLK_HAS_SEGS) {
+      constexpr int SEG_PER_BLK = GROUPS / SEG_KT;
+#pragma unroll
+      for (int q = 0; q < SEG_PER_BLK; q++) {
+        uint32_t const off = _gang_pick_u32(seg_off, blk * SEG_PER_BLK + q);
+#pragma unroll
+        for (int kin = 0; kin < SEG_KT; kin++) {
+          load_one(off, kin, A[q * SEG_KT + kin], S[q * SEG_KT + kin]);
+        }
+      }
+    } else {
+      constexpr int BLK_PER_SEG = SEG_KT / GROUPS;
+      uint32_t const off = _gang_pick_u32(seg_off, blk / BLK_PER_SEG);
+      int const kin0 = (blk % BLK_PER_SEG) * GROUPS;
+#pragma unroll
+      for (int j = 0; j < GROUPS; j++) {
+        load_one(off, kin0 + j, A[j], S[j]);
+      }
+    }
+  };
+  auto consume = [&](int base, i32x8_t const *Ap, int const *Sp) {
+    i32x8_t B[GROUPS];
+    int BS[GROUPS];
+#pragma unroll
+    for (int j = 0; j < GROUPS; j++) {
+      B[j] = _gang_load_fp8_mfma_b(s_tok_fp8, (base + j) * K_PER_MFMA, g);
+      BS[j] = (int)s_tok_scales[base + j];
+    }
+#pragma unroll
+    for (int j = 0; j < GROUPS; j++) {
+      acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(Ap[j], B[j], acc, Sp[j], BS[j]);
+    }
+  };
+
+  i32x8_t A[GROUPS];
+  int S[GROUPS];
+  load_blk(0, A, S);
+// IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation; see the deep loop.
+#pragma unroll 1
+  for (int blk = 0; blk < NBLK - 1; blk++) {
+    i32x8_t N[GROUPS];
+    int NS[GROUPS];
+    load_blk(blk + 1, N, NS);
+    consume(blk * GROUPS, A, S);
+#pragma unroll
+    for (int j = 0; j < GROUPS; j++) {
+      A[j] = N[j];
+      S[j] = NS[j];
+    }
+  }
+  consume((NBLK - 1) * GROUPS, A, S);
+  return acc;
+}
+
+// The activation half of the fused tile: NSEG gathered SEG_LEN-wide bf16 slabs
+// quantized into one contiguous E4M3 run in LDS with one E8M0 per 128 --
+// _gang_wave_parallel_fp8_quant_nt's math, except that each 32-element
+// sub-block reads its own segment's slab. Every sub-block of every segment is
+// in flight at once (80 threads at 10 x 256); the single-slab quantizer per
+// segment would serialise ten load latencies and ten barriers. A segment at or
+// past n_live is zero, which quantizes to scale byte 0 over zero data.
+template <int BATCH_SIZE, int NUM_TOPK, int NSEG, int SEG_LEN>
+__device__ __forceinline__ void
+    _gang_tp_quant_seg_nt(unsigned short const *__restrict__ act,
+                          int const *__restrict__ d_mask,
+                          int const *__restrict__ d_routing,
+                          int tok_idx,
+                          int n_live,
+                          uint8_t *__restrict__ s_tok_fp8,
+                          uint8_t *__restrict__ s_tok_scales) {
+  constexpr int SUB_BLOCK = 32;
+  constexpr int SB_PER_SEG = SEG_LEN / SUB_BLOCK;
+  constexpr int NSUBBLOCKS = NSEG * SB_PER_SEG;
+  static_assert(SEG_LEN % 128 == 0,
+                "a 128-element scale block must not straddle two segments");
+  int const tid = threadIdx.x;
+  int const lane_id = tid & 63;
+
+  for (int sb = tid; sb < NSUBBLOCKS; sb += MPK_NT) {
+    int const seg = sb / SB_PER_SEG;
+    int const base = sb * SUB_BLOCK;
+    int const super_blk = sb / 4;
+    int const sub_idx = sb & 3;
+    uint32_t dw[16];
+    if (seg < n_live) {
+      int const e = d_mask[seg];
+      int const slot = d_routing[e * BATCH_SIZE + tok_idx] - 1;
+      uint32_t const *p =
+          (uint32_t const *)(act + slot * SEG_LEN +
+                             (sb % SB_PER_SEG) * SUB_BLOCK);
+      // Early-clobber outputs; see _gang_wave_parallel_fp8_quant_nt.
+      asm volatile("global_load_dwordx4 %0, %4, off sc0 sc1 nt\n"
+                   "global_load_dwordx4 %1, %5, off sc0 sc1 nt\n"
+                   "global_load_dwordx4 %2, %6, off sc0 sc1 nt\n"
+                   "global_load_dwordx4 %3, %7, off sc0 sc1 nt"
+                   : "=&v"(*(i32x4_t *)&dw[0]),
+                     "=&v"(*(i32x4_t *)&dw[4]),
+                     "=&v"(*(i32x4_t *)&dw[8]),
+                     "=&v"(*(i32x4_t *)&dw[12])
+                   : "v"(p), "v"(p + 4), "v"(p + 8), "v"(p + 12)
+                   : "memory");
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    } else {
+#pragma unroll
+      for (int j = 0; j < 16; j++) {
+        dw[j] = 0;
+      }
+    }
+
+    float vals[32];
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 16; j++) {
+      float lo = _gang_bf16_to_float((unsigned short)(dw[j] & 0xFFFF));
+      float hi = _gang_bf16_to_float((unsigned short)(dw[j] >> 16));
+      vals[j * 2] = lo;
+      vals[j * 2 + 1] = hi;
+      amax = fmaxf(amax, fmaxf(fabsf(lo), fabsf(hi)));
+    }
+    // NSUBBLOCKS is a multiple of 4, so all four partners of a 128-element
+    // block ran this iteration.
+    int const base_lane = lane_id & ~3;
+    float const block_amax =
+        fmaxf(fmaxf(__shfl(amax, base_lane), __shfl(amax, base_lane + 1)),
+              fmaxf(__shfl(amax, base_lane + 2), __shfl(amax, base_lane + 3)));
+    uint8_t const se = _gang_compute_e8m0_fp8(block_amax);
+    float scale_f = 1.0f;
+    if (se != 0) {
+      union {
+        float f;
+        uint32_t u;
+      } sv;
+      sv.u = (uint32_t)se << 23;
+      scale_f = sv.f;
+    }
+#pragma unroll
+    for (int j = 0; j < 32; j += 4) {
+      fp8x4_t pk = {};
+      pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
+          pk, vals[j], vals[j + 1], scale_f, false);
+      pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
+          pk, vals[j + 2], vals[j + 3], scale_f, true);
+      *(int *)(s_tok_fp8 + base + j) = *(int const *)&pk;
+    }
+    if (sub_idx == 0) {
+      s_tok_scales[super_blk] = se;
+    }
+  }
+  MPK_WS_WAVE_SYNC(tid >> 6);
+  __syncthreads();
+}
+
+// One output row block (OUTPUT_PER_WG rows of the hidden) over all activated
+// experts. tile_idx is the per-XCD index, as everywhere in the gang MoE; the
+// row block is tile_idx * 8 + xcd. Weight: [NUM_EXPERTS][OUTPUT_SIZE/OPW]
+// packed MXFP workgroups of this rank's I_LOCAL K-columns. Input: W13's
+// [BATCH][NUM_TOPK][I_LOCAL] bf16 activation, already routing-weighted.
+// Output: atomicAdd into the [BATCH][OUTPUT_SIZE] f32 workspace.
+template <int BATCH_SIZE,
+          int OUTPUT_SIZE,
+          int I_LOCAL,
+          int NUM_EXPERTS,
+          int NUM_TOPK,
+          int OUTPUT_PER_WG,
+          bool WEIGHT_FP4,
+          int NSEG>
+__device__ __noinline__ void
+    gang_moe_w2_tp_linear_mxfp8_kernel(void const *input_ptr,
+                                       void const *weight_ptr,
+                                       void const *routing_ptr,
+                                       void const *mask_ptr,
+                                       void *output_ptr,
+                                       int tile_idx) {
+  static_assert(BATCH_SIZE == 1,
+                "the segments are one token's experts; more rows would need "
+                "a per-row segment list");
+  static_assert(OUTPUT_PER_WG % 64 == 0 && OUTPUT_SIZE % OUTPUT_PER_WG == 0,
+                "N-parallel tile: 4 waves x 16 rows");
+  static_assert(I_LOCAL % 128 == 0, "a segment is whole k-tiles");
+  static_assert(NSEG >= NUM_TOPK, "every activated expert needs a segment");
+  constexpr int K_PER_MFMA = 128;
+  constexpr int SEG_KT = I_LOCAL / K_PER_MFMA;
+  constexpr int GR =
+      _gang_moe_pf_groups(NSEG * SEG_KT, MPK_MOE_PF_GROUPS_W2);
+  static_assert(GR >= 2 && (GR % SEG_KT == 0 || SEG_KT % GR == 0),
+                "NSEG * I_LOCAL must split into prefetch blocks that nest "
+                "with the segments");
+  constexpr int NUM_BLOCKS_32 = I_LOCAL / 32;
+  constexpr int W_ROW_BYTES = WEIGHT_FP4 ? I_LOCAL / 2 : I_LOCAL;
+  constexpr int W_BPK = _gang_moe_bytes_per_ktile<WEIGHT_FP4>();
+  constexpr int WG_DATA_BYTES = OUTPUT_PER_WG * W_ROW_BYTES;
+  constexpr int WG_BYTES = WG_DATA_BYTES + OUTPUT_PER_WG * NUM_BLOCKS_32;
+  constexpr int EXPERT_WGS = OUTPUT_SIZE / OUTPUT_PER_WG;
+  constexpr int64_t EXPERT_BYTES = static_cast<int64_t>(EXPERT_WGS) * WG_BYTES;
+  static_assert(EXPERT_BYTES * NUM_EXPERTS < (int64_t(1) << 32),
+                "segment offsets are 32-bit");
+  constexpr int NUM_WAVES = 4;
+  constexpr int TILES_PER_WAVE = OUTPUT_PER_WG / 16 / NUM_WAVES;
+  constexpr int tok_idx = 0;
+
+  int const wg_idx = tile_idx * 8 + _gang_moe_get_xcd_id();
+  if (wg_idx >= EXPERT_WGS) {
+    return;
+  }
+  int const *d_mask = (int const *)mask_ptr;
+  int const *d_routing = (int const *)routing_ptr;
+  int const n_live = d_mask[NUM_EXPERTS];
+  if (n_live > NSEG) {
+    __builtin_trap();
+  }
+  uint32_t seg_off[NSEG];
+  int const e_pad = (n_live > 0) ? d_mask[0] : 0;
+#pragma unroll
+  for (int s = 0; s < NSEG; s++) {
+    int const e = (s < n_live) ? d_mask[s] : e_pad;
+    seg_off[s] = static_cast<uint32_t>(e) * static_cast<uint32_t>(EXPERT_BYTES);
+  }
+
+  // Expert 0's block for this row tile; seg_off adds the expert.
+  uint8_t const *wg_data =
+      (uint8_t const *)weight_ptr + static_cast<int64_t>(wg_idx) * WG_BYTES;
+  uint8_t const *wg_scales = wg_data + WG_DATA_BYTES;
+
+  extern __shared__ char _gang_moe_mxfp8_smem[];
+  uint8_t *s_tok_fp8 = (uint8_t *)_gang_moe_mxfp8_smem;
+  uint8_t *s_tok_scales = s_tok_fp8 + NSEG * I_LOCAL;
+
+  _gang_tp_quant_seg_nt<BATCH_SIZE, NUM_TOPK, NSEG, I_LOCAL>(
+      (unsigned short const *)input_ptr +
+          static_cast<size_t>(tok_idx) * (NUM_TOPK * I_LOCAL),
+      d_mask,
+      d_routing,
+      tok_idx,
+      n_live,
+      s_tok_fp8,
+      s_tok_scales);
+
+  int const tid = threadIdx.x;
+  int const warp_id = tid >> 6;
+  int const lane_id = tid & 63;
+  int const col = lane_id & 15;
+  int const g = lane_id >> 4;
+  float *d_workspace = (float *)output_ptr;
+
+  for (int tile_iter = 0; tile_iter < TILES_PER_WAVE; tile_iter++) {
+    int const wave_tile = warp_id + tile_iter * NUM_WAVES;
+    int const w_row = wave_tile * 16 + col;
+    uint8_t const *w_data_row =
+        wg_data + (MPK_MOE_KMAJOR >= 1
+                       ? static_cast<size_t>(w_row / 16) * (16 * W_ROW_BYTES) +
+                             static_cast<size_t>(w_row % 16) * W_BPK
+                       : static_cast<size_t>(w_row) * W_ROW_BYTES);
+    int const row_scale_base =
+        MPK_MOE_KMAJOR >= 2
+            ? (w_row / 16) * (16 * NUM_BLOCKS_32) + (w_row % 16) * 4
+            : w_row * NUM_BLOCKS_32;
+    f32x4_t acc = _gang_moe_kloop_seg<WEIGHT_FP4, GR, NSEG, SEG_KT>(
+        w_data_row, wg_scales, row_scale_base, seg_off, s_tok_fp8,
+        s_tok_scales, g);
+    if (col == 0) {
+      float *ws = d_workspace + static_cast<size_t>(tok_idx) * OUTPUT_SIZE +
+                  wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4;
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        atomicAdd(&ws[i], acc[i]);
+      }
+    }
+  }
+  __syncthreads();
 }
 
 } // namespace kernel
