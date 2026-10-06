@@ -238,8 +238,17 @@ static constexpr int FULL_LAYER_ENTRY_SLOT = 71;
 //
 // The arrival counter, the leader election and the self-heal quota all key
 // off the folder count, so they move together with this.
+//
+// MEASURED 2026-10-06, NP=8 GPUs 0-7, 1024/1024, decode median, G1 PASS,
+// coherent text, at the head-local / 64-chunk defaults: control 8.630 8.657;
+// FOLD_WGS=4 8.575 8.628 (-0.042); with MPK_EP_POLL_BATCH=1 as well, three
+// interleaved pairs 8.631/8.601 8.650/8.583 8.603/8.568 (-0.044). The local
+// fold is 4.3 us/layer of S0->S3; the per-peer stamps (MPK_EP_PEER_STAMPS)
+// put the wait after it at 8.3 us even on the rank that waits least.
+// Gates with both: see the commit that flipped them. Default 4; GLM's demo.py
+// sets MPK_EP_POLL_BATCH=1 to match.
 #ifndef MPK_EP_FOLD_WGS
-#define MPK_EP_FOLD_WGS 1
+#define MPK_EP_FOLD_WGS 4
 #endif
 static constexpr int FULL_LAYER_EP_FOLDERS = 8 * MPK_EP_FOLD_WGS;
 

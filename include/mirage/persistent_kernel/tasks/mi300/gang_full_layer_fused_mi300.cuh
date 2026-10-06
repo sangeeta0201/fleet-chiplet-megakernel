@@ -681,6 +681,11 @@ __device__ __forceinline__ void
       //
       // Kept, defaulted off. It is strictly fewer instructions for the same
       // predicate, so turning it on costs nothing; it just buys nothing.
+      //
+      // RE-MEASURED 2026-10-06 on GLM-5.2 NP=8 1024/1024 at the head-local /
+      // 64-chunk defaults, where the fold is no longer one rank's lateness:
+      // control 8.630 8.657 -> 8.612 8.589 ms (-0.043); with
+      // MPK_EP_FOLD_WGS=4, -0.044 over three pairs. See MPK_EP_FOLD_WGS.
       if constexpr (EP_WORLD_SIZE == 8 && FULL_LAYER_EP_SIGNAL_STRIDE == 8) {
         mpk_u64x8 const _b = ld_sys_u64_x8(
             reinterpret_cast<unsigned long long const *>(ep_signal));
@@ -705,6 +710,20 @@ __device__ __forceinline__ void
                 ld_sys_u64(reinterpret_cast<unsigned long long *>(sp));
             if (_v >= (unsigned long long)ep_sig_expected) {
               remaining &= ~(1u << p);
+#if MPK_EP_PEER_STAMPS
+              // Stage slot 36 + p: when this rank first saw peer p's signal.
+              // Minus this rank's S3 (own push drained) it is transport plus
+              // that peer's lateness; the earliest peer bounds the transport.
+              //
+              // GLM-5.2 NP=8 1024/1024, 2026-10-06 (shipping-scaled): on every
+              // rank the delay rises with p, ~0.35 us per index -- this loop's
+              // own serialized poll order, not which peers are late. The rank
+              // that waits least still takes 8.3 us from S3 to S4, 3.5 us of
+              // it before even its earliest peer is seen (its own signal
+              // store and drain sit in front of the first poll); the others
+              // take ~11. So the fold's critical path is mostly mechanism.
+              mpk_stage_stamp(36 + p);
+#endif
             } else if (p == (int)(__builtin_ctz(remaining))) {
               _obs_low = (int)_v;
             }

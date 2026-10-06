@@ -1076,6 +1076,12 @@ def get_compile_command(
             # barrier epoch, so unlike MPK_SUBPHASE_TIMING its cost does not
             # scale with tile count.
             flags = flags + ["-DMPK_BAR_SKEW=%d" % _bar_skew]
+            if os.environ.get("MPK_EP_PEER_STAMPS", "0") == "1":
+                # Stage slots 36 + p: when the EP waiter saw peer p's signal.
+                # Against the same rank's S3 that splits the fold wait into
+                # transport and per-peer lateness. Note at the stamp site in
+                # gang_full_layer_fused_mi300.cuh.
+                flags = flags + ["-DMPK_EP_PEER_STAMPS=1"]
             _drop_ns = int(os.environ.get("MPK_BAR_SKEW_DROP_NS", "0"))
             if _drop_ns > 0:
                 # Stale-reference drop threshold for the stage stamps. The

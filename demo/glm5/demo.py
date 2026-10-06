@@ -1394,6 +1394,11 @@ if __name__ == "__main__":
         # Gang dispatch is what the MI350/MI355 GEMM and MoE kernels are
         # written for; the non-gang fallbacks exist but are not the tuned path.
         os.environ.setdefault("USE_GANG", "1")
+        # The EP fold's batched peer poll. Its define is shared with gpt-oss's
+        # monolith, so GLM's default is set here rather than in the header.
+        # Measured with MPK_EP_FOLD_WGS=4 (the header default in
+        # gang_mla_full_layer_fused_mi300.cuh); note there.
+        os.environ.setdefault("MPK_EP_POLL_BATCH", "1")
 
         # ── Geometry ─────────────────────────────────────────────────────────
         hidden_size = config.hidden_size
