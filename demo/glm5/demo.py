@@ -1984,7 +1984,33 @@ if __name__ == "__main__":
             #                      (chunks=16 control: 10.545)
             #   1024/1024                           decode_min 11.304 vs 12.721
             _kv_tiles = max(1, (args.max_seq_length + 7) // 8)
-            num_kv_chunks = max(1, min(32, _kv_tiles))
+            # The head-local decode (MPK_MLA_HEAD_LOCAL) decodes one 16-head
+            # group per rank, so 64 chunks is 8 items per XCD where the
+            # replicated decode would put 32 on 29 workers -- the geometry that
+            # wedged at 64 above. GLM_MLA_HL_CHUNK_CAP is its cap. Provisional
+            # here: head-local needs qb_tp, derived further down and
+            # re-checked against this there.
+            #
+            # MEASURED 2026-10-06, NP=8 GPUs 0-7, 1024/1024, head-local on,
+            # decode median, G1 PASS, coherent text:
+            #   chunks=32   8.853 8.898   mean 8.876
+            #   chunks=64   8.707 8.670   mean 8.689   (-0.187)
+            #   chunks=128  8.907 8.928   mean 8.918   (+0.042, the merge's
+            #               four exposed load latencies outweigh the trip)
+            # Gates with MPK_MOE_SHARED_EARLY=1, through this cap: NP=4
+            # ppl512 2.5122 (64 chunks), ppl128 2.7924 (17), longseq
+            # 256/512/1024 G1 PASS; NP=8 ppl512 2.5800 2.6163 against 2.6083
+            # 2.5410 at cap 32. Default 64.
+            _hl_chunks_ok = (
+                os.environ.get("MPK_MLA_HEAD_LOCAL", "1") != "0"
+                and moe_ep and world_size > 1 and FUSE_FULL_LAYER
+                and UNABSORB_K
+                and int(os.environ.get("GLM_QB_TP", "1")) == 1
+                and args.max_num_batched_tokens == 1
+                and int(os.environ.get("GLM_MLA_PAIR_MERGE", "0")) == 0)
+            _cap = (int(os.environ.get("GLM_MLA_HL_CHUNK_CAP", "64"))
+                    if _hl_chunks_ok else 32)
+            num_kv_chunks = max(1, min(_cap, _kv_tiles))
         assert num_kv_chunks >= 1
         # The merge is otherwise one task per q group -- 2 CUs of 256, each
         # thread carrying kv_lora/16 = 32 unrolled softmax chains. Slice the
@@ -2524,6 +2550,15 @@ if __name__ == "__main__":
                  # W_UK's tiles have to stay a whole number per XCD too.
                  and ((num_heads // world_size) * kv_lora
                       // WUK_GEMV_ROWS) % 8 == 0)
+        # Past 32 chunks only the head-local decode keeps the decode inside one
+        # round per XCD; the replicated one wedged there. Fail here instead.
+        if num_kv_chunks > 32:
+            assert (qb_tp and os.environ.get("MPK_MLA_HEAD_LOCAL", "1") != "0"
+                    and args.max_num_batched_tokens == 1
+                    and int(os.environ.get("GLM_MLA_PAIR_MERGE", "0")) == 0), (
+                f"{num_kv_chunks} KV chunks needs the head-local decode "
+                f"(MPK_MLA_HEAD_LOCAL=1, q_b TP, one row, no pair merge); "
+                f"the replicated decode deadlocks past 32")
         qb_tp_heads = (num_heads // world_size) if qb_tp else num_heads
         print(f"[CFG] q_b/W_UK tp={int(qb_tp)} heads_per_rank={qb_tp_heads} "
               f"qb_tiles_per_xcd={qb_tp_heads * qb_nope_span // 8 // QB_GEMM_OPW}"

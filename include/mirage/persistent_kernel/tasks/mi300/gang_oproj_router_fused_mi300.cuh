@@ -101,6 +101,33 @@ namespace kernel {
 #if MPK_MOE_SHARED_KSHARD > 0 && !MPK_MOE_LIVE_BOUND
 #error "MPK_MOE_SHARED_KSHARD needs MPK_MOE_LIVE_BOUND: the shared W2 loop bound is computed in that block, and the static bound has no separate shared class"
 #endif
+// MPK_MOE_SHARED_EARLY: on EP_SHARED_PE, run the shared expert's W13 during
+// the router (RMSNorm + gate GEMV + serial TopK, ~8 us/layer at NP=8) on the
+// workers that have no router tile, instead of in the W13 round. The shared
+// expert needs no routing -- its slot and token are fixed -- so all it waits
+// for is the o_proj all-gather the router waits for too. At NP=8 it is rank
+// 0's second expert in a ~1-expert round (W13 crit 7.77 us there against
+// ~5.05 on the other ranks), and every other rank pays rank 0's lateness in
+// the EP fold. W2 is unchanged: its SwiGLU input sits in the fixed slot.
+//
+// MEASURED 2026-10-06, NP=8 GPUs 0-7, 1024/1024, 64 KV chunks, decode median,
+// G1 PASS, coherent text: 8.716 8.671 -> 8.629 8.616 ms (-0.071). Stage
+// stamps on rank 0 (instrumented): W13 crit 10.16 -> 6.23 us, but the early
+// tiles still finish ~3.5 us after routing is published and the MoE end
+// barely moves (131.7 -> 131.6) -- rank 0's remaining excess is W2, 13.1 us
+// against ~9.1 elsewhere, because it still runs the shared expert's W2 too.
+// A first version normed with a strided 2-byte loop (~15 us of exposed
+// latency per tile) and was neutral (-0.017). Gated together with the
+// 64-chunk head-local decode (see GLM_MLA_HL_CHUNK_CAP in demo.py). Default 1.
+#ifndef MPK_MOE_SHARED_EARLY
+#define MPK_MOE_SHARED_EARLY 1
+#endif
+#if MPK_MOE_SHARED_EARLY && (MPK_MOE_SHARED_KSHARD > 0 || MPK_SHARED_DUP)
+#error "MPK_MOE_SHARED_EARLY moves the whole shared expert; KSHARD and SHARED_DUP rewrite its slot run"
+#endif
+#if MPK_MOE_SHARED_EARLY && !MPK_MOE_LIVE_BOUND
+#error "MPK_MOE_SHARED_EARLY drops the shared expert from the live W13 bound, which needs MPK_MOE_LIVE_BOUND"
+#endif
 // One boolean for "the W13 ceiling probe forced the flat arrival", so the
 // self-heal's quota and the arrival cannot disagree across the #ifdef.
 #ifdef MPK_W13_EARLY_REL
@@ -283,6 +310,13 @@ __device__ __attribute__((always_inline)) void
   // 3 = routing-ready wait, 4 = MoE W13, 5 = W13->W2 barrier, 6 = MoE W2.
   unsigned long long _sp_t0 = __builtin_amdgcn_s_memrealtime();
 #endif
+
+  // MPK_MOE_SHARED_EARLY applies when there is a shared expert, one row and EP.
+  constexpr bool SH_EARLY = MPK_MOE_SHARED_EARLY && EP_WORLD_SIZE > 1 &&
+                            BATCH_SIZE == 1 && MOE_NUM_EXPERTS > NUM_EXPERTS;
+  static_assert(!SH_EARLY || MOE_NUM_TOPK == TOPK_K + 1,
+                "the early shared tile writes slot MOE_NUM_TOPK - 1, which is "
+                "the shared expert's only when there is exactly one");
 
   // Mechanism C barrier layout, HIER_STRIDE int32 (one cache line) per slot.
   constexpr int HIER_STRIDE = 16;
@@ -1425,6 +1459,145 @@ __device__ __attribute__((always_inline)) void
 #endif
   }
 
+#if MPK_MOE_SHARED_EARLY
+  // ── MPK_MOE_SHARED_EARLY: the shared expert's W13, ahead of routing ──────
+  // Run by the workers past router_tile_n, which have nothing to do until the
+  // routing poll. Shared tile s goes to the s-th of them, grid-stride. Each
+  // re-norms the hidden row into LDS itself rather than reading the router's
+  // normed row, which nothing signals and which this would race.
+  if constexpr (SH_EARLY && EP_MY_PE == EP_SHARED_PE) {
+    static_assert(MOE_W13_TILES_PER_EXPERT % 8 == 0,
+                  "the shared expert's W13 workgroups split evenly over XCDs");
+    constexpr int SH_TILES = MOE_W13_TILES_PER_EXPERT / 8;
+    constexpr int SH_NORM_LDS_OFF = 64 * 1024;
+    static_assert(SH_NORM_LDS_OFF + HIDDEN_SIZE * 2 <=
+                      mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE,
+                  "the early shared tile's normed row sits past W13's own LDS");
+    int const sh_pool = tiles_per_xcd - router_tile_n;
+    if (sh_pool <= 0) {
+      // No worker left to run them; the W13 round skips them regardless.
+      __builtin_trap();
+    }
+    int const sh_first = xcd_rank - router_tile_n;
+    if (sh_first >= 0 && sh_first < SH_TILES) {
+      if (tid == 0) {
+        // The router's own release flag; heal off a peer XCD's, as it does.
+        int _spins = 0;
+        while (ld_nt_s32(&hier_barrier[xcd_id * HIER_STRIDE]) <
+               oproj_expected) {
+          if ((++_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
+            if (hier_barrier_peer_released(hier_barrier, HIER_STRIDE,
+                                           oproj_expected, xcd_id) != 0) {
+              st_flag_u32((void *)&hier_barrier[xcd_id * HIER_STRIDE],
+                          (unsigned)oproj_expected);
+              asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+            }
+          }
+          __builtin_amdgcn_s_sleep(1);
+        }
+      }
+      __syncthreads();
+      asm volatile("buffer_inv" ::: "memory");
+
+      // Every row and gamma load issued up front, 16 B each, so the norm pays
+      // one exposed latency: the row was just written through by o_proj and
+      // the peers, and a strided 2-byte loop that consumes each load before
+      // issuing the next measured ~15 us for this block at NP=8.
+      constexpr int SH_THREADS = 256;
+      constexpr int SH_CHUNKS = HIDDEN_SIZE / (8 * SH_THREADS);
+      static_assert(HIDDEN_SIZE % (8 * SH_THREADS) == 0,
+                    "the early norm gives each thread whole 8-element chunks");
+      if (MPK_NT != SH_THREADS) {
+        __builtin_trap();
+      }
+      typedef unsigned int __attribute__((ext_vector_type(4))) sh_u32x4;
+      extern __shared__ char _mpk_sh_early_smem[];
+      sh_u32x4 *const sh_norm4 =
+          reinterpret_cast<sh_u32x4 *>(_mpk_sh_early_smem + SH_NORM_LDS_OFF);
+      sh_u32x4 const *const sh_hid4 = static_cast<sh_u32x4 const *>(hidden_ptr);
+      sh_u32x4 const *const sh_gam4 = static_cast<sh_u32x4 const *>(norm_weight_ptr);
+      sh_u32x4 hv[SH_CHUNKS], gv[SH_CHUNKS];
+#pragma unroll
+      for (int c = 0; c < SH_CHUNKS; c++) {
+        hv[c] = sh_hid4[tid + c * SH_THREADS];
+        gv[c] = sh_gam4[tid + c * SH_THREADS];
+      }
+      float ssq = 0.0f;
+#pragma unroll
+      for (int c = 0; c < SH_CHUNKS; c++) {
+        __hip_bfloat16 const *h8 =
+            reinterpret_cast<__hip_bfloat16 const *>(&hv[c]);
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+          float const v = __bfloat162float(h8[j]);
+          ssq += v * v;
+        }
+      }
+#pragma unroll
+      for (int off = 32; off > 0; off >>= 1) {
+        ssq += __shfl_xor(ssq, off);
+      }
+      __shared__ float sh_red[SH_THREADS / 64];
+      if ((tid & 63) == 0) {
+        sh_red[tid >> 6] = ssq;
+      }
+      __syncthreads();
+      float tot = 0.0f;
+#pragma unroll
+      for (int w = 0; w < SH_THREADS / 64; w++) {
+        tot += sh_red[w];
+      }
+      float const irms = rsqrtf(tot / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
+#pragma unroll
+      for (int c = 0; c < SH_CHUNKS; c++) {
+        __hip_bfloat16 const *h8 =
+            reinterpret_cast<__hip_bfloat16 const *>(&hv[c]);
+        __hip_bfloat16 const *g8 =
+            reinterpret_cast<__hip_bfloat16 const *>(&gv[c]);
+        sh_u32x4 out;
+        __hip_bfloat16 *o8 = reinterpret_cast<__hip_bfloat16 *>(&out);
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+          o8[j] = __float2bfloat16(__bfloat162float(h8[j]) * irms *
+                                   __bfloat162float(g8[j]));
+        }
+        sh_norm4[tid + c * SH_THREADS] = out;
+      }
+      __syncthreads();
+      __hip_bfloat16 const *const sh_norm =
+          reinterpret_cast<__hip_bfloat16 const *>(sh_norm4);
+
+      for (int s = sh_first; s < SH_TILES; s += sh_pool) {
+        gang_moe_w13_linear_mxfp8_kernel<BATCH_SIZE,
+                                         2 * MOE_INTERMEDIATE,
+                                         2 * MOE_INTERMEDIATE,
+                                         HIDDEN_SIZE,
+                                         MOE_NUM_EXPERTS,
+                                         MOE_NUM_TOPK,
+                                         MOE_W13_TILES_PER_EXPERT,
+                                         MOE_W13_OPW,
+                                         /*FUSE_SWIGLU=*/true,
+                                         /*WRITE_THROUGH=*/true,
+                                         MOE_WEIGHT_FP4,
+                                         EP_WORLD_SIZE,
+                                         EP_MY_PE,
+                                         /*EP_NUM_ROUTED=*/NUM_EXPERTS,
+                                         EP_SHARED_PE,
+                                         /*EMIT_FP8=*/MPK_MOE_ACT_FP8 != 0,
+                                         MPK_MOE_SHARED_KSHARD,
+                                         /*SHARED_MODE=*/2>(
+            sh_norm,
+            moe_gate_up_weight_ptr,
+            routing_indices_ptr,
+            active_expert_ids_ptr,
+            moe_w13_bias_ptr,
+            moe_swiglu_out_ptr,
+            s * 8 + xcd_id);
+      }
+    }
+  }
+#endif
+
   MPK_WS_PHASE(74, routing_expected, xcd_id);
   // Stage stamp 32: RMSNorm + router GEMV + sigmoid/bias TopK done (all workers).
   if (tid == 0) {
@@ -1686,10 +1859,11 @@ __device__ __attribute__((always_inline)) void
         // 1 + MPK_SHARED_DUP consecutive slots in the owned subsequence. W2
         // keeps `owned`: its epilogue is an atomicAdd and a duplicated tile
         // would double-count the contribution.
-        owned_w13 += is_owned ? ((MPK_SHARED_DUP && cand >= NUM_EXPERTS)
-                                     ? (1 + MPK_SHARED_DUP)
-                                     : 1)
-                              : 0;
+        owned_w13 += (is_owned && !(SH_EARLY && cand >= NUM_EXPERTS))
+                         ? ((MPK_SHARED_DUP && cand >= NUM_EXPERTS)
+                                ? (1 + MPK_SHARED_DUP)
+                                : 1)
+                         : 0;
       }
     } else {
       owned = n_act;
@@ -1813,7 +1987,8 @@ __device__ __attribute__((always_inline)) void
                                      /*EP_NUM_ROUTED=*/NUM_EXPERTS,
                                      EP_SHARED_PE,
                                      /*EMIT_FP8=*/MPK_MOE_ACT_FP8 != 0,
-                                     MPK_MOE_SHARED_KSHARD>(
+                                     MPK_MOE_SHARED_KSHARD,
+                                     /*SHARED_MODE=*/SH_EARLY ? 1 : 0>(
         norm_output_ptr,
         moe_gate_up_weight_ptr,
         routing_indices_ptr,

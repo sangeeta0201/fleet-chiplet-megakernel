@@ -105,7 +105,7 @@ MPK_FORWARD_VARS=(
   GLM_PROLOGUE_PREFETCH GLM_OPROJ_RESTAGE
   GLM_UNABSORB_OPROJ GLM_WUV_GEMV_ROWS WUV_MFMA GLM_WUV_TP
   GLM_UNABSORB_QB GLM_WUK_GEMV_ROWS GLM_QB_OPW GLM_QB_TP
-  GLM_MLA_NUM_KV_CHUNKS GLM_MLA_MERGE_DIM_SPLITS GLM_MLA_MERGE_WT
+  GLM_MLA_NUM_KV_CHUNKS GLM_MLA_HL_CHUNK_CAP GLM_MLA_MERGE_DIM_SPLITS GLM_MLA_MERGE_WT
   # Compile-time and read per-rank via os.environ in persistent_kernel.py, so
   # without -x only rank 0 builds the pair-local decode barrier and the ranks
   # deadlock at Phase 6. Same bug the ceiling probes below had.
@@ -127,7 +127,7 @@ MPK_FORWARD_VARS=(
   # other three deadlock at the layer barrier. MPK_EP_WAIT_AT_USE was on the
   # gpt-oss list and missing here, which is why it has never been re-priced
   # at the NP=4 point.
-  MPK_EP_WAIT_AT_USE MPK_MOE_NOPAD MPK_MOE_SHARED_KSHARD
+  MPK_EP_WAIT_AT_USE MPK_MOE_NOPAD MPK_MOE_SHARED_KSHARD MPK_MOE_SHARED_EARLY
   # Ceiling probes. All are WRONG OUTPUT by construction and all are
   # compile-time, so every rank has to see them or the ranks build different
   # megakernels and the layer barriers deadlock.

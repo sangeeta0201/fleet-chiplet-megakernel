@@ -1641,6 +1641,13 @@ def get_compile_command(
             # MFMA_ITERS/slices >= 4 and GLM-5's W2 has MFMA_ITERS = 16.
             assert _sk in ("0", "2", "4"), "MPK_MOE_SHARED_KSHARD is 0, 2, or 4"
             flags = flags + [f"-DMPK_MOE_SHARED_KSHARD={_sk}"]
+        _se = os.environ.get("MPK_MOE_SHARED_EARLY")
+        if _se is not None:
+            # EP_SHARED_PE runs the shared expert's W13 during the router
+            # instead of in the W13 round. Note at the define in
+            # gang_oproj_router_fused_mi300.cuh. Compile-time, every rank.
+            assert _se in ("0", "1"), "MPK_MOE_SHARED_EARLY is 0 or 1"
+            flags = flags + [f"-DMPK_MOE_SHARED_EARLY={_se}"]
         _moe_afp8 = os.environ.get("MPK_MOE_ACT_FP8")
         if _moe_afp8 is not None:
             # W13 emits the SwiGLU result as MXFP8 (E4M3 + one E8M0 per 32) and

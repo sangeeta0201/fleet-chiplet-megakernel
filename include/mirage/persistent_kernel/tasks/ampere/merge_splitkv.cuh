@@ -207,6 +207,36 @@ __device__ __forceinline__ void
 #endif
 }
 
+// G consecutive chunks of the online-softmax merge: all 2G loads first, then
+// the updates in exactly the flat loop's order, so the result is the same.
+template <int G, typename LseP, typename OP>
+__device__ __forceinline__ void merge_online_group(LseP lse_g,
+                                                   OP o_g,
+                                                   int lse_linear0,
+                                                   int lse_step,
+                                                   int head_dim,
+                                                   int o_col,
+                                                   float &m_global,
+                                                   float &d_global,
+                                                   float &o_global) {
+  float other_m[G], other_o[G];
+#pragma unroll
+  for (int g = 0; g < G; ++g) {
+    int const lse_linear = lse_linear0 + g * lse_step;
+    other_m[g] = lse_g[lse_linear] * 1.44269504088896340736f;
+    other_o[g] = o_g[lse_linear * head_dim + o_col];
+  }
+#pragma unroll
+  for (int g = 0; g < G; ++g) {
+    float const m_prev = m_global, d_prev = d_global;
+    m_global = max(m_prev, other_m[g]);
+    d_global = d_prev * ptx_exp2(m_prev - m_global) +
+               ptx_exp2(other_m[g] - m_global);
+    o_global = o_global * ptx_exp2(m_prev - m_global) +
+               other_o[g] * ptx_exp2(other_m[g] - m_global);
+  }
+}
+
 // CK FMHA merge variant: reads float o_acc/lse_acc with interleaved kv_head
 // layout lse layout:  lse[token * (NUM_QO_GROUPS * NUM_KV_CHUNKS * QO_PER_KV)
 //                  + kv_head * NUM_KV_CHUNKS * QO_PER_KV
@@ -376,6 +406,32 @@ __device__ __forceinline__ void
       float m_global = -inf;
       float d_global = 1.f;
       float o_global = 0.f;
+      if constexpr (NUM_KV_CHUNKS > 32) {
+        // Past 32 chunks the full unroll below either fails (128 compiles to
+        // a rolled loop that waits on every chunk's loads) or does not finish
+        // compiling (64 ran 18 minutes). Groups of 32: one exposed load
+        // latency per group, same update order.
+        constexpr int MRG_G = 32;
+        constexpr int MRG_FULL = NUM_KV_CHUNKS / MRG_G;
+        constexpr int MRG_TAIL = NUM_KV_CHUNKS % MRG_G;
+        int const lse_linear0 = head_idx +
+                                (first_token_pos + token_idx) * LSE_TOKEN_STRIDE +
+                                lse_kv_offset;
+        int const o_col = dim_base + thread_in_group * VAL_PER_THREAD + i;
+#pragma unroll 1
+        for (int grp = 0; grp < MRG_FULL; ++grp) {
+          merge_online_group<MRG_G>(
+              lse_g, o_g, lse_linear0 + grp * MRG_G * NUM_QO_HEADS_PER_KV,
+              NUM_QO_HEADS_PER_KV, HEAD_DIM, o_col, m_global, d_global,
+              o_global);
+        }
+        if constexpr (MRG_TAIL > 0) {
+          merge_online_group<MRG_TAIL>(
+              lse_g, o_g, lse_linear0 + MRG_FULL * MRG_G * NUM_QO_HEADS_PER_KV,
+              NUM_QO_HEADS_PER_KV, HEAD_DIM, o_col, m_global, d_global,
+              o_global);
+        }
+      } else {
 #pragma unroll
       for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
         float m_prev = m_global, d_prev = d_global;
@@ -396,6 +452,7 @@ __device__ __forceinline__ void
         float other_o = o_g[o_offset];
         o_global = o_global * ptx_exp2(m_prev - m_global) +
                    other_o * ptx_exp2(other_m - m_global);
+      }
       }
       float out_f = __fdividef(o_global, d_global);
       if (sinks_ptr != nullptr) {

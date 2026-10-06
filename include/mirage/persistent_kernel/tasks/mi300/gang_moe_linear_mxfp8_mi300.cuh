@@ -1905,7 +1905,11 @@ template <int BATCH_SIZE,
           // its length is a template argument two levels down (SPLIT_ITERS on
           // the MFMA loop, SPLIT_LEN on the stage), so its two classes cannot
           // share an instantiation and the caller runs 1 and 2 as two loops.
-          int TILE_CLASS = 0>
+          int TILE_CLASS = 0,
+          // MPK_MOE_SHARED_EARLY, W13 only: EP_SHARED_PE ran the shared
+          // expert's W13 tiles ahead of routing, so they leave the owned
+          // subsequence. Default false is byte-for-byte the old decode.
+          bool SKIP_SHARED = false>
 __device__ __forceinline__ bool _gang_moe_mxfp8_tile(int tile_idx,
                                                      int const *d_mask,
                                                      int const *d_routing,
@@ -1989,7 +1993,7 @@ __device__ __forceinline__ bool _gang_moe_mxfp8_tile(int tile_idx,
         int const cand = d_mask[i];
         bool const owned =
             (cand >= EP_NUM_ROUTED)
-                ? (EP_MY_PE == EP_SHARED_PE)
+                ? (!SKIP_SHARED && EP_MY_PE == EP_SHARED_PE)
                 : (cand >= EP_BASE && cand < EP_BASE + EP_LOCAL_ROUTED);
         // At DUP_SHARED > 0 the shared expert consumes 1 + DUP_SHARED slots
         // instead of one. With mult == 1 `seen` still steps by exactly one
@@ -2121,7 +2125,13 @@ template <int BATCH_SIZE,
           // kernel runs WGS/W of its tiles instead of all of them, writing
           // its slice at the same offset in the rank-local scratch that W2
           // will read back. Must be set together with W2's.
-          int SHARED_KSHARD = 0>
+          int SHARED_KSHARD = 0,
+          // MPK_MOE_SHARED_EARLY. 0: the routed decode. 1: the same, minus
+          // the shared expert (it already ran). 2: one tile of the shared
+          // expert, tile_idx = its workgroup, with no routing read at all --
+          // its slot (NUM_TOPK - 1, after the routed ones) and token are
+          // fixed, which is what lets it run before the TopK.
+          int SHARED_MODE = 0>
 __device__ __noinline__ void
     gang_moe_w13_linear_mxfp8_kernel(void const *input_ptr,
                                      void const *weight_ptr,
@@ -2177,31 +2187,43 @@ __device__ __noinline__ void
   unsigned short *d_output = (unsigned short *)output_ptr;
 
   int expert_id, local_eid, tok_idx, wg_idx, topk_slot;
-  if (!_gang_moe_mxfp8_tile<BATCH_SIZE,
-                            NUM_EXPERTS,
-                            TILES_PER_EXPERT,
-                            EXPERT_WGS,
-                            EP_WORLD_SIZE,
-                            EP_MY_PE,
-                            EP_NUM_ROUTED,
-                            EP_SHARED_PE,
-                            // W13 ONLY. Its epilogue is a plain (or
-                            // write-through) store of a deterministic value,
-                            // so a duplicated tile rewrites the same bits and
-                            // the output is unchanged. Never set this on W2.
-                            /*DUP_SHARED=*/(MPK_SHARED_DUP),
-                            SHARED_KSHARD,
-                            /*SHARED_WG_DIV=*/(SHARED_KSHARD > 0
-                                                   ? SHARED_KSHARD
-                                                   : 1)>(
-                                          tile_idx,
-                                          (int const *)mask_ptr,
-                                          (int const *)routing_ptr,
-                                          &expert_id,
-                                          &local_eid,
-                                          &tok_idx,
-                                          &wg_idx,
-                                          &topk_slot)) {
+  if constexpr (SHARED_MODE == 2) {
+    static_assert(EP_WORLD_SIZE > 1 && SHARED_KSHARD == 0 &&
+                      MPK_SHARED_DUP == 0 && BATCH_SIZE == 1,
+                  "the early shared tile is the EP, one-row, unsharded case");
+    expert_id = EP_NUM_ROUTED;
+    local_eid = EP_NUM_ROUTED / EP_WORLD_SIZE;
+    tok_idx = 0;
+    wg_idx = tile_idx;
+    topk_slot = NUM_TOPK - 1;
+  } else if (!_gang_moe_mxfp8_tile<BATCH_SIZE,
+                                   NUM_EXPERTS,
+                                   TILES_PER_EXPERT,
+                                   EXPERT_WGS,
+                                   EP_WORLD_SIZE,
+                                   EP_MY_PE,
+                                   EP_NUM_ROUTED,
+                                   EP_SHARED_PE,
+                                   // W13 ONLY. Its epilogue is a plain (or
+                                   // write-through) store of a deterministic
+                                   // value, so a duplicated tile rewrites the
+                                   // same bits and the output is unchanged.
+                                   // Never set this on W2.
+                                   /*DUP_SHARED=*/(MPK_SHARED_DUP),
+                                   SHARED_KSHARD,
+                                   /*SHARED_WG_DIV=*/(SHARED_KSHARD > 0
+                                                          ? SHARED_KSHARD
+                                                          : 1),
+                                   /*TILE_CLASS=*/0,
+                                   /*SKIP_SHARED=*/(SHARED_MODE == 1)>(
+                 tile_idx,
+                 (int const *)mask_ptr,
+                 (int const *)routing_ptr,
+                 &expert_id,
+                 &local_eid,
+                 &tok_idx,
+                 &wg_idx,
+                 &topk_slot)) {
     return;
   }
 

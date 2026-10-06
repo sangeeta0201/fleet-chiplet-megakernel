@@ -370,6 +370,15 @@ static int run_suite() {
   rc |= run_case<32, WRITE_THROUGH>(1030);
   rc |= run_case<32, WRITE_THROUGH>(1537);
   rc |= run_case<32, WRITE_THROUGH>(2048);
+  // MPK_MLA_HEAD_LOCAL's wider splits: 1-2 tiles per chunk at 1k/1k, most
+  // chunks empty at a short sequence.
+  rc |= run_case<64, WRITE_THROUGH>(17);
+  rc |= run_case<64, WRITE_THROUGH>(1030);
+  rc |= run_case<64, WRITE_THROUGH>(2048);
+  rc |= run_case<128, WRITE_THROUGH>(17);
+  rc |= run_case<128, WRITE_THROUGH>(1030);
+  rc |= run_case<128, WRITE_THROUGH>(1537);
+  rc |= run_case<128, WRITE_THROUGH>(2048);
   return rc;
 }
 

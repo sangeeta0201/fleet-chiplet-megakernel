@@ -198,6 +198,11 @@ int main() {
   if (NUM_CHUNKS != 16) {
     rc |= run_case<true, 32>(NUM_CHUNKS, "wt=1 splits=32 active=all");
   }
+  // 64/128 chunks (MPK_MLA_HEAD_LOCAL): a 1030-token sequence leaves just
+  // over half of them occupied.
+  if (NUM_CHUNKS > 32) {
+    rc |= run_case<true, 32>(NUM_CHUNKS / 2 + 1, "wt=1 splits=32 active=half+1");
+  }
   rc |= run_case<false, 32>(16, "wt=0 splits=32 active=16");
   rc |= run_case<true, 32>(16, "wt=1 splits=32 active=16");
   rc |= run_case<true, 32>(15, "wt=1 splits=32 active=15");
