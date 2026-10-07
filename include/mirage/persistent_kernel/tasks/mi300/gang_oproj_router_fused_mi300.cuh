@@ -171,6 +171,33 @@ namespace kernel {
                    MPK_ABL_PIPE_W13W2 || !MPK_MOE_LIVE_BOUND)
 #error "MPK_MOE_TP replaces the EP tile spaces that KSHARD, SHARED_DUP and the W13/W2 pipe probe rewrite, and sizes its loops in the live-bound block"
 #endif
+// ── MPK_OPROJ_RP: row-parallel o_proj, one all-reduce instead of two gathers
+// The head-local attention leaves rank p holding v for its own heads only,
+// i.e. columns [p * K/EP, +K/EP) of o_proj's input. The column-sharded o_proj
+// needs the whole v row, so W_UV all-gathers it, and then o_proj all-gathers
+// its own output columns: two cross-rank rendezvous back to back. Reducing
+// over the rank's own K slice instead gives every rank a partial of the WHOLE
+// hidden row from local data, so W_UV's gather goes away and o_proj's becomes
+// an all-reduce: each tile pushes its rows of the f32 partial into slot
+// EP_MY_PE of every peer's slot buffer, the existing rendezvous covers the
+// pushes, and the router sums the EP_WORLD_SIZE slots in rank order (rank 0's
+// GEMV adds the residual) and rounds once, so every rank holds the identical
+// row. The slots sit in the layer's ep_gather past the fold's planes, which
+// nothing else touches.
+//
+// Probes at the TP-MoE default, NP=8 1024/1024: the W_UV gather alone is
+// 0.350 ms (7.818 -> 7.468), the o_proj gather 0.330, both 0.621.
+// MEASURED 2026-10-07, same setup, n=3 interleaved, G1 PASS: column 7.776 ->
+// RP 7.488 -> RP with W_UV absorbed into the per-rank weight (no W_UV phase)
+// 7.227 ms. NP=8 ppl512 2.5005 / 2.5957 / 2.4875. Defaulted on by demo.py,
+// which packs the weight; this define stays 0 for the same reason.
+#ifndef MPK_OPROJ_RP
+#define MPK_OPROJ_RP 0
+#endif
+#if MPK_OPROJ_RP && (defined(MPK_OPROJ_SKIP_PEER_WAIT) || \
+                     defined(MPK_WUV_SKIP_PEER_WAIT) || !MPK_OPROJ_MXFP4)
+#error "MPK_OPROJ_RP owns both exchanges, and its weight is packed MXFP4"
+#endif
 // One boolean for "the W13 ceiling probe forced the flat arrival", so the
 // self-heal's quota and the arrival cannot disagree across the #ifdef.
 #ifdef MPK_W13_EARLY_REL
@@ -333,7 +360,10 @@ __device__ __attribute__((always_inline)) void
         void *router_partials_ptr = nullptr,
         // MPK_BAR_TAGGED slot arrays (mpk_atoms.cuh). Null on the standalone
         // dispatch and outside ml_mode, which keeps every site on Mechanism C.
-        int *bar_tags = nullptr
+        int *bar_tags = nullptr,
+        // MPK_OPROJ_RP only: symmetric [EP_WORLD_SIZE, BATCH_SIZE,
+        // HIDDEN_SIZE] f32, slot p holding rank p's o_proj partial.
+        void *oproj_rp_slots_ptr = nullptr
 #if MPK_QKVA_PF_KB > 0
         ,
         // Next layer's qkv_a weight for this XCD. Null on the last layer of
@@ -619,7 +649,9 @@ __device__ __attribute__((always_inline)) void
     // exists. As a ceiling, 2026-09-25, NP=4, 1024/1024, 2 alternating reps,
     // decode median: control 9.748 -> 9.518 ms (-0.230). All three
     // cross-GPU deletions together: see MPK_QB_SKIP_PEER_WAIT.
-#ifdef MPK_WUV_SKIP_PEER_WAIT
+#if defined(MPK_WUV_SKIP_PEER_WAIT) || MPK_OPROJ_RP
+    // Under MPK_OPROJ_RP o_proj reduces over this rank's own v columns only,
+    // so the gather has no reader.
     (void)wuv_all_mapped;
     bool const wuv_push = false;
 #else
@@ -1002,6 +1034,24 @@ __device__ __attribute__((always_inline)) void
     bool const oproj_tp =
         (EP_WORLD_SIZE > 1) && (ep_signal_ptr != nullptr) &&
         (oproj_tiles_per_xcd * OPROJ_ROWS_PER_WG * 8 == OPROJ_TP_COLS);
+    // MPK_OPROJ_RP: every rank covers the whole row over its own K slice.
+    constexpr bool OPROJ_RP = MPK_OPROJ_RP && (EP_WORLD_SIZE > 1);
+    constexpr int OPROJ_K =
+        OPROJ_RP ? OPROJ_REDUCTION_SIZE / EP_WORLD_SIZE : OPROJ_REDUCTION_SIZE;
+    // The rank's K slice is its own heads' columns of the activation row: v
+    // un-absorbed, or the latent attn_out with W_UV folded into the weight.
+    static_assert(!OPROJ_RP || (BATCH_SIZE == 1 &&
+                                OPROJ_REDUCTION_SIZE % EP_WORLD_SIZE == 0),
+                  "row-parallel o_proj reduces one row over the rank's own "
+                  "slice of the activation row");
+    bool const oproj_rp =
+        OPROJ_RP && (ep_signal_ptr != nullptr) &&
+        (oproj_rp_slots_ptr != nullptr) &&
+        (oproj_tiles_per_xcd * OPROJ_ROWS_PER_WG * 8 == HIDDEN_SIZE);
+    if (OPROJ_RP && !oproj_rp) {
+      // The weight is packed as a K slice; any other path reads it wrong.
+      __builtin_trap();
+    }
     // The output columns and the residual columns are the SAME columns, so both
     // are derived here from one base rather than the output being offset by the
     // kernel and the residual by the input partition map -- which has no rank
@@ -1011,6 +1061,13 @@ __device__ __attribute__((always_inline)) void
         static_cast<size_t>(xcd_id) * oproj_tiles_per_xcd * OPROJ_ROWS_PER_WG;
     unsigned short *const xcd_out =
         static_cast<unsigned short *>(hidden_ptr) + oproj_col_base;
+    // Under RP the tile writes its f32 partial into this rank's slot, which
+    // the push below copies to the same offset on every peer. f32 so the
+    // cross-rank sum rounds once, as the column form does.
+    float *const xcd_out_rp =
+        OPROJ_RP ? static_cast<float *>(oproj_rp_slots_ptr) +
+                       (size_t)EP_MY_PE * HIDDEN_SIZE + oproj_col_base
+                 : nullptr;
     unsigned short const *const xcd_res =
         static_cast<unsigned short const *>(oproj_residual_ptr) +
         oproj_col_base;
@@ -1019,8 +1076,8 @@ __device__ __attribute__((always_inline)) void
     // either; that is the property the Phase-9 fold relies on too.
     constexpr int OPROJ_NPEER = (EP_WORLD_SIZE > 1) ? (EP_WORLD_SIZE - 1) : 1;
     int64_t oproj_peer_delta[OPROJ_NPEER];
-    bool oproj_all_mapped = oproj_tp;
-    if (oproj_tp) {
+    bool oproj_all_mapped = oproj_tp || oproj_rp;
+    if (oproj_tp || oproj_rp) {
 #pragma unroll
       for (int q = 0; q < OPROJ_NPEER; q++) {
         oproj_peer_delta[q] = 0;
@@ -1050,7 +1107,7 @@ __device__ __attribute__((always_inline)) void
     (void)oproj_all_mapped;
     bool const oproj_push = false;
 #else
-    bool const oproj_push = oproj_tp && oproj_all_mapped;
+    bool const oproj_push = (oproj_tp || oproj_rp) && oproj_all_mapped;
 #endif
     // The fold rides the same shard: it is exactly the o_proj column slice
     // that makes each rank's share of the two contractions well defined, so
@@ -1080,22 +1137,38 @@ __device__ __attribute__((always_inline)) void
       // stage_a. The switch is compile-time because the host packer is
       // switched by the same env var and a runtime branch would leave both
       // bodies in the binary for no reason.
+      // RP reduces over the rank's own K slice of the activation row.
+      void const *const oproj_act =
+          OPROJ_RP ? (void const *)(static_cast<unsigned short const *>(
+                                        UNABSORB_V ? (void const *)v_out_ptr
+                                                   : oproj_input_ptr) +
+                                    (size_t)EP_MY_PE * OPROJ_K)
+          : UNABSORB_V ? (void const *)v_out_ptr
+                       : oproj_input_ptr;
 #if MPK_OPROJ_MXFP4
       gang_gemv_mxfp4_kernel<BATCH_SIZE,
+                             OPROJ_K,
+                             OPROJ_ROWS_PER_WG,
+                             // RP: the residual rides rank 0's partial only.
+                             /*HAS_RESIDUAL=*/!OPROJ_RP || EP_MY_PE == 0,
+                             /*WRITE_THROUGH=*/true,
+                             /*F32_OUT=*/OPROJ_RP>(
+          oproj_act,
+          oproj_weight_ptr,
+          xcd_res,
+          OPROJ_RP ? (void *)xcd_out_rp : (void *)xcd_out,
+          num_active_tokens,
 #else
       gang_gemv_mxfp8_kernel<BATCH_SIZE,
-#endif
-                             OPROJ_REDUCTION_SIZE,
+                             OPROJ_K,
                              OPROJ_ROWS_PER_WG,
                              /*HAS_RESIDUAL=*/true,
-                             /*WRITE_THROUGH=*/true>(UNABSORB_V
-                                                         ? (void const *)
-                                                               v_out_ptr
-                                                         : oproj_input_ptr,
+                             /*WRITE_THROUGH=*/true>(oproj_act,
                                                      oproj_weight_ptr,
                                                      xcd_res,
                                                      xcd_out,
                                                      num_active_tokens,
+#endif
                                                      OPROJ_ROWS_PER_WG,
                                                      HIDDEN_SIZE,
                                                      /*m_tiles=*/1,
@@ -1125,11 +1198,16 @@ __device__ __attribute__((always_inline)) void
         static_assert((OPROJ_ROWS_PER_WG % 2) == 0,
                       "peer stores are packed 32-bit, so a tile must be an "
                       "even number of bf16");
-        constexpr int OPROJ_TILE_W32 = OPROJ_ROWS_PER_WG / 2;
+        // RP pushes f32 partials: a dword per row.
+        constexpr int OPROJ_TILE_W32 =
+            OPROJ_RP ? OPROJ_ROWS_PER_WG : OPROJ_ROWS_PER_WG / 2;
         __syncthreads();
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-        unsigned int *const src32 = reinterpret_cast<unsigned int *>(
-            xcd_out + (size_t)t * OPROJ_ROWS_PER_WG);
+        unsigned int *const src32 =
+            OPROJ_RP ? reinterpret_cast<unsigned int *>(
+                           xcd_out_rp + (size_t)t * OPROJ_ROWS_PER_WG)
+                     : reinterpret_cast<unsigned int *>(
+                           xcd_out + (size_t)t * OPROJ_ROWS_PER_WG);
         // Every live query row, not just the first. The GEMV above writes
         // rows [0, num_active_tokens) of this tile's columns; the all-gather
         // has to carry all of them or a peer's copy of row m > 0 keeps
@@ -1457,7 +1535,10 @@ __device__ __attribute__((always_inline)) void
                                            TOPK_K,
                                            /*SIGMOID_BIAS=*/true,
                                            /*OPROJ_BARRIER=*/true,
-                                           ROUTER_EXPERTS_PER_TILE>(
+                                           ROUTER_EXPERTS_PER_TILE,
+                                           /*SUM_SLOTS=*/OPROJ_RP
+                                               ? EP_WORLD_SIZE
+                                               : 0>(
           hidden_ptr,
           norm_weight_ptr,
           norm_output_ptr,
@@ -1496,7 +1577,10 @@ __device__ __attribute__((always_inline)) void
                       : nullptr,
           /*folded_ranks=*/router_fold ? EP_WORLD_SIZE : 0,
           /*folded_stride=*/NUM_EXPERTS + 1,
-          /*folded_expert_base=*/xcd_id * (NUM_EXPERTS / 8));
+          /*folded_expert_base=*/xcd_id * (NUM_EXPERTS / 8),
+          /*sum_slots=*/oproj_rp_slots_ptr,
+          /*sum_hidden_out=*/hidden_ptr,
+          /*sum_tile=*/xcd_id * router_tile_n + t);
     }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     {

@@ -100,7 +100,10 @@ template <int BATCH_SIZE, // = m_per_tile
           int REDUCTION_SIZE,
           int ROWS_PER_WG,
           bool HAS_RESIDUAL,
-          bool WRITE_THROUGH = false>
+          bool WRITE_THROUGH = false,
+          // output_ptr is f32 rather than bf16: a partial that is summed
+          // across ranks before it is rounded (MPK_OPROJ_RP).
+          bool F32_OUT = false>
 __device__ __noinline__ void
     gang_gemv_mxfp4_kernel(void const *input_ptr,
                            void const *weight_ptr,
@@ -349,7 +352,14 @@ __device__ __noinline__ void
       if constexpr (HAS_RESIDUAL) {
         v += b2f(ld_g<unsigned short>(R + idx));
       }
-      if constexpr (WRITE_THROUGH) {
+      if constexpr (F32_OUT) {
+        float *const Of = static_cast<float *>(output_ptr);
+        if constexpr (WRITE_THROUGH) {
+          st_wt_u32(&Of[idx], __float_as_uint(v));
+        } else {
+          Of[idx] = v;
+        }
+      } else if constexpr (WRITE_THROUGH) {
         unsigned short const o = f2b(v);
         st_wt_u16(&O[idx], o);
       } else {

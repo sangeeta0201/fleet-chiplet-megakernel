@@ -4332,12 +4332,21 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
   // identical, so the format is not recoverable from the shape alone -- but
   // this registration only needs the row to be one of the two, and the
   // compile-time flag that picks the kernel body also picks the packer.
+  // MPK_OPROJ_RP packs each rank's 1/world-th K slice instead, at MXFP4.
+  char const *oproj_rp_env = std::getenv("MPK_OPROJ_RP");
+  bool const oproj_rp =
+      oproj_rp_env != nullptr && std::string(oproj_rp_env) == "1";
+  int const oproj_k_rp =
+      ep_world_size > 0 ? oproj_reduction_size / ep_world_size : 0;
   assert((input_ops[15]->dtensor.dim[1] ==
               oproj_rows_per_wg *
                   (oproj_reduction_size + oproj_reduction_size / 32) ||
           input_ops[15]->dtensor.dim[1] ==
               oproj_rows_per_wg *
-                  (oproj_reduction_size / 2 + oproj_reduction_size / 32)) &&
+                  (oproj_reduction_size / 2 + oproj_reduction_size / 32) ||
+          (oproj_rp && ep_inline &&
+           input_ops[15]->dtensor.dim[1] ==
+               oproj_rows_per_wg * (oproj_k_rp / 2 + oproj_k_rp / 32))) &&
          "o_proj weight is not packed at this reduction and row count");
   // Either the whole row, or this rank's 1/world-th of it under output-wise
   // sharded o_proj followed by the in-kernel all-gather. The kernel detects

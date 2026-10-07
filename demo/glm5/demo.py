@@ -2351,7 +2351,18 @@ if __name__ == "__main__":
         # o_proj differ only in rounding.
         o_proj_red_absorbed = o_proj_red
         o_proj_red_unabsorbed = num_heads * v_head
-        UNABSORB_V = (int(os.environ.get("GLM_UNABSORB_OPROJ", "1")) == 1
+        # Except under the row-parallel o_proj (MPK_OPROJ_RP, below), where a
+        # rank's K slice of the absorbed weight is its own heads' latent
+        # attn_out: the W_UV phase and its barrier go, for 6144 x 4096 of
+        # MXFP4 per rank instead of 6144 x 2048 plus W_UV. MEASURED
+        # 2026-10-07, NP=8, 1024/1024, n=3 interleaved, G1 PASS, coherent
+        # text: column o_proj 7.776, RP un-absorbed 7.488, RP absorbed 7.227
+        # ms; NP=8 ppl512 2.5005 / 2.5957 / 2.4875. RP's own eligibility is
+        # re-checked below; this only picks the default.
+        _rp_hint = (os.environ.get("MPK_OPROJ_RP") != "0" and moe_ep
+                    and FUSE_FULL_LAYER and bs == 1)
+        UNABSORB_V = (int(os.environ.get("GLM_UNABSORB_OPROJ",
+                                         "0" if _rp_hint else "1")) == 1
                       and v_head < kv_lora
                       and o_proj_red_unabsorbed % 256 == 0
                       # Phase 8b walks attn_out head by head at a stride of
@@ -2583,6 +2594,43 @@ if __name__ == "__main__":
         oproj_tp_cols = hidden_size // world_size if oproj_tp else hidden_size
         print(f"[CFG] o_proj tp={int(oproj_tp)} cols_per_rank={oproj_tp_cols} "
               f"tiles_per_xcd={oproj_tp_cols // 8 // oproj_tile_n}")
+        # ── row-parallel o_proj in the fused layers (MPK_OPROJ_RP) ────────
+        # The W_UV shard leaves rank p with v for its own heads only, which is
+        # exactly o_proj's K slice [p * K/EP, +that). Reducing over it gives
+        # every rank a partial of the whole hidden row, so the W_UV gather
+        # goes and o_proj's gather becomes an all-reduce (note at the define
+        # in gang_oproj_router_fused_mi300.cuh). The dense prologue keeps the
+        # column shard above. The kernel and the registrar read the same
+        # variable, so it is the switch.
+        OPROJ_RP_ROWS = hidden_size // 8 // OPROJ_TILES_PER_XCD
+        # Un-absorbed the rank's K slice is its heads' v, which needs the W_UV
+        # shard to produce it locally; absorbed (GLM_UNABSORB_OPROJ=0) it is
+        # its heads' latent attn_out and there is no W_UV phase.
+        _rp_k = (o_proj_red_unabsorbed if UNABSORB_V
+                 else o_proj_red) // world_size
+        _rp_ok = (oproj_tp_eligible and OPROJ_MXFP4
+                  and (wuv_tp or not UNABSORB_V) and bs == 1
+                  and o_proj_red == num_heads * kv_lora
+                  and OPROJ_RP_ROWS & (OPROJ_RP_ROWS - 1) == 0
+                  and _rp_k % ((256 // OPROJ_RP_ROWS) * 32) == 0)
+        # MEASURED 2026-10-07, NP=8 GPUs 0-7, 1024/1024, decode median, n=3
+        # interleaved, G1 PASS, coherent text, f32 partials: column 7.771
+        # 7.787 7.771 -> RP 7.471 7.485 7.508 (-0.288) -> RP with W_UV
+        # absorbed (the default above) 7.231 7.231 7.218 (-0.549). Tokens
+        # first differ from the column form at 92-94 of 1024, where the
+        # roundings meet a near-tie. On wherever it applies; written back
+        # because persistent_kernel.py and the registrar read the same
+        # variable.
+        _rp_env = os.environ.get("MPK_OPROJ_RP")
+        OPROJ_RP = _rp_ok if _rp_env is None else _rp_env == "1"
+        os.environ["MPK_OPROJ_RP"] = "1" if OPROJ_RP else "0"
+        if OPROJ_RP:
+            assert _rp_ok, (
+                "MPK_OPROJ_RP needs the fused MXFP4 o_proj, whole heads per "
+                "rank (the W_UV shard if un-absorbed) and one row")
+            print(f"[CFG] o_proj rp=1 absorbed={int(not UNABSORB_V)} "
+                  f"k_per_rank={_rp_k} rows={OPROJ_RP_ROWS} "
+                  f"tiles_per_xcd={OPROJ_TILES_PER_XCD}")
         # ── the same shard for the DENSE prologue's o_proj ────────────────
         # The three dense layers were left out of the shard above because they
         # have no fused whole-layer task to rendezvous inside. That left them
@@ -2979,9 +3027,17 @@ if __name__ == "__main__":
         ep_signal = None
         router_partials = None
         if moe_ep:
+            # The tails (main, and MTP's) fold and return before o_proj, and
+            # the LM head reads exactly world_size planes from them.
+            _ep_tail_slots = {num_layers} | (
+                {num_layers + 2} if mtp_in_graph else set())
             ep_gather_list = [
                 mpk.new_tensor(
-                    dims=(world_size, bs, hidden_size),
+                    # MPK_OPROJ_RP's f32 o_proj partials take 2 * world_size
+                    # more bf16 planes; the fold reads the first world_size.
+                    dims=(world_size * (3 if OPROJ_RP and
+                                        li not in _ep_tail_slots else 1),
+                          bs, hidden_size),
                     dtype=mi.bfloat16,
                     name=f"ep_gather_{li}",
                     io_category="nvshmem_tensor",
@@ -3610,7 +3666,12 @@ if __name__ == "__main__":
                     attn.o_proj.weight.data, attn._w_uv,
                     num_heads, v_head, kv_lora).to(torch.bfloat16)
                 o_w = pad_cols(o_w, layer_o_proj_red)
-            if oproj_tp and (fuse_full_layer or dense_tp_this):
+            if OPROJ_RP and fuse_full_layer:
+                # This rank's K slice: its own heads' v columns, the same
+                # slice the W_UV shard produces.
+                _kr = layer_o_proj_red // world_size
+                o_w = o_w[:, rank * _kr:(rank + 1) * _kr].contiguous()
+            elif oproj_tp and (fuse_full_layer or dense_tp_this):
                 # Keep only the output rows this rank owns. Everything
                 # downstream follows from dim 0: oproj_tiles_per_xcd is
                 # oproj_weight.dim(0) // 8, so the tile count drops from 48 to
@@ -3634,7 +3695,10 @@ if __name__ == "__main__":
                 # nibble-packed row -- it asserts on the row width first, which
                 # is how this was caught. Three of 78 layers, so leaving them
                 # MXFP8 costs nothing measurable.
-                o_w = pack_dense_mxfp8(o_w, oproj_tile_n,
+                o_w = pack_dense_mxfp8(o_w,
+                                       OPROJ_RP_ROWS
+                                       if OPROJ_RP and fuse_full_layer
+                                       else oproj_tile_n,
                                        fake_fp4=FAKE_MXFP4_ATTN,
                                        fp4=OPROJ_MXFP4 and fuse_full_layer)
             w_o = _attach_input_keep(o_w, f"layer_{i}_o_absorbed")
@@ -4247,7 +4311,8 @@ if __name__ == "__main__":
                     q_workspace_slots=(num_heads if unabsorb_k_this
                                        else qb_head_slots),
                     merge_dim_splits=MLA_MERGE_DIM_SPLITS,
-                    oproj_rows_per_wg=oproj_tile_n,
+                    oproj_rows_per_wg=(OPROJ_RP_ROWS if OPROJ_RP
+                                       else oproj_tile_n),
                     oproj_reduction_size=layer_o_proj_red,
                     wuv_mxfp8_weight=w_wuv,
                     v_out=mla_v_out if unabsorb_this else None,

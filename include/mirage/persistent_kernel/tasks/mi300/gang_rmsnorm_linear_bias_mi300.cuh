@@ -762,7 +762,13 @@ template <typename T,
           // reductions and the arrival atomic to add one dot product. The row
           // read, the RMSNorm and the normed write are all shared across a
           // tile's experts; only the gate row and the accumulator are not.
-          int EXPERTS_PER_TILE = 1>
+          int EXPERTS_PER_TILE = 1,
+          // MPK_OPROJ_RP: the row is not in norm_input_ptr but split over
+          // SUM_SLOTS f32 rank partials at `sum_slots`, REDUCTION_SIZE apart.
+          // Step 1 sums them in slot order and rounds to bf16 once -- the same
+          // row on every rank -- keeps it in registers for Step 2, and writes
+          // this tile's 1/total_gang_tiles share of it to `sum_hidden_out`.
+          int SUM_SLOTS = 0>
 __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     void const *norm_input_ptr,  // input_ptrs[0]: [batch, REDUCTION_SIZE]
     void const *norm_weight_ptr, // input_ptrs[1]: [REDUCTION_SIZE]
@@ -825,7 +831,12 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     float const *folded_lines = nullptr,
     int folded_ranks = 0,
     int folded_stride = 0,
-    int folded_expert_base = 0) {
+    int folded_expert_base = 0,
+    // SUM_SLOTS > 0 only; see the template parameter. sum_tile is this
+    // tile's index among the total_gang_tiles.
+    void const *sum_slots = nullptr,
+    void *sum_hidden_out = nullptr,
+    int sum_tile = 0) {
 
   using bf16 = __hip_bfloat16;
   bf16 const *__restrict__ d_hidden = static_cast<bf16 const *>(norm_input_ptr);
@@ -1061,13 +1072,64 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   // read-then-overwrite ordering that made a single red[0] safe stops being
   // obvious. BATCH_SIZE floats of LDS is not a number worth being clever for.
   __shared__ float s_irms[BATCH_SIZE];
-  bool const irms_cached = (irms_cache != nullptr) && (irms_cache[0] > 0.0f);
+  // SUM_SLOTS keeps the summed row for Step 2, so it cannot skip Step 1.
+  bool const irms_cached = (SUM_SLOTS == 0) && (irms_cache != nullptr) &&
+                           (irms_cache[0] > 0.0f);
   float ssq[BATCH_SIZE];
 #pragma unroll
   for (int m = 0; m < BATCH_SIZE; m++) {
     ssq[m] = 0.0f;
   }
-  if (!irms_cached && !folded) {
+  constexpr int SUM_ITERS = (SUM_SLOTS > 0) ? MAX_ITERS_PF : 1;
+  float hs[SUM_ITERS][4];
+  if constexpr (SUM_SLOTS > 0) {
+    static_assert(BATCH_SIZE == 1 && OPROJ_BARRIER &&
+                      REDUCTION_SIZE % (4 * 256) == 0,
+                  "the slot sum walks one row in whole 256 x 4 passes, the "
+                  "same walk Step 2's prefetch path indexes");
+    typedef float sum_f4_t __attribute__((ext_vector_type(4)));
+    float const *const sl = static_cast<float const *>(sum_slots);
+    unsigned short *const hout = static_cast<unsigned short *>(sum_hidden_out);
+    int const q_per = H4_PF / total_gang_tiles;
+    if (q_per * total_gang_tiles != H4_PF) {
+      __builtin_trap();
+    }
+    int const q_lo = sum_tile * q_per;
+#pragma unroll
+    for (int iter = 0; iter < SUM_ITERS; iter++) {
+      int const i = tid + iter * 256;
+      int const base = i * 4;
+      sum_f4_t pk[SUM_SLOTS];
+#pragma unroll
+      for (int p = 0; p < SUM_SLOTS; p++) {
+        pk[p] = *reinterpret_cast<sum_f4_t const *>(
+            sl + (size_t)p * REDUCTION_SIZE + base);
+      }
+      float f[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+      for (int p = 0; p < SUM_SLOTS; p++) {
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          f[j] += pk[p][j];
+        }
+      }
+      unsigned b[4];
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        bf16 const r = __float2bfloat16(f[j]);
+        unsigned short u;
+        __builtin_memcpy(&u, &r, 2);
+        b[j] = u;
+        hs[iter][j] = __uint_as_float(b[j] << 16);
+        ssq[0] += hs[iter][j] * hs[iter][j];
+      }
+      if (i >= q_lo && i < q_lo + q_per) {
+        st_wt_u64((void *)(hout + base),
+                  (unsigned long long)(b[0] | (b[1] << 16)) |
+                      ((unsigned long long)(b[2] | (b[3] << 16)) << 32));
+      }
+    }
+  } else if (!irms_cached && !folded) {
     int const h4 = REDUCTION_SIZE >> 2;
     for (int i = tid; i < h4; i += (int)MPK_NT) {
       int base = i * 4;
@@ -1288,11 +1350,19 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
       // was.
 #pragma unroll
       for (int m = 0; m < BATCH_SIZE; m++) {
-        bf16 const *hr = d_hidden + (size_t)m * REDUCTION_SIZE;
-        float h0 = __bfloat162float(hr[base]);
-        float h1 = __bfloat162float(hr[base + 1]);
-        float h2 = __bfloat162float(hr[base + 2]);
-        float h3 = __bfloat162float(hr[base + 3]);
+        float h0, h1, h2, h3;
+        if constexpr (SUM_SLOTS > 0) {
+          h0 = hs[iter][0];
+          h1 = hs[iter][1];
+          h2 = hs[iter][2];
+          h3 = hs[iter][3];
+        } else {
+          bf16 const *hr = d_hidden + (size_t)m * REDUCTION_SIZE;
+          h0 = __bfloat162float(hr[base]);
+          h1 = __bfloat162float(hr[base + 1]);
+          h2 = __bfloat162float(hr[base + 2]);
+          h3 = __bfloat162float(hr[base + 3]);
+        }
 
         float n0 = h0 * irms[m] * __bfloat162float(gp[0]);
         float n1 = h1 * irms[m] * __bfloat162float(gp[1]);

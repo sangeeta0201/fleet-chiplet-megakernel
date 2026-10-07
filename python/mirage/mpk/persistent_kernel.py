@@ -1673,6 +1673,11 @@ def get_compile_command(
             _kp = os.environ.get("MPK_MOE_TP_W2_KPARTS", "1")
             assert _kp in ("1", "2"), "MPK_MOE_TP_W2_KPARTS is 1 or 2"
             flags = flags + [f"-DMPK_MOE_TP_W2_KPARTS={_kp}"]
+        # Row-parallel o_proj (note at the define in
+        # gang_oproj_router_fused_mi300.cuh). The demo packs the K slice and
+        # widens ep_gather from the same variable.
+        if os.environ.get("MPK_OPROJ_RP", "0") == "1":
+            flags = flags + ["-DMPK_OPROJ_RP=1"]
         _moe_afp8 = os.environ.get("MPK_MOE_ACT_FP8")
         if _moe_afp8 is not None:
             # W13 emits the SwiGLU result as MXFP8 (E4M3 + one E8M0 per 32) and
@@ -3325,7 +3330,11 @@ class PersistentKernel:
                 "the EP fold needs both ep_gather and ep_signal"
             assert self.world_size > 1, "the EP fold needs world_size > 1"
             assert ep_gather.num_dims == 3   # (world_size, batch, hidden)
-            assert ep_gather.dim(0) == self.world_size
+            # MPK_OPROJ_RP's f32 o_proj partials take 2 * world_size more
+            # bf16 planes; the tail variant returns before o_proj.
+            assert ep_gather.dim(0) == self.world_size * (
+                3 if os.environ.get("MPK_OPROJ_RP", "0") == "1"
+                and not ep_tail_only else 1)
             assert 0 <= ep_fold_rank < self.world_size
             # One 64-byte line per PE, so a peer's signal store never shares a
             # line with another's. int32 units because mi.uint64 has no
@@ -3462,12 +3471,15 @@ class PersistentKernel:
         # MXFP8 stores K data bytes a row, MXFP4 K/2; the scale half is K/32
         # either way. Accept both and let the width say which, so the check
         # still catches a genuinely wrong shape without needing the flag
-        # threaded down here.
+        # threaded down here. MPK_OPROJ_RP packs the rank's K slice at MXFP4.
+        _oproj_k_rp = oproj_reduction_size // max(1, self.world_size)
         assert oproj_mxfp8_weight.dim(1) in (
             oproj_rows_per_wg * (oproj_reduction_size +
                                  oproj_reduction_size // 32),
             oproj_rows_per_wg * (oproj_reduction_size // 2 +
-                                 oproj_reduction_size // 32)), (
+                                 oproj_reduction_size // 32),
+            *((oproj_rows_per_wg * (_oproj_k_rp // 2 + _oproj_k_rp // 32),)
+              if os.environ.get("MPK_OPROJ_RP", "0") == "1" else ())), (
             oproj_mxfp8_weight.dim(1), oproj_rows_per_wg, oproj_reduction_size)
         unabsorb_v = wuv_mxfp8_weight is not None
         if unabsorb_v:

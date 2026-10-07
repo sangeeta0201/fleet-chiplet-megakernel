@@ -2145,13 +2145,17 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       // MXFP4; the E8M0 scale half is one byte per 32 either way. This is not
       // cosmetic: PF_WG_BYTES is both the buffer resource's range and the
       // per-tile voffset stride, so an MXFP8 width over an MXFP4 tensor walks
-      // past the end of the allocation and faults.
+      // past the end of the allocation and faults. Likewise MPK_OPROJ_RP's
+      // tile reduces over the rank's K slice only.
+      constexpr int PF_K = (MPK_OPROJ_RP && EP_WORLD_SIZE > 1)
+                               ? OPROJ_REDUCTION_SIZE / EP_WORLD_SIZE
+                               : OPROJ_REDUCTION_SIZE;
 #if MPK_OPROJ_MXFP4
-      constexpr int PF_WG_DATA = OPROJ_ROWS_PER_WG * (OPROJ_REDUCTION_SIZE / 2);
+      constexpr int PF_WG_DATA = OPROJ_ROWS_PER_WG * (PF_K / 2);
 #else
-      constexpr int PF_WG_DATA = OPROJ_ROWS_PER_WG * OPROJ_REDUCTION_SIZE;
+      constexpr int PF_WG_DATA = OPROJ_ROWS_PER_WG * PF_K;
 #endif
-      constexpr int PF_WG_SCALE = OPROJ_ROWS_PER_WG * (OPROJ_REDUCTION_SIZE / 32);
+      constexpr int PF_WG_SCALE = OPROJ_ROWS_PER_WG * (PF_K / 32);
       constexpr int PF_WG_BYTES = PF_WG_DATA + PF_WG_SCALE;
       constexpr int PF_N16 = (PF_WG_BYTES + 15) / 16;
       constexpr int PF_LPT = (PF_N16 + 255) / 256;
@@ -2492,7 +2496,14 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       (ROUTER_FOLD && ml_mode) ? input_ptrs[FL_ROUTER_WT_IN] : nullptr,
       /*router_partials=*/
       (ROUTER_FOLD && ml_mode) ? input_ptrs[FL_ROUTER_PARTS_IN] : nullptr,
-      bar_tags
+      bar_tags,
+      // MPK_OPROJ_RP: the f32 o_proj partials take the planes of this
+      // layer's ep_gather past the fold's, which demo.py allocates triple.
+      /*oproj_rp_slots=*/
+      (MPK_OPROJ_RP && EP_WORLD_SIZE > 1 && ml_mode)
+          ? (void *)(static_cast<unsigned short *>(input_ptrs[27]) +
+                     (size_t)EP_WORLD_SIZE * BATCH_SIZE * QKV_REDUCTION_SIZE)
+          : nullptr
 #if MPK_QKVA_PF_KB > 0
       ,
       /*next_qkv_weight=*/input_ptrs[MPK_QKVA_PF_SLOT]
