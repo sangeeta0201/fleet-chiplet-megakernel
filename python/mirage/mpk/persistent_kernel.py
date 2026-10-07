@@ -1530,8 +1530,10 @@ def get_compile_command(
             # (gang_moe_linear_mxfp8_mi300.cuh).
             "MPK_MOE_TP_W2_PF",
             # The router TopK takes its winners' scores by shuffle instead of
-            # re-reading them (moe_topk_sigmoid_bias_mi300.cuh).
+            # re-reading them, and skips its two 256-store clears on the fused
+            # one-row path (moe_topk_sigmoid_bias_mi300.cuh).
             "MPK_TOPK_WIN_SHFL",
+            "MPK_TOPK_SKIP_CLEARS",
         ):
             _x = os.environ.get(_v)
             if _x is not None:

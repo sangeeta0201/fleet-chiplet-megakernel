@@ -619,7 +619,9 @@ __device__ __attribute__((noinline)) void
                                     /*WARPS_PER_CTA=*/4,
                                     /*BYTES_PER_LDG=*/16,
                                     /*K_STATIC=*/K,
-                                    ROUTING_ROW_STRIDE>(
+                                    ROUTING_ROW_STRIDE,
+                                    /*SKIP_CLEARS=*/(MPK_TOPK_SKIP_CLEARS &&
+                                                     ROUTING_ROW_STRIDE == 1)>(
       logits_base,
       bias_ptr,
       topk_weight_ptr,

@@ -51,8 +51,20 @@
 
 // MPK_TOPK_WIN_SHFL: take the eight winners' scores from the lanes that hold
 // them instead of re-reading their logits; see the sort-then-merge path.
+// MEASURED NEUTRAL alone (2026-10-07, NP=8 1024/1024 n=3: 7.804 on vs
+// 7.778 off, overlapping): selection 1986 -> 900 ns, but the store drain it
+// used to absorb moved into the logit clear (448 -> 1599). See SKIP_CLEARS.
+// Off by default.
 #ifndef MPK_TOPK_WIN_SHFL
-#define MPK_TOPK_WIN_SHFL 1
+#define MPK_TOPK_WIN_SHFL 0
+#endif
+// MPK_TOPK_SKIP_CLEARS: the fused router passes SKIP_CLEARS (one row only).
+// MEASURED NEUTRAL with either winner path (2026-10-07, NP=8 1024/1024,
+// n=3 each, tokens identical to control): control 7.809, skip 7.812,
+// skip + old winners 7.791. The router's serial tail is not what the MoE
+// start waits on at this point. Off by default.
+#ifndef MPK_TOPK_SKIP_CLEARS
+#define MPK_TOPK_SKIP_CLEARS 0
 #endif
 
 namespace kernel {
@@ -110,7 +122,16 @@ template <typename T,
           //
           // 0 keeps the old behaviour (stride == num_rows) for callers that
           // have no BATCH_SIZE to hand.
-          int ROUTING_ROW_STRIDE = 0>
+          int ROUTING_ROW_STRIDE = 0,
+          // Skip the routing_indices zero fill and the logit-row clear. Only
+          // for the fused one-row router: there the router GEMV overwrites
+          // every logit each layer (st_wt, no split-K accumulation), and the
+          // MoE tiles read routing_indices only at experts active_expert_ids
+          // names, all of which this kernel rewrites. Both fills are 256
+          // stores each, and on gfx950 the in-order vmcnt makes every later
+          // wait in this tail drain them first (SP7: moving the winners'
+          // re-read off memory just moved that drain into the clear).
+          bool SKIP_CLEARS = false>
 __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
     void *__restrict__ input_ptr, // [num_rows, NUM_EXPERTS]
     void *__restrict__ bias_ptr,  // [NUM_EXPERTS] e_score_correction_bias
@@ -152,8 +173,8 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
   // Initialize routing indices to 0.
   // active_expert_ids initialization is NOT needed: we write directly to
   // active_expert_ids[0..k-1] during TopK and set the count after.
-  for (int expert = start_expert + threadIdx.x; expert < end_expert;
-       expert += MPK_NT) {
+  for (int expert = start_expert + threadIdx.x;
+       !SKIP_CLEARS && expert < end_expert; expert += MPK_NT) {
     if (routing_indices != nullptr) {
       for (int row = 0; row < rstride; ++row) {
         routing_indices[expert * rstride + row] = 0;
@@ -563,7 +584,7 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
 #if !MPK_TOPK_WIN_SHFL
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 #endif
-    for (int ldg = 0; ldg < LDG_PER_THREAD; ++ldg) {
+    for (int ldg = 0; !SKIP_CLEARS && ldg < LDG_PER_THREAD; ++ldg) {
       int src_offset = ldg * THREADS_PER_ROW * ELTS_PER_LDG;
       for (int e = 0; e < ELTS_PER_LDG; ++e) {
         thread_read_ptr[src_offset + e] = static_cast<T>(0);
