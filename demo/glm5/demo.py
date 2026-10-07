@@ -1743,7 +1743,17 @@ if __name__ == "__main__":
         # 16 is the remaining value; it is the K-parallel path at 3 rounds,
         # whose W2 twin measured -1.34 ms. W13 width is closed in both
         # directions at NP=4.
-        MOE_W13_OPW = int(os.environ.get("GLM_MOE_W13_OPW", "64"))
+        # Under MPK_MOE_TP W13 is 9 slots x (512/OPW) tiles, 9 per XCD at 64:
+        # a third of the workers, each wave too short of bytes in flight to
+        # reach the roof. 32 is the K_HALF shape (two row groups x two
+        # reduction halves; gang_moe_linear_mxfp8_mi300.cuh), 18 tiles per
+        # XCD. MEASURED 2026-10-06, NP=8 1024/1024, n=3 each, one batch, G1
+        # PASS, generated tokens identical across all nine runs:
+        #   OPW 64            8.033 (8.011 8.052 8.037)
+        #   OPW 32            7.894 (7.887 7.898 7.896)   -0.139
+        #   OPW 32, depth 8   7.915 (7.893 7.927 7.924)   -0.118
+        MOE_W13_OPW = int(os.environ.get("GLM_MOE_W13_OPW",
+                                         "32" if MOE_TP else "64"))
         # Under MPK_MOE_TP a W2 tile is one row block over all nine slots
         # (K = 10 x 256), and the tile count no longer depends on the routing:
         # 6144/OPW per rank. 128 leaves 6 tiles/XCD on 29 workers; 64 halves
@@ -1829,7 +1839,10 @@ if __name__ == "__main__":
             # splits MFMA_ITERS four ways, one group of four k-tiles minimum.
             for _nm, _opw, _k in (("W13", MOE_W13_OPW, hidden_size),
                                   ("W2", MOE_W2_OPW, moe_inter_k)):
-                assert _opw % 64 == 0 or _opw == 16, \
+                # W13 also takes 32: two row groups x two reduction halves
+                # (K_HALF in gang_moe_linear_mxfp8_mi300.cuh).
+                assert (_opw % 64 == 0 or _opw == 16
+                        or (_nm == "W13" and _opw == 32)), \
                     f"MoE {_nm} OPW {_opw} is neither N- nor K-parallel"
                 if _opw == 16:
                     assert (_k // 128) % 16 == 0, \

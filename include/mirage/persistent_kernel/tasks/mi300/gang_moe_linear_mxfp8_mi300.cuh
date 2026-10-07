@@ -2140,15 +2140,15 @@ __device__ __noinline__ void
                                      void const *bias_ptr,
                                      void *output_ptr,
                                      int tile_idx) {
-  // CLOSED 2026-08-21: this assert is why W13 tile narrowing has no middle
-  // point left. GLM_MOE_W13_OPW already defaults to 64, so 16 -- the measured
-  // -1.34 ms (95a044a) -- was the ONLY legal value below the default. 32 is
-  // rejected here and would starve the 16-row MFMA anyway (8 rows over 4
-  // waves), which is the same reason 16 lost. Do not reopen looking for a
-  // middle point; there is none.
-  static_assert(OUTPUT_PER_WG % 64 == 0 || OUTPUT_PER_WG == 16,
-                "OUTPUT_PER_WG is either N-parallel (a multiple of 64 = 4 "
-                "waves x 16 rows) or the K-parallel width, 16");
+  // 2026-08-21 closed narrowing below 64 rows: 16 (the K-parallel branch)
+  // measured -1.34 ms (95a044a), and 32 as an N-parallel split would put 8
+  // rows on each of 4 waves and starve the 16-row MFMA. 32 is now legal as a
+  // different shape -- two 16-row groups times two halves of the reduction,
+  // see K_HALF -- which keeps every wave at 16 rows and on the deep loop.
+  static_assert(OUTPUT_PER_WG % 64 == 0 || OUTPUT_PER_WG == 16 ||
+                    OUTPUT_PER_WG == 32,
+                "OUTPUT_PER_WG is N-parallel (a multiple of 64 = 4 waves x "
+                "16 rows), the K-parallel width 16, or the K_HALF width 32");
   static_assert(REDUCTION_SIZE % 128 == 0,
                 "K must be a multiple of 128 for FP8 MFMA");
 
@@ -2175,10 +2175,12 @@ __device__ __noinline__ void
   constexpr int NUM_WAVES = 4;
   // N-parallel splits the workgroup's rows across the waves; K-parallel gives
   // every wave the same 16 rows and splits the reduction, so it has exactly
-  // one tile. See the branch below.
-  constexpr bool K_PARALLEL = (OUTPUT_PER_WG < 64);
+  // one tile; K_HALF is two row groups by two reduction halves. See the
+  // branches below.
+  constexpr bool K_PARALLEL = (OUTPUT_PER_WG == 16);
+  constexpr bool K_HALF = (OUTPUT_PER_WG == 32);
   constexpr int TILES_PER_WAVE =
-      K_PARALLEL ? 1 : (OUTPUT_PER_WG / 16 / NUM_WAVES);
+      (K_PARALLEL || K_HALF) ? 1 : (OUTPUT_PER_WG / 16 / NUM_WAVES);
   constexpr int FP8_TOK_DATA = REDUCTION_SIZE;
 
   unsigned short const *A = (unsigned short const *)input_ptr;
@@ -2251,7 +2253,10 @@ __device__ __noinline__ void
   // E8M0 byte per 32-column block: 160 B at OUTPUT_PER_WG = 64.
   constexpr int W13_ACT_COLS = EMIT_FP8 ? OUTPUT_PER_WG / 2 : 0;
   constexpr int W13_ACT_BLKS = EMIT_FP8 ? W13_ACT_COLS / 32 : 0;
-  float *s_act = s_reduce + (K_PARALLEL ? NUM_WAVES * OUTPUT_PER_WG : 0);
+  // K_HALF parks the second reduction half's 32 partial rows here.
+  constexpr int S_REDUCE_FLOATS =
+      K_PARALLEL ? NUM_WAVES * OUTPUT_PER_WG : (K_HALF ? OUTPUT_PER_WG : 0);
+  float *s_act = s_reduce + S_REDUCE_FLOATS;
   float *s_act_scale_f = s_act + W13_ACT_COLS;
   if constexpr (EMIT_FP8) {
     static_assert(!K_PARALLEL,
@@ -2285,7 +2290,9 @@ __device__ __noinline__ void
   // Phase 0: put block 0 of this wave's weight rows in flight BEFORE the quant
   // below spends its VALU. See the knob's header for why this warms L2 rather
   // than handing LDS to the k-loop.
-  if constexpr (!K_PARALLEL && MPK_MOE_KMAJOR >= 1) {
+  // Not under K_HALF: the warm addresses below are N-parallel's four row
+  // groups, and a 32-row tile has two.
+  if constexpr (!K_PARALLEL && !K_HALF && MPK_MOE_KMAJOR >= 1) {
     constexpr int W_KS = _gang_moe_w_kstride<WEIGHT_FP4>();
     constexpr int SC_KS = _gang_moe_sc_kstride();
     // The k-loop's prefill is exactly the dispatcher's group width, so warming
@@ -2495,7 +2502,57 @@ __device__ __noinline__ void
   // 4x the tiles at 4x the cost per byte and the makespan gets worse, not
   // better. The prologue is NOT the fixed cost that would have made
   // subdivision pay: at 0.86 us it is 6% of the tile.
-  if constexpr (!K_PARALLEL) {
+  if constexpr (K_HALF) {
+    // ── K_HALF: 32 rows, two row groups x two halves of the reduction ──
+    //
+    // Waves 0/1 take row groups 0/1 over k-tiles [0, KH), waves 2/3 the same
+    // rows over [KH, 2*KH), and one LDS add joins the halves before the
+    // epilogue. Each wave keeps the full 16-row MFMA, K-major data and the
+    // deep loop, so the per-byte cost is the N-parallel one; what the shape
+    // buys is twice the tiles of OPW 64, hence twice the workers streaming.
+    // That is what W13 is short of under MPK_MOE_TP: 9 tiles per XCD on 29
+    // workers at OPW 64, each wave holding too few bytes in flight to reach
+    // the roof on its own. Standalone, same 15 MB of W13-shaped tiles
+    // (tests/standalone/bench_w13_split.hip): 72 tiles x 48 k-tiles per wave
+    // 8.07 us, 144 x 24 4.52 us. In the megakernel at NP=8 1024/1024, TP:
+    // 8.033 -> 7.894 ms (-0.139, n=3 each, tokens identical); numbers at
+    // MOE_W13_OPW in demo.py. Bit-identical to OPW 64 under exact arithmetic
+    // in tests/standalone/test_moe_w13_khalf.hip.
+    static_assert(MFMA_ITERS % 2 == 0, "the reduction splits in halves");
+    constexpr int KH = MFMA_ITERS / 2;
+    int const rg = warp_id & 1;
+    int const kh = warp_id >> 1;
+    int const w_row = rg * 16 + col;
+    uint8_t const *w_data_row =
+        wg_data +
+        (MPK_MOE_KMAJOR >= 1
+             ? static_cast<size_t>(rg) * (16 * W_ROW_BYTES) +
+                   static_cast<size_t>(col) * W_BPK
+             : static_cast<size_t>(w_row) * W_ROW_BYTES) +
+        static_cast<size_t>(kh) * KH * _gang_moe_w_kstride<WEIGHT_FP4>();
+    int const row_scale_base =
+        (MPK_MOE_KMAJOR >= 2 ? rg * (16 * NUM_BLOCKS_32) + col * 4
+                             : w_row * NUM_BLOCKS_32) +
+        kh * KH * _gang_moe_sc_kstride();
+    f32x4_t acc = _gang_moe_kloop<WEIGHT_FP4, false, MPK_MOE_PF_GROUPS_W13, KH,
+                                  (bool)MPK_MOE_PF_DBUF_W13>(
+        w_data_row, wg_scales, row_scale_base,
+        s_tok_fp8 + kh * KH * K_PER_MFMA, s_tok_scales + kh * KH, g);
+    if (kh == 1 && col == 0) {
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        s_reduce[rg * 16 + g * 4 + i] = acc[i];
+      }
+    }
+    __syncthreads();
+    if (kh == 0 && col == 0) {
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        acc[i] += s_reduce[rg * 16 + g * 4 + i];
+      }
+      emit(acc, wg_idx * OUTPUT_PER_WG + rg * 16 + g * 4);
+    }
+  } else if constexpr (!K_PARALLEL) {
   for (int tile_iter = 0; tile_iter < TILES_PER_WAVE; tile_iter++) {
     int const wave_tile = warp_id + tile_iter * NUM_WAVES;
     int const w_row = wave_tile * 16 + col;
