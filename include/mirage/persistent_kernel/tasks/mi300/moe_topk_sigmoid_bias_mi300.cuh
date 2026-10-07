@@ -49,6 +49,12 @@
 // Reuse MI300_WARP_SIZE from the softmax router (same wave layout).
 #include "moe_topk_softmax_mi300.cuh"
 
+// MPK_TOPK_WIN_SHFL: take the eight winners' scores from the lanes that hold
+// them instead of re-reading their logits; see the sort-then-merge path.
+#ifndef MPK_TOPK_WIN_SHFL
+#define MPK_TOPK_WIN_SHFL 1
+#endif
+
 namespace kernel {
 
 // Hardware-accelerated sigmoid: rcp(1 + exp(-x)).
@@ -375,18 +381,42 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
           MTK_D(0, 2) MTK_D(1, 3) MTK_D(4, 6) MTK_D(5, 7)
           MTK_D(0, 1) MTK_D(2, 3) MTK_D(4, 5) MTK_D(6, 7)
         }
+#if MPK_TOPK_WIN_SHFL
+        // The winners' unbiased scores, at full precision, from the lanes that
+        // hold them: expert e is element e % VPT of group lane e / VPT. Every
+        // lane of the group holds the same eight keys, so the element pick is
+        // group-uniform and one shuffle per winner moves it. The =0 path
+        // re-reads the eight logits from memory -- dependent loads after the
+        // buffer_inv, ~2 us of SP7[3] -- and that read is also what forces
+        // the vmcnt(0) drain in front of the logit clear below.
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          int const e = (int)(key[i] & 0xFFu);
+          int const j = e % VPT;
+          float sel = score_chunk[0];
+#pragma unroll
+          for (int jj = 1; jj < VPT; ++jj) {
+            sel = (j == jj) ? score_chunk[jj] : sel;
+          }
+          float const s = __shfl(sel, e / VPT, THREADS_PER_ROW);
+          if (thread_group_idx == 0) {
+            topk_experts[i] = e;
+            topk_vals[i] = s;
+            row_sum_for_renorm += s;
+          }
+        }
+#else
         if (thread_group_idx == 0) {
 #pragma unroll
           for (int i = 0; i < 8; ++i) {
             int const e = (int)(key[i] & 0xFFu);
-            // Full precision, and from this lane's L1: the row was read a few
-            // hundred nanoseconds ago by this same wavefront.
             float const s = fast_sigmoid(static_cast<float>(thread_row_ptr[e]));
             topk_experts[i] = e;
             topk_vals[i] = s;
             row_sum_for_renorm += s;
           }
         }
+#endif
       }
     }
 #undef MTK_D
@@ -525,12 +555,14 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
 #endif
 
     // Reset input buffer to 0 (for split-k gate linear compatibility).
-    // Deliberately after selection: the winners' weights are recomputed from
-    // this row. Lane 0 read eight arbitrary elements of it a few instructions
-    // ago and every lane is about to overwrite its own eight, so drain first
-    // -- the addresses cross lanes, which is exactly the case neither the
-    // compiler's alias analysis nor same-wave VMEM ordering covers.
+    // After selection, which reads this row. With MPK_TOPK_WIN_SHFL every
+    // lane overwrites only the eight elements it loaded itself and already
+    // consumed, so no drain is needed; the k-loop path's lanes do the same.
+    // Without it lane 0 has just re-read eight arbitrary elements across
+    // lanes, which neither alias analysis nor same-wave VMEM ordering covers.
+#if !MPK_TOPK_WIN_SHFL
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
     for (int ldg = 0; ldg < LDG_PER_THREAD; ++ldg) {
       int src_offset = ldg * THREADS_PER_ROW * ELTS_PER_LDG;
       for (int e = 0; e < ELTS_PER_LDG; ++e) {

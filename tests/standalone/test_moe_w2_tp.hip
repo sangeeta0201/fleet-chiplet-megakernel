@@ -85,7 +85,7 @@ static unsigned short f32_to_bf16_exact(float f) {
   return (unsigned short)(u >> 16); // exact: +-2^j has a zero low half
 }
 
-template <int OPW, int I_LOCAL, int NSEG>
+template <int OPW, int I_LOCAL, int NSEG, int KP>
 __global__ void __launch_bounds__(256, 1)
     run_w2_tp(void const *input,
               void const *weight,
@@ -94,11 +94,11 @@ __global__ void __launch_bounds__(256, 1)
               void *out,
               void const *routing_weight) {
   gang_moe_w2_tp_linear_mxfp8_kernel<1, HIDDEN, I_LOCAL, NUM_EXPERTS, NUM_TOPK,
-                                     OPW, /*WEIGHT_FP4=*/true, NSEG>(
+                                     OPW, /*WEIGHT_FP4=*/true, NSEG, KP>(
       input, weight, routing, mask, out, blockIdx.x, routing_weight);
 }
 
-template <int OPW, int I_LOCAL, int NSEG>
+template <int OPW, int I_LOCAL, int NSEG, int KP = 1>
 static bool run_case(int n_live, uint32_t seed) {
   constexpr int ROW_BYTES = I_LOCAL / 2; // MXFP4
   constexpr int BLK32 = I_LOCAL / 32;
@@ -223,7 +223,8 @@ static bool run_case(int n_live, uint32_t seed) {
   HIP_CHECK(hipMemset(d_out, 0, HIDDEN * 4));
 
   constexpr int SMEM = NSEG * I_LOCAL + NSEG * I_LOCAL / 128 + 256;
-  run_w2_tp<OPW, I_LOCAL, NSEG><<<dim3((WGS + 7) / 8, 8), 256, SMEM>>>(
+  run_w2_tp<OPW, I_LOCAL, NSEG, KP><<<dim3((WGS * KP + 7) / 8, 8), 256,
+                                      SMEM>>>(
       d_in, d_w, d_route, d_mask, d_out, d_rw);
   HIP_CHECK(hipGetLastError());
   HIP_CHECK(hipDeviceSynchronize());
@@ -242,9 +243,9 @@ static bool run_case(int n_live, uint32_t seed) {
   }
   bool const pass = (bad == 0);
   int const show = worst_n >= 0 ? worst_n : HIDDEN - 1;
-  printf("[%s] OPW=%d I_LOCAL=%d NSEG=%d n_live=%d seed=%u  worst rel %.3e  row %d: gpu %.6f "
+  printf("[%s] OPW=%d I_LOCAL=%d NSEG=%d KP=%d n_live=%d seed=%u  worst rel %.3e  row %d: gpu %.6f "
          "ref %.6f (sum|p| %.1f)  bad rows %d/%d\n",
-         pass ? "PASS" : "FAIL", OPW, I_LOCAL, NSEG, n_live, seed, worst,
+         pass ? "PASS" : "FAIL", OPW, I_LOCAL, NSEG, KP, n_live, seed, worst,
          show, out[show],
          ref[show], mag[show], bad, HIDDEN);
   HIP_CHECK(hipFree(d_in));
@@ -264,6 +265,10 @@ int main() {
   ok &= run_case<64, 256, 10>(1, 3);
   ok &= run_case<128, 256, 10>(9, 4);
   ok &= run_case<128, 256, 10>(7, 5);
+  // The same, split into two reduction parts (two atomicAdds per row).
+  ok &= run_case<64, 256, 10, 2>(9, 8);
+  ok &= run_case<64, 256, 10, 2>(4, 9);
+  ok &= run_case<128, 256, 10, 2>(9, 10);
   // 2 ranks: 8-tile segments, two blocks per segment.
   ok &= run_case<128, 1024, 9>(9, 6);
   ok &= run_case<64, 1024, 9>(4, 7);

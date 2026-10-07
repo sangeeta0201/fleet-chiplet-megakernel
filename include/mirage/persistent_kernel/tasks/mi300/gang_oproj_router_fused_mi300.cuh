@@ -161,6 +161,12 @@ namespace kernel {
 #ifndef MPK_MOE_TP
 #define MPK_MOE_TP 0
 #endif
+// Parts each fused W2 tile's reduction is split into (K_PARTS of
+// gang_moe_w2_tp_linear_mxfp8_kernel); the host widens the W2 tile count to
+// match from the same variable.
+#ifndef MPK_MOE_TP_W2_KPARTS
+#define MPK_MOE_TP_W2_KPARTS 1
+#endif
 #if MPK_MOE_TP && (MPK_MOE_SHARED_KSHARD > 0 || MPK_SHARED_DUP || \
                    MPK_ABL_PIPE_W13W2 || !MPK_MOE_LIVE_BOUND)
 #error "MPK_MOE_TP replaces the EP tile spaces that KSHARD, SHARED_DUP and the W13/W2 pipe probe rewrite, and sizes its loops in the live-bound block"
@@ -1959,7 +1965,7 @@ __device__ __attribute__((always_inline)) void
     // count does not depend on the routing.
     int const w2_live =
         MPK_MOE_TP
-            ? (HIDDEN_SIZE / MOE_W2_OPW + 7) / 8
+            ? (HIDDEN_SIZE / MOE_W2_OPW * MPK_MOE_TP_W2_KPARTS + 7) / 8
             : ((owned - (SH_EARLY_W2 ? owned_shared : 0)) *
                    MOE_W2_TILES_PER_EXPERT +
                7) /
@@ -2410,10 +2416,15 @@ __device__ __attribute__((always_inline)) void
 #if MPK_MOE_TP
     // Segments: every activated slot, padded so the reduction is whole
     // depth-4 blocks of whole segments (10 x 256 at GLM's 9 slots and 8 ranks).
+    // Split in parts, each part only needs depth-2 blocks of whole segments:
+    // at 10 segments and 2 parts each part is 5 x 2 k-tiles.
     constexpr int TP_SEG_KT = MOE_INTERMEDIATE / 128;
-    constexpr int TP_SEG_ROUND = (TP_SEG_KT % 4 == 0)   ? 1
-                                 : (TP_SEG_KT % 2 == 0) ? 2
-                                                        : 4;
+    constexpr int TP_SEG_ROUND =
+        (MPK_MOE_TP_W2_KPARTS > 1)
+            ? MPK_MOE_TP_W2_KPARTS * (TP_SEG_KT % 2 == 0 ? 1 : 2)
+            : ((TP_SEG_KT % 4 == 0)   ? 1
+               : (TP_SEG_KT % 2 == 0) ? 2
+                                      : 4);
     constexpr int TP_NSEG =
         (MOE_NUM_TOPK + TP_SEG_ROUND - 1) / TP_SEG_ROUND * TP_SEG_ROUND;
     gang_moe_w2_tp_linear_mxfp8_kernel<BATCH_SIZE,
@@ -2423,7 +2434,8 @@ __device__ __attribute__((always_inline)) void
                                        MOE_NUM_TOPK,
                                        MOE_W2_OPW,
                                        MOE_WEIGHT_FP4,
-                                       TP_NSEG>(moe_swiglu_out_ptr,
+                                       TP_NSEG,
+                                       MPK_MOE_TP_W2_KPARTS>(moe_swiglu_out_ptr,
                                                 moe_down_weight_ptr,
                                                 routing_indices_ptr,
                                                 active_expert_ids_ptr,

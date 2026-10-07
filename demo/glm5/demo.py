@@ -1178,6 +1178,17 @@ if __name__ == "__main__":
             and _ckpt_is_mxfp4()):
         os.environ.setdefault("MPK_MOE_TP", "1")
     MOE_TP = os.environ.get("MPK_MOE_TP", "0") == "1"
+    if MOE_TP:
+        # The fused W2 tile split into two reduction parts (24 tiles/XCD),
+        # each issuing its whole 10-k-tile reduction up front. MEASURED
+        # 2026-10-07, NP=8 1024/1024, n=3 each, one batch, G1 PASS:
+        #   1 part 7.911 (7.907 7.895 7.932)
+        #   2 parts 7.872 (7.868 7.891 7.857)            -0.039
+        #   2 parts + prefetch-all 7.759 (7.769 7.748 7.761)  -0.152
+        # Notes at K_PARTS and MPK_MOE_TP_W2_PF in
+        # gang_moe_linear_mxfp8_mi300.cuh.
+        os.environ.setdefault("MPK_MOE_TP_W2_KPARTS", "2")
+        os.environ.setdefault("MPK_MOE_TP_W2_PF", "1")
     # The MXFP4-checkpoint half of the precondition is checked in the loader,
     # after it has auto-detected the format.
     assert not MOE_TP or moe_ep, (

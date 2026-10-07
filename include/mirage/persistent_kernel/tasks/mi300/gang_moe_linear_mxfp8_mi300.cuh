@@ -3327,7 +3327,10 @@ __device__ __noinline__ void
 // hit, against a zero activation.
 
 // MPK_MOE_TP_W2_PF=1: issue the fused tile's whole reduction up front instead
-// of one depth-GROUPS block ahead; see the branch in _gang_moe_kloop_seg.
+// of one depth-GROUPS block ahead; see the branch in _gang_moe_kloop_seg. At
+// the full 20 k-tiles it costs 374 VGPRs and 230 scratch ops; at K_PARTS=2's
+// 10 it is register-free (319 VGPRs, no scratch) and, with the split, worth
+// -0.152 ms at NP=8 (numbers in demo.py, which sets both under MPK_MOE_TP).
 #ifndef MPK_MOE_TP_W2_PF
 #define MPK_MOE_TP_W2_PF 0
 #endif
@@ -3475,6 +3478,8 @@ __device__ __forceinline__ f32x4_t
 // The weight is applied here and not in W13's epilogue: held live across
 // W13's k-loop it cost that loop its prefetch (a full vmcnt(0) at the top of
 // every block instead of vmcnt(6)) and W13 +2.7 us/layer.
+// NSEG segments starting at activated slot seg_base (a K_PARTS part of the
+// fused tile's reduction), staged from LDS offset 0.
 template <int BATCH_SIZE, int NUM_TOPK, int NSEG, int SEG_LEN>
 __device__ __forceinline__ void
     _gang_tp_quant_seg_nt(unsigned short const *__restrict__ act,
@@ -3483,6 +3488,7 @@ __device__ __forceinline__ void
                           float const *__restrict__ d_routing_weight,
                           int tok_idx,
                           int n_live,
+                          int seg_base,
                           uint8_t *__restrict__ s_tok_fp8,
                           uint8_t *__restrict__ s_tok_scales) {
   constexpr int SUB_BLOCK = 32;
@@ -3494,7 +3500,7 @@ __device__ __forceinline__ void
   int const lane_id = tid & 63;
 
   for (int sb = tid; sb < NSUBBLOCKS; sb += MPK_NT) {
-    int const seg = sb / SB_PER_SEG;
+    int const seg = seg_base + sb / SB_PER_SEG;
     int const base = sb * SUB_BLOCK;
     int const super_blk = sb / 4;
     int const sub_idx = sb & 3;
@@ -3576,6 +3582,14 @@ __device__ __forceinline__ void
 // [BATCH][NUM_TOPK][I_LOCAL] bf16 activation and the [BATCH][NUM_TOPK] f32
 // routing weights. Output: atomicAdd into the [BATCH][OUTPUT_SIZE] f32
 // workspace.
+//
+// K_PARTS > 1 splits the NSEG segments into that many parts, one tile each:
+// K_PARTS times the tiles, each with 1/K_PARTS of the reduction -- the same
+// trade that made W13's K_HALF pay, here without even an LDS combine,
+// because the epilogue is already an atomicAdd. Two parts stay
+// deterministic: the workspace is zero when W2 starts (the EP fold re-zeroes
+// it), and 0 + a + b == 0 + b + a exactly. The part is the high digit of the
+// tile index, so neighbouring workers take different row blocks.
 template <int BATCH_SIZE,
           int OUTPUT_SIZE,
           int I_LOCAL,
@@ -3583,7 +3597,8 @@ template <int BATCH_SIZE,
           int NUM_TOPK,
           int OUTPUT_PER_WG,
           bool WEIGHT_FP4,
-          int NSEG>
+          int NSEG,
+          int K_PARTS = 1>
 __device__ __noinline__ void
     gang_moe_w2_tp_linear_mxfp8_kernel(void const *input_ptr,
                                        void const *weight_ptr,
@@ -3599,10 +3614,14 @@ __device__ __noinline__ void
                 "N-parallel tile: 4 waves x 16 rows");
   static_assert(I_LOCAL % 128 == 0, "a segment is whole k-tiles");
   static_assert(NSEG >= NUM_TOPK, "every activated expert needs a segment");
+  static_assert(K_PARTS >= 1 && K_PARTS <= 2 && NSEG % K_PARTS == 0,
+                "the parts split the segments evenly; more than two addends "
+                "per row would make the atomicAdd order observable");
+  constexpr int NSEG_P = NSEG / K_PARTS;
   constexpr int K_PER_MFMA = 128;
   constexpr int SEG_KT = I_LOCAL / K_PER_MFMA;
   constexpr int GR =
-      _gang_moe_pf_groups(NSEG * SEG_KT, MPK_MOE_PF_GROUPS_W2);
+      _gang_moe_pf_groups(NSEG_P * SEG_KT, MPK_MOE_PF_GROUPS_W2);
   static_assert(GR >= 2 && (GR % SEG_KT == 0 || SEG_KT % GR == 0),
                 "NSEG * I_LOCAL must split into prefetch blocks that nest "
                 "with the segments");
@@ -3619,10 +3638,13 @@ __device__ __noinline__ void
   constexpr int TILES_PER_WAVE = OUTPUT_PER_WG / 16 / NUM_WAVES;
   constexpr int tok_idx = 0;
 
-  int const wg_idx = tile_idx * 8 + _gang_moe_get_xcd_id();
-  if (wg_idx >= EXPERT_WGS) {
+  int const global_tile = tile_idx * 8 + _gang_moe_get_xcd_id();
+  int const part = global_tile / EXPERT_WGS;
+  int const wg_idx = global_tile % EXPERT_WGS;
+  if (part >= K_PARTS) {
     return;
   }
+  int const seg_base = part * NSEG_P;
   int const *d_mask = (int const *)mask_ptr;
   int const *d_routing = (int const *)routing_ptr;
   int const n_live = d_mask[NUM_EXPERTS];
@@ -3637,18 +3659,19 @@ __device__ __noinline__ void
 
   extern __shared__ char _gang_moe_mxfp8_smem[];
   uint8_t *s_tok_fp8 = (uint8_t *)_gang_moe_mxfp8_smem;
-  uint8_t *s_tok_scales = s_tok_fp8 + NSEG * I_LOCAL;
-  constexpr int SEG_OFF_LDS = (NSEG * I_LOCAL + NSEG * I_LOCAL / 128 + 3) & ~3;
+  uint8_t *s_tok_scales = s_tok_fp8 + NSEG_P * I_LOCAL;
+  constexpr int SEG_OFF_LDS =
+      (NSEG_P * I_LOCAL + NSEG_P * I_LOCAL / 128 + 3) & ~3;
   uint32_t *s_seg_off = (uint32_t *)(_gang_moe_mxfp8_smem + SEG_OFF_LDS);
   // Published by the barrier the quantizer below ends with.
-  if (threadIdx.x < NSEG) {
-    int const s = threadIdx.x;
+  if (threadIdx.x < NSEG_P) {
+    int const s = seg_base + threadIdx.x;
     int const e = (s < n_live) ? d_mask[s] : ((n_live > 0) ? d_mask[0] : 0);
-    s_seg_off[s] =
+    s_seg_off[threadIdx.x] =
         static_cast<uint32_t>(e) * static_cast<uint32_t>(EXPERT_BYTES);
   }
 
-  _gang_tp_quant_seg_nt<BATCH_SIZE, NUM_TOPK, NSEG, I_LOCAL>(
+  _gang_tp_quant_seg_nt<BATCH_SIZE, NUM_TOPK, NSEG_P, I_LOCAL>(
       (unsigned short const *)input_ptr +
           static_cast<size_t>(tok_idx) * (NUM_TOPK * I_LOCAL),
       d_mask,
@@ -3656,6 +3679,7 @@ __device__ __noinline__ void
       (float const *)routing_weight_ptr,
       tok_idx,
       n_live,
+      seg_base,
       s_tok_fp8,
       s_tok_scales);
 
@@ -3678,7 +3702,7 @@ __device__ __noinline__ void
         MPK_MOE_KMAJOR >= 2
             ? (w_row / 16) * (16 * NUM_BLOCKS_32) + (w_row % 16) * 4
             : w_row * NUM_BLOCKS_32;
-    f32x4_t acc = _gang_moe_kloop_seg<WEIGHT_FP4, GR, NSEG, SEG_KT>(
+    f32x4_t acc = _gang_moe_kloop_seg<WEIGHT_FP4, GR, NSEG_P, SEG_KT>(
         w_data_row, wg_scales, row_scale_base, (_gang_lds_u32)s_seg_off,
         s_tok_fp8, s_tok_scales, g);
     if (col == 0) {

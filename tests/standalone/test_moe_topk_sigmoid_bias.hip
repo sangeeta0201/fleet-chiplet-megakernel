@@ -35,6 +35,11 @@
 #include <hip/hip_runtime.h>
 #include <vector>
 
+// The thread-count macro tasks/common/worker_config.h supplies inside the
+// megakernel; this kernel launches 256 threads.
+#ifndef MPK_NT
+#define MPK_NT (blockDim.x)
+#endif
 #include "mirage/persistent_kernel/mpk_atoms.cuh"
 #include "mirage/persistent_kernel/tasks/mi300/moe_topk_sigmoid_bias_mi300.cuh"
 
@@ -45,6 +50,12 @@ static constexpr int TOPK = 8;
 static constexpr float ROUTED_SCALING = 2.5f;
 // Minimum gap between the k-th and (k+1)-th biased score for a row to be used.
 static constexpr float SEP_EPS = 1e-3f;
+
+// The megakernel passes K_STATIC = k (8), which selects the sort-then-merge
+// path; 0 is the runtime-k argmax loop. Build both.
+#ifndef TOPK_K_STATIC
+#define TOPK_K_STATIC 0
+#endif
 
 __global__ void topk_sigmoid_bias_entry(void *input,
                                         void *bias,
@@ -57,7 +68,8 @@ __global__ void topk_sigmoid_bias_entry(void *input,
                                             8,
                                             NUM_EXPERTS,
                                             4,
-                                            16>(
+                                            16,
+                                            TOPK_K_STATIC>(
       input,
       bias,
       output,

@@ -1529,6 +1529,9 @@ def get_compile_command(
             # MPK_MOE_TP's fused W2 tile issues its whole reduction up front
             # (gang_moe_linear_mxfp8_mi300.cuh).
             "MPK_MOE_TP_W2_PF",
+            # The router TopK takes its winners' scores by shuffle instead of
+            # re-reading them (moe_topk_sigmoid_bias_mi300.cuh).
+            "MPK_TOPK_WIN_SHFL",
         ):
             _x = os.environ.get(_v)
             if _x is not None:
@@ -1663,6 +1666,11 @@ def get_compile_command(
         # match, so the host reads the same variable.
         if os.environ.get("MPK_MOE_TP", "0") == "1":
             flags = flags + ["-DMPK_MOE_TP=1"]
+            # Parts each fused W2 tile's reduction is split into; the W2 tile
+            # count below widens by the same factor.
+            _kp = os.environ.get("MPK_MOE_TP_W2_KPARTS", "1")
+            assert _kp in ("1", "2"), "MPK_MOE_TP_W2_KPARTS is 1 or 2"
+            flags = flags + [f"-DMPK_MOE_TP_W2_KPARTS={_kp}"]
         _moe_afp8 = os.environ.get("MPK_MOE_ACT_FP8")
         if _moe_afp8 is not None:
             # W13 emits the SwiGLU result as MXFP8 (E4M3 + one E8M0 per 32) and
@@ -3651,9 +3659,11 @@ class PersistentKernel:
             moe_max_activated * batch_size * moe_down_weight.dim(1)
             * int(os.environ.get("MPK_W2_KSPLIT", "1")) + 7) // 8
         if moe_tp:
-            # One fused-experts tile per output row block.
+            # One fused-experts tile per output row block and reduction part.
             assert batch_size == 1, "the fused-experts W2 tile is one row"
-            moe_w2_tiles_per_xcd = (moe_down_weight.dim(1) + 7) // 8
+            moe_w2_tiles_per_xcd = (
+                moe_down_weight.dim(1)
+                * int(os.environ.get("MPK_MOE_TP_W2_KPARTS", "1")) + 7) // 8
 
         oproj_topk_tiles_per_xcd = max(oproj_tiles_per_xcd, router_tile_n)
 
