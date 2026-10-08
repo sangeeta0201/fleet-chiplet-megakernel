@@ -2737,6 +2737,16 @@ if __name__ == "__main__":
                 f"(MPK_MLA_HEAD_LOCAL=1, q_b TP, one row, no pair merge); "
                 f"the replicated decode deadlocks past 32")
         qb_tp_heads = (num_heads // world_size) if qb_tp else num_heads
+        # Below 16 heads per rank the head-local group's other heads are a
+        # partner rank's and never read: decode stores and merge reads only
+        # this rank's. Bit-identical. MEASURED 2026-10-08, NP=8 1024/1024, n=3
+        # interleaved, tokens identical: 6.893 6.900 6.898 -> 6.807 6.838
+        # 6.842 ms; ppl512 2.4838 both; longseq 256/512/1024 G1 PASS.
+        if (qb_tp and qb_tp_heads < 16
+                and os.environ.get("MPK_MLA_HEAD_LOCAL", "1") != "0"
+                and args.max_num_batched_tokens == 1
+                and int(os.environ.get("GLM_MLA_PAIR_MERGE", "0")) == 0):
+            os.environ.setdefault("MPK_MLA_MERGE_OWN_HEADS", "1")
         # Under the head shard a rank's W_UK is 8 heads x 512 rows, so the
         # 128-row width above leaves 4 tiles per XCD against 29 workers in one
         # round; 64 is still one round, at 8 tiles of half the work each.
@@ -3056,10 +3066,11 @@ if __name__ == "__main__":
             #   [644 .. 2195] MPK_ROUTER_XSPLIT's per-XCD flags + row
             #   [2196 .. 2515] MPK_ROUTER_LL's logit words + routing copies
             #   [2516 .. 4067] MPK_QKV_XSPLIT's per-XCD flags + row
+            #   [4068 .. 4451] MPK_OPROJ_LL == 2's per-XCD f32 o_proj rows
             # Keep in step with FULL_LAYER_COUNTER_SLOTS in
             # gang_mla_full_layer_fused_mi300.cuh.
             (((218 + 4 * 24 + 4 * 16 + 8 * 32 + 9 + 1 + 8 * 194 + 32 + 8 * 36
-               + 8 * 194)
+               + 8 * 194 + 8 * 48)
               if UNABSORB_K
               else 106 if UNABSORB_V else 96) * 16,),
             torch_dtype=torch.int32)
@@ -3084,19 +3095,32 @@ if __name__ == "__main__":
         ep_signal = None
         router_partials = None
         if moe_ep:
+            # The EP fold's slots as epoch-tagged words, validated by the
+            # split resolve -- no drain of the fold's XGMI stores, no count,
+            # no peer signal, no release. Same rounding and slot order, so
+            # bit-identical. MEASURED 2026-10-08, NP=8 1024/1024, n=3
+            # interleaved, tokens identical: 6.820 6.819 6.824 -> 6.492 6.504
+            # 6.477 ms. The LL slots are read only by the split resolve.
+            if os.environ.get("MPK_FOLD_W2", "0") != "1":
+                os.environ.setdefault("MPK_EP_LL", "1")
+            if os.environ.get("MPK_EP_LL") == "1":
+                os.environ.setdefault("MPK_QKV_XSPLIT", "1")
             # The tails (main, and MTP's) fold and return before o_proj, and
             # the LM head reads exactly world_size planes from them.
             _ep_tail_slots = {num_layers} | (
                 {num_layers + 2} if mtp_in_graph else set())
+            _ep_ll = os.environ.get("MPK_EP_LL", "0") == "1"
             ep_gather_list = [
                 mpk.new_tensor(
                     # MPK_OPROJ_RP's f32 o_proj partials take 2 * world_size
                     # more bf16 planes (4 * world_size as MPK_OPROJ_LL's
-                    # 8-byte words); the fold reads the first world_size.
-                    dims=(world_size * ((5 if os.environ.get(
-                                            "MPK_OPROJ_LL", "0") == "1" else 3)
-                                        if OPROJ_RP and
-                                        li not in _ep_tail_slots else 1),
+                    # 8-byte words), past the fold's world_size (2 * as
+                    # MPK_EP_LL's words). Tails fold bf16 for the LM head.
+                    dims=(world_size * (
+                        (2 if _ep_ll and li not in _ep_tail_slots else 1)
+                        + ((4 if os.environ.get("MPK_OPROJ_LL", "0") != "0"
+                            else 2)
+                           if OPROJ_RP and li not in _ep_tail_slots else 0)),
                           bs, hidden_size),
                     dtype=mi.bfloat16,
                     name=f"ep_gather_{li}",

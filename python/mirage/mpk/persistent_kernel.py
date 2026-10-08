@@ -1554,15 +1554,17 @@ def get_compile_command(
             # Logits as epoch-tagged words, TopK per XCD into L2 copies
             # (gang_rmsnorm_linear_bias_mi300.cuh, mpk_atoms.cuh).
             "MPK_ROUTER_LL",
-            # The o_proj partials as epoch-tagged words
-            # (gang_oproj_router_fused_mi300.cuh, mpk_atoms.cuh).
-            "MPK_OPROJ_LL",
             # The merge skips the partner rank's heads of the head-local group
             # (gang_mla_attn_fused_mi300.cuh).
             "MPK_MLA_MERGE_OWN_HEADS",
             # qkv_a's EP resolve split over the XCD's tiles
             # (gang_rmsnorm_linear_mxfp8_bias_mi300.cuh, mpk_atoms.cuh).
             "MPK_QKV_XSPLIT",
+            # The EP fold's slots as epoch-tagged words, validated by the
+            # split resolve (gang_mla_full_layer_fused_mi300.cuh).
+            "MPK_EP_LL",
+            # ... folded on each XCD's last worker instead of its first.
+            "MPK_EP_LL_FOLD_LAST",
             # Ceiling probes, wrong output (gang_mla_attn_fused_mi300.cuh).
             "MPK_ATTN_PROBE_NOQBWAIT",
             "MPK_ATTN_PROBE_NODECWAIT",
@@ -1571,6 +1573,12 @@ def get_compile_command(
             if _x is not None:
                 assert _x in ("0", "1"), f"{_v} is 0 or 1"
                 flags = flags + [f"-D{_v}={_x}"]
+        # The o_proj partials as epoch-tagged words: 1 from the GEMV epilogue,
+        # 2 from the push (gang_oproj_router_fused_mi300.cuh, mpk_atoms.cuh).
+        _x = os.environ.get("MPK_OPROJ_LL")
+        if _x is not None:
+            assert _x in ("0", "1", "2"), "MPK_OPROJ_LL is 0, 1 or 2"
+            flags = flags + [f"-DMPK_OPROJ_LL={_x}"]
         # KV tiles landed per batch in the MLA decode (0 = per trip). Needs
         # MPK_MLA_OACC_VGPR=1; the header refuses the combination otherwise.
         _mb = os.environ.get("MPK_MLA_DECODE_BATCH")
@@ -3363,11 +3371,17 @@ class PersistentKernel:
             assert self.world_size > 1, "the EP fold needs world_size > 1"
             assert ep_gather.num_dims == 3   # (world_size, batch, hidden)
             # MPK_OPROJ_RP's f32 o_proj partials take 2 * world_size more
-            # bf16 planes; the tail variant returns before o_proj.
+            # bf16 planes (4 * as MPK_OPROJ_LL words), and MPK_EP_LL's fold
+            # words twice the fold's own; the tail variant returns before
+            # o_proj and folds bf16.
+            _env = os.environ.get
+            _fold_planes = (2 if _env("MPK_EP_LL", "0") == "1"
+                            and not ep_tail_only else 1)
+            _rp_planes = ((4 if _env("MPK_OPROJ_LL", "0") != "0" else 2)
+                          if _env("MPK_OPROJ_RP", "0") == "1"
+                          and not ep_tail_only else 0)
             assert ep_gather.dim(0) == self.world_size * (
-                (5 if os.environ.get("MPK_OPROJ_LL", "0") == "1" else 3)
-                if os.environ.get("MPK_OPROJ_RP", "0") == "1"
-                and not ep_tail_only else 1)
+                _fold_planes + _rp_planes)
             assert 0 <= ep_fold_rank < self.world_size
             # One 64-byte line per PE, so a peer's signal store never shares a
             # line with another's. int32 units because mi.uint64 has no
@@ -3826,6 +3840,9 @@ class PersistentKernel:
         if os.environ.get("MPK_QKV_XSPLIT", "0") == "1":
             # FULL_LAYER_QXS_SLOT's eight 194-line exchange blocks.
             counter_slots = 644 + 8 * 194 + 32 + 8 * 36 + 8 * 194
+        if os.environ.get("MPK_OPROJ_LL", "0") == "2":
+            # FULL_LAYER_OLL_SLOT's eight 48-line f32 row blocks.
+            counter_slots = 644 + 8 * 194 + 32 + 8 * 36 + 8 * 194 + 8 * 48
         assert counters.dim(0) >= counter_slots * 16, (
             f"the fused layer needs {counter_slots * 16} int32 of counters, "
             f"got {counters.dim(0)}")

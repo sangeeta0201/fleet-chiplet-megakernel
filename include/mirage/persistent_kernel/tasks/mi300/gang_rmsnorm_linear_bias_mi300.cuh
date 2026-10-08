@@ -764,7 +764,8 @@ __device__ __attribute__((noinline)) void
                                     /*BYTES_PER_LDG=*/16,
                                     /*K_STATIC=*/K,
                                     /*ROUTING_ROW_STRIDE=*/1,
-                                    /*SKIP_CLEARS=*/false,
+                                    // The logits are this call's own LDS copy.
+                                    /*SKIP_CLEARS=*/MPK_TOPK_SKIP_CLEARS != 0,
                                     /*L2_STORES=*/true>(
       s_logits,
       bias_ptr,
@@ -1129,7 +1130,11 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     // leave this XCD's own L2 lines alone.
     asm volatile("buffer_inv" ::: "memory");
     // Drain the prefetch. nt loads bypass L2 and are unaffected by the inv.
-    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    // Under SUM_LL not until Step 2 uses it: vmcnt retires in issue order,
+    // so a wave with XGMI pushes in flight would sit here on their acks.
+    if constexpr (!SUM_LL) {
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    }
     MPK_WS_MARK(771, tile_idx);
     // Stage stamp 33: o_proj all-gather observed (router workers). S31 -> S33
     // is the o_proj rendezvous as the router sees it, S33 -> S34 its work.
@@ -1240,64 +1245,38 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
       }
       __syncthreads();
     }
+    // Four words per slot, two 16-byte system-scope loads each: the peers'
+    // words arrive over XGMI, so nothing on this side may cache them.
+    typedef unsigned int ll_u4_t __attribute__((ext_vector_type(4)));
+    ll_u4_t llw[SUM_LL ? SUM_SLOTS : 1][2];
     if constexpr (SUM_LL) {
-      // Wait on one sentinel word per (slot, 32-row o_proj tile) before
-      // touching the slice: the whole slice re-read per spin, by every router
-      // tile on the GPU, put ~3 MB of system-scope loads on the fabric per
-      // poll round and slowed the run by 0.5 ms. The sentinel only says the
-      // tile has arrived -- its other rows are separate stores -- so the
-      // slice is still validated word by word below, and rarely re-read.
+      // One pass over the slice first -- by now it has usually landed --
+      // and only while some of it is missing, a spin on one sentinel word
+      // per (slot, 32-row o_proj tile) before the next pass. Re-reading the
+      // whole slice per spin, from every router tile on the GPU, put ~3 MB
+      // of system-scope loads on the fabric per round and slowed the run by
+      // 0.5 ms. Waves 0-1 only: MPK_OPROJ_LL == 2 keeps its XGMI stores, and
+      // so their acks, on wave 3.
       constexpr int LL_TILE_ROWS = 32;
       unsigned long long const *const ll =
           static_cast<unsigned long long const *>(sum_slots);
       int const tiles_per_slice = (xs_f4 * 4) / LL_TILE_ROWS;
       int const sentinels = SUM_SLOTS * tiles_per_slice;
-      if ((xs_f4 * 4) % LL_TILE_ROWS != 0 || sentinels > MPK_NT) {
+      if ((xs_f4 * 4) % LL_TILE_ROWS != 0 || sentinels > 128 || xs_f4 > 128) {
         __builtin_trap();
       }
       unsigned const want = static_cast<unsigned>(stream_expected);
+      int const i0 = xs_t * xs_f4 + tid;
       while (true) {
-        bool ready = true;
-        if (tid < sentinels) {
-          int const s = tid / tiles_per_slice;
-          int const j = tid % tiles_per_slice;
-          unsigned long long w8;
-          asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1\n"
-                       "s_waitcnt vmcnt(0)"
-                       : "=v"(w8)
-                       : "v"(ll + (size_t)s * REDUCTION_SIZE +
-                             xs_t * xs_f4 * 4 + j * LL_TILE_ROWS)
-                       : "memory");
-          ready = (unsigned)(w8 >> 32) == want;
-        }
-        if (__syncthreads_and(ready)) {
-          break;
-        }
-        __builtin_amdgcn_s_sleep(2);
-      }
-    }
-    MPK_WS_MARK(791, xs_t);
-    if (tid < xs_f4) {
-      int const i = xs_t * xs_f4 + tid;
-      sum_f4_t v[SUM_SLOTS];
-      if constexpr (SUM_LL) {
-        // Four words per slot, two 16-byte system-scope loads each (the
-        // peers' words arrive over XGMI, so nothing on this side may cache
-        // them), polled until every epoch is this layer's.
-        typedef unsigned int ll_u4_t __attribute__((ext_vector_type(4)));
-        unsigned long long const *const ll =
-            static_cast<unsigned long long const *>(sum_slots);
-        ll_u4_t w[SUM_SLOTS][2];
-        unsigned const want = static_cast<unsigned>(stream_expected);
-        while (true) {
-          bool ok = true;
+        bool ok = true;
+        if (tid < xs_f4) {
 #pragma unroll
           for (int s = 0; s < SUM_SLOTS; s++) {
 #pragma unroll
             for (int h = 0; h < 2; h++) {
               asm volatile("global_load_dwordx4 %0, %1, off sc0 sc1"
-                           : "=v"(w[s][h])
-                           : "v"(ll + (size_t)s * REDUCTION_SIZE + i * 4 +
+                           : "=v"(llw[s][h])
+                           : "v"(ll + (size_t)s * REDUCTION_SIZE + i0 * 4 +
                                  h * 2)
                            : "memory");
             }
@@ -1307,20 +1286,37 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
           for (int s = 0; s < SUM_SLOTS; s++) {
 #pragma unroll
             for (int h = 0; h < 2; h++) {
-              ok = ok && w[s][h][1] == want && w[s][h][3] == want;
+              ok = ok && llw[s][h][1] == want && llw[s][h][3] == want;
             }
           }
-          if (ok) {
-            break;
-          }
-          __builtin_amdgcn_s_sleep(1);
         }
+        if (__syncthreads_and(ok)) {
+          break;
+        }
+        if (tid < sentinels) {
+          int const s = tid / tiles_per_slice;
+          int const j = tid % tiles_per_slice;
+          unsigned long long *const sp = const_cast<unsigned long long *>(
+              ll + (size_t)s * REDUCTION_SIZE + xs_t * xs_f4 * 4 +
+              j * LL_TILE_ROWS);
+          while ((unsigned)(ld_sys_u64(sp) >> 32) != want) {
+            __builtin_amdgcn_s_sleep(1);
+          }
+        }
+        __syncthreads();
+      }
+    }
+    MPK_WS_MARK(791, xs_t);
+    if (tid < xs_f4) {
+      int const i = xs_t * xs_f4 + tid;
+      sum_f4_t v[SUM_SLOTS];
+      if constexpr (SUM_LL) {
 #pragma unroll
         for (int s = 0; s < SUM_SLOTS; s++) {
-          v[s][0] = __uint_as_float(w[s][0][0]);
-          v[s][1] = __uint_as_float(w[s][0][2]);
-          v[s][2] = __uint_as_float(w[s][1][0]);
-          v[s][3] = __uint_as_float(w[s][1][2]);
+          v[s][0] = __uint_as_float(llw[s][0][0]);
+          v[s][1] = __uint_as_float(llw[s][0][2]);
+          v[s][2] = __uint_as_float(llw[s][1][0]);
+          v[s][3] = __uint_as_float(llw[s][1][2]);
         }
       } else {
 #pragma unroll
@@ -1358,7 +1354,12 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
         st_wt_u64((void *)(hout + i * 4), pk);
       }
     }
-    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    // Under SUM_LL only the waves that stored the slice drain: a wave with
+    // XGMI pushes still in flight would hold the flag back for their acks.
+    // Wave-uniform, so the wait is branched around rather than masked.
+    if (!SUM_LL || __builtin_amdgcn_readfirstlane(tid) < xs_f4) {
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    }
     __syncthreads();
     if (tid == 0) {
       asm volatile("global_store_dword %0, %1, off\n"
@@ -1651,6 +1652,10 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     atomicAdd(&g_subphase_ns[6][1], (_rt_t1 - _rt_t0) * 10); // Step 1 norm
   }
 #endif
+  // SUM_LL's deferred prefetch drain (see the barrier above).
+  if constexpr (OPROJ_BARRIER && SUM_LL) {
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  }
 
   // ═══ Step 2: Fused Gate GEMV + norm write ═══
   // One expert per worker. Each thread handles REDUCTION_SIZE/blockDim.x

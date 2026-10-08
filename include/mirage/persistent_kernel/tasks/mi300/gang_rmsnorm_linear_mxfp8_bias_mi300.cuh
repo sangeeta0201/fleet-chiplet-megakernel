@@ -1290,15 +1290,71 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
         reinterpret_cast<uint64_t const *>(d_nw + (v * NTHREADS + tid) * VEC));
   }
 
+  uint2 r = {0u, 0u};
+  uint2 pk[NEXTRA];
+  if (wg_idx < XS_N) {
+    int const off = (wg_idx * XS_F4 + tid) * VEC;
+#if MPK_EP_LL
+    // MPK_EP_LL: slot p is EP_SLOT_ELEMS / 2 (epoch << 32 | bf16x2) words,
+    // landed by the peers' folds over XGMI, so every read is system scope.
+    // One pass over the whole slice first -- usually the words are already
+    // there -- and only if some are not, a spin on one word per slot before
+    // the next pass, so a late peer costs eight polled words, not the slice.
+    {
+      typedef unsigned int ll_u4_t __attribute__((ext_vector_type(4)));
+      constexpr size_t LL_SLOT_WORDS = (size_t)EP_SLOT_ELEMS / 2;
+      unsigned long long const *const ll =
+          reinterpret_cast<unsigned long long const *>(d_res);
+      ll_u4_t w[EP_PEER_SLOTS];
+      while (true) {
+        bool ok = true;
+        if (tid < XS_F4) {
+#pragma unroll
+          for (int p = 0; p < EP_PEER_SLOTS; p++) {
+            asm volatile("global_load_dwordx4 %0, %1, off sc0 sc1"
+                         : "=v"(w[p])
+                         : "v"(ll + (size_t)p * LL_SLOT_WORDS + off / 2)
+                         : "memory");
+          }
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#pragma unroll
+          for (int p = 0; p < EP_PEER_SLOTS; p++) {
+            ok = ok && w[p][1] == epoch && w[p][3] == epoch;
+          }
+        }
+        if (__syncthreads_and(ok)) {
+          break;
+        }
+        if (tid < EP_PEER_SLOTS) {
+          unsigned long long *const sent = const_cast<unsigned long long *>(
+              ll + (size_t)tid * LL_SLOT_WORDS + (wg_idx * XS_F4 * VEC) / 2);
+          while ((unsigned)(ld_sys_u64(sent) >> 32) != epoch) {
+            __builtin_amdgcn_s_sleep(1);
+          }
+        }
+        __syncthreads();
+      }
+      if (tid < XS_F4) {
+        r = make_uint2(w[0][0], w[0][2]);
+#pragma unroll
+        for (int p = 0; p < NEXTRA; p++) {
+          pk[p] = make_uint2(w[p + 1][0], w[p + 1][2]);
+        }
+      }
+    }
+#else
+    if (tid < XS_F4) {
+      r = _rnlm8_ld_g_u2((void const *)(d_res + off));
+#pragma unroll
+      for (int p = 0; p < NEXTRA; p++) {
+        pk[p] = _rnlm8_ld_g_u2(
+            (void const *)(d_res + (size_t)(p + 1) * EP_SLOT_ELEMS + off));
+      }
+    }
+#endif
+  }
   if (wg_idx < XS_N && tid < XS_F4) {
     int const off = (wg_idx * XS_F4 + tid) * VEC;
-    uint2 const r = _rnlm8_ld_g_u2((void const *)(d_res + off));
-    uint2 pk[NEXTRA];
-#pragma unroll
-    for (int p = 0; p < NEXTRA; p++) {
-      pk[p] = _rnlm8_ld_g_u2(
-          (void const *)(d_res + (size_t)(p + 1) * EP_SLOT_ELEMS + off));
-    }
     float f[4];
     f[0] = _gang_bf16_to_float((unsigned short)r.x);
     f[1] = _gang_bf16_to_float((unsigned short)(r.x >> 16));

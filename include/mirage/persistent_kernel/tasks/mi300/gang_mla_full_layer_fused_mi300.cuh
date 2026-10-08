@@ -513,12 +513,71 @@ static constexpr int FULL_LAYER_RLL_SLOT =
     FULL_LAYER_XSPLIT_SLOT + FULL_LAYER_XSPLIT_LINES;
 // MPK_QKV_XSPLIT's exchange, the same per-XCD layout as MPK_ROUTER_XSPLIT's.
 static constexpr int FULL_LAYER_QXS_SLOT = FULL_LAYER_RLL_SLOT + MPK_RLL_LINES;
-static constexpr int FULL_LAYER_COUNTER_SLOTS =
+// MPK_OPROJ_LL == 2: each XCD's f32 o_proj rows, plain-stored by the GEMV and
+// read back in L2 by the push. XCD-private, whole 128-byte lines.
+static constexpr int FULL_LAYER_OLL_SLOT =
     FULL_LAYER_QXS_SLOT + FULL_LAYER_XSPLIT_LINES;
+static constexpr int FULL_LAYER_COUNTER_SLOTS =
+    FULL_LAYER_OLL_SLOT + 8 * MPK_OLL_XCD_INTS / 16;
 static_assert(FULL_LAYER_XSPLIT_SLOT % 2 == 0 && MPK_XSPLIT_XCD_INTS % 32 == 0 &&
                   FULL_LAYER_RLL_SLOT % 2 == 0 && MPK_RLL_XCD_INTS % 32 == 0 &&
-                  MPK_RLL_WORD_LINES % 2 == 0 && FULL_LAYER_QXS_SLOT % 2 == 0,
+                  MPK_RLL_WORD_LINES % 2 == 0 && FULL_LAYER_QXS_SLOT % 2 == 0 &&
+                  FULL_LAYER_OLL_SLOT % 2 == 0 && MPK_OLL_XCD_INTS % 32 == 0,
               "the XCD-private blocks must not share a 128-byte L2 line");
+
+#if MPK_EP_LL
+// MPK_EP_LL's fold: _full_layer_ep_fold_partial's arithmetic and workspace
+// zeroing, element for element, but each bf16 pair leaves as one
+// (epoch << 32 | pair) word, to this rank's slot and every peer's copy. The
+// word is its own arrival, so nothing here is drained or counted. Slots are
+// OUTPUT_STRIDE / 2 words per row, BATCH_SIZE rows.
+template <int BATCH_SIZE, int OUTPUT_SIZE, int OUTPUT_STRIDE, bool FOLD,
+          int NPEER>
+__device__ __forceinline__ void
+_full_layer_ep_fold_ll(void *workspace_f32_ptr, void const *residual_ptr,
+                       unsigned long long *out_words,
+                       unsigned long long *const *peer_words, int col_lo,
+                       int col_hi, unsigned epoch) {
+  static_assert(OUTPUT_SIZE % 2 == 0 && OUTPUT_STRIDE % 2 == 0,
+                "a word carries a whole bf16 pair");
+  float *__restrict__ d_ws = static_cast<float *>(workspace_f32_ptr);
+  unsigned short const *__restrict__ d_res =
+      static_cast<unsigned short const *>(residual_ptr);
+  unsigned long long const ep_hi = (unsigned long long)epoch << 32;
+  for (int row = 0; row < BATCH_SIZE; ++row) {
+    float *ws_row = d_ws + row * OUTPUT_STRIDE;
+    unsigned short const *res_row = d_res + row * OUTPUT_STRIDE;
+    size_t const wrow = (size_t)row * (OUTPUT_STRIDE / 2);
+    for (int p = (col_lo >> 1) + threadIdx.x; p < (col_hi >> 1);
+         p += MPK_NT) {
+      int const off = p << 1;
+      unsigned packed = 0;
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        float v = ws_row[off + j];
+        if constexpr (FOLD) {
+          unsigned rbits = (unsigned)res_row[off + j] << 16;
+          float rv;
+          __builtin_memcpy(&rv, &rbits, 4);
+          v += rv;
+        }
+        unsigned u;
+        __builtin_memcpy(&u, &v, 4);
+        unsigned rounding_bias = ((u >> 16) & 1) + 0x7FFFu;
+        unsigned short bf = (unsigned short)((u + rounding_bias) >> 16);
+        packed |= ((unsigned)bf) << (16 * j);
+      }
+      unsigned long long const w = ep_hi | packed;
+      st_wt_u64((void *)(out_words + wrow + p), w);
+      st_wt_u64((void *)&ws_row[off], 0ull);
+#pragma unroll
+      for (int q = 0; q < NPEER; ++q) {
+        st_wt_u64((void *)(peer_words[q] + wrow + p), w);
+      }
+    }
+  }
+}
+#endif
 // The entry rendezvous stays Mechanism C under two builds: MPK_BAR_SKEW's
 // stage stamps are referenced to its elected last arriver, which a tagged
 // entry does not have, and MPK_QKVA_ENTRY_PF's DMA sits between its arrival
@@ -1192,6 +1251,8 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     // count -- not (EP_WORLD_SIZE - 1) * it, which would never be reached.
     int const ep_expected = task_layer_idx + 1;
     uint64_t const ep_sig_expected = (uint64_t)ep_expected;
+    // The tail's slot is the LM head's input, which reads bf16 planes.
+    constexpr bool EP_LL = MPK_EP_LL && !EP_TAIL_ONLY;
 
     // Is every peer directly mapped? Hoisted out of the fold block, which
     // only the eight folding work-groups enter, because the peer wait further
@@ -1227,7 +1288,16 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     // -- it still bumps the arrival counter, which is what the count is for.
     constexpr int EP_FOLD_SUB =
         ((EP_FOLD_CHUNK + MPK_EP_FOLD_WGS - 1) / MPK_EP_FOLD_WGS + 1) & ~1;
-    int const ep_col_lo_raw = ep_xcd_lo + xcd_rank * EP_FOLD_SUB;
+    // MPK_EP_LL_FOLD_LAST: the folders are the XCD's last workers rather than
+    // its first. gfx950 counts stores in vmcnt, so a folder that is also a
+    // qkv_a resolver has its own XGMI stores' acks in front of its first
+    // validation wait, and every tile on its XCD waits for that resolver.
+    int const ep_fold_rank =
+        (EP_LL && MPK_EP_LL_FOLD_LAST)
+            ? xcd_rank - (tiles_per_xcd - MPK_EP_FOLD_WGS)
+            : xcd_rank;
+    int const ep_col_lo_raw =
+        ep_xcd_lo + (ep_fold_rank > 0 ? ep_fold_rank : 0) * EP_FOLD_SUB;
     int const ep_col_lo =
         (ep_col_lo_raw < ep_xcd_hi) ? ep_col_lo_raw : ep_xcd_hi;
     int const ep_col_hi = (ep_col_lo + EP_FOLD_SUB) < ep_xcd_hi
@@ -1259,7 +1329,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     // nothing -- but it still enters, because FULL_LAYER_EP_FOLDERS is a
     // compile-time count and the arrival counter has to see every one of them
     // or the leader is never elected.
-    if (ep_fold_here && xcd_rank < MPK_EP_FOLD_WGS) {
+    if (ep_fold_here && ep_fold_rank >= 0 && ep_fold_rank < MPK_EP_FOLD_WGS) {
       // One delta, two addresses, per peer. The gather slot and the signal
       // line are both symmetric-heap objects and the local->peer offset is
       // heap-wide, so translating the signal costs an add and no second
@@ -1331,6 +1401,40 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       // so the values line up with the embedding and with the dense probes.
       MPK_BSDBG_N(12, task_layer_idx, input_ptrs[0], 256, EP_MY_PE,
                   "layer_x_in", BATCH_SIZE, QKV_REDUCTION_SIZE);
+#if MPK_EP_LL
+      if constexpr (EP_LL) {
+        // The resolvers tell this layer's words apart by epoch alone, so the
+        // epoch has to be the layer counter, and every peer has to be a
+        // direct store away.
+        if (!ep_direct || !ml_mode) {
+          __builtin_trap();
+        }
+        unsigned long long *const ll_mine =
+            reinterpret_cast<unsigned long long *>(ep_gather) +
+            (size_t)EP_MY_PE * (EP_SLOT_ELEMS / 2);
+        unsigned long long *ll_peer[EP_NPEER];
+#pragma unroll
+        for (int q = 0; q < EP_NPEER; q++) {
+          ll_peer[q] = reinterpret_cast<unsigned long long *>(
+              reinterpret_cast<char *>(ll_mine) + ep_peer_delta[q]);
+        }
+        _full_layer_ep_fold_ll<BATCH_SIZE,
+                               QKV_REDUCTION_SIZE,
+                               QKV_REDUCTION_SIZE,
+                               (EP_MY_PE == EP_FOLD_PE),
+                               EP_NPEER>(input_ptrs[13],
+                                         input_ptrs[0],
+                                         ll_mine,
+                                         ll_peer,
+                                         ep_col_lo,
+                                         ep_col_hi,
+                                         (unsigned)ep_expected);
+        if (tid == 0) {
+          mpk_stage_stamp(3);
+        }
+      } else
+#endif
+      {
       _full_layer_ep_fold_partial<BATCH_SIZE,
                                   QKV_REDUCTION_SIZE,
                                   QKV_REDUCTION_SIZE,
@@ -1456,6 +1560,7 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
         }
 #endif
       }
+      }
     }
 
     // ── wait: this rank's slot complete, then every peer's ────────────────
@@ -1512,7 +1617,12 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     // upstream of the qkv_a -> q_b barrier that gates all of attention, so one
     // late peer stalls the whole XCD instead of one worker.
     MPK_WS_PHASE(12, task_layer_idx, xcd_id);
-    if (tid == 0) {
+    // MPK_EP_LL: no leader and no release. The resolvers wait on the words
+    // themselves, and the WAR hazards the release covered (this layer's
+    // Phase 9 rewriting input_ptrs[0], Phase 15 accumulating into the zeroed
+    // workspace) sit behind the qkv_a -> q_b rendezvous the folders join
+    // after folding.
+    if (tid == 0 && !EP_LL) {
       if (ep_leader) {
 #if MPK_EP_ABLATE == 0
         MPK_WS_PHASE(13, task_layer_idx, xcd_id);
@@ -2566,11 +2676,13 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       (ROUTER_FOLD && ml_mode) ? input_ptrs[FL_ROUTER_PARTS_IN] : nullptr,
       bar_tags,
       // MPK_OPROJ_RP: the f32 o_proj partials take the planes of this
-      // layer's ep_gather past the fold's, which demo.py allocates triple.
+      // layer's ep_gather past the fold's, which demo.py allocates triple
+      // (the fold's own region is twice as wide under MPK_EP_LL).
       /*oproj_rp_slots=*/
       (MPK_OPROJ_RP && EP_WORLD_SIZE > 1 && ml_mode)
           ? (void *)(static_cast<unsigned short *>(input_ptrs[27]) +
-                     (size_t)EP_WORLD_SIZE * BATCH_SIZE * QKV_REDUCTION_SIZE)
+                     (size_t)(MPK_EP_LL ? 2 : 1) * EP_WORLD_SIZE * BATCH_SIZE *
+                         QKV_REDUCTION_SIZE)
           : nullptr,
       // MPK_FOLD_W2: the next layer's ep_gather and this task's fold counters.
       /*fold_next_gather=*/
@@ -2589,7 +2701,12 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       // told apart by epoch alone.
       /*router_ll=*/
       (MPK_ROUTER_LL && ml_mode) ? counters + FULL_LAYER_RLL_SLOT * HIER_STRIDE
-                                 : nullptr
+                                 : nullptr,
+      // The words' epoch is the layer counter here too.
+      /*oproj_oll=*/
+      (MPK_OPROJ_LL == 2 && MPK_OPROJ_RP && EP_WORLD_SIZE > 1 && ml_mode)
+          ? counters + FULL_LAYER_OLL_SLOT * HIER_STRIDE
+          : nullptr
 #if MPK_QKVA_PF_KB > 0
       ,
       /*next_qkv_weight=*/input_ptrs[MPK_QKVA_PF_SLOT]

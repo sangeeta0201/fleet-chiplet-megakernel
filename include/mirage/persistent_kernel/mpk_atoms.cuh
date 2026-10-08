@@ -1028,8 +1028,46 @@ __device__ __forceinline__ bool
 // first 16 qkv_a tiles, which swap slices through an XCD-private row laid out
 // exactly like MPK_ROUTER_XSPLIT's (FULL_LAYER_QXS_SLOT). Same per-element add
 // order and per-thread ssq order as the unsplit resolve.
+//
+// MEASURED 2026-10-08, NP=8 1024/1024, n=3 interleaved against the XSPLIT +
+// ROUTER_LL default, tokens identical: 6.903 6.891 6.888 -> 6.977 7.014 6.974
+// (+0.09). The unsplit resolve is already one batched pass over L2-resident
+// slots; the exchange's extra rendezvous costs more than the re-reads. Off,
+// except as MPK_EP_LL's receiver.
 #ifndef MPK_QKV_XSPLIT
 #define MPK_QKV_XSPLIT 0
+#endif
+
+// MPK_EP_LL: the head-of-layer EP fold writes its slot as (epoch << 32 |
+// bf16x2) 8-byte words into every rank's copy, and MPK_QKV_XSPLIT's resolvers
+// validate them word by word. Gone: the fold's drain of its XGMI pushes, the
+// fold-done count, the leader's peer signals and peer wait, and the per-XCD
+// release -- the drain-then-signal pair MPK_FOLD_W2's note prices at ~2 us
+// of acks. The fold region of ep_gather doubles (world -> 2 * world planes,
+// ahead of MPK_OPROJ_RP's). Tail folds (LM head input) keep the bf16 slot.
+//
+// MEASURED 2026-10-08, NP=8 1024/1024, n=3 interleaved against the own-heads
+// default, tokens identical: 6.820 6.819 6.824 -> 6.492 6.504 6.477 ms
+// (-0.33).
+// Twice what the fold's stamped cross-rank wait promised: the resolve now
+// starts on the bytes, not on a release one fan-out behind them. demo.py
+// turns it on under MoE EP.
+#ifndef MPK_EP_LL
+#define MPK_EP_LL 0
+#endif
+// MPK_EP_LL_FOLD_LAST: under MPK_EP_LL, fold on each XCD's last worker instead
+// of xcd_rank 0, which is also split resolver 0 (see the fold site).
+#ifndef MPK_EP_LL_FOLD_LAST
+#define MPK_EP_LL_FOLD_LAST 0
+#endif
+#if MPK_EP_LL && !MPK_QKV_XSPLIT
+#error "MPK_EP_LL: the LL slots are only read by MPK_QKV_XSPLIT's resolvers"
+#endif
+#if MPK_EP_LL && MPK_FOLD_W2
+#error "MPK_EP_LL replaces the head fold's protocol; MPK_FOLD_W2 moves it"
+#endif
+#if MPK_EP_LL && (defined(MPK_QKV_EP_FOLD) || defined(MPK_QKV_PRO_HOIST))
+#error "MPK_EP_LL: the in-tile EP folds read the gather slots as bf16"
 #endif
 
 // MPK_OPROJ_LL: MPK_OPROJ_RP's f32 partials travel as (epoch << 32 | f32)
@@ -1044,9 +1082,19 @@ __device__ __forceinline__ bool
 // instead of the whole slice per spin did not move it (7.544 -> 7.6). The
 // worker image grows 348 VGPR / 96 AGPR / 496 B private against 319 / 63 /
 // 336. Not yet localized; off.
+//
+// == 2 keeps the GEMV as it is and moves the words into the push: the GEMV
+// plain-stores its f32 rows to an XCD-private block in L2 (FULL_LAYER_OLL_SLOT),
+// and the tile's wave 3 alone reads them back and writes the words, local and
+// peers. vmcnt retires in issue order, loads and stores mixed, so a wave with
+// XGMI stores in flight cannot finish any later load until they are acked;
+// keeping them on wave 3 leaves the router's validating waves 0-1 free of
+// them. The o_proj arrival, election, signals and release are skipped.
 #ifndef MPK_OPROJ_LL
 #define MPK_OPROJ_LL 0
 #endif
+// f32 rows per XCD for MPK_OPROJ_LL == 2: 768 at GLM-5's 6144 / 8.
+#define MPK_OLL_XCD_INTS 768
 #define MPK_RLL_WORD_LINES 32
 #define MPK_RLL_IDS_LINES 17
 #define MPK_RLL_XCD_INTS ((2 + 2 * MPK_RLL_IDS_LINES) * 16)
@@ -1062,6 +1110,13 @@ __device__ __forceinline__ bool
 // deterministic here and reads 2.4838 (x3) against 2.5532 (x3), +2.8%, and
 // the 1024-token generation collapses into a repetition loop (distinct 0.078)
 // where the default does not. Off by default.
+//
+// Three corpus windows, ppl512 (PPL_SKIP_TOKENS 0 / 1024 / 2048):
+//   E4M3 default   2.4838  2.9497  2.0749
+//   E2M1 ties-up   2.5532  3.0345  2.1836   (+2.8% +2.9% +5.2%)
+//   E2M1 RNE       2.5205  2.9785  2.1440   (+1.5% +1.0% +3.3%)
+// GLM_QKV_FP4_RNE narrows it but never closes it: the format costs quality
+// on qkv_a, not the rounding rule. Rejected.
 #ifndef MPK_QKV_MXFP4
 #define MPK_QKV_MXFP4 0
 #endif

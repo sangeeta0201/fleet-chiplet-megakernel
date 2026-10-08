@@ -403,7 +403,9 @@ __device__ __attribute__((always_inline)) void
         // MPK_ROUTER_XSPLIT only: the eight per-XCD exchange blocks.
         int *router_xsplit_ptr = nullptr,
         // MPK_ROUTER_LL only: the logit words and per-XCD routing copies.
-        int *router_ll_ptr = nullptr
+        int *router_ll_ptr = nullptr,
+        // MPK_OPROJ_LL == 2 only: the eight per-XCD f32 o_proj row blocks.
+        int *oproj_oll_ptr = nullptr
 #if MPK_QKVA_PF_KB > 0
         ,
         // Next layer's qkv_a weight for this XCD. Null on the last layer of
@@ -1105,8 +1107,23 @@ __device__ __attribute__((always_inline)) void
     // the push below copies to the same offset on every peer. f32 so the
     // cross-rank sum rounds once, as the column form does.
     constexpr bool RP_F32 = OPROJ_RP && !MPK_OPROJ_RP_BF16;
+    // MPK_OPROJ_LL == 2: the GEMV's f32 rows go to this XCD's block in L2
+    // and the push turns them into the words.
+    constexpr bool OLL2 = OPROJ_RP && MPK_OPROJ_LL == 2;
+    static_assert(!(OLL2 && SH_EARLY),
+                  "MPK_OPROJ_LL == 2 publishes no o_proj release for the early "
+                  "shared tiles to wait on");
+    float *const oll_xcd =
+        OLL2 ? reinterpret_cast<float *>(oproj_oll_ptr) +
+                   (size_t)xcd_id * MPK_OLL_XCD_INTS
+             : nullptr;
+    if (OLL2 && (oproj_oll_ptr == nullptr ||
+                 oproj_tiles_per_xcd * OPROJ_ROWS_PER_WG > MPK_OLL_XCD_INTS)) {
+      __builtin_trap();
+    }
     void *const xcd_out_rp =
         !OPROJ_RP ? nullptr
+        : OLL2    ? (void *)oll_xcd
         : MPK_OPROJ_LL
             ? (void *)(static_cast<unsigned long long *>(oproj_rp_slots_ptr) +
                        (size_t)EP_MY_PE * HIDDEN_SIZE + oproj_col_base)
@@ -1185,7 +1202,7 @@ __device__ __attribute__((always_inline)) void
       // bodies in the binary for no reason.
 #if MPK_OPROJ_MXFP4
       GangLLPush oproj_ll = {};
-      if constexpr (OPROJ_RP && MPK_OPROJ_LL) {
+      if constexpr (OPROJ_RP && MPK_OPROJ_LL == 1) {
         static_assert(OPROJ_NPEER <= 7, "GangLLPush carries seven peers");
         oproj_ll.epoch = (unsigned)oproj_expected;
         oproj_ll.npeer = OPROJ_NPEER;
@@ -1209,9 +1226,10 @@ __device__ __attribute__((always_inline)) void
                              OPROJ_ROWS_PER_WG,
                              // RP: the residual rides rank 0's partial only.
                              /*HAS_RESIDUAL=*/!OPROJ_RP || EP_MY_PE == 0,
-                             /*WRITE_THROUGH=*/true,
+                             // LL2's rows are read back on this XCD only.
+                             /*WRITE_THROUGH=*/!OLL2,
                              /*F32_OUT=*/RP_F32,
-                             /*LL_OUT=*/OPROJ_RP && MPK_OPROJ_LL>(
+                             /*LL_OUT=*/OPROJ_RP && MPK_OPROJ_LL == 1>(
           oproj_act,
           oproj_weight_ptr,
           xcd_res,
@@ -1258,7 +1276,36 @@ __device__ __attribute__((always_inline)) void
       // i.e. sc0 sc1, so the bytes are in memory but this CU's vL1 may hold
       // the line these lanes read before it. ld_nt_s32 is the sc0 sc1 load,
       // and it carries its own vmcnt drain.
-      // Under MPK_OPROJ_LL the GEMV already wrote every peer's copy.
+      // MPK_OPROJ_LL == 2: wave 3 alone turns the tile's L2 rows into words,
+      // here and on every peer; see the define for why only wave 3.
+      if constexpr (OLL2) {
+        static_assert(MPK_NT == 256 && OPROJ_ROWS_PER_WG <= 64,
+                      "one wave carries a tile's push");
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        __syncthreads();
+        if (oproj_push && tid >= MPK_NT - 64) {
+          int const w = tid - (MPK_NT - 64);
+          if (w < OPROJ_ROWS_PER_WG) {
+            unsigned const v = __builtin_nontemporal_load(
+                reinterpret_cast<unsigned const *>(oll_xcd) +
+                (size_t)t * OPROJ_ROWS_PER_WG + w);
+            unsigned long long const word =
+                ((unsigned long long)(unsigned)oproj_expected << 32) | v;
+            unsigned long long *const dst =
+                static_cast<unsigned long long *>(oproj_rp_slots_ptr) +
+                (size_t)EP_MY_PE * HIDDEN_SIZE + oproj_col_base +
+                (size_t)t * OPROJ_ROWS_PER_WG + w;
+            st_wt_u64((void *)dst, word);
+#pragma unroll
+            for (int q = 0; q < OPROJ_NPEER; q++) {
+              st_wt_u64((void *)(reinterpret_cast<char *>(dst) +
+                                 oproj_peer_delta[q]),
+                        word);
+            }
+          }
+        }
+      }
+      // Under MPK_OPROJ_LL the GEMV or the block above wrote every copy.
       if (oproj_push && !(OPROJ_RP && MPK_OPROJ_LL)) {
         static_assert((OPROJ_ROWS_PER_WG % 2) == 0,
                       "peer stores are packed 32-bit, so a tile must be an "
@@ -1393,6 +1440,10 @@ __device__ __attribute__((always_inline)) void
     // __syncthreads is execution-only; s_waitcnt is what actually retires all
     // 256 threads' stores, and it has to happen before the release atomic or a
     // waiting XCD can be let through ahead of the data.
+    //
+    // MPK_OPROJ_LL == 2 has no barrier here at all: the router validates the
+    // words, and draining wave 3's XGMI stores is exactly the wait it removes.
+    if constexpr (!OLL2) {
     __syncthreads();
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
@@ -1546,6 +1597,7 @@ __device__ __attribute__((always_inline)) void
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       }
     }
+    } // !OLL2
     // The *wait* deliberately does not happen here, and neither does the
     // acquire. Both are handed to the router kernel, which issues its gamma
     // and gate-weight loads before polling so they are in flight while the

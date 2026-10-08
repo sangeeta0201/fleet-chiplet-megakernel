@@ -478,7 +478,8 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // other heads are a partner rank's, decoded from a stale query row and
   // never read (W_UV / o_proj take this rank's heads only), so the decode
   // stores only this rank's partials and the merge reads only those -- half
-  // the o_acc either way at NP=8.
+  // the o_acc either way at NP=8. MEASURED 2026-10-08, NP=8 1024/1024, n=3:
+  // -0.06 ms, bit-identical. demo.py turns it on wherever head-local runs.
 #ifndef MPK_MLA_MERGE_OWN_HEADS
 #define MPK_MLA_MERGE_OWN_HEADS 0
 #endif
