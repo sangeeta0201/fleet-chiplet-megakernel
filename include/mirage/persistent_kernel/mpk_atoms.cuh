@@ -982,6 +982,93 @@ __device__ __forceinline__ bool
 #endif
 #define MPK_FOLD_W2_SLOT 32
 
+// MPK_ROUTER_XSPLIT: under MPK_ROUTER_STREAM the XCD's router tiles split the
+// o_proj slot sum between them and swap slices through an XCD-private row in
+// the fused layer's counter buffer (FULL_LAYER_XSPLIT_SLOT), instead of every
+// tile reading every slot for the whole row. Per XCD: two 64-byte lines of
+// flags (a word per router tile), then MPK_XSPLIT_ROW_LINES lines of bf16 row.
+//
+// Every per-XCD block is a whole number of 128-byte L2 lines and starts on
+// one. The blocks are written with plain stores and live dirty in eight
+// non-coherent L2s; a line shared by two XCDs' blocks is written back whole by
+// whichever L2 evicts it, which restores the other XCD's stale flags in memory
+// -- and an `nt` poll, which streams the line out of L2, then reads them back.
+// That hung the first build (193-line blocks: XCD x's row tail shared a line
+// with XCD x+1's flags).
+//
+// MEASURED 2026-10-08, NP=8 1024/1024, n=3 interleaved, every token identical
+// to the default: 7.157 7.160 7.159 -> 7.040 7.030 7.025 ms. Step 1 was
+// 10.4 of the router's 13.4 instrumented us (SP6[1]). demo.py turns it on
+// wherever MPK_ROUTER_STREAM is.
+#ifndef MPK_ROUTER_XSPLIT
+#define MPK_ROUTER_XSPLIT 0
+#endif
+#define MPK_XSPLIT_FLAG_LINES 2
+#define MPK_XSPLIT_ROW_LINES 192
+#define MPK_XSPLIT_XCD_INTS ((MPK_XSPLIT_FLAG_LINES + MPK_XSPLIT_ROW_LINES) * 16)
+
+// MPK_ROUTER_LL: the router tiles publish each logit as one 8-byte
+// (epoch << 32 | bf16) word, and one block per XCD polls all of them and runs
+// the TopK into XCD-private routing copies. Replaces the arrival atomic, the
+// single elected tail with its GPU-wide fence and release, and the MoE
+// workers' cold cross-XCD reads of the routing. Region (FULL_LAYER_RLL_SLOT):
+// MPK_RLL_WORD_LINES of words, then per XCD a flag line, a line of TopK
+// weights, and MPK_RLL_IDS_LINES each of active ids and routing indices.
+//
+// MEASURED 2026-10-08, NP=8 1024/1024, n=3 interleaved, every token identical
+// to the default: 7.159 7.133 7.151 -> 7.079 7.038 7.002 ms. The tail it
+// replaces was 7.0 instrumented us per layer (SP6[4]): 4.4 selection, 1.6
+// fence + release. On by default under MPK_OPROJ_RP (demo.py).
+#ifndef MPK_ROUTER_LL
+#define MPK_ROUTER_LL 0
+#endif
+// Same 128-byte rule as MPK_ROUTER_XSPLIT for the per-XCD copies (36 lines).
+// MPK_QKV_XSPLIT: qkv_a's EP resolve (the eight-slot sum + residual every
+// tile re-reads for the whole row, ~46% of the tile) split over the XCD's
+// first 16 qkv_a tiles, which swap slices through an XCD-private row laid out
+// exactly like MPK_ROUTER_XSPLIT's (FULL_LAYER_QXS_SLOT). Same per-element add
+// order and per-thread ssq order as the unsplit resolve.
+#ifndef MPK_QKV_XSPLIT
+#define MPK_QKV_XSPLIT 0
+#endif
+
+// MPK_OPROJ_LL: MPK_OPROJ_RP's f32 partials travel as (epoch << 32 | f32)
+// 8-byte words, written by the o_proj GEMV straight into every rank's slot,
+// and the split router validates them word by word -- no read-back push, no
+// drain-then-signal, no wait on the o_proj release. The slot region doubles
+// (ep_gather RP planes 3x -> 5x world).
+//
+// MEASURED NEGATIVE 2026-10-08, NP=8 1024/1024, n=3 interleaved against the
+// XSPLIT + ROUTER_LL default, tokens identical: 6.895 6.883 6.902 -> 7.582
+// 7.584 7.619 ms (+0.70). Polling one sentinel word per (slot, o_proj tile)
+// instead of the whole slice per spin did not move it (7.544 -> 7.6). The
+// worker image grows 348 VGPR / 96 AGPR / 496 B private against 319 / 63 /
+// 336. Not yet localized; off.
+#ifndef MPK_OPROJ_LL
+#define MPK_OPROJ_LL 0
+#endif
+#define MPK_RLL_WORD_LINES 32
+#define MPK_RLL_IDS_LINES 17
+#define MPK_RLL_XCD_INTS ((2 + 2 * MPK_RLL_IDS_LINES) * 16)
+#define MPK_RLL_LINES (MPK_RLL_WORD_LINES + 8 * MPK_RLL_XCD_INTS / 16)
+
+// MPK_QKV_MXFP4: GLM's fused-layer qkv_a weight is packed E2M1 instead of
+// E4M3 (demo.py GLM_QKV_MXFP4), halving the phase's weight stream. Faked in
+// bf16 first (GLM_FAKE_MXFP4_QKV): ppl@1024 2.50 vs 2.57 default.
+//
+// MEASURED 2026-10-08, NP=8 1024/1024, n=3: 7.178 7.176 7.155 -> 6.957
+// 6.978 6.965 ms (-0.21). The E2M1 path is bit-exact against E4M3 on the same
+// values (tests/standalone/test_qkv_fp4.hip). But quality: ppl512 is
+// deterministic here and reads 2.4838 (x3) against 2.5532 (x3), +2.8%, and
+// the 1024-token generation collapses into a repetition loop (distinct 0.078)
+// where the default does not. Off by default.
+#ifndef MPK_QKV_MXFP4
+#define MPK_QKV_MXFP4 0
+#endif
+#if MPK_QKV_MXFP4 && (MPK_QKVA_ENTRY_PF || MPK_QKVA_PF_KB > 0)
+#error "MPK_QKV_MXFP4: the qkv_a prefetchers still size tiles as E4M3"
+#endif
+
 // MPK_MOE_SHADOW_KB: kilobytes of cold weight read that each W13-idle worker
 // pulls during the W13 phase. CORRECT OUTPUT -- see the long note at the
 // probe site in gang_oproj_router_fused_mi300.cuh. 87 is the like-for-like

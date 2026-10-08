@@ -266,7 +266,11 @@ template <typename T,
           int KV_CHUNK_SIZE = 128,
           int PAGE_SIZE = 4096,
           bool WRITE_THROUGH = false,
-          int DIM_SPLITS = 1>
+          int DIM_SPLITS = 1,
+          // Merge only heads [head_base, head_base + HEADS_N) of the group:
+          // GLM's head-local decode fills a 16-head group of which a rank at
+          // NP=8 owns 8, and the other 8 are never read.
+          int HEADS_N = NUM_QO_HEADS_PER_KV>
 __device__ __forceinline__ void
     merge_splitkv_ck_fmha(float const *lse_ptr,
                           float const *o_ptr,
@@ -276,7 +280,10 @@ __device__ __forceinline__ void
                           int16_t request_id,
                           T *output_ptr,
                           int merge_task_offset,
-                          void const *sinks_ptr = nullptr) {
+                          void const *sinks_ptr = nullptr,
+                          int head_base = 0) {
+  static_assert(HEADS_N >= 1 && HEADS_N <= NUM_QO_HEADS_PER_KV,
+                "HEADS_N is a sub-range of the group");
 
   static_assert(HEAD_DIM % DIM_SPLITS == 0,
                 "DIM_SPLITS must divide HEAD_DIM evenly");
@@ -309,7 +316,14 @@ __device__ __forceinline__ void
 
   // Use 32 threads per head to match work items (1 token * 8 heads = 8 groups =
   // 256/32)
-  constexpr int THREADS_PER_TOKEN = (NUM_QO_HEADS_PER_KV <= 8) ? 32 : 16;
+  // A sub-range keeps 16 threads per head when the slice is too narrow for
+  // 32 (GLM: 512 / 32 splits = 16 dims); half the groups then idle, and each
+  // item reads half the o_acc.
+  constexpr int THREADS_PER_TOKEN =
+      (NUM_QO_HEADS_PER_KV <= 8 ||
+       (HEADS_N <= 8 && HEAD_DIM / DIM_SPLITS >= 32))
+          ? 32
+          : 16;
   constexpr int DIM_PER_SLICE = HEAD_DIM / DIM_SPLITS;
   constexpr int VAL_PER_THREAD = DIM_PER_SLICE / THREADS_PER_TOKEN;
   constexpr int num_groups = NUM_THREADS / THREADS_PER_TOKEN;
@@ -330,10 +344,9 @@ __device__ __forceinline__ void
   __sink_bf16 const *d_sinks = reinterpret_cast<__sink_bf16 const *>(sinks_ptr);
 
 #pragma unroll
-  for (int tok = group_id; tok < num_tokens * NUM_QO_HEADS_PER_KV;
-       tok += num_groups) {
-    int token_idx = tok / NUM_QO_HEADS_PER_KV;
-    int head_idx = tok % NUM_QO_HEADS_PER_KV;
+  for (int tok = group_id; tok < num_tokens * HEADS_N; tok += num_groups) {
+    int token_idx = tok / HEADS_N;
+    int head_idx = head_base + tok % HEADS_N;
 
     // Load this head's sink once (independent of dim).
     float sink_val_log2 = 0.0f;

@@ -96,6 +96,14 @@ __device__ __forceinline__ unsigned cvt_fp4_pair(unsigned raw, float scale) {
 // packer is the same one: pack_mxfp8_workgroup reads its row width from the
 // data tensor, so quantize_mxfp4's [out, K/2] lands in the identical
 // data-then-scales layout with no repacking work.
+// MPK_OPROJ_LL's per-call push description, by value so the deltas stay in
+// registers (a pointer to the caller's array is a scratch spill on both sides).
+struct GangLLPush {
+  unsigned epoch;
+  int npeer;
+  int64_t delta[7];
+};
+
 template <int BATCH_SIZE, // = m_per_tile
           int REDUCTION_SIZE,
           int ROWS_PER_WG,
@@ -103,7 +111,10 @@ template <int BATCH_SIZE, // = m_per_tile
           bool WRITE_THROUGH = false,
           // output_ptr is f32 rather than bf16: a partial that is summed
           // across ranks before it is rounded (MPK_OPROJ_RP).
-          bool F32_OUT = false>
+          bool F32_OUT = false,
+          // MPK_OPROJ_LL: output_ptr is 8-byte (ll_epoch << 32 | f32) words,
+          // stored to it and to the same offset on each of ll_npeer peers.
+          bool LL_OUT = false>
 __device__ __noinline__ void
     gang_gemv_mxfp4_kernel(void const *input_ptr,
                            void const *weight_ptr,
@@ -117,7 +128,9 @@ __device__ __noinline__ void
                            int wgm,
                            int tile_idx,
                            void const *bias_ptr = nullptr,
-                           bool stage_a = true) {
+                           bool stage_a = true,
+                           GangLLPush ll = {}) {
+  static_assert(!LL_OUT || F32_OUT, "the LL words carry f32 partials");
   using gang_gemv_detail::b2f;
   using gang_gemv_detail::f2b;
   using gang_gemv_mxfp4_detail::cvt_fp4_pair;
@@ -352,7 +365,24 @@ __device__ __noinline__ void
       if constexpr (HAS_RESIDUAL) {
         v += b2f(ld_g<unsigned short>(R + idx));
       }
-      if constexpr (F32_OUT) {
+      if constexpr (LL_OUT) {
+        // The epoch rides in the same 8-byte store as the value, so a reader
+        // that sees this layer's epoch has this layer's value -- no drain, no
+        // separate signal.
+        unsigned long long *const Ow =
+            static_cast<unsigned long long *>(output_ptr);
+        unsigned long long const word =
+            ((unsigned long long)ll.epoch << 32) | __float_as_uint(v);
+        st_wt_u64((void *)&Ow[idx], word);
+#pragma unroll
+        for (int q = 0; q < 7; q++) {
+          if (q < ll.npeer) {
+            st_wt_u64((void *)(reinterpret_cast<char *>(&Ow[idx]) +
+                               ll.delta[q]),
+                      word);
+          }
+        }
+      } else if constexpr (F32_OUT) {
         float *const Of = static_cast<float *>(output_ptr);
         if constexpr (WRITE_THROUGH) {
           st_wt_u32(&Of[idx], __float_as_uint(v));

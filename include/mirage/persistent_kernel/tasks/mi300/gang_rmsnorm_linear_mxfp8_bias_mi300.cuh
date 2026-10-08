@@ -1246,6 +1246,162 @@ _rnlm8_resadd_norm_rcp(float const *__restrict__ d_ws,
   return rsqrtf(red[0] / float(REDUCTION_SIZE) + eps);
 }
 
+#if MPK_QKV_XSPLIT
+// MPK_QKV_XSPLIT: _rnlm8_resadd_norm_rcp's EP resolve split over the XCD's
+// first XS_N tiles. Tile w < XS_N sums row slice w over every slot, in the
+// same slot order, and stores it to the XCD-private row `xs`; then every tile
+// takes the whole row back, staging s_x and accumulating ssq with the same
+// thread mapping as the unsplit loop -- so s_x, x_out and rms are identical to
+// it. The flags and the row live in this XCD's L2: plain stores, `nt` loads
+// (see MPK_ROUTER_XSPLIT for why exactly those).
+template <int REDUCTION_SIZE, int EP_PEER_SLOTS, int EP_SLOT_ELEMS>
+__device__ __forceinline__ float
+_rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
+                              unsigned short *__restrict__ d_x_out,
+                              unsigned short *__restrict__ s_x,
+                              float eps,
+                              unsigned short const *__restrict__ d_nw,
+                              unsigned short *__restrict__ s_nw,
+                              int *xs,
+                              unsigned epoch,
+                              int wg_idx) {
+  constexpr int VEC = 4;
+  constexpr int NTHREADS = 256;
+  constexpr int ITERS = REDUCTION_SIZE / (NTHREADS * VEC);
+  constexpr int XS_N = 16;
+  constexpr int H4 = REDUCTION_SIZE / VEC;
+  constexpr int XS_F4 = H4 / XS_N;
+  constexpr int NEXTRA = EP_PEER_SLOTS - 1;
+  static_assert(REDUCTION_SIZE % (NTHREADS * VEC) == 0 && H4 % XS_N == 0 &&
+                    XS_F4 <= NTHREADS && EP_PEER_SLOTS > 1,
+                "the split resolve walks whole float4 groups");
+  static_assert(REDUCTION_SIZE * 2 <= MPK_XSPLIT_ROW_LINES * 64,
+                "the resolved bf16 row overruns its exchange block");
+  int const tid = threadIdx.x;
+  unsigned *const flag = reinterpret_cast<unsigned *>(xs);
+  unsigned short *const row =
+      reinterpret_cast<unsigned short *>(xs + MPK_XSPLIT_FLAG_LINES * 16);
+
+  // The norm weight does not depend on the exchange; get it in flight first.
+  uint64_t nw[ITERS];
+#pragma unroll
+  for (int v = 0; v < ITERS; v++) {
+    nw[v] = *(__attribute__((address_space(1))) uint64_t const *)(
+        reinterpret_cast<uint64_t const *>(d_nw + (v * NTHREADS + tid) * VEC));
+  }
+
+  if (wg_idx < XS_N && tid < XS_F4) {
+    int const off = (wg_idx * XS_F4 + tid) * VEC;
+    uint2 const r = _rnlm8_ld_g_u2((void const *)(d_res + off));
+    uint2 pk[NEXTRA];
+#pragma unroll
+    for (int p = 0; p < NEXTRA; p++) {
+      pk[p] = _rnlm8_ld_g_u2(
+          (void const *)(d_res + (size_t)(p + 1) * EP_SLOT_ELEMS + off));
+    }
+    float f[4];
+    f[0] = _gang_bf16_to_float((unsigned short)r.x);
+    f[1] = _gang_bf16_to_float((unsigned short)(r.x >> 16));
+    f[2] = _gang_bf16_to_float((unsigned short)r.y);
+    f[3] = _gang_bf16_to_float((unsigned short)(r.y >> 16));
+#pragma unroll
+    for (int p = 0; p < NEXTRA; p++) {
+      f[0] += _gang_bf16_to_float((unsigned short)pk[p].x);
+      f[1] += _gang_bf16_to_float((unsigned short)(pk[p].x >> 16));
+      f[2] += _gang_bf16_to_float((unsigned short)pk[p].y);
+      f[3] += _gang_bf16_to_float((unsigned short)(pk[p].y >> 16));
+    }
+    unsigned long long const packed =
+        (unsigned long long)((unsigned)_gang_float_to_bf16(f[0]) |
+                             ((unsigned)_gang_float_to_bf16(f[1]) << 16)) |
+        ((unsigned long long)((unsigned)_gang_float_to_bf16(f[2]) |
+                              ((unsigned)_gang_float_to_bf16(f[3]) << 16))
+         << 32);
+    asm volatile("global_store_dwordx2 %0, %1, off"
+                 :
+                 : "v"(row + off), "v"(packed)
+                 : "memory");
+    // Every XCD resolves every slice, as every XCD's tile 0 stored the whole
+    // row before; the stores are idempotent.
+    st_wt_u64((void *)(d_x_out + off), packed);
+  }
+  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  __syncthreads();
+  if (wg_idx < XS_N && tid == 0) {
+    asm volatile("global_store_dword %0, %1, off\n"
+                 "s_waitcnt vmcnt(0)"
+                 :
+                 : "v"(flag + wg_idx), "v"(epoch)
+                 : "memory");
+  }
+  if (tid < 64) {
+    while (true) {
+      unsigned seen = epoch;
+      if (tid < XS_N) {
+        asm volatile("global_load_dword %0, %1, off nt\n"
+                     "s_waitcnt vmcnt(0)"
+                     : "=v"(seen)
+                     : "v"(flag + tid)
+                     : "memory");
+      }
+      if (__ballot(seen >= epoch) == ~0ull) {
+        break;
+      }
+      __builtin_amdgcn_s_sleep(1);
+    }
+  }
+  __syncthreads();
+
+  float ssq = 0.0f;
+  unsigned long long rv[ITERS];
+#pragma unroll
+  for (int v = 0; v < ITERS; v++) {
+    rv[v] = __builtin_nontemporal_load(reinterpret_cast<unsigned long long const *>(
+        row + (v * NTHREADS + tid) * VEC));
+  }
+#pragma unroll
+  for (int v = 0; v < ITERS; v++) {
+    int const off = (v * NTHREADS + tid) * VEC;
+    *reinterpret_cast<uint64_t *>(s_nw + off) = nw[v];
+    *reinterpret_cast<unsigned long long *>(s_x + off) = rv[v];
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      float const q = _gang_bf16_to_float(
+          (unsigned short)((rv[v] >> (16 * i)) & 0xFFFFull));
+      ssq += q * q;
+    }
+  }
+
+#if MPK_RMSNORM_DPP
+  ssq = gang_rmsnorm_detail::_mpk_wave_sum_to_lane0(ssq);
+#else
+#pragma unroll
+  for (int offset = 32; offset > 0; offset >>= 1) {
+    ssq += __shfl_xor(ssq, offset);
+  }
+#endif
+  __shared__ float red[16];
+  int const wave_id = tid >> 6;
+  int const lane_id = tid & 63;
+  int const num_waves = MPK_NT >> 6;
+  if (lane_id == 0) {
+    red[wave_id] = ssq;
+  }
+  __syncthreads();
+  if (wave_id == 0) {
+    ssq = (lane_id < num_waves) ? red[lane_id] : 0.0f;
+    for (int offset = num_waves >> 1; offset > 0; offset >>= 1) {
+      ssq += __shfl_xor(ssq, offset);
+    }
+    if (lane_id == 0) {
+      red[0] = ssq;
+    }
+  }
+  __syncthreads();
+  return rsqrtf(red[0] / float(REDUCTION_SIZE) + eps);
+}
+#endif // MPK_QKV_XSPLIT
+
 // _rnlm8_resadd_norm_rcp without the residual: the plain path's
 // rmsnorm_rcp_amd, plus the LDS staging of the row and the norm weight.
 //
@@ -1495,27 +1651,48 @@ __device__ __forceinline__ T _rnlm8_ld_g_nt(void const *p) {
 // callers already pass (kt = ki * 128) and scaled here by the layout's stride
 // multiplier. KMUL/HI_OFF are template parameters rather than reads of the
 // macro so that a single translation unit could hold both layouts.
+//
+// HI_OFF == 0 is MXFP4 (MPK_QKV_MXFP4): a lane's 32 E2M1 values are one
+// 16-byte chunk at +g*16 of the row's 64-byte k-tile, so the byte offset is
+// half the FP8 one and src0's upper 128 bits stay zero.
 template <int KMUL, int HI_OFF>
 __device__ __forceinline__ i32x8_t
     _rnlm8_load_w(uint8_t const *base, int kt, int g) {
-  uint8_t const *p = base + kt * KMUL + g * 16;
+  constexpr bool FP4 = (HI_OFF == 0);
+  uint8_t const *p = base + (FP4 ? kt * KMUL / 2 : kt * KMUL) + g * 16;
 #if MPK_ATTN_STREAM_NT >= 1
   i32x4_t lo = _rnlm8_ld_g_nt<i32x4_t>(p);
-  i32x4_t hi = _rnlm8_ld_g_nt<i32x4_t>(p + HI_OFF);
 #else
   i32x4_t lo = _gang_ld_g<i32x4_t>(p);
-  i32x4_t hi = _gang_ld_g<i32x4_t>(p + HI_OFF);
 #endif
-  i32x8_t r;
+  i32x8_t r = {};
   r[0] = lo[0];
   r[1] = lo[1];
   r[2] = lo[2];
   r[3] = lo[3];
-  r[4] = hi[0];
-  r[5] = hi[1];
-  r[6] = hi[2];
-  r[7] = hi[3];
+  if constexpr (!FP4) {
+#if MPK_ATTN_STREAM_NT >= 1
+    i32x4_t hi = _rnlm8_ld_g_nt<i32x4_t>(p + HI_OFF);
+#else
+    i32x4_t hi = _gang_ld_g<i32x4_t>(p + HI_OFF);
+#endif
+    r[4] = hi[0];
+    r[5] = hi[1];
+    r[6] = hi[2];
+    r[7] = hi[3];
+  }
   return r;
+}
+
+// The weight x token MFMA for the layout _rnlm8_load_w loaded: E2M1 src0 when
+// FP4, E4M3 otherwise. Tokens are E4M3 either way.
+template <bool FP4>
+__device__ __forceinline__ f32x4_t _rnlm8_mfma(i32x8_t a, i32x8_t b,
+                                               f32x4_t c, int scale_a,
+                                               int scale_b) {
+  return __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
+      a, b, c, FP4 ? 4 : 0 /*cbsz: src0 format*/, 0 /*blgp: E4M3 src1*/, 0,
+      _gang_mfma_vscale(scale_a), 0, _gang_mfma_vscale(scale_b));
 }
 
 // The matching scale byte. `off4` is the row-major offset the callers already
@@ -1672,7 +1849,7 @@ __device__ __forceinline__ f32x4_t
 #pragma unroll
     for (int j = 0; j < GROUPS; j++) {
       i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (base + j) * K_PER_MFMA, g);
-      acc = _gang_mfma_f8xf8(A[j], b, acc, S[j], (int)s_tok_scales[base + j]);
+      acc = _rnlm8_mfma<W_HIOFF == 0>(A[j], b, acc, S[j], (int)s_tok_scales[base + j]);
     }
 #pragma unroll
     for (int j = 0; j < GROUPS; j++) {
@@ -1687,7 +1864,7 @@ __device__ __forceinline__ f32x4_t
 #pragma unroll
   for (int j = 0; j < GROUPS; j++) {
     i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (tail + j) * K_PER_MFMA, g);
-    acc = _gang_mfma_f8xf8(A[j], b, acc, S[j], (int)s_tok_scales[tail + j]);
+    acc = _rnlm8_mfma<W_HIOFF == 0>(A[j], b, acc, S[j], (int)s_tok_scales[tail + j]);
   }
   // Pin the accumulator. At NBLK == 1 -- ITERS_PER_WAVE == GROUPS, which is
   // the K=2048 / OUTPUT_PER_WG=16 instantiation -- the block loop above has a
@@ -1791,7 +1968,7 @@ __device__ __forceinline__ f32x4_t
     for (int j = 0; j < GROUPS; j++) {
       int const kk = ki_start + b * GROUPS + j;
       i32x8_t bb = _gang_load_fp8_mfma_b(s_tok_fp8, kk * K_PER_MFMA, g);
-      acc = _gang_mfma_f8xf8(src[j], bb, acc, ssc[j], (int)s_tok_scales[kk]);
+      acc = _rnlm8_mfma<W_HIOFF == 0>(src[j], bb, acc, ssc[j], (int)s_tok_scales[kk]);
     }
   };
 
@@ -2059,7 +2236,10 @@ template <int BATCH_SIZE,
           // multiply-add on every output store. Measured: n=2 min went 8.738
           // -> 8.780 ms/token with the offset runtime-defaulted, and back to
           // baseline once it became a template parameter.
-          bool PPL_SINK = false>
+          bool PPL_SINK = false,
+          // MPK_QKV_MXFP4: the weight is packed E2M1 (pack_dense_mxfp8 with
+          // fp4=True), same workgroup layout at half the data bytes.
+          bool WEIGHT_FP4 = false>
 __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     void const *norm_input_ptr,  // [batch, REDUCTION_SIZE] bf16
     void const *norm_weight_ptr, // [REDUCTION_SIZE] bf16
@@ -2088,7 +2268,10 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     // needs no separate f32 sink: the row is already written to HBM here, and
     // it is written at the same bf16 width the argmax downstream reduces, so
     // redirecting it captures exactly the values the kernel decided on.
-    int logits_row = 0) {
+    int logits_row = 0,
+    // MPK_QKV_XSPLIT only: this XCD's exchange block and the layer epoch.
+    int *qxs = nullptr,
+    unsigned qxs_epoch = 0) {
 
   static_assert(OUTPUT_PER_WG % 16 == 0,
                 "OUTPUT_PER_WG must be multiple of 16");
@@ -2113,7 +2296,9 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
 
   // ── Weight layout constants ─────────────────────────────────────────────
   constexpr int NUM_BLOCKS_32 = REDUCTION_SIZE / 32;
-  constexpr int WG_DATA_BYTES = OUTPUT_PER_WG * REDUCTION_SIZE;
+  // E2M1 nibbles under WEIGHT_FP4: half the data bytes, the same scales.
+  constexpr int W_ROW_BYTES = WEIGHT_FP4 ? REDUCTION_SIZE / 2 : REDUCTION_SIZE;
+  constexpr int WG_DATA_BYTES = OUTPUT_PER_WG * W_ROW_BYTES;
   constexpr int WG_SCALE_BYTES = OUTPUT_PER_WG * NUM_BLOCKS_32;
   constexpr int WG_BYTES = WG_DATA_BYTES + WG_SCALE_BYTES;
 
@@ -2125,7 +2310,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
   constexpr bool W_KMAJOR = _rnlm8_wk<OUTPUT_PER_WG>();
   constexpr bool SC_KMAJOR = _rnlm8_sck<OUTPUT_PER_WG>();
   constexpr int W_KMUL = W_KMAJOR ? 16 : 1;
-  constexpr int W_HIOFF = W_KMAJOR ? 1024 : 64;
+  // 0 tells _rnlm8_load_w and _rnlm8_mfma the row is E2M1.
+  constexpr int W_HIOFF = WEIGHT_FP4 ? 0 : (W_KMAJOR ? 1024 : 64);
   constexpr int SC_KMUL = SC_KMAJOR ? 16 : 1;
   static_assert(!W_KMAJOR || OUTPUT_PER_WG == 16,
                 "the K-major weight layout is only packed for the K-parallel "
@@ -2381,6 +2567,31 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     // slot p of token `tok_idx` sits at p * BATCH_SIZE * REDUCTION_SIZE +
     // tok_idx * REDUCTION_SIZE -- the base pointer below is unchanged and the
     // helper adds the slot term itself.
+#if MPK_QKV_XSPLIT
+    bool qxs_done = false;
+    if constexpr (EP_PEER_SLOTS > 1 && !EP_PRE_FOLDED && LDS_PROLOGUE &&
+                  BATCH_SIZE == 1) {
+      if (qxs != nullptr) {
+        if (n_wgs_per_xcd < 16) {
+          __builtin_trap();
+        }
+        rms_rcp = _rnlm8_resadd_norm_rcp_xsplit<REDUCTION_SIZE,
+                                                EP_PEER_SLOTS,
+                                                BATCH_SIZE * REDUCTION_SIZE>(
+            (unsigned short const *)norm_input_ptr,
+            (unsigned short *)resadd_x_out_ptr,
+            s_x_bf16,
+            /*eps=*/1e-5f,
+            (unsigned short const *)norm_weight_ptr,
+            s_nw_bf16,
+            qxs,
+            qxs_epoch,
+            wg_idx);
+        qxs_done = true;
+      }
+    }
+    if (!qxs_done)
+#endif
     rms_rcp = _rnlm8_resadd_norm_rcp<REDUCTION_SIZE,
                                      EP_PEER_SLOTS,
                                      BATCH_SIZE * REDUCTION_SIZE,
@@ -2486,9 +2697,9 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     // stride then lives in W_KMUL, not in this base.
     uint8_t const *h_data =
         wg_data + (W_KMAJOR
-                       ? static_cast<int64_t>(h_row / 16) * REDUCTION_SIZE * 16 +
+                       ? static_cast<int64_t>(h_row / 16) * W_ROW_BYTES * 16 +
                              static_cast<int64_t>(h_row % 16) * 64
-                       : static_cast<int64_t>(h_row) * REDUCTION_SIZE);
+                       : static_cast<int64_t>(h_row) * W_ROW_BYTES);
     uint8_t const *h_scale =
         wg_scales + (SC_KMAJOR ? (h_row / 16) * NUM_BLOCKS_32 * 16 +
                                      (h_row % 16) * 4
@@ -2576,9 +2787,9 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
       // branch only so the two read alike.
       uint8_t const *w_data_row =
           wg_data + (W_KMAJOR
-                         ? static_cast<int64_t>(w_row / 16) * REDUCTION_SIZE * 16 +
+                         ? static_cast<int64_t>(w_row / 16) * W_ROW_BYTES * 16 +
                                static_cast<int64_t>(w_row % 16) * 64
-                         : static_cast<int64_t>(w_row) * REDUCTION_SIZE);
+                         : static_cast<int64_t>(w_row) * W_ROW_BYTES);
       uint8_t const *w_scale_row =
           wg_scales + (SC_KMAJOR ? (w_row / 16) * NUM_BLOCKS_32 * 16 +
                                        (w_row % 16) * 4
@@ -2652,7 +2863,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
         __builtin_amdgcn_sched_barrier(0);
 #pragma unroll
         for (int ki = 0; ki < MFMA_ITERS; ki++) {
-          acc = _gang_mfma_f8xf8(a[ki], b[ki], acc, sa[ki],
+          acc = _rnlm8_mfma<W_HIOFF == 0>(a[ki], b[ki], acc, sa[ki],
                                  (int)s_tok_scales[ki]);
         }
         // This is what "prevents ROCm miscompilation" below actually means,
@@ -2716,7 +2927,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
           {
             i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
             int sb = (int)s_tok_scales[ki];
-            acc = _gang_mfma_f8xf8(a0, b, acc, sa0, sb);
+            acc = _rnlm8_mfma<W_HIOFF == 0>(a0, b, acc, sa0, sb);
           }
           if (ki + 4 < MFMA_ITERS) {
             int kt4 = (ki + 4) * K_PER_MFMA;
@@ -2729,7 +2940,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
             i32x8_t b =
                 _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 1) * K_PER_MFMA, g);
             int sb = (int)s_tok_scales[ki + 1];
-            acc = _gang_mfma_f8xf8(a1, b, acc, sa1, sb);
+            acc = _rnlm8_mfma<W_HIOFF == 0>(a1, b, acc, sa1, sb);
           }
           if (ki + 5 < MFMA_ITERS) {
             int kt5 = (ki + 5) * K_PER_MFMA;
@@ -2742,7 +2953,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
             i32x8_t b =
                 _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 2) * K_PER_MFMA, g);
             int sb = (int)s_tok_scales[ki + 2];
-            acc = _gang_mfma_f8xf8(a2, b, acc, sa2, sb);
+            acc = _rnlm8_mfma<W_HIOFF == 0>(a2, b, acc, sa2, sb);
           }
           if (ki + 6 < MFMA_ITERS) {
             int kt6 = (ki + 6) * K_PER_MFMA;
@@ -2755,7 +2966,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
             i32x8_t b =
                 _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 3) * K_PER_MFMA, g);
             int sb = (int)s_tok_scales[ki + 3];
-            acc = _gang_mfma_f8xf8(a3, b, acc, sa3, sb);
+            acc = _rnlm8_mfma<W_HIOFF == 0>(a3, b, acc, sa3, sb);
           }
           if (ki + 7 < MFMA_ITERS) {
             int kt7 = (ki + 7) * K_PER_MFMA;
@@ -2809,9 +3020,9 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     // base is just this lane's 64-byte slot inside the wave's block.
     uint8_t const *w_data_row =
         wg_data + (W_KMAJOR
-                       ? static_cast<int64_t>(w_row / 16) * REDUCTION_SIZE * 16 +
+                       ? static_cast<int64_t>(w_row / 16) * W_ROW_BYTES * 16 +
                              static_cast<int64_t>(w_row % 16) * 64
-                       : static_cast<int64_t>(w_row) * REDUCTION_SIZE);
+                       : static_cast<int64_t>(w_row) * W_ROW_BYTES);
     uint8_t const *w_scale_row =
         wg_scales + (SC_KMAJOR ? (w_row / 16) * NUM_BLOCKS_32 * 16 +
                                      (w_row % 16) * 4
@@ -2860,7 +3071,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
       {
         i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
         int sb = (int)s_tok_scales[ki];
-        acc = _gang_mfma_f8xf8(a0, b, acc, sa0, sb);
+        acc = _rnlm8_mfma<W_HIOFF == 0>(a0, b, acc, sa0, sb);
       }
       if (ki + 4 < ki_end) {
         int kt4 = (ki + 4) * K_PER_MFMA;
@@ -2872,7 +3083,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
       {
         i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 1) * K_PER_MFMA, g);
         int sb = (int)s_tok_scales[ki + 1];
-        acc = _gang_mfma_f8xf8(a1, b, acc, sa1, sb);
+        acc = _rnlm8_mfma<W_HIOFF == 0>(a1, b, acc, sa1, sb);
       }
       if (ki + 5 < ki_end) {
         int kt5 = (ki + 5) * K_PER_MFMA;
@@ -2884,7 +3095,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
       {
         i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 2) * K_PER_MFMA, g);
         int sb = (int)s_tok_scales[ki + 2];
-        acc = _gang_mfma_f8xf8(a2, b, acc, sa2, sb);
+        acc = _rnlm8_mfma<W_HIOFF == 0>(a2, b, acc, sa2, sb);
       }
       if (ki + 6 < ki_end) {
         int kt6 = (ki + 6) * K_PER_MFMA;
@@ -2896,7 +3107,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
       if (ki + 3 < ki_end) {
         i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 3) * K_PER_MFMA, g);
         int sb = (int)s_tok_scales[ki + 3];
-        acc = _gang_mfma_f8xf8(a3, b, acc, sa3, sb);
+        acc = _rnlm8_mfma<W_HIOFF == 0>(a3, b, acc, sa3, sb);
       }
       if (ki + 7 < ki_end) {
         int kt7 = (ki + 7) * K_PER_MFMA;

@@ -502,8 +502,23 @@ static constexpr int FULL_LAYER_BAR_TAG_LINES =
 static constexpr int FULL_LAYER_FOLDW2_SLOT =
     FULL_LAYER_BAR_TAG_SLOT + FULL_LAYER_BAR_TAG_LINES;
 static constexpr int FULL_LAYER_FOLDW2_LINES = 9;
+// MPK_ROUTER_XSPLIT's per-XCD flags + summed row (mpk_atoms.cuh). Each XCD's
+// block is only ever touched by that XCD, so it lives in its L2 -- which is
+// why the region starts on a 128-byte line (an even 64-byte slot).
+static constexpr int FULL_LAYER_XSPLIT_SLOT =
+    (FULL_LAYER_FOLDW2_SLOT + FULL_LAYER_FOLDW2_LINES + 1) / 2 * 2;
+static constexpr int FULL_LAYER_XSPLIT_LINES = 8 * MPK_XSPLIT_XCD_INTS / 16;
+// MPK_ROUTER_LL's logit words and per-XCD routing copies (mpk_atoms.cuh).
+static constexpr int FULL_LAYER_RLL_SLOT =
+    FULL_LAYER_XSPLIT_SLOT + FULL_LAYER_XSPLIT_LINES;
+// MPK_QKV_XSPLIT's exchange, the same per-XCD layout as MPK_ROUTER_XSPLIT's.
+static constexpr int FULL_LAYER_QXS_SLOT = FULL_LAYER_RLL_SLOT + MPK_RLL_LINES;
 static constexpr int FULL_LAYER_COUNTER_SLOTS =
-    FULL_LAYER_FOLDW2_SLOT + FULL_LAYER_FOLDW2_LINES;
+    FULL_LAYER_QXS_SLOT + FULL_LAYER_XSPLIT_LINES;
+static_assert(FULL_LAYER_XSPLIT_SLOT % 2 == 0 && MPK_XSPLIT_XCD_INTS % 32 == 0 &&
+                  FULL_LAYER_RLL_SLOT % 2 == 0 && MPK_RLL_XCD_INTS % 32 == 0 &&
+                  MPK_RLL_WORD_LINES % 2 == 0 && FULL_LAYER_QXS_SLOT % 2 == 0,
+              "the XCD-private blocks must not share a 128-byte L2 line");
 // The entry rendezvous stays Mechanism C under two builds: MPK_BAR_SKEW's
 // stage stamps are referenced to its elected last arriver, which a tagged
 // entry does not have, and MPK_QKVA_ENTRY_PF's DMA sits between its arrival
@@ -1786,7 +1801,11 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       // value a peer would publish. Slot 2 of the per-PE line; see
       // QB_EP_SIGNAL_SLOT in gang_mla_attn_fused_mi300.cuh.
       /*ep_signal=*/(EP_WORLD_SIZE > 1 && ml_mode) ? input_ptrs[28] : nullptr,
-      bar_tags);
+      bar_tags,
+      // The flag epoch is the layer counter, so ml_mode only.
+      /*qkv_xsplit=*/(MPK_QKV_XSPLIT && EP_WORLD_SIZE > 1 && ml_mode)
+          ? counters + FULL_LAYER_QXS_SLOT * HIER_STRIDE
+          : nullptr);
 
   MPK_WS_PHASE(60, task_layer_idx, xcd_id);
   // Stage 0: the residual stream this layer consumed -- and READ IT AS
@@ -2561,7 +2580,16 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       /*fold_counters=*/
       (MPK_FOLD_W2 && EP_WORLD_SIZE > 1 && ml_mode)
           ? counters + FULL_LAYER_FOLDW2_SLOT * HIER_STRIDE
-          : nullptr
+          : nullptr,
+      /*router_xsplit=*/
+      (MPK_ROUTER_XSPLIT && MPK_OPROJ_RP && EP_WORLD_SIZE > 1 && ml_mode)
+          ? counters + FULL_LAYER_XSPLIT_SLOT * HIER_STRIDE
+          : nullptr,
+      // Only where the routing epoch is the layer counter: the LL words are
+      // told apart by epoch alone.
+      /*router_ll=*/
+      (MPK_ROUTER_LL && ml_mode) ? counters + FULL_LAYER_RLL_SLOT * HIER_STRIDE
+                                 : nullptr
 #if MPK_QKVA_PF_KB > 0
       ,
       /*next_qkv_weight=*/input_ptrs[MPK_QKVA_PF_SLOT]

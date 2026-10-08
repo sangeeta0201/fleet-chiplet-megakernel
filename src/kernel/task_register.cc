@@ -3968,8 +3968,14 @@ int TaskRegister::register_gang_mla_attn_fused_mi300_task(
 
   // The packed MXFP8 weights erase N and K, so the byte stride is the only
   // cross-check left.
+  // MPK_QKV_MXFP4 packs qkv_a as E2M1: half the data bytes, the same scales.
+  char const *qkv_fp4_env = std::getenv("MPK_QKV_MXFP4");
+  int const qkv_row_bytes =
+      (qkv_fp4_env != nullptr && std::string(qkv_fp4_env) == "1")
+          ? qkv_reduction / 2
+          : qkv_reduction;
   assert(input_ops[3]->dtensor.dim[1] ==
-             qkv_opw * (qkv_reduction + qkv_reduction / 32) &&
+             qkv_opw * (qkv_row_bytes + qkv_reduction / 32) &&
          "qkv_a MXFP8 weight is not packed at this reduction and row count");
   assert(input_ops[7]->dtensor.dim[1] ==
              qb_opw * (qb_reduction + qb_reduction / 32) &&
@@ -4247,8 +4253,14 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
          "the packed qkv_a weight does not cover the row exactly");
   assert(qb_actual_hidden <= qb_reduction && qb_reduction <= kv_input_stride);
   assert(kv_input_offset + kv_lora_rank + qk_rope_head_dim <= kv_input_stride);
+  // MPK_QKV_MXFP4 packs qkv_a as E2M1: half the data bytes, the same scales.
+  char const *qkv_fp4_env = std::getenv("MPK_QKV_MXFP4");
+  int const qkv_row_bytes =
+      (qkv_fp4_env != nullptr && std::string(qkv_fp4_env) == "1")
+          ? qkv_reduction / 2
+          : qkv_reduction;
   assert(input_ops[3]->dtensor.dim[1] ==
-             qkv_opw * (qkv_reduction + qkv_reduction / 32) &&
+             qkv_opw * (qkv_row_bytes + qkv_reduction / 32) &&
          "qkv_a MXFP8 weight is not packed at this reduction and row count");
   assert(input_ops[7]->dtensor.dim[1] ==
              qb_opw * (qb_reduction + qb_reduction / 32) &&

@@ -720,6 +720,78 @@ __device__ __attribute__((noinline)) void
   }
 #endif
 }
+
+#if MPK_ROUTER_LL
+// MPK_ROUTER_LL's TopK, run by one router block per XCD once its own logits
+// are out: wait until all NUM_EXPERTS words carry this layer's epoch, then
+// select into this XCD's routing copy and release this XCD's MoE workers
+// through its L2. Every XCD selects from the same bf16 logits with the same
+// code, so the eight copies are identical.
+template <typename T, int NUM_EXPERTS, int K>
+__device__ __attribute__((noinline)) void
+    topk_ll_noinline(int *rll,
+                     int xcd,
+                     unsigned epoch,
+                     void *bias_ptr,
+                     int num_active_tokens,
+                     bool renormalize,
+                     float routed_scaling_factor,
+                     int num_shared_experts) {
+  static_assert(NUM_EXPERTS == MPK_NT, "one logit word per thread");
+  static_assert(NUM_EXPERTS * 8 <= MPK_RLL_WORD_LINES * 64,
+                "the logit words overrun their lines");
+  static_assert(NUM_EXPERTS + 16 <= MPK_RLL_IDS_LINES * 16,
+                "the routing copies overrun their lines");
+  int const tid = threadIdx.x;
+  unsigned long long const *const words =
+      reinterpret_cast<unsigned long long const *>(rll);
+  __shared__ unsigned short s_logits[NUM_EXPERTS];
+  unsigned long long w;
+  while (true) {
+    w = ld_sys_u64(const_cast<unsigned long long *>(words + tid));
+    if (__syncthreads_and((unsigned)(w >> 32) == epoch)) {
+      break;
+    }
+    __builtin_amdgcn_s_sleep(1);
+  }
+  s_logits[tid] = static_cast<unsigned short>(w & 0xFFFFu);
+  __syncthreads();
+  int *const xb = rll + MPK_RLL_WORD_LINES * 16 + xcd * MPK_RLL_XCD_INTS;
+  topk_sigmoid_bias_mi300_task_impl<T,
+                                    /*VPT=*/8,
+                                    NUM_EXPERTS,
+                                    /*WARPS_PER_CTA=*/4,
+                                    /*BYTES_PER_LDG=*/16,
+                                    /*K_STATIC=*/K,
+                                    /*ROUTING_ROW_STRIDE=*/1,
+                                    /*SKIP_CLEARS=*/false,
+                                    /*L2_STORES=*/true>(
+      s_logits,
+      bias_ptr,
+      /*topk_weight=*/xb + 16,
+      num_active_tokens,
+      K,
+      /*routing_indices=*/xb + 32 + MPK_RLL_IDS_LINES * 16,
+      /*active_expert_ids=*/xb + 32,
+      0,
+      NUM_EXPERTS,
+      renormalize,
+      routed_scaling_factor,
+      num_shared_experts);
+  // Every wave wrote some of the copy (the zero fill is block-wide), so each
+  // drains its own stores before the barrier the release sits behind.
+  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  __syncthreads();
+  if (tid == 0) {
+    asm volatile("global_store_dword %0, %1, off\n"
+                 "s_waitcnt vmcnt(0)"
+                 :
+                 : "v"(xb), "v"(epoch)
+                 : "memory");
+    mpk_stage_stamp(35);
+  }
+}
+#endif // MPK_ROUTER_LL
 } // namespace gang_rmsnorm_topk_detail
 
 // Croc-style fused RMSNorm + Gate GEMV + TopK.
@@ -774,7 +846,11 @@ template <typename T,
           // MPK_ROUTER_STREAM: the barrier above releases on this rank's own
           // slot only; each peer slot is added in as its own signal lands, in
           // slot order, so the row is bit-identical to the unstreamed sum.
-          bool SUM_STREAM = false>
+          bool SUM_STREAM = false,
+          // MPK_OPROJ_LL: the slots are (epoch << 32 | f32) words, each one
+          // its own signal, so neither the per-peer signals nor the o_proj
+          // release are waited on.
+          bool SUM_LL = false>
 __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     void const *norm_input_ptr,  // input_ptrs[0]: [batch, REDUCTION_SIZE]
     void const *norm_weight_ptr, // input_ptrs[1]: [REDUCTION_SIZE]
@@ -849,7 +925,11 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     int stream_my_pe = 0,
     unsigned long long const *stream_sig = nullptr,
     int stream_sig_stride = 0,
-    unsigned long long stream_expected = 0) {
+    unsigned long long stream_expected = 0,
+    // MPK_ROUTER_XSPLIT: this XCD's exchange block (flag line, then the row).
+    int *xsplit = nullptr,
+    // MPK_ROUTER_LL: the logit words, then the eight per-XCD routing copies.
+    int *rll = nullptr) {
 
   using bf16 = __hip_bfloat16;
   bf16 const *__restrict__ d_hidden = static_cast<bf16 const *>(norm_input_ptr);
@@ -977,8 +1057,8 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
       // is instead of leaving the whole kernel as one bucket.
       MPK_WS_WAIT_BEGIN(770, oproj_release_expected);
       int _obs770;
-      while ((_obs770 = ld_nt_s32(&hier[oproj_xcd_id * 16])) <
-             oproj_release_expected) {
+      while (!SUM_LL && (_obs770 = ld_nt_s32(&hier[oproj_xcd_id * 16])) <
+                            oproj_release_expected) {
         MPK_WS_WAIT_TICK(_obs770, _spins);
         if ((++_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
           // #135. The old aux reported hier[0], which answers nothing when
@@ -1127,6 +1207,211 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
                  stream_sig + (size_t)s * stream_sig_stride)) >=
                  stream_expected;
     };
+#if MPK_ROUTER_XSPLIT
+    // The XCD's xs_n router tiles split the row xs_n ways: each sums its
+    // slice over every slot and the slices meet in an XCD-private row in L2,
+    // so a peer's line is read cold once per XCD rather than once per tile,
+    // and the walk is one round trip instead of a poll-probe-load chain per
+    // slot pair. Per element the slot order, the bf16 rounding and the
+    // per-thread ssq order are the walk's below, so the result is identical.
+    int const xs_n = total_gang_tiles / 8;
+    int const xs_f4 = (xs_n > 0) ? H4_PF / xs_n : 0;
+    int const xs_x = (xs_n > 0) ? sum_tile / xs_n : -1;
+    int const xs_t = (xs_n > 0) ? sum_tile % xs_n : 0;
+    if (xsplit == nullptr || xs_n * 8 != total_gang_tiles || xs_n > 64 ||
+        xs_f4 * xs_n != H4_PF || xs_f4 > 256 ||
+        xs_x != gang_rmsnorm_topk_detail::get_xcd_id()) {
+      __builtin_trap();
+    }
+    static_assert(REDUCTION_SIZE * 2 <= MPK_XSPLIT_ROW_LINES * 64,
+                  "the summed bf16 row overruns its exchange block");
+    unsigned *const xs_flag = reinterpret_cast<unsigned *>(xsplit);
+    unsigned short *const xs_row =
+        reinterpret_cast<unsigned short *>(xsplit + MPK_XSPLIT_FLAG_LINES * 16);
+    unsigned const xs_epoch = static_cast<unsigned>(stream_expected);
+    MPK_WS_MARK(790, xs_t);
+    MPK_WS_WAIT_AUX(gang_rmsnorm_topk_detail::get_xcd_id(), xs_x, xs_t,
+                    (int)xs_epoch);
+    if constexpr (!SUM_LL) {
+      if (tid < SUM_SLOTS) {
+        while (!slot_ready(tid)) {
+          __builtin_amdgcn_s_sleep(1);
+        }
+      }
+      __syncthreads();
+    }
+    if constexpr (SUM_LL) {
+      // Wait on one sentinel word per (slot, 32-row o_proj tile) before
+      // touching the slice: the whole slice re-read per spin, by every router
+      // tile on the GPU, put ~3 MB of system-scope loads on the fabric per
+      // poll round and slowed the run by 0.5 ms. The sentinel only says the
+      // tile has arrived -- its other rows are separate stores -- so the
+      // slice is still validated word by word below, and rarely re-read.
+      constexpr int LL_TILE_ROWS = 32;
+      unsigned long long const *const ll =
+          static_cast<unsigned long long const *>(sum_slots);
+      int const tiles_per_slice = (xs_f4 * 4) / LL_TILE_ROWS;
+      int const sentinels = SUM_SLOTS * tiles_per_slice;
+      if ((xs_f4 * 4) % LL_TILE_ROWS != 0 || sentinels > MPK_NT) {
+        __builtin_trap();
+      }
+      unsigned const want = static_cast<unsigned>(stream_expected);
+      while (true) {
+        bool ready = true;
+        if (tid < sentinels) {
+          int const s = tid / tiles_per_slice;
+          int const j = tid % tiles_per_slice;
+          unsigned long long w8;
+          asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1\n"
+                       "s_waitcnt vmcnt(0)"
+                       : "=v"(w8)
+                       : "v"(ll + (size_t)s * REDUCTION_SIZE +
+                             xs_t * xs_f4 * 4 + j * LL_TILE_ROWS)
+                       : "memory");
+          ready = (unsigned)(w8 >> 32) == want;
+        }
+        if (__syncthreads_and(ready)) {
+          break;
+        }
+        __builtin_amdgcn_s_sleep(2);
+      }
+    }
+    MPK_WS_MARK(791, xs_t);
+    if (tid < xs_f4) {
+      int const i = xs_t * xs_f4 + tid;
+      sum_f4_t v[SUM_SLOTS];
+      if constexpr (SUM_LL) {
+        // Four words per slot, two 16-byte system-scope loads each (the
+        // peers' words arrive over XGMI, so nothing on this side may cache
+        // them), polled until every epoch is this layer's.
+        typedef unsigned int ll_u4_t __attribute__((ext_vector_type(4)));
+        unsigned long long const *const ll =
+            static_cast<unsigned long long const *>(sum_slots);
+        ll_u4_t w[SUM_SLOTS][2];
+        unsigned const want = static_cast<unsigned>(stream_expected);
+        while (true) {
+          bool ok = true;
+#pragma unroll
+          for (int s = 0; s < SUM_SLOTS; s++) {
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+              asm volatile("global_load_dwordx4 %0, %1, off sc0 sc1"
+                           : "=v"(w[s][h])
+                           : "v"(ll + (size_t)s * REDUCTION_SIZE + i * 4 +
+                                 h * 2)
+                           : "memory");
+            }
+          }
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#pragma unroll
+          for (int s = 0; s < SUM_SLOTS; s++) {
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+              ok = ok && w[s][h][1] == want && w[s][h][3] == want;
+            }
+          }
+          if (ok) {
+            break;
+          }
+          __builtin_amdgcn_s_sleep(1);
+        }
+#pragma unroll
+        for (int s = 0; s < SUM_SLOTS; s++) {
+          v[s][0] = __uint_as_float(w[s][0][0]);
+          v[s][1] = __uint_as_float(w[s][0][2]);
+          v[s][2] = __uint_as_float(w[s][1][0]);
+          v[s][3] = __uint_as_float(w[s][1][2]);
+        }
+      } else {
+#pragma unroll
+        for (int s = 0; s < SUM_SLOTS; s++) {
+          v[s] = __builtin_nontemporal_load(reinterpret_cast<sum_f4_t const *>(
+              sl + (size_t)s * REDUCTION_SIZE + i * 4));
+        }
+      }
+      float a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+      for (int s = 0; s < SUM_SLOTS; s++) {
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          a[j] += v[s][j];
+        }
+      }
+      unsigned b[4];
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        bf16 const r = __float2bfloat16(a[j]);
+        unsigned short u;
+        __builtin_memcpy(&u, &r, 2);
+        b[j] = u;
+      }
+      unsigned long long const pk =
+          (unsigned long long)(b[0] | (b[1] << 16)) |
+          ((unsigned long long)(b[2] | (b[3] << 16)) << 32);
+      asm volatile("global_store_dwordx2 %0, %1, off"
+                   :
+                   : "v"(xs_row + i * 4), "v"(pk)
+                   : "memory");
+      // Every XCD sums every element; the one whose eighth of the row it is
+      // publishes it.
+      if (i / (H4_PF / 8) == xs_x) {
+        st_wt_u64((void *)(hout + i * 4), pk);
+      }
+    }
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    __syncthreads();
+    if (tid == 0) {
+      asm volatile("global_store_dword %0, %1, off\n"
+                   "s_waitcnt vmcnt(0)"
+                   :
+                   : "v"(xs_flag + xs_t), "v"(xs_epoch)
+                   : "memory");
+    }
+    MPK_WS_MARK(792, xs_t);
+    // The flags and the row are only ever written from this XCD, so its L2
+    // is where they are coherent. `nt` is the load that misses the vL1 and
+    // still hits the L2: sc0 alone is Hit-LRU in the vL1, sc1 bypasses the
+    // L2 on this multi-L2 part, and a bare buffer_inv is a NOP -- each of
+    // those spins on a stale copy of the line forever. All of wave 0 polls
+    // and leaves on one ballot, so a capture can say whose flag is missing.
+    if (tid < 64) {
+      int spins = 0;
+      while (true) {
+        unsigned seen = xs_epoch;
+        if (tid < xs_n) {
+          asm volatile("global_load_dword %0, %1, off nt\n"
+                       "s_waitcnt vmcnt(0)"
+                       : "=v"(seen)
+                       : "v"(xs_flag + tid)
+                       : "memory");
+        }
+        unsigned long long const ok = __ballot(seen >= xs_epoch);
+        if (ok == ~0ull) {
+          break;
+        }
+        if ((++spins & 4095) == 0) {
+          MPK_WS_MARK(794, (int)(~ok & 0xFFFFull));
+        }
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+    __syncthreads();
+    MPK_WS_MARK(793, xs_t);
+#pragma unroll
+    for (int iter = 0; iter < SUM_ITERS; iter++) {
+      int const i = tid + iter * 256;
+      unsigned long long const pk = __builtin_nontemporal_load(
+          reinterpret_cast<unsigned long long const *>(xs_row + i * 4));
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        unsigned const b = (unsigned)(pk >> (16 * j)) & 0xFFFFu;
+        hs[iter][j] = __uint_as_float(b << 16);
+        ssq[0] += hs[iter][j] * hs[iter][j];
+      }
+    }
+    (void)hacc;
+    (void)q_lo;
+#else
     int p = 0;
 #pragma unroll 1
     while (p < SUM_SLOTS) {
@@ -1192,6 +1477,7 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
                       ((unsigned long long)(b[2] | (b[3] << 16)) << 32));
       }
     }
+#endif // MPK_ROUTER_XSPLIT
   } else if constexpr (SUM_SLOTS > 0) {
     static_assert(BATCH_SIZE == 1 && OPROJ_BARRIER &&
                       REDUCTION_SIZE % (4 * 256) == 0,
@@ -1647,6 +1933,21 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
         s += __bfloat162float(d_bias[first_expert + e]);
       }
       bf16 bval = __float2bfloat16(s);
+#if MPK_ROUTER_LL
+      if (rll != nullptr) {
+        // The epoch rides in the same 8-byte store as the logit, so a reader
+        // that sees this layer's epoch has this layer's logit.
+        unsigned short u;
+        __builtin_memcpy(&u, &bval, 2);
+        int const g = gang_rmsnorm_topk_detail::get_xcd_id() *
+                          (NUM_EXPERTS / 8) +
+                      first_expert + e;
+        st_wt_u64((void *)(reinterpret_cast<unsigned long long *>(rll) + g),
+                  ((unsigned long long)(unsigned)routing_epoch_hint << 32) |
+                      u);
+        continue;
+      }
+#endif
       st_wt_u16(&d_logits[(size_t)m * NUM_EXPERTS + first_expert + e],
                 *reinterpret_cast<unsigned short *>(&bval));
     }
@@ -1688,8 +1989,19 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   // before Phase 3 uniformly, so no XCD's line drifts out of step.
   __shared__ int s_completed;
   MPK_WS_MARK(772, tile_idx);
+#if MPK_ROUTER_LL
+  // The logit words are the arrival; nobody counts and nobody is elected.
+  bool const rll_on = rll != nullptr;
+  if (rll_on && (BATCH_SIZE != 1 || !SIGMOID_BIAS || routing_epoch_hint <= 0)) {
+    __builtin_trap();
+  }
+#else
+  bool const rll_on = false;
+#endif
   if (tid == 0) {
-    s_completed = atomicAdd(static_cast<int *>(gang_counter_ptr), 1) + 1;
+    s_completed = rll_on
+                      ? 0
+                      : atomicAdd(static_cast<int *>(gang_counter_ptr), 1) + 1;
   }
   __syncthreads();
   int completed = s_completed;
@@ -1708,7 +2020,22 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
 #endif
 
   // ═══ Step 4: Last worker runs TopK ═══
-  if (completed == total_gang_tiles) {
+#if MPK_ROUTER_LL
+  if constexpr (SIGMOID_BIAS && BATCH_SIZE == 1) {
+    if (rll_on && tile_idx == 0) {
+      gang_rmsnorm_topk_detail::topk_ll_noinline<T, NUM_EXPERTS, K>(
+          rll,
+          gang_rmsnorm_topk_detail::get_xcd_id(),
+          (unsigned)routing_epoch_hint,
+          const_cast<void *>(bias_ptr),
+          num_active_tokens,
+          renormalize,
+          routed_scaling_factor,
+          num_shared_experts);
+    }
+  }
+#endif
+  if (!rll_on && completed == total_gang_tiles) {
     if constexpr (SIGMOID_BIAS) {
       gang_rmsnorm_topk_detail::
           topk_sigmoid_noinline<T, NUM_EXPERTS, K, /*ROUTING_ROW_STRIDE=*/

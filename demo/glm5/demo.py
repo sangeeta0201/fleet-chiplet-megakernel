@@ -718,7 +718,7 @@ FAKE_MXFP4_ATTN = os.environ.get("GLM_FAKE_MXFP4_ATTN", "0") == "1"
 OPROJ_MXFP4 = os.environ.get("GLM_OPROJ_MXFP4", "1") == "1"
 
 
-def quantize_mxfp4(w: torch.Tensor) -> tuple:
+def quantize_mxfp4(w: torch.Tensor, rne: bool = False) -> tuple:
     """Quantize a [..., out, K] bf16 weight to MXFP4: E2M1 nibbles with one
     E8M0 exponent per 32 contiguous K elements.
 
@@ -754,6 +754,10 @@ def quantize_mxfp4(w: torch.Tensor) -> tuple:
     for thr, code in ((0.25, 1), (0.75, 2), (1.25, 3), (1.75, 4),
                       (2.50, 5), (3.50, 6), (5.00, 7)):
         nib[a >= thr] = code
+        if rne and code & 1:
+            # An exact midpoint goes to the even code (mantissa 0) -- the
+            # ladder above sends every tie up, i.e. away from zero.
+            nib[a == thr] = code - 1
     nib[n < 0] |= 8
 
     packed = nib[..., 0::2] | (nib[..., 1::2] << 4)
@@ -783,11 +787,28 @@ def pack_moe_mxfp8(stacked: torch.Tensor,
     return torch.stack(packed).contiguous()
 
 
+def mxfp4_roundtrip(w: torch.Tensor) -> torch.Tensor:
+    """quantize_mxfp4 and back to w's dtype: exactly the values fp4=True
+    packs, unlike fake_quantize_mxfp4, which rounds ties the other way."""
+    data, se = quantize_mxfp4(w)
+    nib = torch.stack([data & 0xF, data >> 4], dim=-1).reshape(
+        *data.shape[:-1], data.shape[-1] * 2)
+    mag = _E2M1_LEVELS.to(w.device)[(nib & 7).long()]
+    val = torch.where((nib & 8) != 0, -mag, mag)
+    scale = torch.where(se == 0, torch.ones_like(se, dtype=torch.float32),
+                        (se.to(torch.int32) << 23).view(torch.float32))
+    K = w.shape[-1]
+    out = val.reshape(*w.shape[:-1], K // 32, 32) * scale.unsqueeze(-1)
+    return out.reshape(w.shape).to(w.dtype)
+
+
 def pack_dense_mxfp8(w: torch.Tensor, output_per_wg: int = 64,
                      rows_per_chunk: int = 8192,
                      fake_fp4: bool = False,
                      fp4: bool = False,
-                     kmajor: int = 0) -> torch.Tensor:
+                     kmajor: int = 0,
+                     fake_exact: bool = False,
+                     fp4_rne: bool = False) -> torch.Tensor:
     """Quantize + pack a 2-D [out, K] bf16 weight into the MXFP8 per-workgroup
     layout, in row chunks.
 
@@ -815,7 +836,8 @@ def pack_dense_mxfp8(w: torch.Tensor, output_per_wg: int = 64,
     assert rows % output_per_wg == 0, (rows, output_per_wg)
     step = max(output_per_wg,
                (rows_per_chunk // output_per_wg) * output_per_wg)
-    quant = (quantize_mxfp4 if fp4
+    quant = ((lambda x: quantize_mxfp4(x, rne=fp4_rne)) if fp4
+             else (lambda x: quantize_mxfp8(mxfp4_roundtrip(x))) if fake_exact
              else (lambda x: quantize_mxfp8(fake_quantize_mxfp4(x))) if fake_fp4
              else quantize_mxfp8)
     # K-major is only correct where the consuming kernel takes its K-parallel
@@ -1885,6 +1907,9 @@ if __name__ == "__main__":
         # 16 rather than 64: worth 6.30 -> 6.13 ms/token. It is the only
         # value the K-parallel branch is correct for.
         QKV_MXFP8_OPW = int(os.environ.get("GLM_QKV_MXFP8_OPW", "16"))
+        # MPK_QKV_MXFP4: qkv_a packed E2M1 on the fused-attention layers; the
+        # builder compiles the matching kernel off the same variable.
+        QKV_MXFP4 = os.environ.get("MPK_QKV_MXFP4", "0") == "1"
         # q_b gets its own switch: it is the one dense GEMM whose MXFP8 form
         # needs a fused-kvupd kernel of its own, so being able to A/B it
         # against the bf16 twin on a single build is worth a knob.
@@ -2634,6 +2659,18 @@ if __name__ == "__main__":
             # identical to the default: 7.248 7.247 7.225 -> 7.221 7.194
             # 7.204 ms (-0.034).
             os.environ.setdefault("MPK_ROUTER_STREAM", "1")
+            # The XCD's 16 router tiles split that slot sum between them and
+            # swap slices through their L2 instead of each walking all eight
+            # slots for the whole row; bit-identical output. MEASURED
+            # 2026-10-08, NP=8 1024/1024, n=3 interleaved, tokens identical
+            # to the default: 7.157 7.160 7.159 -> 7.040 7.030 7.025 ms.
+            if os.environ.get("MPK_ROUTER_STREAM") == "1":
+                os.environ.setdefault("MPK_ROUTER_XSPLIT", "1")
+            # Logits as epoch-tagged words and the TopK run per XCD into L2
+            # copies of the routing, in place of the elected tail's fence and
+            # GPU-wide release; same routing. MEASURED 2026-10-08, same
+            # protocol: 7.159 7.133 7.151 -> 7.079 7.038 7.002 ms.
+            os.environ.setdefault("MPK_ROUTER_LL", "1")
             print(f"[CFG] o_proj rp=1 absorbed={int(not UNABSORB_V)} "
                   f"k_per_rank={_rp_k} rows={OPROJ_RP_ROWS} "
                   f"tiles_per_xcd={OPROJ_TILES_PER_XCD}")
@@ -3015,9 +3052,15 @@ if __name__ == "__main__":
             #   [314 .. 377]  MPK_NULL_TAGGED, four 256-slot tag arrays
             #   [378 .. 633]  MPK_BAR_TAGGED, eight 512-int regions
             #   [634 .. 642]  MPK_FOLD_W2's row-block and push counters
+            #   [643]         pad: the next two start on 128-byte lines
+            #   [644 .. 2195] MPK_ROUTER_XSPLIT's per-XCD flags + row
+            #   [2196 .. 2515] MPK_ROUTER_LL's logit words + routing copies
+            #   [2516 .. 4067] MPK_QKV_XSPLIT's per-XCD flags + row
             # Keep in step with FULL_LAYER_COUNTER_SLOTS in
             # gang_mla_full_layer_fused_mi300.cuh.
-            (((218 + 4 * 24 + 4 * 16 + 8 * 32 + 9) if UNABSORB_K
+            (((218 + 4 * 24 + 4 * 16 + 8 * 32 + 9 + 1 + 8 * 194 + 32 + 8 * 36
+               + 8 * 194)
+              if UNABSORB_K
               else 106 if UNABSORB_V else 96) * 16,),
             torch_dtype=torch.int32)
         # ── the EP exchange buffers ──────────────────────────────────────
@@ -3048,8 +3091,11 @@ if __name__ == "__main__":
             ep_gather_list = [
                 mpk.new_tensor(
                     # MPK_OPROJ_RP's f32 o_proj partials take 2 * world_size
-                    # more bf16 planes; the fold reads the first world_size.
-                    dims=(world_size * (3 if OPROJ_RP and
+                    # more bf16 planes (4 * world_size as MPK_OPROJ_LL's
+                    # 8-byte words); the fold reads the first world_size.
+                    dims=(world_size * ((5 if os.environ.get(
+                                            "MPK_OPROJ_LL", "0") == "1" else 3)
+                                        if OPROJ_RP and
                                         li not in _ep_tail_slots else 1),
                           bs, hidden_size),
                     dtype=mi.bfloat16,
@@ -3490,6 +3536,17 @@ if __name__ == "__main__":
                 [pad_rows(attn.q_a_proj.weight.data, q_lora_pad),
                  pad_rows(attn.kv_a_proj_with_mqa.weight.data,
                           kv_a_out_pad)], dim=0).contiguous()
+            # E2M1 reaches only the fused attention's qkv_a call; the dense
+            # prologue's standalone chain still reads E4M3. This is fuse_attn's
+            # predicate, decided below and asserted equal there.
+            qkv_fused_this = (DENSE_MXFP8 and QB_MXFP8
+                              and num_kv_chunks > 1
+                              and (FUSE_ATTN
+                                   or (FUSE_FULL_LAYER and layer.is_moe
+                                       and use_mxfp8_oproj and MOE_MXFP8
+                                       and FUSE_MOE_SWIGLU
+                                       and FUSE_MOE_MULSUMADD)))
+            qkv_fp4_this = QKV_MXFP4 and qkv_fused_this
             if DENSE_MXFP8:
                 # The packer preserves row order, so the [q_a | latent] split
                 # the rest of the layer indexes by still lands where it did.
@@ -3497,7 +3554,21 @@ if __name__ == "__main__":
                 # all-zero block with an E8M0 of 0 -- decoded as 1.0.
                 qkv_a_stack = pack_dense_mxfp8(
                     qkv_a_stack, QKV_MXFP8_OPW,
-                    fake_fp4=FAKE_MXFP4_ATTN,
+                    # GLM_FAKE_MXFP4_QKV: E2M1 rounding on qkv_a alone, to
+                    # price MXFP4 there before the kernel takes nibbles.
+                    fake_fp4=FAKE_MXFP4_ATTN or os.environ.get(
+                        "GLM_FAKE_MXFP4_QKV", "0") == "1",
+                    # =2: the E2M1 values fp4=True would pack, through the
+                    # E4M3 kernel -- the oracle for the E2M1 kernel path. =3:
+                    # the same, on exactly the layers MPK_QKV_MXFP4 covers.
+                    fake_exact=(os.environ.get("GLM_FAKE_MXFP4_QKV", "0") == "2"
+                                or (os.environ.get("GLM_FAKE_MXFP4_QKV",
+                                                   "0") == "3"
+                                    and qkv_fused_this)),
+                    fp4=qkv_fp4_this,
+                    # GLM_QKV_FP4_RNE=1: ties to even instead of gpt-oss's
+                    # ties-up ladder.
+                    fp4_rne=os.environ.get("GLM_QKV_FP4_RNE", "0") == "1",
                     # QKV_MXFP8_OPW is 16, so this is one of the two K-parallel
                     # call sites K-major is packed for. See DENSE_KMAJOR.
                     kmajor=DENSE_KMAJOR if QKV_MXFP8_OPW == 16 else 0)
@@ -3575,6 +3646,8 @@ if __name__ == "__main__":
                              and i < first_k_dense)
             if fuse_full_layer:
                 fuse_attn = True
+            assert qkv_fp4_this == (QKV_MXFP4 and fuse_attn), (
+                "qkv_a's E2M1 packing predicate drifted from fuse_attn")
 
             # ── q_b, absorbed or not ─────────────────────────────────────
             # Only the whole-layer fused task has a Phase 3b to apply W_UK in,

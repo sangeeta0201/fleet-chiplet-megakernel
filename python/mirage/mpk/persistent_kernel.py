@@ -1546,6 +1546,26 @@ def get_compile_command(
             # The EP fold moves into the previous layer's W2 epilogue
             # (gang_moe_linear_mxfp8_mi300.cuh, mpk_atoms.cuh).
             "MPK_FOLD_W2",
+            # qkv_a's weight is packed E2M1 (demo/glm5 GLM_QKV_MXFP4).
+            "MPK_QKV_MXFP4",
+            # The streamed router splits its slot sum over the XCD's tiles
+            # (gang_rmsnorm_linear_bias_mi300.cuh, mpk_atoms.cuh).
+            "MPK_ROUTER_XSPLIT",
+            # Logits as epoch-tagged words, TopK per XCD into L2 copies
+            # (gang_rmsnorm_linear_bias_mi300.cuh, mpk_atoms.cuh).
+            "MPK_ROUTER_LL",
+            # The o_proj partials as epoch-tagged words
+            # (gang_oproj_router_fused_mi300.cuh, mpk_atoms.cuh).
+            "MPK_OPROJ_LL",
+            # The merge skips the partner rank's heads of the head-local group
+            # (gang_mla_attn_fused_mi300.cuh).
+            "MPK_MLA_MERGE_OWN_HEADS",
+            # qkv_a's EP resolve split over the XCD's tiles
+            # (gang_rmsnorm_linear_mxfp8_bias_mi300.cuh, mpk_atoms.cuh).
+            "MPK_QKV_XSPLIT",
+            # Ceiling probes, wrong output (gang_mla_attn_fused_mi300.cuh).
+            "MPK_ATTN_PROBE_NOQBWAIT",
+            "MPK_ATTN_PROBE_NODECWAIT",
         ):
             _x = os.environ.get(_v)
             if _x is not None:
@@ -3345,7 +3365,8 @@ class PersistentKernel:
             # MPK_OPROJ_RP's f32 o_proj partials take 2 * world_size more
             # bf16 planes; the tail variant returns before o_proj.
             assert ep_gather.dim(0) == self.world_size * (
-                3 if os.environ.get("MPK_OPROJ_RP", "0") == "1"
+                (5 if os.environ.get("MPK_OPROJ_LL", "0") == "1" else 3)
+                if os.environ.get("MPK_OPROJ_RP", "0") == "1"
                 and not ep_tail_only else 1)
             assert 0 <= ep_fold_rank < self.world_size
             # One 64-byte line per PE, so a peer's signal store never shares a
@@ -3795,6 +3816,16 @@ class PersistentKernel:
         if os.environ.get("MPK_FOLD_W2", "0") == "1":
             # FULL_LAYER_FOLDW2_SLOT's lines, past the tag arrays.
             counter_slots = 643
+        if os.environ.get("MPK_ROUTER_XSPLIT", "0") == "1":
+            # FULL_LAYER_XSPLIT_SLOT (644, 128-byte aligned) + eight 194-line
+            # exchange blocks.
+            counter_slots = 644 + 8 * 194
+        if os.environ.get("MPK_ROUTER_LL", "0") == "1":
+            # FULL_LAYER_RLL_SLOT's 32 word lines + eight 36-line copies.
+            counter_slots = 644 + 8 * 194 + 32 + 8 * 36
+        if os.environ.get("MPK_QKV_XSPLIT", "0") == "1":
+            # FULL_LAYER_QXS_SLOT's eight 194-line exchange blocks.
+            counter_slots = 644 + 8 * 194 + 32 + 8 * 36 + 8 * 194
         assert counters.dim(0) >= counter_slots * 16, (
             f"the fused layer needs {counter_slots * 16} int32 of counters, "
             f"got {counters.dim(0)}")

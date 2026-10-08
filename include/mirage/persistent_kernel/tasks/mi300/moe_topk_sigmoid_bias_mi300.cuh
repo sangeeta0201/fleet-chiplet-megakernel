@@ -76,6 +76,18 @@ __device__ __forceinline__ float fast_sigmoid(float x) {
   return __builtin_amdgcn_rcpf(1.0f + __expf(-x));
 }
 
+// The routing stores. Write-through by default, because the consumers are on
+// other XCDs; L2_STORES is for MPK_ROUTER_LL's per-XCD copy, which is only
+// ever read from the XCD that wrote it.
+template <bool L2>
+__device__ __forceinline__ void _tk_st_u32(void *p, unsigned v) {
+  if constexpr (L2) {
+    asm volatile("global_store_dword %0, %1, off" : : "v"(p), "v"(v) : "memory");
+  } else {
+    st_wt_u32(p, v);
+  }
+}
+
 // Fused sigmoid + bias TopK kernel for AMD MI300/MI350.
 //
 // Block size: 256 threads (4 wavefronts of 64).
@@ -131,7 +143,8 @@ template <typename T,
           // stores each, and on gfx950 the in-order vmcnt makes every later
           // wait in this tail drain them first (SP7: moving the winners'
           // re-read off memory just moved that drain into the clear).
-          bool SKIP_CLEARS = false>
+          bool SKIP_CLEARS = false,
+          bool L2_STORES = false>
 __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
     void *__restrict__ input_ptr, // [num_rows, NUM_EXPERTS]
     void *__restrict__ bias_ptr,  // [NUM_EXPERTS] e_score_correction_bias
@@ -196,7 +209,7 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
     // it, and the tile decoder walks tok over the full BATCH_SIZE. A dead row
     // left holding a stale k+1 would run the shared expert on garbage.
     for (int row = threadIdx.x; row < rstride; row += MPK_NT) {
-      st_wt_u32((void *)&routing_indices[NUM_EXPERTS * rstride + row],
+      _tk_st_u32<L2_STORES>((void *)&routing_indices[NUM_EXPERTS * rstride + row],
                 (unsigned)(row < num_rows ? (k + 1) : 0));
     }
   }
@@ -616,11 +629,11 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
           break;
         }
         int const expert = topk_experts[k_idx];
-        st_wt_u32((void *)&output[k_total * thread_row + k_idx],
+        _tk_st_u32<L2_STORES>((void *)&output[k_total * thread_row + k_idx],
                   __float_as_uint(topk_vals[k_idx] * inv));
         if (expert >= start_expert && expert < end_expert &&
             routing_indices != nullptr) {
-          st_wt_u32((void *)&routing_indices[(expert - start_expert) * rstride +
+          _tk_st_u32<L2_STORES>((void *)&routing_indices[(expert - start_expert) * rstride +
                                              thread_row],
                     (unsigned)(k_idx + 1));
           if (active_expert_ids != nullptr) {
@@ -631,7 +644,7 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
               int const loc = expert - start_expert;
               atomicOr(&s_used[loc >> 5], 1u << (loc & 31));
             } else {
-              st_wt_u32((void *)&active_expert_ids[k_idx], (unsigned)expert);
+              _tk_st_u32<L2_STORES>((void *)&active_expert_ids[k_idx], (unsigned)expert);
             }
           }
         }
@@ -640,7 +653,7 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
 
     // Shared expert: slot k, weight 1.0, unscaled and unrenormalized.
     if (num_shared_experts > 0 && thread_group_idx == 0) {
-      st_wt_u32((void *)&output[k_total * thread_row + k],
+      _tk_st_u32<L2_STORES>((void *)&output[k_total * thread_row + k],
                 __float_as_uint(1.0f));
     }
   }
@@ -650,9 +663,9 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
   // all rows for batch=1): the shared expert id, then the slot count.
   if (active_expert_ids != nullptr && !multirow && threadIdx.x == 0) {
     if (num_shared_experts > 0) {
-      st_wt_u32((void *)&active_expert_ids[k], (unsigned)NUM_EXPERTS);
+      _tk_st_u32<L2_STORES>((void *)&active_expert_ids[k], (unsigned)NUM_EXPERTS);
     }
-    st_wt_u32((void *)&active_expert_ids[NUM_EXPERTS + num_shared_experts],
+    _tk_st_u32<L2_STORES>((void *)&active_expert_ids[NUM_EXPERTS + num_shared_experts],
               (unsigned)k_total);
   }
 
@@ -683,14 +696,14 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
         slot += (unsigned)__popc(s_used[w]);
       }
       slot += (unsigned)__popc(s_used[word] & (bit - 1u));
-      st_wt_u32((void *)&active_expert_ids[slot],
+      _tk_st_u32<L2_STORES>((void *)&active_expert_ids[slot],
                 (unsigned)(start_expert + loc));
     }
     if (threadIdx.x == 0) {
       if (num_shared_experts > 0) {
-        st_wt_u32((void *)&active_expert_ids[total], (unsigned)NUM_EXPERTS);
+        _tk_st_u32<L2_STORES>((void *)&active_expert_ids[total], (unsigned)NUM_EXPERTS);
       }
-      st_wt_u32((void *)&active_expert_ids[NUM_EXPERTS + num_shared_experts],
+      _tk_st_u32<L2_STORES>((void *)&active_expert_ids[NUM_EXPERTS + num_shared_experts],
                 total + (unsigned)num_shared_experts);
     }
   }

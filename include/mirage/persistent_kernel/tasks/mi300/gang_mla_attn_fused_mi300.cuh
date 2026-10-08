@@ -222,7 +222,9 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     void *ep_signal_ptr = nullptr,
     // MPK_BAR_TAGGED slot arrays (mpk_atoms.cuh). Null on the standalone
     // dispatch and outside ml_mode, which keeps every site on Mechanism C.
-    int *bar_tags = nullptr) {
+    int *bar_tags = nullptr,
+    // MPK_QKV_XSPLIT only: the eight per-XCD exchange blocks.
+    int *qkv_xsplit = nullptr) {
 
   int const tid = threadIdx.x;
   int const xcd_id = tile_idx / tiles_per_xcd;
@@ -472,6 +474,20 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   constexpr int HL_MRG_ITEMS = HL_GROUPS * MERGE_DIM_SPLITS;
   int const dec_tiles = head_local ? (HL_DEC_ITEMS + 7) / 8 : mla_tiles_per_xcd;
   int const mrg_tiles = head_local ? (HL_MRG_ITEMS + 7) / 8 : merge_tiles_per_xcd;
+  // MPK_MLA_MERGE_OWN_HEADS: below 16 heads per rank the head-local group's
+  // other heads are a partner rank's, decoded from a stale query row and
+  // never read (W_UV / o_proj take this rank's heads only), so the decode
+  // stores only this rank's partials and the merge reads only those -- half
+  // the o_acc either way at NP=8.
+#ifndef MPK_MLA_MERGE_OWN_HEADS
+#define MPK_MLA_MERGE_OWN_HEADS 0
+#endif
+  constexpr int MRG_HEADS =
+      (MPK_MLA_MERGE_OWN_HEADS && QB_TP_HEADS < 16) ? QB_TP_HEADS : 16;
+  if (MRG_HEADS != 16 && !head_local) {
+    __builtin_trap();
+  }
+  int const own_head_lo = (MRG_HEADS != 16) ? qb_head_base % 16 : 0;
 
   // ── deferred rope ───────────────────────────────────────────────────────
   // Sharded, q_b's makespan is one tile: four of them per XCD against 29
@@ -697,6 +713,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // number is gateable. `#pragma unroll 1` keeps the compiler from cloning
   // the 600-instruction body, which would change the I-cache footprint and
   // confound the byte question with an issue question.
+  // The split resolve's tiles wait on each other: each needs its own worker.
+  if (qkv_xsplit != nullptr && qkv_tiles_per_xcd > tiles_per_xcd) {
+    __builtin_trap();
+  }
 #pragma unroll 1
   for (int _qrep = 0; _qrep < MPK_QKVA_REPS; ++_qrep)
   for (int t = xcd_rank; t < qkv_tiles_per_xcd; t += tiles_per_xcd) {
@@ -723,7 +743,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
                                               QKV_PRO_HOIST,
                                           /*SP_QKV=*/true,
                                           /*PRO_PUB=*/QKV_PRO_HOIST,
-                                          /*FOLD_ROWS=*/QKV_FOLD_ROWS>(
+                                          /*FOLD_ROWS=*/QKV_FOLD_ROWS,
+                                          QKV_REDUCTION_SIZE,
+                                          /*PPL_SINK=*/false,
+                                          /*WEIGHT_FP4=*/MPK_QKV_MXFP4 != 0>(
         // Pre-folded, the resolved row is in x_out_ptr and the gather buffer
         // is not read again.
         /*norm_input_ptr=*/(QKV_EP_FOLD || QKV_PRO_HOIST)
@@ -740,7 +763,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         t,
         moe_ws_f32_ptr,
         x_out_ptr,
-        pro_pub);
+        pro_pub,
+        /*logits_row=*/0,
+        qkv_xsplit ? qkv_xsplit + xcd_id * MPK_XSPLIT_XCD_INTS : nullptr,
+        (unsigned)qkv_expected);
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     if (tid == 0 && g_subphase_active) {
       atomicAdd(&g_subphase_ns[0][0],
@@ -1341,8 +1367,20 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // Only the decode ranks need what this barrier protects. Everyone else
   // falls through to the decode barrier's arrival, which is what orders them
   // against the merge.
+  //
+  // MPK_ATTN_PROBE_NOQBWAIT / MPK_ATTN_PROBE_NODECWAIT: CEILING PROBES, WRONG
+  // OUTPUT by construction. Every arrival and release still happens, only the
+  // decode ranks' wait here (resp. the merge ranks' wait at Phase 6) is
+  // skipped -- the most an XCD-local attention chain could take out of these
+  // two GPU-wide rendezvous, skew relocation included.
+#ifndef MPK_ATTN_PROBE_NOQBWAIT
+#define MPK_ATTN_PROBE_NOQBWAIT 0
+#endif
+#ifndef MPK_ATTN_PROBE_NODECWAIT
+#define MPK_ATTN_PROBE_NODECWAIT 0
+#endif
   if (xcd_rank < dec_tiles) {
-    if (tid == 0) {
+    if (tid == 0 && !MPK_ATTN_PROBE_NOQBWAIT) {
       // Self-heal, see MPK_FL_REPUBLISH_SPINS.
       int *const _qb_flag = &qb_barrier[xcd_id * HIER_STRIDE];
       MPK_WS_WAIT_BEGIN(763, qb_expected);
@@ -1458,7 +1496,9 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
           kv_last_page_len,
           mla_total_work_items,
           decode_item,
-          scale_s);
+          scale_s,
+          own_head_lo,
+          MRG_HEADS);
     }
 #endif
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
@@ -1525,7 +1565,8 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   if (xcd_rank >= mrg_tiles) {
     return;
   }
-  if (dec_tagged) {
+  if (MPK_ATTN_PROBE_NODECWAIT) {
+  } else if (dec_tagged) {
     tag_bar_wait_site(dec_tags, dec_arrivals, decode_expected, tid, xcd_id,
                       xcd_rank);
   } else if (tid == 0) {
@@ -1610,7 +1651,8 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
                           /*KV_CHUNK_SIZE=*/128,
                           PAGE_SIZE,
                           MERGE_WRITE_THROUGH,
-                          MERGE_DIM_SPLITS>(
+                          MERGE_DIM_SPLITS,
+                          MRG_HEADS>(
         reinterpret_cast<float const *>(lse_ptr),
         reinterpret_cast<float const *>(o_acc_ptr),
         qo_indptr,
@@ -1618,7 +1660,9 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         kv_last_page_len,
         request_id,
         reinterpret_cast<bfloat16 *>(attn_out_ptr),
-        merge_offset);
+        merge_offset,
+        /*sinks_ptr=*/nullptr,
+        /*head_base=*/own_head_lo);
   }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   {

@@ -885,7 +885,12 @@ __device__ __noinline__ void
                         int token_idx,
                         int q_head_group,
                         int kv_chunk_idx,
-                        float scale_s) {
+                        float scale_s,
+                        // Heads of the group whose partials are stored; the
+                        // rest are computed (the MFMA is 16 rows either way)
+                        // and dropped. See MPK_MLA_MERGE_OWN_HEADS.
+                        int out_head_lo = 0,
+                        int out_heads = 16) {
   using bf16 = __hip_bfloat16;
   using gang_mla_decode_detail::__ldg_bf16x4_raw;
   using gang_mla_decode_detail::bf16x4_t;
@@ -1452,7 +1457,8 @@ __device__ __noinline__ void
         o[dim_offset] = static_cast<bf16>(o_acc[vb][h] * inv_l);
       }
     }
-  } else {
+  } else if (q_head_local - out_head_lo >= 0 &&
+             q_head_local - out_head_lo < out_heads) {
     // Split-KV partial output: float + LSE, laid out exactly the way
     // merge_splitkv_ck_fmha indexes it with q_head_group as kv_head_idx.
     constexpr int LSE_S = NUM_Q_GROUPS * NUM_KV_CHUNKS * Q_HEADS_PER_GROUP;
@@ -1514,7 +1520,8 @@ __device__ __noinline__ void
   // scale_s carries log2(e), so m_running is a log2 exponent and l_sum sums
   // exp2 terms; merge_splitkv_ck_fmha wants natural-log LSE (it multiplies by
   // log2(e) on the way back in), hence the ln(2) on m_running.
-  if (warp_id == 0 && kgrp == 0) {
+  if (warp_id == 0 && kgrp == 0 && q_head_local - out_head_lo >= 0 &&
+      q_head_local - out_head_lo < out_heads) {
     constexpr int LSE_STRIDE =
         NUM_Q_GROUPS * NUM_KV_CHUNKS * Q_HEADS_PER_GROUP;
     float *lse_out = reinterpret_cast<float *>(lse_ptr) +
@@ -1589,7 +1596,9 @@ __device__ __noinline__ void
                            int const *kv_last_page_len,
                            int total_work_items,
                            int tile_idx,
-                           float scale_s) {
+                           float scale_s,
+                           int out_head_lo = 0,
+                           int out_heads = 16) {
   if (tile_idx >= total_work_items) {
     return;
   }
@@ -1627,7 +1636,9 @@ __device__ __noinline__ void
                                        token_idx,
                                        q_head_group,
                                        kv_chunk_idx,
-                                       scale_s);
+                                       scale_s,
+                                       out_head_lo,
+                                       out_heads);
 }
 
 } // namespace kernel

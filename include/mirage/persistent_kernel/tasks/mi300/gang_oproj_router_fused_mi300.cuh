@@ -217,6 +217,12 @@ namespace kernel {
 #if MPK_ROUTER_STREAM && (!MPK_OPROJ_RP || MPK_OPROJ_RP_BF16)
 #error "MPK_ROUTER_STREAM streams MPK_OPROJ_RP's f32 slots"
 #endif
+#if MPK_ROUTER_XSPLIT && !MPK_ROUTER_STREAM
+#error "MPK_ROUTER_XSPLIT replaces MPK_ROUTER_STREAM's per-tile slot walk"
+#endif
+#if MPK_OPROJ_LL && (!MPK_ROUTER_XSPLIT || !MPK_OPROJ_MXFP4 || MPK_OPROJ_RP_BF16)
+#error "MPK_OPROJ_LL is the MXFP4 f32 RP exchange as the split router reads it"
+#endif
 #if MPK_FOLD_W2 && !MPK_MOE_TP
 #error "MPK_FOLD_W2 folds in the tensor-parallel W2's epilogue"
 #endif
@@ -393,7 +399,11 @@ __device__ __attribute__((always_inline)) void
         // MPK_FOLD_W2 only: the NEXT layer's ep_gather, which W2 folds this
         // layer's output into, and the fold's counter lines.
         void *fold_next_gather_ptr = nullptr,
-        int *fold_counters_ptr = nullptr
+        int *fold_counters_ptr = nullptr,
+        // MPK_ROUTER_XSPLIT only: the eight per-XCD exchange blocks.
+        int *router_xsplit_ptr = nullptr,
+        // MPK_ROUTER_LL only: the logit words and per-XCD routing copies.
+        int *router_ll_ptr = nullptr
 #if MPK_QKVA_PF_KB > 0
         ,
         // Next layer's qkv_a weight for this XCD. Null on the last layer of
@@ -1097,6 +1107,9 @@ __device__ __attribute__((always_inline)) void
     constexpr bool RP_F32 = OPROJ_RP && !MPK_OPROJ_RP_BF16;
     void *const xcd_out_rp =
         !OPROJ_RP ? nullptr
+        : MPK_OPROJ_LL
+            ? (void *)(static_cast<unsigned long long *>(oproj_rp_slots_ptr) +
+                       (size_t)EP_MY_PE * HIDDEN_SIZE + oproj_col_base)
         : RP_F32  ? (void *)(static_cast<float *>(oproj_rp_slots_ptr) +
                              (size_t)EP_MY_PE * HIDDEN_SIZE + oproj_col_base)
                   : (void *)(static_cast<unsigned short *>(oproj_rp_slots_ptr) +
@@ -1170,6 +1183,18 @@ __device__ __attribute__((always_inline)) void
       // stage_a. The switch is compile-time because the host packer is
       // switched by the same env var and a runtime branch would leave both
       // bodies in the binary for no reason.
+#if MPK_OPROJ_MXFP4
+      GangLLPush oproj_ll = {};
+      if constexpr (OPROJ_RP && MPK_OPROJ_LL) {
+        static_assert(OPROJ_NPEER <= 7, "GangLLPush carries seven peers");
+        oproj_ll.epoch = (unsigned)oproj_expected;
+        oproj_ll.npeer = OPROJ_NPEER;
+#pragma unroll
+        for (int q = 0; q < OPROJ_NPEER; q++) {
+          oproj_ll.delta[q] = oproj_peer_delta[q];
+        }
+      }
+#endif
       // RP reduces over the rank's own K slice of the activation row.
       void const *const oproj_act =
           OPROJ_RP ? (void const *)(static_cast<unsigned short const *>(
@@ -1185,7 +1210,8 @@ __device__ __attribute__((always_inline)) void
                              // RP: the residual rides rank 0's partial only.
                              /*HAS_RESIDUAL=*/!OPROJ_RP || EP_MY_PE == 0,
                              /*WRITE_THROUGH=*/true,
-                             /*F32_OUT=*/RP_F32>(
+                             /*F32_OUT=*/RP_F32,
+                             /*LL_OUT=*/OPROJ_RP && MPK_OPROJ_LL>(
           oproj_act,
           oproj_weight_ptr,
           xcd_res,
@@ -1209,7 +1235,12 @@ __device__ __attribute__((always_inline)) void
                                                      /*wgm=*/0,
                                                      t,
                                                      /*bias_ptr=*/nullptr,
-                                                     stage_a);
+                                                     stage_a
+#if MPK_OPROJ_MXFP4
+                                                     ,
+                                                     oproj_ll
+#endif
+                                                     );
       stage_a = RESTAGE;
       // Push the tile straight into every peer's copy of the hidden row, at
       // the identical offset -- the slices are disjoint, so the all-gather is
@@ -1227,7 +1258,8 @@ __device__ __attribute__((always_inline)) void
       // i.e. sc0 sc1, so the bytes are in memory but this CU's vL1 may hold
       // the line these lanes read before it. ld_nt_s32 is the sc0 sc1 load,
       // and it carries its own vmcnt drain.
-      if (oproj_push) {
+      // Under MPK_OPROJ_LL the GEMV already wrote every peer's copy.
+      if (oproj_push && !(OPROJ_RP && MPK_OPROJ_LL)) {
         static_assert((OPROJ_ROWS_PER_WG % 2) == 0,
                       "peer stores are packed 32-bit, so a tile must be an "
                       "even number of bf16");
@@ -1565,6 +1597,11 @@ __device__ __attribute__((always_inline)) void
       s_router_irms[tid] = -1.0f;
     }
     __syncthreads();
+    // The split router's tiles wait on each other, so each needs a worker of
+    // its own: a worker holding two would deadlock against itself.
+    if (router_xsplit_ptr != nullptr && router_tile_n > tiles_per_xcd) {
+      __builtin_trap();
+    }
     for (int t = xcd_rank; t < router_tile_n; t += tiles_per_xcd) {
       gang_rmsnorm_linear_bias_topk_kernel<__hip_bfloat16,
                                            BATCH_SIZE,
@@ -1580,7 +1617,9 @@ __device__ __attribute__((always_inline)) void
                                                : 0,
                                            /*SUM_F32=*/RP_F32,
                                            /*SUM_STREAM=*/OPROJ_RP &&
-                                               MPK_ROUTER_STREAM>(
+                                               MPK_ROUTER_STREAM,
+                                           /*SUM_LL=*/OPROJ_RP &&
+                                               MPK_OPROJ_LL>(
           hidden_ptr,
           norm_weight_ptr,
           norm_output_ptr,
@@ -1628,7 +1667,11 @@ __device__ __attribute__((always_inline)) void
           static_cast<unsigned long long const *>(ep_signal_ptr) +
               (ep_signal_ptr ? OPROJ_EP_SIGNAL_SLOT : 0),
           /*stream_sig_stride=*/OPROJ_EP_SIGNAL_STRIDE,
-          /*stream_expected=*/(unsigned long long)oproj_expected);
+          /*stream_expected=*/(unsigned long long)oproj_expected,
+          /*xsplit=*/router_xsplit_ptr
+              ? router_xsplit_ptr + xcd_id * MPK_XSPLIT_XCD_INTS
+              : nullptr,
+          /*rll=*/router_ll_ptr);
     }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     {
@@ -1808,7 +1851,33 @@ __device__ __attribute__((always_inline)) void
   // that ran the TopK tail this poll succeeds on its first load. Separate from
   // the o_proj barrier so that the MoE-only workers, which never arrived
   // there, still have something to wait on.
-  if (tid == 0) {
+#if MPK_ROUTER_LL
+  // Under MPK_ROUTER_LL this XCD's own TopK block publishes the routing into
+  // this XCD's L2, so the wait is an `nt` load: it misses the vL1 and hits the
+  // L2 (sc0 alone still hits the vL1, and a bare buffer_inv is a NOP).
+  int *const rll_xcd =
+      router_ll_ptr ? router_ll_ptr + MPK_RLL_WORD_LINES * 16 +
+                          xcd_id * MPK_RLL_XCD_INTS
+                    : nullptr;
+  bool const rll_on = rll_xcd != nullptr;
+  if (tid == 0 && rll_on) {
+    while (true) {
+      unsigned seen;
+      asm volatile("global_load_dword %0, %1, off nt\n"
+                   "s_waitcnt vmcnt(0)"
+                   : "=v"(seen)
+                   : "v"(rll_xcd)
+                   : "memory");
+      if (seen >= (unsigned)routing_expected) {
+        break;
+      }
+      __builtin_amdgcn_s_sleep(1);
+    }
+  }
+#else
+  bool const rll_on = false;
+#endif
+  if (tid == 0 && !rll_on) {
     int *my_flag = &routing_ready[(1 + xcd_id) * HIER_STRIDE];
     // Self-heal, see MPK_FL_REPUBLISH_SPINS in
     // gang_mla_full_layer_fused_mi300.cuh. Unlike the barriers there this one
@@ -1853,6 +1922,15 @@ __device__ __attribute__((always_inline)) void
   // producer wrote through, and this XCD's L2 still holds the normed row that
   // Phase 5 is about to consume.
   asm volatile("buffer_inv" ::: "memory");
+#if MPK_ROUTER_LL
+  // Everything below reads the routing through these three, so pointing them
+  // at this XCD's copy is the whole switch.
+  if (rll_on) {
+    topk_weight_ptr = rll_xcd + 16;
+    active_expert_ids_ptr = rll_xcd + 32;
+    routing_indices_ptr = rll_xcd + 32 + MPK_RLL_IDS_LINES * 16;
+  }
+#endif
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   {
     unsigned long long _sp_t4 = __builtin_amdgcn_s_memrealtime();
