@@ -273,6 +273,9 @@ static constexpr int FULL_LAYER_EP_FOLDERS = 8 * MPK_EP_FOLD_WGS;
 //   control 12.072 / 11.837   level 1 12.077 / 11.835   level 2 12.094 / 11.855
 // The ~0.09 ms/token the markers implied is not there: qkv_a is not on the
 // token's critical path. Off.
+// Re-measured 2026-10-08 under MPK_EP_LL (qkv_a's resolve now waits on the
+// peers' words), NP=8 1024/1024, n=2 interleaved: 6.471 6.476 -> 6.493 6.482
+// ms. Still off.
 #ifndef MPK_QKVA_ENTRY_PF
 #define MPK_QKVA_ENTRY_PF 0
 #endif
@@ -764,7 +767,12 @@ template <
     // inputs; needs the o_proj column shard, so it is EP-only.
     // See ROUTER_FOLD in gang_oproj_router_fused_mi300.cuh.
     bool ROUTER_FOLD = false>
-__device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
+#if MPK_FL_INLINE
+__device__ __attribute__((always_inline)) void
+#else
+__device__ __noinline__ void
+#endif
+gang_mla_full_layer_fused_kernel_mi300(
     // Pointer arrays are passed whole rather than unpacked into 38 named
     // parameters, which is what gpt-oss's full-layer task does and for the
     // same reason: the unpacked form costs a few hundred bytes of stack frame

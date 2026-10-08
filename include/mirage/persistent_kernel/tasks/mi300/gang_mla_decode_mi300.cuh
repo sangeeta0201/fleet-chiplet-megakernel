@@ -305,6 +305,9 @@ __device__ __forceinline__ void mla_tile_bar() { __syncthreads(); }
 // Both inside the control spread at n=2, as the bench predicts (-0.1 and
 // -0.3 us/trip at ~3.5 trips). Off. Every run pair, controls included, first
 // diverges at token 92-126, so off-topic tails are not evidence either way.
+// Together, re-measured 2026-10-08 at the 6.47 ms EP_LL default (n=2):
+// 6.471 6.476 -> 6.484 6.488 ms, and QK_2ACC's summation order moves the
+// tokens. Off.
 //
 // MPK_MLA_QK_2ACC: split the 18-step QK MFMA chain over a[32:35] (even k32
 // steps) and a[36:39] (odd), so consecutive MFMAs are independent.
@@ -872,7 +875,16 @@ template <typename T,
 // out at 880-939). The body spills nothing at 284. Its live set is genuine:
 // arch peaks at 248 in the same window where 24-36 AGPRs are live, so moving
 // the MFMA accumulators to arch VGPRs trades 36 acc for 36 arch and loses.
+//
+// That prologue/epilogue is not free, though: forcing the GLM fused layer
+// always_inline (MPK_FL_INLINE) deleted its 60-VGPR one and measured -0.18
+// ms. MPK_DECODE_INLINE forces the same here, which plain removal of
+// __noinline__ did not (CLOSED 2 above).
+#if MPK_DECODE_INLINE
+__device__ __attribute__((always_inline)) void
+#else
 __device__ __noinline__ void
+#endif
     mla_decode_absorbed(void const *q_workspace_ptr,
                         void const *paged_kv_cache_ptr,
                         void *output_ptr,
@@ -1585,7 +1597,11 @@ template <typename T,
           int KV_CACHE_STRIDE,
           bool WRITE_THROUGH = false,
           int BATCH_SIZE = 1>
+#if MPK_DECODE_INLINE
+__device__ __attribute__((always_inline)) void
+#else
 __device__ __noinline__ void
+#endif
     gang_mla_decode_kernel(void const *q_workspace_ptr,
                            void const *paged_kv_cache_ptr,
                            void *output_ptr,

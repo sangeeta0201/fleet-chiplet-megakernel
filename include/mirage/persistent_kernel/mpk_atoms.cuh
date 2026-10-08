@@ -1055,8 +1055,34 @@ __device__ __forceinline__ bool
 #ifndef MPK_EP_LL
 #define MPK_EP_LL 0
 #endif
+// MPK_FL_INLINE: inline the GLM fused layer into the worker's dispatch. As a
+// __noinline__ call it saves and restores its callee-saved VGPRs through
+// scratch on every layer -- 60 of them (87 under MPK_OPROJ_LL=2), i.e.
+// ~60 KB of spill traffic per worker per layer. Private segment 336 -> 80 B.
+// MEASURED 2026-10-08, NP=8 1024/1024, n=3 interleaved, tokens identical:
+// 6.497 6.475 6.515 -> 6.312 6.299 6.297 ms (-0.19); with MPK_OPROJ_LL=2,
+// whose router-chain gain those spills had been eating, 6.172 6.163 6.130
+// (-0.34). Default on.
+#ifndef MPK_FL_INLINE
+#define MPK_FL_INLINE 1
+#endif
+// MPK_ROUTER_INLINE: likewise the router tile (gang_rmsnorm_linear_bias_topk_
+// kernel), whose ~45 arguments arrive partly on the stack -- 20 scratch loads
+// at the head of a critical-path phase.
+#ifndef MPK_ROUTER_INLINE
+#define MPK_ROUTER_INLINE 0
+#endif
+// MPK_DECODE_INLINE: likewise the MLA decode (gang_mla_decode_kernel and
+// mla_decode_absorbed), one call pair per decode item.
+#ifndef MPK_DECODE_INLINE
+#define MPK_DECODE_INLINE 0
+#endif
+
 // MPK_EP_LL_FOLD_LAST: under MPK_EP_LL, fold on each XCD's last worker instead
 // of xcd_rank 0, which is also split resolver 0 (see the fold site).
+// MEASURED NEUTRAL 2026-10-08, NP=8 1024/1024, n=3 interleaved, tokens
+// identical: 6.510 6.488 6.509 -> 6.484 6.467 6.505 (-0.017, overlapping).
+// Resolver 0's own acks are back before the peers' words land. Off.
 #ifndef MPK_EP_LL_FOLD_LAST
 #define MPK_EP_LL_FOLD_LAST 0
 #endif
@@ -1090,6 +1116,13 @@ __device__ __forceinline__ bool
 // XGMI stores in flight cannot finish any later load until they are acked;
 // keeping them on wave 3 leaves the router's validating waves 0-1 free of
 // them. The o_proj arrival, election, signals and release are skipped.
+// MEASURED NEUTRAL 2026-10-08, NP=8 1024/1024, n=2 interleaved against the
+// EP_LL default, tokens identical: 6.491 6.493 -> 6.506 6.505 ms. The worker
+// image grows to 352 VGPR / 96 AGPR / 544 B private (319 / 63 / 336), all of
+// it callee-saved spill in the fused layer's prologue -- and the stamps put
+// the router chain 3.3 us/layer shorter. With that prologue gone
+// (MPK_FL_INLINE): 6.312 6.299 6.297 -> 6.172 6.163 6.130 ms (-0.15).
+// demo.py sets 2 under MPK_ROUTER_XSPLIT.
 #ifndef MPK_OPROJ_LL
 #define MPK_OPROJ_LL 0
 #endif

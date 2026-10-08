@@ -765,6 +765,8 @@ __device__ __attribute__((noinline)) void
                                     /*K_STATIC=*/K,
                                     /*ROUTING_ROW_STRIDE=*/1,
                                     // The logits are this call's own LDS copy.
+                                    // MEASURED NEUTRAL here too (2026-10-08,
+                                    // 6.510 6.488 -> 6.487 6.492 ms).
                                     /*SKIP_CLEARS=*/MPK_TOPK_SKIP_CLEARS != 0,
                                     /*L2_STORES=*/true>(
       s_logits,
@@ -852,7 +854,12 @@ template <typename T,
           // its own signal, so neither the per-peer signals nor the o_proj
           // release are waited on.
           bool SUM_LL = false>
-__device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
+#if MPK_ROUTER_INLINE
+__device__ __attribute__((always_inline)) void
+#else
+__device__ __attribute__((noinline)) void
+#endif
+gang_rmsnorm_linear_bias_topk_kernel(
     void const *norm_input_ptr,  // input_ptrs[0]: [batch, REDUCTION_SIZE]
     void const *norm_weight_ptr, // input_ptrs[1]: [REDUCTION_SIZE]
     void *norm_output_ptr, // input_ptrs[2]: [batch, REDUCTION_SIZE] scratch

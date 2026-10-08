@@ -1565,6 +1565,13 @@ def get_compile_command(
             "MPK_EP_LL",
             # ... folded on each XCD's last worker instead of its first.
             "MPK_EP_LL_FOLD_LAST",
+            # The GLM fused layer inlined into the worker's dispatch
+            # (gang_mla_full_layer_fused_mi300.cuh, mpk_atoms.cuh).
+            "MPK_FL_INLINE",
+            # ... and the router tile (gang_rmsnorm_linear_bias_mi300.cuh).
+            "MPK_ROUTER_INLINE",
+            # ... and the MLA decode (gang_mla_decode_mi300.cuh).
+            "MPK_DECODE_INLINE",
             # Ceiling probes, wrong output (gang_mla_attn_fused_mi300.cuh).
             "MPK_ATTN_PROBE_NOQBWAIT",
             "MPK_ATTN_PROBE_NODECWAIT",

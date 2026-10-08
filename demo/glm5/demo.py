@@ -2671,6 +2671,13 @@ if __name__ == "__main__":
             # GPU-wide release; same routing. MEASURED 2026-10-08, same
             # protocol: 7.159 7.133 7.151 -> 7.079 7.038 7.002 ms.
             os.environ.setdefault("MPK_ROUTER_LL", "1")
+            # The o_proj partials as epoch-tagged words pushed by wave 3, no
+            # o_proj barrier; the split router validates them. Bit-identical.
+            # MEASURED 2026-10-08 with the fused layer inlined, same
+            # protocol: 6.312 6.299 6.297 -> 6.172 6.163 6.130 ms.
+            if (os.environ.get("MPK_ROUTER_XSPLIT") == "1"
+                    and os.environ.get("MPK_OPROJ_RP_BF16", "0") != "1"):
+                os.environ.setdefault("MPK_OPROJ_LL", "2")
             print(f"[CFG] o_proj rp=1 absorbed={int(not UNABSORB_V)} "
                   f"k_per_rank={_rp_k} rows={OPROJ_RP_ROWS} "
                   f"tiles_per_xcd={OPROJ_TILES_PER_XCD}")
