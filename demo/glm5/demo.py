@@ -2700,6 +2700,13 @@ if __name__ == "__main__":
                 f"(MPK_MLA_HEAD_LOCAL=1, q_b TP, one row, no pair merge); "
                 f"the replicated decode deadlocks past 32")
         qb_tp_heads = (num_heads // world_size) if qb_tp else num_heads
+        # Under the head shard a rank's W_UK is 8 heads x 512 rows, so the
+        # 128-row width above leaves 4 tiles per XCD against 29 workers in one
+        # round; 64 is still one round, at 8 tiles of half the work each.
+        # MEASURED 2026-10-08, NP=8 1024/1024, n=3 interleaved, G1 PASS,
+        # coherent text: 7.209 7.207 7.219 -> 7.170 7.188 7.146 ms (-0.044).
+        if qb_tp and os.environ.get("GLM_WUK_GEMV_ROWS") is None:
+            WUK_GEMV_ROWS = 64
         print(f"[CFG] q_b/W_UK tp={int(qb_tp)} heads_per_rank={qb_tp_heads} "
               f"qb_tiles_per_xcd={qb_tp_heads * qb_nope_span // 8 // QB_GEMM_OPW}"
               f" wuk_tiles_per_xcd={qb_tp_heads * kv_lora // 8 // WUK_GEMV_ROWS}")
