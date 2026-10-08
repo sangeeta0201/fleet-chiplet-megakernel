@@ -194,6 +194,32 @@ namespace kernel {
 #ifndef MPK_OPROJ_RP
 #define MPK_OPROJ_RP 0
 #endif
+// MPK_OPROJ_RP_BF16: exchange bf16 partials instead of f32 -- half the push
+// and half of each router tile's slot reads, for eight extra roundings.
+// MEASURED (2026-10-08, NP=8 1024/1024, W_UV absorbed, n=3 interleaved, G1
+// PASS): f32 7.240 7.248 7.233 vs bf16 7.256 7.255 7.264 (+0.018); ppl512
+// 2.4875 vs 2.3965, i.e. inside what rounding alone moves it. The slot bytes
+// are not what the router waits on. Off.
+#ifndef MPK_OPROJ_RP_BF16
+#define MPK_OPROJ_RP_BF16 0
+#endif
+// MPK_ROUTER_STREAM (under MPK_OPROJ_RP): the o_proj -> router release waits
+// for this rank's own tiles only, and each router tile adds peer slot p in as
+// p's signal lands, in slot order. The all-reduce's wait then overlaps the
+// router's row walk instead of preceding it, and the row is bit-identical to
+// the unstreamed sum.
+// MEASURED 2026-10-08, NP=8 1024/1024, n=3 interleaved, tokens identical:
+// 7.248 7.247 7.225 -> 7.221 7.194 7.204 ms (-0.034). demo.py turns it on
+// with MPK_OPROJ_RP.
+#ifndef MPK_ROUTER_STREAM
+#define MPK_ROUTER_STREAM 0
+#endif
+#if MPK_ROUTER_STREAM && (!MPK_OPROJ_RP || MPK_OPROJ_RP_BF16)
+#error "MPK_ROUTER_STREAM streams MPK_OPROJ_RP's f32 slots"
+#endif
+#if MPK_FOLD_W2 && !MPK_MOE_TP
+#error "MPK_FOLD_W2 folds in the tensor-parallel W2's epilogue"
+#endif
 #if MPK_OPROJ_RP && (defined(MPK_OPROJ_SKIP_PEER_WAIT) || \
                      defined(MPK_WUV_SKIP_PEER_WAIT) || !MPK_OPROJ_MXFP4)
 #error "MPK_OPROJ_RP owns both exchanges, and its weight is packed MXFP4"
@@ -363,7 +389,11 @@ __device__ __attribute__((always_inline)) void
         int *bar_tags = nullptr,
         // MPK_OPROJ_RP only: symmetric [EP_WORLD_SIZE, BATCH_SIZE,
         // HIDDEN_SIZE] f32, slot p holding rank p's o_proj partial.
-        void *oproj_rp_slots_ptr = nullptr
+        void *oproj_rp_slots_ptr = nullptr,
+        // MPK_FOLD_W2 only: the NEXT layer's ep_gather, which W2 folds this
+        // layer's output into, and the fold's counter lines.
+        void *fold_next_gather_ptr = nullptr,
+        int *fold_counters_ptr = nullptr
 #if MPK_QKVA_PF_KB > 0
         ,
         // Next layer's qkv_a weight for this XCD. Null on the last layer of
@@ -1064,10 +1094,13 @@ __device__ __attribute__((always_inline)) void
     // Under RP the tile writes its f32 partial into this rank's slot, which
     // the push below copies to the same offset on every peer. f32 so the
     // cross-rank sum rounds once, as the column form does.
-    float *const xcd_out_rp =
-        OPROJ_RP ? static_cast<float *>(oproj_rp_slots_ptr) +
-                       (size_t)EP_MY_PE * HIDDEN_SIZE + oproj_col_base
-                 : nullptr;
+    constexpr bool RP_F32 = OPROJ_RP && !MPK_OPROJ_RP_BF16;
+    void *const xcd_out_rp =
+        !OPROJ_RP ? nullptr
+        : RP_F32  ? (void *)(static_cast<float *>(oproj_rp_slots_ptr) +
+                             (size_t)EP_MY_PE * HIDDEN_SIZE + oproj_col_base)
+                  : (void *)(static_cast<unsigned short *>(oproj_rp_slots_ptr) +
+                             (size_t)EP_MY_PE * HIDDEN_SIZE + oproj_col_base);
     unsigned short const *const xcd_res =
         static_cast<unsigned short const *>(oproj_residual_ptr) +
         oproj_col_base;
@@ -1152,11 +1185,11 @@ __device__ __attribute__((always_inline)) void
                              // RP: the residual rides rank 0's partial only.
                              /*HAS_RESIDUAL=*/!OPROJ_RP || EP_MY_PE == 0,
                              /*WRITE_THROUGH=*/true,
-                             /*F32_OUT=*/OPROJ_RP>(
+                             /*F32_OUT=*/RP_F32>(
           oproj_act,
           oproj_weight_ptr,
           xcd_res,
-          OPROJ_RP ? (void *)xcd_out_rp : (void *)xcd_out,
+          OPROJ_RP ? xcd_out_rp : (void *)xcd_out,
           num_active_tokens,
 #else
       gang_gemv_mxfp8_kernel<BATCH_SIZE,
@@ -1198,16 +1231,20 @@ __device__ __attribute__((always_inline)) void
         static_assert((OPROJ_ROWS_PER_WG % 2) == 0,
                       "peer stores are packed 32-bit, so a tile must be an "
                       "even number of bf16");
-        // RP pushes f32 partials: a dword per row.
+        // RP's f32 partials are a dword per row.
         constexpr int OPROJ_TILE_W32 =
-            OPROJ_RP ? OPROJ_ROWS_PER_WG : OPROJ_ROWS_PER_WG / 2;
+            RP_F32 ? OPROJ_ROWS_PER_WG : OPROJ_ROWS_PER_WG / 2;
         __syncthreads();
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         unsigned int *const src32 =
-            OPROJ_RP ? reinterpret_cast<unsigned int *>(
-                           xcd_out_rp + (size_t)t * OPROJ_ROWS_PER_WG)
-                     : reinterpret_cast<unsigned int *>(
-                           xcd_out + (size_t)t * OPROJ_ROWS_PER_WG);
+            RP_F32 ? reinterpret_cast<unsigned int *>(
+                         static_cast<float *>(xcd_out_rp) +
+                         (size_t)t * OPROJ_ROWS_PER_WG)
+            : OPROJ_RP ? reinterpret_cast<unsigned int *>(
+                             static_cast<unsigned short *>(xcd_out_rp) +
+                             (size_t)t * OPROJ_ROWS_PER_WG)
+                       : reinterpret_cast<unsigned int *>(
+                             xcd_out + (size_t)t * OPROJ_ROWS_PER_WG);
         // Every live query row, not just the first. The GEMV above writes
         // rows [0, num_active_tokens) of this tile's columns; the all-gather
         // has to carry all of them or a peer's copy of row m > 0 keeps
@@ -1444,7 +1481,9 @@ __device__ __attribute__((always_inline)) void
           MPK_SIG_FLUSH();
           // Poll all peers concurrently off one bitmask rather than in rank
           // order, so a slow link costs its own latency and not the sum.
-          unsigned remaining = (1u << OPROJ_NPEER) - 1u;
+          // MPK_ROUTER_STREAM leaves the peer slots to the router tiles.
+          unsigned remaining =
+              (OPROJ_RP && MPK_ROUTER_STREAM) ? 0u : (1u << OPROJ_NPEER) - 1u;
           while (remaining) {
 #pragma unroll
             for (int q = 0; q < OPROJ_NPEER; q++) {
@@ -1538,7 +1577,10 @@ __device__ __attribute__((always_inline)) void
                                            ROUTER_EXPERTS_PER_TILE,
                                            /*SUM_SLOTS=*/OPROJ_RP
                                                ? EP_WORLD_SIZE
-                                               : 0>(
+                                               : 0,
+                                           /*SUM_F32=*/RP_F32,
+                                           /*SUM_STREAM=*/OPROJ_RP &&
+                                               MPK_ROUTER_STREAM>(
           hidden_ptr,
           norm_weight_ptr,
           norm_output_ptr,
@@ -1580,7 +1622,13 @@ __device__ __attribute__((always_inline)) void
           /*folded_expert_base=*/xcd_id * (NUM_EXPERTS / 8),
           /*sum_slots=*/oproj_rp_slots_ptr,
           /*sum_hidden_out=*/hidden_ptr,
-          /*sum_tile=*/xcd_id * router_tile_n + t);
+          /*sum_tile=*/xcd_id * router_tile_n + t,
+          /*stream_my_pe=*/EP_MY_PE,
+          /*stream_sig=*/
+          static_cast<unsigned long long const *>(ep_signal_ptr) +
+              (ep_signal_ptr ? OPROJ_EP_SIGNAL_SLOT : 0),
+          /*stream_sig_stride=*/OPROJ_EP_SIGNAL_STRIDE,
+          /*stream_expected=*/(unsigned long long)oproj_expected);
     }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     {
@@ -2490,6 +2538,39 @@ __device__ __attribute__((always_inline)) void
     MPK_PIPE_W2_TILE(_pipe_my);
   }
 #endif
+  // MPK_FOLD_W2: what the W2 epilogue needs to fold its row block into the
+  // next layer's gather slots. The residual is this layer's hidden row, added
+  // on the one rank the head-of-layer fold adds it on.
+  constexpr int W2_FOLD_NPEER =
+      (MPK_FOLD_W2 && MPK_MOE_TP && EP_WORLD_SIZE > 1) ? EP_WORLD_SIZE - 1 : 0;
+  GangW2FoldPush w2_fold = {};
+  if constexpr (W2_FOLD_NPEER > 0) {
+    static_assert(W2_FOLD_NPEER <= 8, "GangW2FoldPush holds eight deltas");
+    static_assert(HIDDEN_SIZE / MOE_W2_OPW <= 8 * 16,
+                  "one counter per W2 row block, eight lines of them");
+    if (fold_next_gather_ptr == nullptr || fold_counters_ptr == nullptr ||
+        ep_signal_ptr == nullptr) {
+      __builtin_trap();
+    }
+    w2_fold.rb_counter = fold_counters_ptr;
+    w2_fold.push_counter = fold_counters_ptr + 8 * 16;
+    w2_fold.residual = (EP_MY_PE == EP_SHARED_PE)
+                           ? static_cast<unsigned short const *>(hidden_ptr)
+                           : nullptr;
+    w2_fold.slot = static_cast<unsigned short *>(fold_next_gather_ptr) +
+                   (size_t)EP_MY_PE * BATCH_SIZE * HIDDEN_SIZE;
+    w2_fold.sig = static_cast<unsigned long long *>(ep_signal_ptr);
+    w2_fold.sig_stride = OPROJ_EP_SIGNAL_STRIDE;
+    w2_fold.my_pe = EP_MY_PE;
+    w2_fold.sig_value = (unsigned long long)(oproj_expected + 1);
+#pragma unroll
+    for (int q = 0; q < W2_FOLD_NPEER; q++) {
+      if (!mpk_shmem_peer_delta((q < EP_MY_PE) ? q : (q + 1),
+                                &w2_fold.peer_delta[q])) {
+        __builtin_trap();
+      }
+    }
+  }
   for (int t = xcd_rank; t < moe_w2_live; t += tiles_per_xcd) {
     // Tiles [0, _pipe_tiles) were MOVED onto the W13-idle workers above, so
     // their natural owners skip them. _pipe_tiles is 0 when the probe is off
@@ -2519,13 +2600,15 @@ __device__ __attribute__((always_inline)) void
                                        MOE_W2_OPW,
                                        MOE_WEIGHT_FP4,
                                        TP_NSEG,
-                                       MPK_MOE_TP_W2_KPARTS>(moe_swiglu_out_ptr,
+                                       MPK_MOE_TP_W2_KPARTS,
+                                       W2_FOLD_NPEER>(moe_swiglu_out_ptr,
                                                 moe_down_weight_ptr,
                                                 routing_indices_ptr,
                                                 active_expert_ids_ptr,
                                                 moe_workspace_f32_ptr,
                                                 t,
-                                                topk_weight_ptr);
+                                                topk_weight_ptr,
+                                                w2_fold);
 #else
     gang_moe_w2_linear_mxfp8_kernel<BATCH_SIZE,
                                     HIDDEN_SIZE,

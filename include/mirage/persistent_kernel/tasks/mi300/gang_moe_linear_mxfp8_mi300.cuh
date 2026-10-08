@@ -3590,6 +3590,36 @@ __device__ __forceinline__ void
 // deterministic: the workspace is zero when W2 starts (the EP fold re-zeroes
 // it), and 0 + a + b == 0 + b + a exactly. The part is the high digit of the
 // tile index, so neighbouring workers take different row blocks.
+//
+// MPK_FOLD_W2 (FOLD_NPEER > 0): the EP fold of this row block, done by
+// whichever part lands last, instead of at the head of the next layer. That
+// part reads the block's finished f32 rows, adds the residual on the fold
+// rank, rounds to bf16 exactly as _full_layer_ep_fold_partial does, zeroes
+// them, and stores them into its own slot of the NEXT layer's ep_gather here
+// and on every peer; the last block of the rank to be pushed raises the
+// rank's fold signal. Output is bit-identical to the head-of-layer fold.
+//
+// MEASURED NEGATIVE (2026-10-08, NP=8 1024/1024, under MPK_OPROJ_RP and
+// MPK_ROUTER_STREAM, tokens identical to the default). Stage stamps: the
+// head fold 7.03 -> 2.76 us/layer, but W2 4.36 -> 7.01, because the
+// second part now drains its XGMI pushes (~2 us of remote-write acks)
+// before it can leave -- the same drain the head fold paid, moved, not
+// hidden. One run 7.278 vs 7.22 default. Raising the signal from the next
+// layer's entry instead (no drain in W2; the entry barrier's own drain
+// orders the pushes) is worse, 7.563 vs 7.197: the drain moves to the
+// entry arrival and every rank then waits on its peers' entries. Hiding the
+// ack latency needs a receiver-validated (LL-style) slot format. Off.
+struct GangW2FoldPush {
+  int *rb_counter;                 // per row block, +K_PARTS per layer
+  int *push_counter;               // +EXPERT_WGS per layer
+  unsigned short const *residual;  // this layer's hidden row; null elsewhere
+  unsigned short *slot;            // next layer's ep_gather, slot my_pe
+  unsigned long long *sig;         // the symmetric EP signal array
+  int sig_stride;                  // u64 per PE line; slot 0 is the fold's
+  int my_pe;
+  unsigned long long sig_value;    // the next layer's fold epoch
+  int64_t peer_delta[8];           // heap delta per peer, rank order
+};
 template <int BATCH_SIZE,
           int OUTPUT_SIZE,
           int I_LOCAL,
@@ -3598,7 +3628,9 @@ template <int BATCH_SIZE,
           int OUTPUT_PER_WG,
           bool WEIGHT_FP4,
           int NSEG,
-          int K_PARTS = 1>
+          int K_PARTS = 1,
+          // MPK_FOLD_W2: peers the epilogue fold publishes to; 0 is off.
+          int FOLD_NPEER = 0>
 __device__ __noinline__ void
     gang_moe_w2_tp_linear_mxfp8_kernel(void const *input_ptr,
                                        void const *weight_ptr,
@@ -3606,7 +3638,8 @@ __device__ __noinline__ void
                                        void const *mask_ptr,
                                        void *output_ptr,
                                        int tile_idx,
-                                       void const *routing_weight_ptr) {
+                                       void const *routing_weight_ptr,
+                                       GangW2FoldPush fold = {}) {
   static_assert(BATCH_SIZE == 1,
                 "the segments are one token's experts; more rows would need "
                 "a per-row segment list");
@@ -3715,6 +3748,76 @@ __device__ __noinline__ void
     }
   }
   __syncthreads();
+
+  if constexpr (FOLD_NPEER > 0) {
+    static_assert(EXPERT_WGS % 8 == 0,
+                  "the fold reads the parts' sum out of one XCD's L2, so "
+                  "every part of a row block must land on the same XCD");
+    // Retire this part's atomicAdds before counting it in.
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    __shared__ int s_fold_last;
+    if (tid == 0) {
+      int const prev = atom_add_release_gpu_s32(&fold.rb_counter[wg_idx], 1);
+      s_fold_last = (prev % K_PARTS == K_PARTS - 1) ? 1 : 0;
+    }
+    __syncthreads();
+    if (s_fold_last) {
+      // The atomicAdds above carry no scope bits, so they resolve in this
+      // XCD's L2 -- and every part of a row block runs on the same XCD (its
+      // global tiles wg_idx + p * EXPERT_WGS share % 8). Read through L2, not
+      // past it; drop L1 first, since the same worker takes the same block
+      // every layer.
+      asm volatile("buffer_inv" ::: "memory");
+      int const row0 = wg_idx * OUTPUT_PER_WG;
+      for (int w = tid; w < OUTPUT_PER_WG / 2; w += (int)MPK_NT) {
+        int const off = row0 + 2 * w;
+        unsigned packed = 0;
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+          float v = d_workspace[off + j];
+          if (fold.residual != nullptr) {
+            v += __uint_as_float((unsigned)fold.residual[off + j] << 16);
+          }
+          unsigned const u = __float_as_uint(v);
+          unsigned const rounding_bias = ((u >> 16) & 1) + 0x7FFFu;
+          packed |= ((u + rounding_bias) >> 16) << (16 * j);
+        }
+        st_wt_u32((void *)&fold.slot[off], packed);
+#pragma unroll
+        for (int q = 0; q < FOLD_NPEER; q++) {
+          st_wt_u32((void *)(reinterpret_cast<char *>(&fold.slot[off]) +
+                             fold.peer_delta[q]),
+                    packed);
+        }
+        // Zero what was just read, write-through, from this XCD -- the one
+        // whose L2 the next layer's atomicAdds on these rows resolve in.
+        // The o_proj-stage zero is written from a fixed XCD per column range
+        // and does not reach that line; measured, leaving it to that zero
+        // corrupts every layer.
+        st_wt_u64((void *)(d_workspace + off), 0ull);
+      }
+      __syncthreads();
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      if (tid == 0) {
+        int const pp = atom_add_release_gpu_s32(fold.push_counter, 1);
+        if (pp % EXPERT_WGS == EXPERT_WGS - 1) {
+          // Every row block of this rank is in every slot: the peers' copies
+          // of this rank's line, then the local one, as the fold leader does.
+          unsigned long long *const my_line =
+              fold.sig + (size_t)fold.my_pe * fold.sig_stride;
+#pragma unroll
+          for (int q = 0; q < FOLD_NPEER; q++) {
+            st_wt_u64((void *)(reinterpret_cast<char *>(my_line) +
+                               fold.peer_delta[q]),
+                      fold.sig_value);
+          }
+          st_wt_u64((void *)my_line, fold.sig_value);
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          MPK_SIG_FLUSH();
+        }
+      }
+    }
+  }
 }
 
 } // namespace kernel

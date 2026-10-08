@@ -768,7 +768,13 @@ template <typename T,
           // Step 1 sums them in slot order and rounds to bf16 once -- the same
           // row on every rank -- keeps it in registers for Step 2, and writes
           // this tile's 1/total_gang_tiles share of it to `sum_hidden_out`.
-          int SUM_SLOTS = 0>
+          int SUM_SLOTS = 0,
+          // The slots hold f32 partials; false is bf16 (MPK_OPROJ_RP_BF16).
+          bool SUM_F32 = true,
+          // MPK_ROUTER_STREAM: the barrier above releases on this rank's own
+          // slot only; each peer slot is added in as its own signal lands, in
+          // slot order, so the row is bit-identical to the unstreamed sum.
+          bool SUM_STREAM = false>
 __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     void const *norm_input_ptr,  // input_ptrs[0]: [batch, REDUCTION_SIZE]
     void const *norm_weight_ptr, // input_ptrs[1]: [REDUCTION_SIZE]
@@ -836,7 +842,14 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     // tile's index among the total_gang_tiles.
     void const *sum_slots = nullptr,
     void *sum_hidden_out = nullptr,
-    int sum_tile = 0) {
+    int sum_tile = 0,
+    // SUM_STREAM only: this rank's index, and the u64 signal line slot p's
+    // writer bumps to `stream_expected` once slot p is whole, at
+    // stream_sig + p * stream_sig_stride.
+    int stream_my_pe = 0,
+    unsigned long long const *stream_sig = nullptr,
+    int stream_sig_stride = 0,
+    unsigned long long stream_expected = 0) {
 
   using bf16 = __hip_bfloat16;
   bf16 const *__restrict__ d_hidden = static_cast<bf16 const *>(norm_input_ptr);
@@ -1082,7 +1095,104 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   }
   constexpr int SUM_ITERS = (SUM_SLOTS > 0) ? MAX_ITERS_PF : 1;
   float hs[SUM_ITERS][4];
-  if constexpr (SUM_SLOTS > 0) {
+  if constexpr (SUM_SLOTS > 0 && SUM_STREAM) {
+    static_assert(SUM_F32 && OPROJ_BARRIER && BATCH_SIZE == 1 &&
+                      REDUCTION_SIZE % (4 * 256) == 0,
+                  "the streamed slot sum takes f32 partials and one row");
+    typedef float sum_f4_t __attribute__((ext_vector_type(4)));
+    float const *const sl = static_cast<float const *>(sum_slots);
+    unsigned short *const hout = static_cast<unsigned short *>(sum_hidden_out);
+    int const q_per = H4_PF / total_gang_tiles;
+    if (q_per * total_gang_tiles != H4_PF) {
+      __builtin_trap();
+    }
+    int const q_lo = sum_tile * q_per;
+    float hacc[SUM_ITERS][4];
+#pragma unroll
+    for (int iter = 0; iter < SUM_ITERS; iter++) {
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        hacc[iter][j] = 0.0f;
+      }
+    }
+    // Slot order, not arrival order: the row has to round the same on every
+    // rank, and the same as the unstreamed sum (0 + s0 + s1 + ...), so the
+    // output is bit-identical to it. This rank's own slot is covered by the
+    // barrier above. A round takes slot p and, if it is already signalled,
+    // p + 1, issuing both slots' loads before accumulating either.
+    __shared__ int s_stream_two;
+    auto slot_ready = [&](int s) -> bool {
+      return s == stream_my_pe ||
+             ld_sys_u64(const_cast<unsigned long long *>(
+                 stream_sig + (size_t)s * stream_sig_stride)) >=
+                 stream_expected;
+    };
+    int p = 0;
+#pragma unroll 1
+    while (p < SUM_SLOTS) {
+      if (tid == 0) {
+        while (!slot_ready(p)) {
+          __builtin_amdgcn_s_sleep(1);
+        }
+        s_stream_two = (p + 1 < SUM_SLOTS && slot_ready(p + 1)) ? 1 : 0;
+      }
+      __syncthreads();
+      bool const two = s_stream_two != 0;
+      asm volatile("buffer_inv" ::: "memory");
+      sum_f4_t va[SUM_ITERS], vb[SUM_ITERS];
+#pragma unroll
+      for (int iter = 0; iter < SUM_ITERS; iter++) {
+        va[iter] = *reinterpret_cast<sum_f4_t const *>(
+            sl + (size_t)p * REDUCTION_SIZE + (tid + iter * 256) * 4);
+      }
+      if (two) {
+#pragma unroll
+        for (int iter = 0; iter < SUM_ITERS; iter++) {
+          vb[iter] = *reinterpret_cast<sum_f4_t const *>(
+              sl + (size_t)(p + 1) * REDUCTION_SIZE + (tid + iter * 256) * 4);
+        }
+      }
+#pragma unroll
+      for (int iter = 0; iter < SUM_ITERS; iter++) {
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          hacc[iter][j] += va[iter][j];
+        }
+      }
+      if (two) {
+#pragma unroll
+        for (int iter = 0; iter < SUM_ITERS; iter++) {
+#pragma unroll
+          for (int j = 0; j < 4; j++) {
+            hacc[iter][j] += vb[iter][j];
+          }
+        }
+      }
+      // s_stream_two is rewritten next round.
+      __syncthreads();
+      p += two ? 2 : 1;
+    }
+#pragma unroll
+    for (int iter = 0; iter < SUM_ITERS; iter++) {
+      int const i = tid + iter * 256;
+      int const base = i * 4;
+      unsigned b[4];
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        bf16 const r = __float2bfloat16(hacc[iter][j]);
+        unsigned short u;
+        __builtin_memcpy(&u, &r, 2);
+        b[j] = u;
+        hs[iter][j] = __uint_as_float(b[j] << 16);
+        ssq[0] += hs[iter][j] * hs[iter][j];
+      }
+      if (i >= q_lo && i < q_lo + q_per) {
+        st_wt_u64((void *)(hout + base),
+                  (unsigned long long)(b[0] | (b[1] << 16)) |
+                      ((unsigned long long)(b[2] | (b[3] << 16)) << 32));
+      }
+    }
+  } else if constexpr (SUM_SLOTS > 0) {
     static_assert(BATCH_SIZE == 1 && OPROJ_BARRIER &&
                       REDUCTION_SIZE % (4 * 256) == 0,
                   "the slot sum walks one row in whole 256 x 4 passes, the "
@@ -1099,18 +1209,36 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     for (int iter = 0; iter < SUM_ITERS; iter++) {
       int const i = tid + iter * 256;
       int const base = i * 4;
-      sum_f4_t pk[SUM_SLOTS];
-#pragma unroll
-      for (int p = 0; p < SUM_SLOTS; p++) {
-        pk[p] = *reinterpret_cast<sum_f4_t const *>(
-            sl + (size_t)p * REDUCTION_SIZE + base);
-      }
       float f[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+      if constexpr (SUM_F32) {
+        sum_f4_t pk[SUM_SLOTS];
 #pragma unroll
-      for (int p = 0; p < SUM_SLOTS; p++) {
+        for (int p = 0; p < SUM_SLOTS; p++) {
+          pk[p] = *reinterpret_cast<sum_f4_t const *>(
+              sl + (size_t)p * REDUCTION_SIZE + base);
+        }
 #pragma unroll
-        for (int j = 0; j < 4; j++) {
-          f[j] += pk[p][j];
+        for (int p = 0; p < SUM_SLOTS; p++) {
+#pragma unroll
+          for (int j = 0; j < 4; j++) {
+            f[j] += pk[p][j];
+          }
+        }
+      } else {
+        unsigned short const *const sl16 =
+            static_cast<unsigned short const *>(sum_slots);
+        uint2 pk[SUM_SLOTS];
+#pragma unroll
+        for (int p = 0; p < SUM_SLOTS; p++) {
+          pk[p] = *reinterpret_cast<uint2 const *>(
+              sl16 + (size_t)p * REDUCTION_SIZE + base);
+        }
+#pragma unroll
+        for (int p = 0; p < SUM_SLOTS; p++) {
+          f[0] += __uint_as_float(pk[p].x << 16);
+          f[1] += __uint_as_float(pk[p].x & 0xFFFF0000u);
+          f[2] += __uint_as_float(pk[p].y << 16);
+          f[3] += __uint_as_float(pk[p].y & 0xFFFF0000u);
         }
       }
       unsigned b[4];

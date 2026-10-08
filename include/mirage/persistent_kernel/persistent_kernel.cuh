@@ -3363,6 +3363,22 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               }
 #endif
 
+#if MPK_FOLD_W2
+              // The next layer's ep_gather, which this layer's W2 folds into.
+              // Null past the last table entry, which has no successor.
+              static_assert(MPK_FOLD_W2_SLOT < MAX_INPUTS_PER_TASK,
+                            "the fold slot must fit in TaskDesc");
+              if (threadIdx.x == 0) {
+                task_desc->input_ptrs[MPK_FOLD_W2_SLOT] =
+                    (ml + 1 < config.ml_num_layers)
+                        ? config.ml_input_table[(xcd_id * config.ml_num_layers +
+                                                 ml + 1) *
+                                                    MAX_INPUTS_PER_TASK +
+                                                27]
+                        : nullptr;
+              }
+              __syncthreads();
+#endif
 #if MPK_QKVA_PF_KB > 0
               // Next layer's qkv_a. Slot 33 is a legal vehicle (current [3]
               // via slot 33: 11.353 G1 PASS). The same-heap guard is purely

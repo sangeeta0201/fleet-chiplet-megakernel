@@ -1534,6 +1534,18 @@ def get_compile_command(
             # one-row path (moe_topk_sigmoid_bias_mi300.cuh).
             "MPK_TOPK_WIN_SHFL",
             "MPK_TOPK_SKIP_CLEARS",
+            # The Phase 8 o_proj prefetch is issued by the idle ranks for
+            # every tile (gang_mla_full_layer_fused_mi300.cuh).
+            "MPK_OPROJ_PF_IDLE",
+            # MPK_OPROJ_RP exchanges bf16 partials instead of f32
+            # (gang_oproj_router_fused_mi300.cuh).
+            "MPK_OPROJ_RP_BF16",
+            # The router streams the peer o_proj slots as their signals land
+            # (gang_oproj_router_fused_mi300.cuh).
+            "MPK_ROUTER_STREAM",
+            # The EP fold moves into the previous layer's W2 epilogue
+            # (gang_moe_linear_mxfp8_mi300.cuh, mpk_atoms.cuh).
+            "MPK_FOLD_W2",
         ):
             _x = os.environ.get(_v)
             if _x is not None:
@@ -3780,6 +3792,9 @@ class PersistentKernel:
         # region whether or not that one is live, so the map never renumbers.
         if unabsorb_k:
             counter_slots = 114
+        if os.environ.get("MPK_FOLD_W2", "0") == "1":
+            # FULL_LAYER_FOLDW2_SLOT's lines, past the tag arrays.
+            counter_slots = 643
         assert counters.dim(0) >= counter_slots * 16, (
             f"the fused layer needs {counter_slots * 16} int32 of counters, "
             f"got {counters.dim(0)}")

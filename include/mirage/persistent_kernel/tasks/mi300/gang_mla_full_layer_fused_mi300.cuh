@@ -276,6 +276,15 @@ static constexpr int FULL_LAYER_EP_FOLDERS = 8 * MPK_EP_FOLD_WGS;
 #ifndef MPK_QKVA_ENTRY_PF
 #define MPK_QKVA_ENTRY_PF 0
 #endif
+// MPK_OPROJ_PF_IDLE: the Phase 8 o_proj prefetch is issued by the ranks past
+// merge_tiles_per_xcd, for every tile, instead of by each tile's own rank.
+// See the prefetch site. MEASURED NEUTRAL (2026-10-08, NP=8 1024/1024 under
+// MPK_OPROJ_RP, n=3 interleaved, tokens identical): 7.218 7.251 7.227 ->
+// 7.199 7.217 7.225 (-0.018). The 2.1 us the last merge arriver spent on its
+// own prefetch is absorbed like any uniform pre-barrier time. Off.
+#ifndef MPK_OPROJ_PF_IDLE
+#define MPK_OPROJ_PF_IDLE 0
+#endif
 
 static constexpr int FULL_LAYER_MLA_EP_RELEASE_SLOT = 80;
 static constexpr int FULL_LAYER_MLA_EP_FOLD_DONE_SLOT = 88;
@@ -487,8 +496,14 @@ static constexpr int FULL_LAYER_BAR_TAG_SLOT =
     FULL_LAYER_MAX_NULL_PHASES * FULL_LAYER_NULL_TAG_LINES;
 static constexpr int FULL_LAYER_BAR_TAG_LINES =
     MPK_TAGBAR_ARRAYS * MPK_TAGBAR_SLOTS / 16;
-static constexpr int FULL_LAYER_COUNTER_SLOTS =
+// MPK_FOLD_W2's counters: lines [0 .. 7] are one int per W2 row block (up to
+// 128), line 8 the rank's pushed-block count. Allocated unconditionally, like
+// every optional region here.
+static constexpr int FULL_LAYER_FOLDW2_SLOT =
     FULL_LAYER_BAR_TAG_SLOT + FULL_LAYER_BAR_TAG_LINES;
+static constexpr int FULL_LAYER_FOLDW2_LINES = 9;
+static constexpr int FULL_LAYER_COUNTER_SLOTS =
+    FULL_LAYER_FOLDW2_SLOT + FULL_LAYER_FOLDW2_LINES;
 // The entry rendezvous stays Mechanism C under two builds: MPK_BAR_SKEW's
 // stage stamps are referenced to its elected last arriver, which a tagged
 // entry does not have, and MPK_QKVA_ENTRY_PF's DMA sits between its arrival
@@ -1212,13 +1227,24 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     int *const ep_release =
         counters + FULL_LAYER_MLA_EP_RELEASE_SLOT * HIER_STRIDE;
 
+    // MPK_FOLD_W2: past the first layer of the table the previous layer's W2
+    // has already folded and pushed this slot and raised the rank's signal,
+    // and the entry barrier above orders this rank's own pushes before
+    // anyone's arrival. All that is left here is the peer wait, which one
+    // fixed worker takes.
+    bool const ep_fold_here =
+        !(MPK_FOLD_W2 && ml_mode && (task_layer_idx % ml_num_layers) != 0);
+    if (!ep_fold_here && tid == 0) {
+      ep_leader = (xcd_id == 0 && xcd_rank == 0);
+    }
+
     // One folding work-group per XCD, eight in total, on disjoint columns.
     // xcd_rank 0 is the same rank that leads every other per-XCD job here.
     // An overshooting last sub-slice comes out empty (lo == hi) and folds
     // nothing -- but it still enters, because FULL_LAYER_EP_FOLDERS is a
     // compile-time count and the arrival counter has to see every one of them
     // or the leader is never elected.
-    if (xcd_rank < MPK_EP_FOLD_WGS) {
+    if (ep_fold_here && xcd_rank < MPK_EP_FOLD_WGS) {
       // One delta, two addresses, per peer. The gather slot and the signal
       // line are both symmetric-heap objects and the local->peer offset is
       // heap-wide, so translating the signal costs an add and no second
@@ -2139,6 +2165,11 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
     // MEASURED at GLM-5, 78 layers, NP=8:
     //   prefetch on   18.2 ms/iter (17.993 / 18.220 / 18.227 / 18.110)
     //   prefetch off  see below
+    // Re-measured 2026-10-08 under MPK_OPROJ_RP (68 KB tiles), NP=8
+    // 1024/1024, n=3 interleaved: on 7.232 7.222 7.242, off (GLM_OPROJ_
+    // PREFETCH=0) 7.334 7.327 7.330 -- still +0.10 ms to drop it, although
+    // the stamps put its issue + retire (S24 -> S25, S26 -> S27) at 2.1 us on
+    // the last merge arriver's path.
 #ifndef MPK_GLM_OPROJ_PREFETCH_OFF
     {
       // The data half is one byte per element at MXFP8 and one nibble at
@@ -2194,13 +2225,31 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       // 15.3 MB per XCD against 4 MB of L2; the prefetch pays anyway (off is
       // 19% worse on o_proj), so L2 residency is not the limit, barrier
       // interference is.
+      //
+      // MPK_OPROJ_PF_IDLE: the target is this XCD's L2, so who issues a tile's
+      // prefetch does not matter -- only when. The merge ranks arrive here
+      // last and set the release; the ranks past them have been spinning
+      // since the decode. Give every tile to the latter, grid-striding, and
+      // the last arriver no longer issues and retires a DMA on its own path
+      // (2.1 us of S24 -> S27 under MPK_OPROJ_RP).
+#if MPK_OPROJ_PF_IDLE
+      int const pf_stride = tiles_per_xcd - merge_tiles_per_xcd;
+      int const pf_first = xcd_rank - merge_tiles_per_xcd;
+#pragma unroll 1
+      for (int pf_tile = (pf_stride > 0 && pf_first >= 0)
+                             ? pf_first
+                             : oproj_tiles_per_xcd;
+           pf_tile < oproj_tiles_per_xcd; pf_tile += pf_stride) {
+#else
       if (xcd_rank < oproj_tiles_per_xcd) {
+        int const pf_tile = xcd_rank;
+#endif
         extern __shared__ char _fused_smem[];
         i32x4_t const pf_rsrc = make_w_buffer_rsrc(
             input_ptrs[15],
             static_cast<uint32_t>(oproj_tiles_per_xcd) * PF_WG_BYTES);
         uint32_t const pf_wg_voff =
-            static_cast<uint32_t>(xcd_rank) * PF_WG_BYTES;
+            static_cast<uint32_t>(pf_tile) * PF_WG_BYTES;
         // buffer_load_lds writes to M0 + lane_id * 16, so one wave64 fills
         // 1024 bytes and the four waves need distinct 1 KB slices.
         auto *pf_dst =
@@ -2503,6 +2552,15 @@ __device__ __noinline__ void gang_mla_full_layer_fused_kernel_mi300(
       (MPK_OPROJ_RP && EP_WORLD_SIZE > 1 && ml_mode)
           ? (void *)(static_cast<unsigned short *>(input_ptrs[27]) +
                      (size_t)EP_WORLD_SIZE * BATCH_SIZE * QKV_REDUCTION_SIZE)
+          : nullptr,
+      // MPK_FOLD_W2: the next layer's ep_gather and this task's fold counters.
+      /*fold_next_gather=*/
+      (MPK_FOLD_W2 && EP_WORLD_SIZE > 1 && ml_mode)
+          ? input_ptrs[MPK_FOLD_W2_SLOT]
+          : nullptr,
+      /*fold_counters=*/
+      (MPK_FOLD_W2 && EP_WORLD_SIZE > 1 && ml_mode)
+          ? counters + FULL_LAYER_FOLDW2_SLOT * HIER_STRIDE
           : nullptr
 #if MPK_QKVA_PF_KB > 0
       ,

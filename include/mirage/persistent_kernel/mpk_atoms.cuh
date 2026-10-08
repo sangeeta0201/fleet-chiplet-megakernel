@@ -972,6 +972,16 @@ __device__ __forceinline__ bool
 #define MPK_ABL_ML_BOUNDARY 0
 #endif
 
+// MPK_FOLD_W2: GLM's EP fold moves from the head of layer L+1 into layer L's
+// W2 epilogue (gang_moe_w2_tp_linear_mxfp8_kernel), which therefore writes
+// layer L+1's ep_gather. The multi-layer loop hands it that pointer in
+// TaskDesc input slot MPK_FOLD_W2_SLOT, read off the next layer's own input
+// [27] -- the same vehicle MPK_QKVA_PF_SLOT uses for the next qkv_a weight.
+#ifndef MPK_FOLD_W2
+#define MPK_FOLD_W2 0
+#endif
+#define MPK_FOLD_W2_SLOT 32
+
 // MPK_MOE_SHADOW_KB: kilobytes of cold weight read that each W13-idle worker
 // pulls during the W13 phase. CORRECT OUTPUT -- see the long note at the
 // probe site in gang_oproj_router_fused_mi300.cuh. 87 is the like-for-like

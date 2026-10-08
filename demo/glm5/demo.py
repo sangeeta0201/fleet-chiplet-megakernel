@@ -2628,6 +2628,12 @@ if __name__ == "__main__":
             assert _rp_ok, (
                 "MPK_OPROJ_RP needs the fused MXFP4 o_proj, whole heads per "
                 "rank (the W_UV shard if un-absorbed) and one row")
+            # The router takes each peer slot as its signal lands instead of
+            # after the whole all-reduce; bit-identical output. MEASURED
+            # 2026-10-08, NP=8 1024/1024, n=3 interleaved, all 1024 tokens
+            # identical to the default: 7.248 7.247 7.225 -> 7.221 7.194
+            # 7.204 ms (-0.034).
+            os.environ.setdefault("MPK_ROUTER_STREAM", "1")
             print(f"[CFG] o_proj rp=1 absorbed={int(not UNABSORB_V)} "
                   f"k_per_rank={_rp_k} rows={OPROJ_RP_ROWS} "
                   f"tiles_per_xcd={OPROJ_TILES_PER_XCD}")
@@ -3001,9 +3007,10 @@ if __name__ == "__main__":
             #   [218 .. 313]  MPK_NULL_PHASES, four rendezvous x 24 lines
             #   [314 .. 377]  MPK_NULL_TAGGED, four 256-slot tag arrays
             #   [378 .. 633]  MPK_BAR_TAGGED, eight 512-int regions
+            #   [634 .. 642]  MPK_FOLD_W2's row-block and push counters
             # Keep in step with FULL_LAYER_COUNTER_SLOTS in
             # gang_mla_full_layer_fused_mi300.cuh.
-            (((218 + 4 * 24 + 4 * 16 + 8 * 32) if UNABSORB_K
+            (((218 + 4 * 24 + 4 * 16 + 8 * 32 + 9) if UNABSORB_K
               else 106 if UNABSORB_V else 96) * 16,),
             torch_dtype=torch.int32)
         # ── the EP exchange buffers ──────────────────────────────────────
