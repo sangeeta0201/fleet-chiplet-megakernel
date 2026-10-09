@@ -154,7 +154,13 @@ static bool run_case(int n_live, uint32_t seed) {
   std::vector<int> routing(NUM_EXPERTS, 0);
   for (int s = 0; s < n_live; s++) {
     mask[s] = experts[s];
+#if MPK_MOE_BS1_DECODE
+    // The one-row TopK's layout, which the fixed-slot decode relies on: every
+    // slot live, slot s routed as s + 1.
+    routing[experts[s]] = s + 1;
+#else
     routing[experts[s]] = (s * 4 + 3) % NUM_TOPK + 1; // a permutation of 1..9
+#endif
   }
   mask[NUM_EXPERTS] = n_live;
 
@@ -206,6 +212,9 @@ static bool run_case(int n_live, uint32_t seed) {
   HIP_CHECK(hipMemcpy(d_w, packed.data(), packed.size(),
                       hipMemcpyHostToDevice));
 #ifdef TP_NEGCTL
+#if MPK_MOE_BS1_DECODE
+#error "TP_NEGCTL corrupts routing_indices, which the fixed-slot decode never reads: build with -DMPK_MOE_BS1_DECODE=0"
+#endif
   // Negative control: the kernel reads one expert's activation from the wrong
   // slab. Every case with n_live > 1 must then FAIL.
   std::vector<int> routing_dev = routing;
@@ -259,19 +268,30 @@ static bool run_case(int n_live, uint32_t seed) {
 
 int main() {
   bool ok = true;
+  // Under MPK_MOE_BS1_DECODE the live count is NUM_TOPK by contract, so only
+  // the full-slot cases apply; build with -DMPK_MOE_BS1_DECODE=0 for the rest.
+  constexpr bool ALL = !MPK_MOE_BS1_DECODE;
   // 8 ranks: 2-tile segments, two per depth-4 block.
   ok &= run_case<64, 256, 10>(9, 1);
-  ok &= run_case<64, 256, 10>(5, 2);
-  ok &= run_case<64, 256, 10>(1, 3);
+  if (ALL) {
+    ok &= run_case<64, 256, 10>(5, 2);
+    ok &= run_case<64, 256, 10>(1, 3);
+  }
   ok &= run_case<128, 256, 10>(9, 4);
-  ok &= run_case<128, 256, 10>(7, 5);
+  if (ALL) {
+    ok &= run_case<128, 256, 10>(7, 5);
+  }
   // The same, split into two reduction parts (two atomicAdds per row).
   ok &= run_case<64, 256, 10, 2>(9, 8);
-  ok &= run_case<64, 256, 10, 2>(4, 9);
+  if (ALL) {
+    ok &= run_case<64, 256, 10, 2>(4, 9);
+  }
   ok &= run_case<128, 256, 10, 2>(9, 10);
   // 2 ranks: 8-tile segments, two blocks per segment.
   ok &= run_case<128, 1024, 9>(9, 6);
-  ok &= run_case<64, 1024, 9>(4, 7);
+  if (ALL) {
+    ok &= run_case<64, 1024, 9>(4, 7);
+  }
   printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;
 }

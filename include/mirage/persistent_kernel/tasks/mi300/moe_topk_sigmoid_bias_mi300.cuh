@@ -62,7 +62,9 @@
 // MEASURED NEUTRAL with either winner path (2026-10-07, NP=8 1024/1024,
 // n=3 each, tokens identical to control): control 7.809, skip 7.812,
 // skip + old winners 7.791. The router's serial tail is not what the MoE
-// start waits on at this point. Off by default.
+// start waits on at this point. Off by default. Re-measured with
+// MPK_TOPK_WIN_SHFL on the K-split TopK (2026-10-09, n=4 vs 3, tokens
+// identical): 5.901 5.914 5.894 -> 5.900 5.913 5.902 5.893 ms, neutral.
 #ifndef MPK_TOPK_SKIP_CLEARS
 #define MPK_TOPK_SKIP_CLEARS 0
 #endif

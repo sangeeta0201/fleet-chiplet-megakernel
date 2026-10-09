@@ -1587,6 +1587,14 @@ def get_compile_command(
             # One-row MoE tile decode with the slot count and slots fixed
             # (gang_moe_linear_mxfp8_mi300.cuh).
             "MPK_MOE_BS1_DECODE",
+            # Pricing probe, wrong output (gang_rmsnorm_linear_mxfp8_bias_mi300.cuh).
+            "MPK_QXS_XOUT_PLAIN_PROBE",
+            # Split-KV merge on both group halves, one round trip
+            # (tasks/ampere/merge_splitkv.cuh).
+            "MPK_MERGE_HALVES",
+            # Decode prologue chain and merge qo_indptr ahead of their waits
+            # (gang_mla_attn_fused_mi300.cuh).
+            "MPK_ATTN_META_PF",
             # Ceiling probes, wrong output (gang_mla_attn_fused_mi300.cuh).
             "MPK_ATTN_PROBE_NOQBWAIT",
             "MPK_ATTN_PROBE_NODECWAIT",
@@ -1595,6 +1603,10 @@ def get_compile_command(
             if _x is not None:
                 assert _x in ("0", "1"), f"{_v} is 0 or 1"
                 flags = flags + [f"-D{_v}={_x}"]
+        # Pricing probe: ns of delay ahead of the K-split TopK's release.
+        _x = os.environ.get("MPK_TOPK_PAD_NS")
+        if _x is not None:
+            flags = flags + [f"-DMPK_TOPK_PAD_NS={int(_x)}"]
         # The qkv_a-idle workers prefetch qkv_a's weight into L2
         # (gang_mla_attn_fused_mi300.cuh).
         _x = os.environ.get("MPK_QKVA_IDLE_PF")

@@ -1379,7 +1379,16 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
                  : "memory");
     // Every XCD resolves every slice, as every XCD's tile 0 stored the whole
     // row before; the stores are idempotent.
+#if MPK_QXS_XOUT_PLAIN_PROBE
+    // PRICING PROBE, WRONG OUTPUT: x_out stays dirty in this XCD's L2, so
+    // the flag drain below waits on L2 stores only.
+    asm volatile("global_store_dwordx2 %0, %1, off"
+                 :
+                 : "v"(d_x_out + off), "v"(packed)
+                 : "memory");
+#else
     st_wt_u64((void *)(d_x_out + off), packed);
+#endif
   }
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
   __syncthreads();

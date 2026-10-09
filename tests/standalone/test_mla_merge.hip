@@ -55,13 +55,14 @@ static constexpr int BLOCK_THREADS = 256;
 static constexpr int LSE_TOKEN_STRIDE = QO_GROUPS * NUM_CHUNKS * QO_PER_KV;
 static constexpr int OUT_TOKEN_STRIDE = QO_GROUPS * QO_PER_KV * HEAD_DIM;
 
-template <bool WRITE_THROUGH, int DIM_SPLITS>
+template <bool WRITE_THROUGH, int DIM_SPLITS, int HEADS_N = QO_PER_KV>
 __global__ void merge_entry(float const *lse,
                             float const *o_acc,
                             int const *qo_indptr,
                             int const *kv_indptr,
                             int const *kv_last_page_len,
-                            bf16 *out) {
+                            bf16 *out,
+                            int head_base) {
   kernel::merge_splitkv_ck_fmha<bf16,
                                 QO_PER_KV,
                                 QO_GROUPS,
@@ -70,14 +71,17 @@ __global__ void merge_entry(float const *lse,
                                 /*KV_CHUNK_SIZE=*/128,
                                 PAGE_SIZE,
                                 WRITE_THROUGH,
-                                DIM_SPLITS>(lse,
-                                            o_acc,
-                                            qo_indptr,
-                                            kv_indptr,
-                                            kv_last_page_len,
-                                            /*request_id=*/0,
-                                            out,
-                                            /*merge_task_offset=*/blockIdx.x);
+                                DIM_SPLITS,
+                                HEADS_N>(lse,
+                                         o_acc,
+                                         qo_indptr,
+                                         kv_indptr,
+                                         kv_last_page_len,
+                                         /*request_id=*/0,
+                                         out,
+                                         /*merge_task_offset=*/blockIdx.x,
+                                         /*sinks_ptr=*/nullptr,
+                                         head_base);
 }
 
 static float frand() {
@@ -86,8 +90,10 @@ static float frand() {
 
 // active_chunks: chunks [0, active_chunks) carry real partials, the rest are
 // the decode's empty-chunk early return (lse = -1e30, o_acc never written).
-template <bool WRITE_THROUGH, int DIM_SPLITS>
-static int run_case(int active_chunks, char const *tag) {
+// HEADS_N < 16 merges heads [head_base, head_base + HEADS_N) of each group
+// only (MPK_MLA_MERGE_OWN_HEADS), and only those are checked.
+template <bool WRITE_THROUGH, int DIM_SPLITS, int HEADS_N = QO_PER_KV>
+static int run_case(int active_chunks, char const *tag, int head_base = 0) {
   size_t const lse_n = (size_t)LSE_TOKEN_STRIDE;
   size_t const o_n = lse_n * HEAD_DIM;
   size_t const out_n = (size_t)OUT_TOKEN_STRIDE;
@@ -134,9 +140,9 @@ static int run_case(int active_chunks, char const *tag) {
   hipMemcpy(d_lastlen, h_ll, 4, hipMemcpyHostToDevice);
 
   int const grid = QO_GROUPS * DIM_SPLITS;
-  hipLaunchKernelGGL((merge_entry<WRITE_THROUGH, DIM_SPLITS>),
+  hipLaunchKernelGGL((merge_entry<WRITE_THROUGH, DIM_SPLITS, HEADS_N>),
                      dim3(grid), dim3(BLOCK_THREADS), 0, 0,
-                     d_lse, d_o, d_qo, d_kvp, d_lastlen, d_out);
+                     d_lse, d_o, d_qo, d_kvp, d_lastlen, d_out, head_base);
   hipError_t err = hipDeviceSynchronize();
   if (err != hipSuccess) {
     printf("FAIL %-28s launch: %s\n", tag, hipGetErrorString(err));
@@ -149,7 +155,7 @@ static int run_case(int active_chunks, char const *tag) {
   int bad = 0;
   float max_err = 0.0f, ref_max = 0.0f;
   for (int g = 0; g < QO_GROUPS && bad < 8; ++g) {
-    for (int h = 0; h < QO_PER_KV && bad < 8; ++h) {
+    for (int h = head_base; h < head_base + HEADS_N && bad < 8; ++h) {
       double denom = 0.0, mx = -1e300;
       for (int c = 0; c < active_chunks; ++c) {
         mx = std::max(mx, (double)h_lse[g * NUM_CHUNKS * QO_PER_KV +
@@ -202,6 +208,15 @@ int main() {
   // over half of them occupied.
   if (NUM_CHUNKS > 32) {
     rc |= run_case<true, 32>(NUM_CHUNKS / 2 + 1, "wt=1 splits=32 active=half+1");
+    // The shipping NP=8 shape: 8 own heads of the 16-head group, which
+    // MPK_MERGE_HALVES runs on both group halves. active=9 leaves the second
+    // chunk half empty.
+    for (int hb = 0; hb < QO_PER_KV; hb += 8) {
+      rc |= run_case<true, 32, 8>(NUM_CHUNKS, "wt=1 splits=32 own8 all", hb);
+      rc |= run_case<true, 32, 8>(NUM_CHUNKS / 2 + 1,
+                                  "wt=1 splits=32 own8 half+1", hb);
+      rc |= run_case<true, 32, 8>(9, "wt=1 splits=32 own8 active=9", hb);
+    }
   }
   rc |= run_case<false, 32>(16, "wt=0 splits=32 active=16");
   rc |= run_case<true, 32>(16, "wt=1 splits=32 active=16");

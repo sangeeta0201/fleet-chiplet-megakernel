@@ -983,7 +983,12 @@ __device__ __forceinline__ bool
 // illegal address in the first iteration; with MPK_EP_LL (the W2 epilogue
 // pushing LL words, GangW2FoldPush::ll_slot) it wedges in the first
 // iteration, yet completes with correct output under MPK_WORKER_STATE=1.
-// Next step is rocgdb on the fault (.claude/skills/gpu-fault-debugging).
+// 2026-10-09 on the dbcd01f defaults: MPK_EP_LL=0 completes, output
+// correct, with rank 0 under rocgdb precise-memory (no fault to catch);
+// MPK_EP_LL completes 3/3 at full speed but at 6.182 6.184 6.180 ms against
+// 5.89, and one of the three runs' text differs from the other two and from
+// the default -- a race in the fold path, timing-dependent like the faults.
+// Off; a fix has to clear both the race and the +0.29 ms.
 #ifndef MPK_FOLD_W2
 #define MPK_FOLD_W2 0
 #endif
@@ -1208,6 +1213,35 @@ __device__ __forceinline__ bool
 // (-0.05). Default on; MPK_MOE_TP builds only.
 #ifndef MPK_MOE_BS1_DECODE
 #define MPK_MOE_BS1_DECODE 1
+#endif
+// MPK_QXS_XOUT_PLAIN_PROBE: pricing probe, WRONG OUTPUT. The qkv_a split
+// resolver's x_out store goes to L2 instead of write-through, to price the
+// write-through drain in front of its exchange flag. MEASURED 2026-10-09,
+// NP=8 1024/1024: 5.897 5.869 vs 5.885 ms -- nothing to recover there.
+#ifndef MPK_QXS_XOUT_PLAIN_PROBE
+#define MPK_QXS_XOUT_PLAIN_PROBE 0
+#endif
+// MPK_ATTN_META_PF: the decode tiles walk the decode's dependent prologue
+// loads (indptrs, page id, the chunk's KV rows) into L2 while they wait at
+// the q_b -> decode barrier, and the merge tiles read qo_indptr across the
+// decode -> merge wait (gang_mla_attn_fused_mi300.cuh).
+#ifndef MPK_ATTN_META_PF
+#define MPK_ATTN_META_PF 0
+#endif
+// MPK_TOPK_PAD_NS: pricing probe, correct output. Delays the K-split TopK's
+// routing release by this many ns on every rank and layer.
+#ifndef MPK_TOPK_PAD_NS
+#define MPK_TOPK_PAD_NS 0
+#endif
+// MPK_MERGE_HALVES: the split-KV merge (tasks/ampere/merge_splitkv.cuh) runs
+// each head on two thread groups, one per chunk half, so every thread's lse
+// and o loads go out together: one round trip instead of two.
+// MEASURED 2026-10-09, NP=8 1024/1024, interleaved: 5.893 5.893 5.901 ->
+// 5.756 5.753 5.737 5.734 5.745 ms (-0.15). Tokens move (the merge
+// reassociates); ppl512 2.4098 against 2.4112; test_mla_merge own8 cases
+// PASS. Default on.
+#ifndef MPK_MERGE_HALVES
+#define MPK_MERGE_HALVES 1
 #endif
 // Same default as gang_oproj_router_fused_mi300.cuh, which the MoE kernels'
 // header is compiled ahead of.

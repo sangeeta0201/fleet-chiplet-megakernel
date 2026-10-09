@@ -281,7 +281,12 @@ __device__ __forceinline__ void
                           T *output_ptr,
                           int merge_task_offset,
                           void const *sinks_ptr = nullptr,
-                          int head_base = 0) {
+                          int head_base = 0,
+                          // qo_indptr[request_id] and [request_id + 1], when
+                          // the caller read them ahead of its barrier; the
+                          // lse/o addresses depend on them.
+                          int first_token_pos_hint = -1,
+                          int last_token_pos_hint = -1) {
   static_assert(HEADS_N >= 1 && HEADS_N <= NUM_QO_HEADS_PER_KV,
                 "HEADS_N is a sub-range of the group");
 
@@ -292,8 +297,12 @@ __device__ __forceinline__ void
   int const dim_slice =
       (DIM_SPLITS == 1) ? 0 : (merge_task_offset % DIM_SPLITS);
 
-  int const first_token_pos = qo_indptr_buffer_ptr[request_id];
-  int const last_token_pos = qo_indptr_buffer_ptr[request_id + 1];
+  int const first_token_pos = first_token_pos_hint >= 0
+                                  ? first_token_pos_hint
+                                  : qo_indptr_buffer_ptr[request_id];
+  int const last_token_pos = first_token_pos_hint >= 0
+                                 ? last_token_pos_hint
+                                 : qo_indptr_buffer_ptr[request_id + 1];
   if (first_token_pos == last_token_pos) {
     return;
   }
@@ -342,6 +351,66 @@ __device__ __forceinline__ void
   // kv_head_idx*NUM_QO_HEADS_PER_KV + head.
   using __sink_bf16 = __hip_bfloat16;
   __sink_bf16 const *d_sinks = reinterpret_cast<__sink_bf16 const *>(sinks_ptr);
+
+#if MPK_MERGE_HALVES
+  // MPK_MERGE_HALVES: one row, one dim per thread, and half the groups idle
+  // (GLM at NP=8: 8 heads, 16 groups of 16). Give every head two groups --
+  // group g takes head g >> 1 over chunk half g & 1 -- so each thread issues
+  // its half's lse and o loads together in one round trip instead of two
+  // dependent 32-chunk batches, and the partner halves, 16 lanes apart in
+  // one wave, combine with a shuffle.
+  if constexpr (HEADS_N * 2 == num_groups && VAL_PER_THREAD == 1 &&
+                NUM_KV_CHUNKS % 2 == 0 && WRITE_THROUGH &&
+                THREADS_PER_TOKEN == 16) {
+    if (num_tokens == 1 && sinks_ptr == nullptr) {
+      constexpr int HC = NUM_KV_CHUNKS / 2;
+      int const head_idx = head_base + (group_id >> 1);
+      int const half = group_id & 1;
+      int const lse0 = head_idx + first_token_pos * LSE_TOKEN_STRIDE +
+                       lse_kv_offset + half * HC * NUM_QO_HEADS_PER_KV;
+      int const o_col = dim_base + thread_in_group;
+      float l[HC], o[HC];
+#pragma unroll
+      for (int c = 0; c < HC; ++c) {
+        int const ll = lse0 + c * NUM_QO_HEADS_PER_KV;
+        l[c] = lse_g[ll] * 1.44269504088896340736f;
+        o[c] = o_g[ll * HEAD_DIM + o_col];
+      }
+      float m = -inf;
+#pragma unroll
+      for (int c = 0; c < HC; ++c) {
+        m = max(m, l[c]);
+      }
+      float d = 0.f, os = 0.f;
+#pragma unroll
+      for (int c = 0; c < HC; ++c) {
+        float const w = ptx_exp2(l[c] - m);
+        d += w;
+        os += w * o[c];
+      }
+      float const mp = __shfl_xor(m, 16);
+      float const dp = __shfl_xor(d, 16);
+      float const op = __shfl_xor(os, 16);
+      float const mm = max(m, mp);
+      float const a = ptx_exp2(m - mm);
+      float const b = ptx_exp2(mp - mm);
+      float const out_f = __fdividef(os * a + op * b, d * a + dp * b);
+      float const partner = __shfl_down(out_f, 1, THREADS_PER_TOKEN);
+      if (half == 0 && (thread_in_group & 1) == 0) {
+        int const out_offset = first_token_pos * OUT_TOKEN_STRIDE +
+                               kv_head_idx * NUM_QO_HEADS_PER_KV * HEAD_DIM +
+                               head_idx * HEAD_DIM + o_col;
+        __hip_bfloat16 v0 = (__hip_bfloat16)out_f;
+        __hip_bfloat16 v1 = (__hip_bfloat16)partner;
+        uint16_t lo, hi;
+        memcpy(&lo, &v0, 2);
+        memcpy(&hi, &v1, 2);
+        st_wt_u32((void *)&output_ptr[out_offset], lo | ((uint32_t)hi << 16));
+      }
+      return;
+    }
+  }
+#endif
 
 #pragma unroll
   for (int tok = group_id; tok < num_tokens * HEADS_N; tok += num_groups) {

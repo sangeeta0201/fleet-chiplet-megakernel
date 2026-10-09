@@ -1484,6 +1484,59 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
 #define MPK_ATTN_PROBE_NODECWAIT 0
 #endif
   if (xcd_rank < dec_tiles) {
+#if MPK_ATTN_META_PF
+    // MPK_ATTN_META_PF: the decode's prologue is a chain of dependent loads
+    // -- qo/kv_indptr and last_page_len, then kv_indices for the page, then
+    // the chunk's KV rows -- none of which depends on the query. Waves 1-3
+    // walk the same chain while wave 0 polls, so after the release every
+    // link is an L2 hit. Rows go to a never-read LDS window past the
+    // decode's own (KV tile + o_acc, ~50 KB).
+    if (head_local && tid >= 64 && kv_cache_ptr != nullptr) {
+      int const hl_item = xcd_id * dec_tiles + xcd_rank;
+      if (hl_item < HL_DEC_ITEMS) {
+        int const chunk = hl_item / HL_GROUPS;
+        int const req = request_id;
+        int const kp0 = kv_indptr[req];
+        int const kp1 = kv_indptr[req + 1];
+        int const lpl = kv_last_page_len[req];
+        int const qs = qo_indptr[req];
+        int const qe = qo_indptr[req + 1];
+        int const seqlen = (kp1 - kp0 - 1) * PAGE_SIZE + lpl;
+        int const ntiles = (seqlen + 15) / 16;
+        int const tpc = (ntiles + NUM_KV_CHUNKS - 1) / NUM_KV_CHUNKS;
+        int const tok0 = chunk * tpc * 16;
+        if (qe > qs && tok0 < seqlen) {
+          int const pid = kv_indices[kp0 + tok0 / PAGE_SIZE];
+          int ntok = tpc * 16;
+          if (ntok > seqlen - tok0) {
+            ntok = seqlen - tok0;
+          }
+          if (ntok > PAGE_SIZE - tok0 % PAGE_SIZE) {
+            ntok = PAGE_SIZE - tok0 % PAGE_SIZE;
+          }
+          uint32_t const bytes =
+              (uint32_t)ntok * (uint32_t)KV_CACHE_STRIDE * 2u;
+          char const *const base =
+              static_cast<char const *>(kv_cache_ptr) +
+              ((size_t)pid * PAGE_SIZE + tok0 % PAGE_SIZE) *
+                  (size_t)KV_CACHE_STRIDE * 2;
+          extern __shared__ char _dpf_smem[];
+          i32x4_t const rsrc = make_w_buffer_rsrc(base, bytes);
+          auto *dst = (__attribute__((address_space(3))) uint32_t *)(
+              _dpf_smem + 140 * 1024 + ((tid >> 6) - 1) * 1024);
+          int voff = (tid - 64) * 16;
+          int const last = (int)bytes - 16;
+          int const n = ((int)bytes + 192 * 16 - 1) / (192 * 16);
+          for (int i = 0; i < n; i++) {
+            int const v = voff < last ? voff : last;
+            __llvm_amdgcn_raw_buffer_load_lds(rsrc, dst, 16, v, 0, 0, 1);
+            voff += 192 * 16;
+            asm volatile("" : "+v"(voff) : : "memory");
+          }
+        }
+      }
+    }
+#endif
     if (tid == 0 && !MPK_ATTN_PROBE_NOQBWAIT) {
       // Self-heal, see MPK_FL_REPUBLISH_SPINS.
       int *const _qb_flag = &qb_barrier[xcd_id * HIER_STRIDE];
@@ -1669,6 +1722,14 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   if (xcd_rank >= mrg_tiles) {
     return;
   }
+#if MPK_ATTN_META_PF
+  // The merge's lse/o addresses hang off qo_indptr; read it across the wait.
+  int const mrg_qs = qo_indptr[request_id];
+  int const mrg_qe = qo_indptr[request_id + 1];
+#else
+  int const mrg_qs = -1;
+  int const mrg_qe = -1;
+#endif
   if (MPK_ATTN_PROBE_NODECWAIT) {
   } else if (dec_tagged) {
     tag_bar_wait_site(dec_tags, dec_arrivals, decode_expected, tid, xcd_id,
@@ -1766,7 +1827,9 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         reinterpret_cast<bfloat16 *>(attn_out_ptr),
         merge_offset,
         /*sinks_ptr=*/nullptr,
-        /*head_base=*/own_head_lo);
+        /*head_base=*/own_head_lo,
+        mrg_qs,
+        mrg_qe);
   }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   {

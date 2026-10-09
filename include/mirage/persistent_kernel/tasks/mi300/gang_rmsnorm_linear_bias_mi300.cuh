@@ -781,8 +781,15 @@ __device__ __attribute__((noinline)) void
             MPK_XSPLIT_FLAG_LINES * 16) +
         (tid & 31);
     // Each round re-issues every word still stale, all in flight at once:
-    // re-polling them one at a time costs a round trip per late tile.
+    // re-polling them one at a time costs a round trip per late tile. The
+    // first 16 threads carry this XCD's sums of squares in the same rounds.
+    unsigned long long const *const sp =
+        reinterpret_cast<unsigned long long const *>(
+            ks_all + xcd * MPK_XSPLIT_XCD_INTS + MPK_XSPLIT_FLAG_LINES * 16) +
+        (tid & 15) * 64 + 32;
+    bool const has_sw = tid < 16;
     unsigned long long pw[16];
+    unsigned long long sw = (unsigned long long)epoch << 32;
 #pragma unroll
     for (int t = 0; t < 16; t++) {
       asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1"
@@ -790,9 +797,15 @@ __device__ __attribute__((noinline)) void
                    : "v"(blk + t * 64)
                    : "memory");
     }
+    if (has_sw) {
+      asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1"
+                   : "=v"(sw)
+                   : "v"(sp)
+                   : "memory");
+    }
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     while (true) {
-      bool ok = true;
+      bool ok = (unsigned)(sw >> 32) == epoch;
 #pragma unroll
       for (int t = 0; t < 16; t++) {
         ok = ok && (unsigned)(pw[t] >> 32) == epoch;
@@ -810,19 +823,18 @@ __device__ __attribute__((noinline)) void
                        : "memory");
         }
       }
+      if ((unsigned)(sw >> 32) != epoch) {
+        asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1"
+                     : "+v"(sw)
+                     : "v"(sp)
+                     : "memory");
+      }
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
-    if (tid < 16) {
-      unsigned long long *const sp =
-          const_cast<unsigned long long *>(
-              reinterpret_cast<unsigned long long const *>(
-                  ks_all + xcd * MPK_XSPLIT_XCD_INTS +
-                  MPK_XSPLIT_FLAG_LINES * 16)) +
-          tid * 64 + 32;
-      unsigned long long sw;
-      while ((unsigned)((sw = ld_sys_u64(sp)) >> 32) != epoch) {
-        __builtin_amdgcn_s_sleep(1);
-      }
+    if (tid == 0) {
+      mpk_stage_stamp(40);
+    }
+    if (has_sw) {
       s_ssq[tid] = __uint_as_float((unsigned)sw);
     }
     s_bias[tid] = b;
@@ -874,6 +886,10 @@ __device__ __attribute__((noinline)) void
   }
   s_logits[tid] = static_cast<unsigned short>(w & 0xFFFFu);
   __syncthreads();
+  // Stage stamps 41/42/43: logits ready, selection done, normed flags seen.
+  if (tid == 0) {
+    mpk_stage_stamp(41);
+  }
   int *const xb = rll + MPK_RLL_WORD_LINES * 16 + xcd * MPK_RLL_XCD_INTS;
   topk_sigmoid_bias_mi300_task_impl<T,
                                     /*VPT=*/8,
@@ -899,6 +915,9 @@ __device__ __attribute__((noinline)) void
       renormalize,
       routed_scaling_factor,
       num_shared_experts);
+  if (tid == 0) {
+    mpk_stage_stamp(42);
+  }
   // Every wave wrote some of the copy (the zero fill is block-wide), so each
   // drains its own stores before the barrier the release sits behind.
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
@@ -924,6 +943,21 @@ __device__ __attribute__((noinline)) void
       }
     }
     __syncthreads();
+    if (tid == 0) {
+      mpk_stage_stamp(43);
+    }
+#if MPK_TOPK_PAD_NS > 0
+    // PRICING PROBE: a fixed delay ahead of the routing release, every rank,
+    // every layer. The wall's slope against it says whether this tail is on
+    // the critical path.
+    if (tid == 0) {
+      unsigned long long const t0 = __builtin_amdgcn_s_memrealtime();
+      while ((__builtin_amdgcn_s_memrealtime() - t0) * 10ull <
+             (unsigned long long)MPK_TOPK_PAD_NS) {
+      }
+    }
+    __syncthreads();
+#endif
   }
   if (tid == 0) {
     asm volatile("global_store_dword %0, %1, off\n"
