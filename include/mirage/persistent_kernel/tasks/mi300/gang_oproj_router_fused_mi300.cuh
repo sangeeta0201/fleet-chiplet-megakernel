@@ -1739,6 +1739,33 @@ __device__ __attribute__((always_inline)) void
 #endif
   }
 
+  // MPK_ROUTER_KSPLIT: the TopK polls the router tiles' partials from the
+  // XCD's first worker past them, which has nothing else until routing.
+  if constexpr (gang_rmsnorm_topk_detail::router_ksplit_on<
+                    BATCH_SIZE, HIDDEN_SIZE, NUM_EXPERTS, /*SIGMOID_BIAS=*/true,
+                    /*OPROJ_BARRIER=*/true, ROUTER_EXPERTS_PER_TILE,
+                    /*SUM_LL=*/MPK_OPROJ_RP && (EP_WORLD_SIZE > 1) &&
+                        MPK_OPROJ_LL>()) {
+    bool const ks_on = router_xsplit_ptr != nullptr && router_ll_ptr != nullptr;
+    if (ks_on && tiles_per_xcd <= router_tile_n) {
+      __builtin_trap();
+    }
+    if (ks_on && xcd_rank == router_tile_n) {
+      gang_rmsnorm_topk_detail::topk_ll_noinline<__hip_bfloat16, NUM_EXPERTS,
+                                                 TOPK_K, /*KSPLIT=*/true>(
+          router_ll_ptr,
+          xcd_id,
+          (unsigned)routing_expected,
+          const_cast<void *>(router_bias_ptr),
+          num_active_tokens,
+          renormalize,
+          routed_scaling_factor,
+          num_shared_experts,
+          router_xsplit_ptr,
+          (float)ACTUAL_HIDDEN_DIM);
+    }
+  }
+
 #if MPK_MOE_SHARED_EARLY
   // ── MPK_MOE_SHARED_EARLY: the shared expert's W13, ahead of routing ──────
   // Run by the workers past router_tile_n, which have nothing to do until the
@@ -2032,7 +2059,9 @@ __device__ __attribute__((always_inline)) void
 #if MPK_MOE_LIVE_BOUND
   {
     int const *d_mask_live = static_cast<int const *>(active_expert_ids_ptr);
-    int const n_act = d_mask_live[MOE_NUM_EXPERTS];
+    int const n_act = (MPK_MOE_BS1_DECODE && MPK_MOE_TP && BATCH_SIZE == 1)
+                          ? MOE_NUM_TOPK
+                          : d_mask_live[MOE_NUM_EXPERTS];
 #if MPK_VPROBE
     // ── V PROBE (MPK_VPROBE=<routing-epoch stride>, 0 = off) ────────────────
     // Prints the ACTIVATED EXPERT LIST, not just its size, so the union of

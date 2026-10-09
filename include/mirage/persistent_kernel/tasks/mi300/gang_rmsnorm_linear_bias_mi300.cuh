@@ -721,6 +721,22 @@ __device__ __attribute__((noinline)) void
 #endif
 }
 
+// MPK_ROUTER_KSPLIT engages only on this shape; the fused caller tests the same
+// predicate to place the TopK on its own worker.
+template <int BATCH_SIZE,
+          int REDUCTION_SIZE,
+          int NUM_EXPERTS,
+          bool SIGMOID_BIAS,
+          bool OPROJ_BARRIER,
+          int EXPERTS_PER_TILE,
+          bool SUM_LL>
+constexpr bool router_ksplit_on() {
+  return MPK_ROUTER_KSPLIT && MPK_ROUTER_XSPLIT && MPK_ROUTER_LL && SUM_LL &&
+         OPROJ_BARRIER && SIGMOID_BIAS && BATCH_SIZE == 1 &&
+         EXPERTS_PER_TILE == 2 && NUM_EXPERTS == 256 &&
+         REDUCTION_SIZE % (16 * 64) == 0;
+}
+
 #if MPK_ROUTER_LL
 // MPK_ROUTER_LL's TopK, run by one router block per XCD once its own logits
 // are out: wait until all NUM_EXPERTS words carry this layer's epoch, then
@@ -764,6 +780,8 @@ __device__ __attribute__((noinline)) void
             ks_all + (tid >> 5) * MPK_XSPLIT_XCD_INTS +
             MPK_XSPLIT_FLAG_LINES * 16) +
         (tid & 31);
+    // Each round re-issues every word still stale, all in flight at once:
+    // re-polling them one at a time costs a round trip per late tile.
     unsigned long long pw[16];
 #pragma unroll
     for (int t = 0; t < 16; t++) {
@@ -773,12 +791,26 @@ __device__ __attribute__((noinline)) void
                    : "memory");
     }
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    while (true) {
+      bool ok = true;
 #pragma unroll
-    for (int t = 0; t < 16; t++) {
-      while ((unsigned)(pw[t] >> 32) != epoch) {
-        __builtin_amdgcn_s_sleep(1);
-        pw[t] = ld_sys_u64(const_cast<unsigned long long *>(blk + t * 64));
+      for (int t = 0; t < 16; t++) {
+        ok = ok && (unsigned)(pw[t] >> 32) == epoch;
       }
+      if (ok) {
+        break;
+      }
+      __builtin_amdgcn_s_sleep(1);
+#pragma unroll
+      for (int t = 0; t < 16; t++) {
+        if ((unsigned)(pw[t] >> 32) != epoch) {
+          asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1"
+                       : "+v"(pw[t])
+                       : "v"(blk + t * 64)
+                       : "memory");
+        }
+      }
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
     if (tid < 16) {
       unsigned long long *const sp =
@@ -1101,11 +1133,9 @@ gang_rmsnorm_linear_bias_topk_kernel(
   // MPK_ROUTER_KSPLIT: this tile's 384 columns of all 32 of the XCD's gate
   // rows (thread t: row t / 8, 8-column chunks t % 8 + 8j), and gamma's
   // same 384 columns on the slice-summing threads.
-  constexpr bool KSPLIT =
-      MPK_ROUTER_KSPLIT && MPK_ROUTER_XSPLIT && MPK_ROUTER_LL && SUM_LL &&
-      OPROJ_BARRIER && SIGMOID_BIAS && BATCH_SIZE == 1 &&
-      EXPERTS_PER_TILE == 2 && NUM_EXPERTS == 256 &&
-      REDUCTION_SIZE % (16 * 64) == 0;
+  constexpr bool KSPLIT = gang_rmsnorm_topk_detail::router_ksplit_on<
+      BATCH_SIZE, REDUCTION_SIZE, NUM_EXPERTS, SIGMOID_BIAS, OPROJ_BARRIER,
+      EXPERTS_PER_TILE, SUM_LL>();
   constexpr int KS_SLICE = REDUCTION_SIZE / 16;
   constexpr int KS_CH = KS_SLICE / 64;
   typedef int __attribute__((ext_vector_type(4))) i32x4_ks_t;
@@ -1618,20 +1648,8 @@ gang_rmsnorm_linear_bias_topk_kernel(
                      : "memory");
         mpk_stage_stamp(39);
       }
-      if (tile_idx == 0) {
-        gang_rmsnorm_topk_detail::topk_ll_noinline<T, NUM_EXPERTS, K,
-                                                   /*KSPLIT=*/true>(
-            rll,
-            gang_rmsnorm_topk_detail::get_xcd_id(),
-            (unsigned)routing_epoch_hint,
-            const_cast<void *>(bias_ptr),
-            num_active_tokens,
-            renormalize,
-            routed_scaling_factor,
-            num_shared_experts,
-            xsplit - xs_x * MPK_XSPLIT_XCD_INTS,
-            (float)ACTUAL_HIDDEN_DIM);
-      }
+      // The TopK runs on the XCD's first worker past the router tiles (the
+      // fused caller), so it polls from the start rather than behind this.
       return;
     }
     if (tid < xs_f4) {

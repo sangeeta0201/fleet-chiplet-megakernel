@@ -1909,7 +1909,10 @@ template <int BATCH_SIZE,
           // MPK_MOE_SHARED_EARLY, W13 only: EP_SHARED_PE ran the shared
           // expert's W13 tiles ahead of routing, so they leave the owned
           // subsequence. Default false is byte-for-byte the old decode.
-          bool SKIP_SHARED = false>
+          bool SKIP_SHARED = false,
+          // MPK_MOE_BS1_DECODE: the slot count when it is a constant (one
+          // row, non-EP decode); 0 reads it, and the slot, from the routing.
+          int FIXED_SLOTS = 0>
 __device__ __forceinline__ bool _gang_moe_mxfp8_tile(int tile_idx,
                                                      int const *d_mask,
                                                      int const *d_routing,
@@ -1918,7 +1921,12 @@ __device__ __forceinline__ bool _gang_moe_mxfp8_tile(int tile_idx,
                                                      int *tok_idx,
                                                      int *wg_idx,
                                                      int *topk_slot) {
-  int const num_activated_experts = d_mask[NUM_EXPERTS];
+  static_assert(FIXED_SLOTS == 0 ||
+                    (BATCH_SIZE == 1 && EP_WORLD_SIZE == 1 &&
+                     DUP_SHARED == 0 && SHARED_KSHARD == 0),
+                "a fixed slot count holds for one row's non-EP decode only");
+  int const num_activated_experts =
+      FIXED_SLOTS > 0 ? FIXED_SLOTS : d_mask[NUM_EXPERTS];
   int global_tile = tile_idx * 8 + _gang_moe_get_xcd_id();
   int e, leid;
   // Offset of this tile inside its expert's slot run, and whether that expert
@@ -2047,7 +2055,9 @@ __device__ __forceinline__ bool _gang_moe_mxfp8_tile(int tile_idx,
   if (tok >= BATCH_SIZE) {
     return false;
   }
-  int const route_val = d_routing[e * BATCH_SIZE + tok];
+  int const route_val = FIXED_SLOTS > 0
+                            ? global_tile / TILES_PER_EXPERT + 1
+                            : d_routing[e * BATCH_SIZE + tok];
   if (route_val == 0) {
     return false;
   }
@@ -2217,7 +2227,14 @@ __device__ __noinline__ void
                                                           ? SHARED_KSHARD
                                                           : 1),
                                    /*TILE_CLASS=*/0,
-                                   /*SKIP_SHARED=*/(SHARED_MODE == 1)>(
+                                   /*SKIP_SHARED=*/(SHARED_MODE == 1),
+                                   /*FIXED_SLOTS=*/(MPK_MOE_BS1_DECODE &&
+                                                    BATCH_SIZE == 1 &&
+                                                    EP_WORLD_SIZE == 1 &&
+                                                    MPK_SHARED_DUP == 0 &&
+                                                    SHARED_KSHARD == 0)
+                                       ? NUM_TOPK
+                                       : 0>(
                  tile_idx,
                  (int const *)mask_ptr,
                  (int const *)routing_ptr,
@@ -3480,7 +3497,13 @@ __device__ __forceinline__ f32x4_t
 // every block instead of vmcnt(6)) and W13 +2.7 us/layer.
 // NSEG segments starting at activated slot seg_base (a K_PARTS part of the
 // fused tile's reduction), staged from LDS offset 0.
-template <int BATCH_SIZE, int NUM_TOPK, int NSEG, int SEG_LEN>
+// FIXED_SLOTS (MPK_MOE_BS1_DECODE): segment s is topk slot s, so neither the
+// expert id nor routing_indices is read.
+template <int BATCH_SIZE,
+          int NUM_TOPK,
+          int NSEG,
+          int SEG_LEN,
+          bool FIXED_SLOTS = false>
 __device__ __forceinline__ void
     _gang_tp_quant_seg_nt(unsigned short const *__restrict__ act,
                           int const *__restrict__ d_mask,
@@ -3507,8 +3530,8 @@ __device__ __forceinline__ void
     uint32_t dw[16];
     float rw = 0.0f;
     if (seg < n_live) {
-      int const e = d_mask[seg];
-      int const slot = d_routing[e * BATCH_SIZE + tok_idx] - 1;
+      int const slot =
+          FIXED_SLOTS ? seg : d_routing[d_mask[seg] * BATCH_SIZE + tok_idx] - 1;
       rw = d_routing_weight[tok_idx * NUM_TOPK + slot];
       uint32_t const *p =
           (uint32_t const *)(act + slot * SEG_LEN +
@@ -3684,7 +3707,7 @@ __device__ __noinline__ void
   int const seg_base = part * NSEG_P;
   int const *d_mask = (int const *)mask_ptr;
   int const *d_routing = (int const *)routing_ptr;
-  int const n_live = d_mask[NUM_EXPERTS];
+  int const n_live = MPK_MOE_BS1_DECODE ? NUM_TOPK : d_mask[NUM_EXPERTS];
   if (n_live > NSEG) {
     __builtin_trap();
   }
@@ -3708,7 +3731,8 @@ __device__ __noinline__ void
         static_cast<uint32_t>(e) * static_cast<uint32_t>(EXPERT_BYTES);
   }
 
-  _gang_tp_quant_seg_nt<BATCH_SIZE, NUM_TOPK, NSEG_P, I_LOCAL>(
+  _gang_tp_quant_seg_nt<BATCH_SIZE, NUM_TOPK, NSEG_P, I_LOCAL,
+                        /*FIXED_SLOTS=*/MPK_MOE_BS1_DECODE != 0>(
       (unsigned short const *)input_ptr +
           static_cast<size_t>(tok_idx) * (NUM_TOPK * I_LOCAL),
       d_mask,

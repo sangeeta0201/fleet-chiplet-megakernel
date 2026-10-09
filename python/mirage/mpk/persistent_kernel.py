@@ -1584,6 +1584,9 @@ def get_compile_command(
             # Per-slice router partials, summed by the TopK
             # (gang_rmsnorm_linear_bias_mi300.cuh).
             "MPK_ROUTER_KSPLIT",
+            # One-row MoE tile decode with the slot count and slots fixed
+            # (gang_moe_linear_mxfp8_mi300.cuh).
+            "MPK_MOE_BS1_DECODE",
             # Ceiling probes, wrong output (gang_mla_attn_fused_mi300.cuh).
             "MPK_ATTN_PROBE_NOQBWAIT",
             "MPK_ATTN_PROBE_NODECWAIT",
@@ -1886,7 +1889,9 @@ def get_compile_command(
                 "-lmpi",
                 "-lhsa-runtime64",
             ]
-        return common_cmd + specific_cmd + flags
+        # Debug builds only, e.g. MPK_EXTRA_HIPCC_FLAGS=-ggdb for rocgdb.
+        _extra = os.environ.get("MPK_EXTRA_HIPCC_FLAGS", "").split()
+        return common_cmd + specific_cmd + flags + _extra
 
     if profiling:
         flags = flags + ["-DMPK_ENABLE_PROFILING"]

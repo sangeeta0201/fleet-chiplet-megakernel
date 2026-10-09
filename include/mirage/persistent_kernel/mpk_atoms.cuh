@@ -1185,12 +1185,25 @@ __device__ __forceinline__ bool
 // then writes its slice of the normed row and flags it; the TopK waits on
 // those flags before releasing the MoE.
 // MEASURED 2026-10-09, NP=8 1024/1024, interleaved: 6.041 6.034 6.032 ->
-// 6.000 6.019 6.027 6.004 ms (-0.02). The tokens move (the logit and 1/rms
-// sums reassociate, and bf16 logits flip near-ties); ppl512 2.4112 against
-// 2.4838, longseq 256/512/1024 G1 PASS. Default on; it only engages under
-// XSPLIT + ROUTER_LL + OPROJ_LL.
+// 6.000 6.019 6.027 6.004 ms (-0.02) with the TopK on router tile 0. The
+// tokens move (the logit and 1/rms sums reassociate, and bf16 logits flip
+// near-ties); ppl512 2.4112 against 2.4838, longseq 256/512/1024 G1 PASS.
+// Stamps: router work 4.25 -> 2.38 us, but the TopK tail 2.21 -> 4.41, since
+// tile 0 wrote its normed slice first and re-polled stale words one at a
+// time. With the TopK on the XCD's first worker past the router tiles
+// (gang_oproj_router_fused_mi300.cuh) and whole-round re-polls, same tokens:
+// 6.039 6.056 6.035 -> 5.958 5.961 5.966 5.962 ms (-0.08). Default on; it
+// only engages under XSPLIT + ROUTER_LL + OPROJ_LL.
 #ifndef MPK_ROUTER_KSPLIT
 #define MPK_ROUTER_KSPLIT 1
+#endif
+// MPK_MOE_BS1_DECODE: at one row the TopK always emits NUM_TOPK slots (the
+// routed k plus the shared expert) and routes slot s through
+// routing_indices[e] = s + 1, so the MoE tile decode needs neither the slot
+// count nor the routing_indices load: one dependent L2 round trip (the
+// expert id) after the routing release instead of four.
+#ifndef MPK_MOE_BS1_DECODE
+#define MPK_MOE_BS1_DECODE 0
 #endif
 #define MPK_RLL_WORD_LINES 32
 #define MPK_RLL_IDS_LINES 17
