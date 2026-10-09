@@ -3619,6 +3619,10 @@ struct GangW2FoldPush {
   int my_pe;
   unsigned long long sig_value;    // the next layer's fold epoch
   int64_t peer_delta[8];           // heap delta per peer, rank order
+  // MPK_EP_LL: non-null when the next layer reads LL words -- this rank's
+  // slot of its ep_gather as (sig_value << 32 | bf16x2) words. The push is
+  // then its own arrival: no drain, no push count, no signal.
+  unsigned long long *ll_slot;
 };
 template <int BATCH_SIZE,
           int OUTPUT_SIZE,
@@ -3769,6 +3773,7 @@ __device__ __noinline__ void
       // every layer.
       asm volatile("buffer_inv" ::: "memory");
       int const row0 = wg_idx * OUTPUT_PER_WG;
+      unsigned long long const ll_hi = fold.sig_value << 32;
       for (int w = tid; w < OUTPUT_PER_WG / 2; w += (int)MPK_NT) {
         int const off = row0 + 2 * w;
         unsigned packed = 0;
@@ -3782,12 +3787,23 @@ __device__ __noinline__ void
           unsigned const rounding_bias = ((u >> 16) & 1) + 0x7FFFu;
           packed |= ((u + rounding_bias) >> 16) << (16 * j);
         }
-        st_wt_u32((void *)&fold.slot[off], packed);
+        if (fold.ll_slot != nullptr) {
+          unsigned long long const word = ll_hi | packed;
+          st_wt_u64((void *)&fold.ll_slot[off / 2], word);
 #pragma unroll
-        for (int q = 0; q < FOLD_NPEER; q++) {
-          st_wt_u32((void *)(reinterpret_cast<char *>(&fold.slot[off]) +
-                             fold.peer_delta[q]),
-                    packed);
+          for (int q = 0; q < FOLD_NPEER; q++) {
+            st_wt_u64((void *)(reinterpret_cast<char *>(&fold.ll_slot[off / 2]) +
+                               fold.peer_delta[q]),
+                      word);
+          }
+        } else {
+          st_wt_u32((void *)&fold.slot[off], packed);
+#pragma unroll
+          for (int q = 0; q < FOLD_NPEER; q++) {
+            st_wt_u32((void *)(reinterpret_cast<char *>(&fold.slot[off]) +
+                               fold.peer_delta[q]),
+                      packed);
+          }
         }
         // Zero what was just read, write-through, from this XCD -- the one
         // whose L2 the next layer's atomicAdds on these rows resolve in.
@@ -3796,6 +3812,7 @@ __device__ __noinline__ void
         // corrupts every layer.
         st_wt_u64((void *)(d_workspace + off), 0ull);
       }
+      if (fold.ll_slot == nullptr) {
       __syncthreads();
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       if (tid == 0) {
@@ -3816,6 +3833,7 @@ __device__ __noinline__ void
           MPK_SIG_FLUSH();
         }
       }
+      } // fold.ll_slot == nullptr
     }
   }
 }

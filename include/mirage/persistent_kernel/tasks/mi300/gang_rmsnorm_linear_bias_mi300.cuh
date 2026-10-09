@@ -747,6 +747,25 @@ __device__ __attribute__((noinline)) void
       reinterpret_cast<unsigned long long const *>(rll);
   __shared__ unsigned short s_logits[NUM_EXPERTS];
   unsigned long long w;
+#if MPK_TOPK_LL_PREBIAS
+  // MPK_TOPK_LL_PREBIAS: the correction bias does not depend on the logits,
+  // so its load rides the first poll round and the selection reads it out of
+  // LDS; and each thread spins on its own word, so the last word to land is
+  // seen one load after it lands rather than one block-wide round after.
+  // Dynamic LDS, at its base: static LDS is at its 8 KB budget, and nothing
+  // of this worker's is in flight there between the o_proj prefetch window
+  // (retired at Phase 8) and the MoE's, which starts after routing.
+  extern __shared__ char _topk_dyn_smem[];
+  T *const s_bias = reinterpret_cast<T *>(_topk_dyn_smem);
+  T const b = static_cast<T const *>(bias_ptr)[tid];
+  while ((unsigned)((w = ld_sys_u64(const_cast<unsigned long long *>(
+                         words + tid))) >>
+                    32) != epoch) {
+    __builtin_amdgcn_s_sleep(1);
+  }
+  s_bias[tid] = b;
+  bias_ptr = s_bias;
+#else
   while (true) {
     w = ld_sys_u64(const_cast<unsigned long long *>(words + tid));
     if (__syncthreads_and((unsigned)(w >> 32) == epoch)) {
@@ -754,6 +773,7 @@ __device__ __attribute__((noinline)) void
     }
     __builtin_amdgcn_s_sleep(1);
   }
+#endif
   s_logits[tid] = static_cast<unsigned short>(w & 0xFFFFu);
   __syncthreads();
   int *const xb = rll + MPK_RLL_WORD_LINES * 16 + xcd * MPK_RLL_XCD_INTS;

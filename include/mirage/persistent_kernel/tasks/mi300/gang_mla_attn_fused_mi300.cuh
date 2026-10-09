@@ -91,6 +91,8 @@
 #include "tasks/mi300/gang_gemv_mxfp8_mi300.cuh"
 #include "tasks/mi300/gang_mla_decode_mi300.cuh"
 #include "tasks/mi300/gang_rmsnorm_linear_mxfp8_bias_mla_kvupd_mi300.cuh"
+// make_w_buffer_rsrc / __llvm_amdgcn_raw_buffer_load_lds (MPK_QKVA_IDLE_PF).
+#include "tasks/mi300/gang_moe_linear_mxfp4_mi300.cuh"
 
 namespace kernel {
 
@@ -718,6 +720,61 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   if (qkv_xsplit != nullptr && qkv_tiles_per_xcd > tiles_per_xcd) {
     __builtin_trap();
   }
+#if MPK_QKVA_IDLE_PF
+  // MPK_QKVA_IDLE_PF: the workers that own no qkv_a tile pull this XCD's
+  // whole qkv_a weight region into L2, split evenly between them, while the
+  // tiles resolve the EP slots -- so the K-loops read L2, not HBM. Not the
+  // tiles themselves (MPK_QKVA_ENTRY_PF): vmcnt retires in issue order, so a
+  // slab in flight on a tile's wave delays that wave's resolve loads, and
+  // every __syncthreads drains it. These workers' drain lands on their
+  // qkv_a -> q_b arrival, which is never the last. Their LDS is idle here;
+  // the window is a per-wave 1 KB at its base, overwritten by every load.
+  // Level 2 adds q_b's weight, the next phase's, after qkv_a's: one range,
+  // two buffer resources, split evenly across the idle workers.
+  if (xcd_rank >= qkv_tiles_per_xcd && qkv_weight_ptr != nullptr) {
+    constexpr uint32_t QIP_WG_BYTES =
+        QKV_OUTPUT_PER_WG * QKV_REDUCTION_SIZE +
+        QKV_OUTPUT_PER_WG * (QKV_REDUCTION_SIZE / 32);
+    constexpr uint32_t QIP_QB_WG_BYTES =
+        QB_OUTPUT_PER_WG * QB_REDUCTION_SIZE +
+        QB_OUTPUT_PER_WG * (QB_REDUCTION_SIZE / 32);
+    int const n_idle = tiles_per_xcd - qkv_tiles_per_xcd;
+    uint32_t const r0 = (uint32_t)qkv_n_wgs_per_xcd * QIP_WG_BYTES;
+    uint32_t const r1 = (MPK_QKVA_IDLE_PF >= 2 && qb_weight_ptr != nullptr)
+                            ? (uint32_t)qb_n_wgs_per_xcd * QIP_QB_WG_BYTES
+                            : 0u;
+    uint32_t const total = r0 + r1;
+    uint32_t const chunk =
+        ((total + (uint32_t)n_idle - 1u) / (uint32_t)n_idle + 4095u) & ~4095u;
+    uint32_t const lo = (uint32_t)(xcd_rank - qkv_tiles_per_xcd) * chunk;
+    uint32_t const hi = (lo + chunk < total) ? lo + chunk : total;
+    extern __shared__ char _qip_smem[];
+    auto *dst = (__attribute__((address_space(3)))
+                 uint32_t *)(_qip_smem + (tid >> 6) * 1024);
+#pragma unroll 1
+    for (int r = 0; r < 2; r++) {
+      uint32_t const rb = r == 0 ? 0u : r0;
+      uint32_t const re = r == 0 ? r0 : total;
+      uint32_t const a = lo > rb ? lo : rb;
+      uint32_t const b = hi < re ? hi : re;
+      if (a >= b) {
+        continue;
+      }
+      i32x4_t const rsrc = make_w_buffer_rsrc(
+          r == 0 ? qkv_weight_ptr : qb_weight_ptr, re - rb);
+      int voff = (int)(a - rb) + tid * 16;
+      int const last = (int)(b - rb) - 16;
+      int const n = (int)((b - a + 4095u) / 4096u);
+      for (int i = 0; i < n; i++) {
+        int const v = voff < last ? voff : last;
+        // aux = sc0: allocate in L2 for the K-loop (see the o_proj prefetch).
+        __llvm_amdgcn_raw_buffer_load_lds(rsrc, dst, 16, v, 0, 0, 1);
+        voff += 4096;
+        asm volatile("" : "+v"(voff) : : "memory");
+      }
+    }
+  }
+#endif
 #pragma unroll 1
   for (int _qrep = 0; _qrep < MPK_QKVA_REPS; ++_qrep)
   for (int t = xcd_rank; t < qkv_tiles_per_xcd; t += tiles_per_xcd) {

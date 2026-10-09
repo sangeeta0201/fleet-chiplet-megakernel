@@ -3108,10 +3108,14 @@ if __name__ == "__main__":
             # bit-identical. MEASURED 2026-10-08, NP=8 1024/1024, n=3
             # interleaved, tokens identical: 6.820 6.819 6.824 -> 6.492 6.504
             # 6.477 ms. The LL slots are read only by the split resolve.
-            if os.environ.get("MPK_FOLD_W2", "0") != "1":
-                os.environ.setdefault("MPK_EP_LL", "1")
+            os.environ.setdefault("MPK_EP_LL", "1")
             if os.environ.get("MPK_EP_LL") == "1":
                 os.environ.setdefault("MPK_QKV_XSPLIT", "1")
+                # Under MPK_FOLD_W2 the last real layer's W2 recognises the
+                # tail as the run's last entry; MTP appends two more.
+                assert not (os.environ.get("MPK_FOLD_W2", "0") == "1"
+                            and mtp_in_graph), (
+                    "MPK_FOLD_W2 + MPK_EP_LL assumes the EP tail ends the run")
             # The tails (main, and MTP's) fold and return before o_proj, and
             # the LM head reads exactly world_size planes from them.
             _ep_tail_slots = {num_layers} | (

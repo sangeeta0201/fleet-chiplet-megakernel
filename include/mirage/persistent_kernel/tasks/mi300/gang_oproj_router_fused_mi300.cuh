@@ -405,7 +405,9 @@ __device__ __attribute__((always_inline)) void
         // MPK_ROUTER_LL only: the logit words and per-XCD routing copies.
         int *router_ll_ptr = nullptr,
         // MPK_OPROJ_LL == 2 only: the eight per-XCD f32 o_proj row blocks.
-        int *oproj_oll_ptr = nullptr
+        int *oproj_oll_ptr = nullptr,
+        // MPK_FOLD_W2 under MPK_EP_LL: the next layer is the EP tail.
+        bool fold_next_is_tail = false
 #if MPK_QKVA_PF_KB > 0
         ,
         // Next layer's qkv_a weight for this XCD. Null on the last layer of
@@ -2693,6 +2695,14 @@ __device__ __attribute__((always_inline)) void
     w2_fold.sig_stride = OPROJ_EP_SIGNAL_STRIDE;
     w2_fold.my_pe = EP_MY_PE;
     w2_fold.sig_value = (unsigned long long)(oproj_expected + 1);
+    // MPK_EP_LL: the next layer's resolvers validate words -- unless the next
+    // layer is the tail, whose slot is the LM head's bf16 input and whose
+    // leader waits on the signal.
+    w2_fold.ll_slot =
+        (MPK_EP_LL && !fold_next_is_tail)
+            ? static_cast<unsigned long long *>(fold_next_gather_ptr) +
+                  (size_t)EP_MY_PE * (BATCH_SIZE * HIDDEN_SIZE / 2)
+            : nullptr;
 #pragma unroll
     for (int q = 0; q < W2_FOLD_NPEER; q++) {
       if (!mpk_shmem_peer_delta((q < EP_MY_PE) ? q : (q + 1),

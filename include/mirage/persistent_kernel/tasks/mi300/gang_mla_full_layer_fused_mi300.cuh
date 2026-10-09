@@ -2714,7 +2714,11 @@ gang_mla_full_layer_fused_kernel_mi300(
       /*oproj_oll=*/
       (MPK_OPROJ_LL == 2 && MPK_OPROJ_RP && EP_WORLD_SIZE > 1 && ml_mode)
           ? counters + FULL_LAYER_OLL_SLOT * HIER_STRIDE
-          : nullptr
+          : nullptr,
+      // The tail is the run's last entry (demo.py emits it right after the
+      // last real layer, and refuses MTP under MPK_FOLD_W2 + MPK_EP_LL).
+      /*fold_next_is_tail=*/ml_mode &&
+          (task_layer_idx % ml_num_layers) == ml_num_layers - 2
 #if MPK_QKVA_PF_KB > 0
       ,
       /*next_qkv_weight=*/input_ptrs[MPK_QKVA_PF_SLOT]

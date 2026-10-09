@@ -1572,6 +1572,9 @@ def get_compile_command(
             "MPK_ROUTER_INLINE",
             # ... and the MLA decode (gang_mla_decode_mi300.cuh).
             "MPK_DECODE_INLINE",
+            # The LL TopK stages its bias during the logit poll
+            # (gang_rmsnorm_linear_bias_mi300.cuh).
+            "MPK_TOPK_LL_PREBIAS",
             # Ceiling probes, wrong output (gang_mla_attn_fused_mi300.cuh).
             "MPK_ATTN_PROBE_NOQBWAIT",
             "MPK_ATTN_PROBE_NODECWAIT",
@@ -1580,6 +1583,12 @@ def get_compile_command(
             if _x is not None:
                 assert _x in ("0", "1"), f"{_v} is 0 or 1"
                 flags = flags + [f"-D{_v}={_x}"]
+        # The qkv_a-idle workers prefetch qkv_a's weight into L2, and at 2
+        # q_b's too (gang_mla_attn_fused_mi300.cuh).
+        _x = os.environ.get("MPK_QKVA_IDLE_PF")
+        if _x is not None:
+            assert _x in ("0", "1", "2"), "MPK_QKVA_IDLE_PF is 0, 1 or 2"
+            flags = flags + [f"-DMPK_QKVA_IDLE_PF={_x}"]
         # The o_proj partials as epoch-tagged words: 1 from the GEMV epilogue,
         # 2 from the push (gang_oproj_router_fused_mi300.cuh, mpk_atoms.cuh).
         _x = os.environ.get("MPK_OPROJ_LL")

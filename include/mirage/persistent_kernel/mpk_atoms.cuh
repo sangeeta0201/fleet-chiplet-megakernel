@@ -977,6 +977,13 @@ __device__ __forceinline__ bool
 // layer L+1's ep_gather. The multi-layer loop hands it that pointer in
 // TaskDesc input slot MPK_FOLD_W2_SLOT, read off the next layer's own input
 // [27] -- the same vehicle MPK_QKVA_PF_SLOT uses for the next qkv_a weight.
+//
+// BROKEN on the 2026-10-08 defaults (MPK_EP_LL, MPK_OPROJ_LL=2,
+// MPK_FL_INLINE), not yet localized: alone (MPK_EP_LL=0) it faults with an
+// illegal address in the first iteration; with MPK_EP_LL (the W2 epilogue
+// pushing LL words, GangW2FoldPush::ll_slot) it wedges in the first
+// iteration, yet completes with correct output under MPK_WORKER_STATE=1.
+// Next step is rocgdb on the fault (.claude/skills/gpu-fault-debugging).
 #ifndef MPK_FOLD_W2
 #define MPK_FOLD_W2 0
 #endif
@@ -1069,11 +1076,18 @@ __device__ __forceinline__ bool
 // MPK_ROUTER_INLINE: likewise the router tile (gang_rmsnorm_linear_bias_topk_
 // kernel), whose ~45 arguments arrive partly on the stack -- 20 scratch loads
 // at the head of a critical-path phase.
+// MEASURED NEGATIVE 2026-10-08, NP=8 1024/1024, n=3 interleaved on the
+// FL_INLINE + OPROJ_LL=2 default: 6.164 6.130 6.180 -> 6.242 6.256 6.250 ms,
+// and the tokens move (the inlined gate dot contracts differently). Off.
 #ifndef MPK_ROUTER_INLINE
 #define MPK_ROUTER_INLINE 0
 #endif
 // MPK_DECODE_INLINE: likewise the MLA decode (gang_mla_decode_kernel and
 // mla_decode_absorbed), one call pair per decode item.
+// MEASURED NEUTRAL 2026-10-08, NP=8 1024/1024, n=3 interleaved (on a base
+// that also had MPK_ROUTER_INLINE): 6.240 6.254 6.260 -> 6.269 6.256 6.266
+// ms. Its prologue is 8 VGPRs now, not the 60 the note in the decode had;
+// inlined, the AGPR overflow grows 106 -> 136. Off.
 #ifndef MPK_DECODE_INLINE
 #define MPK_DECODE_INLINE 0
 #endif
@@ -1089,9 +1103,8 @@ __device__ __forceinline__ bool
 #if MPK_EP_LL && !MPK_QKV_XSPLIT
 #error "MPK_EP_LL: the LL slots are only read by MPK_QKV_XSPLIT's resolvers"
 #endif
-#if MPK_EP_LL && MPK_FOLD_W2
-#error "MPK_EP_LL replaces the head fold's protocol; MPK_FOLD_W2 moves it"
-#endif
+// Under MPK_FOLD_W2 the W2 epilogue pushes the words itself (GangW2FoldPush::
+// ll_slot), except into the tail, which keeps the bf16 slot and signal.
 #if MPK_EP_LL && (defined(MPK_QKV_EP_FOLD) || defined(MPK_QKV_PRO_HOIST))
 #error "MPK_EP_LL: the in-tile EP folds read the gather slots as bf16"
 #endif
@@ -1128,6 +1141,23 @@ __device__ __forceinline__ bool
 #endif
 // f32 rows per XCD for MPK_OPROJ_LL == 2: 768 at GLM-5's 6144 / 8.
 #define MPK_OLL_XCD_INTS 768
+// MPK_QKVA_IDLE_PF: the qkv_a-idle workers prefetch the XCD's qkv_a weight
+// into L2 while the tiles resolve (gang_mla_attn_fused_mi300.cuh); 2 adds
+// q_b's. MEASURED 2026-10-09, NP=8 1024/1024, n=3 interleaved, tokens
+// identical: 6.160 6.145 6.157 -> 6.119 6.093 6.094 ms (-0.05). Gated with
+// MPK_TOPK_LL_PREBIAS: ppl512 2.4838, longseq 256/512/1024 G1 PASS. Default 1.
+#ifndef MPK_QKVA_IDLE_PF
+#define MPK_QKVA_IDLE_PF 1
+#endif
+
+// MPK_TOPK_LL_PREBIAS: the LL TopK stages the correction bias into LDS during
+// its logit poll and polls per thread (topk_ll_noinline). MEASURED
+// 2026-10-08, NP=8 1024/1024, n=3 interleaved, tokens identical: 6.156 6.174
+// 6.142 -> 6.084 6.091 6.091 ms (-0.07): the bias read was a cold round trip
+// behind the last logit. Default 1.
+#ifndef MPK_TOPK_LL_PREBIAS
+#define MPK_TOPK_LL_PREBIAS 1
+#endif
 #define MPK_RLL_WORD_LINES 32
 #define MPK_RLL_IDS_LINES 17
 #define MPK_RLL_XCD_INTS ((2 + 2 * MPK_RLL_IDS_LINES) * 16)
@@ -1153,7 +1183,7 @@ __device__ __forceinline__ bool
 #ifndef MPK_QKV_MXFP4
 #define MPK_QKV_MXFP4 0
 #endif
-#if MPK_QKV_MXFP4 && (MPK_QKVA_ENTRY_PF || MPK_QKVA_PF_KB > 0)
+#if MPK_QKV_MXFP4 && (MPK_QKVA_ENTRY_PF || MPK_QKVA_PF_KB > 0 || MPK_QKVA_IDLE_PF)
 #error "MPK_QKV_MXFP4: the qkv_a prefetchers still size tiles as E4M3"
 #endif
 
