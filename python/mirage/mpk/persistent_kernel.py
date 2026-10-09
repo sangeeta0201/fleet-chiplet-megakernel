@@ -1583,11 +1583,11 @@ def get_compile_command(
             if _x is not None:
                 assert _x in ("0", "1"), f"{_v} is 0 or 1"
                 flags = flags + [f"-D{_v}={_x}"]
-        # The qkv_a-idle workers prefetch qkv_a's weight into L2, and at 2
-        # q_b's too (gang_mla_attn_fused_mi300.cuh).
+        # The qkv_a-idle workers prefetch qkv_a's weight into L2
+        # (gang_mla_attn_fused_mi300.cuh).
         _x = os.environ.get("MPK_QKVA_IDLE_PF")
         if _x is not None:
-            assert _x in ("0", "1", "2"), "MPK_QKVA_IDLE_PF is 0, 1 or 2"
+            assert _x in ("0", "1"), "MPK_QKVA_IDLE_PF is 0 or 1"
             flags = flags + [f"-DMPK_QKVA_IDLE_PF={_x}"]
         # The o_proj partials as epoch-tagged words: 1 from the GEMV epilogue,
         # 2 from the push (gang_oproj_router_fused_mi300.cuh, mpk_atoms.cuh).

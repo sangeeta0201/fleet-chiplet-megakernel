@@ -729,42 +729,30 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // every __syncthreads drains it. These workers' drain lands on their
   // qkv_a -> q_b arrival, which is never the last. Their LDS is idle here;
   // the window is a per-wave 1 KB at its base, overwritten by every load.
-  // Level 2 adds q_b's weight, the next phase's, after qkv_a's: one range,
-  // two buffer resources, split evenly across the idle workers.
+  //
+  // A two-region form that also covered q_b's weight (one range, a buffer
+  // resource per region, under a `#pragma unroll 1` loop) wedged the first
+  // decode iteration 3/3 with MPK_TOPK_LL_PREBIAS, and 1/1 at level 2, while
+  // this form passed 7/7 and the gates. Not localized; do not reintroduce it
+  // without a worker-state capture.
   if (xcd_rank >= qkv_tiles_per_xcd && qkv_weight_ptr != nullptr) {
     constexpr uint32_t QIP_WG_BYTES =
         QKV_OUTPUT_PER_WG * QKV_REDUCTION_SIZE +
         QKV_OUTPUT_PER_WG * (QKV_REDUCTION_SIZE / 32);
-    constexpr uint32_t QIP_QB_WG_BYTES =
-        QB_OUTPUT_PER_WG * QB_REDUCTION_SIZE +
-        QB_OUTPUT_PER_WG * (QB_REDUCTION_SIZE / 32);
     int const n_idle = tiles_per_xcd - qkv_tiles_per_xcd;
-    uint32_t const r0 = (uint32_t)qkv_n_wgs_per_xcd * QIP_WG_BYTES;
-    uint32_t const r1 = (MPK_QKVA_IDLE_PF >= 2 && qb_weight_ptr != nullptr)
-                            ? (uint32_t)qb_n_wgs_per_xcd * QIP_QB_WG_BYTES
-                            : 0u;
-    uint32_t const total = r0 + r1;
+    uint32_t const total = (uint32_t)qkv_n_wgs_per_xcd * QIP_WG_BYTES;
     uint32_t const chunk =
         ((total + (uint32_t)n_idle - 1u) / (uint32_t)n_idle + 4095u) & ~4095u;
     uint32_t const lo = (uint32_t)(xcd_rank - qkv_tiles_per_xcd) * chunk;
     uint32_t const hi = (lo + chunk < total) ? lo + chunk : total;
-    extern __shared__ char _qip_smem[];
-    auto *dst = (__attribute__((address_space(3)))
-                 uint32_t *)(_qip_smem + (tid >> 6) * 1024);
-#pragma unroll 1
-    for (int r = 0; r < 2; r++) {
-      uint32_t const rb = r == 0 ? 0u : r0;
-      uint32_t const re = r == 0 ? r0 : total;
-      uint32_t const a = lo > rb ? lo : rb;
-      uint32_t const b = hi < re ? hi : re;
-      if (a >= b) {
-        continue;
-      }
-      i32x4_t const rsrc = make_w_buffer_rsrc(
-          r == 0 ? qkv_weight_ptr : qb_weight_ptr, re - rb);
-      int voff = (int)(a - rb) + tid * 16;
-      int const last = (int)(b - rb) - 16;
-      int const n = (int)((b - a + 4095u) / 4096u);
+    if (lo < hi) {
+      extern __shared__ char _qip_smem[];
+      i32x4_t const rsrc = make_w_buffer_rsrc(qkv_weight_ptr, total);
+      auto *dst = (__attribute__((address_space(3)))
+                   uint32_t *)(_qip_smem + (tid >> 6) * 1024);
+      int voff = (int)lo + tid * 16;
+      int const last = (int)hi - 16;
+      int const n = (int)((hi - lo + 4095u) / 4096u);
       for (int i = 0; i < n; i++) {
         int const v = voff < last ? voff : last;
         // aux = sc0: allocate in L2 for the K-loop (see the o_proj prefetch).

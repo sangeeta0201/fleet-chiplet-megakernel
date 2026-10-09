@@ -1142,8 +1142,8 @@ __device__ __forceinline__ bool
 // f32 rows per XCD for MPK_OPROJ_LL == 2: 768 at GLM-5's 6144 / 8.
 #define MPK_OLL_XCD_INTS 768
 // MPK_QKVA_IDLE_PF: the qkv_a-idle workers prefetch the XCD's qkv_a weight
-// into L2 while the tiles resolve (gang_mla_attn_fused_mi300.cuh); 2 adds
-// q_b's. MEASURED 2026-10-09, NP=8 1024/1024, n=3 interleaved, tokens
+// into L2 while the tiles resolve (gang_mla_attn_fused_mi300.cuh).
+// MEASURED 2026-10-09, NP=8 1024/1024, n=3 interleaved, tokens
 // identical: 6.160 6.145 6.157 -> 6.119 6.093 6.094 ms (-0.05). Gated with
 // MPK_TOPK_LL_PREBIAS: ppl512 2.4838, longseq 256/512/1024 G1 PASS. Default 1.
 #ifndef MPK_QKVA_IDLE_PF
