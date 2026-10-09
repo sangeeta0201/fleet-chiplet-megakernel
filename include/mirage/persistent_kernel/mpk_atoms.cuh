@@ -1225,8 +1225,11 @@ __device__ __forceinline__ bool
 // loads (indptrs, page id, the chunk's KV rows) into L2 while they wait at
 // the q_b -> decode barrier, and the merge tiles read qo_indptr across the
 // decode -> merge wait (gang_mla_attn_fused_mi300.cuh).
+// MEASURED 2026-10-09, NP=8 1024/1024, interleaved, tokens identical
+// (ppl512 2.4098 = control): 5.747 5.740 5.724 -> 5.709 5.703 5.705 5.708
+// ms (-0.03). Default on.
 #ifndef MPK_ATTN_META_PF
-#define MPK_ATTN_META_PF 0
+#define MPK_ATTN_META_PF 1
 #endif
 // MPK_TOPK_PAD_NS: pricing probe, correct output. Delays the K-split TopK's
 // routing release by this many ns on every rank and layer.
