@@ -1150,6 +1150,24 @@ __device__ __forceinline__ bool
 #define MPK_QKVA_IDLE_PF 1
 #endif
 
+// MPK_QB_IDLE_PF: after MPK_QKVA_IDLE_PF's block, the same idle workers pull
+// q_b's weight into L2 too (gang_mla_attn_fused_mi300.cuh).
+// MEASURED NEGATIVE 2026-10-09, NP=8 1024/1024, interleaved, tokens
+// identical: 6.034 6.041 -> 6.117 6.163 6.153 ms. Its bytes compete with
+// qkv_a's own L2 stream. Off.
+#ifndef MPK_QB_IDLE_PF
+#define MPK_QB_IDLE_PF 0
+#endif
+// MPK_QB_SELF_PF: each q_b tile's waves 1-3 prefetch its own slab into L2
+// during the qkv_a -> q_b rendezvous, after qkv_a's stream has finished
+// (gang_mla_attn_fused_mi300.cuh).
+// MEASURED NEUTRAL 2026-10-09, NP=8 1024/1024, interleaved, tokens
+// identical: 6.038 6.021 -> 6.043 6.056 6.072 ms. q_b + W_UK is not bound
+// by its weight fetch. Off.
+#ifndef MPK_QB_SELF_PF
+#define MPK_QB_SELF_PF 0
+#endif
+
 // MPK_TOPK_LL_PREBIAS: the LL TopK stages the correction bias into LDS during
 // its logit poll and polls per thread (topk_ll_noinline). MEASURED
 // 2026-10-08, NP=8 1024/1024, n=3 interleaved, tokens identical: 6.156 6.174
@@ -1157,6 +1175,22 @@ __device__ __forceinline__ bool
 // behind the last logit. Default 1.
 #ifndef MPK_TOPK_LL_PREBIAS
 #define MPK_TOPK_LL_PREBIAS 1
+#endif
+// MPK_ROUTER_KSPLIT: under MPK_ROUTER_XSPLIT + MPK_ROUTER_LL each router tile
+// contracts only its own 384-column slice, against all 32 of its XCD's
+// experts, and pushes 32 partial logits plus its slice's sum of squares as LL
+// words into its XCD's exchange row; the TopK sums the 16 partials per expert
+// and applies 1/rms itself. Deletes the XCD row swap, the whole-row re-read
+// and the 256-thread reductions from the router's critical path. Each tile
+// then writes its slice of the normed row and flags it; the TopK waits on
+// those flags before releasing the MoE.
+// MEASURED 2026-10-09, NP=8 1024/1024, interleaved: 6.041 6.034 6.032 ->
+// 6.000 6.019 6.027 6.004 ms (-0.02). The tokens move (the logit and 1/rms
+// sums reassociate, and bf16 logits flip near-ties); ppl512 2.4112 against
+// 2.4838, longseq 256/512/1024 G1 PASS. Default on; it only engages under
+// XSPLIT + ROUTER_LL + OPROJ_LL.
+#ifndef MPK_ROUTER_KSPLIT
+#define MPK_ROUTER_KSPLIT 1
 #endif
 #define MPK_RLL_WORD_LINES 32
 #define MPK_RLL_IDS_LINES 17

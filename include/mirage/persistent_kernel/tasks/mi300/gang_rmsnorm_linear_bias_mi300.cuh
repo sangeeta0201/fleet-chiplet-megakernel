@@ -727,7 +727,11 @@ __device__ __attribute__((noinline)) void
 // select into this XCD's routing copy and release this XCD's MoE workers
 // through its L2. Every XCD selects from the same bf16 logits with the same
 // code, so the eight copies are identical.
-template <typename T, int NUM_EXPERTS, int K>
+// KSPLIT (MPK_ROUTER_KSPLIT): the logits arrive as 16 per-slice partials per
+// expert in the XCDs' exchange rows (ks_all = XCD 0's block), unscaled; this
+// XCD's 16 sums of squares give 1/rms. The release also waits for this XCD's
+// 16 normed-slice flags.
+template <typename T, int NUM_EXPERTS, int K, bool KSPLIT = false>
 __device__ __attribute__((noinline)) void
     topk_ll_noinline(int *rll,
                      int xcd,
@@ -736,7 +740,9 @@ __device__ __attribute__((noinline)) void
                      int num_active_tokens,
                      bool renormalize,
                      float routed_scaling_factor,
-                     int num_shared_experts) {
+                     int num_shared_experts,
+                     int const *ks_all = nullptr,
+                     float ks_hidden = 0.0f) {
   static_assert(NUM_EXPERTS == MPK_NT, "one logit word per thread");
   static_assert(NUM_EXPERTS * 8 <= MPK_RLL_WORD_LINES * 64,
                 "the logit words overrun their lines");
@@ -747,6 +753,65 @@ __device__ __attribute__((noinline)) void
       reinterpret_cast<unsigned long long const *>(rll);
   __shared__ unsigned short s_logits[NUM_EXPERTS];
   unsigned long long w;
+  if constexpr (KSPLIT) {
+    static_assert(NUM_EXPERTS == 256, "32 experts per XCD, 16 slices");
+    extern __shared__ char _topk_dyn_smem[];
+    T *const s_bias = reinterpret_cast<T *>(_topk_dyn_smem);
+    float *const s_ssq = reinterpret_cast<float *>(_topk_dyn_smem + 512);
+    T const b = static_cast<T const *>(bias_ptr)[tid];
+    unsigned long long const *const blk =
+        reinterpret_cast<unsigned long long const *>(
+            ks_all + (tid >> 5) * MPK_XSPLIT_XCD_INTS +
+            MPK_XSPLIT_FLAG_LINES * 16) +
+        (tid & 31);
+    unsigned long long pw[16];
+#pragma unroll
+    for (int t = 0; t < 16; t++) {
+      asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1"
+                   : "=v"(pw[t])
+                   : "v"(blk + t * 64)
+                   : "memory");
+    }
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#pragma unroll
+    for (int t = 0; t < 16; t++) {
+      while ((unsigned)(pw[t] >> 32) != epoch) {
+        __builtin_amdgcn_s_sleep(1);
+        pw[t] = ld_sys_u64(const_cast<unsigned long long *>(blk + t * 64));
+      }
+    }
+    if (tid < 16) {
+      unsigned long long *const sp =
+          const_cast<unsigned long long *>(
+              reinterpret_cast<unsigned long long const *>(
+                  ks_all + xcd * MPK_XSPLIT_XCD_INTS +
+                  MPK_XSPLIT_FLAG_LINES * 16)) +
+          tid * 64 + 32;
+      unsigned long long sw;
+      while ((unsigned)((sw = ld_sys_u64(sp)) >> 32) != epoch) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+      s_ssq[tid] = __uint_as_float((unsigned)sw);
+    }
+    s_bias[tid] = b;
+    bias_ptr = s_bias;
+    __syncthreads();
+    float tot = 0.0f;
+#pragma unroll
+    for (int t = 0; t < 16; t++) {
+      tot += s_ssq[t];
+    }
+    float const irms = rsqrtf(tot / ks_hidden + 1e-5f);
+    float s = 0.0f;
+#pragma unroll
+    for (int t = 0; t < 16; t++) {
+      s += __uint_as_float((unsigned)pw[t]);
+    }
+    __hip_bfloat16 const lb = __float2bfloat16(s * irms);
+    unsigned short u;
+    __builtin_memcpy(&u, &lb, 2);
+    w = u;
+  } else {
 #if MPK_TOPK_LL_PREBIAS
   // MPK_TOPK_LL_PREBIAS: the correction bias does not depend on the logits,
   // so its load rides the first poll round and the selection reads it out of
@@ -774,6 +839,7 @@ __device__ __attribute__((noinline)) void
     __builtin_amdgcn_s_sleep(1);
   }
 #endif
+  }
   s_logits[tid] = static_cast<unsigned short>(w & 0xFFFFu);
   __syncthreads();
   int *const xb = rll + MPK_RLL_WORD_LINES * 16 + xcd * MPK_RLL_XCD_INTS;
@@ -805,6 +871,28 @@ __device__ __attribute__((noinline)) void
   // drains its own stores before the barrier the release sits behind.
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
   __syncthreads();
+  if constexpr (KSPLIT) {
+    // The MoE reads the normed row this XCD's router tiles wrote into its L2.
+    if (tid < 64) {
+      unsigned const *const ks_flag =
+          reinterpret_cast<unsigned const *>(ks_all + xcd * MPK_XSPLIT_XCD_INTS);
+      while (true) {
+        unsigned seen = epoch;
+        if (tid < 16) {
+          asm volatile("global_load_dword %0, %1, off nt\n"
+                       "s_waitcnt vmcnt(0)"
+                       : "=v"(seen)
+                       : "v"(ks_flag + tid)
+                       : "memory");
+        }
+        if (__ballot(seen >= epoch) == ~0ull) {
+          break;
+        }
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+    __syncthreads();
+  }
   if (tid == 0) {
     asm volatile("global_store_dword %0, %1, off\n"
                  "s_waitcnt vmcnt(0)"
@@ -1010,8 +1098,41 @@ gang_rmsnorm_linear_bias_topk_kernel(
                 "dwordx2-aligned per-tile slices");
   i32x2_pf_t fg_pf[FOLD_PF]; // gamma, this tile's slice
   int const fold_col0 = tile_idx * FOLD_COLS;
+  // MPK_ROUTER_KSPLIT: this tile's 384 columns of all 32 of the XCD's gate
+  // rows (thread t: row t / 8, 8-column chunks t % 8 + 8j), and gamma's
+  // same 384 columns on the slice-summing threads.
+  constexpr bool KSPLIT =
+      MPK_ROUTER_KSPLIT && MPK_ROUTER_XSPLIT && MPK_ROUTER_LL && SUM_LL &&
+      OPROJ_BARRIER && SIGMOID_BIAS && BATCH_SIZE == 1 &&
+      EXPERTS_PER_TILE == 2 && NUM_EXPERTS == 256 &&
+      REDUCTION_SIZE % (16 * 64) == 0;
+  constexpr int KS_SLICE = REDUCTION_SIZE / 16;
+  constexpr int KS_CH = KS_SLICE / 64;
+  typedef int __attribute__((ext_vector_type(4))) i32x4_ks_t;
+  i32x4_ks_t ks_w[KSPLIT ? KS_CH : 1];
+  i32x2_pf_t ks_g = {0, 0};
+  if constexpr (KSPLIT) {
+    char const *const ks_wb =
+        (char const *)gate_weight_ptr +
+        ((size_t)(tid >> 3) * REDUCTION_SIZE + (size_t)tile_idx * KS_SLICE +
+         (tid & 7) * 8) * 2;
+#pragma unroll
+    for (int j = 0; j < KS_CH; j++) {
+      asm volatile("global_load_dwordx4 %0, %1, off sc0 nt"
+                   : "=v"(ks_w[j])
+                   : "v"(ks_wb + j * 128)
+                   : "memory");
+    }
+    if (tid < KS_SLICE / 4) {
+      asm volatile("global_load_dwordx2 %0, %1, off sc0 nt"
+                   : "=v"(ks_g)
+                   : "v"((char const *)norm_weight_ptr +
+                         ((size_t)tile_idx * KS_SLICE + tid * 4) * 2)
+                   : "memory");
+    }
+  }
   if constexpr (OPROJ_BARRIER) {
-    if (folded) {
+    if (!KSPLIT && folded) {
       // gamma only. The hidden row is precisely what the barrier below
       // guards -- the o_proj all-gather has not finished writing it yet --
       // so it is read after the spin like it always was, just 384 columns at
@@ -1033,7 +1154,7 @@ gang_rmsnorm_linear_bias_topk_kernel(
                      : "memory");
       }
     }
-    if (!folded) {
+    if (!KSPLIT && !folded) {
     char const *g_base_pf = (char const *)norm_weight_ptr;
     char const *w_base_pf = (char const *)gate_weight_ptr +
                             (int64_t)first_expert * REDUCTION_SIZE * 2;
@@ -1334,6 +1455,185 @@ gang_rmsnorm_linear_bias_topk_kernel(
       }
     }
     MPK_WS_MARK(791, xs_t);
+    // Stage stamps 36/37/38/39 split S33 -> S34: slice validated, XCD row
+    // exchange passed, norm done, logits stored (before the Step 3 drain).
+    if (tid == 0) {
+      mpk_stage_stamp(36);
+    }
+    if constexpr (KSPLIT) {
+      // Partial logits and the slice's sum of squares go to this XCD's row
+      // area as 64-word blocks, one per tile: words 0..31 the XCD's experts,
+      // word 32 the sum of squares. Every XCD sums every slice identically, so
+      // any XCD's 16 sums of squares give the same 1/rms bit for bit.
+      if (xs_f4 * 4 != KS_SLICE || xs_t != tile_idx || rll == nullptr ||
+          routing_epoch_hint <= 0) {
+        __builtin_trap();
+      }
+      extern __shared__ char _rks_dyn_smem[];
+      float *const ks_lds = reinterpret_cast<float *>(_rks_dyn_smem + 2048);
+      float *const ks_ssq = reinterpret_cast<float *>(_rks_dyn_smem + 4096);
+      unsigned long long *const ks_own =
+          reinterpret_cast<unsigned long long *>(xsplit +
+                                                 MPK_XSPLIT_FLAG_LINES * 16);
+      unsigned long long const ks_ep =
+          (unsigned long long)(unsigned)routing_epoch_hint << 32;
+      float hk[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+      float g4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+      float ssq_t = 0.0f;
+      int const i = xs_t * xs_f4 + tid;
+      if (tid < xs_f4) {
+        float a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (int s = 0; s < SUM_SLOTS; s++) {
+          a[0] += __uint_as_float(llw[s][0][0]);
+          a[1] += __uint_as_float(llw[s][0][2]);
+          a[2] += __uint_as_float(llw[s][1][0]);
+          a[3] += __uint_as_float(llw[s][1][2]);
+        }
+        unsigned b[4];
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          bf16 const r = __float2bfloat16(a[j]);
+          unsigned short u;
+          __builtin_memcpy(&u, &r, 2);
+          b[j] = u;
+          hk[j] = __uint_as_float(b[j] << 16);
+          ssq_t += hk[j] * hk[j];
+        }
+        if (i / (H4_PF / 8) == xs_x) {
+          st_wt_u64((void *)(hout + i * 4),
+                    (unsigned long long)(b[0] | (b[1] << 16)) |
+                        ((unsigned long long)(b[2] | (b[3] << 16)) << 32));
+        }
+        unsigned const glo = (unsigned)ks_g[0];
+        unsigned const ghi = (unsigned)ks_g[1];
+        g4[0] = __uint_as_float(glo << 16);
+        g4[1] = __uint_as_float(glo & 0xFFFF0000u);
+        g4[2] = __uint_as_float(ghi << 16);
+        g4[3] = __uint_as_float(ghi & 0xFFFF0000u);
+        typedef float ks_f4_t __attribute__((ext_vector_type(4)));
+        ks_f4_t hg;
+        hg[0] = hk[0] * g4[0];
+        hg[1] = hk[1] * g4[1];
+        hg[2] = hk[2] * g4[2];
+        hg[3] = hk[3] * g4[3];
+        *reinterpret_cast<ks_f4_t *>(ks_lds + tid * 4) = hg;
+      }
+      {
+        float v = ssq_t;
+#pragma unroll
+        for (int off = 32; off > 0; off >>= 1) {
+          v += __shfl_xor(v, off);
+        }
+        if (lane == 0) {
+          red[wave] = v;
+        }
+      }
+      __syncthreads();
+      if (tid == 0) {
+        mpk_stage_stamp(37);
+      }
+      // SUM_LL's deferred prefetch drain: the gate chunks are used next.
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      float acc = 0.0f;
+#pragma unroll
+      for (int j = 0; j < KS_CH; j++) {
+        typedef float ks_f4_t __attribute__((ext_vector_type(4)));
+        int const c = (tid & 7) + 8 * j;
+        ks_f4_t const h0 = *reinterpret_cast<ks_f4_t const *>(ks_lds + c * 8);
+        ks_f4_t const h1 =
+            *reinterpret_cast<ks_f4_t const *>(ks_lds + c * 8 + 4);
+        unsigned const w0 = (unsigned)ks_w[j][0];
+        unsigned const w1 = (unsigned)ks_w[j][1];
+        unsigned const w2 = (unsigned)ks_w[j][2];
+        unsigned const w3 = (unsigned)ks_w[j][3];
+        acc += __uint_as_float(w0 << 16) * h0[0] +
+               __uint_as_float(w0 & 0xFFFF0000u) * h0[1] +
+               __uint_as_float(w1 << 16) * h0[2] +
+               __uint_as_float(w1 & 0xFFFF0000u) * h0[3] +
+               __uint_as_float(w2 << 16) * h1[0] +
+               __uint_as_float(w2 & 0xFFFF0000u) * h1[1] +
+               __uint_as_float(w3 << 16) * h1[2] +
+               __uint_as_float(w3 & 0xFFFF0000u) * h1[3];
+      }
+      acc += __shfl_xor(acc, 1);
+      acc += __shfl_xor(acc, 2);
+      acc += __shfl_xor(acc, 4);
+      if (tid == 0) {
+        mpk_stage_stamp(38);
+      }
+      unsigned long long *const ks_blk = ks_own + xs_t * 64;
+      if ((tid & 7) == 0) {
+        st_wt_u64((void *)(ks_blk + (tid >> 3)), ks_ep | __float_as_uint(acc));
+      }
+      if (tid == 0) {
+        float const s = ((red[0] + red[1]) + red[2]) + red[3];
+        st_wt_u64((void *)(ks_blk + 32), ks_ep | __float_as_uint(s));
+        mpk_stage_stamp(34);
+      }
+      // This tile's slice of the normed row, from the XCD's 16 sums of
+      // squares in tile order -- the TopK's own sum, so the MoE input and
+      // the logits share one 1/rms.
+      if (tid < 16) {
+        unsigned long long sw;
+        while ((unsigned)((sw = ld_sys_u64(ks_own + tid * 64 + 32)) >> 32) !=
+               (unsigned)routing_epoch_hint) {
+          __builtin_amdgcn_s_sleep(1);
+        }
+        ks_ssq[tid] = __uint_as_float((unsigned)sw);
+      }
+      __syncthreads();
+      if (tid < xs_f4) {
+        float tot = 0.0f;
+#pragma unroll
+        for (int t = 0; t < 16; t++) {
+          tot += ks_ssq[t];
+        }
+        float const irms_k = rsqrtf(tot / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
+        unsigned nb[4];
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          bf16 const r = __float2bfloat16(hk[j] * irms_k * g4[j]);
+          unsigned short u;
+          __builtin_memcpy(&u, &r, 2);
+          nb[j] = u;
+        }
+        unsigned long long const npk =
+            (unsigned long long)(nb[0] | (nb[1] << 16)) |
+            ((unsigned long long)(nb[2] | (nb[3] << 16)) << 32);
+        asm volatile("global_store_dwordx2 %0, %1, off"
+                     :
+                     : "v"(d_normed + i * 4), "v"(npk)
+                     : "memory");
+      }
+      if (__builtin_amdgcn_readfirstlane(tid) < xs_f4) {
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      }
+      __syncthreads();
+      if (tid == 0) {
+        asm volatile("global_store_dword %0, %1, off\n"
+                     "s_waitcnt vmcnt(0)"
+                     :
+                     : "v"(xs_flag + xs_t), "v"((unsigned)routing_epoch_hint)
+                     : "memory");
+        mpk_stage_stamp(39);
+      }
+      if (tile_idx == 0) {
+        gang_rmsnorm_topk_detail::topk_ll_noinline<T, NUM_EXPERTS, K,
+                                                   /*KSPLIT=*/true>(
+            rll,
+            gang_rmsnorm_topk_detail::get_xcd_id(),
+            (unsigned)routing_epoch_hint,
+            const_cast<void *>(bias_ptr),
+            num_active_tokens,
+            renormalize,
+            routed_scaling_factor,
+            num_shared_experts,
+            xsplit - xs_x * MPK_XSPLIT_XCD_INTS,
+            (float)ACTUAL_HIDDEN_DIM);
+      }
+      return;
+    }
     if (tid < xs_f4) {
       int const i = xs_t * xs_f4 + tid;
       sum_f4_t v[SUM_SLOTS];
@@ -1425,6 +1725,9 @@ gang_rmsnorm_linear_bias_topk_kernel(
     }
     __syncthreads();
     MPK_WS_MARK(793, xs_t);
+    if (tid == 0) {
+      mpk_stage_stamp(37);
+    }
 #pragma unroll
     for (int iter = 0; iter < SUM_ITERS; iter++) {
       int const i = tid + iter * 256;
@@ -1682,6 +1985,9 @@ gang_rmsnorm_linear_bias_topk_kernel(
   // SUM_LL's deferred prefetch drain (see the barrier above).
   if constexpr (OPROJ_BARRIER && SUM_LL) {
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  }
+  if (tid == 0) {
+    mpk_stage_stamp(38);
   }
 
   // ═══ Step 2: Fused Gate GEMV + norm write ═══
@@ -1984,6 +2290,7 @@ gang_rmsnorm_linear_bias_topk_kernel(
                 *reinterpret_cast<unsigned short *>(&bval));
     }
     }
+    mpk_stage_stamp(39);
   }
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING

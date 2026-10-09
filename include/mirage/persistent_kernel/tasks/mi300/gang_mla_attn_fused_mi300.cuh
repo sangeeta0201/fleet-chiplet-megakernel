@@ -763,6 +763,39 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     }
   }
 #endif
+#if MPK_QB_IDLE_PF
+  // MPK_QB_IDLE_PF: the same workers then pull q_b's weight, the next phase's,
+  // into L2. A separate straight-line block on purpose -- see the two-region
+  // note above.
+  if (xcd_rank >= qkv_tiles_per_xcd && qb_weight_ptr != nullptr) {
+    constexpr uint32_t QBP_WG_BYTES =
+        QB_OUTPUT_PER_WG * QB_REDUCTION_SIZE +
+        QB_OUTPUT_PER_WG * (QB_REDUCTION_SIZE / 32);
+    int const qbp_idle = tiles_per_xcd - qkv_tiles_per_xcd;
+    uint32_t const qbp_total = (uint32_t)qb_n_wgs_per_xcd * QBP_WG_BYTES;
+    uint32_t const qbp_chunk =
+        ((qbp_total + (uint32_t)qbp_idle - 1u) / (uint32_t)qbp_idle + 4095u) &
+        ~4095u;
+    uint32_t const qbp_lo = (uint32_t)(xcd_rank - qkv_tiles_per_xcd) * qbp_chunk;
+    uint32_t const qbp_hi =
+        (qbp_lo + qbp_chunk < qbp_total) ? qbp_lo + qbp_chunk : qbp_total;
+    if (qbp_lo < qbp_hi) {
+      extern __shared__ char _qbp_smem[];
+      i32x4_t const qbp_rsrc = make_w_buffer_rsrc(qb_weight_ptr, qbp_total);
+      auto *qbp_dst = (__attribute__((address_space(3)))
+                       uint32_t *)(_qbp_smem + (tid >> 6) * 1024);
+      int qbp_voff = (int)qbp_lo + tid * 16;
+      int const qbp_last = (int)qbp_hi - 16;
+      int const qbp_n = (int)((qbp_hi - qbp_lo + 4095u) / 4096u);
+      for (int i = 0; i < qbp_n; i++) {
+        int const v = qbp_voff < qbp_last ? qbp_voff : qbp_last;
+        __llvm_amdgcn_raw_buffer_load_lds(qbp_rsrc, qbp_dst, 16, v, 0, 0, 1);
+        qbp_voff += 4096;
+        asm volatile("" : "+v"(qbp_voff) : : "memory");
+      }
+    }
+  }
+#endif
 #pragma unroll 1
   for (int _qrep = 0; _qrep < MPK_QKVA_REPS; ++_qrep)
   for (int t = xcd_rank; t < qkv_tiles_per_xcd; t += tiles_per_xcd) {
@@ -840,6 +873,31 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // cheap fence sufficient.
   __syncthreads();
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#if MPK_QB_SELF_PF
+  // MPK_QB_SELF_PF: each q_b tile's waves 1-3 pull its weight slab into L2
+  // while the block waits on this rendezvous. Not wave 0: its tid 0 arrives
+  // and polls, and vmcnt retires in issue order. The trailing __syncthreads
+  // retires the DMAs before q_b touches LDS.
+  if (xcd_rank < qb_n_wgs_per_xcd && tid >= 64 && qb_weight_ptr != nullptr) {
+    constexpr int QSP_WG_BYTES = QB_OUTPUT_PER_WG * QB_REDUCTION_SIZE +
+                                 QB_OUTPUT_PER_WG * (QB_REDUCTION_SIZE / 32);
+    extern __shared__ char _qsp_smem[];
+    i32x4_t const qsp_rsrc = make_w_buffer_rsrc(
+        qb_weight_ptr, (uint32_t)qb_n_wgs_per_xcd * QSP_WG_BYTES);
+    auto *qsp_dst = (__attribute__((address_space(3)))
+                     uint32_t *)(_qsp_smem + (tid >> 6) * 1024);
+    int const qsp_base = xcd_rank * QSP_WG_BYTES;
+    int qsp_voff = qsp_base + (tid - 64) * 16;
+    int const qsp_last = qsp_base + QSP_WG_BYTES - 16;
+    constexpr int QSP_N = (QSP_WG_BYTES + 192 * 16 - 1) / (192 * 16);
+    for (int i = 0; i < QSP_N; i++) {
+      int const v = qsp_voff < qsp_last ? qsp_voff : qsp_last;
+      __llvm_amdgcn_raw_buffer_load_lds(qsp_rsrc, qsp_dst, 16, v, 0, 0, 1);
+      qsp_voff += 192 * 16;
+      asm volatile("" : "+v"(qsp_voff) : : "memory");
+    }
+  }
+#endif
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   {
     unsigned long long _t = __builtin_amdgcn_s_memrealtime();

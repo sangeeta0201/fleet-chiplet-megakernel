@@ -1575,6 +1575,15 @@ def get_compile_command(
             # The LL TopK stages its bias during the logit poll
             # (gang_rmsnorm_linear_bias_mi300.cuh).
             "MPK_TOPK_LL_PREBIAS",
+            # The qkv_a-idle workers also prefetch q_b's weight
+            # (gang_mla_attn_fused_mi300.cuh).
+            "MPK_QB_IDLE_PF",
+            # Each q_b tile prefetches its own slab during the qkv_a -> q_b
+            # rendezvous (gang_mla_attn_fused_mi300.cuh).
+            "MPK_QB_SELF_PF",
+            # Per-slice router partials, summed by the TopK
+            # (gang_rmsnorm_linear_bias_mi300.cuh).
+            "MPK_ROUTER_KSPLIT",
             # Ceiling probes, wrong output (gang_mla_attn_fused_mi300.cuh).
             "MPK_ATTN_PROBE_NOQBWAIT",
             "MPK_ATTN_PROBE_NODECWAIT",
