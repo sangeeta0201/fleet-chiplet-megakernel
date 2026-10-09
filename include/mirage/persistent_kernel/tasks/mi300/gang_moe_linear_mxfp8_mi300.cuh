@@ -2229,6 +2229,7 @@ __device__ __noinline__ void
                                    /*TILE_CLASS=*/0,
                                    /*SKIP_SHARED=*/(SHARED_MODE == 1),
                                    /*FIXED_SLOTS=*/(MPK_MOE_BS1_DECODE &&
+                                                    MPK_MOE_TP &&
                                                     BATCH_SIZE == 1 &&
                                                     EP_WORLD_SIZE == 1 &&
                                                     MPK_SHARED_DUP == 0 &&

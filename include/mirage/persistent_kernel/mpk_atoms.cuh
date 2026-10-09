@@ -1201,9 +1201,18 @@ __device__ __forceinline__ bool
 // routed k plus the shared expert) and routes slot s through
 // routing_indices[e] = s + 1, so the MoE tile decode needs neither the slot
 // count nor the routing_indices load: one dependent L2 round trip (the
-// expert id) after the routing release instead of four.
+// expert id) after the routing release instead of four, and W2's segment
+// quantizer loads its weights and activations without the id chain.
+// MEASURED 2026-10-09, NP=8 1024/1024, interleaved, tokens identical (ppl512
+// 2.4112 = control): 5.953 5.955 5.931 -> 5.898 5.900 5.890 5.889 ms
+// (-0.05). Default on; MPK_MOE_TP builds only.
 #ifndef MPK_MOE_BS1_DECODE
-#define MPK_MOE_BS1_DECODE 0
+#define MPK_MOE_BS1_DECODE 1
+#endif
+// Same default as gang_oproj_router_fused_mi300.cuh, which the MoE kernels'
+// header is compiled ahead of.
+#ifndef MPK_MOE_TP
+#define MPK_MOE_TP 0
 #endif
 #define MPK_RLL_WORD_LINES 32
 #define MPK_RLL_IDS_LINES 17
