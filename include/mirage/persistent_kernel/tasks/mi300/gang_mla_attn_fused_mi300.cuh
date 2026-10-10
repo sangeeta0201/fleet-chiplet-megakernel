@@ -226,7 +226,11 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     // dispatch and outside ml_mode, which keeps every site on Mechanism C.
     int *bar_tags = nullptr,
     // MPK_QKV_XSPLIT only: the eight per-XCD exchange blocks.
-    int *qkv_xsplit = nullptr) {
+    int *qkv_xsplit = nullptr,
+    // MPK_ATTN_OUT_LL: the merge's output as LL words for this rank's
+    // row-parallel o_proj, which then skips the Phase 8 wait.
+    unsigned long long *attn_ll = nullptr,
+    unsigned attn_ll_epoch = 0) {
 
   int const tid = threadIdx.x;
   int const xcd_id = tile_idx / tiles_per_xcd;
@@ -509,6 +513,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     __builtin_trap();
   }
   int const own_head_lo = (MRG_HEADS != 16) ? qb_head_base % 16 : 0;
+  // The words cover this rank's heads only.
+  if (attn_ll != nullptr && (!head_local || MRG_HEADS != QB_TP_HEADS)) {
+    __builtin_trap();
+  }
 
   // ── deferred rope ───────────────────────────────────────────────────────
   // Sharded, q_b's makespan is one tile: four of them per XCD against 29
@@ -927,7 +935,22 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
 #endif
   bool const qkv_tagged =
       (MPK_BAR_TAGGED & MPK_TAGBAR_QKV) != 0 && bar_tags != nullptr;
-  if (qkv_tagged) {
+  // MPK_ATTN_PROBE_NOQKVWAIT: CEILING PROBE, WRONG OUTPUT by construction.
+  // Every arrival and release still happens; only the wait is skipped -- the
+  // most a receiver-validated qkv_a -> q_b hand-off could take out.
+#ifndef MPK_ATTN_PROBE_NOQKVWAIT
+#define MPK_ATTN_PROBE_NOQKVWAIT 0
+#endif
+  if (MPK_ATTN_PROBE_NOQKVWAIT) {
+    if (tid == 0 &&
+        hier_barrier_arrive(qkv_barrier, HIER_STRIDE, arrivals, tiles_per_xcd,
+                            xcd_id, bar_tree, /*skew_slot=*/2)) {
+      for (int x = 0; x < 8; x++) {
+        st_flag_u32((void *)&qkv_barrier[x * HIER_STRIDE], (unsigned)qkv_expected);
+      }
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    }
+  } else if (qkv_tagged) {
     int *const tags = bar_tags + MPK_TAGBAR_IDX_QKV * MPK_TAGBAR_SLOTS;
     if (tid == 0) {
       tag_bar_arrive(tags, xcd_id * tiles_per_xcd + xcd_rank, qkv_expected);
@@ -1127,6 +1150,18 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
                   "a head's absorbed rows must fill whole GEMV tiles");
     constexpr int TILES_PER_HEAD = KV_LORA_RANK / WUK_ROWS_PER_WG;
     constexpr int QK_DIM_ = KV_LORA_RANK + QK_ROPE_HEAD_DIM;
+    // MPK_WUK_HOIST: the deferred rope's position is four index loads that do
+    // not depend on q_nope; read them ahead of the barrier below instead of
+    // behind it, on the W_UK tile's path.
+    int rope_pos_early = 0;
+    if constexpr (MPK_WUK_HOIST && QB_DEFER_ROPE) {
+      int const req = request_id;
+      int const ftp = qo_indptr[req];
+      int const ntok = qo_indptr[req + 1] - ftp;
+      int const fpp = kv_indptr[req];
+      rope_pos_early = (kv_indptr[req + 1] - fpp - 1) * PAGE_SIZE +
+                       kv_last_page_len[req] - ntok;
+    }
 
     // Trace stamps 51/52/53: q_b tiles done, W_UK barrier passed, W_UK done.
     if (tid == 0) {
@@ -1234,8 +1269,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     // inside this scope rather than at function scope so the seven int64 do
     // not sit live across the decode, which is the register-hungriest phase.
     int64_t qb_peer_delta[QB_NPEER];
-    bool qb_all_mapped = qb_tp;
-    if (qb_tp) {
+    // The peers' deltas only serve the query push, which head-local skips.
+    bool const qb_need_peers = qb_tp && !(MPK_WUK_HOIST && head_local);
+    bool qb_all_mapped = qb_need_peers;
+    if (qb_need_peers) {
 #pragma unroll
       for (int q = 0; q < QB_NPEER; q++) {
         qb_peer_delta[q] = 0;
@@ -1267,8 +1304,8 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     // Hoisted out of the tile loop because it is four scalar loads and does
     // not depend on the tile; `rope_pos` is the position of token row 0, and
     // row r sits at rope_pos + r, the same walk latent_to_cache does.
-    int rope_pos = 0;
-    if constexpr (QB_DEFER_ROPE) {
+    int rope_pos = rope_pos_early;
+    if constexpr (QB_DEFER_ROPE && !MPK_WUK_HOIST) {
       int const req = request_id;
       int const first_token_pos = qo_indptr[req];
       int const num_tokens = qo_indptr[req + 1] - first_token_pos;
@@ -1542,6 +1579,9 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     // MPK_DEC_PRELOAD: this item's first KV tiles went into the decode's own
     // LDS tile buffers below, so those trips skip their load.
     int npre = 0;
+    // MPK_DEC_HINTS: the walk below already has the decode's prologue loads
+    // in registers -- on every thread under MPK_DEC_PRELOAD.
+    int hint_q_row = -1, hint_first_page = -1, hint_seqlen = -1;
 #if MPK_ATTN_META_PF
     // MPK_ATTN_META_PF: the decode's prologue is a chain of dependent loads
     // -- qo/kv_indptr and last_page_len, then kv_indices for the page, then
@@ -1564,6 +1604,11 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         int const ntiles = (seqlen + 15) / 16;
         int const tpc = (ntiles + NUM_KV_CHUNKS - 1) / NUM_KV_CHUNKS;
         int const tok0 = chunk * tpc * 16;
+        if (MPK_DEC_HINTS && MPK_DEC_PRELOAD && BATCH_SIZE == 1 && qe == qs + 1) {
+          hint_q_row = qs;
+          hint_first_page = kp0;
+          hint_seqlen = seqlen;
+        }
         if (qe > qs && tok0 < seqlen) {
           int const pid = kv_indices[kp0 + tok0 / PAGE_SIZE];
           int ntok = tpc * 16;
@@ -1747,7 +1792,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
           scale_s,
           own_head_lo,
           MRG_HEADS,
-          t == dec_rank ? npre : 0);
+          t == dec_rank ? npre : 0,
+          hint_q_row,
+          hint_first_page,
+          hint_seqlen);
     }
 #endif
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
@@ -1921,7 +1969,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         /*sinks_ptr=*/nullptr,
         /*head_base=*/own_head_lo,
         mrg_qs,
-        mrg_qe);
+        mrg_qe,
+        attn_ll,
+        attn_ll_epoch,
+        /*ll_head0=*/qb_head_base);
   }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   {

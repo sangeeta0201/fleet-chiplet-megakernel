@@ -407,7 +407,16 @@ __device__ __attribute__((always_inline)) void
         // MPK_OPROJ_LL == 2 only: the eight per-XCD f32 o_proj row blocks.
         int *oproj_oll_ptr = nullptr,
         // MPK_FOLD_W2 under MPK_EP_LL: the next layer is the EP tail.
-        bool fold_next_is_tail = false
+        bool fold_next_is_tail = false,
+        // MPK_W2_ACT_LL only: W13's SwiGLU output as epoch-tagged words.
+        int *w2_act_ll_ptr = nullptr,
+        // MPK_ATTN_OUT_LL only: the merge's output as epoch-tagged words,
+        // which the row-parallel o_proj stages in place of attn_out.
+        unsigned long long const *attn_ll_ptr = nullptr,
+        unsigned attn_ll_epoch = 0,
+        // MPK_W2_PARTS_LL only: the W2 parts' f32 rows as epoch-tagged words.
+        unsigned long long *w2_pl_ptr = nullptr,
+        unsigned w2_pl_epoch = 0
 #if MPK_QKVA_PF_KB > 0
         ,
         // Next layer's qkv_a weight for this XCD. Null on the last layer of
@@ -1214,6 +1223,10 @@ __device__ __attribute__((always_inline)) void
         }
       }
 #endif
+      if (attn_ll_ptr != nullptr &&
+          (!OPROJ_RP || UNABSORB_V || !MPK_OPROJ_MXFP4 || BATCH_SIZE != 1)) {
+        __builtin_trap();
+      }
       // RP reduces over the rank's own K slice of the activation row.
       void const *const oproj_act =
           OPROJ_RP ? (void const *)(static_cast<unsigned short const *>(
@@ -1258,7 +1271,9 @@ __device__ __attribute__((always_inline)) void
                                                      stage_a
 #if MPK_OPROJ_MXFP4
                                                      ,
-                                                     oproj_ll
+                                                     oproj_ll,
+                                                     attn_ll_ptr,
+                                                     attn_ll_epoch
 #endif
                                                      );
       stage_a = RESTAGE;
@@ -2364,6 +2379,13 @@ __device__ __attribute__((always_inline)) void
   // publishes the routes the W13 tile waits on (MPK_TRACE: router worker
   // slice done -> route word seen, median 3.3 us). Quantize it into s_tok_fp8
   // inside that wait. Not on the TopK's worker, whose LDS the TopK owns.
+  // MPK_W2_ACT_LL: W13 -> W2 through epoch-tagged words, one-row TP with the
+  // routing words only (the epoch is the routing epoch).
+  unsigned long long *const w2_act_ll =
+      (MPK_W2_ACT_LL && MPK_MOE_TP && MPK_MOE_BS1_DECODE && BATCH_SIZE == 1 &&
+       ll_route != nullptr && w2_act_ll_ptr != nullptr)
+          ? reinterpret_cast<unsigned long long *>(w2_act_ll_ptr)
+          : nullptr;
   bool w13_staged = false;
 #if MPK_W13_ACT_EARLY
   if constexpr (BATCH_SIZE == 1) {
@@ -2431,7 +2453,8 @@ __device__ __attribute__((always_inline)) void
         t,
         ll_route,
         (unsigned)routing_expected,
-        w13_staged && t == xcd_rank && _w13rep == 0);
+        w13_staged && t == xcd_rank && _w13rep == 0,
+        w2_act_ll);
   }
 
 #if MPK_MOE_SHADOW_KB > 0
@@ -2715,7 +2738,9 @@ __device__ __attribute__((always_inline)) void
         moe_down_weight_ptr, xcd_rank, ll_route, (unsigned)routing_expected);
   }
 #endif
-  if (w13_tagged) {
+  if (w2_act_ll != nullptr) {
+    // The W2 tiles validate W13's words themselves.
+  } else if (w13_tagged) {
     tag_bar_wait_site(w13_tags, tiles_per_xcd * 8, w13_expected, tid, xcd_id,
                       xcd_rank);
   } else if (tid == 0) {
@@ -2861,7 +2886,10 @@ __device__ __attribute__((always_inline)) void
                                                 topk_weight_ptr,
                                                 w2_fold,
                                                 ll_route,
-                                                (unsigned)routing_expected);
+                                                (unsigned)routing_expected,
+                                                w2_act_ll,
+                                                w2_pl_ptr,
+                                                w2_pl_epoch);
 #else
     gang_moe_w2_linear_mxfp8_kernel<BATCH_SIZE,
                                     HIDDEN_SIZE,

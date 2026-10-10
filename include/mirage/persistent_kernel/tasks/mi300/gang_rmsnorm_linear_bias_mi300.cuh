@@ -958,6 +958,12 @@ __device__ __attribute__((noinline)) void
     }
     __syncthreads();
   }
+  // Trace stamp 63: normed flags seen; S63 -> S42 is the selection alone.
+  if (tid == 0) {
+    mpk_stage_stamp(63);
+  }
+  // MPK_TOPK_RANK's scratch: past s_bias [0, 512) and s_ssq [512, 1536).
+  extern __shared__ char _topk_rank_smem[];
   topk_sigmoid_bias_mi300_task_impl<T,
                                     /*VPT=*/8,
                                     NUM_EXPERTS,
@@ -984,7 +990,9 @@ __device__ __attribute__((noinline)) void
       routed_scaling_factor,
       num_shared_experts,
       ll_route,
-      epoch);
+      epoch,
+      MPK_TOPK_RANK ? reinterpret_cast<unsigned *>(_topk_rank_smem + 2048)
+                    : nullptr);
   if (tid == 0) {
     mpk_stage_stamp(42);
   }

@@ -57,6 +57,12 @@ static constexpr float SEP_EPS = 1e-3f;
 #define TOPK_K_STATIC 0
 #endif
 
+// TOPK_RANK=1 hands the impl LDS scratch, which selects the one-expert-per-
+// thread rank path (MPK_TOPK_RANK) at one row; more rows keep the sort path.
+#ifndef TOPK_RANK
+#define TOPK_RANK 0
+#endif
+
 __global__ void topk_sigmoid_bias_entry(void *input,
                                         void *bias,
                                         void *output,
@@ -64,6 +70,7 @@ __global__ void topk_sigmoid_bias_entry(void *input,
                                         void *routing_indices,
                                         void *active_expert_ids,
                                         int num_shared_experts) {
+  __shared__ unsigned s_rank[NUM_EXPERTS + 16];
   kernel::topk_sigmoid_bias_mi300_task_impl<hip_bfloat16,
                                             8,
                                             NUM_EXPERTS,
@@ -81,7 +88,10 @@ __global__ void topk_sigmoid_bias_entry(void *input,
       NUM_EXPERTS,
       /*renormalize=*/true,
       ROUTED_SCALING,
-      num_shared_experts);
+      num_shared_experts,
+      /*ll_route=*/nullptr,
+      /*ll_epoch=*/0,
+      TOPK_RANK ? s_rank : nullptr);
 }
 
 // Round-trip through bf16 so the host reference sees exactly the values the

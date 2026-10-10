@@ -2200,7 +2200,11 @@ __device__ __noinline__ void
                                      unsigned ll_epoch = 0,
                                      // MPK_W13_ACT_EARLY: the caller already
                                      // quantized row 0 into s_tok_fp8.
-                                     bool act_staged = false) {
+                                     bool act_staged = false,
+                                     // MPK_W2_ACT_LL: the SwiGLU pairs go out
+                                     // as (ll_epoch << 32 | bf16x2) words here
+                                     // instead of to output_ptr.
+                                     unsigned long long *act_ll = nullptr) {
   // 2026-08-21 closed narrowing below 64 rows: 16 (the K-parallel branch)
   // measured -1.34 ms (95a044a), and 32 as an N-parallel split would put 8
   // rows on each of 4 waves and starve the 16-row MFMA. 32 is now legal as a
@@ -2518,7 +2522,16 @@ __device__ __noinline__ void
         // them separately.
         if (act_ok[0] && act_ok[1]) {
           unsigned packed = (unsigned)act[0] | ((unsigned)act[1] << 16);
-          st_wt_u32((void *)act_addr, packed);
+          if (act_ll != nullptr) {
+            size_t const widx =
+                ((size_t)tok_idx * (NUM_TOPK * ACT_STRIDE) +
+                 (size_t)topk_slot * ACT_STRIDE + (size_t)(out_base >> 1)) /
+                2;
+            st_wt_u64((void *)(act_ll + widx),
+                      ((unsigned long long)ll_epoch << 32) | packed);
+          } else {
+            st_wt_u32((void *)act_addr, packed);
+          }
         } else {
 #pragma unroll
           for (int p = 0; p < 2; p++) {
@@ -3666,7 +3679,10 @@ __device__ __forceinline__ void
                           unsigned long long const *ll_route = nullptr,
                           unsigned ll_epoch = 0,
                           uint32_t *s_seg_off = nullptr,
-                          uint32_t expert_bytes = 0) {
+                          uint32_t expert_bytes = 0,
+                          // MPK_W2_ACT_LL: the slabs as (ll_epoch << 32 |
+                          // bf16x2) words, validated here.
+                          unsigned long long const *act_ll = nullptr) {
   constexpr int SUB_BLOCK = 32;
   constexpr int SB_PER_SEG = SEG_LEN / SUB_BLOCK;
   constexpr int NSUBBLOCKS = NSEG * SB_PER_SEG;
@@ -3715,6 +3731,41 @@ __device__ __forceinline__ void
                        ll_route, 16 + slot, ll_epoch))
                  : d_routing_weight[tok_idx * NUM_TOPK + slot];
       }
+      if (act_ll != nullptr) {
+        // The sub-block's 16 words; poll until W13 has written all of them.
+        typedef unsigned long long u64x2_t __attribute__((ext_vector_type(2)));
+        unsigned long long const *const wp =
+            act_ll + ((size_t)tok_idx * (NUM_TOPK * SEG_LEN) +
+                      (size_t)slot * SEG_LEN +
+                      (size_t)(sb % SB_PER_SEG) * SUB_BLOCK) /
+                         2;
+        u64x2_t aw[8];
+        while (true) {
+#pragma unroll
+          for (int j = 0; j < 8; j++) {
+            asm volatile("global_load_dwordx4 %0, %1, off sc0 sc1"
+                         : "=v"(aw[j])
+                         : "v"(wp + 2 * j)
+                         : "memory");
+          }
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          bool ok = true;
+#pragma unroll
+          for (int j = 0; j < 8; j++) {
+            ok = ok && (unsigned)(aw[j].x >> 32) == ll_epoch &&
+                 (unsigned)(aw[j].y >> 32) == ll_epoch;
+          }
+          if (ok) {
+            break;
+          }
+          __builtin_amdgcn_s_sleep(1);
+        }
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+          dw[2 * j] = (uint32_t)aw[j].x;
+          dw[2 * j + 1] = (uint32_t)aw[j].y;
+        }
+      } else {
       // Early-clobber outputs; see _gang_wave_parallel_fp8_quant_nt.
       asm volatile("global_load_dwordx4 %0, %4, off sc0 sc1 nt\n"
                    "global_load_dwordx4 %1, %5, off sc0 sc1 nt\n"
@@ -3727,6 +3778,7 @@ __device__ __forceinline__ void
                    : "v"(p), "v"(p + 4), "v"(p + 8), "v"(p + 12)
                    : "memory");
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      }
       if (ll_batch) {
         if ((unsigned)(w_word >> 32) != ll_epoch) {
           w_word = _gang_ll_route_word(ll_route, 16 + slot, ll_epoch);
@@ -3866,7 +3918,16 @@ __device__ __noinline__ void
                                        GangW2FoldPush fold = {},
                                        unsigned long long const *ll_route =
                                            nullptr,
-                                       unsigned ll_epoch = 0) {
+                                       unsigned ll_epoch = 0,
+                                       unsigned long long const *act_ll =
+                                           nullptr,
+                                       // MPK_W2_PARTS_LL: each part's f32
+                                       // rows also go out as (pl_epoch << 32 |
+                                       // f32) words, plane `part`, so the next
+                                       // layer's EP fold reads them without
+                                       // the layer-entry rendezvous.
+                                       unsigned long long *pl_words = nullptr,
+                                       unsigned pl_epoch = 0) {
   static_assert(BATCH_SIZE == 1,
                 "the segments are one token's experts; more rows would need "
                 "a per-row segment list");
@@ -3955,7 +4016,8 @@ __device__ __noinline__ void
       ll_route,
       ll_epoch,
       seg_in_quant ? s_seg_off : nullptr,
-      static_cast<uint32_t>(EXPERT_BYTES));
+      static_cast<uint32_t>(EXPERT_BYTES),
+      act_ll);
   // Trace stamps 57/58: W2 activations staged, k-loop and atomics issued.
   if (threadIdx.x == 0) {
     mpk_stage_stamp(57);
@@ -3989,6 +4051,22 @@ __device__ __noinline__ void
 #pragma unroll
       for (int i = 0; i < 4; i++) {
         atomicAdd(&ws[i], acc[i]);
+      }
+      if (pl_words != nullptr) {
+#ifdef MPK_PL_DEBUG
+        if (pl_epoch < 6 && wave_tile == 0 && g == 0 && tile_idx == 0) {
+          printf("[PLW2] epoch=%u xcd=%d part=%d wg=%d\n", pl_epoch,
+                 _gang_moe_get_xcd_id(), part, wg_idx);
+        }
+#endif
+        unsigned long long *const pw =
+            pl_words + static_cast<size_t>(part) * OUTPUT_SIZE +
+            wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4;
+        unsigned long long const hi = (unsigned long long)pl_epoch << 32;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+          st_wt_u64((void *)(pw + i), hi | __float_as_uint(acc[i]));
+        }
       }
     }
   }

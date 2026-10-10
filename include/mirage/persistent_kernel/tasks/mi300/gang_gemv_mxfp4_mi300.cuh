@@ -129,7 +129,12 @@ __device__ __noinline__ void
                            int tile_idx,
                            void const *bias_ptr = nullptr,
                            bool stage_a = true,
-                           GangLLPush ll = {}) {
+                           GangLLPush ll = {},
+                           // MPK_ATTN_OUT_LL: the activation row as
+                           // (a_epoch << 32 | bf16x2) words, validated while
+                           // staged; replaces input_ptr for the staging.
+                           unsigned long long const *a_ll = nullptr,
+                           unsigned a_epoch = 0) {
   static_assert(!LL_OUT || F32_OUT, "the LL words carry f32 partials");
   using gang_gemv_detail::b2f;
   using gang_gemv_detail::f2b;
@@ -199,18 +204,6 @@ __device__ __noinline__ void
       static_cast<size_t>(mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE);
   extern __shared__ char _fused_smem[];
   unsigned short *s_a = reinterpret_cast<unsigned short *>(_fused_smem);
-  if constexpr (STAGE_A) {
-    if (stage_a) {
-      u32x4_t const *src = reinterpret_cast<u32x4_t const *>(tile_input);
-      u32x4_t *dst = reinterpret_cast<u32x4_t *>(s_a);
-#pragma unroll
-      for (int i = tid; i < static_cast<int>(A_LDS_BYTES / sizeof(u32x4_t));
-           i += NTHREADS) {
-        dst[i] = ld_g<u32x4_t>(src + i);
-      }
-      __syncthreads();
-    }
-  }
 
   unsigned char const *w_row =
       wg + static_cast<size_t>(row) * (REDUCTION_SIZE / 2);
@@ -227,6 +220,78 @@ __device__ __noinline__ void
                          : (ITERS % 4 == 0)        ? 4
                          : (ITERS % 2 == 0)        ? 2
                                                    : 1;
+
+  // MPK_OPROJ_WFIRST: trip 0's weights and scales go out ahead of the
+  // activation staging, whose __syncthreads would otherwise hold them back,
+  // so the two round trips overlap instead of running back to back.
+  u32x4_t wv0[UNROLL];
+  unsigned char sv0[UNROLL];
+  if constexpr (MPK_OPROJ_WFIRST != 0) {
+#pragma unroll
+    for (int u = 0; u < UNROLL; u++) {
+      int const c = u * LANES_PER_ROW + lane;
+#if MPK_ATTN_STREAM_NT >= 1
+      wv0[u] = ld_g_nt<u32x4_t>(w_row + c * VEC_BYTES);
+#else
+      wv0[u] = ld_g<u32x4_t>(w_row + c * VEC_BYTES);
+#endif
+#if MPK_ATTN_STREAM_NT == 1
+      sv0[u] = ld_g_nt<unsigned char>(s_row + c);
+#else
+      sv0[u] = ld_g<unsigned char>(s_row + c);
+#endif
+    }
+  }
+
+  if constexpr (STAGE_A) {
+    if (stage_a && a_ll != nullptr) {
+      static_assert(BATCH_SIZE == 1, "the activation words carry one row");
+      typedef unsigned long long u64x2_t __attribute__((ext_vector_type(2)));
+      constexpr int NW2 = REDUCTION_SIZE / 4; // u64x2 per row
+      static_assert(NW2 % NTHREADS == 0, "whole word pairs per thread");
+      constexpr int PER_T = NW2 / NTHREADS;
+      unsigned *dst = reinterpret_cast<unsigned *>(s_a);
+      // Every pair in flight at once, one wait; re-issue only while some
+      // word still carries an older epoch.
+      u64x2_t w[PER_T];
+      while (true) {
+#pragma unroll
+        for (int j = 0; j < PER_T; j++) {
+          asm volatile("global_load_dwordx4 %0, %1, off sc0 sc1"
+                       : "=v"(w[j])
+                       : "v"(a_ll + 2 * (tid + j * NTHREADS))
+                       : "memory");
+        }
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        bool ok = true;
+#pragma unroll
+        for (int j = 0; j < PER_T; j++) {
+          ok = ok && (unsigned)(w[j].x >> 32) == a_epoch &&
+               (unsigned)(w[j].y >> 32) == a_epoch;
+        }
+        if (ok) {
+          break;
+        }
+        __builtin_amdgcn_s_sleep(1);
+      }
+#pragma unroll
+      for (int j = 0; j < PER_T; j++) {
+        int const i = tid + j * NTHREADS;
+        dst[2 * i] = (unsigned)w[j].x;
+        dst[2 * i + 1] = (unsigned)w[j].y;
+      }
+      __syncthreads();
+    } else if (stage_a) {
+      u32x4_t const *src = reinterpret_cast<u32x4_t const *>(tile_input);
+      u32x4_t *dst = reinterpret_cast<u32x4_t *>(s_a);
+#pragma unroll
+      for (int i = tid; i < static_cast<int>(A_LDS_BYTES / sizeof(u32x4_t));
+           i += NTHREADS) {
+        dst[i] = ld_g<u32x4_t>(src + i);
+      }
+      __syncthreads();
+    }
+  }
 
   float acc[BATCH_SIZE][4];
 #pragma unroll
@@ -267,6 +332,7 @@ __device__ __noinline__ void
   // unrolled body reports no loop and has nothing to take. Check for the
   // backedge before porting a pipelining transform, not just the phase's
   // byte share.
+#pragma unroll
   for (int i0 = 0; i0 < ITERS; i0 += UNROLL) {
     // Indexed only by fully unrolled loops, so these stay in VGPRs. The
     // activation vector is 4 wide rather than 2: 32 elements of weight need
@@ -279,6 +345,10 @@ __device__ __noinline__ void
       // Chunk index within the row, in units of VEC elements.
       int const c = (i0 + u) * LANES_PER_ROW + lane;
       int const k = c * VEC;
+      if (MPK_OPROJ_WFIRST != 0 && i0 == 0) {
+        wv[u] = wv0[u];
+        sv[u] = sv0[u];
+      } else {
       // MPK_ATTN_STREAM_NT: weight + scale only. o_proj is the biggest single
       // weight stream in the attention half (100.7 MB/layer/GPU before the
       // 4-way shard) and, like the rest, is read exactly once per token.
@@ -293,6 +363,7 @@ __device__ __noinline__ void
 #else
       sv[u] = ld_g<unsigned char>(s_row + c);
 #endif
+      }
 #pragma unroll
       for (int m = 0; m < BATCH_SIZE; m++) {
         // if constexpr, not a ternary on the pointer: a select between an

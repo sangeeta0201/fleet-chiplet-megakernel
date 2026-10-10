@@ -109,15 +109,17 @@ __global__ void __launch_bounds__(256, 1)
                  void *out,
                  void const *routing_weight,
                  unsigned long long const *ll,
-                 unsigned epoch) {
+                 unsigned epoch,
+                 unsigned long long const *act_ll) {
   gang_moe_w2_tp_linear_mxfp8_kernel<1, HIDDEN, I_LOCAL, NUM_EXPERTS, NUM_TOPK,
                                      OPW, /*WEIGHT_FP4=*/true, NSEG, KP>(
       input, weight, routing, mask, out, blockIdx.x, routing_weight,
-      GangW2FoldPush{}, ll, epoch);
+      GangW2FoldPush{}, ll, epoch, act_ll);
 }
 
 template <int OPW, int I_LOCAL, int NSEG, int KP = 1>
-static bool run_case(int n_live, uint32_t seed, bool ll = false) {
+static bool run_case(int n_live, uint32_t seed, bool ll = false,
+                     bool act_words = false) {
   constexpr int ROW_BYTES = I_LOCAL / 2; // MXFP4
   constexpr int BLK32 = I_LOCAL / 32;
   constexpr int WGS = HIDDEN / OPW;
@@ -266,9 +268,28 @@ static bool run_case(int n_live, uint32_t seed, bool ll = false) {
     HIP_CHECK(hipMemcpy(d_ll, words.data(), words.size() * 8,
                         hipMemcpyHostToDevice));
     HIP_CHECK(hipMemset(d_rw, 0, rw.size() * 4));
+    // MPK_W2_ACT_LL: the activation slabs as (EPOCH << 32 | bf16x2) words;
+    // the bf16 buffer is zeroed so a kernel reading it gets all-zero rows.
+    unsigned long long *d_act_ll = nullptr;
+    if (act_words) {
+      std::vector<unsigned long long> aw(act_bf16.size() / 2);
+      for (size_t i = 0; i < aw.size(); i++) {
+        aw[i] = ((unsigned long long)EPOCH << 32) |
+                (unsigned long long)((uint32_t)act_bf16[2 * i] |
+                                     ((uint32_t)act_bf16[2 * i + 1] << 16));
+      }
+      HIP_CHECK(hipMalloc(&d_act_ll, aw.size() * 8));
+      HIP_CHECK(hipMemcpy(d_act_ll, aw.data(), aw.size() * 8,
+                          hipMemcpyHostToDevice));
+      HIP_CHECK(hipMemset(d_in, 0, act_bf16.size() * 2));
+    }
     run_w2_tp_ll<OPW, I_LOCAL, NSEG, KP><<<dim3((WGS * KP + 7) / 8, 8), 256,
                                            SMEM>>>(
-        d_in, d_w, d_route, d_mask, d_out, d_rw, d_ll, EPOCH);
+        d_in, d_w, d_route, d_mask, d_out, d_rw, d_ll, EPOCH, d_act_ll);
+    if (d_act_ll != nullptr) {
+      HIP_CHECK(hipDeviceSynchronize());
+      HIP_CHECK(hipFree(d_act_ll));
+    }
   } else {
     run_w2_tp<OPW, I_LOCAL, NSEG, KP><<<dim3((WGS * KP + 7) / 8, 8), 256,
                                         SMEM>>>(
@@ -294,7 +315,7 @@ static bool run_case(int n_live, uint32_t seed, bool ll = false) {
   printf("[%s] OPW=%d I_LOCAL=%d NSEG=%d KP=%d n_live=%d seed=%u%s  worst rel %.3e  row %d: gpu %.6f "
          "ref %.6f (sum|p| %.1f)  bad rows %d/%d\n",
          pass ? "PASS" : "FAIL", OPW, I_LOCAL, NSEG, KP, n_live, seed,
-         ll ? " ll" : "", worst,
+         act_words ? " ll+act" : (ll ? " ll" : ""), worst,
          show, out[show],
          ref[show], mag[show], bad, HIDDEN);
   HIP_CHECK(hipFree(d_in));
@@ -341,6 +362,10 @@ int main() {
   ok &= run_case<64, 256, 10>(9, 11, true);
   ok &= run_case<64, 256, 10, 2>(9, 12, true);
   ok &= run_case<128, 1024, 9>(9, 13, true);
+  // MPK_W2_ACT_LL: the activations as words too.
+  ok &= run_case<64, 256, 10>(9, 14, true, true);
+  ok &= run_case<64, 256, 10, 2>(9, 15, true, true);
+  ok &= run_case<128, 1024, 9>(9, 16, true, true);
 #endif
   printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;

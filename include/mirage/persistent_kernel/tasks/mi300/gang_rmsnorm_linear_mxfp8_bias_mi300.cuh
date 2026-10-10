@@ -2223,8 +2223,12 @@ __device__ __host__ constexpr int _rnlm8_pf_groups(int ki, int req) {
 #ifndef MPK_ATTN_PF_GROUPS_N
 #define MPK_ATTN_PF_GROUPS_N MPK_ATTN_PF_GROUPS
 #endif
+// K-parallel defaults to 6, not to the unified knob: it is qkv_a's loop
+// (ITERS_PER_WAVE 12). MEASURED 2026-10-10, NP=8 1024/1024, n=3 interleaved
+// on the 9ef34be + MPK_DEC_PRELOAD=2 default, text identical:
+// 4.795 4.807 4.795 -> 6: 4.749 4.759 4.772, 12: 4.767 4.763 4.759 ms.
 #ifndef MPK_ATTN_PF_GROUPS_K
-#define MPK_ATTN_PF_GROUPS_K MPK_ATTN_PF_GROUPS
+#define MPK_ATTN_PF_GROUPS_K 6
 #endif
 // ── BOTH BRANCHES SWEPT ALONE AT NP=4, 2026-08-28. AXIS CLOSED. ──────────
 // The split was the right diagnosis and it did not pay: neither branch hides
@@ -2846,6 +2850,10 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     _sp_t2 = __builtin_amdgcn_s_memrealtime();
   }
 #endif
+  // Trace stamps 62/61 (qkv_a only): token quantized, K-loop done.
+  if (FUSE_RESADD && threadIdx.x == 0) {
+    mpk_stage_stamp(62);
+  }
   // ── Step 3: MFMA FP8(weights) x FP8(tokens) ────────────────────────────
   if constexpr (OUTPUT_PER_WG >= 64) {
     // N-parallel: 4 waves handle different output rows (depth-4 pipeline)
@@ -3207,6 +3215,9 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     // stalled wave 0 read back another wave's accumulator as token bytes. The
     // window is 256 B unfolded and 512 B folded; the barrier is one per tile.
     __syncthreads();
+    if (FUSE_RESADD && threadIdx.x == 0) {
+      mpk_stage_stamp(61);
+    }
     if (FOLD_ROWS ? (col < rows_here) : (col == 0)) {
       int const r = FOLD_ROWS ? col : 0;
       for (int i = 0; i < 4; i++) {

@@ -3117,10 +3117,13 @@ if __name__ == "__main__":
             #   [2196 .. 2515] MPK_ROUTER_LL's logit words + routing copies
             #   [2516 .. 4067] MPK_QKV_XSPLIT's per-XCD flags + row
             #   [4068 .. 4451] MPK_OPROJ_LL == 2's per-XCD f32 o_proj rows
+            #   [4452 .. 4595] MPK_W2_ACT_LL's SwiGLU words
+            #   [4596 .. 4851] MPK_ATTN_OUT_LL's attention-output words
+            #   [4852 .. 6387] MPK_W2_PARTS_LL's W2 part words
             # Keep in step with FULL_LAYER_COUNTER_SLOTS in
             # gang_mla_full_layer_fused_mi300.cuh.
             (((218 + 4 * 24 + 4 * 16 + 8 * 32 + 9 + 1 + 8 * 194 + 32 + 8 * 36
-               + 8 * 194 + 8 * 48)
+               + 8 * 194 + 8 * 48 + 144 + 256 + 1536)
               if UNABSORB_K or QB_ABS_TP
               else 106 if UNABSORB_V else 96) * 16,),
             torch_dtype=torch.int32)

@@ -522,8 +522,25 @@ static constexpr int FULL_LAYER_QXS_SLOT = FULL_LAYER_RLL_SLOT + MPK_RLL_LINES;
 // read back in L2 by the push. XCD-private, whole 128-byte lines.
 static constexpr int FULL_LAYER_OLL_SLOT =
     FULL_LAYER_QXS_SLOT + FULL_LAYER_XSPLIT_LINES;
-static constexpr int FULL_LAYER_COUNTER_SLOTS =
+// MPK_W2_ACT_LL: W13's SwiGLU output as (epoch << 32 | bf16x2) words, one
+// [NUM_TOPK][I_LOCAL / 2] block read by every XCD's W2 tiles. 144 lines
+// covers GLM-5's 9 slots x 256 at 8 ranks.
+static constexpr int FULL_LAYER_W2LL_SLOT =
     FULL_LAYER_OLL_SLOT + 8 * MPK_OLL_XCD_INTS / 16;
+static constexpr int FULL_LAYER_W2LL_LINES = 144;
+// MPK_ATTN_OUT_LL: the merge's [8 heads][512] bf16 output as 2048
+// (epoch << 32 | bf16x2) words, read by this rank's o_proj tiles. Here
+// rather than in attn_out so the words share the epochs' lifetime.
+static constexpr int FULL_LAYER_ALL_SLOT =
+    FULL_LAYER_W2LL_SLOT + FULL_LAYER_W2LL_LINES;
+static constexpr int FULL_LAYER_ALL_LINES = 256;
+// MPK_W2_PARTS_LL: the W2 parts' f32 rows as (epoch << 32 | f32) words,
+// [2 parts][6144] at GLM-5, read by the next layer's EP folders.
+static constexpr int FULL_LAYER_W2PL_SLOT =
+    FULL_LAYER_ALL_SLOT + FULL_LAYER_ALL_LINES;
+static constexpr int FULL_LAYER_W2PL_LINES = 1536;
+static constexpr int FULL_LAYER_COUNTER_SLOTS =
+    FULL_LAYER_W2PL_SLOT + FULL_LAYER_W2PL_LINES;
 static_assert(FULL_LAYER_XSPLIT_SLOT % 2 == 0 && MPK_XSPLIT_XCD_INTS % 32 == 0 &&
                   FULL_LAYER_RLL_SLOT % 2 == 0 && MPK_RLL_XCD_INTS % 32 == 0 &&
                   MPK_RLL_WORD_LINES % 2 == 0 && FULL_LAYER_QXS_SLOT % 2 == 0 &&
@@ -579,6 +596,86 @@ _full_layer_ep_fold_ll(void *workspace_f32_ptr, void const *residual_ptr,
       for (int q = 0; q < NPEER; ++q) {
         st_wt_u64((void *)(peer_words[q] + wrow + p), w);
       }
+    }
+  }
+}
+
+// MPK_W2_PARTS_LL's fold: _full_layer_ep_fold_ll with the f32 row read from
+// the W2 parts' words instead of the workspace. part 0 + part 1 is the
+// workspace's 0 + a + b exactly (two addends commute), so the words out are
+// the same. Polled per pair, so the folder needs no layer-entry rendezvous.
+template <int OUTPUT_SIZE, int K_PARTS, bool FOLD, int NPEER>
+__device__ __forceinline__ void _full_layer_ep_fold_ll_parts(
+    unsigned long long const *part_words, void *workspace_f32_ptr,
+    void const *residual_ptr, unsigned long long *out_words,
+    unsigned long long *const *peer_words, int col_lo, int col_hi,
+    unsigned epoch_in, unsigned epoch) {
+  static_assert(K_PARTS == 1 || K_PARTS == 2, "one or two W2 parts");
+  typedef unsigned long long pw2_t __attribute__((ext_vector_type(2)));
+  float *__restrict__ ws_row = static_cast<float *>(workspace_f32_ptr);
+  unsigned short const *__restrict__ res_row =
+      static_cast<unsigned short const *>(residual_ptr);
+  unsigned long long const ep_hi = (unsigned long long)epoch << 32;
+  for (int p = (col_lo >> 1) + threadIdx.x; p < (col_hi >> 1); p += MPK_NT) {
+    int const off = p << 1;
+    pw2_t w[K_PARTS];
+#ifdef MPK_PL_DEBUG
+    unsigned _spins = 0;
+#endif
+    while (true) {
+#pragma unroll
+      for (int k = 0; k < K_PARTS; ++k) {
+        asm volatile("global_load_dwordx4 %0, %1, off sc0 sc1"
+                     : "=v"(w[k])
+                     : "v"(part_words + (size_t)k * OUTPUT_SIZE + off)
+                     : "memory");
+      }
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      bool ok = true;
+#pragma unroll
+      for (int k = 0; k < K_PARTS; ++k) {
+        ok = ok && (unsigned)(w[k].x >> 32) == epoch_in &&
+             (unsigned)(w[k].y >> 32) == epoch_in;
+      }
+      if (ok) {
+        break;
+      }
+#ifdef MPK_PL_DEBUG
+      if (++_spins == (1u << 21)) {
+        printf("[PLDBG] blk=%d col=%d want=%u got p0=%u,%u p1=%u,%u\n",
+               (int)blockIdx.x, off, epoch_in, (unsigned)(w[0].x >> 32),
+               (unsigned)(w[0].y >> 32),
+               (unsigned)(w[K_PARTS - 1].x >> 32),
+               (unsigned)(w[K_PARTS - 1].y >> 32));
+      }
+#endif
+      __builtin_amdgcn_s_sleep(1);
+    }
+    unsigned packed = 0;
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+      float v = __uint_as_float((unsigned)(j == 0 ? w[0].x : w[0].y));
+      if constexpr (K_PARTS == 2) {
+        v += __uint_as_float((unsigned)(j == 0 ? w[1].x : w[1].y));
+      }
+      if constexpr (FOLD) {
+        unsigned rbits = (unsigned)res_row[off + j] << 16;
+        float rv;
+        __builtin_memcpy(&rv, &rbits, 4);
+        v += rv;
+      }
+      unsigned u;
+      __builtin_memcpy(&u, &v, 4);
+      unsigned rounding_bias = ((u >> 16) & 1) + 0x7FFFu;
+      unsigned short bf = (unsigned short)((u + rounding_bias) >> 16);
+      packed |= ((unsigned)bf) << (16 * j);
+    }
+    unsigned long long const wd = ep_hi | packed;
+    st_wt_u64((void *)(out_words + p), wd);
+    st_wt_u64((void *)&ws_row[off], 0ull);
+#pragma unroll
+    for (int q = 0; q < NPEER; ++q) {
+      st_wt_u64((void *)(peer_words[q] + p), wd);
     }
   }
 }
@@ -925,6 +1022,22 @@ gang_mla_full_layer_fused_kernel_mi300(
   // poll your own XCD's flag. Costs one all-XCD barrier per layer, which is
   // what the removed event boundary was anyway; what multi-layer mode buys is
   // the scheduler round trip on either side of it, not the sync itself.
+  // MPK_W2_PARTS_LL: the EP folders read the previous W2's part words, which
+  // carry their own epoch, so they arrive here but do not wait. Not the
+  // table's first layer (its input is the embedding) nor the tail.
+  int const pl_fold_rank = (MPK_EP_LL && MPK_EP_LL_FOLD_LAST)
+                               ? xcd_rank - (tiles_per_xcd - MPK_EP_FOLD_WGS)
+                               : xcd_rank;
+  bool const pl_layer =
+      MPK_W2_PARTS_LL && MPK_EP_LL && !EP_TAIL_ONLY && EP_WORLD_SIZE > 1 &&
+      BATCH_SIZE == 1 && ml_mode && (task_layer_idx % ml_num_layers) != 0;
+  bool const pl_fold =
+      pl_layer && pl_fold_rank >= 0 && pl_fold_rank < MPK_EP_FOLD_WGS;
+  // MPK_ENTRY_NOWAIT: nobody waits. Past the folders, every input of the
+  // layer's head is an epoch-tagged word or flag (the EP slots, the XCD
+  // exchange), and the buffers it writes were last read before the previous
+  // layer's W2, which everything here transitively waits on.
+  bool const entry_skip = pl_fold || (MPK_ENTRY_NOWAIT && pl_layer);
   if (ml_mode) {
     int const entry_expected = task_layer_idx + 1;
     int const arrivals = tiles_per_xcd * 8;
@@ -953,8 +1066,10 @@ gang_mla_full_layer_fused_kernel_mi300(
         tag_bar_arrive(tags, xcd_id * tiles_per_xcd + xcd_rank,
                        entry_expected);
       }
-      tag_bar_wait_site(tags, arrivals, entry_expected, tid, xcd_id,
-                        xcd_rank);
+      if (!entry_skip) {
+        tag_bar_wait_site(tags, arrivals, entry_expected, tid, xcd_id,
+                          xcd_rank);
+      }
     }
 #else
     if (tid == 0) {
@@ -1036,7 +1151,7 @@ gang_mla_full_layer_fused_kernel_mi300(
       int _spins = 0;
       int _heals = 0;
       int _obs;
-      while ((_obs = ld_nt_s32(my_flag)) < entry_expected) {
+      while (!entry_skip && (_obs = ld_nt_s32(my_flag)) < entry_expected) {
         ++_spins;
         MPK_WS_WAIT_TICK(_obs, _spins);
         // Self-heal, see MPK_FL_REPUBLISH_SPINS. Same one-shot fan-out as
@@ -1428,17 +1543,43 @@ gang_mla_full_layer_fused_kernel_mi300(
           ll_peer[q] = reinterpret_cast<unsigned long long *>(
               reinterpret_cast<char *>(ll_mine) + ep_peer_delta[q]);
         }
-        _full_layer_ep_fold_ll<BATCH_SIZE,
-                               QKV_REDUCTION_SIZE,
-                               QKV_REDUCTION_SIZE,
-                               (EP_MY_PE == EP_FOLD_PE),
-                               EP_NPEER>(input_ptrs[13],
-                                         input_ptrs[0],
-                                         ll_mine,
-                                         ll_peer,
-                                         ep_col_lo,
-                                         ep_col_hi,
-                                         (unsigned)ep_expected);
+        if (pl_fold) {
+#ifdef MPK_PL_DEBUG
+          if (tid == 0 && task_layer_idx < 6) {
+            printf("[PLF] layer=%d xcd=%d rank=%d cols=[%d,%d) want=%u\n",
+                   task_layer_idx, xcd_id, xcd_rank, ep_col_lo, ep_col_hi,
+                   (unsigned)task_layer_idx);
+          }
+#endif
+          MPK_WS_PHASE(66, task_layer_idx, xcd_id);
+          _full_layer_ep_fold_ll_parts<QKV_REDUCTION_SIZE,
+                                       MPK_MOE_TP_W2_KPARTS,
+                                       (EP_MY_PE == EP_FOLD_PE),
+                                       EP_NPEER>(
+              reinterpret_cast<unsigned long long const *>(
+                  counters + FULL_LAYER_W2PL_SLOT * HIER_STRIDE),
+              input_ptrs[13],
+              input_ptrs[0],
+              ll_mine,
+              ll_peer,
+              ep_col_lo,
+              ep_col_hi,
+              /*epoch_in=*/(unsigned)task_layer_idx,
+              (unsigned)ep_expected);
+          MPK_WS_PHASE(67, task_layer_idx, xcd_id);
+        } else {
+          _full_layer_ep_fold_ll<BATCH_SIZE,
+                                 QKV_REDUCTION_SIZE,
+                                 QKV_REDUCTION_SIZE,
+                                 (EP_MY_PE == EP_FOLD_PE),
+                                 EP_NPEER>(input_ptrs[13],
+                                           input_ptrs[0],
+                                           ll_mine,
+                                           ll_peer,
+                                           ep_col_lo,
+                                           ep_col_hi,
+                                           (unsigned)ep_expected);
+        }
         if (tid == 0) {
           mpk_stage_stamp(3);
         }
@@ -1819,6 +1960,14 @@ gang_mla_full_layer_fused_kernel_mi300(
   }
   __syncthreads();
   int const attn_release_expected = s_exp[3];
+  // MPK_ATTN_OUT_LL: epoch is the layer counter, so ml_mode only.
+  unsigned long long *const attn_ll =
+      (MPK_ATTN_OUT_LL && MPK_OPROJ_RP && MPK_OPROJ_MXFP4 &&
+       EP_WORLD_SIZE > 1 && WUV_ROWS_PER_WG == 0 && BATCH_SIZE == 1 &&
+       ml_mode)
+          ? reinterpret_cast<unsigned long long *>(
+                counters + FULL_LAYER_ALL_SLOT * HIER_STRIDE)
+          : nullptr;
 
   // ══════════════════════════════════════════════════════════════════════
   // Phases 1-7: the attention half
@@ -1925,7 +2074,9 @@ gang_mla_full_layer_fused_kernel_mi300(
       // The flag epoch is the layer counter, so ml_mode only.
       /*qkv_xsplit=*/(MPK_QKV_XSPLIT && EP_WORLD_SIZE > 1 && ml_mode)
           ? counters + FULL_LAYER_QXS_SLOT * HIER_STRIDE
-          : nullptr);
+          : nullptr,
+      attn_ll,
+      (unsigned)attn_release_expected);
 
   MPK_WS_PHASE(60, task_layer_idx, xcd_id);
   // Stage 0: the residual stream this layer consumed -- and READ IT AS
@@ -2466,7 +2617,9 @@ gang_mla_full_layer_fused_kernel_mi300(
     // o_proj then reads whatever v_out happens to hold. Timing only.
     (void)attn_release_expected;
 #else
-    if (attn_tagged) {
+    if (attn_ll != nullptr) {
+      // The o_proj tiles validate the merge's words themselves.
+    } else if (attn_tagged) {
       tag_bar_wait_site(attn_tags, arrivals, attn_release_expected, tid,
                         xcd_id, xcd_rank);
     } else if (tid == 0) {
@@ -2720,7 +2873,21 @@ gang_mla_full_layer_fused_kernel_mi300(
       // The tail is the run's last entry (demo.py emits it right after the
       // last real layer, and refuses MTP under MPK_FOLD_W2 + MPK_EP_LL).
       /*fold_next_is_tail=*/ml_mode &&
-          (task_layer_idx % ml_num_layers) == ml_num_layers - 2
+          (task_layer_idx % ml_num_layers) == ml_num_layers - 2,
+      // MPK_W2_ACT_LL: the words' epoch is the layer counter.
+      /*w2_act_ll=*/(MPK_W2_ACT_LL && MPK_MOE_TP && ml_mode)
+          ? counters + FULL_LAYER_W2LL_SLOT * HIER_STRIDE
+          : nullptr,
+      attn_ll,
+      (unsigned)attn_release_expected,
+      // MPK_W2_PARTS_LL: epoch task_layer_idx + 1, which the next layer's
+      // folders expect as their own task_layer_idx.
+      (MPK_W2_PARTS_LL && MPK_EP_LL && EP_WORLD_SIZE > 1 && BATCH_SIZE == 1 &&
+       ml_mode)
+          ? reinterpret_cast<unsigned long long *>(
+                counters + FULL_LAYER_W2PL_SLOT * HIER_STRIDE)
+          : nullptr,
+      (unsigned)(task_layer_idx + 1)
 #if MPK_QKVA_PF_KB > 0
       ,
       /*next_qkv_weight=*/input_ptrs[MPK_QKVA_PF_SLOT]

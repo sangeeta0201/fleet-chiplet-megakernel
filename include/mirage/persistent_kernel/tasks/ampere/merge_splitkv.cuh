@@ -286,7 +286,14 @@ __device__ __forceinline__ void
                           // the caller read them ahead of its barrier; the
                           // lse/o addresses depend on them.
                           int first_token_pos_hint = -1,
-                          int last_token_pos_hint = -1) {
+                          int last_token_pos_hint = -1,
+                          // MPK_ATTN_OUT_LL: each bf16 pair leaves as one
+                          // (ll_epoch << 32 | pair) word at ll_out, indexed
+                          // by (global head - ll_head0) * HEAD_DIM + column,
+                          // halved; only the halves path can produce it.
+                          unsigned long long *ll_out = nullptr,
+                          unsigned ll_epoch = 0,
+                          int ll_head0 = 0) {
   static_assert(HEADS_N >= 1 && HEADS_N <= NUM_QO_HEADS_PER_KV,
                 "HEADS_N is a sub-range of the group");
 
@@ -405,12 +412,23 @@ __device__ __forceinline__ void
         uint16_t lo, hi;
         memcpy(&lo, &v0, 2);
         memcpy(&hi, &v1, 2);
-        st_wt_u32((void *)&output_ptr[out_offset], lo | ((uint32_t)hi << 16));
+        uint32_t const packed = lo | ((uint32_t)hi << 16);
+        if (ll_out != nullptr) {
+          int const gh = kv_head_idx * NUM_QO_HEADS_PER_KV + head_idx;
+          st_wt_u64((void *)(ll_out + ((gh - ll_head0) * HEAD_DIM + o_col) / 2),
+                    ((unsigned long long)ll_epoch << 32) | packed);
+        } else {
+          st_wt_u32((void *)&output_ptr[out_offset], packed);
+        }
       }
       return;
     }
   }
 #endif
+  // The consumer polls words only the halves path writes.
+  if (ll_out != nullptr) {
+    __builtin_trap();
+  }
 
 #pragma unroll
   for (int tok = group_id; tok < num_tokens * HEADS_N; tok += num_groups) {

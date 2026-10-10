@@ -199,7 +199,11 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
     // MPK_ROUTE_LL, one row: slot k's expert as (ll_epoch << 32 | id) at
     // ll_route[k] and its weight at ll_route[16 + k], shared slot included.
     unsigned long long *__restrict__ ll_route = nullptr,
-    unsigned ll_epoch = 0) {
+    unsigned ll_epoch = 0,
+    // MPK_TOPK_RANK, one row of NUM_EXPERTS == block size, k == 8: LDS
+    // scratch (NUM_EXPERTS + 16 words) for the one-expert-per-thread rank
+    // selection. Null keeps the sort-then-merge path.
+    unsigned *__restrict__ rank_lds = nullptr) {
   T *input = static_cast<T *>(input_ptr);
   T *bias = static_cast<T *>(bias_ptr);
   float *output = static_cast<float *>(output_ptr);
@@ -311,6 +315,50 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
     __syncthreads();
   }
 
+  // One expert per thread: each counts the keys above its own, and the
+  // eight with rank < 8 are the winners in descending key order -- the same
+  // keys, order and weight sum as the sort-then-merge network below, with
+  // no dependent shuffle chain.
+  bool rank_done = false;
+  int rk_expert[8];
+  float rk_val[8];
+  float rk_sum = 0.f;
+  if constexpr (K_STATIC == 8 && VPT == 8 &&
+                BYTES_PER_LDG / sizeof(T) == VPT) {
+    if (rank_lds != nullptr && num_rows == 1 && k == 8 &&
+        (int)MPK_NT == NUM_EXPERTS) {
+      unsigned *const s_key = rank_lds;
+      int const e = threadIdx.x;
+      float const sc = fast_sigmoid(static_cast<float>(input[e]));
+      unsigned b = __float_as_uint(sc + static_cast<float>(bias[e]));
+      b = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+      unsigned const key = (b & 0xFFFFFF00u) | (unsigned)e;
+      s_key[e] = key;
+      __syncthreads();
+      int rank = 0;
+#pragma unroll 8
+      for (int j = 0; j < NUM_EXPERTS; j += 4) {
+        uint4 const kk = *reinterpret_cast<uint4 const *>(&s_key[j]);
+        rank += (kk.x > key) + (kk.y > key) + (kk.z > key) + (kk.w > key);
+      }
+      __syncthreads();
+      if (rank < 8) {
+        s_key[rank] = (unsigned)e;
+        s_key[8 + rank] = __float_as_uint(sc);
+      }
+      __syncthreads();
+      if (threadIdx.x == 0) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          rk_expert[i] = (int)s_key[i];
+          rk_val[i] = __uint_as_float(s_key[8 + i]);
+          rk_sum += rk_val[i];
+        }
+      }
+      rank_done = true;
+    }
+  }
+
   int const warp_idx = threadIdx.x / MI300_WARP_SIZE;
   int const lane_idx = threadIdx.x % MI300_WARP_SIZE;
   int const warp_base_row = warp_idx * ROWS_PER_WARP;
@@ -321,6 +369,7 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
   if (thread_row < num_rows) {
     // Load row data
     T *thread_row_ptr = input + thread_row * ELTS_PER_ROW;
+    (void)thread_row_ptr;
     int const first_elt = thread_group_idx * ELTS_PER_LDG;
     T *thread_read_ptr = thread_row_ptr + first_elt;
     T *thread_bias_ptr = bias + first_elt;
@@ -418,8 +467,19 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
     key[i] = _a > _b ? _b : _a;                                                \
     key[j] = _a > _b ? _a : _b;                                                \
   }
+    if (rank_done) {
+      used_fast = true;
+      if (thread_group_idx == 0) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          topk_experts[i] = rk_expert[i];
+          topk_vals[i] = rk_val[i];
+        }
+        row_sum_for_renorm = rk_sum;
+      }
+    }
     if constexpr (FAST_SORT_MERGE) {
-      if (k == 8) {
+      if (k == 8 && !rank_done) {
         used_fast = true;
         unsigned key[8];
 #pragma unroll

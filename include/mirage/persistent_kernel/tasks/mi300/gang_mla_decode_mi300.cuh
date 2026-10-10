@@ -308,6 +308,8 @@ __device__ __forceinline__ void mla_tile_bar() { __syncthreads(); }
 // Together, re-measured 2026-10-08 at the 6.47 ms EP_LL default (n=2):
 // 6.471 6.476 -> 6.484 6.488 ms, and QK_2ACC's summation order moves the
 // tokens. Off.
+// QK_2ACC alone again 2026-10-10 on the PRELOAD=2 default, n=3 interleaved:
+// 4.779 4.791 4.794 -> 4.776 4.777 4.769 ms, tokens move. Off.
 //
 // MPK_MLA_QK_2ACC: split the 18-step QK MFMA chain over a[32:35] (even k32
 // steps) and a[36:39] (odd), so consecutive MFMAs are independent.
@@ -906,7 +908,13 @@ __device__ __noinline__ void
                         // The chunk's first `tiles_in_lds` tiles are already
                         // in LDS, full, tile t at lds_kv + t * KV_LDS_BYTES
                         // (MPK_DEC_PRELOAD); those trips skip their load.
-                        int tiles_in_lds = 0) {
+                        int tiles_in_lds = 0,
+                        // MPK_DEC_HINTS, one row: qo_indptr[req] and the
+                        // request's (first page, seqlen), as the caller read
+                        // them ahead of its barrier. -1 loads them here.
+                        int hint_q_row = -1,
+                        int hint_first_page = -1,
+                        int hint_seqlen = -1) {
   using bf16 = __hip_bfloat16;
   using gang_mla_decode_detail::__ldg_bf16x4_raw;
   using gang_mla_decode_detail::bf16x4_t;
@@ -955,8 +963,10 @@ __device__ __noinline__ void
                 "o_acc ds offsets must fit in the 16-bit ds offset field");
 
   int const req = request_id;
-  int const query_start = ld_g<int>(&qo_indptr[req]);
-  int const query_end = ld_g<int>(&qo_indptr[req + 1]);
+  bool const hinted = BATCH_SIZE == 1 && hint_q_row >= 0;
+  int const query_start = hinted ? hint_q_row : ld_g<int>(&qo_indptr[req]);
+  int const query_end =
+      hinted ? hint_q_row + 1 : ld_g<int>(&qo_indptr[req + 1]);
   if (query_start == query_end) {
     return;
   }
@@ -990,10 +1000,17 @@ __device__ __noinline__ void
     tok_back = num_tokens - 1 - token_idx;
   }
 
-  int const first_page = ld_g<int>(&kv_indptr[req]);
-  int const num_pages = ld_g<int>(&kv_indptr[req + 1]) - first_page;
-  int const seqlen_k = (num_pages - 1) * PAGE_SIZE +
-                       ld_g<int>(&kv_last_page_len[req]) - tok_back;
+  int first_page;
+  int seqlen_k;
+  if (hinted) {
+    first_page = hint_first_page;
+    seqlen_k = hint_seqlen;
+  } else {
+    first_page = ld_g<int>(&kv_indptr[req]);
+    int const num_pages = ld_g<int>(&kv_indptr[req + 1]) - first_page;
+    seqlen_k = (num_pages - 1) * PAGE_SIZE +
+               ld_g<int>(&kv_last_page_len[req]) - tok_back;
+  }
 
   int const tid = threadIdx.x;
   int const warp_id = tid / 64;
@@ -1640,7 +1657,11 @@ __device__ __noinline__ void
                            int out_heads = 16,
                            // MPK_DEC_PRELOAD: the caller already DMA'd this
                            // chunk's first tiles, full; see mla_decode_absorbed.
-                           int tiles_in_lds = 0) {
+                           int tiles_in_lds = 0,
+                           // MPK_DEC_HINTS; see mla_decode_absorbed.
+                           int hint_q_row = -1,
+                           int hint_first_page = -1,
+                           int hint_seqlen = -1) {
   if (tile_idx >= total_work_items) {
     return;
   }
@@ -1681,7 +1702,10 @@ __device__ __noinline__ void
                                        scale_s,
                                        out_head_lo,
                                        out_heads,
-                                       tiles_in_lds);
+                                       tiles_in_lds,
+                                       hint_q_row,
+                                       hint_first_page,
+                                       hint_seqlen);
 }
 
 } // namespace kernel

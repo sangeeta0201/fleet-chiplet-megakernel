@@ -1616,6 +1616,15 @@ def get_compile_command(
             "MPK_W13_ACT_EARLY",
             "MPK_W2_EARLY_PF",
             "MPK_ML_NO_FENCE",
+            "MPK_WUK_HOIST",
+            "MPK_W2_ACT_LL",
+            "MPK_ATTN_OUT_LL",
+            "MPK_OPROJ_WFIRST",
+            "MPK_TOPK_RANK",
+            "MPK_ATTN_PROBE_NOQKVWAIT",
+            "MPK_W2_PARTS_LL",
+            "MPK_ENTRY_NOWAIT",
+            "MPK_DEC_HINTS",
             # Ceiling probes, wrong output (gang_mla_attn_fused_mi300.cuh).
             "MPK_ATTN_PROBE_NOQBWAIT",
             "MPK_ATTN_PROBE_NODECWAIT",
@@ -3915,6 +3924,18 @@ class PersistentKernel:
         if os.environ.get("MPK_OPROJ_LL", "0") == "2":
             # FULL_LAYER_OLL_SLOT's eight 48-line f32 row blocks.
             counter_slots = 644 + 8 * 194 + 32 + 8 * 36 + 8 * 194 + 8 * 48
+        if os.environ.get("MPK_W2_ACT_LL", "0") == "1":
+            # FULL_LAYER_W2LL_SLOT's 144 lines of SwiGLU words.
+            counter_slots = (644 + 8 * 194 + 32 + 8 * 36 + 8 * 194 + 8 * 48
+                             + 144)
+        if os.environ.get("MPK_ATTN_OUT_LL", "0") == "1":
+            # FULL_LAYER_ALL_SLOT's 256 lines of attention-output words.
+            counter_slots = (644 + 8 * 194 + 32 + 8 * 36 + 8 * 194 + 8 * 48
+                             + 144 + 256)
+        if os.environ.get("MPK_W2_PARTS_LL", "0") == "1":
+            # FULL_LAYER_W2PL_SLOT's 1536 lines of W2 part words.
+            counter_slots = (644 + 8 * 194 + 32 + 8 * 36 + 8 * 194 + 8 * 48
+                             + 144 + 256 + 1536)
         assert counters.dim(0) >= counter_slots * 16, (
             f"the fused layer needs {counter_slots * 16} int32 of counters, "
             f"got {counters.dim(0)}")

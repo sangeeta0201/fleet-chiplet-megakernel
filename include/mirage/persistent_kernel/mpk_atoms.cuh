@@ -1249,8 +1249,83 @@ __device__ __forceinline__ bool
 // MPK_WUK_PF: the W_UK workers pull their tile's weight into L2 while they
 // wait at Phase 3b's XCD barrier (gang_mla_attn_fused_mi300.cuh). The
 // MPK_TRACE profile puts the W_UK step at ~3 us behind that barrier.
+// MPK_WUK_HOIST: Phase 3b's deferred-rope position read ahead of its barrier,
+// and no peer-delta lookups under head-local (gang_mla_attn_fused_mi300.cuh).
+// MEASURED NEUTRAL 2026-10-10, NP=8 1024/1024, n=3 interleaved, text
+// identical: 4.779 4.791 4.794 -> 4.794 4.785 4.776 ms. Off.
+#ifndef MPK_WUK_HOIST
+#define MPK_WUK_HOIST 0
+#endif
+
+// MPK_W2_ACT_LL: W13 publishes its SwiGLU output as epoch-tagged words that
+// the TP W2 tiles validate themselves, so the W2 workers skip the W13 -> W2
+// wait (gang_oproj_router_fused_mi300.cuh, gang_moe_linear_mxfp8_mi300.cuh).
+// MEASURED 2026-10-10, NP=8 1024/1024, n=3 interleaved on the 9ef34be +
+// MPK_DEC_PRELOAD=2 default, text identical: 4.779 4.791 4.794 -> 4.728
+// 4.722 4.722 ms (-0.064). Default on.
+#ifndef MPK_W2_ACT_LL
+#define MPK_W2_ACT_LL 1
+#endif
+
+// MPK_ATTN_OUT_LL: the split-KV merge publishes this rank's attention output
+// as epoch-tagged words that the row-parallel o_proj validates while staging,
+// so every worker skips the Phase 8 attention-release wait
+// (gang_mla_full_layer_fused_mi300.cuh, merge_splitkv.cuh).
+// MEASURED 2026-10-10, NP=8 1024/1024, n=3 interleaved on the 9ef34be +
+// MPK_DEC_PRELOAD=2 + MPK_ATTN_PF_GROUPS_K=6 default, text identical:
+// 4.762 4.764 4.759 -> 4.711 4.713 4.712 ms (-0.050). Default on.
+#ifndef MPK_ATTN_OUT_LL
+#define MPK_ATTN_OUT_LL 1
+#endif
+
+// MPK_OPROJ_WFIRST: the o_proj MXFP4 GEMV issues its first trip of weight
+// loads ahead of the activation staging (gang_gemv_mxfp4_mi300.cuh).
+// MEASURED NEGATIVE 2026-10-10, same batch as MPK_ATTN_OUT_LL, text
+// identical: 4.762 4.764 4.759 -> 4.784 4.761 4.783 ms (+0.014). Off.
+#ifndef MPK_OPROJ_WFIRST
+#define MPK_OPROJ_WFIRST 0
+#endif
+
+// MPK_TOPK_RANK: the per-XCD routing TopK selects by rank -- one expert per
+// thread, counting the keys above its own in LDS -- instead of the 32-lane
+// sort-then-merge network. Same keys, order and weights
+// (moe_topk_sigmoid_bias_mi300.cuh).
+// MEASURED NEGATIVE 2026-10-10, same batch as MPK_ATTN_OUT_LL, text
+// identical: 4.762 4.764 -> 4.842 4.861 ms (+0.09). MPK_TRACE puts the
+// network at 1.90 us (stamps 63 -> 42); 64 broadcast ds_read_b128 and 256
+// compare-adds per thread cost more than its shuffle chain. Off.
+#ifndef MPK_TOPK_RANK
+#define MPK_TOPK_RANK 0
+#endif
+
+// BROKEN 2026-10-10: wedges in the first iteration (rc=124); MPK_PL_DEBUG
+// prints the part epochs and any poll that spins ~1 s. Off.
+// MPK_W2_PARTS_LL: the TP W2 also writes each K-part's f32 rows as
+// epoch-tagged words (FULL_LAYER_W2PL_SLOT), and the next layer's EP_LL
+// folders fold from those, arriving at the layer-entry rendezvous without
+// waiting on it -- the last W2 tile's return path and the rendezvous leave
+// the cross-rank critical path (gang_mla_full_layer_fused_mi300.cuh).
+#ifndef MPK_W2_PARTS_LL
+#define MPK_W2_PARTS_LL 0
+#endif
+// MPK_ENTRY_NOWAIT: under MPK_W2_PARTS_LL, every worker arrives at the
+// layer-entry rendezvous without waiting on it (not the table's first layer
+// nor the tail).
+#ifndef MPK_ENTRY_NOWAIT
+#define MPK_ENTRY_NOWAIT 0
+#endif
+// MPK_DEC_HINTS: under MPK_DEC_PRELOAD the decode tiles hand the decode the
+// indptr values their prologue walk already loaded, so its dependent
+// qo_indptr -> kv_indptr loads leave the post-barrier path
+// (gang_mla_attn_fused_mi300.cuh, gang_mla_decode_mi300.cuh).
+#ifndef MPK_DEC_HINTS
+#define MPK_DEC_HINTS 0
+#endif
+
 // MPK_ML_NO_FENCE: the multi-layer loop skips its per-layer threadfence_gpu
-// (persistent_kernel.cuh); the __syncthreads stays.
+// (persistent_kernel.cuh); the __syncthreads stays. MEASURED NEUTRAL
+// 2026-10-10 on the five-lever default, tokens identical: 4.831 -> 4.829
+// 4.822 ms. Off: no gain to pay for dropping a fence.
 #ifndef MPK_ML_NO_FENCE
 #define MPK_ML_NO_FENCE 0
 #endif
@@ -1270,8 +1345,10 @@ __device__ __forceinline__ bool
 // first two) into the decode's LDS tile buffers during the q_b -> decode
 // wait, short of the current token's row. With MPK_DEC_REMAP: 4.904 4.901
 // (-0.187); the MPK_TRACE decode item spent 1.72 us of 8.4 on that tile.
+// 2 against 1 on the five-lever default, interleaved, tokens identical:
+// 4.838 4.830 4.835 -> 4.789 4.783 4.799 4.802 ms (-0.042).
 #ifndef MPK_DEC_PRELOAD
-#define MPK_DEC_PRELOAD 1
+#define MPK_DEC_PRELOAD 2
 #endif
 // MPK_W13_ACT_EARLY: the W13 workers quantize the normed row into LDS while
 // the TopK selects (gang_oproj_router_fused_mi300.cuh). 5.065 5.037 (-0.038).
