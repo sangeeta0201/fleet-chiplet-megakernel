@@ -1797,6 +1797,8 @@ __device__ unsigned int g_is_tt_cnt[MPK_IS_TT];
 __device__ volatile unsigned long long g_is_t0;
 __device__ volatile unsigned long long g_is_prev_end;
 __device__ unsigned long long g_is_gap_ns;
+// The scheduler's prepare_next_batch, inside the pre window.
+__device__ unsigned long long g_is_prep_ns;
 #endif
 
 __device__ __forceinline__ void execute_worker(RuntimeConfig config,
@@ -4593,8 +4595,9 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                    (double)g_is_post_ns / 1000.0 / isn,
                    (double)(g_is_pre_ns + g_is_fused_ns + g_is_post_ns) /
                        1000.0 / isn);
-            printf("[ITERSPLIT] pre_gap_us=%.2f\n",
-                   (double)g_is_gap_ns / 1000.0 / isn);
+            printf("[ITERSPLIT] pre_gap_us=%.2f prep_us=%.2f\n",
+                   (double)g_is_gap_ns / 1000.0 / isn,
+                   (double)g_is_prep_ns / 1000.0 / isn);
             for (int t = 0; t < MPK_IS_TT; t++) {
               if (g_is_tt_cnt[t] == 0u) {
                 continue;
@@ -4672,6 +4675,9 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
           terminate_schedulers(config);
         } else {
           unsigned long long prep_done_clk = get_wallclock_ns();
+#ifdef MPK_ITER_SPLIT
+          g_is_prep_ns += prep_done_clk - iter_end_clk;
+#endif
 #ifdef MPK_PRECOMPUTED_DISPATCH
           // Signal workers to start next iteration.
           // iter_ready starts at 0; every END_OF_TASK_GRAPH bumps it.
