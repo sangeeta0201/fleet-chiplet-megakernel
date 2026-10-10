@@ -1595,6 +1595,9 @@ def get_compile_command(
             # Decode prologue chain and merge qo_indptr ahead of their waits
             # (gang_mla_attn_fused_mi300.cuh).
             "MPK_ATTN_META_PF",
+            # DPP lane exchange in the TopK sort-merge
+            # (moe_topk_sigmoid_bias_mi300.cuh).
+            "MPK_TOPK_DPP",
             # Ceiling probes, wrong output (gang_mla_attn_fused_mi300.cuh).
             "MPK_ATTN_PROBE_NOQBWAIT",
             "MPK_ATTN_PROBE_NODECWAIT",

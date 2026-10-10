@@ -65,6 +65,15 @@
 // start waits on at this point. Off by default. Re-measured with
 // MPK_TOPK_WIN_SHFL on the K-split TopK (2026-10-09, n=4 vs 3, tokens
 // identical): 5.901 5.914 5.894 -> 5.900 5.913 5.902 5.893 ms, neutral.
+// MPK_TOPK_DPP: DPP lane exchange in the sort-then-merge rounds; see
+// topk_sigmoid_bias_mi300_task_impl's DPP_XOR. Bit-exact against ds_bpermute
+// over 200 random rows, 3749 -> 3492 cycles per call standalone; MEASURED
+// NEUTRAL 2026-10-09, NP=8 1024/1024: 5.684 5.710 5.699 -> 5.696 5.690
+// 5.700 5.697 ms. The selection is ~330 dependent instructions on ONE wave
+// (160 of them min/max), so it is issue-bound, not shuffle-bound. Off.
+#ifndef MPK_TOPK_DPP
+#define MPK_TOPK_DPP 0
+#endif
 #ifndef MPK_TOPK_SKIP_CLEARS
 #define MPK_TOPK_SKIP_CLEARS 0
 #endif
@@ -76,6 +85,29 @@ namespace kernel {
 // for fdiv).
 __device__ __forceinline__ float fast_sigmoid(float x) {
   return __builtin_amdgcn_rcpf(1.0f + __expf(-x));
+}
+
+// Lane ^ mask inside 16-lane rows by DPP: quad_perm for 1 and 2, and for 4
+// and 8 two mirrors whose composition is that xor (half_mirror is ^7 and the
+// quad reverse ^3; mirror is ^15). 16 and up cross rows and stay ds_bpermute.
+__device__ __forceinline__ unsigned _tk_xor_lanes(unsigned v, int mask,
+                                                  int width) {
+  switch (mask) {
+    case 1:
+      return (unsigned)__builtin_amdgcn_mov_dpp((int)v, 0xB1, 0xF, 0xF, false);
+    case 2:
+      return (unsigned)__builtin_amdgcn_mov_dpp((int)v, 0x4E, 0xF, 0xF, false);
+    case 4:
+      return (unsigned)__builtin_amdgcn_mov_dpp(
+          __builtin_amdgcn_mov_dpp((int)v, 0x141, 0xF, 0xF, false), 0x1B, 0xF,
+          0xF, false);
+    case 8:
+      return (unsigned)__builtin_amdgcn_mov_dpp(
+          __builtin_amdgcn_mov_dpp((int)v, 0x140, 0xF, 0xF, false), 0x141,
+          0xF, 0xF, false);
+    default:
+      return (unsigned)__shfl_xor((int)v, mask, width);
+  }
 }
 
 // The routing stores. Write-through by default, because the consumers are on
@@ -146,7 +178,11 @@ template <typename T,
           // wait in this tail drain them first (SP7: moving the winners'
           // re-read off memory just moved that drain into the clear).
           bool SKIP_CLEARS = false,
-          bool L2_STORES = false>
+          bool L2_STORES = false,
+          // MPK_TOPK_DPP: the sort-then-merge rounds below 16 lanes move keys
+          // with DPP instead of ds_bpermute (same partner lanes, so the same
+          // result); only the 16-lane round still crosses rows through LDS.
+          bool DPP_XOR = MPK_TOPK_DPP != 0>
 __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
     void *__restrict__ input_ptr, // [num_rows, NUM_EXPERTS]
     void *__restrict__ bias_ptr,  // [NUM_EXPERTS] e_score_correction_bias
@@ -404,7 +440,9 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
           unsigned o[8];
 #pragma unroll
           for (int i = 0; i < 8; ++i) {
-            o[i] = (unsigned)__shfl_xor((int)key[i], mask, THREADS_PER_ROW);
+            o[i] = DPP_XOR ? _tk_xor_lanes(key[i], mask, THREADS_PER_ROW)
+                           : (unsigned)__shfl_xor((int)key[i], mask,
+                                                  THREADS_PER_ROW);
           }
           // Reversing the partner's descending list and taking the elementwise
           // max keeps exactly the top 8 of the 16, as a bitonic sequence.
