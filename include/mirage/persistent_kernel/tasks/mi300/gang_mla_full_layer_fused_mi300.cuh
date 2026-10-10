@@ -246,7 +246,9 @@ static constexpr int FULL_LAYER_ENTRY_SLOT = 71;
 // fold is 4.3 us/layer of S0->S3; the per-peer stamps (MPK_EP_PEER_STAMPS)
 // put the wait after it at 8.3 us even on the rank that waits least.
 // Gates with both: see the commit that flipped them. Default 4; GLM's demo.py
-// sets MPK_EP_POLL_BATCH=1 to match.
+// sets MPK_EP_POLL_BATCH=1 to match. 8 (the XCD's last 8 workers, exactly
+// the 29 - 21 qkv_a tiles) MEASURED NEUTRAL 2026-10-10 on the dense-fused
+// default: 5.088 -> 5.085 5.101 5.095 ms.
 #ifndef MPK_EP_FOLD_WGS
 #define MPK_EP_FOLD_WGS 4
 #endif

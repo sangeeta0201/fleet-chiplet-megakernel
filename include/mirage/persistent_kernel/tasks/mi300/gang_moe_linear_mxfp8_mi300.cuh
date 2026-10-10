@@ -108,6 +108,19 @@
 #define MPK_MOE_ACT_FP8 0
 #endif
 
+// MPK_W2_LL_BATCH: the TP W2 tile's staging takes its expert ids and routing
+// weights from the MPK_ROUTE_LL words on the same wait as the activation
+// slabs, instead of an id poll, then a weight poll, then the slabs -- three
+// dependent round trips in front of every W2 tile's k-loop (2.3 us of
+// staging per tile in the MPK_TRACE profile, against a 2.0 us k-loop).
+// MEASURED NEUTRAL 2026-10-10, NP=8 1024/1024, tokens identical: 5.088
+// 5.084 -> 5.100 5.095 5.090 5.114 ms. The k-loop issues its whole weight
+// reduction only once the staging is done (it needs the segment offsets),
+// so the tile waits on that weight stream, not on the staging. Off.
+#ifndef MPK_W2_LL_BATCH
+#define MPK_W2_LL_BATCH 0
+#endif
+
 // ── K-MAJOR WEIGHT ─────────────────────────────────────────────────────────
 //
 // MPK_MOE_KMAJOR: permute the data half of the per-workgroup weight so a
@@ -2058,6 +2071,10 @@ __device__ __forceinline__ bool _gang_moe_mxfp8_tile(int tile_idx,
       }
       asm volatile("buffer_inv" ::: "memory");
       e = (int)(unsigned)wv;
+      // Trace stamps 55/56: W13 slot's route word seen, k-loop done.
+      if (threadIdx.x == 0) {
+        mpk_stage_stamp(55);
+      }
     } else {
       e = d_mask[global_tile / TILES_PER_EXPERT];
     }
@@ -2180,7 +2197,10 @@ __device__ __noinline__ void
                                      int tile_idx,
                                      unsigned long long const *ll_route =
                                          nullptr,
-                                     unsigned ll_epoch = 0) {
+                                     unsigned ll_epoch = 0,
+                                     // MPK_W13_ACT_EARLY: the caller already
+                                     // quantized row 0 into s_tok_fp8.
+                                     bool act_staged = false) {
   // 2026-08-21 closed narrowing below 64 rows: 16 (the K-parallel branch)
   // measured -1.34 ms (95a044a), and 32 as an N-parallel split would put 8
   // rows on each of 4 waves and starve the 16-row MFMA. 32 is now legal as a
@@ -2392,6 +2412,9 @@ __device__ __noinline__ void
     // nothing outstanding), the DMA goes out next, and only the pack half
     // rides behind it -- back_range() touches registers and LDS only, so it
     // forces no vmcnt and runs while the weights fly.
+    if (act_staged) {
+      __builtin_trap(); // the warm-block quant has no pre-staged form
+    }
     auto qst = _gang_fp8_quant_front<REDUCTION_SIZE>(
         A + static_cast<size_t>(tok_idx) * REDUCTION_SIZE, s_tok_scales);
 #pragma unroll
@@ -2419,7 +2442,7 @@ __device__ __noinline__ void
     // The unsplit quant ends with this; the split form does not, and the
     // k-loop's B operand reads columns other threads packed.
     __syncthreads();
-  } else {
+  } else if (!act_staged) {
     // Phase 1: quantize this token's activation to FP8 E4M3 in LDS.
     _gang_wave_parallel_fp8_quant<REDUCTION_SIZE>(
         A + static_cast<size_t>(tok_idx) * REDUCTION_SIZE,
@@ -2428,10 +2451,12 @@ __device__ __noinline__ void
   }
 #else
   // Phase 1: quantize this token's activation to FP8 E4M3 in LDS.
-  _gang_wave_parallel_fp8_quant<REDUCTION_SIZE>(
-      A + static_cast<size_t>(tok_idx) * REDUCTION_SIZE,
-      s_tok_fp8,
-      s_tok_scales);
+  if (!act_staged) {
+    _gang_wave_parallel_fp8_quant<REDUCTION_SIZE>(
+        A + static_cast<size_t>(tok_idx) * REDUCTION_SIZE,
+        s_tok_fp8,
+        s_tok_scales);
+  }
 #endif
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   unsigned long long _sp_q1 = __builtin_amdgcn_s_memrealtime();
@@ -2596,6 +2621,9 @@ __device__ __noinline__ void
       }
     }
     __syncthreads();
+    if (threadIdx.x == 0) {
+      mpk_stage_stamp(56);
+    }
     if (kh == 0 && col == 0) {
 #pragma unroll
       for (int i = 0; i < 4; i++) {
@@ -3534,6 +3562,75 @@ __device__ __forceinline__ unsigned long long
   }
 }
 
+// MPK_W2_EARLY_PF: pull the TP W2 tile `tile_idx`'s weight -- one WG_BYTES
+// block per segment, at that slot's expert -- into L2 ahead of the W13 -> W2
+// release. The k-loop's own up-front issue (MPK_MOE_TP_W2_PF) can only start
+// after the release and the staging, since it reads the segment offsets the
+// staging writes; the routing words it derives them from are final long
+// before. Waves 1-3 only (the caller's wave 0 polls), into a never-read 1 KB
+// LDS window per wave; the caller's __syncthreads retires it.
+template <int OUTPUT_SIZE,
+          int I_LOCAL,
+          int NUM_TOPK,
+          int OUTPUT_PER_WG,
+          bool WEIGHT_FP4,
+          int NSEG,
+          int K_PARTS>
+__device__ __forceinline__ void
+    _gang_w2_tp_l2_prefetch(void const *weight_ptr,
+                            int tile_idx,
+                            unsigned long long const *ll_route,
+                            unsigned ll_epoch) {
+  constexpr int NSEG_P = NSEG / K_PARTS;
+  constexpr int NUM_BLOCKS_32 = I_LOCAL / 32;
+  constexpr int W_ROW_BYTES = WEIGHT_FP4 ? I_LOCAL / 2 : I_LOCAL;
+  constexpr int WG_BYTES =
+      OUTPUT_PER_WG * W_ROW_BYTES + OUTPUT_PER_WG * NUM_BLOCKS_32;
+  constexpr int EXPERT_WGS = OUTPUT_SIZE / OUTPUT_PER_WG;
+  constexpr int64_t EXPERT_BYTES = static_cast<int64_t>(EXPERT_WGS) * WG_BYTES;
+  int const global_tile = tile_idx * 8 + _gang_moe_get_xcd_id();
+  int const part = global_tile / EXPERT_WGS;
+  int const wg_idx = global_tile % EXPERT_WGS;
+  int const tid = threadIdx.x;
+  if (part >= K_PARTS || tid < 64) {
+    return;
+  }
+  unsigned long long w[NSEG_P];
+#pragma unroll
+  for (int s = 0; s < NSEG_P; s++) {
+    int const slot = part * NSEG_P + s;
+    asm volatile("global_load_dwordx2 %0, %1, off nt"
+                 : "=v"(w[s])
+                 : "v"(ll_route + (slot < NUM_TOPK ? slot : 0))
+                 : "memory");
+  }
+  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  extern __shared__ char _w2pf_smem[];
+  auto *dst = (__attribute__((address_space(3))) uint32_t *)(
+      _w2pf_smem + 140 * 1024 + ((tid >> 6) - 1) * 1024);
+#pragma unroll
+  for (int s = 0; s < NSEG_P; s++) {
+    int const slot = part * NSEG_P + s;
+    if ((unsigned)(w[s] >> 32) != ll_epoch) {
+      w[s] = _gang_ll_route_word(ll_route, slot < NUM_TOPK ? slot : 0,
+                                 ll_epoch);
+    }
+    i32x4_t const rsrc = make_w_buffer_rsrc(
+        static_cast<uint8_t const *>(weight_ptr) +
+            static_cast<int64_t>((unsigned)w[s]) * EXPERT_BYTES +
+            static_cast<int64_t>(wg_idx) * WG_BYTES,
+        static_cast<uint32_t>(WG_BYTES));
+    int voff = (tid - 64) * 16;
+#pragma unroll
+    for (int i = 0; i < (WG_BYTES + 192 * 16 - 1) / (192 * 16); i++) {
+      int const v = voff < WG_BYTES - 16 ? voff : WG_BYTES - 16;
+      __llvm_amdgcn_raw_buffer_load_lds(rsrc, dst, 16, v, 0, 0, 1);
+      voff += 192 * 16;
+      asm volatile("" : "+v"(voff) : : "memory");
+    }
+  }
+}
+
 // The activation half of the fused tile: NSEG gathered SEG_LEN-wide bf16 slabs
 // quantized into one contiguous E4M3 run in LDS with one E8M0 per 128 --
 // _gang_wave_parallel_fp8_quant_nt's math, except that each 32-element
@@ -3567,7 +3664,9 @@ __device__ __forceinline__ void
                           uint8_t *__restrict__ s_tok_fp8,
                           uint8_t *__restrict__ s_tok_scales,
                           unsigned long long const *ll_route = nullptr,
-                          unsigned ll_epoch = 0) {
+                          unsigned ll_epoch = 0,
+                          uint32_t *s_seg_off = nullptr,
+                          uint32_t expert_bytes = 0) {
   constexpr int SUB_BLOCK = 32;
   constexpr int SB_PER_SEG = SEG_LEN / SUB_BLOCK;
   constexpr int NSUBBLOCKS = NSEG * SB_PER_SEG;
@@ -3575,24 +3674,47 @@ __device__ __forceinline__ void
                 "a 128-element scale block must not straddle two segments");
   int const tid = threadIdx.x;
   int const lane_id = tid & 63;
+  // FIXED_SLOTS with routing words: the activation address does not depend
+  // on either word, and both words were validated by W13 before the W13 -> W2
+  // release, so the expert id, the weight and the slab go out together and
+  // retire on one wait instead of three dependent round trips. A stale word
+  // (never seen) falls back to the poll. s_seg_off, when given, is filled
+  // here by each segment's first sub-block instead of by the caller.
+  constexpr bool LL_BATCH = FIXED_SLOTS && MPK_W2_LL_BATCH;
+  bool const ll_batch = LL_BATCH && ll_route != nullptr;
 
   for (int sb = tid; sb < NSUBBLOCKS; sb += MPK_NT) {
     int const seg = seg_base + sb / SB_PER_SEG;
     int const base = sb * SUB_BLOCK;
     int const super_blk = sb / 4;
     int const sub_idx = sb & 3;
+    bool const seg_head = s_seg_off != nullptr && (sb % SB_PER_SEG) == 0;
     uint32_t dw[16];
     float rw = 0.0f;
     if (seg < n_live) {
       int const slot =
           FIXED_SLOTS ? seg : d_routing[d_mask[seg] * BATCH_SIZE + tok_idx] - 1;
-      rw = (FIXED_SLOTS && ll_route != nullptr)
-               ? __uint_as_float(
-                     (unsigned)_gang_ll_route_word(ll_route, 16 + slot, ll_epoch))
-               : d_routing_weight[tok_idx * NUM_TOPK + slot];
       uint32_t const *p =
           (uint32_t const *)(act + slot * SEG_LEN +
                              (sb % SB_PER_SEG) * SUB_BLOCK);
+      unsigned long long w_word = 0, id_word = 0;
+      if (ll_batch) {
+        asm volatile("global_load_dwordx2 %0, %1, off nt"
+                     : "=v"(w_word)
+                     : "v"(ll_route + 16 + slot)
+                     : "memory");
+        if (seg_head) {
+          asm volatile("global_load_dwordx2 %0, %1, off nt"
+                       : "=v"(id_word)
+                       : "v"(ll_route + slot)
+                       : "memory");
+        }
+      } else {
+        rw = (FIXED_SLOTS && ll_route != nullptr)
+                 ? __uint_as_float((unsigned)_gang_ll_route_word(
+                       ll_route, 16 + slot, ll_epoch))
+                 : d_routing_weight[tok_idx * NUM_TOPK + slot];
+      }
       // Early-clobber outputs; see _gang_wave_parallel_fp8_quant_nt.
       asm volatile("global_load_dwordx4 %0, %4, off sc0 sc1 nt\n"
                    "global_load_dwordx4 %1, %5, off sc0 sc1 nt\n"
@@ -3605,10 +3727,28 @@ __device__ __forceinline__ void
                    : "v"(p), "v"(p + 4), "v"(p + 8), "v"(p + 12)
                    : "memory");
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      if (ll_batch) {
+        if ((unsigned)(w_word >> 32) != ll_epoch) {
+          w_word = _gang_ll_route_word(ll_route, 16 + slot, ll_epoch);
+        }
+        rw = __uint_as_float((unsigned)w_word);
+        if (seg_head) {
+          if ((unsigned)(id_word >> 32) != ll_epoch) {
+            id_word = _gang_ll_route_word(ll_route, slot, ll_epoch);
+          }
+          s_seg_off[sb / SB_PER_SEG] = (uint32_t)id_word * expert_bytes;
+        }
+      }
     } else {
 #pragma unroll
       for (int j = 0; j < 16; j++) {
         dw[j] = 0;
+      }
+      // A segment past n_live reads slot 0's expert (its data is zero).
+      if (seg_head) {
+        s_seg_off[sb / SB_PER_SEG] =
+            (uint32_t)_gang_ll_route_word(ll_route, 0, ll_epoch) *
+            expert_bytes;
       }
     }
 
@@ -3783,8 +3923,11 @@ __device__ __noinline__ void
   constexpr int SEG_OFF_LDS =
       (NSEG_P * I_LOCAL + NSEG_P * I_LOCAL / 128 + 3) & ~3;
   uint32_t *s_seg_off = (uint32_t *)(_gang_moe_mxfp8_smem + SEG_OFF_LDS);
-  // Published by the barrier the quantizer below ends with.
-  if (threadIdx.x < NSEG_P) {
+  // Published by the barrier the quantizer below ends with. With routing
+  // words the quantizer fills it, on the same wait as the activations.
+  bool const seg_in_quant =
+      MPK_MOE_BS1_DECODE && MPK_W2_LL_BATCH && ll_route != nullptr;
+  if (!seg_in_quant && threadIdx.x < NSEG_P) {
     int const s = seg_base + threadIdx.x;
     int e;
     if (MPK_MOE_BS1_DECODE && ll_route != nullptr) {
@@ -3810,7 +3953,13 @@ __device__ __noinline__ void
       s_tok_fp8,
       s_tok_scales,
       ll_route,
-      ll_epoch);
+      ll_epoch,
+      seg_in_quant ? s_seg_off : nullptr,
+      static_cast<uint32_t>(EXPERT_BYTES));
+  // Trace stamps 57/58: W2 activations staged, k-loop and atomics issued.
+  if (threadIdx.x == 0) {
+    mpk_stage_stamp(57);
+  }
 
   int const tid = threadIdx.x;
   int const warp_id = tid >> 6;
@@ -3844,6 +3993,9 @@ __device__ __noinline__ void
     }
   }
   __syncthreads();
+  if (tid == 0) {
+    mpk_stage_stamp(58);
+  }
 
   if constexpr (FOLD_NPEER > 0) {
     static_assert(EXPERT_WGS % 8 == 0,

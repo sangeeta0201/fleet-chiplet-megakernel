@@ -98,8 +98,26 @@ __global__ void __launch_bounds__(256, 1)
       input, weight, routing, mask, out, blockIdx.x, routing_weight);
 }
 
+// MPK_ROUTE_LL: the expert ids and routing weights as epoch-tagged words, as
+// the fused layer's TopK publishes them.
+template <int OPW, int I_LOCAL, int NSEG, int KP>
+__global__ void __launch_bounds__(256, 1)
+    run_w2_tp_ll(void const *input,
+                 void const *weight,
+                 void const *routing,
+                 void const *mask,
+                 void *out,
+                 void const *routing_weight,
+                 unsigned long long const *ll,
+                 unsigned epoch) {
+  gang_moe_w2_tp_linear_mxfp8_kernel<1, HIDDEN, I_LOCAL, NUM_EXPERTS, NUM_TOPK,
+                                     OPW, /*WEIGHT_FP4=*/true, NSEG, KP>(
+      input, weight, routing, mask, out, blockIdx.x, routing_weight,
+      GangW2FoldPush{}, ll, epoch);
+}
+
 template <int OPW, int I_LOCAL, int NSEG, int KP = 1>
-static bool run_case(int n_live, uint32_t seed) {
+static bool run_case(int n_live, uint32_t seed, bool ll = false) {
   constexpr int ROW_BYTES = I_LOCAL / 2; // MXFP4
   constexpr int BLK32 = I_LOCAL / 32;
   constexpr int WGS = HIDDEN / OPW;
@@ -232,9 +250,30 @@ static bool run_case(int n_live, uint32_t seed) {
   HIP_CHECK(hipMemset(d_out, 0, HIDDEN * 4));
 
   constexpr int SMEM = NSEG * I_LOCAL + NSEG * I_LOCAL / 128 + 256;
-  run_w2_tp<OPW, I_LOCAL, NSEG, KP><<<dim3((WGS * KP + 7) / 8, 8), 256,
-                                      SMEM>>>(
-      d_in, d_w, d_route, d_mask, d_out, d_rw);
+  unsigned long long *d_ll = nullptr;
+  if (ll) {
+    // Ids at [s], weights at [16 + s]; the plain weights are zeroed so a
+    // kernel that reads them instead produces all-zero rows.
+    constexpr unsigned EPOCH = 0x5a5au;
+    std::vector<unsigned long long> words(32, 0ull);
+    for (int k = 0; k < n_live; k++) {
+      uint32_t wbits;
+      memcpy(&wbits, &rw[k], 4);
+      words[k] = ((unsigned long long)EPOCH << 32) | (uint32_t)experts[k];
+      words[16 + k] = ((unsigned long long)EPOCH << 32) | wbits;
+    }
+    HIP_CHECK(hipMalloc(&d_ll, words.size() * 8));
+    HIP_CHECK(hipMemcpy(d_ll, words.data(), words.size() * 8,
+                        hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemset(d_rw, 0, rw.size() * 4));
+    run_w2_tp_ll<OPW, I_LOCAL, NSEG, KP><<<dim3((WGS * KP + 7) / 8, 8), 256,
+                                           SMEM>>>(
+        d_in, d_w, d_route, d_mask, d_out, d_rw, d_ll, EPOCH);
+  } else {
+    run_w2_tp<OPW, I_LOCAL, NSEG, KP><<<dim3((WGS * KP + 7) / 8, 8), 256,
+                                        SMEM>>>(
+        d_in, d_w, d_route, d_mask, d_out, d_rw);
+  }
   HIP_CHECK(hipGetLastError());
   HIP_CHECK(hipDeviceSynchronize());
   std::vector<float> out(HIDDEN);
@@ -252,9 +291,10 @@ static bool run_case(int n_live, uint32_t seed) {
   }
   bool const pass = (bad == 0);
   int const show = worst_n >= 0 ? worst_n : HIDDEN - 1;
-  printf("[%s] OPW=%d I_LOCAL=%d NSEG=%d KP=%d n_live=%d seed=%u  worst rel %.3e  row %d: gpu %.6f "
+  printf("[%s] OPW=%d I_LOCAL=%d NSEG=%d KP=%d n_live=%d seed=%u%s  worst rel %.3e  row %d: gpu %.6f "
          "ref %.6f (sum|p| %.1f)  bad rows %d/%d\n",
-         pass ? "PASS" : "FAIL", OPW, I_LOCAL, NSEG, KP, n_live, seed, worst,
+         pass ? "PASS" : "FAIL", OPW, I_LOCAL, NSEG, KP, n_live, seed,
+         ll ? " ll" : "", worst,
          show, out[show],
          ref[show], mag[show], bad, HIDDEN);
   HIP_CHECK(hipFree(d_in));
@@ -263,6 +303,9 @@ static bool run_case(int n_live, uint32_t seed) {
   HIP_CHECK(hipFree(d_mask));
   HIP_CHECK(hipFree(d_out));
   HIP_CHECK(hipFree(d_rw));
+  if (d_ll != nullptr) {
+    HIP_CHECK(hipFree(d_ll));
+  }
   return pass;
 }
 
@@ -292,6 +335,13 @@ int main() {
   if (ALL) {
     ok &= run_case<64, 1024, 9>(4, 7);
   }
+#if MPK_MOE_BS1_DECODE
+  // Routing words instead of routing_indices / routing_weight: the padded
+  // tenth segment, two reduction parts, and the 2-rank shape.
+  ok &= run_case<64, 256, 10>(9, 11, true);
+  ok &= run_case<64, 256, 10, 2>(9, 12, true);
+  ok &= run_case<128, 1024, 9>(9, 13, true);
+#endif
   printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;
 }

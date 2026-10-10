@@ -366,7 +366,7 @@ __device__ __forceinline__ T ld_g(void const *p) {
   return *(__attribute__((address_space(1))) T const *)q;
 }
 
-#if MPK_MLA_DECODE_DMA_PF || MPK_MLA_DECODE_BATCH
+#if MPK_MLA_DECODE_DMA_PF || MPK_MLA_DECODE_BATCH || MPK_DEC_PRELOAD
 typedef int __attribute__((ext_vector_type(4))) mla_i32x4_t;
 
 // Raw buffer V# over [base, base + range_bytes), wave-uniform.
@@ -902,7 +902,10 @@ __device__ __noinline__ void
                         // rest are computed (the MFMA is 16 rows either way)
                         // and dropped. See MPK_MLA_MERGE_OWN_HEADS.
                         int out_head_lo = 0,
-                        int out_heads = 16) {
+                        int out_heads = 16,
+                        // The chunk's first tile is already in lds_kv, full
+                        // (MPK_DEC_PRELOAD); trip 0 skips its load.
+                        bool tile0_in_lds = false) {
   using bf16 = __hip_bfloat16;
   using gang_mla_decode_detail::__ldg_bf16x4_raw;
   using gang_mla_decode_detail::bf16x4_t;
@@ -1096,6 +1099,11 @@ __device__ __noinline__ void
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   unsigned long long _d_t1 = __builtin_amdgcn_s_memrealtime();
 #endif
+  // Trace stamps 46..50 split the decode item: indptrs read and chunk
+  // partitioned, Q issued, first KV tile in LDS, loop done, output issued.
+  if (tid == 0) {
+    mpk_stage_stamp(46);
+  }
 
   // Q first, then one KV tile per loop trip from HBM.
   __bf16 qr[NUM_K32][8];
@@ -1129,6 +1137,9 @@ __device__ __noinline__ void
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   unsigned long long _d_t2 = __builtin_amdgcn_s_memrealtime();
 #endif
+  if (tid == 0) {
+    mpk_stage_stamp(47);
+  }
 
 #if MPK_MLA_DECODE_DMA_PF
   static_assert(PAGE_SIZE % KV_TILE == 0,
@@ -1237,7 +1248,8 @@ __device__ __noinline__ void
       // and does not wait lgkmcnt. Do not put vmcnt(0) inside the my_tok <
       // tile_len branch: that wait is divergent on a partial tile and hangs
       // the fused kernel from the first prefill step.
-      if (my_tok < tile_len) {
+      if (tile0_in_lds && t == 0) {
+      } else if (my_tok < tile_len) {
         long const row = get_kv_row(kv_start + tile_start + my_tok);
 #pragma unroll
         for (int r = 0; r < LDG_PER_TILE; r++) {
@@ -1262,6 +1274,9 @@ __device__ __noinline__ void
     }
     mla_tile_bar();
 #endif
+    if (tid == 0 && t == 0) {
+      mpk_stage_stamp(48);
+    }
 
 #if MPK_MLA_DECODE_DMA_PF
     // Every wave is past trip t - 1, so the other buffer is free. Only full
@@ -1434,6 +1449,9 @@ __device__ __noinline__ void
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   unsigned long long _d_t3 = __builtin_amdgcn_s_memrealtime();
 #endif
+  if (tid == 0) {
+    mpk_stage_stamp(49);
+  }
 
   // ===== Output =====
   // l_head lives on the kgrp lanes; fold them into one value per q head.
@@ -1552,6 +1570,9 @@ __device__ __noinline__ void
     }
   }
 
+  if (tid == 0) {
+    mpk_stage_stamp(50);
+  }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   if (tid == 0 && g_subphase_active) {
     unsigned long long _d_t4 = __builtin_amdgcn_s_memrealtime();
@@ -1614,7 +1635,10 @@ __device__ __noinline__ void
                            int tile_idx,
                            float scale_s,
                            int out_head_lo = 0,
-                           int out_heads = 16) {
+                           int out_heads = 16,
+                           // MPK_DEC_PRELOAD: the caller already DMA'd this
+                           // chunk's first tile, full, into lds_kv.
+                           bool tile0_in_lds = false) {
   if (tile_idx >= total_work_items) {
     return;
   }
@@ -1654,7 +1678,8 @@ __device__ __noinline__ void
                                        kv_chunk_idx,
                                        scale_s,
                                        out_head_lo,
-                                       out_heads);
+                                       out_heads,
+                                       tile0_in_lds);
 }
 
 } // namespace kernel

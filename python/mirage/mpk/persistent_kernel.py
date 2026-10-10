@@ -1604,6 +1604,18 @@ def get_compile_command(
             # Raw stage-stamp trace of a few decode iterations (mpk_atoms.cuh),
             # dumped to MPK_TRACE_OUT.rank<r>.bin.
             "MPK_TRACE",
+            # TP W2 staging: routing words on the activations' wait
+            # (gang_moe_linear_mxfp8_mi300.cuh).
+            "MPK_W2_LL_BATCH",
+            # W_UK weight into L2 across Phase 3b's barrier
+            # (gang_mla_attn_fused_mi300.cuh).
+            "MPK_WUK_PF",
+            # Decode items on the workers past q_b's tiles
+            # (gang_mla_attn_fused_mi300.cuh).
+            "MPK_DEC_REMAP",
+            "MPK_DEC_PRELOAD",
+            "MPK_W13_ACT_EARLY",
+            "MPK_W2_EARLY_PF",
             # Ceiling probes, wrong output (gang_mla_attn_fused_mi300.cuh).
             "MPK_ATTN_PROBE_NOQBWAIT",
             "MPK_ATTN_PROBE_NODECWAIT",

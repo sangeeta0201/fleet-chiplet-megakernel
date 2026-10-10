@@ -1246,6 +1246,33 @@ __device__ __forceinline__ bool
 #define MPK_ROUTE_LL_ON (MPK_ROUTE_LL && MPK_MOE_BS1_DECODE && MPK_MOE_TP)
 // MPK_TOPK_PAD_NS: pricing probe, correct output. Delays the K-split TopK's
 // routing release by this many ns on every rank and layer.
+// MPK_WUK_PF: the W_UK workers pull their tile's weight into L2 while they
+// wait at Phase 3b's XCD barrier (gang_mla_attn_fused_mi300.cuh). The
+// MPK_TRACE profile puts the W_UK step at ~3 us behind that barrier.
+// MPK_DEC_REMAP: the head-local decode items on the workers past q_b's tiles,
+// which skip Phase 3b's wait (gang_mla_attn_fused_mi300.cuh).
+#ifndef MPK_DEC_REMAP
+#define MPK_DEC_REMAP 0
+#endif
+// MPK_DEC_PRELOAD: the decode worker DMAs its item's first full KV tile into
+// the decode's LDS tile buffer during the q_b -> decode wait.
+#ifndef MPK_DEC_PRELOAD
+#define MPK_DEC_PRELOAD 0
+#endif
+// MPK_W13_ACT_EARLY: the W13 workers quantize the normed row into LDS while
+// the TopK selects (gang_oproj_router_fused_mi300.cuh).
+#ifndef MPK_W13_ACT_EARLY
+#define MPK_W13_ACT_EARLY 0
+#endif
+// MPK_W2_EARLY_PF: the TP W2 workers pull their tile's weight into L2
+// across the W13 -> W2 wait (gang_oproj_router_fused_mi300.cuh).
+#ifndef MPK_W2_EARLY_PF
+#define MPK_W2_EARLY_PF 0
+#endif
+#ifndef MPK_WUK_PF
+#define MPK_WUK_PF 0
+#endif
+
 #ifndef MPK_TOPK_PAD_NS
 #define MPK_TOPK_PAD_NS 0
 #endif
@@ -1865,7 +1892,7 @@ __device__ __forceinline__ void mpk_stage_stamp(int idx) {
     return;
   }
   unsigned int const w = blockIdx.x;
-  if (w >= MPK_STAGE_WORKERS) {
+  if (w >= MPK_STAGE_WORKERS || idx >= MPK_STAGE_SLOTS) {
     return;
   }
   unsigned int const p = w * MPK_STAGE_SLOTS + (unsigned int)idx;
@@ -1910,7 +1937,8 @@ __device__ __forceinline__ void mpk_stage_stamp(int idx) {
 #endif
 #define MPK_TRACE_ITERS 4
 #define MPK_TRACE_LAYERS 80
-#define MPK_STAGE_SLOTS 46
+// 46 shared with MPK_BAR_SKEW, then trace-only sub-phase stamps 46..63.
+#define MPK_STAGE_SLOTS 64
 #define MPK_STAGE_WORKERS 512
 #define MPK_TRACE_WORDS                                                        \
   ((size_t)MPK_TRACE_ITERS * MPK_TRACE_LAYERS * MPK_STAGE_SLOTS *              \

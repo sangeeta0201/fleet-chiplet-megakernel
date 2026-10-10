@@ -2352,6 +2352,46 @@ __device__ __attribute__((always_inline)) void
   // scratch, which is disjoint from its inputs, so the body is idempotent.
   // W2 cannot take this probe -- its epilogue f32-atomicAdds into the
   // residual workspace, so a second pass would double the layer output.
+  // MPK_W13_ACT_EARLY: the activation W13 quantizes is the normed row, final
+  // once this XCD's 16 normed-slice flags are up -- ~3 us before the TopK
+  // publishes the routes the W13 tile waits on (MPK_TRACE: router worker
+  // slice done -> route word seen, median 3.3 us). Quantize it into s_tok_fp8
+  // inside that wait. Not on the TopK's worker, whose LDS the TopK owns.
+  bool w13_staged = false;
+#if MPK_W13_ACT_EARLY
+  if constexpr (BATCH_SIZE == 1) {
+    if (ll_route != nullptr && xcd_rank < moe_w13_live &&
+        xcd_rank != router_tile_n) {
+      if (tid < 64) {
+        unsigned const *const ks_flag = reinterpret_cast<unsigned const *>(
+            router_xsplit_ptr + xcd_id * MPK_XSPLIT_XCD_INTS);
+        unsigned const want = static_cast<unsigned>(routing_expected);
+        while (true) {
+          unsigned seen = want;
+          if (tid < 16) {
+            asm volatile("global_load_dword %0, %1, off nt\n"
+                         "s_waitcnt vmcnt(0)"
+                         : "=v"(seen)
+                         : "v"(ks_flag + tid)
+                         : "memory");
+          }
+          if (__ballot(seen >= want) == ~0ull) {
+            break;
+          }
+          __builtin_amdgcn_s_sleep(1);
+        }
+      }
+      __syncthreads();
+      asm volatile("buffer_inv" ::: "memory");
+      extern __shared__ char _w13_stage_smem[];
+      _gang_wave_parallel_fp8_quant<HIDDEN_SIZE>(
+          static_cast<unsigned short const *>(norm_output_ptr),
+          reinterpret_cast<uint8_t *>(_w13_stage_smem),
+          reinterpret_cast<uint8_t *>(_w13_stage_smem) + HIDDEN_SIZE);
+      w13_staged = true;
+    }
+  }
+#endif
 #pragma unroll 1
   for (int _w13rep = 0; _w13rep < MPK_W13_REPS; ++_w13rep)
   for (int t = xcd_rank; t < moe_w13_live; t += tiles_per_xcd) {
@@ -2383,7 +2423,8 @@ __device__ __attribute__((always_inline)) void
         moe_swiglu_out_ptr,
         t,
         ll_route,
-        (unsigned)routing_expected);
+        (unsigned)routing_expected,
+        w13_staged && t == xcd_rank && _w13rep == 0);
   }
 
 #if MPK_MOE_SHADOW_KB > 0
@@ -2648,6 +2689,25 @@ __device__ __attribute__((always_inline)) void
   if (xcd_rank >= moe_w2_tiles_per_xcd) {
     return;
   }
+#if MPK_W2_EARLY_PF && MPK_MOE_TP
+  // MPK_W2_EARLY_PF: this worker's W2 tile weight into L2 during the wait;
+  // see _gang_w2_tp_l2_prefetch. The W13-idle workers get here during W13.
+  if (MPK_MOE_BS1_DECODE && ll_route != nullptr && xcd_rank < moe_w2_live) {
+    constexpr int PF_SEG_KT = MOE_INTERMEDIATE / 128;
+    constexpr int PF_SEG_ROUND =
+        (MPK_MOE_TP_W2_KPARTS > 1)
+            ? MPK_MOE_TP_W2_KPARTS * (PF_SEG_KT % 2 == 0 ? 1 : 2)
+            : ((PF_SEG_KT % 4 == 0)   ? 1
+               : (PF_SEG_KT % 2 == 0) ? 2
+                                      : 4);
+    constexpr int PF_NSEG =
+        (MOE_NUM_TOPK + PF_SEG_ROUND - 1) / PF_SEG_ROUND * PF_SEG_ROUND;
+    _gang_w2_tp_l2_prefetch<HIDDEN_SIZE, MOE_INTERMEDIATE, MOE_NUM_TOPK,
+                            MOE_W2_OPW, MOE_WEIGHT_FP4, PF_NSEG,
+                            MPK_MOE_TP_W2_KPARTS>(
+        moe_down_weight_ptr, xcd_rank, ll_route, (unsigned)routing_expected);
+  }
+#endif
   if (w13_tagged) {
     tag_bar_wait_site(w13_tags, tiles_per_xcd * 8, w13_expected, tid, xcd_id,
                       xcd_rank);

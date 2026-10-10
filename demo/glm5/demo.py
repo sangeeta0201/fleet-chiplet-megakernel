@@ -1966,7 +1966,21 @@ if __name__ == "__main__":
         # unpadded and 8-aligned: q_b's per-XCD column chunk and W_UK's per-XCD
         # tile run have to land on the same eight heads, which is what lets
         # Phase 3b's barrier stay XCD-local.
+        # GLM_QB_ABS_TP: W_UK absorbed back into q_b, but head-sharded as the
+        # un-absorbed form is. The trade that un-absorbing won was 72 absorbed
+        # tiles per XCD against 29 workers; sharded, an XCD owns one head, so
+        # absorbed it is nine tiles in one round and Phase 3b -- the W_UK
+        # GEMV and the XCD barrier ahead of it -- goes away, for +4.6 MB of
+        # q_b weight per rank per layer.
+        # MEASURED SLOWER 2026-10-10, NP=8 1024/1024, dense-fused default:
+        # 5.183 ms against ~5.10. The absorbed tile cannot go below the rope
+        # width (64 columns, 131 KB a tile) with no barrier to defer the
+        # rotation past, where the un-absorbed q_b runs 16-column K-parallel
+        # tiles of 33 KB; the slower q_b tile and the extra bytes outweigh
+        # the W_UK stage (~3 us + its barrier in the MPK_TRACE profile). Off.
+        QB_ABS_TP = os.environ.get("GLM_QB_ABS_TP", "0") == "1"
         UNABSORB_K = (int(os.environ.get("GLM_UNABSORB_QB", "1")) == 1
+                      and not QB_ABS_TP
                       and QB_MXFP8
                       and qk_nope < kv_lora
                       and num_heads == num_heads_pad
@@ -2133,7 +2147,7 @@ if __name__ == "__main__":
             _hl_chunks_ok = (
                 os.environ.get("MPK_MLA_HEAD_LOCAL", "1") != "0"
                 and moe_ep and world_size > 1 and FUSE_FULL_LAYER
-                and UNABSORB_K
+                and (UNABSORB_K or QB_ABS_TP)
                 and int(os.environ.get("GLM_QB_TP", "1")) == 1
                 and args.max_num_batched_tokens == 1
                 and int(os.environ.get("GLM_MLA_PAIR_MERGE", "0")) == 0)
@@ -2744,14 +2758,25 @@ if __name__ == "__main__":
         # 0 at 8 heads. Phase 5 onwards still sees all 64.
         qb_tp = (int(os.environ.get("GLM_QB_TP", "1")) == 1
                  and moe_ep and world_size > 1
-                 and FUSE_FULL_LAYER and UNABSORB_K
+                 and FUSE_FULL_LAYER and (UNABSORB_K or QB_ABS_TP)
                  # One whole head per (rank, XCD), at minimum.
                  and num_heads % (world_size * 8) == 0
-                 and (num_heads // world_size) * qb_nope_span
+                 and num_heads == num_heads_pad
+                 and (num_heads // world_size)
+                 * (qb_nope_span if UNABSORB_K else qk_dim)
                  % GANG_OUT_ALIGN == 0
                  # W_UK's tiles have to stay a whole number per XCD too.
-                 and ((num_heads // world_size) * kv_lora
-                      // WUK_GEMV_ROWS) % 8 == 0)
+                 and (not UNABSORB_K
+                      or ((num_heads // world_size) * kv_lora
+                          // WUK_GEMV_ROWS) % 8 == 0))
+        # The absorbed shard has no W_UK stage to push the peers' query heads
+        # from, so it only runs under the head-local decode (which reads its
+        # own heads alone); the kernel traps otherwise.
+        assert not (QB_ABS_TP and qb_tp) or (
+            os.environ.get("MPK_MLA_HEAD_LOCAL", "1") != "0"
+            and args.max_num_batched_tokens == 1
+            and int(os.environ.get("GLM_MLA_PAIR_MERGE", "0")) == 0), (
+            "GLM_QB_ABS_TP needs the head-local decode")
         # Past 32 chunks only the head-local decode keeps the decode inside one
         # round per XCD; the replicated one wedged there. Fail here instead.
         if num_kv_chunks > 32:
@@ -3096,7 +3121,7 @@ if __name__ == "__main__":
             # gang_mla_full_layer_fused_mi300.cuh.
             (((218 + 4 * 24 + 4 * 16 + 8 * 32 + 9 + 1 + 8 * 194 + 32 + 8 * 36
                + 8 * 194 + 8 * 48)
-              if UNABSORB_K
+              if UNABSORB_K or QB_ABS_TP
               else 106 if UNABSORB_V else 96) * 16,),
             torch_dtype=torch.int32)
         # ── the EP exchange buffers ──────────────────────────────────────
@@ -3762,7 +3787,14 @@ if __name__ == "__main__":
                     attn.q_b_proj.weight.data, attn._w_uk,
                     num_heads, qk_nope, qk_rope, q_lora).to(torch.bfloat16)
                 q_b_w = pad_cols(q_b_w, q_lora_pad)
-                q_b_w = pad_rows(q_b_w, qb_out_width)
+                if QB_ABS_TP and qb_tp and fuse_full_layer:
+                    # This rank's heads, head-major over the 576-wide span:
+                    # one contiguous block, one head per XCD.
+                    q_b_w = q_b_w[rank * qb_tp_heads * qk_dim:
+                                  (rank + 1) * qb_tp_heads * qk_dim,
+                                  :].contiguous()
+                else:
+                    q_b_w = pad_rows(q_b_w, qb_out_width)
                 w_wuk = None
             # Absorbed q_b's 576-wide head span is only divisible by the rope
             # width, so only the un-absorbed layers get the wider tile. See

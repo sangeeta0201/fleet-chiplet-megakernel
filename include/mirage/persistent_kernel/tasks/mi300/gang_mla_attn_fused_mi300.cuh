@@ -436,10 +436,12 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   constexpr int QB_TP_HEADS =
       (EP_WORLD_SIZE > 1) ? (NUM_Q_HEADS / EP_WORLD_SIZE) : NUM_Q_HEADS;
   constexpr int QB_NPEER = (EP_WORLD_SIZE > 1) ? (EP_WORLD_SIZE - 1) : 1;
-  bool const qb_tp = UNABSORB_K && (EP_WORLD_SIZE > 1) &&
-                     (ep_signal_ptr != nullptr) &&
+  // Absorbed (GLM_QB_ABS_TP), a head is QB_QK_DIM wide and there is no
+  // W_UK stage: the per-XCD head's nine q_b tiles write the query row itself.
+  constexpr int QB_SPAN = UNABSORB_K ? QB_HEAD_SPAN : QB_QK_DIM;
+  bool const qb_tp = (EP_WORLD_SIZE > 1) && (ep_signal_ptr != nullptr) &&
                      (qb_n_wgs_per_xcd * QB_OUTPUT_PER_WG * 8 ==
-                      QB_TP_HEADS * QB_HEAD_SPAN);
+                      QB_TP_HEADS * QB_SPAN);
   // Both scratch rows stay declared at the full 64 heads; only the weights are
   // sliced, so every offset this rank touches is its own head base plus the
   // per-XCD offset the replicated form already used.
@@ -469,12 +471,28 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   constexpr int HL_GROUPS = (QB_TP_HEADS >= 16) ? QB_TP_HEADS / 16 : 1;
   bool const head_local =
       MPK_MLA_HEAD_LOCAL && qb_tp && !PAIR_MERGE && BATCH_SIZE == 1;
+  // The peers' query heads are pushed from the W_UK stage, which the absorbed
+  // shard does not have; only the head-local decode, which never reads them,
+  // can run it.
+  if (qb_tp && !UNABSORB_K && !head_local) {
+    __builtin_trap();
+  }
   int const hl_g0 = qb_head_base / 16;
   // Items per XCD round up: short-sequence builds use chunk counts like 17,
   // and the tail XCDs skip the indices past the end.
   constexpr int HL_DEC_ITEMS = HL_GROUPS * NUM_KV_CHUNKS;
   constexpr int HL_MRG_ITEMS = HL_GROUPS * MERGE_DIM_SPLITS;
   int const dec_tiles = head_local ? (HL_DEC_ITEMS + 7) / 8 : mla_tiles_per_xcd;
+  // MPK_DEC_REMAP: the decode items run on the workers past q_b's tiles
+  // instead of ranks 0.., which are also the W_UK workers -- the last to
+  // reach the q_b -> decode barrier, so MPK_ATTN_META_PF's prologue walk had
+  // nothing to hide under. Those workers also skip Phase 3b's XCD wait (they
+  // have no W_UK tile), so the walk runs across q_b and W_UK.
+  int const dec_base = (MPK_DEC_REMAP && head_local &&
+                        qb_tiles_per_xcd + dec_tiles <= tiles_per_xcd)
+                           ? qb_tiles_per_xcd
+                           : 0;
+  int const dec_rank = xcd_rank - dec_base;
   int const mrg_tiles = head_local ? (HL_MRG_ITEMS + 7) / 8 : merge_tiles_per_xcd;
   // MPK_MLA_MERGE_OWN_HEADS: below 16 heads per rank the head-local group's
   // other heads are a partner rank's, decoded from a stale query row and
@@ -1019,7 +1037,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     unsigned short *xcd_q_ws =
         static_cast<unsigned short *>(UNABSORB_K ? q_nope_ptr
                                                  : q_workspace_ptr) +
-        static_cast<size_t>(qb_head_base) * QB_HEAD_SPAN +
+        static_cast<size_t>(qb_head_base) * QB_SPAN +
         static_cast<size_t>(xcd_id) * qb_n_wgs_per_xcd * QB_OUTPUT_PER_WG;
     gang_rmsnorm_linear_mxfp8_bias_mla_kvupd_kernel<BATCH_SIZE,
                                                     QB_OUTPUT_PER_WG,
@@ -1110,6 +1128,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     constexpr int TILES_PER_HEAD = KV_LORA_RANK / WUK_ROWS_PER_WG;
     constexpr int QK_DIM_ = KV_LORA_RANK + QK_ROPE_HEAD_DIM;
 
+    // Trace stamps 51/52/53: q_b tiles done, W_UK barrier passed, W_UK done.
+    if (tid == 0) {
+      mpk_stage_stamp(51);
+    }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     // Close [2] here so it stays "q_b" and [7] is "W_UK + its barrier". Phase
     // 4 still adds to [2] below; with this path on, what it adds is the
@@ -1126,6 +1148,33 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
 
     __syncthreads();
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#if MPK_WUK_PF
+    // MPK_WUK_PF: the W_UK tile's weight does not depend on q_nope, so waves
+    // 1-3 pull it into L2 while wave 0 arrives and polls; the __syncthreads
+    // after the wait retires it. Same never-read LDS window as the decode's
+    // prologue prefetch, which is not live until Phase 4.
+    if (xcd_rank < wuk_tiles_per_xcd && tid >= 64) {
+      constexpr int WUK_WG_BYTES =
+          WUK_ROWS_PER_WG * (QK_NOPE_HEAD_DIM + QK_NOPE_HEAD_DIM / 32);
+      extern __shared__ char _wpf_smem[];
+      i32x4_t const rsrc = make_w_buffer_rsrc(
+          static_cast<char const *>(wuk_weight_ptr) +
+              static_cast<size_t>(xcd_rank) * WUK_WG_BYTES,
+          WUK_WG_BYTES);
+      auto *dst = (__attribute__((address_space(3))) uint32_t *)(
+          _wpf_smem + 140 * 1024 + ((tid >> 6) - 1) * 1024);
+      int voff = (tid - 64) * 16;
+      constexpr int LAST = WUK_WG_BYTES - 16;
+      constexpr int N = (WUK_WG_BYTES + 192 * 16 - 1) / (192 * 16);
+#pragma unroll
+      for (int i = 0; i < N; i++) {
+        int const v = voff < LAST ? voff : LAST;
+        __llvm_amdgcn_raw_buffer_load_lds(rsrc, dst, 16, v, 0, 0, 1);
+        voff += 192 * 16;
+        asm volatile("" : "+v"(voff) : : "memory");
+      }
+    }
+#endif
     if (tid == 0) {
       int *const _cnt = &wuk_barrier[xcd_id * HIER_STRIDE + 8];
       int *const _flag = &wuk_barrier[xcd_id * HIER_STRIDE];
@@ -1141,7 +1190,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
       MPK_WS_WAIT_BEGIN(768, wuk_expected_in);
       int _spins = 0;
       int _obs;
-      while ((_obs = ld_nt_s32(_flag)) < wuk_expected_in) {
+      // Under MPK_DEC_REMAP a worker with no W_UK tile arrives and goes on:
+      // nothing past this barrier reads q_nope except the W_UK tiles.
+      bool const wuk_wait = dec_base == 0 || xcd_rank < wuk_tiles_per_xcd;
+      while (wuk_wait && (_obs = ld_nt_s32(_flag)) < wuk_expected_in) {
         ++_spins;
         MPK_WS_WAIT_TICK(_obs, _spins);
         if ((_spins & (MPK_FL_REPUBLISH_SPINS - 1)) == 0) {
@@ -1155,6 +1207,9 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     }
     __syncthreads();
     asm volatile("buffer_inv" ::: "memory");
+    if (tid == 0) {
+      mpk_stage_stamp(52);
+    }
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     // [7] above is "W_UK + its barrier", which is not enough to tell an
@@ -1483,7 +1538,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
 #ifndef MPK_ATTN_PROBE_NODECWAIT
 #define MPK_ATTN_PROBE_NODECWAIT 0
 #endif
-  if (xcd_rank < dec_tiles) {
+  if (dec_rank >= 0 && dec_rank < dec_tiles) {
+    // MPK_DEC_PRELOAD: this item's first KV tile went into the decode's own
+    // LDS tile buffer below, so its trip 0 skips the load.
+    bool pre0 = false;
 #if MPK_ATTN_META_PF
     // MPK_ATTN_META_PF: the decode's prologue is a chain of dependent loads
     // -- qo/kv_indptr and last_page_len, then kv_indices for the page, then
@@ -1491,8 +1549,9 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     // walk the same chain while wave 0 polls, so after the release every
     // link is an L2 hit. Rows go to a never-read LDS window past the
     // decode's own (KV tile + o_acc, ~50 KB).
-    if (head_local && tid >= 64 && kv_cache_ptr != nullptr) {
-      int const hl_item = xcd_id * dec_tiles + xcd_rank;
+    if (head_local && (MPK_DEC_PRELOAD || tid >= 64) &&
+        kv_cache_ptr != nullptr) {
+      int const hl_item = xcd_id * dec_tiles + dec_rank;
       if (hl_item < HL_DEC_ITEMS) {
         int const chunk = hl_item / HL_GROUPS;
         int const req = request_id;
@@ -1514,24 +1573,52 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
           if (ntok > PAGE_SIZE - tok0 % PAGE_SIZE) {
             ntok = PAGE_SIZE - tok0 % PAGE_SIZE;
           }
-          uint32_t const bytes =
-              (uint32_t)ntok * (uint32_t)KV_CACHE_STRIDE * 2u;
-          char const *const base =
+          // Not the current token's row: Phase 3's tile 0 appends it, and
+          // only the barrier this walk runs ahead of orders that store.
+          if (tok0 + ntok > seqlen - 1) {
+            ntok = seqlen - 1 - tok0;
+          }
+          char const *base =
               static_cast<char const *>(kv_cache_ptr) +
               ((size_t)pid * PAGE_SIZE + tok0 % PAGE_SIZE) *
                   (size_t)KV_CACHE_STRIDE * 2;
           extern __shared__ char _dpf_smem[];
-          i32x4_t const rsrc = make_w_buffer_rsrc(base, bytes);
-          auto *dst = (__attribute__((address_space(3))) uint32_t *)(
-              _dpf_smem + 140 * 1024 + ((tid >> 6) - 1) * 1024);
-          int voff = (tid - 64) * 16;
-          int const last = (int)bytes - 16;
-          int const n = ((int)bytes + 192 * 16 - 1) / (192 * 16);
-          for (int i = 0; i < n; i++) {
-            int const v = voff < last ? voff : last;
-            __llvm_amdgcn_raw_buffer_load_lds(rsrc, dst, 16, v, 0, 0, 1);
-            voff += 192 * 16;
-            asm volatile("" : "+v"(voff) : : "memory");
+#if MPK_DEC_PRELOAD
+          // ntok is clamped to the page and short of the current row, so 16
+          // or more means the decode's trip 0 is a full tile of rows that are
+          // final. All four waves DMA it -- wave 0 before it polls -- and the
+          // __syncthreads after the release retires it.
+          static_assert(KV_CACHE_STRIDE == KV_LORA_RANK + QK_ROPE_HEAD_DIM,
+                        "the tile is the cache rows verbatim");
+          pre0 = ntok >= 16;
+          if (pre0) {
+            unsigned const wid = __builtin_amdgcn_readfirstlane(tid >> 6);
+            gang_mla_decode_detail::mla_dma_tile(
+                gang_mla_decode_detail::mla_buffer_rsrc(
+                    base, 16u * (unsigned)KV_CACHE_STRIDE * 2u),
+                __builtin_amdgcn_readfirstlane(static_cast<unsigned>(
+                    reinterpret_cast<uintptr_t>(_dpf_smem))) +
+                    wid * 1024u,
+                static_cast<unsigned>(tid) * 16u, wid < 2u);
+            base += 16 * (size_t)KV_CACHE_STRIDE * 2;
+            ntok -= 16;
+          }
+#endif
+          uint32_t const bytes =
+              (uint32_t)ntok * (uint32_t)KV_CACHE_STRIDE * 2u;
+          if (tid >= 64 && bytes > 0) {
+            i32x4_t const rsrc = make_w_buffer_rsrc(base, bytes);
+            auto *dst = (__attribute__((address_space(3))) uint32_t *)(
+                _dpf_smem + 140 * 1024 + ((tid >> 6) - 1) * 1024);
+            int voff = (tid - 64) * 16;
+            int const last = (int)bytes - 16;
+            int const n = ((int)bytes + 192 * 16 - 1) / (192 * 16);
+            for (int i = 0; i < n; i++) {
+              int const v = voff < last ? voff : last;
+              __llvm_amdgcn_raw_buffer_load_lds(rsrc, dst, 16, v, 0, 0, 1);
+              voff += 192 * 16;
+              asm volatile("" : "+v"(voff) : : "memory");
+            }
           }
         }
       }
@@ -1608,7 +1695,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     // attribution is wrong the same way the W13->W2 barrier's was, and
     // widening the decode (more kv chunks, more q groups) cannot pay.
 #ifndef MPK_MLA_SKIP_DECODE
-    for (int t = xcd_rank; t < dec_tiles; t += tiles_per_xcd) {
+    for (int t = dec_rank; t < dec_tiles; t += tiles_per_xcd) {
       // Under PAIR_MERGE this XCD owns chunks [pair_half * mla_tiles_per_xcd,
       // +mla_tiles_per_xcd) of q_group pair_id, and the decode kernel wants
       // chunk * NUM_Q_GROUPS + q_group. Still a bijection onto
@@ -1655,7 +1742,8 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
           decode_item,
           scale_s,
           own_head_lo,
-          MRG_HEADS);
+          MRG_HEADS,
+          pre0 && t == dec_rank);
     }
 #endif
 #ifdef MPK_ENABLE_SUBPHASE_TIMING

@@ -2691,6 +2691,12 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
           input_row);
     }
   }
+  // Trace stamp 54: row resolved and normalized, the GEMV about to start.
+  // FUSE_RESADD is qkv_a's resolve; q_b runs this body too and must not
+  // overwrite the slot.
+  if (FUSE_RESADD && threadIdx.x == 0) {
+    mpk_stage_stamp(54);
+  }
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   // Split the prologue: everything above is the residual resolve, the LDS
