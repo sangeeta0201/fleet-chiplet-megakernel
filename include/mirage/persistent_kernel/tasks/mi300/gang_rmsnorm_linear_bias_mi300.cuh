@@ -991,8 +991,9 @@ __device__ __attribute__((noinline)) void
       num_shared_experts,
       ll_route,
       epoch,
-      MPK_TOPK_RANK ? reinterpret_cast<unsigned *>(_topk_rank_smem + 2048)
-                    : nullptr);
+      (MPK_TOPK_RANK || MPK_TOPK_THRESH)
+          ? reinterpret_cast<unsigned *>(_topk_rank_smem + 2048)
+          : nullptr);
   if (tid == 0) {
     mpk_stage_stamp(42);
   }

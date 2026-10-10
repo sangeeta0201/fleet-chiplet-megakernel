@@ -2220,8 +2220,11 @@ __device__ __host__ constexpr int _rnlm8_pf_groups(int ki, int req) {
 //
 // So give each branch its own request. Both default to the unified knob, so
 // this is a no-op until one is set.
+// N-parallel defaults to 8: q_b's 16-trip loop (W_UK's 4 trips cannot go
+// deeper than 4). MEASURED 2026-10-10, same batch as MPK_MOE_PF_GROUPS_W13's
+// re-sweep: 4.667 4.651 4.655 -> 8: 4.645 4.647 4.644, 16: 4.687 4.679 ms.
 #ifndef MPK_ATTN_PF_GROUPS_N
-#define MPK_ATTN_PF_GROUPS_N MPK_ATTN_PF_GROUPS
+#define MPK_ATTN_PF_GROUPS_N 8
 #endif
 // K-parallel defaults to 6, not to the unified knob: it is qkv_a's loop
 // (ITERS_PER_WAVE 12). MEASURED 2026-10-10, NP=8 1024/1024, n=3 interleaved

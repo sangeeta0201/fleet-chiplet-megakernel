@@ -1621,8 +1621,8 @@ def get_compile_command(
             "MPK_ATTN_OUT_LL",
             "MPK_OPROJ_WFIRST",
             "MPK_TOPK_RANK",
+            "MPK_TOPK_THRESH",
             "MPK_ATTN_PROBE_NOQKVWAIT",
-            "MPK_W2_PARTS_LL",
             "MPK_ENTRY_NOWAIT",
             "MPK_DEC_HINTS",
             # Ceiling probes, wrong output (gang_mla_attn_fused_mi300.cuh).
@@ -1642,6 +1642,11 @@ def get_compile_command(
             flags = flags + [f"-DMPK_TRACE_T0={int(_x)}"]
         # Decode KV tiles DMA'd into LDS ahead of the q_b -> decode release
         # (gang_mla_attn_fused_mi300.cuh): 0, 1 or 2.
+        _x = os.environ.get("MPK_W2_PARTS_LL")
+        if _x is not None:
+            # 1: the folders skip the entry wait; 2: same words, still wait.
+            assert _x in ("0", "1", "2"), "MPK_W2_PARTS_LL is 0, 1 or 2"
+            flags = flags + [f"-DMPK_W2_PARTS_LL={_x}"]
         _x = os.environ.get("MPK_DEC_PRELOAD")
         if _x is not None:
             assert _x in ("0", "1", "2"), "MPK_DEC_PRELOAD is 0, 1 or 2"
@@ -3932,7 +3937,7 @@ class PersistentKernel:
             # FULL_LAYER_ALL_SLOT's 256 lines of attention-output words.
             counter_slots = (644 + 8 * 194 + 32 + 8 * 36 + 8 * 194 + 8 * 48
                              + 144 + 256)
-        if os.environ.get("MPK_W2_PARTS_LL", "0") == "1":
+        if os.environ.get("MPK_W2_PARTS_LL", "0") != "0":
             # FULL_LAYER_W2PL_SLOT's 1536 lines of W2 part words.
             counter_slots = (644 + 8 * 194 + 32 + 8 * 36 + 8 * 194 + 8 * 48
                              + 144 + 256 + 1536)

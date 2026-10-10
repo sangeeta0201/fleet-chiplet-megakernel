@@ -641,12 +641,8 @@ __device__ __forceinline__ void _full_layer_ep_fold_ll_parts(
         break;
       }
 #ifdef MPK_PL_DEBUG
-      if (++_spins == (1u << 21)) {
-        printf("[PLDBG] blk=%d col=%d want=%u got p0=%u,%u p1=%u,%u\n",
-               (int)blockIdx.x, off, epoch_in, (unsigned)(w[0].x >> 32),
-               (unsigned)(w[0].y >> 32),
-               (unsigned)(w[K_PARTS - 1].x >> 32),
-               (unsigned)(w[K_PARTS - 1].y >> 32));
+      if (++_spins == (1u << 22)) {
+        __builtin_trap();
       }
 #endif
       __builtin_amdgcn_s_sleep(1);
@@ -1033,11 +1029,21 @@ gang_mla_full_layer_fused_kernel_mi300(
       BATCH_SIZE == 1 && ml_mode && (task_layer_idx % ml_num_layers) != 0;
   bool const pl_fold =
       pl_layer && pl_fold_rank >= 0 && pl_fold_rank < MPK_EP_FOLD_WGS;
+  // Under MPK_BAR_TAGGED_HIER the entry's tag poll is xcd_rank 0's alone, and
+  // it publishes the release line the rest of its XCD waits on -- so xcd_rank
+  // 0 must wait. The folders are ranks 0.. unless MPK_EP_LL_FOLD_LAST moves
+  // them to the XCD's last ranks; without that a skipping folder 0 wedged the
+  // first iteration.
+  bool const entry_leader = FULL_LAYER_TAGGED_ENTRY && MPK_BAR_TAGGED_HIER &&
+                            xcd_rank == 0;
   // MPK_ENTRY_NOWAIT: nobody waits. Past the folders, every input of the
   // layer's head is an epoch-tagged word or flag (the EP slots, the XCD
   // exchange), and the buffers it writes were last read before the previous
   // layer's W2, which everything here transitively waits on.
-  bool const entry_skip = pl_fold || (MPK_ENTRY_NOWAIT && pl_layer);
+  // MPK_W2_PARTS_LL == 2 folds from the words but still waits (bisection).
+  bool const entry_skip =
+      !entry_leader &&
+      ((pl_fold && MPK_W2_PARTS_LL != 2) || (MPK_ENTRY_NOWAIT && pl_layer));
   if (ml_mode) {
     int const entry_expected = task_layer_idx + 1;
     int const arrivals = tiles_per_xcd * 8;

@@ -74,6 +74,13 @@
 #ifndef MPK_TOPK_DPP
 #define MPK_TOPK_DPP 0
 #endif
+// MPK_TOPK_THRESH: select through a threshold -- T is the 8th-largest of the
+// 32 lanes' maxima, so only keys >= T can win -- and sort just those
+// (<= 32, else the network below runs). Same keys, same order. Needs the
+// rank_lds scratch the fused router passes.
+#ifndef MPK_TOPK_THRESH
+#define MPK_TOPK_THRESH 0
+#endif
 #ifndef MPK_TOPK_SKIP_CLEARS
 #define MPK_TOPK_SKIP_CLEARS 0
 #endif
@@ -325,7 +332,7 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
   float rk_sum = 0.f;
   if constexpr (K_STATIC == 8 && VPT == 8 &&
                 BYTES_PER_LDG / sizeof(T) == VPT) {
-    if (rank_lds != nullptr && num_rows == 1 && k == 8 &&
+    if (MPK_TOPK_RANK && rank_lds != nullptr && num_rows == 1 && k == 8 &&
         (int)MPK_NT == NUM_EXPERTS) {
       unsigned *const s_key = rank_lds;
       int const e = threadIdx.x;
@@ -491,6 +498,72 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
           b = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
           key[i] = (b & 0xFFFFFF00u) | (unsigned)col[i];
         }
+        // MPK_TOPK_THRESH: T, the 8th-largest of the lanes' maxima, bounds the
+        // answer from below -- at least eight lanes reach T -- so only keys
+        // >= T can win, and those few are sorted instead of all 256.
+        bool thresh_done = false;
+        if constexpr (MPK_TOPK_THRESH != 0 && THREADS_PER_ROW == 32) {
+          if (rank_lds != nullptr && num_rows == 1) {
+            int const ln = thread_group_idx;
+            auto xch = [&](unsigned v, int j) -> unsigned {
+              return DPP_XOR ? _tk_xor_lanes(v, j, THREADS_PER_ROW)
+                             : (unsigned)__shfl_xor((int)v, j,
+                                                    THREADS_PER_ROW);
+            };
+            // Descending bitonic sort of one value per lane.
+            auto sort32 = [&](unsigned v) -> unsigned {
+#pragma unroll
+              for (int kk = 2; kk <= 32; kk <<= 1) {
+#pragma unroll
+                for (int j = kk >> 1; j > 0; j >>= 1) {
+                  unsigned const o = xch(v, j);
+                  bool const lo = (ln & j) == 0;
+                  bool const desc = (ln & kk) == 0 || kk == 32;
+                  bool const keep_max = (lo == desc);
+                  v = keep_max ? (v > o ? v : o) : (v > o ? o : v);
+                }
+              }
+              return v;
+            };
+            unsigned m = key[0];
+#pragma unroll
+            for (int i = 1; i < 8; ++i) {
+              m = key[i] > m ? key[i] : m;
+            }
+            unsigned const t =
+                (unsigned)__builtin_amdgcn_readlane((int)sort32(m), 7);
+            int c = 0;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+              c += key[i] >= t ? 1 : 0;
+            }
+            int incl = c;
+#pragma unroll
+            for (int d = 1; d < 32; d <<= 1) {
+              int const up = __shfl_up(incl, d, THREADS_PER_ROW);
+              incl += (ln >= d) ? up : 0;
+            }
+            int const total = __shfl(incl, 31, THREADS_PER_ROW);
+            if (total <= 32) {
+              int pos = incl - c;
+#pragma unroll
+              for (int i = 0; i < 8; ++i) {
+                if (key[i] >= t) {
+                  rank_lds[pos++] = key[i];
+                }
+              }
+              asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+              unsigned const cand = (ln < total) ? rank_lds[ln] : 0u;
+              unsigned const s = sort32(cand);
+#pragma unroll
+              for (int i = 0; i < 8; ++i) {
+                key[i] = (unsigned)__builtin_amdgcn_readlane((int)s, i);
+              }
+              thresh_done = true;
+            }
+          }
+        }
+        if (!thresh_done) {
         // Bitonic sort of 8, descending: the textbook ascending network with
         // every arrow reversed. MTK_D puts the larger at the lower index.
         MTK_D(0, 1) MTK_A(2, 3) MTK_D(4, 5) MTK_A(6, 7)
@@ -519,6 +592,7 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
           MTK_D(0, 2) MTK_D(1, 3) MTK_D(4, 6) MTK_D(5, 7)
           MTK_D(0, 1) MTK_D(2, 3) MTK_D(4, 5) MTK_D(6, 7)
         }
+        } // !thresh_done
 #if MPK_TOPK_WIN_SHFL
         // The winners' unbiased scores, at full precision, from the lanes that
         // hold them: expert e is element e % VPT of group lane e / VPT. Every

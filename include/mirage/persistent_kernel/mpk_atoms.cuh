@@ -1298,8 +1298,11 @@ __device__ __forceinline__ bool
 #define MPK_TOPK_RANK 0
 #endif
 
-// BROKEN 2026-10-10: wedges in the first iteration (rc=124); MPK_PL_DEBUG
-// prints the part epochs and any poll that spins ~1 s. Off.
+// The 2026-10-10 first-iteration wedge was folder 0 = xcd_rank 0 skipping the
+// MPK_BAR_TAGGED_HIER entry poll that releases its XCD; xcd_rank 0 now always
+// waits, so the skip pays only with MPK_EP_LL_FOLD_LAST (folders at the XCD's
+// last ranks). =2 folds from the words but keeps the wait (text identical to
+// the default, 4.736 under MPK_PL_DEBUG).
 // MPK_W2_PARTS_LL: the TP W2 also writes each K-part's f32 rows as
 // epoch-tagged words (FULL_LAYER_W2PL_SLOT), and the next layer's EP_LL
 // folders fold from those, arriving at the layer-entry rendezvous without

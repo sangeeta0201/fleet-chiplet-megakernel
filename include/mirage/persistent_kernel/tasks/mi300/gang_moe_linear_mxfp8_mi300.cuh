@@ -1702,8 +1702,11 @@ __device__ __host__ constexpr int _gang_moe_pf_groups(int ki, int req) {
 // numbers and the two-instrument correctness argument. W2 keeps inheriting the
 // unified default because 4 is its structural maximum -- its trip count is 16,
 // so anything wider stops pipelining.
+// Re-swept 2026-10-10 on the TP + MPK_W2_ACT_LL + MPK_ATTN_OUT_LL default,
+// NP=8 1024/1024, interleaved, text identical: 6 (control) 4.667 4.651
+// 4.655 -> 8: 4.603 4.607, 12: 4.630 4.617 ms. 8 now.
 #ifndef MPK_MOE_PF_GROUPS_W13
-#define MPK_MOE_PF_GROUPS_W13 6
+#define MPK_MOE_PF_GROUPS_W13 8
 #endif
 #ifndef MPK_MOE_PF_GROUPS_W2
 #define MPK_MOE_PF_GROUPS_W2 MPK_MOE_PF_GROUPS

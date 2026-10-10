@@ -57,11 +57,9 @@ static constexpr float SEP_EPS = 1e-3f;
 #define TOPK_K_STATIC 0
 #endif
 
-// TOPK_RANK=1 hands the impl LDS scratch, which selects the one-expert-per-
-// thread rank path (MPK_TOPK_RANK) at one row; more rows keep the sort path.
-#ifndef TOPK_RANK
-#define TOPK_RANK 0
-#endif
+// Build with -DMPK_TOPK_RANK=1 or -DMPK_TOPK_THRESH=1 to run that selection
+// path at one row; both need the LDS scratch passed below. More rows keep
+// the sort path.
 
 __global__ void topk_sigmoid_bias_entry(void *input,
                                         void *bias,
@@ -91,7 +89,7 @@ __global__ void topk_sigmoid_bias_entry(void *input,
       num_shared_experts,
       /*ll_route=*/nullptr,
       /*ll_epoch=*/0,
-      TOPK_RANK ? s_rank : nullptr);
+      (MPK_TOPK_RANK || MPK_TOPK_THRESH) ? s_rank : nullptr);
 }
 
 // Round-trip through bf16 so the host reference sees exactly the values the
@@ -129,7 +127,7 @@ int main(int argc, char **argv) {
   int const SLOTS = TOPK + num_shared;
   int const TOTAL_EXPERTS = NUM_EXPERTS + num_shared;
 
-  srand(1234);
+  srand(getenv("TOPK_SEED") ? atoi(getenv("TOPK_SEED")) : 1234);
   auto urand = []() { return (float)rand() / (float)RAND_MAX; };
 
   std::vector<float> logits((size_t)num_rows * NUM_EXPERTS);
