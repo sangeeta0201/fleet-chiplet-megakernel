@@ -1613,9 +1613,9 @@ def get_compile_command(
             # Decode items on the workers past q_b's tiles
             # (gang_mla_attn_fused_mi300.cuh).
             "MPK_DEC_REMAP",
-            "MPK_DEC_PRELOAD",
             "MPK_W13_ACT_EARLY",
             "MPK_W2_EARLY_PF",
+            "MPK_ML_NO_FENCE",
             # Ceiling probes, wrong output (gang_mla_attn_fused_mi300.cuh).
             "MPK_ATTN_PROBE_NOQBWAIT",
             "MPK_ATTN_PROBE_NODECWAIT",
@@ -1631,6 +1631,12 @@ def get_compile_command(
         _x = os.environ.get("MPK_TRACE_T0")
         if _x is not None:
             flags = flags + [f"-DMPK_TRACE_T0={int(_x)}"]
+        # Decode KV tiles DMA'd into LDS ahead of the q_b -> decode release
+        # (gang_mla_attn_fused_mi300.cuh): 0, 1 or 2.
+        _x = os.environ.get("MPK_DEC_PRELOAD")
+        if _x is not None:
+            assert _x in ("0", "1", "2"), "MPK_DEC_PRELOAD is 0, 1 or 2"
+            flags = flags + [f"-DMPK_DEC_PRELOAD={_x}"]
         # The qkv_a-idle workers prefetch qkv_a's weight into L2
         # (gang_mla_attn_fused_mi300.cuh).
         _x = os.environ.get("MPK_QKVA_IDLE_PF")

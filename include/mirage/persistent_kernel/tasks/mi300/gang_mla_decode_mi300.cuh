@@ -903,9 +903,10 @@ __device__ __noinline__ void
                         // and dropped. See MPK_MLA_MERGE_OWN_HEADS.
                         int out_head_lo = 0,
                         int out_heads = 16,
-                        // The chunk's first tile is already in lds_kv, full
-                        // (MPK_DEC_PRELOAD); trip 0 skips its load.
-                        bool tile0_in_lds = false) {
+                        // The chunk's first `tiles_in_lds` tiles are already
+                        // in LDS, full, tile t at lds_kv + t * KV_LDS_BYTES
+                        // (MPK_DEC_PRELOAD); those trips skip their load.
+                        int tiles_in_lds = 0) {
   using bf16 = __hip_bfloat16;
   using gang_mla_decode_detail::__ldg_bf16x4_raw;
   using gang_mla_decode_detail::bf16x4_t;
@@ -1238,7 +1239,8 @@ __device__ __noinline__ void
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     } else {
 #else
-    __bf16 *const cur_kv = lds_kv;
+    __bf16 *const cur_kv =
+        (t < tiles_in_lds) ? lds_kv + t * (KV_TILE * QK_DIM) : lds_kv;
     {
 #endif
 
@@ -1248,7 +1250,7 @@ __device__ __noinline__ void
       // and does not wait lgkmcnt. Do not put vmcnt(0) inside the my_tok <
       // tile_len branch: that wait is divergent on a partial tile and hangs
       // the fused kernel from the first prefill step.
-      if (tile0_in_lds && t == 0) {
+      if (t < tiles_in_lds) {
       } else if (my_tok < tile_len) {
         long const row = get_kv_row(kv_start + tile_start + my_tok);
 #pragma unroll
@@ -1637,8 +1639,8 @@ __device__ __noinline__ void
                            int out_head_lo = 0,
                            int out_heads = 16,
                            // MPK_DEC_PRELOAD: the caller already DMA'd this
-                           // chunk's first tile, full, into lds_kv.
-                           bool tile0_in_lds = false) {
+                           // chunk's first tiles, full; see mla_decode_absorbed.
+                           int tiles_in_lds = 0) {
   if (tile_idx >= total_work_items) {
     return;
   }
@@ -1679,7 +1681,7 @@ __device__ __noinline__ void
                                        scale_s,
                                        out_head_lo,
                                        out_heads,
-                                       tile0_in_lds);
+                                       tiles_in_lds);
 }
 
 } // namespace kernel

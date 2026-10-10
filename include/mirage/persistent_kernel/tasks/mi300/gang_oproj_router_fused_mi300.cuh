@@ -1262,6 +1262,10 @@ __device__ __attribute__((always_inline)) void
 #endif
                                                      );
       stage_a = RESTAGE;
+      // Trace stamps 59/60: o_proj GEMV returned, its LL push issued.
+      if (tid == 0 && t == xcd_rank) {
+        mpk_stage_stamp(59);
+      }
       // Push the tile straight into every peer's copy of the hidden row, at
       // the identical offset -- the slices are disjoint, so the all-gather is
       // EP_NPEER stores of the bytes this workgroup just produced and no
@@ -1305,6 +1309,9 @@ __device__ __attribute__((always_inline)) void
                         word);
             }
           }
+        }
+        if (tid == 0 && t == xcd_rank) {
+          mpk_stage_stamp(60);
         }
       }
       // Under MPK_OPROJ_LL the GEMV or the block above wrote every copy.

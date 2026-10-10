@@ -1539,9 +1539,9 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
 #define MPK_ATTN_PROBE_NODECWAIT 0
 #endif
   if (dec_rank >= 0 && dec_rank < dec_tiles) {
-    // MPK_DEC_PRELOAD: this item's first KV tile went into the decode's own
-    // LDS tile buffer below, so its trip 0 skips the load.
-    bool pre0 = false;
+    // MPK_DEC_PRELOAD: this item's first KV tiles went into the decode's own
+    // LDS tile buffers below, so those trips skip their load.
+    int npre = 0;
 #if MPK_ATTN_META_PF
     // MPK_ATTN_META_PF: the decode's prologue is a chain of dependent loads
     // -- qo/kv_indptr and last_page_len, then kv_indices for the page, then
@@ -1590,18 +1590,22 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
           // __syncthreads after the release retires it.
           static_assert(KV_CACHE_STRIDE == KV_LORA_RANK + QK_ROPE_HEAD_DIM,
                         "the tile is the cache rows verbatim");
-          pre0 = ntok >= 16;
-          if (pre0) {
-            unsigned const wid = __builtin_amdgcn_readfirstlane(tid >> 6);
-            gang_mla_decode_detail::mla_dma_tile(
-                gang_mla_decode_detail::mla_buffer_rsrc(
-                    base, 16u * (unsigned)KV_CACHE_STRIDE * 2u),
-                __builtin_amdgcn_readfirstlane(static_cast<unsigned>(
-                    reinterpret_cast<uintptr_t>(_dpf_smem))) +
-                    wid * 1024u,
-                static_cast<unsigned>(tid) * 16u, wid < 2u);
-            base += 16 * (size_t)KV_CACHE_STRIDE * 2;
-            ntok -= 16;
+          // MPK_DEC_PRELOAD=2 takes the second tile too, into the next buffer.
+          constexpr int TILE_BYTES = 16 * KV_CACHE_STRIDE * 2;
+          unsigned const wid = __builtin_amdgcn_readfirstlane(tid >> 6);
+          unsigned const smem0 = __builtin_amdgcn_readfirstlane(
+              static_cast<unsigned>(reinterpret_cast<uintptr_t>(_dpf_smem)));
+#pragma unroll
+          for (int k = 0; k < (MPK_DEC_PRELOAD >= 2 ? 2 : 1); k++) {
+            if (ntok >= 16) {
+              gang_mla_decode_detail::mla_dma_tile(
+                  gang_mla_decode_detail::mla_buffer_rsrc(base, TILE_BYTES),
+                  smem0 + k * TILE_BYTES + wid * 1024u,
+                  static_cast<unsigned>(tid) * 16u, wid < 2u);
+              base += TILE_BYTES;
+              ntok -= 16;
+              npre = k + 1;
+            }
           }
 #endif
           uint32_t const bytes =
@@ -1743,7 +1747,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
           scale_s,
           own_head_lo,
           MRG_HEADS,
-          pre0 && t == dec_rank);
+          t == dec_rank ? npre : 0);
     }
 #endif
 #ifdef MPK_ENABLE_SUBPHASE_TIMING

@@ -1249,28 +1249,46 @@ __device__ __forceinline__ bool
 // MPK_WUK_PF: the W_UK workers pull their tile's weight into L2 while they
 // wait at Phase 3b's XCD barrier (gang_mla_attn_fused_mi300.cuh). The
 // MPK_TRACE profile puts the W_UK step at ~3 us behind that barrier.
-// MPK_DEC_REMAP: the head-local decode items on the workers past q_b's tiles,
-// which skip Phase 3b's wait (gang_mla_attn_fused_mi300.cuh).
-#ifndef MPK_DEC_REMAP
-#define MPK_DEC_REMAP 0
+// MPK_ML_NO_FENCE: the multi-layer loop skips its per-layer threadfence_gpu
+// (persistent_kernel.cuh); the __syncthreads stays.
+#ifndef MPK_ML_NO_FENCE
+#define MPK_ML_NO_FENCE 0
 #endif
-// MPK_DEC_PRELOAD: the decode worker DMAs its item's first full KV tile into
-// the decode's LDS tile buffer during the q_b -> decode wait.
+
+// Five levers from the MPK_TRACE profile, measured 2026-10-10 at NP=8
+// 1024/1024 as one multi-arm batch against a shared control (two rounds,
+// every arm's text identical to the control's): control 5.092 5.087 ms.
+//
+// MPK_DEC_REMAP: the head-local decode items on the workers past q_b's tiles,
+// which skip Phase 3b's wait (gang_mla_attn_fused_mi300.cuh). The default
+// ranks were also the W_UK workers, last to the q_b -> decode barrier, so
+// META_PF's prologue walk had nothing to hide under. 5.011 4.989 (-0.090).
+#ifndef MPK_DEC_REMAP
+#define MPK_DEC_REMAP 1
+#endif
+// MPK_DEC_PRELOAD: the decode worker DMAs its item's first full KV tile (2:
+// first two) into the decode's LDS tile buffers during the q_b -> decode
+// wait, short of the current token's row. With MPK_DEC_REMAP: 4.904 4.901
+// (-0.187); the MPK_TRACE decode item spent 1.72 us of 8.4 on that tile.
 #ifndef MPK_DEC_PRELOAD
-#define MPK_DEC_PRELOAD 0
+#define MPK_DEC_PRELOAD 1
 #endif
 // MPK_W13_ACT_EARLY: the W13 workers quantize the normed row into LDS while
-// the TopK selects (gang_oproj_router_fused_mi300.cuh).
+// the TopK selects (gang_oproj_router_fused_mi300.cuh). 5.065 5.037 (-0.038).
 #ifndef MPK_W13_ACT_EARLY
-#define MPK_W13_ACT_EARLY 0
+#define MPK_W13_ACT_EARLY 1
 #endif
 // MPK_W2_EARLY_PF: the TP W2 workers pull their tile's weight into L2
-// across the W13 -> W2 wait (gang_oproj_router_fused_mi300.cuh).
+// across the W13 -> W2 wait (gang_oproj_router_fused_mi300.cuh). 5.062 5.068
+// (-0.025).
 #ifndef MPK_W2_EARLY_PF
-#define MPK_W2_EARLY_PF 0
+#define MPK_W2_EARLY_PF 1
 #endif
+// (MPK_WUK_PF below: 5.064 5.057, -0.029.) All five together, interleaved
+// against their own control, text identical: 5.109 5.110 5.094 -> 4.831
+// 4.828 4.821 ms (-0.278).
 #ifndef MPK_WUK_PF
-#define MPK_WUK_PF 0
+#define MPK_WUK_PF 1
 #endif
 
 #ifndef MPK_TOPK_PAD_NS

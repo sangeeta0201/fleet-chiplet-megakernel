@@ -3462,7 +3462,12 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               // modified for the next layer.
 #if MPK_ABL_ML_BOUNDARY < 2
               if (ml < ml_end - 1) {
-                if (threadIdx.x == 0 && block_xcd_local_rank == 0) {
+                // MPK_ML_NO_FENCE: skip the agent-scope release (an L2
+                // writeback on gfx950) and keep the join. Every cross-XCD
+                // hand-off inside the fused layer already carries its own
+                // write-through stores and invalidates.
+                if (threadIdx.x == 0 && block_xcd_local_rank == 0 &&
+                    !MPK_ML_NO_FENCE) {
                   threadfence_gpu();
                 }
                 __syncthreads();
