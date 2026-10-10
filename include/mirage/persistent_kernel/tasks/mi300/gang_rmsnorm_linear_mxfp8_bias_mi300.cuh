@@ -342,6 +342,22 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_rmsnorm(
 // SwiGLU pair. That needs an 8-byte-aligned destination: OUTPUT_PER_WG % 16 ==
 // 0 makes every term of the column index a multiple of 4, so the requirement
 // reduces to a 4-aligned output_stride, which the registrar asserts.
+__device__ __forceinline__ void _rnlm8_ll_store4(unsigned long long *dst,
+                                                 unsigned epoch,
+                                                 unsigned short v0,
+                                                 unsigned short v1,
+                                                 unsigned short v2,
+                                                 unsigned short v3) {
+  unsigned long long const eh = (unsigned long long)epoch << 32;
+  unsigned long long const w0 = eh | v0 | ((unsigned)v1 << 16);
+  unsigned long long const w1 = eh | v2 | ((unsigned)v3 << 16);
+  asm volatile("global_store_dwordx2 %0, %1, off\n"
+               "global_store_dwordx2 %0, %2, off offset:8"
+               :
+               : "v"(dst), "v"(w0), "v"(w1)
+               : "memory");
+}
+
 template <bool WRITE_THROUGH>
 __device__ __forceinline__ void _rnlm8_store4(unsigned short *dst,
                                               unsigned short v0,
@@ -1324,6 +1340,10 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
         }
         if (__syncthreads_and(ok)) {
           break;
+        }
+        if (MPK_XS_POLL_FULL) {
+          __builtin_amdgcn_s_sleep(1);
+          continue;
         }
         if (tid < EP_PEER_SLOTS) {
           unsigned long long *const sent = const_cast<unsigned long long *>(
@@ -2343,7 +2363,13 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     int logits_row = 0,
     // MPK_QKV_XSPLIT only: this XCD's exchange block and the layer epoch.
     int *qxs = nullptr,
-    unsigned qxs_epoch = 0) {
+    unsigned qxs_epoch = 0,
+    // MPK_WUK_LL, one row: output columns [0, ll_cols) also leave as
+    // (ll_epoch << 32 | bf16x2) words at ll_out[col / 2], plain stores into
+    // this XCD's L2 for a same-XCD consumer polling with nt loads.
+    unsigned long long *ll_out = nullptr,
+    unsigned ll_epoch = 0,
+    int ll_cols = 0) {
 
   static_assert(OUTPUT_PER_WG % 16 == 0,
                 "OUTPUT_PER_WG must be multiple of 16");
@@ -3077,6 +3103,13 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
         _rnlm8_store4<WRITE_THROUGH>(
             d_output + ppl_row_off + out_idx,
             packed[0], packed[1], packed[2], packed[3]);
+        if (BATCH_SIZE == 1 && ll_out != nullptr) {
+          int const lc = wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4;
+          if (lc < ll_cols) {
+            _rnlm8_ll_store4(ll_out + lc / 2, ll_epoch, packed[0], packed[1],
+                             packed[2], packed[3]);
+          }
+        }
       }
     }
   } else {
@@ -3255,6 +3288,13 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
       _rnlm8_store4<WRITE_THROUGH>(
           d_output + ppl_row_off + out_idx,
           packed[0], packed[1], packed[2], packed[3]);
+      if (BATCH_SIZE == 1 && ll_out != nullptr) {
+        int const lc = wg_idx * OUTPUT_PER_WG + g * 4;
+        if (lc < ll_cols) {
+          _rnlm8_ll_store4(ll_out + lc / 2, ll_epoch, packed[0], packed[1],
+                           packed[2], packed[3]);
+        }
+      }
     }
   }
 

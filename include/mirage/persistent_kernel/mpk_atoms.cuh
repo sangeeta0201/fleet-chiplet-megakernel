@@ -1338,6 +1338,55 @@ __device__ __forceinline__ bool
 #ifndef MPK_DEC_MERGE_LL
 #define MPK_DEC_MERGE_LL 0
 #endif
+// MPK_OPROJ_SHIFT: under MPK_ATTN_OUT_LL, o_proj tile t runs on xcd_rank
+// t + MPK_OPROJ_SHIFT, off the merge ranks (4 under head-local GLM:
+// HL_MRG_ITEMS = 32 merge items over 8 XCDs), which reach o_proj last
+// (gang_oproj_router_fused_mi300.cuh, gang_mla_full_layer_fused_mi300.cuh).
+// MEASURED 2026-10-10, NP=8 1024/1024, interleaved, text identical:
+// 4.437 4.421 4.432 -> 4.347 4.343 4.344 ms (-0.085). Default 4.
+#ifndef MPK_OPROJ_SHIFT
+#define MPK_OPROJ_SHIFT 4
+#endif
+// MPK_MOE_SKIP_TOPK: the per-XCD routing TopK worker runs no W13 or W2 tile.
+// MPK_TRACE (trace 5) has the 8 TopK workers last at every MoE stamp: W13
+// start +0.87 us, W13 done +1.70, W2 done +2.63 against the median worker.
+// MPK_WUK_LL: q_b -> W_UK without the XCD-local W_UK barrier. q_b's head row
+// also leaves as epoch words in the XCD's L2; the W_UK tiles stage their
+// activation from those and the head's last tile ropes from them. Trace 5:
+// W_UK barrier passed 1.65 us after the slowest q_b tile. MEASURED alone
+// 2026-10-10: 4.420 -> 4.427 ms, null -- on only as MPK_DEC_Q_LL's carrier.
+#ifndef MPK_WUK_LL
+#define MPK_WUK_LL 1
+#endif
+// MPK_DEC_Q_LL (needs MPK_WUK_LL): q_b/W_UK -> decode without the q_b
+// barrier. W_UK's rows and the roped tail also leave as epoch words, the
+// latent tile flags the current token's cache row, and the decode stages its
+// own heads' query from the words. Trace 5: the decode barrier passed 1.55 us
+// after the last W_UK tile, then 0.7 us to the decode's first stamp.
+// MEASURED 2026-10-10, NP=8 1024/1024, interleaved, text identical, with
+// MPK_WUK_LL: 4.420 4.415 4.421 -> 4.376 4.365 4.370 ms (-0.049); with
+// MPK_OPROJ_SHIFT=4 as well, 4.344 4.336 4.350 -> 4.284 4.287 (-0.06 more).
+#ifndef MPK_DEC_Q_LL
+#define MPK_DEC_Q_LL 1
+#endif
+// MPK_XS_POLL_FULL: the qkv_a split resolver re-reads its whole slice of the
+// eight EP slots each round instead of spinning on one sentinel per slot and
+// then re-reading -- one system-scope round trip less after the last word
+// lands, at ~12 KB per tile per round of polling traffic. Trace 5: the first
+// resolve lands ~4 us after the rank's own last fold.
+#ifndef MPK_XS_POLL_FULL
+#define MPK_XS_POLL_FULL 0
+#endif
+// MPK_DML_DBG: MPK_DEC_MERGE_LL bisection. 1: the decode writes its LL words
+// and its normal partials, the merge keeps the barrier and the normal path --
+// ran clean, text identical. 2: LL words only, the merge reads them but still
+// waits at the barrier.
+#ifndef MPK_DML_DBG
+#define MPK_DML_DBG 0
+#endif
+#ifndef MPK_MOE_SKIP_TOPK
+#define MPK_MOE_SKIP_TOPK 0
+#endif
 
 // MPK_ML_NO_FENCE: the multi-layer loop skips its per-layer threadfence_gpu
 // (persistent_kernel.cuh); the __syncthreads stays. MEASURED NEUTRAL

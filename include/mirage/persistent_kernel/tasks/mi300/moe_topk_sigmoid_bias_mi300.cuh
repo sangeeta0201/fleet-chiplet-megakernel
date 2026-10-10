@@ -272,6 +272,11 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
   }
   __syncthreads();
 
+  // Trace stamps 44/45/4/53 (TopK worker only; those slots' other sites are
+  // dead under MPK_EP_LL): clears done, scores loaded, selected, published.
+  if (threadIdx.x == 0) {
+    mpk_stage_stamp(44);
+  }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   unsigned long long _tk_a1 = __builtin_amdgcn_s_memrealtime();
   if (threadIdx.x == 0 && g_subphase_active) {
@@ -423,6 +428,9 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
 
     // Fused Top-K selection — Step 1 uses inline asm for branchless local
     // argmax.
+    if (threadIdx.x == 0) {
+      mpk_stage_stamp(45);
+    }
     int const start_col = first_elt;
     float row_sum_for_renorm = 0.f;
     float topk_vals[8];
@@ -637,6 +645,9 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
     }
 #undef MTK_D
 #undef MTK_A
+    if (threadIdx.x == 0) {
+      mpk_stage_stamp(4);
+    }
 
     // topk_vals is 8 wide, so k has always been capped at 8 here; the unroll
     // bound just makes that cap explicit. The `break` is dead code whenever
@@ -856,6 +867,9 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
         ll_route[16 + k] = hi | __float_as_uint(1.0f);
       }
     }
+  }
+  if (threadIdx.x == 0) {
+    mpk_stage_stamp(53);
   }
   __syncthreads();
 

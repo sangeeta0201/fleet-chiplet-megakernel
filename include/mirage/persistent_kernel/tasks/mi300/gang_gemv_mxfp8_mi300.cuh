@@ -207,7 +207,20 @@ __device__ __noinline__ void
                            int wgm,
                            int tile_idx,
                            void const *bias_ptr = nullptr,
-                           bool stage_a = true) {
+                           bool stage_a = true,
+                           // MPK_WUK_LL, one row: the activation arrives as
+                           // REDUCTION_SIZE / 2 (a_epoch << 32 | bf16x2)
+                           // words, written by the same XCD into its L2, and
+                           // is staged once every word carries the epoch.
+                           unsigned long long const *a_ll = nullptr,
+                           unsigned a_epoch = 0,
+                           // MPK_DEC_Q_LL, one row, no bias or residual: the
+                           // tile's rows also leave as (o_epoch << 32 |
+                           // bf16x2) words, row pair (2j, 2j+1) of the tile at
+                           // o_ll[(n_tile * ROWS_PER_WG) / 2 + j], write-
+                           // through for consumers on other XCDs.
+                           unsigned long long *o_ll = nullptr,
+                           unsigned o_epoch = 0) {
   using gang_gemv_detail::b2f;
   using gang_gemv_detail::f2b;
   using gang_gemv_mxfp8_detail::cvt_fp8_pair;
@@ -305,6 +318,45 @@ __device__ __noinline__ void
       static_cast<size_t>(mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE);
   extern __shared__ char _fused_smem[];
   unsigned short *s_a = reinterpret_cast<unsigned short *>(_fused_smem);
+  if constexpr (STAGE_A && BATCH_SIZE == 1 && REDUCTION_SIZE % 8 == 0 &&
+                REDUCTION_SIZE / 8 <= NTHREADS) {
+    if (a_ll != nullptr) {
+      typedef unsigned int ll_u4_t __attribute__((ext_vector_type(4)));
+      constexpr int LL_THREADS = REDUCTION_SIZE / 8;
+      ll_u4_t w0 = {0u, 0u, 0u, 0u}, w1 = {0u, 0u, 0u, 0u};
+      while (true) {
+        bool ok = true;
+        if (tid < LL_THREADS) {
+          asm volatile("global_load_dwordx4 %0, %2, off nt\n"
+                       "global_load_dwordx4 %1, %2, off offset:16 nt\n"
+                       "s_waitcnt vmcnt(0)"
+                       : "=&v"(w0), "=&v"(w1)
+                       : "v"(a_ll + tid * 4)
+                       : "memory");
+          ok = w0[1] == a_epoch && w0[3] == a_epoch && w1[1] == a_epoch &&
+               w1[3] == a_epoch;
+        }
+        if (__syncthreads_and(ok)) {
+          break;
+        }
+        __builtin_amdgcn_s_sleep(1);
+      }
+      if (tid < LL_THREADS) {
+        u32x4_t v;
+        v[0] = w0[0];
+        v[1] = w0[2];
+        v[2] = w1[0];
+        v[3] = w1[2];
+        reinterpret_cast<u32x4_t *>(s_a)[tid] = v;
+      }
+      __syncthreads();
+      stage_a = false;
+    }
+  } else {
+    if (a_ll != nullptr) {
+      __builtin_trap();
+    }
+  }
   if constexpr (STAGE_A) {
     // The tile coords check above is block-uniform, so every thread that
     // reaches this __syncthreads reaches it together, and so is `stage_a`.
@@ -575,6 +627,26 @@ __device__ __noinline__ void
     }
   }
 
+  if constexpr (BATCH_SIZE == 1 && !HAS_RESIDUAL && ROWS_PER_WG % 2 == 0) {
+    if (o_ll != nullptr) {
+      if (Bs != nullptr) {
+        __builtin_trap();
+      }
+      // sum + 0.0f, exactly the bias-less value the bf16 store below rounds.
+      float const v_lo = sum[0] + 0.0f;
+      float const v_hi = __shfl_down(v_lo, LANES_PER_ROW);
+      if (lane == 0 && (row & 1) == 0 && num_active_tokens > 0) {
+        unsigned const lo = f2b(v_lo);
+        unsigned const hi = f2b(v_hi);
+        st_wt_u64((void *)(o_ll + (n_tile * ROWS_PER_WG + row) / 2),
+                  ((unsigned long long)o_epoch << 32) | lo | (hi << 16));
+      }
+    }
+  } else {
+    if (o_ll != nullptr) {
+      __builtin_trap();
+    }
+  }
   if (lane == 0) {
     int const n_local = n_tile * ROWS_PER_WG + row;
     float const bv = Bs ? b2f(ld_g<unsigned short>(Bs + n_local)) : 0.0f;

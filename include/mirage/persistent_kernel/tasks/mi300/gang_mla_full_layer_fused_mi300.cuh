@@ -544,8 +544,18 @@ static constexpr int FULL_LAYER_W2PL_LINES = 1536;
 static constexpr int FULL_LAYER_DLSE_SLOT =
     FULL_LAYER_W2PL_SLOT + FULL_LAYER_W2PL_LINES;
 static constexpr int FULL_LAYER_DLSE_LINES = 512;
-static constexpr int FULL_LAYER_COUNTER_SLOTS =
+// MPK_WUK_LL: q_b's head row as epoch words, 128 words (16 lines) per XCD,
+// written and read by that XCD only.
+static constexpr int FULL_LAYER_WUKLL_SLOT =
     FULL_LAYER_DLSE_SLOT + FULL_LAYER_DLSE_LINES;
+static constexpr int FULL_LAYER_WUKLL_LINES = 128;
+// MPK_DEC_Q_LL: the 8 own heads' 576-wide query rows as words (288 lines),
+// then the current token's cache-row flag (line 288).
+static constexpr int FULL_LAYER_QLL_SLOT =
+    FULL_LAYER_WUKLL_SLOT + FULL_LAYER_WUKLL_LINES;
+static constexpr int FULL_LAYER_QLL_LINES = 320;
+static constexpr int FULL_LAYER_COUNTER_SLOTS =
+    FULL_LAYER_QLL_SLOT + FULL_LAYER_QLL_LINES;
 static_assert(FULL_LAYER_XSPLIT_SLOT % 2 == 0 && MPK_XSPLIT_XCD_INTS % 32 == 0 &&
                   FULL_LAYER_RLL_SLOT % 2 == 0 && MPK_RLL_XCD_INTS % 32 == 0 &&
                   MPK_RLL_WORD_LINES % 2 == 0 && FULL_LAYER_QXS_SLOT % 2 == 0 &&
@@ -2092,6 +2102,16 @@ gang_mla_full_layer_fused_kernel_mi300(
       (MPK_DEC_MERGE_LL && ml_mode)
           ? reinterpret_cast<unsigned long long *>(
                 counters + FULL_LAYER_DLSE_SLOT * HIER_STRIDE)
+          : nullptr,
+      // MPK_WUK_LL: epoch is the W_UK barrier's layer value, ml_mode only.
+      (MPK_WUK_LL && ml_mode && BATCH_SIZE == 1)
+          ? reinterpret_cast<unsigned long long *>(
+                counters + FULL_LAYER_WUKLL_SLOT * HIER_STRIDE)
+          : nullptr,
+      // MPK_DEC_Q_LL: epoch is the q_b -> decode barrier's layer value.
+      (MPK_DEC_Q_LL && ml_mode && BATCH_SIZE == 1)
+          ? reinterpret_cast<unsigned long long *>(
+                counters + FULL_LAYER_QLL_SLOT * HIER_STRIDE)
           : nullptr);
 
   MPK_WS_PHASE(60, task_layer_idx, xcd_id);
@@ -2547,8 +2567,17 @@ gang_mla_full_layer_fused_kernel_mi300(
                              : oproj_tiles_per_xcd;
            pf_tile < oproj_tiles_per_xcd; pf_tile += pf_stride) {
 #else
-      if (xcd_rank < oproj_tiles_per_xcd) {
-        int const pf_tile = xcd_rank;
+      // MPK_OPROJ_SHIFT moves the tiles off the merge ranks; prefetch the
+      // tile this rank will run.
+      int const pf_base =
+          (MPK_OPROJ_SHIFT > 0 && attn_ll != nullptr &&
+           oproj_tiles_per_xcd > router_tile_n &&
+           MPK_OPROJ_SHIFT + oproj_tiles_per_xcd <= tiles_per_xcd)
+              ? MPK_OPROJ_SHIFT
+              : 0;
+      if (xcd_rank - pf_base >= 0 &&
+          xcd_rank - pf_base < oproj_tiles_per_xcd) {
+        int const pf_tile = xcd_rank - pf_base;
 #endif
         extern __shared__ char _fused_smem[];
         i32x4_t const pf_rsrc = make_w_buffer_rsrc(

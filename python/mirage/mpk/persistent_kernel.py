@@ -1623,6 +1623,10 @@ def get_compile_command(
             "MPK_TOPK_RANK",
             "MPK_TOPK_THRESH",
             "MPK_DEC_MERGE_LL",
+            "MPK_MOE_SKIP_TOPK",
+            "MPK_WUK_LL",
+            "MPK_DEC_Q_LL",
+            "MPK_XS_POLL_FULL",
             "MPK_ATTN_PROBE_NOQKVWAIT",
             "MPK_ENTRY_NOWAIT",
             "MPK_DEC_HINTS",
@@ -1643,6 +1647,14 @@ def get_compile_command(
             flags = flags + [f"-DMPK_TRACE_T0={int(_x)}"]
         # Decode KV tiles DMA'd into LDS ahead of the q_b -> decode release
         # (gang_mla_attn_fused_mi300.cuh): 0, 1 or 2.
+        _x = os.environ.get("MPK_OPROJ_SHIFT")
+        if _x is not None:
+            assert _x.isdigit() and 0 <= int(_x) <= 8, "MPK_OPROJ_SHIFT is 0..8"
+            flags = flags + [f"-DMPK_OPROJ_SHIFT={_x}"]
+        _x = os.environ.get("MPK_DML_DBG")
+        if _x is not None:
+            assert _x in ("0", "1", "2"), "MPK_DML_DBG is 0, 1 or 2"
+            flags = flags + [f"-DMPK_DML_DBG={_x}"]
         _x = os.environ.get("MPK_W2_PARTS_LL")
         if _x is not None:
             # 1: the folders skip the entry wait; 2: same words, still wait.
@@ -3946,6 +3958,14 @@ class PersistentKernel:
             # FULL_LAYER_DLSE_SLOT's 512 lines of decode lse words.
             counter_slots = (644 + 8 * 194 + 32 + 8 * 36 + 8 * 194 + 8 * 48
                              + 144 + 256 + 1536 + 512)
+        if os.environ.get("MPK_WUK_LL", "0") == "1":
+            # FULL_LAYER_WUKLL_SLOT's 128 lines of q_b head words.
+            counter_slots = (644 + 8 * 194 + 32 + 8 * 36 + 8 * 194 + 8 * 48
+                             + 144 + 256 + 1536 + 512 + 128)
+        if os.environ.get("MPK_DEC_Q_LL", "0") == "1":
+            # FULL_LAYER_QLL_SLOT's 320 lines of query words + the KV flag.
+            counter_slots = (644 + 8 * 194 + 32 + 8 * 36 + 8 * 194 + 8 * 48
+                             + 144 + 256 + 1536 + 512 + 128 + 320)
         assert counters.dim(0) >= counter_slots * 16, (
             f"the fused layer needs {counter_slots * 16} int32 of counters, "
             f"got {counters.dim(0)}")

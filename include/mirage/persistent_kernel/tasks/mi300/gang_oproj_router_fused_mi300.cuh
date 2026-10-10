@@ -1017,8 +1017,20 @@ __device__ __attribute__((always_inline)) void
   // arrival count is sized to this set.
   int const oproj_topk_tiles_per_xcd =
       oproj_tiles_per_xcd > router_tile_n ? oproj_tiles_per_xcd : router_tile_n;
+  // MPK_OPROJ_SHIFT: under MPK_ATTN_OUT_LL the merge ranks (xcd_rank <
+  // MPK_OPROJ_SHIFT) reach o_proj last, after their merge, its drain and
+  // the weight prefetch, while every other rank is already polling the
+  // merge's words -- so the merge ranks' tiles go to the ranks past them.
+  // The set grows by the shift; only the ranks holding an o_proj tile
+  // arrive, so the barrier still counts oproj_topk_tiles_per_xcd per XCD.
+  int const op_base =
+      (MPK_OPROJ_SHIFT > 0 && attn_ll_ptr != nullptr &&
+       oproj_tiles_per_xcd > router_tile_n &&
+       MPK_OPROJ_SHIFT + oproj_tiles_per_xcd <= tiles_per_xcd)
+          ? MPK_OPROJ_SHIFT
+          : 0;
 
-  if (xcd_rank < oproj_topk_tiles_per_xcd) {
+  if (xcd_rank < oproj_topk_tiles_per_xcd + op_base) {
     MPK_WS_PHASE(71, routing_expected, xcd_id);
     // Stage stamp 29: o_proj/router worker set entered (SUBSET: xcd_rank < oproj_topk_tiles_per_xcd).
     if (tid == 0) {
@@ -1205,7 +1217,8 @@ __device__ __attribute__((always_inline)) void
     float *const xcd_acc =
         static_cast<float *>(router_partials_ptr) +
         (size_t)xcd_id * (NUM_EXPERTS + 1);
-    for (int t = xcd_rank; t < oproj_tiles_per_xcd; t += tiles_per_xcd) {
+    for (int t = xcd_rank - op_base; t >= 0 && t < oproj_tiles_per_xcd;
+         t += tiles_per_xcd) {
       // MXFP4 and MXFP8 differ only in the weight's element format: same
       // packer layout, same signature, same caller contract including
       // stage_a. The switch is compile-time because the host packer is
@@ -1278,7 +1291,7 @@ __device__ __attribute__((always_inline)) void
                                                      );
       stage_a = RESTAGE;
       // Trace stamps 59/60: o_proj GEMV returned, its LL push issued.
-      if (tid == 0 && t == xcd_rank) {
+      if (tid == 0 && t == xcd_rank - op_base) {
         mpk_stage_stamp(59);
       }
       // Push the tile straight into every peer's copy of the hidden row, at
@@ -1325,7 +1338,7 @@ __device__ __attribute__((always_inline)) void
             }
           }
         }
-        if (tid == 0 && t == xcd_rank) {
+        if (tid == 0 && t == xcd_rank - op_base) {
           mpk_stage_stamp(60);
         }
       }
@@ -1484,7 +1497,9 @@ __device__ __attribute__((always_inline)) void
     // reduce and 257 to push -- work for 256 threads, not for one. Everything
     // downstream of the election still runs on tid 0 alone.
     __shared__ int s_oproj_leader;
-    if (tid == 0) {
+    if (tid == 0 && xcd_rank < op_base) {
+      s_oproj_leader = 0;
+    } else if (tid == 0) {
       // Modular test rather than a reset: the counter is monotonic for the
       // whole run, so there is no window in which a fast worker from the next
       // layer can observe a zeroed counter.
@@ -2386,10 +2401,22 @@ __device__ __attribute__((always_inline)) void
        ll_route != nullptr && w2_act_ll_ptr != nullptr)
           ? reinterpret_cast<unsigned long long *>(w2_act_ll_ptr)
           : nullptr;
+  // MPK_MOE_SKIP_TOPK: the routing TopK worker (xcd_rank == router_tile_n)
+  // runs no W13 or W2 tile -- it reaches them last, after the selection, and
+  // every W2 tile waits on the last W13 output -- so the MoE tiles map onto
+  // the XCD's other ranks: mrk is this worker's MoE rank, -1 for the TopK's.
+  bool const moe_skip_topk =
+      MPK_MOE_SKIP_TOPK && router_xsplit_ptr != nullptr &&
+      router_ll_ptr != nullptr && moe_w13_live + 1 <= tiles_per_xcd &&
+      moe_w2_tiles_per_xcd + 1 <= tiles_per_xcd;
+  int const mrk = !moe_skip_topk            ? xcd_rank
+                  : xcd_rank == router_tile_n ? -1
+                  : xcd_rank > router_tile_n  ? xcd_rank - 1
+                                              : xcd_rank;
   bool w13_staged = false;
 #if MPK_W13_ACT_EARLY
   if constexpr (BATCH_SIZE == 1) {
-    if (ll_route != nullptr && xcd_rank < moe_w13_live &&
+    if (ll_route != nullptr && mrk >= 0 && mrk < moe_w13_live &&
         xcd_rank != router_tile_n) {
       if (tid < 64) {
         unsigned const *const ks_flag = reinterpret_cast<unsigned const *>(
@@ -2423,7 +2450,7 @@ __device__ __attribute__((always_inline)) void
 #endif
 #pragma unroll 1
   for (int _w13rep = 0; _w13rep < MPK_W13_REPS; ++_w13rep)
-  for (int t = xcd_rank; t < moe_w13_live; t += tiles_per_xcd) {
+  for (int t = mrk; t >= 0 && t < moe_w13_live; t += tiles_per_xcd) {
     gang_moe_w13_linear_mxfp8_kernel<BATCH_SIZE,
                                      2 * MOE_INTERMEDIATE,
                                      2 * MOE_INTERMEDIATE,
@@ -2453,7 +2480,7 @@ __device__ __attribute__((always_inline)) void
         t,
         ll_route,
         (unsigned)routing_expected,
-        w13_staged && t == xcd_rank && _w13rep == 0,
+        w13_staged && t == mrk && _w13rep == 0,
         w2_act_ll);
   }
 
@@ -2716,13 +2743,14 @@ __device__ __attribute__((always_inline)) void
   // pulls next-layer qkv_a concurrently with the W2 wait+tiles.
   MPK_QKVA_PF_BODY(moe_w2_live);
 #endif
-  if (xcd_rank >= moe_w2_tiles_per_xcd) {
+  if (mrk >= moe_w2_tiles_per_xcd) {
     return;
   }
 #if MPK_W2_EARLY_PF && MPK_MOE_TP
   // MPK_W2_EARLY_PF: this worker's W2 tile weight into L2 during the wait;
   // see _gang_w2_tp_l2_prefetch. The W13-idle workers get here during W13.
-  if (MPK_MOE_BS1_DECODE && ll_route != nullptr && xcd_rank < moe_w2_live) {
+  if (MPK_MOE_BS1_DECODE && ll_route != nullptr && mrk >= 0 &&
+      mrk < moe_w2_live) {
     constexpr int PF_SEG_KT = MOE_INTERMEDIATE / 128;
     constexpr int PF_SEG_ROUND =
         (MPK_MOE_TP_W2_KPARTS > 1)
@@ -2735,7 +2763,7 @@ __device__ __attribute__((always_inline)) void
     _gang_w2_tp_l2_prefetch<HIDDEN_SIZE, MOE_INTERMEDIATE, MOE_NUM_TOPK,
                             MOE_W2_OPW, MOE_WEIGHT_FP4, PF_NSEG,
                             MPK_MOE_TP_W2_KPARTS>(
-        moe_down_weight_ptr, xcd_rank, ll_route, (unsigned)routing_expected);
+        moe_down_weight_ptr, mrk, ll_route, (unsigned)routing_expected);
   }
 #endif
   if (w2_act_ll != nullptr) {
@@ -2847,7 +2875,7 @@ __device__ __attribute__((always_inline)) void
       }
     }
   }
-  for (int t = xcd_rank; t < moe_w2_live; t += tiles_per_xcd) {
+  for (int t = mrk; t >= 0 && t < moe_w2_live; t += tiles_per_xcd) {
     // Tiles [0, _pipe_tiles) were MOVED onto the W13-idle workers above, so
     // their natural owners skip them. _pipe_tiles is 0 when the probe is off
     // and this folds away. Work is moved, never added or dropped.

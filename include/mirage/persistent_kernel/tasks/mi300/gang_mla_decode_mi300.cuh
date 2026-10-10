@@ -921,7 +921,18 @@ __device__ __noinline__ void
                         // so the merge validates them instead of waiting.
                         unsigned long long *ll_o = nullptr,
                         unsigned long long *ll_lse = nullptr,
-                        unsigned ll_epoch = 0) {
+                        unsigned ll_epoch = 0,
+                        // MPK_DEC_Q_LL, one row: the own heads' query rows as
+                        // (q_ll_epoch << 32 | bf16x2) words, head h at
+                        // q_ll + h * QK_DIM / 2 for q heads q_ll_own_lo + h,
+                        // h < 8, staged through LDS instead of read from
+                        // q_workspace behind the q_b barrier; kv_flag carries
+                        // q_ll_epoch once the current token's cache row is
+                        // stored, and the chunk holding that row waits on it.
+                        unsigned long long const *q_ll = nullptr,
+                        unsigned q_ll_epoch = 0,
+                        int q_ll_own_lo = 0,
+                        unsigned long long const *kv_flag = nullptr) {
   using bf16 = __hip_bfloat16;
   using gang_mla_decode_detail::__ldg_bf16x4_raw;
   using gang_mla_decode_detail::bf16x4_t;
@@ -1079,6 +1090,8 @@ __device__ __noinline__ void
                                                      lse_ptr))),
                     ((unsigned long long)ll_epoch << 32) |
                         __float_as_uint(empty));
+        }
+        if (ll_lse != nullptr && MPK_DML_DBG != 1) {
         } else if constexpr (WRITE_THROUGH) {
           float const empty = -1e30f;
           unsigned raw;
@@ -1138,7 +1151,73 @@ __device__ __noinline__ void
 
   // Q first, then one KV tile per loop trip from HBM.
   __bf16 qr[NUM_K32][8];
-  {
+  if (BATCH_SIZE == 1 && q_ll != nullptr) {
+    constexpr int Q_LL_HEADS = 8;
+    constexpr int Q_WORDS = Q_LL_HEADS * QK_DIM / 2;
+    static_assert(Q_WORDS % 256 == 0 && QK_DIM % 2 == 0,
+                  "the staged rows split evenly over 256 threads");
+    constexpr int Q_PER = Q_WORDS / 256;
+    constexpr int Q_LDS_OFF = 96 * 1024;
+    static_assert(Q_LDS_OFF >= 65536 && Q_LDS_OFF + Q_WORDS * 4 <= 140 * 1024,
+                  "past the decode's tiles and o_acc, short of MPK_ATTN_META_PF's "
+                  "never-read window at 140 KB");
+    unsigned *const q_lds =
+        reinterpret_cast<unsigned *>(_mla_decode_smem + Q_LDS_OFF);
+    unsigned long long w[Q_PER];
+    while (true) {
+#pragma unroll
+      for (int j = 0; j < Q_PER; j++) {
+        asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1"
+                     : "=v"(w[j])
+                     : "v"(q_ll + tid + 256 * j)
+                     : "memory");
+      }
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      bool ok = true;
+#pragma unroll
+      for (int j = 0; j < Q_PER; j++) {
+        ok = ok && (unsigned)(w[j] >> 32) == q_ll_epoch;
+      }
+      if (__syncthreads_and(ok)) {
+        break;
+      }
+      __builtin_amdgcn_s_sleep(1);
+    }
+#pragma unroll
+    for (int j = 0; j < Q_PER; j++) {
+      q_lds[tid + 256 * j] = (unsigned)w[j];
+    }
+    if (kv_flag != nullptr && tid == 0 && chunk_last_tile >= ntiles) {
+      while (true) {
+        unsigned long long f;
+        asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1\n"
+                     "s_waitcnt vmcnt(0)"
+                     : "=v"(f)
+                     : "v"(kv_flag)
+                     : "memory");
+        if ((unsigned)(f >> 32) == q_ll_epoch) {
+          break;
+        }
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+    __syncthreads();
+    asm volatile("buffer_inv" ::: "memory");
+    int const own = midx - q_ll_own_lo;
+    bool const mine = own >= 0 && own < Q_LL_HEADS;
+    unsigned short const *const q_row_lds =
+        reinterpret_cast<unsigned short const *>(q_lds) +
+        (mine ? own : 0) * QK_DIM;
+#pragma unroll
+    for (int kc = 0; kc < NUM_K32; kc++) {
+      int dim_off = kc * 32 + kgrp * 8;
+      u32x4_t raw = {0u, 0u, 0u, 0u};
+      if (mine) {
+        raw = *reinterpret_cast<u32x4_t const *>(q_row_lds + dim_off);
+      }
+      __builtin_memcpy(&qr[kc][0], &raw, 16);
+    }
+  } else {
     int const q_head = q_head_group * Q_HEADS_PER_GROUP + midx;
     char const *q_ptr = reinterpret_cast<char const *>(q_workspace_ptr) +
                         (static_cast<long>(q_row) * Q_WORKSPACE_STRIDE +
@@ -1578,7 +1657,8 @@ __device__ __noinline__ void
           };
           st_wt_u64((void *)ow, ep | pk(raw[0], raw[1]));
           st_wt_u64((void *)(ow + 1), ep | pk(raw[2], raw[3]));
-        } else {
+        }
+        if (ll_o == nullptr || MPK_DML_DBG == 1) {
           unsigned long long lo, hi;
           __builtin_memcpy(&lo, &raw[0], 8);
           __builtin_memcpy(&hi, &raw[2], 8);
@@ -1615,6 +1695,8 @@ __device__ __noinline__ void
                          (lse_out - reinterpret_cast<float *>(lse_ptr))),
                 ((unsigned long long)ll_epoch << 32) |
                     __float_as_uint(lse_val));
+    }
+    if (ll_lse != nullptr && MPK_DML_DBG != 1) {
     } else if constexpr (WRITE_THROUGH) {
       unsigned raw;
       __builtin_memcpy(&raw, &lse_val, 4);
@@ -1700,7 +1782,12 @@ __device__ __noinline__ void
                            // MPK_DEC_MERGE_LL; see mla_decode_absorbed.
                            unsigned long long *ll_o = nullptr,
                            unsigned long long *ll_lse = nullptr,
-                           unsigned ll_epoch = 0) {
+                           unsigned ll_epoch = 0,
+                           // MPK_DEC_Q_LL; see mla_decode_absorbed.
+                           unsigned long long const *q_ll = nullptr,
+                           unsigned q_ll_epoch = 0,
+                           int q_ll_own_lo = 0,
+                           unsigned long long const *kv_flag = nullptr) {
   if (tile_idx >= total_work_items) {
     return;
   }
@@ -1747,7 +1834,11 @@ __device__ __noinline__ void
                                        hint_seqlen,
                                        ll_o,
                                        ll_lse,
-                                       ll_epoch);
+                                       ll_epoch,
+                                       q_ll,
+                                       q_ll_epoch,
+                                       q_ll_own_lo,
+                                       kv_flag);
 }
 
 } // namespace kernel

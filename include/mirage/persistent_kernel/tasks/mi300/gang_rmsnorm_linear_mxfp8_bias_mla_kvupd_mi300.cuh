@@ -120,7 +120,11 @@ __device__ __attribute__((noinline)) void
         float kv_eps,
         // Un-absorbed only: the 576-wide query row MLA decode reads, whole
         // rather than this XCD's slice, since the head index below is global.
-        void *q_rope_out_ptr = nullptr) {
+        void *q_rope_out_ptr = nullptr,
+        // MPK_WUK_LL; see gang_rmsnorm_linear_mxfp8_bias_kernel.
+        unsigned long long *ll_out = nullptr,
+        unsigned ll_epoch = 0,
+        int ll_cols = 0) {
   using bf16 = __hip_bfloat16;
   constexpr int QK_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM;
   constexpr bool UNABSORB_K = QK_NOPE_HEAD_DIM > 0;
@@ -213,7 +217,16 @@ __device__ __attribute__((noinline)) void
                                                            num_active_tokens,
                                                            n_wgs_per_xcd,
                                                            o_stride,
-                                                           gemm_tile_idx);
+                                                           gemm_tile_idx,
+                                                           nullptr,
+                                                           nullptr,
+                                                           nullptr,
+                                                           0,
+                                                           nullptr,
+                                                           0,
+                                                           ll_out,
+                                                           ll_epoch,
+                                                           ll_cols);
 
   if constexpr (DEFER_ROPE) {
     // The caller rotates, after its own barrier. Nothing below this point --

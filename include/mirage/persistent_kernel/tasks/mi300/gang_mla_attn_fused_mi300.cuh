@@ -232,7 +232,11 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     unsigned long long *attn_ll = nullptr,
     unsigned attn_ll_epoch = 0,
     // MPK_DEC_MERGE_LL: the decode's lse words; its o words reuse o_acc.
-    unsigned long long *dec_ll_lse = nullptr) {
+    unsigned long long *dec_ll_lse = nullptr,
+    // MPK_WUK_LL: eight per-XCD blocks of FULL_LAYER_WUKLL_XCD_WORDS words.
+    unsigned long long *wuk_ll = nullptr,
+    // MPK_DEC_Q_LL: the own heads' query rows as words, then the KV flag.
+    unsigned long long *dec_q_ll = nullptr) {
 
   int const tid = threadIdx.x;
   int const xcd_id = tile_idx / tiles_per_xcd;
@@ -537,6 +541,29 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // already carries the head's rope tail into the peers.
   constexpr bool QB_DEFER_ROPE =
       UNABSORB_K && (QB_OUTPUT_PER_WG < QK_ROPE_HEAD_DIM);
+  // MPK_WUK_LL: q_b -> W_UK through this XCD's head as epoch words in its L2
+  // (one head per XCD, the rope deferred to W_UK's last tile), so the W_UK
+  // tiles and the rotation validate the words instead of the XCD barrier.
+  constexpr int WUKLL_XCD_WORDS = 128;
+  bool const wk_ll = wuk_ll != nullptr && BATCH_SIZE == 1;
+  if (wk_ll && (!QB_DEFER_ROPE || !head_local ||
+                (QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM) / 2 > WUKLL_XCD_WORDS ||
+                qb_n_wgs_per_xcd * QB_OUTPUT_PER_WG !=
+                    QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM)) {
+    __builtin_trap();
+  }
+  unsigned long long *const wk_words =
+      wk_ll ? wuk_ll + (size_t)xcd_id * WUKLL_XCD_WORDS : nullptr;
+  // MPK_DEC_Q_LL: W_UK's rows and the roped tail also leave as epoch words, and
+  // XCD 0's latent tile flags the current token's cache row, so the decode
+  // validates its query instead of waiting at the q_b -> decode barrier.
+  constexpr int QLL_HEAD_WORDS = (KV_LORA_RANK + QK_ROPE_HEAD_DIM) / 2;
+  bool const dq_ll = dec_q_ll != nullptr && BATCH_SIZE == 1;
+  if (dq_ll && (!wk_ll || MRG_HEADS != QB_TP_HEADS || QB_TP_HEADS != 8)) {
+    __builtin_trap();
+  }
+  unsigned long long *const dq_flag =
+      dq_ll ? dec_q_ll + 8 * QLL_HEAD_WORDS : nullptr;
 
   // Release values are read once, up front, before anything in this layer has
   // run -- the same argument as the MoE task's s_expected block. Reading a
@@ -1109,7 +1136,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         // Biasing the pointer by this rank's head base is what makes it land
         // on the global head, and costs the kernel nothing.
         /*q_rope_out_ptr=*/static_cast<unsigned short *>(q_workspace_ptr) +
-            static_cast<size_t>(qb_head_base) * QB_QK_DIM);
+            static_cast<size_t>(qb_head_base) * QB_QK_DIM,
+        wk_words,
+        (unsigned)wuk_expected_in,
+        QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM);
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     if (tid == 0 && g_subphase_active) {
       unsigned long long _d =
@@ -1152,6 +1182,16 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // barrier is worth much less than the 12.4 us suggests: heads 0-6 are ready
   // after round 1, but head 7 is produced by tiles 29-32, which are exactly
   // the round-2 tiles, so the makespan floor stays 20.6 + 2.52.
+  // MPK_DEC_Q_LL: q_b tile 0 on XCD 0 appended the current token's cache row;
+  // flag it once those stores are acknowledged.
+  if (dq_ll && xcd_id == 0 && xcd_rank == 0) {
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    __syncthreads();
+    if (tid == 0) {
+      st_wt_u64((void *)dq_flag,
+                ((unsigned long long)(unsigned)qb_expected << 32) | 1ull);
+    }
+  }
   if constexpr (UNABSORB_K) {
     static_assert(KV_LORA_RANK % WUK_ROWS_PER_WG == 0,
                   "a head's absorbed rows must fill whole GEMV tiles");
@@ -1188,8 +1228,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     }
 #endif
 
-    __syncthreads();
-    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    if (!wk_ll) {
+      __syncthreads();
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    }
 #if MPK_WUK_PF
     // MPK_WUK_PF: the W_UK tile's weight does not depend on q_nope, so waves
     // 1-3 pull it into L2 while wave 0 arrives and polls; the __syncthreads
@@ -1217,7 +1259,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
       }
     }
 #endif
-    if (tid == 0) {
+    if (tid == 0 && !wk_ll) {
       int *const _cnt = &wuk_barrier[xcd_id * HIER_STRIDE + 8];
       int *const _flag = &wuk_barrier[xcd_id * HIER_STRIDE];
       int prev = atom_add_release_gpu_s32(_cnt, 1);
@@ -1247,8 +1289,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         __builtin_amdgcn_s_sleep(1);
       }
     }
-    __syncthreads();
-    asm volatile("buffer_inv" ::: "memory");
+    if (!wk_ll) {
+      __syncthreads();
+      asm volatile("buffer_inv" ::: "memory");
+    }
     if (tid == 0) {
       mpk_stage_stamp(52);
     }
@@ -1350,7 +1394,11 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
                              NUM_Q_HEADS * QB_HEAD_SPAN>(
           head_in, wuk_weight_ptr, /*residual=*/nullptr, tile_out,
           num_active_tokens, WUK_ROWS_PER_WG, NUM_Q_HEADS * QK_DIM_,
-          /*m_tiles=*/1, wuk_tiles_per_xcd, /*wgm=*/0, t);
+          /*m_tiles=*/1, wuk_tiles_per_xcd, /*wgm=*/0, t,
+          /*bias_ptr=*/nullptr, /*stage_a=*/true, wk_words,
+          (unsigned)wuk_expected_in,
+          dq_ll ? dec_q_ll + (size_t)xcd_id * QLL_HEAD_WORDS : nullptr,
+          (unsigned)qb_expected);
       // Push the rows this workgroup just produced straight into every peer's
       // copy of the query row, at the identical offset. The head slices are
       // disjoint across ranks, so the all-gather is QB_NPEER stores of those
@@ -1386,7 +1434,22 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
           // two callers below pass different meanings of and which nothing
           // constrains at BATCH_SIZE 1. rope_tile_inplace has a __syncthreads
           // in it, so the bound has to be block-uniform, which qb_rows is.
-          for (int r = 0; r < qb_rows; ++r) {
+          if (wk_ll) {
+            gang_mla_kvupd_detail::rope_tile_from_ll<QK_ROPE_HEAD_DIM,
+                                                     /*WRITE_THROUGH=*/true>(
+                wk_words + QK_NOPE_HEAD_DIM / 2, (unsigned)wuk_expected_in,
+                reinterpret_cast<rope_bf16 const *>(cos_ptr) +
+                    static_cast<size_t>(rope_pos) * QK_ROPE_HEAD_DIM,
+                reinterpret_cast<rope_bf16 const *>(sin_ptr) +
+                    static_cast<size_t>(rope_pos) * QK_ROPE_HEAD_DIM,
+                reinterpret_cast<rope_bf16 *>(q_workspace_ptr) +
+                    static_cast<size_t>(head) * QK_DIM_ + KV_LORA_RANK,
+                dq_ll ? dec_q_ll + (size_t)xcd_id * QLL_HEAD_WORDS +
+                            KV_LORA_RANK / 2
+                      : nullptr,
+                (unsigned)qb_expected);
+          }
+          for (int r = 0; !wk_ll && r < qb_rows; ++r) {
             gang_mla_kvupd_detail::rope_tile_inplace<QK_ROPE_HEAD_DIM,
                                                      /*WRITE_THROUGH=*/true>(
                 reinterpret_cast<rope_bf16 *>(q_nope_ptr) +
@@ -1680,7 +1743,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
       }
     }
 #endif
-    if (tid == 0 && !MPK_ATTN_PROBE_NOQBWAIT) {
+    if (tid == 0 && !MPK_ATTN_PROBE_NOQBWAIT && !dq_ll) {
       // Self-heal, see MPK_FL_REPUBLISH_SPINS.
       int *const _qb_flag = &qb_barrier[xcd_id * HIER_STRIDE];
       MPK_WS_WAIT_BEGIN(763, qb_expected);
@@ -1805,7 +1868,11 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
           hint_seqlen,
           dm_ll ? reinterpret_cast<unsigned long long *>(o_acc_ptr) : nullptr,
           dm_ll ? dec_ll_lse : nullptr,
-          (unsigned)decode_expected);
+          (unsigned)decode_expected,
+          dq_ll ? dec_q_ll : nullptr,
+          (unsigned)qb_expected,
+          own_head_lo,
+          dq_flag);
     }
 #endif
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
@@ -1882,7 +1949,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
 #endif
   // Under MPK_DEC_MERGE_LL every merge rank skips the wait together, so the
   // tagged rendezvous' xcd_rank-0 release is owed to nobody.
-  if (MPK_ATTN_PROBE_NODECWAIT || dm_ll) {
+  if (MPK_ATTN_PROBE_NODECWAIT || (dm_ll && MPK_DML_DBG == 0)) {
   } else if (dec_tagged) {
     tag_bar_wait_site(dec_tags, dec_arrivals, decode_expected, tid, xcd_id,
                       xcd_rank);
@@ -1985,9 +2052,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         attn_ll,
         attn_ll_epoch,
         /*ll_head0=*/qb_head_base,
-        dm_ll ? reinterpret_cast<unsigned long long const *>(o_acc_ptr)
-              : nullptr,
-        dm_ll ? dec_ll_lse : nullptr,
+        (dm_ll && MPK_DML_DBG != 1)
+            ? reinterpret_cast<unsigned long long const *>(o_acc_ptr)
+            : nullptr,
+        (dm_ll && MPK_DML_DBG != 1) ? dec_ll_lse : nullptr,
         (unsigned)decode_expected);
   }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING

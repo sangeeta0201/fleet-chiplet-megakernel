@@ -350,6 +350,64 @@ __device__ __forceinline__ void rope_tile_inplace(bf16 *tile,
   }
 }
 
+// MPK_WUK_LL: rope_tile_inplace with the slice read from q_b's epoch words
+// instead of the scratch row -- pair (2j, 2j+1) is words[j] -- so the rotation
+// needs no barrier in front of it. Same arithmetic, same stores.
+// MPK_DEC_Q_LL: q_ll, if set, also takes the rotated slice as (q_epoch << 32
+// | bf16x2) words, element pair (2j, 2j+1) at q_ll[j], write-through.
+template <int QK_ROPE_HEAD_DIM, bool WRITE_THROUGH = false>
+__device__ __forceinline__ void rope_tile_from_ll(
+    unsigned long long const *words, unsigned epoch, bf16 const *cos_data,
+    bf16 const *sin_data, bf16 *out, unsigned long long *q_ll = nullptr,
+    unsigned q_epoch = 0) {
+  constexpr int ROPE_HALF = QK_ROPE_HEAD_DIM / 2;
+  int const tid = threadIdx.x;
+  float r0 = 0.0f, r1 = 0.0f;
+  if (tid < ROPE_HALF) {
+    unsigned long long w;
+    while (true) {
+      asm volatile("global_load_dwordx2 %0, %1, off nt\n"
+                   "s_waitcnt vmcnt(0)"
+                   : "=v"(w)
+                   : "v"(words + tid)
+                   : "memory");
+      if ((unsigned)(w >> 32) == epoch) {
+        break;
+      }
+      __builtin_amdgcn_s_sleep(1);
+    }
+    unsigned short const lo = (unsigned short)(w & 0xFFFFu);
+    unsigned short const hi = (unsigned short)((w >> 16) & 0xFFFFu);
+    bf16 b0, b1;
+    __builtin_memcpy(&b0, &lo, 2);
+    __builtin_memcpy(&b1, &hi, 2);
+    float const x0 = __cvt_bf16_to_f32_mla(b0);
+    float const x1 = __cvt_bf16_to_f32_mla(b1);
+    float const c = __cvt_bf16_to_f32_mla(cos_data[tid]);
+    float const s = __cvt_bf16_to_f32_mla(sin_data[tid]);
+    r0 = x0 * c - x1 * s;
+    r1 = x1 * c + x0 * s;
+    cache_store<WRITE_THROUGH>(&out[tid], r0);
+    cache_store<WRITE_THROUGH>(&out[tid + ROPE_HALF], r1);
+  }
+  if (q_ll != nullptr) {
+    float const n0 = __shfl_down(r0, 1);
+    float const n1 = __shfl_down(r1, 1);
+    if (tid < ROPE_HALF && (tid & 1) == 0) {
+      auto bits = [](float v) -> unsigned {
+        bf16 const b = static_cast<bf16>(v);
+        unsigned short raw;
+        __builtin_memcpy(&raw, &b, 2);
+        return raw;
+      };
+      unsigned long long const eh = (unsigned long long)q_epoch << 32;
+      st_wt_u64((void *)(q_ll + tid / 2), eh | bits(r0) | (bits(n0) << 16));
+      st_wt_u64((void *)(q_ll + (ROPE_HALF + tid) / 2),
+                eh | bits(r1) | (bits(n1) << 16));
+    }
+  }
+}
+
 } // namespace gang_mla_kvupd_detail
 
 // See the file header. Template parameters up to NORM_SPAN are
