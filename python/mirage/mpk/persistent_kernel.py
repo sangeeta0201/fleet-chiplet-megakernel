@@ -1601,6 +1601,9 @@ def get_compile_command(
             # Routing as epoch-tagged words the MoE tiles validate
             # (gang_rmsnorm_linear_bias_mi300.cuh, gang_oproj_router_fused).
             "MPK_ROUTE_LL",
+            # Raw stage-stamp trace of a few decode iterations (mpk_atoms.cuh),
+            # dumped to MPK_TRACE_OUT.rank<r>.bin.
+            "MPK_TRACE",
             # Ceiling probes, wrong output (gang_mla_attn_fused_mi300.cuh).
             "MPK_ATTN_PROBE_NOQBWAIT",
             "MPK_ATTN_PROBE_NODECWAIT",
@@ -1613,6 +1616,9 @@ def get_compile_command(
         _x = os.environ.get("MPK_TOPK_PAD_NS")
         if _x is not None:
             flags = flags + [f"-DMPK_TOPK_PAD_NS={int(_x)}"]
+        _x = os.environ.get("MPK_TRACE_T0")
+        if _x is not None:
+            flags = flags + [f"-DMPK_TRACE_T0={int(_x)}"]
         # The qkv_a-idle workers prefetch qkv_a's weight into L2
         # (gang_mla_attn_fused_mi300.cuh).
         _x = os.environ.get("MPK_QKVA_IDLE_PF")

@@ -2067,6 +2067,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
       pc_pos = 0;
       pc_iter = 1;
       pc_my_len = tmpl_len;
+      mpk_trace_set_slot(-1);
       pc_terminated = 0;
       pc_xcd_rank = my_rank;
       pc_has_begin = (tmpl_len > 0 && tmpl_src[0] == 1)
@@ -3180,6 +3181,16 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #endif
 
             for (int ml = ml_begin; ml < ml_end; ml++) {
+#if defined(MPK_TRACE) && MPK_TRACE && !MPK_BAR_SKEW
+              if (threadIdx.x == 0) {
+                long const _ti = (long)pc_iter - MPK_TRACE_T0;
+                mpk_trace_set_slot(
+                    (_ti >= 0 && _ti < MPK_TRACE_ITERS &&
+                     ml < MPK_TRACE_LAYERS)
+                        ? (int)_ti * MPK_TRACE_LAYERS + ml
+                        : -1);
+              }
+#endif
 #if MPK_HWID_PROBE
               // Per wave, stored only when a queue restore has moved it.
               if ((threadIdx.x & 63) == 0 && g_hwid_probe != nullptr) {
@@ -3459,6 +3470,9 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #endif
             }
 
+            if (threadIdx.x == 0) {
+              mpk_trace_set_slot(-1);
+            }
             // Deferred event signal: after compaction, layer 0's trigger_event
             // points to the last layer's event (gates FUSE_TAIL). Signal via
             // the two-level path since this task is in the queue.
@@ -7071,6 +7085,40 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
 
 // Entry point for C/C++
 // TODO: change launch config
+#if defined(MPK_TRACE) && MPK_TRACE && !MPK_BAR_SKEW
+// MPK_TRACE's buffer to MPK_TRACE_OUT.rank<r>.bin: six ints (magic 'MPTK',
+// T0, iters, layers, stamps, workers), then the raw u32 [iter][layer][stamp]
+// [worker] array.
+static void mpk_trace_dump() {
+  char const *out = std::getenv("MPK_TRACE_OUT");
+  if (out == nullptr || *out == 0) {
+    return;
+  }
+  std::vector<unsigned> h(MPK_TRACE_WORDS);
+  if (hipMemcpyFromSymbol(h.data(), HIP_SYMBOL(g_mpk_trace),
+                          MPK_TRACE_WORDS * sizeof(unsigned), 0,
+                          hipMemcpyDeviceToHost) != hipSuccess) {
+    fprintf(stderr, "[MPK_TRACE] copy failed\n");
+    return;
+  }
+  char const *r = std::getenv("OMPI_COMM_WORLD_RANK");
+  char path[1024];
+  snprintf(path, sizeof(path), "%s.rank%s.bin", out, r != nullptr ? r : "0");
+  FILE *f = fopen(path, "wb");
+  if (f == nullptr) {
+    fprintf(stderr, "[MPK_TRACE] cannot open %s\n", path);
+    return;
+  }
+  int const hdr[6] = {0x4b54504d, MPK_TRACE_T0, MPK_TRACE_ITERS,
+                      MPK_TRACE_LAYERS, MPK_STAGE_SLOTS, MPK_STAGE_WORKERS};
+  fwrite(hdr, sizeof(int), 6, f);
+  fwrite(h.data(), sizeof(unsigned), MPK_TRACE_WORDS, f);
+  fclose(f);
+  printf("[MPK_TRACE] wrote %s\n", path);
+  fflush(stdout);
+}
+#endif
+
 extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
   fprintf(stderr, "[HOST_DBG] launch_persistent_kernel ENTER\n");
   // HOST-SIDE breadcrumbs for the launch wedge (#135). MEASURED: on a wedged
@@ -8646,6 +8694,9 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
     (void)cudaStreamSynchronize(global_runtime_config.worker_stream);
     (void)cudaStreamSynchronize(global_runtime_config.scheduler_stream);
     g_iter_hb_epoch.fetch_add(1, std::memory_order_relaxed);
+#if defined(MPK_TRACE) && MPK_TRACE && !MPK_BAR_SKEW
+    mpk_trace_dump();
+#endif
   } else {
     int num_sms_to_use = global_runtime_config.num_workers + num_schedulers;
 #ifdef USE_NVSHMEM
@@ -8663,6 +8714,9 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
         global_runtime_config);
 #endif
     (void)cudaDeviceSynchronize();
+#if defined(MPK_TRACE) && MPK_TRACE && !MPK_BAR_SKEW
+    mpk_trace_dump();
+#endif
   }
 }
 

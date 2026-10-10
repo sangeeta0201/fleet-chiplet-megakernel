@@ -1896,8 +1896,49 @@ __device__ __forceinline__ void mpk_stage_stamp(int idx) {
     g_stage_pmax[q] = d;
   }
 }
+#elif defined(MPK_TRACE) && MPK_TRACE
+// MPK_TRACE: every stage stamp of decode iterations [MPK_TRACE_T0,
+// + MPK_TRACE_ITERS) as the raw low 32 bits of s_memrealtime (10 ns ticks),
+// one fire-and-forget store per stamp, into [iter][layer][stamp][worker].
+// MPK_BAR_SKEW's accumulators cost a dependent load-modify-store each (~1 us,
+// 8.8 against 5.9 ms/token) and their per-worker means mix in the first
+// layer's samples, whose reference predates the prologue. Dumped by the host
+// after the kernel returns (MPK_TRACE_OUT.rank<r>.bin); unwritten entries
+// stay 0.
+#ifndef MPK_TRACE_T0
+#define MPK_TRACE_T0 1600
+#endif
+#define MPK_TRACE_ITERS 4
+#define MPK_TRACE_LAYERS 80
+#define MPK_STAGE_SLOTS 46
+#define MPK_STAGE_WORKERS 512
+#define MPK_TRACE_WORDS                                                        \
+  ((size_t)MPK_TRACE_ITERS * MPK_TRACE_LAYERS * MPK_STAGE_SLOTS *              \
+   MPK_STAGE_WORKERS)
+__device__ unsigned g_mpk_trace[MPK_TRACE_WORDS];
+// (iter - T0) * MPK_TRACE_LAYERS + ml while a traced layer runs, else -1.
+// Written and read by tid 0 only, so no join.
+__shared__ int s_mpk_trace_slot;
+__device__ __forceinline__ void mpk_trace_set_slot(int slot) {
+  s_mpk_trace_slot = slot;
+}
+__device__ __forceinline__ void mpk_stage_stamp(int idx) {
+  unsigned const t = (unsigned)__builtin_amdgcn_s_memrealtime();
+  int const slot = s_mpk_trace_slot;
+  unsigned const w = blockIdx.x;
+  if (slot < 0 || w >= MPK_STAGE_WORKERS) {
+    return;
+  }
+  __builtin_nontemporal_store(
+      t, &g_mpk_trace[((size_t)slot * MPK_STAGE_SLOTS + idx) *
+                          MPK_STAGE_WORKERS +
+                      w]);
+}
 #else
 __device__ __forceinline__ void mpk_stage_stamp(int) {}
+#endif
+#if !(defined(MPK_TRACE) && MPK_TRACE) || MPK_BAR_SKEW
+__device__ __forceinline__ void mpk_trace_set_slot(int) {}
 #endif
 
 // MPK_ML_BOUNDARY_PAD: nanoseconds of pure delay injected into the multi-layer
