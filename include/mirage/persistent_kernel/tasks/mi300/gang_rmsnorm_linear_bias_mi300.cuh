@@ -769,6 +769,43 @@ __device__ __attribute__((noinline)) void
       reinterpret_cast<unsigned long long const *>(rll);
   __shared__ unsigned short s_logits[NUM_EXPERTS];
   unsigned long long w;
+  if constexpr (KSPLIT && MPK_ROUTE_LL_ON) {
+    // GLM_DENSE_FUSED: routed_scaling_factor 0 marks a dense layer whose MLP
+    // is K + num_shared always-active virtual experts, so there is nothing to
+    // select: slot k is expert k at weight 1. The router tiles' (zero)
+    // partials go unread. Same ordering as below: the words are written by
+    // the wave that saw the normed flags.
+    if (routed_scaling_factor == 0.0f) {
+      if (tid < 64) {
+        unsigned const *const ks_flag = reinterpret_cast<unsigned const *>(
+            ks_all + xcd * MPK_XSPLIT_XCD_INTS);
+        while (true) {
+          unsigned seen = epoch;
+          if (tid < 16) {
+            asm volatile("global_load_dword %0, %1, off nt\n"
+                         "s_waitcnt vmcnt(0)"
+                         : "=v"(seen)
+                         : "v"(ks_flag + tid)
+                         : "memory");
+          }
+          if (__ballot(seen >= epoch) == ~0ull) {
+            break;
+          }
+          __builtin_amdgcn_s_sleep(1);
+        }
+        unsigned long long *const ll_dense =
+            reinterpret_cast<unsigned long long *>(
+                rll + MPK_RLL_WORD_LINES * 16 + xcd * MPK_RLL_XCD_INTS + 32 +
+                MPK_RLL_IDS_LINES * 16);
+        if (tid < K + num_shared_experts) {
+          unsigned long long const hi = (unsigned long long)epoch << 32;
+          ll_dense[tid] = hi | (unsigned)tid;
+          ll_dense[16 + tid] = hi | __float_as_uint(1.0f);
+        }
+      }
+      return;
+    }
+  }
   if constexpr (KSPLIT) {
     static_assert(NUM_EXPERTS == 256, "32 experts per XCD, 16 slices");
     extern __shared__ char _topk_dyn_smem[];

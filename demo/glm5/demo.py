@@ -1610,6 +1610,24 @@ if __name__ == "__main__":
         # because attn_out now crosses a barrier instead of an event.
         FUSE_FULL_LAYER = (
             os.environ.get("GLM_FUSE_FULL_LAYER", "0") == "1")
+        # GLM_DENSE_FUSED: the first_k_dense layers through the whole-layer
+        # task as well, their MLP as always-active virtual experts on the TP
+        # MoE path (see the dense branch of the layer loop). MPK_ITER_SPLIT put
+        # the unfused prologue at 590 of 5589 us/token.
+        # MEASURED 2026-10-10, NP=8 1024/1024, n=4 vs 3 interleaved, G1 PASS,
+        # each arm's text identical across its runs: 5.676 5.676 5.679 ->
+        # 5.100 5.089 5.116 5.096 ms (-0.58). The dense MLP is MXFP4 here
+        # (MXFP8 unfused), so the text departs from the control at token 95 of
+        # 1024, coherent, distinct 0.178 vs 0.157. ppl512 2.3670 against
+        # 2.4098: the fused path keeps the SwiGLU and the residual sum in f32
+        # where the unfused chain rounds each stage to bf16. Gates: standalone
+        # set PASS, longseq 256/512/1024 G1 PASS (distinct 0.551 0.486 0.178).
+        # On by default wherever the one-row TP MoE path it rides is on.
+        DENSE_FUSED = (os.environ.get("GLM_DENSE_FUSED", "1") == "1"
+                       and FUSE_FULL_LAYER and moe_ep and MOE_TP and MOE_MXFP4
+                       and FUSE_MOE_SWIGLU
+                       and args.max_num_batched_tokens == 1
+                       and os.environ.get("MPK_ROUTE_LL", "1") != "0")
 
         # ── expert parallelism ───────────────────────────────────────────
         # The routed experts split by ID across the ranks -- gpt-oss's
@@ -3176,6 +3194,17 @@ if __name__ == "__main__":
                 )
         moe_mid = make_tensor("moe_mid", (bs, topk_total, 2 * moe_inter_k))
         moe_act = make_tensor("moe_act", (bs, topk_total, moe_inter_k))
+        # GLM_DENSE_FUSED's slot-count-sized pair (see the dense branch).
+        dense_virt = 0
+        dense_moe_act = dense_topk_weight = None
+        dense_router_w = dense_router_b = None
+        if DENSE_FUSED and first_k_dense > 0:
+            dense_virt = config.intermediate_size // moe_inter
+            dense_moe_act = make_tensor("dense_moe_act",
+                                        (bs, dense_virt, moe_inter_k))
+            dense_topk_weight = make_tensor("dense_topk_weight",
+                                            (bs, dense_virt),
+                                            torch_dtype=torch.float32)
         moe_out = make_tensor("moe_out", (bs, topk_total, hidden_size))
         # atomicAdd target for the fused W2 epilogue. Zero-initialised here
         # and re-zeroed by moe_residual_add_f32 as it consumes each layer.
@@ -3577,7 +3606,8 @@ if __name__ == "__main__":
             qkv_fused_this = (DENSE_MXFP8 and QB_MXFP8
                               and num_kv_chunks > 1
                               and (FUSE_ATTN
-                                   or (FUSE_FULL_LAYER and layer.is_moe
+                                   or (FUSE_FULL_LAYER
+                                       and (layer.is_moe or DENSE_FUSED)
                                        and use_mxfp8_oproj and MOE_MXFP8
                                        and FUSE_MOE_SWIGLU
                                        and FUSE_MOE_MULSUMADD)))
@@ -3669,7 +3699,8 @@ if __name__ == "__main__":
             # and it is emitted at the MoE call site further down because the
             # expert weights it needs are not built until then. Here it only
             # has to switch every attention stage off.
-            fuse_full_layer = (FUSE_FULL_LAYER and layer.is_moe
+            fuse_full_layer = (FUSE_FULL_LAYER
+                               and (layer.is_moe or DENSE_FUSED)
                                and DENSE_MXFP8 and QB_MXFP8
                                and num_kv_chunks > 1
                                and use_mxfp8_oproj and MOE_MXFP8
@@ -3678,7 +3709,7 @@ if __name__ == "__main__":
             # only. `i < first_k_dense` is what makes oproj_xbufs[i] -- one
             # mailbox per dense layer -- in range.
             dense_tp_this = (dense_oproj_tp and not layer.is_moe
-                             and i < first_k_dense)
+                             and i < first_k_dense and not fuse_full_layer)
             if fuse_full_layer:
                 fuse_attn = True
             assert qkv_fp4_this == (QKV_MXFP4 and fuse_attn), (
@@ -4075,7 +4106,7 @@ if __name__ == "__main__":
                 layer.post_attention_layernorm.weight.data,
                 f"layer_{i}_post_attention_layernorm")
 
-            if not layer.is_moe:
+            if not layer.is_moe and not fuse_full_layer:
                 # 6a. Dense layer (the first `first_k_dense_replace` of them).
                 #
                 # These three were left bf16 long after everything else moved
@@ -4191,6 +4222,134 @@ if __name__ == "__main__":
                         block_dim=(256, 1, 1),
                     )
                 x = dense_out
+                continue
+
+            if not layer.is_moe:
+                # 6a'. GLM_DENSE_FUSED: the dense layer as the whole-layer task.
+                # Its MLP is a sum of independent intermediate slices, so it is
+                # n_virt always-active experts of the routed width: virtual
+                # expert v holds intermediate [v * moe_inter, +moe_inter), and
+                # this rank its TP slice, packed exactly like a routed expert.
+                # The stack is padded with zero experts to the routed count the
+                # task is templated on; the routing only ever names 0..n_virt-1.
+                # routed_scaling_factor 0 is the kernel's mark for it (the TopK
+                # publishes the identity routing, weight 1, slot v -> expert v).
+                assert (moe_ep and MOE_TP and MOE_MXFP4 and FUSE_MOE_SWIGLU
+                        and bs == 1
+                        and os.environ.get("MPK_ROUTE_LL", "1") != "0"), (
+                    "GLM_DENSE_FUSED rides the one-row TP MoE path and its "
+                    "identity routing is published as MPK_ROUTE_LL words")
+                gate_w = layer.mlp.gate_proj.weight.data
+                up_w = layer.mlp.up_proj.weight.data
+                down_w = layer.mlp.down_proj.weight.data
+                assert gate_w.shape[0] == dense_virt * moe_inter
+                gu_parts, dn_parts = [], []
+                for v in range(dense_virt):
+                    _lo = v * moe_inter + (rank * moe_inter_k)
+                    _hi = _lo + moe_inter_k
+                    gb, gs = quantize_mxfp4(gate_w[_lo:_hi])
+                    ub, us = quantize_mxfp4(up_w[_lo:_hi])
+                    db, ds = quantize_mxfp4(down_w[:, _lo:_hi].contiguous())
+                    gu_parts.append(pack_mxfp8_workgroup(
+                        interleave_gate_up(gb, ub, moe_inter_k),
+                        interleave_gate_up(gs, us, moe_inter_k),
+                        MOE_W13_OPW, MOE_KMAJOR))
+                    dn_parts.append(pack_mxfp8_workgroup(
+                        db, ds, MOE_W2_OPW, MOE_KMAJOR))
+                _pad = moe_held + num_shared - dense_virt
+                gu_parts += [torch.zeros_like(gu_parts[0])] * _pad
+                dn_parts += [torch.zeros_like(dn_parts[0])] * _pad
+                w_moe_gu = _attach_input_keep(torch.stack(gu_parts).contiguous(),
+                                              f"layer_{i}_dense_gate_up")
+                w_moe_down = _attach_input_keep(
+                    torch.stack(dn_parts).contiguous(), f"layer_{i}_dense_down")
+                del gu_parts, dn_parts, gate_w, up_w, down_w
+                _release(layer.mlp.gate_proj.weight, layer.mlp.up_proj.weight,
+                         layer.mlp.down_proj.weight)
+                if dense_router_w is None:
+                    dense_router_w = _attach_input_keep(
+                        torch.zeros(num_experts, hidden_size,
+                                    dtype=torch.bfloat16, device="cuda"),
+                        "dense_router_zero")
+                    dense_router_b = _attach_input_keep(
+                        torch.zeros(num_experts, dtype=torch.bfloat16,
+                                    device="cuda"), "dense_router_bias_zero")
+                fl_kwargs = dict(
+                    x=x,
+                    pre_norm_weight=w_norm,
+                    pre_norm_scratch=rmsnorm_out,
+                    qkv_mxfp8_weight=w_qkv_a,
+                    qkv_bias=zero_bias(qkv_a_pad),
+                    q_a_norm_weight=w_q_a_norm,
+                    q_a_norm_scratch=q_a_norm_out,
+                    qb_mxfp8_weight=w_q_b,
+                    qb_bias=zero_bias(
+                        qb_nope_width if unabsorb_k_this else qb_out_width),
+                    kv_norm_weight=w_kv_a_norm,
+                    cos_pos_embed=cos_pos_embed,
+                    sin_pos_embed=sin_pos_embed,
+                    kv_cache=kv_cache,
+                    moe_workspace_f32=moe_ws_f32,
+                    counters=full_layer_counter,
+                    oproj_mxfp8_weight=w_o,
+                    residual=oproj_resid,
+                    post_norm_weight=w_norm_moe,
+                    post_norm_output=rmsnorm_out_moe,
+                    router_weight=dense_router_w,
+                    router_bias=dense_router_b,
+                    logits_scratch=moe_gate_out,
+                    moe_gate_up_weight=w_moe_gu,
+                    moe_down_weight=w_moe_down,
+                    moe_w13_bias=zero_moe_bias(2 * moe_inter_k),
+                    moe_w2_bias=zero_moe_bias(hidden_size),
+                    moe_swiglu_out=dense_moe_act,
+                    qkv_a_out=qkv_a_out,
+                    q_workspace=mla_q_ws,
+                    lse=mla_lse,
+                    o_acc=mla_o_acc,
+                    attn_out=attn_out,
+                    x_out=layer_out,
+                    hidden=attn_proj_out,
+                    topk_weight=dense_topk_weight,
+                    routing_indices=moe_routing_indices,
+                    active_expert_ids=moe_mask,
+                    qkv_output_per_wg=QKV_MXFP8_OPW,
+                    qkv_actual_hidden_dim=hidden_size,
+                    qb_output_per_wg=qb_opw_this,
+                    qb_reduction_size=q_lora_pad,
+                    qb_actual_hidden_dim=q_lora,
+                    kv_offset=q_lora_pad,
+                    mla_params=(num_heads_pad, kv_lora, qk_rope, qk_head_dim,
+                                num_kv_chunks),
+                    q_workspace_slots=(num_heads if unabsorb_k_this
+                                       else qb_head_slots),
+                    merge_dim_splits=MLA_MERGE_DIM_SPLITS,
+                    oproj_rows_per_wg=(OPROJ_RP_ROWS if OPROJ_RP
+                                       else oproj_tile_n),
+                    oproj_reduction_size=layer_o_proj_red,
+                    wuv_mxfp8_weight=w_wuv,
+                    v_out=mla_v_out if unabsorb_this else None,
+                    wuv_rows_per_wg=WUV_GEMV_ROWS if unabsorb_this else 0,
+                    wuv_v_head_dim=v_head if unabsorb_this else 0,
+                    wuk_mxfp8_weight=w_wuk,
+                    q_nope=mla_q_nope if unabsorb_k_this else None,
+                    wuk_rows_per_wg=WUK_GEMV_ROWS if unabsorb_k_this else 0,
+                    qk_nope_head_dim=qk_nope if unabsorb_k_this else 0,
+                    actual_hidden_dim=hidden_size,
+                    # The shared slot is the last virtual expert.
+                    num_experts_per_tok=dense_virt - num_shared,
+                    routed_scaling_factor=0.0,
+                    norm_topk_prob=config.norm_topk_prob,
+                    moe_w13_output_per_wg=MOE_W13_OPW,
+                    moe_w2_output_per_wg=MOE_W2_OPW,
+                    router_experts_per_tile=ROUTER_EPT,
+                    block_dim=(256, 1, 1),
+                    ep_gather=ep_gather_list[gather_idx(i)],
+                    ep_signal=ep_signal,
+                    ep_fold_rank=ep_fold_rank,
+                )
+                mpk.gang_mla_full_layer_fused_layer(**fl_kwargs)
+                x = attn_proj_out
                 continue
 
             # 6b. MoE layer. The shared expert is stacked as expert
