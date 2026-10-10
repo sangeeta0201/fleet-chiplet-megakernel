@@ -539,8 +539,13 @@ static constexpr int FULL_LAYER_ALL_LINES = 256;
 static constexpr int FULL_LAYER_W2PL_SLOT =
     FULL_LAYER_ALL_SLOT + FULL_LAYER_ALL_LINES;
 static constexpr int FULL_LAYER_W2PL_LINES = 1536;
-static constexpr int FULL_LAYER_COUNTER_SLOTS =
+// MPK_DEC_MERGE_LL: the decode's lse as (epoch << 32 | f32) words, indexed
+// like the lse buffer (4 q groups x 64 chunks x 16 heads at GLM-5).
+static constexpr int FULL_LAYER_DLSE_SLOT =
     FULL_LAYER_W2PL_SLOT + FULL_LAYER_W2PL_LINES;
+static constexpr int FULL_LAYER_DLSE_LINES = 512;
+static constexpr int FULL_LAYER_COUNTER_SLOTS =
+    FULL_LAYER_DLSE_SLOT + FULL_LAYER_DLSE_LINES;
 static_assert(FULL_LAYER_XSPLIT_SLOT % 2 == 0 && MPK_XSPLIT_XCD_INTS % 32 == 0 &&
                   FULL_LAYER_RLL_SLOT % 2 == 0 && MPK_RLL_XCD_INTS % 32 == 0 &&
                   MPK_RLL_WORD_LINES % 2 == 0 && FULL_LAYER_QXS_SLOT % 2 == 0 &&
@@ -2082,7 +2087,12 @@ gang_mla_full_layer_fused_kernel_mi300(
           ? counters + FULL_LAYER_QXS_SLOT * HIER_STRIDE
           : nullptr,
       attn_ll,
-      (unsigned)attn_release_expected);
+      (unsigned)attn_release_expected,
+      // MPK_DEC_MERGE_LL: epoch is the layer counter, so ml_mode only.
+      (MPK_DEC_MERGE_LL && ml_mode)
+          ? reinterpret_cast<unsigned long long *>(
+                counters + FULL_LAYER_DLSE_SLOT * HIER_STRIDE)
+          : nullptr);
 
   MPK_WS_PHASE(60, task_layer_idx, xcd_id);
   // Stage 0: the residual stream this layer consumed -- and READ IT AS

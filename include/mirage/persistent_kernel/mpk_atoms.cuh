@@ -1103,7 +1103,7 @@ __device__ __forceinline__ bool
 // identical: 6.510 6.488 6.509 -> 6.484 6.467 6.505 (-0.017, overlapping).
 // Resolver 0's own acks are back before the peers' words land. Off.
 #ifndef MPK_EP_LL_FOLD_LAST
-#define MPK_EP_LL_FOLD_LAST 0
+#define MPK_EP_LL_FOLD_LAST 1
 #endif
 #if MPK_EP_LL && !MPK_QKV_XSPLIT
 #error "MPK_EP_LL: the LL slots are only read by MPK_QKV_XSPLIT's resolvers"
@@ -1301,21 +1301,27 @@ __device__ __forceinline__ bool
 // The 2026-10-10 first-iteration wedge was folder 0 = xcd_rank 0 skipping the
 // MPK_BAR_TAGGED_HIER entry poll that releases its XCD; xcd_rank 0 now always
 // waits, so the skip pays only with MPK_EP_LL_FOLD_LAST (folders at the XCD's
-// last ranks). =2 folds from the words but keeps the wait (text identical to
-// the default, 4.736 under MPK_PL_DEBUG).
+// last ranks). =2 folds from the words but keeps the wait.
+// MEASURED 2026-10-10 on the ea9e4d2 default, NP=8 1024/1024, n=3
+// interleaved, text identical: 4.615 4.618 4.610 -> with FOLD_LAST:
+// 4.565 4.572 4.567 (-0.046); + MPK_ENTRY_NOWAIT and the entry on
+// Mechanism C (MPK_BAR_TAGGED=30): 4.471 4.458 4.465 (-0.149). FOLD_LAST
+// alone: 4.624 4.644 4.631. All four default on.
 // MPK_W2_PARTS_LL: the TP W2 also writes each K-part's f32 rows as
 // epoch-tagged words (FULL_LAYER_W2PL_SLOT), and the next layer's EP_LL
 // folders fold from those, arriving at the layer-entry rendezvous without
 // waiting on it -- the last W2 tile's return path and the rendezvous leave
 // the cross-rank critical path (gang_mla_full_layer_fused_mi300.cuh).
 #ifndef MPK_W2_PARTS_LL
-#define MPK_W2_PARTS_LL 0
+#define MPK_W2_PARTS_LL 1
 #endif
 // MPK_ENTRY_NOWAIT: under MPK_W2_PARTS_LL, every worker arrives at the
 // layer-entry rendezvous without waiting on it (not the table's first layer
-// nor the tail).
+// nor the tail). With MPK_BAR_TAGGED's entry bit set the tagged entry still
+// makes xcd_rank 0 wait (it holds its XCD's release), and xcd_rank 0 is a
+// qkv_a resolver -- so the entry runs on Mechanism C (MPK_BAR_TAGGED=30).
 #ifndef MPK_ENTRY_NOWAIT
-#define MPK_ENTRY_NOWAIT 0
+#define MPK_ENTRY_NOWAIT 1
 #endif
 // MPK_DEC_HINTS: under MPK_DEC_PRELOAD the decode tiles hand the decode the
 // indptr values their prologue walk already loaded, so its dependent
@@ -1323,6 +1329,14 @@ __device__ __forceinline__ bool
 // (gang_mla_attn_fused_mi300.cuh, gang_mla_decode_mi300.cuh).
 #ifndef MPK_DEC_HINTS
 #define MPK_DEC_HINTS 0
+#endif
+// MPK_DEC_MERGE_LL: the decode writes its split-KV partials as epoch words
+// (o as bf16 pairs, same bytes as the f32 partials; lse as f32 words in
+// FULL_LAYER_DLSE_SLOT) and the merge validates them, so the merge ranks
+// skip the decode -> merge wait. Rounds the partials to bf16 before the
+// merge, so it moves the tokens: ppl-gated.
+#ifndef MPK_DEC_MERGE_LL
+#define MPK_DEC_MERGE_LL 0
 #endif
 
 // MPK_ML_NO_FENCE: the multi-layer loop skips its per-layer threadfence_gpu
@@ -2185,8 +2199,10 @@ __device__ __forceinline__ void mpk_ml_boundary_pad() {}
 // release value is snapshotted off its own Mechanism-C flag would never see
 // that flag advance once the site stops writing it. Outside ml_mode the
 // fused layer passes no slot arrays and every site stays Mechanism C.
+// 30, not 31: the entry rendezvous is back on Mechanism C, where a skipping
+// worker leaves no one stranded (MPK_ENTRY_NOWAIT).
 #ifndef MPK_BAR_TAGGED
-#define MPK_BAR_TAGGED 31
+#define MPK_BAR_TAGGED 30
 #endif
 #define MPK_TAGBAR_ENTRY 1
 #define MPK_TAGBAR_QKV 2

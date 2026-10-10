@@ -230,7 +230,9 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     // MPK_ATTN_OUT_LL: the merge's output as LL words for this rank's
     // row-parallel o_proj, which then skips the Phase 8 wait.
     unsigned long long *attn_ll = nullptr,
-    unsigned attn_ll_epoch = 0) {
+    unsigned attn_ll_epoch = 0,
+    // MPK_DEC_MERGE_LL: the decode's lse words; its o words reuse o_acc.
+    unsigned long long *dec_ll_lse = nullptr) {
 
   int const tid = threadIdx.x;
   int const xcd_id = tile_idx / tiles_per_xcd;
@@ -515,6 +517,11 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   int const own_head_lo = (MRG_HEADS != 16) ? qb_head_base % 16 : 0;
   // The words cover this rank's heads only.
   if (attn_ll != nullptr && (!head_local || MRG_HEADS != QB_TP_HEADS)) {
+    __builtin_trap();
+  }
+  // MPK_DEC_MERGE_LL: the decode -> merge hand-off through epoch words.
+  bool const dm_ll = dec_ll_lse != nullptr && BATCH_SIZE == 1;
+  if (dm_ll && (!head_local || MRG_HEADS != QB_TP_HEADS)) {
     __builtin_trap();
   }
 
@@ -1795,7 +1802,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
           t == dec_rank ? npre : 0,
           hint_q_row,
           hint_first_page,
-          hint_seqlen);
+          hint_seqlen,
+          dm_ll ? reinterpret_cast<unsigned long long *>(o_acc_ptr) : nullptr,
+          dm_ll ? dec_ll_lse : nullptr,
+          (unsigned)decode_expected);
     }
 #endif
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
@@ -1870,7 +1880,9 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   int const mrg_qs = -1;
   int const mrg_qe = -1;
 #endif
-  if (MPK_ATTN_PROBE_NODECWAIT) {
+  // Under MPK_DEC_MERGE_LL every merge rank skips the wait together, so the
+  // tagged rendezvous' xcd_rank-0 release is owed to nobody.
+  if (MPK_ATTN_PROBE_NODECWAIT || dm_ll) {
   } else if (dec_tagged) {
     tag_bar_wait_site(dec_tags, dec_arrivals, decode_expected, tid, xcd_id,
                       xcd_rank);
@@ -1972,7 +1984,11 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         mrg_qe,
         attn_ll,
         attn_ll_epoch,
-        /*ll_head0=*/qb_head_base);
+        /*ll_head0=*/qb_head_base,
+        dm_ll ? reinterpret_cast<unsigned long long const *>(o_acc_ptr)
+              : nullptr,
+        dm_ll ? dec_ll_lse : nullptr,
+        (unsigned)decode_expected);
   }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   {

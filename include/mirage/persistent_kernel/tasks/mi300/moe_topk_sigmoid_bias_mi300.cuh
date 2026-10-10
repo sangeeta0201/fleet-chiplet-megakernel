@@ -78,6 +78,10 @@
 // 32 lanes' maxima, so only keys >= T can win -- and sort just those
 // (<= 32, else the network below runs). Same keys, same order. Needs the
 // rank_lds scratch the fused router passes.
+// MEASURED NEGATIVE 2026-10-10 on the ea9e4d2 default, text identical:
+// 4.603 -> 4.739 ms. Its two 32-lane bitonic sorts are 30 DEPENDENT cross-lane
+// steps (ds_bpermute without MPK_TOPK_DPP), where each of the network's five
+// merge rounds issues its eight exchanges independently. Off.
 #ifndef MPK_TOPK_THRESH
 #define MPK_TOPK_THRESH 0
 #endif

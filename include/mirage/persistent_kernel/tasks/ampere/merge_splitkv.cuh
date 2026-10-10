@@ -293,7 +293,13 @@ __device__ __forceinline__ void
                           // halved; only the halves path can produce it.
                           unsigned long long *ll_out = nullptr,
                           unsigned ll_epoch = 0,
-                          int ll_head0 = 0) {
+                          int ll_head0 = 0,
+                          // MPK_DEC_MERGE_LL: the decode's partials as epoch
+                          // words (o: bf16 pairs at half the f32 index, lse:
+                          // f32), validated here; halves path only.
+                          unsigned long long const *ll_o_in = nullptr,
+                          unsigned long long const *ll_lse_in = nullptr,
+                          unsigned ll_in_epoch = 0) {
   static_assert(HEADS_N >= 1 && HEADS_N <= NUM_QO_HEADS_PER_KV,
                 "HEADS_N is a sub-range of the group");
 
@@ -377,11 +383,51 @@ __device__ __forceinline__ void
                        lse_kv_offset + half * HC * NUM_QO_HEADS_PER_KV;
       int const o_col = dim_base + thread_in_group;
       float l[HC], o[HC];
+      if (ll_o_in != nullptr) {
+        unsigned long long lw[HC], ow[HC];
+        while (true) {
+#pragma unroll
+          for (int c = 0; c < HC; ++c) {
+            int const ll = lse0 + c * NUM_QO_HEADS_PER_KV;
+            asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1"
+                         : "=v"(lw[c])
+                         : "v"(ll_lse_in + ll)
+                         : "memory");
+            asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1"
+                         : "=v"(ow[c])
+                         : "v"(ll_o_in + ((ll * HEAD_DIM + o_col) >> 1))
+                         : "memory");
+          }
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          bool ok = true;
+#pragma unroll
+          for (int c = 0; c < HC; ++c) {
+            // An empty chunk stamps lse -1e30 and no o.
+            bool const empty = (unsigned)lw[c] == 0xF149F2CAu;
+            ok = ok && (unsigned)(lw[c] >> 32) == ll_in_epoch &&
+                 (empty || (unsigned)(ow[c] >> 32) == ll_in_epoch);
+          }
+          if (ok) {
+            break;
+          }
+          __builtin_amdgcn_s_sleep(1);
+        }
+#pragma unroll
+        for (int c = 0; c < HC; ++c) {
+          bool const empty = (unsigned)lw[c] == 0xF149F2CAu;
+          l[c] = __uint_as_float((unsigned)lw[c]) * 1.44269504088896340736f;
+          unsigned const half16 =
+              (o_col & 1) ? (unsigned)(ow[c] >> 16) & 0xFFFFu
+                          : (unsigned)ow[c] & 0xFFFFu;
+          o[c] = empty ? 0.f : __uint_as_float(half16 << 16);
+        }
+      } else {
 #pragma unroll
       for (int c = 0; c < HC; ++c) {
         int const ll = lse0 + c * NUM_QO_HEADS_PER_KV;
         l[c] = lse_g[ll] * 1.44269504088896340736f;
         o[c] = o_g[ll * HEAD_DIM + o_col];
+      }
       }
       float m = -inf;
 #pragma unroll
@@ -425,8 +471,9 @@ __device__ __forceinline__ void
     }
   }
 #endif
-  // The consumer polls words only the halves path writes.
-  if (ll_out != nullptr) {
+  // The consumer polls words only the halves path writes, and the decode's
+  // words only the halves path reads.
+  if (ll_out != nullptr || ll_o_in != nullptr) {
     __builtin_trap();
   }
 

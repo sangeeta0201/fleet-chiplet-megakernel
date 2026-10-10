@@ -914,7 +914,14 @@ __device__ __noinline__ void
                         // them ahead of its barrier. -1 loads them here.
                         int hint_q_row = -1,
                         int hint_first_page = -1,
-                        int hint_seqlen = -1) {
+                        int hint_seqlen = -1,
+                        // MPK_DEC_MERGE_LL: the partials leave as epoch words
+                        // -- o as (ll_epoch << 32 | bf16x2) at half the f32
+                        // index, lse as (ll_epoch << 32 | f32) at its index --
+                        // so the merge validates them instead of waiting.
+                        unsigned long long *ll_o = nullptr,
+                        unsigned long long *ll_lse = nullptr,
+                        unsigned ll_epoch = 0) {
   using bf16 = __hip_bfloat16;
   using gang_mla_decode_detail::__ldg_bf16x4_raw;
   using gang_mla_decode_detail::bf16x4_t;
@@ -1066,7 +1073,13 @@ __device__ __noinline__ void
                          static_cast<long>(q_row) * LSE_STRIDE +
                          q_head_group * NUM_KV_CHUNKS * Q_HEADS_PER_GROUP +
                          kv_chunk_idx * Q_HEADS_PER_GROUP + midx;
-        if constexpr (WRITE_THROUGH) {
+        if (ll_lse != nullptr) {
+          float const empty = -1e30f;
+          st_wt_u64((void *)(ll_lse + (lse_out - reinterpret_cast<float *>(
+                                                     lse_ptr))),
+                    ((unsigned long long)ll_epoch << 32) |
+                        __float_as_uint(empty));
+        } else if constexpr (WRITE_THROUGH) {
           float const empty = -1e30f;
           unsigned raw;
           __builtin_memcpy(&raw, &empty, 4);
@@ -1550,11 +1563,28 @@ __device__ __noinline__ void
         // note above mla_decode_absorbed), and the dwordx4 asm needs a
         // 4-aligned VGPR quad for its payload operand. Do not "simplify" this
         // back to one store without re-running the WRITE_THROUGH=true arm.
-        unsigned long long lo, hi;
-        __builtin_memcpy(&lo, &raw[0], 8);
-        __builtin_memcpy(&hi, &raw[2], 8);
-        st_wt_u64((void *)&o[dim_offset], lo);
-        st_wt_u64((void *)&o[dim_offset + 2], hi);
+        if (ll_o != nullptr) {
+          unsigned long long *const ow =
+              ll_o + ((&o[dim_offset] - reinterpret_cast<float *>(output_ptr)) >>
+                      1);
+          unsigned long long const ep = (unsigned long long)ll_epoch << 32;
+          auto pk = [](unsigned a, unsigned b) -> unsigned {
+            __hip_bfloat16 const x = __float2bfloat16(__uint_as_float(a));
+            __hip_bfloat16 const y = __float2bfloat16(__uint_as_float(b));
+            unsigned short ux, uy;
+            __builtin_memcpy(&ux, &x, 2);
+            __builtin_memcpy(&uy, &y, 2);
+            return (unsigned)ux | ((unsigned)uy << 16);
+          };
+          st_wt_u64((void *)ow, ep | pk(raw[0], raw[1]));
+          st_wt_u64((void *)(ow + 1), ep | pk(raw[2], raw[3]));
+        } else {
+          unsigned long long lo, hi;
+          __builtin_memcpy(&lo, &raw[0], 8);
+          __builtin_memcpy(&hi, &raw[2], 8);
+          st_wt_u64((void *)&o[dim_offset], lo);
+          st_wt_u64((void *)&o[dim_offset + 2], hi);
+        }
       } else {
 #pragma unroll
         for (int h = 0; h < 4; h++) {
@@ -1580,7 +1610,12 @@ __device__ __noinline__ void
     float lse_val = (l_sum > 0.0f)
                         ? (m_running * 0.69314718055994530942f + logf(l_sum))
                         : -1e30f;
-    if constexpr (WRITE_THROUGH) {
+    if (ll_lse != nullptr) {
+      st_wt_u64((void *)(ll_lse +
+                         (lse_out - reinterpret_cast<float *>(lse_ptr))),
+                ((unsigned long long)ll_epoch << 32) |
+                    __float_as_uint(lse_val));
+    } else if constexpr (WRITE_THROUGH) {
       unsigned raw;
       __builtin_memcpy(&raw, &lse_val, 4);
       st_wt_u32((void *)lse_out, raw);
@@ -1661,7 +1696,11 @@ __device__ __noinline__ void
                            // MPK_DEC_HINTS; see mla_decode_absorbed.
                            int hint_q_row = -1,
                            int hint_first_page = -1,
-                           int hint_seqlen = -1) {
+                           int hint_seqlen = -1,
+                           // MPK_DEC_MERGE_LL; see mla_decode_absorbed.
+                           unsigned long long *ll_o = nullptr,
+                           unsigned long long *ll_lse = nullptr,
+                           unsigned ll_epoch = 0) {
   if (tile_idx >= total_work_items) {
     return;
   }
@@ -1705,7 +1744,10 @@ __device__ __noinline__ void
                                        tiles_in_lds,
                                        hint_q_row,
                                        hint_first_page,
-                                       hint_seqlen);
+                                       hint_seqlen,
+                                       ll_o,
+                                       ll_lse,
+                                       ll_epoch);
 }
 
 } // namespace kernel

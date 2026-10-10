@@ -1622,6 +1622,7 @@ def get_compile_command(
             "MPK_OPROJ_WFIRST",
             "MPK_TOPK_RANK",
             "MPK_TOPK_THRESH",
+            "MPK_DEC_MERGE_LL",
             "MPK_ATTN_PROBE_NOQKVWAIT",
             "MPK_ENTRY_NOWAIT",
             "MPK_DEC_HINTS",
@@ -3941,6 +3942,10 @@ class PersistentKernel:
             # FULL_LAYER_W2PL_SLOT's 1536 lines of W2 part words.
             counter_slots = (644 + 8 * 194 + 32 + 8 * 36 + 8 * 194 + 8 * 48
                              + 144 + 256 + 1536)
+        if os.environ.get("MPK_DEC_MERGE_LL", "0") == "1":
+            # FULL_LAYER_DLSE_SLOT's 512 lines of decode lse words.
+            counter_slots = (644 + 8 * 194 + 32 + 8 * 36 + 8 * 194 + 8 * 48
+                             + 144 + 256 + 1536 + 512)
         assert counters.dim(0) >= counter_slots * 16, (
             f"the fused layer needs {counter_slots * 16} int32 of counters, "
             f"got {counters.dim(0)}")

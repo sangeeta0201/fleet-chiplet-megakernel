@@ -3120,10 +3120,11 @@ if __name__ == "__main__":
             #   [4452 .. 4595] MPK_W2_ACT_LL's SwiGLU words
             #   [4596 .. 4851] MPK_ATTN_OUT_LL's attention-output words
             #   [4852 .. 6387] MPK_W2_PARTS_LL's W2 part words
+            #   [6388 .. 6899] MPK_DEC_MERGE_LL's decode lse words
             # Keep in step with FULL_LAYER_COUNTER_SLOTS in
             # gang_mla_full_layer_fused_mi300.cuh.
             (((218 + 4 * 24 + 4 * 16 + 8 * 32 + 9 + 1 + 8 * 194 + 32 + 8 * 36
-               + 8 * 194 + 8 * 48 + 144 + 256 + 1536)
+               + 8 * 194 + 8 * 48 + 144 + 256 + 1536 + 512)
               if UNABSORB_K or QB_ABS_TP
               else 106 if UNABSORB_V else 96) * 16,),
             torch_dtype=torch.int32)
