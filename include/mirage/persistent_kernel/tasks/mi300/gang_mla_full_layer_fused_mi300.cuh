@@ -2575,9 +2575,18 @@ gang_mla_full_layer_fused_kernel_mi300(
            MPK_OPROJ_SHIFT + oproj_tiles_per_xcd <= tiles_per_xcd)
               ? MPK_OPROJ_SHIFT
               : 0;
-      if (xcd_rank - pf_base >= 0 &&
-          xcd_rank - pf_base < oproj_tiles_per_xcd) {
-        int const pf_tile = xcd_rank - pf_base;
+      // Same map as gang_oproj_router_fused's op_tile under MPK_OPROJ_SKIP_TOPK.
+      bool const pf_skip_topk =
+          MPK_OPROJ_SKIP_TOPK && pf_base > 0 && MPK_ROUTER_XSPLIT &&
+          MPK_OPROJ_RP && EP_WORLD_SIZE > 1 && MPK_ROUTER_LL && ml_mode &&
+          router_tile_n >= pf_base &&
+          pf_base + oproj_tiles_per_xcd + 1 <= tiles_per_xcd;
+      int const pf_tile =
+          (pf_skip_topk && xcd_rank == router_tile_n)
+              ? -1
+              : xcd_rank - pf_base -
+                    ((pf_skip_topk && xcd_rank > router_tile_n) ? 1 : 0);
+      if (pf_tile >= 0 && pf_tile < oproj_tiles_per_xcd) {
 #endif
         extern __shared__ char _fused_smem[];
         i32x4_t const pf_rsrc = make_w_buffer_rsrc(

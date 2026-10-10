@@ -1029,8 +1029,22 @@ __device__ __attribute__((always_inline)) void
        MPK_OPROJ_SHIFT + oproj_tiles_per_xcd <= tiles_per_xcd)
           ? MPK_OPROJ_SHIFT
           : 0;
+  // MPK_OPROJ_SKIP_TOPK: the routing TopK worker (xcd_rank == router_tile_n)
+  // holds no o_proj tile either -- the tiles past it move up one rank -- so
+  // it reaches the TopK with no o_proj stores of its own in flight.
+  bool const op_skip_topk =
+      MPK_OPROJ_SKIP_TOPK && op_base > 0 && router_xsplit_ptr != nullptr &&
+      router_ll_ptr != nullptr && router_tile_n >= op_base &&
+      op_base + oproj_tiles_per_xcd + 1 <= tiles_per_xcd;
+  // This rank's first o_proj tile; negative for a rank that holds none.
+  int const op_tile =
+      (op_skip_topk && xcd_rank == router_tile_n)
+          ? -1
+          : xcd_rank - op_base -
+                ((op_skip_topk && xcd_rank > router_tile_n) ? 1 : 0);
 
-  if (xcd_rank < oproj_topk_tiles_per_xcd + op_base) {
+  if (xcd_rank <
+      oproj_topk_tiles_per_xcd + op_base + (op_skip_topk ? 1 : 0)) {
     MPK_WS_PHASE(71, routing_expected, xcd_id);
     // Stage stamp 29: o_proj/router worker set entered (SUBSET: xcd_rank < oproj_topk_tiles_per_xcd).
     if (tid == 0) {
@@ -1217,7 +1231,7 @@ __device__ __attribute__((always_inline)) void
     float *const xcd_acc =
         static_cast<float *>(router_partials_ptr) +
         (size_t)xcd_id * (NUM_EXPERTS + 1);
-    for (int t = xcd_rank - op_base; t >= 0 && t < oproj_tiles_per_xcd;
+    for (int t = op_tile; t >= 0 && t < oproj_tiles_per_xcd;
          t += tiles_per_xcd) {
       // MXFP4 and MXFP8 differ only in the weight's element format: same
       // packer layout, same signature, same caller contract including
@@ -1291,7 +1305,7 @@ __device__ __attribute__((always_inline)) void
                                                      );
       stage_a = RESTAGE;
       // Trace stamps 59/60: o_proj GEMV returned, its LL push issued.
-      if (tid == 0 && t == xcd_rank - op_base) {
+      if (tid == 0 && t == op_tile) {
         mpk_stage_stamp(59);
       }
       // Push the tile straight into every peer's copy of the hidden row, at
@@ -1338,7 +1352,7 @@ __device__ __attribute__((always_inline)) void
             }
           }
         }
-        if (tid == 0 && t == xcd_rank - op_base) {
+        if (tid == 0 && t == op_tile) {
           mpk_stage_stamp(60);
         }
       }
@@ -1497,7 +1511,7 @@ __device__ __attribute__((always_inline)) void
     // reduce and 257 to push -- work for 256 threads, not for one. Everything
     // downstream of the election still runs on tid 0 alone.
     __shared__ int s_oproj_leader;
-    if (tid == 0 && xcd_rank < op_base) {
+    if (tid == 0 && (op_tile < 0 || op_tile >= oproj_tiles_per_xcd)) {
       s_oproj_leader = 0;
     } else if (tid == 0) {
       // Modular test rather than a reset: the counter is monotonic for the

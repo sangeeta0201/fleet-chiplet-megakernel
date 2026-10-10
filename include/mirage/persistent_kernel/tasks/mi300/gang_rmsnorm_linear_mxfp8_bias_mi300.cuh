@@ -1338,6 +1338,9 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
             ok = ok && w[p][1] == epoch && w[p][3] == epoch;
           }
         }
+        if (MPK_PROBE_XRANK_NOWAIT == 1 || MPK_PROBE_XRANK_NOWAIT == 3) {
+          ok = true;
+        }
         if (__syncthreads_and(ok)) {
           break;
         }

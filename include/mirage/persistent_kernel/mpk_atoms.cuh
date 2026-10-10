@@ -906,9 +906,9 @@ __device__ __forceinline__ bool
 // stamp count and lands mostly on the two MoE barriers (+4.5 and +5.7 us);
 // slot 2 moved +0.13 us, so qkv_a's decomposition is not the probe's doing.
 // MPK_ML_PTR_PREFETCH: see the multi-layer loop in persistent_kernel.cuh.
-// Off by default so the load-at-the-boundary form stays the reference.
+// Default on with MPK_MOE_SKIP_TOPK (see there): 4.284 -> 4.260 ms together.
 #ifndef MPK_ML_PTR_PREFETCH
-#define MPK_ML_PTR_PREFETCH 0
+#define MPK_ML_PTR_PREFETCH 1
 #endif
 
 // MPK_ABL_ML_BOUNDARY: the SUBTRACTIVE ceiling probe for the multi-layer
@@ -1347,9 +1347,6 @@ __device__ __forceinline__ bool
 #ifndef MPK_OPROJ_SHIFT
 #define MPK_OPROJ_SHIFT 4
 #endif
-// MPK_MOE_SKIP_TOPK: the per-XCD routing TopK worker runs no W13 or W2 tile.
-// MPK_TRACE (trace 5) has the 8 TopK workers last at every MoE stamp: W13
-// start +0.87 us, W13 done +1.70, W2 done +2.63 against the median worker.
 // MPK_WUK_LL: q_b -> W_UK without the XCD-local W_UK barrier. q_b's head row
 // also leaves as epoch words in the XCD's L2; the W_UK tiles stage their
 // activation from those and the head's last tile ropes from them. Trace 5:
@@ -1369,6 +1366,28 @@ __device__ __forceinline__ bool
 #ifndef MPK_DEC_Q_LL
 #define MPK_DEC_Q_LL 1
 #endif
+// MPK_OPROJ_SKIP_TOPK: under MPK_OPROJ_SHIFT the routing TopK worker holds no
+// o_proj tile either (the tiles past it move up a rank), so its TopK does not
+// drain o_proj stores (trace 6: selection 1.19 us, publish 0.78 us).
+#ifndef MPK_OPROJ_SKIP_TOPK
+#define MPK_OPROJ_SKIP_TOPK 0
+#endif
+// MPK_PROBE_XRANK_NOWAIT: CEILING PROBE, WRONG OUTPUT. Skip the validation
+// of the two cross-rank exchanges' words and read whatever is there: 1 both,
+// 2 the router's o_proj slots only, 3 the qkv_a resolver's EP slots only.
+#ifndef MPK_PROBE_XRANK_NOWAIT
+#define MPK_PROBE_XRANK_NOWAIT 0
+#endif
+// MPK_LL_POLL_GATE: the o_proj GEMV's MPK_ATTN_OUT_LL staging re-reads all
+// 2048 words (16 KB) per round from its tile's entry (~19 us into the layer in
+// trace 6) to the merge's last item (~30 us): ~30 MB/layer/rank of
+// system-scope polling across the decode and the merge. Poll one word per
+// merge item until half have landed, then the full rounds. MEASURED
+// 2026-10-10, NP=8 1024/1024, interleaved, text identical: 4.287 4.279 4.283
+// -> 4.261 4.258 4.267 ms (-0.021). Default on.
+#ifndef MPK_LL_POLL_GATE
+#define MPK_LL_POLL_GATE 1
+#endif
 // MPK_XS_POLL_FULL: the qkv_a split resolver re-reads its whole slice of the
 // eight EP slots each round instead of spinning on one sentinel per slot and
 // then re-reading -- one system-scope round trip less after the last word
@@ -1384,8 +1403,16 @@ __device__ __forceinline__ bool
 #ifndef MPK_DML_DBG
 #define MPK_DML_DBG 0
 #endif
+// MPK_MOE_SKIP_TOPK: the per-XCD routing TopK worker runs no W13 or W2 tile.
+// MPK_TRACE (trace 5) has the 8 TopK workers last at every MoE stamp: W13
+// start +0.87 us, W13 done +1.70, W2 done +2.63 against the median worker.
+// Alone it only exposes the folders' layer boundary (trace 6s: W2 tail
+// max-med 4.3 -> 1.45 us, folders' S8 -> S0 3.3 us on the fold path), so it
+// ships with MPK_ML_PTR_PREFETCH. MEASURED 2026-10-10, NP=8 1024/1024,
+// interleaved, text identical: 4.276 4.290 4.287 -> skip 4.279 4.288 4.279,
+// prefetch 4.274 4.275 4.270, both 4.266 4.256 4.259 ms (-0.024). Default on.
 #ifndef MPK_MOE_SKIP_TOPK
-#define MPK_MOE_SKIP_TOPK 0
+#define MPK_MOE_SKIP_TOPK 1
 #endif
 
 // MPK_ML_NO_FENCE: the multi-layer loop skips its per-layer threadfence_gpu

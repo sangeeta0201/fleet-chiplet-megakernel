@@ -1165,14 +1165,14 @@ __device__ __noinline__ void
         reinterpret_cast<unsigned *>(_mla_decode_smem + Q_LDS_OFF);
     unsigned long long w[Q_PER];
     while (true) {
+      // Compiler-visible loads: separate asm loads ahead of one vmcnt(0)
+      // leave the outputs free for the allocator to move before they land
+      // (see merge_splitkv_ck_fmha's MPK_DEC_MERGE_LL read).
 #pragma unroll
       for (int j = 0; j < Q_PER; j++) {
-        asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1"
-                     : "=v"(w[j])
-                     : "v"(q_ll + tid + 256 * j)
-                     : "memory");
+        w[j] = __hip_atomic_load(q_ll + tid + 256 * j, __ATOMIC_RELAXED,
+                                 __HIP_MEMORY_SCOPE_SYSTEM);
       }
-      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       bool ok = true;
 #pragma unroll
       for (int j = 0; j < Q_PER; j++) {

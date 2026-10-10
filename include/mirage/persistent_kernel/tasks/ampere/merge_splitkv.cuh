@@ -15,6 +15,12 @@
 
 #pragma once
 
+// MPK_DEC_MERGE_LL: the merge's lse staging, in dynamic LDS past the decode's
+// query staging (96 KB) and short of MPK_ATTN_META_PF's window (140 KB).
+#ifndef MPK_MRG_LL_LDS_OFF
+#define MPK_MRG_LL_LDS_OFF (120 * 1024)
+#endif
+
 // this kernel merges the result of one KV head chunk back to the full KV
 // cache，
 // it taks the output of multitoken_paged_attention_task_impl_32_64_split_kv and
@@ -258,6 +264,85 @@ __device__ __forceinline__ void merge_online_group(LseP lse_g,
 // The slice index rides in on kv_head_idx rather than a separate argument so
 // that callers keep passing merge_task_offset straight through; the kernel
 // decomposes it because only it knows DIM_SPLITS.
+// MPK_DEC_MERGE_LL's half of the halves path, out of line: the block's
+// HEADS_N x NUM_KV_CHUNKS lse words go to LDS once ([chunk][head]), each
+// thread polls its HC o words, and returns this half's online-softmax partials
+// (max, denominator, weighted sum) in log2 units. Inlined into the attention
+// task, the HC words a thread carries pushed its allocation into a build that
+// faulted at the first task fetch; here they get their own frame.
+template <int HC, int HEADS_N, int NUM_KV_CHUNKS, int NUM_QO_HEADS_PER_KV,
+          int HEAD_DIM, int NUM_THREADS>
+__device__ __noinline__ float3 merge_halves_ll_partials(
+    unsigned long long const *ll_o_in, unsigned long long const *ll_lse_in,
+    unsigned ll_in_epoch, int lse_base, int lse0, int o_col, int half,
+    int my_h) {
+  extern __shared__ char _mrg_ll_smem[];
+  float *const s_lse =
+      reinterpret_cast<float *>(_mrg_ll_smem + MPK_MRG_LL_LDS_OFF);
+  constexpr int NL = HEADS_N * NUM_KV_CHUNKS;
+  while (true) {
+    bool ok = true;
+    for (int i = threadIdx.x; i < NL; i += NUM_THREADS) {
+      int const h = i % HEADS_N;
+      int const c = i / HEADS_N;
+      unsigned long long const w = __hip_atomic_load(
+          ll_lse_in + lse_base + h + c * NUM_QO_HEADS_PER_KV, __ATOMIC_RELAXED,
+          __HIP_MEMORY_SCOPE_SYSTEM);
+      ok = ok && (unsigned)(w >> 32) == ll_in_epoch;
+      s_lse[i] = __uint_as_float((unsigned)w);
+    }
+    if (__syncthreads_and(ok)) {
+      break;
+    }
+    __builtin_amdgcn_s_sleep(1);
+  }
+  unsigned long long ow[HC];
+  while (true) {
+#pragma unroll
+    for (int c = 0; c < HC; ++c) {
+      int const ll = lse0 + c * NUM_QO_HEADS_PER_KV;
+      ow[c] = __hip_atomic_load(ll_o_in + ((ll * HEAD_DIM + o_col) >> 1),
+                                __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+    bool ok = true;
+#pragma unroll
+    for (int c = 0; c < HC; ++c) {
+      // An empty chunk stamps lse -1e30 and no o.
+      bool const empty =
+          __float_as_uint(s_lse[(half * HC + c) * HEADS_N + my_h]) ==
+          0xF149F2CAu;
+      ok = ok && (empty || (unsigned)(ow[c] >> 32) == ll_in_epoch);
+    }
+    if (ok) {
+      break;
+    }
+    __builtin_amdgcn_s_sleep(1);
+  }
+  float l[HC], o[HC];
+#pragma unroll
+  for (int c = 0; c < HC; ++c) {
+    float const lv = s_lse[(half * HC + c) * HEADS_N + my_h];
+    bool const empty = __float_as_uint(lv) == 0xF149F2CAu;
+    l[c] = lv * 1.44269504088896340736f;
+    unsigned const half16 = (o_col & 1) ? (unsigned)(ow[c] >> 16) & 0xFFFFu
+                                        : (unsigned)ow[c] & 0xFFFFu;
+    o[c] = empty ? 0.f : __uint_as_float(half16 << 16);
+  }
+  float m = -INFINITY;
+#pragma unroll
+  for (int c = 0; c < HC; ++c) {
+    m = max(m, l[c]);
+  }
+  float d = 0.f, os = 0.f;
+#pragma unroll
+  for (int c = 0; c < HC; ++c) {
+    float const w = ptx_exp2(l[c] - m);
+    d += w;
+    os += w * o[c];
+  }
+  return make_float3(m, d, os);
+}
+
 template <typename T,
           int NUM_QO_HEADS_PER_KV,
           int NUM_QO_GROUPS,
@@ -382,64 +467,39 @@ __device__ __forceinline__ void
       int const lse0 = head_idx + first_token_pos * LSE_TOKEN_STRIDE +
                        lse_kv_offset + half * HC * NUM_QO_HEADS_PER_KV;
       int const o_col = dim_base + thread_in_group;
-      float l[HC], o[HC];
+      float m, d, os;
       if (ll_o_in != nullptr) {
-        unsigned long long lw[HC], ow[HC];
-        while (true) {
-#pragma unroll
-          for (int c = 0; c < HC; ++c) {
-            int const ll = lse0 + c * NUM_QO_HEADS_PER_KV;
-            asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1"
-                         : "=v"(lw[c])
-                         : "v"(ll_lse_in + ll)
-                         : "memory");
-            asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1"
-                         : "=v"(ow[c])
-                         : "v"(ll_o_in + ((ll * HEAD_DIM + o_col) >> 1))
-                         : "memory");
-          }
-          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-          bool ok = true;
-#pragma unroll
-          for (int c = 0; c < HC; ++c) {
-            // An empty chunk stamps lse -1e30 and no o.
-            bool const empty = (unsigned)lw[c] == 0xF149F2CAu;
-            ok = ok && (unsigned)(lw[c] >> 32) == ll_in_epoch &&
-                 (empty || (unsigned)(ow[c] >> 32) == ll_in_epoch);
-          }
-          if (ok) {
-            break;
-          }
-          __builtin_amdgcn_s_sleep(1);
-        }
+        float3 const pp =
+            merge_halves_ll_partials<HC, HEADS_N, NUM_KV_CHUNKS,
+                                     NUM_QO_HEADS_PER_KV, HEAD_DIM,
+                                     NUM_THREADS>(
+                ll_o_in, ll_lse_in, ll_in_epoch,
+                head_base + first_token_pos * LSE_TOKEN_STRIDE + lse_kv_offset,
+                lse0, o_col, half, group_id >> 1);
+        m = pp.x;
+        d = pp.y;
+        os = pp.z;
+      } else {
+        float l[HC], o[HC];
 #pragma unroll
         for (int c = 0; c < HC; ++c) {
-          bool const empty = (unsigned)lw[c] == 0xF149F2CAu;
-          l[c] = __uint_as_float((unsigned)lw[c]) * 1.44269504088896340736f;
-          unsigned const half16 =
-              (o_col & 1) ? (unsigned)(ow[c] >> 16) & 0xFFFFu
-                          : (unsigned)ow[c] & 0xFFFFu;
-          o[c] = empty ? 0.f : __uint_as_float(half16 << 16);
+          int const ll = lse0 + c * NUM_QO_HEADS_PER_KV;
+          l[c] = lse_g[ll] * 1.44269504088896340736f;
+          o[c] = o_g[ll * HEAD_DIM + o_col];
         }
-      } else {
+        m = -inf;
 #pragma unroll
-      for (int c = 0; c < HC; ++c) {
-        int const ll = lse0 + c * NUM_QO_HEADS_PER_KV;
-        l[c] = lse_g[ll] * 1.44269504088896340736f;
-        o[c] = o_g[ll * HEAD_DIM + o_col];
-      }
-      }
-      float m = -inf;
+        for (int c = 0; c < HC; ++c) {
+          m = max(m, l[c]);
+        }
+        d = 0.f;
+        os = 0.f;
 #pragma unroll
-      for (int c = 0; c < HC; ++c) {
-        m = max(m, l[c]);
-      }
-      float d = 0.f, os = 0.f;
-#pragma unroll
-      for (int c = 0; c < HC; ++c) {
-        float const w = ptx_exp2(l[c] - m);
-        d += w;
-        os += w * o[c];
+        for (int c = 0; c < HC; ++c) {
+          float const w = ptx_exp2(l[c] - m);
+          d += w;
+          os += w * o[c];
+        }
       }
       float const mp = __shfl_xor(m, 16);
       float const dp = __shfl_xor(d, 16);

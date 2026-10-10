@@ -1627,6 +1627,8 @@ def get_compile_command(
             "MPK_WUK_LL",
             "MPK_DEC_Q_LL",
             "MPK_XS_POLL_FULL",
+            "MPK_LL_POLL_GATE",
+            "MPK_OPROJ_SKIP_TOPK",
             "MPK_ATTN_PROBE_NOQKVWAIT",
             "MPK_ENTRY_NOWAIT",
             "MPK_DEC_HINTS",
@@ -1651,6 +1653,10 @@ def get_compile_command(
         if _x is not None:
             assert _x.isdigit() and 0 <= int(_x) <= 8, "MPK_OPROJ_SHIFT is 0..8"
             flags = flags + [f"-DMPK_OPROJ_SHIFT={_x}"]
+        _x = os.environ.get("MPK_PROBE_XRANK_NOWAIT")
+        if _x is not None:
+            assert _x in ("0", "1", "2", "3"), "MPK_PROBE_XRANK_NOWAIT is 0..3"
+            flags = flags + [f"-DMPK_PROBE_XRANK_NOWAIT={_x}"]
         _x = os.environ.get("MPK_DML_DBG")
         if _x is not None:
             assert _x in ("0", "1", "2"), "MPK_DML_DBG is 0, 1 or 2"

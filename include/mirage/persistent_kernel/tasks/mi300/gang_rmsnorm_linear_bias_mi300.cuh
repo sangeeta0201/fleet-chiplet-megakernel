@@ -1587,6 +1587,9 @@ gang_rmsnorm_linear_bias_topk_kernel(
             }
           }
         }
+        if (MPK_PROBE_XRANK_NOWAIT == 1 || MPK_PROBE_XRANK_NOWAIT == 2) {
+          ok = true;
+        }
         if (__syncthreads_and(ok)) {
           break;
         }

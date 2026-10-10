@@ -254,15 +254,43 @@ __device__ __noinline__ void
       // Every pair in flight at once, one wait; re-issue only while some
       // word still carries an older epoch.
       u64x2_t w[PER_T];
+#if MPK_LL_POLL_GATE
+      // MPK_LL_POLL_GATE: under MPK_ATTN_OUT_LL a thread's four pairs are all
+      // one merge item's (K = 4 * tid + 1024 j, item (K % 512) / 16), so lanes
+      // 4m, m < 32, sample every item. Poll only those, slowly, until half
+      // the items have landed; the full rounds below then catch the rest.
+      {
+        bool const proxy_t = (tid & 3) == 0 && tid < 128;
+        while (true) {
+          bool pok = false;
+          if (proxy_t) {
+            asm volatile("global_load_dwordx4 %0, %1, off sc0 sc1\n"
+                         "s_waitcnt vmcnt(0)"
+                         : "=v"(w[0])
+                         : "v"(a_ll + 2 * tid)
+                         : "memory");
+            pok = (unsigned)(w[0].x >> 32) == a_epoch &&
+                  (unsigned)(w[0].y >> 32) == a_epoch;
+          }
+          if (__syncthreads_count(pok) >= 16) {
+            break;
+          }
+          __builtin_amdgcn_s_sleep(8);
+        }
+      }
+#endif
       while (true) {
+        // Compiler-visible loads (see merge_splitkv_ck_fmha's
+        // MPK_DEC_MERGE_LL read): asm outputs ahead of a separate vmcnt(0)
+        // can be moved before they land.
 #pragma unroll
         for (int j = 0; j < PER_T; j++) {
-          asm volatile("global_load_dwordx4 %0, %1, off sc0 sc1"
-                       : "=v"(w[j])
-                       : "v"(a_ll + 2 * (tid + j * NTHREADS))
-                       : "memory");
+          unsigned long long const *const pp = a_ll + 2 * (tid + j * NTHREADS);
+          w[j].x = __hip_atomic_load(pp, __ATOMIC_RELAXED,
+                                     __HIP_MEMORY_SCOPE_SYSTEM);
+          w[j].y = __hip_atomic_load(pp + 1, __ATOMIC_RELAXED,
+                                     __HIP_MEMORY_SCOPE_SYSTEM);
         }
-        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         bool ok = true;
 #pragma unroll
         for (int j = 0; j < PER_T; j++) {

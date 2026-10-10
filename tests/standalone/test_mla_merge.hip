@@ -35,6 +35,11 @@
 #include <hip/hip_runtime.h>
 #include <vector>
 
+// The LL path stages its lse words in dynamic LDS at MPK_MRG_LL_LDS_OFF.
+#ifndef MPK_MRG_LL_LDS_OFF
+#define MPK_MRG_LL_LDS_OFF 0
+#endif
+static constexpr int MRG_DYN_LDS = MPK_MRG_LL_LDS_OFF + 4096;
 #include "mirage/persistent_kernel/mpk_atoms.cuh"
 #include "mirage/persistent_kernel/tasks/common/utils.cuh"
 #include "mirage/persistent_kernel/tasks/ampere/merge_splitkv.cuh"
@@ -62,7 +67,10 @@ __global__ void merge_entry(float const *lse,
                             int const *kv_indptr,
                             int const *kv_last_page_len,
                             bf16 *out,
-                            int head_base) {
+                            int head_base,
+                            unsigned long long const *ll_o = nullptr,
+                            unsigned long long const *ll_lse = nullptr,
+                            unsigned ll_epoch = 0) {
   kernel::merge_splitkv_ck_fmha<bf16,
                                 QO_PER_KV,
                                 QO_GROUPS,
@@ -81,7 +89,28 @@ __global__ void merge_entry(float const *lse,
                                          out,
                                          /*merge_task_offset=*/blockIdx.x,
                                          /*sinks_ptr=*/nullptr,
-                                         head_base);
+                                         head_base,
+                                         -1,
+                                         -1,
+                                         nullptr,
+                                         0,
+                                         0,
+                                         ll_o,
+                                         ll_lse,
+                                         ll_epoch);
+}
+
+static unsigned short to_bf16_bits(float f) {
+  bf16 const b = (bf16)f;
+  unsigned short u;
+  memcpy(&u, &b, 2);
+  return u;
+}
+static float from_bf16_bits(unsigned short u) {
+  unsigned const w = (unsigned)u << 16;
+  float f;
+  memcpy(&f, &w, 4);
+  return f;
 }
 
 static float frand() {
@@ -92,8 +121,13 @@ static float frand() {
 // the decode's empty-chunk early return (lse = -1e30, o_acc never written).
 // HEADS_N < 16 merges heads [head_base, head_base + HEADS_N) of each group
 // only (MPK_MLA_MERGE_OWN_HEADS), and only those are checked.
+// ll: MPK_DEC_MERGE_LL -- the partials arrive as epoch words the way the
+// decode writes them (o as bf16 pairs at half the f32 index, lse as f32), and
+// the reference uses the bf16-rounded o. Empty chunks' o words keep a stale
+// epoch, which the merge must ignore.
 template <bool WRITE_THROUGH, int DIM_SPLITS, int HEADS_N = QO_PER_KV>
-static int run_case(int active_chunks, char const *tag, int head_base = 0) {
+static int run_case(int active_chunks, char const *tag, int head_base = 0,
+                    bool ll = false) {
   size_t const lse_n = (size_t)LSE_TOKEN_STRIDE;
   size_t const o_n = lse_n * HEAD_DIM;
   size_t const out_n = (size_t)OUT_TOKEN_STRIDE;
@@ -120,6 +154,31 @@ static int run_case(int active_chunks, char const *tag, int head_base = 0) {
     }
   }
 
+  unsigned const epoch = 0x1234567u;
+  unsigned long long *d_ll_o = nullptr, *d_ll_lse = nullptr;
+  if (ll) {
+    std::vector<unsigned long long> w_o(o_n / 2), w_lse(lse_n);
+    for (size_t i = 0; i < lse_n; ++i) {
+      unsigned u;
+      memcpy(&u, &h_lse[i], 4);
+      w_lse[i] = ((unsigned long long)epoch << 32) | u;
+    }
+    for (size_t w = 0; w < o_n / 2; ++w) {
+      size_t const lse_idx = (2 * w) / HEAD_DIM;
+      bool const empty = h_lse[lse_idx] == -1e30f;
+      unsigned short const lo = to_bf16_bits(h_o[2 * w]);
+      unsigned short const hi = to_bf16_bits(h_o[2 * w + 1]);
+      w_o[w] = ((unsigned long long)(empty ? epoch - 1 : epoch) << 32) |
+               lo | ((unsigned)hi << 16);
+      // The reference sees what the words carry.
+      h_o[2 * w] = from_bf16_bits(lo);
+      h_o[2 * w + 1] = from_bf16_bits(hi);
+    }
+    hipMalloc(&d_ll_o, w_o.size() * 8);
+    hipMalloc(&d_ll_lse, w_lse.size() * 8);
+    hipMemcpy(d_ll_o, w_o.data(), w_o.size() * 8, hipMemcpyHostToDevice);
+    hipMemcpy(d_ll_lse, w_lse.data(), w_lse.size() * 8, hipMemcpyHostToDevice);
+  }
   float *d_lse, *d_o;
   bf16 *d_out;
   int *d_qo, *d_kvp, *d_lastlen;
@@ -141,8 +200,9 @@ static int run_case(int active_chunks, char const *tag, int head_base = 0) {
 
   int const grid = QO_GROUPS * DIM_SPLITS;
   hipLaunchKernelGGL((merge_entry<WRITE_THROUGH, DIM_SPLITS, HEADS_N>),
-                     dim3(grid), dim3(BLOCK_THREADS), 0, 0,
-                     d_lse, d_o, d_qo, d_kvp, d_lastlen, d_out, head_base);
+                     dim3(grid), dim3(BLOCK_THREADS), MRG_DYN_LDS, 0,
+                     d_lse, d_o, d_qo, d_kvp, d_lastlen, d_out, head_base,
+                     d_ll_o, d_ll_lse, epoch);
   hipError_t err = hipDeviceSynchronize();
   if (err != hipSuccess) {
     printf("FAIL %-28s launch: %s\n", tag, hipGetErrorString(err));
@@ -185,6 +245,10 @@ static int run_case(int active_chunks, char const *tag, int head_base = 0) {
     }
   }
   hipFree(d_lse); hipFree(d_o); hipFree(d_out);
+  if (ll) {
+    hipFree(d_ll_o);
+    hipFree(d_ll_lse);
+  }
   hipFree(d_qo); hipFree(d_kvp); hipFree(d_lastlen);
 
   if (bad) {
@@ -216,6 +280,11 @@ int main() {
       rc |= run_case<true, 32, 8>(NUM_CHUNKS / 2 + 1,
                                   "wt=1 splits=32 own8 half+1", hb);
       rc |= run_case<true, 32, 8>(9, "wt=1 splits=32 own8 active=9", hb);
+#ifdef TEST_MERGE_LL
+      rc |= run_case<true, 32, 8>(NUM_CHUNKS, "LL own8 all", hb, true);
+      rc |= run_case<true, 32, 8>(NUM_CHUNKS / 2 + 1, "LL own8 half+1", hb, true);
+      rc |= run_case<true, 32, 8>(9, "LL own8 active=9", hb, true);
+#endif
     }
   }
   rc |= run_case<false, 32>(16, "wt=0 splits=32 active=16");
