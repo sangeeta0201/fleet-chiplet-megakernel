@@ -195,7 +195,11 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
     int const end_expert,
     bool const renormalize,
     float const routed_scaling_factor,
-    int const num_shared_experts) {
+    int const num_shared_experts,
+    // MPK_ROUTE_LL, one row: slot k's expert as (ll_epoch << 32 | id) at
+    // ll_route[k] and its weight at ll_route[16 + k], shared slot included.
+    unsigned long long *__restrict__ ll_route = nullptr,
+    unsigned ll_epoch = 0) {
   T *input = static_cast<T *>(input_ptr);
   T *bias = static_cast<T *>(bias_ptr);
   float *output = static_cast<float *>(output_ptr);
@@ -695,6 +699,24 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
     if (num_shared_experts > 0 && thread_group_idx == 0) {
       _tk_st_u32<L2_STORES>((void *)&output[k_total * thread_row + k],
                 __float_as_uint(1.0f));
+    }
+    if (ll_route != nullptr && thread_group_idx == 0 && thread_row == 0) {
+      unsigned long long const hi = (unsigned long long)ll_epoch << 32;
+      float const inv = renormalize ? (routed_scaling_factor /
+                                       row_sum_for_renorm)
+                                    : routed_scaling_factor;
+#pragma unroll
+      for (int k_idx = 0; k_idx < K_UNROLL; ++k_idx) {
+        if (k_idx >= k) {
+          break;
+        }
+        ll_route[k_idx] = hi | (unsigned)topk_experts[k_idx];
+        ll_route[16 + k_idx] = hi | __float_as_uint(topk_vals[k_idx] * inv);
+      }
+      if (num_shared_experts > 0) {
+        ll_route[k] = hi | (unsigned)NUM_EXPERTS;
+        ll_route[16 + k] = hi | __float_as_uint(1.0f);
+      }
     }
   }
   __syncthreads();

@@ -1941,7 +1941,20 @@ __device__ __attribute__((always_inline)) void
                           xcd_id * MPK_RLL_XCD_INTS
                     : nullptr;
   bool const rll_on = rll_xcd != nullptr;
-  if (tid == 0 && rll_on) {
+  // MPK_ROUTE_LL: the K-split TopK's routing words, which each MoE tile
+  // validates itself (see topk_ll_noinline), so nobody polls the flag.
+  constexpr bool ROUTE_LL =
+      MPK_ROUTE_LL_ON &&
+      gang_rmsnorm_topk_detail::router_ksplit_on<
+          BATCH_SIZE, HIDDEN_SIZE, NUM_EXPERTS, /*SIGMOID_BIAS=*/true,
+          /*OPROJ_BARRIER=*/true, ROUTER_EXPERTS_PER_TILE,
+          /*SUM_LL=*/MPK_OPROJ_RP && (EP_WORLD_SIZE > 1) && MPK_OPROJ_LL>();
+  unsigned long long const *const ll_route =
+      (ROUTE_LL && rll_on && router_xsplit_ptr != nullptr)
+          ? reinterpret_cast<unsigned long long const *>(
+                rll_xcd + 32 + MPK_RLL_IDS_LINES * 16)
+          : nullptr;
+  if (tid == 0 && rll_on && ll_route == nullptr) {
     while (true) {
       unsigned seen;
       asm volatile("global_load_dword %0, %1, off nt\n"
@@ -2368,7 +2381,9 @@ __device__ __attribute__((always_inline)) void
         active_expert_ids_ptr,
         moe_w13_bias_ptr,
         moe_swiglu_out_ptr,
-        t);
+        t,
+        ll_route,
+        (unsigned)routing_expected);
   }
 
 #if MPK_MOE_SHADOW_KB > 0
@@ -2777,7 +2792,9 @@ __device__ __attribute__((always_inline)) void
                                                 moe_workspace_f32_ptr,
                                                 t,
                                                 topk_weight_ptr,
-                                                w2_fold);
+                                                w2_fold,
+                                                ll_route,
+                                                (unsigned)routing_expected);
 #else
     gang_moe_w2_linear_mxfp8_kernel<BATCH_SIZE,
                                     HIDDEN_SIZE,

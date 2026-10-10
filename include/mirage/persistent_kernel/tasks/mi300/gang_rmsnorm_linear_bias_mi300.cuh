@@ -891,6 +891,36 @@ __device__ __attribute__((noinline)) void
     mpk_stage_stamp(41);
   }
   int *const xb = rll + MPK_RLL_WORD_LINES * 16 + xcd * MPK_RLL_XCD_INTS;
+  // MPK_ROUTE_LL: the routing goes out as epoch-tagged words that the MoE
+  // tiles validate themselves, in the routing_indices lines (which the
+  // one-row TP decode never reads). Words written after the normed flags are
+  // seen, so a tile that sees its word also sees the normed row in L2.
+  constexpr bool ROUTE_LL = KSPLIT && MPK_ROUTE_LL_ON;
+  unsigned long long *const ll_route =
+      ROUTE_LL ? reinterpret_cast<unsigned long long *>(
+                     xb + 32 + MPK_RLL_IDS_LINES * 16)
+               : nullptr;
+  if constexpr (ROUTE_LL) {
+    if (tid < 64) {
+      unsigned const *const ks_flag =
+          reinterpret_cast<unsigned const *>(ks_all + xcd * MPK_XSPLIT_XCD_INTS);
+      while (true) {
+        unsigned seen = epoch;
+        if (tid < 16) {
+          asm volatile("global_load_dword %0, %1, off nt\n"
+                       "s_waitcnt vmcnt(0)"
+                       : "=v"(seen)
+                       : "v"(ks_flag + tid)
+                       : "memory");
+        }
+        if (__ballot(seen >= epoch) == ~0ull) {
+          break;
+        }
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+    __syncthreads();
+  }
   topk_sigmoid_bias_mi300_task_impl<T,
                                     /*VPT=*/8,
                                     NUM_EXPERTS,
@@ -908,15 +938,24 @@ __device__ __attribute__((noinline)) void
       /*topk_weight=*/xb + 16,
       num_active_tokens,
       K,
-      /*routing_indices=*/xb + 32 + MPK_RLL_IDS_LINES * 16,
+      /*routing_indices=*/ROUTE_LL ? nullptr
+                                   : xb + 32 + MPK_RLL_IDS_LINES * 16,
       /*active_expert_ids=*/xb + 32,
       0,
       NUM_EXPERTS,
       renormalize,
       routed_scaling_factor,
-      num_shared_experts);
+      num_shared_experts,
+      ll_route,
+      epoch);
   if (tid == 0) {
     mpk_stage_stamp(42);
+  }
+  if constexpr (ROUTE_LL) {
+    if (tid == 0) {
+      mpk_stage_stamp(35);
+    }
+    return;
   }
   // Every wave wrote some of the copy (the zero fill is block-wide), so each
   // drains its own stores before the barrier the release sits behind.

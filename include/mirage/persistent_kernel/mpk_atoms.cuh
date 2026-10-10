@@ -1231,6 +1231,19 @@ __device__ __forceinline__ bool
 #ifndef MPK_ATTN_META_PF
 #define MPK_ATTN_META_PF 1
 #endif
+// MPK_ROUTE_LL: the K-split TopK publishes each slot's expert and weight as
+// epoch-tagged words in its XCD's L2 (after the normed flags), and the MoE
+// tiles validate the words they need instead of polling a release flag that
+// sat behind a store drain (topk_ll_noinline, gang_oproj_router_fused).
+// One-row TP decode only.
+// MEASURED 2026-10-10, NP=8 1024/1024, interleaved, tokens identical:
+// 5.699 5.714 5.713 -> 5.683 5.659 5.688 5.669 ms (-0.03). Default on.
+#ifndef MPK_ROUTE_LL
+#define MPK_ROUTE_LL 1
+#endif
+// The publisher (topk_ll_noinline) and the readers (gang_oproj_router_fused)
+// must agree, or one side waits on a flag the other no longer writes.
+#define MPK_ROUTE_LL_ON (MPK_ROUTE_LL && MPK_MOE_BS1_DECODE && MPK_MOE_TP)
 // MPK_TOPK_PAD_NS: pricing probe, correct output. Delays the K-split TopK's
 // routing release by this many ns on every rank and layer.
 #ifndef MPK_TOPK_PAD_NS

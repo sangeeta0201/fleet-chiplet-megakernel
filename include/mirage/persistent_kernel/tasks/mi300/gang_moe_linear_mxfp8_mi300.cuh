@@ -1920,7 +1920,13 @@ __device__ __forceinline__ bool _gang_moe_mxfp8_tile(int tile_idx,
                                                      int *local_eid,
                                                      int *tok_idx,
                                                      int *wg_idx,
-                                                     int *topk_slot) {
+                                                     int *topk_slot,
+                                                     // MPK_ROUTE_LL: the
+                                                     // slot's expert as an
+                                                     // epoch-tagged word.
+                                                     unsigned long long const
+                                                         *ll_route = nullptr,
+                                                     unsigned ll_epoch = 0) {
   static_assert(FIXED_SLOTS == 0 ||
                     (BATCH_SIZE == 1 && EP_WORLD_SIZE == 1 &&
                      DUP_SHARED == 0 && SHARED_KSHARD == 0),
@@ -2032,7 +2038,29 @@ __device__ __forceinline__ bool _gang_moe_mxfp8_tile(int tile_idx,
     if (global_tile >= num_activated_experts * TILES_PER_EXPERT) {
       return false;
     }
-    e = d_mask[global_tile / TILES_PER_EXPERT];
+    if (FIXED_SLOTS > 0 && ll_route != nullptr) {
+      // Written into this XCD's L2 by its TopK block after the normed row;
+      // `nt` misses the vL1 and hits the L2. Then drop the vL1 for the rows
+      // read below.
+      unsigned long long const *const wp =
+          ll_route + global_tile / TILES_PER_EXPERT;
+      unsigned long long wv;
+      while (true) {
+        asm volatile("global_load_dwordx2 %0, %1, off nt\n"
+                     "s_waitcnt vmcnt(0)"
+                     : "=v"(wv)
+                     : "v"(wp)
+                     : "memory");
+        if ((unsigned)(wv >> 32) == ll_epoch) {
+          break;
+        }
+        __builtin_amdgcn_s_sleep(1);
+      }
+      asm volatile("buffer_inv" ::: "memory");
+      e = (int)(unsigned)wv;
+    } else {
+      e = d_mask[global_tile / TILES_PER_EXPERT];
+    }
     leid = e;
     within = global_tile % TILES_PER_EXPERT;
   }
@@ -2149,7 +2177,10 @@ __device__ __noinline__ void
                                      void const *mask_ptr,
                                      void const *bias_ptr,
                                      void *output_ptr,
-                                     int tile_idx) {
+                                     int tile_idx,
+                                     unsigned long long const *ll_route =
+                                         nullptr,
+                                     unsigned ll_epoch = 0) {
   // 2026-08-21 closed narrowing below 64 rows: 16 (the K-parallel branch)
   // measured -1.34 ms (95a044a), and 32 as an N-parallel split would put 8
   // rows on each of 4 waves and starve the 16-row MFMA. 32 is now legal as a
@@ -2243,7 +2274,9 @@ __device__ __noinline__ void
                  &local_eid,
                  &tok_idx,
                  &wg_idx,
-                 &topk_slot)) {
+                 &topk_slot,
+                 ll_route,
+                 ll_epoch)) {
     return;
   }
 
@@ -3483,6 +3516,24 @@ __device__ __forceinline__ f32x4_t
   }
 }
 
+// MPK_ROUTE_LL: word `idx` of this XCD's routing words once it carries
+// `epoch`. Written into this XCD's L2 by its TopK block; `nt` misses the vL1.
+__device__ __forceinline__ unsigned long long
+    _gang_ll_route_word(unsigned long long const *ll, int idx, unsigned epoch) {
+  unsigned long long w;
+  while (true) {
+    asm volatile("global_load_dwordx2 %0, %1, off nt\n"
+                 "s_waitcnt vmcnt(0)"
+                 : "=v"(w)
+                 : "v"(ll + idx)
+                 : "memory");
+    if ((unsigned)(w >> 32) == epoch) {
+      return w;
+    }
+    __builtin_amdgcn_s_sleep(1);
+  }
+}
+
 // The activation half of the fused tile: NSEG gathered SEG_LEN-wide bf16 slabs
 // quantized into one contiguous E4M3 run in LDS with one E8M0 per 128 --
 // _gang_wave_parallel_fp8_quant_nt's math, except that each 32-element
@@ -3514,7 +3565,9 @@ __device__ __forceinline__ void
                           int n_live,
                           int seg_base,
                           uint8_t *__restrict__ s_tok_fp8,
-                          uint8_t *__restrict__ s_tok_scales) {
+                          uint8_t *__restrict__ s_tok_scales,
+                          unsigned long long const *ll_route = nullptr,
+                          unsigned ll_epoch = 0) {
   constexpr int SUB_BLOCK = 32;
   constexpr int SB_PER_SEG = SEG_LEN / SUB_BLOCK;
   constexpr int NSUBBLOCKS = NSEG * SB_PER_SEG;
@@ -3533,7 +3586,10 @@ __device__ __forceinline__ void
     if (seg < n_live) {
       int const slot =
           FIXED_SLOTS ? seg : d_routing[d_mask[seg] * BATCH_SIZE + tok_idx] - 1;
-      rw = d_routing_weight[tok_idx * NUM_TOPK + slot];
+      rw = (FIXED_SLOTS && ll_route != nullptr)
+               ? __uint_as_float(
+                     (unsigned)_gang_ll_route_word(ll_route, 16 + slot, ll_epoch))
+               : d_routing_weight[tok_idx * NUM_TOPK + slot];
       uint32_t const *p =
           (uint32_t const *)(act + slot * SEG_LEN +
                              (sb % SB_PER_SEG) * SUB_BLOCK);
@@ -3667,7 +3723,10 @@ __device__ __noinline__ void
                                        void *output_ptr,
                                        int tile_idx,
                                        void const *routing_weight_ptr,
-                                       GangW2FoldPush fold = {}) {
+                                       GangW2FoldPush fold = {},
+                                       unsigned long long const *ll_route =
+                                           nullptr,
+                                       unsigned ll_epoch = 0) {
   static_assert(BATCH_SIZE == 1,
                 "the segments are one token's experts; more rows would need "
                 "a per-row segment list");
@@ -3727,7 +3786,13 @@ __device__ __noinline__ void
   // Published by the barrier the quantizer below ends with.
   if (threadIdx.x < NSEG_P) {
     int const s = seg_base + threadIdx.x;
-    int const e = (s < n_live) ? d_mask[s] : ((n_live > 0) ? d_mask[0] : 0);
+    int e;
+    if (MPK_MOE_BS1_DECODE && ll_route != nullptr) {
+      e = (int)(unsigned)_gang_ll_route_word(ll_route, s < n_live ? s : 0,
+                                             ll_epoch);
+    } else {
+      e = (s < n_live) ? d_mask[s] : ((n_live > 0) ? d_mask[0] : 0);
+    }
     s_seg_off[threadIdx.x] =
         static_cast<uint32_t>(e) * static_cast<uint32_t>(EXPERT_BYTES);
   }
@@ -3743,7 +3808,9 @@ __device__ __noinline__ void
       n_live,
       seg_base,
       s_tok_fp8,
-      s_tok_scales);
+      s_tok_scales,
+      ll_route,
+      ll_epoch);
 
   int const tid = threadIdx.x;
   int const warp_id = tid >> 6;

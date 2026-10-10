@@ -1598,6 +1598,9 @@ def get_compile_command(
             # DPP lane exchange in the TopK sort-merge
             # (moe_topk_sigmoid_bias_mi300.cuh).
             "MPK_TOPK_DPP",
+            # Routing as epoch-tagged words the MoE tiles validate
+            # (gang_rmsnorm_linear_bias_mi300.cuh, gang_oproj_router_fused).
+            "MPK_ROUTE_LL",
             # Ceiling probes, wrong output (gang_mla_attn_fused_mi300.cuh).
             "MPK_ATTN_PROBE_NOQBWAIT",
             "MPK_ATTN_PROBE_NODECWAIT",
