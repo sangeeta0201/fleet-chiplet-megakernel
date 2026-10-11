@@ -2697,6 +2697,45 @@ gang_mla_full_layer_fused_kernel_mi300(
       }
     }
 #endif // MPK_GLM_OPROJ_PREFETCH_OFF
+#if MPK_ROUTER_L2PF
+    if constexpr (HIDDEN_SIZE % (16 * 64) == 0 && NUM_EXPERTS % 8 == 0 &&
+                  (NUM_EXPERTS / 8) * 8 == MPK_NT) {
+      if (ml_mode && xcd_rank < router_tile_n &&
+          router_tile_n <= tiles_per_xcd) {
+        constexpr int KS_SLICE = HIDDEN_SIZE / 16;
+        constexpr int RPF_LDS_OFF =
+            ((int)(sizeof(unsigned short) * BATCH_SIZE *
+                   OPROJ_REDUCTION_SIZE) +
+             255) / 256 * 256 + 4096;
+        static_assert(RPF_LDS_OFF + 4096 <=
+                          mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE,
+                      "the router prefetch window sits past the o_proj one");
+        extern __shared__ char _fused_smem[];
+        auto *rpf_dst = (__attribute__((address_space(3))) uint32_t *)(
+            _fused_smem + RPF_LDS_OFF + (tid >> 6) * 1024);
+        // The router tile's own layout: thread t takes row t / 8, chunks
+        // t % 8 + 8j of this tile's KS_SLICE columns.
+        i32x4_t const rpf_w = make_w_buffer_rsrc(
+            input_ptrs[19],
+            static_cast<uint32_t>((NUM_EXPERTS / 8) * HIDDEN_SIZE * 2));
+        int rpf_voff = (tid >> 3) * HIDDEN_SIZE * 2 +
+                       xcd_rank * KS_SLICE * 2 + (tid & 7) * 16;
+#pragma unroll
+        for (int j = 0; j < KS_SLICE / 64; j++) {
+          __llvm_amdgcn_raw_buffer_load_lds(rpf_w, rpf_dst, 16, rpf_voff, 0, 0,
+                                            1);
+          rpf_voff += 128;
+          asm volatile("" : "+v"(rpf_voff) : : "memory");
+        }
+        if (tid < KS_SLICE / 8) {
+          i32x4_t const rpf_g = make_w_buffer_rsrc(
+              input_ptrs[17], static_cast<uint32_t>(HIDDEN_SIZE * 2));
+          __llvm_amdgcn_raw_buffer_load_lds(
+              rpf_g, rpf_dst, 16, xcd_rank * KS_SLICE * 2 + tid * 16, 0, 0, 1);
+        }
+      }
+    }
+#endif
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     _b_t3 = __builtin_amdgcn_s_memrealtime();
 #endif

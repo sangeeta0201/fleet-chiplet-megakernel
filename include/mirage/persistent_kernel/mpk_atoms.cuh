@@ -1452,9 +1452,15 @@ __device__ __forceinline__ bool
 // MPK_ML_NO_FENCE: the multi-layer loop skips its per-layer threadfence_gpu
 // (persistent_kernel.cuh); the __syncthreads stays. MEASURED NEUTRAL
 // 2026-10-10 on the five-lever default, tokens identical: 4.831 -> 4.829
-// 4.822 ms. Off: no gain to pay for dropping a fence.
+// 4.822 ms. Re-measured 2026-10-11 on 1f81211 (MPK_ENTRY_NOARRIVE no longer
+// drains every worker at the next layer's entry): the fence's one worker per
+// XCD -- a resolver -- sat 3.3-3.6 us in it on its own W2 XGMI acks, the
+// slowest on its XCD in 286 of 288 layers (MPK_TRACE S74 -> S12). Dropped,
+// text identical: 3.949 3.957 3.945 vs 3.961 3.965 3.958, plus 3.944 vs
+// 3.950 (-0.011). Small, because the acks are then waited for at that
+// worker's next call. Default on.
 #ifndef MPK_ML_NO_FENCE
-#define MPK_ML_NO_FENCE 0
+#define MPK_ML_NO_FENCE 1
 #endif
 
 // Five levers from the MPK_TRACE profile, measured 2026-10-10 at NP=8
@@ -1712,8 +1718,45 @@ __device__ __forceinline__ bool
 // the pass retire behind the whole 3 MB burst (S33 -> first pass ~2 us for
 // every tile); after validation (MPK_ROUTER_W_LATE) the gate dot waited for
 // them instead (+0.027 ms). Here they stream during the validation.
+// MEASURED SLOWER 2026-10-11 on 1f81211: 4.010 vs 3.950 ms (r1). The first
+// pass rarely validates, so the second pass's vmcnt(0) now waits for the
+// whole burst; issued up front it had finished by then. Off.
 #ifndef MPK_ROUTER_KS_MID
 #define MPK_ROUTER_KS_MID 0
+#endif
+// MPK_QUANT_WIDE: the RMSNorm + MXFP8 quantizer of qkv_a and q_b gives each
+// lane eight contiguous elements, so one 16-lane DPP row is exactly one
+// 128-element E8M0 block and its max is four DPP steps. The default gives
+// each thread a whole 32-element sub-block -- a serial chain of 32 converts,
+// multiplies and maxes, then four ds_bpermute shuffles -- on 192 threads at
+// qkv_a and 48 (one wave) at q_b. MPK_TRACE: S54 -> S62 1.16 us (qkv_a),
+// S72 -> S73 1.09 us (q_b), both on the critical path. Same products in the
+// same order, same block max, same converts: bit-identical.
+// MEASURED SLOWER 2026-10-11 on 1f81211, n=3: 3.979 3.980 3.983 vs 3.961
+// 3.965 3.958 ms (+0.020), bit-exact in test_qwide (8 seeds x 1536/2048/
+// 6144, LDS and global rows). The default is 32-way bank-conflicted and
+// serial and still wins, so the quantizer is not what S72 -> S73 measures.
+#ifndef MPK_QUANT_WIDE
+#define MPK_QUANT_WIDE 0
+#endif
+// MPK_W13_ACT_W3: the K_HALF W13 tile parks its SwiGLU epoch words in LDS and
+// wave 3 alone stores them. They were issued by waves 0/1 -- exactly the
+// waves that then poll W2's staging, where the polls retire in issue order
+// behind those write-through stores. MPK_TRACE: the last W2 tile to stage is
+// always the last W13 worker's own, 3.12 us after the last W13 k-loop
+// against 2.19 for the W2 workers that ran no W13. Pair with
+// MPK_W13_NO_ARRIVE, whose all-wave drain would otherwise put it back.
+#ifndef MPK_W13_ACT_W3
+#define MPK_W13_ACT_W3 0
+#endif
+// MPK_ROUTER_L2PF: each router-tile worker pulls its own K-split slice of the
+// gate rows (32 rows x 768 B) and of gamma into L2 at Phase 8, ~10 us ahead
+// of its router tile, through a never-read LDS window as the o_proj prefetch
+// does. At the tile's head all 128 tiles of a GPU ask HBM for their 24 KB at
+// once, and the slice validation's first pass retires behind that burst
+// (MPK_TRACE: S33 -> first pass 2.15 us); from L2 the burst is short.
+#ifndef MPK_ROUTER_L2PF
+#define MPK_ROUTER_L2PF 0
 #endif
 // (MPK_WUK_PF below: 5.064 5.057, -0.029.) All five together, interleaved
 // against their own control, text identical: 5.109 5.110 5.094 -> 4.831

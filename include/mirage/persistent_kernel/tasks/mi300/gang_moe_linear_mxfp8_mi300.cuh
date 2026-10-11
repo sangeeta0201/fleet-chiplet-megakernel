@@ -2354,6 +2354,12 @@ __device__ __noinline__ void
       K_PARALLEL ? NUM_WAVES * OUTPUT_PER_WG : (K_HALF ? OUTPUT_PER_WG : 0);
   float *s_act = s_reduce + S_REDUCE_FLOATS;
   float *s_act_scale_f = s_act + W13_ACT_COLS;
+#if MPK_W13_ACT_W3
+  // K_HALF's eight epoch words per tile and their slots in act_ll; every
+  // tile writes all eight before the closing barrier, wave 3 stores them.
+  __shared__ unsigned long long s_actw[OUTPUT_PER_WG / 4];
+  __shared__ unsigned s_actw_widx[OUTPUT_PER_WG / 4];
+#endif
   if constexpr (EMIT_FP8) {
     static_assert(!K_PARALLEL,
                   "EMIT_FP8 needs the N-parallel branch: a K-parallel "
@@ -2563,8 +2569,19 @@ __device__ __noinline__ void
                 ((size_t)tok_idx * (NUM_TOPK * ACT_STRIDE) +
                  (size_t)topk_slot * ACT_STRIDE + (size_t)(out_base >> 1)) /
                 2;
+#if MPK_W13_ACT_W3
+            if constexpr (K_HALF) {
+              int const li = (out_base - wg_idx * OUTPUT_PER_WG) >> 2;
+              s_actw[li] = ((unsigned long long)ll_epoch << 32) | packed;
+              s_actw_widx[li] = (unsigned)widx;
+            } else {
+              st_wt_u64((void *)(act_ll + widx),
+                        ((unsigned long long)ll_epoch << 32) | packed);
+            }
+#else
             st_wt_u64((void *)(act_ll + widx),
                       ((unsigned long long)ll_epoch << 32) | packed);
+#endif
           } else {
             st_wt_u32((void *)act_addr, packed);
           }
@@ -2834,6 +2851,16 @@ __device__ __noinline__ void
   }
 
   __syncthreads();
+#if MPK_W13_ACT_W3
+  if constexpr (K_HALF && FUSE_SWIGLU && WRITE_THROUGH && !EMIT_FP8) {
+    static_assert(OUTPUT_PER_WG / 4 <= 64, "one wave stores the tile's words");
+    if (act_ll != nullptr && (threadIdx.x >> 6) == 3 &&
+        (threadIdx.x & 63) < OUTPUT_PER_WG / 4) {
+      int const li = threadIdx.x & 63;
+      st_wt_u64((void *)(act_ll + s_actw_widx[li]), s_actw[li]);
+    }
+  }
+#endif
 
   // ── EMIT_FP8 write-out ────────────────────────────────────────────────────
   //

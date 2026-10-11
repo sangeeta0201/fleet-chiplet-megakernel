@@ -227,6 +227,69 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_rmsnorm(
     }
   };
 
+#if MPK_QUANT_WIDE
+  static_assert(REDUCTION_SIZE % 128 == 0,
+                "a DPP row covers one whole 128-element E8M0 block");
+  constexpr int NCHUNK = REDUCTION_SIZE / 8;
+  (void)ld_src;
+  (void)ld_nw;
+#pragma unroll
+  for (int c0 = 0; c0 < NCHUNK; c0 += MPK_NT) {
+    int const c = c0 + (int)threadIdx.x;
+    // NCHUNK is a multiple of 16, so a row is live or dead as a whole and
+    // the DPP below never mixes the two.
+    bool const live = c < NCHUNK;
+    float v[8];
+    float amax = 0.0f;
+    if (live) {
+      i4 const sv = ld_src16(c * 8);
+      i4 const nv = ld_nw16(c * 8);
+#pragma unroll
+      for (int e = 0; e < 8; e++) {
+        v[e] = _gang_bf16_to_float(sv[e]) * rms_rcp *
+               _gang_bf16_to_float(nv[e]);
+        amax = fmaxf(amax, fabsf(v[e]));
+      }
+    }
+    // Row max: xor 1, xor 2, half-row mirror, row mirror.
+    amax = fmaxf(amax, __int_as_float(__builtin_amdgcn_mov_dpp(
+                           __float_as_int(amax), 0xB1, 0xF, 0xF, false)));
+    amax = fmaxf(amax, __int_as_float(__builtin_amdgcn_mov_dpp(
+                           __float_as_int(amax), 0x4E, 0xF, 0xF, false)));
+    amax = fmaxf(amax, __int_as_float(__builtin_amdgcn_mov_dpp(
+                           __float_as_int(amax), 0x141, 0xF, 0xF, false)));
+    amax = fmaxf(amax, __int_as_float(__builtin_amdgcn_mov_dpp(
+                           __float_as_int(amax), 0x140, 0xF, 0xF, false)));
+    if (live) {
+      uint8_t const se = _gang_compute_e8m0_fp8(amax);
+      float scale_f;
+      if (se == 0) {
+        scale_f = 1.0f;
+      } else {
+        union {
+          float f;
+          uint32_t u;
+        } sv;
+        sv.u = (uint32_t)se << 23;
+        scale_f = sv.f;
+      }
+      fp8x4_t pk0 = {}, pk1 = {};
+      pk0 = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(pk0, v[0], v[1], scale_f,
+                                                     false);
+      pk0 = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(pk0, v[2], v[3], scale_f,
+                                                     true);
+      pk1 = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(pk1, v[4], v[5], scale_f,
+                                                     false);
+      pk1 = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(pk1, v[6], v[7], scale_f,
+                                                     true);
+      *(int *)(s_tok_fp8 + c * 8) = *(int const *)&pk0;
+      *(int *)(s_tok_fp8 + c * 8 + 4) = *(int const *)&pk1;
+      if ((threadIdx.x & 15) == 0) {
+        s_tok_scales[c / 16] = se;
+      }
+    }
+  }
+#else
   constexpr int SUB_BLOCK = 32;
   constexpr int NSUBBLOCKS = REDUCTION_SIZE / SUB_BLOCK;
   int const tid = threadIdx.x;
@@ -308,6 +371,7 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_rmsnorm(
       s_tok_scales[super_blk] = se;
     }
   }
+#endif
   if constexpr (BARRIER_LDS_ONLY) {
     asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
     __builtin_amdgcn_s_barrier();
