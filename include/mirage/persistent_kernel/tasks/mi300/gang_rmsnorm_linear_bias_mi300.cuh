@@ -754,6 +754,41 @@ constexpr bool router_ksplit_on() {
          REDUCTION_SIZE % (16 * 64) == 0;
 }
 
+#if MPK_ROUTER_KS_EARLY
+// MPK_ROUTER_KS_EARLY: tile `tile_idx`'s K-split slices, in the layout the
+// router's own loads use. Compiler-visible loads: held across o_proj, they
+// may be copied or spilled, and only then does the compiler wait for them.
+typedef int __attribute__((ext_vector_type(4))) ks_pre_i32x4_t;
+typedef int __attribute__((ext_vector_type(2))) ks_pre_i32x2_t;
+template <int REDUCTION_SIZE>
+struct RouterKsPre {
+  ks_pre_i32x4_t w[REDUCTION_SIZE / 16 / 64];
+  ks_pre_i32x2_t g;
+};
+template <int REDUCTION_SIZE>
+__device__ __forceinline__ void
+router_ks_preload(RouterKsPre<REDUCTION_SIZE> &p, void const *gate_weight_ptr,
+                  void const *norm_weight_ptr, int tile_idx) {
+  constexpr int KS_SLICE = REDUCTION_SIZE / 16;
+  int const tid = threadIdx.x;
+  char const *const wb =
+      (char const *)gate_weight_ptr +
+      ((size_t)(tid >> 3) * REDUCTION_SIZE + (size_t)tile_idx * KS_SLICE +
+       (tid & 7) * 8) * 2;
+#pragma unroll
+  for (int j = 0; j < KS_SLICE / 64; j++) {
+    p.w[j] = __builtin_nontemporal_load(
+        reinterpret_cast<ks_pre_i32x4_t const *>(wb + j * 128));
+  }
+  p.g = ks_pre_i32x2_t{0, 0};
+  if (tid < KS_SLICE / 4) {
+    p.g = __builtin_nontemporal_load(reinterpret_cast<ks_pre_i32x2_t const *>(
+        (char const *)norm_weight_ptr +
+        ((size_t)tile_idx * KS_SLICE + tid * 4) * 2));
+  }
+}
+#endif
+
 #if MPK_ROUTER_LL
 // MPK_ROUTER_LL's TopK, run by one router block per XCD once its own logits
 // are out: wait until all NUM_EXPERTS words carry this layer's epoch, then
@@ -1152,7 +1187,12 @@ template <typename T,
           // MPK_OPROJ_LL: the slots are (epoch << 32 | f32) words, each one
           // its own signal, so neither the per-peer signals nor the o_proj
           // release are waited on.
-          bool SUM_LL = false>
+          bool SUM_LL = false
+#if MPK_ROUTER_KS_EARLY
+          ,
+          bool KS_PRE = false
+#endif
+          >
 #if MPK_ROUTER_INLINE
 __device__ __attribute__((always_inline)) void
 #else
@@ -1236,7 +1276,12 @@ gang_rmsnorm_linear_bias_topk_kernel(
     // MPK_ROUTER_XSPLIT: this XCD's exchange block (flag line, then the row).
     int *xsplit = nullptr,
     // MPK_ROUTER_LL: the logit words, then the eight per-XCD routing copies.
-    int *rll = nullptr) {
+    int *rll = nullptr
+#if MPK_ROUTER_KS_EARLY
+    ,
+    gang_rmsnorm_topk_detail::RouterKsPre<REDUCTION_SIZE> ks_pre = {}
+#endif
+    ) {
 
   using bf16 = __hip_bfloat16;
   bf16 const *__restrict__ d_hidden = static_cast<bf16 const *>(norm_input_ptr);
@@ -1351,7 +1396,16 @@ gang_rmsnorm_linear_bias_topk_kernel(
     }
   }
 #else
-  if constexpr (KSPLIT) {
+#if MPK_ROUTER_KS_EARLY
+  if constexpr (KSPLIT && KS_PRE) {
+#pragma unroll
+    for (int j = 0; j < KS_CH; j++) {
+      ks_w[j] = ks_pre.w[j];
+    }
+    ks_g = ks_pre.g;
+  } else
+#endif
+  if constexpr (KSPLIT && !MPK_ROUTER_KS_MID) {
     char const *const ks_wb =
         (char const *)gate_weight_ptr +
         ((size_t)(tid >> 3) * REDUCTION_SIZE + (size_t)tile_idx * KS_SLICE +
@@ -1517,7 +1571,9 @@ gang_rmsnorm_linear_bias_topk_kernel(
     }
     // Plain buffer_inv, no sc1: drop the vL1 so d_hidden is re-read, but
     // leave this XCD's own L2 lines alone.
-    asm volatile("buffer_inv" ::: "memory");
+    if constexpr (!(MPK_ROUTER_NO_INV && SUM_LL && KSPLIT)) {
+      asm volatile("buffer_inv" ::: "memory");
+    }
     // Drain the prefetch. nt loads bypass L2 and are unaffected by the inv.
     // Under SUM_LL not until Step 2 uses it: vmcnt retires in issue order,
     // so a wave with XGMI pushes in flight would sit here on their acks.
@@ -1657,8 +1713,57 @@ gang_rmsnorm_linear_bias_topk_kernel(
       unsigned const want = static_cast<unsigned>(stream_expected);
       int const i0 = xs_t * xs_f4 + tid;
       int ll_pass = 0;
+#if MPK_ROUTER_KS_MID
+      bool ks_first = true;
+#endif
       while (true) {
         bool ok = true;
+#if MPK_ROUTER_KS_MID
+        if (tid < xs_f4) {
+#pragma unroll
+          for (int s = 0; s < SUM_SLOTS; s++) {
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+              asm volatile("global_load_dwordx4 %0, %1, off sc0 sc1"
+                           : "=v"(llw[s][h])
+                           : "v"(ll + (size_t)s * REDUCTION_SIZE + i0 * 4 +
+                                 h * 2)
+                           : "memory");
+            }
+          }
+        }
+        if constexpr (KSPLIT) {
+          if (ks_first) {
+            static_assert(KS_CH == 6, "the vmcnt(7)/vmcnt(6) count the slices");
+            // Gamma first: the slice sum reads it before the gate dot's
+            // drain, and vmcnt(6) then retires exactly it.
+            if (tid < KS_SLICE / 4) {
+              asm volatile("global_load_dwordx2 %0, %1, off sc0 nt"
+                           : "=v"(ks_g)
+                           : "v"((char const *)norm_weight_ptr +
+                                 ((size_t)tile_idx * KS_SLICE + tid * 4) * 2)
+                           : "memory");
+            }
+            char const *const ks_wb =
+                (char const *)gate_weight_ptr +
+                ((size_t)(tid >> 3) * REDUCTION_SIZE +
+                 (size_t)tile_idx * KS_SLICE + (tid & 7) * 8) * 2;
+#pragma unroll
+            for (int j = 0; j < KS_CH; j++) {
+              asm volatile("global_load_dwordx4 %0, %1, off sc0 nt"
+                           : "=v"(ks_w[j])
+                           : "v"(ks_wb + j * 128)
+                           : "memory");
+            }
+          }
+        }
+        if (tid < xs_f4) {
+          if (KSPLIT && ks_first) {
+            asm volatile("s_waitcnt vmcnt(7)" ::: "memory");
+          } else {
+            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          }
+#else
         if (tid < xs_f4) {
 #pragma unroll
           for (int s = 0; s < SUM_SLOTS; s++) {
@@ -1672,6 +1777,18 @@ gang_rmsnorm_linear_bias_topk_kernel(
             }
           }
           asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
+          // The memory clobber orders memory, not the register compares
+          // below: without a tie, the scheduler may hoist them above the
+          // wait onto words still in flight (seen once the gate slice came
+          // in by argument), and the slice then never validates.
+#pragma unroll
+          for (int s = 0; s < SUM_SLOTS; s++) {
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+              asm volatile("" : "+v"(llw[s][h]));
+            }
+          }
 #pragma unroll
           for (int s = 0; s < SUM_SLOTS; s++) {
 #pragma unroll
@@ -1688,6 +1805,9 @@ gang_rmsnorm_linear_bias_topk_kernel(
         if (tid == 0 && ++ll_pass == 1) {
           mpk_stage_stamp(68);
         }
+#if MPK_ROUTER_KS_MID
+        ks_first = false;
+#endif
         if (all_ok) {
           break;
         }
@@ -1760,6 +1880,10 @@ gang_rmsnorm_linear_bias_topk_kernel(
                     (unsigned long long)(b[0] | (b[1] << 16)) |
                         ((unsigned long long)(b[2] | (b[3] << 16)) << 32));
         }
+#if MPK_ROUTER_KS_MID
+        asm volatile("s_waitcnt vmcnt(6)" ::: "memory");
+        asm volatile("" : "+v"(ks_g));
+#endif
         unsigned const glo = (unsigned)ks_g[0];
         unsigned const ghi = (unsigned)ks_g[1];
         g4[0] = __uint_as_float(glo << 16);
@@ -1790,6 +1914,12 @@ gang_rmsnorm_linear_bias_topk_kernel(
       }
       // SUM_LL's deferred prefetch drain: the gate chunks are used next.
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#if MPK_ROUTER_KS_MID
+#pragma unroll
+      for (int j = 0; j < KS_CH; j++) {
+        asm volatile("" : "+v"(ks_w[j]));
+      }
+#endif
       float acc = 0.0f;
 #pragma unroll
       for (int j = 0; j < KS_CH; j++) {

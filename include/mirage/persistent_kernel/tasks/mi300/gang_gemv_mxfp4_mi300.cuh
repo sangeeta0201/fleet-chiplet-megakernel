@@ -104,6 +104,18 @@ struct GangLLPush {
   int64_t delta[7];
 };
 
+#if MPK_OLL2_LDS
+namespace gang_gemv_mxfp4_detail {
+// MPK_OLL2_LDS: where the epilogue leaves a tile's row values, past the
+// staged activation so a second pass's skipped staging still finds it.
+template <int BATCH_SIZE, int REDUCTION_SIZE>
+constexpr size_t lds_out_off() {
+  return (sizeof(unsigned short) * BATCH_SIZE * REDUCTION_SIZE + 255) &
+         ~(size_t)255;
+}
+} // namespace gang_gemv_mxfp4_detail
+#endif
+
 template <int BATCH_SIZE, // = m_per_tile
           int REDUCTION_SIZE,
           int ROWS_PER_WG,
@@ -114,8 +126,17 @@ template <int BATCH_SIZE, // = m_per_tile
           bool F32_OUT = false,
           // MPK_OPROJ_LL: output_ptr is 8-byte (ll_epoch << 32 | f32) words,
           // stored to it and to the same offset on each of ll_npeer peers.
-          bool LL_OUT = false>
+          bool LL_OUT = false
+#if MPK_OLL2_LDS
+          ,
+          bool LDS_OUT = false
+#endif
+          >
+#if MPK_GEMV4_INLINE
+__device__ __attribute__((always_inline)) void
+#else
 __device__ __noinline__ void
+#endif
     gang_gemv_mxfp4_kernel(void const *input_ptr,
                            void const *weight_ptr,
                            void const *residual_ptr, // may be null
@@ -194,6 +215,28 @@ __device__ __noinline__ void
   int const tid = threadIdx.x;
   int const row = tid / LANES_PER_ROW;
   int const lane = tid % LANES_PER_ROW;
+#if MPK_GEMV4_EPI_PRE
+  float epi_bv = 0.0f;
+  float epi_r[BATCH_SIZE];
+#pragma unroll
+  for (int m = 0; m < BATCH_SIZE; m++) {
+    epi_r[m] = 0.0f;
+  }
+  if (lane == 0) {
+    if (Bs) {
+      epi_bv = b2f(ld_g<unsigned short>(Bs + n_tile * ROWS_PER_WG + row));
+    }
+    if constexpr (HAS_RESIDUAL) {
+#pragma unroll
+      for (int m = 0; m < BATCH_SIZE; m++) {
+        if (m_tile * BATCH_SIZE + m < num_active_tokens) {
+          epi_r[m] = b2f(ld_g<unsigned short>(
+              R + out_off + static_cast<size_t>(m) * o_stride + row));
+        }
+      }
+    }
+  }
+#endif
 
   // Identical to the fp8 kernel: the activation is bf16 either way, so the
   // staging area and its size are unchanged by narrowing the weight.
@@ -457,7 +500,12 @@ __device__ __noinline__ void
 
   if (lane == 0) {
     int const n_local = n_tile * ROWS_PER_WG + row;
+#if MPK_GEMV4_EPI_PRE
+    float const bv = epi_bv;
+    (void)n_local;
+#else
     float const bv = Bs ? b2f(ld_g<unsigned short>(Bs + n_local)) : 0.0f;
+#endif
 #pragma unroll
     for (int m = 0; m < BATCH_SIZE; m++) {
       if (m_tile * BATCH_SIZE + m >= num_active_tokens) {
@@ -466,7 +514,11 @@ __device__ __noinline__ void
       size_t const idx = out_off + static_cast<size_t>(m) * o_stride + row;
       float v = sum[m] + bv;
       if constexpr (HAS_RESIDUAL) {
+#if MPK_GEMV4_EPI_PRE
+        v += epi_r[m];
+#else
         v += b2f(ld_g<unsigned short>(R + idx));
+#endif
       }
       if constexpr (LL_OUT) {
         // The epoch rides in the same 8-byte store as the value, so a reader
@@ -492,6 +544,20 @@ __device__ __noinline__ void
         } else {
           Of[idx] = v;
         }
+#if MPK_OLL2_LDS
+        if constexpr (LDS_OUT) {
+          static_assert(BATCH_SIZE == 1, "one value per tile row");
+          static_assert(gang_gemv_mxfp4_detail::lds_out_off<BATCH_SIZE,
+                                                            REDUCTION_SIZE>() +
+                                ROWS_PER_WG * sizeof(float) <=
+                            mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE,
+                        "the row values fit past the staged activation");
+          reinterpret_cast<float *>(
+              _fused_smem +
+              gang_gemv_mxfp4_detail::lds_out_off<BATCH_SIZE,
+                                                  REDUCTION_SIZE>())[row] = v;
+        }
+#endif
       } else if constexpr (WRITE_THROUGH) {
         unsigned short const o = f2b(v);
         st_wt_u16(&O[idx], o);

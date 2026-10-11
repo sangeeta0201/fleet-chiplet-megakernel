@@ -324,6 +324,8 @@ __device__ __forceinline__ void mla_tile_bar() { __syncthreads(); }
 // tokens. Off.
 // QK_2ACC alone again 2026-10-10 on the PRELOAD=2 default, n=3 interleaved:
 // 4.779 4.791 4.794 -> 4.776 4.777 4.769 ms, tokens move. Off.
+// DECODE_BATCH re-measured 2026-10-11 on 5df165e (every item two tiles at
+// 1024-2048 context): control 4.004, =2 4.079, =4 4.062 ms. Off.
 //
 // MPK_MLA_QK_2ACC: split the 18-step QK MFMA chain over a[32:35] (even k32
 // steps) and a[36:39] (odd), so consecutive MFMAs are independent.

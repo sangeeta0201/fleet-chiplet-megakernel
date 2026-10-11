@@ -644,6 +644,12 @@ __device__ __forceinline__ void _full_layer_ep_fold_ll_parts(
   for (int p = (col_lo >> 1) + threadIdx.x; p < (col_hi >> 1); p += MPK_NT) {
     int const off = p << 1;
     pw2_t w[K_PARTS];
+#if MPK_FOLD_RES_PRE
+    unsigned res_pair = 0;
+    if constexpr (FOLD) {
+      res_pair = *reinterpret_cast<unsigned const *>(res_row + off);
+    }
+#endif
 #ifdef MPK_PL_DEBUG
     unsigned _spins = 0;
 #endif
@@ -681,7 +687,11 @@ __device__ __forceinline__ void _full_layer_ep_fold_ll_parts(
         v += __uint_as_float((unsigned)(j == 0 ? w[k].x : w[k].y));
       }
       if constexpr (FOLD) {
+#if MPK_FOLD_RES_PRE
+        unsigned rbits = (j == 0 ? (res_pair & 0xFFFFu) : (res_pair >> 16)) << 16;
+#else
         unsigned rbits = (unsigned)res_row[off + j] << 16;
+#endif
         float rv;
         __builtin_memcpy(&rv, &rbits, 4);
         v += rv;
@@ -1074,7 +1084,15 @@ gang_mla_full_layer_fused_kernel_mi300(
     int const entry_expected = task_layer_idx + 1;
     int const arrivals = tiles_per_xcd * 8;
     __syncthreads();
+#if MPK_ENTRY_NOARRIVE
+    bool const entry_quiet = MPK_ENTRY_NOWAIT && pl_layer && entry_skip &&
+                             !FULL_LAYER_TAGGED_ENTRY;
+    if (!entry_quiet) {
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    }
+#else
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
     // Two-level arrival when the population divides across the eight XCDs,
     // which for this barrier it does by construction (arrivals is
     // tiles_per_xcd * 8). See hier_barrier_arrive.
@@ -1105,8 +1123,14 @@ gang_mla_full_layer_fused_kernel_mi300(
     }
 #else
     if (tid == 0) {
+#if MPK_ENTRY_NOARRIVE
+      if (!entry_quiet &&
+          hier_barrier_arrive(entry_bar, HIER_STRIDE, arrivals, tiles_per_xcd,
+                              xcd_id, entry_tree, /*skew_slot=*/0)) {
+#else
       if (hier_barrier_arrive(entry_bar, HIER_STRIDE, arrivals, tiles_per_xcd,
                               xcd_id, entry_tree, /*skew_slot=*/0)) {
+#endif
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         for (int x = 0; x < 8; x++) {
           st_flag_u32((void *)&entry_bar[x * HIER_STRIDE],

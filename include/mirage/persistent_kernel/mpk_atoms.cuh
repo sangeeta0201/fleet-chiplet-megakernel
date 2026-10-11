@@ -1530,8 +1530,10 @@ __device__ __forceinline__ bool
 // bytes at entry instead. Issued up front on every wave, they sat in the
 // validating waves' vmcnt ahead of the first pass (MPK_TRACE: S33 -> first
 // pass 2.05 us against a ~1 us local round trip).
-// DO NOT ENABLE: wedged at decode iteration 2 in both NP=8 runs (2026-10-11),
-// the second after retiring ks_g ahead of its first read; cause not found.
+// It wedged at decode iteration 2 until the validation compares were tied
+// below their vmcnt(0) (the scheduler had hoisted them onto words still in
+// flight). Since then it runs, text identical, and MEASURED SLOWER 2026-10-11:
+// 4.027 vs 4.000 ms. Off.
 #ifndef MPK_ROUTER_W_LATE
 #define MPK_ROUTER_W_LATE 0
 #endif
@@ -1604,6 +1606,114 @@ __device__ __forceinline__ bool
 // 4.016 ms (-0.027), still behind the striped control. Off with it.
 #ifndef MPK_XE_W2_PF
 #define MPK_XE_W2_PF 0
+#endif
+// MPK_RNLM8_BIAS_PRE: the MXFP8 RMSNorm+linear tile (qkv_a, q_b) loads its
+// epilogue lanes' four bias values ahead of the k-loop instead of between the
+// last MFMA (or the cross-wave reduction) and the output store, the same
+// dependent read MPK_W13_BIAS_PRE took out of W13.
+// MEASURED NULL 2026-10-11 on 5df165e: 4.011 vs 4.000 ms. Off.
+#ifndef MPK_RNLM8_BIAS_PRE
+#define MPK_RNLM8_BIAS_PRE 0
+#endif
+// MPK_GEMV4_EPI_PRE: the MXFP4 GEMV's epilogue lanes (o_proj) load their
+// residual and bias ahead of the activation staging instead of after the
+// k-loop's shuffle reduction. Under MPK_OPROJ_RP the residual rides rank 0's
+// partial only, so this is a dependent read on one rank's push that every
+// rank's router waits for.
+// MEASURED NULL 2026-10-11 on 5df165e, n=3: 3.995 3.997 4.003 vs 4.006 3.994
+// 3.998 ms, text identical. (One earlier r1 wedged rank 6 in iteration 1, the
+// box's random first-iteration wedge; the rerun was clean.) Off.
+#ifndef MPK_GEMV4_EPI_PRE
+#define MPK_GEMV4_EPI_PRE 0
+#endif
+// MPK_FOLD_RES_PRE: the W2-parts EP fold loads its residual pair (fold PE
+// only) ahead of the part-word poll instead of after it, where the poll's
+// memory clobber kept the read behind the last part's arrival; every rank's
+// next resolve waits for that rank's push.
+// DO NOT ENABLE: changes the generated text (2026-10-11, 3.997 vs 4.006 ms).
+// The residual row is not final when the fold PE reaches the poll -- the
+// router's slice sum writes it -- so the early read can see the last layer's.
+#ifndef MPK_FOLD_RES_PRE
+#define MPK_FOLD_RES_PRE 0
+#endif
+// MPK_ROUTER_NO_INV: the K-split, LL-summing router tile skips the buffer_inv
+// ahead of its slice validation. Everything that path reads afterwards is a
+// system-scope load (the o_proj words, the sentinels, the sums of squares) or
+// was issued before it (the gate slice), so the L1 drop protects nothing --
+// and MPK_TRACE shows the tile 0.9 us between leaving o_proj and S33 with no
+// other instruction there that can wait.
+#ifndef MPK_ROUTER_NO_INV
+#define MPK_ROUTER_NO_INV 0
+#endif
+// MPK_ROUTER_KS_EARLY: a K-split router tile's gate and gamma slices are
+// loaded when its worker enters o_proj (S29, ~18 us ahead) and handed to the
+// router, instead of at the router's head. There all 128 tiles of a GPU ask
+// for their 24 KB at once, and the slice validation's loads retire behind
+// that burst: S33 -> first pass is 1.9-2.4 us however late the tile starts.
+// DO NOT ENABLE: wedges in decode iteration 1 (rank 1 alone finishes it), 6/6
+// attempts, with and without the validation-compare tie. The addressing
+// matches the router's own loads, the by-value copy is stored behind a
+// vmcnt(0), and no straight-line asm-output hazard shows; cause unknown.
+#ifndef MPK_ROUTER_KS_EARLY
+#define MPK_ROUTER_KS_EARLY 0
+#endif
+// MPK_OLL2_LDS: under MPK_OPROJ_LL == 2 the o_proj GEMV's epilogue lanes also
+// leave their row's f32 in LDS, and wave 3 builds the push words from there
+// instead of draining every wave's L2 stores and reading the rows back. Both
+// hops sit between the last o_proj tile and every rank's router.
+// MEASURED 2026-10-11 on 5df165e, n=3: 3.985 3.985 3.984 vs 3.996 3.996 3.998
+// ms (-0.012), text identical.
+#ifndef MPK_OLL2_LDS
+#define MPK_OLL2_LDS 1
+#endif
+// Force-inline the task kernels that are otherwise __noinline__. Every call
+// into a non-kernel function opens with s_waitcnt vmcnt(0) expcnt(0)
+// lgkmcnt(0) -- the callee cannot know what its caller left in flight -- so
+// each call drains the wave's stores, XGMI pushes included, before the phase
+// starts. MPK_TRACE puts the router's at 0.9 us (S31 -> S33: wave 3's o_proj
+// push). Inlined, waits land only on the registers that need them.
+//   MPK_MOE_W13_INLINE  gang_moe_w13_linear_mxfp8_kernel
+//   MPK_MOE_W2_INLINE   gang_moe_w2_tp_linear_mxfp8_kernel
+//   MPK_GEMV4_INLINE    gang_gemv_mxfp4_kernel (o_proj)
+//   MPK_RNLM8_INLINE    gang_rmsnorm_linear_mxfp8_bias_kernel (qkv_a, q_b)
+// MEASURED 2026-10-11 on 5df165e + the router tie, r1 vs 4.003 ms: router
+// inline 4.031, W13 4.042, W2 4.003, GEMV4 wedged in iteration 1 (2/2),
+// RNLM8 not run. The drain is real but the inlined bodies cost more than it
+// does; removing the drain at the source (MPK_ENTRY_NOARRIVE) is what paid.
+#ifndef MPK_MOE_W13_INLINE
+#define MPK_MOE_W13_INLINE 0
+#endif
+#ifndef MPK_MOE_W2_INLINE
+#define MPK_MOE_W2_INLINE 0
+#endif
+#ifndef MPK_GEMV4_INLINE
+#define MPK_GEMV4_INLINE 0
+#endif
+#ifndef MPK_RNLM8_INLINE
+#define MPK_RNLM8_INLINE 0
+#endif
+// MPK_ENTRY_NOARRIVE: under MPK_ENTRY_NOWAIT, the layers nobody waits at
+// (pl_layer) skip the layer-entry drain and arrival as well. Both retire in
+// issue order behind the previous W2's XGMI part pushes -- the arrival is a
+// returning atomic plus vmcnt(0) -- and MPK_TRACE puts the last resolver's
+// S14 -> S9 at 1.2 us of exactly that. The first and tail layers still
+// arrive and wait; each contributes `arrivals` to the counter, so their
+// modular election and release values are unchanged, and the self-heal
+// quota is only ever further away.
+// MEASURED 2026-10-11 on 5df165e + the router tie: alone 3.967 vs 4.003 ms
+// (r1); with MPK_OLL2_LDS, n=3, 3.956 3.959 3.960 vs 3.992 3.995 3.990
+// (-0.034), text identical.
+#ifndef MPK_ENTRY_NOARRIVE
+#define MPK_ENTRY_NOARRIVE 1
+#endif
+// MPK_ROUTER_KS_MID: the K-split router tile issues its gate and gamma slices
+// right after its first validation pass's loads, and that pass waits
+// vmcnt(7) -- its own 16 loads, not the 7 behind them. Up front they made
+// the pass retire behind the whole 3 MB burst (S33 -> first pass ~2 us for
+// every tile); after validation (MPK_ROUTER_W_LATE) the gate dot waited for
+// them instead (+0.027 ms). Here they stream during the validation.
+#ifndef MPK_ROUTER_KS_MID
+#define MPK_ROUTER_KS_MID 0
 #endif
 // (MPK_WUK_PF below: 5.064 5.057, -0.029.) All five together, interleaved
 // against their own control, text identical: 5.109 5.110 5.094 -> 4.831
@@ -2276,8 +2386,8 @@ __device__ __forceinline__ void mpk_stage_stamp(int idx) {
 #endif
 #define MPK_TRACE_ITERS 4
 #define MPK_TRACE_LAYERS 80
-// 46 shared with MPK_BAR_SKEW, then trace-only sub-phase stamps 46..71.
-#define MPK_STAGE_SLOTS 72
+// 46 shared with MPK_BAR_SKEW, then trace-only sub-phase stamps 46..79.
+#define MPK_STAGE_SLOTS 80
 #define MPK_STAGE_WORKERS 512
 #define MPK_TRACE_WORDS                                                        \
   ((size_t)MPK_TRACE_ITERS * MPK_TRACE_LAYERS * MPK_STAGE_SLOTS *              \

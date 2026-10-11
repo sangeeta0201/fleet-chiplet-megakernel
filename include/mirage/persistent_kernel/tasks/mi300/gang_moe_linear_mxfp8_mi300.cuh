@@ -2204,7 +2204,11 @@ template <int BATCH_SIZE,
           // its slot (NUM_TOPK - 1, after the routed ones) and token are
           // fixed, which is what lets it run before the TopK.
           int SHARED_MODE = 0>
+#if MPK_MOE_W13_INLINE
+__device__ __attribute__((always_inline)) void
+#else
 __device__ __noinline__ void
+#endif
     gang_moe_w13_linear_mxfp8_kernel(void const *input_ptr,
                                      void const *weight_ptr,
                                      void const *routing_ptr,
@@ -3964,7 +3968,11 @@ template <int BATCH_SIZE,
           int K_PARTS = 1,
           // MPK_FOLD_W2: peers the epilogue fold publishes to; 0 is off.
           int FOLD_NPEER = 0>
+#if MPK_MOE_W2_INLINE
+__device__ __attribute__((always_inline)) void
+#else
 __device__ __noinline__ void
+#endif
     gang_moe_w2_tp_linear_mxfp8_kernel(void const *input_ptr,
                                        void const *weight_ptr,
                                        void const *routing_ptr,

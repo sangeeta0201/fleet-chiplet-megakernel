@@ -1050,6 +1050,19 @@ __device__ __attribute__((always_inline)) void
     if (tid == 0) {
       mpk_stage_stamp(29);
     }
+#if MPK_ROUTER_KS_EARLY
+    constexpr bool RKS_PRE = gang_rmsnorm_topk_detail::router_ksplit_on<
+        BATCH_SIZE, HIDDEN_SIZE, NUM_EXPERTS, true, true,
+        ROUTER_EXPERTS_PER_TILE,
+        MPK_OPROJ_RP && (EP_WORLD_SIZE > 1) && MPK_OPROJ_LL>();
+    gang_rmsnorm_topk_detail::RouterKsPre<HIDDEN_SIZE> rks_pre = {};
+    if constexpr (RKS_PRE) {
+      if (xcd_rank < router_tile_n) {
+        gang_rmsnorm_topk_detail::router_ks_preload<HIDDEN_SIZE>(
+            rks_pre, router_weight_ptr, norm_weight_ptr, xcd_rank);
+      }
+    }
+#endif
     // ══════════════════════════════════════════════════════════════════════
     // Phase 1: absorbed o_proj (MXFP8 GEMV + residual)
     // ══════════════════════════════════════════════════════════════════════
@@ -1271,7 +1284,12 @@ __device__ __attribute__((always_inline)) void
                              // LL2's rows are read back on this XCD only.
                              /*WRITE_THROUGH=*/!OLL2,
                              /*F32_OUT=*/RP_F32,
-                             /*LL_OUT=*/OPROJ_RP && MPK_OPROJ_LL == 1>(
+                             /*LL_OUT=*/OPROJ_RP && MPK_OPROJ_LL == 1
+#if MPK_OLL2_LDS
+                             ,
+                             /*LDS_OUT=*/OLL2
+#endif
+                             >(
           oproj_act,
           oproj_weight_ptr,
           xcd_res,
@@ -1329,14 +1347,23 @@ __device__ __attribute__((always_inline)) void
       if constexpr (OLL2) {
         static_assert(MPK_NT == 256 && OPROJ_ROWS_PER_WG <= 64,
                       "one wave carries a tile's push");
+#if !MPK_OLL2_LDS
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
         __syncthreads();
         if (oproj_push && tid >= MPK_NT - 64) {
           int const w = tid - (MPK_NT - 64);
           if (w < OPROJ_ROWS_PER_WG) {
+#if MPK_OLL2_LDS
+            extern __shared__ char _oll2_smem[];
+            unsigned const v = reinterpret_cast<unsigned const *>(
+                _oll2_smem +
+                gang_gemv_mxfp4_detail::lds_out_off<BATCH_SIZE, OPROJ_K>())[w];
+#else
             unsigned const v = __builtin_nontemporal_load(
                 reinterpret_cast<unsigned const *>(oll_xcd) +
                 (size_t)t * OPROJ_ROWS_PER_WG + w);
+#endif
             unsigned long long const word =
                 ((unsigned long long)(unsigned)oproj_expected << 32) | v;
             unsigned long long *const dst =
@@ -1724,7 +1751,12 @@ __device__ __attribute__((always_inline)) void
                                            /*SUM_STREAM=*/OPROJ_RP &&
                                                MPK_ROUTER_STREAM,
                                            /*SUM_LL=*/OPROJ_RP &&
-                                               MPK_OPROJ_LL>(
+                                               MPK_OPROJ_LL
+#if MPK_ROUTER_KS_EARLY
+                                           ,
+                                           /*KS_PRE=*/RKS_PRE
+#endif
+                                           >(
           hidden_ptr,
           norm_weight_ptr,
           norm_output_ptr,
@@ -1776,7 +1808,12 @@ __device__ __attribute__((always_inline)) void
           /*xsplit=*/router_xsplit_ptr
               ? router_xsplit_ptr + xcd_id * MPK_XSPLIT_XCD_INTS
               : nullptr,
-          /*rll=*/router_ll_ptr);
+          /*rll=*/router_ll_ptr
+#if MPK_ROUTER_KS_EARLY
+          ,
+          rks_pre
+#endif
+          );
     }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     {

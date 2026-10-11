@@ -3455,6 +3455,12 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               if (threadIdx.x == 0) {
                 gang_tiles_executed = my_tiles;
               }
+              // Stage stamp 74: tid 0 is back from the layer, ahead of the
+              // boundary fence and join. Splits S8 -> S12 into the return
+              // path and the wait for the block's other waves.
+              if (threadIdx.x == 0) {
+                mpk_stage_stamp(74);
+              }
 
               // Inter-layer sync: threadfence_gpu flushes L2 write buffer so
               // next layer's buffer_inv + QKV epoch barrier sees fresh data.

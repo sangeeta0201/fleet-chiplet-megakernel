@@ -2404,7 +2404,12 @@ template <int BATCH_SIZE,
           // MPK_QKV_MXFP4: the weight is packed E2M1 (pack_dense_mxfp8 with
           // fp4=True), same workgroup layout at half the data bytes.
           bool WEIGHT_FP4 = false>
-__device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
+#if MPK_RNLM8_INLINE
+__device__ __attribute__((always_inline)) void
+#else
+__device__ __noinline__ void
+#endif
+gang_rmsnorm_linear_mxfp8_bias_kernel(
     void const *norm_input_ptr,  // [batch, REDUCTION_SIZE] bf16
     void const *norm_weight_ptr, // [REDUCTION_SIZE] bf16
     void *norm_output_ptr,       // unused: see the note at Step 1+2
@@ -2805,6 +2810,11 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
   if (FUSE_RESADD && threadIdx.x == 0) {
     mpk_stage_stamp(54);
   }
+  // Trace stamps 72/73/74 (q_b and the rest of !FUSE_RESADD): row normed,
+  // token quantized, K-loop done.
+  if (!FUSE_RESADD && threadIdx.x == 0) {
+    mpk_stage_stamp(72);
+  }
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   // Split the prologue: everything above is the residual resolve, the LDS
@@ -2958,9 +2968,19 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
   if (FUSE_RESADD && threadIdx.x == 0) {
     mpk_stage_stamp(62);
   }
+  if (!FUSE_RESADD && threadIdx.x == 0) {
+    mpk_stage_stamp(73);
+  }
   // ── Step 3: MFMA FP8(weights) x FP8(tokens) ────────────────────────────
   if constexpr (OUTPUT_PER_WG >= 64) {
     // N-parallel: 4 waves handle different output rows (depth-4 pipeline)
+#if MPK_RNLM8_BIAS_PRE
+    uint2 bias_q = {0u, 0u};
+    if (TILES_PER_WAVE == 1 && (FOLD_ROWS ? (col < rows_here) : (col == 0))) {
+      bias_q = *reinterpret_cast<uint2 const *>(
+          d_bias + wg_idx * OUTPUT_PER_WG + warp_id * 16 + g * 4);
+    }
+#endif
     for (int tile_iter = 0; tile_iter < TILES_PER_WAVE; tile_iter++) {
       int wave_tile = warp_id + tile_iter * NUM_WAVES;
       int w_row = wave_tile * 16 + col;
@@ -3167,7 +3187,14 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
           float sum = acc[i];
 
           // Add bias (partitioned per XCD)
+#if MPK_RNLM8_BIAS_PRE
+          unsigned const bq = (i < 2) ? bias_q.x : bias_q.y;
+          unsigned bt = TILES_PER_WAVE == 1
+                            ? (((i & 1) ? (bq >> 16) : (bq & 0xFFFFu)) << 16)
+                            : (unsigned)d_bias[out_n] << 16;
+#else
           unsigned bt = (unsigned)d_bias[out_n] << 16;
+#endif
           float bv;
           __builtin_memcpy(&bv, &bt, 4);
 
@@ -3204,6 +3231,13 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
 
     int const ki_start = warp_id * ITERS_PER_WAVE;
     int const ki_end = ki_start + ITERS_PER_WAVE;
+#if MPK_RNLM8_BIAS_PRE
+    uint2 bias_q = {0u, 0u};
+    if (warp_id == 0 && (FOLD_ROWS ? (col < rows_here) : (col == 0))) {
+      bias_q = *reinterpret_cast<uint2 const *>(
+          d_bias + wg_idx * OUTPUT_PER_WG + g * 4);
+    }
+#endif
 
     int w_row = col; // All 4 waves process same 16 output rows
     // w_row is `col` in [0,16) here, so under K-major w_row/16 is 0 and the
@@ -3352,7 +3386,13 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
 
         int out_n = wg_idx * OUTPUT_PER_WG + g * 4 + i;
 
+#if MPK_RNLM8_BIAS_PRE
+        unsigned const bq = (i < 2) ? bias_q.x : bias_q.y;
+        unsigned bt = ((i & 1) ? (bq >> 16) : (bq & 0xFFFFu)) << 16;
+        (void)out_n;
+#else
         unsigned bt = (unsigned)d_bias[out_n] << 16;
+#endif
         float bv;
         __builtin_memcpy(&bv, &bt, 4);
 
