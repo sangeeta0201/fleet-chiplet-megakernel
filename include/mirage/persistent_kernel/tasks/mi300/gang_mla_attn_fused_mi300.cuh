@@ -2021,6 +2021,51 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // Under MPK_DEC_MERGE_LL every merge rank skips the wait together, so the
   // tagged rendezvous' xcd_rank-0 release is owed to nobody.
   if (MPK_ATTN_PROBE_NODECWAIT || (dm_ll && MPK_DML_DBG == 0)) {
+#if MPK_DEC_DIRECT_WAIT
+  } else if (dec_tagged && head_local && dec_tiles == 8 &&
+             dec_base + dec_tiles <= tiles_per_xcd) {
+    // Lane l: XCD l / 8's decode rank dec_base + l % 8, the slot its
+    // tag_bar_arrive above wrote. xcd_rank 0 alone polls them and relays
+    // through its XCD's release line, as the stock site does: eight memory
+    // pollers, not one per merge rank.
+    int *const dd_xflag = dec_tags + MPK_TAGBAR_XFLAG_OFF + xcd_id * 32;
+    if (xcd_rank == 0) {
+      if (tid < 64) {
+        int const slot = (tid >> 3) * tiles_per_xcd + dec_base + (tid & 7);
+        while (true) {
+          unsigned seen;
+          asm volatile("global_load_dword %0, %1, off sc0 sc1\n"
+                       "s_waitcnt vmcnt(0)"
+                       : "=v"(seen)
+                       : "v"(&dec_tags[slot])
+                       : "memory");
+          if (__ballot((int)seen >= decode_expected) == ~0ull) {
+            break;
+          }
+          __builtin_amdgcn_s_sleep(1);
+        }
+        if (tid == 0) {
+          asm volatile("global_store_dword %0, %1, off"
+                       :
+                       : "v"(dd_xflag), "v"(decode_expected)
+                       : "memory");
+        }
+      }
+    } else if (tid == 0) {
+      int v;
+      for (;;) {
+        asm volatile("global_load_dword %0, %1, off nt\n"
+                     "s_waitcnt vmcnt(0)"
+                     : "=v"(v)
+                     : "v"(dd_xflag)
+                     : "memory");
+        if (v >= decode_expected) {
+          break;
+        }
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+#endif
   } else if (dec_tagged) {
     tag_bar_wait_site(dec_tags, dec_arrivals, decode_expected, tid, xcd_id,
                       xcd_rank,

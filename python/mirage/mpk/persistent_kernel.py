@@ -1660,6 +1660,8 @@ def get_compile_command(
             "MPK_QUANT_WIDE",
             "MPK_W13_ACT_W3",
             "MPK_ROUTER_L2PF",
+            "MPK_DEC_DIRECT_WAIT",
+            "MPK_DEC_OUT_B128",
             "MPK_ATTN_PROBE_NOQKVWAIT",
             "MPK_ENTRY_NOWAIT",
             "MPK_DEC_HINTS",

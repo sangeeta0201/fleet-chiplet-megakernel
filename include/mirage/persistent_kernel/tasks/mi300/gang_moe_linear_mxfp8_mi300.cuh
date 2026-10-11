@@ -2355,10 +2355,13 @@ __device__ __noinline__ void
   float *s_act = s_reduce + S_REDUCE_FLOATS;
   float *s_act_scale_f = s_act + W13_ACT_COLS;
 #if MPK_W13_ACT_W3
-  // K_HALF's eight epoch words per tile and their slots in act_ll; every
-  // tile writes all eight before the closing barrier, wave 3 stores them.
-  __shared__ unsigned long long s_actw[OUTPUT_PER_WG / 4];
-  __shared__ unsigned s_actw_widx[OUTPUT_PER_WG / 4];
+  // K_HALF's eight epoch words per tile and their slots in act_ll, past the
+  // rest of this tile's scratch; every tile writes all eight before the
+  // closing barrier, wave 3 stores them. Dynamic, not __shared__: the
+  // dynamic allocation is already the whole of LDS.
+  unsigned long long *const s_actw = (unsigned long long *)(
+      ((uintptr_t)(s_act_scale_f + W13_ACT_BLKS) + 15u) & ~(uintptr_t)15);
+  unsigned *const s_actw_widx = (unsigned *)(s_actw + OUTPUT_PER_WG / 4);
 #endif
   if constexpr (EMIT_FP8) {
     static_assert(!K_PARALLEL,

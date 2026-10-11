@@ -354,6 +354,14 @@ __device__ __forceinline__ void mla_tile_bar() { __syncthreads(); }
 #include "tasks/mi300/paged_attention_decode_minimal_hd64_mi300.cuh"
 #include "mpk_atoms.cuh"
 
+#if MPK_DEC_OUT_B128
+typedef int __attribute__((ext_vector_type(4))) mpk_dec_i32x4_t;
+extern "C" __device__ void
+__mpk_dec_raw_buffer_store_v4i32(mpk_dec_i32x4_t data, mpk_dec_i32x4_t rsrc,
+                                 int voffset, int soffset, int aux)
+    __asm("llvm.amdgcn.raw.buffer.store.v4i32");
+#endif
+
 namespace kernel {
 
 namespace gang_mla_decode_detail {
@@ -1744,6 +1752,18 @@ __device__ __noinline__ void
                static_cast<long>(kv_chunk_idx) * Q_HEADS_PER_GROUP *
                    KV_LORA_RANK +
                static_cast<long>(q_head_local) * KV_LORA_RANK;
+#if MPK_DEC_OUT_B128
+    // One V# over the whole partial buffer; the offsets below stay well
+    // inside 2^31 bytes. aux 17 = sc0 sc1, st_wt's write-through.
+    mpk_dec_i32x4_t o_rsrc;
+    {
+      unsigned long long const ob = (unsigned long long)output_ptr;
+      o_rsrc[0] = (int)__builtin_amdgcn_readfirstlane((unsigned)ob);
+      o_rsrc[1] = (int)__builtin_amdgcn_readfirstlane((unsigned)(ob >> 32));
+      o_rsrc[2] = (int)0x7FFFFFFF;
+      o_rsrc[3] = (int)0x00020000u;
+    }
+#endif
 #pragma unroll
     for (int vb = 0; vb < NUM_V_BLOCKS; vb++) {
       int dim_offset = vb * 64 + warp_id * 16 + kgrp * 4;
@@ -1792,11 +1812,21 @@ __device__ __noinline__ void
           st_wt_u64((void *)(ow + 1), ep | pk(raw[2], raw[3]));
         }
         if (ll_o == nullptr || MPK_DML_DBG == 1) {
+#if MPK_DEC_OUT_B128
+          mpk_dec_i32x4_t const d4 = {(int)raw[0], (int)raw[1], (int)raw[2],
+                                      (int)raw[3]};
+          __mpk_dec_raw_buffer_store_v4i32(
+              d4, o_rsrc,
+              (int)((&o[dim_offset] - reinterpret_cast<float *>(output_ptr)) *
+                    4),
+              0, 17);
+#else
           unsigned long long lo, hi;
           __builtin_memcpy(&lo, &raw[0], 8);
           __builtin_memcpy(&hi, &raw[2], 8);
           st_wt_u64((void *)&o[dim_offset], lo);
           st_wt_u64((void *)&o[dim_offset + 2], hi);
+#endif
         }
       } else {
 #pragma unroll

@@ -1601,7 +1601,8 @@ __device__ __forceinline__ bool
 // (always NUM_EXPERTS at 1.0) go out as soon as the TopK has seen the normed
 // flags, ahead of the selection, so the shared slot's W13 tiles start on the
 // normed row instead of on the routing. Only pays under MPK_MOE_XCD_EXPERT,
-// where it measured +0.012 ms on top of it (4.031 -> 4.043). Off.
+// where it measured +0.012 ms on top of it (4.031 -> 4.043). Alone on the TP
+// default 2026-10-11 (7bc1c7e): 3.949 vs 3.950 ms (r1), null. Off.
 #ifndef MPK_TOPK_SH_EARLY
 #define MPK_TOPK_SH_EARLY 0
 #endif
@@ -1746,6 +1747,8 @@ __device__ __forceinline__ bool
 // always the last W13 worker's own, 3.12 us after the last W13 k-loop
 // against 2.19 for the W2 workers that ran no W13. Pair with
 // MPK_W13_NO_ARRIVE, whose all-wave drain would otherwise put it back.
+// MEASURED NULL 2026-10-11 on 7bc1c7e, with MPK_W13_NO_ARRIVE: 3.954 vs 3.950
+// ms (r1), text identical. Off.
 #ifndef MPK_W13_ACT_W3
 #define MPK_W13_ACT_W3 0
 #endif
@@ -1755,8 +1758,44 @@ __device__ __forceinline__ bool
 // does. At the tile's head all 128 tiles of a GPU ask HBM for their 24 KB at
 // once, and the slice validation's first pass retires behind that burst
 // (MPK_TRACE: S33 -> first pass 2.15 us); from L2 the burst is short.
+// MEASURED NULL 2026-10-11 on 7bc1c7e, n=3: 3.955 3.956 3.953 vs 3.953 3.949
+// 3.947 ms. With MPK_ROUTER_KS_MID's +0.060 and MPK_ROUTER_W_LATE's +0.027,
+// the pass is not waiting on the gate slice: its own system-scope reads of
+// the peers' o_proj words, which no cache in front of HBM can hold, are the
+// ~2 us. Off.
 #ifndef MPK_ROUTER_L2PF
 #define MPK_ROUTER_L2PF 0
+#endif
+// MPK_DEC_DIRECT_WAIT: under the head-local decode the merge ranks poll the
+// 64 decode workers' tags themselves instead of their XCD's release line.
+// The tagged rendezvous' relay -- xcd_rank 0 polls all 232 workers' slots,
+// then republishes in L2 -- waits for every worker to reach Phase 6, decode
+// or not, and adds its own hop; the merge reads only the decode partials,
+// and each decode worker drains them before its tag. MPK_ATTN_PROBE_NODECWAIT
+// prices the whole wait at -0.085 ms (7bc1c7e, r1).
+// Every merge rank polling the 64 tags itself MEASURED SLOWER 2026-10-11,
+// 4.033 vs 3.950 ms (r1), text identical -- thirty-two memory pollers on the
+// lines the stragglers write (the reason MPK_BAR_TAGGED_HIER exists). So
+// xcd_rank 0 alone polls and relays, as the stock site does; only what it
+// waits for narrows. That MEASURED SLOWER too: 4.042 vs 3.946 ms (r1), text
+// identical. Starting the merge on the decode workers alone, ahead of the
+// rest of the gang, costs ~1.2 us/layer somewhere downstream; the
+// NODECWAIT probe's -0.085 came with wrong attention output, hence wrong
+// routing and a different MoE, and is not a price for this wait. Off.
+#ifndef MPK_DEC_DIRECT_WAIT
+#define MPK_DEC_DIRECT_WAIT 0
+#endif
+// MPK_DEC_OUT_B128: the split-KV decode writes each lane's four f32 partials
+// as one write-through buffer_store_dwordx4 (cache policy sc0 sc1, through the
+// raw-buffer intrinsic, so the compiler allocates the aligned VGPR quad that
+// broke the inline-asm dwordx4 form) instead of two st_wt_u64. MPK_TRACE: the
+// output step is 1.40 us on every decode item, all of them on the critical
+// path, for 16 KB of stores.
+// MEASURED 2026-10-11 on 7bc1c7e, n=3: 3.897 3.890 3.896 vs 3.938 3.939 3.938
+// ms (-0.044), text identical; test_mla_decode 60/60 at both WRITE_THROUGH
+// arms. Default on.
+#ifndef MPK_DEC_OUT_B128
+#define MPK_DEC_OUT_B128 1
 #endif
 // (MPK_WUK_PF below: 5.064 5.057, -0.029.) All five together, interleaved
 // against their own control, text identical: 5.109 5.110 5.094 -> 4.831
