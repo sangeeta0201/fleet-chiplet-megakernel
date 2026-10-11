@@ -680,6 +680,19 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
           MTK_D(0, 1) MTK_D(2, 3) MTK_D(4, 5) MTK_D(6, 7)
         }
         } // !thresh_done
+#if MPK_TOPK_ID_EARLY
+        if (ll_route != nullptr && thread_row == 0 && thread_group_idx <= 8) {
+          unsigned id = (unsigned)NUM_EXPERTS;
+#pragma unroll
+          for (int i = 0; i < 8; ++i) {
+            id = (thread_group_idx == i) ? (key[i] & 0xFFu) : id;
+          }
+          if (thread_group_idx < 8 || num_shared_experts > 0) {
+            ll_route[thread_group_idx] =
+                ((unsigned long long)ll_epoch << 32) | id;
+          }
+        }
+#endif
 #if MPK_TOPK_WIN_SHFL
         // The winners' unbiased scores, at full precision, from the lanes that
         // hold them: expert e is element e % VPT of group lane e / VPT. Every

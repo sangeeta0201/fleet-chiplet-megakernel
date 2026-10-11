@@ -18,6 +18,23 @@
 #include "gang_linear_mi300.cuh"
 #include "moe_topk_sigmoid_bias_mi300.cuh"
 #include "moe_topk_softmax_mi300.cuh"
+#if MPK_ROUTER_W_LATE
+typedef int __attribute__((ext_vector_type(4))) _rwl_i32x4_t;
+extern "C" __device__ void _rwl_buffer_load_lds(
+    _rwl_i32x4_t rsrc, __attribute__((address_space(3))) uint32_t *lds_ptr,
+    int32_t size, int32_t voffset, int32_t soffset, int32_t imm_offset,
+    int32_t aux) __asm("llvm.amdgcn.raw.buffer.load.lds");
+__device__ __forceinline__ _rwl_i32x4_t _rwl_rsrc(void const *base,
+                                                  uint32_t range_bytes) {
+  uint64_t const addr = reinterpret_cast<uint64_t>(base);
+  _rwl_i32x4_t r;
+  r[0] = (int)__builtin_amdgcn_readfirstlane((uint32_t)(addr & 0xFFFFFFFFu));
+  r[1] = (int)__builtin_amdgcn_readfirstlane((uint32_t)(addr >> 32));
+  r[2] = (int)__builtin_amdgcn_readfirstlane(range_bytes);
+  r[3] = (int)0x00020000u;
+  return r;
+}
+#endif
 #include <hip/hip_bf16.h>
 #include "mpk_bsdbg.cuh"
 
@@ -976,6 +993,15 @@ __device__ __attribute__((noinline)) void
   if (tid == 0) {
     mpk_stage_stamp(63);
   }
+#if MPK_TOPK_SH_EARLY
+  if constexpr (ROUTE_LL) {
+    if (tid == 0 && num_shared_experts > 0) {
+      unsigned long long const sh_hi = (unsigned long long)epoch << 32;
+      ll_route[K] = sh_hi | (unsigned)NUM_EXPERTS;
+      ll_route[16 + K] = sh_hi | __float_as_uint(1.0f);
+    }
+  }
+#endif
   // MPK_TOPK_RANK's scratch: past s_bias [0, 512) and s_ssq [512, 1536).
   extern __shared__ char _topk_rank_smem[];
   topk_sigmoid_bias_mi300_task_impl<T,
@@ -1274,6 +1300,57 @@ gang_rmsnorm_linear_bias_topk_kernel(
   typedef int __attribute__((ext_vector_type(4))) i32x4_ks_t;
   i32x4_ks_t ks_w[KSPLIT ? KS_CH : 1];
   i32x2_pf_t ks_g = {0, 0};
+#if MPK_ROUTER_W_LATE
+  // Gamma first and retired before returning: the slice sum reads ks_g at
+  // once, while ks_w waits for the drain ahead of the gate dot. Up front,
+  // the validation pass's own waits retired both.
+  auto ks_load = [&]() {
+    static_assert(!KSPLIT || KS_CH == 6, "the vmcnt below counts KS_CH loads");
+    char const *const ks_wb =
+        (char const *)gate_weight_ptr +
+        ((size_t)(tid >> 3) * REDUCTION_SIZE + (size_t)tile_idx * KS_SLICE +
+         (tid & 7) * 8) * 2;
+    if (tid < KS_SLICE / 4) {
+      asm volatile("global_load_dwordx2 %0, %1, off sc0 nt"
+                   : "=v"(ks_g)
+                   : "v"((char const *)norm_weight_ptr +
+                         ((size_t)tile_idx * KS_SLICE + tid * 4) * 2)
+                   : "memory");
+    }
+#pragma unroll
+    for (int j = 0; j < KS_CH; j++) {
+      asm volatile("global_load_dwordx4 %0, %1, off sc0 nt"
+                   : "=v"(ks_w[j])
+                   : "v"(ks_wb + j * 128)
+                   : "memory");
+    }
+    asm volatile("s_waitcnt vmcnt(6)" ::: "memory");
+  };
+  if constexpr (KSPLIT) {
+    // 32 gate rows x KS_SLICE bf16 plus gamma's KS_SLICE, as 16-byte chunks
+    // into a never-read LDS window: L2 only, waves 2-3 only.
+    if (tid >= 128) {
+      constexpr int ROW_CH = KS_SLICE * 2 / 16;
+      constexpr int W_CH = 32 * ROW_CH;
+      extern __shared__ char _rwl_smem[];
+      _rwl_i32x4_t const w_rsrc = _rwl_rsrc(
+          (char const *)gate_weight_ptr + (size_t)tile_idx * KS_SLICE * 2,
+          (uint32_t)(31 * REDUCTION_SIZE * 2 + KS_SLICE * 2));
+      _rwl_i32x4_t const g_rsrc = _rwl_rsrc(
+          (char const *)norm_weight_ptr + (size_t)tile_idx * KS_SLICE * 2,
+          (uint32_t)(KS_SLICE * 2));
+      auto *dst = (__attribute__((address_space(3))) uint32_t *)(
+          _rwl_smem + 140 * 1024 + ((tid >> 6) - 2) * 1024);
+      for (int c = tid - 128; c < W_CH; c += 128) {
+        int const voff = (c / ROW_CH) * REDUCTION_SIZE * 2 + (c % ROW_CH) * 16;
+        _rwl_buffer_load_lds(w_rsrc, dst, 16, voff, 0, 0, 1);
+      }
+      if (tid - 128 < ROW_CH) {
+        _rwl_buffer_load_lds(g_rsrc, dst, 16, (tid - 128) * 16, 0, 0, 1);
+      }
+    }
+  }
+#else
   if constexpr (KSPLIT) {
     char const *const ks_wb =
         (char const *)gate_weight_ptr +
@@ -1294,6 +1371,7 @@ gang_rmsnorm_linear_bias_topk_kernel(
                    : "memory");
     }
   }
+#endif
   if constexpr (OPROJ_BARRIER) {
     if (!KSPLIT && folded) {
       // gamma only. The hidden row is precisely what the barrier below
@@ -1632,6 +1710,11 @@ gang_rmsnorm_linear_bias_topk_kernel(
     if (tid == 0) {
       mpk_stage_stamp(36);
     }
+#if MPK_ROUTER_W_LATE
+    if constexpr (KSPLIT) {
+      ks_load();
+    }
+#endif
     if constexpr (KSPLIT) {
       // Partial logits and the slice's sum of squares go to this XCD's row
       // area as 64-word blocks, one per tile: words 0..31 the XCD's experts,

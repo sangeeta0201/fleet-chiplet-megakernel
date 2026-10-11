@@ -1637,6 +1637,14 @@ def get_compile_command(
             "MPK_W13_NO_ARRIVE",
             "MPK_W13_BIAS_PRE",
             "MPK_KS_SSQ_NT",
+            "MPK_ROUTER_W_LATE",
+            "MPK_WUK_WFIRST",
+            "MPK_RESOLVE_NW_LATE",
+            "MPK_QXS_XOUT_LATE",
+            "MPK_TOPK_ID_EARLY",
+            "MPK_MOE_XCD_EXPERT",
+            "MPK_TOPK_SH_EARLY",
+            "MPK_XE_W2_PF",
             "MPK_ATTN_PROBE_NOQKVWAIT",
             "MPK_ENTRY_NOWAIT",
             "MPK_DEC_HINTS",
@@ -3992,6 +4000,11 @@ class PersistentKernel:
             # FULL_LAYER_QXSLL_SLOT's 8 x 384 lines of resolved-row words.
             counter_slots = (644 + 8 * 194 + 32 + 8 * 36 + 8 * 194 + 8 * 48
                              + 144 + 256 + 1536 + 512 + 128 + 320 + 3072)
+        if os.environ.get("MPK_MOE_XCD_EXPERT", "0") == "1":
+            # FULL_LAYER_W2P9_SLOT's 9 x 6144 W2 words, past the QXSLL block.
+            counter_slots = (644 + 8 * 194 + 32 + 8 * 36 + 8 * 194 + 8 * 48
+                             + 144 + 256 + 1536 + 512 + 128 + 320 + 3072
+                             + 6912)
         assert counters.dim(0) >= counter_slots * 16, (
             f"the fused layer needs {counter_slots * 16} int32 of counters, "
             f"got {counters.dim(0)}")

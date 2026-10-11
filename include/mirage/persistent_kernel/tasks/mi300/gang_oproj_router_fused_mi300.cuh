@@ -2762,13 +2762,57 @@ __device__ __attribute__((always_inline)) void
   // pulls next-layer qkv_a concurrently with the W2 wait+tiles.
   MPK_QKVA_PF_BODY(moe_w2_live);
 #endif
-  if (mrk >= moe_w2_tiles_per_xcd) {
+#if MPK_MOE_XCD_EXPERT
+  // The tail folds the last layer's W2 from the workspace, so that layer
+  // keeps the striped W2 (and its atomics).
+  constexpr bool XE_ON = MPK_MOE_TP && BATCH_SIZE == 1 && MOE_NUM_TOPK == 9 &&
+                         MOE_W13_TILES_PER_EXPERT == 16 &&
+                         (HIDDEN_SIZE / MOE_W2_OPW) % 16 == 0;
+  bool const xe_layer = XE_ON && !fold_next_is_tail;
+#else
+  constexpr bool xe_layer = false;
+#endif
+#if MPK_MOE_XCD_EXPERT
+#if MPK_XE_W2_PF
+  if constexpr (XE_ON) if (xe_layer) {
+    constexpr int PF_WGS = HIDDEN_SIZE / MOE_W2_OPW;
+    constexpr int PF_W = 6;
+    constexpr int PF_RB = PF_WGS / PF_W;
+    constexpr int PF_ROW_BYTES =
+        MOE_WEIGHT_FP4 ? MOE_INTERMEDIATE / 2 : MOE_INTERMEDIATE;
+    constexpr int PF_WG_BYTES =
+        MOE_W2_OPW * PF_ROW_BYTES + MOE_W2_OPW * (MOE_INTERMEDIATE / 32);
+    static_assert(PF_WGS % PF_W == 0, "the row blocks split six ways");
+    int const pf_i = mrk - moe_w13_live;
+    if (ll_route != nullptr && pf_i >= 0 && pf_i < PF_W && tid >= 64) {
+      int const e = (int)(unsigned)_gang_ll_route_word(
+          ll_route, xcd_id, (unsigned)routing_expected);
+      extern __shared__ char _xepf_smem[];
+      i32x4_t const rsrc = make_w_buffer_rsrc(
+          static_cast<uint8_t const *>(moe_down_weight_ptr) +
+              (static_cast<int64_t>(e) * PF_WGS + pf_i * PF_RB) * PF_WG_BYTES,
+          static_cast<uint32_t>(PF_RB * PF_WG_BYTES));
+      auto *dst = (__attribute__((address_space(3))) uint32_t *)(
+          _xepf_smem + 140 * 1024 + ((tid >> 6) - 1) * 1024);
+      for (int v = (tid - 64) * 16; v < PF_RB * PF_WG_BYTES; v += 192 * 16) {
+        __llvm_amdgcn_raw_buffer_load_lds(rsrc, dst, 16, v, 0, 0, 1);
+      }
+    }
+  }
+#endif
+  // The W2 workers are the W13 workers: routed slot xcd_id on mrk 0-15, the
+  // shared slot's row blocks on mrk 16-17.
+  if (xe_layer && (mrk < 0 || mrk >= moe_w13_live)) {
+    return;
+  }
+#endif
+  if (!xe_layer && mrk >= moe_w2_tiles_per_xcd) {
     return;
   }
 #if MPK_W2_EARLY_PF && MPK_MOE_TP
   // MPK_W2_EARLY_PF: this worker's W2 tile weight into L2 during the wait;
   // see _gang_w2_tp_l2_prefetch. The W13-idle workers get here during W13.
-  if (MPK_MOE_BS1_DECODE && ll_route != nullptr && mrk >= 0 &&
+  if (!xe_layer && MPK_MOE_BS1_DECODE && ll_route != nullptr && mrk >= 0 &&
       mrk < moe_w2_live) {
     constexpr int PF_SEG_KT = MOE_INTERMEDIATE / 128;
     constexpr int PF_SEG_ROUND =
@@ -2905,6 +2949,28 @@ __device__ __attribute__((always_inline)) void
       }
     }
   }
+#if MPK_MOE_XCD_EXPERT
+  if constexpr (XE_ON) if (xe_layer) {
+    constexpr int XE_WGS = HIDDEN_SIZE / MOE_W2_OPW;
+    constexpr int XE_ROUTED = 8;
+    constexpr int XE_RB = XE_WGS / 16;
+    if (ll_route == nullptr || w2_pl_ptr == nullptr || w2_act_ll == nullptr) {
+      __builtin_trap();
+    }
+    bool const xe_routed = mrk < 16;
+    int const xe_slot = xe_routed ? xcd_id : XE_ROUTED;
+    int const xe_rb0 = (xe_routed ? mrk : (mrk - 16) * 8 + xcd_id) * XE_RB;
+    gang_moe_w2_xcd_linear_mxfp8_kernel<BATCH_SIZE, HIDDEN_SIZE,
+                                        MOE_INTERMEDIATE, MOE_NUM_EXPERTS,
+                                        MOE_NUM_TOPK, MOE_W2_OPW,
+                                        MOE_WEIGHT_FP4, XE_RB>(
+        moe_swiglu_out_ptr, moe_down_weight_ptr, xe_slot, xe_rb0, ll_route,
+        (unsigned)routing_expected, w2_act_ll, /*act_local=*/xe_routed,
+        w2_pl_ptr, w2_pl_epoch);
+  }
+  if (xe_layer) {
+  } else
+#endif
   for (int t = mrk; t >= 0 && t < moe_w2_live; t += tiles_per_xcd) {
     // Tiles [0, _pipe_tiles) were MOVED onto the W13-idle workers above, so
     // their natural owners skip them. _pipe_tiles is 0 when the probe is off

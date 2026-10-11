@@ -2143,7 +2143,8 @@ if __name__ == "__main__":
             # Gates with MPK_MOE_SHARED_EARLY=1, through this cap: NP=4
             # ppl512 2.5122 (64 chunks), ppl128 2.7924 (17), longseq
             # 256/512/1024 G1 PASS; NP=8 ppl512 2.5800 2.6163 against 2.6083
-            # 2.5410 at cap 32. Default 64.
+            # 2.5410 at cap 32. Default 64. 96 re-measured 2026-10-11 on the
+            # d754c72 defaults: 4.105 vs 4.031 ms (+0.074).
             _hl_chunks_ok = (
                 os.environ.get("MPK_MLA_HEAD_LOCAL", "1") != "0"
                 and moe_ep and world_size > 1 and FUSE_FULL_LAYER
@@ -3128,7 +3129,10 @@ if __name__ == "__main__":
             # gang_mla_full_layer_fused_mi300.cuh.
             (((218 + 4 * 24 + 4 * 16 + 8 * 32 + 9 + 1 + 8 * 194 + 32 + 8 * 36
                + 8 * 194 + 8 * 48 + 144 + 256 + 1536 + 512 + 128 + 320
-               + (3072 if os.environ.get("MPK_QXS_ROW_LL", "0") == "1" else 0))
+               + (3072 if os.environ.get("MPK_QXS_ROW_LL", "0") == "1"
+                  or os.environ.get("MPK_MOE_XCD_EXPERT", "0") == "1" else 0)
+               + (6912 if os.environ.get("MPK_MOE_XCD_EXPERT", "0") == "1"
+                  else 0))
               if UNABSORB_K or QB_ABS_TP
               else 106 if UNABSORB_V else 96) * 16,),
             torch_dtype=torch.int32)

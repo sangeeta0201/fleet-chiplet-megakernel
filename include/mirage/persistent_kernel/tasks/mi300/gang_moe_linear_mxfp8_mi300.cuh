@@ -1950,6 +1950,20 @@ __device__ __forceinline__ bool _gang_moe_mxfp8_tile(int tile_idx,
   int const num_activated_experts =
       FIXED_SLOTS > 0 ? FIXED_SLOTS : d_mask[NUM_EXPERTS];
   int global_tile = tile_idx * 8 + _gang_moe_get_xcd_id();
+#if MPK_MOE_XCD_EXPERT
+  // Eight routed slots on eight XCDs plus one shared slot only; the dense
+  // prologue's six virtual slots keep the striped map.
+  if constexpr (EP_WORLD_SIZE == 1 && FIXED_SLOTS == 9 &&
+                TILES_PER_EXPERT % 8 == 0) {
+    // XCD x: routed slot x's tiles first, then TILES_PER_EXPERT / 8 of the
+    // shared slot's, striped over the XCDs.
+    int const xe_x = _gang_moe_get_xcd_id();
+    global_tile = tile_idx < TILES_PER_EXPERT
+                      ? xe_x * TILES_PER_EXPERT + tile_idx
+                      : (FIXED_SLOTS - 1) * TILES_PER_EXPERT +
+                            (tile_idx - TILES_PER_EXPERT) * 8 + xe_x;
+  }
+#endif
   int e, leid;
   // Offset of this tile inside its expert's slot run, and whether that expert
   // is the K-sharded shared one. `within` replaces the old
@@ -3712,7 +3726,10 @@ __device__ __forceinline__ void
                           uint32_t expert_bytes = 0,
                           // MPK_W2_ACT_LL: the slabs as (ll_epoch << 32 |
                           // bf16x2) words, validated here.
-                          unsigned long long const *act_ll = nullptr) {
+                          unsigned long long const *act_ll = nullptr,
+                          // MPK_MOE_XCD_EXPERT: the slab was written on this
+                          // XCD, so the poll reads its L2.
+                          bool act_local = false) {
   constexpr int SUB_BLOCK = 32;
   constexpr int SB_PER_SEG = SEG_LEN / SUB_BLOCK;
   constexpr int NSUBBLOCKS = NSEG * SB_PER_SEG;
@@ -3771,12 +3788,22 @@ __device__ __forceinline__ void
                          2;
         u64x2_t aw[8];
         while (true) {
+          if (act_local) {
 #pragma unroll
-          for (int j = 0; j < 8; j++) {
-            asm volatile("global_load_dwordx4 %0, %1, off sc0 sc1"
-                         : "=v"(aw[j])
-                         : "v"(wp + 2 * j)
-                         : "memory");
+            for (int j = 0; j < 8; j++) {
+              asm volatile("global_load_dwordx4 %0, %1, off nt"
+                           : "=v"(aw[j])
+                           : "v"(wp + 2 * j)
+                           : "memory");
+            }
+          } else {
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+              asm volatile("global_load_dwordx4 %0, %1, off sc0 sc1"
+                           : "=v"(aw[j])
+                           : "v"(wp + 2 * j)
+                           : "memory");
+            }
           }
           asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
           bool ok = true;
@@ -4097,6 +4124,20 @@ __device__ __noinline__ void
         for (int i = 0; i < 4; i++) {
           st_wt_u64((void *)(pw + i), hi | __float_as_uint(acc[i]));
         }
+#if MPK_MOE_XCD_EXPERT
+        // The EP fold sums nine planes on every layer; this path fills
+        // K_PARTS of them, so part 0 writes zeros into the rest.
+        if (part == 0) {
+#pragma unroll
+          for (int z = K_PARTS; z < 9; z++) {
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+              st_wt_u64((void *)(pw + static_cast<size_t>(z) * OUTPUT_SIZE + i),
+                        hi);
+            }
+          }
+        }
+#endif
       }
     }
   }
@@ -4189,5 +4230,141 @@ __device__ __noinline__ void
     }
   }
 }
+
+#if MPK_MOE_XCD_EXPERT
+// MPK_MOE_XCD_EXPERT's W2: RB consecutive row blocks of one slot, reducing
+// over that slot's I_LOCAL only. The slot's activation is staged once, all
+// RB x SEG_KT weight tiles go out before the first MFMA (one memory latency
+// for the call, as MPK_MOE_TP_W2_PF does for one block), and each block's
+// rows leave as (pl_epoch << 32 | f32) words in plane `slot`; the EP fold
+// sums the planes in slot order, so there are no atomics.
+template <int BATCH_SIZE,
+          int OUTPUT_SIZE,
+          int I_LOCAL,
+          int NUM_EXPERTS,
+          int NUM_TOPK,
+          int OUTPUT_PER_WG,
+          bool WEIGHT_FP4,
+          int RB>
+__device__ __noinline__ void gang_moe_w2_xcd_linear_mxfp8_kernel(
+    void const *input_ptr,
+    void const *weight_ptr,
+    int slot,
+    int rb0,
+    unsigned long long const *ll_route,
+    unsigned ll_epoch,
+    unsigned long long const *act_ll,
+    bool act_local,
+    unsigned long long *pl_words,
+    unsigned pl_epoch) {
+  static_assert(BATCH_SIZE == 1, "one token's slots");
+  static_assert(OUTPUT_PER_WG == 64, "one 16-row tile per wave per block");
+  static_assert(I_LOCAL % 128 == 0, "a slot is whole k-tiles");
+  constexpr int K_PER_MFMA = 128;
+  constexpr int SEG_KT = I_LOCAL / K_PER_MFMA;
+  constexpr int NUM_BLOCKS_32 = I_LOCAL / 32;
+  constexpr int W_ROW_BYTES = WEIGHT_FP4 ? I_LOCAL / 2 : I_LOCAL;
+  constexpr int W_BPK = _gang_moe_bytes_per_ktile<WEIGHT_FP4>();
+  constexpr int WG_DATA_BYTES = OUTPUT_PER_WG * W_ROW_BYTES;
+  constexpr int WG_BYTES = WG_DATA_BYTES + OUTPUT_PER_WG * NUM_BLOCKS_32;
+  constexpr int EXPERT_WGS = OUTPUT_SIZE / OUTPUT_PER_WG;
+  constexpr int64_t EXPERT_BYTES = static_cast<int64_t>(EXPERT_WGS) * WG_BYTES;
+  static_assert(EXPERT_BYTES * NUM_EXPERTS < (int64_t(1) << 32),
+                "segment offsets are 32-bit");
+  constexpr int W_KS = _gang_moe_w_kstride<WEIGHT_FP4>();
+  constexpr int SC_KS = _gang_moe_sc_kstride();
+  if (rb0 < 0 || rb0 + RB > EXPERT_WGS || slot < 0 || slot >= NUM_TOPK) {
+    return;
+  }
+  extern __shared__ char _gang_moe_mxfp8_smem[];
+  uint8_t *s_tok_fp8 = (uint8_t *)_gang_moe_mxfp8_smem;
+  uint8_t *s_tok_scales = s_tok_fp8 + I_LOCAL;
+  constexpr int SEG_OFF_LDS = (I_LOCAL + I_LOCAL / 128 + 3) & ~3;
+  uint32_t *s_seg_off = (uint32_t *)(_gang_moe_mxfp8_smem + SEG_OFF_LDS);
+  bool const seg_in_quant =
+      MPK_MOE_BS1_DECODE && MPK_W2_LL_BATCH && ll_route != nullptr;
+  if (!seg_in_quant && threadIdx.x == 0) {
+    int const e =
+        (int)(unsigned)_gang_ll_route_word(ll_route, slot, ll_epoch);
+    s_seg_off[0] = static_cast<uint32_t>(e) * static_cast<uint32_t>(EXPERT_BYTES);
+  }
+  _gang_tp_quant_seg_nt<BATCH_SIZE, NUM_TOPK, /*NSEG=*/1, I_LOCAL,
+                        /*FIXED_SLOTS=*/true>(
+      (unsigned short const *)input_ptr, nullptr, nullptr, nullptr,
+      /*tok_idx=*/0, /*n_live=*/NUM_TOPK, /*seg_base=*/slot, s_tok_fp8,
+      s_tok_scales, ll_route, ll_epoch, seg_in_quant ? s_seg_off : nullptr,
+      static_cast<uint32_t>(EXPERT_BYTES), act_ll, act_local);
+  if (threadIdx.x == 0) {
+    mpk_stage_stamp(57);
+  }
+
+  int const tid = threadIdx.x;
+  int const warp_id = tid >> 6;
+  int const lane_id = tid & 63;
+  int const col = lane_id & 15;
+  int const g = lane_id >> 4;
+  int const w_row = warp_id * 16 + col;
+  uint8_t const *const wg_data =
+      (uint8_t const *)weight_ptr + static_cast<int64_t>(rb0) * WG_BYTES;
+  uint8_t const *const w_data_row =
+      wg_data + (MPK_MOE_KMAJOR >= 1
+                     ? static_cast<size_t>(w_row / 16) * (16 * W_ROW_BYTES) +
+                           static_cast<size_t>(w_row % 16) * W_BPK
+                     : static_cast<size_t>(w_row) * W_ROW_BYTES);
+  int const row_scale_base =
+      MPK_MOE_KMAJOR >= 2
+          ? (w_row / 16) * (16 * NUM_BLOCKS_32) + (w_row % 16) * 4
+          : w_row * NUM_BLOCKS_32;
+  _gang_gp8 const wdr_g = (_gang_gp8)w_data_row;
+  _gang_gp8 const wsc_g =
+      (_gang_gp8)(wg_data + WG_DATA_BYTES) + (row_scale_base + g);
+  uint32_t const off0 = ((_gang_lds_u32)s_seg_off)[0];
+  i32x8_t AF[RB][SEG_KT];
+  int SF[RB][SEG_KT];
+#pragma unroll
+  for (int r = 0; r < RB; r++) {
+#pragma unroll
+    for (int kin = 0; kin < SEG_KT; kin++) {
+      uint32_t const off = off0 + static_cast<uint32_t>(r * WG_BYTES);
+      AF[r][kin] = _gang_load_w_mfma_a_at_gp<WEIGHT_FP4>(wdr_g + off,
+                                                         kin * W_KS, g);
+#if MPK_MOE_STREAM_NT
+      SF[r][kin] = (int)__builtin_nontemporal_load(wsc_g + off + kin * SC_KS);
+#else
+      SF[r][kin] = (int)wsc_g[off + kin * SC_KS];
+#endif
+    }
+  }
+  i32x8_t B[SEG_KT];
+  int BS[SEG_KT];
+#pragma unroll
+  for (int k = 0; k < SEG_KT; k++) {
+    B[k] = _gang_load_fp8_mfma_b(s_tok_fp8, k * K_PER_MFMA, g);
+    BS[k] = (int)s_tok_scales[k];
+  }
+  unsigned long long const hi = (unsigned long long)pl_epoch << 32;
+#pragma unroll
+  for (int r = 0; r < RB; r++) {
+    f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (int k = 0; k < SEG_KT; k++) {
+      acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(AF[r][k], B[k], acc, SF[r][k], BS[k]);
+    }
+    if (col == 0 && pl_words != nullptr) {
+      unsigned long long *const pw =
+          pl_words + static_cast<size_t>(slot) * OUTPUT_SIZE +
+          (rb0 + r) * OUTPUT_PER_WG + warp_id * 16 + g * 4;
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        st_wt_u64((void *)(pw + i), hi | __float_as_uint(acc[i]));
+      }
+    }
+  }
+  __syncthreads();
+  if (tid == 0) {
+    mpk_stage_stamp(58);
+  }
+}
+#endif // MPK_MOE_XCD_EXPERT
 
 } // namespace kernel

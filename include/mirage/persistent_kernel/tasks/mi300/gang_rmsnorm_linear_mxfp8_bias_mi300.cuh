@@ -1304,11 +1304,21 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
 
   // The norm weight does not depend on the exchange; get it in flight first.
   uint64_t nw[ITERS];
+#if MPK_RESOLVE_NW_LATE
+  auto nw_load = [&]() {
+#pragma unroll
+    for (int v = 0; v < ITERS; v++) {
+      nw[v] = *(__attribute__((address_space(1))) uint64_t const *)(
+          reinterpret_cast<uint64_t const *>(d_nw + (v * NTHREADS + tid) * VEC));
+    }
+  };
+#else
 #pragma unroll
   for (int v = 0; v < ITERS; v++) {
     nw[v] = *(__attribute__((address_space(1))) uint64_t const *)(
         reinterpret_cast<uint64_t const *>(d_nw + (v * NTHREADS + tid) * VEC));
   }
+#endif
 
   uint2 r = {0u, 0u};
   uint2 pk[NEXTRA];
@@ -1390,6 +1400,13 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
     }
 #endif
   }
+#if MPK_RESOLVE_NW_LATE
+  // Every tile stages the norm weight at the gather, resolver or not.
+  nw_load();
+#endif
+#if MPK_QXS_XOUT_LATE
+  unsigned long long xo_packed = 0;
+#endif
   if (wg_idx < XS_N && tid < XS_F4) {
     int const off = (wg_idx * XS_F4 + tid) * VEC;
     float f[4];
@@ -1434,6 +1451,8 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
                  :
                  : "v"(d_x_out + off), "v"(packed)
                  : "memory");
+#elif MPK_QXS_XOUT_LATE
+    xo_packed = packed;
 #else
     st_wt_u64((void *)(d_x_out + off), packed);
 #endif
@@ -1531,6 +1550,11 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
     }
   }
   __syncthreads();
+#if MPK_QXS_XOUT_LATE
+  if (wg_idx < XS_N && tid < XS_F4) {
+    st_wt_u64((void *)(d_x_out + (wg_idx * XS_F4 + tid) * VEC), xo_packed);
+  }
+#endif
   return rsqrtf(red[0] / float(REDUCTION_SIZE) + eps);
 }
 #endif // MPK_QKV_XSPLIT

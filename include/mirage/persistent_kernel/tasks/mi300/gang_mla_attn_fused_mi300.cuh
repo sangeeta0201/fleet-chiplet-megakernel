@@ -972,7 +972,8 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // MPK_QB_SELF_PF: each q_b tile's waves 1-3 pull its weight slab into L2
   // while the block waits on this rendezvous. Not wave 0: its tid 0 arrives
   // and polls, and vmcnt retires in issue order. The trailing __syncthreads
-  // retires the DMAs before q_b touches LDS.
+  // retires the DMAs before q_b touches LDS. Re-measured 2026-10-11 on the
+  // d754c72 defaults: 4.035 vs 4.040 ms, null.
   if (xcd_rank < qb_n_wgs_per_xcd && tid >= 64 && qb_weight_ptr != nullptr) {
     constexpr int QSP_WG_BYTES = QB_OUTPUT_PER_WG * QB_REDUCTION_SIZE +
                                  QB_OUTPUT_PER_WG * (QB_REDUCTION_SIZE / 32);

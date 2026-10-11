@@ -559,8 +559,13 @@ static constexpr int FULL_LAYER_QLL_LINES = 320;
 static constexpr int FULL_LAYER_QXSLL_SLOT =
     FULL_LAYER_QLL_SLOT + FULL_LAYER_QLL_LINES;
 static constexpr int FULL_LAYER_QXSLL_LINES = 8 * 384;
-static constexpr int FULL_LAYER_COUNTER_SLOTS =
+// MPK_MOE_XCD_EXPERT: W2's f32 rows per slot as (epoch << 32 | f32) words,
+// [9 slots][6144] at GLM-5, read by the next layer's EP folders.
+static constexpr int FULL_LAYER_W2P9_SLOT =
     FULL_LAYER_QXSLL_SLOT + FULL_LAYER_QXSLL_LINES;
+static constexpr int FULL_LAYER_W2P9_LINES = 9 * 6144 * 8 / 64;
+static constexpr int FULL_LAYER_COUNTER_SLOTS =
+    FULL_LAYER_W2P9_SLOT + (MPK_MOE_XCD_EXPERT ? FULL_LAYER_W2P9_LINES : 0);
 static_assert(FULL_LAYER_XSPLIT_SLOT % 2 == 0 && MPK_XSPLIT_XCD_INTS % 32 == 0 &&
                   FULL_LAYER_RLL_SLOT % 2 == 0 && MPK_RLL_XCD_INTS % 32 == 0 &&
                   MPK_RLL_WORD_LINES % 2 == 0 && FULL_LAYER_QXS_SLOT % 2 == 0 &&
@@ -630,7 +635,7 @@ __device__ __forceinline__ void _full_layer_ep_fold_ll_parts(
     void const *residual_ptr, unsigned long long *out_words,
     unsigned long long *const *peer_words, int col_lo, int col_hi,
     unsigned epoch_in, unsigned epoch) {
-  static_assert(K_PARTS == 1 || K_PARTS == 2, "one or two W2 parts");
+  static_assert(K_PARTS >= 1 && K_PARTS <= 9, "one to nine W2 parts");
   typedef unsigned long long pw2_t __attribute__((ext_vector_type(2)));
   float *__restrict__ ws_row = static_cast<float *>(workspace_f32_ptr);
   unsigned short const *__restrict__ res_row =
@@ -671,8 +676,9 @@ __device__ __forceinline__ void _full_layer_ep_fold_ll_parts(
 #pragma unroll
     for (int j = 0; j < 2; ++j) {
       float v = __uint_as_float((unsigned)(j == 0 ? w[0].x : w[0].y));
-      if constexpr (K_PARTS == 2) {
-        v += __uint_as_float((unsigned)(j == 0 ? w[1].x : w[1].y));
+#pragma unroll
+      for (int k = 1; k < K_PARTS; ++k) {
+        v += __uint_as_float((unsigned)(j == 0 ? w[k].x : w[k].y));
       }
       if constexpr (FOLD) {
         unsigned rbits = (unsigned)res_row[off + j] << 16;
@@ -1579,11 +1585,14 @@ gang_mla_full_layer_fused_kernel_mi300(
 #endif
           MPK_WS_PHASE(66, task_layer_idx, xcd_id);
           _full_layer_ep_fold_ll_parts<QKV_REDUCTION_SIZE,
-                                       MPK_MOE_TP_W2_KPARTS,
+                                       MPK_MOE_XCD_EXPERT ? 9
+                                                          : MPK_MOE_TP_W2_KPARTS,
                                        (EP_MY_PE == EP_FOLD_PE),
                                        EP_NPEER>(
               reinterpret_cast<unsigned long long const *>(
-                  counters + FULL_LAYER_W2PL_SLOT * HIER_STRIDE),
+                  counters + (MPK_MOE_XCD_EXPERT ? FULL_LAYER_W2P9_SLOT
+                                                 : FULL_LAYER_W2PL_SLOT) *
+                                 HIER_STRIDE),
               input_ptrs[13],
               input_ptrs[0],
               ll_mine,
@@ -2950,7 +2959,9 @@ gang_mla_full_layer_fused_kernel_mi300(
       (MPK_W2_PARTS_LL && MPK_EP_LL && EP_WORLD_SIZE > 1 && BATCH_SIZE == 1 &&
        ml_mode)
           ? reinterpret_cast<unsigned long long *>(
-                counters + FULL_LAYER_W2PL_SLOT * HIER_STRIDE)
+                counters + (MPK_MOE_XCD_EXPERT ? FULL_LAYER_W2P9_SLOT
+                                               : FULL_LAYER_W2PL_SLOT) *
+                               HIER_STRIDE)
           : nullptr,
       (unsigned)(task_layer_idx + 1)
 #if MPK_QKVA_PF_KB > 0

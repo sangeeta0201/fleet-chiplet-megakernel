@@ -1300,6 +1300,7 @@ __device__ __forceinline__ bool
 // loads ahead of the activation staging (gang_gemv_mxfp4_mi300.cuh).
 // MEASURED NEGATIVE 2026-10-10, same batch as MPK_ATTN_OUT_LL, text
 // identical: 4.762 4.764 4.759 -> 4.784 4.761 4.783 ms (+0.014). Off.
+// Re-measured 2026-10-11 under MPK_ATTN_OUT_LL: 4.059 vs 4.031 (+0.028).
 #ifndef MPK_OPROJ_WFIRST
 #define MPK_OPROJ_WFIRST 0
 #endif
@@ -1523,6 +1524,86 @@ __device__ __forceinline__ bool
 // MEASURED NULL 2026-10-11, same batch: 4.139 vs 4.132 4.128 ms. Off.
 #ifndef MPK_KS_SSQ_NT
 #define MPK_KS_SSQ_NT 0
+#endif
+// MPK_ROUTER_W_LATE: the K-split router tile's gate-slice and gamma loads
+// move behind its o_proj slice validation, and waves 2-3 warm L2 with the same
+// bytes at entry instead. Issued up front on every wave, they sat in the
+// validating waves' vmcnt ahead of the first pass (MPK_TRACE: S33 -> first
+// pass 2.05 us against a ~1 us local round trip).
+// DO NOT ENABLE: wedged at decode iteration 2 in both NP=8 runs (2026-10-11),
+// the second after retiring ks_g ahead of its first read; cause not found.
+#ifndef MPK_ROUTER_W_LATE
+#define MPK_ROUTER_W_LATE 0
+#endif
+// MPK_WUK_WFIRST: a one-trip MXFP8 GEMV with LL activation input (W_UK) loads
+// its weights and scales ahead of the activation poll and consumes them from
+// registers, so the trip's L2 round trip overlaps the poll instead of
+// following the staging (MPK_TRACE: the last q_b worker's W_UK GEMV returns
+// 2.20 us after its q_b tile, 0.8 us behind early workers).
+// MEASURED NULL 2026-10-11, NP=8 1024/1024: 4.041 vs 4.040 ms. Off.
+#ifndef MPK_WUK_WFIRST
+#define MPK_WUK_WFIRST 0
+#endif
+// MPK_RESOLVE_NW_LATE: the split resolve loads its norm weight after the EP
+// slot validation instead of ahead of it, where the 12 KB (a fresh layer's,
+// so not in L2) sat in the validating waves' vmcnt ahead of the first pass.
+// It is first used at the gather, behind the XCD exchange.
+// MEASURED NULL 2026-10-11, NP=8 1024/1024: 4.040 vs 4.040 ms. Off.
+#ifndef MPK_RESOLVE_NW_LATE
+#define MPK_RESOLVE_NW_LATE 0
+#endif
+// MPK_QXS_XOUT_LATE: the split resolver's write-through x_out store goes out
+// after the norm instead of ahead of its exchange flag, so the flag's drain
+// waits on the L2 row stores only. Its ack then retires under qkv_a's first
+// weight wait, an HBM fetch; the qkv_a -> q_b drain orders it for o_proj.
+// MEASURED NULL 2026-10-11, NP=8 1024/1024: 4.043 vs 4.037 ms. Off.
+#ifndef MPK_QXS_XOUT_LATE
+#define MPK_QXS_XOUT_LATE 0
+#endif
+// MPK_TOPK_ID_EARLY: under MPK_ROUTE_LL the sort-merge TopK writes the eight
+// expert-id words (and the shared slot's) as soon as the merge settles, one
+// lane each; the W13 tiles start on the id alone, and the weight words follow
+// with the renormalisation as before (MPK_TRACE: selection done -> routing
+// published 0.6 us, behind a vmcnt(0) drain and the logit clears).
+// MEASURED 2026-10-11, NP=8 1024/1024, interleaved, text identical:
+// 4.040 4.036 4.035 -> 3.997 3.998 4.002 ms (-0.038). Default on.
+#ifndef MPK_TOPK_ID_EARLY
+#define MPK_TOPK_ID_EARLY 1
+#endif
+// MPK_MOE_XCD_EXPERT: under MPK_MOE_TP with 8 routed slots on 8 XCDs, XCD x
+// runs routed slot x's whole W13 (16 tiles) and its whole W2 (96 row blocks
+// over 16 workers, 6 each, K = one slot), so the W13 -> W2 activation hand-off
+// stays in that XCD's L2. The shared slot's W13 is two tiles per XCD and its
+// W2 the remaining 16 x 6 row blocks, read across XCDs. W2 writes one f32
+// plane per slot and the EP fold sums the nine in slot order. Layers on the
+// striped W2 (the dense prologue, and the last layer, whose output the tail
+// folds from the workspace) write zeros into the planes they do not fill.
+// MEASURED NEGATIVE 2026-10-11, NP=8 1024/1024, untraced, text coherent but
+// moved (W2 sum order): control 4.000 / 3.993 ms; alone 4.031, + TOPK_SH_EARLY
+// 4.043, + XE_W2_PF 4.016 / 4.021, + W13_NO_ARRIVE 4.012. MPK_TRACE runs show
+// the opposite (middle layers -1.8 us each, traced decode 4.258 -> 4.191), so
+// the stamps hide whatever costs it; suspects are the fold now waiting on
+// nine XCDs' W2 per column instead of two parts, and W13 + W2 serial on the
+// same 144 workers (per XCD the routed W2 stages 2.3-2.8 us after its last
+// W13 tile, not the ~1 us an L2 hand-off should take). Off.
+#ifndef MPK_MOE_XCD_EXPERT
+#define MPK_MOE_XCD_EXPERT 0
+#endif
+// MPK_TOPK_SH_EARLY: under MPK_ROUTE_LL the shared slot's id and weight words
+// (always NUM_EXPERTS at 1.0) go out as soon as the TopK has seen the normed
+// flags, ahead of the selection, so the shared slot's W13 tiles start on the
+// normed row instead of on the routing. Only pays under MPK_MOE_XCD_EXPERT,
+// where it measured +0.012 ms on top of it (4.031 -> 4.043). Off.
+#ifndef MPK_TOPK_SH_EARLY
+#define MPK_TOPK_SH_EARLY 0
+#endif
+// MPK_XE_W2_PF: under MPK_MOE_XCD_EXPERT the six W13-idle MoE workers of an
+// XCD pull that XCD's routed W2 row blocks (16 each) into L2 while W13 runs,
+// so the W2 workers' loads hit L2. Waves 1-3, never-read LDS window.
+// MEASURED 2026-10-11 on MPK_MOE_XCD_EXPERT + MPK_TOPK_SH_EARLY: 4.043 ->
+// 4.016 ms (-0.027), still behind the striped control. Off with it.
+#ifndef MPK_XE_W2_PF
+#define MPK_XE_W2_PF 0
 #endif
 // (MPK_WUK_PF below: 5.064 5.057, -0.029.) All five together, interleaved
 // against their own control, text identical: 5.109 5.110 5.094 -> 4.831

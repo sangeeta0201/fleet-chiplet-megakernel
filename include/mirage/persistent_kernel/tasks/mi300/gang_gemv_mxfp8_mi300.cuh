@@ -318,6 +318,35 @@ __device__ __noinline__ void
       static_cast<size_t>(mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE);
   extern __shared__ char _fused_smem[];
   unsigned short *s_a = reinterpret_cast<unsigned short *>(_fused_smem);
+#if MPK_WUK_WFIRST
+  constexpr bool WF_ON = STAGE_A && BATCH_SIZE == 1 && ITERS <= 2;
+  u32x4_t wf_w[WF_ON ? ITERS : 1];
+  unsigned char wf_s[WF_ON ? ITERS : 1];
+  bool const wf_live = WF_ON && a_ll != nullptr;
+  if constexpr (WF_ON) {
+    if (wf_live) {
+      unsigned char const *const wf_wrow =
+          wg + static_cast<size_t>(row) * REDUCTION_SIZE;
+      unsigned char const *const wf_srow =
+          wg + WG_DATA_BYTES +
+          static_cast<size_t>(row) * (REDUCTION_SIZE / SCALE_BLOCK);
+#pragma unroll
+      for (int u = 0; u < ITERS; u++) {
+        int const k = (u * LANES_PER_ROW + lane) * VEC;
+#if MPK_ATTN_STREAM_NT >= 1
+        wf_w[u] = ld_g_nt<u32x4_t>(wf_wrow + k);
+#else
+        wf_w[u] = ld_g<u32x4_t>(wf_wrow + k);
+#endif
+#if MPK_ATTN_STREAM_NT == 1
+        wf_s[u] = ld_g_nt<unsigned char>(wf_srow + k / SCALE_BLOCK);
+#else
+        wf_s[u] = ld_g<unsigned char>(wf_srow + k / SCALE_BLOCK);
+#endif
+      }
+    }
+  }
+#endif
   if constexpr (STAGE_A && BATCH_SIZE == 1 && REDUCTION_SIZE % 8 == 0 &&
                 REDUCTION_SIZE / 8 <= NTHREADS) {
     if (a_ll != nullptr) {
@@ -569,6 +598,12 @@ __device__ __noinline__ void
       // Chunk index within the row, in units of VEC elements.
       int const c = (i0 + u) * LANES_PER_ROW + lane;
       int const k = c * VEC;
+#if MPK_WUK_WFIRST
+      if (WF_ON && wf_live) {
+        wv[u] = wf_w[u < ITERS ? u : 0];
+        sv[u] = wf_s[u < ITERS ? u : 0];
+      } else {
+#endif
 #if MPK_ATTN_STREAM_NT >= 1
       wv[u] = ld_g_nt<u32x4_t>(w_row + k);
 #else
@@ -578,6 +613,9 @@ __device__ __noinline__ void
       sv[u] = ld_g_nt<unsigned char>(s_row + k / SCALE_BLOCK);
 #else
       sv[u] = ld_g<unsigned char>(s_row + k / SCALE_BLOCK);
+#endif
+#if MPK_WUK_WFIRST
+      }
 #endif
 #pragma unroll
       for (int m = 0; m < BATCH_SIZE; m++) {
