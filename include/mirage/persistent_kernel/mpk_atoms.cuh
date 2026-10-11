@@ -1797,6 +1797,41 @@ __device__ __forceinline__ bool
 #ifndef MPK_DEC_OUT_B128
 #define MPK_DEC_OUT_B128 1
 #endif
+// MPK_MERGE_LSE_LDS: the split-KV merge's halves path reads the block's lse
+// words once (two per thread) into LDS instead of each thread loading its
+// half's HC lse words itself -- the same HC addresses for all 16 lanes of a
+// group, so 32 of each thread's 64 scattered global loads were duplicates.
+// The merge is load-issue bound like the decode's output was. Bit-exact.
+// MEASURED SLOWER 2026-10-11 on d2d99b1: 3.913 vs 3.894 ms (r1). A group's 16
+// lanes on one lse address coalesce to one transaction, so the duplicates
+// were nearly free and the LDS round trip plus barrier are not. Off.
+#ifndef MPK_MERGE_LSE_LDS
+#define MPK_MERGE_LSE_LDS 0
+#endif
+// MPK_MLA_QK_PIPE: the decode's 18-step QK loop reads K chunk kc+1 from LDS
+// before chunk kc's MFMA. The volatile MFMA asm kept the scheduler from
+// hoisting any LDS read past it, so every step was ds_read_b128 ->
+// s_waitcnt lgkmcnt(0) -> MFMA, a full LDS round trip per step (final ISA);
+// MPK_TRACE has the one-tile loop at 2.76 us on every decode item. Same MFMA
+// order: bit-exact. Final ISA: each step now waits lgkmcnt(1).
+// MEASURED 2026-10-11 on d2d99b1, n=3: 3.868 3.870 3.867 vs 3.893 3.889 3.894
+// ms (-0.024), text identical; test_mla_decode 60/60 both arms. Default on.
+#ifndef MPK_MLA_QK_PIPE
+#define MPK_MLA_QK_PIPE 1
+#endif
+// MPK_MLA_PV_PIPE: the same for the PV step's V reads -- block vb+1's four
+// ds_read_u16 go out before block vb is packed. The allocator reused one set
+// of temporaries, so each block waited lgkmcnt(0) before the next block's
+// reads could issue: eight serialized LDS round trips per tile. Bit-exact.
+// NO EFFECT as written, with or without a sched_barrier: the final ISA
+// already overlaps half a block (block N's second pair with block N+1's
+// first), and what serializes the groups is the allocator reusing the same
+// few temporaries -- the next group cannot issue into registers a pending
+// pack still reads. More temporaries (or asm with fixed ones) is the fix,
+// in the function that sets the megakernel's VGPR budget. Off.
+#ifndef MPK_MLA_PV_PIPE
+#define MPK_MLA_PV_PIPE 0
+#endif
 // (MPK_WUK_PF below: 5.064 5.057, -0.029.) All five together, interleaved
 // against their own control, text identical: 5.109 5.110 5.094 -> 4.831
 // 4.828 4.821 ms (-0.278).

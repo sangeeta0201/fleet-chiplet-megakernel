@@ -541,6 +541,26 @@ __device__ __forceinline__ void mla_qk_acc32_zero() {
                : "a32", "a33", "a34", "a35");
 }
 
+#if MPK_MLA_QK_PIPE
+// mla_qk_acc32_mfma with the K chunk already in registers.
+__device__ __forceinline__ void mla_qk_acc32_mfma_kv(bf16x8_t av,
+                                                    __bf16 const *b) {
+  bf16x8_t bv;
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    bv[i] = b[i];
+  }
+  u32x4_t avu, bvu;
+  __builtin_memcpy(&avu, &av, 16);
+  __builtin_memcpy(&bvu, &bv, 16);
+  asm volatile("s_nop 1\n"
+               "v_mfma_f32_16x16x32_bf16 a[32:35], %0, %1, a[32:35]\n"
+               :
+               : "v"(avu), "v"(bvu)
+               : "a32", "a33", "a34", "a35");
+}
+#endif
+
 __device__ __forceinline__ void mla_qk_acc32_mfma(__bf16 const *a,
                                                  __bf16 const *b) {
   bf16x8_t av, bv;
@@ -1549,6 +1569,30 @@ __device__ __noinline__ void
         gang_mla_decode_detail::mla_qk_acc2_mfma<1>(kr1, qr[kc + 1]);
       }
       __mfma_hd64_fp32x4 scores = gang_mla_decode_detail::mla_qk_acc2_read();
+#elif MPK_MLA_QK_PIPE && !MPK_MLA_KV_SWZ
+      mla_qk_acc32_zero();
+      {
+        // One chunk in flight ahead of the MFMA that consumes the previous.
+        using kq_t = gang_mla_decode_detail::bf16x8_t;
+        __bf16 const *const k_row = &cur_kv[midx * QK_DIM + kgrp * 8];
+        kq_t kq0 = *reinterpret_cast<kq_t const *>(k_row);
+        kq_t kq1;
+#pragma unroll
+        for (int kc = 0; kc < NUM_K32; kc++) {
+          if (kc + 1 < NUM_K32) {
+            kq_t const nx =
+                *reinterpret_cast<kq_t const *>(k_row + (kc + 1) * 32);
+            if (kc & 1) {
+              kq0 = nx;
+            } else {
+              kq1 = nx;
+            }
+          }
+          gang_mla_decode_detail::mla_qk_acc32_mfma_kv((kc & 1) ? kq1 : kq0,
+                                                       qr[kc]);
+        }
+      }
+      __mfma_hd64_fp32x4 scores = mla_qk_acc32_read();
 #else
       mla_qk_acc32_zero();
 #pragma unroll
@@ -1609,7 +1653,42 @@ __device__ __noinline__ void
       pb[1] = (__bf16)w1;
       pb[2] = (__bf16)w2;
       pb[3] = (__bf16)w3;
-#if MPK_MLA_OACC_VGPR
+#if MPK_MLA_OACC_VGPR && MPK_MLA_PV_PIPE && !MPK_MLA_KV_SWZ
+      {
+        u32x2_t vau[NUM_V_BLOCKS];
+        __bf16 const *const v_base =
+            &cur_kv[(kgrp * 4) * QK_DIM + warp_id * 16 + midx];
+        bf16x4_t va0, va1;
+        va0[0] = v_base[0 * QK_DIM];
+        va0[1] = v_base[1 * QK_DIM];
+        va0[2] = v_base[2 * QK_DIM];
+        va0[3] = v_base[3 * QK_DIM];
+#pragma unroll
+        for (int vb = 0; vb < NUM_V_BLOCKS; vb++) {
+          if (vb + 1 < NUM_V_BLOCKS) {
+            __bf16 const *const nx = v_base + (vb + 1) * 64;
+            bf16x4_t vn;
+            vn[0] = nx[0 * QK_DIM];
+            vn[1] = nx[1 * QK_DIM];
+            vn[2] = nx[2 * QK_DIM];
+            vn[3] = nx[3 * QK_DIM];
+            if (vb & 1) {
+              va0 = vn;
+            } else {
+              va1 = vn;
+            }
+          }
+          // Left alone, the scheduler sinks these reads below the pack.
+          __builtin_amdgcn_sched_barrier(0);
+          bf16x4_t const va = (vb & 1) ? va1 : va0;
+          __builtin_memcpy(&vau[vb], &va, 8);
+          o_acc_r[vb] *= rescale;
+        }
+        u32x2_t pbu;
+        __builtin_memcpy(&pbu, &pb, 8);
+        gang_mla_decode_detail::mla_pv8_vgpr(o_acc_r, vau, pbu);
+      }
+#elif MPK_MLA_OACC_VGPR
       {
         u32x2_t vau[NUM_V_BLOCKS];
 #pragma unroll

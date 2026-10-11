@@ -481,12 +481,53 @@ __device__ __forceinline__ void
         os = pp.z;
       } else {
         float l[HC], o[HC];
+#if MPK_MERGE_LSE_LDS
+        // The block's HEADS_N x NUM_KV_CHUNKS lse words, read once -- not
+        // HC times by each of a group's 16 lanes -- and staged [head][chunk]
+        // so a thread's HC words are contiguous.
+        {
+          extern __shared__ char _mrg_lse_smem[];
+          float *const s_lse =
+              reinterpret_cast<float *>(_mrg_lse_smem + MPK_MRG_LL_LDS_OFF);
+          constexpr int NL = HEADS_N * NUM_KV_CHUNKS;
+          constexpr int LPT = (NL + NUM_THREADS - 1) / NUM_THREADS;
+          int const lse_base = head_base + first_token_pos * LSE_TOKEN_STRIDE +
+                               lse_kv_offset;
+          float lr[LPT];
+#pragma unroll
+          for (int j = 0; j < LPT; ++j) {
+            int const i = threadIdx.x + j * NUM_THREADS;
+            lr[j] = (i < NL) ? lse_g[lse_base + i % HEADS_N +
+                                     (i / HEADS_N) * NUM_QO_HEADS_PER_KV]
+                             : 0.f;
+          }
+#pragma unroll
+          for (int c = 0; c < HC; ++c) {
+            o[c] = o_g[(lse0 + c * NUM_QO_HEADS_PER_KV) * HEAD_DIM + o_col];
+          }
+#pragma unroll
+          for (int j = 0; j < LPT; ++j) {
+            int const i = threadIdx.x + j * NUM_THREADS;
+            if (i < NL) {
+              s_lse[(i % HEADS_N) * NUM_KV_CHUNKS + i / HEADS_N] = lr[j];
+            }
+          }
+          __syncthreads();
+          float const *const my_l =
+              s_lse + (group_id >> 1) * NUM_KV_CHUNKS + half * HC;
+#pragma unroll
+          for (int c = 0; c < HC; ++c) {
+            l[c] = my_l[c] * 1.44269504088896340736f;
+          }
+        }
+#else
 #pragma unroll
         for (int c = 0; c < HC; ++c) {
           int const ll = lse0 + c * NUM_QO_HEADS_PER_KV;
           l[c] = lse_g[ll] * 1.44269504088896340736f;
           o[c] = o_g[ll * HEAD_DIM + o_col];
         }
+#endif
         m = -inf;
 #pragma unroll
         for (int c = 0; c < HC; ++c) {
