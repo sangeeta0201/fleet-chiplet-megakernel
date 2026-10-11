@@ -1409,7 +1409,15 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     bool const rope_remap = MPK_ROPE_REMAP && wk_ll &&
                             wuk_tiles_per_xcd == TILES_PER_HEAD &&
                             wuk_tiles_per_xcd < tiles_per_xcd;
+#if MPK_WUK_REMAP
+    bool const wuk_remap = wk_ll && dec_base > 0 &&
+                           dec_base + wuk_tiles_per_xcd <= tiles_per_xcd;
+    int const wuk_rank = wuk_remap ? xcd_rank - dec_base : xcd_rank;
+    for (int t = wuk_rank; t >= 0 && t < wuk_tiles_per_xcd;
+         t += tiles_per_xcd) {
+#else
     for (int t = xcd_rank; t < wuk_tiles_per_xcd; t += tiles_per_xcd) {
+#endif
       int const heads_per_xcd = wuk_tiles_per_xcd / TILES_PER_HEAD;
       int const head = qb_head_base + xcd_id * heads_per_xcd +
                        t / TILES_PER_HEAD;

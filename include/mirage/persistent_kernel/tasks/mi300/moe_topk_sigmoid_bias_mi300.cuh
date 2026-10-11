@@ -223,7 +223,75 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
     // MPK_TOPK_RANK, one row of NUM_EXPERTS == block size, k == 8: LDS
     // scratch (NUM_EXPERTS + 16 words) for the one-expert-per-thread rank
     // selection. Null keeps the sort-then-merge path.
-    unsigned *__restrict__ rank_lds = nullptr) {
+    unsigned *__restrict__ rank_lds = nullptr,
+    // MPK_TOPK_FLAG_LATE: 16 flags (one 64-byte line) that must all reach
+    // ll_epoch before the first ll_route word goes out.
+    unsigned const *__restrict__ pub_gate = nullptr) {
+#if MPK_TOPK_FLAG_LATE
+  static_assert(MPK_TOPK_ID_EARLY && !MPK_TOPK_SH_EARLY,
+                "the gate sits in front of the early ID publish");
+  bool gate_ok = pub_gate == nullptr;
+  typedef unsigned gate_u4_t __attribute__((ext_vector_type(4)));
+#if MPK_TOPK_FLAG_PF
+  // MPK_TOPK_FLAG_PF: the first read of the flags goes out here, ahead of the
+  // selection, and is only waited for at the gate -- by then it has landed,
+  // and the selection issues no vmem of its own in between.
+  gate_u4_t p0 = {0u, 0u, 0u, 0u}, p1 = p0, p2 = p0, p3 = p0;
+  if (pub_gate != nullptr) {
+    asm volatile("global_load_dwordx4 %0, %4, off nt\n"
+                 "global_load_dwordx4 %1, %4, off offset:16 nt\n"
+                 "global_load_dwordx4 %2, %4, off offset:32 nt\n"
+                 "global_load_dwordx4 %3, %4, off offset:48 nt"
+                 : "=&v"(p0), "=&v"(p1), "=&v"(p2), "=&v"(p3)
+                 : "v"(pub_gate)
+                 : "memory");
+  }
+#endif
+  // Every calling lane reads all 16 flags, so any active-lane set is fine.
+  auto wait_gate = [&]() {
+    if (gate_ok) {
+      return;
+    }
+#if MPK_TOPK_FLAG_PF
+    {
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      asm volatile("" : "+v"(p0), "+v"(p1), "+v"(p2), "+v"(p3));
+      bool ok = true;
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        ok = ok && p0[i] >= ll_epoch && p1[i] >= ll_epoch &&
+             p2[i] >= ll_epoch && p3[i] >= ll_epoch;
+      }
+      if (ok) {
+        gate_ok = true;
+        return;
+      }
+    }
+#endif
+    while (true) {
+      gate_u4_t g0, g1, g2, g3;
+      asm volatile("global_load_dwordx4 %0, %4, off nt\n"
+                   "global_load_dwordx4 %1, %4, off offset:16 nt\n"
+                   "global_load_dwordx4 %2, %4, off offset:32 nt\n"
+                   "global_load_dwordx4 %3, %4, off offset:48 nt\n"
+                   "s_waitcnt vmcnt(0)"
+                   : "=&v"(g0), "=&v"(g1), "=&v"(g2), "=&v"(g3)
+                   : "v"(pub_gate)
+                   : "memory");
+      bool ok = true;
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        ok = ok && g0[i] >= ll_epoch && g1[i] >= ll_epoch &&
+             g2[i] >= ll_epoch && g3[i] >= ll_epoch;
+      }
+      if (ok) {
+        break;
+      }
+      __builtin_amdgcn_s_sleep(1);
+    }
+    gate_ok = true;
+  };
+#endif
   T *input = static_cast<T *>(input_ptr);
   T *bias = static_cast<T *>(bias_ptr);
   float *output = static_cast<float *>(output_ptr);
@@ -680,6 +748,9 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
           MTK_D(0, 1) MTK_D(2, 3) MTK_D(4, 5) MTK_D(6, 7)
         }
         } // !thresh_done
+#if MPK_TOPK_FLAG_LATE
+        wait_gate();
+#endif
 #if MPK_TOPK_ID_EARLY
         if (ll_route != nullptr && thread_row == 0 && thread_group_idx <= 8) {
           unsigned id = (unsigned)NUM_EXPERTS;
@@ -938,6 +1009,9 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
                 __float_as_uint(1.0f));
     }
     if (ll_route != nullptr && thread_group_idx == 0 && thread_row == 0) {
+#if MPK_TOPK_FLAG_LATE
+      wait_gate();
+#endif
       unsigned long long const hi = (unsigned long long)ll_epoch << 32;
       float const inv = renormalize ? (routed_scaling_factor /
                                        row_sum_for_renorm)

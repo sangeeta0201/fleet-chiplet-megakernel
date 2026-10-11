@@ -1664,7 +1664,7 @@ def get_compile_command(
             "MPK_DEC_OUT_B128",
             "MPK_MERGE_LSE_LDS",
             "MPK_MLA_QK_PIPE",
-            "MPK_MLA_PV_PIPE",
+            "MPK_MLA_PV_PIPE", "MPK_WUK_REMAP", "MPK_TOPK_FLAG_LATE", "MPK_TOPK_FLAG_PF", "MPK_MLA_PV_ASM", "MPK_OPROJ_WFIRST_GATE", "MPK_OPROJ_WALL_GATE",
             "MPK_ATTN_PROBE_NOQKVWAIT",
             "MPK_ENTRY_NOWAIT",
             "MPK_DEC_HINTS",
@@ -1689,6 +1689,10 @@ def get_compile_command(
         if _x is not None:
             assert _x.isdigit() and 0 <= int(_x) <= 8, "MPK_OPROJ_SHIFT is 0..8"
             flags = flags + [f"-DMPK_OPROJ_SHIFT={_x}"]
+        _x = os.environ.get("MPK_LL_POLL_GATE_N")
+        if _x is not None:
+            assert _x.isdigit() and 1 <= int(_x) <= 32, "MPK_LL_POLL_GATE_N is 1..32"
+            flags = flags + [f"-DMPK_LL_POLL_GATE_N={_x}"]
         _x = os.environ.get("MPK_W2_PF_MODE")
         if _x is not None:
             assert _x in ("0", "1", "2"), "MPK_W2_PF_MODE is 0..2"

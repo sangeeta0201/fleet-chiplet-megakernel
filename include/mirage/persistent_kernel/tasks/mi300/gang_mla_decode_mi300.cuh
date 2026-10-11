@@ -1688,6 +1688,75 @@ __device__ __noinline__ void
         __builtin_memcpy(&pbu, &pb, 8);
         gang_mla_decode_detail::mla_pv8_vgpr(o_acc_r, vau, pbu);
       }
+#elif MPK_MLA_OACC_VGPR && MPK_MLA_PV_ASM && !MPK_MLA_KV_SWZ
+      {
+        static_assert(NUM_V_BLOCKS == 8 && QK_DIM == 576,
+                      "the read offsets below are block * 128 + row * 1152");
+        unsigned const v_addr = static_cast<unsigned>(reinterpret_cast<uintptr_t>(
+            &cur_kv[(kgrp * 4) * QK_DIM + warp_id * 16 + midx]));
+        unsigned t[32];
+        // Every read into its own register, so no block's reads wait on the
+        // previous block's pack. Blocks 0-3 here, 4-7 and the one wait below.
+        asm volatile("ds_read_u16 %0, %16 offset:0\n"
+                     "ds_read_u16 %1, %16 offset:1152\n"
+                     "ds_read_u16 %2, %16 offset:2304\n"
+                     "ds_read_u16 %3, %16 offset:3456\n"
+                     "ds_read_u16 %4, %16 offset:128\n"
+                     "ds_read_u16 %5, %16 offset:1280\n"
+                     "ds_read_u16 %6, %16 offset:2432\n"
+                     "ds_read_u16 %7, %16 offset:3584\n"
+                     "ds_read_u16 %8, %16 offset:256\n"
+                     "ds_read_u16 %9, %16 offset:1408\n"
+                     "ds_read_u16 %10, %16 offset:2560\n"
+                     "ds_read_u16 %11, %16 offset:3712\n"
+                     "ds_read_u16 %12, %16 offset:384\n"
+                     "ds_read_u16 %13, %16 offset:1536\n"
+                     "ds_read_u16 %14, %16 offset:2688\n"
+                     "ds_read_u16 %15, %16 offset:3840"
+                     : "=&v"(t[0]), "=&v"(t[1]), "=&v"(t[2]), "=&v"(t[3]),
+                       "=&v"(t[4]), "=&v"(t[5]), "=&v"(t[6]), "=&v"(t[7]),
+                       "=&v"(t[8]), "=&v"(t[9]), "=&v"(t[10]), "=&v"(t[11]),
+                       "=&v"(t[12]), "=&v"(t[13]), "=&v"(t[14]), "=&v"(t[15])
+                     : "v"(v_addr)
+                     : "memory");
+        asm volatile("ds_read_u16 %0, %16 offset:512\n"
+                     "ds_read_u16 %1, %16 offset:1664\n"
+                     "ds_read_u16 %2, %16 offset:2816\n"
+                     "ds_read_u16 %3, %16 offset:3968\n"
+                     "ds_read_u16 %4, %16 offset:640\n"
+                     "ds_read_u16 %5, %16 offset:1792\n"
+                     "ds_read_u16 %6, %16 offset:2944\n"
+                     "ds_read_u16 %7, %16 offset:4096\n"
+                     "ds_read_u16 %8, %16 offset:768\n"
+                     "ds_read_u16 %9, %16 offset:1920\n"
+                     "ds_read_u16 %10, %16 offset:3072\n"
+                     "ds_read_u16 %11, %16 offset:4224\n"
+                     "ds_read_u16 %12, %16 offset:896\n"
+                     "ds_read_u16 %13, %16 offset:2048\n"
+                     "ds_read_u16 %14, %16 offset:3200\n"
+                     "ds_read_u16 %15, %16 offset:4352\n"
+                     "s_waitcnt lgkmcnt(0)"
+                     : "=&v"(t[16]), "=&v"(t[17]), "=&v"(t[18]), "=&v"(t[19]),
+                       "=&v"(t[20]), "=&v"(t[21]), "=&v"(t[22]), "=&v"(t[23]),
+                       "=&v"(t[24]), "=&v"(t[25]), "=&v"(t[26]), "=&v"(t[27]),
+                       "=&v"(t[28]), "=&v"(t[29]), "=&v"(t[30]), "=&v"(t[31])
+                     : "v"(v_addr)
+                     : "memory");
+#pragma unroll
+        for (int i = 0; i < 16; i++) {
+          asm volatile("" : "+v"(t[i]));
+        }
+        u32x2_t vau[NUM_V_BLOCKS];
+#pragma unroll
+        for (int vb = 0; vb < NUM_V_BLOCKS; vb++) {
+          vau[vb][0] = t[4 * vb] | (t[4 * vb + 1] << 16);
+          vau[vb][1] = t[4 * vb + 2] | (t[4 * vb + 3] << 16);
+          o_acc_r[vb] *= rescale;
+        }
+        u32x2_t pbu;
+        __builtin_memcpy(&pbu, &pb, 8);
+        gang_mla_decode_detail::mla_pv8_vgpr(o_acc_r, vau, pbu);
+      }
 #elif MPK_MLA_OACC_VGPR
       {
         u32x2_t vau[NUM_V_BLOCKS];

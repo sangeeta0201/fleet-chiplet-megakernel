@@ -1271,6 +1271,39 @@ __device__ __forceinline__ bool
 #ifndef MPK_ROPE_REMAP
 #define MPK_ROPE_REMAP 1
 #endif
+// MPK_TOPK_FLAG_LATE: the TopK checks its XCD's 16 normed-row flags in front
+// of the routing's first ll_route word instead of ahead of the selection,
+// which reads only the logits. MPK_TRACE: logits ready -> normed flags seen
+// -> select start is 0.53 us of the 1.45 us selection's lead-in.
+// MEASURED NULL-NEGATIVE 2026-10-11, NP=8 1024/1024, text identical: 3.894
+// 3.885 vs 3.876 3.882 3.875 ms. The gate's own load + vmcnt(0) is an L2
+// round trip after the selection even when the flags landed long before.
+// AND IT HANGS: 2 of 3 runs stalled in the first decode iteration with one
+// rank short of iteration 1, no fault, HBM idle (watchdog, retried clean).
+// The clears inside the selection do not touch the flags; cause not found.
+// DO NOT ENABLE either flag until it is.
+// MPK_TOPK_FLAG_PF (needs FLAG_LATE): issue that read ahead of the selection
+// and wait on it only at the gate.
+#ifndef MPK_TOPK_FLAG_LATE
+#define MPK_TOPK_FLAG_LATE 0
+#endif
+#ifndef MPK_TOPK_FLAG_PF
+#define MPK_TOPK_FLAG_PF 0
+#endif
+// MPK_WUK_REMAP: under MPK_WUK_LL + MPK_DEC_REMAP, W_UK tile t runs on the
+// XCD's decode worker t (idle-polling for its query from the attention entry)
+// instead of q_b worker t, which reaches it only after its own q_b tile.
+// MPK_TRACE: the decode waits on the last W_UK tile, on the last q_b worker,
+// 17.20 us vs 16.48 for the first; even idle W_UK workers return 1.7 us after
+// the head's last q_b tile. The decode's preload walk follows the W_UK tile.
+// MEASURED 2026-10-11, NP=8 1024/1024, text identical: 3.866 -> 4.005 ms
+// (+0.139; with MPK_WUK_WFIRST 4.012). The decode workers' KV preload and
+// prologue walk, issued at ~11 us today, slide behind the W_UK tile, and the
+// decode waits on them. A local all-heads W_UK is no way round it: each decode
+// item runs all 8 heads, one per XCD. Off.
+#ifndef MPK_WUK_REMAP
+#define MPK_WUK_REMAP 0
+#endif
 #ifndef MPK_WUK_HOIST
 #define MPK_WUK_HOIST 0
 #endif
@@ -1303,6 +1336,24 @@ __device__ __forceinline__ bool
 // Re-measured 2026-10-11 under MPK_ATTN_OUT_LL: 4.059 vs 4.031 (+0.028).
 #ifndef MPK_OPROJ_WFIRST
 #define MPK_OPROJ_WFIRST 0
+#endif
+// MPK_OPROJ_WFIRST_GATE: those trip-0 loads issued once MPK_LL_POLL_GATE has
+// seen half the merge items land, not at entry (~17 us, beside the decode's
+// KV and the merge's partial reads). MPK_TRACE: staged -> GEMV returned is
+// 2.39 us with every weight load issued after the staging.
+#ifndef MPK_OPROJ_WFIRST_GATE
+#define MPK_OPROJ_WFIRST_GATE 0
+#endif
+// MPK_OPROJ_WALL_GATE: all 16 trips' weight and scale loads at that point (32
+// vmem, ~80 VGPRs). The C++ K-loop issues trip 8-15's loads only as trip
+// 0-7's land, so it pays two HBM round trips after the staging.
+// MEASURED NEGATIVE 2026-10-11, NP=8 1024/1024, text identical: control
+// 3.882 3.881; WFIRST_GATE 3.898 3.898 (+0.016); WALL_GATE 3.919 (+0.037).
+// The more weight traffic issued beside the merge's tail, the worse -- the
+// same barrier interference the Phase 8 o_proj prefetch note measures with a
+// second round. Off.
+#ifndef MPK_OPROJ_WALL_GATE
+#define MPK_OPROJ_WALL_GATE 0
 #endif
 
 // MPK_TOPK_RANK: the per-XCD routing TopK selects by rank -- one expert per
@@ -1416,6 +1467,13 @@ __device__ __forceinline__ bool
 // -> 4.261 4.258 4.267 ms (-0.021). Default on.
 #ifndef MPK_LL_POLL_GATE
 #define MPK_LL_POLL_GATE 1
+#endif
+// MPK_LL_POLL_GATE_N: merge items (of 32) the sentinel poll waits for before
+// the full 16 KB rounds start; 192 tiles' rounds are ~3 MB each, run beside
+// the merge's tail. MPK_OPROJ_WFIRST_GATE's 6 MB of weight loads at the same
+// point measured +0.016 ms, so that tail is sensitive to the traffic.
+#ifndef MPK_LL_POLL_GATE_N
+#define MPK_LL_POLL_GATE_N 16
 #endif
 // MPK_XS_POLL_FULL: the qkv_a split resolver re-reads its whole slice of the
 // eight EP slots each round instead of spinning on one sentinel per slot and
@@ -1735,8 +1793,18 @@ __device__ __forceinline__ bool
 // same order, same block max, same converts: bit-identical.
 // MEASURED SLOWER 2026-10-11 on 1f81211, n=3: 3.979 3.980 3.983 vs 3.961
 // 3.965 3.958 ms (+0.020), bit-exact in test_qwide (8 seeds x 1536/2048/
-// 6144, LDS and global rows). The default is 32-way bank-conflicted and
-// serial and still wins, so the quantizer is not what S72 -> S73 measures.
+// 6144, LDS and global rows). That build was not the design: at q_b the
+// x * rcp products packed into v_pk_mul_f32 with rcp broadcast from a VGPR
+// pair whose other half was a hoisted weight load in flight, so the waitcnt
+// pass put vmcnt(9) at the top of the quantizer -- an L2 round trip before
+// any work. And at qkv_a's 6144 it is three trips with a DPP max each, 336
+// instructions per wave against the default's 267. Now: rcp from an SGPR,
+// and wide only where it is one trip (REDUCTION_SIZE / 8 <= 256, i.e. q_b's
+// 2048): prefetch -> barrier 250 -> 109 instructions, spread over 4 waves.
+// test_qwide bit-exact. MEASURED NULL 2026-10-11 (r1, text identical): 3.889
+// vs 3.876; with MPK_QB_SELF_PF 3.876. The shorter quantizer only moves the
+// wait onto the hoisted weight loads, and pulling those into L2 first does
+// not move the wall either. Off.
 #ifndef MPK_QUANT_WIDE
 #define MPK_QUANT_WIDE 0
 #endif
@@ -1831,6 +1899,17 @@ __device__ __forceinline__ bool
 // in the function that sets the megakernel's VGPR budget. Off.
 #ifndef MPK_MLA_PV_PIPE
 #define MPK_MLA_PV_PIPE 0
+#endif
+// MPK_MLA_PV_ASM: the PV step's 32 V reads (ds_read_u16, four rows of each of
+// the eight 64-column blocks) issued from asm into 32 distinct registers with
+// one wait, then packed. The final ISA of the C++ form reuses each block's
+// second and fourth read registers as the next block's first and third, so a
+// block's reads wait on the previous block's v_perm: eight serialized LDS
+// round trips per tile. Same values, same packing, same MFMAs: bit-exact.
+// The ISA is as designed: 32 ds_read_u16, one lgkmcnt(0), 16 packs, 8 MFMAs.
+// MEASURED NULL 2026-10-11 (r1, text identical): 3.884 vs 3.876 3.882. Off.
+#ifndef MPK_MLA_PV_ASM
+#define MPK_MLA_PV_ASM 0
 #endif
 // (MPK_WUK_PF below: 5.064 5.057, -0.029.) All five together, interleaved
 // against their own control, text identical: 5.109 5.110 5.094 -> 4.831

@@ -1003,7 +1003,9 @@ __device__ __attribute__((noinline)) void
       ROUTE_LL ? reinterpret_cast<unsigned long long *>(
                      xb + 32 + MPK_RLL_IDS_LINES * 16)
                : nullptr;
-  if constexpr (ROUTE_LL) {
+  // MPK_TOPK_FLAG_LATE: the selection reads only the logits, so the wait moves
+  // into it, in front of its first ll_route store, and overlaps the sort.
+  if constexpr (ROUTE_LL && !MPK_TOPK_FLAG_LATE) {
     if (tid < 64) {
       unsigned const *const ks_flag =
           reinterpret_cast<unsigned const *>(ks_all + xcd * MPK_XSPLIT_XCD_INTS);
@@ -1068,7 +1070,14 @@ __device__ __attribute__((noinline)) void
       epoch,
       (MPK_TOPK_RANK || MPK_TOPK_THRESH || MPK_TOPK_4W)
           ? reinterpret_cast<unsigned *>(_topk_rank_smem + 2048)
-          : nullptr);
+          : nullptr
+#if MPK_TOPK_FLAG_LATE
+      ,
+      ROUTE_LL ? reinterpret_cast<unsigned const *>(ks_all +
+                                                    xcd * MPK_XSPLIT_XCD_INTS)
+               : nullptr
+#endif
+  );
   if (tid == 0) {
     mpk_stage_stamp(42);
   }

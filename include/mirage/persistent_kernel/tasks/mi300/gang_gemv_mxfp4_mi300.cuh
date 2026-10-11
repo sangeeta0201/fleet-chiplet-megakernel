@@ -267,9 +267,37 @@ __device__ __noinline__ void
   // MPK_OPROJ_WFIRST: trip 0's weights and scales go out ahead of the
   // activation staging, whose __syncthreads would otherwise hold them back,
   // so the two round trips overlap instead of running back to back.
-  u32x4_t wv0[UNROLL];
-  unsigned char sv0[UNROLL];
-  if constexpr (MPK_OPROJ_WFIRST != 0) {
+  // MPK_OPROJ_WFIRST_GATE: the same trip-0 loads, issued once
+  // MPK_LL_POLL_GATE has seen half the merge items land rather than at
+  // entry, where they ran beside the decode's and the merge's reads.
+  // MPK_OPROJ_WALL_GATE: every trip's, so the K-loop runs from registers.
+  constexpr bool WF_GATE =
+      MPK_OPROJ_WFIRST_GATE != 0 || MPK_OPROJ_WALL_GATE != 0;
+  constexpr int WF_TRIPS = MPK_OPROJ_WALL_GATE != 0 ? ITERS : UNROLL;
+  constexpr bool WF_ANY = MPK_OPROJ_WFIRST != 0 || WF_GATE;
+  u32x4_t wv0[WF_TRIPS];
+  unsigned char sv0[WF_TRIPS];
+  bool wf_issued = false;
+  auto wf_issue = [&]() __attribute__((always_inline)) {
+#pragma unroll
+    for (int u = 0; u < WF_TRIPS; u++) {
+      int const c = u * LANES_PER_ROW + lane;
+#if MPK_ATTN_STREAM_NT >= 1
+      wv0[u] = ld_g_nt<u32x4_t>(w_row + c * VEC_BYTES);
+#else
+      wv0[u] = ld_g<u32x4_t>(w_row + c * VEC_BYTES);
+#endif
+#if MPK_ATTN_STREAM_NT == 1
+      sv0[u] = ld_g_nt<unsigned char>(s_row + c);
+#else
+      sv0[u] = ld_g<unsigned char>(s_row + c);
+#endif
+    }
+    wf_issued = true;
+  };
+  (void)wf_issue;
+  (void)wf_issued;
+  if constexpr (MPK_OPROJ_WFIRST != 0 && !WF_GATE) {
 #pragma unroll
     for (int u = 0; u < UNROLL; u++) {
       int const c = u * LANES_PER_ROW + lane;
@@ -315,13 +343,16 @@ __device__ __noinline__ void
             pok = (unsigned)(w[0].x >> 32) == a_epoch &&
                   (unsigned)(w[0].y >> 32) == a_epoch;
           }
-          if (__syncthreads_count(pok) >= 16) {
+          if (__syncthreads_count(pok) >= MPK_LL_POLL_GATE_N) {
             break;
           }
           __builtin_amdgcn_s_sleep(8);
         }
       }
 #endif
+      if constexpr (WF_GATE) {
+        wf_issue();
+      }
       while (true) {
         // Compiler-visible loads (see merge_splitkv_ck_fmha's
         // MPK_DEC_MERGE_LL read): asm outputs ahead of a separate vmcnt(0)
@@ -365,6 +396,11 @@ __device__ __noinline__ void
         dst[i] = ld_g<u32x4_t>(src + i);
       }
       __syncthreads();
+    }
+  }
+  if constexpr (WF_GATE) {
+    if (!wf_issued) {
+      wf_issue();
     }
   }
 
@@ -420,9 +456,9 @@ __device__ __noinline__ void
       // Chunk index within the row, in units of VEC elements.
       int const c = (i0 + u) * LANES_PER_ROW + lane;
       int const k = c * VEC;
-      if (MPK_OPROJ_WFIRST != 0 && i0 == 0) {
-        wv[u] = wv0[u];
-        sv[u] = sv0[u];
+      if (WF_ANY && i0 + u < WF_TRIPS) {
+        wv[u] = wv0[i0 + u];
+        sv[u] = sv0[i0 + u];
       } else {
       // MPK_ATTN_STREAM_NT: weight + scale only. o_proj is the biggest single
       // weight stream in the attention half (100.7 MB/layer/GPU before the

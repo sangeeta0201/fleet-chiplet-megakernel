@@ -227,12 +227,26 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_rmsnorm(
     }
   };
 
+  // Wide only where it is one trip: at qkv_a's 6144 it is three trips of
+  // eight with a DPP max each, longer per wave than the default's one
+  // 32-element chain on three waves.
 #if MPK_QUANT_WIDE
+  constexpr bool QWIDE = REDUCTION_SIZE / 8 <= MPK_NT;
+#else
+  constexpr bool QWIDE = false;
+#endif
+  if constexpr (QWIDE) {
   static_assert(REDUCTION_SIZE % 128 == 0,
                 "a DPP row covers one whole 128-element E8M0 block");
   constexpr int NCHUNK = REDUCTION_SIZE / 8;
   (void)ld_src;
   (void)ld_nw;
+  // Block-uniform, and in an SGPR it cannot be the broadcast half of a
+  // v_pk_mul_f32 VGPR pair: the pair's other register can be a hoisted
+  // prefetch load still in flight, and the waitcnt pass then waits for that
+  // load (q_b: vmcnt(9) at the top of this loop, an L2 round trip).
+  float const rcp_u =
+      __int_as_float(__builtin_amdgcn_readfirstlane(__float_as_int(rms_rcp)));
 #pragma unroll
   for (int c0 = 0; c0 < NCHUNK; c0 += MPK_NT) {
     int const c = c0 + (int)threadIdx.x;
@@ -246,7 +260,7 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_rmsnorm(
       i4 const nv = ld_nw16(c * 8);
 #pragma unroll
       for (int e = 0; e < 8; e++) {
-        v[e] = _gang_bf16_to_float(sv[e]) * rms_rcp *
+        v[e] = _gang_bf16_to_float(sv[e]) * rcp_u *
                _gang_bf16_to_float(nv[e]);
         amax = fmaxf(amax, fabsf(v[e]));
       }
@@ -289,7 +303,7 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_rmsnorm(
       }
     }
   }
-#else
+  } else {
   constexpr int SUB_BLOCK = 32;
   constexpr int NSUBBLOCKS = REDUCTION_SIZE / SUB_BLOCK;
   int const tid = threadIdx.x;
@@ -371,7 +385,7 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_rmsnorm(
       s_tok_scales[super_blk] = se;
     }
   }
-#endif
+  } // QWIDE
   if constexpr (BARRIER_LDS_ONLY) {
     asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
     __builtin_amdgcn_s_barrier();
