@@ -85,6 +85,9 @@
 // already 15 loads deep, and the merge is ~4 us of a ~185 us layer. Correct:
 // tests/standalone/test_mla_merge.hip passes at 16 and 32 chunks with the
 // same max error (1.95e-3, bf16 rounding) as the running form. Kept off.
+#ifndef MPK_PROBE_MERGE63
+#define MPK_PROBE_MERGE63 0
+#endif
 #ifndef MPK_MERGE_TWO_PASS
 #define MPK_MERGE_TWO_PASS 0
 #endif
@@ -525,7 +528,10 @@ __device__ __forceinline__ void
         for (int c = 0; c < HC; ++c) {
           int const ll = lse0 + c * NUM_QO_HEADS_PER_KV;
           l[c] = lse_g[ll] * 1.44269504088896340736f;
-          o[c] = o_g[ll * HEAD_DIM + o_col];
+          // MPK_PROBE_MERGE63: PRICING PROBE, WRONG OUTPUT -- the last o load
+          // dropped, so the 2 * HC = 64 loads fit vmcnt's 63 in flight.
+          o[c] = (MPK_PROBE_MERGE63 && c == HC - 1) ? 0.f
+                                                    : o_g[ll * HEAD_DIM + o_col];
         }
 #endif
         m = -inf;

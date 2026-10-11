@@ -1511,8 +1511,10 @@ __device__ __forceinline__ bool
 // MPK_RESOLVE_POLL_INC: the same per-thread incremental spin for the qkv_a
 // split resolver's EP slots (S70 -> S71 0.19 us in MPK_TRACE: the first pass
 // usually lands, so this is the small end of the same fix).
+// MEASURED 2026-10-11 r1, text identical: rpi+g4 3.836 -> 3.821; with
+// DEC_Q_INC 3.797 -> 3.792. Default on with it (gates g14).
 #ifndef MPK_RESOLVE_POLL_INC
-#define MPK_RESOLVE_POLL_INC 0
+#define MPK_RESOLVE_POLL_INC 1
 #endif
 // MPK_DEC_KVF_EARLY: the decode's cache-row flag read in the query poll's
 // round (thread 0) instead of in its own poll after the query validates.
@@ -1526,8 +1528,14 @@ __device__ __forceinline__ bool
 // MPK_DEC_Q_INC: the decode's query poll as a per-thread incremental spin
 // (only words still on an older epoch re-read) instead of block-synchronized
 // full rounds -- MPK_ROUTER_POLL_INC's shape on the W_UK -> decode handoff.
+// A thread's nine words span the eight heads' W_UK tiles on eight XCDs, so
+// once most heads land it re-reads one word, not nine: the old rounds put
+// ~1.2 MB/round of system-scope reads beside the last heads' stores.
+// MEASURED 2026-10-11, NP=8 1024/1024, text identical: r1 on rpi+g4 3.790 vs
+// 3.836; on cdd3c7a 3.797 vs 3.845; with RESOLVE_POLL_INC 3.792, then n=3
+// 3.789 3.783 vs 3.852 3.840 control. Default on (gates g14).
 #ifndef MPK_DEC_Q_INC
-#define MPK_DEC_Q_INC 0
+#define MPK_DEC_Q_INC 1
 #endif
 // MPK_XS_POLL_FULL: the qkv_a split resolver re-reads its whole slice of the
 // eight EP slots each round instead of spinning on one sentinel per slot and
@@ -1964,6 +1972,24 @@ __device__ __forceinline__ bool
 // MEASURED NULL 2026-10-11 (r1, text identical): 3.884 vs 3.876 3.882. Off.
 #ifndef MPK_MLA_PV_ASM
 #define MPK_MLA_PV_ASM 0
+#endif
+// MPK_MLA_QK_PIPE2: the QK loop with two K chunks in flight instead of one.
+// MPK_TRACE stamps 75-77 (trip 0, median item): QK 0.68 us, softmax 0.20,
+// PV 0.48 per tile -- QK at about one LDS round trip per step, against an
+// 18-step MFMA chain of ~0.17 us. Same MFMA order: bit-exact.
+// Alone on the unswizzled tile NULL (3.846 vs 3.845): its K reads are 8-way
+// bank-conflicted, so a second one in flight only queues behind the first.
+// With MPK_MLA_KV_SWZ (see gang_mla_decode_mi300.cuh) on DEC_Q_INC +
+// RESOLVE_POLL_INC, n=2: 3.789 3.783 -> SWZ 3.764 3.763 -> SWZ + PIPE2 3.752
+// 3.753 ms, text identical. Default on with KV_SWZ (gates g14).
+#ifndef MPK_MLA_QK_PIPE2
+#define MPK_MLA_QK_PIPE2 1
+#endif
+// MPK_PROBE_MERGE63: PRICING PROBE, WRONG OUTPUT. The merge's halves path
+// issues 2 x 32 loads before one wait, one more than vmcnt's 63 in flight, so
+// the 64th cannot issue until the first returns. The probe drops one.
+#ifndef MPK_PROBE_MERGE63
+#define MPK_PROBE_MERGE63 0
 #endif
 // (MPK_WUK_PF below: 5.064 5.057, -0.029.) All five together, interleaved
 // against their own control, text identical: 5.109 5.110 5.094 -> 4.831

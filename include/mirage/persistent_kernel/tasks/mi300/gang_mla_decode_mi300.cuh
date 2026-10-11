@@ -300,9 +300,14 @@ __device__ __forceinline__ void mla_tile_bar() { __syncthreads(); }
 // extra in AGPRs) make the standalone kernels 2-4% faster instead, e.g. the
 // 64-chunk pair 13.04 / 13.81 -> 12.49 / 13.64 us; 60/60 both budgets.
 // Megakernel NULL 2026-10-11 on MPK_WUK_EARLY_PF + MPK_ROPE_REMAP: 4.130 vs
-// 4.132 4.128 ms. Off.
+// 4.132 4.128 ms. That was before the QK loop kept K reads in flight
+// (MPK_MLA_QK_PIPE), when each read was waited for on its own. With the
+// pipelined loop running on the swizzled tile it pays: DEC_Q_INC +
+// RESOLVE_POLL_INC 3.789 3.783 -> + KV_SWZ 3.764 3.763 -> + QK_PIPE2 3.752
+// 3.753 ms, text identical (MPK_TRACE: the decode is ~6 us/layer of the
+// critical path, MPK_MLA_SKIP_DECODE 3.377 vs 3.845). Default on (gates g14).
 #ifndef MPK_MLA_KV_SWZ
-#define MPK_MLA_KV_SWZ 0
+#define MPK_MLA_KV_SWZ 1
 #endif
 #ifndef MPK_MLA_OACC_VGPR
 #define MPK_MLA_OACC_VGPR 1
@@ -541,7 +546,7 @@ __device__ __forceinline__ void mla_qk_acc32_zero() {
                : "a32", "a33", "a34", "a35");
 }
 
-#if MPK_MLA_QK_PIPE
+#if MPK_MLA_QK_PIPE || MPK_MLA_QK_PIPE2
 // mla_qk_acc32_mfma with the K chunk already in registers.
 __device__ __forceinline__ void mla_qk_acc32_mfma_kv(bf16x8_t av,
                                                     __bf16 const *b) {
@@ -1620,6 +1625,51 @@ __device__ __noinline__ void
         gang_mla_decode_detail::mla_qk_acc2_mfma<1>(kr1, qr[kc + 1]);
       }
       __mfma_hd64_fp32x4 scores = gang_mla_decode_detail::mla_qk_acc2_read();
+#elif (MPK_MLA_QK_PIPE || MPK_MLA_QK_PIPE2) && MPK_MLA_KV_SWZ
+      mla_qk_acc32_zero();
+      {
+        // The pipelined loop on the swizzled tile: the K reads stop being
+        // 8-way bank-conflicted, so the reads in flight can actually overlap.
+        using kq_t = gang_mla_decode_detail::bf16x8_t;
+        constexpr int QD = MPK_MLA_QK_PIPE2 ? 2 : 1;
+        auto kaddr = [&](int kc) -> kq_t const * {
+          return reinterpret_cast<kq_t const *>(
+              &cur_kv[((kc & 1) ? kswz_o : kswz_e) + kc * 32]);
+        };
+        kq_t kq[3];
+#pragma unroll
+        for (int d = 0; d < QD; d++) {
+          kq[d] = *kaddr(d);
+        }
+#pragma unroll
+        for (int kc = 0; kc < NUM_K32; kc++) {
+          if (kc + QD < NUM_K32) {
+            kq[(kc + QD) % 3] = *kaddr(kc + QD);
+          }
+          gang_mla_decode_detail::mla_qk_acc32_mfma_kv(kq[kc % 3], qr[kc]);
+        }
+      }
+      __mfma_hd64_fp32x4 scores = mla_qk_acc32_read();
+#elif MPK_MLA_QK_PIPE2 && !MPK_MLA_KV_SWZ
+      mla_qk_acc32_zero();
+      {
+        // Two chunks in flight ahead of the MFMA: one LDS round trip per step
+        // was the whole step (MPK_TRACE: QK 0.68 us per tile).
+        using kq_t = gang_mla_decode_detail::bf16x8_t;
+        __bf16 const *const k_row = &cur_kv[midx * QK_DIM + kgrp * 8];
+        kq_t kq[3];
+        kq[0] = *reinterpret_cast<kq_t const *>(k_row);
+        kq[1] = *reinterpret_cast<kq_t const *>(k_row + 32);
+#pragma unroll
+        for (int kc = 0; kc < NUM_K32; kc++) {
+          if (kc + 2 < NUM_K32) {
+            kq[(kc + 2) % 3] =
+                *reinterpret_cast<kq_t const *>(k_row + (kc + 2) * 32);
+          }
+          gang_mla_decode_detail::mla_qk_acc32_mfma_kv(kq[kc % 3], qr[kc]);
+        }
+      }
+      __mfma_hd64_fp32x4 scores = mla_qk_acc32_read();
 #elif MPK_MLA_QK_PIPE && !MPK_MLA_KV_SWZ
       mla_qk_acc32_zero();
       {

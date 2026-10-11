@@ -2875,6 +2875,36 @@ __device__ __attribute__((always_inline)) void
             moe_down_weight_ptr, t, ll_route, (unsigned)routing_expected);
       }
     }
+    // MPK_W2_PF_MODE == 3: mode 2's pull of the W13 workers' tiles, held
+    // until W13's output starts landing -- issued during W13 it competed with
+    // W13's stream (+0.044) and W13's 3.6 MB/XCD through L2 could evict it.
+    // The trigger is any routed slot's first activation word carrying the
+    // epoch (the shared slot can run early).
+    if (MPK_W2_PF_MODE == 3 && mrk >= moe_w13_live && w2_act_ll != nullptr) {
+      if (tid < 64) {
+        while (true) {
+          bool hit = false;
+          if (tid < MOE_NUM_TOPK - 1) {
+            unsigned long long const v = __hip_atomic_load(
+                w2_act_ll + (size_t)tid * (MOE_INTERMEDIATE / 2),
+                __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            hit = (unsigned)(v >> 32) == (unsigned)routing_expected;
+          }
+          if (__ballot(hit) != 0ull) {
+            break;
+          }
+          __builtin_amdgcn_s_sleep(1);
+        }
+      }
+      __syncthreads();
+      int const n_idle = moe_w2_live - moe_w13_live;
+      for (int t = mrk - moe_w13_live; t < moe_w13_live; t += n_idle) {
+        _gang_w2_tp_l2_prefetch<HIDDEN_SIZE, MOE_INTERMEDIATE, MOE_NUM_TOPK,
+                                MOE_W2_OPW, MOE_WEIGHT_FP4, PF_NSEG,
+                                MPK_MOE_TP_W2_KPARTS>(
+            moe_down_weight_ptr, t, ll_route, (unsigned)routing_expected);
+      }
+    }
   }
 #endif
   if (w2_act_ll != nullptr) {

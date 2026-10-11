@@ -170,8 +170,28 @@ run_with_watchdog() {
     if [ "$armed" -eq 0 ]; then
       if grep -q "launch_persistent_kernel ENTER" "$log" 2>/dev/null; then
         armed=1
+        quiet=0
         _watchdog_cache_hbm_paths
         echo "[watchdog] armed ENTER hbm_paths=${#hbm_paths[@]}" >> "$log"
+      elif [ "${MPK_PRE_ENTER_QUIET_CAP:-0}" -gt 0 ]; then
+        # Opt-in: before ENTER the build streams compiler output, so a log
+        # frozen this long is a rank stuck short of launch (seen: two ranks
+        # that never finished compiling, no compiler running, the other six
+        # spinning) -- otherwise only the hard cap reaps it.
+        local pre_size
+        pre_size=$(stat -c %s "$log" 2>/dev/null || echo 0)
+        if [ "$pre_size" -gt "$last_size" ]; then
+          last_size=$pre_size
+          quiet=0
+        else
+          quiet=$(( quiet + 10 ))
+          if [ "$quiet" -ge "$MPK_PRE_ENTER_QUIET_CAP" ]; then
+            echo "[watchdog] no log growth for ${quiet}s before ENTER -- killing pgid $pgid" \
+                 >> "$log"
+            _watchdog_reap "$pgid" "$child"
+            return 124
+          fi
+        fi
       fi
       continue
     fi
