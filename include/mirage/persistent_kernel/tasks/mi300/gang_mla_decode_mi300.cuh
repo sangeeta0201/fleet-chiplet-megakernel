@@ -290,6 +290,20 @@ __device__ __forceinline__ void mla_tile_bar() { __syncthreads(); }
 // coherent text: decode median 9.613/9.580 -> 9.288/9.318 ms (-0.294).
 // Gates (NP=4): ppl512 2.6148, ppl128 2.9048 (torch 2.4073, ratio 1.207),
 // longseq 256/512/1024 G1 PASS, test_mla_merge and test_st_wt PASS. Default 1.
+// MPK_MLA_KV_SWZ: XOR-swizzled KV tile in LDS; see mla_kv_swz_src. Off, the
+// addressing below is the unswizzled code verbatim (routing it through
+// mla_kv_idx cost 10 VGPRs and 36 B of scratch on the whole megakernel).
+// MEASURED NEGATIVE 2026-10-11, NP=8 1024/1024, with the reads routed through
+// mla_kv_idx: test_mla_decode's SQ_LDS_BANK_CONFLICT 1,747,200 -> 0 on the
+// 64-chunk kernels, but the megakernel 4.278 4.276 -> 4.345 4.343 ms (382
+// VGPRs, 384 B scratch). The per-lane bases below (370 VGPRs, 160 B, the 8
+// extra in AGPRs) make the standalone kernels 2-4% faster instead, e.g. the
+// 64-chunk pair 13.04 / 13.81 -> 12.49 / 13.64 us; 60/60 both budgets.
+// Megakernel NULL 2026-10-11 on MPK_WUK_EARLY_PF + MPK_ROPE_REMAP: 4.130 vs
+// 4.132 4.128 ms. Off.
+#ifndef MPK_MLA_KV_SWZ
+#define MPK_MLA_KV_SWZ 0
+#endif
 #ifndef MPK_MLA_OACC_VGPR
 #define MPK_MLA_OACC_VGPR 1
 #endif
@@ -368,6 +382,25 @@ __device__ __forceinline__ T ld_g(void const *p) {
   return *(__attribute__((address_space(1))) T const *)q;
 }
 
+// MPK_MLA_KV_SWZ: LDS chunk q (16 B) of the tile -- row q / 72, chunk c --
+// holds the row's chunk c ^ (row >> 1). Rows are 72 chunks (576 bf16), 8 mod 16,
+// so unswizzled the 16 rows a QK ds_read_b128 spans sit on two of gfx950's 16
+// 16-byte bank groups (8-way); swizzled, chunk ^ rotl(row) covers all 16.
+// Returns the byte offset into the source tile for LDS chunk q.
+__device__ __forceinline__ unsigned mla_kv_swz_src(unsigned q) {
+  unsigned const r = q / 72u;
+  unsigned const c = q - r * 72u;
+  return (r * 72u + (c ^ (r >> 1))) * 16u;
+}
+// Element (row, d) of a KV tile in LDS, in bf16 units; see mla_kv_swz_src.
+template <int QK_DIM>
+__device__ __forceinline__ int mla_kv_idx(int row, int d) {
+#if MPK_MLA_KV_SWZ
+  return row * QK_DIM + ((((d >> 3) ^ (row >> 1)) << 3) | (d & 7));
+#else
+  return row * QK_DIM + d;
+#endif
+}
 #if MPK_MLA_DECODE_DMA_PF || MPK_MLA_DECODE_BATCH || MPK_DEC_PRELOAD
 typedef int __attribute__((ext_vector_type(4))) mla_i32x4_t;
 
@@ -403,6 +436,46 @@ __device__ __forceinline__ void mla_dma_tile(mla_i32x4_t rsrc,
                                              bool tail_wave) {
   unsigned const m1 = m0_base + 4096u, m2 = m0_base + 8192u,
                  m3 = m0_base + 12288u, m4 = m0_base + 16384u;
+#if MPK_MLA_KV_SWZ
+  // voff is tid * 16; round k fills LDS chunks 256 k + tid.
+  unsigned const q0 = voff / 16u;
+  unsigned const v0 = mla_kv_swz_src(q0), v1 = mla_kv_swz_src(q0 + 256u),
+                 v2 = mla_kv_swz_src(q0 + 512u), v3 = mla_kv_swz_src(q0 + 768u),
+                 v4 = mla_kv_swz_src(q0 + 1024u < 1152u ? q0 + 1024u : 0u);
+  unsigned const z = 0u;
+  if (tail_wave) {
+    asm volatile("s_mov_b32 m0, %[m0]\n\ts_nop 0\n\t"
+                 "buffer_load_dwordx4 %[v0], %[rsrc], %[z] offen lds\n\t"
+                 "s_mov_b32 m0, %[m1]\n\ts_nop 0\n\t"
+                 "buffer_load_dwordx4 %[v1], %[rsrc], %[z] offen lds\n\t"
+                 "s_mov_b32 m0, %[m2]\n\ts_nop 0\n\t"
+                 "buffer_load_dwordx4 %[v2], %[rsrc], %[z] offen lds\n\t"
+                 "s_mov_b32 m0, %[m3]\n\ts_nop 0\n\t"
+                 "buffer_load_dwordx4 %[v3], %[rsrc], %[z] offen lds\n\t"
+                 "s_mov_b32 m0, %[m4]\n\ts_nop 0\n\t"
+                 "buffer_load_dwordx4 %[v4], %[rsrc], %[z] offen lds"
+                 :
+                 : [rsrc] "s"(rsrc), [z] "s"(z), [v0] "v"(v0), [v1] "v"(v1),
+                   [v2] "v"(v2), [v3] "v"(v3), [v4] "v"(v4), [m0] "s"(m0_base),
+                   [m1] "s"(m1), [m2] "s"(m2), [m3] "s"(m3), [m4] "s"(m4)
+                 : "memory", "m0");
+  } else {
+    asm volatile("s_mov_b32 m0, %[m0]\n\ts_nop 0\n\t"
+                 "buffer_load_dwordx4 %[v0], %[rsrc], %[z] offen lds\n\t"
+                 "s_mov_b32 m0, %[m1]\n\ts_nop 0\n\t"
+                 "buffer_load_dwordx4 %[v1], %[rsrc], %[z] offen lds\n\t"
+                 "s_mov_b32 m0, %[m2]\n\ts_nop 0\n\t"
+                 "buffer_load_dwordx4 %[v2], %[rsrc], %[z] offen lds\n\t"
+                 "s_mov_b32 m0, %[m3]\n\ts_nop 0\n\t"
+                 "buffer_load_dwordx4 %[v3], %[rsrc], %[z] offen lds"
+                 :
+                 : [rsrc] "s"(rsrc), [z] "s"(z), [v0] "v"(v0), [v1] "v"(v1),
+                   [v2] "v"(v2), [v3] "v"(v3), [m0] "s"(m0_base),
+                   [m1] "s"(m1), [m2] "s"(m2), [m3] "s"(m3)
+                 : "memory", "m0");
+  }
+  return;
+#endif
   unsigned const s0 = 0u, s1 = 4096u, s2 = 8192u, s3 = 12288u, s4 = 16384u;
   if (tail_wave) {
     asm volatile(MLA_DMA_ROUND("m0", "s0") MLA_DMA_ROUND("m1", "s1")
@@ -1048,6 +1121,20 @@ __device__ __noinline__ void
   // 256 threads x 4 elements = 16 tok x 64 dim per round, LDG_PER_TILE rounds
   int const my_tok = tid / 16;
   int const my_dim0 = (tid % 16) * 4;
+#if MPK_MLA_KV_SWZ
+  // 16-byte chunk c of tile row r sits at c ^ (r >> 1). Per lane that is one
+  // register-path write column, two QK bases (even / odd k-chunk) and two PV
+  // bases (rows kgrp*4 + {0,1} / {2,3}), each taking immediate offsets.
+  int const my_wcol = (((my_dim0 >> 3) ^ (my_tok >> 1)) << 3) | (my_dim0 & 7);
+  int const kswz_f = midx >> 1;
+  int const kswz_lane = midx * QK_DIM + ((kgrp ^ (kswz_f & 3)) << 3);
+  int const kswz_e = kswz_lane + ((kswz_f >> 2) << 5);
+  int const kswz_o = kswz_lane - ((kswz_f >> 2) << 5);
+  int const vswz_h = (2 * warp_id + (midx >> 3)) ^ (2 * kgrp);
+  int const vswz_b0 = kgrp * 4 * QK_DIM + (vswz_h << 3) + (midx & 7);
+  int const vswz_b2 =
+      kgrp * 4 * QK_DIM + 2 * QK_DIM + ((vswz_h ^ 1) << 3) + (midx & 7);
+#endif
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   // Slot 2 is free on the MXFP8 fused path (its only other user is
@@ -1187,6 +1274,10 @@ __device__ __noinline__ void
     for (int j = 0; j < Q_PER; j++) {
       q_lds[tid + 256 * j] = (unsigned)w[j];
     }
+    // Trace stamp 67: the query words validated, before the cache-row flag.
+    if (tid == 0) {
+      mpk_stage_stamp(67);
+    }
     if (kv_flag != nullptr && tid == 0 && chunk_last_tile >= ntiles) {
       while (true) {
         unsigned long long f;
@@ -1325,7 +1416,11 @@ __device__ __noinline__ void
             uint64_t val;
             __builtin_memcpy(&val, &v, 8);
             auto *dst = (__attribute__((address_space(3))) uint64_t *)&bkv
+#if MPK_MLA_KV_SWZ
+                            [my_tok * QK_DIM + my_wcol + r * 64];
+#else
                             [my_tok * QK_DIM + my_dim0 + r * 64];
+#endif
             *dst = val;
           }
         } else {
@@ -1333,7 +1428,11 @@ __device__ __noinline__ void
 #pragma unroll
           for (int r = 0; r < LDG_PER_TILE; r++) {
             auto *dst = (__attribute__((address_space(3))) uint64_t *)&bkv
+#if MPK_MLA_KV_SWZ
+                            [my_tok * QK_DIM + my_wcol + r * 64];
+#else
                             [my_tok * QK_DIM + my_dim0 + r * 64];
+#endif
             *dst = zero8;
           }
         }
@@ -1369,7 +1468,11 @@ __device__ __noinline__ void
           uint64_t val;
           __builtin_memcpy(&val, &v, 8);
           auto *dst = (__attribute__((address_space(3))) uint64_t *)&cur_kv
+#if MPK_MLA_KV_SWZ
+                          [my_tok * QK_DIM + my_wcol + r * 64];
+#else
                           [my_tok * QK_DIM + my_dim0 + r * 64];
+#endif
           *dst = val;
         }
       } else {
@@ -1377,7 +1480,11 @@ __device__ __noinline__ void
 #pragma unroll
         for (int r = 0; r < LDG_PER_TILE; r++) {
           auto *dst = (__attribute__((address_space(3))) uint64_t *)&cur_kv
+#if MPK_MLA_KV_SWZ
+                          [my_tok * QK_DIM + my_wcol + r * 64];
+#else
                           [my_tok * QK_DIM + my_dim0 + r * 64];
+#endif
           *dst = zero8;
         }
       }
@@ -1416,11 +1523,17 @@ __device__ __noinline__ void
 #pragma unroll
       for (int kc = 0; kc < NUM_K32; kc += 2) {
         __bf16 kr0[8], kr1[8];
+#if MPK_MLA_KV_SWZ
+        __bf16 const *k_ptr = &cur_kv[kswz_e + kc * 32];
+        __bf16 const *k_ptr1 = &cur_kv[kswz_o + (kc + 1) * 32];
+#else
         __bf16 const *k_ptr = &cur_kv[midx * QK_DIM + kc * 32 + kgrp * 8];
+        __bf16 const *k_ptr1 = k_ptr + 32;
+#endif
 #pragma unroll
         for (int i = 0; i < 8; i++) {
           kr0[i] = k_ptr[i];
-          kr1[i] = k_ptr[32 + i];
+          kr1[i] = k_ptr1[i];
         }
         gang_mla_decode_detail::mla_qk_acc2_mfma<0>(kr0, qr[kc]);
         gang_mla_decode_detail::mla_qk_acc2_mfma<1>(kr1, qr[kc + 1]);
@@ -1431,7 +1544,11 @@ __device__ __noinline__ void
 #pragma unroll
       for (int kc = 0; kc < NUM_K32; kc++) {
         __bf16 kr[8];
+#if MPK_MLA_KV_SWZ
+        __bf16 const *k_ptr = &cur_kv[((kc & 1) ? kswz_o : kswz_e) + kc * 32];
+#else
         __bf16 const *k_ptr = &cur_kv[midx * QK_DIM + kc * 32 + kgrp * 8];
+#endif
 #pragma unroll
         for (int i = 0; i < 8; i++) {
           kr[i] = k_ptr[i];
@@ -1488,12 +1605,19 @@ __device__ __noinline__ void
 #pragma unroll
         for (int vb = 0; vb < NUM_V_BLOCKS; vb++) {
           bf16x4_t va;
+#if MPK_MLA_KV_SWZ
+          va[0] = cur_kv[vswz_b0 + vb * 64];
+          va[1] = cur_kv[vswz_b0 + QK_DIM + vb * 64];
+          va[2] = cur_kv[vswz_b2 + vb * 64];
+          va[3] = cur_kv[vswz_b2 + QK_DIM + vb * 64];
+#else
           __bf16 const *v_ptr =
               &cur_kv[(kgrp * 4) * QK_DIM + vb * 64 + warp_id * 16 + midx];
           va[0] = v_ptr[0 * QK_DIM];
           va[1] = v_ptr[1 * QK_DIM];
           va[2] = v_ptr[2 * QK_DIM];
           va[3] = v_ptr[3 * QK_DIM];
+#endif
           __builtin_memcpy(&vau[vb], &va, 8);
           o_acc_r[vb] *= rescale;
         }
@@ -1505,12 +1629,19 @@ __device__ __noinline__ void
 #pragma unroll
       for (int vb = 0; vb < NUM_V_BLOCKS; vb++) {
         bf16x4_t va;
+#if MPK_MLA_KV_SWZ
+        va[0] = cur_kv[vswz_b0 + vb * 64];
+        va[1] = cur_kv[vswz_b0 + QK_DIM + vb * 64];
+        va[2] = cur_kv[vswz_b2 + vb * 64];
+        va[3] = cur_kv[vswz_b2 + QK_DIM + vb * 64];
+#else
         __bf16 const *v_ptr =
             &cur_kv[(kgrp * 4) * QK_DIM + vb * 64 + warp_id * 16 + midx];
         va[0] = v_ptr[0 * QK_DIM];
         va[1] = v_ptr[1 * QK_DIM];
         va[2] = v_ptr[2 * QK_DIM];
         va[3] = v_ptr[3 * QK_DIM];
+#endif
         if (vb == 0) {
           mla_flash_pv_b0<KV_LDS_BYTES>(oacc_base, rescale, va, pb);
         } else if (vb == 1) {

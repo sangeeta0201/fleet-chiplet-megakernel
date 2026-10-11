@@ -1280,7 +1280,11 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
                               unsigned short *__restrict__ s_nw,
                               int *xs,
                               unsigned epoch,
-                              int wg_idx) {
+                              int wg_idx,
+                              // MPK_QXS_ROW_LL: this XCD's resolved row as
+                              // (epoch << 32 | bf16x2) words in its L2; the
+                              // tiles validate the words instead of a flag.
+                              unsigned long long *row_ll = nullptr) {
   constexpr int VEC = 4;
   constexpr int NTHREADS = 256;
   constexpr int ITERS = REDUCTION_SIZE / (NTHREADS * VEC);
@@ -1322,6 +1326,7 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
       unsigned long long const *const ll =
           reinterpret_cast<unsigned long long const *>(d_res);
       ll_u4_t w[EP_PEER_SLOTS];
+      int ll_pass = 0;
       while (true) {
         bool ok = true;
         if (tid < XS_F4) {
@@ -1341,7 +1346,13 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
         if (MPK_PROBE_XRANK_NOWAIT == 1 || MPK_PROBE_XRANK_NOWAIT == 3) {
           ok = true;
         }
-        if (__syncthreads_and(ok)) {
+        bool const all_ok = __syncthreads_and(ok);
+        // Trace stamps 70/71: the slots' first validation pass returned, and
+        // every slot word validated.
+        if (threadIdx.x == 0 && ++ll_pass == 1) {
+          mpk_stage_stamp(70);
+        }
+        if (all_ok) {
           break;
         }
         if (MPK_XS_POLL_FULL) {
@@ -1356,6 +1367,9 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
           }
         }
         __syncthreads();
+      }
+      if (threadIdx.x == 0) {
+        mpk_stage_stamp(71);
       }
       if (tid < XS_F4) {
         r = make_uint2(w[0][0], w[0][2]);
@@ -1396,10 +1410,21 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
         ((unsigned long long)((unsigned)_gang_float_to_bf16(f[2]) |
                               ((unsigned)_gang_float_to_bf16(f[3]) << 16))
          << 32);
-    asm volatile("global_store_dwordx2 %0, %1, off"
-                 :
-                 : "v"(row + off), "v"(packed)
-                 : "memory");
+    if (MPK_QXS_ROW_LL && row_ll != nullptr) {
+      unsigned long long const eh = (unsigned long long)epoch << 32;
+      unsigned long long const w0 = eh | (unsigned)packed;
+      unsigned long long const w1 = eh | (unsigned)(packed >> 32);
+      asm volatile("global_store_dwordx2 %0, %1, off\n"
+                   "global_store_dwordx2 %0, %2, off offset:8"
+                   :
+                   : "v"(row_ll + off / 2), "v"(w0), "v"(w1)
+                   : "memory");
+    } else {
+      asm volatile("global_store_dwordx2 %0, %1, off"
+                   :
+                   : "v"(row + off), "v"(packed)
+                   : "memory");
+    }
     // Every XCD resolves every slice, as every XCD's tile 0 stored the whole
     // row before; the stores are idempotent.
 #if MPK_QXS_XOUT_PLAIN_PROBE
@@ -1413,6 +1438,28 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
     st_wt_u64((void *)(d_x_out + off), packed);
 #endif
   }
+  float ssq = 0.0f;
+  unsigned long long rv[ITERS];
+  if (MPK_QXS_ROW_LL && row_ll != nullptr) {
+    while (true) {
+      bool ok = true;
+#pragma unroll
+      for (int v = 0; v < ITERS; v++) {
+        unsigned long long const *const wp =
+            row_ll + ((v * NTHREADS + tid) * VEC) / 2;
+        unsigned long long const w0 = __builtin_nontemporal_load(wp);
+        unsigned long long const w1 = __builtin_nontemporal_load(wp + 1);
+        ok = ok && (unsigned)(w0 >> 32) == epoch &&
+             (unsigned)(w1 >> 32) == epoch;
+        rv[v] = (unsigned long long)(unsigned)w0 |
+                ((unsigned long long)(unsigned)w1 << 32);
+      }
+      if (__syncthreads_and(ok)) {
+        break;
+      }
+      __builtin_amdgcn_s_sleep(1);
+    }
+  } else {
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
   __syncthreads();
   if (wg_idx < XS_N && tid == 0) {
@@ -1439,13 +1486,11 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
     }
   }
   __syncthreads();
-
-  float ssq = 0.0f;
-  unsigned long long rv[ITERS];
 #pragma unroll
   for (int v = 0; v < ITERS; v++) {
     rv[v] = __builtin_nontemporal_load(reinterpret_cast<unsigned long long const *>(
         row + (v * NTHREADS + tid) * VEC));
+  }
   }
 #pragma unroll
   for (int v = 0; v < ITERS; v++) {
@@ -2372,7 +2417,9 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
     // this XCD's L2 for a same-XCD consumer polling with nt loads.
     unsigned long long *ll_out = nullptr,
     unsigned ll_epoch = 0,
-    int ll_cols = 0) {
+    int ll_cols = 0,
+    // MPK_QXS_ROW_LL: this XCD's resolved-row words; see the split resolve.
+    unsigned long long *qxs_row_ll = nullptr) {
 
   static_assert(OUTPUT_PER_WG % 16 == 0,
                 "OUTPUT_PER_WG must be multiple of 16");
@@ -2687,7 +2734,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp8_bias_kernel(
             s_nw_bf16,
             qxs,
             qxs_epoch,
-            wg_idx);
+            wg_idx,
+            qxs_row_ll);
         qxs_done = true;
       }
     }

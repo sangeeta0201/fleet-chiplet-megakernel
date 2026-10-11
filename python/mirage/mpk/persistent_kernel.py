@@ -1629,6 +1629,14 @@ def get_compile_command(
             "MPK_XS_POLL_FULL",
             "MPK_LL_POLL_GATE",
             "MPK_OPROJ_SKIP_TOPK",
+            "MPK_QXS_ROW_LL",
+            "MPK_TOPK_4W",
+            "MPK_MLA_KV_SWZ",
+            "MPK_WUK_EARLY_PF",
+            "MPK_ROPE_REMAP",
+            "MPK_W13_NO_ARRIVE",
+            "MPK_W13_BIAS_PRE",
+            "MPK_KS_SSQ_NT",
             "MPK_ATTN_PROBE_NOQKVWAIT",
             "MPK_ENTRY_NOWAIT",
             "MPK_DEC_HINTS",
@@ -1653,6 +1661,14 @@ def get_compile_command(
         if _x is not None:
             assert _x.isdigit() and 0 <= int(_x) <= 8, "MPK_OPROJ_SHIFT is 0..8"
             flags = flags + [f"-DMPK_OPROJ_SHIFT={_x}"]
+        _x = os.environ.get("MPK_W2_PF_MODE")
+        if _x is not None:
+            assert _x in ("0", "1", "2"), "MPK_W2_PF_MODE is 0..2"
+            flags = flags + [f"-DMPK_W2_PF_MODE={_x}"]
+        _x = os.environ.get("MPK_TAG_DIRECT_SITES")
+        if _x is not None:
+            assert _x.isdigit() and 0 <= int(_x) <= 31, "MPK_TAG_DIRECT_SITES is 0..31"
+            flags = flags + [f"-DMPK_TAG_DIRECT_SITES={_x}"]
         _x = os.environ.get("MPK_PROBE_XRANK_NOWAIT")
         if _x is not None:
             assert _x in ("0", "1", "2", "3"), "MPK_PROBE_XRANK_NOWAIT is 0..3"
@@ -3972,6 +3988,10 @@ class PersistentKernel:
             # FULL_LAYER_QLL_SLOT's 320 lines of query words + the KV flag.
             counter_slots = (644 + 8 * 194 + 32 + 8 * 36 + 8 * 194 + 8 * 48
                              + 144 + 256 + 1536 + 512 + 128 + 320)
+        if os.environ.get("MPK_QXS_ROW_LL", "0") == "1":
+            # FULL_LAYER_QXSLL_SLOT's 8 x 384 lines of resolved-row words.
+            counter_slots = (644 + 8 * 194 + 32 + 8 * 36 + 8 * 194 + 8 * 48
+                             + 144 + 256 + 1536 + 512 + 128 + 320 + 3072)
         assert counters.dim(0) >= counter_slots * 16, (
             f"the fused layer needs {counter_slots * 16} int32 of counters, "
             f"got {counters.dim(0)}")

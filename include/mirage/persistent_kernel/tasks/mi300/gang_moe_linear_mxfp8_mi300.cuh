@@ -2477,8 +2477,25 @@ __device__ __noinline__ void
   // Phase 2 epilogue, hoisted out of both parallelization branches. `acc`
   // holds one lane's four output columns, starting at out_base; at one token
   // per tile only col 0 carries a result, so every caller guards on that.
+#if MPK_W13_BIAS_PRE
+  auto emit = [&](f32x4_t const &acc, int const out_base,
+                  uint2 const *bias_pre = nullptr) {
+    unsigned short const *bias_row = d_bias + local_eid * OUTPUT_STRIDE;
+    auto bias_at = [&](int out_n) -> float {
+      if (bias_pre != nullptr) {
+        unsigned const w = (out_n - out_base) < 2 ? bias_pre->x : bias_pre->y;
+        return _gang_bf16_to_float(
+            (unsigned short)(((out_n - out_base) & 1) ? (w >> 16) : (w & 0xFFFFu)));
+      }
+      return _gang_bf16_to_float(bias_row[out_n]);
+    };
+#else
   auto emit = [&](f32x4_t const &acc, int const out_base) {
     unsigned short const *bias_row = d_bias + local_eid * OUTPUT_STRIDE;
+    auto bias_at = [&](int out_n) -> float {
+      return _gang_bf16_to_float(bias_row[out_n]);
+    };
+#endif
 
     if constexpr (FUSE_SWIGLU) {
       constexpr int ACT_STRIDE = OUTPUT_STRIDE / 2;
@@ -2500,9 +2517,8 @@ __device__ __noinline__ void
 #pragma unroll
         for (int p = 0; p < 2; p++) {
           int const out_n = out_base + 2 * p;
-          float const gate = acc[2 * p] + _gang_bf16_to_float(bias_row[out_n]);
-          float const up =
-              acc[2 * p + 1] + _gang_bf16_to_float(bias_row[out_n + 1]);
+          float const gate = acc[2 * p] + bias_at(out_n);
+          float const up = acc[2 * p + 1] + bias_at(out_n + 1);
           s_act[act_local + p] = fast_silu(gate) * up;
         }
         return;
@@ -2512,9 +2528,8 @@ __device__ __noinline__ void
         int const out_n = out_base + 2 * p;
         act_ok[p] = (out_n + 1 < OUTPUT_SIZE);
         if (act_ok[p]) {
-          float const gate = acc[2 * p] + _gang_bf16_to_float(bias_row[out_n]);
-          float const up =
-              acc[2 * p + 1] + _gang_bf16_to_float(bias_row[out_n + 1]);
+          float const gate = acc[2 * p] + bias_at(out_n);
+          float const up = acc[2 * p + 1] + bias_at(out_n + 1);
           act[p] = _gang_float_to_bf16(fast_silu(gate) * up);
         }
       }
@@ -2626,6 +2641,14 @@ __device__ __noinline__ void
         (MPK_MOE_KMAJOR >= 2 ? rg * (16 * NUM_BLOCKS_32) + col * 4
                              : w_row * NUM_BLOCKS_32) +
         kh * KH * _gang_moe_sc_kstride();
+#if MPK_W13_BIAS_PRE
+    int const emit_base = wg_idx * OUTPUT_PER_WG + rg * 16 + g * 4;
+    uint2 bias_q = {0u, 0u};
+    if (FUSE_SWIGLU && kh == 0 && col == 0) {
+      bias_q = *reinterpret_cast<uint2 const *>(
+          d_bias + local_eid * OUTPUT_STRIDE + emit_base);
+    }
+#endif
     f32x4_t acc = _gang_moe_kloop<WEIGHT_FP4, false, MPK_MOE_PF_GROUPS_W13, KH,
                                   (bool)MPK_MOE_PF_DBUF_W13>(
         w_data_row, wg_scales, row_scale_base,
@@ -2645,7 +2668,11 @@ __device__ __noinline__ void
       for (int i = 0; i < 4; i++) {
         acc[i] += s_reduce[rg * 16 + g * 4 + i];
       }
+#if MPK_W13_BIAS_PRE
+      emit(acc, emit_base, FUSE_SWIGLU ? &bias_q : nullptr);
+#else
       emit(acc, wg_idx * OUTPUT_PER_WG + rg * 16 + g * 4);
+#endif
     }
   } else if constexpr (!K_PARALLEL) {
   for (int tile_iter = 0; tile_iter < TILES_PER_WAVE; tile_iter++) {

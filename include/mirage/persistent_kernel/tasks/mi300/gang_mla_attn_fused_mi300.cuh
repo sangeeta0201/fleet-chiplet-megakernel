@@ -236,7 +236,9 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     // MPK_WUK_LL: eight per-XCD blocks of FULL_LAYER_WUKLL_XCD_WORDS words.
     unsigned long long *wuk_ll = nullptr,
     // MPK_DEC_Q_LL: the own heads' query rows as words, then the KV flag.
-    unsigned long long *dec_q_ll = nullptr) {
+    unsigned long long *dec_q_ll = nullptr,
+    // MPK_QXS_ROW_LL: eight per-XCD blocks of the resolved row as words.
+    unsigned long long *qxs_row_ll = nullptr) {
 
   int const tid = threadIdx.x;
   int const xcd_id = tile_idx / tiles_per_xcd;
@@ -905,7 +907,13 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         pro_pub,
         /*logits_row=*/0,
         qkv_xsplit ? qkv_xsplit + xcd_id * MPK_XSPLIT_XCD_INTS : nullptr,
-        (unsigned)qkv_expected);
+        (unsigned)qkv_expected,
+        /*ll_out=*/nullptr,
+        /*ll_epoch=*/0u,
+        /*ll_cols=*/0,
+        (qkv_xsplit != nullptr && qxs_row_ll != nullptr)
+            ? qxs_row_ll + (size_t)xcd_id * (QKV_REDUCTION_SIZE / 2)
+            : nullptr);
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     if (tid == 0 && g_subphase_active) {
       atomicAdd(&g_subphase_ns[0][0],
@@ -933,6 +941,33 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // cheap fence sufficient.
   __syncthreads();
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#if MPK_WUK_EARLY_PF
+  // Waves 1-3 only, into the same never-read LDS window as MPK_WUK_PF. Their
+  // next counted wait is q_b's first weight load, also an HBM fetch.
+  if constexpr (UNABSORB_K) {
+    if (xcd_rank < wuk_tiles_per_xcd && tid >= 64 && wuk_weight_ptr != nullptr) {
+      constexpr int WEP_WG_BYTES =
+          WUK_ROWS_PER_WG * (QK_NOPE_HEAD_DIM + QK_NOPE_HEAD_DIM / 32);
+      extern __shared__ char _wep_smem[];
+      i32x4_t const wep_rsrc = make_w_buffer_rsrc(
+          static_cast<char const *>(wuk_weight_ptr) +
+              static_cast<size_t>(xcd_rank) * WEP_WG_BYTES,
+          WEP_WG_BYTES);
+      auto *wep_dst = (__attribute__((address_space(3))) uint32_t *)(
+          _wep_smem + 140 * 1024 + ((tid >> 6) - 1) * 1024);
+      int wep_voff = (tid - 64) * 16;
+      constexpr int WEP_LAST = WEP_WG_BYTES - 16;
+      constexpr int WEP_N = (WEP_WG_BYTES + 192 * 16 - 1) / (192 * 16);
+#pragma unroll
+      for (int i = 0; i < WEP_N; i++) {
+        int const v = wep_voff < WEP_LAST ? wep_voff : WEP_LAST;
+        __llvm_amdgcn_raw_buffer_load_lds(wep_rsrc, wep_dst, 16, v, 0, 0, 1);
+        wep_voff += 192 * 16;
+        asm volatile("" : "+v"(wep_voff) : : "memory");
+      }
+    }
+  }
+#endif
 #if MPK_QB_SELF_PF
   // MPK_QB_SELF_PF: each q_b tile's waves 1-3 pull its weight slab into L2
   // while the block waits on this rendezvous. Not wave 0: its tid 0 arrives
@@ -989,7 +1024,8 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     if (tid == 0) {
       tag_bar_arrive(tags, xcd_id * tiles_per_xcd + xcd_rank, qkv_expected);
     }
-    tag_bar_wait_site(tags, arrivals, qkv_expected, tid, xcd_id, xcd_rank);
+    tag_bar_wait_site(tags, arrivals, qkv_expected, tid, xcd_id, xcd_rank,
+                      (MPK_TAG_DIRECT_SITES & MPK_TAGBAR_QKV) != 0);
   } else if (tid == 0) {
     // Modular test rather than a reset: the counter is monotonic for the
     // whole run, so no worker from the next layer can observe a zeroed one.
@@ -1190,6 +1226,8 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     if (tid == 0) {
       st_wt_u64((void *)dq_flag,
                 ((unsigned long long)(unsigned)qb_expected << 32) | 1ull);
+      // Trace stamp 66: the cache-row flag published.
+      mpk_stage_stamp(66);
     }
   }
   if constexpr (UNABSORB_K) {
@@ -1232,7 +1270,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
       __syncthreads();
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
-#if MPK_WUK_PF
+#if MPK_WUK_PF && !MPK_WUK_EARLY_PF
     // MPK_WUK_PF: the W_UK tile's weight does not depend on q_nope, so waves
     // 1-3 pull it into L2 while wave 0 arrives and polls; the __syncthreads
     // after the wait retires it. Same never-read LDS window as the decode's
@@ -1367,6 +1405,9 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
       rope_pos = global_seq_len - num_tokens;
     }
 
+    bool const rope_remap = MPK_ROPE_REMAP && wk_ll &&
+                            wuk_tiles_per_xcd == TILES_PER_HEAD &&
+                            wuk_tiles_per_xcd < tiles_per_xcd;
     for (int t = xcd_rank; t < wuk_tiles_per_xcd; t += tiles_per_xcd) {
       int const heads_per_xcd = wuk_tiles_per_xcd / TILES_PER_HEAD;
       int const head = qb_head_base + xcd_id * heads_per_xcd +
@@ -1399,6 +1440,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
           (unsigned)wuk_expected_in,
           dq_ll ? dec_q_ll + (size_t)xcd_id * QLL_HEAD_WORDS : nullptr,
           (unsigned)qb_expected);
+      // Trace stamps 64/65: W_UK GEMV returned, the head's rope tail done.
+      if (tid == 0) {
+        mpk_stage_stamp(64);
+      }
       // Push the rows this workgroup just produced straight into every peer's
       // copy of the query row, at the identical offset. The head slices are
       // disjoint across ranks, so the all-gather is QB_NPEER stores of those
@@ -1426,7 +1471,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
       // rope_tile_inplace has a __syncthreads in it, so the guard has to be
       // block-uniform; t and TILES_PER_HEAD both are.
       if constexpr (QB_DEFER_ROPE) {
-        if ((t % TILES_PER_HEAD) == TILES_PER_HEAD - 1) {
+        if (!rope_remap && (t % TILES_PER_HEAD) == TILES_PER_HEAD - 1) {
           using rope_bf16 = gang_mla_kvupd_detail::bf16;
           // One rotation per live token row. Both scratch rows are declared at
           // the full head count on every rank (see the QB_TP note above), so
@@ -1464,6 +1509,9 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
                     static_cast<size_t>(r) * NUM_Q_HEADS * QK_DIM_ +
                     static_cast<size_t>(head) * QK_DIM_ + KV_LORA_RANK);
           }
+          if (tid == 0) {
+            mpk_stage_stamp(65);
+          }
         }
       }
       if (qb_push) {
@@ -1500,6 +1548,28 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
       ++_wuk_tiles;
 #endif
+    }
+    if constexpr (QB_DEFER_ROPE) {
+      if (rope_remap && xcd_rank == wuk_tiles_per_xcd) {
+        using rope_bf16 = gang_mla_kvupd_detail::bf16;
+        int const head = qb_head_base + xcd_id;
+        gang_mla_kvupd_detail::rope_tile_from_ll<QK_ROPE_HEAD_DIM,
+                                                 /*WRITE_THROUGH=*/true>(
+            wk_words + QK_NOPE_HEAD_DIM / 2, (unsigned)wuk_expected_in,
+            reinterpret_cast<rope_bf16 const *>(cos_ptr) +
+                static_cast<size_t>(rope_pos) * QK_ROPE_HEAD_DIM,
+            reinterpret_cast<rope_bf16 const *>(sin_ptr) +
+                static_cast<size_t>(rope_pos) * QK_ROPE_HEAD_DIM,
+            reinterpret_cast<rope_bf16 *>(q_workspace_ptr) +
+                static_cast<size_t>(head) * QK_DIM_ + KV_LORA_RANK,
+            dq_ll ? dec_q_ll + (size_t)xcd_id * QLL_HEAD_WORDS +
+                        KV_LORA_RANK / 2
+                  : nullptr,
+            (unsigned)qb_expected);
+        if (tid == 0) {
+          mpk_stage_stamp(65);
+        }
+      }
     }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     {
@@ -1952,7 +2022,8 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   if (MPK_ATTN_PROBE_NODECWAIT || (dm_ll && MPK_DML_DBG == 0)) {
   } else if (dec_tagged) {
     tag_bar_wait_site(dec_tags, dec_arrivals, decode_expected, tid, xcd_id,
-                      xcd_rank);
+                      xcd_rank,
+                      (MPK_TAG_DIRECT_SITES & MPK_TAGBAR_DECODE) != 0);
   } else if (tid == 0) {
     // Self-heal, see MPK_FL_REPUBLISH_SPINS. Note the arrival above is
     // unconditional but this wait is merge-ranks-only, so the counter still

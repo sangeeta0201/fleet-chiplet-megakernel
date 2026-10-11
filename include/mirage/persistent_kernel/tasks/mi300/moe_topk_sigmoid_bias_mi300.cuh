@@ -71,6 +71,15 @@
 // NEUTRAL 2026-10-09, NP=8 1024/1024: 5.684 5.710 5.699 -> 5.696 5.690
 // 5.700 5.697 ms. The selection is ~330 dependent instructions on ONE wave
 // (160 of them min/max), so it is issue-bound, not shuffle-bound. Off.
+// MPK_TOPK_4W: the selection on all four waves; see the block after
+// MPK_TOPK_RANK's in topk_sigmoid_bias_mi300_task_impl. Bit-identical to the
+// sort-then-merge network over 200 seeds, but MEASURED NEGATIVE 2026-10-11,
+// NP=8 1024/1024: 4.243 4.246 -> 4.299 4.306 ms (+0.06). Re-measured on the
+// same stack, MPK_TOPK_WIN_SHFL 4.234 4.253 -> 4.270 4.267 (worse),
+// MPK_TOPK_SKIP_CLEARS 4.245 4.237 and MPK_TOPK_DPP 4.232 4.228 (null).
+#ifndef MPK_TOPK_4W
+#define MPK_TOPK_4W 0
+#endif
 #ifndef MPK_TOPK_DPP
 #define MPK_TOPK_DPP 0
 #endif
@@ -368,6 +377,72 @@ __device__ __forceinline__ void topk_sigmoid_bias_mi300_task_impl(
         for (int i = 0; i < 8; ++i) {
           rk_expert[i] = (int)s_key[i];
           rk_val[i] = __uint_as_float(s_key[8 + i]);
+          rk_sum += rk_val[i];
+        }
+      }
+      rank_done = true;
+    }
+  }
+  // MPK_TOPK_4W: the same keys (24-bit score, 8-bit expert) on all four
+  // waves, one per lane: each wave bitonic-sorts its 64 descending, its top 8
+  // go to LDS with their unbiased scores, and wave 0 sorts those 32 carrying
+  // the scores. Winners, order and sum match the sort-then-merge network,
+  // which runs ~330 dependent instructions on 32 lanes of one wave.
+  if constexpr (K_STATIC == 8 && VPT == 8 &&
+                BYTES_PER_LDG / sizeof(T) == VPT && NUM_EXPERTS == 256) {
+    if (MPK_TOPK_4W && !rank_done && rank_lds != nullptr && num_rows == 1 &&
+        k == 8 && (int)MPK_NT == NUM_EXPERTS) {
+      unsigned *const s_ck = rank_lds;
+      float *const s_cv = reinterpret_cast<float *>(rank_lds + 32);
+      int const e = threadIdx.x;
+      int const ln = e & 63;
+      auto x64 = [](unsigned v, int j) -> unsigned {
+        return j < 16 ? _tk_xor_lanes(v, j, 64)
+                      : (unsigned)__shfl_xor((int)v, j, 64);
+      };
+      float const sc = fast_sigmoid(static_cast<float>(input[e]));
+      unsigned b = __float_as_uint(sc + static_cast<float>(bias[e]));
+      b = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+      unsigned key = (b & 0xFFFFFF00u) | (unsigned)e;
+#pragma unroll
+      for (int kk = 2; kk <= 64; kk <<= 1) {
+#pragma unroll
+        for (int j = kk >> 1; j > 0; j >>= 1) {
+          unsigned const o = x64(key, j);
+          bool const keep_max = ((ln & j) == 0) == ((ln & kk) == 0);
+          key = keep_max ? (key > o ? key : o) : (key > o ? o : key);
+        }
+      }
+      // The winner's unbiased score lives on the lane that owns its expert,
+      // which is in this wave: experts [64 w, 64 w + 64).
+      float const wsc = __shfl(sc, (int)(key & 63u), 64);
+      if (ln < 8) {
+        s_ck[(e >> 6) * 8 + ln] = key;
+        s_cv[(e >> 6) * 8 + ln] = wsc;
+      }
+      __syncthreads();
+      if (e < 64) {
+        unsigned ck = ln < 32 ? s_ck[ln] : 0u;
+        float cv = ln < 32 ? s_cv[ln] : 0.f;
+#pragma unroll
+        for (int kk = 2; kk <= 32; kk <<= 1) {
+#pragma unroll
+          for (int j = kk >> 1; j > 0; j >>= 1) {
+            unsigned const ok_ = x64(ck, j);
+            float const ov = __uint_as_float(x64(__float_as_uint(cv), j));
+            bool const keep_max =
+                ((ln & j) == 0) == ((ln & kk) == 0 || kk == 32);
+            bool const take = keep_max ? (ok_ > ck) : (ok_ < ck);
+            ck = take ? ok_ : ck;
+            cv = take ? ov : cv;
+          }
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          rk_expert[i] = (int)((unsigned)__builtin_amdgcn_readlane((int)ck, i) &
+                               0xFFu);
+          rk_val[i] = __uint_as_float(
+              (unsigned)__builtin_amdgcn_readlane((int)__float_as_uint(cv), i));
           rk_sum += rk_val[i];
         }
       }

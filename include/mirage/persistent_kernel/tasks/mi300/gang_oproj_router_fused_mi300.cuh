@@ -2657,12 +2657,17 @@ __device__ __attribute__((always_inline)) void
   // moe_w2_tiles_per_xcd return to the scheduler a whole W2 stage early
   // instead of spinning, which is the same trade Phase 2 makes for o_proj.
   __syncthreads();
-  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  bool const w13_arrive =
+      !(MPK_W13_NO_ARRIVE && w2_act_ll != nullptr && w13_expected_in >= 0);
+  if (w13_arrive) {
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  }
   bool const w13_tagged = (MPK_BAR_TAGGED & MPK_TAGBAR_W13) != 0 &&
                           !MPK_W13_EARLY_REL_ON && bar_tags != nullptr;
   int *const w13_tags =
       w13_tagged ? bar_tags + MPK_TAGBAR_IDX_W13 * MPK_TAGBAR_SLOTS : nullptr;
-  if (tid == 0 && w13_tagged) {
+  if (!w13_arrive) {
+  } else if (tid == 0 && w13_tagged) {
     tag_bar_arrive(w13_tags, xcd_id * tiles_per_xcd + xcd_rank, w13_expected);
   } else if (tid == 0) {
     int const arrivals = tiles_per_xcd * 8;
@@ -2774,10 +2779,21 @@ __device__ __attribute__((always_inline)) void
                                       : 4);
     constexpr int PF_NSEG =
         (MOE_NUM_TOPK + PF_SEG_ROUND - 1) / PF_SEG_ROUND * PF_SEG_ROUND;
-    _gang_w2_tp_l2_prefetch<HIDDEN_SIZE, MOE_INTERMEDIATE, MOE_NUM_TOPK,
-                            MOE_W2_OPW, MOE_WEIGHT_FP4, PF_NSEG,
-                            MPK_MOE_TP_W2_KPARTS>(
-        moe_down_weight_ptr, mrk, ll_route, (unsigned)routing_expected);
+    if (MPK_W2_PF_MODE == 0 || mrk >= moe_w13_live) {
+      _gang_w2_tp_l2_prefetch<HIDDEN_SIZE, MOE_INTERMEDIATE, MOE_NUM_TOPK,
+                              MOE_W2_OPW, MOE_WEIGHT_FP4, PF_NSEG,
+                              MPK_MOE_TP_W2_KPARTS>(
+          moe_down_weight_ptr, mrk, ll_route, (unsigned)routing_expected);
+    }
+    if (MPK_W2_PF_MODE == 2 && mrk >= moe_w13_live) {
+      int const n_idle = moe_w2_live - moe_w13_live;
+      for (int t = mrk - moe_w13_live; t < moe_w13_live; t += n_idle) {
+        _gang_w2_tp_l2_prefetch<HIDDEN_SIZE, MOE_INTERMEDIATE, MOE_NUM_TOPK,
+                                MOE_W2_OPW, MOE_WEIGHT_FP4, PF_NSEG,
+                                MPK_MOE_TP_W2_KPARTS>(
+            moe_down_weight_ptr, t, ll_route, (unsigned)routing_expected);
+      }
+    }
   }
 #endif
   if (w2_act_ll != nullptr) {

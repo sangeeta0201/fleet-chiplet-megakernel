@@ -3123,10 +3123,12 @@ if __name__ == "__main__":
             #   [6388 .. 6899] MPK_DEC_MERGE_LL's decode lse words
             #   [6900 .. 7027] MPK_WUK_LL's q_b head words
             #   [7028 .. 7347] MPK_DEC_Q_LL's query words + cache-row flag
+            #   [7348 .. 10419] MPK_QXS_ROW_LL's resolved-row words
             # Keep in step with FULL_LAYER_COUNTER_SLOTS in
             # gang_mla_full_layer_fused_mi300.cuh.
             (((218 + 4 * 24 + 4 * 16 + 8 * 32 + 9 + 1 + 8 * 194 + 32 + 8 * 36
-               + 8 * 194 + 8 * 48 + 144 + 256 + 1536 + 512 + 128 + 320)
+               + 8 * 194 + 8 * 48 + 144 + 256 + 1536 + 512 + 128 + 320
+               + (3072 if os.environ.get("MPK_QXS_ROW_LL", "0") == "1" else 0))
               if UNABSORB_K or QB_ABS_TP
               else 106 if UNABSORB_V else 96) * 16,),
             torch_dtype=torch.int32)

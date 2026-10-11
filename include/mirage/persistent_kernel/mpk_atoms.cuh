@@ -1253,6 +1253,24 @@ __device__ __forceinline__ bool
 // and no peer-delta lookups under head-local (gang_mla_attn_fused_mi300.cuh).
 // MEASURED NEUTRAL 2026-10-10, NP=8 1024/1024, n=3 interleaved, text
 // identical: 4.779 4.791 4.794 -> 4.794 4.785 4.776 ms. Off.
+// MPK_WUK_EARLY_PF: MPK_WUK_PF's weight pull issued ahead of the qkv_a -> q_b
+// rendezvous instead of after the worker's q_b tile. Under MPK_WUK_LL the
+// W_UK worker whose q_b tile finishes last pays the whole HBM fetch behind
+// it: MPK_TRACE puts its GEMV at 2.76 us after its own q_b tile against
+// 1.40 us after the last q_b tile for workers that finished q_b early.
+// MEASURED 2026-10-11, NP=8 1024/1024, interleaved, text identical:
+// 4.242 4.242 4.248 -> 4.207 4.199 4.204 ms (-0.041). Default on.
+#ifndef MPK_WUK_EARLY_PF
+#define MPK_WUK_EARLY_PF 1
+#endif
+// MPK_ROPE_REMAP: under MPK_WUK_LL the head's rope tail runs on the XCD's
+// first worker past the W_UK tiles instead of after the last W_UK tile's
+// GEMV, which put it 0.7 us behind that GEMV on the decode's query path.
+// MEASURED 2026-10-11, same batch: 4.164 4.165 ms alone (-0.079), 4.130
+// 4.130 with MPK_WUK_EARLY_PF (-0.114). Default on.
+#ifndef MPK_ROPE_REMAP
+#define MPK_ROPE_REMAP 1
+#endif
 #ifndef MPK_WUK_HOIST
 #define MPK_WUK_HOIST 0
 #endif
@@ -1366,9 +1384,19 @@ __device__ __forceinline__ bool
 #ifndef MPK_DEC_Q_LL
 #define MPK_DEC_Q_LL 1
 #endif
+// MPK_QXS_ROW_LL: the qkv_a split resolve's row exchange as epoch words in the
+// XCD's L2 -- no drain, no per-tile flag, no flag poll before the row read.
+// Trace 7: the resolve completes 4.8 us after the attention entry with the
+// folds long done. MEASURED NEGATIVE 2026-10-11, NP=8 1024/1024, interleaved,
+// text identical: 4.243 4.246 4.244 -> 4.278 4.274 4.264 ms (+0.028) -- every
+// qkv_a tile polling 24 KB of row words costs more than the flag hop. Off.
+#ifndef MPK_QXS_ROW_LL
+#define MPK_QXS_ROW_LL 0
+#endif
 // MPK_OPROJ_SKIP_TOPK: under MPK_OPROJ_SHIFT the routing TopK worker holds no
 // o_proj tile either (the tiles past it move up a rank), so its TopK does not
 // drain o_proj stores (trace 6: selection 1.19 us, publish 0.78 us).
+// MEASURED NEGATIVE 2026-10-10: 4.235 4.239 4.246 -> 4.246 4.252 4.245 ms. Off.
 #ifndef MPK_OPROJ_SKIP_TOPK
 #define MPK_OPROJ_SKIP_TOPK 0
 #endif
@@ -1396,6 +1424,11 @@ __device__ __forceinline__ bool
 #ifndef MPK_XS_POLL_FULL
 #define MPK_XS_POLL_FULL 0
 #endif
+// MPK_DEC_MERGE_LL's fault was the merge's LL half inlined into the attention
+// task (64 asm-load outputs; then, with atomic loads, a build that faulted at
+// the first task fetch). Out of line (merge_halves_ll_partials) it runs and
+// matches, but MEASURED 4.259 -> 4.875 ms: all 32 merge items poll the same
+// 512 lse words from right after W_UK, and the merge finishes 5.4 us later.
 // MPK_DML_DBG: MPK_DEC_MERGE_LL bisection. 1: the decode writes its LL words
 // and its normal partials, the merge keeps the barrier and the normal path --
 // ran clean, text identical. 2: LL words only, the merge reads them but still
@@ -1453,6 +1486,43 @@ __device__ __forceinline__ bool
 // (-0.025).
 #ifndef MPK_W2_EARLY_PF
 #define MPK_W2_EARLY_PF 1
+#endif
+// MPK_W2_PF_MODE: which workers issue MPK_W2_EARLY_PF's pull. 0: every W2
+// worker. 1: only the W13-idle ones -- a W13 worker issues it right behind
+// its W13 tile, and its 67 KB of DMA then sits in the CU's memory pipe ahead
+// of the staging poll (MPK_TRACE: staged +3.74 us after the last W13 tile vs
+// +2.18 on W13-idle workers, the same 1.40 us k-loop after). 2: as 1, and
+// each W13-idle W2 worker also pulls a share of the W13 workers' tiles.
+// MEASURED 2026-10-11, NP=8 1024/1024, on MPK_WUK_EARLY_PF + MPK_ROPE_REMAP
+// (control 4.132 4.128 ms), text identical: 1 -> 4.084 (-0.048); 2 -> 4.176
+// (+0.044, the extra pull competes with W13's own stream). Default 1.
+#ifndef MPK_W2_PF_MODE
+#define MPK_W2_PF_MODE 1
+#endif
+// MPK_W13_NO_ARRIVE: under MPK_W2_ACT_LL in the fused layer nothing waits on
+// the W13 -> W2 rendezvous (the W2 tiles validate W13's words, and the
+// release value is passed in rather than read back), so skip its store drain
+// and arrival on every worker of the layer.
+// MEASURED NULL 2026-10-11, same batch: 4.127 vs 4.132 4.128 ms. Off.
+#ifndef MPK_W13_NO_ARRIVE
+#define MPK_W13_NO_ARRIVE 0
+#endif
+// MPK_W13_BIAS_PRE: the K_HALF W13 tile's emitting lanes load their four bias
+// values ahead of the k-loop instead of behind it, where the dependent
+// global read sat between the last MFMA and the activation store.
+// MEASURED 2026-10-11, same batch: 4.078 vs 4.132 4.128 ms (-0.054), text
+// identical. Default on.
+#ifndef MPK_W13_BIAS_PRE
+#define MPK_W13_BIAS_PRE 1
+#endif
+// MPK_KS_SSQ_NT: the K-split router's per-tile sums of squares are written
+// and read on one XCD only (its 16 router tiles and its TopK), so the two
+// polls of them read through that XCD's L2 (`nt`) instead of at system scope.
+// The partial-logit words beside them stay system scope: every XCD's TopK
+// reads every XCD's.
+// MEASURED NULL 2026-10-11, same batch: 4.139 vs 4.132 4.128 ms. Off.
+#ifndef MPK_KS_SSQ_NT
+#define MPK_KS_SSQ_NT 0
 #endif
 // (MPK_WUK_PF below: 5.064 5.057, -0.029.) All five together, interleaved
 // against their own control, text identical: 5.109 5.110 5.094 -> 4.831
@@ -2125,8 +2195,8 @@ __device__ __forceinline__ void mpk_stage_stamp(int idx) {
 #endif
 #define MPK_TRACE_ITERS 4
 #define MPK_TRACE_LAYERS 80
-// 46 shared with MPK_BAR_SKEW, then trace-only sub-phase stamps 46..63.
-#define MPK_STAGE_SLOTS 64
+// 46 shared with MPK_BAR_SKEW, then trace-only sub-phase stamps 46..71.
+#define MPK_STAGE_SLOTS 72
 #define MPK_STAGE_WORKERS 512
 #define MPK_TRACE_WORDS                                                        \
   ((size_t)MPK_TRACE_ITERS * MPK_TRACE_LAYERS * MPK_STAGE_SLOTS *              \
@@ -2285,6 +2355,15 @@ __device__ __forceinline__ void mpk_ml_boundary_pad() {}
 #define MPK_TAGBAR_DECODE 4
 #define MPK_TAGBAR_ATTN 8
 #define MPK_TAGBAR_W13 16
+// MPK_TAG_DIRECT_SITES: MPK_TAGBAR_* bits whose waiters poll the tags directly
+// (see tag_bar_wait_site). Trace 7: the merge starts 2.3 us after the last
+// decode item behind the two-hop decode -> merge release. MEASURED NEGATIVE
+// 2026-10-11, NP=8 1024/1024 (control 4.240): decode site 4.368, qkv site
+// 4.485, both 4.459 ms -- the waiters' tag polling costs far more than the
+// release hop. MPK_QB_SELF_PF re-measured on the same stack: 4.238 (null).
+#ifndef MPK_TAG_DIRECT_SITES
+#define MPK_TAG_DIRECT_SITES 0
+#endif
 // One region per rendezvous, in the order below: 256 int32 slots, then eight
 // 128-byte per-XCD release lines (MPK_BAR_TAGGED_HIER).
 #define MPK_TAGBAR_SLOTS 512
@@ -2349,9 +2428,20 @@ __device__ __forceinline__ void tag_bar_wait(int *tags, int arrivals,
 // What a converted site calls, from every thread of the workgroup, between
 // its tag_bar_arrive and its own trailing __syncthreads + buffer_inv.
 // `region` is the rendezvous' MPK_TAGBAR_SLOTS-int region.
+// `direct`: every waiter's wave 0 polls the tags itself instead of the
+// xcd_rank-0 release line -- one hop instead of two, for a site with few
+// waiters. Every waiter of a site must agree, since nobody then writes its
+// release line.
 __device__ __forceinline__ void tag_bar_wait_site(int *region, int arrivals,
                                                   int epoch, int tid,
-                                                  int xcd_id, int xcd_rank) {
+                                                  int xcd_id, int xcd_rank,
+                                                  bool direct = false) {
+  if (direct) {
+    if (tid < 64) {
+      tag_bar_wait(region, arrivals, epoch, tid);
+    }
+    return;
+  }
 #if MPK_BAR_TAGGED_HIER
   // 128 B apart: one L2 line per XCD, so no two XCDs' L2s hold the same line.
   int *const xflag = region + MPK_TAGBAR_XFLAG_OFF + xcd_id * 32;

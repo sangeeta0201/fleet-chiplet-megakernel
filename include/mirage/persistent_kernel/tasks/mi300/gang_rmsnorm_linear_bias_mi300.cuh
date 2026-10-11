@@ -835,10 +835,17 @@ __device__ __attribute__((noinline)) void
                    : "memory");
     }
     if (has_sw) {
+#if MPK_KS_SSQ_NT
+      asm volatile("global_load_dwordx2 %0, %1, off nt"
+                   : "=v"(sw)
+                   : "v"(sp)
+                   : "memory");
+#else
       asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1"
                    : "=v"(sw)
                    : "v"(sp)
                    : "memory");
+#endif
     }
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     while (true) {
@@ -861,10 +868,17 @@ __device__ __attribute__((noinline)) void
         }
       }
       if ((unsigned)(sw >> 32) != epoch) {
+#if MPK_KS_SSQ_NT
+        asm volatile("global_load_dwordx2 %0, %1, off nt"
+                     : "+v"(sw)
+                     : "v"(sp)
+                     : "memory");
+#else
         asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1"
                      : "+v"(sw)
                      : "v"(sp)
                      : "memory");
+#endif
       }
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
@@ -991,7 +1005,7 @@ __device__ __attribute__((noinline)) void
       num_shared_experts,
       ll_route,
       epoch,
-      (MPK_TOPK_RANK || MPK_TOPK_THRESH)
+      (MPK_TOPK_RANK || MPK_TOPK_THRESH || MPK_TOPK_4W)
           ? reinterpret_cast<unsigned *>(_topk_rank_smem + 2048)
           : nullptr);
   if (tid == 0) {
@@ -1564,6 +1578,7 @@ gang_rmsnorm_linear_bias_topk_kernel(
       }
       unsigned const want = static_cast<unsigned>(stream_expected);
       int const i0 = xs_t * xs_f4 + tid;
+      int ll_pass = 0;
       while (true) {
         bool ok = true;
         if (tid < xs_f4) {
@@ -1590,7 +1605,12 @@ gang_rmsnorm_linear_bias_topk_kernel(
         if (MPK_PROBE_XRANK_NOWAIT == 1 || MPK_PROBE_XRANK_NOWAIT == 2) {
           ok = true;
         }
-        if (__syncthreads_and(ok)) {
+        bool const all_ok = __syncthreads_and(ok);
+        // Trace stamp 68: the slice's first validation pass returned.
+        if (tid == 0 && ++ll_pass == 1) {
+          mpk_stage_stamp(68);
+        }
+        if (all_ok) {
           break;
         }
         if (tid < sentinels) {
@@ -1728,10 +1748,24 @@ gang_rmsnorm_linear_bias_topk_kernel(
       // the logits share one 1/rms.
       if (tid < 16) {
         unsigned long long sw;
+#if MPK_KS_SSQ_NT
+        while (true) {
+          asm volatile("global_load_dwordx2 %0, %1, off nt\n"
+                       "s_waitcnt vmcnt(0)"
+                       : "=v"(sw)
+                       : "v"(ks_own + tid * 64 + 32)
+                       : "memory");
+          if ((unsigned)(sw >> 32) == (unsigned)routing_epoch_hint) {
+            break;
+          }
+          __builtin_amdgcn_s_sleep(1);
+        }
+#else
         while ((unsigned)((sw = ld_sys_u64(ks_own + tid * 64 + 32)) >> 32) !=
                (unsigned)routing_epoch_hint) {
           __builtin_amdgcn_s_sleep(1);
         }
+#endif
         ks_ssq[tid] = __uint_as_float((unsigned)sw);
       }
       __syncthreads();

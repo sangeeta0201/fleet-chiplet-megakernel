@@ -309,6 +309,10 @@ __device__ __noinline__ void
         dst[2 * i + 1] = (unsigned)w[j].y;
       }
       __syncthreads();
+      // Trace stamp 69: the activation words validated and staged.
+      if (tid == 0) {
+        mpk_stage_stamp(69);
+      }
     } else if (stage_a) {
       u32x4_t const *src = reinterpret_cast<u32x4_t const *>(tile_input);
       u32x4_t *dst = reinterpret_cast<u32x4_t *>(s_a);

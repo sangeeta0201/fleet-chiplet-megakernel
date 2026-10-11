@@ -31,6 +31,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
 #include <vector>
@@ -89,7 +90,7 @@ __global__ void topk_sigmoid_bias_entry(void *input,
       num_shared_experts,
       /*ll_route=*/nullptr,
       /*ll_epoch=*/0,
-      (MPK_TOPK_RANK || MPK_TOPK_THRESH) ? s_rank : nullptr);
+      (MPK_TOPK_RANK || MPK_TOPK_THRESH || MPK_TOPK_4W) ? s_rank : nullptr);
 }
 
 // Round-trip through bf16 so the host reference sees exactly the values the
@@ -240,6 +241,21 @@ int main(int argc, char **argv) {
             (size_t)(TOTAL_EXPERTS + 1) * 4,
             hipMemcpyDeviceToHost);
 
+  // TOPK_DUMP=1: every output word in hex, for bit-exact diffs between
+  // selection paths built from the same seed.
+  if (getenv("TOPK_DUMP")) {
+    for (size_t i = 0; i < out.size(); ++i) {
+      unsigned u;
+      memcpy(&u, &out[i], 4);
+      printf("W %zu %08x\n", i, u);
+    }
+    for (size_t i = 0; i < routing.size(); ++i) {
+      if (routing[i]) printf("R %zu %d\n", i, routing[i]);
+    }
+    for (size_t i = 0; i < active.size(); ++i) {
+      printf("A %zu %d\n", i, active[i]);
+    }
+  }
   int failures = 0;
   float max_rel = 0.f;
 

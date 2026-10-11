@@ -554,8 +554,13 @@ static constexpr int FULL_LAYER_WUKLL_LINES = 128;
 static constexpr int FULL_LAYER_QLL_SLOT =
     FULL_LAYER_WUKLL_SLOT + FULL_LAYER_WUKLL_LINES;
 static constexpr int FULL_LAYER_QLL_LINES = 320;
-static constexpr int FULL_LAYER_COUNTER_SLOTS =
+// MPK_QXS_ROW_LL: each XCD's resolved 6144-wide row as 3072 words (384 lines),
+// written and read by that XCD only.
+static constexpr int FULL_LAYER_QXSLL_SLOT =
     FULL_LAYER_QLL_SLOT + FULL_LAYER_QLL_LINES;
+static constexpr int FULL_LAYER_QXSLL_LINES = 8 * 384;
+static constexpr int FULL_LAYER_COUNTER_SLOTS =
+    FULL_LAYER_QXSLL_SLOT + FULL_LAYER_QXSLL_LINES;
 static_assert(FULL_LAYER_XSPLIT_SLOT % 2 == 0 && MPK_XSPLIT_XCD_INTS % 32 == 0 &&
                   FULL_LAYER_RLL_SLOT % 2 == 0 && MPK_RLL_XCD_INTS % 32 == 0 &&
                   MPK_RLL_WORD_LINES % 2 == 0 && FULL_LAYER_QXS_SLOT % 2 == 0 &&
@@ -2112,6 +2117,12 @@ gang_mla_full_layer_fused_kernel_mi300(
       (MPK_DEC_Q_LL && ml_mode && BATCH_SIZE == 1)
           ? reinterpret_cast<unsigned long long *>(
                 counters + FULL_LAYER_QLL_SLOT * HIER_STRIDE)
+          : nullptr,
+      // MPK_QXS_ROW_LL: epoch is the layer counter (the split resolve's).
+      (MPK_QXS_ROW_LL && MPK_QKV_XSPLIT && EP_WORLD_SIZE > 1 && ml_mode &&
+       BATCH_SIZE == 1 && QKV_REDUCTION_SIZE / 2 <= 384 * 8)
+          ? reinterpret_cast<unsigned long long *>(
+                counters + FULL_LAYER_QXSLL_SLOT * HIER_STRIDE)
           : nullptr);
 
   MPK_WS_PHASE(60, task_layer_idx, xcd_id);
