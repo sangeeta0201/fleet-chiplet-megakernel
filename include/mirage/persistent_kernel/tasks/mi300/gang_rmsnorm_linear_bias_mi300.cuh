@@ -858,6 +858,9 @@ __device__ __attribute__((noinline)) void
       return;
     }
   }
+#if MPK_TOPK_FLAG_OVL
+  unsigned fl_early = 0u;
+#endif
   if constexpr (KSPLIT) {
     static_assert(NUM_EXPERTS == 256, "32 experts per XCD, 16 slices");
     extern __shared__ char _topk_dyn_smem[];
@@ -937,6 +940,19 @@ __device__ __attribute__((noinline)) void
     if (tid == 0) {
       mpk_stage_stamp(40);
     }
+#if MPK_TOPK_FLAG_OVL
+    // MPK_TOPK_FLAG_OVL: the first read of the 16 normed flags goes out here
+    // and is waited for at the flag poll below, so its round trip runs under
+    // the logit pass instead of after it. The poll and its barrier stay.
+    if (MPK_ROUTE_LL_ON && tid < 16) {
+      asm volatile("global_load_dword %0, %1, off nt"
+                   : "=v"(fl_early)
+                   : "v"(reinterpret_cast<unsigned const *>(
+                             ks_all + xcd * MPK_XSPLIT_XCD_INTS) +
+                         tid)
+                   : "memory");
+    }
+#endif
     if (has_sw) {
       s_ssq[tid] = __uint_as_float((unsigned)sw);
     }
@@ -1009,6 +1025,12 @@ __device__ __attribute__((noinline)) void
     if (tid < 64) {
       unsigned const *const ks_flag =
           reinterpret_cast<unsigned const *>(ks_all + xcd * MPK_XSPLIT_XCD_INTS);
+#if MPK_TOPK_FLAG_OVL
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      asm volatile("" : "+v"(fl_early));
+      unsigned const seen0 = tid < 16 ? fl_early : epoch;
+      if (__ballot(seen0 >= epoch) != ~0ull)
+#endif
       while (true) {
         unsigned seen = epoch;
         if (tid < 16) {
@@ -1725,6 +1747,62 @@ gang_rmsnorm_linear_bias_topk_kernel(
 #if MPK_ROUTER_KS_MID
       bool ks_first = true;
 #endif
+#if MPK_ROUTER_POLL_INC && !MPK_ROUTER_KS_MID
+      // MPK_ROUTER_POLL_INC: each thread re-reads only its slots still
+      // carrying an older epoch, keeps the landed ones, and spins on its own:
+      // no sentinel probe, so no full re-pass after the last word lands, and
+      // the polling traffic shrinks to the words still missing.
+      (void)ll_pass;
+      (void)sentinels;
+      if (tid < xs_f4) {
+        constexpr unsigned ALL_SLOTS = (1u << SUM_SLOTS) - 1u;
+        unsigned vmask = 0u;
+        bool first = true;
+        while (true) {
+#pragma unroll
+          for (int s = 0; s < SUM_SLOTS; s++) {
+            if (!(vmask & (1u << s))) {
+#pragma unroll
+              for (int h = 0; h < 2; h++) {
+                asm volatile("global_load_dwordx4 %0, %1, off sc0 sc1"
+                             : "=v"(llw[s][h])
+                             : "v"(ll + (size_t)s * REDUCTION_SIZE + i0 * 4 +
+                                   h * 2)
+                             : "memory");
+              }
+            }
+          }
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#pragma unroll
+          for (int s = 0; s < SUM_SLOTS; s++) {
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+              asm volatile("" : "+v"(llw[s][h]));
+            }
+          }
+#pragma unroll
+          for (int s = 0; s < SUM_SLOTS; s++) {
+            if (llw[s][0][1] == want && llw[s][0][3] == want &&
+                llw[s][1][1] == want && llw[s][1][3] == want) {
+              vmask |= 1u << s;
+            }
+          }
+          if (MPK_PROBE_XRANK_NOWAIT == 1 || MPK_PROBE_XRANK_NOWAIT == 2) {
+            vmask = ALL_SLOTS;
+          }
+          // Trace stamp 68: the slice's first validation pass returned.
+          if (tid == 0 && first) {
+            mpk_stage_stamp(68);
+          }
+          first = false;
+          if (vmask == ALL_SLOTS) {
+            break;
+          }
+          __builtin_amdgcn_s_sleep(1);
+        }
+      }
+      __syncthreads();
+#else
       while (true) {
         bool ok = true;
 #if MPK_ROUTER_KS_MID
@@ -1832,6 +1910,7 @@ gang_rmsnorm_linear_bias_topk_kernel(
         }
         __syncthreads();
       }
+#endif
     }
     MPK_WS_MARK(791, xs_t);
     // Stage stamps 36/37/38/39 split S33 -> S34: slice validated, XCD row

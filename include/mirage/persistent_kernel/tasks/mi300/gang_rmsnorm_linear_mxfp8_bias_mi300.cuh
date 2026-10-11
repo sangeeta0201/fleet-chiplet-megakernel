@@ -1415,6 +1415,50 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
           reinterpret_cast<unsigned long long const *>(d_res);
       ll_u4_t w[EP_PEER_SLOTS];
       int ll_pass = 0;
+#if MPK_RESOLVE_POLL_INC
+      // MPK_RESOLVE_POLL_INC: as MPK_ROUTER_POLL_INC -- each thread re-reads
+      // only its slots still on an older epoch and spins on its own.
+      (void)ll_pass;
+      if (tid < XS_F4) {
+        constexpr unsigned ALL_SLOTS = (1u << EP_PEER_SLOTS) - 1u;
+        unsigned vmask = 0u;
+        bool first = true;
+        while (true) {
+#pragma unroll
+          for (int p = 0; p < EP_PEER_SLOTS; p++) {
+            if (!(vmask & (1u << p))) {
+              asm volatile("global_load_dwordx4 %0, %1, off sc0 sc1"
+                           : "=v"(w[p])
+                           : "v"(ll + (size_t)p * LL_SLOT_WORDS + off / 2)
+                           : "memory");
+            }
+          }
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#pragma unroll
+          for (int p = 0; p < EP_PEER_SLOTS; p++) {
+            asm volatile("" : "+v"(w[p]));
+          }
+#pragma unroll
+          for (int p = 0; p < EP_PEER_SLOTS; p++) {
+            if (w[p][1] == epoch && w[p][3] == epoch) {
+              vmask |= 1u << p;
+            }
+          }
+          if (MPK_PROBE_XRANK_NOWAIT == 1 || MPK_PROBE_XRANK_NOWAIT == 3) {
+            vmask = ALL_SLOTS;
+          }
+          if (threadIdx.x == 0 && first) {
+            mpk_stage_stamp(70);
+          }
+          first = false;
+          if (vmask == ALL_SLOTS) {
+            break;
+          }
+          __builtin_amdgcn_s_sleep(1);
+        }
+      }
+      __syncthreads();
+#else
       while (true) {
         bool ok = true;
         if (tid < XS_F4) {
@@ -1456,6 +1500,7 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
         }
         __syncthreads();
       }
+#endif
       if (threadIdx.x == 0) {
         mpk_stage_stamp(71);
       }

@@ -1290,6 +1290,14 @@ __device__ __forceinline__ bool
 #ifndef MPK_TOPK_FLAG_PF
 #define MPK_TOPK_FLAG_PF 0
 #endif
+// MPK_TOPK_FLAG_OVL: the TopK's first read of the 16 normed flags issued as
+// the partials land (S40) and waited for at the flag poll, so it overlaps the
+// logit pass (S40 -> S41 0.45 us; S41 -> S63 0.27 us today). The poll and its
+// barrier stay ahead of the selection, unlike MPK_TOPK_FLAG_LATE.
+// MEASURED NULL 2026-10-11 r1, text identical: 3.884 vs 3.881. Off.
+#ifndef MPK_TOPK_FLAG_OVL
+#define MPK_TOPK_FLAG_OVL 0
+#endif
 // MPK_WUK_REMAP: under MPK_WUK_LL + MPK_DEC_REMAP, W_UK tile t runs on the
 // XCD's decode worker t (idle-polling for its query from the attention entry)
 // instead of q_b worker t, which reaches it only after its own q_b tile.
@@ -1472,8 +1480,54 @@ __device__ __forceinline__ bool
 // the full 16 KB rounds start; 192 tiles' rounds are ~3 MB each, run beside
 // the merge's tail. MPK_OPROJ_WFIRST_GATE's 6 MB of weight loads at the same
 // point measured +0.016 ms, so that tail is sensitive to the traffic.
+// MEASURED 2026-10-11 r1 (control 3.881): 32 -> 3.919, 24 -> 3.892, 8 ->
+// 3.872. Later full rounds cost more than their traffic saves: an item that
+// lands while the gate holds is seen by its block-synchronized s_sleep(8)
+// rounds, after it by its own thread's spin. With MPK_ROUTER_POLL_INC, n=3
+// interleaved, text identical: control 3.885 3.882 3.878; ROUTER_POLL_INC
+// 3.855 3.855 3.866; + GATE_N 8 3.850 3.842 3.841 (-0.038); GATE_N 4 alone
+// 3.863 3.860 3.865. Value-independent (every word is validated before the
+// staging either way); gated with ROUTER_POLL_INC in g13. Default 8.
 #ifndef MPK_LL_POLL_GATE_N
-#define MPK_LL_POLL_GATE_N 16
+#define MPK_LL_POLL_GATE_N 8
+#endif
+// MPK_LL_POLL_GATE_SLEEP: s_sleep between that sentinel poll's rounds. A
+// round is 32 lanes x 16 B per tile, ~100 KB across the GPU.
+#ifndef MPK_LL_POLL_GATE_SLEEP
+#define MPK_LL_POLL_GATE_SLEEP 8
+#endif
+// MPK_ROUTER_POLL_INC: the router's o_proj-slot validation as a per-thread
+// spin that re-reads only the slots still carrying an older epoch, instead
+// of full pass -> sentinel spin -> full re-pass. MPK_TRACE: o_proj seen ->
+// first pass 2.04 us, first pass -> validated 1.37 us; the re-pass is one
+// more system-scope round trip after the last word lands.
+// MEASURED 2026-10-11, NP=8 1024/1024, text identical: 3.858 vs 3.881 (r1),
+// then n=3 interleaved 3.855 3.855 3.866 vs 3.885 3.882 3.878 (-0.023).
+// Gates g13 (with LL_POLL_GATE_N): standalone PASS, ppl512 2.3670, longseq
+// 256/512/1024 G1 PASS with token dumps identical to g12. Default on.
+#ifndef MPK_ROUTER_POLL_INC
+#define MPK_ROUTER_POLL_INC 1
+#endif
+// MPK_RESOLVE_POLL_INC: the same per-thread incremental spin for the qkv_a
+// split resolver's EP slots (S70 -> S71 0.19 us in MPK_TRACE: the first pass
+// usually lands, so this is the small end of the same fix).
+#ifndef MPK_RESOLVE_POLL_INC
+#define MPK_RESOLVE_POLL_INC 0
+#endif
+// MPK_DEC_KVF_EARLY: the decode's cache-row flag read in the query poll's
+// round (thread 0) instead of in its own poll after the query validates.
+// MPK_TRACE: Q validated -> Q + flag ready 0.6 us, one system-scope round
+// trip on a flag set ~4 us earlier.
+// The ISA is as designed (flag load in the query round, its poll gone).
+// MEASURED NULL 2026-10-11 r1, text identical: 3.883 vs 3.881. Off.
+#ifndef MPK_DEC_KVF_EARLY
+#define MPK_DEC_KVF_EARLY 0
+#endif
+// MPK_DEC_Q_INC: the decode's query poll as a per-thread incremental spin
+// (only words still on an older epoch re-read) instead of block-synchronized
+// full rounds -- MPK_ROUTER_POLL_INC's shape on the W_UK -> decode handoff.
+#ifndef MPK_DEC_Q_INC
+#define MPK_DEC_Q_INC 0
 #endif
 // MPK_XS_POLL_FULL: the qkv_a split resolver re-reads its whole slice of the
 // eight EP slots each round instead of spinning on one sentinel per slot and

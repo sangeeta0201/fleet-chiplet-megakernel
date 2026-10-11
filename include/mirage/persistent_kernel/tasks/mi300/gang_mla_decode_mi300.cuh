@@ -1281,6 +1281,41 @@ __device__ __noinline__ void
     unsigned *const q_lds =
         reinterpret_cast<unsigned *>(_mla_decode_smem + Q_LDS_OFF);
     unsigned long long w[Q_PER];
+#if MPK_DEC_KVF_EARLY
+    // MPK_DEC_KVF_EARLY: thread 0 reads the cache-row flag in the same round
+    // as the query words, so the flag costs no round trip of its own after
+    // them; it was set long before (S66 ~14.7 us vs S67 ~19 us).
+    bool kvf_seen = !(kv_flag != nullptr && chunk_last_tile >= ntiles);
+#endif
+#if MPK_DEC_Q_INC && !MPK_DEC_KVF_EARLY
+    // MPK_DEC_Q_INC: each thread re-reads only its words still on an older
+    // epoch and spins on its own; the barrier after the cache-row flag below
+    // orders the LDS writes for every reader, as before.
+    {
+      static_assert(Q_PER <= 32, "one valid bit per staged word");
+      constexpr unsigned ALL_Q = (Q_PER == 32) ? ~0u : ((1u << Q_PER) - 1u);
+      unsigned vq = 0u;
+      while (true) {
+#pragma unroll
+        for (int j = 0; j < Q_PER; j++) {
+          if (!(vq & (1u << j))) {
+            w[j] = __hip_atomic_load(q_ll + tid + 256 * j, __ATOMIC_RELAXED,
+                                     __HIP_MEMORY_SCOPE_SYSTEM);
+          }
+        }
+#pragma unroll
+        for (int j = 0; j < Q_PER; j++) {
+          if ((unsigned)(w[j] >> 32) == q_ll_epoch) {
+            vq |= 1u << j;
+          }
+        }
+        if (vq == ALL_Q) {
+          break;
+        }
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+#else
     while (true) {
       // Compiler-visible loads: separate asm loads ahead of one vmcnt(0)
       // leave the outputs free for the allocator to move before they land
@@ -1290,16 +1325,30 @@ __device__ __noinline__ void
         w[j] = __hip_atomic_load(q_ll + tid + 256 * j, __ATOMIC_RELAXED,
                                  __HIP_MEMORY_SCOPE_SYSTEM);
       }
+#if MPK_DEC_KVF_EARLY
+      unsigned long long kvf = 0;
+      if (tid == 0 && !kvf_seen) {
+        kvf = __hip_atomic_load(kv_flag, __ATOMIC_RELAXED,
+                                __HIP_MEMORY_SCOPE_SYSTEM);
+      }
+#endif
       bool ok = true;
 #pragma unroll
       for (int j = 0; j < Q_PER; j++) {
         ok = ok && (unsigned)(w[j] >> 32) == q_ll_epoch;
       }
+#if MPK_DEC_KVF_EARLY
+      if (tid == 0 && !kvf_seen) {
+        kvf_seen = (unsigned)(kvf >> 32) == q_ll_epoch;
+        ok = ok && kvf_seen;
+      }
+#endif
       if (__syncthreads_and(ok)) {
         break;
       }
       __builtin_amdgcn_s_sleep(1);
     }
+#endif
 #pragma unroll
     for (int j = 0; j < Q_PER; j++) {
       q_lds[tid + 256 * j] = (unsigned)w[j];
@@ -1308,6 +1357,7 @@ __device__ __noinline__ void
     if (tid == 0) {
       mpk_stage_stamp(67);
     }
+#if !MPK_DEC_KVF_EARLY
     if (kv_flag != nullptr && tid == 0 && chunk_last_tile >= ntiles) {
       while (true) {
         unsigned long long f;
@@ -1322,6 +1372,7 @@ __device__ __noinline__ void
         __builtin_amdgcn_s_sleep(1);
       }
     }
+#endif
     __syncthreads();
     asm volatile("buffer_inv" ::: "memory");
     int const own = midx - q_ll_own_lo;
@@ -1611,6 +1662,10 @@ __device__ __noinline__ void
       }
       __mfma_hd64_fp32x4 scores = mla_qk_acc32_read();
 #endif
+      // Trace stamps 75/76/77 (trip 0): QK done, softmax done, PV done.
+      if (tid == 0 && t == 0) {
+        mpk_stage_stamp(75);
+      }
       scores[0] *= scale_s;
       scores[1] *= scale_s;
       scores[2] *= scale_s;
@@ -1653,6 +1708,9 @@ __device__ __noinline__ void
       pb[1] = (__bf16)w1;
       pb[2] = (__bf16)w2;
       pb[3] = (__bf16)w3;
+      if (tid == 0 && t == 0) {
+        mpk_stage_stamp(76);
+      }
 #if MPK_MLA_OACC_VGPR && MPK_MLA_PV_PIPE && !MPK_MLA_KV_SWZ
       {
         u32x2_t vau[NUM_V_BLOCKS];
@@ -1821,6 +1879,9 @@ __device__ __noinline__ void
 #endif
     }
 
+    if (tid == 0 && t == 0) {
+      mpk_stage_stamp(77);
+    }
     // The QK and PV steps both read the whole LDS tile, so the refill has to
     // wait for every lane rather than slotting between them the way the HD=64
     // decode does.

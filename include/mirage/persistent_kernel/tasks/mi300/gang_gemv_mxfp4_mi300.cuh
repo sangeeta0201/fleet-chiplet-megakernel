@@ -346,7 +346,7 @@ __device__ __noinline__ void
           if (__syncthreads_count(pok) >= MPK_LL_POLL_GATE_N) {
             break;
           }
-          __builtin_amdgcn_s_sleep(8);
+          __builtin_amdgcn_s_sleep(MPK_LL_POLL_GATE_SLEEP);
         }
       }
 #endif
