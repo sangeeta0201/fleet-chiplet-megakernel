@@ -814,6 +814,45 @@ __device__ __forceinline__ void tk2l_sort(unsigned &key, unsigned &pay,
   }
 }
 
+#if MPK_TOPK_2L_MERGE
+// The top 8 of eight descending lists of 8 (lane 8x + i holds list x's i-th),
+// descending in lanes 0-7: three levels of "max against the partner list
+// reversed" (a bitonic 8 holding the pair's top 8) and a 3-step clean.
+// Same winners in the same order as tk2l_sort<64>'s lanes 0-7.
+__device__ __forceinline__ void tk2l_top8_of_64(unsigned &key, unsigned &pay,
+                                                int lane) {
+  auto step = [&](unsigned ok, unsigned op, bool keep_max) {
+    unsigned const nk = keep_max ? (key > ok ? key : ok) : (key > ok ? ok : key);
+    pay = (nk != key) ? op : pay;
+    key = nk;
+  };
+  auto clean8 = [&]() {
+#pragma unroll
+    for (int j = 4; j > 0; j >>= 1) {
+      step(_tk_xor_lanes(key, j, 64), _tk_xor_lanes(pay, j, 64),
+           (lane & j) == 0);
+    }
+  };
+  // Lists 2m, 2m+1 share a 16-lane row: lane i's partner is lane 15 - i.
+  step((unsigned)__builtin_amdgcn_mov_dpp((int)key, 0x140, 0xF, 0xF, false),
+       (unsigned)__builtin_amdgcn_mov_dpp((int)pay, 0x140, 0xF, 0xF, false),
+       (lane & 8) == 0);
+  clean8();
+  // Rows 2r, 2r+1, then the two halves: mirror each 8-lane group, then
+  // take the partner row's / half's lane.
+#pragma unroll
+  for (int x = 16; x <= 32; x <<= 1) {
+    unsigned const mk =
+        (unsigned)__builtin_amdgcn_mov_dpp((int)key, 0x141, 0xF, 0xF, false);
+    unsigned const mp =
+        (unsigned)__builtin_amdgcn_mov_dpp((int)pay, 0x141, 0xF, 0xF, false);
+    step((unsigned)__shfl_xor((int)mk, x, 64),
+         (unsigned)__shfl_xor((int)mp, x, 64), (lane & x) == 0);
+    clean8();
+  }
+}
+#endif
+
 // MPK_TOPK_2L (mpk_atoms.cuh): wave 0 only. Level 1 builds this XCD's 32
 // keys exactly as the one-level gather and selection do -- the 16 partials
 // in tile order, 1/rms from this XCD's 16 sums of squares in tile order, the
@@ -980,7 +1019,11 @@ __device__ __forceinline__ void topk_2l_ks(int *rll,
   }
   unsigned key2 = (unsigned)wa;
   unsigned pay2 = (unsigned)wb & 0xFFFFu;
+#if MPK_TOPK_2L_MERGE
+  tk2l_top8_of_64(key2, pay2, lane);
+#else
   tk2l_sort<64>(key2, pay2, lane);
+#endif
   if (lane == 0) {
     mpk_stage_stamp(4);
   }

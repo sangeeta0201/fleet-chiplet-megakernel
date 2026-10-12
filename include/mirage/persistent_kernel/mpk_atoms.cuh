@@ -1703,6 +1703,36 @@ __device__ __forceinline__ bool
 #ifndef MPK_W2_PF_MODE
 #define MPK_W2_PF_MODE 1
 #endif
+// MPK_W2_WPRE: under MPK_MOE_TP_W2_PF the TP W2 tile reads its segments'
+// expert ids from the routing words at entry and issues its whole weight
+// reduction into registers before the activation staging, instead of after
+// it (the k-loop needed the staging's s_seg_off). MPK_TRACE (trace21): the
+// W2 tiles on W13 workers -- the last W2 tile in 292/292 layers -- run a
+// 2.04 us k-loop after staging, the HBM round trip of a weight stream
+// issued only then; the L2-prefetched W13-idle tiles 1.40. Same loads, same
+// MFMA order: bit-identical. =1: every wave preloads, so wave 0, which
+// stages, retires its weight loads before its first poll pass (vmcnt is in
+// order). =2: waves 1-3 also load wave 0's operands and leave them in LDS,
+// so the staging polls have nothing older in flight.
+// MEASURED 2026-10-12 on 40c2a2d, NP=8 1024/1024, n=3 interleaved, text
+// identical: =1 3.551 3.552 3.551 vs 3.560 3.561 3.554 (-0.007); again
+// 3.549 3.548 3.547 vs 3.557 3.559 3.553 (-0.008). =2 3.553 3.557 3.555
+// (-0.001). MPK_TRACE (trace22/23): the k-loop after staging drops 2.04 ->
+// 0.72 us, but the staging grows 1.96 -> 3.32: the 6.7 MB weight burst at W2
+// entry slows the W13 -> W2 activation hand-off, which polls through the
+// same memory path. With MPK_TOPK_2L_MERGE: 3.537 3.529 3.534 vs 3.549 3.552
+// 3.552 (-0.018). Default 1.
+#ifndef MPK_W2_WPRE
+#define MPK_W2_WPRE 1
+#endif
+// MPK_W2_WPRE_BB: under MPK_W2_WPRE, all ten B operands are read from LDS
+// before the MFMAs (one wait) instead of one pair per MFMA. Final ISA: one
+// lgkmcnt(0), ten back-to-back MFMAs.
+// MEASURED SLOWER 2026-10-12 with =1, n=3, text identical: 3.569 3.576 3.574
+// vs 3.554 3.559 3.555 (+0.017; -0.007 without it).
+#ifndef MPK_W2_WPRE_BB
+#define MPK_W2_WPRE_BB 0
+#endif
 // MPK_W13_NO_ARRIVE: under MPK_W2_ACT_LL in the fused layer nothing waits on
 // the W13 -> W2 rendezvous (the W2 tiles validate W13's words, and the
 // release value is passed in rather than read back), so skip its store drain
@@ -1765,6 +1795,18 @@ __device__ __forceinline__ bool
 // phase's dynamic LDS base stay put. Prices whether the base move matters.
 #ifndef MPK_TOPK_2L_KEEP_LDS
 #define MPK_TOPK_2L_KEEP_LDS 1
+#endif
+// MPK_TOPK_2L_MERGE: the two-level TopK's level 2 takes the top 8 of the
+// eight XCDs' sorted candidate lists with a three-level merge (max against
+// the partner list reversed, then a 3-step clean: 12 compare steps, 2
+// cross-row shuffles) instead of a full 64-lane bitonic sort (21 steps, 3
+// cross-row). MPK_TRACE (trace21): S41 -> S4 0.52 us. Same winners, same
+// order (test_topk_2l: 400 cases, dump identical to the one-level TopK).
+// MEASURED 2026-10-12 on 40c2a2d, n=3, text identical: alone 3.566 3.566
+// 3.553 vs 3.549 3.552 3.552 (+0.011); with MPK_W2_WPRE=1 3.537 3.529 3.534
+// (-0.018, against -0.008 for MPK_W2_WPRE alone). Default on with it.
+#ifndef MPK_TOPK_2L_MERGE
+#define MPK_TOPK_2L_MERGE 1
 #endif
 // MPK_ROUTER_W_LATE: the K-split router tile's gate-slice and gamma loads
 // move behind its o_proj slice validation, and waves 2-3 warm L2 with the same

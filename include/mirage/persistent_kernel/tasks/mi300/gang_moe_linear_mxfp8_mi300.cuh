@@ -4104,7 +4104,119 @@ __device__ __noinline__ void
   // words the quantizer fills it, on the same wait as the activations.
   bool const seg_in_quant =
       MPK_MOE_BS1_DECODE && MPK_W2_LL_BATCH && ll_route != nullptr;
+#if MPK_W2_WPRE
+  constexpr bool WPRE = MPK_MOE_TP_W2_PF && MPK_MOE_BS1_DECODE &&
+                        TILES_PER_WAVE == 1 && NSEG_P * SEG_KT <= 32;
+  // MPK_W2_WPRE >= 2: wave 0, which stages, issues no weight loads ahead of
+  // its polls; waves 1-3 also load its operands and leave them in LDS.
+  constexpr bool W0_LDS = WPRE && MPK_W2_WPRE >= 2;
+  constexpr int PKT = WPRE ? NSEG_P * SEG_KT : 1;
+  constexpr int W0_OFF = 16384;
+  static_assert(!W0_LDS || SEG_OFF_LDS + NSEG_P * 4 <= W0_OFF,
+                "wave 0's operands overlap the staging");
+  bool const wpre = WPRE && ll_route != nullptr;
+  i32x8_t pre_a[PKT];
+  int pre_s[PKT];
+  i32x4_t *const w0_a = (i32x4_t *)(_gang_moe_mxfp8_smem + W0_OFF);
+  int *const w0_s = (int *)(_gang_moe_mxfp8_smem + W0_OFF + PKT * 64 * 16);
+  if constexpr (WPRE) {
+    if (wpre && !(W0_LDS && (threadIdx.x >> 6) == 0)) {
+      unsigned long long idw[NSEG_P];
+#pragma unroll
+      for (int s = 0; s < NSEG_P; s++) {
+        int const seg = seg_base + s;
+        idw[s] = 0ull;
+        asm volatile("global_load_dwordx2 %0, %1, off nt"
+                     : "+v"(idw[s])
+                     : "v"(ll_route + (seg < n_live ? seg : 0))
+                     : "memory");
+      }
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#pragma unroll
+      for (int s = 0; s < NSEG_P; s++) {
+        asm volatile("" : "+v"(idw[s]));
+      }
+      int const p_row = (threadIdx.x >> 6) * 16 + (threadIdx.x & 15);
+      int const p_g = (threadIdx.x & 63) >> 4;
+      _gang_gp8 const p_wdr =
+          (_gang_gp8)(wg_data +
+                      (MPK_MOE_KMAJOR >= 1
+                           ? static_cast<size_t>(p_row / 16) * (16 * W_ROW_BYTES) +
+                                 static_cast<size_t>(p_row % 16) * W_BPK
+                           : static_cast<size_t>(p_row) * W_ROW_BYTES));
+      _gang_gp8 const p_wsc =
+          (_gang_gp8)wg_scales +
+          ((MPK_MOE_KMAJOR >= 2
+                ? (p_row / 16) * (16 * NUM_BLOCKS_32) + (p_row % 16) * 4
+                : p_row * NUM_BLOCKS_32) +
+           p_g);
+      constexpr int W_KS = _gang_moe_w_kstride<WEIGHT_FP4>();
+      constexpr int SC_KS = _gang_moe_sc_kstride();
+      // Wave 0's row for this lane, and this wave's share of its k-tiles:
+      // k % 3 == wave - 1.
+      int const q_row = threadIdx.x & 15;
+      _gang_gp8 const q_wdr =
+          (_gang_gp8)(wg_data +
+                      (MPK_MOE_KMAJOR >= 1
+                           ? static_cast<size_t>(q_row % 16) * W_BPK
+                           : static_cast<size_t>(q_row) * W_ROW_BYTES));
+      _gang_gp8 const q_wsc =
+          (_gang_gp8)wg_scales +
+          ((MPK_MOE_KMAJOR >= 2 ? (q_row % 16) * 4 : q_row * NUM_BLOCKS_32) +
+           p_g);
+      int const q_sel = (threadIdx.x >> 6) - 1;
+      i32x8_t q_a[(PKT + 2) / 3];
+      int q_s[(PKT + 2) / 3];
+#pragma unroll
+      for (int s = 0; s < NSEG_P; s++) {
+        int const seg = seg_base + s;
+        if ((unsigned)(idw[s] >> 32) != ll_epoch) {
+          idw[s] = _gang_ll_route_word(ll_route, seg < n_live ? seg : 0,
+                                       ll_epoch);
+        }
+        uint32_t const off = (uint32_t)(unsigned)idw[s] *
+                             static_cast<uint32_t>(EXPERT_BYTES);
+#pragma unroll
+        for (int kin = 0; kin < SEG_KT; kin++) {
+          int const k = s * SEG_KT + kin;
+          pre_a[k] = _gang_load_w_mfma_a_at_gp<WEIGHT_FP4>(
+              p_wdr + off, kin * W_KS, p_g);
+#if MPK_MOE_STREAM_NT
+          pre_s[k] =
+              (int)__builtin_nontemporal_load(p_wsc + off + kin * SC_KS);
+#else
+          pre_s[k] = (int)p_wsc[off + kin * SC_KS];
+#endif
+          if constexpr (W0_LDS) {
+            if (k % 3 == q_sel) {
+              q_a[k / 3] = _gang_load_w_mfma_a_at_gp<WEIGHT_FP4>(
+                  q_wdr + off, kin * W_KS, p_g);
+#if MPK_MOE_STREAM_NT
+              q_s[k / 3] =
+                  (int)__builtin_nontemporal_load(q_wsc + off + kin * SC_KS);
+#else
+              q_s[k / 3] = (int)q_wsc[off + kin * SC_KS];
+#endif
+            }
+          }
+        }
+      }
+      if constexpr (W0_LDS) {
+#pragma unroll
+        for (int k = 0; k < PKT; k++) {
+          if (k % 3 == q_sel) {
+            i32x8_t const a = q_a[k / 3];
+            w0_a[k * 64 + (threadIdx.x & 63)] = i32x4_t{a[0], a[1], a[2], a[3]};
+            w0_s[k * 64 + (threadIdx.x & 63)] = q_s[k / 3];
+          }
+        }
+      }
+    }
+  }
+  if (!wpre && !seg_in_quant && threadIdx.x < NSEG_P) {
+#else
   if (!seg_in_quant && threadIdx.x < NSEG_P) {
+#endif
     int const s = seg_base + threadIdx.x;
     int e;
     if (MPK_MOE_BS1_DECODE && ll_route != nullptr) {
@@ -4158,9 +4270,57 @@ __device__ __noinline__ void
         MPK_MOE_KMAJOR >= 2
             ? (w_row / 16) * (16 * NUM_BLOCKS_32) + (w_row % 16) * 4
             : w_row * NUM_BLOCKS_32;
+#if MPK_W2_WPRE
+    f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (wpre) {
+      if (W0_LDS && warp_id == 0) {
+#pragma unroll
+        for (int k = 0; k < (W0_LDS ? PKT : 0); k++) {
+          i32x4_t const v = w0_a[k * 64 + lane_id];
+          pre_a[k] = i32x8_t{};
+          pre_a[k][0] = v[0];
+          pre_a[k][1] = v[1];
+          pre_a[k][2] = v[2];
+          pre_a[k][3] = v[3];
+          pre_s[k] = w0_s[k * 64 + lane_id];
+        }
+      }
+#if MPK_W2_WPRE_BB
+      // All B operands up front, one LDS wait, then the MFMAs back to back:
+      // left to itself the scheduler reuses one B register pair and pays an
+      // LDS round trip per k-tile.
+      i32x8_t pre_b[PKT];
+#pragma unroll
+      for (int k = 0; k < (WPRE ? PKT : 0); k++) {
+        pre_b[k] = _gang_load_fp8_mfma_b(s_tok_fp8, k * 128, g);
+      }
+#pragma unroll
+      for (int k = 0; k < (WPRE ? PKT : 0); k++) {
+        asm volatile("" : "+v"(pre_b[k]));
+      }
+#pragma unroll
+      for (int k = 0; k < (WPRE ? PKT : 0); k++) {
+        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(pre_a[k], pre_b[k], acc, pre_s[k],
+                                            (int)s_tok_scales[k]);
+      }
+#else
+#pragma unroll
+      for (int k = 0; k < (WPRE ? PKT : 0); k++) {
+        i32x8_t const B = _gang_load_fp8_mfma_b(s_tok_fp8, k * 128, g);
+        acc = _gang_mfma_w_x_f8<WEIGHT_FP4>(pre_a[k], B, acc, pre_s[k],
+                                            (int)s_tok_scales[k]);
+      }
+#endif
+    } else {
+      acc = _gang_moe_kloop_seg<WEIGHT_FP4, GR, NSEG_P, SEG_KT>(
+          w_data_row, wg_scales, row_scale_base, (_gang_lds_u32)s_seg_off,
+          s_tok_fp8, s_tok_scales, g);
+    }
+#else
     f32x4_t acc = _gang_moe_kloop_seg<WEIGHT_FP4, GR, NSEG_P, SEG_KT>(
         w_data_row, wg_scales, row_scale_base, (_gang_lds_u32)s_seg_off,
         s_tok_fp8, s_tok_scales, g);
+#endif
     if (col == 0) {
       float *ws = d_workspace + static_cast<size_t>(tok_idx) * OUTPUT_SIZE +
                   wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4;

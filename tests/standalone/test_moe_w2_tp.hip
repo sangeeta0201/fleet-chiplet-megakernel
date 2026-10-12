@@ -251,7 +251,10 @@ static bool run_case(int n_live, uint32_t seed, bool ll = false,
                       hipMemcpyHostToDevice));
   HIP_CHECK(hipMemset(d_out, 0, HIDDEN * 4));
 
-  constexpr int SMEM = NSEG * I_LOCAL + NSEG * I_LOCAL / 128 + 256;
+  // MPK_W2_WPRE >= 2 parks wave 0's operands at 16 KB of dynamic LDS.
+  constexpr int SMEM_STAGE = NSEG * I_LOCAL + NSEG * I_LOCAL / 128 + 256;
+  constexpr int SMEM =
+      (MPK_W2_WPRE >= 2 && SMEM_STAGE < 65536) ? 65536 : SMEM_STAGE;
   unsigned long long *d_ll = nullptr;
   if (ll) {
     // Ids at [s], weights at [16 + s]; the plain weights are zeroed so a
