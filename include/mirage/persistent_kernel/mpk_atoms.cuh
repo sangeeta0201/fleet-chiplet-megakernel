@@ -1902,11 +1902,12 @@ __device__ __forceinline__ bool
 // tile against 2.44 for everyone else, every layer, and the slowest o_proj
 // tile is the one the router waits for on every rank. Before the skip they
 // reached Phase 8 at ~15 us and ran 2.32. 0 is off.
-// MEASURED 2026-10-12 on 12ad8d7, n=3, text identical: control 3.697 3.687
-// 3.695; 14 -> 3.689 3.690 3.674 (-0.009); 10 -> 3.688 3.694 3.685 (-0.004).
-// Inside the noise. Off.
+// MEASURED 2026-10-12 on a87dc19: 14 won two clean standalone pairs by
+// 0.012 ms, and combined with MPK_ROUTER_L2PF won three more runs at
+// 3.496/3.501/3.492 ms versus 3.520/3.509 ms controls. The combined arm was
+// token-identical to control and passed PPL (2.3670) and 256/512/1024 longseq.
 #ifndef MPK_OPROJ_PF_MIN_US
-#define MPK_OPROJ_PF_MIN_US 0
+#define MPK_OPROJ_PF_MIN_US 14
 #endif
 // MPK_W2_ACT_SENT: a W2 staging thread whose full pass over its 16 SwiGLU
 // words misses spins on two of them (one per producing W13 tile) before the
@@ -2155,13 +2156,12 @@ __device__ __forceinline__ bool
 // does. At the tile's head all 128 tiles of a GPU ask HBM for their 24 KB at
 // once, and the slice validation's first pass retires behind that burst
 // (MPK_TRACE: S33 -> first pass 2.15 us); from L2 the burst is short.
-// MEASURED NULL 2026-10-11 on 7bc1c7e, n=3: 3.955 3.956 3.953 vs 3.953 3.949
-// 3.947 ms. With MPK_ROUTER_KS_MID's +0.060 and MPK_ROUTER_W_LATE's +0.027,
-// the pass is not waiting on the gate slice: its own system-scope reads of
-// the peers' o_proj words, which no cache in front of HBM can hold, are the
-// ~2 us. Off.
+// MEASURED 2026-10-12 on a87dc19: won three standalone pairs by ~0.020 ms.
+// Combined with MPK_OPROJ_PF_MIN_US=14 it ran at 3.496/3.501/3.492 ms versus
+// 3.520/3.509 ms controls, with identical tokens, PPL 2.3670, and passing
+// 256/512/1024 longseq.
 #ifndef MPK_ROUTER_L2PF
-#define MPK_ROUTER_L2PF 0
+#define MPK_ROUTER_L2PF 1
 #endif
 // MPK_DEC_DIRECT_WAIT: under the head-local decode the merge ranks poll the
 // 64 decode workers' tags themselves instead of their XCD's release line.
