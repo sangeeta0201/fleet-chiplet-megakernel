@@ -1884,6 +1884,12 @@ __device__ __forceinline__ bool
 #ifndef MPK_OPROJ_A_PAD
 #define MPK_OPROJ_A_PAD 0
 #endif
+// MPK_PROBE_W13_HALFK: PRICING PROBE, WRONG OUTPUT. The K_HALF W13 tile's
+// waves run half their k-tiles: how much of a faster W13 stream the wall
+// keeps.
+#ifndef MPK_PROBE_W13_HALFK
+#define MPK_PROBE_W13_HALFK 0
+#endif
 // MPK_PROBE_OPROJ_HALFK: PRICING PROBE, WRONG OUTPUT. The MXFP4 o_proj GEMV
 // runs half its K-loop: how much of a faster o_proj GEMV the wall keeps.
 #ifndef MPK_PROBE_OPROJ_HALFK
@@ -2053,11 +2059,16 @@ __device__ __forceinline__ bool
 // inline 4.031, W13 4.042, W2 4.003, GEMV4 wedged in iteration 1 (2/2),
 // RNLM8 not run. The drain is real but the inlined bodies cost more than it
 // does; removing the drain at the source (MPK_ENTRY_NOARRIVE) is what paid.
+// W2 re-measured 2026-10-12 on b6c8fa5, where the W2 return's drain of its
+// write-through part words sits on the layer boundary (MPK_ML_BOUNDARY_PAD
+// =1000: +0.066 ms, 85% critical) and nothing else drains before the next
+// layer's first non-inlined call. n=3, text identical: 3.510 3.519 3.513 vs
+// 3.540 3.531 3.533 (-0.021); worker 386 VGPR (366), 0 spills. Default on.
 #ifndef MPK_MOE_W13_INLINE
 #define MPK_MOE_W13_INLINE 0
 #endif
 #ifndef MPK_MOE_W2_INLINE
-#define MPK_MOE_W2_INLINE 0
+#define MPK_MOE_W2_INLINE 1
 #endif
 #ifndef MPK_GEMV4_INLINE
 #define MPK_GEMV4_INLINE 0
@@ -2242,6 +2253,15 @@ __device__ __forceinline__ bool
 // 3.753 ms, text identical. Default on with KV_SWZ (gates g14).
 #ifndef MPK_MLA_QK_PIPE2
 #define MPK_MLA_QK_PIPE2 1
+#endif
+// MPK_MLA_QK_SPLIT: the decode's 16 x 16 QK score block is computed by one
+// wave instead of all four (each read the whole 18 KB K tile for the same
+// scores) and handed to the others through the dead Q staging block at
+// 96 KB; when the next tile is already in LDS (MPK_DEC_PRELOAD), wave 1 runs
+// that tile's chain beside it and the next trip skips QK. Same chains: same
+// bits. MPK_MLA_SKIP_DECODE prices the decode item at -0.358 ms (b6c8fa5).
+#ifndef MPK_MLA_QK_SPLIT
+#define MPK_MLA_QK_SPLIT 0
 #endif
 // MPK_PROBE_MERGE63: PRICING PROBE, WRONG OUTPUT. The merge's halves path
 // issues 2 x 32 loads before one wait, one more than vmcnt's 63 in flight, so

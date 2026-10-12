@@ -1420,6 +1420,10 @@ __device__ __noinline__ void
 #endif
   float m_running = -INFINITY;
   float l_head[4] = {0, 0, 0, 0};
+#if MPK_MLA_QK_SPLIT
+  __mfma_hd64_fp32x4 qks_next = {0.0f, 0.0f, 0.0f, 0.0f};
+  bool qks_have_next = false;
+#endif
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   unsigned long long _d_t2 = __builtin_amdgcn_s_memrealtime();
@@ -1603,7 +1607,60 @@ __device__ __noinline__ void
 #endif
 
     {
-#if MPK_MLA_QK_2ACC
+#if MPK_MLA_QK_SPLIT && MPK_MLA_QK_PIPE2 && MPK_MLA_KV_SWZ && \
+    MPK_MLA_OACC_VGPR && !MPK_MLA_DECODE_DMA_PF
+      // MPK_MLA_QK_SPLIT: the 16 x 16 score block is the same for all four
+      // waves, which each read the whole 18 KB K tile for it. Wave 0 runs
+      // tile t's chain and, when tile t + 1 is already in LDS, wave 1 runs
+      // its chain beside it; both leave their scores in the dead Q staging
+      // block and every wave reads them back. Same chains: same bits.
+      __mfma_hd64_fp32x4 scores;
+      if (qks_have_next) {
+        scores = qks_next;
+        qks_have_next = false;
+      } else {
+        bool const pair = t + 1 < ntiles && t + 1 < tiles_in_lds;
+        float *const s_sc =
+            reinterpret_cast<float *>(_mla_decode_smem + 96 * 1024);
+        if (warp_id == 0 || (pair && warp_id == 1)) {
+          __bf16 const *const kv =
+              (warp_id == 0) ? cur_kv : lds_kv + (t + 1) * (KV_TILE * QK_DIM);
+          mla_qk_acc32_zero();
+          using kq_t = gang_mla_decode_detail::bf16x8_t;
+          auto kaddr = [&](int kc) -> kq_t const * {
+            return reinterpret_cast<kq_t const *>(
+                &kv[((kc & 1) ? kswz_o : kswz_e) + kc * 32]);
+          };
+          kq_t kq[3];
+          kq[0] = *kaddr(0);
+          kq[1] = *kaddr(1);
+#pragma unroll
+          for (int kc = 0; kc < NUM_K32; kc++) {
+            if (kc + 2 < NUM_K32) {
+              kq[(kc + 2) % 3] = *kaddr(kc + 2);
+            }
+            gang_mla_decode_detail::mla_qk_acc32_mfma_kv(kq[kc % 3], qr[kc]);
+          }
+          __mfma_hd64_fp32x4 const sc = mla_qk_acc32_read();
+#pragma unroll
+          for (int h = 0; h < 4; h++) {
+            s_sc[warp_id * 256 + lane * 4 + h] = sc[h];
+          }
+        }
+        mla_tile_bar();
+#pragma unroll
+        for (int h = 0; h < 4; h++) {
+          scores[h] = s_sc[lane * 4 + h];
+        }
+        if (pair) {
+#pragma unroll
+          for (int h = 0; h < 4; h++) {
+            qks_next[h] = s_sc[256 + lane * 4 + h];
+          }
+          qks_have_next = true;
+        }
+      }
+#elif MPK_MLA_QK_2ACC
       static_assert(NUM_K32 % 2 == 0, "QK splits into two equal chains");
       gang_mla_decode_detail::mla_qk_acc2_zero();
 #pragma unroll

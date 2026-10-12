@@ -2687,7 +2687,8 @@ __device__ __noinline__ void
           d_bias + local_eid * OUTPUT_STRIDE + emit_base);
     }
 #endif
-    f32x4_t acc = _gang_moe_kloop<WEIGHT_FP4, false, MPK_MOE_PF_GROUPS_W13, KH,
+    f32x4_t acc = _gang_moe_kloop<WEIGHT_FP4, false, MPK_MOE_PF_GROUPS_W13,
+                                  MPK_PROBE_W13_HALFK ? KH / 2 : KH,
                                   (bool)MPK_MOE_PF_DBUF_W13>(
         w_data_row, wg_scales, row_scale_base,
         s_tok_fp8 + kh * KH * K_PER_MFMA, s_tok_scales + kh * KH, g);

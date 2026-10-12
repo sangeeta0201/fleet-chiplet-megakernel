@@ -49,8 +49,12 @@ static constexpr int BLOCK_THREADS = 256;
 static constexpr int LDS_BASE_BYTES =
     16 * QK_DIM * 2 + 256 * 32 * 4 + (MPK_MLA_DECODE_DMA_PF ? 16 * QK_DIM * 2 : 0);
 static constexpr int LDS_BATCH_BYTES = MPK_MLA_DECODE_BATCH * 16 * QK_DIM * 2;
-static constexpr int LDS_BYTES =
+static constexpr int LDS_TILE_BYTES =
     LDS_BATCH_BYTES > LDS_BASE_BYTES ? LDS_BATCH_BYTES : LDS_BASE_BYTES;
+// MPK_MLA_QK_SPLIT hands the scores over at 96 KB of dynamic LDS.
+static constexpr int LDS_BYTES =
+    (MPK_MLA_QK_SPLIT && LDS_TILE_BYTES < 98 * 1024) ? 98 * 1024
+                                                     : LDS_TILE_BYTES;
 
 static constexpr float LOG2E = 1.44269504088896340736f;
 
