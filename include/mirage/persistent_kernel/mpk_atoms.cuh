@@ -1416,6 +1416,21 @@ __device__ __forceinline__ bool
 #ifndef MPK_DEC_MERGE_LL
 #define MPK_DEC_MERGE_LL 0
 #endif
+// MPK_DEC_LSE_LL: MPK_DEC_MERGE_LL's lse words only. The decode keeps its
+// f32 partials, drains them, and only then writes each head's lse as an
+// epoch word; the merge ranks skip the decode -> merge rendezvous, poll their
+// lse words, and load the partials after -- so the merge waits on its own 64
+// decode items, not a 232-tag relay, and its inputs are the same f32 values:
+// bit-identical. MPK_ATTN_PROBE_NODECWAIT priced the rendezvous at -0.066 ms
+// from a build with 2.6x the default's SGPR spills.
+// MEASURED NEGATIVE 2026-10-11 on the g14 defaults, text identical (the
+// merge reads its lse from LDS and keeps one copy of the arithmetic; a
+// per-lane out-of-line copy contracted differently and moved the tokens):
+// 3.754 -> 3.818 ms (+0.064). The partials' round trip now follows the
+// words', and the merge ranks poll from their W_UK tile onward. Off.
+#ifndef MPK_DEC_LSE_LL
+#define MPK_DEC_LSE_LL 0
+#endif
 // MPK_OPROJ_SHIFT: under MPK_ATTN_OUT_LL, o_proj tile t runs on xcd_rank
 // t + MPK_OPROJ_SHIFT, off the merge ranks (4 under head-local GLM:
 // HL_MRG_ITEMS = 32 merge items over 8 XCDs), which reach o_proj last
@@ -1679,6 +1694,53 @@ __device__ __forceinline__ bool
 // MEASURED NULL 2026-10-11, NP=8 1024/1024: 4.040 vs 4.040 ms. Off.
 #ifndef MPK_RESOLVE_NW_LATE
 #define MPK_RESOLVE_NW_LATE 0
+#endif
+// MPK_QXS_EARLY_RES: the split resolve's slice sums run on the XCD's last
+// MPK_QXS_EARLY_RES_N workers -- past the 24 qkv_a tiles (the kv_a half is
+// padded 576 -> 1024 rows), so with no qkv_a tile; at 4 they are the EP
+// folders -- instead of on qkv_a tiles 0-15. Those tiles are W13 + W2
+// workers: MPK_TRACE has the last one leave its W2 tile 3.4 us before it
+// reaches the resolve, while the peers' fold words land ~1.5 us before its
+// first pass returns. The tiles keep only the gather. Same slot order and
+// rounding: the row is identical.
+// MEASURED NEGATIVE 2026-10-11 on the g14 defaults, text identical: 3.877 vs
+// 3.750 ms (+0.127). MPK_TRACE: the resolve validates no earlier (last
+// 3.04 vs 3.12 us) -- it is bound by the peers' fold words landing, not by
+// the resolvers reaching it -- while the folders, now resolving before their
+// MPK_QKVA_IDLE_PF share, arrive last at qkv_a -> q_b (+1.58 us) and the late
+// prefetch slows the qkv_a K-loop (+0.53 us). Off.
+#ifndef MPK_QXS_EARLY_RES
+#define MPK_QXS_EARLY_RES 0
+#endif
+#ifndef MPK_QXS_EARLY_RES_N
+#define MPK_QXS_EARLY_RES_N 4
+#endif
+// MPK_QA_LL: qkv_a -> q_b through epoch words. The qkv_a tiles also write
+// their q_a rows as (epoch << 32 | bf16x2) words, write-through (the q_b
+// tiles are on every XCD), into the MPK_QXS_ROW_LL region; the q_b GEMM tiles
+// validate those words per thread instead of waiting at the gang-wide
+// qkv_a -> q_b rendezvous, which only xcd_rank 0 (the latent tile, which
+// reads kv_a) still waits on. The norm's traversal is unchanged, so q_b's
+// input and output are bit-identical. MPK_TRACE under the no-wait probe
+// prices the rendezvous at ~1.1 us of the chain (S50), which that probe's
+// build then lost to 2.4x the SGPR spills.
+// MEASURED 2026-10-11 on the g14 defaults, NP=8 1024/1024, n=3 interleaved,
+// text identical, SGPR spills 300 vs 298: 3.747 3.753 3.754 -> 3.700 3.706
+// 3.691 ms (-0.052). Default on.
+#ifndef MPK_QA_LL
+#define MPK_QA_LL 1
+#endif
+// MPK_QKVA_SKIP_PAD: qkv_a's row is [q_a | latent | padding] with the latent
+// padded 576 -> 1024 for the output alignment, and nothing reads the padding.
+// At GLM-5.2 that is 28 of 192 tiles (XCD 7's 24 and XCD 6's last 4), ~15%
+// of qkv_a's weight stream, plus the same bytes in MPK_QKVA_IDLE_PF's L2
+// prefetch -- all of it zeros, fetched while the real tiles fetch theirs.
+// Skip those tiles and prefetch only the live ones.
+// MEASURED 2026-10-11 on the g14 defaults, NP=8 1024/1024, n=3 interleaved,
+// text identical: 3.747 3.753 3.754 -> 3.734 3.746 3.733 ms (-0.013).
+// Default on.
+#ifndef MPK_QKVA_SKIP_PAD
+#define MPK_QKVA_SKIP_PAD 1
 #endif
 // MPK_QXS_XOUT_LATE: the split resolver's write-through x_out store goes out
 // after the norm instead of ahead of its exchange flag, so the flag's drain
@@ -1970,6 +2032,8 @@ __device__ __forceinline__ bool
 // round trips per tile. Same values, same packing, same MFMAs: bit-exact.
 // The ISA is as designed: 32 ds_read_u16, one lgkmcnt(0), 16 packs, 8 MFMAs.
 // MEASURED NULL 2026-10-11 (r1, text identical): 3.884 vs 3.876 3.882. Off.
+// On the swizzled tile (MPK_MLA_KV_SWZ, a two-base variant of the same asm):
+// NULL too, 3.754 vs 3.747 on the g14 defaults.
 #ifndef MPK_MLA_PV_ASM
 #define MPK_MLA_PV_ASM 0
 #endif
@@ -1988,6 +2052,8 @@ __device__ __forceinline__ bool
 // MPK_PROBE_MERGE63: PRICING PROBE, WRONG OUTPUT. The merge's halves path
 // issues 2 x 32 loads before one wait, one more than vmcnt's 63 in flight, so
 // the 64th cannot issue until the first returns. The probe drops one.
+// MEASURED NULL 2026-10-11 on the g14 defaults: 3.752 vs 3.747 -- the 64th
+// load's wait is not a cost worth a redesign (cf. MPK_MERGE_LSE_LDS).
 #ifndef MPK_PROBE_MERGE63
 #define MPK_PROBE_MERGE63 0
 #endif

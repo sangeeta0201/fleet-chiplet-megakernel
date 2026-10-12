@@ -771,6 +771,16 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     asm volatile("buffer_inv" ::: "memory");
   }
 
+#if MPK_QA_LL
+  // MPK_QA_LL: the q_a words (the region the fused layer hands over as
+  // qxs_row_ll), and this XCD's share of the QB_REDUCTION_SIZE rows q_b reads.
+  static_assert(QB_REDUCTION_SIZE == 256 * 8 || !MPK_QA_LL,
+                "q_b reads the words as one 8-element group per thread");
+  unsigned long long *const qa_ll = BATCH_SIZE == 1 ? qxs_row_ll : nullptr;
+  int const qkv_xcd_rows = qkv_n_wgs_per_xcd * QKV_OUTPUT_PER_WG;
+  int qa_cols = QB_REDUCTION_SIZE - xcd_id * qkv_xcd_rows;
+  qa_cols = qa_cols < 0 ? 0 : (qa_cols > qkv_xcd_rows ? qkv_xcd_rows : qa_cols);
+#endif
 #ifndef MPK_ABL_QKV
   // MPK_QKVA_REPS: price an EXTRA un-hidden qkv_a pass. 1 is the shipping
   // path; the long note is at the define in mpk_atoms.cuh. The body is
@@ -782,6 +792,42 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   if (qkv_xsplit != nullptr && qkv_tiles_per_xcd > tiles_per_xcd) {
     __builtin_trap();
   }
+  // MPK_QKVA_SKIP_PAD: this XCD's tiles past the latent's last row.
+  int qkv_live_per_xcd = qkv_tiles_per_xcd;
+  int qkv_pf_wgs = qkv_n_wgs_per_xcd;
+  if constexpr (MPK_QKVA_SKIP_PAD && BATCH_SIZE == 1 && !QKV_FOLD_ROWS) {
+    constexpr int QKV_LIVE_ROWS =
+        KV_INPUT_OFFSET + KV_LORA_RANK + QK_ROPE_HEAD_DIM;
+    int const live = (QKV_LIVE_ROWS -
+                      xcd_id * qkv_n_wgs_per_xcd * QKV_OUTPUT_PER_WG +
+                      QKV_OUTPUT_PER_WG - 1) /
+                     QKV_OUTPUT_PER_WG;
+    qkv_live_per_xcd =
+        live < 0 ? 0 : (live < qkv_tiles_per_xcd ? live : qkv_tiles_per_xcd);
+    qkv_pf_wgs = qkv_live_per_xcd;
+  }
+#if MPK_QXS_EARLY_RES
+  // MPK_QXS_EARLY_RES: the XCD's last MPK_QXS_EARLY_RES_N workers resolve
+  // the split's slices. They must own no qkv_a tile -- the tiles wait on
+  // every slice's flag.
+  if constexpr (EP_PEER_SLOTS > 1 && !QKV_EP_FOLD && !QKV_PRO_HOIST &&
+                BATCH_SIZE == 1) {
+    if (qkv_xsplit != nullptr) {
+      int const res_base = tiles_per_xcd - MPK_QXS_EARLY_RES_N;
+      if (res_base < qkv_tiles_per_xcd) {
+        __builtin_trap();
+      }
+      if (xcd_rank >= res_base) {
+        _rnlm8_xs_resolve_early<QKV_REDUCTION_SIZE, EP_PEER_SLOTS,
+                                BATCH_SIZE * QKV_REDUCTION_SIZE>(
+            static_cast<unsigned short const *>(x_ptr),
+            static_cast<unsigned short *>(x_out_ptr),
+            qkv_xsplit + xcd_id * MPK_XSPLIT_XCD_INTS,
+            (unsigned)qkv_expected, xcd_rank - res_base);
+      }
+    }
+  }
+#endif
 #if MPK_QKVA_IDLE_PF
   // MPK_QKVA_IDLE_PF: the workers that own no qkv_a tile pull this XCD's
   // whole qkv_a weight region into L2, split evenly between them, while the
@@ -802,7 +848,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         QKV_OUTPUT_PER_WG * QKV_REDUCTION_SIZE +
         QKV_OUTPUT_PER_WG * (QKV_REDUCTION_SIZE / 32);
     int const n_idle = tiles_per_xcd - qkv_tiles_per_xcd;
-    uint32_t const total = (uint32_t)qkv_n_wgs_per_xcd * QIP_WG_BYTES;
+    uint32_t const total = (uint32_t)qkv_pf_wgs * QIP_WG_BYTES;
     uint32_t const chunk =
         ((total + (uint32_t)n_idle - 1u) / (uint32_t)n_idle + 4095u) & ~4095u;
     uint32_t const lo = (uint32_t)(xcd_rank - qkv_tiles_per_xcd) * chunk;
@@ -860,7 +906,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
 #endif
 #pragma unroll 1
   for (int _qrep = 0; _qrep < MPK_QKVA_REPS; ++_qrep)
-  for (int t = xcd_rank; t < qkv_tiles_per_xcd; t += tiles_per_xcd) {
+  for (int t = xcd_rank; t < qkv_live_per_xcd; t += tiles_per_xcd) {
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     // SP4[0] is 20.06 us/layer and the phase is one grid-stride round, so
     // either a tile really costs 20 us or most of SP4[0] is not tile work.
@@ -887,7 +933,12 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
                                           /*FOLD_ROWS=*/QKV_FOLD_ROWS,
                                           QKV_REDUCTION_SIZE,
                                           /*PPL_SINK=*/false,
-                                          /*WEIGHT_FP4=*/MPK_QKV_MXFP4 != 0>(
+                                          /*WEIGHT_FP4=*/MPK_QKV_MXFP4 != 0
+#if MPK_QA_LL
+                                          ,
+                                          /*LL_WT=*/true
+#endif
+                                          >(
         // Pre-folded, the resolved row is in x_out_ptr and the gather buffer
         // is not read again.
         /*norm_input_ptr=*/(QKV_EP_FOLD || QKV_PRO_HOIST)
@@ -908,12 +959,23 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         /*logits_row=*/0,
         qkv_xsplit ? qkv_xsplit + xcd_id * MPK_XSPLIT_XCD_INTS : nullptr,
         (unsigned)qkv_expected,
+#if MPK_QA_LL
+        // MPK_QA_LL: this XCD's q_a rows also leave as words, at their global
+        // row; the latent and padding rows do not.
+        /*ll_out=*/qa_ll != nullptr
+            ? qa_ll + (size_t)xcd_id * (qkv_n_wgs_per_xcd * QKV_OUTPUT_PER_WG / 2)
+            : nullptr,
+        /*ll_epoch=*/(unsigned)qkv_expected,
+        /*ll_cols=*/qa_cols,
+        nullptr);
+#else
         /*ll_out=*/nullptr,
         /*ll_epoch=*/0u,
         /*ll_cols=*/0,
         (qkv_xsplit != nullptr && qxs_row_ll != nullptr)
             ? qxs_row_ll + (size_t)xcd_id * (QKV_REDUCTION_SIZE / 2)
             : nullptr);
+#endif
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     if (tid == 0 && g_subphase_active) {
       atomicAdd(&g_subphase_ns[0][0],
@@ -1025,6 +1087,11 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     if (tid == 0) {
       tag_bar_arrive(tags, xcd_id * tiles_per_xcd + xcd_rank, qkv_expected);
     }
+#if MPK_QA_LL
+    // MPK_QA_LL: the q_b tiles validate the q_a words instead; only xcd_rank
+    // 0 -- the latent tile, which reads kv_a, and the XCD's tag relay -- waits.
+    if (qa_ll == nullptr || xcd_rank == 0)
+#endif
     tag_bar_wait_site(tags, arrivals, qkv_expected, tid, xcd_id, xcd_rank,
                       (MPK_TAG_DIRECT_SITES & MPK_TAGBAR_QKV) != 0);
   } else if (tid == 0) {
@@ -1176,7 +1243,13 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
             static_cast<size_t>(qb_head_base) * QB_QK_DIM,
         wk_words,
         (unsigned)wuk_expected_in,
-        QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM);
+        QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM
+#if MPK_QA_LL
+        ,
+        qa_ll,
+        (unsigned)qkv_expected
+#endif
+        );
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     if (tid == 0 && g_subphase_active) {
       unsigned long long _d =
@@ -1945,7 +2018,9 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
           hint_q_row,
           hint_first_page,
           hint_seqlen,
-          dm_ll ? reinterpret_cast<unsigned long long *>(o_acc_ptr) : nullptr,
+          (dm_ll && !MPK_DEC_LSE_LL)
+              ? reinterpret_cast<unsigned long long *>(o_acc_ptr)
+              : nullptr,
           dm_ll ? dec_ll_lse : nullptr,
           (unsigned)decode_expected,
           dq_ll ? dec_q_ll : nullptr,
@@ -2177,7 +2252,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         attn_ll,
         attn_ll_epoch,
         /*ll_head0=*/qb_head_base,
-        (dm_ll && MPK_DML_DBG != 1)
+        (dm_ll && MPK_DML_DBG != 1 && !MPK_DEC_LSE_LL)
             ? reinterpret_cast<unsigned long long const *>(o_acc_ptr)
             : nullptr,
         (dm_ll && MPK_DML_DBG != 1) ? dec_ll_lse : nullptr,

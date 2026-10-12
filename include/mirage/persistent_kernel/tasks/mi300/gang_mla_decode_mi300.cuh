@@ -1796,6 +1796,80 @@ __device__ __noinline__ void
         __builtin_memcpy(&pbu, &pb, 8);
         gang_mla_decode_detail::mla_pv8_vgpr(o_acc_r, vau, pbu);
       }
+#elif MPK_MLA_OACC_VGPR && MPK_MLA_PV_ASM && MPK_MLA_KV_SWZ
+      {
+        // The swizzled tile's 32 V reads from two per-lane bases (rows
+        // kgrp*4 + {0,1} and + {2,3}), all into distinct registers, one
+        // wait. Swizzled, each LDS round trip is short, so the C++ form's
+        // eight serialized groups were most of the PV step (MPK_TRACE: 0.45
+        // us per tile against eight independent MFMAs).
+        static_assert(NUM_V_BLOCKS == 8 && QK_DIM == 576,
+                      "the read offsets below are block * 128 + row * 1152");
+        unsigned const b0 = static_cast<unsigned>(
+            reinterpret_cast<uintptr_t>(&cur_kv[vswz_b0]));
+        unsigned const b2 = static_cast<unsigned>(
+            reinterpret_cast<uintptr_t>(&cur_kv[vswz_b2]));
+        unsigned t[32];
+        asm volatile("ds_read_u16 %0, %16 offset:0\n"
+                     "ds_read_u16 %1, %16 offset:1152\n"
+                     "ds_read_u16 %2, %17 offset:0\n"
+                     "ds_read_u16 %3, %17 offset:1152\n"
+                     "ds_read_u16 %4, %16 offset:128\n"
+                     "ds_read_u16 %5, %16 offset:1280\n"
+                     "ds_read_u16 %6, %17 offset:128\n"
+                     "ds_read_u16 %7, %17 offset:1280\n"
+                     "ds_read_u16 %8, %16 offset:256\n"
+                     "ds_read_u16 %9, %16 offset:1408\n"
+                     "ds_read_u16 %10, %17 offset:256\n"
+                     "ds_read_u16 %11, %17 offset:1408\n"
+                     "ds_read_u16 %12, %16 offset:384\n"
+                     "ds_read_u16 %13, %16 offset:1536\n"
+                     "ds_read_u16 %14, %17 offset:384\n"
+                     "ds_read_u16 %15, %17 offset:1536"
+                     : "=&v"(t[0]), "=&v"(t[1]), "=&v"(t[2]), "=&v"(t[3]),
+                       "=&v"(t[4]), "=&v"(t[5]), "=&v"(t[6]), "=&v"(t[7]),
+                       "=&v"(t[8]), "=&v"(t[9]), "=&v"(t[10]), "=&v"(t[11]),
+                       "=&v"(t[12]), "=&v"(t[13]), "=&v"(t[14]), "=&v"(t[15])
+                     : "v"(b0), "v"(b2)
+                     : "memory");
+        asm volatile("ds_read_u16 %0, %16 offset:512\n"
+                     "ds_read_u16 %1, %16 offset:1664\n"
+                     "ds_read_u16 %2, %17 offset:512\n"
+                     "ds_read_u16 %3, %17 offset:1664\n"
+                     "ds_read_u16 %4, %16 offset:640\n"
+                     "ds_read_u16 %5, %16 offset:1792\n"
+                     "ds_read_u16 %6, %17 offset:640\n"
+                     "ds_read_u16 %7, %17 offset:1792\n"
+                     "ds_read_u16 %8, %16 offset:768\n"
+                     "ds_read_u16 %9, %16 offset:1920\n"
+                     "ds_read_u16 %10, %17 offset:768\n"
+                     "ds_read_u16 %11, %17 offset:1920\n"
+                     "ds_read_u16 %12, %16 offset:896\n"
+                     "ds_read_u16 %13, %16 offset:2048\n"
+                     "ds_read_u16 %14, %17 offset:896\n"
+                     "ds_read_u16 %15, %17 offset:2048\n"
+                     "s_waitcnt lgkmcnt(0)"
+                     : "=&v"(t[16]), "=&v"(t[17]), "=&v"(t[18]), "=&v"(t[19]),
+                       "=&v"(t[20]), "=&v"(t[21]), "=&v"(t[22]), "=&v"(t[23]),
+                       "=&v"(t[24]), "=&v"(t[25]), "=&v"(t[26]), "=&v"(t[27]),
+                       "=&v"(t[28]), "=&v"(t[29]), "=&v"(t[30]), "=&v"(t[31])
+                     : "v"(b0), "v"(b2)
+                     : "memory");
+#pragma unroll
+        for (int i = 0; i < 16; i++) {
+          asm volatile("" : "+v"(t[i]));
+        }
+        u32x2_t vau[NUM_V_BLOCKS];
+#pragma unroll
+        for (int vb = 0; vb < NUM_V_BLOCKS; vb++) {
+          vau[vb][0] = t[4 * vb] | (t[4 * vb + 1] << 16);
+          vau[vb][1] = t[4 * vb + 2] | (t[4 * vb + 3] << 16);
+          o_acc_r[vb] *= rescale;
+        }
+        u32x2_t pbu;
+        __builtin_memcpy(&pbu, &pb, 8);
+        gang_mla_decode_detail::mla_pv8_vgpr(o_acc_r, vau, pbu);
+      }
 #elif MPK_MLA_OACC_VGPR && MPK_MLA_PV_ASM && !MPK_MLA_KV_SWZ
       {
         static_assert(NUM_V_BLOCKS == 8 && QK_DIM == 576,
@@ -2096,6 +2170,14 @@ __device__ __noinline__ void
     }
   }
 
+#if MPK_DEC_LSE_LL
+  // MPK_DEC_LSE_LL: the lse word is the merge's signal that this item's f32
+  // partials are in memory, so every wave's stores retire before it goes.
+  if (ll_lse != nullptr && ll_o == nullptr) {
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    __syncthreads();
+  }
+#endif
   // LSE for the split-KV merge. One lane per q head writes.
   //
   // scale_s carries log2(e), so m_running is a log2 exponent and l_sum sums

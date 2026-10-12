@@ -259,9 +259,102 @@ static int run_case(int active_chunks, char const *tag, int head_base = 0,
   return 0;
 }
 
+#ifdef TEST_MERGE_LSE_LL
+// MPK_DEC_LSE_LL: the same partials through the default halves path and
+// through the lse words (f32 o unchanged) must give bit-identical output.
+static int run_lse_ll_bitexact(int active_chunks, int head_base,
+                               char const *tag) {
+  size_t const lse_n = (size_t)LSE_TOKEN_STRIDE;
+  size_t const o_n = lse_n * HEAD_DIM;
+  size_t const out_n = (size_t)OUT_TOKEN_STRIDE;
+  std::vector<float> h_lse(lse_n), h_o(o_n);
+  for (size_t i = 0; i < o_n; ++i) {
+    h_o[i] = frand() * 8.0f;
+  }
+  for (size_t i = 0; i < lse_n; ++i) {
+    int const c = (int)((i / QO_PER_KV) % NUM_CHUNKS);
+    h_lse[i] = c < active_chunks ? frand() * 3.0f : -1e30f;
+  }
+  unsigned const epoch = 0x2345678u;
+  std::vector<unsigned long long> w_lse(lse_n);
+  for (size_t i = 0; i < lse_n; ++i) {
+    unsigned u;
+    memcpy(&u, &h_lse[i], 4);
+    w_lse[i] = ((unsigned long long)epoch << 32) | u;
+  }
+  float *d_lse, *d_o;
+  bf16 *d_out0, *d_out1;
+  unsigned long long *d_ll_lse;
+  int *d_qo, *d_kvp, *d_lastlen;
+  hipMalloc(&d_lse, lse_n * 4);
+  hipMalloc(&d_o, o_n * 4);
+  hipMalloc(&d_out0, out_n * sizeof(bf16));
+  hipMalloc(&d_out1, out_n * sizeof(bf16));
+  hipMalloc(&d_ll_lse, lse_n * 8);
+  hipMalloc(&d_qo, 2 * 4);
+  hipMalloc(&d_kvp, 2 * 4);
+  hipMalloc(&d_lastlen, 4);
+  hipMemcpy(d_lse, h_lse.data(), lse_n * 4, hipMemcpyHostToDevice);
+  hipMemcpy(d_o, h_o.data(), o_n * 4, hipMemcpyHostToDevice);
+  hipMemcpy(d_ll_lse, w_lse.data(), lse_n * 8, hipMemcpyHostToDevice);
+  hipMemset(d_out0, 0, out_n * sizeof(bf16));
+  hipMemset(d_out1, 0, out_n * sizeof(bf16));
+  int const h_qo[2] = {0, 1};
+  int const h_kvp[2] = {0, 1};
+  int const h_ll[1] = {257};
+  hipMemcpy(d_qo, h_qo, 8, hipMemcpyHostToDevice);
+  hipMemcpy(d_kvp, h_kvp, 8, hipMemcpyHostToDevice);
+  hipMemcpy(d_lastlen, h_ll, 4, hipMemcpyHostToDevice);
+  int const grid = QO_GROUPS * 32;
+  hipLaunchKernelGGL((merge_entry<true, 32, 8>), dim3(grid),
+                     dim3(BLOCK_THREADS), MRG_DYN_LDS, 0, d_lse, d_o, d_qo,
+                     d_kvp, d_lastlen, d_out0, head_base, nullptr, nullptr,
+                     0u);
+  hipLaunchKernelGGL((merge_entry<true, 32, 8>), dim3(grid),
+                     dim3(BLOCK_THREADS), MRG_DYN_LDS, 0, d_lse, d_o, d_qo,
+                     d_kvp, d_lastlen, d_out1, head_base, nullptr,
+                     d_ll_lse, epoch);
+  hipError_t const err = hipDeviceSynchronize();
+  std::vector<unsigned short> a(out_n), b(out_n);
+  hipMemcpy(a.data(), d_out0, out_n * 2, hipMemcpyDeviceToHost);
+  hipMemcpy(b.data(), d_out1, out_n * 2, hipMemcpyDeviceToHost);
+  int diff = 0;
+  for (int g = 0; g < QO_GROUPS; ++g) {
+    for (int h = head_base; h < head_base + 8; ++h) {
+      for (int d = 0; d < HEAD_DIM; ++d) {
+        size_t const i = (size_t)g * QO_PER_KV * HEAD_DIM + (size_t)h * HEAD_DIM + d;
+        if (a[i] != b[i]) {
+          if (diff < 4) {
+            printf("  g%d h%-2d dim %-4d: default %04x lse-ll %04x\n", g, h, d,
+                   a[i], b[i]);
+          }
+          ++diff;
+        }
+      }
+    }
+  }
+  hipFree(d_lse); hipFree(d_o); hipFree(d_out0); hipFree(d_out1);
+  hipFree(d_ll_lse); hipFree(d_qo); hipFree(d_kvp); hipFree(d_lastlen);
+  if (err != hipSuccess || diff) {
+    printf("FAIL %-28s %d values differ (%s)\n", tag, diff,
+           hipGetErrorString(err));
+    return 1;
+  }
+  printf("PASS %-28s bit-identical to the default halves path\n", tag);
+  return 0;
+}
+#endif
+
 int main() {
   srand(20250905);
   int rc = 0;
+#ifdef TEST_MERGE_LSE_LL
+  for (int hb = 0; hb < QO_PER_KV; hb += 8) {
+    rc |= run_lse_ll_bitexact(NUM_CHUNKS, hb, "LSE-LL own8 all");
+    rc |= run_lse_ll_bitexact(NUM_CHUNKS / 2 + 1, hb, "LSE-LL own8 half+1");
+    rc |= run_lse_ll_bitexact(9, hb, "LSE-LL own8 active=9");
+  }
+#endif
   // The shipping fused configuration is WRITE_THROUGH=true, DIM_SPLITS=32.
   // active_chunks 16 is seqlen>=241 (every chunk carries a tile); 9 and 15 are
   // the shorter sequences that decode correctly today.

@@ -2137,7 +2137,8 @@ gang_mla_full_layer_fused_kernel_mi300(
       attn_ll,
       (unsigned)attn_release_expected,
       // MPK_DEC_MERGE_LL: epoch is the layer counter, so ml_mode only.
-      (MPK_DEC_MERGE_LL && ml_mode)
+      // MPK_DEC_LSE_LL uses its lse words alone.
+      ((MPK_DEC_MERGE_LL || MPK_DEC_LSE_LL) && ml_mode)
           ? reinterpret_cast<unsigned long long *>(
                 counters + FULL_LAYER_DLSE_SLOT * HIER_STRIDE)
           : nullptr,
@@ -2152,11 +2153,15 @@ gang_mla_full_layer_fused_kernel_mi300(
                 counters + FULL_LAYER_QLL_SLOT * HIER_STRIDE)
           : nullptr,
       // MPK_QXS_ROW_LL: epoch is the layer counter (the split resolve's).
-      (MPK_QXS_ROW_LL && MPK_QKV_XSPLIT && EP_WORLD_SIZE > 1 && ml_mode &&
-       BATCH_SIZE == 1 && QKV_REDUCTION_SIZE / 2 <= 384 * 8)
+      // MPK_QA_LL borrows the same region for the q_a words.
+      ((MPK_QXS_ROW_LL && MPK_QKV_XSPLIT && EP_WORLD_SIZE > 1 && ml_mode &&
+        BATCH_SIZE == 1 && QKV_REDUCTION_SIZE / 2 <= 384 * 8) ||
+       (MPK_QA_LL && ml_mode && BATCH_SIZE == 1))
           ? reinterpret_cast<unsigned long long *>(
                 counters + FULL_LAYER_QXSLL_SLOT * HIER_STRIDE)
           : nullptr);
+  static_assert(!(MPK_QA_LL && MPK_QXS_ROW_LL),
+                "MPK_QA_LL and MPK_QXS_ROW_LL share one counter region");
 
   MPK_WS_PHASE(60, task_layer_idx, xcd_id);
   // Stage 0: the residual stream this layer consumed -- and READ IT AS

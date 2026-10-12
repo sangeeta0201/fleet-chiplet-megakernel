@@ -267,6 +267,39 @@ __device__ __forceinline__ void merge_online_group(LseP lse_g,
 // The slice index rides in on kv_head_idx rather than a separate argument so
 // that callers keep passing merge_task_offset straight through; the kernel
 // decomposes it because only it knows DIM_SPLITS.
+#if MPK_DEC_LSE_LL
+// MPK_DEC_LSE_LL: the block's HEADS_N x NUM_KV_CHUNKS lse words into LDS
+// ([chunk][head], as merge_halves_ll_partials stages them), one load per
+// word rather than per lane, until every word carries the epoch. The caller
+// reads its partials only after this returns. Out of line so the polled
+// words do not land in the attention task's allocation.
+template <int HEADS_N, int NUM_KV_CHUNKS, int NUM_QO_HEADS_PER_KV,
+          int NUM_THREADS>
+__device__ __noinline__ void merge_lse_ll_to_lds(
+    unsigned long long const *ll_lse_in, unsigned ll_in_epoch, int lse_base) {
+  extern __shared__ char _mrg_lsell_smem[];
+  float *const s_lse =
+      reinterpret_cast<float *>(_mrg_lsell_smem + MPK_MRG_LL_LDS_OFF);
+  constexpr int NL = HEADS_N * NUM_KV_CHUNKS;
+  while (true) {
+    bool ok = true;
+    for (int i = threadIdx.x; i < NL; i += NUM_THREADS) {
+      int const h = i % HEADS_N;
+      int const c = i / HEADS_N;
+      unsigned long long const w = __hip_atomic_load(
+          ll_lse_in + lse_base + h + c * NUM_QO_HEADS_PER_KV, __ATOMIC_RELAXED,
+          __HIP_MEMORY_SCOPE_SYSTEM);
+      ok = ok && (unsigned)(w >> 32) == ll_in_epoch;
+      s_lse[i] = __uint_as_float((unsigned)w);
+    }
+    if (__syncthreads_and(ok)) {
+      break;
+    }
+    __builtin_amdgcn_s_sleep(1);
+  }
+}
+#endif
+
 // MPK_DEC_MERGE_LL's half of the halves path, out of line: the block's
 // HEADS_N x NUM_KV_CHUNKS lse words go to LDS once ([chunk][head]), each
 // thread polls its HC o words, and returns this half's online-softmax partials
@@ -523,6 +556,34 @@ __device__ __forceinline__ void
             l[c] = my_l[c] * 1.44269504088896340736f;
           }
         }
+#elif MPK_DEC_LSE_LL
+        // The raw lse first, then one copy of the arithmetic for either
+        // source, so the words give the default's bits.
+        float lr[HC];
+        if (ll_lse_in != nullptr) {
+          merge_lse_ll_to_lds<HEADS_N, NUM_KV_CHUNKS, NUM_QO_HEADS_PER_KV,
+                              NUM_THREADS>(
+              ll_lse_in, ll_in_epoch,
+              head_base + first_token_pos * LSE_TOKEN_STRIDE + lse_kv_offset);
+          extern __shared__ char _mrg_lsell_rd_smem[];
+          float const *const s_lse = reinterpret_cast<float const *>(
+              _mrg_lsell_rd_smem + MPK_MRG_LL_LDS_OFF);
+#pragma unroll
+          for (int c = 0; c < HC; ++c) {
+            lr[c] = s_lse[(half * HC + c) * HEADS_N + (group_id >> 1)];
+          }
+        } else {
+#pragma unroll
+          for (int c = 0; c < HC; ++c) {
+            lr[c] = lse_g[lse0 + c * NUM_QO_HEADS_PER_KV];
+          }
+        }
+#pragma unroll
+        for (int c = 0; c < HC; ++c) {
+          int const ll = lse0 + c * NUM_QO_HEADS_PER_KV;
+          l[c] = lr[c] * 1.44269504088896340736f;
+          o[c] = o_g[ll * HEAD_DIM + o_col];
+        }
 #else
 #pragma unroll
         for (int c = 0; c < HC; ++c) {
@@ -580,7 +641,11 @@ __device__ __forceinline__ void
 #endif
   // The consumer polls words only the halves path writes, and the decode's
   // words only the halves path reads.
-  if (ll_out != nullptr || ll_o_in != nullptr) {
+  if (ll_out != nullptr || ll_o_in != nullptr
+#if MPK_DEC_LSE_LL
+      || ll_lse_in != nullptr
+#endif
+  ) {
     __builtin_trap();
   }
 

@@ -436,6 +436,23 @@ __device__ __forceinline__ void _rnlm8_ll_store4(unsigned long long *dst,
                : "memory");
 }
 
+// _rnlm8_ll_store4 write-through, for a consumer on another XCD (MPK_QA_LL).
+__device__ __forceinline__ void _rnlm8_ll_store4_wt(unsigned long long *dst,
+                                                    unsigned epoch,
+                                                    unsigned short v0,
+                                                    unsigned short v1,
+                                                    unsigned short v2,
+                                                    unsigned short v3) {
+  unsigned long long const eh = (unsigned long long)epoch << 32;
+  unsigned long long const w0 = eh | v0 | ((unsigned)v1 << 16);
+  unsigned long long const w1 = eh | v2 | ((unsigned)v3 << 16);
+  asm volatile("global_store_dwordx2 %0, %1, off sc0 sc1\n"
+               "global_store_dwordx2 %0, %2, off offset:8 sc0 sc1"
+               :
+               : "v"(dst), "v"(w0), "v"(w1)
+               : "memory");
+}
+
 template <bool WRITE_THROUGH>
 __device__ __forceinline__ void _rnlm8_store4(unsigned short *dst,
                                               unsigned short v0,
@@ -1366,13 +1383,19 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
   constexpr int VEC = 4;
   constexpr int NTHREADS = 256;
   constexpr int ITERS = REDUCTION_SIZE / (NTHREADS * VEC);
-  constexpr int XS_N = 16;
+  // MPK_QXS_EARLY_RES: the slices are resolved by _rnlm8_xs_resolve_early on
+  // the XCD's last workers; the tiles only gather.
+  constexpr int XS_N = MPK_QXS_EARLY_RES ? MPK_QXS_EARLY_RES_N : 16;
+  constexpr bool XS_RES = !MPK_QXS_EARLY_RES;
   constexpr int H4 = REDUCTION_SIZE / VEC;
   constexpr int XS_F4 = H4 / XS_N;
   constexpr int NEXTRA = EP_PEER_SLOTS - 1;
   static_assert(REDUCTION_SIZE % (NTHREADS * VEC) == 0 && H4 % XS_N == 0 &&
-                    XS_F4 <= NTHREADS && EP_PEER_SLOTS > 1,
+                    (XS_F4 <= NTHREADS || !XS_RES) && EP_PEER_SLOTS > 1,
                 "the split resolve walks whole float4 groups");
+  static_assert(XS_RES || (!MPK_QXS_ROW_LL && !MPK_QXS_XOUT_LATE &&
+                           !MPK_QXS_XOUT_PLAIN_PROBE),
+                "MPK_QXS_EARLY_RES resolves the flag-and-row form only");
   static_assert(REDUCTION_SIZE * 2 <= MPK_XSPLIT_ROW_LINES * 64,
                 "the resolved bf16 row overruns its exchange block");
   int const tid = threadIdx.x;
@@ -1400,7 +1423,7 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
 
   uint2 r = {0u, 0u};
   uint2 pk[NEXTRA];
-  if (wg_idx < XS_N) {
+  if (XS_RES && wg_idx < XS_N) {
     int const off = (wg_idx * XS_F4 + tid) * VEC;
 #if MPK_EP_LL
     // MPK_EP_LL: slot p is EP_SLOT_ELEMS / 2 (epoch << 32 | bf16x2) words,
@@ -1530,7 +1553,7 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
 #if MPK_QXS_XOUT_LATE
   unsigned long long xo_packed = 0;
 #endif
-  if (wg_idx < XS_N && tid < XS_F4) {
+  if (XS_RES && wg_idx < XS_N && tid < XS_F4) {
     int const off = (wg_idx * XS_F4 + tid) * VEC;
     float f[4];
     f[0] = _gang_bf16_to_float((unsigned short)r.x);
@@ -1602,6 +1625,7 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
       __builtin_amdgcn_s_sleep(1);
     }
   } else {
+  if constexpr (XS_RES) {
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
   __syncthreads();
   if (wg_idx < XS_N && tid == 0) {
@@ -1610,6 +1634,7 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
                  :
                  : "v"(flag + wg_idx), "v"(epoch)
                  : "memory");
+  }
   }
   if (tid < 64) {
     while (true) {
@@ -1680,6 +1705,135 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
 #endif
   return rsqrtf(red[0] / float(REDUCTION_SIZE) + eps);
 }
+
+#if MPK_QXS_EARLY_RES
+// MPK_QXS_EARLY_RES: the resolve half of the split resolve above for slice
+// `slice` of MPK_QXS_EARLY_RES_N, run by a worker that owns no qkv_a tile.
+// Element for element the MPK_EP_LL + MPK_RESOLVE_POLL_INC path above: same
+// slot order, same bf16 rounding, same row and x_out stores, then the
+// slice's flag. A slice wider than the block takes GPT float4 groups per
+// thread. Not inlined: the worker kernel's allocation sees one call.
+template <int REDUCTION_SIZE, int EP_PEER_SLOTS, int EP_SLOT_ELEMS>
+__device__ __noinline__ void
+_rnlm8_xs_resolve_early(unsigned short const *__restrict__ d_res,
+                        unsigned short *__restrict__ d_x_out, int *xs,
+                        unsigned epoch, int slice) {
+  constexpr int VEC = 4;
+  constexpr int XS_N = MPK_QXS_EARLY_RES_N;
+  constexpr int H4 = REDUCTION_SIZE / VEC;
+  constexpr int XS_F4 = H4 / XS_N;
+  constexpr int GPT = (XS_F4 + 255) / 256;
+  static_assert(H4 % XS_N == 0 && GPT * EP_PEER_SLOTS <= 32 &&
+                    EP_PEER_SLOTS > 1 && MPK_EP_LL && MPK_RESOLVE_POLL_INC,
+                "the early resolve is the EP_LL incremental-poll resolve");
+  typedef unsigned int ll_u4_t __attribute__((ext_vector_type(4)));
+  constexpr size_t LL_SLOT_WORDS = (size_t)EP_SLOT_ELEMS / 2;
+  int const tid = threadIdx.x;
+  unsigned *const flag = reinterpret_cast<unsigned *>(xs);
+  unsigned short *const row =
+      reinterpret_cast<unsigned short *>(xs + MPK_XSPLIT_FLAG_LINES * 16);
+  unsigned long long const *const ll =
+      reinterpret_cast<unsigned long long const *>(d_res);
+  if (tid < XS_F4) {
+    int off[GPT];
+    unsigned all = 0u;
+#pragma unroll
+    for (int g = 0; g < GPT; g++) {
+      off[g] = (slice * XS_F4 + tid + g * 256) * VEC;
+      if (tid + g * 256 < XS_F4) {
+        all |= ((1u << EP_PEER_SLOTS) - 1u) << (g * EP_PEER_SLOTS);
+      }
+    }
+    ll_u4_t w[GPT][EP_PEER_SLOTS];
+    unsigned vmask = 0u;
+    bool first = true;
+    while (true) {
+#pragma unroll
+      for (int g = 0; g < GPT; g++) {
+#pragma unroll
+        for (int p = 0; p < EP_PEER_SLOTS; p++) {
+          unsigned const bit = 1u << (g * EP_PEER_SLOTS + p);
+          if ((all & bit) && !(vmask & bit)) {
+            asm volatile("global_load_dwordx4 %0, %1, off sc0 sc1"
+                         : "=v"(w[g][p])
+                         : "v"(ll + (size_t)p * LL_SLOT_WORDS + off[g] / 2)
+                         : "memory");
+          }
+        }
+      }
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#pragma unroll
+      for (int g = 0; g < GPT; g++) {
+#pragma unroll
+        for (int p = 0; p < EP_PEER_SLOTS; p++) {
+          asm volatile("" : "+v"(w[g][p]));
+        }
+      }
+#pragma unroll
+      for (int g = 0; g < GPT; g++) {
+#pragma unroll
+        for (int p = 0; p < EP_PEER_SLOTS; p++) {
+          unsigned const bit = 1u << (g * EP_PEER_SLOTS + p);
+          if ((all & bit) && w[g][p][1] == epoch && w[g][p][3] == epoch) {
+            vmask |= bit;
+          }
+        }
+      }
+      if (MPK_PROBE_XRANK_NOWAIT == 1 || MPK_PROBE_XRANK_NOWAIT == 3) {
+        vmask = all;
+      }
+      if (tid == 0 && first) {
+        mpk_stage_stamp(70);
+      }
+      first = false;
+      if (vmask == all) {
+        break;
+      }
+      __builtin_amdgcn_s_sleep(1);
+    }
+    if (tid == 0) {
+      mpk_stage_stamp(71);
+    }
+#pragma unroll
+    for (int g = 0; g < GPT; g++) {
+      if (tid + g * 256 < XS_F4) {
+        float f[4];
+        f[0] = _gang_bf16_to_float((unsigned short)w[g][0][0]);
+        f[1] = _gang_bf16_to_float((unsigned short)(w[g][0][0] >> 16));
+        f[2] = _gang_bf16_to_float((unsigned short)w[g][0][2]);
+        f[3] = _gang_bf16_to_float((unsigned short)(w[g][0][2] >> 16));
+#pragma unroll
+        for (int p = 1; p < EP_PEER_SLOTS; p++) {
+          f[0] += _gang_bf16_to_float((unsigned short)w[g][p][0]);
+          f[1] += _gang_bf16_to_float((unsigned short)(w[g][p][0] >> 16));
+          f[2] += _gang_bf16_to_float((unsigned short)w[g][p][2]);
+          f[3] += _gang_bf16_to_float((unsigned short)(w[g][p][2] >> 16));
+        }
+        unsigned long long const packed =
+            (unsigned long long)((unsigned)_gang_float_to_bf16(f[0]) |
+                                 ((unsigned)_gang_float_to_bf16(f[1]) << 16)) |
+            ((unsigned long long)((unsigned)_gang_float_to_bf16(f[2]) |
+                                  ((unsigned)_gang_float_to_bf16(f[3]) << 16))
+             << 32);
+        asm volatile("global_store_dwordx2 %0, %1, off"
+                     :
+                     : "v"(row + off[g]), "v"(packed)
+                     : "memory");
+        st_wt_u64((void *)(d_x_out + off[g]), packed);
+      }
+    }
+  }
+  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  __syncthreads();
+  if (tid == 0) {
+    asm volatile("global_store_dword %0, %1, off\n"
+                 "s_waitcnt vmcnt(0)"
+                 :
+                 : "v"(flag + slice), "v"(epoch)
+                 : "memory");
+  }
+}
+#endif // MPK_QXS_EARLY_RES
 #endif // MPK_QKV_XSPLIT
 
 // _rnlm8_resadd_norm_rcp without the residual: the plain path's
@@ -1793,6 +1947,106 @@ _rnlm8_stage_norm_rcp(unsigned short const *__restrict__ d_in,
 
   return rsqrtf(red[0] / float(ACTUAL_HIDDEN_DIM) + eps);
 }
+
+#if MPK_QA_LL
+// MPK_QA_LL: _rnlm8_stage_norm_rcp with the row read from (epoch << 32 |
+// bf16x2) words, each thread re-reading only its words still on an older
+// epoch. Same thread mapping and accumulation order, so s_x, s_nw and the
+// returned rms_rcp are bit-identical to it.
+template <int REDUCTION_SIZE, int ACTUAL_HIDDEN_DIM>
+__device__ __forceinline__ float
+_rnlm8_stage_norm_rcp_ll(unsigned long long const *__restrict__ d_ll,
+                         unsigned epoch,
+                         unsigned short const *__restrict__ d_nw,
+                         unsigned short *__restrict__ s_x,
+                         unsigned short *__restrict__ s_nw,
+                         float eps = 1e-5f) {
+  constexpr int NTHREADS = 256;
+  static_assert(REDUCTION_SIZE == NTHREADS * 8,
+                "one 8-element group (four words) per thread");
+  using gu64 = __attribute__((address_space(1))) uint64_t const *;
+  typedef unsigned int ll_u4_t __attribute__((ext_vector_type(4)));
+  int const tid = threadIdx.x;
+  int const off = tid * 8;
+  uint64_t const w_lo = *(gu64)reinterpret_cast<uint64_t const *>(d_nw + off);
+  uint64_t const w_hi =
+      *(gu64)reinterpret_cast<uint64_t const *>(d_nw + off + 4);
+  ll_u4_t a, b;
+  unsigned vmask = 0u;
+  while (true) {
+    if (!(vmask & 1u)) {
+      asm volatile("global_load_dwordx4 %0, %1, off sc0 sc1"
+                   : "=v"(a)
+                   : "v"(d_ll + tid * 4)
+                   : "memory");
+    }
+    if (!(vmask & 2u)) {
+      asm volatile("global_load_dwordx4 %0, %1, off sc0 sc1"
+                   : "=v"(b)
+                   : "v"(d_ll + tid * 4 + 2)
+                   : "memory");
+    }
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    asm volatile("" : "+v"(a), "+v"(b));
+    if (a[1] == epoch && a[3] == epoch) {
+      vmask |= 1u;
+    }
+    if (b[1] == epoch && b[3] == epoch) {
+      vmask |= 2u;
+    }
+    if (vmask == 3u) {
+      break;
+    }
+    __builtin_amdgcn_s_sleep(1);
+  }
+  uint64_t const lo = (uint64_t)a[0] | ((uint64_t)a[2] << 32);
+  uint64_t const hi = (uint64_t)b[0] | ((uint64_t)b[2] << 32);
+  *reinterpret_cast<uint64_t *>(s_x + off) = lo;
+  *reinterpret_cast<uint64_t *>(s_nw + off) = w_lo;
+  *reinterpret_cast<uint64_t *>(s_x + off + 4) = hi;
+  *reinterpret_cast<uint64_t *>(s_nw + off + 4) = w_hi;
+  float ssq = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    float const q =
+        _gang_bf16_to_float((unsigned short)((lo >> (16 * i)) & 0xFFFFu));
+    ssq += q * q;
+  }
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    float const q =
+        _gang_bf16_to_float((unsigned short)((hi >> (16 * i)) & 0xFFFFu));
+    ssq += q * q;
+  }
+#if MPK_RMSNORM_DPP
+  ssq = gang_rmsnorm_detail::_mpk_wave_sum_to_lane0(ssq);
+#else
+#pragma unroll
+  for (int offset = 32; offset > 0; offset >>= 1) {
+    ssq += __shfl_xor(ssq, offset);
+  }
+#endif
+  __shared__ float red[16];
+  int const wave_id = tid >> 6;
+  int const lane_id = tid & 63;
+  int const num_waves = MPK_NT >> 6;
+  if (lane_id == 0) {
+    red[wave_id] = ssq;
+  }
+  __syncthreads();
+  if (wave_id == 0) {
+    ssq = (lane_id < num_waves) ? red[lane_id] : 0.0f;
+    for (int offset = num_waves >> 1; offset > 0; offset >>= 1) {
+      ssq += __shfl_xor(ssq, offset);
+    }
+    if (lane_id == 0) {
+      red[0] = ssq;
+    }
+  }
+  __syncthreads();
+  return rsqrtf(red[0] / float(ACTUAL_HIDDEN_DIM) + eps);
+}
+#endif // MPK_QA_LL
 
 // ── K-major weight layout for the attention-half GEMM ──────────────────────
 //
@@ -2526,7 +2780,10 @@ template <int BATCH_SIZE,
           bool PPL_SINK = false,
           // MPK_QKV_MXFP4: the weight is packed E2M1 (pack_dense_mxfp8 with
           // fp4=True), same workgroup layout at half the data bytes.
-          bool WEIGHT_FP4 = false>
+          bool WEIGHT_FP4 = false,
+          // MPK_QA_LL: the ll_out words go write-through, for a consumer on
+          // another XCD.
+          bool LL_WT = false>
 #if MPK_RNLM8_INLINE
 __device__ __attribute__((always_inline)) void
 #else
@@ -2916,6 +3173,20 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
         (unsigned short const *)norm_input_ptr +
         (size_t)tok_idx * INPUT_ROW_STRIDE;
     if constexpr (LDS_PROLOGUE) {
+#if MPK_QA_LL
+      // MPK_QA_LL (q_b only): qxs_row_ll / qxs_epoch carry the q_a words,
+      // which replace the qkv_a -> q_b rendezvous for this tile.
+      bool qa_done = false;
+      if constexpr (BATCH_SIZE == 1 && REDUCTION_SIZE == 256 * 8) {
+        if (qxs_row_ll != nullptr) {
+          rms_rcp = _rnlm8_stage_norm_rcp_ll<REDUCTION_SIZE, ACTUAL_HIDDEN_DIM>(
+              qxs_row_ll, qxs_epoch, (unsigned short const *)norm_weight_ptr,
+              s_x_bf16, s_nw_bf16);
+          qa_done = true;
+        }
+      }
+      if (!qa_done)
+#endif
       rms_rcp = _rnlm8_stage_norm_rcp<REDUCTION_SIZE, ACTUAL_HIDDEN_DIM>(
           raw_row, (unsigned short const *)norm_weight_ptr, s_x_bf16,
           s_nw_bf16);
@@ -3331,8 +3602,13 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
         if (BATCH_SIZE == 1 && ll_out != nullptr) {
           int const lc = wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4;
           if (lc < ll_cols) {
-            _rnlm8_ll_store4(ll_out + lc / 2, ll_epoch, packed[0], packed[1],
-                             packed[2], packed[3]);
+            if constexpr (LL_WT) {
+              _rnlm8_ll_store4_wt(ll_out + lc / 2, ll_epoch, packed[0],
+                                  packed[1], packed[2], packed[3]);
+            } else {
+              _rnlm8_ll_store4(ll_out + lc / 2, ll_epoch, packed[0], packed[1],
+                               packed[2], packed[3]);
+            }
           }
         }
       }
@@ -3529,8 +3805,13 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
       if (BATCH_SIZE == 1 && ll_out != nullptr) {
         int const lc = wg_idx * OUTPUT_PER_WG + g * 4;
         if (lc < ll_cols) {
-          _rnlm8_ll_store4(ll_out + lc / 2, ll_epoch, packed[0], packed[1],
-                           packed[2], packed[3]);
+          if constexpr (LL_WT) {
+            _rnlm8_ll_store4_wt(ll_out + lc / 2, ll_epoch, packed[0],
+                                packed[1], packed[2], packed[3]);
+          } else {
+            _rnlm8_ll_store4(ll_out + lc / 2, ll_epoch, packed[0], packed[1],
+                             packed[2], packed[3]);
+          }
         }
       }
     }

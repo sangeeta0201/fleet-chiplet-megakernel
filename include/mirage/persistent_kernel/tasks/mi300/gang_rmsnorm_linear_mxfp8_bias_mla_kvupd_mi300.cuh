@@ -124,7 +124,14 @@ __device__ __attribute__((noinline)) void
         // MPK_WUK_LL; see gang_rmsnorm_linear_mxfp8_bias_kernel.
         unsigned long long *ll_out = nullptr,
         unsigned ll_epoch = 0,
-        int ll_cols = 0) {
+        int ll_cols = 0
+#if MPK_QA_LL
+        // MPK_QA_LL: the q_a row as epoch words, read instead of the row.
+        ,
+        unsigned long long *qa_ll = nullptr,
+        unsigned qa_epoch = 0
+#endif
+        ) {
   using bf16 = __hip_bfloat16;
   constexpr int QK_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM;
   constexpr bool UNABSORB_K = QK_NOPE_HEAD_DIM > 0;
@@ -223,10 +230,18 @@ __device__ __attribute__((noinline)) void
                                                            nullptr,
                                                            0,
                                                            nullptr,
+#if MPK_QA_LL
+                                                           qa_epoch,
+                                                           ll_out,
+                                                           ll_epoch,
+                                                           ll_cols,
+                                                           qa_ll);
+#else
                                                            0,
                                                            ll_out,
                                                            ll_epoch,
                                                            ll_cols);
+#endif
 
   if constexpr (DEFER_ROPE) {
     // The caller rotates, after its own barrier. Nothing below this point --
