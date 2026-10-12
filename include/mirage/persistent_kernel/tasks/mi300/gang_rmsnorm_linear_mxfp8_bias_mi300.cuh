@@ -3596,9 +3596,13 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
         }
         int out_idx = (FOLD_ROWS ? col : tok_base) * output_stride +
                       wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4;
-        _rnlm8_store4<WRITE_THROUGH>(
-            d_output + ppl_row_off + out_idx,
-            packed[0], packed[1], packed[2], packed[3]);
+        if (!(MPK_QB_LL_NOOUT && !LL_WT && BATCH_SIZE == 1 &&
+              ll_out != nullptr &&
+              wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4 < ll_cols)) {
+          _rnlm8_store4<WRITE_THROUGH>(
+              d_output + ppl_row_off + out_idx,
+              packed[0], packed[1], packed[2], packed[3]);
+        }
         if (BATCH_SIZE == 1 && ll_out != nullptr) {
           int const lc = wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4;
           if (lc < ll_cols) {
@@ -3799,9 +3803,12 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
       }
       int out_idx = (FOLD_ROWS ? (tok_base + r) : tok_base) * output_stride +
                     wg_idx * OUTPUT_PER_WG + g * 4;
-      _rnlm8_store4<WRITE_THROUGH>(
-          d_output + ppl_row_off + out_idx,
-          packed[0], packed[1], packed[2], packed[3]);
+      if (!(MPK_QB_LL_NOOUT && !LL_WT && BATCH_SIZE == 1 && ll_out != nullptr &&
+            wg_idx * OUTPUT_PER_WG + g * 4 < ll_cols)) {
+        _rnlm8_store4<WRITE_THROUGH>(
+            d_output + ppl_row_off + out_idx,
+            packed[0], packed[1], packed[2], packed[3]);
+      }
       if (BATCH_SIZE == 1 && ll_out != nullptr) {
         int const lc = wg_idx * OUTPUT_PER_WG + g * 4;
         if (lc < ll_cols) {

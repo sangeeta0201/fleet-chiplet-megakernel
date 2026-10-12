@@ -423,6 +423,77 @@ __device__ __noinline__ void
                          : (ITERS % 2 == 0)        ? 2
                                                    : 1;
 
+#if MPK_WUK_VL4
+  // MPK_WUK_VL4: a 2-lane row computed as the 4-lane row of a half-height
+  // tile computes it, bit for bit -- virtual lane 2 * lane + v walks chunks
+  // vl, vl + 4, vl + 8, ... on its own four chains, and the row sum is
+  // ((s0 + s2) + (s1 + s3)), the 4-lane shuffle tree's order. So W_UK's
+  // 128-row tiles (MPK_WUK_IDLE_MAP) emit exactly the 64-row tiles' rows.
+  // Its own copy of the one-row, no-residual epilogue below.
+  if constexpr (LANES_PER_ROW == 2 && BATCH_SIZE == 1 && STAGE_A &&
+                !HAS_RESIDUAL && (ITERS % 2) == 0) {
+    float va[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};
+#pragma unroll
+    for (int i = 0; i < ITERS / 2; i++) {
+#pragma unroll
+      for (int v = 0; v < 2; v++) {
+        int const k = (i * 4 + 2 * lane + v) * VEC;
+#if MPK_ATTN_STREAM_NT >= 1
+        u32x4_t const wvv = ld_g_nt<u32x4_t>(w_row + k);
+#else
+        u32x4_t const wvv = ld_g<u32x4_t>(w_row + k);
+#endif
+#if MPK_ATTN_STREAM_NT == 1
+        unsigned char const svv = ld_g_nt<unsigned char>(s_row + k / SCALE_BLOCK);
+#else
+        unsigned char const svv = ld_g<unsigned char>(s_row + k / SCALE_BLOCK);
+#endif
+        u32x4_t const av0 = *reinterpret_cast<u32x4_t const *>(s_a + k);
+        u32x4_t const av1 = *reinterpret_cast<u32x4_t const *>(s_a + k + 8);
+        float const sc = e8m0_to_f32(svv);
+        unsigned const wd[4] = {wvv.x, wvv.y, wvv.z, wvv.w};
+#pragma unroll
+        for (int h = 0; h < 4; h++) {
+          u32x4_t const aa = (h >> 1) ? av1 : av0;
+          unsigned const ax = (h & 1) ? aa.z : aa.x;
+          unsigned const ay = (h & 1) ? aa.w : aa.y;
+          va[v][2 * (h & 1)] = gang_gemv_detail::fma_pair(
+              cvt_fp8_pair<false>(wd[h], sc), ax, va[v][2 * (h & 1)]);
+          va[v][2 * (h & 1) + 1] = gang_gemv_detail::fma_pair(
+              cvt_fp8_pair<true>(wd[h], sc), ay, va[v][2 * (h & 1) + 1]);
+        }
+      }
+    }
+    float const s0 = (va[0][0] + va[0][1]) + (va[0][2] + va[0][3]);
+    float const s1 = (va[1][0] + va[1][1]) + (va[1][2] + va[1][3]);
+    float const vsum = (s0 + __shfl_xor(s0, 1)) + (s1 + __shfl_xor(s1, 1));
+    if (o_ll != nullptr) {
+      if (Bs != nullptr) {
+        __builtin_trap();
+      }
+      float const v_lo = vsum + 0.0f;
+      float const v_hi = __shfl_down(v_lo, LANES_PER_ROW);
+      if (lane == 0 && (row & 1) == 0 && num_active_tokens > 0) {
+        unsigned const lo = f2b(v_lo);
+        unsigned const hi = f2b(v_hi);
+        st_wt_u64((void *)(o_ll + (n_tile * ROWS_PER_WG + row) / 2),
+                  ((unsigned long long)o_epoch << 32) | lo | (hi << 16));
+      }
+    }
+    if (lane == 0 && m_tile * BATCH_SIZE < num_active_tokens) {
+      int const n_local = n_tile * ROWS_PER_WG + row;
+      float const bv = Bs ? b2f(ld_g<unsigned short>(Bs + n_local)) : 0.0f;
+      size_t const idx = out_off + row;
+      float const v = vsum + bv;
+      if constexpr (WRITE_THROUGH) {
+        st_wt_u16(&O[idx], f2b(v));
+      } else {
+        O[idx] = f2b(v);
+      }
+    }
+    return;
+  }
+#endif
   float acc[BATCH_SIZE][4];
 #pragma unroll
   for (int m = 0; m < BATCH_SIZE; m++) {

@@ -576,12 +576,11 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
 #if MPK_WUK_IDLE_MAP
   // MPK_WUK_IDLE_MAP: the W_UK tiles grid-stride over the workers with no q_b
   // tile -- xcd_rank 0 (not on XCD 0, where it owns the latent row), then the
-  // EP folders from the XCD's last rank down.
-  if (wk_ll) {
+  // EP folders from the XCD's last rank down. The folders must sit past the
+  // decode ranks; otherwise the map stays as it is.
+  if (wk_ll && dec_base > 0 &&
+      tiles_per_xcd - MPK_EP_FOLD_WGS >= dec_base + dec_tiles) {
     int const off = (xcd_id != 0) ? 1 : 0;
-    if (dec_base == 0 || tiles_per_xcd - MPK_EP_FOLD_WGS < dec_base + dec_tiles) {
-      __builtin_trap();
-    }
     int const k = tiles_per_xcd - 1 - xcd_rank + off;
     wuk_stride = MPK_EP_FOLD_WGS + off;
     wuk_t0 = (off && xcd_rank == 0)                     ? 0

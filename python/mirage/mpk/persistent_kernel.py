@@ -1664,7 +1664,7 @@ def get_compile_command(
             "MPK_DEC_OUT_B128",
             "MPK_MERGE_LSE_LDS",
             "MPK_MLA_QK_PIPE",
-            "MPK_MLA_PV_PIPE", "MPK_WUK_REMAP", "MPK_TOPK_FLAG_LATE", "MPK_TOPK_FLAG_PF", "MPK_MLA_PV_ASM", "MPK_OPROJ_WFIRST_GATE", "MPK_OPROJ_WALL_GATE", "MPK_ROUTER_POLL_INC", "MPK_DEC_KVF_EARLY", "MPK_TOPK_FLAG_OVL", "MPK_RESOLVE_POLL_INC", "MPK_DEC_Q_INC", "MPK_MLA_QK_PIPE2", "MPK_PROBE_MERGE63", "MPK_QXS_EARLY_RES", "MPK_QKVA_SKIP_PAD", "MPK_QA_LL", "MPK_DEC_LSE_LL", "MPK_W2_ACT_SENT", "MPK_PROBE_OPROJ_HALFK", "MPK_OPROJ_A_PAD", "MPK_WUK_LAT_REMAP", "MPK_WUK_IDLE_MAP", "MPK_QKVA_SKIP_PAD",
+            "MPK_MLA_PV_PIPE", "MPK_WUK_REMAP", "MPK_TOPK_FLAG_LATE", "MPK_TOPK_FLAG_PF", "MPK_MLA_PV_ASM", "MPK_OPROJ_WFIRST_GATE", "MPK_OPROJ_WALL_GATE", "MPK_ROUTER_POLL_INC", "MPK_DEC_KVF_EARLY", "MPK_TOPK_FLAG_OVL", "MPK_RESOLVE_POLL_INC", "MPK_DEC_Q_INC", "MPK_MLA_QK_PIPE2", "MPK_PROBE_MERGE63", "MPK_QXS_EARLY_RES", "MPK_QKVA_SKIP_PAD", "MPK_QA_LL", "MPK_DEC_LSE_LL", "MPK_W2_ACT_SENT", "MPK_PROBE_OPROJ_HALFK", "MPK_OPROJ_A_PAD", "MPK_WUK_LAT_REMAP", "MPK_WUK_IDLE_MAP", "MPK_QB_LL_NOOUT", "MPK_WUK_VL4", "MPK_ROUTER_HOUT_LATE", "MPK_TOPK_2L_KEEP_LDS", "MPK_QKVA_SKIP_PAD",
             "MPK_ATTN_PROBE_NOQKVWAIT",
             "MPK_ENTRY_NOWAIT",
             "MPK_DEC_HINTS",
@@ -1701,6 +1701,14 @@ def get_compile_command(
         if _x is not None:
             assert _x.isdigit() and 0 <= int(_x) <= 40, "MPK_OPROJ_PF_MIN_US is 0..40"
             flags = flags + [f"-DMPK_OPROJ_PF_MIN_US={_x}"]
+        # MPK_TOPK_2L: 1 the two-level K-split TopK, 2 its level-1 poll at
+        # system scope, 3 also the normed flags read during the candidate poll,
+        # 4 as 3 with the router's partials and sums of squares kept in the
+        # XCD's L2 (gang_rmsnorm_linear_bias_mi300.cuh).
+        _x = os.environ.get("MPK_TOPK_2L")
+        if _x is not None:
+            assert _x in ("0", "1", "2", "3", "4"), "MPK_TOPK_2L is 0..4"
+            flags = flags + [f"-DMPK_TOPK_2L={_x}"]
         _x = os.environ.get("MPK_W2_PF_MODE")
         if _x is not None:
             assert _x in ("0", "1", "2", "3"), "MPK_W2_PF_MODE is 0..3"

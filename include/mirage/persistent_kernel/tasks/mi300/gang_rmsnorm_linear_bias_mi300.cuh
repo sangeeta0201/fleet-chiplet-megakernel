@@ -790,6 +790,254 @@ router_ks_preload(RouterKsPre<REDUCTION_SIZE> &p, void const *gate_weight_ptr,
 #endif
 
 #if MPK_ROUTER_LL
+#if MPK_TOPK_2L
+// Descending bitonic sort of one (key, payload) pair per lane of a wave64,
+// over lanes [0, N). Keys are unique where it matters, so the network's
+// order is the keys' order.
+template <int N>
+__device__ __forceinline__ void tk2l_sort(unsigned &key, unsigned &pay,
+                                          int lane) {
+#pragma unroll
+  for (int k = 2; k <= N; k <<= 1) {
+#pragma unroll
+    for (int j = k >> 1; j > 0; j >>= 1) {
+      unsigned const ok = _tk_xor_lanes(key, j, 64);
+      unsigned const op = _tk_xor_lanes(pay, j, 64);
+      bool const keep_max = (((lane & j) == 0) == ((lane & k) == 0));
+      // max/min and one select, not a compare picked by keep_max: that form
+      // compiled to an exec-mask branch per step. The payload moves only
+      // when the key does.
+      unsigned const nk = keep_max ? (key > ok ? key : ok) : (key > ok ? ok : key);
+      pay = (nk != key) ? op : pay;
+      key = nk;
+    }
+  }
+}
+
+// MPK_TOPK_2L (mpk_atoms.cuh): wave 0 only. Level 1 builds this XCD's 32
+// keys exactly as the one-level gather and selection do -- the 16 partials
+// in tile order, 1/rms from this XCD's 16 sums of squares in tile order, the
+// logit rounded to bf16, sigmoid plus bias, 24 bits of order-preserving
+// score over the 8-bit id -- and publishes the top 8 as (key, bf16 logit)
+// word pairs in the free line past the 16 tile blocks. Level 2 sorts the
+// eight XCDs' candidates and emits what topk_sigmoid_bias_mi300_task_impl
+// emits for the winners, in its order and with its weight sum order.
+// The router tiles write their partials and sums of squares at system scope,
+// which bypasses L2 on this multi-L2 part; an `nt` poll can keep hitting the
+// line it pulled into L2 before the write. MPK_TOPK_2L=2 polls at system
+// scope, as the one-level gather does.
+#if MPK_TOPK_2L == 2 || MPK_TOPK_2L == 3
+#define TK2L_L1_LD "global_load_dwordx2 %0, %1, off sc0 sc1"
+#else
+#define TK2L_L1_LD "global_load_dwordx2 %0, %1, off nt"
+#endif
+template <typename T, int NUM_EXPERTS, int K>
+__device__ __forceinline__ void topk_2l_ks(int *rll,
+                                           int xcd,
+                                           unsigned epoch,
+                                           void const *bias_ptr,
+                                           bool renormalize,
+                                           float routed_scaling_factor,
+                                           int num_shared_experts,
+                                           int const *ks_all,
+                                           float ks_hidden) {
+  static_assert(NUM_EXPERTS == 256 && K == 8,
+                "32 experts and at most 8 winners per XCD");
+  static_assert(16 * 64 + 16 <= MPK_XSPLIT_ROW_LINES * 8,
+                "the candidate line overruns the exchange block");
+  int const tid = threadIdx.x;
+  if (tid >= 64) {
+    return;
+  }
+  int const lane = tid;
+  constexpr int CAND = 16 * 64;
+  auto blocks = [&](int x) {
+    return reinterpret_cast<unsigned long long *>(
+        const_cast<int *>(ks_all) + x * MPK_XSPLIT_XCD_INTS +
+        MPK_XSPLIT_FLAG_LINES * 16);
+  };
+  unsigned long long *const own = blocks(xcd);
+  unsigned long long const hi = (unsigned long long)epoch << 32;
+
+  // ── level 1: this XCD's 32 experts ──
+  int const e = xcd * 32 + (lane & 31);
+  bool const has_p = lane < 32;
+  bool const has_s = lane >= 32 && lane < 48;
+  float const bias = static_cast<float>(static_cast<T const *>(bias_ptr)[e]);
+  unsigned long long pw[16];
+#pragma unroll
+  for (int t = 0; t < 16; t++) {
+    pw[t] = has_p ? 0ull : hi;
+  }
+  unsigned long long sw = has_s ? 0ull : hi;
+  while (true) {
+#pragma unroll
+    for (int t = 0; t < 16; t++) {
+      if ((unsigned)(pw[t] >> 32) != epoch) {
+        asm volatile(TK2L_L1_LD
+                     : "+v"(pw[t])
+                     : "v"(own + t * 64 + lane)
+                     : "memory");
+      }
+    }
+    if ((unsigned)(sw >> 32) != epoch) {
+      asm volatile(TK2L_L1_LD
+                   : "+v"(sw)
+                   : "v"(own + (lane - 32) * 64 + 32)
+                   : "memory");
+    }
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    // The conditional loads write their registers only when they land; keep
+    // every use (and any copy) behind the wait.
+#pragma unroll
+    for (int t = 0; t < 16; t++) {
+      asm volatile("" : "+v"(pw[t]));
+    }
+    asm volatile("" : "+v"(sw));
+    bool ok = (unsigned)(sw >> 32) == epoch;
+#pragma unroll
+    for (int t = 0; t < 16; t++) {
+      ok = ok && (unsigned)(pw[t] >> 32) == epoch;
+    }
+    if (__ballot(ok) == ~0ull) {
+      break;
+    }
+    __builtin_amdgcn_s_sleep(1);
+  }
+  float tot = 0.0f;
+#pragma unroll
+  for (int t = 0; t < 16; t++) {
+    tot += __int_as_float(
+        __builtin_amdgcn_readlane((int)(unsigned)sw, 32 + t));
+  }
+  float const irms = rsqrtf(tot / ks_hidden + 1e-5f);
+  float s = 0.0f;
+#pragma unroll
+  for (int t = 0; t < 16; t++) {
+    s += __uint_as_float((unsigned)pw[t]);
+  }
+  __hip_bfloat16 const lb = __float2bfloat16(s * irms);
+  unsigned short lu;
+  __builtin_memcpy(&lu, &lb, 2);
+  T lt;
+  __builtin_memcpy(&lt, &lu, 2);
+  float const rb = fast_sigmoid(static_cast<float>(lt)) + bias;
+  unsigned b = __float_as_uint(rb);
+  b = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+  unsigned key = has_p ? ((b & 0xFFFFFF00u) | (unsigned)e) : 0u;
+  unsigned pay = lu;
+  tk2l_sort<32>(key, pay, lane);
+  if (lane < 8) {
+    st_wt_u64((void *)(own + CAND + 2 * lane), hi | key);
+    st_wt_u64((void *)(own + CAND + 2 * lane + 1), hi | pay);
+  }
+  // Trace stamps 40/41/4/35 here: candidates out, candidates in, winners
+  // sorted, routing out.
+  if (lane == 0) {
+    mpk_stage_stamp(40);
+  }
+
+  // ── level 2: the eight XCDs' candidates ──
+  unsigned long long const *const cw = blocks(lane >> 3) + CAND + 2 * (lane & 7);
+  unsigned long long wa = 0ull, wb = 0ull;
+  unsigned const *const ks_flag =
+      reinterpret_cast<unsigned const *>(ks_all + xcd * MPK_XSPLIT_XCD_INTS);
+  // MPK_TOPK_2L >= 3: this XCD's 16 normed flags ride the candidate rounds,
+  // so their round trip is not after the sort.
+  unsigned fl = (MPK_TOPK_2L >= 3 && lane < 16) ? 0u : epoch;
+  while (true) {
+    if (fl < epoch) {
+      asm volatile("global_load_dword %0, %1, off nt"
+                   : "+v"(fl)
+                   : "v"(ks_flag + lane)
+                   : "memory");
+    }
+    if ((unsigned)(wa >> 32) != epoch) {
+      asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1"
+                   : "+v"(wa)
+                   : "v"(cw)
+                   : "memory");
+    }
+    if ((unsigned)(wb >> 32) != epoch) {
+      asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1"
+                   : "+v"(wb)
+                   : "v"(cw + 1)
+                   : "memory");
+    }
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    asm volatile("" : "+v"(wa));
+    asm volatile("" : "+v"(wb));
+    asm volatile("" : "+v"(fl));
+    bool const ok = (unsigned)(wa >> 32) == epoch &&
+                    (unsigned)(wb >> 32) == epoch;
+    if (__ballot(ok) == ~0ull) {
+      break;
+    }
+    __builtin_amdgcn_s_sleep(1);
+  }
+  if (lane == 0) {
+    mpk_stage_stamp(41);
+  }
+  unsigned key2 = (unsigned)wa;
+  unsigned pay2 = (unsigned)wb & 0xFFFFu;
+  tk2l_sort<64>(key2, pay2, lane);
+  if (lane == 0) {
+    mpk_stage_stamp(4);
+  }
+  T wt;
+  unsigned short const wu = (unsigned short)pay2;
+  __builtin_memcpy(&wt, &wu, 2);
+  float const sv = fast_sigmoid(static_cast<float>(wt));
+  float row_sum = 0.f;
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    row_sum += __int_as_float(__builtin_amdgcn_readlane(__float_as_int(sv), i));
+  }
+  float const inv =
+      renormalize ? (routed_scaling_factor / row_sum) : routed_scaling_factor;
+
+  // The routing words go out after this XCD's normed flags, as below.
+  if (__ballot(fl >= epoch) != ~0ull) {
+    while (true) {
+      unsigned seen = epoch;
+      if (lane < 16) {
+        asm volatile("global_load_dword %0, %1, off nt\n"
+                     "s_waitcnt vmcnt(0)"
+                     : "=v"(seen)
+                     : "v"(ks_flag + lane)
+                     : "memory");
+      }
+      if (__ballot(seen >= epoch) == ~0ull) {
+        break;
+      }
+      __builtin_amdgcn_s_sleep(1);
+    }
+  }
+  int *const xb = rll + MPK_RLL_WORD_LINES * 16 + xcd * MPK_RLL_XCD_INTS;
+  unsigned long long *const ll_route =
+      reinterpret_cast<unsigned long long *>(xb + 32 + MPK_RLL_IDS_LINES * 16);
+  if (lane < K) {
+    ll_route[lane] = hi | (key2 & 0xFFu);
+  } else if (lane == K && num_shared_experts > 0) {
+    ll_route[K] = hi | (unsigned)NUM_EXPERTS;
+  }
+  if (lane < K) {
+    float const w = sv * inv;
+    _tk_st_u32<true>((void *)(xb + 16 + lane), __float_as_uint(w));
+    ll_route[16 + lane] = hi | __float_as_uint(w);
+  } else if (lane == K && num_shared_experts > 0) {
+    _tk_st_u32<true>((void *)(xb + 16 + K), __float_as_uint(1.0f));
+    ll_route[16 + K] = hi | __float_as_uint(1.0f);
+    _tk_st_u32<true>((void *)(xb + 32 + K), (unsigned)NUM_EXPERTS);
+  }
+  if (lane == 0) {
+    _tk_st_u32<true>((void *)(xb + 32 + NUM_EXPERTS + num_shared_experts),
+                     (unsigned)(K + num_shared_experts));
+    mpk_stage_stamp(35);
+  }
+}
+#endif // MPK_TOPK_2L
+
 // MPK_ROUTER_LL's TopK, run by one router block per XCD once its own logits
 // are out: wait until all NUM_EXPERTS words carry this layer's epoch, then
 // select into this XCD's routing copy and release this XCD's MoE workers
@@ -857,12 +1105,33 @@ __device__ __attribute__((noinline)) void
       }
       return;
     }
+#if MPK_TOPK_2L
+    if constexpr (K == 8 && NUM_EXPERTS == 256) {
+#if MPK_TOPK_2L_KEEP_LDS
+      // Keeps s_logits allocated, and stands in for the selection's 32-byte
+      // s_used, so the static LDS -- and with it every phase's dynamic LDS
+      // base -- stays where the one-level TopK puts it.
+      __shared__ unsigned tk2l_used_pad[8];
+      asm volatile("" : : "v"(&s_logits[0]), "v"(&tk2l_used_pad[0]) : "memory");
+#endif
+      topk_2l_ks<T, NUM_EXPERTS, K>(rll, xcd, epoch, bias_ptr, renormalize,
+                                    routed_scaling_factor, num_shared_experts,
+                                    ks_all, ks_hidden);
+      return;
+    }
+#endif
   }
 #if MPK_TOPK_FLAG_OVL
   unsigned fl_early = 0u;
 #endif
   if constexpr (KSPLIT) {
     static_assert(NUM_EXPERTS == 256, "32 experts per XCD, 16 slices");
+#if MPK_TOPK_2L >= 4
+    // The router tiles left their partials in their own XCD's L2 for the
+    // two-level TopK; this gather reads every XCD's, so it would see stale
+    // lines. Only reached when the two-level path does not apply.
+    __builtin_trap();
+#endif
     extern __shared__ char _topk_dyn_smem[];
     T *const s_bias = reinterpret_cast<T *>(_topk_dyn_smem);
     float *const s_ssq = reinterpret_cast<float *>(_topk_dyn_smem + 512);
@@ -1943,6 +2212,9 @@ gang_rmsnorm_linear_bias_topk_kernel(
       float hk[4] = {0.0f, 0.0f, 0.0f, 0.0f};
       float g4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
       float ssq_t = 0.0f;
+#if MPK_ROUTER_HOUT_LATE
+      unsigned long long hout_w = 0ull;
+#endif
       int const i = xs_t * xs_f4 + tid;
       if (tid < xs_f4) {
         float a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -1963,11 +2235,16 @@ gang_rmsnorm_linear_bias_topk_kernel(
           hk[j] = __uint_as_float(b[j] << 16);
           ssq_t += hk[j] * hk[j];
         }
+#if MPK_ROUTER_HOUT_LATE
+        hout_w = (unsigned long long)(b[0] | (b[1] << 16)) |
+                 ((unsigned long long)(b[2] | (b[3] << 16)) << 32);
+#else
         if (i / (H4_PF / 8) == xs_x) {
           st_wt_u64((void *)(hout + i * 4),
                     (unsigned long long)(b[0] | (b[1] << 16)) |
                         ((unsigned long long)(b[2] | (b[3] << 16)) << 32));
         }
+#endif
 #if MPK_ROUTER_KS_MID
         asm volatile("s_waitcnt vmcnt(6)" ::: "memory");
         asm volatile("" : "+v"(ks_g));
@@ -2036,6 +2313,25 @@ gang_rmsnorm_linear_bias_topk_kernel(
         mpk_stage_stamp(38);
       }
       unsigned long long *const ks_blk = ks_own + xs_t * 64;
+#if MPK_TOPK_2L >= 4
+      // MPK_TOPK_2L >= 4: only this XCD reads these words (its TopK's level 1
+      // and its router tiles' 1/rms), so they stay in its L2.
+      if ((tid & 7) == 0) {
+        asm volatile("global_store_dwordx2 %0, %1, off"
+                     :
+                     : "v"(ks_blk + (tid >> 3)),
+                       "v"(ks_ep | __float_as_uint(acc))
+                     : "memory");
+      }
+      if (tid == 0) {
+        float const s = ((red[0] + red[1]) + red[2]) + red[3];
+        asm volatile("global_store_dwordx2 %0, %1, off"
+                     :
+                     : "v"(ks_blk + 32), "v"(ks_ep | __float_as_uint(s))
+                     : "memory");
+        mpk_stage_stamp(34);
+      }
+#else
       if ((tid & 7) == 0) {
         st_wt_u64((void *)(ks_blk + (tid >> 3)), ks_ep | __float_as_uint(acc));
       }
@@ -2044,12 +2340,22 @@ gang_rmsnorm_linear_bias_topk_kernel(
         st_wt_u64((void *)(ks_blk + 32), ks_ep | __float_as_uint(s));
         mpk_stage_stamp(34);
       }
+#endif
+#if MPK_ROUTER_HOUT_LATE
+      // MPK_ROUTER_HOUT_LATE: the residual slice goes out here, behind the
+      // logit words, so the gate dot's vmcnt(0) above does not wait for its
+      // write-through ack. The normed-flag drain below still orders it ahead
+      // of the routing, and everything downstream waits on the routing.
+      if (tid < xs_f4 && i / (H4_PF / 8) == xs_x) {
+        st_wt_u64((void *)(hout + i * 4), hout_w);
+      }
+#endif
       // This tile's slice of the normed row, from the XCD's 16 sums of
       // squares in tile order -- the TopK's own sum, so the MoE input and
       // the logits share one 1/rms.
       if (tid < 16) {
         unsigned long long sw;
-#if MPK_KS_SSQ_NT
+#if MPK_KS_SSQ_NT || MPK_TOPK_2L >= 4
         while (true) {
           asm volatile("global_load_dwordx2 %0, %1, off nt\n"
                        "s_waitcnt vmcnt(0)"

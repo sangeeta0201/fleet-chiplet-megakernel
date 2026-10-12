@@ -1338,11 +1338,39 @@ __device__ __forceinline__ bool
 // tile). Five idle workers (four on XCD 0) hold 128-row tiles
 // (GLM_WUK_GEMV_ROWS=128), not the 64-row default's eight. Supersedes
 // MPK_WUK_LAT_REMAP.
+// MEASURED 2026-10-12 on g16 (8498895), NP=8 1024/1024, n=3, control 3.591
+// 3.595 3.592: 64-row tiles grid-striding over the five (two serial tiles on
+// an idle worker), text identical, 3.725 3.723 3.729 (+0.133); 128-row tiles,
+// one per idle worker, 3.570 3.572 -- but the 2-lane row reduction moves the
+// tokens from the first one. With MPK_WUK_VL4 (the 64-row tiles' reduction
+// order), all 1024 tokens identical on all 8 ranks, n=3: 3.563 3.568 3.562
+// vs 3.593 3.595 3.598 (-0.031). Default on, with MPK_WUK_VL4 and demo.py's
+// 128-row default under it.
 #ifndef MPK_WUK_IDLE_MAP
-#define MPK_WUK_IDLE_MAP 0
+#define MPK_WUK_IDLE_MAP 1
+#endif
+// MPK_QB_LL_NOOUT: under MPK_WUK_LL a q_b tile skips its write-through store
+// of the nope scratch row: the W_UK tiles and the deferred rope read the
+// XCD's epoch words instead, and nothing reads the row. The store's remote
+// ack sat in wave 0's vmcnt ahead of the same worker's W_UK word poll (the
+// GEMV stages its activation on wave 0), so a W_UK tile on a q_b worker
+// returned ~0.9 us later than one on an idle worker (MPK_TRACE on 12ad8d7).
+// MEASURED 2026-10-12 on g16, NP=8 1024/1024, n=3, text identical: 3.590
+// 3.585 3.587 vs 3.595 3.596 3.602 (-0.011). Subsumed by MPK_WUK_IDLE_MAP,
+// which takes the W_UK tiles off the q_b workers: together 3.566 3.568 vs
+// 3.595 3.589, no better than the idle map alone. Off.
+#ifndef MPK_QB_LL_NOOUT
+#define MPK_QB_LL_NOOUT 0
 #endif
 #if MPK_WUK_IDLE_MAP && (MPK_WUK_REMAP || !MPK_EP_LL_FOLD_LAST)
 #error "MPK_WUK_IDLE_MAP replaces the W_UK tile map and needs the folders last"
+#endif
+// MPK_WUK_VL4: a 2-lane-per-row MXFP8 GEMV row (W_UK's 128-row tiles) is
+// computed in the 4-lane row's chunk split and sum order, so 128-row tiles
+// give the 64-row tiles' bits (gang_gemv_mxfp8_mi300.cuh). Pairs with
+// MPK_WUK_IDLE_MAP + GLM_WUK_GEMV_ROWS=128.
+#ifndef MPK_WUK_VL4
+#define MPK_WUK_VL4 1
 #endif
 #ifndef MPK_WUK_HOIST
 #define MPK_WUK_HOIST 0
@@ -1670,6 +1698,8 @@ __device__ __forceinline__ bool
 // MEASURED 2026-10-11, NP=8 1024/1024, on MPK_WUK_EARLY_PF + MPK_ROPE_REMAP
 // (control 4.132 4.128 ms), text identical: 1 -> 4.084 (-0.048); 2 -> 4.176
 // (+0.044, the extra pull competes with W13's own stream). Default 1.
+// 3 (mode 2's pull held until W13's words land) MEASURED 2026-10-12 on the
+// MPK_WUK_IDLE_MAP defaults, r1: 3.759 vs 3.564 (+0.195).
 #ifndef MPK_W2_PF_MODE
 #define MPK_W2_PF_MODE 1
 #endif
@@ -1695,8 +1725,46 @@ __device__ __forceinline__ bool
 // The partial-logit words beside them stay system scope: every XCD's TopK
 // reads every XCD's.
 // MEASURED NULL 2026-10-11, same batch: 4.139 vs 4.132 4.128 ms. Off.
+// The sums of squares are system-scope stores, which bypass L2 on this
+// multi-L2 part, so an `nt` poll can hit a line it cached before they landed
+// (see MPK_TOPK_2L, which lost 0.106 ms to exactly that).
 #ifndef MPK_KS_SSQ_NT
 #define MPK_KS_SSQ_NT 0
+#endif
+// MPK_TOPK_2L: the K-split TopK in two levels. Each XCD's router tiles hold
+// the whole logit of that XCD's 32 experts, so its TopK sums them through its
+// own L2, keeps their top 8 and publishes those keys with their bf16 logits;
+// every TopK then picks the top 8 of the 64 candidates. No XCD holds more
+// than 8 of the winners, and the keys (24-bit biased score, 8-bit id) are
+// unique, so the same 8 come out in the same order with the same weights:
+// bit-identical. Replaces each TopK's system-scope gather of 4096 partials
+// and the 256-key sort on one wave (MPK_TRACE on g16: gather 1.44 us after
+// the last router store, selection 1.52 us). test_topk_2l: 400 seeded cases
+// incl. forced ties, every output identical to the one-level TopK.
+// MEASURED 2026-10-12 on g16, NP=8 1024/1024, n=3, text identical: =1
+// (level-1 poll through L2, `nt`) 3.706 3.705 3.702 vs 3.595 3.596 3.602
+// (+0.106). The router tiles' words are system-scope stores, which bypass L2
+// here, so the poll kept hitting the line it had cached before they landed.
+// =2 polls at system scope; =3 also reads the normed flags during the
+// candidate rounds instead of after the sort; =4 is =3 with the router
+// tiles' partials and sums of squares as plain stores read through the XCD's
+// L2 -- only that XCD reads them once the TopK is two-level.
+// With the branchless sort step (the first build's compare-select compiled
+// to an exec branch per bitonic step: 1.0 us a sort), same batches, n=3:
+// =2 3.617 (r1) vs 3.589; =1 3.630 (r1); =3 3.594 3.604 3.605 vs 3.596 3.593
+// 3.591 (+0.008). On the MPK_WUK_IDLE_MAP defaults, n=3, text identical:
+// =4 3.563 3.566 3.566, =4 + MPK_TOPK_2L_KEEP_LDS 3.554 3.561 3.558, vs
+// 3.564 3.569 3.569 (-0.002 / -0.009): of the two-level build's -0.009, its
+// 544-byte smaller static LDS, which moves every phase's dynamic base, gives
+// back 0.007. Default =4 with MPK_TOPK_2L_KEEP_LDS.
+#ifndef MPK_TOPK_2L
+#define MPK_TOPK_2L 4
+#endif
+// MPK_TOPK_2L_KEEP_LDS: the two-level TopK still allocates the one-level
+// one's 512-byte logit row, so the worker's static LDS (8208 B) and every
+// phase's dynamic LDS base stay put. Prices whether the base move matters.
+#ifndef MPK_TOPK_2L_KEEP_LDS
+#define MPK_TOPK_2L_KEEP_LDS 1
 #endif
 // MPK_ROUTER_W_LATE: the K-split router tile's gate-slice and gamma loads
 // move behind its o_proj slice validation, and waves 2-3 warm L2 with the same
@@ -1980,6 +2048,16 @@ __device__ __forceinline__ bool
 // whole burst; issued up front it had finished by then. Off.
 #ifndef MPK_ROUTER_KS_MID
 #define MPK_ROUTER_KS_MID 0
+#endif
+// MPK_ROUTER_HOUT_LATE: the K-split router tile's write-through store of its
+// residual slice goes out after its logit words instead of during the slot
+// sum, where its ack sat in the vmcnt(0) the gate dot waits on for the gate
+// slices (S37 -> S38). The normed-flag drain still retires it before the
+// routing, which everything downstream waits on.
+// MEASURED 2026-10-12 on g16, NP=8 1024/1024, n=3, all tokens identical on
+// all ranks: 3.579 3.584 3.578 vs 3.596 3.593 3.591 (-0.013). Default on.
+#ifndef MPK_ROUTER_HOUT_LATE
+#define MPK_ROUTER_HOUT_LATE 1
 #endif
 // MPK_QUANT_WIDE: the RMSNorm + MXFP8 quantizer of qkv_a and q_b gives each
 // lane eight contiguous elements, so one 16-lane DPP row is exactly one

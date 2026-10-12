@@ -2803,8 +2803,12 @@ if __name__ == "__main__":
         # round; 64 is still one round, at 8 tiles of half the work each.
         # MEASURED 2026-10-08, NP=8 1024/1024, n=3 interleaved, G1 PASS,
         # coherent text: 7.209 7.207 7.219 -> 7.170 7.188 7.146 ms (-0.044).
+        # MPK_WUK_IDLE_MAP (default on) runs those 4 tiles on the q_b-idle
+        # workers instead, and MPK_WUK_VL4 keeps the 64-row tiles' bits:
+        # 128 again (numbers at MPK_WUK_IDLE_MAP in mpk_atoms.cuh).
         if qb_tp and os.environ.get("GLM_WUK_GEMV_ROWS") is None:
-            WUK_GEMV_ROWS = 64
+            WUK_GEMV_ROWS = (128 if os.environ.get("MPK_WUK_IDLE_MAP", "1") != "0"
+                             else 64)
         print(f"[CFG] q_b/W_UK tp={int(qb_tp)} heads_per_rank={qb_tp_heads} "
               f"qb_tiles_per_xcd={qb_tp_heads * qb_nope_span // 8 // QB_GEMM_OPW}"
               f" wuk_tiles_per_xcd={qb_tp_heads * kv_lora // 8 // WUK_GEMV_ROWS}")
