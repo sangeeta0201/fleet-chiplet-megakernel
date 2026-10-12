@@ -442,6 +442,11 @@ __device__ __forceinline__ mla_i32x4_t mla_buffer_rsrc(void const *base,
 // two rounds that touches VMEM -- a scratch reload under this function's
 // register pressure, as the first build showed -- arrives with a vmcnt wait,
 // and vmcnt retires in issue order, so it drains every round before it.
+//
+// Each block opens with s_nop 4: rsrc's base words come from v_readfirstlane,
+// a VALU write of an SGPR needs 5 wait states before a VMEM instruction reads
+// it, and the compiler does not insert them in front of inline asm.
+#define MLA_DMA_SGPR_WAIT "s_nop 4\n\t"
 #define MLA_DMA_ROUND(M, S)                                                    \
   "s_mov_b32 m0, %[" M "]\n\t"                                                 \
   "s_nop 0\n\t"                                                                \
@@ -459,7 +464,8 @@ __device__ __forceinline__ void mla_dma_tile(mla_i32x4_t rsrc,
                  v4 = mla_kv_swz_src(q0 + 1024u < 1152u ? q0 + 1024u : 0u);
   unsigned const z = 0u;
   if (tail_wave) {
-    asm volatile("s_mov_b32 m0, %[m0]\n\ts_nop 0\n\t"
+    asm volatile(MLA_DMA_SGPR_WAIT
+                 "s_mov_b32 m0, %[m0]\n\ts_nop 0\n\t"
                  "buffer_load_dwordx4 %[v0], %[rsrc], %[z] offen lds\n\t"
                  "s_mov_b32 m0, %[m1]\n\ts_nop 0\n\t"
                  "buffer_load_dwordx4 %[v1], %[rsrc], %[z] offen lds\n\t"
@@ -475,7 +481,8 @@ __device__ __forceinline__ void mla_dma_tile(mla_i32x4_t rsrc,
                    [m1] "s"(m1), [m2] "s"(m2), [m3] "s"(m3), [m4] "s"(m4)
                  : "memory", "m0");
   } else {
-    asm volatile("s_mov_b32 m0, %[m0]\n\ts_nop 0\n\t"
+    asm volatile(MLA_DMA_SGPR_WAIT
+                 "s_mov_b32 m0, %[m0]\n\ts_nop 0\n\t"
                  "buffer_load_dwordx4 %[v0], %[rsrc], %[z] offen lds\n\t"
                  "s_mov_b32 m0, %[m1]\n\ts_nop 0\n\t"
                  "buffer_load_dwordx4 %[v1], %[rsrc], %[z] offen lds\n\t"
@@ -493,9 +500,9 @@ __device__ __forceinline__ void mla_dma_tile(mla_i32x4_t rsrc,
 #endif
   unsigned const s0 = 0u, s1 = 4096u, s2 = 8192u, s3 = 12288u, s4 = 16384u;
   if (tail_wave) {
-    asm volatile(MLA_DMA_ROUND("m0", "s0") MLA_DMA_ROUND("m1", "s1")
-                     MLA_DMA_ROUND("m2", "s2") MLA_DMA_ROUND("m3", "s3")
-                         MLA_DMA_ROUND("m4", "s4")
+    asm volatile(MLA_DMA_SGPR_WAIT MLA_DMA_ROUND("m0", "s0")
+                     MLA_DMA_ROUND("m1", "s1") MLA_DMA_ROUND("m2", "s2")
+                         MLA_DMA_ROUND("m3", "s3") MLA_DMA_ROUND("m4", "s4")
                  :
                  : [rsrc] "s"(rsrc), [voff] "v"(voff), [m0] "s"(m0_base),
                    [m1] "s"(m1), [m2] "s"(m2), [m3] "s"(m3), [m4] "s"(m4),
@@ -503,8 +510,9 @@ __device__ __forceinline__ void mla_dma_tile(mla_i32x4_t rsrc,
                    [s4] "s"(s4)
                  : "memory", "m0");
   } else {
-    asm volatile(MLA_DMA_ROUND("m0", "s0") MLA_DMA_ROUND("m1", "s1")
-                     MLA_DMA_ROUND("m2", "s2") MLA_DMA_ROUND("m3", "s3")
+    asm volatile(MLA_DMA_SGPR_WAIT MLA_DMA_ROUND("m0", "s0")
+                     MLA_DMA_ROUND("m1", "s1") MLA_DMA_ROUND("m2", "s2")
+                         MLA_DMA_ROUND("m3", "s3")
                  :
                  : [rsrc] "s"(rsrc), [voff] "v"(voff), [m0] "s"(m0_base),
                    [m1] "s"(m1), [m2] "s"(m2), [m3] "s"(m3), [s0] "s"(s0),
@@ -513,6 +521,7 @@ __device__ __forceinline__ void mla_dma_tile(mla_i32x4_t rsrc,
   }
 }
 #undef MLA_DMA_ROUND
+#undef MLA_DMA_SGPR_WAIT
 #endif
 
 // Native bf16 MFMA. gfx950 runs bf16 at the same rate as fp16, so the latent
