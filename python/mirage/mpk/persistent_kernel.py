@@ -446,6 +446,10 @@ def get_compile_command(
             "-x", "hip",
             file_name,
             "-O2",  # -O3 causes LLVM AMDGPU register allocator to hang on large fused kernels
+            # GLM-5.2 NP=8 1024/1024, 2026-10-12 on b646d2f + the mla_dma_tile
+            # wait-state fix, n=2, tokens identical: control 3.505 3.510 ms;
+            # MPK_EXTRA_HIPCC_FLAGS=-O3 3.561 3.568 (it builds now, but slower);
+            # -mllvm=-amdgpu-sched-strategy=max-ilp 4.041 4.030. Keep -O2.
             # NOTE: do NOT add --save-temps here. Under multi-GPU SPMD both ranks
             # share a cwd and compile an input named test.cu, so --save-temps
             # dumps colliding intermediate object files (test-hip-amdgcn-*.o),
