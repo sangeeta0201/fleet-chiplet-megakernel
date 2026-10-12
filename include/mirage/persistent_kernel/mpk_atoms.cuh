@@ -1169,6 +1169,8 @@ __device__ __forceinline__ bool
 // MEASURED NEUTRAL 2026-10-09, NP=8 1024/1024, interleaved, tokens
 // identical: 6.038 6.021 -> 6.043 6.056 6.072 ms. q_b + W_UK is not bound
 // by its weight fetch. Off.
+// Re-measured on 12ad8d7, where q_b idles in the MPK_QA_LL word poll, n=3:
+// 3.698 3.685 3.702 vs 3.690 3.698 3.691 ms, null.
 #ifndef MPK_QB_SELF_PF
 #define MPK_QB_SELF_PF 0
 #endif
@@ -1311,6 +1313,36 @@ __device__ __forceinline__ bool
 // item runs all 8 heads, one per XCD. Off.
 #ifndef MPK_WUK_REMAP
 #define MPK_WUK_REMAP 0
+#endif
+// MPK_WUK_LAT_REMAP: under MPK_WUK_LL, XCD 0's W_UK tile 0 (and its early
+// weight pull) runs on the XCD's last worker -- an EP folder with nothing to
+// do between the fold and o_proj -- instead of xcd_rank 0, which owns q_b's
+// latent row and reaches Phase 3b only after the KV-cache append and its
+// flag. MPK_TRACE on 12ad8d7: that one tile is the layer's last W_UK return
+// in 277 of 292 layers, 16.80 us against 15.89 for the next XCD's, and the
+// decode validates its query behind it (17.18 median). Same GEMV on the same
+// words, so bit-identical.
+// MEASURED 2026-10-12 on 12ad8d7, NP=8 1024/1024, n=3 interleaved, all 1024
+// tokens identical on all 8 ranks: 3.689 3.684 3.705 -> 3.597 3.597 3.595 ms
+// (-0.097). Default on.
+#ifndef MPK_WUK_LAT_REMAP
+#define MPK_WUK_LAT_REMAP 1
+#endif
+#if MPK_WUK_LAT_REMAP && MPK_WUK_REMAP
+#error "MPK_WUK_LAT_REMAP moves one tile off the identity map MPK_WUK_REMAP replaces"
+#endif
+// MPK_WUK_IDLE_MAP: every W_UK tile on a worker with no q_b tile -- xcd_rank 0
+// off XCD 0 and the EP folders (the XCD's last ranks) -- since even with its
+// weight in L2 a W_UK tile on a q_b worker returns ~0.9 us later than on an
+// idle one (MPK_TRACE on 12ad8d7: 2.4 vs 1.55 us after the head's last q_b
+// tile). Five idle workers (four on XCD 0) hold 128-row tiles
+// (GLM_WUK_GEMV_ROWS=128), not the 64-row default's eight. Supersedes
+// MPK_WUK_LAT_REMAP.
+#ifndef MPK_WUK_IDLE_MAP
+#define MPK_WUK_IDLE_MAP 0
+#endif
+#if MPK_WUK_IDLE_MAP && (MPK_WUK_REMAP || !MPK_EP_LL_FOLD_LAST)
+#error "MPK_WUK_IDLE_MAP replaces the W_UK tile map and needs the folders last"
 #endif
 #ifndef MPK_WUK_HOIST
 #define MPK_WUK_HOIST 0
@@ -1730,6 +1762,46 @@ __device__ __forceinline__ bool
 #ifndef MPK_QA_LL
 #define MPK_QA_LL 1
 #endif
+// MPK_OPROJ_A_PAD: the o_proj GEMV stages its activation row with 16 bytes
+// after every 32-element chunk (gang_gemv_mxfp4_mi300.cuh). Its 64
+// ds_read_b128 a thread (256 a CU, 1 KB returned each) read eight
+// consecutive chunks per wave, 64 bytes apart -- banks 0/16/32/48 twice --
+// beside 256 cvt + 256 dot2 per wave; 80 bytes apart the eight hit disjoint
+// banks. Same values, same order: bit-identical.
+// MEASURED NULL 2026-10-12 on 12ad8d7, NP=8 1024/1024, n=3 interleaved, all
+// 1024 tokens identical: 3.701 3.691 3.689 -> 3.686 3.683 3.695 ms (-0.006,
+// inside the spread). Off.
+#ifndef MPK_OPROJ_A_PAD
+#define MPK_OPROJ_A_PAD 0
+#endif
+// MPK_PROBE_OPROJ_HALFK: PRICING PROBE, WRONG OUTPUT. The MXFP4 o_proj GEMV
+// runs half its K-loop: how much of a faster o_proj GEMV the wall keeps.
+#ifndef MPK_PROBE_OPROJ_HALFK
+#define MPK_PROBE_OPROJ_HALFK 0
+#endif
+// MPK_OPROJ_PF_MIN_US: the Phase 8 o_proj weight prefetch waits until this
+// many us past the worker's layer entry. Under MPK_QKVA_SKIP_PAD four workers
+// on XCD 6 (ranks 20-23, decode-idle at this context) reach Phase 8 ~3.8 us
+// in and run their GEMV ~24 us later: MPK_TRACE has them at 3.04-3.08 us a
+// tile against 2.44 for everyone else, every layer, and the slowest o_proj
+// tile is the one the router waits for on every rank. Before the skip they
+// reached Phase 8 at ~15 us and ran 2.32. 0 is off.
+// MEASURED 2026-10-12 on 12ad8d7, n=3, text identical: control 3.697 3.687
+// 3.695; 14 -> 3.689 3.690 3.674 (-0.009); 10 -> 3.688 3.694 3.685 (-0.004).
+// Inside the noise. Off.
+#ifndef MPK_OPROJ_PF_MIN_US
+#define MPK_OPROJ_PF_MIN_US 0
+#endif
+// MPK_W2_ACT_SENT: a W2 staging thread whose full pass over its 16 SwiGLU
+// words misses spins on two of them (one per producing W13 tile) before the
+// next full pass. The W13-idle W2 workers poll from the route onward, ~5 us
+// beside W13's HBM-bound K-loop, eight dwordx4 a thread a round; the late
+// W2 tiles that set the phase's makespan still take their first pass whole.
+// MEASURED NULL 2026-10-12 on 12ad8d7, n=3, text identical: 3.703 3.688
+// 3.690 -> 3.697 3.689 3.692 ms. Off.
+#ifndef MPK_W2_ACT_SENT
+#define MPK_W2_ACT_SENT 0
+#endif
 // MPK_QKVA_SKIP_PAD: qkv_a's row is [q_a | latent | padding] with the latent
 // padded 576 -> 1024 for the output alignment, and nothing reads the padding.
 // At GLM-5.2 that is 28 of 192 tiles (XCD 7's 24 and XCD 6's last 4), ~15%
@@ -1747,6 +1819,8 @@ __device__ __forceinline__ bool
 // waits on the L2 row stores only. Its ack then retires under qkv_a's first
 // weight wait, an HBM fetch; the qkv_a -> q_b drain orders it for o_proj.
 // MEASURED NULL 2026-10-11, NP=8 1024/1024: 4.043 vs 4.037 ms. Off.
+// Re-measured on 12ad8d7 (MPK_QA_LL), n=3: 3.698 3.701 3.688 vs 3.701 3.691
+// 3.689, null.
 #ifndef MPK_QXS_XOUT_LATE
 #define MPK_QXS_XOUT_LATE 0
 #endif

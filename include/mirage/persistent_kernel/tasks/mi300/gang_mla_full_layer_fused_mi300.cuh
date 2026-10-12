@@ -1080,6 +1080,11 @@ gang_mla_full_layer_fused_kernel_mi300(
   bool const entry_skip =
       !entry_leader &&
       ((pl_fold && MPK_W2_PARTS_LL != 2) || (MPK_ENTRY_NOWAIT && pl_layer));
+#if MPK_OPROJ_PF_MIN_US > 0
+  // MPK_OPROJ_PF_MIN_US: this worker's layer entry, re-read past the entry
+  // rendezvous below.
+  unsigned long long fl_t0 = __builtin_amdgcn_s_memrealtime();
+#endif
   if (ml_mode) {
     int const entry_expected = task_layer_idx + 1;
     int const arrivals = tiles_per_xcd * 8;
@@ -1243,6 +1248,9 @@ gang_mla_full_layer_fused_kernel_mi300(
     if (tid == 0) {
       mpk_stage_stamp(0);
     }
+#if MPK_OPROJ_PF_MIN_US > 0
+    fl_t0 = __builtin_amdgcn_s_memrealtime();
+#endif
 
     // ── MPK_NULL_PHASES: price one rendezvous ────────────────────────────
     // Byte-for-byte the barrier above, including the buffer_inv, with no work
@@ -2546,6 +2554,15 @@ gang_mla_full_layer_fused_kernel_mi300(
     // the stamps put its issue + retire (S24 -> S25, S26 -> S27) at 2.1 us on
     // the last merge arriver's path.
 #ifndef MPK_GLM_OPROJ_PREFETCH_OFF
+#if MPK_OPROJ_PF_MIN_US > 0
+    // MPK_OPROJ_PF_MIN_US: a worker this early (no qkv_a, q_b, decode or
+    // merge work) holds its prefetch back, so the tile is not ~24 us old in
+    // L2 when its GEMV runs.
+    while (__builtin_amdgcn_s_memrealtime() - fl_t0 <
+           (unsigned long long)MPK_OPROJ_PF_MIN_US * 100ull) {
+      __builtin_amdgcn_s_sleep(8);
+    }
+#endif
     {
       // The data half is one byte per element at MXFP8 and one nibble at
       // MXFP4; the E8M0 scale half is one byte per 32 either way. This is not

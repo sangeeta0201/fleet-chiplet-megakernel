@@ -1664,7 +1664,7 @@ def get_compile_command(
             "MPK_DEC_OUT_B128",
             "MPK_MERGE_LSE_LDS",
             "MPK_MLA_QK_PIPE",
-            "MPK_MLA_PV_PIPE", "MPK_WUK_REMAP", "MPK_TOPK_FLAG_LATE", "MPK_TOPK_FLAG_PF", "MPK_MLA_PV_ASM", "MPK_OPROJ_WFIRST_GATE", "MPK_OPROJ_WALL_GATE", "MPK_ROUTER_POLL_INC", "MPK_DEC_KVF_EARLY", "MPK_TOPK_FLAG_OVL", "MPK_RESOLVE_POLL_INC", "MPK_DEC_Q_INC", "MPK_MLA_QK_PIPE2", "MPK_PROBE_MERGE63", "MPK_QXS_EARLY_RES", "MPK_QKVA_SKIP_PAD", "MPK_QA_LL", "MPK_DEC_LSE_LL", "MPK_QKVA_SKIP_PAD",
+            "MPK_MLA_PV_PIPE", "MPK_WUK_REMAP", "MPK_TOPK_FLAG_LATE", "MPK_TOPK_FLAG_PF", "MPK_MLA_PV_ASM", "MPK_OPROJ_WFIRST_GATE", "MPK_OPROJ_WALL_GATE", "MPK_ROUTER_POLL_INC", "MPK_DEC_KVF_EARLY", "MPK_TOPK_FLAG_OVL", "MPK_RESOLVE_POLL_INC", "MPK_DEC_Q_INC", "MPK_MLA_QK_PIPE2", "MPK_PROBE_MERGE63", "MPK_QXS_EARLY_RES", "MPK_QKVA_SKIP_PAD", "MPK_QA_LL", "MPK_DEC_LSE_LL", "MPK_W2_ACT_SENT", "MPK_PROBE_OPROJ_HALFK", "MPK_OPROJ_A_PAD", "MPK_WUK_LAT_REMAP", "MPK_WUK_IDLE_MAP", "MPK_QKVA_SKIP_PAD",
             "MPK_ATTN_PROBE_NOQKVWAIT",
             "MPK_ENTRY_NOWAIT",
             "MPK_DEC_HINTS",
@@ -1697,6 +1697,10 @@ def get_compile_command(
         if _x is not None:
             assert _x.isdigit() and 1 <= int(_x) <= 127, "MPK_LL_POLL_GATE_SLEEP is 1..127"
             flags = flags + [f"-DMPK_LL_POLL_GATE_SLEEP={_x}"]
+        _x = os.environ.get("MPK_OPROJ_PF_MIN_US")
+        if _x is not None:
+            assert _x.isdigit() and 0 <= int(_x) <= 40, "MPK_OPROJ_PF_MIN_US is 0..40"
+            flags = flags + [f"-DMPK_OPROJ_PF_MIN_US={_x}"]
         _x = os.environ.get("MPK_W2_PF_MODE")
         if _x is not None:
             assert _x in ("0", "1", "2", "3"), "MPK_W2_PF_MODE is 0..3"

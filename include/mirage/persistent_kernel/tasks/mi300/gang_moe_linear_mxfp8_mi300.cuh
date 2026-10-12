@@ -3849,6 +3849,27 @@ __device__ __forceinline__ void
           if (ok) {
             break;
           }
+#if MPK_W2_ACT_SENT
+          // MPK_W2_ACT_SENT: a miss means W13 is still running; spin on one
+          // word per producing tile before the next full pass.
+          if (!act_local) {
+            while (true) {
+              unsigned long long s0, s1;
+              asm volatile("global_load_dwordx2 %0, %2, off sc0 sc1\n"
+                           "global_load_dwordx2 %1, %3, off sc0 sc1\n"
+                           "s_waitcnt vmcnt(0)"
+                           : "=&v"(s0), "=&v"(s1)
+                           : "v"(wp + 7), "v"(wp + 15)
+                           : "memory");
+              if ((unsigned)(s0 >> 32) == ll_epoch &&
+                  (unsigned)(s1 >> 32) == ll_epoch) {
+                break;
+              }
+              __builtin_amdgcn_s_sleep(2);
+            }
+            continue;
+          }
+#endif
           __builtin_amdgcn_s_sleep(1);
         }
 #pragma unroll

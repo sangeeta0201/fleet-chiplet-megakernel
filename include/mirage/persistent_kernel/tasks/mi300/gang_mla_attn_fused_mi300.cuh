@@ -94,6 +94,12 @@
 // make_w_buffer_rsrc / __llvm_amdgcn_raw_buffer_load_lds (MPK_QKVA_IDLE_PF).
 #include "tasks/mi300/gang_moe_linear_mxfp4_mi300.cuh"
 
+// The EP folders per XCD (MPK_WUK_IDLE_MAP's pool). The note is in
+// gang_mla_full_layer_fused_mi300.cuh, which includes this file first.
+#ifndef MPK_EP_FOLD_WGS
+#define MPK_EP_FOLD_WGS 4
+#endif
+
 namespace kernel {
 
 // Self-heal gate for the Mechanism-C flag polls. Same value and same
@@ -556,6 +562,33 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   }
   unsigned long long *const wk_words =
       wk_ll ? wuk_ll + (size_t)xcd_id * WUKLL_XCD_WORDS : nullptr;
+  // This worker's first W_UK tile. MPK_WUK_LAT_REMAP swaps XCD 0's tile 0
+  // from the latent row's worker onto the XCD's last one.
+  int wuk_t0 = xcd_rank;
+  int wuk_stride = tiles_per_xcd;
+#if MPK_WUK_LAT_REMAP
+  if (wk_ll && xcd_id == 0 && wuk_tiles_per_xcd < tiles_per_xcd - 1) {
+    wuk_t0 = (xcd_rank == 0)                   ? wuk_tiles_per_xcd
+             : (xcd_rank == tiles_per_xcd - 1) ? 0
+                                               : xcd_rank;
+  }
+#endif
+#if MPK_WUK_IDLE_MAP
+  // MPK_WUK_IDLE_MAP: the W_UK tiles grid-stride over the workers with no q_b
+  // tile -- xcd_rank 0 (not on XCD 0, where it owns the latent row), then the
+  // EP folders from the XCD's last rank down.
+  if (wk_ll) {
+    int const off = (xcd_id != 0) ? 1 : 0;
+    if (dec_base == 0 || tiles_per_xcd - MPK_EP_FOLD_WGS < dec_base + dec_tiles) {
+      __builtin_trap();
+    }
+    int const k = tiles_per_xcd - 1 - xcd_rank + off;
+    wuk_stride = MPK_EP_FOLD_WGS + off;
+    wuk_t0 = (off && xcd_rank == 0)                     ? 0
+             : (xcd_rank > 0 && k >= off && k < wuk_stride) ? k
+                                                      : wuk_tiles_per_xcd;
+  }
+#endif
   // MPK_DEC_Q_LL: W_UK's rows and the roped tail also leave as epoch words, and
   // XCD 0's latent tile flags the current token's cache row, so the decode
   // validates its query instead of waiting at the q_b -> decode barrier.
@@ -1007,13 +1040,21 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // Waves 1-3 only, into the same never-read LDS window as MPK_WUK_PF. Their
   // next counted wait is q_b's first weight load, also an HBM fetch.
   if constexpr (UNABSORB_K) {
-    if (xcd_rank < wuk_tiles_per_xcd && tid >= 64 && wuk_weight_ptr != nullptr) {
+#if MPK_WUK_IDLE_MAP
+#pragma unroll 1
+    for (int wt = wuk_t0; wt < wuk_tiles_per_xcd && tid >= 64 &&
+                          wuk_weight_ptr != nullptr;
+         wt += wuk_stride) {
+#else
+    if (wuk_t0 < wuk_tiles_per_xcd && tid >= 64 && wuk_weight_ptr != nullptr) {
+      int const wt = wuk_t0;
+#endif
       constexpr int WEP_WG_BYTES =
           WUK_ROWS_PER_WG * (QK_NOPE_HEAD_DIM + QK_NOPE_HEAD_DIM / 32);
       extern __shared__ char _wep_smem[];
       i32x4_t const wep_rsrc = make_w_buffer_rsrc(
           static_cast<char const *>(wuk_weight_ptr) +
-              static_cast<size_t>(xcd_rank) * WEP_WG_BYTES,
+              static_cast<size_t>(wt) * WEP_WG_BYTES,
           WEP_WG_BYTES);
       auto *wep_dst = (__attribute__((address_space(3))) uint32_t *)(
           _wep_smem + 140 * 1024 + ((tid >> 6) - 1) * 1024);
@@ -1349,13 +1390,13 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     // 1-3 pull it into L2 while wave 0 arrives and polls; the __syncthreads
     // after the wait retires it. Same never-read LDS window as the decode's
     // prologue prefetch, which is not live until Phase 4.
-    if (xcd_rank < wuk_tiles_per_xcd && tid >= 64) {
+    if (wuk_t0 < wuk_tiles_per_xcd && tid >= 64) {
       constexpr int WUK_WG_BYTES =
           WUK_ROWS_PER_WG * (QK_NOPE_HEAD_DIM + QK_NOPE_HEAD_DIM / 32);
       extern __shared__ char _wpf_smem[];
       i32x4_t const rsrc = make_w_buffer_rsrc(
           static_cast<char const *>(wuk_weight_ptr) +
-              static_cast<size_t>(xcd_rank) * WUK_WG_BYTES,
+              static_cast<size_t>(wuk_t0) * WUK_WG_BYTES,
           WUK_WG_BYTES);
       auto *dst = (__attribute__((address_space(3))) uint32_t *)(
           _wpf_smem + 140 * 1024 + ((tid >> 6) - 1) * 1024);
@@ -1489,7 +1530,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     for (int t = wuk_rank; t >= 0 && t < wuk_tiles_per_xcd;
          t += tiles_per_xcd) {
 #else
-    for (int t = xcd_rank; t < wuk_tiles_per_xcd; t += tiles_per_xcd) {
+    for (int t = wuk_t0; t < wuk_tiles_per_xcd; t += wuk_stride) {
 #endif
       int const heads_per_xcd = wuk_tiles_per_xcd / TILES_PER_HEAD;
       int const head = qb_head_base + xcd_id * heads_per_xcd +

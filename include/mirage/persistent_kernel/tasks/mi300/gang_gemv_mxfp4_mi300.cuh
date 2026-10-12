@@ -66,6 +66,10 @@
 #pragma once
 #include "tasks/mi300/gang_gemv_mxfp8_mi300.cuh"
 
+#ifndef MPK_PROBE_OPROJ_HALFK
+#define MPK_PROBE_OPROJ_HALFK 0
+#endif
+
 namespace kernel {
 
 namespace gang_gemv_mxfp4_detail {
@@ -104,17 +108,31 @@ struct GangLLPush {
   int64_t delta[7];
 };
 
-#if MPK_OLL2_LDS
+#ifndef MPK_OPROJ_A_PAD
+#define MPK_OPROJ_A_PAD 0
+#endif
 namespace gang_gemv_mxfp4_detail {
+// MPK_OPROJ_A_PAD: the staged activation row with 16 bytes after every
+// 32-element chunk. A wave's eight lanes of a row read eight consecutive
+// chunks; at 64 bytes apart they land on banks 0/16/32/48 twice over, at 80
+// bytes apart on eight disjoint 4-bank groups of the 64.
+template <int BATCH_SIZE, int REDUCTION_SIZE>
+constexpr int a_row_elems() {
+  return (MPK_OPROJ_A_PAD && BATCH_SIZE == 1) ? REDUCTION_SIZE + REDUCTION_SIZE / 4
+                                              : REDUCTION_SIZE;
+}
+#if MPK_OLL2_LDS
 // MPK_OLL2_LDS: where the epilogue leaves a tile's row values, past the
 // staged activation so a second pass's skipped staging still finds it.
 template <int BATCH_SIZE, int REDUCTION_SIZE>
 constexpr size_t lds_out_off() {
-  return (sizeof(unsigned short) * BATCH_SIZE * REDUCTION_SIZE + 255) &
+  return (sizeof(unsigned short) * BATCH_SIZE *
+              a_row_elems<BATCH_SIZE, REDUCTION_SIZE>() +
+          255) &
          ~(size_t)255;
 }
-} // namespace gang_gemv_mxfp4_detail
 #endif
+} // namespace gang_gemv_mxfp4_detail
 
 template <int BATCH_SIZE, // = m_per_tile
           int REDUCTION_SIZE,
@@ -240,8 +258,10 @@ __device__ __noinline__ void
 
   // Identical to the fp8 kernel: the activation is bf16 either way, so the
   // staging area and its size are unchanged by narrowing the weight.
-  constexpr size_t A_LDS_BYTES =
-      sizeof(unsigned short) * BATCH_SIZE * REDUCTION_SIZE;
+  constexpr bool A_PAD = MPK_OPROJ_A_PAD && BATCH_SIZE == 1;
+  constexpr int A_ROW =
+      gang_gemv_mxfp4_detail::a_row_elems<BATCH_SIZE, REDUCTION_SIZE>();
+  constexpr size_t A_LDS_BYTES = sizeof(unsigned short) * BATCH_SIZE * A_ROW;
   constexpr bool STAGE_A =
       A_LDS_BYTES <=
       static_cast<size_t>(mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE);
@@ -379,8 +399,10 @@ __device__ __noinline__ void
 #pragma unroll
       for (int j = 0; j < PER_T; j++) {
         int const i = tid + j * NTHREADS;
-        dst[2 * i] = (unsigned)w[j].x;
-        dst[2 * i + 1] = (unsigned)w[j].y;
+        // Pair i is elements [4i, 4i + 4), inside chunk i / 8.
+        int const d = 2 * i + (A_PAD ? (i >> 3) * 4 : 0);
+        dst[d] = (unsigned)w[j].x;
+        dst[d + 1] = (unsigned)w[j].y;
       }
       __syncthreads();
       // Trace stamp 69: the activation words validated and staged.
@@ -391,9 +413,12 @@ __device__ __noinline__ void
       u32x4_t const *src = reinterpret_cast<u32x4_t const *>(tile_input);
       u32x4_t *dst = reinterpret_cast<u32x4_t *>(s_a);
 #pragma unroll
-      for (int i = tid; i < static_cast<int>(A_LDS_BYTES / sizeof(u32x4_t));
+      for (int i = tid;
+           i < static_cast<int>(sizeof(unsigned short) * BATCH_SIZE *
+                                REDUCTION_SIZE / sizeof(u32x4_t));
            i += NTHREADS) {
-        dst[i] = ld_g<u32x4_t>(src + i);
+        // Vector i is elements [8i, 8i + 8), inside chunk i / 4.
+        dst[A_PAD ? i + (i >> 2) : i] = ld_g<u32x4_t>(src + i);
       }
       __syncthreads();
     }
@@ -444,7 +469,8 @@ __device__ __noinline__ void
   // backedge before porting a pipelining transform, not just the phase's
   // byte share.
 #pragma unroll
-  for (int i0 = 0; i0 < ITERS; i0 += UNROLL) {
+  for (int i0 = 0; i0 < (MPK_PROBE_OPROJ_HALFK ? ITERS / 2 : ITERS);
+       i0 += UNROLL) {
     // Indexed only by fully unrolled loops, so these stay in VGPRs. The
     // activation vector is 4 wide rather than 2: 32 elements of weight need
     // 64 bytes of bf16.
@@ -481,7 +507,8 @@ __device__ __noinline__ void
         // LDS-derived and a global pointer would collapse both to generic and
         // cost flat_load where ds_read belongs.
         if constexpr (STAGE_A) {
-          unsigned short const *a = s_a + m * REDUCTION_SIZE + k;
+          unsigned short const *a =
+              s_a + m * A_ROW + k + (A_PAD ? (k >> 5) * 8 : 0);
 #pragma unroll
           for (int h = 0; h < 4; h++) {
             av[u][m][h] = *reinterpret_cast<u32x4_t const *>(a + 8 * h);
