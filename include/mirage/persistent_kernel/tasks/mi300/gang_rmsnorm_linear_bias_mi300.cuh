@@ -1079,6 +1079,43 @@ __device__ __forceinline__ void topk_2l_ks(int *rll,
     mpk_stage_stamp(35);
   }
 }
+
+// MPK_W13_SELF_TOPK: topk_2l_ks's level 2 on one wave of a W13 tile, for the
+// tile's own slot. Same candidate words, same merge, so lane `slot` holds the
+// key whose id topk_2l_ks publishes as routing word `slot`.
+__device__ __forceinline__ int tk2l_slot_expert(int const *ks_all,
+                                                unsigned epoch, int slot) {
+  int const lane = threadIdx.x & 63;
+  constexpr int CAND = 16 * 64;
+  unsigned long long const *const cw =
+      reinterpret_cast<unsigned long long const *>(
+          ks_all + (lane >> 3) * MPK_XSPLIT_XCD_INTS +
+          MPK_XSPLIT_FLAG_LINES * 16) +
+      CAND + 2 * (lane & 7);
+  unsigned long long wa = 0ull;
+  while (true) {
+    if ((unsigned)(wa >> 32) != epoch) {
+      asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1"
+                   : "+v"(wa)
+                   : "v"(cw)
+                   : "memory");
+    }
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    asm volatile("" : "+v"(wa));
+    if (__ballot((unsigned)(wa >> 32) == epoch) == ~0ull) {
+      break;
+    }
+    __builtin_amdgcn_s_sleep(1);
+  }
+  unsigned key = (unsigned)wa;
+  unsigned pay = 0u;
+#if MPK_TOPK_2L_MERGE
+  tk2l_top8_of_64(key, pay, lane);
+#else
+  tk2l_sort<64>(key, pay, lane);
+#endif
+  return (int)((unsigned)__builtin_amdgcn_readlane((int)key, slot) & 0xFFu);
+}
 #endif // MPK_TOPK_2L
 
 // MPK_ROUTER_LL's TopK, run by one router block per XCD once its own logits

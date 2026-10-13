@@ -2502,6 +2502,39 @@ __device__ __attribute__((always_inline)) void
 #pragma unroll 1
   for (int _w13rep = 0; _w13rep < MPK_W13_REPS; ++_w13rep)
   for (int t = mrk; t >= 0 && t < moe_w13_live; t += tiles_per_xcd) {
+    int w13_pre_e = -1;
+#if MPK_W13_SELF_TOPK && MPK_ROUTER_LL && MPK_TOPK_2L
+    // MPK_W13_SELF_TOPK: the tile picks its slot's expert from the eight
+    // XCDs' TopK candidates itself instead of waiting for its XCD's TopK to
+    // merge them and publish the routing words. Only on a tile whose row
+    // MPK_W13_ACT_EARLY staged behind the normed flags, since the candidates
+    // go out before them.
+    if constexpr (BATCH_SIZE == 1 && NUM_EXPERTS == 256 && TOPK_K == 8) {
+      if (ll_route != nullptr && w13_staged && t == mrk && _w13rep == 0) {
+        int const slot = (t * 8 + xcd_id) / MOE_W13_TILES_PER_EXPERT;
+        if (routed_scaling_factor == 0.0f) {
+          // GLM_DENSE_FUSED: slot k is virtual expert k.
+          w13_pre_e = slot;
+        } else if (slot == TOPK_K && num_shared_experts > 0) {
+          w13_pre_e = NUM_EXPERTS;
+        } else if (slot < TOPK_K) {
+          extern __shared__ char _w13_self_smem[];
+          int *const s_self_e =
+              reinterpret_cast<int *>(_w13_self_smem + 136 * 1024);
+          if (tid < 64) {
+            int const e = gang_rmsnorm_topk_detail::tk2l_slot_expert(
+                static_cast<int const *>(router_xsplit_ptr),
+                (unsigned)routing_expected, slot);
+            if (tid == 0) {
+              *s_self_e = e;
+            }
+          }
+          __syncthreads();
+          w13_pre_e = *s_self_e;
+        }
+      }
+    }
+#endif
     gang_moe_w13_linear_mxfp8_kernel<BATCH_SIZE,
                                      2 * MOE_INTERMEDIATE,
                                      2 * MOE_INTERMEDIATE,
@@ -2532,7 +2565,8 @@ __device__ __attribute__((always_inline)) void
         ll_route,
         (unsigned)routing_expected,
         w13_staged && t == mrk && _w13rep == 0,
-        w2_act_ll);
+        w2_act_ll,
+        w13_pre_e);
   }
 
 #if MPK_MOE_SHADOW_KB > 0

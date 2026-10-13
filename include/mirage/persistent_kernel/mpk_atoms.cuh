@@ -1808,6 +1808,21 @@ __device__ __forceinline__ bool
 #ifndef MPK_TOPK_2L_MERGE
 #define MPK_TOPK_2L_MERGE 1
 #endif
+// MPK_W13_SELF_TOPK: under MPK_TOPK_2L each routed W13 tile's wave 0 polls the
+// eight XCDs' level-1 candidates and runs the level-2 merge itself, taking its
+// slot's expert from it, instead of waiting for its XCD's TopK to merge, see
+// the normed flags and publish the routing words (MPK_TRACE: candidates in ->
+// W13 route seen ~0.9 us). The shared slot (and a dense layer's virtual
+// experts) start without a poll. The TopK still publishes the words W2 reads.
+// Same keys, same merge: bit-identical.
+// MEASURED 2026-10-13 on 49d37f8, NP=8 1024/1024, n=2 interleaved, all 1024
+// rank-0 tokens identical: 3.470 3.471 vs 3.503 3.506 ms (-0.034). ppl512
+// 2.3670 on all 8 ranks (= default), longseq 256/512/1024 G1 PASS, standalone
+// PASS. Defaulted, n=3 interleaved against =0, tokens identical: 3.480 3.478
+// 3.471 vs 3.509 3.504 3.505 ms (-0.030). Default on.
+#ifndef MPK_W13_SELF_TOPK
+#define MPK_W13_SELF_TOPK 1
+#endif
 // MPK_ROUTER_W_LATE: the K-split router tile's gate-slice and gamma loads
 // move behind its o_proj slice validation, and waves 2-3 warm L2 with the same
 // bytes at entry instead. Issued up front on every wave, they sat in the

@@ -1942,7 +1942,11 @@ __device__ __forceinline__ bool _gang_moe_mxfp8_tile(int tile_idx,
                                                      // epoch-tagged word.
                                                      unsigned long long const
                                                          *ll_route = nullptr,
-                                                     unsigned ll_epoch = 0) {
+                                                     unsigned ll_epoch = 0,
+                                                     // MPK_W13_SELF_TOPK: the
+                                                     // slot's expert, already
+                                                     // selected by the caller.
+                                                     int pre_e = -1) {
   static_assert(FIXED_SLOTS == 0 ||
                     (BATCH_SIZE == 1 && EP_WORLD_SIZE == 1 &&
                      DUP_SHARED == 0 && SHARED_KSHARD == 0),
@@ -2068,7 +2072,12 @@ __device__ __forceinline__ bool _gang_moe_mxfp8_tile(int tile_idx,
     if (global_tile >= num_activated_experts * TILES_PER_EXPERT) {
       return false;
     }
-    if (FIXED_SLOTS > 0 && ll_route != nullptr) {
+    if (FIXED_SLOTS > 0 && pre_e >= 0) {
+      e = pre_e;
+      if (threadIdx.x == 0) {
+        mpk_stage_stamp(55);
+      }
+    } else if (FIXED_SLOTS > 0 && ll_route != nullptr) {
       // Written into this XCD's L2 by its TopK block after the normed row;
       // `nt` misses the vL1 and hits the L2. Then drop the vL1 for the rows
       // read below.
@@ -2225,7 +2234,10 @@ __device__ __noinline__ void
                                      // MPK_W2_ACT_LL: the SwiGLU pairs go out
                                      // as (ll_epoch << 32 | bf16x2) words here
                                      // instead of to output_ptr.
-                                     unsigned long long *act_ll = nullptr) {
+                                     unsigned long long *act_ll = nullptr,
+                                     // MPK_W13_SELF_TOPK: the slot's expert,
+                                     // selected by the caller (-1: poll).
+                                     int pre_e = -1) {
   // 2026-08-21 closed narrowing below 64 rows: 16 (the K-parallel branch)
   // measured -1.34 ms (95a044a), and 32 as an N-parallel split would put 8
   // rows on each of 4 waves and starve the 16-row MFMA. 32 is now legal as a
@@ -2321,7 +2333,8 @@ __device__ __noinline__ void
                  &wg_idx,
                  &topk_slot,
                  ll_route,
-                 ll_epoch)) {
+                 ll_epoch,
+                 pre_e)) {
     return;
   }
 
