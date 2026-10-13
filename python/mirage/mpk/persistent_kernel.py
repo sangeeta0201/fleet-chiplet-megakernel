@@ -1668,7 +1668,7 @@ def get_compile_command(
             "MPK_DEC_OUT_B128",
             "MPK_MERGE_LSE_LDS",
             "MPK_MLA_QK_PIPE",
-            "MPK_MLA_PV_PIPE", "MPK_WUK_REMAP", "MPK_TOPK_FLAG_LATE", "MPK_TOPK_FLAG_PF", "MPK_MLA_PV_ASM", "MPK_OPROJ_WFIRST_GATE", "MPK_OPROJ_WALL_GATE", "MPK_ROUTER_POLL_INC", "MPK_DEC_KVF_EARLY", "MPK_TOPK_FLAG_OVL", "MPK_RESOLVE_POLL_INC", "MPK_DEC_Q_INC", "MPK_MLA_QK_PIPE2", "MPK_PROBE_MERGE63", "MPK_QXS_EARLY_RES", "MPK_QKVA_SKIP_PAD", "MPK_QA_LL", "MPK_DEC_LSE_LL", "MPK_W2_ACT_SENT", "MPK_PROBE_OPROJ_HALFK", "MPK_OPROJ_A_PAD", "MPK_WUK_LAT_REMAP", "MPK_WUK_IDLE_MAP", "MPK_QB_LL_NOOUT", "MPK_WUK_VL4", "MPK_ROUTER_HOUT_LATE", "MPK_TOPK_2L_KEEP_LDS", "MPK_W2_WPRE_BB", "MPK_TOPK_2L_MERGE", "MPK_PROBE_W13_HALFK", "MPK_MLA_QK_SPLIT", "MPK_QKVA_SKIP_PAD", "MPK_W13_SELF_TOPK",
+            "MPK_MLA_PV_PIPE", "MPK_WUK_REMAP", "MPK_TOPK_FLAG_LATE", "MPK_TOPK_FLAG_PF", "MPK_MLA_PV_ASM", "MPK_OPROJ_WFIRST_GATE", "MPK_OPROJ_WALL_GATE", "MPK_ROUTER_POLL_INC", "MPK_DEC_KVF_EARLY", "MPK_TOPK_FLAG_OVL", "MPK_RESOLVE_POLL_INC", "MPK_DEC_Q_INC", "MPK_MLA_QK_PIPE2", "MPK_PROBE_MERGE63", "MPK_QXS_EARLY_RES", "MPK_QKVA_SKIP_PAD", "MPK_QA_LL", "MPK_DEC_LSE_LL", "MPK_W2_ACT_SENT", "MPK_PROBE_OPROJ_HALFK", "MPK_OPROJ_A_PAD", "MPK_WUK_LAT_REMAP", "MPK_WUK_IDLE_MAP", "MPK_QB_LL_NOOUT", "MPK_WUK_VL4", "MPK_ROUTER_HOUT_LATE", "MPK_TOPK_2L_KEEP_LDS", "MPK_W2_WPRE_BB", "MPK_TOPK_2L_MERGE", "MPK_PROBE_W13_HALFK", "MPK_MLA_QK_SPLIT", "MPK_QKVA_SKIP_PAD", "MPK_W13_SELF_TOPK", "MPK_W2F_RT_OFF", "MPK_ROUTE_BATCH", "MPK_MOE_DPP", "MPK_W2_SELF_IDS", "MPK_W2_WPRE_LATE",
             "MPK_ATTN_PROBE_NOQKVWAIT",
             "MPK_ENTRY_NOWAIT",
             "MPK_DEC_HINTS",
@@ -1687,6 +1687,16 @@ def get_compile_command(
         _x = os.environ.get("MPK_TRACE_T0")
         if _x is not None:
             flags = flags + [f"-DMPK_TRACE_T0={int(_x)}"]
+        # MPK_TRACE_SPARSE=L: stamp only layers L, L + 1, into LDS
+        # (mpk_atoms.cuh).
+        _x = os.environ.get("MPK_TRACE_SPARSE")
+        if _x is not None:
+            assert 0 <= int(_x) <= 76, "MPK_TRACE_SPARSE is a layer 0..76"
+            flags = flags + [f"-DMPK_TRACE_SPARSE={int(_x)}"]
+            # Its 640 B of static LDS: the default 155 KB dynamic request
+            # leaves 16 B of the CU's 160 KB beside the 8176 B static.
+            if int(_x) > 0 and os.environ.get("MPK_WORKER_LDS_KB") is None:
+                flags = flags + ["-DMPK_WORKER_LDS_KB=154"]
         # Decode KV tiles DMA'd into LDS ahead of the q_b -> decode release
         # (gang_mla_attn_fused_mi300.cuh): 0, 1 or 2.
         _x = os.environ.get("MPK_OPROJ_SHIFT")
@@ -1719,6 +1729,13 @@ def get_compile_command(
         if _x is not None:
             assert _x in ("0", "1", "2"), "MPK_W2_WPRE is 0..2"
             flags = flags + [f"-DMPK_W2_WPRE={_x}"]
+        # MPK_W2_FOLD: 1 the full-K W2 fold tile with its weight DMA'd into
+        # LDS, 2 the same with the weight in registers
+        # (gang_moe_linear_mxfp8_mi300.cuh).
+        _x = os.environ.get("MPK_W2_FOLD")
+        if _x is not None:
+            assert _x in ("0", "1", "2"), "MPK_W2_FOLD is 0..2"
+            flags = flags + [f"-DMPK_W2_FOLD={_x}"]
         _x = os.environ.get("MPK_W2_PF_MODE")
         if _x is not None:
             assert _x in ("0", "1", "2", "3"), "MPK_W2_PF_MODE is 0..3"

@@ -1063,8 +1063,16 @@ gang_mla_full_layer_fused_kernel_mi300(
   bool const pl_layer =
       MPK_W2_PARTS_LL && MPK_EP_LL && !EP_TAIL_ONLY && EP_WORLD_SIZE > 1 &&
       BATCH_SIZE == 1 && ml_mode && (task_layer_idx % ml_num_layers) != 0;
-  bool const pl_fold =
-      pl_layer && pl_fold_rank >= 0 && pl_fold_rank < MPK_EP_FOLD_WGS;
+  // MPK_W2_FOLD: the previous layer's W2 tiles folded and pushed this
+  // layer's EP slots themselves (gang_oproj_router_fused_mi300.cuh traps
+  // where they could not), so nothing folds here.
+  // MPK_W2F_RT_OFF: PROBE. The fold path compiled in but never taken (an
+  // always-false runtime test both halves share), so the build's register
+  // allocation is priced on its own.
+  bool const w2f_rt = !MPK_W2F_RT_OFF || ml_num_layers > 4096;
+  bool const w2f_prev = MPK_W2_FOLD && pl_layer && w2f_rt;
+  bool const pl_fold = pl_layer && !w2f_prev && pl_fold_rank >= 0 &&
+                       pl_fold_rank < MPK_EP_FOLD_WGS;
   // Under MPK_BAR_TAGGED_HIER the entry's tag poll is xcd_rank 0's alone, and
   // it publishes the release line the rest of its XCD waits on -- so xcd_rank
   // 0 must wait. The folders are ranks 0.. unless MPK_EP_LL_FOLD_LAST moves
@@ -1507,7 +1515,8 @@ gang_mla_full_layer_fused_kernel_mi300(
     // anyone's arrival. All that is left here is the peer wait, which one
     // fixed worker takes.
     bool const ep_fold_here =
-        !(MPK_FOLD_W2 && ml_mode && (task_layer_idx % ml_num_layers) != 0);
+        !(MPK_FOLD_W2 && ml_mode && (task_layer_idx % ml_num_layers) != 0) &&
+        !w2f_prev;
     if (!ep_fold_here && tid == 0) {
       ep_leader = (xcd_id == 0 && xcd_rank == 0);
     }
@@ -3008,7 +3017,8 @@ gang_mla_full_layer_fused_kernel_mi300(
           : nullptr,
       // MPK_FOLD_W2: the next layer's ep_gather and this task's fold counters.
       /*fold_next_gather=*/
-      (MPK_FOLD_W2 && EP_WORLD_SIZE > 1 && ml_mode)
+      ((MPK_FOLD_W2 || (MPK_W2_FOLD && w2f_rt)) && EP_WORLD_SIZE > 1 &&
+       ml_mode)
           ? input_ptrs[MPK_FOLD_W2_SLOT]
           : nullptr,
       /*fold_counters=*/

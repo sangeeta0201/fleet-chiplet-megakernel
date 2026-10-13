@@ -1823,6 +1823,90 @@ __device__ __forceinline__ bool
 #ifndef MPK_W13_SELF_TOPK
 #define MPK_W13_SELF_TOPK 1
 #endif
+// MPK_W2_FOLD: TileRT's expert_down_allreduce shape for the one-row TP W2.
+// A W2 tile is one 64-row block over all nine slots (12 per XCD instead of 24
+// half-K tiles), on the 12 MoE workers that run no routed W13 tile: the ten
+// W13-idle ones and the shared slot's two, whose W13 starts on the normed row
+// without waiting for routing. Each DMAs its nine 8.5 KB weight blocks into
+// LDS as soon as the routing words land, so after the SwiGLU words validate
+// it only stages them and runs 18 MFMAs from LDS -- and it folds the result
+// itself (the two halves' sums in the folder's order, the residual on the
+// fold rank, bf16) and pushes the words to every rank's next-layer gather
+// slot. The next layer's folders and the W13 workers' own W2 tiles are gone.
+// MPK_TRACE (mtrace_c): the last W2 tile is always the last W13 worker's own,
+// staged 4.1 us after the last W13 k-loop against 2.2 for a W13-idle worker,
+// and the next layer's fold lands 1.2 us after the last W2 tile.
+// Bit-identical: same staging, same per-half MFMA order, same fold.
+// MEASURED SLOWER 2026-10-13 on 49d37f8, NP=8 1024/1024, interleaved, all
+// 1024 rank-0 tokens identical: =1 (LDS) 3.637 3.640 vs 3.497, and 3.598 vs
+// 3.511; =2 (registers) 3.537 3.537 3.542 vs 3.511 3.500 3.495 (+0.037);
+// MPK_W2F_RT_OFF 3.529 3.535 (+0.035) -- the path itself is neutral, the
+// build pays for having it. MPK_TRACE_SPARSE: W13's last k-loop ends 0.5 us
+// later (the 7 MB weight pull lands in W13's stream), and the shared slot's
+// two workers per XCD stage 1.4 us behind the W13-idle ones (their SwiGLU
+// stores retire, then the routing poll, before their weight fetch). With
+// MPK_W2_ACT_SENT 3.534, 3.541 3.538; with the routing words polled as whole
+// rounds 3.528 3.530 vs 3.499 3.502; on the MPK_W13_SELF_TOPK default with
+// MPK_MOE_W13_INLINE + MPK_W13_NO_ARRIVE + MPK_W13_ACT_W3 3.514 3.513 vs
+// 3.476 3.478. Off.
+#ifndef MPK_W2_FOLD
+#define MPK_W2_FOLD 0
+#endif
+// MPK_MOE_DPP: the MoE chain's intra-wave exchanges as DPP and gfx950
+// register swaps instead of ds_bpermute -- the K-split router tile's sum of
+// squares (lane 0's tree) and gate-dot reduction, the two cross-row steps of
+// the TopK merge (run by every W13 tile under MPK_W13_SELF_TOPK), and the TP
+// W2 staging's per-quad scale max. Same partners, same order: bit-identical
+// (m_dpp_test: all four exchanges match their shuffle forms on 4096 random
+// waves). gang_rmsnorm_linear_bias_mi300.cuh's MPK_RMSNORM_DPP helper is not
+// usable here: its row_shr steps leave lane 0 outside its row's sum.
+// MEASURED 2026-10-13 on the MPK_W13_SELF_TOPK default, NP=8 1024/1024, n=3
+// interleaved, all 1024 rank-0 tokens identical: 3.471 3.462 3.471 vs 3.476
+// 3.476 3.475 (-0.008). Defaulted, n=3 against =0: 3.483 3.465 3.468 vs
+// 3.473 3.474 3.477 (-0.003); pooled -0.005, near the noise. ppl512 2.3670
+// on all 8 ranks, longseq 256/512/1024 G1 PASS, standalone PASS. Default on.
+#ifndef MPK_MOE_DPP
+#define MPK_MOE_DPP 1
+#endif
+// MPK_W2_SELF_IDS: under MPK_W13_SELF_TOPK a W13 tile's merge leaves all
+// nine slot ids in LDS, and the same worker's W2 tile -- the last W2 tile to
+// stage in every layer -- takes its segments' ids from there instead of
+// reading the routing words (one L2 round trip, ahead of its weight preload
+// and so of its first staging poll). Same ids: bit-identical.
+// MEASURED SLOWER 2026-10-13 on the MPK_W13_SELF_TOPK default, n=3
+// interleaved, text identical: 3.488 3.484 3.478 vs 3.471 3.473 3.475
+// (+0.010): the preload burst lands earlier in W13's tail. Off.
+#ifndef MPK_W2_SELF_IDS
+#define MPK_W2_SELF_IDS 0
+#endif
+// MPK_W2_WPRE_LATE: the W2 tiles on W13 workers -- each issued right behind
+// its worker's W13 tile, while the last W13 tiles still stream -- skip
+// MPK_W2_WPRE and load their weights after the staging, so the 144 x 40 KB
+// burst no longer lands in the W13 tail (MPK_W2_SELF_IDS, which issues it
+// one L2 round trip earlier, measured +0.017). The W13-idle tiles keep the
+// preload. Same loads, same MFMA order: bit-identical.
+// MEASURED SLOWER 2026-10-13, r1, text identical: 3.656 vs 3.471-3.476
+// (+0.18) -- without the preload the tile's weight stream starts after the
+// staging, in the depth-4 k-loop's dependent trips. Off.
+#ifndef MPK_W2_WPRE_LATE
+#define MPK_W2_WPRE_LATE 0
+#endif
+// MPK_ROUTE_BATCH: the TP W2's routing-word reads (MPK_W2_EARLY_PF's pull and
+// MPK_W2_WPRE's preload) poll all nine words as whole rounds. A W13-idle
+// worker gets there before the TopK publishes, finds every word stale, and
+// re-polled them one round trip at a time. Timing only: bit-identical.
+// MEASURED SLOWER 2026-10-13 on 49d37f8, n=2 interleaved, text identical:
+// 3.549 3.536 vs 3.499 3.505 (+0.04); with MPK_W2_PF_MODE=2 3.608 (r1). The
+// pulls start earlier, inside W13's stream. Off.
+#ifndef MPK_ROUTE_BATCH
+#define MPK_ROUTE_BATCH 0
+#endif
+// MPK_W2F_RT_OFF: PROBE, correct output. MPK_W2_FOLD's code compiled in and
+// never taken (the old W2 and fold run), to price its effect on the build.
+// MEASURED 2026-10-13: +0.035, see MPK_W2_FOLD.
+#ifndef MPK_W2F_RT_OFF
+#define MPK_W2F_RT_OFF 0
+#endif
 // MPK_ROUTER_W_LATE: the K-split router tile's gate-slice and gamma loads
 // move behind its o_proj slice validation, and waves 2-3 warm L2 with the same
 // bytes at entry instead. Issued up front on every wave, they sat in the
@@ -2080,6 +2164,9 @@ __device__ __forceinline__ bool
 // =1000: +0.066 ms, 85% critical) and nothing else drains before the next
 // layer's first non-inlined call. n=3, text identical: 3.510 3.519 3.513 vs
 // 3.540 3.531 3.533 (-0.021); worker 386 VGPR (366), 0 spills. Default on.
+// W13 re-measured 2026-10-13 on the MPK_W13_SELF_TOPK default with
+// MPK_W13_NO_ARRIVE=1, text identical: 3.473 3.473 vs 3.476 3.478
+// (null); + MPK_W13_ACT_W3 3.489 3.478 (+0.006).
 #ifndef MPK_MOE_W13_INLINE
 #define MPK_MOE_W13_INLINE 0
 #endif
@@ -2955,6 +3042,9 @@ __device__ __forceinline__ void mpk_stage_stamp(int idx) {
 #ifndef MPK_TRACE_T0
 #define MPK_TRACE_T0 1600
 #endif
+#ifndef MPK_TRACE_SPARSE
+#define MPK_TRACE_SPARSE 0
+#endif
 #define MPK_TRACE_ITERS 4
 #define MPK_TRACE_LAYERS 80
 // 46 shared with MPK_BAR_SKEW, then trace-only sub-phase stamps 46..79.
@@ -2970,6 +3060,19 @@ __shared__ int s_mpk_trace_slot;
 __device__ __forceinline__ void mpk_trace_set_slot(int slot) {
   s_mpk_trace_slot = slot;
 }
+// MPK_TRACE_SPARSE=L: only layers L and L + 1 are stamped, in each of
+// MPK_TRACE_ITERS * MPK_TRACE_LAYERS / 2 decode iterations from MPK_TRACE_T0
+// (slot 2 * (iter - T0) + (ml - L)), and the stamps go to LDS -- the global
+// stores of the dense trace count in vmcnt, so every stamp ahead of a poll's
+// vmcnt(0) delayed that poll by a store round trip, and by different amounts
+// in different designs (a fold that traced 1.3 us/layer faster measured
+// 0.03 ms slower). Layer L + 2 flushes the 2 x 80 words to the same
+// [slot][stamp][worker] buffer; the other layers run untraced. Cost
+// 2026-10-13: traced decode 3.686 against 3.50 untraced (+5%; the dense
+// trace +6-8%). m_sparse_chain.py reads the dump.
+#if MPK_TRACE_SPARSE > 0
+__shared__ unsigned s_mpk_tl[2][MPK_STAGE_SLOTS];
+#endif
 __device__ __forceinline__ void mpk_stage_stamp(int idx) {
   unsigned const t = (unsigned)__builtin_amdgcn_s_memrealtime();
   int const slot = s_mpk_trace_slot;
@@ -2977,11 +3080,51 @@ __device__ __forceinline__ void mpk_stage_stamp(int idx) {
   if (slot < 0 || w >= MPK_STAGE_WORKERS) {
     return;
   }
+#if MPK_TRACE_SPARSE > 0
+  s_mpk_tl[slot & 1][idx] = t;
+#else
   __builtin_nontemporal_store(
       t, &g_mpk_trace[((size_t)slot * MPK_STAGE_SLOTS + idx) *
                           MPK_STAGE_WORKERS +
                       w]);
+#endif
 }
+#if MPK_TRACE_SPARSE > 0
+// The traced slot for layer ml of decode iteration it, else -1.
+__device__ __forceinline__ int mpk_trace_sparse_slot(long it, int ml) {
+  long const ti = it - MPK_TRACE_T0;
+  int const d = ml - MPK_TRACE_SPARSE;
+  return (ti >= 0 && ti < MPK_TRACE_ITERS * MPK_TRACE_LAYERS / 2 &&
+          (d == 0 || d == 1))
+             ? (int)ti * 2 + d
+             : -1;
+}
+// Called by every thread after a block-wide barrier at layer ml's top: at
+// ml == L + 2, threads 0..159 move the two traced layers' stamps out of LDS
+// and clear them (unwritten stamps stay 0, as in the dense trace).
+__device__ __forceinline__ void mpk_trace_sparse_flush(long it, int ml) {
+  int const tid = threadIdx.x;
+  unsigned const w = blockIdx.x;
+  if (ml != MPK_TRACE_SPARSE + 2 || tid >= 2 * MPK_STAGE_SLOTS ||
+      w >= MPK_STAGE_WORKERS) {
+    return;
+  }
+  int const s0 = mpk_trace_sparse_slot(it, MPK_TRACE_SPARSE);
+  if (s0 < 0) {
+    return;
+  }
+  int const row = tid / MPK_STAGE_SLOTS;
+  int const idx = tid % MPK_STAGE_SLOTS;
+  unsigned const v = s_mpk_tl[row][idx];
+  if (v != 0u) {
+    __builtin_nontemporal_store(
+        v, &g_mpk_trace[((size_t)(s0 + row) * MPK_STAGE_SLOTS + idx) *
+                            MPK_STAGE_WORKERS +
+                        w]);
+  }
+  s_mpk_tl[row][idx] = 0u;
+}
+#endif
 #else
 __device__ __forceinline__ void mpk_stage_stamp(int) {}
 #endif

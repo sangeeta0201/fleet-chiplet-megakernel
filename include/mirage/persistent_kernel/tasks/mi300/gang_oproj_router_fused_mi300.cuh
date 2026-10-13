@@ -2465,6 +2465,41 @@ __device__ __attribute__((always_inline)) void
                   : xcd_rank > router_tile_n  ? xcd_rank - 1
                                               : xcd_rank;
   bool w13_staged = false;
+  // MPK_W2_FOLD: this worker's W2 fold tile (-1: none). An XCD's 12
+  // row-block tiles go to MoE ranks that run no routed W13 tile: the
+  // W13-idle ones where there are 12 (a dense layer's six virtual slots
+  // leave 16), else the ten of them plus the shared slot's two W13 workers
+  // (mrk 16, 17 of 18), whose W13 starts on the normed row. Not on the layer
+  // before the EP tail, which folds the workspace.
+#if MPK_W2_FOLD
+  constexpr bool W2F_ON =
+      MPK_MOE_TP && MPK_MOE_BS1_DECODE && MPK_W2_ACT_LL && MPK_EP_LL &&
+      MPK_W2_PARTS_LL && BATCH_SIZE == 1 && MOE_WEIGHT_FP4 &&
+      EP_WORLD_SIZE == 8 && MOE_NUM_TOPK == TOPK_K + 1 &&
+      MOE_W13_TILES_PER_EXPERT == 16 && MOE_W2_OPW == 64 &&
+      HIDDEN_SIZE / MOE_W2_OPW == 12 * 8;
+  // The next layer skips its fold wherever it would fold this layer's W2
+  // part words, so this layer must push wherever it would write them.
+  bool const w2f_layer = w2_pl_ptr != nullptr && !fold_next_is_tail &&
+                         (!MPK_W2F_RT_OFF || fold_next_gather_ptr != nullptr);
+  int const w2f_base = (moe_w13_live + 12 <= tiles_per_xcd - 1)
+                           ? moe_w13_live
+                           : moe_w13_live - MOE_W13_TILES_PER_EXPERT / 8;
+  if (w2f_layer &&
+      (!W2F_ON || ll_route == nullptr || w2_act_ll == nullptr ||
+       !moe_skip_topk || fold_next_gather_ptr == nullptr ||
+       ep_signal_ptr == nullptr || tiles_per_xcd != 29 ||
+       moe_w13_live != MOE_NUM_TOPK * MOE_W13_TILES_PER_EXPERT / 8 ||
+       w2f_base + 12 > tiles_per_xcd - 1)) {
+    __builtin_trap();
+  }
+  int const w2f_j = (w2f_layer && mrk >= w2f_base && mrk < w2f_base + 12)
+                        ? mrk - w2f_base
+                        : -1;
+#else
+  constexpr bool w2f_layer = false;
+  int const w2f_j = -1;
+#endif
 #if MPK_W13_ACT_EARLY
   if constexpr (BATCH_SIZE == 1) {
     if (ll_route != nullptr && mrk >= 0 && mrk < moe_w13_live &&
@@ -2499,38 +2534,74 @@ __device__ __attribute__((always_inline)) void
     }
   }
 #endif
+#if MPK_W2_FOLD
+  // A W13-idle W2 fold worker pulls its tile's weight in (LDS, or registers
+  // at MPK_W2_FOLD == 2) as soon as the routing words land.
+  GangW2FRegs<MOE_NUM_TOPK, MOE_INTERMEDIATE> w2f_regs;
+  auto w2f_fetch = [&]() {
+    if constexpr (MPK_W2_FOLD == 2) {
+      _gang_w2f_preload<HIDDEN_SIZE, MOE_INTERMEDIATE, MOE_NUM_TOPK,
+                        MOE_W2_OPW, MOE_WEIGHT_FP4>(
+          w2f_regs, moe_down_weight_ptr, w2f_j * 8 + xcd_id, ll_route,
+          (unsigned)routing_expected);
+    } else {
+      _gang_w2f_dma<HIDDEN_SIZE, MOE_INTERMEDIATE, MOE_NUM_TOPK, MOE_W2_OPW,
+                    MOE_WEIGHT_FP4>(moe_down_weight_ptr, w2f_j * 8 + xcd_id,
+                                    ll_route, (unsigned)routing_expected);
+    }
+  };
+  if constexpr (W2F_ON) {
+    if (w2f_j >= 0 && mrk >= moe_w13_live) {
+      w2f_fetch();
+    }
+  }
+#endif
+  // MPK_W2_SELF_IDS: the slot ids this worker's own merge produced, at
+  // 136 KB + 16 (nothing else uses that LDS through W13 and W2); null when
+  // its W13 tile did not merge.
+  int *w2_self_ids = nullptr;
 #pragma unroll 1
   for (int _w13rep = 0; _w13rep < MPK_W13_REPS; ++_w13rep)
   for (int t = mrk; t >= 0 && t < moe_w13_live; t += tiles_per_xcd) {
     int w13_pre_e = -1;
-#if MPK_W13_SELF_TOPK && MPK_ROUTER_LL && MPK_TOPK_2L
+#if (MPK_W13_SELF_TOPK && MPK_ROUTER_LL && MPK_TOPK_2L) || MPK_W2_FOLD
     // MPK_W13_SELF_TOPK: the tile picks its slot's expert from the eight
     // XCDs' TopK candidates itself instead of waiting for its XCD's TopK to
     // merge them and publish the routing words. Only on a tile whose row
     // MPK_W13_ACT_EARLY staged behind the normed flags, since the candidates
-    // go out before them.
+    // go out before them. The shared slot (and a dense layer's virtual
+    // experts) need no routing at all, which is also what lets MPK_W2_FOLD
+    // put W2 tiles on the shared slot's W13 workers.
     if constexpr (BATCH_SIZE == 1 && NUM_EXPERTS == 256 && TOPK_K == 8) {
-      if (ll_route != nullptr && w13_staged && t == mrk && _w13rep == 0) {
+      if ((MPK_W13_SELF_TOPK || w2f_layer) && ll_route != nullptr &&
+          w13_staged && t == mrk && _w13rep == 0) {
         int const slot = (t * 8 + xcd_id) / MOE_W13_TILES_PER_EXPERT;
         if (routed_scaling_factor == 0.0f) {
           // GLM_DENSE_FUSED: slot k is virtual expert k.
-          w13_pre_e = slot;
+          w13_pre_e = MPK_W13_SELF_TOPK || slot == TOPK_K ? slot : -1;
         } else if (slot == TOPK_K && num_shared_experts > 0) {
           w13_pre_e = NUM_EXPERTS;
-        } else if (slot < TOPK_K) {
+        } else if (MPK_W13_SELF_TOPK && slot < TOPK_K) {
+#if MPK_W13_SELF_TOPK && MPK_ROUTER_LL && MPK_TOPK_2L
           extern __shared__ char _w13_self_smem[];
           int *const s_self_e =
               reinterpret_cast<int *>(_w13_self_smem + 136 * 1024);
+          int *const s_ids = MPK_W2_SELF_IDS ? s_self_e + 4 : nullptr;
           if (tid < 64) {
             int const e = gang_rmsnorm_topk_detail::tk2l_slot_expert(
                 static_cast<int const *>(router_xsplit_ptr),
-                (unsigned)routing_expected, slot);
+                (unsigned)routing_expected, slot, s_ids);
             if (tid == 0) {
               *s_self_e = e;
+              if (MPK_W2_SELF_IDS) {
+                s_ids[TOPK_K] = num_shared_experts > 0 ? NUM_EXPERTS : 0;
+              }
             }
           }
           __syncthreads();
           w13_pre_e = *s_self_e;
+          w2_self_ids = s_ids;
+#endif
         }
       }
     }
@@ -2568,6 +2639,14 @@ __device__ __attribute__((always_inline)) void
         w2_act_ll,
         w13_pre_e);
   }
+#if MPK_W2_FOLD
+  // The shared slot's W13 workers pull theirs behind their (early) W13 tile.
+  if constexpr (W2F_ON) {
+    if (w2f_j >= 0 && mrk < moe_w13_live) {
+      w2f_fetch();
+    }
+  }
+#endif
 
 #if MPK_MOE_SHADOW_KB > 0
   // ── item 2 CAPACITY probe. CORRECT OUTPUT, so the wall number is gateable.
@@ -2772,6 +2851,42 @@ __device__ __attribute__((always_inline)) void
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
   }
+#if MPK_W2_FOLD
+  if constexpr (W2F_ON) {
+    if (w2f_layer) {
+      if (w2f_j < 0) {
+        return;
+      }
+      if (tid == 0) {
+        mpk_stage_stamp(7);
+      }
+      // The two accumulators split where MPK_MOE_TP_W2_KPARTS splits the
+      // padded segments, which is what keeps the fold bit-identical.
+      static_assert(MPK_MOE_TP_W2_KPARTS == 2,
+                    "MPK_W2_FOLD reproduces the two-part sum");
+      constexpr int W2F_SEG_KT = MOE_INTERMEDIATE / 128;
+      constexpr int W2F_SEG_ROUND = 2 * (W2F_SEG_KT % 2 == 0 ? 1 : 2);
+      constexpr int W2F_NSEG = (MOE_NUM_TOPK + W2F_SEG_ROUND - 1) /
+                               W2F_SEG_ROUND * W2F_SEG_ROUND;
+      gang_moe_w2_fold_kernel<HIDDEN_SIZE, MOE_INTERMEDIATE, MOE_NUM_TOPK,
+                              MOE_W2_OPW, MOE_WEIGHT_FP4, W2F_NSEG / 2,
+                              EP_WORLD_SIZE, EP_MY_PE,
+                              /*REGS=*/MPK_W2_FOLD == 2>(
+          w2f_j * 8 + xcd_id,
+          (EP_MY_PE == EP_SHARED_PE)
+              ? static_cast<unsigned short const *>(hidden_ptr)
+              : nullptr,
+          static_cast<unsigned long long *>(fold_next_gather_ptr) +
+              (size_t)EP_MY_PE * (HIDDEN_SIZE / 2),
+          (unsigned long long)(oproj_expected + 1), ll_route,
+          (unsigned)routing_expected, w2_act_ll, &w2f_regs);
+      if (tid == 0) {
+        mpk_stage_stamp(8);
+      }
+      return;
+    }
+  }
+#endif
 #if MPK_MOE_SHARED_EARLY
   // ── MPK_MOE_SHARED_EARLY=2: the shared expert's W2, off the W2 round ─────
   // After this worker's W13 -> W2 arrival and before its wait, so the routed
@@ -3114,7 +3229,11 @@ __device__ __attribute__((always_inline)) void
                                                 (unsigned)routing_expected,
                                                 w2_act_ll,
                                                 w2_pl_ptr,
-                                                w2_pl_epoch);
+                                                w2_pl_epoch,
+                                                t == mrk ? w2_self_ids
+                                                         : nullptr,
+                                                MPK_W2_WPRE_LATE &&
+                                                    mrk < moe_w13_live);
 #else
     gang_moe_w2_linear_mxfp8_kernel<BATCH_SIZE,
                                     HIDDEN_SIZE,

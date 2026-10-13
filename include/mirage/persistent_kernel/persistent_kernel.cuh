@@ -2061,6 +2061,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
     for (int i = threadIdx.x; i < tmpl_len; i += MPK_NT) {
       pc_my_queue[i] = tmpl_src[i];
     }
+#if defined(MPK_TRACE) && MPK_TRACE && !MPK_BAR_SKEW && MPK_TRACE_SPARSE > 0
+    for (int i = threadIdx.x; i < 2 * MPK_STAGE_SLOTS; i += MPK_NT) {
+      s_mpk_tl[i / MPK_STAGE_SLOTS][i % MPK_STAGE_SLOTS] = 0u;
+    }
+#endif
     __syncthreads();
     if (threadIdx.x == 0) {
       config.precomp_queue_len[worker_id] = tmpl_len;
@@ -3183,12 +3188,16 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
             for (int ml = ml_begin; ml < ml_end; ml++) {
 #if defined(MPK_TRACE) && MPK_TRACE && !MPK_BAR_SKEW
               if (threadIdx.x == 0) {
+#if MPK_TRACE_SPARSE > 0
+                mpk_trace_set_slot(mpk_trace_sparse_slot((long)pc_iter, ml));
+#else
                 long const _ti = (long)pc_iter - MPK_TRACE_T0;
                 mpk_trace_set_slot(
                     (_ti >= 0 && _ti < MPK_TRACE_ITERS &&
                      ml < MPK_TRACE_LAYERS)
                         ? (int)_ti * MPK_TRACE_LAYERS + ml
                         : -1);
+#endif
               }
 #endif
 #if MPK_HWID_PROBE
@@ -3333,6 +3342,9 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               // layer's epoch and wait on a release that never comes. This
               // is a sync-correctness barrier, not boundary bookkeeping.
               __syncthreads();
+#if defined(MPK_TRACE) && MPK_TRACE && !MPK_BAR_SKEW && MPK_TRACE_SPARSE > 0
+              mpk_trace_sparse_flush((long)pc_iter, ml);
+#endif
 
               // Boundary pricing probe. Sits exactly where the bookkeeping
               // does -- after the pointer refresh, before the dispatch -- and
@@ -5985,6 +5997,22 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
                td.variant_id,
                (int)td.task_type);
       }
+#if MPK_W2_FOLD && !MPK_FOLD_W2
+      // MPK_W2_FOLD: layer L's W2 writes layer L + 1's EP gather slots, so
+      // slot MPK_FOLD_W2_SLOT carries that layer's input [27]. Static, so it
+      // rides the pointer refresh; the run's first layer reads its TaskDesc.
+      static_assert(MPK_FOLD_W2_SLOT < ML_N_IN, "the fold slot must fit");
+      for (int L = 0; L + 1 < ml_layers; L++) {
+        for (int xcd = 0; xcd < NUM_XCDS_ML; xcd++) {
+          void *const nxt =
+              h_input_table[(xcd * ml_layers + L + 1) * ML_N_IN + 27];
+          h_input_table[(xcd * ml_layers + L) * ML_N_IN + MPK_FOLD_W2_SLOT] =
+              nxt;
+          all_tasks[fused_layer_positions[L] + xcd]
+              .input_ptrs[MPK_FOLD_W2_SLOT] = nxt;
+        }
+      }
+#endif
 
       // Validate the tables before upload. The layer loop dereferences every
       // slot the kernel reads, so a null there is a nil-address GPU fault with

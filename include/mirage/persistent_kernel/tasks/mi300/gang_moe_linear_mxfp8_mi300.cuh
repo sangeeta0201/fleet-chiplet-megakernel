@@ -3667,6 +3667,36 @@ __device__ __forceinline__ unsigned long long
   }
 }
 
+// Routing words [0, N) of this XCD once all carry `epoch`, polled as whole
+// rounds. A worker that starts before the TopK has published finds them all
+// stale, and re-polling them one at a time (as _gang_ll_route_word does)
+// then costs one round trip per word behind the first.
+template <int N>
+__device__ __forceinline__ void
+    _gang_ll_route_words(unsigned long long const *ll, unsigned epoch,
+                         unsigned long long (&w)[N]) {
+  while (true) {
+#pragma unroll
+    for (int s = 0; s < N; s++) {
+      asm volatile("global_load_dwordx2 %0, %1, off nt"
+                   : "=v"(w[s])
+                   : "v"(ll + s)
+                   : "memory");
+    }
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    unsigned stale = 0u;
+#pragma unroll
+    for (int s = 0; s < N; s++) {
+      asm volatile("" : "+v"(w[s]));
+      stale |= (unsigned)(w[s] >> 32) ^ epoch;
+    }
+    if (__builtin_amdgcn_readfirstlane(stale) == 0u) {
+      return;
+    }
+    __builtin_amdgcn_s_sleep(1);
+  }
+}
+
 // MPK_W2_EARLY_PF: pull the TP W2 tile `tile_idx`'s weight -- one WG_BYTES
 // block per segment, at that slot's expert -- into L2 ahead of the W13 -> W2
 // release. The k-loop's own up-front issue (MPK_MOE_TP_W2_PF) can only start
@@ -3701,6 +3731,17 @@ __device__ __forceinline__ void
     return;
   }
   unsigned long long w[NSEG_P];
+#if MPK_ROUTE_BATCH
+  {
+    unsigned long long all[NUM_TOPK];
+    _gang_ll_route_words<NUM_TOPK>(ll_route, ll_epoch, all);
+#pragma unroll
+    for (int s = 0; s < NSEG_P; s++) {
+      int const slot = part * NSEG_P + s;
+      w[s] = all[slot < NUM_TOPK ? slot : 0];
+    }
+  }
+#else
 #pragma unroll
   for (int s = 0; s < NSEG_P; s++) {
     int const slot = part * NSEG_P + s;
@@ -3710,13 +3751,14 @@ __device__ __forceinline__ void
                  : "memory");
   }
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
   extern __shared__ char _w2pf_smem[];
   auto *dst = (__attribute__((address_space(3))) uint32_t *)(
       _w2pf_smem + 140 * 1024 + ((tid >> 6) - 1) * 1024);
 #pragma unroll
   for (int s = 0; s < NSEG_P; s++) {
     int const slot = part * NSEG_P + s;
-    if ((unsigned)(w[s] >> 32) != ll_epoch) {
+    if (!MPK_ROUTE_BATCH && (unsigned)(w[s] >> 32) != ll_epoch) {
       w[s] = _gang_ll_route_word(ll_route, slot < NUM_TOPK ? slot : 0,
                                  ll_epoch);
     }
@@ -3942,10 +3984,21 @@ __device__ __forceinline__ void
     }
     // NSUBBLOCKS is a multiple of 4, so all four partners of a 128-element
     // block ran this iteration.
+#if MPK_MOE_DPP
+    // The quad's max through two quad_perm DPP steps instead of four
+    // ds_bpermute: max(max(a0, a1), max(a2, a3)) on every lane of the quad.
+    float const m1 = fmaxf(
+        amax, __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(amax),
+                                                      0xB1, 0xF, 0xF, false)));
+    float const block_amax = fmaxf(
+        m1, __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(m1), 0x4E,
+                                                    0xF, 0xF, false)));
+#else
     int const base_lane = lane_id & ~3;
     float const block_amax =
         fmaxf(fmaxf(__shfl(amax, base_lane), __shfl(amax, base_lane + 1)),
               fmaxf(__shfl(amax, base_lane + 2), __shfl(amax, base_lane + 3)));
+#endif
     uint8_t const se = _gang_compute_e8m0_fp8(block_amax);
     float scale_f = 1.0f;
     if (se != 0) {
@@ -4057,7 +4110,15 @@ __device__ __noinline__ void
                                        // layer's EP fold reads them without
                                        // the layer-entry rendezvous.
                                        unsigned long long *pl_words = nullptr,
-                                       unsigned pl_epoch = 0) {
+                                       unsigned pl_epoch = 0,
+                                       // MPK_W2_SELF_IDS: this layer's slot
+                                       // ids from the worker's own TopK merge
+                                       // (LDS), so the weight preload reads
+                                       // no routing words.
+                                       int const *self_ids = nullptr,
+                                       // MPK_W2_WPRE_LATE: this tile's weight
+                                       // stream waits for its staging.
+                                       bool skip_wpre = false) {
   static_assert(BATCH_SIZE == 1,
                 "the segments are one token's experts; more rows would need "
                 "a per-row segment list");
@@ -4128,7 +4189,7 @@ __device__ __noinline__ void
   constexpr int W0_OFF = 16384;
   static_assert(!W0_LDS || SEG_OFF_LDS + NSEG_P * 4 <= W0_OFF,
                 "wave 0's operands overlap the staging");
-  bool const wpre = WPRE && ll_route != nullptr;
+  bool const wpre = WPRE && ll_route != nullptr && !skip_wpre;
   i32x8_t pre_a[PKT];
   int pre_s[PKT];
   i32x4_t *const w0_a = (i32x4_t *)(_gang_moe_mxfp8_smem + W0_OFF);
@@ -4136,20 +4197,41 @@ __device__ __noinline__ void
   if constexpr (WPRE) {
     if (wpre && !(W0_LDS && (threadIdx.x >> 6) == 0)) {
       unsigned long long idw[NSEG_P];
+#if MPK_ROUTE_BATCH
+      {
+        unsigned long long all[NUM_TOPK];
+        _gang_ll_route_words<NUM_TOPK>(ll_route, ll_epoch, all);
 #pragma unroll
-      for (int s = 0; s < NSEG_P; s++) {
-        int const seg = seg_base + s;
-        idw[s] = 0ull;
-        asm volatile("global_load_dwordx2 %0, %1, off nt"
-                     : "+v"(idw[s])
-                     : "v"(ll_route + (seg < n_live ? seg : 0))
-                     : "memory");
+        for (int s = 0; s < NSEG_P; s++) {
+          int const seg = seg_base + s;
+          idw[s] = all[seg < n_live ? seg : 0];
+        }
       }
-      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#else
+      if (MPK_W2_SELF_IDS && self_ids != nullptr) {
 #pragma unroll
-      for (int s = 0; s < NSEG_P; s++) {
-        asm volatile("" : "+v"(idw[s]));
+        for (int s = 0; s < NSEG_P; s++) {
+          int const seg = seg_base + s;
+          idw[s] = ((unsigned long long)ll_epoch << 32) |
+                   (unsigned)self_ids[seg < n_live ? seg : 0];
+        }
+      } else {
+#pragma unroll
+        for (int s = 0; s < NSEG_P; s++) {
+          int const seg = seg_base + s;
+          idw[s] = 0ull;
+          asm volatile("global_load_dwordx2 %0, %1, off nt"
+                       : "+v"(idw[s])
+                       : "v"(ll_route + (seg < n_live ? seg : 0))
+                       : "memory");
+        }
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#pragma unroll
+        for (int s = 0; s < NSEG_P; s++) {
+          asm volatile("" : "+v"(idw[s]));
+        }
       }
+#endif
       int const p_row = (threadIdx.x >> 6) * 16 + (threadIdx.x & 15);
       int const p_g = (threadIdx.x & 63) >> 4;
       _gang_gp8 const p_wdr =
@@ -4184,7 +4266,7 @@ __device__ __noinline__ void
 #pragma unroll
       for (int s = 0; s < NSEG_P; s++) {
         int const seg = seg_base + s;
-        if ((unsigned)(idw[s] >> 32) != ll_epoch) {
+        if (!MPK_ROUTE_BATCH && (unsigned)(idw[s] >> 32) != ll_epoch) {
           idw[s] = _gang_ll_route_word(ll_route, seg < n_live ? seg : 0,
                                        ll_epoch);
         }
@@ -4463,6 +4545,285 @@ __device__ __noinline__ void
     }
   }
 }
+
+#if MPK_W2_FOLD
+// MPK_W2_FOLD (mpk_atoms.cuh): one OUTPUT_PER_WG-row block over all NUM_TOPK
+// slots. The slots' weight blocks sit in LDS from W2F_LDS_OFF, one per
+// SEG_STRIDE (whole 1 KB DMA chunks; the scale tail's chunk overhangs into
+// padding), past the staging's activation run.
+constexpr int W2F_LDS_OFF = 4096;
+template <int OUTPUT_SIZE, int I_LOCAL, int OUTPUT_PER_WG, bool WEIGHT_FP4>
+struct GangW2F {
+  static constexpr int NUM_BLOCKS_32 = I_LOCAL / 32;
+  static constexpr int W_ROW_BYTES = WEIGHT_FP4 ? I_LOCAL / 2 : I_LOCAL;
+  static constexpr int WG_DATA_BYTES = OUTPUT_PER_WG * W_ROW_BYTES;
+  static constexpr int WG_BYTES = WG_DATA_BYTES + OUTPUT_PER_WG * NUM_BLOCKS_32;
+  static constexpr int EXPERT_WGS = OUTPUT_SIZE / OUTPUT_PER_WG;
+  static constexpr int64_t EXPERT_BYTES =
+      static_cast<int64_t>(EXPERT_WGS) * WG_BYTES;
+  static constexpr int CHUNKS = (WG_BYTES + 1023) / 1024;
+  static constexpr int SEG_STRIDE = CHUNKS * 1024;
+};
+
+// Row block wg_idx's weight blocks, one per slot at that slot's expert, into
+// LDS. The experts come from the routing words; every 1 KB chunk is one
+// buffer_load_dwordx4 ... lds, dealt round-robin over the four waves. Inline
+// asm with its own m0 per load: through the intrinsic a moving destination
+// makes the compiler wait out each load before the next. Retired by the
+// caller's vmcnt waits.
+template <int OUTPUT_SIZE, int I_LOCAL, int NUM_TOPK, int OUTPUT_PER_WG,
+          bool WEIGHT_FP4>
+__device__ __forceinline__ void
+    _gang_w2f_dma(void const *weight_ptr, int wg_idx,
+                  unsigned long long const *ll_route, unsigned ll_epoch) {
+  using P = GangW2F<OUTPUT_SIZE, I_LOCAL, OUTPUT_PER_WG, WEIGHT_FP4>;
+  static_assert(W2F_LDS_OFF + NUM_TOPK * P::SEG_STRIDE <=
+                    mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE,
+                "the W2 fold tile's weight blocks overrun the dynamic LDS");
+  static_assert(P::EXPERT_BYTES * 512 < (int64_t(1) << 40),
+                "expert offsets stay well inside the heap");
+  int const tid = threadIdx.x;
+  int const warp = __builtin_amdgcn_readfirstlane(tid >> 6);
+  int const lane = tid & 63;
+  unsigned long long w[NUM_TOPK];
+  _gang_ll_route_words<NUM_TOPK>(ll_route, ll_epoch, w);
+  extern __shared__ char _w2f_dma_smem[];
+  unsigned const lds_base =
+      static_cast<unsigned>(reinterpret_cast<uintptr_t>(_w2f_dma_smem)) +
+      W2F_LDS_OFF;
+#pragma unroll
+  for (int s = 0; s < NUM_TOPK; s++) {
+    int const e = __builtin_amdgcn_readfirstlane((int)(unsigned)w[s]);
+    i32x4_t const rsrc = make_w_buffer_rsrc(
+        static_cast<uint8_t const *>(weight_ptr) +
+            static_cast<int64_t>(e) * P::EXPERT_BYTES +
+            static_cast<int64_t>(wg_idx) * P::WG_BYTES,
+        static_cast<uint32_t>(P::WG_BYTES));
+#pragma unroll
+    for (int c = 0; c < P::CHUNKS; c++) {
+      if ((s * P::CHUNKS + c) % 4 == warp) {
+        unsigned const m0 = __builtin_amdgcn_readfirstlane(
+            lds_base + static_cast<unsigned>(s * P::SEG_STRIDE + c * 1024));
+        unsigned const voff = static_cast<unsigned>(c * 1024 + lane * 16);
+        asm volatile("s_mov_b32 m0, %0\n"
+                     "buffer_load_dwordx4 %1, %2, 0 offen nt lds"
+                     :
+                     : "s"(m0), "v"(voff), "s"(rsrc)
+                     : "memory", "m0");
+      }
+    }
+  }
+}
+
+// MPK_W2_FOLD == 2: the same weight held in registers instead of LDS -- LDS
+// DMA streams ~12 GB/s per CU against ~26 for plain loads, which left the
+// tile's 81 KB still landing ~7 us after the routing (trace w2f_trace).
+template <int NUM_TOPK, int I_LOCAL>
+struct GangW2FRegs {
+  static constexpr int KT = NUM_TOPK * (I_LOCAL / 128);
+  i32x4_t a[KT];
+  int s[KT];
+};
+template <int OUTPUT_SIZE, int I_LOCAL, int NUM_TOPK, int OUTPUT_PER_WG,
+          bool WEIGHT_FP4>
+__device__ __forceinline__ void
+    _gang_w2f_preload(GangW2FRegs<NUM_TOPK, I_LOCAL> &r, void const *weight_ptr,
+                      int wg_idx, unsigned long long const *ll_route,
+                      unsigned ll_epoch) {
+  using P = GangW2F<OUTPUT_SIZE, I_LOCAL, OUTPUT_PER_WG, WEIGHT_FP4>;
+  constexpr int SEG_KT = I_LOCAL / 128;
+  constexpr int W_KS = _gang_moe_w_kstride<WEIGHT_FP4>();
+  constexpr int SC_KS = _gang_moe_sc_kstride();
+  constexpr int W_BPK = _gang_moe_bytes_per_ktile<WEIGHT_FP4>();
+  int const tid = threadIdx.x;
+  int const row = (tid >> 6) * 16 + (tid & 15);
+  int const g = (tid & 63) >> 4;
+  unsigned long long w[NUM_TOPK];
+  _gang_ll_route_words<NUM_TOPK>(ll_route, ll_epoch, w);
+  uint8_t const *const wg_data = static_cast<uint8_t const *>(weight_ptr) +
+                                 static_cast<int64_t>(wg_idx) * P::WG_BYTES;
+  _gang_gp8 const p_wdr =
+      (_gang_gp8)(wg_data + (row / 16) * (16 * P::W_ROW_BYTES) +
+                  (row % 16) * W_BPK);
+  _gang_gp8 const p_wsc =
+      (_gang_gp8)(wg_data + P::WG_DATA_BYTES) +
+      ((row / 16) * (16 * P::NUM_BLOCKS_32) + (row % 16) * 4 + g);
+#pragma unroll
+  for (int s = 0; s < NUM_TOPK; s++) {
+    int64_t const off = static_cast<int64_t>((unsigned)w[s]) * P::EXPERT_BYTES;
+#pragma unroll
+    for (int kin = 0; kin < SEG_KT; kin++) {
+      i32x8_t const a8 =
+          _gang_load_w_mfma_a_at_gp<WEIGHT_FP4>(p_wdr + off, kin * W_KS, g);
+      r.a[s * SEG_KT + kin] = i32x4_t{a8[0], a8[1], a8[2], a8[3]};
+#if MPK_MOE_STREAM_NT
+      r.s[s * SEG_KT + kin] =
+          (int)__builtin_nontemporal_load(p_wsc + off + kin * SC_KS);
+#else
+      r.s[s * SEG_KT + kin] = (int)p_wsc[off + kin * SC_KS];
+#endif
+    }
+  }
+}
+
+// The tile: the slots' SwiGLU words staged as one E4M3 run (the TP tile's
+// staging, all NUM_TOPK segments), 2 * NUM_TOPK k-tiles against the LDS
+// weight, and the EP fold of the block's rows. The two accumulators split
+// the k-tiles where MPK_MOE_TP_W2_KPARTS=2 splits its parts (slots
+// [0, SPLIT) and [SPLIT, NUM_TOPK)), and the fold adds them in the folder's
+// order, so the words are the head-of-layer fold's bit for bit.
+// residual: this layer's hidden row on the fold rank, else null. ll_slot:
+// this rank's slot of the next layer's gather (words); the peers' copies are
+// one heap delta away, looked up only at the push. REGS: the weight comes
+// from _gang_w2f_preload's registers instead of LDS.
+template <int OUTPUT_SIZE, int I_LOCAL, int NUM_TOPK, int OUTPUT_PER_WG,
+          bool WEIGHT_FP4, int SPLIT, int EP_WORLD, int EP_ME,
+          bool REGS = false>
+__device__ __forceinline__ void
+    gang_moe_w2_fold_kernel(int wg_idx, unsigned short const *residual,
+                            unsigned long long *ll_slot,
+                            unsigned long long sig_value,
+                            unsigned long long const *ll_route,
+                            unsigned ll_epoch,
+                            unsigned long long const *act_ll,
+                            GangW2FRegs<NUM_TOPK, I_LOCAL> const *regs =
+                                nullptr) {
+  using P = GangW2F<OUTPUT_SIZE, I_LOCAL, OUTPUT_PER_WG, WEIGHT_FP4>;
+  static_assert(WEIGHT_FP4 && OUTPUT_PER_WG == 64 && I_LOCAL % 128 == 0,
+                "one 16-row FP4 tile per wave");
+  static_assert(SPLIT > 0 && SPLIT < NUM_TOPK, "two non-empty halves");
+  constexpr int SEG_KT = I_LOCAL / 128;
+  constexpr int KT = NUM_TOPK * SEG_KT;
+  constexpr int W_BPK = _gang_moe_bytes_per_ktile<WEIGHT_FP4>();
+  static_assert(NUM_TOPK * I_LOCAL + NUM_TOPK * I_LOCAL / 128 <= W2F_LDS_OFF,
+                "the staged activations run into the weight blocks");
+  extern __shared__ char _w2f_smem[];
+  uint8_t *const s_tok_fp8 = reinterpret_cast<uint8_t *>(_w2f_smem);
+  uint8_t *const s_tok_scales = s_tok_fp8 + NUM_TOPK * I_LOCAL;
+  // This wave's weight DMA; the staging's barrier then publishes every
+  // wave's.
+  if constexpr (!REGS) {
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  }
+  int const tid = threadIdx.x;
+  int const warp = tid >> 6;
+  int const lane = tid & 63;
+  int const col = lane & 15;
+  int const g = lane >> 4;
+  // The epilogue's own loads go out ahead of the staging, whose polls then
+  // retire them: the residual rows, written through by another XCD's router
+  // tiles (the head-of-layer fold read them on the writer's XCD), so read
+  // past this XCD's L2; and every peer's heap delta, which must not be
+  // loaded behind a push (vmcnt counts both, in order, so each such load
+  // waited out an XGMI ack: +0.68 ms).
+  int const row0 = wg_idx * OUTPUT_PER_WG + warp * 16 + g * 4;
+  unsigned long long res4 = 0ull;
+  if (col == 0 && residual != nullptr) {
+    res4 = __hip_atomic_load(
+        reinterpret_cast<unsigned long long const *>(residual + row0),
+        __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  }
+  int64_t pd[EP_WORLD - 1];
+#pragma unroll
+  for (int q = 0; q < EP_WORLD - 1; q++) {
+    if (!mpk_shmem_peer_delta((q < EP_ME) ? q : (q + 1), &pd[q])) {
+      __builtin_trap();
+    }
+  }
+  _gang_tp_quant_seg_nt<1, NUM_TOPK, NUM_TOPK, I_LOCAL, /*FIXED_SLOTS=*/true>(
+      reinterpret_cast<unsigned short const *>(act_ll), nullptr, nullptr,
+      nullptr, /*tok_idx=*/0, /*n_live=*/NUM_TOPK, /*seg_base=*/0, s_tok_fp8,
+      s_tok_scales, ll_route, ll_epoch, nullptr, 0, act_ll);
+  if (threadIdx.x == 0) {
+    mpk_stage_stamp(57);
+  }
+  using lds_i4 = __attribute__((address_space(3))) i32x4_t const *;
+  using lds_u8 = __attribute__((address_space(3))) uint8_t const *;
+  char const *const wb = _w2f_smem + W2F_LDS_OFF;
+  f32x4_t acc0 = {0.0f, 0.0f, 0.0f, 0.0f};
+  f32x4_t acc1 = {0.0f, 0.0f, 0.0f, 0.0f};
+  // W2F_GROUP k-tiles' operands in flight at a time: unbounded, the
+  // scheduler hoists all 18 tiles' LDS reads (~250 VGPRs) to the top.
+  constexpr int W2F_GROUP = 6;
+#pragma unroll
+  for (int k0 = 0; k0 < KT; k0 += W2F_GROUP) {
+#pragma unroll
+    for (int k = k0; k < k0 + W2F_GROUP && k < KT; k++) {
+      int const s = k / SEG_KT;
+      int const kin = k % SEG_KT;
+      int const a_off = s * P::SEG_STRIDE + warp * (16 * P::W_ROW_BYTES) +
+                        kin * (16 * W_BPK) + col * W_BPK + g * 16;
+      int const sc_off = s * P::SEG_STRIDE + P::WG_DATA_BYTES +
+                         warp * (16 * P::NUM_BLOCKS_32) + kin * 64 + col * 4 +
+                         g;
+      i32x4_t av;
+      int sa;
+      if constexpr (REGS) {
+        (void)a_off;
+        (void)sc_off;
+        av = regs->a[k];
+        sa = regs->s[k];
+      } else {
+        av = *(lds_i4)(wb + a_off);
+        sa = (int)*(lds_u8)(wb + sc_off);
+      }
+      i32x8_t a = {};
+      a[0] = av[0];
+      a[1] = av[1];
+      a[2] = av[2];
+      a[3] = av[3];
+      i32x8_t const b = _gang_load_fp8_mfma_b(s_tok_fp8, k * 128, g);
+      if (s < SPLIT) {
+        acc0 = _gang_mfma_w_x_f8<WEIGHT_FP4>(a, b, acc0, sa,
+                                             (int)s_tok_scales[k]);
+      } else {
+        acc1 = _gang_mfma_w_x_f8<WEIGHT_FP4>(a, b, acc1, sa,
+                                             (int)s_tok_scales[k]);
+      }
+    }
+    __builtin_amdgcn_sched_barrier(0);
+  }
+  if (col == 0) {
+    unsigned long long const hi = sig_value << 32;
+    unsigned long long words[2];
+#pragma unroll
+    for (int p = 0; p < 2; p++) {
+      unsigned packed = 0;
+#pragma unroll
+      for (int j = 0; j < 2; j++) {
+        float v = acc0[2 * p + j];
+        v += acc1[2 * p + j];
+        if (residual != nullptr) {
+          unsigned const rbits =
+              ((unsigned)(res4 >> (16 * (2 * p + j))) & 0xFFFFu) << 16;
+          float rv;
+          __builtin_memcpy(&rv, &rbits, 4);
+          v += rv;
+        }
+        unsigned u;
+        __builtin_memcpy(&u, &v, 4);
+        unsigned const rounding_bias = ((u >> 16) & 1) + 0x7FFFu;
+        packed |= ((u + rounding_bias) >> 16) << (16 * j);
+      }
+      words[p] = hi | packed;
+    }
+    // Two whole words per 16-byte store: each still validates on its own.
+    unsigned long long *const dst = ll_slot + (row0 >> 1);
+    unsigned const w0 = (unsigned)words[0], w1 = (unsigned)(words[0] >> 32);
+    unsigned const w2 = (unsigned)words[1], w3 = (unsigned)(words[1] >> 32);
+#pragma unroll
+    for (int q = 0; q < EP_WORLD - 1; q++) {
+      st_wt_u128((void *)(reinterpret_cast<char *>(dst) + pd[q]), w0, w1, w2,
+                 w3);
+    }
+    st_wt_u128((void *)dst, w0, w1, w2, w3);
+  }
+  __syncthreads();
+  if (tid == 0) {
+    mpk_stage_stamp(58);
+  }
+}
+#endif // MPK_W2_FOLD
 
 #if MPK_MOE_XCD_EXPERT
 // MPK_MOE_XCD_EXPERT's W2: RB consecutive row blocks of one slot, reducing

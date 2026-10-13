@@ -155,6 +155,42 @@ __device__ __forceinline__ float _mpk_wave_sum_to_lane0(float v) {
   return v;
 }
 #endif
+#if MPK_MOE_DPP
+// Lane 0's `for (off = 32; off; off >>= 1) v += __shfl_xor(v, off)`, bit for
+// bit: the two register swaps, then row_shl (lane n reads lane n + N, so lane
+// 0 reads lanes 8, 4, 2, 1 -- row_shr would read n - N and leave lane 0
+// outside its own row's sum). Only lane 0's result is the reduction.
+__device__ __forceinline__ float _moe_wave_sum_lane0(float v) {
+  {
+    float a = v, b = v;
+    asm volatile("s_nop 1\n\tv_permlane32_swap_b32_e32 %0, %1"
+                 : "+v"(a), "+v"(b));
+    v = a + b;
+  }
+  {
+    float a = v, b = v;
+    asm volatile("s_nop 1\n\tv_permlane16_swap_b32_e32 %0, %1"
+                 : "+v"(a), "+v"(b));
+    v = a + b;
+  }
+  float t;
+  asm volatile(
+      "s_nop 1\n\t"
+      "v_mov_b32_dpp %1, %0 row_shl:8 row_mask:0xf bank_mask:0xf bound_ctrl:1\n\t"
+      "v_add_f32 %0, %0, %1\n\t"
+      "s_nop 1\n\t"
+      "v_mov_b32_dpp %1, %0 row_shl:4 row_mask:0xf bank_mask:0xf bound_ctrl:1\n\t"
+      "v_add_f32 %0, %0, %1\n\t"
+      "s_nop 1\n\t"
+      "v_mov_b32_dpp %1, %0 row_shl:2 row_mask:0xf bank_mask:0xf bound_ctrl:1\n\t"
+      "v_add_f32 %0, %0, %1\n\t"
+      "s_nop 1\n\t"
+      "v_mov_b32_dpp %1, %0 row_shl:1 row_mask:0xf bank_mask:0xf bound_ctrl:1\n\t"
+      "v_add_f32 %0, %0, %1"
+      : "+v"(v), "=&v"(t));
+  return v;
+}
+#endif
 
 template <int STORAGE_DIM, int ACTUAL_HIDDEN_DIM, int NORM_SPAN = STORAGE_DIM>
 __device__ __forceinline__ float rmsnorm_rcp_amd(void const *input_ptr,
@@ -814,6 +850,21 @@ __device__ __forceinline__ void tk2l_sort(unsigned &key, unsigned &pay,
   }
 }
 
+#if MPK_MOE_DPP
+// Lane ^ x for x = 16 or 32 through the gfx950 register swaps: with both
+// operands holding v, one of the pair holds the xor partner's value.
+__device__ __forceinline__ unsigned _tk_xor_rows(unsigned v, int x, int lane) {
+  unsigned a = v, b = v;
+  if (x == 16) {
+    asm volatile("s_nop 1\n\tv_permlane16_swap_b32_e32 %0, %1"
+                 : "+v"(a), "+v"(b));
+  } else {
+    asm volatile("s_nop 1\n\tv_permlane32_swap_b32_e32 %0, %1"
+                 : "+v"(a), "+v"(b));
+  }
+  return (lane & x) ? a : b;
+}
+#endif
 #if MPK_TOPK_2L_MERGE
 // The top 8 of eight descending lists of 8 (lane 8x + i holds list x's i-th),
 // descending in lanes 0-7: three levels of "max against the partner list
@@ -846,8 +897,13 @@ __device__ __forceinline__ void tk2l_top8_of_64(unsigned &key, unsigned &pay,
         (unsigned)__builtin_amdgcn_mov_dpp((int)key, 0x141, 0xF, 0xF, false);
     unsigned const mp =
         (unsigned)__builtin_amdgcn_mov_dpp((int)pay, 0x141, 0xF, 0xF, false);
+#if MPK_MOE_DPP
+    step(_tk_xor_rows(mk, x, lane), _tk_xor_rows(mp, x, lane),
+         (lane & x) == 0);
+#else
     step((unsigned)__shfl_xor((int)mk, x, 64),
          (unsigned)__shfl_xor((int)mp, x, 64), (lane & x) == 0);
+#endif
     clean8();
   }
 }
@@ -1084,7 +1140,8 @@ __device__ __forceinline__ void topk_2l_ks(int *rll,
 // tile's own slot. Same candidate words, same merge, so lane `slot` holds the
 // key whose id topk_2l_ks publishes as routing word `slot`.
 __device__ __forceinline__ int tk2l_slot_expert(int const *ks_all,
-                                                unsigned epoch, int slot) {
+                                                unsigned epoch, int slot,
+                                                int *s_ids = nullptr) {
   int const lane = threadIdx.x & 63;
   constexpr int CAND = 16 * 64;
   unsigned long long const *const cw =
@@ -1114,6 +1171,9 @@ __device__ __forceinline__ int tk2l_slot_expert(int const *ks_all,
 #else
   tk2l_sort<64>(key, pay, lane);
 #endif
+  if (s_ids != nullptr && lane < 8) {
+    s_ids[lane] = (int)(key & 0xFFu);
+  }
   return (int)((unsigned)__builtin_amdgcn_readlane((int)key, slot) & 0xFFu);
 }
 #endif // MPK_TOPK_2L
@@ -2344,11 +2404,15 @@ gang_rmsnorm_linear_bias_topk_kernel(
         *reinterpret_cast<ks_f4_t *>(ks_lds + tid * 4) = hg;
       }
       {
+#if MPK_MOE_DPP
+        float const v = gang_rmsnorm_detail::_moe_wave_sum_lane0(ssq_t);
+#else
         float v = ssq_t;
 #pragma unroll
         for (int off = 32; off > 0; off >>= 1) {
           v += __shfl_xor(v, off);
         }
+#endif
         if (lane == 0) {
           red[wave] = v;
         }
@@ -2386,9 +2450,15 @@ gang_rmsnorm_linear_bias_topk_kernel(
                __uint_as_float(w3 << 16) * h1[2] +
                __uint_as_float(w3 & 0xFFFF0000u) * h1[3];
       }
+#if MPK_MOE_DPP
+      acc += __uint_as_float(_tk_xor_lanes(__float_as_uint(acc), 1, 64));
+      acc += __uint_as_float(_tk_xor_lanes(__float_as_uint(acc), 2, 64));
+      acc += __uint_as_float(_tk_xor_lanes(__float_as_uint(acc), 4, 64));
+#else
       acc += __shfl_xor(acc, 1);
       acc += __shfl_xor(acc, 2);
       acc += __shfl_xor(acc, 4);
+#endif
       if (tid == 0) {
         mpk_stage_stamp(38);
       }
