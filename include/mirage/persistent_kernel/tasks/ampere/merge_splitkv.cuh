@@ -20,6 +20,12 @@
 #ifndef MPK_MRG_LL_LDS_OFF
 #define MPK_MRG_LL_LDS_OFF (120 * 1024)
 #endif
+// MPK_DEC_MERGE_LL32: the merge's o staging, [chunk][thread] f32, 32 KB.
+// Unused by every phase a merge rank runs; Phase 8's prefetch windows above
+// it are only written after the merge.
+#ifndef MPK_MRG_LL32_O_LDS_OFF
+#define MPK_MRG_LL32_O_LDS_OFF (64 * 1024)
+#endif
 
 // this kernel merges the result of one KV head chunk back to the full KV
 // cache，
@@ -379,6 +385,113 @@ __device__ __noinline__ float3 merge_halves_ll_partials(
   return make_float3(m, d, os);
 }
 
+#if MPK_DEC_MERGE_LL32 || MPK_MERGE_LIVE
+// The chunks the decode's partition leaves non-empty: KV_TILE 16, the
+// sequence's tiles spread ceil(tiles / chunks) to a chunk. An empty chunk
+// stamps lse -1e30 and no o (no MPK_DEC_MERGE_LL32 word at all).
+template <int NUM_KV_CHUNKS, int PAGE_SIZE>
+__device__ __forceinline__ int mla_live_chunks(int const *kv_indptr,
+                                               int const *last_page_len,
+                                               int req) {
+  int const seqlen = (kv_indptr[req + 1] - kv_indptr[req] - 1) * PAGE_SIZE +
+                     last_page_len[req];
+  int const ntiles = (seqlen + 15) / 16;
+  int const tpc = (ntiles + NUM_KV_CHUNKS - 1) / NUM_KV_CHUNKS;
+  return tpc > 0 ? (ntiles + tpc - 1) / tpc : 0;
+}
+#endif
+#if MPK_DEC_MERGE_LL32
+#if !MPK_MERGE_HALVES
+#error "MPK_DEC_MERGE_LL32's words are read by the halves path only"
+#endif
+
+// MPK_DEC_MERGE_LL32's poll, out of line like merge_halves_ll_partials: the
+// block's HEADS_N x NUM_KV_CHUNKS lse words ([head][chunk]) and each thread's
+// HC o words, re-read until every word of a live chunk carries the epoch, then
+// left in LDS as f32 -- lse [head][chunk], o [chunk][thread] -- so the halves
+// path runs its one copy of the arithmetic on them.
+template <int HC, int HEADS_N, int NUM_KV_CHUNKS, int HEAD_DIM,
+          int NUM_THREADS>
+__device__ __noinline__ void
+    merge_ll32_to_lds(unsigned long long const *ll_o_in,
+                      unsigned long long const *ll_lse_in, unsigned epoch,
+                      int n_live, int o_col, int half, int my_h) {
+  extern __shared__ char _mrg_ll32_smem[];
+  float *const s_lse =
+      reinterpret_cast<float *>(_mrg_ll32_smem + MPK_MRG_LL_LDS_OFF);
+  float *const s_o =
+      reinterpret_cast<float *>(_mrg_ll32_smem + MPK_MRG_LL32_O_LDS_OFF);
+  constexpr int NL = HEADS_N * NUM_KV_CHUNKS;
+  constexpr int LPT = NL / NUM_THREADS;
+  static_assert(NL % NUM_THREADS == 0 && LPT <= 32 && HC <= 32,
+                "one valid bit per word");
+  constexpr unsigned ALL_L = (LPT == 32) ? ~0u : ((1u << LPT) - 1u);
+  constexpr unsigned ALL_O = (HC == 32) ? ~0u : ((1u << HC) - 1u);
+  int const tid = threadIdx.x;
+  unsigned long long lw[LPT], ow[HC];
+  unsigned lv = 0u, ov = 0u;
+#pragma unroll
+  for (int j = 0; j < LPT; ++j) {
+    lw[j] = 0ull;
+    if ((tid + j * NUM_THREADS) % NUM_KV_CHUNKS >= n_live) {
+      lv |= 1u << j;
+    }
+  }
+#pragma unroll
+  for (int c = 0; c < HC; ++c) {
+    ow[c] = 0ull;
+    if (half * HC + c >= n_live) {
+      ov |= 1u << c;
+    }
+  }
+  while (true) {
+#pragma unroll
+    for (int j = 0; j < LPT; ++j) {
+      if (!(lv & (1u << j))) {
+        lw[j] = __hip_atomic_load(ll_lse_in + tid + j * NUM_THREADS,
+                                  __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      }
+    }
+#pragma unroll
+    for (int c = 0; c < HC; ++c) {
+      if (!(ov & (1u << c))) {
+        ow[c] = __hip_atomic_load(
+            ll_o_in + ((half * HC + c) * HEADS_N + my_h) * HEAD_DIM + o_col,
+            __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < LPT; ++j) {
+      if ((unsigned)(lw[j] >> 32) == epoch) {
+        lv |= 1u << j;
+      }
+    }
+#pragma unroll
+    for (int c = 0; c < HC; ++c) {
+      if ((unsigned)(ow[c] >> 32) == epoch) {
+        ov |= 1u << c;
+      }
+    }
+    if (__syncthreads_and(lv == ALL_L && ov == ALL_O)) {
+      break;
+    }
+    __builtin_amdgcn_s_sleep(1);
+  }
+#pragma unroll
+  for (int j = 0; j < LPT; ++j) {
+    int const i = tid + j * NUM_THREADS;
+    s_lse[i] = (i % NUM_KV_CHUNKS < n_live) ? __uint_as_float((unsigned)lw[j])
+                                            : -1e30f;
+  }
+#pragma unroll
+  for (int c = 0; c < HC; ++c) {
+    s_o[c * NUM_THREADS + tid] =
+        (half * HC + c < n_live) ? __uint_as_float((unsigned)ow[c]) : 0.f;
+  }
+  __syncthreads();
+}
+#endif
+
 template <typename T,
           int NUM_QO_HEADS_PER_KV,
           int NUM_QO_GROUPS,
@@ -498,13 +611,124 @@ __device__ __forceinline__ void
                 THREADS_PER_TOKEN == 16) {
     if (num_tokens == 1 && sinks_ptr == nullptr) {
       constexpr int HC = NUM_KV_CHUNKS / 2;
+#if MPK_MERGE_QUAD
+      // MPK_MERGE_QUAD: one wave, lane = (head, half, quad of 4 dims), so each
+      // lane's partials are one dwordx4 per chunk -- 64 loads in flight
+      // instead of 4 waves x 64 dword loads -- and each dim runs the halves
+      // path's own arithmetic below, op for op: bit-identical. Waves 1-3
+      // have nothing to do. MPK_MERGE_LIVE also skips the chunks the
+      // decode left empty (lse -1e30, o never written): weight 0 either way.
+      if (ll_o_in == nullptr && HEADS_N == 8) {
+        if (threadIdx.x >= 64) {
+          return;
+        }
+        int const ql = threadIdx.x;
+        int const q_head = head_base + (ql >> 3);
+        int const q_half = (ql >> 2) & 1;
+        int const q_col = dim_base + (ql & 3) * 4;
+        int const q_lse0 = q_head + first_token_pos * LSE_TOKEN_STRIDE +
+                           lse_kv_offset + q_half * HC * NUM_QO_HEADS_PER_KV;
+#if MPK_MERGE_LIVE
+        int const n_live = mla_live_chunks<NUM_KV_CHUNKS, PAGE_SIZE>(
+            paged_kv_indptr_buffer_ptr, paged_kv_last_page_len_buffer_ptr,
+            request_id);
+#else
+        constexpr int n_live = NUM_KV_CHUNKS;
+#endif
+        float l[HC], o[HC][4];
+#pragma unroll
+        for (int c = 0; c < HC; ++c) {
+          // An empty chunk reads chunk 0's line (in flight already, no new
+          // bytes) and takes lse -1e30, o 0: a select, not a branch around
+          // the load, which would wait for each load on its own.
+          bool const live = q_half * HC + c < n_live;
+          int const ll = live ? q_lse0 + c * NUM_QO_HEADS_PER_KV
+                              : q_lse0 - q_half * HC * NUM_QO_HEADS_PER_KV;
+          float const lse_v = lse_g[ll];
+          l[c] = (live ? lse_v : -1e30f) * 1.44269504088896340736f;
+#if MPK_DEC_PART_F16
+          typedef unsigned int q_u2_t __attribute__((ext_vector_type(2)));
+          q_u2_t const hv = *(__attribute__((address_space(1))) q_u2_t const *)(
+              reinterpret_cast<_Float16 const *>(o_ptr) + (size_t)ll * HEAD_DIM +
+              q_col);
+          _Float16 h4[4];
+          __builtin_memcpy(h4, &hv, 8);
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            o[c][j] = live ? (float)h4[j] : 0.f;
+          }
+#else
+          // ext_vector_type, not float4: HIP_vector_type's copy constructor
+          // takes a generic reference and cannot bind an addrspace(1) load.
+          typedef float q_f4_t __attribute__((ext_vector_type(4)));
+          q_f4_t const v = *(__attribute__((address_space(1))) q_f4_t const *)(
+              o_ptr + (size_t)ll * HEAD_DIM + q_col);
+          o[c][0] = live ? v.x : 0.f;
+          o[c][1] = live ? v.y : 0.f;
+          o[c][2] = live ? v.z : 0.f;
+          o[c][3] = live ? v.w : 0.f;
+#endif
+        }
+        float m = -inf;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) {
+          m = max(m, l[c]);
+        }
+        float d = 0.f, os[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int c = 0; c < HC; ++c) {
+          float const w = ptx_exp2(l[c] - m);
+          d += w;
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            os[j] += w * o[c][j];
+          }
+        }
+        float const mp = __shfl_xor(m, 4);
+        float const dp = __shfl_xor(d, 4);
+        float const mm = max(m, mp);
+        float const a = ptx_exp2(m - mm);
+        float const b = ptx_exp2(mp - mm);
+        // The halves path's combine compiles to fma(os, a, b * op) over
+        // fma(d, a, b * dp); packed four wide, LLVM contracts the other
+        // product, so spell its form out.
+        float const den = __builtin_fmaf(d, a, dp * b);
+        float out_f[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          float const op = __shfl_xor(os[j], 4);
+          out_f[j] = __fdividef(__builtin_fmaf(os[j], a, op * b), den);
+        }
+        if (q_half == 0) {
+          int const gh = kv_head_idx * NUM_QO_HEADS_PER_KV + q_head;
+#pragma unroll
+          for (int j = 0; j < 4; j += 2) {
+            __hip_bfloat16 v0 = (__hip_bfloat16)out_f[j];
+            __hip_bfloat16 v1 = (__hip_bfloat16)out_f[j + 1];
+            uint16_t lo, hi;
+            memcpy(&lo, &v0, 2);
+            memcpy(&hi, &v1, 2);
+            uint32_t const packed = lo | ((uint32_t)hi << 16);
+            if (ll_out != nullptr) {
+              st_wt_u64((void *)(ll_out + ((gh - ll_head0) * HEAD_DIM + q_col + j) / 2),
+                        ((unsigned long long)ll_epoch << 32) | packed);
+            } else {
+              st_wt_u32((void *)&output_ptr[first_token_pos * OUT_TOKEN_STRIDE +
+                                            gh * HEAD_DIM + q_col + j],
+                        packed);
+            }
+          }
+        }
+        return;
+      }
+#endif
       int const head_idx = head_base + (group_id >> 1);
       int const half = group_id & 1;
       int const lse0 = head_idx + first_token_pos * LSE_TOKEN_STRIDE +
                        lse_kv_offset + half * HC * NUM_QO_HEADS_PER_KV;
       int const o_col = dim_base + thread_in_group;
       float m, d, os;
-      if (ll_o_in != nullptr) {
+      if (ll_o_in != nullptr && !MPK_DEC_MERGE_LL32) {
         float3 const pp =
             merge_halves_ll_partials<HC, HEADS_N, NUM_KV_CHUNKS,
                                      NUM_QO_HEADS_PER_KV, HEAD_DIM,
@@ -584,6 +808,98 @@ __device__ __forceinline__ void
           l[c] = lr[c] * 1.44269504088896340736f;
           o[c] = o_g[ll * HEAD_DIM + o_col];
         }
+#elif MPK_DEC_MERGE_LL32
+        // The raw lse and o from either source, then the one copy of the
+        // arithmetic below, so the words give the default's bits.
+        float lr[HC];
+        if (ll_o_in != nullptr) {
+          int const n_live = mla_live_chunks<NUM_KV_CHUNKS, PAGE_SIZE>(
+              paged_kv_indptr_buffer_ptr, paged_kv_last_page_len_buffer_ptr,
+              request_id);
+          // The gate. The merge ranks get here a whole decode early, so
+          // wave 0 alone polls head 0's lse words -- 64 chunks, 8 lines --
+          // until every live chunk has written, before the block reads its
+          // partials.
+          if (threadIdx.x < 64) {
+#pragma unroll 1
+            for (int c0 = 0; c0 < NUM_KV_CHUNKS; c0 += 64) {
+              int const c = c0 + (int)threadIdx.x;
+              bool seen = c >= n_live;
+              while (true) {
+                if (!seen) {
+                  seen = (unsigned)(__hip_atomic_load(
+                                        ll_lse_in + c, __ATOMIC_RELAXED,
+                                        __HIP_MEMORY_SCOPE_SYSTEM) >>
+                                    32) == ll_in_epoch;
+                }
+                if (__all(seen)) {
+                  break;
+                }
+                __builtin_amdgcn_s_sleep(2);
+              }
+            }
+          }
+          __syncthreads();
+          // Trace stamps 78/79: the gate passed, the block's words validated.
+          if (threadIdx.x == 0) {
+            mpk_stage_stamp(78);
+          }
+          merge_ll32_to_lds<HC, HEADS_N, NUM_KV_CHUNKS, HEAD_DIM,
+                            NUM_THREADS>(ll_o_in, ll_lse_in, ll_in_epoch,
+                                         n_live, o_col, half, group_id >> 1);
+          if (threadIdx.x == 0) {
+            mpk_stage_stamp(79);
+          }
+          extern __shared__ char _mrg_ll32_rd_smem[];
+          float const *const s_lse = reinterpret_cast<float const *>(
+              _mrg_ll32_rd_smem + MPK_MRG_LL_LDS_OFF);
+          float const *const s_o = reinterpret_cast<float const *>(
+              _mrg_ll32_rd_smem + MPK_MRG_LL32_O_LDS_OFF);
+#pragma unroll
+          for (int c = 0; c < HC; ++c) {
+            lr[c] = s_lse[(group_id >> 1) * NUM_KV_CHUNKS + half * HC + c];
+            o[c] = s_o[c * NUM_THREADS + threadIdx.x];
+          }
+        } else {
+#pragma unroll
+          for (int c = 0; c < HC; ++c) {
+            int const ll = lse0 + c * NUM_QO_HEADS_PER_KV;
+            lr[c] = lse_g[ll];
+            o[c] = o_g[ll * HEAD_DIM + o_col];
+          }
+        }
+#pragma unroll
+        for (int c = 0; c < HC; ++c) {
+          l[c] = lr[c] * 1.44269504088896340736f;
+        }
+#else
+#if MPK_MERGE_LIVE || MPK_DEC_PART_F16
+        // MPK_MERGE_LIVE: an empty chunk's own lse word is the decode's
+        // -1e30, so its o only has to be finite -- read chunk 0's, a line
+        // this thread fetches anyway, instead of a stale one. The address
+        // moves, no loaded value is selected, so the loads stay batched.
+        // MPK_DEC_PART_F16: the partials are f16, at the same index.
+#if MPK_MERGE_LIVE
+        int const n_live = mla_live_chunks<NUM_KV_CHUNKS, PAGE_SIZE>(
+            paged_kv_indptr_buffer_ptr, paged_kv_last_page_len_buffer_ptr,
+            request_id);
+#else
+        constexpr int n_live = NUM_KV_CHUNKS;
+#endif
+        int const ll0 = lse0 - half * HC * NUM_QO_HEADS_PER_KV;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) {
+          int const ll = lse0 + c * NUM_QO_HEADS_PER_KV;
+          int const lo = (half * HC + c < n_live) ? ll : ll0;
+          l[c] = lse_g[ll] * 1.44269504088896340736f;
+#if MPK_DEC_PART_F16
+          o[c] = (float)*(__attribute__((address_space(1))) _Float16 const *)(
+              reinterpret_cast<_Float16 const *>(o_ptr) +
+              (size_t)lo * HEAD_DIM + o_col);
+#else
+          o[c] = o_g[lo * HEAD_DIM + o_col];
+#endif
+        }
 #else
 #pragma unroll
         for (int c = 0; c < HC; ++c) {
@@ -594,6 +910,7 @@ __device__ __forceinline__ void
           o[c] = (MPK_PROBE_MERGE63 && c == HC - 1) ? 0.f
                                                     : o_g[ll * HEAD_DIM + o_col];
         }
+#endif
 #endif
         m = -inf;
 #pragma unroll

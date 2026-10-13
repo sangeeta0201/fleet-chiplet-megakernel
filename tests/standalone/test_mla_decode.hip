@@ -265,7 +265,20 @@ static int run_case(int seqlen) {
   } else {
     std::vector<float> o_acc(out_elems);
     std::vector<float> lse(LSE_S);
+#if MPK_DEC_PART_F16
+    // The write-through path stores f16 partials at the same element index.
+    if (WRITE_THROUGH) {
+      std::vector<_Float16> o_h(out_elems);
+      hipMemcpy(o_h.data(), d_out, out_elems * 2, hipMemcpyDeviceToHost);
+      for (size_t i = 0; i < out_elems; ++i) {
+        o_acc[i] = (float)o_h[i];
+      }
+    } else {
+      hipMemcpy(o_acc.data(), d_out, out_bytes, hipMemcpyDeviceToHost);
+    }
+#else
     hipMemcpy(o_acc.data(), d_out, out_bytes, hipMemcpyDeviceToHost);
+#endif
     hipMemcpy(lse.data(), d_lse, (size_t)LSE_S * 4, hipMemcpyDeviceToHost);
     // Same merge merge_splitkv_ck_fmha performs.
     for (int g = 0; g < NUM_Q_GROUPS; ++g) {
@@ -342,6 +355,316 @@ static int run_case(int seqlen) {
   return 1;
 }
 
+#if MPK_DEC_MERGE_LL32
+// One q group's chunks, own heads [out_head_lo, +8), as the head-local fused
+// decode runs them; ll_o / ll_lse non-null selects MPK_DEC_MERGE_LL32's words.
+template <int NUM_KV_CHUNKS>
+__global__ void mla_entry_ll32(void const *q_workspace, void const *kv_cache,
+                               void *output, void *lse, int const *qo_indptr,
+                               int const *kv_indptr, int const *kv_indices,
+                               int const *kv_last_page_len, float scale_s,
+                               int g, int out_head_lo,
+                               unsigned long long *ll_o,
+                               unsigned long long *ll_lse, unsigned epoch) {
+  kernel::gang_mla_decode_kernel<bf16, NUM_Q_HEADS, KV_LORA_RANK,
+                                 QK_ROPE_HEAD_DIM, PAGE_SIZE, MAX_SEQ_LEN,
+                                 NUM_KV_CHUNKS, Q_WORKSPACE_STRIDE,
+                                 KV_CACHE_STRIDE, /*WRITE_THROUGH=*/true>(
+      q_workspace, kv_cache, output, lse, qo_indptr, kv_indptr, kv_indices,
+      kv_last_page_len, NUM_Q_GROUPS * NUM_KV_CHUNKS,
+      blockIdx.x * NUM_Q_GROUPS + g, scale_s, out_head_lo, /*out_heads=*/8,
+      /*tiles_in_lds=*/0, -1, -1, -1, ll_o, ll_lse, epoch);
+}
+
+// The words must carry exactly the f32 partials and lse the default path
+// stores, with the epoch, for every live chunk, and nothing for an empty one.
+template <int NUM_KV_CHUNKS>
+static int run_case_ll32(int seqlen, int out_head_lo) {
+  int const num_pages = (seqlen + PAGE_SIZE - 1) / PAGE_SIZE;
+  int const last_page_len = seqlen - (num_pages - 1) * PAGE_SIZE;
+  std::vector<int> h_kv_indices(num_pages);
+  for (int p = 0; p < num_pages; ++p) {
+    h_kv_indices[p] = num_pages - 1 - p;
+  }
+  std::vector<uint16_t> q_b((size_t)NUM_Q_HEADS * QK_DIM);
+  for (auto &v : q_b) {
+    v = to_bf16_bits(frand());
+  }
+  std::vector<uint16_t> kv_b((size_t)num_pages * PAGE_SIZE * KV_CACHE_STRIDE);
+  for (auto &v : kv_b) {
+    v = to_bf16_bits(frand());
+  }
+  int const g = 2;
+  constexpr int LSE_S = NUM_Q_GROUPS * NUM_KV_CHUNKS * 16;
+  size_t const o_elems = (size_t)LSE_S * KV_LORA_RANK;
+  size_t const wo_n = (size_t)NUM_KV_CHUNKS * 8 * KV_LORA_RANK;
+  size_t const wl_n = (size_t)8 * NUM_KV_CHUNKS;
+  unsigned const epoch = 0x456789au;
+  unsigned long long const poison = ((unsigned long long)(epoch - 7) << 32) |
+                                    0x7fc00001ull;
+  std::vector<unsigned long long> h_poison(wo_n, poison);
+
+  void *d_q, *d_kv, *d_out, *d_lse;
+  unsigned long long *d_wo, *d_wl;
+  int *d_qo, *d_kvp, *d_kvi, *d_lpl;
+  hipMalloc(&d_q, q_b.size() * 2);
+  hipMalloc(&d_kv, kv_b.size() * 2);
+  hipMalloc(&d_out, o_elems * 4);
+  hipMalloc(&d_lse, (size_t)LSE_S * 4);
+  hipMalloc(&d_wo, wo_n * 8);
+  hipMalloc(&d_wl, wl_n * 8);
+  hipMalloc(&d_qo, 8);
+  hipMalloc(&d_kvp, 8);
+  hipMalloc(&d_kvi, (size_t)num_pages * 4);
+  hipMalloc(&d_lpl, 4);
+  int const h_qo[2] = {0, 1};
+  int const h_kvp[2] = {0, num_pages};
+  hipMemcpy(d_q, q_b.data(), q_b.size() * 2, hipMemcpyHostToDevice);
+  hipMemcpy(d_kv, kv_b.data(), kv_b.size() * 2, hipMemcpyHostToDevice);
+  hipMemset(d_out, 0, o_elems * 4);
+  hipMemset(d_lse, 0, (size_t)LSE_S * 4);
+  hipMemcpy(d_wo, h_poison.data(), wo_n * 8, hipMemcpyHostToDevice);
+  hipMemcpy(d_wl, h_poison.data(), wl_n * 8, hipMemcpyHostToDevice);
+  hipMemcpy(d_qo, h_qo, 8, hipMemcpyHostToDevice);
+  hipMemcpy(d_kvp, h_kvp, 8, hipMemcpyHostToDevice);
+  hipMemcpy(d_kvi, h_kv_indices.data(), (size_t)num_pages * 4,
+            hipMemcpyHostToDevice);
+  hipMemcpy(d_lpl, &last_page_len, 4, hipMemcpyHostToDevice);
+  float const scale = 1.0f / sqrtf((float)QK_DIM) * LOG2E;
+  auto *fn = &mla_entry_ll32<NUM_KV_CHUNKS>;
+  if (LDS_BYTES > 65536) {
+    hipFuncSetAttribute(reinterpret_cast<void const *>(fn),
+                        hipFuncAttributeMaxDynamicSharedMemorySize, LDS_BYTES);
+  }
+  // f32 partials, then the words.
+  hipLaunchKernelGGL(fn, dim3(NUM_KV_CHUNKS), dim3(BLOCK_THREADS), LDS_BYTES, 0,
+                     d_q, d_kv, d_out, d_lse, d_qo, d_kvp, d_kvi, d_lpl, scale,
+                     g, out_head_lo, nullptr, nullptr, 0u);
+  hipLaunchKernelGGL(fn, dim3(NUM_KV_CHUNKS), dim3(BLOCK_THREADS), LDS_BYTES, 0,
+                     d_q, d_kv, d_out, d_lse, d_qo, d_kvp, d_kvi, d_lpl, scale,
+                     g, out_head_lo, d_wo, d_wl, epoch);
+  hipError_t const err = hipDeviceSynchronize();
+  std::vector<float> o(o_elems), l(LSE_S);
+  std::vector<unsigned long long> wo(wo_n), wl(wl_n);
+  hipMemcpy(o.data(), d_out, o_elems * 4, hipMemcpyDeviceToHost);
+  hipMemcpy(l.data(), d_lse, (size_t)LSE_S * 4, hipMemcpyDeviceToHost);
+  hipMemcpy(wo.data(), d_wo, wo_n * 8, hipMemcpyDeviceToHost);
+  hipMemcpy(wl.data(), d_wl, wl_n * 8, hipMemcpyDeviceToHost);
+  hipFree(d_q); hipFree(d_kv); hipFree(d_out); hipFree(d_lse); hipFree(d_wo);
+  hipFree(d_wl); hipFree(d_qo); hipFree(d_kvp); hipFree(d_kvi); hipFree(d_lpl);
+
+  int const ntiles = (seqlen + 15) / 16;
+  int const tpc = (ntiles + NUM_KV_CHUNKS - 1) / NUM_KV_CHUNKS;
+  int const n_live = tpc > 0 ? (ntiles + tpc - 1) / tpc : 0;
+  int bad = 0;
+  auto expect = [&](unsigned long long w, float f, bool live, char const *what,
+                    int c, int h, int d) {
+    unsigned u;
+    __builtin_memcpy(&u, &f, 4);
+    unsigned long long const want =
+        live ? (((unsigned long long)epoch << 32) | u) : poison;
+    if (w != want) {
+      if (bad < 8) {
+        printf("  %s chunk %d head %d dim %d: %016llx != %016llx\n", what, c,
+               h, d, w, want);
+      }
+      ++bad;
+    }
+  };
+  for (int c = 0; c < NUM_KV_CHUNKS; ++c) {
+    bool const live = c < n_live;
+    for (int h = 0; h < 8; ++h) {
+      int const li = g * NUM_KV_CHUNKS * 16 + c * 16 + out_head_lo + h;
+      expect(wl[(size_t)h * NUM_KV_CHUNKS + c], l[li], live, "lse", c, h, -1);
+      for (int d = 0; d < KV_LORA_RANK; ++d) {
+        expect(wo[((size_t)c * 8 + h) * KV_LORA_RANK + d],
+               o[(size_t)li * KV_LORA_RANK + d], live, "o", c, h, d);
+      }
+    }
+  }
+  if (err != hipSuccess || bad) {
+    printf("FAIL LL32 words chunks=%d seqlen=%-5d hb=%d: %d bad (%s)\n",
+           NUM_KV_CHUNKS, seqlen, out_head_lo, bad, hipGetErrorString(err));
+    return 1;
+  }
+  printf("PASS LL32 words chunks=%d seqlen=%-5d hb=%d live %d\n",
+         NUM_KV_CHUNKS, seqlen, out_head_lo, n_live);
+  return 0;
+}
+#endif
+
+#if MPK_DEC_PRELOAD
+// MPK_DEC_PRELOAD as the fused task runs it: up to two full tiles of the
+// chunk, short of the last row, DMA'd into the decode's LDS buffers ahead of
+// the call and handed over as tiles_in_lds. preload 0 is the plain call.
+template <int NUM_KV_CHUNKS>
+__global__ void mla_entry_pre(void const *q_workspace, void const *kv_cache,
+                              void *output, void *lse, int const *qo_indptr,
+                              int const *kv_indptr, int const *kv_indices,
+                              int const *kv_last_page_len, float scale_s,
+                              int g, int preload, int *npre_out) {
+  int npre = 0;
+  if (preload) {
+    extern __shared__ char _t_pre_smem[];
+    int const seqlen = (kv_indptr[1] - kv_indptr[0] - 1) * PAGE_SIZE +
+                       kv_last_page_len[0];
+    int const ntiles = (seqlen + 15) / 16;
+    int const tpc = (ntiles + NUM_KV_CHUNKS - 1) / NUM_KV_CHUNKS;
+    int const tok0 = (int)blockIdx.x * tpc * 16;
+    if (tok0 < seqlen) {
+      int ntok = tpc * 16;
+      if (ntok > seqlen - tok0) {
+        ntok = seqlen - tok0;
+      }
+      if (ntok > PAGE_SIZE - tok0 % PAGE_SIZE) {
+        ntok = PAGE_SIZE - tok0 % PAGE_SIZE;
+      }
+      if (tok0 + ntok > seqlen - 1) {
+        ntok = seqlen - 1 - tok0;
+      }
+      int const pid = kv_indices[kv_indptr[0] + tok0 / PAGE_SIZE];
+      char const *base = static_cast<char const *>(kv_cache) +
+                         ((size_t)pid * PAGE_SIZE + tok0 % PAGE_SIZE) *
+                             (size_t)KV_CACHE_STRIDE * 2;
+      constexpr int TILE_BYTES = 16 * KV_CACHE_STRIDE * 2;
+      unsigned const wid = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
+      unsigned const smem0 = __builtin_amdgcn_readfirstlane(
+          static_cast<unsigned>(reinterpret_cast<uintptr_t>(_t_pre_smem)));
+#pragma unroll
+      for (int k = 0; k < 2; k++) {
+        if (ntok >= 16) {
+          kernel::gang_mla_decode_detail::mla_dma_tile(
+              kernel::gang_mla_decode_detail::mla_buffer_rsrc(base,
+                                                              TILE_BYTES),
+              smem0 + k * TILE_BYTES + wid * 1024u, threadIdx.x * 16u,
+              wid < 2u);
+          base += TILE_BYTES;
+          ntok -= 16;
+          npre = k + 1;
+        }
+      }
+    }
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    npre_out[blockIdx.x] = npre;
+  }
+  kernel::gang_mla_decode_kernel<bf16, NUM_Q_HEADS, KV_LORA_RANK,
+                                 QK_ROPE_HEAD_DIM, PAGE_SIZE, MAX_SEQ_LEN,
+                                 NUM_KV_CHUNKS, Q_WORKSPACE_STRIDE,
+                                 KV_CACHE_STRIDE, /*WRITE_THROUGH=*/true>(
+      q_workspace, kv_cache, output, lse, qo_indptr, kv_indptr, kv_indices,
+      kv_last_page_len, NUM_Q_GROUPS * NUM_KV_CHUNKS,
+      blockIdx.x * NUM_Q_GROUPS + g, scale_s, 0, 16, npre);
+}
+
+// The preloaded trips must give the plain call's partials and lse, bit for
+// bit (MPK_DEC_PRE_NOBAR / MPK_DEC_QK2T change only who waits and when).
+template <int NUM_KV_CHUNKS>
+static int run_case_pre(int seqlen) {
+  int const num_pages = (seqlen + PAGE_SIZE - 1) / PAGE_SIZE;
+  int const last_page_len = seqlen - (num_pages - 1) * PAGE_SIZE;
+  std::vector<int> h_kv_indices(num_pages);
+  for (int p = 0; p < num_pages; ++p) {
+    h_kv_indices[p] = num_pages - 1 - p;
+  }
+  std::vector<uint16_t> q_b((size_t)NUM_Q_HEADS * QK_DIM);
+  for (auto &v : q_b) {
+    v = to_bf16_bits(frand());
+  }
+  std::vector<uint16_t> kv_b((size_t)num_pages * PAGE_SIZE * KV_CACHE_STRIDE);
+  for (auto &v : kv_b) {
+    v = to_bf16_bits(frand());
+  }
+  int const g = 1;
+  constexpr int LSE_S = NUM_Q_GROUPS * NUM_KV_CHUNKS * 16;
+  size_t const o_elems = (size_t)LSE_S * KV_LORA_RANK;
+  void *d_q, *d_kv, *d_o0, *d_o1, *d_l0, *d_l1;
+  int *d_qo, *d_kvp, *d_kvi, *d_lpl, *d_npre;
+  hipMalloc(&d_q, q_b.size() * 2);
+  hipMalloc(&d_kv, kv_b.size() * 2);
+  hipMalloc(&d_o0, o_elems * 4);
+  hipMalloc(&d_o1, o_elems * 4);
+  hipMalloc(&d_l0, (size_t)LSE_S * 4);
+  hipMalloc(&d_l1, (size_t)LSE_S * 4);
+  hipMalloc(&d_qo, 8);
+  hipMalloc(&d_kvp, 8);
+  hipMalloc(&d_kvi, (size_t)num_pages * 4);
+  hipMalloc(&d_lpl, 4);
+  hipMalloc(&d_npre, NUM_KV_CHUNKS * 4);
+  int const h_qo[2] = {0, 1};
+  int const h_kvp[2] = {0, num_pages};
+  hipMemcpy(d_q, q_b.data(), q_b.size() * 2, hipMemcpyHostToDevice);
+  hipMemcpy(d_kv, kv_b.data(), kv_b.size() * 2, hipMemcpyHostToDevice);
+  hipMemset(d_o0, 0, o_elems * 4);
+  hipMemset(d_o1, 0, o_elems * 4);
+  hipMemset(d_l0, 0, (size_t)LSE_S * 4);
+  hipMemset(d_l1, 0, (size_t)LSE_S * 4);
+  hipMemcpy(d_qo, h_qo, 8, hipMemcpyHostToDevice);
+  hipMemcpy(d_kvp, h_kvp, 8, hipMemcpyHostToDevice);
+  hipMemcpy(d_kvi, h_kv_indices.data(), (size_t)num_pages * 4,
+            hipMemcpyHostToDevice);
+  hipMemcpy(d_lpl, &last_page_len, 4, hipMemcpyHostToDevice);
+  float const scale = 1.0f / sqrtf((float)QK_DIM) * LOG2E;
+  auto *fn = &mla_entry_pre<NUM_KV_CHUNKS>;
+  if (LDS_BYTES > 65536) {
+    hipFuncSetAttribute(reinterpret_cast<void const *>(fn),
+                        hipFuncAttributeMaxDynamicSharedMemorySize, LDS_BYTES);
+  }
+  hipLaunchKernelGGL(fn, dim3(NUM_KV_CHUNKS), dim3(BLOCK_THREADS), LDS_BYTES, 0,
+                     d_q, d_kv, d_o0, d_l0, d_qo, d_kvp, d_kvi, d_lpl, scale, g,
+                     0, d_npre);
+  hipLaunchKernelGGL(fn, dim3(NUM_KV_CHUNKS), dim3(BLOCK_THREADS), LDS_BYTES, 0,
+                     d_q, d_kv, d_o1, d_l1, d_qo, d_kvp, d_kvi, d_lpl, scale, g,
+                     1, d_npre);
+  hipError_t const err = hipDeviceSynchronize();
+  std::vector<unsigned> o0(o_elems), o1(o_elems), l0(LSE_S), l1(LSE_S);
+  std::vector<int> npre(NUM_KV_CHUNKS);
+  hipMemcpy(o0.data(), d_o0, o_elems * 4, hipMemcpyDeviceToHost);
+  hipMemcpy(o1.data(), d_o1, o_elems * 4, hipMemcpyDeviceToHost);
+  hipMemcpy(l0.data(), d_l0, (size_t)LSE_S * 4, hipMemcpyDeviceToHost);
+  hipMemcpy(l1.data(), d_l1, (size_t)LSE_S * 4, hipMemcpyDeviceToHost);
+  hipMemcpy(npre.data(), d_npre, NUM_KV_CHUNKS * 4, hipMemcpyDeviceToHost);
+  hipFree(d_q); hipFree(d_kv); hipFree(d_o0); hipFree(d_o1); hipFree(d_l0);
+  hipFree(d_l1); hipFree(d_qo); hipFree(d_kvp); hipFree(d_kvi); hipFree(d_lpl);
+  hipFree(d_npre);
+  int bad = 0, pre1 = 0, pre2 = 0, nonzero = 0;
+  for (int c = 0; c < NUM_KV_CHUNKS; ++c) {
+    pre1 += npre[c] == 1;
+    pre2 += npre[c] == 2;
+  }
+  for (size_t i = 0; i < o_elems; ++i) {
+    nonzero += o0[i] != 0u;
+    if (o0[i] != o1[i]) {
+      if (bad < 6) {
+        printf("  o[%zu] chunk %zu head %zu dim %zu: %08x != %08x\n", i,
+               (i / KV_LORA_RANK / 16) % NUM_KV_CHUNKS,
+               (i / KV_LORA_RANK) % 16, i % KV_LORA_RANK, o1[i], o0[i]);
+      }
+      ++bad;
+    }
+  }
+  for (int i = 0; i < LSE_S; ++i) {
+    if (l0[i] != l1[i]) {
+      if (bad < 6) {
+        printf("  lse[%d]: %08x != %08x\n", i, l1[i], l0[i]);
+      }
+      ++bad;
+    }
+  }
+  if (err != hipSuccess || bad || nonzero == 0) {
+    printf("FAIL preload chunks=%d seqlen=%-5d: %d bad, %d nonzero (%s)\n",
+           NUM_KV_CHUNKS, seqlen, bad, nonzero, hipGetErrorString(err));
+    return 1;
+  }
+  printf("PASS preload chunks=%d seqlen=%-5d bit-identical (%d chunks 1 "
+         "tile, %d 2 tiles in LDS)\n",
+         NUM_KV_CHUNKS, seqlen, pre1, pre2);
+  return 0;
+}
+#endif
+
 template <bool WRITE_THROUGH>
 static int run_suite() {
   int rc = 0;
@@ -394,5 +717,20 @@ int main() {
   srand(20250811);
   printf("=== WRITE_THROUGH=true ===\n");
   rc |= run_suite<true>();
+#if MPK_DEC_PRELOAD
+  printf("=== MPK_DEC_PRELOAD tiles in LDS ===\n");
+  for (int seqlen : {17, 40, 1030, 1537, 2048}) {
+    rc |= run_case_pre<64>(seqlen);
+  }
+  rc |= run_case_pre<32>(1537);
+#endif
+#if MPK_DEC_MERGE_LL32
+  printf("=== MPK_DEC_MERGE_LL32 words ===\n");
+  for (int hb : {0, 8}) {
+    for (int seqlen : {17, 1030, 1537, 2048}) {
+      rc |= run_case_ll32<64>(seqlen, hb);
+    }
+  }
+#endif
   return rc;
 }

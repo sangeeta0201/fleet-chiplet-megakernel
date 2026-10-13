@@ -373,6 +373,39 @@ __device__ __noinline__ void
       if constexpr (WF_GATE) {
         wf_issue();
       }
+#if MPK_OPROJ_POLL_INC
+      // MPK_OPROJ_POLL_INC: each round re-reads only the words still on an
+      // older epoch.
+      static_assert(2 * PER_T <= 32, "one valid bit per word");
+      unsigned wv = 0u;
+      while (true) {
+#pragma unroll
+        for (int j = 0; j < PER_T; j++) {
+          unsigned long long const *const pp = a_ll + 2 * (tid + j * NTHREADS);
+          if (!(wv & (1u << (2 * j)))) {
+            w[j].x = __hip_atomic_load(pp, __ATOMIC_RELAXED,
+                                       __HIP_MEMORY_SCOPE_SYSTEM);
+          }
+          if (!(wv & (2u << (2 * j)))) {
+            w[j].y = __hip_atomic_load(pp + 1, __ATOMIC_RELAXED,
+                                       __HIP_MEMORY_SCOPE_SYSTEM);
+          }
+        }
+#pragma unroll
+        for (int j = 0; j < PER_T; j++) {
+          if ((unsigned)(w[j].x >> 32) == a_epoch) {
+            wv |= 1u << (2 * j);
+          }
+          if ((unsigned)(w[j].y >> 32) == a_epoch) {
+            wv |= 2u << (2 * j);
+          }
+        }
+        if (wv == (1u << (2 * PER_T)) - 1u) {
+          break;
+        }
+        __builtin_amdgcn_s_sleep(1);
+      }
+#else
       while (true) {
         // Compiler-visible loads (see merge_splitkv_ck_fmha's
         // MPK_DEC_MERGE_LL read): asm outputs ahead of a separate vmcnt(0)
@@ -396,6 +429,7 @@ __device__ __noinline__ void
         }
         __builtin_amdgcn_s_sleep(1);
       }
+#endif
 #pragma unroll
       for (int j = 0; j < PER_T; j++) {
         int const i = tid + j * NTHREADS;

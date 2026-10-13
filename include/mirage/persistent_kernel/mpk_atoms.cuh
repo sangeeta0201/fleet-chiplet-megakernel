@@ -1093,6 +1093,8 @@ __device__ __forceinline__ bool
 // that also had MPK_ROUTER_INLINE): 6.240 6.254 6.260 -> 6.269 6.256 6.266
 // ms. Its prologue is 8 VGPRs now, not the 60 the note in the decode had;
 // inlined, the AGPR overflow grows 106 -> 136. Off.
+// Re-run 2026-10-13 on 49d37f8: illegal memory access on ranks 0-1, three
+// attempts of three, so not measurable as it stands. Not debugged.
 #ifndef MPK_DECODE_INLINE
 #define MPK_DECODE_INLINE 0
 #endif
@@ -1173,6 +1175,35 @@ __device__ __forceinline__ bool
 // 3.698 3.685 3.702 vs 3.690 3.698 3.691 ms, null.
 #ifndef MPK_QB_SELF_PF
 #define MPK_QB_SELF_PF 0
+#endif
+// Tried 2026-10-13 and not kept: q_b's hoisted A-tile fill -- at
+// K_PER_MFMA 128 a wave's four k-tiles, the tile's whole 32 KB slab --
+// issued ahead of the MPK_QA_LL word poll instead of after the norm.
+// MEASURED SLOWER on 91c270e, n=3 interleaved, rank-0 tokens identical: 3.534
+// 3.524 3.531 vs 3.466 3.471 3.467 ms (+0.06); with MPK_QUANT_WIDE 3.519
+// 3.515 3.512. MPK_TRACE: on the XCDs whose q_b workers start polling after
+// their own qkv_a tile (1-7), S72 moved 1.4-1.5 us later -- the poll's
+// vmcnt(0) retires in issue order, so its first round waited on a slab that
+// took ~2.6 us to land -- while on XCD 0, polling from 1.4 us, q_b finished
+// 0.53 us earlier. The same order is why MPK_QB_SELF_PF, whose waves also
+// poll, was null; MPK_QB_DEC_PF issues the slabs from the decode workers.
+// MPK_QB_DEC_PF: the XCD's decode workers, idle from their qkv_a tile
+// (~9 us) to their query (~16 us), pull the XCD's q_b slabs into L2 an
+// eighth each before their KV preload walk (gang_mla_attn_fused_mi300.cuh).
+// The q_b tiles' own fill then hits L2.
+// MEASURED 2026-10-13 on 91c270e, n=3 interleaved, rank-0 tokens identical:
+// 3.462 3.460 3.464 vs 3.470 3.465 3.471 ms (-0.007); with MPK_QUANT_WIDE
+// 3.462 3.466 3.468. MPK_TRACE: S72 unmoved (the slabs do not slow the q_a
+// word poll), and S73 -> S51 stays ~1.1 us with the slab in L2 -- the
+// K-loop was not waiting on it; that span is the MFMAs, the cross-wave sum
+// and the words' store acks.
+// Default on with MPK_DEC_KVF_LAST and MPK_DEC_KVF_INC. The three together
+// vs all three off, 2026-10-13 on 91c270e, n=3 interleaved, rank-0 tokens
+// identical: 3.447 3.450 3.447 vs 3.472 3.473 3.471 ms (-0.024). Gates:
+// test_mla_decode (both WRITE_THROUGH arms), test_mla_merge, test_st_wt PASS;
+// ppl512 2.3670 on all 8 ranks; longseq 256/512/1024 G1 PASS.
+#ifndef MPK_QB_DEC_PF
+#define MPK_QB_DEC_PF 1
 #endif
 
 // MPK_TOPK_LL_PREBIAS: the LL TopK stages the correction bias into LDS during
@@ -1372,6 +1403,19 @@ __device__ __forceinline__ bool
 #ifndef MPK_WUK_VL4
 #define MPK_WUK_VL4 1
 #endif
+// MPK_WUK_VL4_WF: MPK_WUK_WFIRST for the VL4 tile, whose six-trip K-loop
+// WFIRST's one-trip limit excludes: the row's weights and scales load ahead
+// of the q_b word poll. MPK_TRACE (stamps 78/79): words staged -> row sums
+// 0.8 us, all of it after the poll; the last tile's sums -> the decode's
+// query ready 1.9 us. Same loads, same arithmetic: bit-identical.
+// MEASURED NULL 2026-10-13, n=3 interleaved, rank-0 tokens identical: 3.491
+// 3.501 3.499 vs 3.505 3.504 3.498 ms (-0.005). MPK_TRACE: words staged ->
+// row sums 0.73 -> 0.67 us. The step is the VALU chain -- 48 fp8 converts
+// and packed FMAs a thread at one wave per SIMD -- not the weights' round
+// trip. Off.
+#ifndef MPK_WUK_VL4_WF
+#define MPK_WUK_VL4_WF 0
+#endif
 #ifndef MPK_WUK_HOIST
 #define MPK_WUK_HOIST 0
 #endif
@@ -1491,6 +1535,27 @@ __device__ __forceinline__ bool
 #ifndef MPK_DEC_LSE_LL
 #define MPK_DEC_LSE_LL 0
 #endif
+// MPK_DEC_MERGE_LL32: MPK_DEC_MERGE_LL with the partials kept f32. Each value
+// leaves the decode as one (epoch << 32 | f32) word -- [chunk][own head][dim]
+// in o_acc, [own head][chunk] in FULL_LAYER_DLSE_SLOT -- two to a write-through
+// dwordx4, with no drain after it and no decode -> merge rendezvous at all.
+// The merge derives the live chunks from the sequence length (an empty chunk
+// writes nothing), lets wave 0 poll head 0's lse words until every live chunk
+// has written, then re-reads its own words until they all carry the epoch and
+// runs the halves path's arithmetic on the same f32 values: bit-identical.
+// The gate is what MPK_DEC_MERGE_LL lacked: its merge ranks polled every word
+// from right after W_UK.
+// MEASURED SLOWER 2026-10-12 on 49d37f8, NP=8 1024/1024, r1, rank-0 tokens
+// identical: 3.888 vs 3.506 ms (+0.38). MPK_TRACE: the gate passed at 22.57
+// us against the stock barrier's 22.48 -- no earlier -- then validating the
+// 2.2 MB of words took 3.7 us, and the decode's output step went 0.83 ->
+// 1.69 us. The rendezvous was never the slow part. Off.
+#ifndef MPK_DEC_MERGE_LL32
+#define MPK_DEC_MERGE_LL32 0
+#endif
+#if MPK_DEC_MERGE_LL32 && (MPK_DEC_MERGE_LL || MPK_DEC_LSE_LL)
+#error "MPK_DEC_MERGE_LL32 replaces MPK_DEC_MERGE_LL's and MPK_DEC_LSE_LL's words"
+#endif
 // MPK_OPROJ_SHIFT: under MPK_ATTN_OUT_LL, o_proj tile t runs on xcd_rank
 // t + MPK_OPROJ_SHIFT, off the merge ranks (4 under head-local GLM:
 // HL_MRG_ITEMS = 32 merge items over 8 XCDs), which reach o_proj last
@@ -1518,6 +1583,16 @@ __device__ __forceinline__ bool
 // MPK_OPROJ_SHIFT=4 as well, 4.344 4.336 4.350 -> 4.284 4.287 (-0.06 more).
 #ifndef MPK_DEC_Q_LL
 #define MPK_DEC_Q_LL 1
+#endif
+// MPK_WUK_LL_NOOUT: under MPK_DEC_Q_LL the W_UK GEMV leaves its rows as the
+// decode's query words only, not also as the bf16 query row: the decode
+// stages the words and nothing else reads the row. That row was 128 two-byte
+// write-through stores a tile -- partial-line read-modify-writes at the
+// memory side -- in the window where the words land (gang_gemv_mxfp8_mi300).
+// MEASURED NULL 2026-10-13, r1, rank-0 tokens identical: 3.510 vs 3.507
+// ms. Off.
+#ifndef MPK_WUK_LL_NOOUT
+#define MPK_WUK_LL_NOOUT 0
 #endif
 // MPK_QXS_ROW_LL: the qkv_a split resolve's row exchange as epoch words in the
 // XCD's L2 -- no drain, no per-tile flag, no flag poll before the row read.
@@ -1571,6 +1646,32 @@ __device__ __forceinline__ bool
 #ifndef MPK_LL_POLL_GATE_SLEEP
 #define MPK_LL_POLL_GATE_SLEEP 8
 #endif
+// MPK_OPROJ_POLL_INC: the o_proj GEMV's MPK_ATTN_OUT_LL staging, past the
+// LL_POLL_GATE sentinel, re-reads only the words still on an older epoch --
+// MPK_ROUTER_POLL_INC's shape -- instead of a thread's whole eight each round
+// (gang_gemv_mxfp4_mi300.cuh): 192 tiles x 16 KB of system-scope reads a
+// round beside the merge's tail. Same words staged: bit-identical.
+// MEASURED NULL 2026-10-13, r1, rank-0 tokens identical: 3.512 vs 3.506
+// 3.501 ms. Off.
+#ifndef MPK_OPROJ_POLL_INC
+#define MPK_OPROJ_POLL_INC 0
+#endif
+// MPK_OPROJ_PF_DEC: under the head-local decode (MPK_DEC_REMAP) a decode
+// worker skips its own Phase 8 o_proj weight prefetch and the q_b worker
+// dec_tiles ranks below it -- same XCD, same L2, at Phase 8 ~7 us earlier --
+// issues that tile's beside its own (gang_mla_attn_fused_mi300.cuh
+// oproj_pf_role, gang_mla_full_layer_fused_mi300.cuh Phase 8). MPK_TRACE:
+// a decode worker's S24 -> S27 (issue 0.65 us, retire 0.76 us) is the gap
+// between its decode item and its o_proj tile. Same weights: bit-identical.
+// MEASURED SLOWER 2026-10-13, n=2 interleaved, rank-0 tokens identical:
+// 5.113 5.106 vs 3.502 3.495 ms (+1.6 ms, ~20 us a layer). Far past what a
+// moved prefetch can cost; the stall was not traced. Off.
+#ifndef MPK_OPROJ_PF_DEC
+#define MPK_OPROJ_PF_DEC 0
+#endif
+#if MPK_OPROJ_PF_DEC && (MPK_OPROJ_PF_IDLE || MPK_OPROJ_SKIP_TOPK)
+#error "MPK_OPROJ_PF_DEC pairs ranks on the plain MPK_OPROJ_SHIFT map"
+#endif
 // MPK_ROUTER_POLL_INC: the router's o_proj-slot validation as a per-thread
 // spin that re-reads only the slots still carrying an older epoch, instead
 // of full pass -> sentinel spin -> full re-pass. MPK_TRACE: o_proj seen ->
@@ -1600,6 +1701,32 @@ __device__ __forceinline__ bool
 #ifndef MPK_DEC_KVF_EARLY
 #define MPK_DEC_KVF_EARLY 0
 #endif
+// MPK_DEC_KVF_LAST: only the decode item whose chunk holds the current
+// token's cache row waits on XCD 0's flag for it. The test compared the
+// chunk's last tile index with ntiles after the split had narrowed ntiles to
+// the chunk's own count, so it held for every chunk: all ~51 items polled the
+// flag once their query words validated, one system-scope round trip
+// (MPK_TRACE: S67 -> S47 0.69 us on every item; under MPK_PROBE_DEC_NOQ=2
+// all 51 sat until the flag landed, ~15.3 us, not the one chunk). The other
+// chunks' rows were all stored steps earlier. Fewer waits: bit-identical.
+// MEASURED 2026-10-13 on 91c270e, NP=8 1024/1024, n=3 interleaved, rank-0
+// tokens identical: 3.468 3.464 3.469 vs 3.472 3.464 3.476 ms (-0.004).
+// MPK_TRACE: S67 -> S47 0.69 -> 0.56 us; the rest is the other threads'
+// query words still landing, not the flag. Default on with MPK_DEC_KVF_INC
+// and MPK_QB_DEC_PF (the three together: -0.024 ms, see MPK_QB_DEC_PF).
+#ifndef MPK_DEC_KVF_LAST
+#define MPK_DEC_KVF_LAST 1
+#endif
+// MPK_DEC_KVF_INC: under MPK_DEC_Q_INC, the items that wait on the cache-row
+// flag read it in the query poll's rounds (thread 0) instead of in a round
+// trip of their own after the words validate -- MPK_DEC_KVF_EARLY's idea,
+// which as written also gave up MPK_DEC_Q_INC's per-thread spin.
+// MEASURED 2026-10-13 on 91c270e with MPK_DEC_KVF_LAST, n=3 interleaved,
+// rank-0 tokens identical: 3.461 3.467 3.460 vs 3.472 3.464 3.476 ms (-0.008).
+// Default on (with MPK_QB_DEC_PF; see there).
+#ifndef MPK_DEC_KVF_INC
+#define MPK_DEC_KVF_INC 1
+#endif
 // MPK_DEC_Q_INC: the decode's query poll as a per-thread incremental spin
 // (only words still on an older epoch re-read) instead of block-synchronized
 // full rounds -- MPK_ROUTER_POLL_INC's shape on the W_UK -> decode handoff.
@@ -1611,6 +1738,20 @@ __device__ __forceinline__ bool
 // 3.789 3.783 vs 3.852 3.840 control. Default on (gates g14).
 #ifndef MPK_DEC_Q_INC
 #define MPK_DEC_Q_INC 1
+#endif
+// MPK_PROBE_DEC_NOQ: PRICING PROBE, WRONG OUTPUT. The decode takes its query
+// words after one read, valid or not: the Q path's ceiling (q_b, W_UK and
+// their two hand-offs) under MPK_DEC_Q_LL, where MPK_ATTN_PROBE_NOQBWAIT has
+// no wait left to skip. =1 also skips the cache-row flag; =2 keeps it, so
+// the decode starts on XCD 0's latent tile instead.
+// MEASURED 2026-10-13, NP=8 1024/1024, n=2 interleaved against 3.505 3.507:
+// =1 3.261 3.252 (-0.25 ms), =2 3.412 3.416 (-0.09). MPK_TRACE at =2: every
+// stamp from the decode on moves ~1.9 us earlier (S47 17.29 -> 15.39, S69
+// 26.79 -> 24.87), and the decode then waits on its own KV preload. The Q
+// path is worth up to 0.09 ms with the latent tile's flag where it is
+// (S66 ~14.4 us), 0.25 with the flag out of the way too.
+#ifndef MPK_PROBE_DEC_NOQ
+#define MPK_PROBE_DEC_NOQ 0
 #endif
 // MPK_XS_POLL_FULL: the qkv_a split resolver re-reads its whole slice of the
 // eight EP slots each round instead of spinning on one sentinel per slot and
@@ -1677,6 +1818,40 @@ __device__ __forceinline__ bool
 // 4.838 4.830 4.835 -> 4.789 4.783 4.799 4.802 ms (-0.042).
 #ifndef MPK_DEC_PRELOAD
 #define MPK_DEC_PRELOAD 2
+#endif
+// MPK_DEC_PRE_NOBAR: the decode's tile loop skips the barriers of a trip
+// whose tile MPK_DEC_PRELOAD left in LDS (gang_mla_decode_mi300.cuh). The
+// preloaded tiles sit in their own buffers, were retired by the barrier
+// behind the query wait, and nothing writes them, so each trip's load barrier
+// and closing barrier only made the four waves wait for each other twice a
+// trip. Kept: a register-path trip's two (it loads into buffer 0) and the
+// last trip's closing one. At 1025-2048 tokens every live item is two
+// preloaded trips: 3 of 4 barriers go. Same arithmetic: bit-identical.
+// MEASURED NULL 2026-10-13 with MPK_DEC_EXP2_BUILTIN, NP=8 1024/1024, r1,
+// rank-0 tokens identical: 3.505 vs 3.507 ms. Off.
+#ifndef MPK_DEC_PRE_NOBAR
+#define MPK_DEC_PRE_NOBAR 0
+#endif
+// MPK_DEC_EXP2_BUILTIN: the decode softmax's exp2 as __builtin_amdgcn_exp2f
+// (gang_mla_decode_mi300.cuh mla_exp2): speculatable, so the rescale's -inf
+// select is a v_cndmask instead of an exec-mask branch. Bit-exact.
+// MEASURED NULL with MPK_DEC_PRE_NOBAR, above. Off.
+#ifndef MPK_DEC_EXP2_BUILTIN
+#define MPK_DEC_EXP2_BUILTIN 0
+#endif
+// MPK_DEC_QK2T: when trip t + 1's tile is preloaded too (MPK_DEC_PRELOAD=2:
+// every live item at 1025-2048 tokens), trip t's wave runs both tiles' QK
+// chains interleaved -- a[32:35] and a[36:39], one K read of each per step --
+// and trip t + 1 takes its scores from registers. MPK_TRACE: QK 0.41 us a
+// trip, an 18-deep dependent MFMA chain; two side by side cost little more
+// than one. Softmax and PV keep their order: bit-identical. Unlike
+// MPK_MLA_QK_SPLIT there is no hand-off between waves.
+// MEASURED SLOWER 2026-10-13 (r1, with MPK_DEC_PRE_NOBAR and
+// MPK_DEC_EXP2_BUILTIN), tokens identical: 3.561 vs 3.506 ms. The second
+// chain's accumulators spill -- the decode's scratch ops 8 -> 50 in the
+// final ISA -- in the function that sets the megakernel's allocation. Off.
+#ifndef MPK_DEC_QK2T
+#define MPK_DEC_QK2T 0
 #endif
 // MPK_W13_ACT_EARLY: the W13 workers quantize the normed row into LDS while
 // the TopK selects (gang_oproj_router_fused_mi300.cuh). 5.065 5.037 (-0.038).
@@ -2237,6 +2412,12 @@ __device__ __forceinline__ bool
 // vs 3.876; with MPK_QB_SELF_PF 3.876. The shorter quantizer only moves the
 // wait onto the hoisted weight loads, and pulling those into L2 first does
 // not move the wall either. Off.
+// Re-measured 2026-10-13 on 91c270e, where q_b's last tile per XCD sets the
+// W_UK -> decode chain (MPK_WUK_LAT_REMAP moved it there), n=3 interleaved,
+// rank-0 tokens identical: 3.479 3.479 3.482 vs 3.466 3.471 3.467 ms
+// (+0.013); again on stage d15, 3.479 3.477 3.481 vs 3.470 3.465 3.471
+// (+0.010). MPK_TRACE: the quantizer is 0.4-0.7 us instead of 1.06, but the
+// W_UK chain does not start earlier.
 #ifndef MPK_QUANT_WIDE
 #define MPK_QUANT_WIDE 0
 #endif
@@ -2392,6 +2573,48 @@ __device__ __forceinline__ bool
 // PASS. Default on.
 #ifndef MPK_MERGE_HALVES
 #define MPK_MERGE_HALVES 1
+#endif
+// MPK_MERGE_QUAD: the halves path on one wave, lane = (head, half, 4 dims):
+// a lane's partials are one dwordx4 per chunk, 32 + 32 loads in flight
+// against the halves path's 4 waves x 64 dword loads, and each dim keeps the
+// halves path's arithmetic, with the combine's two fmas pinned. Not quite
+// bit-identical: test_mla_merge --dump differs from the halves path in 3
+// bytes over 18 cases (accuracy PASS), so the tokens may move.
+// MEASURED SLOWER 2026-10-13, n=2 interleaved, tokens moved: 3.516 3.516 vs
+// 3.502 3.495 ms (+0.017). Off.
+#ifndef MPK_MERGE_QUAD
+#define MPK_MERGE_QUAD 0
+#endif
+// MPK_MERGE_LIVE: the merge's halves path reads o only for the chunks the
+// decode's partition fills (KV_TILE 16, ceil(tiles / 64) a chunk): 33..64 of
+// 64 over a 1024/1024 run, ~48 on average. An empty chunk keeps its own lse
+// word (the decode's -1e30, weight 0) and reads chunk 0's o, a line the
+// thread fetches anyway; only the address moves, so the loads stay batched.
+// Bit-identical (test_mla_merge --dump). (Under MPK_MERGE_QUAD, a per-chunk
+// select of the loaded values instead: MEASURED +0.51 ms 2026-10-13, r1 --
+// under the attention task's register pressure each chunk's loads were
+// waited for in turn.)
+// MEASURED NULL 2026-10-13, r1, rank-0 tokens identical: 3.513 vs 3.507 ms.
+// A quarter fewer partial lines does not move the merge: it is a round
+// trip, not bytes. Off.
+#ifndef MPK_MERGE_LIVE
+#define MPK_MERGE_LIVE 0
+#endif
+// MPK_DEC_PART_F16: the decode's split-KV partials leave as f16 instead of
+// f32 -- 8 KB a decode item instead of 16, one write-through dwordx2 a lane
+// per block -- and the merge reads them so. A partial is a convex
+// combination of latent rows, far inside f16's range; rounding is 2^-11,
+// under the merged output's own bf16 rounding. VALUE CHANGE: the tokens
+// move, ppl-gated. MPK_TRACE: the output step S49 -> S50 is 0.83 us and the
+// return drain 0.43 us, both on the chain; MPK_DEC_MERGE_LL32's 2x bytes
+// doubled both.
+// MEASURED NULL 2026-10-13, r1: 3.506 vs 3.507 ms (with MPK_MERGE_LIVE
+// 3.524). Half the bytes moves neither leg. Off, so never ppl-gated.
+#ifndef MPK_DEC_PART_F16
+#define MPK_DEC_PART_F16 0
+#endif
+#if MPK_DEC_PART_F16 && (MPK_DEC_MERGE_LL || MPK_DEC_LSE_LL || MPK_DEC_MERGE_LL32)
+#error "MPK_DEC_PART_F16 is the barrier path's partials"
 #endif
 // Same default as gang_oproj_router_fused_mi300.cuh, which the MoE kernels'
 // header is compiled ahead of.

@@ -244,7 +244,11 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     // MPK_DEC_Q_LL: the own heads' query rows as words, then the KV flag.
     unsigned long long *dec_q_ll = nullptr,
     // MPK_QXS_ROW_LL: eight per-XCD blocks of the resolved row as words.
-    unsigned long long *qxs_row_ll = nullptr) {
+    unsigned long long *qxs_row_ll = nullptr,
+    // MPK_OPROJ_PF_DEC: this worker's part in Phase 8's o_proj prefetch, for
+    // the caller -- 0 its own tile, -1 none (a decode worker), r + 1 its own
+    // and decode worker r's. Written by tid 0 ahead of every barrier here.
+    int *oproj_pf_role = nullptr) {
 
   int const tid = threadIdx.x;
   int const xcd_id = tile_idx / tiles_per_xcd;
@@ -511,6 +515,22 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
                            ? qb_tiles_per_xcd
                            : 0;
   int const dec_rank = xcd_rank - dec_base;
+#if MPK_OPROJ_PF_DEC
+  // A decode worker reaches Phase 8 a whole decode late, and its own tile's
+  // prefetch (issue + retire, ~1.4 us) then sits between its decode item and
+  // its o_proj tile; the rank dec_tiles below it is a q_b worker, done ~7 us
+  // earlier, and shares its L2.
+  if (oproj_pf_role != nullptr && tid == 0) {
+    bool const pairs = dec_base > 0 && dec_base >= dec_tiles;
+    int role = 0;
+    if (pairs && dec_rank >= 0 && dec_rank < dec_tiles) {
+      role = -1;
+    } else if (pairs && dec_rank < 0 && dec_rank >= -dec_tiles) {
+      role = xcd_rank + dec_tiles + 1;
+    }
+    *oproj_pf_role = role;
+  }
+#endif
   int const mrg_tiles = head_local ? (HL_MRG_ITEMS + 7) / 8 : merge_tiles_per_xcd;
   // MPK_MLA_MERGE_OWN_HEADS: below 16 heads per rank the head-local group's
   // other heads are a partner rank's, decoded from a stale query row and
@@ -1844,6 +1864,39 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     // MPK_DEC_HINTS: the walk below already has the decode's prologue loads
     // in registers -- on every thread under MPK_DEC_PRELOAD.
     int hint_q_row = -1, hint_first_page = -1, hint_seqlen = -1;
+#if MPK_QB_DEC_PF
+    // MPK_QB_DEC_PF: waves 1-3 pull an eighth of the XCD's q_b slabs into L2
+    // through the never-read window -- off every q_b tile's word poll, whose
+    // in-order vmcnt a slab of its own would stall, and long ahead of this
+    // worker's query poll.
+    if (wk_ll && tid >= 64 && qb_weight_ptr != nullptr) {
+      constexpr uint32_t QDP_WG_BYTES =
+          QB_OUTPUT_PER_WG * QB_REDUCTION_SIZE +
+          QB_OUTPUT_PER_WG * (QB_REDUCTION_SIZE / 32);
+      uint32_t const qdp_total = (uint32_t)qb_n_wgs_per_xcd * QDP_WG_BYTES;
+      uint32_t const qdp_chunk =
+          ((qdp_total + (uint32_t)dec_tiles - 1u) / (uint32_t)dec_tiles +
+           3071u) / 3072u * 3072u;
+      uint32_t const qdp_lo = (uint32_t)dec_rank * qdp_chunk;
+      uint32_t const qdp_hi =
+          (qdp_lo + qdp_chunk < qdp_total) ? qdp_lo + qdp_chunk : qdp_total;
+      if (qdp_lo < qdp_hi) {
+        extern __shared__ char _qdp_smem[];
+        i32x4_t const qdp_rsrc = make_w_buffer_rsrc(qb_weight_ptr, qdp_total);
+        auto *qdp_dst = (__attribute__((address_space(3))) uint32_t *)(
+            _qdp_smem + 140 * 1024 + ((tid >> 6) - 1) * 1024);
+        int qdp_voff = (int)qdp_lo + (tid - 64) * 16;
+        int const qdp_last = (int)qdp_hi - 16;
+        int const qdp_n = (int)((qdp_hi - qdp_lo + 3071u) / 3072u);
+        for (int i = 0; i < qdp_n; i++) {
+          int const v = qdp_voff < qdp_last ? qdp_voff : qdp_last;
+          __llvm_amdgcn_raw_buffer_load_lds(qdp_rsrc, qdp_dst, 16, v, 0, 0, 1);
+          qdp_voff += 3072;
+          asm volatile("" : "+v"(qdp_voff) : : "memory");
+        }
+      }
+    }
+#endif
 #if MPK_ATTN_META_PF
     // MPK_ATTN_META_PF: the decode's prologue is a chain of dependent loads
     // -- qo/kv_indptr and last_page_len, then kv_indices for the page, then
@@ -2091,14 +2144,20 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // Every worker arrives; only the merge ranks wait. The rest return here, a
   // whole merge stage early, rather than spinning -- the same trade the MoE
   // task makes at its W13 -> W2 barrier.
+  // MPK_DEC_MERGE_LL32: the merge validates the decode's words, so nobody
+  // waits here and nobody drains or arrives.
+  bool const dm_ll32 = MPK_DEC_MERGE_LL32 && dm_ll;
   __syncthreads();
-  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  if (!dm_ll32) {
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  }
   bool const dec_tagged = (MPK_BAR_TAGGED & MPK_TAGBAR_DECODE) != 0 &&
                           !PAIR_MERGE && bar_tags != nullptr;
   int *const dec_tags =
       dec_tagged ? bar_tags + MPK_TAGBAR_IDX_DECODE * MPK_TAGBAR_SLOTS
                  : nullptr;
-  if (tid == 0 && dec_tagged) {
+  if (dm_ll32) {
+  } else if (tid == 0 && dec_tagged) {
     tag_bar_arrive(dec_tags, xcd_id * tiles_per_xcd + xcd_rank,
                    decode_expected);
   } else if (tid == 0) {

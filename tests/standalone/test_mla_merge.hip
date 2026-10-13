@@ -39,7 +39,11 @@
 #ifndef MPK_MRG_LL_LDS_OFF
 #define MPK_MRG_LL_LDS_OFF 0
 #endif
-static constexpr int MRG_DYN_LDS = MPK_MRG_LL_LDS_OFF + 4096;
+// MPK_DEC_MERGE_LL32 also stages its o values, 32 KB past that.
+#ifndef MPK_MRG_LL32_O_LDS_OFF
+#define MPK_MRG_LL32_O_LDS_OFF (MPK_MRG_LL_LDS_OFF + 4096)
+#endif
+static constexpr int MRG_DYN_LDS = MPK_MRG_LL32_O_LDS_OFF + 32 * 1024;
 #include "mirage/persistent_kernel/mpk_atoms.cuh"
 #include "mirage/persistent_kernel/tasks/common/utils.cuh"
 #include "mirage/persistent_kernel/tasks/ampere/merge_splitkv.cuh"
@@ -98,6 +102,28 @@ __global__ void merge_entry(float const *lse,
                                          ll_o,
                                          ll_lse,
                                          ll_epoch);
+}
+
+// One group's DIM_SPLITS slices, as the head-local fused merge runs them.
+template <bool WRITE_THROUGH, int DIM_SPLITS, int HEADS_N>
+__global__ void merge_entry_g(int g,
+                              float const *lse,
+                              float const *o_acc,
+                              int const *qo_indptr,
+                              int const *kv_indptr,
+                              int const *kv_last_page_len,
+                              bf16 *out,
+                              int head_base,
+                              unsigned long long const *ll_o,
+                              unsigned long long const *ll_lse,
+                              unsigned ll_epoch) {
+  kernel::merge_splitkv_ck_fmha<bf16, QO_PER_KV, QO_GROUPS, HEAD_DIM,
+                                NUM_CHUNKS, /*KV_CHUNK_SIZE=*/128, PAGE_SIZE,
+                                WRITE_THROUGH, DIM_SPLITS, HEADS_N>(
+      lse, o_acc, qo_indptr, kv_indptr, kv_last_page_len, /*request_id=*/0,
+      out, /*merge_task_offset=*/g * DIM_SPLITS + blockIdx.x,
+      /*sinks_ptr=*/nullptr, head_base, -1, -1, nullptr, 0, 0, ll_o, ll_lse,
+      ll_epoch);
 }
 
 static unsigned short to_bf16_bits(float f) {
@@ -345,9 +371,231 @@ static int run_lse_ll_bitexact(int active_chunks, int head_base,
 }
 #endif
 
-int main() {
-  srand(20250905);
+#if MPK_DEC_MERGE_LL32
+// MPK_DEC_MERGE_LL32: the same f32 partials through the default halves path
+// and through the decode's (epoch << 32 | f32) words -- o [chunk][own head]
+// [dim], lse [own head][chunk], none for an empty chunk -- must give
+// bit-identical output. The live chunks come from the sequence length, as
+// the decode partitions it; the empty ones' words hold a stale epoch.
+static int run_ll32_bitexact(int seqlen, int head_base, char const *tag) {
+  constexpr int HN = 8;
+  int const ntiles = (seqlen + 15) / 16;
+  int const tpc = (ntiles + NUM_CHUNKS - 1) / NUM_CHUNKS;
+  int const n_live = tpc > 0 ? (ntiles + tpc - 1) / tpc : 0;
+  size_t const lse_n = (size_t)LSE_TOKEN_STRIDE;
+  size_t const o_n = lse_n * HEAD_DIM;
+  size_t const out_n = (size_t)OUT_TOKEN_STRIDE;
+  std::vector<float> h_lse(lse_n), h_o(o_n);
+  for (size_t i = 0; i < o_n; ++i) {
+    h_o[i] = frand() * 8.0f;
+  }
+  for (size_t i = 0; i < lse_n; ++i) {
+    int const c = (int)((i / QO_PER_KV) % NUM_CHUNKS);
+    h_lse[i] = c < n_live ? frand() * 3.0f : -1e30f;
+  }
+  unsigned const epoch = 0x3456789u;
+  int const g = 1;
+  std::vector<unsigned long long> w_o((size_t)NUM_CHUNKS * HN * HEAD_DIM),
+      w_lse((size_t)HN * NUM_CHUNKS);
+  for (int c = 0; c < NUM_CHUNKS; ++c) {
+    unsigned const ep = c < n_live ? epoch : epoch - 1;
+    for (int h = 0; h < HN; ++h) {
+      size_t const li =
+          (size_t)g * NUM_CHUNKS * QO_PER_KV + c * QO_PER_KV + head_base + h;
+      unsigned u;
+      memcpy(&u, &h_lse[li], 4);
+      w_lse[(size_t)h * NUM_CHUNKS + c] = ((unsigned long long)ep << 32) | u;
+      for (int d = 0; d < HEAD_DIM; ++d) {
+        memcpy(&u, &h_o[li * HEAD_DIM + d], 4);
+        w_o[((size_t)c * HN + h) * HEAD_DIM + d] =
+            ((unsigned long long)ep << 32) | u;
+      }
+    }
+  }
+  float *d_lse, *d_o;
+  bf16 *d_out0, *d_out1;
+  unsigned long long *d_w_o, *d_w_lse;
+  int *d_qo, *d_kvp, *d_lastlen;
+  hipMalloc(&d_lse, lse_n * 4);
+  hipMalloc(&d_o, o_n * 4);
+  hipMalloc(&d_out0, out_n * sizeof(bf16));
+  hipMalloc(&d_out1, out_n * sizeof(bf16));
+  hipMalloc(&d_w_o, w_o.size() * 8);
+  hipMalloc(&d_w_lse, w_lse.size() * 8);
+  hipMalloc(&d_qo, 2 * 4);
+  hipMalloc(&d_kvp, 2 * 4);
+  hipMalloc(&d_lastlen, 4);
+  hipMemcpy(d_lse, h_lse.data(), lse_n * 4, hipMemcpyHostToDevice);
+  hipMemcpy(d_o, h_o.data(), o_n * 4, hipMemcpyHostToDevice);
+  hipMemcpy(d_w_o, w_o.data(), w_o.size() * 8, hipMemcpyHostToDevice);
+  hipMemcpy(d_w_lse, w_lse.data(), w_lse.size() * 8, hipMemcpyHostToDevice);
+  hipMemset(d_out0, 0, out_n * sizeof(bf16));
+  hipMemset(d_out1, 0, out_n * sizeof(bf16));
+  int const h_qo[2] = {0, 1};
+  int const h_kvp[2] = {0, 1};
+  int const h_ll[1] = {seqlen};
+  hipMemcpy(d_qo, h_qo, 8, hipMemcpyHostToDevice);
+  hipMemcpy(d_kvp, h_kvp, 8, hipMemcpyHostToDevice);
+  hipMemcpy(d_lastlen, h_ll, 4, hipMemcpyHostToDevice);
+  // Group g's 32 slices only: the words carry one group.
+  hipLaunchKernelGGL((merge_entry_g<true, 32, HN>), dim3(32),
+                     dim3(BLOCK_THREADS), MRG_DYN_LDS, 0, g, d_lse, d_o, d_qo,
+                     d_kvp, d_lastlen, d_out0, head_base, nullptr, nullptr,
+                     0u);
+  hipLaunchKernelGGL((merge_entry_g<true, 32, HN>), dim3(32),
+                     dim3(BLOCK_THREADS), MRG_DYN_LDS, 0, g, d_lse, d_o, d_qo,
+                     d_kvp, d_lastlen, d_out1, head_base, d_w_o, d_w_lse,
+                     epoch);
+  hipError_t const err = hipDeviceSynchronize();
+  std::vector<unsigned short> a(out_n), b(out_n);
+  hipMemcpy(a.data(), d_out0, out_n * 2, hipMemcpyDeviceToHost);
+  hipMemcpy(b.data(), d_out1, out_n * 2, hipMemcpyDeviceToHost);
+  int diff = 0, nonzero = 0;
+  for (int h = head_base; h < head_base + HN; ++h) {
+    for (int d = 0; d < HEAD_DIM; ++d) {
+      size_t const i =
+          (size_t)g * QO_PER_KV * HEAD_DIM + (size_t)h * HEAD_DIM + d;
+      nonzero += a[i] != 0;
+      if (a[i] != b[i]) {
+        if (diff < 4) {
+          printf("  h%-2d dim %-4d: default %04x ll32 %04x\n", h, d, a[i],
+                 b[i]);
+        }
+        ++diff;
+      }
+    }
+  }
+  hipFree(d_lse); hipFree(d_o); hipFree(d_out0); hipFree(d_out1);
+  hipFree(d_w_o); hipFree(d_w_lse); hipFree(d_qo); hipFree(d_kvp);
+  hipFree(d_lastlen);
+  if (err != hipSuccess || diff || nonzero < HN * HEAD_DIM / 2) {
+    printf("FAIL %-28s %d values differ, %d nonzero (%s)\n", tag, diff,
+           nonzero, hipGetErrorString(err));
+    return 1;
+  }
+  printf("PASS %-28s live %2d/%d, bit-identical to the default halves path\n",
+         tag, n_live, NUM_CHUNKS);
+  return 0;
+}
+#endif
+
+// MPK_MERGE_QUAD / MPK_MERGE_LIVE bit-exactness: the shipping own8 shape on
+// the decode's own empty-chunk pattern (chunks past the sequence's live count
+// hold lse -1e30 and garbage o), one group, every slice; the outputs go to a
+// file so a default build and a quad build can be compared byte for byte.
+// MPK_DEC_PART_F16 builds hand the merge f16 partials instead.
+static int dump_cases(char const *path) {
+  FILE *f = fopen(path, "wb");
+  if (!f) {
+    printf("FAIL dump: cannot open %s\n", path);
+    return 1;
+  }
   int rc = 0;
+  int const g = 2;
+  for (int hb = 0; hb < QO_PER_KV; hb += 8) {
+    for (int seqlen : {1, 17, 300, 513, 1024, 1025, 1500, 2047, 2048}) {
+      srand(1000 + seqlen + hb);
+      int const ntiles = (seqlen + 15) / 16;
+      int const tpc = (ntiles + NUM_CHUNKS - 1) / NUM_CHUNKS;
+      int const n_live = tpc > 0 ? (ntiles + tpc - 1) / tpc : 0;
+      size_t const lse_n = (size_t)LSE_TOKEN_STRIDE;
+      size_t const o_n = lse_n * HEAD_DIM;
+      size_t const out_n = (size_t)OUT_TOKEN_STRIDE;
+      std::vector<float> h_lse(lse_n), h_o(o_n);
+      for (size_t i = 0; i < o_n; ++i) {
+        h_o[i] = frand() * 8.0f;
+      }
+      for (size_t i = 0; i < lse_n; ++i) {
+        int const c = (int)((i / QO_PER_KV) % NUM_CHUNKS);
+        h_lse[i] = c < n_live ? frand() * 3.0f : -1e30f;
+      }
+      float *d_lse, *d_o;
+      bf16 *d_out;
+      int *d_qo, *d_kvp, *d_lastlen;
+      hipMalloc(&d_lse, lse_n * 4);
+      hipMalloc(&d_o, o_n * 4);
+      hipMalloc(&d_out, out_n * sizeof(bf16));
+      hipMalloc(&d_qo, 8);
+      hipMalloc(&d_kvp, 8);
+      hipMalloc(&d_lastlen, 4);
+      hipMemcpy(d_lse, h_lse.data(), lse_n * 4, hipMemcpyHostToDevice);
+#if MPK_DEC_PART_F16
+      std::vector<_Float16> h_h(o_n);
+      for (size_t i = 0; i < o_n; ++i) {
+        h_h[i] = (_Float16)h_o[i];
+      }
+      hipMemcpy(d_o, h_h.data(), o_n * 2, hipMemcpyHostToDevice);
+#else
+      hipMemcpy(d_o, h_o.data(), o_n * 4, hipMemcpyHostToDevice);
+#endif
+      hipMemset(d_out, 0, out_n * sizeof(bf16));
+      int const h_qo[2] = {0, 1};
+      int const h_kvp[2] = {0, 1};
+      hipMemcpy(d_qo, h_qo, 8, hipMemcpyHostToDevice);
+      hipMemcpy(d_kvp, h_kvp, 8, hipMemcpyHostToDevice);
+      hipMemcpy(d_lastlen, &seqlen, 4, hipMemcpyHostToDevice);
+      hipLaunchKernelGGL((merge_entry_g<true, 32, 8>), dim3(32),
+                         dim3(BLOCK_THREADS), MRG_DYN_LDS, 0, g, d_lse, d_o,
+                         d_qo, d_kvp, d_lastlen, d_out, hb, nullptr, nullptr,
+                         0u);
+      hipError_t const err = hipDeviceSynchronize();
+      std::vector<bf16> h_out(out_n);
+      hipMemcpy(h_out.data(), d_out, out_n * sizeof(bf16),
+                hipMemcpyDeviceToHost);
+      // Against the double reference too (f16 partials: what they carry).
+      float max_err = 0.f;
+      for (int h = hb; h < hb + 8; ++h) {
+        double mx = -1e300, den = 0.0;
+        for (int c = 0; c < n_live; ++c) {
+          mx = std::max(mx, (double)h_lse[g * NUM_CHUNKS * QO_PER_KV + c * QO_PER_KV + h]);
+        }
+        for (int c = 0; c < n_live; ++c) {
+          den += exp((double)h_lse[g * NUM_CHUNKS * QO_PER_KV + c * QO_PER_KV + h] - mx);
+        }
+        for (int dd = 0; dd < HEAD_DIM; ++dd) {
+          double acc = 0.0;
+          for (int c = 0; c < n_live; ++c) {
+            size_t const li = (size_t)g * NUM_CHUNKS * QO_PER_KV + c * QO_PER_KV + h;
+#if MPK_DEC_PART_F16
+            double const ov = (double)h_h[li * HEAD_DIM + dd];
+#else
+            double const ov = (double)h_o[li * HEAD_DIM + dd];
+#endif
+            acc += exp((double)h_lse[li] - mx) * ov;
+          }
+          float const ref = (float)(acc / den);
+          float const got = (float)h_out[(size_t)g * QO_PER_KV * HEAD_DIM + (size_t)h * HEAD_DIM + dd];
+          max_err = std::max(max_err, fabsf(ref - got) / std::max(1.0f, fabsf(ref)));
+        }
+      }
+      bool const ok = err == hipSuccess && max_err < 6e-3f;
+      printf("%s dump hb%d seq%-5d live %2d  max rel err %.3e\n",
+             ok ? "PASS" : "FAIL", hb, seqlen, n_live, max_err);
+      rc |= ok ? 0 : 1;
+      fwrite(h_out.data(), sizeof(bf16), out_n, f);
+      hipFree(d_lse); hipFree(d_o); hipFree(d_out); hipFree(d_qo);
+      hipFree(d_kvp); hipFree(d_lastlen);
+    }
+  }
+  fclose(f);
+  return rc;
+}
+
+int main(int argc, char **argv) {
+  srand(20250905);
+  if (argc > 2 && strcmp(argv[1], "--dump") == 0) {
+    return dump_cases(argv[2]);
+  }
+  int rc = 0;
+#if MPK_DEC_MERGE_LL32
+  for (int hb = 0; hb < QO_PER_KV; hb += 8) {
+    for (int seqlen : {1, 17, 513, 1024, 1025, 1500, 2048}) {
+      char tag[48];
+      snprintf(tag, sizeof(tag), "LL32 own8 hb%d seq%d", hb, seqlen);
+      rc |= run_ll32_bitexact(seqlen, hb, tag);
+    }
+  }
+#endif
 #ifdef TEST_MERGE_LSE_LL
   for (int hb = 0; hb < QO_PER_KV; hb += 8) {
     rc |= run_lse_ll_bitexact(NUM_CHUNKS, hb, "LSE-LL own8 all");

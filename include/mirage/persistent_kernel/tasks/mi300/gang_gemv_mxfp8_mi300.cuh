@@ -347,6 +347,42 @@ __device__ __noinline__ void
     }
   }
 #endif
+#if MPK_WUK_VL4 && MPK_WUK_VL4_WF
+  // MPK_WUK_VL4_WF: the VL4 row's weights and scales go out ahead of the
+  // activation poll, into registers the K-loop below consumes, so their L2
+  // round trip overlaps the poll instead of following the staging.
+  constexpr bool VWF = LANES_PER_ROW == 2 && BATCH_SIZE == 1 && STAGE_A &&
+                       !HAS_RESIDUAL && (ITERS % 2) == 0;
+  u32x4_t vwf_w[VWF ? ITERS : 1];
+  unsigned char vwf_s[VWF ? ITERS : 1];
+  bool const vwf_live = VWF && a_ll != nullptr;
+  if constexpr (VWF) {
+    if (vwf_live) {
+      unsigned char const *const vw_row =
+          wg + static_cast<size_t>(row) * REDUCTION_SIZE;
+      unsigned char const *const vs_row =
+          wg + WG_DATA_BYTES +
+          static_cast<size_t>(row) * (REDUCTION_SIZE / SCALE_BLOCK);
+#pragma unroll
+      for (int i = 0; i < ITERS / 2; i++) {
+#pragma unroll
+        for (int v = 0; v < 2; v++) {
+          int const k = (i * 4 + 2 * lane + v) * VEC;
+#if MPK_ATTN_STREAM_NT >= 1
+          vwf_w[2 * i + v] = ld_g_nt<u32x4_t>(vw_row + k);
+#else
+          vwf_w[2 * i + v] = ld_g<u32x4_t>(vw_row + k);
+#endif
+#if MPK_ATTN_STREAM_NT == 1
+          vwf_s[2 * i + v] = ld_g_nt<unsigned char>(vs_row + k / SCALE_BLOCK);
+#else
+          vwf_s[2 * i + v] = ld_g<unsigned char>(vs_row + k / SCALE_BLOCK);
+#endif
+        }
+      }
+    }
+  }
+#endif
   if constexpr (STAGE_A && BATCH_SIZE == 1 && REDUCTION_SIZE % 8 == 0 &&
                 REDUCTION_SIZE / 8 <= NTHREADS) {
     if (a_ll != nullptr) {
@@ -380,6 +416,10 @@ __device__ __noinline__ void
       }
       __syncthreads();
       stage_a = false;
+      // Trace stamp 78 (W_UK): the activation words validated and staged.
+      if (tid == 0 && o_ll != nullptr) {
+        mpk_stage_stamp(78);
+      }
     }
   } else {
     if (a_ll != nullptr) {
@@ -438,6 +478,25 @@ __device__ __noinline__ void
 #pragma unroll
       for (int v = 0; v < 2; v++) {
         int const k = (i * 4 + 2 * lane + v) * VEC;
+#if MPK_WUK_VL4_WF
+        u32x4_t wvv;
+        unsigned char svv;
+        if (vwf_live) {
+          wvv = vwf_w[2 * i + v];
+          svv = vwf_s[2 * i + v];
+        } else {
+#if MPK_ATTN_STREAM_NT >= 1
+          wvv = ld_g_nt<u32x4_t>(w_row + k);
+#else
+          wvv = ld_g<u32x4_t>(w_row + k);
+#endif
+#if MPK_ATTN_STREAM_NT == 1
+          svv = ld_g_nt<unsigned char>(s_row + k / SCALE_BLOCK);
+#else
+          svv = ld_g<unsigned char>(s_row + k / SCALE_BLOCK);
+#endif
+        }
+#else
 #if MPK_ATTN_STREAM_NT >= 1
         u32x4_t const wvv = ld_g_nt<u32x4_t>(w_row + k);
 #else
@@ -447,6 +506,7 @@ __device__ __noinline__ void
         unsigned char const svv = ld_g_nt<unsigned char>(s_row + k / SCALE_BLOCK);
 #else
         unsigned char const svv = ld_g<unsigned char>(s_row + k / SCALE_BLOCK);
+#endif
 #endif
         u32x4_t const av0 = *reinterpret_cast<u32x4_t const *>(s_a + k);
         u32x4_t const av1 = *reinterpret_cast<u32x4_t const *>(s_a + k + 8);
@@ -467,6 +527,10 @@ __device__ __noinline__ void
     float const s0 = (va[0][0] + va[0][1]) + (va[0][2] + va[0][3]);
     float const s1 = (va[1][0] + va[1][1]) + (va[1][2] + va[1][3]);
     float const vsum = (s0 + __shfl_xor(s0, 1)) + (s1 + __shfl_xor(s1, 1));
+    // Trace stamp 79 (W_UK): the row sums done, ahead of the word stores.
+    if (tid == 0 && o_ll != nullptr) {
+      mpk_stage_stamp(79);
+    }
     if (o_ll != nullptr) {
       if (Bs != nullptr) {
         __builtin_trap();
@@ -480,7 +544,9 @@ __device__ __noinline__ void
                   ((unsigned long long)o_epoch << 32) | lo | (hi << 16));
       }
     }
-    if (lane == 0 && m_tile * BATCH_SIZE < num_active_tokens) {
+    // MPK_WUK_LL_NOOUT: the words above are the decode's only input.
+    if (lane == 0 && m_tile * BATCH_SIZE < num_active_tokens &&
+        !(MPK_WUK_LL_NOOUT && o_ll != nullptr)) {
       int const n_local = n_tile * ROWS_PER_WG + row;
       float const bv = Bs ? b2f(ld_g<unsigned short>(Bs + n_local)) : 0.0f;
       size_t const idx = out_off + row;
@@ -756,7 +822,7 @@ __device__ __noinline__ void
       __builtin_trap();
     }
   }
-  if (lane == 0) {
+  if (lane == 0 && !(MPK_WUK_LL_NOOUT && o_ll != nullptr)) {
     int const n_local = n_tile * ROWS_PER_WG + row;
     float const bv = Bs ? b2f(ld_g<unsigned short>(Bs + n_local)) : 0.0f;
 #pragma unroll

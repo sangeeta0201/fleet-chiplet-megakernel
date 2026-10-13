@@ -2045,6 +2045,13 @@ gang_mla_full_layer_fused_kernel_mi300(
                 counters + FULL_LAYER_ALL_SLOT * HIER_STRIDE)
           : nullptr;
 
+#if MPK_OPROJ_PF_DEC
+  // Set by the attention half (its oproj_pf_role), read at Phase 8.
+  __shared__ int s_oproj_pf_role;
+  if (tid == 0) {
+    s_oproj_pf_role = 0;
+  }
+#endif
   // ══════════════════════════════════════════════════════════════════════
   // Phases 1-7: the attention half
   // ══════════════════════════════════════════════════════════════════════
@@ -2155,7 +2162,7 @@ gang_mla_full_layer_fused_kernel_mi300(
       (unsigned)attn_release_expected,
       // MPK_DEC_MERGE_LL: epoch is the layer counter, so ml_mode only.
       // MPK_DEC_LSE_LL uses its lse words alone.
-      ((MPK_DEC_MERGE_LL || MPK_DEC_LSE_LL) && ml_mode)
+      ((MPK_DEC_MERGE_LL || MPK_DEC_LSE_LL || MPK_DEC_MERGE_LL32) && ml_mode)
           ? reinterpret_cast<unsigned long long *>(
                 counters + FULL_LAYER_DLSE_SLOT * HIER_STRIDE)
           : nullptr,
@@ -2176,7 +2183,13 @@ gang_mla_full_layer_fused_kernel_mi300(
        (MPK_QA_LL && ml_mode && BATCH_SIZE == 1))
           ? reinterpret_cast<unsigned long long *>(
                 counters + FULL_LAYER_QXSLL_SLOT * HIER_STRIDE)
-          : nullptr);
+          : nullptr,
+#if MPK_OPROJ_PF_DEC
+      (attn_ll != nullptr) ? &s_oproj_pf_role : nullptr
+#else
+      nullptr
+#endif
+      );
   static_assert(!(MPK_QA_LL && MPK_QXS_ROW_LL),
                 "MPK_QA_LL and MPK_QXS_ROW_LL share one counter region");
 
@@ -2661,7 +2674,19 @@ gang_mla_full_layer_fused_kernel_mi300(
               ? -1
               : xcd_rank - pf_base -
                     ((pf_skip_topk && xcd_rank > router_tile_n) ? 1 : 0);
+#if MPK_OPROJ_PF_DEC
+      // MPK_OPROJ_PF_DEC: a decode worker's tile is prefetched by its helper
+      // (s_oproj_pf_role), into the same L2, ahead of the decode's tail.
+      int const pf_role = s_oproj_pf_role;
+      int const pf_own = pf_tile;
+#pragma unroll 1
+      for (int pf_k = 0; pf_k < 2; pf_k++) {
+      int const pf_tile = (pf_k == 0) ? (pf_role < 0 ? -1 : pf_own)
+                          : (pf_role > 0 ? pf_role - 1 - pf_base : -1);
       if (pf_tile >= 0 && pf_tile < oproj_tiles_per_xcd) {
+#else
+      if (pf_tile >= 0 && pf_tile < oproj_tiles_per_xcd) {
+#endif
 #endif
         extern __shared__ char _fused_smem[];
         i32x4_t const pf_rsrc = make_w_buffer_rsrc(
@@ -2726,6 +2751,9 @@ gang_mla_full_layer_fused_kernel_mi300(
           asm volatile("" : "+v"(pf_voff) : : "memory");
         }
       }
+#if MPK_OPROJ_PF_DEC && !MPK_OPROJ_PF_IDLE
+      }
+#endif
     }
 #endif // MPK_GLM_OPROJ_PREFETCH_OFF
 #if MPK_ROUTER_L2PF
