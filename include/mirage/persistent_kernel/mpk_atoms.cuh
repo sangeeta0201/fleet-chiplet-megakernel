@@ -1168,6 +1168,18 @@ __device__ __forceinline__ bool
 #ifndef MPK_QB_IDLE_PF
 #define MPK_QB_IDLE_PF 0
 #endif
+// MPK_QB_IDLE_PF_AT_US: under MPK_QB_IDLE_PF, the idle workers issue q_b's
+// slabs this many us after the attention half's entry instead of right behind
+// their qkv_a block. q_b's A tiles land when the slab fetch does (MPK_TRACE
+// q11, MPK_QB_PF_EARLY), MPK_QB_DEC_PF starts it at ~8.6 us, and from the
+// layer's entry it competes with qkv_a's own stream.
+// MEASURED SLOWER 2026-10-14 on 4a21f5e, n=3 interleaved, rank-0 tokens
+// identical: at 4 us 3.411 3.408 3.407, at 6 us 3.404 3.402 3.409 vs 3.393
+// 3.396 3.388 ms (+0.017, +0.013). The slab fetch MPK_QB_DEC_PF starts at
+// ~8.6 us is the better time. Off.
+#ifndef MPK_QB_IDLE_PF_AT_US
+#define MPK_QB_IDLE_PF_AT_US 0
+#endif
 // MPK_QB_SELF_PF: each q_b tile's waves 1-3 prefetch its own slab into L2
 // during the qkv_a -> q_b rendezvous, after qkv_a's stream has finished
 // (gang_mla_attn_fused_mi300.cuh).
@@ -1380,6 +1392,10 @@ __device__ __forceinline__ bool
 // order), all 1024 tokens identical on all 8 ranks, n=3: 3.563 3.568 3.562
 // vs 3.593 3.595 3.598 (-0.031). Default on, with MPK_WUK_VL4 and demo.py's
 // 128-row default under it.
+// Re-measured 2026-10-14 on 4a21f5e, where q_b's return no longer drains
+// (MPK_KVUPD_INLINE): the 64-row tiles back on ranks 0-7 (the q_b workers)
+// with MPK_QB_LL_NOOUT, n=2 interleaved, tokens identical, 3.408 3.408 vs
+// 3.383 3.381 ms (+0.026); without MPK_WUK_EARLY_PF too, 3.459 3.455.
 #ifndef MPK_WUK_IDLE_MAP
 #define MPK_WUK_IDLE_MAP 1
 #endif

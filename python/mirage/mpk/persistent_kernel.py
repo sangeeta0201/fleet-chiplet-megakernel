@@ -1734,6 +1734,10 @@ def get_compile_command(
         if _x is not None:
             assert _x.isdigit() and 0 <= int(_x) <= 40, "MPK_OPROJ_PF_MIN_US is 0..40"
             flags = flags + [f"-DMPK_OPROJ_PF_MIN_US={_x}"]
+        _x = os.environ.get("MPK_QB_IDLE_PF_AT_US")
+        if _x is not None:
+            assert _x.isdigit() and 0 <= int(_x) <= 20, "MPK_QB_IDLE_PF_AT_US is 0..20"
+            flags = flags + [f"-DMPK_QB_IDLE_PF_AT_US={_x}"]
         # MPK_TOPK_2L: 1 the two-level K-split TopK, 2 its level-1 poll at
         # system scope, 3 also the normed flags read during the candidate poll,
         # 4 as 3 with the router's partials and sums of squares kept in the

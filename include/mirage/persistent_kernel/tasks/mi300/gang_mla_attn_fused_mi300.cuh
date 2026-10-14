@@ -652,6 +652,9 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   if (tid == 0) {
     mpk_stage_stamp(16);
   }
+#if MPK_QB_IDLE_PF && MPK_QB_IDLE_PF_AT_US > 0
+  unsigned long long const attn_t0 = __builtin_amdgcn_s_memrealtime();
+#endif
   // ══════════════════════════════════════════════════════════════════════
   // Phase 1: residual resolve + input RMSNorm + [q_a_proj | kv_a_proj_with_mqa]
   // ══════════════════════════════════════════════════════════════════════
@@ -937,6 +940,14 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // into L2. A separate straight-line block on purpose -- see the two-region
   // note above.
   if (xcd_rank >= qkv_tiles_per_xcd && qb_weight_ptr != nullptr) {
+#if MPK_QB_IDLE_PF_AT_US > 0
+    // MPK_QB_IDLE_PF_AT_US: held back until this many us past the attention
+    // half's entry, behind qkv_a's weight stream instead of inside it.
+    while (__builtin_amdgcn_s_memrealtime() - attn_t0 <
+           (unsigned long long)MPK_QB_IDLE_PF_AT_US * 100ull) {
+      __builtin_amdgcn_s_sleep(8);
+    }
+#endif
     constexpr uint32_t QBP_WG_BYTES =
         QB_OUTPUT_PER_WG * QB_REDUCTION_SIZE +
         QB_OUTPUT_PER_WG * (QB_REDUCTION_SIZE / 32);
