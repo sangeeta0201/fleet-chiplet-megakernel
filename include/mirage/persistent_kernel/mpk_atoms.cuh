@@ -2424,7 +2424,10 @@ __device__ __forceinline__ bool
 // code object (qkv_a, q_b's kvupd, W_UK, the decode, o_proj, the router, W13)
 // start at 4-byte granularity, so a change in the head's size moves their hot
 // loops against instruction-cache lines; this puts them back. A tool for
-// measurement, not a lever.
+// measurement, not a lever: every callee shifted by 16 / 32 / 48 / 64 / 128 /
+// 192 bytes on a752ce8, interleaved, tokens identical, 3.448 3.452 / 3.447
+// 3.448 / 3.458 3.450 / 3.446 3.448 / 3.446 3.444 / 3.448 3.453 vs 3.446
+// 3.439 3.451 3.445 -- flat.
 #ifndef MPK_LMH_PAD_BYTES
 #define MPK_LMH_PAD_BYTES 0
 #endif
