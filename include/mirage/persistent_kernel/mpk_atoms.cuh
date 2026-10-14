@@ -1162,6 +1162,9 @@ __device__ __forceinline__ bool
 // MEASURED NEGATIVE 2026-10-09, NP=8 1024/1024, interleaved, tokens
 // identical: 6.034 6.041 -> 6.117 6.163 6.153 ms. Its bytes compete with
 // qkv_a's own L2 stream. Off.
+// Re-measured 2026-10-14 on the MPK_KV_LL defaults, where q_b's A tiles land
+// 0.84 us after their issue (MPK_TRACE q05), n=3 interleaved, tokens
+// identical: 3.401 3.402 3.397 vs 3.394 3.379 3.391 ms (+0.012).
 #ifndef MPK_QB_IDLE_PF
 #define MPK_QB_IDLE_PF 0
 #endif
@@ -2266,8 +2269,25 @@ __device__ __forceinline__ bool
 // last MFMA (or the cross-wave reduction) and the output store, the same
 // dependent read MPK_W13_BIAS_PRE took out of W13.
 // MEASURED NULL 2026-10-11 on 5df165e: 4.011 vs 4.000 ms. Off.
+// Re-measured 2026-10-14 on dfa7148 (q_b's chain now sets the decode's
+// query): 3.480 vs 3.443 ms (+0.037, r1, tokens identical). See
+// MPK_QB_BIAS_PRE.
 #ifndef MPK_RNLM8_BIAS_PRE
 #define MPK_RNLM8_BIAS_PRE 0
+#endif
+// MPK_QB_BIAS_PRE: MPK_RNLM8_BIAS_PRE for q_b's tile alone. Re-measured on
+// dfa7148 the shared flag was slower (bp_r1 3.480 vs 3.443): ahead of qkv_a's
+// k-loop the read is older than every weight load the loop then waits on, and
+// vmcnt retires in order. In q_b's tile it is issued after its four A tiles,
+// and MPK_TRACE (q05) puts the epilogue's own read at 0.27 us between the
+// cross-wave sum and the words.
+// MEASURED NULL 2026-10-14, n=3 interleaved, rank-0 tokens identical: on
+// MPK_KVUPD_INLINE + MPK_QB_NORM_DPP 3.429 3.418 3.425 vs 3.412 3.416 3.420
+// ms (+0.008); on the MPK_KV_LL defaults 3.402 3.395 vs 3.389 3.390 3.387
+// (+0.010). MPK_TRACE (q05): the epilogue's read 0.27 -> 0.16 us, given back
+// elsewhere. Off.
+#ifndef MPK_QB_BIAS_PRE
+#define MPK_QB_BIAS_PRE 0
 #endif
 // MPK_GEMV4_EPI_PRE: the MXFP4 GEMV's epilogue lanes (o_proj) load their
 // residual and bias ahead of the activation staging instead of after the
@@ -2354,6 +2374,85 @@ __device__ __forceinline__ bool
 #ifndef MPK_RNLM8_INLINE
 #define MPK_RNLM8_INLINE 0
 #endif
+// MPK_KVUPD_INLINE: inline q_b's kvupd wrapper
+// (gang_rmsnorm_linear_mxfp8_bias_mla_kvupd_kernel) into the attention task, so
+// q_b calls its GEMM directly. The wrapper takes five of its arguments on the
+// stack: the caller stores them, the wrapper's entry vmcnt(0) waits for those
+// stores and it loads them back before it can call the GEMM. MPK_TRACE (q02,
+// trace-only stamps in the q_a word poll): S18 -> poll entry 0.7-1.0 us on
+// every q_b tile; on XCDs 0-6 that is the critical path, since their q_b
+// workers come off their own qkv_a tile and find every q_a word valid on the
+// first round.
+// MEASURED 2026-10-14 on dfa7148, NP=8 1024/1024, n=3 interleaved, rank-0
+// tokens identical: 3.433 3.435 3.434 vs 3.447 3.450 3.449 ms (-0.015).
+// worker_kernel 390 VGPR either way. MPK_TRACE (q05): S18 -> poll entry 0.95
+// -> 0.64 us, and q_b's return no longer drains its write-through store
+// (S85 -> S51 0.54 -> 0.22 us).
+#ifndef MPK_KVUPD_INLINE
+#define MPK_KVUPD_INLINE 1
+#endif
+// MPK_QB_NORM_DPP: q_b's q_a RMSNorm reduction (_rnlm8_stage_norm_rcp_ll) as
+// the same xor butterfly through permlane swaps and DPP instead of six
+// ds_bpermute round trips, and every wave forming the four-wave total itself,
+// which drops the second barrier. Same pairs, same order: bit-identical
+// (tests/standalone/test_xor_sum_dpp.hip: 1M lanes, 4096 totals). MPK_TRACE
+// (q02): q_a words valid -> normed (S45 -> S72) 0.7 us on every q_b tile.
+// MEASURED 2026-10-14 on dfa7148, NP=8 1024/1024, rank-0 tokens identical:
+// alone 3.433 vs 3.443 ms (r1); with MPK_KVUPD_INLINE, n=3 interleaved,
+// 3.412 3.416 3.420 vs 3.449 3.450 3.444 (-0.032 for the pair). MPK_TRACE
+// (q05): S45 -> S72 0.71 -> 0.42 us. Default on, with MPK_KV_LL (see there).
+#ifndef MPK_QB_NORM_DPP
+#define MPK_QB_NORM_DPP 1
+#endif
+// MPK_KV_LL: under MPK_QA_LL the qkv_a tiles also write the latent rows (the
+// [latent | rope] 576 behind q_a) as (epoch << 32 | bf16x2) words, and XCD 0's
+// latent tile (latent_to_cache) validates them into LDS and reads its row
+// from there, instead of waiting at the qkv_a -> q_b rendezvous for the row.
+// That rendezvous then has no waiter, so nobody arrives at it either: its
+// write-through tag no longer sits in every worker's wave-0 vmcnt into the
+// next call. MPK_TRACE (q02): the rendezvous released the latent tile 2.0 us
+// after the last qkv_a tile, and the cache-row flag the decode waits on (S66)
+// came 3.7 us after that. Same values, same sums: the cache row is
+// bit-identical.
+// MEASURED 2026-10-14 on dfa7148, NP=8 1024/1024, n=3 interleaved, rank-0
+// tokens identical: alone 3.418 3.412 3.416 vs 3.449 3.450 3.444 ms (-0.033);
+// on MPK_KVUPD_INLINE + MPK_QB_NORM_DPP + MPK_QB_BIAS_PRE 3.398 3.389 3.391 vs
+// 3.429 3.418 3.425 (-0.031). MPK_TRACE (q09): latent tile S18 10.75 -> 8.24
+// us, cache-row flag (S66) 13.99 -> 11.95, q_b's S18 -> poll entry 0.64 ->
+// 0.31. The three defaults together vs all three off (HEAD's image), n=3
+// interleaved, tokens identical: 3.389 3.390 3.387 vs 3.443 3.447 3.446 ms
+// (-0.057).
+#ifndef MPK_KV_LL
+#define MPK_KV_LL 1
+#endif
+// MPK_QB_WEARLY: q_b's A tiles issued before its q_a word poll, from waves
+// 1-3, with wave 0 alone polling (vmcnt is per wave and in issue order, so a
+// polling wave must hold no weight). MPK_TRACE (q05, k-loop stamps 80..85):
+// the tiles issued after the norm landed 0.84 us later, just behind the
+// quantizer (0.75 us), so the quantizer was hiding them and MPK_QUANT_WIDE
+// alone measured null. The K-split's four chains keep their k-tiles and their
+// summation order (wave 1 runs two): bit-identical.
+// MEASURED SLOWER 2026-10-14 on dfa7148 + MPK_KVUPD_INLINE + MPK_QB_NORM_DPP +
+// MPK_QB_BIAS_PRE, rank-0 tokens identical: 3.531 vs 3.423 ms (+0.108); with
+// MPK_QUANT_WIDE 3.539. MPK_TRACE (q09): wave 0's poll, entry -> words valid,
+// 0.54 -> 1.62 us. vmcnt is per wave but the CU's request path is not: the
+// other waves' 32 KB of tiles sit ahead of the poll's loads. Off.
+#ifndef MPK_QB_WEARLY
+#define MPK_QB_WEARLY 0
+#endif
+// MPK_QB_PF_EARLY: q_b's hoisted A tiles issued as soon as each wave's q_a
+// words validate, ahead of the RMSNorm reduction, instead of after it. The
+// issue is TA-bound (48 dwordx4/ubyte loads a tile, 32 KB: S72 -> S80 0.42 us
+// in MPK_TRACE q09) and the tiles land 0.84 us after it, behind the
+// quantizer, so the K-loop waits on them. Same loads: bit-identical.
+// MEASURED SLOWER 2026-10-14 on the MPK_KV_LL defaults, n=3 interleaved,
+// rank-0 tokens identical: 3.420 3.422 3.415 vs 3.394 3.379 3.391 ms
+// (+0.031). MPK_TRACE (q11): the first tile still lands at ~11.06 us (S80 ->
+// S81 0.84 -> 1.42 us) -- its arrival is the slab fetch's (MPK_QB_DEC_PF),
+// not the issue's -- and the norm behind the issue goes 0.42 -> 0.74 us. Off.
+#ifndef MPK_QB_PF_EARLY
+#define MPK_QB_PF_EARLY 0
+#endif
 // MPK_LMH_BAL: the LM head (vocab shard 19456 rows, 304 tiles of 64 per rank)
 // as one tile per worker. 38 tiles per XCD over 29 workers is two rounds: all
 // 29 workers stream a 405 KB tile, then 9 of them resolve the row a second
@@ -2385,6 +2484,13 @@ __device__ __forceinline__ bool
 // every function 256-byte aligned (-falign-functions=256): HEAD 3.472 3.478,
 // WRAP 3.488 3.477, this 3.452 3.445 -- where it wins, against a baseline
 // the alignment cost 0.027 ms. Off.
+// Not a cache footprint the head leaves behind (2026-10-14, q06): sparse
+// traces, 160 decode iterations each, behind the wall vs this, at layers 1-2
+// (the first after the head) and 40-41. Layers 1-2: layer period +0.075,
+// -0.067, -0.123 us on ranks 0, 2, 5. Layers 40-41: this 0.26-0.36 us FASTER,
+// nearly all of it in qkv_a's resolve + norm (S71 -> S54, -0.20 to -0.26),
+// the interval the c07 dense trace had +0.14 slower. The per-layer sign
+// follows the build (traced, untraced, aligned), not the head's traffic.
 #ifndef MPK_LMH_BAL
 #define MPK_LMH_BAL 0
 #endif
@@ -2545,6 +2651,10 @@ __device__ __forceinline__ unsigned long long lmh_argmax_key(unsigned bits,
 // (+0.013); again on stage d15, 3.479 3.477 3.481 vs 3.470 3.465 3.471
 // (+0.010). MPK_TRACE: the quantizer is 0.4-0.7 us instead of 1.06, but the
 // W_UK chain does not start earlier.
+// Again 2026-10-14 on dfa7148, n=3 interleaved, tokens identical: 3.449 3.454
+// 3.461 vs 3.447 3.450 3.449 ms (null). MPK_TRACE (q05, k-loop stamps): the A
+// tiles land 0.84 us after their issue and the default quantizer takes 0.75,
+// so it was hiding them (MPK_QB_PF_EARLY, MPK_QB_WEARLY).
 #ifndef MPK_QUANT_WIDE
 #define MPK_QUANT_WIDE 0
 #endif
@@ -3398,7 +3508,11 @@ __device__ __forceinline__ void mpk_stage_stamp(int idx) {
 #define MPK_TRACE_ITERS 4
 #define MPK_TRACE_LAYERS 80
 // 46 shared with MPK_BAR_SKEW, then trace-only sub-phase stamps 46..79.
-#define MPK_STAGE_SLOTS 80
+// MPK_TRACE_SLOTS > 80 makes room for stamps past 79 (q_b's k-loop, 80..85).
+#ifndef MPK_TRACE_SLOTS
+#define MPK_TRACE_SLOTS 80
+#endif
+#define MPK_STAGE_SLOTS MPK_TRACE_SLOTS
 #define MPK_STAGE_WORKERS 512
 #define MPK_TRACE_WORDS                                                        \
   ((size_t)MPK_TRACE_ITERS * MPK_TRACE_LAYERS * MPK_STAGE_SLOTS *              \

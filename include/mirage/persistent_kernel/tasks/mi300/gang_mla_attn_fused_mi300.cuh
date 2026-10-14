@@ -830,8 +830,17 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
                 "q_b reads the words as one 8-element group per thread");
   unsigned long long *const qa_ll = BATCH_SIZE == 1 ? qxs_row_ll : nullptr;
   int const qkv_xcd_rows = qkv_n_wgs_per_xcd * QKV_OUTPUT_PER_WG;
-  int qa_cols = QB_REDUCTION_SIZE - xcd_id * qkv_xcd_rows;
+  // MPK_KV_LL: the latent rows behind the q_a prefix leave as words too, for
+  // XCD 0's latent tile (latent_to_cache).
+  static_assert(!MPK_KV_LL || KV_INPUT_OFFSET == QB_REDUCTION_SIZE,
+                "the latent's words follow the q_a row's");
+  int qa_cols = (MPK_KV_LL ? KV_INPUT_OFFSET + KV_LORA_RANK + QK_ROPE_HEAD_DIM
+                           : QB_REDUCTION_SIZE) -
+                xcd_id * qkv_xcd_rows;
   qa_cols = qa_cols < 0 ? 0 : (qa_cols > qkv_xcd_rows ? qkv_xcd_rows : qa_cols);
+  bool const kv_ll_on = MPK_KV_LL && qa_ll != nullptr;
+#else
+  bool const kv_ll_on = false;
 #endif
 #ifndef MPK_ABL_QKV
   // MPK_QKVA_REPS: price an EXTRA un-hidden qkv_a pass. 1 is the shipping
@@ -1144,15 +1153,20 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     }
   } else if (qkv_tagged) {
     int *const tags = bar_tags + MPK_TAGBAR_IDX_QKV * MPK_TAGBAR_SLOTS;
-    if (tid == 0) {
+    // MPK_KV_LL: nobody reads this site's tags, so nobody writes them either
+    // -- the write-through tag sat in wave 0's vmcnt into q_b's entry.
+    if (tid == 0 && !kv_ll_on) {
       tag_bar_arrive(tags, xcd_id * tiles_per_xcd + xcd_rank, qkv_expected);
     }
 #if MPK_QA_LL
     // MPK_QA_LL: the q_b tiles validate the q_a words instead; only xcd_rank
     // 0 -- the latent tile, which reads kv_a, and the XCD's tag relay -- waits.
+    // MPK_KV_LL: the latent tile validates the latent's words instead, and
+    // nothing reads the relay's line: its wait covers no slots.
     if (qa_ll == nullptr || xcd_rank == 0)
 #endif
-    tag_bar_wait_site(tags, arrivals, qkv_expected, tid, xcd_id, xcd_rank,
+    tag_bar_wait_site(tags, kv_ll_on ? 0 : arrivals, qkv_expected, tid,
+                      xcd_id, xcd_rank,
                       (MPK_TAG_DIRECT_SITES & MPK_TAGBAR_QKV) != 0);
   } else if (tid == 0) {
     // Modular test rather than a reset: the counter is monotonic for the

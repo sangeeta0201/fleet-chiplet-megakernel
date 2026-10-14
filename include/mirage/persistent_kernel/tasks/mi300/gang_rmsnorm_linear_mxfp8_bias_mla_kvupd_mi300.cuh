@@ -95,7 +95,11 @@ template <int BATCH_SIZE,
           // side of it and free the tile width entirely. See the note on the
           // static_assert below.
           bool DEFER_ROPE = false>
+#if MPK_KVUPD_INLINE
+__device__ __attribute__((always_inline)) void
+#else
 __device__ __attribute__((noinline)) void
+#endif
     gang_rmsnorm_linear_mxfp8_bias_mla_kvupd_kernel(
         void const *norm_input_ptr,  // [batch, KV_INPUT_STRIDE] (q_a prefix)
         void const *norm_weight_ptr, // [REDUCTION_SIZE]
@@ -192,7 +196,20 @@ __device__ __attribute__((noinline)) void
                                                             kv_norm_weight_ptr,
                                                             cos_ptr,
                                                             sin_ptr,
-                                                            kv_eps);
+                                                            kv_eps
+#if MPK_QA_LL && MPK_KV_LL
+                                                            ,
+                                                            // The latent's
+                                                            // words follow
+                                                            // the q_a row's.
+                                                            qa_ll != nullptr
+                                                                ? qa_ll +
+                                                                      KV_INPUT_OFFSET /
+                                                                          2
+                                                                : nullptr,
+                                                            qa_epoch
+#endif
+                                                            );
     return;
   }
   int const gemm_tile_idx = tile_idx - 1;

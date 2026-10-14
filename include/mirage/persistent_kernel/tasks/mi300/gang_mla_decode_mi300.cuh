@@ -1398,7 +1398,12 @@ __device__ __noinline__ void
       bool kvf_ok = !(MPK_PROBE_DEC_NOQ != 1 && kv_flag != nullptr &&
                       tid == 0 && holds_cur());
 #endif
+      // Trace stamps 63/53 (thread 0): last round issued, first round back.
+      bool first = true;
       while (true) {
+        if (tid == 0) {
+          mpk_stage_stamp(63);
+        }
 #pragma unroll
         for (int j = 0; j < Q_PER; j++) {
           if (!(vq & (1u << j))) {
@@ -1406,6 +1411,13 @@ __device__ __noinline__ void
                                      __HIP_MEMORY_SCOPE_SYSTEM);
           }
         }
+#if defined(MPK_TRACE) && MPK_TRACE
+        if (tid == 0 && first) {
+          asm volatile("" ::"v"(w[0]), "v"(w[Q_PER - 1]) : "memory");
+          mpk_stage_stamp(53);
+        }
+#endif
+        first = false;
 #if MPK_DEC_KVF_INC
         unsigned long long kvf = 0;
         if (!kvf_ok) {

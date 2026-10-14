@@ -90,6 +90,9 @@ using bf16 = __hip_bfloat16;
 #ifndef MPK_KVUPD_FAST
 #define MPK_KVUPD_FAST 0
 #endif
+#if MPK_KVUPD_FAST && MPK_KV_LL
+#error "MPK_KV_LL stages the row in LDS behind the page table's barrier, which MPK_KVUPD_FAST drops"
+#endif
 
 // Step 2, verbatim from mla_kv_cache_update_impl minus the Q half. Kept
 // noinline so its LDS and register pressure stay off the 287 workers that
@@ -130,7 +133,13 @@ __device__ __attribute__((noinline)) void
                     void const *kv_norm_weight_ptr,
                     void const *cos_ptr,
                     void const *sin_ptr,
-                    float kv_eps) {
+                    float kv_eps
+#if MPK_KV_LL
+                    ,
+                    unsigned long long const *kv_ll = nullptr,
+                    unsigned kv_epoch = 0
+#endif
+                    ) {
   constexpr int ROPE_HALF = QK_ROPE_HEAD_DIM / 2;
   constexpr int NUM_THREADS = 256;
   constexpr int NUM_WARPS = NUM_THREADS / 64;
@@ -206,6 +215,35 @@ __device__ __attribute__((noinline)) void
   bf16 const *__restrict__ d_kv = reinterpret_cast<bf16 const *>(kv_latent_ptr) +
                                   (long)first_token_pos * KV_INPUT_STRIDE +
                                   KV_INPUT_OFFSET;
+#if MPK_KV_LL
+  // MPK_KV_LL: the one token's [latent | rope] row arrives as qkv_a's words,
+  // element pair (2j, 2j+1) at kv_ll[j] behind its epoch, written through by
+  // the qkv_a tiles. Each thread validates its own words and leaves the
+  // pairs in LDS (this worker's dynamic window is idle here: it has no q_b
+  // tile), and the row is read from there below -- the same values the
+  // global row holds once the qkv_a -> q_b rendezvous has passed.
+  extern __shared__ char _kvll_smem[];
+  if (kv_ll != nullptr) {
+    if (num_tokens != 1) {
+      __builtin_trap();
+    }
+    constexpr int KV_WORDS = (KV_LORA_RANK + QK_ROPE_HEAD_DIM) / 2;
+    unsigned *const s_pairs = reinterpret_cast<unsigned *>(_kvll_smem);
+    for (int j = tid; j < KV_WORDS; j += NUM_THREADS) {
+      unsigned long long w;
+      while (true) {
+        w = __hip_atomic_load(kv_ll + j, __ATOMIC_RELAXED,
+                              __HIP_MEMORY_SCOPE_SYSTEM);
+        if ((unsigned)(w >> 32) == kv_epoch) {
+          break;
+        }
+        __builtin_amdgcn_s_sleep(1);
+      }
+      s_pairs[j] = (unsigned)w;
+    }
+    d_kv = reinterpret_cast<bf16 const *>(_kvll_smem);
+  }
+#endif
   bf16 *__restrict__ d_cache = reinterpret_cast<bf16 *>(paged_kv_cache_ptr);
   bf16 const *__restrict__ kv_weight =
       reinterpret_cast<bf16 const *>(kv_norm_weight_ptr);

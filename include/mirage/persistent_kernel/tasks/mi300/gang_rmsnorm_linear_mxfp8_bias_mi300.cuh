@@ -420,6 +420,12 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_rmsnorm(
 // SwiGLU pair. That needs an 8-byte-aligned destination: OUTPUT_PER_WG % 16 ==
 // 0 makes every term of the column index a multiple of 4, so the requirement
 // reduces to a 4-aligned output_stride, which the registrar asserts.
+// Trace-only stamps past 79 in q_b's tile (see MPK_TRACE_SLOTS).
+#if defined(MPK_TRACE) && MPK_TRACE && !MPK_BAR_SKEW && MPK_TRACE_SLOTS > 85
+#define _RNLM8_QB_TR 1
+#else
+#define _RNLM8_QB_TR 0
+#endif
 __device__ __forceinline__ void _rnlm8_ll_store4(unsigned long long *dst,
                                                  unsigned epoch,
                                                  unsigned short v0,
@@ -1949,18 +1955,52 @@ _rnlm8_stage_norm_rcp(unsigned short const *__restrict__ d_in,
 }
 
 #if MPK_QA_LL
+#if MPK_QB_NORM_DPP
+// The __shfl_xor 32, 16, 8, 4, 2, 1 butterfly with the same pairs, through the
+// permlane swaps and DPP instead of six ds_bpermute round trips. A swap hands
+// each lane its partner in one of its two results, and a + b == b + a, so every
+// lane's sum is the butterfly's, bit for bit.
+__device__ __forceinline__ float _rnlm8_xor_sum_dpp(float s) {
+  auto p32 = __builtin_amdgcn_permlane32_swap(__float_as_uint(s),
+                                              __float_as_uint(s), false, false);
+  s = __uint_as_float(p32[0]) + __uint_as_float(p32[1]);
+  auto p16 = __builtin_amdgcn_permlane16_swap(__float_as_uint(s),
+                                              __float_as_uint(s), false, false);
+  s = __uint_as_float(p16[0]) + __uint_as_float(p16[1]);
+  // xor 8: row_ror:8.
+  s += __int_as_float(
+      __builtin_amdgcn_update_dpp(0, __float_as_int(s), 0x128, 0xF, 0xF, false));
+  // xor 4: row_half_mirror (xor 7), then quad_perm [3,2,1,0] (xor 3).
+  int const h = __builtin_amdgcn_update_dpp(0, __float_as_int(s), 0x141, 0xF,
+                                            0xF, false);
+  s += __int_as_float(__builtin_amdgcn_update_dpp(0, h, 0x1B, 0xF, 0xF, false));
+  // xor 2, xor 1: quad_perm [2,3,0,1], [1,0,3,2].
+  s += __int_as_float(
+      __builtin_amdgcn_update_dpp(0, __float_as_int(s), 0x4E, 0xF, 0xF, false));
+  s += __int_as_float(
+      __builtin_amdgcn_update_dpp(0, __float_as_int(s), 0xB1, 0xF, 0xF, false));
+  return s;
+}
+#endif
 // MPK_QA_LL: _rnlm8_stage_norm_rcp with the row read from (epoch << 32 |
 // bf16x2) words, each thread re-reading only its words still on an older
 // epoch. Same thread mapping and accumulation order, so s_x, s_nw and the
 // returned rms_rcp are bit-identical to it.
-template <int REDUCTION_SIZE, int ACTUAL_HIDDEN_DIM>
+struct _rnlm8_nop {
+  __device__ __forceinline__ void operator()() const {}
+};
+// after_poll runs once the wave's words are all valid, ahead of the norm's
+// LDS traffic and barriers (MPK_QB_PF_EARLY issues q_b's A tiles there).
+template <int REDUCTION_SIZE, int ACTUAL_HIDDEN_DIM,
+          typename AfterPoll = _rnlm8_nop>
 __device__ __forceinline__ float
 _rnlm8_stage_norm_rcp_ll(unsigned long long const *__restrict__ d_ll,
                          unsigned epoch,
                          unsigned short const *__restrict__ d_nw,
                          unsigned short *__restrict__ s_x,
                          unsigned short *__restrict__ s_nw,
-                         float eps = 1e-5f) {
+                         float eps = 1e-5f,
+                         AfterPoll after_poll = AfterPoll()) {
   constexpr int NTHREADS = 256;
   static_assert(REDUCTION_SIZE == NTHREADS * 8,
                 "one 8-element group (four words) per thread");
@@ -1968,12 +2008,21 @@ _rnlm8_stage_norm_rcp_ll(unsigned long long const *__restrict__ d_ll,
   typedef unsigned int ll_u4_t __attribute__((ext_vector_type(4)));
   int const tid = threadIdx.x;
   int const off = tid * 8;
+  // Trace stamps 42/43/44/45 (thread 0): entry, first round back, last round
+  // issued, words valid.
+  if (tid == 0) {
+    mpk_stage_stamp(42);
+  }
   uint64_t const w_lo = *(gu64)reinterpret_cast<uint64_t const *>(d_nw + off);
   uint64_t const w_hi =
       *(gu64)reinterpret_cast<uint64_t const *>(d_nw + off + 4);
   ll_u4_t a, b;
   unsigned vmask = 0u;
+  bool first = true;
   while (true) {
+    if (tid == 0) {
+      mpk_stage_stamp(44);
+    }
     if (!(vmask & 1u)) {
       asm volatile("global_load_dwordx4 %0, %1, off sc0 sc1"
                    : "=v"(a)
@@ -1988,6 +2037,10 @@ _rnlm8_stage_norm_rcp_ll(unsigned long long const *__restrict__ d_ll,
     }
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     asm volatile("" : "+v"(a), "+v"(b));
+    if (tid == 0 && first) {
+      mpk_stage_stamp(43);
+    }
+    first = false;
     if (a[1] == epoch && a[3] == epoch) {
       vmask |= 1u;
     }
@@ -1999,6 +2052,10 @@ _rnlm8_stage_norm_rcp_ll(unsigned long long const *__restrict__ d_ll,
     }
     __builtin_amdgcn_s_sleep(1);
   }
+  if (tid == 0) {
+    mpk_stage_stamp(45);
+  }
+  after_poll();
   uint64_t const lo = (uint64_t)a[0] | ((uint64_t)a[2] << 32);
   uint64_t const hi = (uint64_t)b[0] | ((uint64_t)b[2] << 32);
   *reinterpret_cast<uint64_t *>(s_x + off) = lo;
@@ -2018,7 +2075,9 @@ _rnlm8_stage_norm_rcp_ll(unsigned long long const *__restrict__ d_ll,
         _gang_bf16_to_float((unsigned short)((hi >> (16 * i)) & 0xFFFFu));
     ssq += q * q;
   }
-#if MPK_RMSNORM_DPP
+#if MPK_QB_NORM_DPP
+  ssq = _rnlm8_xor_sum_dpp(ssq);
+#elif MPK_RMSNORM_DPP
   ssq = gang_rmsnorm_detail::_mpk_wave_sum_to_lane0(ssq);
 #else
 #pragma unroll
@@ -2034,6 +2093,15 @@ _rnlm8_stage_norm_rcp_ll(unsigned long long const *__restrict__ d_ll,
     red[wave_id] = ssq;
   }
   __syncthreads();
+#if MPK_QB_NORM_DPP
+  // Every wave forms wave 0's xor-2, xor-1 total itself, in its order, so
+  // the second barrier goes.
+  static_assert(MPK_NT == 256, "four wave totals");
+  (void)num_waves;
+  return rsqrtf(((red[0] + red[2]) + (red[1] + red[3])) /
+                    float(ACTUAL_HIDDEN_DIM) +
+                eps);
+#else
   if (wave_id == 0) {
     ssq = (lane_id < num_waves) ? red[lane_id] : 0.0f;
     for (int offset = num_waves >> 1; offset > 0; offset >>= 1) {
@@ -2045,6 +2113,123 @@ _rnlm8_stage_norm_rcp_ll(unsigned long long const *__restrict__ d_ll,
   }
   __syncthreads();
   return rsqrtf(red[0] / float(ACTUAL_HIDDEN_DIM) + eps);
+#endif
+}
+// MPK_QB_WEARLY: _rnlm8_stage_norm_rcp_ll with wave 0 alone loading the norm
+// weight and polling every word (16 a lane), so that waves 1-3 can have their
+// q_b A tiles in flight across it -- vmcnt is per wave and in issue order, so
+// a polling wave must hold nothing else. The row and the weight reach LDS
+// exactly as before, and every thread then sums its own eight elements in the
+// same order: s_x, s_nw and the returned rms_rcp are bit-identical.
+template <int REDUCTION_SIZE, int ACTUAL_HIDDEN_DIM>
+__device__ __forceinline__ float
+_rnlm8_stage_norm_rcp_ll_w0(unsigned long long const *__restrict__ d_ll,
+                            unsigned epoch,
+                            unsigned short const *__restrict__ d_nw,
+                            unsigned short *__restrict__ s_x,
+                            unsigned short *__restrict__ s_nw,
+                            float *__restrict__ red,
+                            float eps = 1e-5f) {
+  constexpr int NTHREADS = 256;
+  static_assert(REDUCTION_SIZE == NTHREADS * 8 && MPK_NT == NTHREADS,
+                "wave 0 stages 32 elements a lane; every thread sums eight");
+  typedef unsigned int ll_u4_t __attribute__((ext_vector_type(4)));
+  using gu4 = __attribute__((address_space(1))) ll_u4_t const *;
+  int const tid = threadIdx.x;
+  if (tid < 64) {
+    if (tid == 0) {
+      mpk_stage_stamp(42);
+    }
+    ll_u4_t nw[4];
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      nw[j] = *(gu4)reinterpret_cast<ll_u4_t const *>(d_nw + tid * 32 + j * 8);
+    }
+    ll_u4_t v[8];
+    unsigned vm = 0u;
+    bool first = true;
+    while (true) {
+      if (tid == 0) {
+        mpk_stage_stamp(44);
+      }
+#pragma unroll
+      for (int j = 0; j < 8; j++) {
+        if (!(vm & (1u << j))) {
+          asm volatile("global_load_dwordx4 %0, %1, off sc0 sc1"
+                       : "=v"(v[j])
+                       : "v"(d_ll + tid * 16 + j * 2)
+                       : "memory");
+        }
+      }
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#pragma unroll
+      for (int j = 0; j < 8; j++) {
+        asm volatile("" : "+v"(v[j]));
+      }
+      if (tid == 0 && first) {
+        mpk_stage_stamp(43);
+      }
+      first = false;
+#pragma unroll
+      for (int j = 0; j < 8; j++) {
+        if (v[j][1] == epoch && v[j][3] == epoch) {
+          vm |= 1u << j;
+        }
+      }
+      if (vm == 0xFFu) {
+        break;
+      }
+      __builtin_amdgcn_s_sleep(1);
+    }
+    if (tid == 0) {
+      mpk_stage_stamp(45);
+    }
+    unsigned *const s32 = reinterpret_cast<unsigned *>(s_x) + tid * 16;
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+      s32[2 * j] = v[j][0];
+      s32[2 * j + 1] = v[j][2];
+    }
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      reinterpret_cast<ll_u4_t *>(s_nw + tid * 32)[j] = nw[j];
+    }
+  }
+  asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+  __builtin_amdgcn_s_barrier();
+  int const off = tid * 8;
+  uint64_t const lo = *reinterpret_cast<uint64_t const *>(s_x + off);
+  uint64_t const hi = *reinterpret_cast<uint64_t const *>(s_x + off + 4);
+  float ssq = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    float const q =
+        _gang_bf16_to_float((unsigned short)((lo >> (16 * i)) & 0xFFFFu));
+    ssq += q * q;
+  }
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    float const q =
+        _gang_bf16_to_float((unsigned short)((hi >> (16 * i)) & 0xFFFFu));
+    ssq += q * q;
+  }
+#if MPK_QB_NORM_DPP
+  ssq = _rnlm8_xor_sum_dpp(ssq);
+#else
+#pragma unroll
+  for (int offset = 32; offset > 0; offset >>= 1) {
+    ssq += __shfl_xor(ssq, offset);
+  }
+#endif
+  int const wave_id = tid >> 6;
+  if ((tid & 63) == 0) {
+    red[wave_id] = ssq;
+  }
+  asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+  __builtin_amdgcn_s_barrier();
+  return rsqrtf(((red[0] + red[2]) + (red[1] + red[3])) /
+                    float(ACTUAL_HIDDEN_DIM) +
+                eps);
 }
 #endif // MPK_QA_LL
 
@@ -3321,6 +3506,70 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
   int bal_ng = 0;
   i32x8_t bal_a[LMH_BAL ? BAL_H : 1];
   int bal_sa[LMH_BAL ? BAL_H : 1];
+  // MPK_QB_WEARLY (q_b): the A tiles go out before the q_a word poll, from
+  // waves 1-3, while wave 0 alone polls (_rnlm8_stage_norm_rcp_ll_w0). The
+  // K-split's four chains -- k-tiles 4c..4c+3, each its own accumulator --
+  // are wave 1's c = 0 and 1 and waves 2 and 3's c = 2 and 3, summed in
+  // chain order as before: bit-identical.
+  constexpr bool QB_WEARLY =
+      MPK_QB_WEARLY && MPK_QA_LL && !FUSE_RESADD && !PRO_PUB && !FOLD_ROWS &&
+      !LMH_SHAPE && BATCH_SIZE == 1 && OUTPUT_PER_WG == 16 &&
+      MFMA_ITERS == 16 && HOIST_PREFILL && REDUCTION_SIZE == 256 * 8;
+  i32x8_t we_a[QB_WEARLY ? 8 : 1];
+  int we_sa[QB_WEARLY ? 8 : 1];
+  // MPK_QB_PF_EARLY (q_b): the hoisted A tiles go out as soon as the wave's
+  // q_a words are valid (_rnlm8_stage_norm_rcp_ll's after_poll), ahead of the
+  // norm's reduction and barriers rather than behind them. Same loads.
+  constexpr bool QB_PF_EARLY = MPK_QB_PF_EARLY && MPK_QA_LL && !QB_WEARLY &&
+                               !FUSE_RESADD && !PRO_PUB && !FOLD_ROWS &&
+                               !LMH_SHAPE && BATCH_SIZE == 1 &&
+                               OUTPUT_PER_WG == 16 && HOIST_PREFILL;
+  auto _rnlm8_qb_prefill = [&](i32x8_t *pa, int *psa)
+      __attribute__((always_inline)) {
+    int const h_ki0 = warp_id * (MFMA_ITERS / NUM_WAVES);
+    uint8_t const *const h_data =
+        wg_data + (W_KMAJOR ? static_cast<int64_t>(col % 16) * 64
+                            : static_cast<int64_t>(col) * W_ROW_BYTES);
+    uint8_t const *const h_scale =
+        wg_scales + (SC_KMAJOR ? (col % 16) * 4 : col * NUM_BLOCKS_32);
+#pragma unroll
+    for (int ki = 0; ki < 4; ki++) {
+      pa[ki] = _rnlm8_load_w<W_KMUL, W_HIOFF, W_NT>(
+          h_data, (h_ki0 + ki) * K_PER_MFMA, g);
+      psa[ki] = _rnlm8_load_sc<SC_KMUL, W_NT>(h_scale, (h_ki0 + ki) * 4, g);
+    }
+#if _RNLM8_QB_TR
+    if (threadIdx.x == 0) {
+      mpk_stage_stamp(80);
+    }
+#endif
+  };
+  if constexpr (QB_WEARLY) {
+    if (qxs_row_ll == nullptr || tok_base != 0) {
+      __builtin_trap();
+    }
+    uint8_t const *const we_data =
+        wg_data + (W_KMAJOR ? static_cast<int64_t>(col % 16) * 64
+                            : static_cast<int64_t>(col) * W_ROW_BYTES);
+    uint8_t const *const we_scale =
+        wg_scales + (SC_KMAJOR ? (col % 16) * 4 : col * NUM_BLOCKS_32);
+    if (warp_id == 1) {
+#pragma unroll
+      for (int j = 0; j < 8; j++) {
+        we_a[j] = _rnlm8_load_w<W_KMUL, W_HIOFF, W_NT>(we_data, j * K_PER_MFMA,
+                                                       g);
+        we_sa[j] = _rnlm8_load_sc<SC_KMUL, W_NT>(we_scale, j * 4, g);
+      }
+    } else if (warp_id > 1) {
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        we_a[j] = _rnlm8_load_w<W_KMUL, W_HIOFF, W_NT>(
+            we_data, (warp_id * 4 + j) * K_PER_MFMA, g);
+        we_sa[j] =
+            _rnlm8_load_sc<SC_KMUL, W_NT>(we_scale, (warp_id * 4 + j) * 4, g);
+      }
+    }
+  }
 
   // Steps 1 and 2 run once per folded row, each into its own LDS plane.
   // rows_here is 1 unless FOLD_ROWS, so this is a no-op loop everywhere else.
@@ -3397,15 +3646,39 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
       // MPK_QA_LL (q_b only): qxs_row_ll / qxs_epoch carry the q_a words,
       // which replace the qkv_a -> q_b rendezvous for this tile.
       bool qa_done = false;
-      if constexpr (BATCH_SIZE == 1 && REDUCTION_SIZE == 256 * 8) {
-        if (qxs_row_ll != nullptr) {
-          rms_rcp = _rnlm8_stage_norm_rcp_ll<REDUCTION_SIZE, ACTUAL_HIDDEN_DIM>(
+      if constexpr (QB_WEARLY) {
+        rms_rcp =
+            _rnlm8_stage_norm_rcp_ll_w0<REDUCTION_SIZE, ACTUAL_HIDDEN_DIM>(
+                qxs_row_ll, qxs_epoch,
+                (unsigned short const *)norm_weight_ptr, s_x_bf16, s_nw_bf16,
+                reinterpret_cast<float *>(s_nw_bf16 + REDUCTION_SIZE));
+        qa_done = true;
+      } else if constexpr (BATCH_SIZE == 1 && REDUCTION_SIZE == 256 * 8) {
+        if constexpr (QB_PF_EARLY) {
+          // No fallback branch for the row: the A tiles must not meet the
+          // plain path's at a join, where their values are waited for.
+          if (qxs_row_ll == nullptr) {
+            __builtin_trap();
+          }
+          rms_rcp = _rnlm8_stage_norm_rcp_ll<REDUCTION_SIZE,
+                                             ACTUAL_HIDDEN_DIM>(
               qxs_row_ll, qxs_epoch, (unsigned short const *)norm_weight_ptr,
-              s_x_bf16, s_nw_bf16);
+              s_x_bf16, s_nw_bf16, 1e-5f,
+              [&]() __attribute__((always_inline)) {
+                _rnlm8_qb_prefill(ph_a, ph_sa);
+              });
+          qa_done = true;
+        } else if (qxs_row_ll != nullptr) {
+          {
+            rms_rcp = _rnlm8_stage_norm_rcp_ll<REDUCTION_SIZE,
+                                               ACTUAL_HIDDEN_DIM>(
+                qxs_row_ll, qxs_epoch,
+                (unsigned short const *)norm_weight_ptr, s_x_bf16, s_nw_bf16);
+          }
           qa_done = true;
         }
       }
-      if (!qa_done)
+      if constexpr (!QB_PF_EARLY) if (!qa_done)
 #endif
       rms_rcp = _rnlm8_stage_norm_rcp<REDUCTION_SIZE, ACTUAL_HIDDEN_DIM>(
           raw_row, (unsigned short const *)norm_weight_ptr, s_x_bf16,
@@ -3502,7 +3775,7 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
     }
     _rnlm8_bal_issue<BAL_H, REDUCTION_SIZE, OUTPUT_PER_WG>(
         W, bal_g0, warp_id * BAL_KQ, col, g, bal_a, bal_sa);
-  } else if constexpr (HOIST_PREFILL) if (_row == 0) {
+  } else if constexpr (HOIST_PREFILL && !QB_WEARLY && !QB_PF_EARLY) if (_row == 0) {
     // N-parallel gives each wave its own 16 rows starting at k-tile 0;
     // K-parallel gives all four waves the same 16 rows and splits K.
     int const h_row = (OUTPUT_PER_WG >= 64) ? (warp_id * 16 + col) : col;
@@ -3526,6 +3799,12 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
           h_data, (h_ki0 + ki) * K_PER_MFMA, g);
       ph_sa[ki] = _rnlm8_load_sc<SC_KMUL, W_NT>(h_scale, (h_ki0 + ki) * 4, g);
     }
+#if _RNLM8_QB_TR
+    // Trace stamp 80 (q_b): the hoisted A tiles issued.
+    if (!FUSE_RESADD && !LMH_SHAPE && threadIdx.x == 0) {
+      mpk_stage_stamp(80);
+    }
+#endif
   }
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
@@ -3599,6 +3878,15 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
   if (!FUSE_RESADD && threadIdx.x == 0) {
     mpk_stage_stamp(73);
   }
+#if _RNLM8_QB_TR
+  // Trace stamp 81 (q_b): this wave's first hoisted A tile has landed.
+  if constexpr (HOIST_PREFILL && !FUSE_RESADD && !LMH_SHAPE && !QB_WEARLY) {
+    asm volatile("" ::"v"(ph_a[0]) : "memory");
+    if (threadIdx.x == 0) {
+      mpk_stage_stamp(81);
+    }
+  }
+#endif
   // ── Step 3: MFMA FP8(weights) x FP8(tokens) ────────────────────────────
   if constexpr (LMH_BAL) {
     float *const red = reinterpret_cast<float *>(s_x_bf16);
@@ -3984,9 +4272,13 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
 
     int const ki_start = warp_id * ITERS_PER_WAVE;
     int const ki_end = ki_start + ITERS_PER_WAVE;
-#if MPK_RNLM8_BIAS_PRE
+#if MPK_RNLM8_BIAS_PRE || MPK_QB_BIAS_PRE
+    // MPK_QB_BIAS_PRE: q_b's alone (not qkv_a's, whose k-loop streams behind
+    // the read).
+    constexpr bool KP_BIAS_PRE = MPK_RNLM8_BIAS_PRE || !FUSE_RESADD;
     uint2 bias_q = {0u, 0u};
-    if (warp_id == 0 && (FOLD_ROWS ? (col < rows_here) : (col == 0))) {
+    if (KP_BIAS_PRE && warp_id == 0 &&
+        (FOLD_ROWS ? (col < rows_here) : (col == 0))) {
       bias_q = *reinterpret_cast<uint2 const *>(
           d_bias + wg_idx * OUTPUT_PER_WG + g * 4);
     }
@@ -4013,7 +4305,23 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
     // and ki0 = warp_id * ITERS_PER_WAVE, which is exactly (w_row, ki_start),
     // so it seeds the first block directly.
     constexpr int KGR = _rnlm8_pf_groups(ITERS_PER_WAVE, MPK_ATTN_PF_GROUPS_K);
-    if constexpr (KGR >= 2) {
+    // MPK_QB_WEARLY: wave 1 runs chains 0 and 1, waves 2 and 3 chains 2 and 3.
+    f32x4_t we_acc1 = {0.0f, 0.0f, 0.0f, 0.0f};
+    if constexpr (QB_WEARLY) {
+      static_assert(ITERS_PER_WAVE == 4, "four chains of four k-tiles");
+      if (warp_id == 1) {
+        acc = _rnlm8_kloop_deep<4, 4, true, W_KMUL, W_HIOFF, SC_KMUL>(
+            w_data_row, w_scale_row, s_tok_fp8, s_tok_scales, 0, g, we_a,
+            we_sa);
+        we_acc1 = _rnlm8_kloop_deep<4, 4, true, W_KMUL, W_HIOFF, SC_KMUL>(
+            w_data_row, w_scale_row, s_tok_fp8, s_tok_scales, 4, g, we_a + 4,
+            we_sa + 4);
+      } else if (warp_id > 1) {
+        acc = _rnlm8_kloop_deep<4, 4, true, W_KMUL, W_HIOFF, SC_KMUL>(
+            w_data_row, w_scale_row, s_tok_fp8, s_tok_scales, ki_start, g,
+            we_a, we_sa);
+      }
+    } else if constexpr (KGR >= 2) {
       acc = _rnlm8_kloop_pick<KGR, ITERS_PER_WAVE, HOIST_PREFILL && KGR >= 4,
                                   W_KMUL, W_HIOFF, SC_KMUL>(
           w_data_row, w_scale_row, s_tok_fp8, s_tok_scales,
@@ -4116,14 +4424,40 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
     if (FUSE_RESADD && threadIdx.x == 0) {
       mpk_stage_stamp(61);
     }
+#if _RNLM8_QB_TR
+    // Trace stamps 82/83/84/85 (q_b): k-loop done on every wave, partials in
+    // LDS, bias read back, words issued.
+    if (!FUSE_RESADD && threadIdx.x == 0) {
+      mpk_stage_stamp(82);
+    }
+#endif
     if (FOLD_ROWS ? (col < rows_here) : (col == 0)) {
       int const r = FOLD_ROWS ? col : 0;
-      for (int i = 0; i < 4; i++) {
-        lds_reduce[warp_id * RED_STRIDE + r * OUTPUT_PER_WG + g * 4 + i] =
-            acc[i];
+      if constexpr (QB_WEARLY) {
+        if (warp_id > 0) {
+          int const c0 = (warp_id == 1) ? 0 : warp_id;
+          for (int i = 0; i < 4; i++) {
+            lds_reduce[c0 * RED_STRIDE + g * 4 + i] = acc[i];
+          }
+          if (warp_id == 1) {
+            for (int i = 0; i < 4; i++) {
+              lds_reduce[RED_STRIDE + g * 4 + i] = we_acc1[i];
+            }
+          }
+        }
+      } else {
+        for (int i = 0; i < 4; i++) {
+          lds_reduce[warp_id * RED_STRIDE + r * OUTPUT_PER_WG + g * 4 + i] =
+              acc[i];
+        }
       }
     }
     __syncthreads();
+#if _RNLM8_QB_TR
+    if (!FUSE_RESADD && threadIdx.x == 0) {
+      mpk_stage_stamp(83);
+    }
+#endif
 
     // Wave 0 reduces across waves and writes output with bias. Folded, wave 0
     // has 16 lane columns and needs only rows_here of them, so the row it
@@ -4139,9 +4473,14 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
 
         int out_n = wg_idx * OUTPUT_PER_WG + g * 4 + i;
 
-#if MPK_RNLM8_BIAS_PRE
-        unsigned const bq = (i < 2) ? bias_q.x : bias_q.y;
-        unsigned bt = ((i & 1) ? (bq >> 16) : (bq & 0xFFFFu)) << 16;
+#if MPK_RNLM8_BIAS_PRE || MPK_QB_BIAS_PRE
+        unsigned bt;
+        if constexpr (KP_BIAS_PRE) {
+          unsigned const bq = (i < 2) ? bias_q.x : bias_q.y;
+          bt = ((i & 1) ? (bq >> 16) : (bq & 0xFFFFu)) << 16;
+        } else {
+          bt = (unsigned)d_bias[out_n] << 16;
+        }
         (void)out_n;
 #else
         unsigned bt = (unsigned)d_bias[out_n] << 16;
@@ -4151,6 +4490,12 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
 
         packed[i] = _gang_float_to_bf16(v + bv);
       }
+#if _RNLM8_QB_TR
+      if (!FUSE_RESADD && threadIdx.x == 0) {
+        asm volatile("" ::"v"(packed[0]) : "memory");
+        mpk_stage_stamp(84);
+      }
+#endif
       int out_idx = (FOLD_ROWS ? (tok_base + r) : tok_base) * output_stride +
                     wg_idx * OUTPUT_PER_WG + g * 4;
       if (!(MPK_QB_LL_NOOUT && !LL_WT && BATCH_SIZE == 1 && ll_out != nullptr &&
@@ -4171,6 +4516,11 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
           }
         }
       }
+#if _RNLM8_QB_TR
+      if (!FUSE_RESADD && threadIdx.x == 0) {
+        mpk_stage_stamp(85);
+      }
+#endif
     }
   }
 
