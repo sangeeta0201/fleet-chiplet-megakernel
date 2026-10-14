@@ -2354,6 +2354,130 @@ __device__ __forceinline__ bool
 #ifndef MPK_RNLM8_INLINE
 #define MPK_RNLM8_INLINE 0
 #endif
+// MPK_LMH_BAL: the LM head (vocab shard 19456 rows, 304 tiles of 64 per rank)
+// as one tile per worker. 38 tiles per XCD over 29 workers is two rounds: all
+// 29 workers stream a 405 KB tile, then 9 of them resolve the row a second
+// time and stream another. Here a worker resolves once and takes 5 or 6 of its
+// XCD's 152 16-row groups; the four waves split each group's K four ways
+// (_rnlm8_bal_kloop), and the head is packed K-major per group so each k-tile
+// is one contiguous 2 KB read. The logits change in the last fp32 bits (four
+// partial sums added in wave order instead of one MFMA chain); every rank-0
+// token of every run matched. The dispatch takes MPK_WORKERS_PER_XCD tiles per
+// XCD (persistent_kernel.py). Implies MPK_LMH_WRAP.
+// Standalone (tests/standalone/test_lmh_bal.hip, one GPU, 232 blocks, same
+// kernel and dispatch): slowest worker 45.4 -> 28.8 us, all 19456 bf16
+// logits identical. Row-major +3 us, interleaved K-split +0.8, first block
+// ahead of the resolve +1.2, no sched_barriers +3 to +5. MPK_LMH_TRACE on the
+// megakernel agrees: head 49-51 -> 31.5-33.7 us.
+// MEASURED SLOWER 2026-10-13/14 on e275027, NP=8 1024/1024, interleaved, all
+// rank-0 tokens identical. Behind the wall, worker_kernel instruction-identical
+// between the arms: MPK_LMH_WRAP 3.450 3.451 3.457 3.450 3.453 3.458 3.452
+// 3.453 3.448 3.456 vs this 3.465 3.463 3.464 3.465 3.464 3.467 (+0.012); with
+// HEAD 3.447 3.448 3.450 3.443 3.448 3.442. The head's 17 us come back as
+// +0.29 us on every MoE layer of the next token (c07 trace: layer period
+// 47.46 -> 47.75 us), all of it in the qkv_a resolve (+0.14) and q_b's k-loop
+// (+0.14), none in the MoE half. Not the clock (MPK_LMH_TRACE's s_memtime:
+// token-mean 2191.8 vs 2192.9 MHz) and not the callees' code placement
+// (MPK_LMH_PAD_BYTES putting every callee back at HEAD's address mod 256 or
+// mod 8 KB: 3.460 3.458, 3.461 3.461). Non-temporal loads halve the traced
+// layer cost but slow the head (3.453 3.465 3.468 3.456); the row-major
+// packing 3.473 3.474; tiles held until 45 us past entry 3.489 3.497. With
+// every function 256-byte aligned (-falign-functions=256): HEAD 3.472 3.478,
+// WRAP 3.488 3.477, this 3.452 3.445 -- where it wins, against a baseline
+// the alignment cost 0.027 ms. Off.
+#ifndef MPK_LMH_BAL
+#define MPK_LMH_BAL 0
+#endif
+#ifndef MPK_WORKERS_PER_XCD
+#define MPK_WORKERS_PER_XCD 0
+#endif
+// MPK_LMH_WRAP: worker_kernel reaches the LM head through _rnlm8_lmh_wall,
+// whose declared clobbers are fixed, so that changes to the head stop moving
+// worker_kernel (see the head's kernel). AMDGPU allocates a caller's registers
+// from its callees' actual clobbers: the first MPK_LMH_BAL clobbered a21-a31
+// as well and worker_kernel went 390 -> 402 VGPRs with a different allocation
+// through the fused layer, 3.490 3.498 vs 3.451.
+// MEASURED (worker_kernel 1348 instructions different from HEAD's): the
+// numbers above, +0.003 against HEAD. Off.
+#ifndef MPK_LMH_WRAP
+#define MPK_LMH_WRAP 0
+#endif
+// MPK_LMH_TRACE: see mpk_lmh_stamp (MPK_TRACE only). MPK_LMH_WALL_FULL: the
+// wall declares every caller-saved register, so that any head -- traced ones
+// use more registers -- leaves worker_kernel unchanged.
+#ifndef MPK_LMH_TRACE
+#define MPK_LMH_TRACE 0
+#endif
+#ifndef MPK_LMH_WALL_FULL
+#define MPK_LMH_WALL_FULL 0
+#endif
+// MPK_LMH_NT: the unbalanced LM head's weight stream as non-temporal loads.
+// Same register footprint as HEAD's head, so worker_kernel is unchanged.
+// MEASURED SLOWER 2026-10-13 on e275027, n=3 interleaved, tokens identical:
+// 3.460 3.455 3.454 vs 3.452 3.447 3.447 (+0.008); behind the wall 3.466
+// 3.471 vs 3.453 3.458. Off.
+#ifndef MPK_LMH_NT
+#define MPK_LMH_NT 0
+#endif
+// MPK_LMH_PAD_BYTES: never-executed s_nop after a branch at the end of the
+// instance that runs the LM head. The noinline callees behind the head in the
+// code object (qkv_a, q_b's kvupd, W_UK, the decode, o_proj, the router, W13)
+// start at 4-byte granularity, so a change in the head's size moves their hot
+// loops against instruction-cache lines; this puts them back. A tool for
+// measurement, not a lever.
+#ifndef MPK_LMH_PAD_BYTES
+#define MPK_LMH_PAD_BYTES 0
+#endif
+// MPK_LMH_ARGMAX: each LM head tile also leaves the argmax of its own logits
+// in g_lmh_key, as one key whose max is the two-level reduce's winner, ties
+// included: the key carries the rank the two block_reduce_max_idx tournaments
+// (argmax_partial's over a chunk of MPK_LMH_ARGMAX_CHUNK columns, then the
+// xrank reduce's over the chunks) break ties by (test_lmh_bal: 200 of 200 rows
+// of ties, +-0, -inf and NaN pick the same column). demo.py drops
+// argmax_partial, and argmax_reduce_xrank reduces the MPK_LMH_ARGMAX_SLOTS
+// keys instead of the partials. Changes the task graph, so worker_kernel too.
+// MEASURED NULL 2026-10-14 on e275027, interleaved, all rank-0 tokens
+// identical: on the unbalanced head 3.454 3.447 with the callees padded back
+// to HEAD's alignment (MPK_LMH_PAD_BYTES=204), 3.460 3.457 without, vs 3.442
+// 3.451; on MPK_LMH_BAL 3.461 3.454 vs 3.464 3.467. The ~5 us argmax_partial
+// took does not survive the graph change's worker_kernel. Off.
+#ifndef MPK_LMH_ARGMAX
+#define MPK_LMH_ARGMAX 0
+#endif
+#ifndef MPK_LMH_ARGMAX_CHUNK
+#define MPK_LMH_ARGMAX_CHUNK 0
+#endif
+// The head's key slots: 8 x tiles per XCD (one per worker balanced).
+#ifndef MPK_LMH_ARGMAX_SLOTS
+#define MPK_LMH_ARGMAX_SLOTS 0
+#endif
+#if MPK_LMH_ARGMAX
+__device__ unsigned long long g_lmh_key[8 * 64];
+// Position t's rank in block_reduce_max_idx, smaller wins a tie: each
+// shfl_down step keeps the lower lane, so the bit-reversed lane decides, then
+// the same over the four waves' results.
+__device__ __forceinline__ unsigned lmh_tree_rank(unsigned t) {
+  return ((__builtin_bitreverse32(t >> 6) >> 30) << 6) |
+         (__builtin_bitreverse32(t & 63u) >> 26);
+}
+// Shard column v holding bf16 `bits`: (order key of the value with -0.0 as
+// +0.0, 0xFFFF - tie rank, a -0.0 flag, v), or 0 when the value cannot win
+// (-inf or NaN, as with the strict > of both levels).
+__device__ __forceinline__ unsigned long long lmh_argmax_key(unsigned bits,
+                                                             unsigned v) {
+  float const x = __uint_as_float(bits << 16);
+  if (!(x > -__builtin_huge_valf())) {
+    return 0ull;
+  }
+  unsigned const u = __float_as_uint(x == 0.0f ? 0.0f : x);
+  unsigned const ok = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+  unsigned const rank =
+      (lmh_tree_rank(v / MPK_LMH_ARGMAX_CHUNK) << 8) |
+      lmh_tree_rank(v % MPK_LMH_ARGMAX_CHUNK);
+  return ((unsigned long long)ok << 32) | ((0xFFFFu - rank) << 16) |
+         (bits == 0x8000u ? 0x8000u : 0u) | v;
+}
+#endif
 // MPK_ENTRY_NOARRIVE: under MPK_ENTRY_NOWAIT, the layers nobody waits at
 // (pl_layer) skip the layer-entry drain and arrival as well. Both retire in
 // issue order behind the previous W2's XGMI part pushes -- the arrival is a
@@ -3346,6 +3470,23 @@ __device__ __forceinline__ void mpk_trace_sparse_flush(long it, int ml) {
                         w]);
   }
   s_mpk_tl[row][idx] = 0u;
+}
+#endif
+// MPK_LMH_TRACE: under MPK_TRACE, the LM head behind its call wall stamps
+// its own entry / resolve / k-loop / exit into the layer slot the loop never
+// fills (MPK_TRACE_LAYERS - 1) of each traced iteration, a worker's first
+// tile at 0..4 and a second tile at 5..9. Its calls are counted per worker,
+// since the head cannot see the iteration.
+#if MPK_LMH_TRACE
+__device__ unsigned g_lmh_tr_calls[MPK_STAGE_WORKERS];
+__device__ __forceinline__ void mpk_lmh_stamp(int slot, int idx) {
+  unsigned const t = (unsigned)__builtin_amdgcn_s_memrealtime();
+  if (slot >= 0) {
+    __builtin_nontemporal_store(
+        t, &g_mpk_trace[((size_t)slot * MPK_STAGE_SLOTS + idx) *
+                            MPK_STAGE_WORKERS +
+                        blockIdx.x]);
+  }
 }
 #endif
 #else

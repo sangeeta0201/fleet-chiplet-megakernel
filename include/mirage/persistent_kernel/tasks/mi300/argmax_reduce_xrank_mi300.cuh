@@ -62,6 +62,44 @@ __device__ __forceinline__ unsigned int argmax_xrank_order_key(float v) {
   return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
 
+#if MPK_LMH_ARGMAX
+// MPK_LMH_ARGMAX's local reduce: the max of the LM head tiles' keys, valid on
+// thread 0. Out of line: this task is inlined into worker_kernel, whose
+// allocation moves with anything added to it (see MPK_LMH_BAL).
+__device__ __noinline__ unsigned long long argmax_xrank_lmh_keys() {
+  int const tidx = threadIdx.x;
+  unsigned long long key = 0ull;
+  // Written write-through by tiles on all eight XCDs.
+  for (int i = tidx; i < MPK_LMH_ARGMAX_SLOTS; i += MPK_NT) {
+    unsigned long long const k = ld_sys_u64(&g_lmh_key[i]);
+    key = k > key ? k : key;
+  }
+#pragma unroll
+  for (int off = NUM_THREADS_PER_WARP / 2; off > 0; off /= 2) {
+    unsigned int const olo =
+        __shfl_xor((unsigned int)key, off, NUM_THREADS_PER_WARP);
+    unsigned int const ohi =
+        __shfl_xor((unsigned int)(key >> 32), off, NUM_THREADS_PER_WARP);
+    unsigned long long const o = ((unsigned long long)ohi << 32) | olo;
+    key = o > key ? o : key;
+  }
+  extern __shared__ char smem[];
+  unsigned long long *s_key = reinterpret_cast<unsigned long long *>(
+      (reinterpret_cast<uintptr_t>(smem) + 127) / 128 * 128);
+  if ((tidx & (NUM_THREADS_PER_WARP - 1)) == 0) {
+    s_key[tidx / NUM_THREADS_PER_WARP] = key;
+  }
+  __syncthreads();
+  if (tidx == 0) {
+#pragma unroll
+    for (int w = 1; w < MPK_NT / NUM_THREADS_PER_WARP; w++) {
+      key = s_key[w] > key ? s_key[w] : key;
+    }
+  }
+  return key;
+}
+#endif
+
 template <typename T,
           int BATCH_SIZE,
           int CHUNK_SIZE,
@@ -86,6 +124,19 @@ __device__ __forceinline__ void
 
   int tidx = threadIdx.x;
 
+  // MPK_LMH_ARGMAX: input_val_ptr is the logit row (VOCAB_SHARD wide, for the
+  // task-graph edge only) and the LM head's tiles left one key each in
+  // g_lmh_key; the local reduce is their max (see lmh_argmax_key).
+  constexpr bool KEYS = MPK_LMH_ARGMAX && NUM_PARTIAL_TASKS == VOCAB_SHARD;
+#if MPK_LMH_ARGMAX
+  static_assert(!KEYS || (CHUNK_SIZE == MPK_LMH_ARGMAX_CHUNK &&
+                          BATCH_SIZE == 1 && VOCAB_SHARD <= 32768 &&
+                          MPK_LMH_ARGMAX_SLOTS > 0 &&
+                          MPK_LMH_ARGMAX_SLOTS <= 8 * 64),
+                "MPK_LMH_ARGMAX: one row, argmax_partial's chunk, a 15-bit "
+                "column and the head's key slots");
+#endif
+
   // The deltas are heap-wide and constant for the process lifetime, so this is
   // an add per peer, not a translation per address. See mpk_comm.cuh.
   int64_t peer_delta[EP_WORLD_SIZE];
@@ -101,7 +152,13 @@ __device__ __forceinline__ void
     // ---- local reduce over this rank's own vocab slice ---------------------
     T local_max = T(-inf);
     long long local_packed_idx = -1;
+    unsigned long long key = 0ull;
 
+    if constexpr (KEYS) {
+#if MPK_LMH_ARGMAX
+      key = argmax_xrank_lmh_keys();
+#endif
+    } else {
 #pragma unroll
     for (int i = tidx; i < NUM_PARTIAL_TASKS; i += MPK_NT) {
       T current_val = partial_vals[i + batch_idx * NUM_PARTIAL_TASKS];
@@ -112,6 +169,7 @@ __device__ __forceinline__ void
       }
     }
     block_reduce_max_idx(local_max, local_packed_idx);
+    }
 
     // Epoch has to be per (step, batch slot): two batch slots in one step would
     // otherwise reuse the same threshold and the second could read the first's
@@ -121,7 +179,20 @@ __device__ __forceinline__ void
 
     if (tidx == 0) {
       unsigned long long payload;
-      if (local_packed_idx == -1) {
+      if constexpr (KEYS) {
+        // The key's value field maps -0.0 to +0.0; the payload keeps the
+        // winner's sign, as the two-level reduce publishes its value.
+        unsigned int const g =
+            (unsigned int)(EP_MY_PE * (long long)VOCAB_SHARD +
+                           (unsigned int)(key & 0x7FFFu));
+        unsigned int const ok = (key & 0x8000u)
+                                    ? argmax_xrank_order_key(-0.0f)
+                                    : (unsigned int)(key >> 32);
+        payload = key == 0ull
+                      ? ((0x007FFFFFull << 32) | 0xFFFFFFFFull)
+                      : (((unsigned long long)ok << 32) |
+                         (unsigned long long)(~g));
+      } else if (local_packed_idx == -1) {
         // No live column on this rank. 0x007FFFFF is order_key(-inf), which
         // loses to any real value; the index is complemented, so all-ones
         // here is index 0 and it never wins.

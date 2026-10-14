@@ -2189,7 +2189,7 @@ __device__ __forceinline__ T _rnlm8_ld_g_nt(void const *p) {
 // HI_OFF == 0 is MXFP4 (MPK_QKV_MXFP4): a lane's 32 E2M1 values are one
 // 16-byte chunk at +g*16 of the row's 64-byte k-tile, so the byte offset is
 // half the FP8 one and src0's upper 128 bits stay zero.
-template <int KMUL, int HI_OFF>
+template <int KMUL, int HI_OFF, bool NT = false>
 __device__ __forceinline__ i32x8_t
     _rnlm8_load_w(uint8_t const *base, int kt, int g) {
   constexpr bool FP4 = (HI_OFF == 0);
@@ -2197,7 +2197,7 @@ __device__ __forceinline__ i32x8_t
 #if MPK_ATTN_STREAM_NT >= 1
   i32x4_t lo = _rnlm8_ld_g_nt<i32x4_t>(p);
 #else
-  i32x4_t lo = _gang_ld_g<i32x4_t>(p);
+  i32x4_t lo = NT ? _rnlm8_ld_g_nt<i32x4_t>(p) : _gang_ld_g<i32x4_t>(p);
 #endif
   i32x8_t r = {};
   r[0] = lo[0];
@@ -2208,7 +2208,8 @@ __device__ __forceinline__ i32x8_t
 #if MPK_ATTN_STREAM_NT >= 1
     i32x4_t hi = _rnlm8_ld_g_nt<i32x4_t>(p + HI_OFF);
 #else
-    i32x4_t hi = _gang_ld_g<i32x4_t>(p + HI_OFF);
+    i32x4_t hi = NT ? _rnlm8_ld_g_nt<i32x4_t>(p + HI_OFF)
+                    : _gang_ld_g<i32x4_t>(p + HI_OFF);
 #endif
     r[4] = hi[0];
     r[5] = hi[1];
@@ -2252,13 +2253,14 @@ __device__ __forceinline__ f32x4_t _rnlm8_mfma(i32x8_t a, i32x8_t b,
 //
 // So the dense k-loop is not address-register-bound the way the MoE one was.
 // Do not re-try this without a new mechanism; the arm has been built and run.
-template <int KMUL>
+template <int KMUL, bool NT = false>
 __device__ __forceinline__ int
     _rnlm8_load_sc(uint8_t const *base, int off4, int g) {
 #if MPK_ATTN_STREAM_NT == 1
   return (int)_rnlm8_ld_g_nt<uint8_t>(base + off4 * KMUL + g);
 #else
-  return (int)_gang_ld_g<uint8_t>(base + off4 * KMUL + g);
+  return NT ? (int)_rnlm8_ld_g_nt<uint8_t>(base + off4 * KMUL + g)
+            : (int)_gang_ld_g<uint8_t>(base + off4 * KMUL + g);
 #endif
 }
 
@@ -2321,7 +2323,8 @@ template <int GROUPS,
           bool SEEDED,
           int W_KMUL,
           int W_HIOFF,
-          int SC_KMUL>
+          int SC_KMUL,
+          bool NT = false>
 __device__ __forceinline__ f32x4_t
     _rnlm8_kloop_deep(uint8_t const *w_data_row,
                       uint8_t const *w_scale_row,
@@ -2359,8 +2362,8 @@ __device__ __forceinline__ f32x4_t
       }
     }
     int kk = ki_start + j;
-    A[j] = _rnlm8_load_w<W_KMUL, W_HIOFF>(w_data_row, kk * K_PER_MFMA, g);
-    S[j] = _rnlm8_load_sc<SC_KMUL>(w_scale_row, kk * 4, g);
+    A[j] = _rnlm8_load_w<W_KMUL, W_HIOFF, NT>(w_data_row, kk * K_PER_MFMA, g);
+    S[j] = _rnlm8_load_sc<SC_KMUL, NT>(w_scale_row, kk * 4, g);
   }
 
 // IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation -- it is what keeps
@@ -2377,8 +2380,8 @@ __device__ __forceinline__ f32x4_t
 #pragma unroll
     for (int j = 0; j < GROUPS; j++) {
       int kk = base + GROUPS + j;
-      N[j] = _rnlm8_load_w<W_KMUL, W_HIOFF>(w_data_row, kk * K_PER_MFMA, g);
-      NS[j] = _rnlm8_load_sc<SC_KMUL>(w_scale_row, kk * 4, g);
+      N[j] = _rnlm8_load_w<W_KMUL, W_HIOFF, NT>(w_data_row, kk * K_PER_MFMA, g);
+      NS[j] = _rnlm8_load_sc<SC_KMUL, NT>(w_scale_row, kk * 4, g);
     }
 #pragma unroll
     for (int j = 0; j < GROUPS; j++) {
@@ -2460,7 +2463,8 @@ template <int GROUPS,
           bool SEEDED,
           int W_KMUL,
           int W_HIOFF,
-          int SC_KMUL>
+          int SC_KMUL,
+          bool NT = false>
 __device__ __forceinline__ f32x4_t
     _rnlm8_kloop_dbuf(uint8_t const *w_data_row,
                       uint8_t const *w_scale_row,
@@ -2492,8 +2496,8 @@ __device__ __forceinline__ f32x4_t
 #pragma unroll
     for (int j = 0; j < GROUPS; j++) {
       int const kk = ki_start + b * GROUPS + j;
-      dst[j] = _rnlm8_load_w<W_KMUL, W_HIOFF>(w_data_row, kk * K_PER_MFMA, g);
-      dsc[j] = _rnlm8_load_sc<SC_KMUL>(w_scale_row, kk * 4, g);
+      dst[j] = _rnlm8_load_w<W_KMUL, W_HIOFF, NT>(w_data_row, kk * K_PER_MFMA, g);
+      dsc[j] = _rnlm8_load_sc<SC_KMUL, NT>(w_scale_row, kk * 4, g);
     }
   };
   auto consume = [&](i32x8_t const (&src)[GROUPS], int const (&ssc)[GROUPS],
@@ -2514,8 +2518,8 @@ __device__ __forceinline__ f32x4_t
         S[j] = seed_sa[j];
       } else {
         int const kk = ki_start + j;
-        A[j] = _rnlm8_load_w<W_KMUL, W_HIOFF>(w_data_row, kk * K_PER_MFMA, g);
-        S[j] = _rnlm8_load_sc<SC_KMUL>(w_scale_row, kk * 4, g);
+        A[j] = _rnlm8_load_w<W_KMUL, W_HIOFF, NT>(w_data_row, kk * K_PER_MFMA, g);
+        S[j] = _rnlm8_load_sc<SC_KMUL, NT>(w_scale_row, kk * 4, g);
       }
     }
   } else {
@@ -2600,7 +2604,8 @@ template <int GROUPS,
           bool SEEDED,
           int W_KMUL,
           int W_HIOFF,
-          int SC_KMUL>
+          int SC_KMUL,
+          bool NT = false>
 __device__ __forceinline__ f32x4_t
     _rnlm8_kloop_pick(uint8_t const *w_data_row,
                       uint8_t const *w_scale_row,
@@ -2614,11 +2619,11 @@ __device__ __forceinline__ f32x4_t
   constexpr bool TAKE_DBUF =
       (MPK_ATTN_PF_DBUF == 1) || (MPK_ATTN_PF_DBUF == 2 && NB % 2 == 1);
   if constexpr (TAKE_DBUF) {
-    return _rnlm8_kloop_dbuf<GROUPS, KI_LEN, SEEDED, W_KMUL, W_HIOFF, SC_KMUL>(
+    return _rnlm8_kloop_dbuf<GROUPS, KI_LEN, SEEDED, W_KMUL, W_HIOFF, SC_KMUL, NT>(
         w_data_row, w_scale_row, s_tok_fp8, s_tok_scales, ki_start, g, seed_a,
         seed_sa);
   } else {
-    return _rnlm8_kloop_deep<GROUPS, KI_LEN, SEEDED, W_KMUL, W_HIOFF, SC_KMUL>(
+    return _rnlm8_kloop_deep<GROUPS, KI_LEN, SEEDED, W_KMUL, W_HIOFF, SC_KMUL, NT>(
         w_data_row, w_scale_row, s_tok_fp8, s_tok_scales, ki_start, g, seed_a,
         seed_sa);
   }
@@ -2722,6 +2727,138 @@ __device__ __host__ constexpr int _rnlm8_pf_groups(int ki, int req) {
 // this axis -- it is the third prefetch-depth sweep on this kernel to land
 // inside the noise floor.
 
+// ── MPK_LMH_BAL: the LM head as one balanced tile per worker ───────────────
+//
+// See MPK_LMH_BAL in mpk_atoms.cuh. A worker's tile is the 16-row groups
+// [g0, g0 + ng) of its XCD's slice. The four waves split every group's K four
+// ways (2 * H k-tiles each), so a wave walks one stream of 2 * ng half-group
+// blocks, double-buffered as in _rnlm8_kloop_dbuf: a block's loads issue
+// before the previous block's MFMAs and are never copied, so the wait in front
+// of the MFMAs names only the block being consumed, across group boundaries
+// too. Group j's partial goes to red[(j * 4 + wave) * 16 + row].
+
+// k-tiles [ki, ki + H) of this lane's row of group gi. The head is packed
+// K-major per 16-row group (demo.py, pack_dense_mxfp8 lm_head=True), so a
+// k-tile of a group is 2 KB of data and 64 B of E8M0, each contiguous: the
+// layout the K-parallel branch reads at OUTPUT_PER_WG 16 (_rnlm8_wk).
+template <int H, int REDUCTION_SIZE, int OUTPUT_PER_WG>
+__device__ __forceinline__ void _rnlm8_bal_issue(uint8_t const *W,
+                                                 int gi,
+                                                 int ki,
+                                                 int col,
+                                                 int g,
+                                                 i32x8_t (&dst)[H],
+                                                 int (&dsc)[H]) {
+  constexpr int NB32 = REDUCTION_SIZE / 32;
+  constexpr int WG_DATA = OUTPUT_PER_WG * REDUCTION_SIZE;
+  constexpr int WG_BYTES = WG_DATA + OUTPUT_PER_WG * NB32;
+  constexpr int GPW = OUTPUT_PER_WG / 16;
+  int const sub = gi % GPW;
+  uint8_t const *wg = W + static_cast<int64_t>(gi / GPW) * WG_BYTES;
+  uint8_t const *d =
+      wg + static_cast<int64_t>(sub) * 16 * REDUCTION_SIZE + col * 64;
+  uint8_t const *s = wg + WG_DATA + sub * 16 * NB32 + col * 4;
+#pragma unroll
+  for (int i = 0; i < H; i++) {
+    dst[i] = _rnlm8_load_w<16, 1024>(d, (ki + i) * 128, g);
+    dsc[i] = _rnlm8_load_sc<16>(s, (ki + i) * 4, g);
+  }
+}
+
+template <int H>
+__device__ __forceinline__ f32x4_t
+    _rnlm8_bal_consume(f32x4_t acc,
+                       i32x8_t const (&src)[H],
+                       int const (&ssc)[H],
+                       uint8_t const *s_tok_fp8,
+                       uint8_t const *s_tok_scales,
+                       int ki,
+                       int g) {
+#pragma unroll
+  for (int i = 0; i < H; i++) {
+    i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + i) * 128, g);
+    acc = _rnlm8_mfma<false>(src[i], b, acc, ssc[i],
+                             (int)s_tok_scales[ki + i]);
+  }
+  return acc;
+}
+
+// A holds group g0's first block on entry (issued above the quantizer). A
+// wave walks KQ k-tiles of every group as KQ / H blocks, an even count, so
+// the pairs below never straddle a group. The sched_barriers keep the issue
+// order as written; left to itself the scheduler regroups the loads and the
+// MFMAs, and the standalone LM head ran 38.0 us instead of 33.5. H = 2 keeps
+// the function inside the clobbers _rnlm8_lmh_wall declares.
+template <int H, int KQ, int REDUCTION_SIZE, int OUTPUT_PER_WG>
+__device__ __forceinline__ void _rnlm8_bal_kloop(uint8_t const *W,
+                                                 int g0,
+                                                 int ng,
+                                                 uint8_t const *s_tok_fp8,
+                                                 uint8_t const *s_tok_scales,
+                                                 float *red,
+                                                 i32x8_t (&A)[H],
+                                                 int (&S)[H]) {
+  static_assert(KQ % (2 * H) == 0, "a group is a whole number of block pairs");
+  constexpr int NP = KQ / (2 * H);
+  int const tid = threadIdx.x;
+  int const warp = tid >> 6;
+  int const col = tid & 15;
+  int const g = (tid & 63) >> 4;
+  int const ki0 = warp * KQ;
+  i32x8_t N[H];
+  int NS[H];
+  // One group: block pairs (2p, 2p + 1); the last pair's refill of A is the
+  // next group's first block, or nothing after the last group.
+  auto group = [&](int j, bool more) {
+    f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (int p = 0; p < NP; p++) {
+      _rnlm8_bal_issue<H, REDUCTION_SIZE, OUTPUT_PER_WG>(
+          W, g0 + j, ki0 + (2 * p + 1) * H, col, g, N, NS);
+      acc = _rnlm8_bal_consume<H>(acc, A, S, s_tok_fp8, s_tok_scales,
+                                  ki0 + 2 * p * H, g);
+      __builtin_amdgcn_sched_barrier(0);
+      if (p + 1 < NP) {
+        _rnlm8_bal_issue<H, REDUCTION_SIZE, OUTPUT_PER_WG>(
+            W, g0 + j, ki0 + (2 * p + 2) * H, col, g, A, S);
+      } else if (more) {
+        _rnlm8_bal_issue<H, REDUCTION_SIZE, OUTPUT_PER_WG>(
+            W, g0 + j + 1, ki0, col, g, A, S);
+      }
+      acc = _rnlm8_bal_consume<H>(acc, N, NS, s_tok_fp8, s_tok_scales,
+                                  ki0 + (2 * p + 1) * H, g);
+      __builtin_amdgcn_sched_barrier(0);
+    }
+    // The pin and `#pragma unroll 1` below: the `col == 0` stores are acc's
+    // only use, and LLVM would otherwise sink the MFMA chain under that EXEC
+    // mask (see _rnlm8_kloop_deep).
+    asm volatile("" : "+v"(acc));
+    if (col == 0) {
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        red[(j * 4 + warp) * 16 + g * 4 + i] = acc[i];
+      }
+    }
+  };
+#pragma unroll 1
+  for (int j = 0; j < ng - 1; j++) {
+    group(j, true);
+  }
+  group(ng - 1, false);
+}
+
+// The LM head's call wall (MPK_LMH_WRAP), defined after the kernel.
+template <int BATCH_SIZE, int OUTPUT_PER_WG, int REDUCTION_SIZE,
+          int ACTUAL_HIDDEN_DIM, bool WRITE_THROUGH, bool FUSE_RESADD,
+          int EP_PEER_SLOTS, bool EP_PRE_FOLDED, bool SP_QKV, bool PRO_PUB,
+          bool FOLD_ROWS, int INPUT_ROW_STRIDE, bool PPL_SINK, bool WEIGHT_FP4,
+          bool LL_WT>
+__device__ __noinline__ void
+    _rnlm8_lmh_wall(void const *, void const *, void *, void const *,
+                    void const *, void *, int, int, int, int, void const *,
+                    void *, void const *, int, int *, unsigned,
+                    unsigned long long *, unsigned, int, unsigned long long *);
+
 template <int BATCH_SIZE,
           int OUTPUT_PER_WG,
           int REDUCTION_SIZE,
@@ -2783,7 +2920,9 @@ template <int BATCH_SIZE,
           bool WEIGHT_FP4 = false,
           // MPK_QA_LL: the ll_out words go write-through, for a consumer on
           // another XCD.
-          bool LL_WT = false>
+          bool LL_WT = false,
+          // The LM head instance behind its call wall (MPK_LMH_WRAP).
+          bool LMH_INNER = false>
 #if MPK_RNLM8_INLINE
 __device__ __attribute__((always_inline)) void
 #else
@@ -2832,6 +2971,66 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
 
   static_assert(OUTPUT_PER_WG % 16 == 0,
                 "OUTPUT_PER_WG must be multiple of 16");
+  // The LM head instance: the only caller with the EP residual fold at
+  // OUTPUT_PER_WG >= 64.
+  constexpr bool LMH_SHAPE = FUSE_RESADD && EP_PEER_SLOTS > 1 &&
+                             !EP_PRE_FOLDED && !PRO_PUB && !FOLD_ROWS &&
+                             !WRITE_THROUGH && !WEIGHT_FP4 &&
+                             BATCH_SIZE == 1 && OUTPUT_PER_WG >= 64;
+  // MPK_LMH_WRAP: worker_kernel reaches the head through _rnlm8_lmh_wall. The
+  // compiler allocates a caller's registers around a call from the callee's
+  // actual clobbers (AMDGPU runs IPRA), so any change to the head's register
+  // use reshapes worker_kernel, fused layer included. The wall declares a
+  // fixed clobber set; see there.
+#if MPK_LMH_TRACE && defined(MPK_TRACE) && MPK_TRACE
+  // MPK_LMH_TRACE (mpk_atoms.cuh): tile_idx < MPK_WORKERS_PER_XCD is a
+  // worker's first tile, balanced or not.
+  int lmh_tr_slot = -1;
+  int lmh_tr_base = 0;
+  if constexpr (LMH_SHAPE && LMH_INNER) {
+    if (threadIdx.x == 0) {
+      unsigned c = g_lmh_tr_calls[blockIdx.x];
+      if (tile_idx < MPK_WORKERS_PER_XCD) {
+        g_lmh_tr_calls[blockIdx.x] = ++c;
+      } else {
+        lmh_tr_base = 5;
+      }
+      long const ti = (long)c - MPK_TRACE_T0;
+      lmh_tr_slot = (ti >= 0 && ti < MPK_TRACE_ITERS)
+                        ? (int)ti * MPK_TRACE_LAYERS + MPK_TRACE_LAYERS - 1
+                        : -1;
+      mpk_lmh_stamp(lmh_tr_slot, lmh_tr_base + 0);
+      // The shader clock beside the 100 MHz one: consecutive iterations'
+      // pairs give the token's mean core clock.
+      if (lmh_tr_slot >= 0 && lmh_tr_base == 0) {
+        __builtin_nontemporal_store(
+            (unsigned)__builtin_amdgcn_s_memtime(),
+            &g_mpk_trace[((size_t)lmh_tr_slot * MPK_STAGE_SLOTS + 10) *
+                             MPK_STAGE_WORKERS +
+                         blockIdx.x]);
+      }
+    }
+  }
+#define MPK_LMH_TR(i)                                                          \
+  do {                                                                         \
+    if (LMH_SHAPE && LMH_INNER && threadIdx.x == 0) {                          \
+      mpk_lmh_stamp(lmh_tr_slot, lmh_tr_base + (i));                           \
+    }                                                                          \
+  } while (0)
+#else
+#define MPK_LMH_TR(i) ((void)0)
+#endif
+  if constexpr (LMH_SHAPE && (MPK_LMH_WRAP || MPK_LMH_BAL) && !LMH_INNER) {
+    _rnlm8_lmh_wall<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE,
+                    ACTUAL_HIDDEN_DIM, WRITE_THROUGH, FUSE_RESADD,
+                    EP_PEER_SLOTS, EP_PRE_FOLDED, SP_QKV, PRO_PUB, FOLD_ROWS,
+                    INPUT_ROW_STRIDE, PPL_SINK, WEIGHT_FP4, LL_WT>(
+        norm_input_ptr, norm_weight_ptr, norm_output_ptr, weight_ptr,
+        bias_ptr, output_ptr, num_active_tokens, n_wgs_per_xcd, output_stride,
+        tile_idx, resadd_workspace_f32_ptr, resadd_x_out_ptr, pro_pub_ptr,
+        logits_row, qxs, qxs_epoch, ll_out, ll_epoch, ll_cols, qxs_row_ll);
+    return;
+  }
   // ── bs=2 bisection probe ────────────────────────────────────────────────
   // GLM_FUSE_ATTN defaults to 0, so the three dense prologue layers run this
   // UNFUSED chain and the whole-layer task covers every MoE layer -- which is
@@ -3101,6 +3300,27 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
       LDS_PROLOGUE && (OUTPUT_PER_WG >= 64 ? (TILES_PER_WAVE == 1) : true);
   i32x8_t ph_a[HOIST_PREFILL ? 4 : 1];
   int ph_sa[HOIST_PREFILL ? 4 : 1];
+  // MPK_LMH_BAL: the LM head instance takes tile_idx as a worker index and
+  // its tile as groups [bal_g0, bal_g0 + bal_ng) of NG; see _rnlm8_bal_kloop.
+  constexpr bool LMH_BAL =
+      MPK_LMH_BAL && LMH_SHAPE && LMH_INNER && HOIST_PREFILL;
+  // MPK_LMH_NT: the unbalanced head's weight stream as non-temporal loads,
+  // in whichever instance runs the head (behind the wall or not).
+  constexpr bool W_NT = MPK_LMH_NT && LMH_SHAPE &&
+                        (LMH_INNER || !(MPK_LMH_WRAP || MPK_LMH_BAL));
+  constexpr int BAL_KQ = MFMA_ITERS / NUM_WAVES;
+  constexpr int BAL_H = 2;
+  static_assert(!LMH_BAL || (MPK_WORKERS_PER_XCD > 0 &&
+                             MFMA_ITERS % NUM_WAVES == 0 &&
+                             BAL_KQ % (2 * BAL_H) == 0),
+                "MPK_LMH_BAL needs MPK_WORKERS_PER_XCD and whole half-quarters "
+                "of K");
+  // Taken after the resolve (below), so that nothing of it is live across
+  // the resolve's batch.
+  int bal_g0 = 0;
+  int bal_ng = 0;
+  i32x8_t bal_a[LMH_BAL ? BAL_H : 1];
+  int bal_sa[LMH_BAL ? BAL_H : 1];
 
   // Steps 1 and 2 run once per folded row, each into its own LDS plane.
   // rows_here is 1 unless FOLD_ROWS, so this is a no-op loop everywhere else.
@@ -3204,6 +3424,7 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
   if (FUSE_RESADD && threadIdx.x == 0) {
     mpk_stage_stamp(54);
   }
+  MPK_LMH_TR(1);
   // Trace stamps 72/73/74 (q_b and the rest of !FUSE_RESADD): row normed,
   // token quantized, K-loop done.
   if (!FUSE_RESADD && threadIdx.x == 0) {
@@ -3269,7 +3490,19 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
   // (N-parallel, TILES_PER_WAVE 1) and QKV_OUTPUT_PER_WG 16 (K-parallel, one
   // fill per wave). A wider OUTPUT_PER_WG would hold these 32 VGPRs live
   // across every later tile_iter for no benefit, so it keeps the old form.
-  if constexpr (HOIST_PREFILL) if (_row == 0) {
+  if constexpr (LMH_BAL) {
+    constexpr int WPX = MPK_WORKERS_PER_XCD > 0 ? MPK_WORKERS_PER_XCD : 1;
+    int const ng_all = n_wgs_per_xcd * (OUTPUT_PER_WG / 16);
+    bal_g0 = tile_idx * ng_all / WPX;
+    bal_ng = (tile_idx + 1) * ng_all / WPX - bal_g0;
+    // red[] lives in the dead s_x_bf16 + s_nw_bf16 planes: 256 B per group.
+    if (tile_idx >= WPX || bal_ng < 1 ||
+        bal_ng * 256 > REDUCTION_SIZE * 4) {
+      __builtin_trap();
+    }
+    _rnlm8_bal_issue<BAL_H, REDUCTION_SIZE, OUTPUT_PER_WG>(
+        W, bal_g0, warp_id * BAL_KQ, col, g, bal_a, bal_sa);
+  } else if constexpr (HOIST_PREFILL) if (_row == 0) {
     // N-parallel gives each wave its own 16 rows starting at k-tile 0;
     // K-parallel gives all four waves the same 16 rows and splits K.
     int const h_row = (OUTPUT_PER_WG >= 64) ? (warp_id * 16 + col) : col;
@@ -3289,9 +3522,9 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
                                : h_row * NUM_BLOCKS_32);
 #pragma unroll
     for (int ki = 0; ki < 4; ki++) {
-      ph_a[ki] = _rnlm8_load_w<W_KMUL, W_HIOFF>(
+      ph_a[ki] = _rnlm8_load_w<W_KMUL, W_HIOFF, W_NT>(
           h_data, (h_ki0 + ki) * K_PER_MFMA, g);
-      ph_sa[ki] = _rnlm8_load_sc<SC_KMUL>(h_scale, (h_ki0 + ki) * 4, g);
+      ph_sa[ki] = _rnlm8_load_sc<SC_KMUL, W_NT>(h_scale, (h_ki0 + ki) * 4, g);
     }
   }
 
@@ -3362,12 +3595,101 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
   if (FUSE_RESADD && threadIdx.x == 0) {
     mpk_stage_stamp(62);
   }
+  MPK_LMH_TR(2);
   if (!FUSE_RESADD && threadIdx.x == 0) {
     mpk_stage_stamp(73);
   }
   // ── Step 3: MFMA FP8(weights) x FP8(tokens) ────────────────────────────
-  if constexpr (OUTPUT_PER_WG >= 64) {
+  if constexpr (LMH_BAL) {
+    float *const red = reinterpret_cast<float *>(s_x_bf16);
+    _rnlm8_bal_kloop<BAL_H, BAL_KQ, REDUCTION_SIZE, OUTPUT_PER_WG>(
+        W, bal_g0, bal_ng, s_tok_fp8, s_tok_scales, red, bal_a, bal_sa);
+    MPK_LMH_TR(3);
+    __syncthreads();
+#if MPK_LMH_ARGMAX
+    // MPK_LMH_ARGMAX: this XCD's slice starts at shard column
+    // xcd * n_wgs_per_xcd * OUTPUT_PER_WG (the gang dispatch runs slice H on
+    // hardware XCD H).
+    constexpr bool LMH_KEYS = MPK_LMH_ARGMAX_CHUNK > 0 && !PPL_SINK;
+    unsigned const key_v0 =
+        (unsigned)((_gang_moe_get_xcd_id() & 7) * n_wgs_per_xcd *
+                   OUTPUT_PER_WG);
+    unsigned long long best = 0ull;
+#else
+    constexpr bool LMH_KEYS = false;
+#endif
+    // Four rows per thread; the waves' partials summed in wave order.
+    for (int q = tid; q < bal_ng * 4; q += MPK_NT) {
+      int const j = q >> 2;
+      int const r0 = (q & 3) * 4;
+      int const n0 = (bal_g0 + j) * 16 + r0;
+      unsigned short packed[4];
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        float const *p = red + j * 64 + r0 + i;
+        float const v = ((p[0] + p[16]) + p[32]) + p[48];
+        unsigned bt = (unsigned)d_bias[n0 + i] << 16;
+        float bv;
+        __builtin_memcpy(&bv, &bt, 4);
+        packed[i] = _gang_float_to_bf16(v + bv);
+      }
+      _rnlm8_store4<false>(d_output + ppl_row_off + tok_base * output_stride +
+                               n0,
+                           packed[0], packed[1], packed[2], packed[3]);
+#if MPK_LMH_ARGMAX
+      if constexpr (LMH_KEYS) {
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+          unsigned long long const k =
+              lmh_argmax_key(packed[i], key_v0 + (unsigned)(n0 + i));
+          best = k > best ? k : best;
+        }
+      }
+#endif
+    }
+#if MPK_LMH_ARGMAX
+    if constexpr (LMH_KEYS) {
+#pragma unroll
+      for (int off = 32; off > 0; off >>= 1) {
+        unsigned const olo = __shfl_xor((unsigned)best, off, 64);
+        unsigned const ohi = __shfl_xor((unsigned)(best >> 32), off, 64);
+        unsigned long long const o = ((unsigned long long)ohi << 32) | olo;
+        best = o > best ? o : best;
+      }
+      // The quantized token's LDS is dead past the k-loop's barrier above.
+      unsigned long long *const s_key =
+          reinterpret_cast<unsigned long long *>(s_tok_fp8_all);
+      if ((tid & 63) == 0) {
+        s_key[warp_id] = best;
+      }
+      __syncthreads();
+      if (tid == 0) {
+#pragma unroll
+        for (int w = 1; w < NUM_WAVES; w++) {
+          best = s_key[w] > best ? s_key[w] : best;
+        }
+        st_wt_u64((void *)&g_lmh_key[(_gang_moe_get_xcd_id() & 7) *
+                                         MPK_WORKERS_PER_XCD +
+                                     tile_idx],
+                  best);
+      }
+    }
+#endif
+
+  } else if constexpr (OUTPUT_PER_WG >= 64) {
     // N-parallel: 4 waves handle different output rows (depth-4 pipeline)
+#if MPK_LMH_ARGMAX
+    // MPK_LMH_ARGMAX on the unbalanced head: each tile leaves the argmax key
+    // of its 64 logits in g_lmh_key[xcd * n_wgs_per_xcd + wg_idx].
+    constexpr bool NP_KEYS =
+        MPK_LMH_ARGMAX_CHUNK > 0 && LMH_SHAPE && !PPL_SINK &&
+        TILES_PER_WAVE == 1 && (LMH_INNER || !(MPK_LMH_WRAP || MPK_LMH_BAL));
+    // The tile's 64 bf16 logits, parked in s_x_bf16's plane (dead past the
+    // quantizer's barrier; the token's is still being read by slower waves)
+    // and keyed by wave 0 after the k-loops, so that nothing of the key is
+    // live through them.
+    unsigned short *const s_lg = s_x_bf16;
+#endif
 #if MPK_RNLM8_BIAS_PRE
     uint2 bias_q = {0u, 0u};
     if (TILES_PER_WAVE == 1 && (FOLD_ROWS ? (col < rows_here) : (col == 0))) {
@@ -3489,7 +3811,7 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
         // (OUTPUT_PER_WG >= 64 on this branch), so ph_a is this tile's fill.
         constexpr int GR = _rnlm8_pf_groups(MFMA_ITERS, MPK_ATTN_PF_GROUPS_N);
         acc = _rnlm8_kloop_pick<GR, MFMA_ITERS, HOIST_PREFILL && GR >= 4,
-                                      W_KMUL, W_HIOFF, SC_KMUL>(
+                                      W_KMUL, W_HIOFF, SC_KMUL, W_NT>(
             w_data_row, w_scale_row, s_tok_fp8, s_tok_scales,
             /*ki_start=*/0, g, ph_a, ph_sa);
       } else {
@@ -3594,6 +3916,14 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
 
           packed[i] = _gang_float_to_bf16(sum + bv);
         }
+#if MPK_LMH_ARGMAX
+        if constexpr (NP_KEYS) {
+#pragma unroll
+          for (int i = 0; i < 4; i++) {
+            s_lg[wave_tile * 16 + g * 4 + i] = packed[i];
+          }
+        }
+#endif
         int out_idx = (FOLD_ROWS ? col : tok_base) * output_stride +
                       wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4;
         if (!(MPK_QB_LL_NOOUT && !LL_WT && BATCH_SIZE == 1 &&
@@ -3617,6 +3947,26 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
         }
       }
     }
+#if MPK_LMH_ARGMAX
+    if constexpr (NP_KEYS) {
+      __syncthreads();
+      if (warp_id == 0) {
+        int const slot = (_gang_moe_get_xcd_id() & 7) * n_wgs_per_xcd + wg_idx;
+        unsigned long long best = lmh_argmax_key(
+            s_lg[lane_id], (unsigned)(slot * OUTPUT_PER_WG + lane_id));
+#pragma unroll
+        for (int off = 32; off > 0; off >>= 1) {
+          unsigned const olo = __shfl_xor((unsigned)best, off, 64);
+          unsigned const ohi = __shfl_xor((unsigned)(best >> 32), off, 64);
+          unsigned long long const o = ((unsigned long long)ohi << 32) | olo;
+          best = o > best ? o : best;
+        }
+        if (lane_id == 0) {
+          st_wt_u64((void *)&g_lmh_key[slot], best);
+        }
+      }
+    }
+#endif
   } else {
     // K-parallel: 4 waves all process same 16 rows, split K across waves.
     // Note this branch emits exactly 16 rows per workgroup regardless of
@@ -3838,7 +4188,103 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
     atomicAdd(&g_subphase_ns[1][5], 1ULL);
   }
 #endif
+  MPK_LMH_TR(4);
+#if MPK_LMH_PAD_BYTES
+  // MPK_LMH_PAD_BYTES: code placement. Bytes of never-executed s_nop after a
+  // branch in the instance that runs the LM head, so the noinline callees
+  // behind it in the code object keep their instruction-cache alignment (see
+  // MPK_LMH_BAL).
+  if constexpr (LMH_SHAPE && (LMH_INNER || !(MPK_LMH_WRAP || MPK_LMH_BAL))) {
+    static_assert(MPK_LMH_PAD_BYTES % 4 == 0, "s_nop is 4 bytes");
+    asm volatile("s_branch .Lc_lmh_pad_end%=\n"
+                 ".rept %0\n"
+                 "s_nop 0\n"
+                 ".endr\n"
+                 ".Lc_lmh_pad_end%=:" ::"i"(MPK_LMH_PAD_BYTES / 4));
+  }
+#endif
   __syncthreads();
+}
+#undef MPK_LMH_TR
+
+template <int BATCH_SIZE, int OUTPUT_PER_WG, int REDUCTION_SIZE,
+          int ACTUAL_HIDDEN_DIM, bool WRITE_THROUGH, bool FUSE_RESADD,
+          int EP_PEER_SLOTS, bool EP_PRE_FOLDED, bool SP_QKV, bool PRO_PUB,
+          bool FOLD_ROWS, int INPUT_ROW_STRIDE, bool PPL_SINK, bool WEIGHT_FP4,
+          bool LL_WT>
+__device__ __noinline__ void
+    _rnlm8_lmh_wall(void const *a0, void const *a1, void *a2, void const *a3,
+                    void const *a4, void *a5, int a6, int a7, int a8, int a9,
+                    void const *a10, void *a11, void const *a12, int a13,
+                    int *a14, unsigned a15, unsigned long long *a16,
+                    unsigned a17, int a18, unsigned long long *a19) {
+  gang_rmsnorm_linear_mxfp8_bias_kernel<
+      BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE, ACTUAL_HIDDEN_DIM,
+      WRITE_THROUGH, FUSE_RESADD, EP_PEER_SLOTS, EP_PRE_FOLDED, SP_QKV, PRO_PUB,
+      FOLD_ROWS, INPUT_ROW_STRIDE, PPL_SINK, WEIGHT_FP4, LL_WT,
+      /*LMH_INNER=*/true>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11,
+                          a12, a13, a14, a15, a16, a17, a18, a19);
+  // The wall's clobbers as worker_kernel sees them: the unbalanced head's
+  // (e275027: every caller-saved VGPR, a0-a20, where CSR VGPRs are parked,
+  // s0-s12, s15, vcc) plus s13-s21, which the balanced head and the wall's
+  // frame use. Fixed here so that no change behind the wall moves
+  // worker_kernel; the call above must stay inside this set (read the inner
+  // instance's registers off the built image after any change).
+#if MPK_LMH_WALL_FULL
+  // Every caller-saved register: no head behind the wall can exceed it.
+  asm volatile(""
+               :
+               :
+               : "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+      "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20",
+      "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30",
+      "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v48",
+      "v49", "v50", "v51", "v52", "v53", "v54", "v55", "v64", "v65", "v66",
+      "v67", "v68", "v69", "v70", "v71", "v80", "v81", "v82", "v83", "v84",
+      "v85", "v86", "v87", "v96", "v97", "v98", "v99", "v100", "v101", "v102",
+      "v103", "v112", "v113", "v114", "v115", "v116", "v117", "v118", "v119",
+      "v128", "v129", "v130", "v131", "v132", "v133", "v134", "v135", "v144",
+      "v145", "v146", "v147", "v148", "v149", "v150", "v151", "v160", "v161",
+      "v162", "v163", "v164", "v165", "v166", "v167", "v176", "v177", "v178",
+      "v179", "v180", "v181", "v182", "v183", "v192", "v193", "v194", "v195",
+      "v196", "v197", "v198", "v199", "v208", "v209", "v210", "v211", "v212",
+      "v213", "v214", "v215", "v224", "v225", "v226", "v227", "v228", "v229",
+      "v230", "v231", "v240", "v241", "v242", "v243", "v244", "v245", "v246",
+      "v247", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9",
+      "a10", "a11", "a12", "a13", "a14", "a15", "a16", "a17", "a18", "a19",
+      "a20", "a21", "a22", "a23", "a24", "a25", "a26", "a27", "a28", "a29",
+      "a30", "a31", "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8",
+      "s9", "s10", "s11", "s12", "s13", "s14", "s15", "s16", "s17", "s18",
+      "s19", "s20", "s21", "s22", "s23", "s24", "s25", "s26", "s27", "s28",
+      "s29", "s40", "s41", "s42", "s43", "s44", "s45", "s46", "s47", "s56",
+      "s57", "s58", "s59", "s60", "s61", "s62", "s63", "s72", "s73", "s74",
+      "s75", "s76", "s77", "s78", "s79", "s88", "s89", "s90", "s91", "s92",
+      "s93", "s94", "s95", "vcc");
+#else
+  asm volatile(""
+               :
+               :
+               : "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+      "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20",
+      "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30",
+      "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v48",
+      "v49", "v50", "v51", "v52", "v53", "v54", "v55", "v64", "v65", "v66",
+      "v67", "v68", "v69", "v70", "v71", "v80", "v81", "v82", "v83", "v84",
+      "v85", "v86", "v87", "v96", "v97", "v98", "v99", "v100", "v101", "v102",
+      "v103", "v112", "v113", "v114", "v115", "v116", "v117", "v118", "v119",
+      "v128", "v129", "v130", "v131", "v132", "v133", "v134", "v135", "v144",
+      "v145", "v146", "v147", "v148", "v149", "v150", "v151", "v160", "v161",
+      "v162", "v163", "v164", "v165", "v166", "v167", "v176", "v177", "v178",
+      "v179", "v180", "v181", "v182", "v183", "v192", "v193", "v194", "v195",
+      "v196", "v197", "v198", "v199", "v208", "v209", "v210", "v211", "v212",
+      "v213", "v214", "v215", "v224", "v225", "v226", "v227", "v228", "v229",
+      "v230", "v231", "v240", "v241", "v242", "v243", "v244", "v245", "v246",
+      "v247", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9",
+      "a10", "a11", "a12", "a13", "a14", "a15", "a16", "a17", "a18", "a19",
+      "a20", "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9",
+      "s10", "s11", "s12", "s13", "s14", "s15", "s16", "s17", "s18", "s19",
+      "s20", "s21", "vcc");
+#endif
 }
 
 } // namespace kernel

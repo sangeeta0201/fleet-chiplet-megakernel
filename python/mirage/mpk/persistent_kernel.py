@@ -1668,7 +1668,7 @@ def get_compile_command(
             "MPK_DEC_OUT_B128",
             "MPK_MERGE_LSE_LDS",
             "MPK_MLA_QK_PIPE",
-            "MPK_MLA_PV_PIPE", "MPK_WUK_REMAP", "MPK_TOPK_FLAG_LATE", "MPK_TOPK_FLAG_PF", "MPK_MLA_PV_ASM", "MPK_OPROJ_WFIRST_GATE", "MPK_OPROJ_WALL_GATE", "MPK_ROUTER_POLL_INC", "MPK_DEC_KVF_EARLY", "MPK_TOPK_FLAG_OVL", "MPK_RESOLVE_POLL_INC", "MPK_DEC_Q_INC", "MPK_MLA_QK_PIPE2", "MPK_PROBE_MERGE63", "MPK_QXS_EARLY_RES", "MPK_QKVA_SKIP_PAD", "MPK_QA_LL", "MPK_DEC_LSE_LL", "MPK_W2_ACT_SENT", "MPK_PROBE_OPROJ_HALFK", "MPK_OPROJ_A_PAD", "MPK_WUK_LAT_REMAP", "MPK_WUK_IDLE_MAP", "MPK_QB_LL_NOOUT", "MPK_WUK_VL4", "MPK_ROUTER_HOUT_LATE", "MPK_TOPK_2L_KEEP_LDS", "MPK_W2_WPRE_BB", "MPK_TOPK_2L_MERGE", "MPK_PROBE_W13_HALFK", "MPK_MLA_QK_SPLIT", "MPK_QKVA_SKIP_PAD", "MPK_W13_SELF_TOPK", "MPK_W2F_RT_OFF", "MPK_ROUTE_BATCH", "MPK_MOE_DPP", "MPK_W2_SELF_IDS", "MPK_W2_WPRE_LATE", "MPK_DEC_MERGE_LL32", "MPK_DEC_PRE_NOBAR", "MPK_DEC_EXP2_BUILTIN", "MPK_DEC_QK2T", "MPK_OPROJ_POLL_INC", "MPK_OPROJ_PF_DEC", "MPK_MERGE_QUAD", "MPK_MERGE_LIVE", "MPK_DEC_PART_F16", "MPK_WUK_LL_NOOUT", "MPK_WUK_VL4_WF", "MPK_DEC_KVF_LAST", "MPK_DEC_KVF_INC", "MPK_QB_DEC_PF",
+            "MPK_MLA_PV_PIPE", "MPK_WUK_REMAP", "MPK_TOPK_FLAG_LATE", "MPK_TOPK_FLAG_PF", "MPK_MLA_PV_ASM", "MPK_OPROJ_WFIRST_GATE", "MPK_OPROJ_WALL_GATE", "MPK_ROUTER_POLL_INC", "MPK_DEC_KVF_EARLY", "MPK_TOPK_FLAG_OVL", "MPK_RESOLVE_POLL_INC", "MPK_DEC_Q_INC", "MPK_MLA_QK_PIPE2", "MPK_PROBE_MERGE63", "MPK_QXS_EARLY_RES", "MPK_QKVA_SKIP_PAD", "MPK_QA_LL", "MPK_DEC_LSE_LL", "MPK_W2_ACT_SENT", "MPK_PROBE_OPROJ_HALFK", "MPK_OPROJ_A_PAD", "MPK_WUK_LAT_REMAP", "MPK_WUK_IDLE_MAP", "MPK_QB_LL_NOOUT", "MPK_WUK_VL4", "MPK_ROUTER_HOUT_LATE", "MPK_TOPK_2L_KEEP_LDS", "MPK_W2_WPRE_BB", "MPK_TOPK_2L_MERGE", "MPK_PROBE_W13_HALFK", "MPK_MLA_QK_SPLIT", "MPK_QKVA_SKIP_PAD", "MPK_W13_SELF_TOPK", "MPK_W2F_RT_OFF", "MPK_ROUTE_BATCH", "MPK_MOE_DPP", "MPK_W2_SELF_IDS", "MPK_W2_WPRE_LATE", "MPK_DEC_MERGE_LL32", "MPK_DEC_PRE_NOBAR", "MPK_DEC_EXP2_BUILTIN", "MPK_DEC_QK2T", "MPK_OPROJ_POLL_INC", "MPK_OPROJ_PF_DEC", "MPK_MERGE_QUAD", "MPK_MERGE_LIVE", "MPK_DEC_PART_F16", "MPK_WUK_LL_NOOUT", "MPK_WUK_VL4_WF", "MPK_DEC_KVF_LAST", "MPK_DEC_KVF_INC", "MPK_QB_DEC_PF", "MPK_LMH_BAL", "MPK_LMH_ARGMAX", "MPK_LMH_WRAP", "MPK_LMH_TRACE", "MPK_LMH_WALL_FULL", "MPK_LMH_NT",
             "MPK_ATTN_PROBE_NOQKVWAIT",
             "MPK_ENTRY_NOWAIT",
             "MPK_DEC_HINTS",
@@ -1680,6 +1680,20 @@ def get_compile_command(
             if _x is not None:
                 assert _x in ("0", "1"), f"{_v} is 0 or 1"
                 flags = flags + [f"-D{_v}={_x}"]
+        # MPK_LMH_BAL's tile map: the LM head's dispatch is one tile per worker.
+        if (os.environ.get("MPK_LMH_BAL", "0") == "1" or
+                os.environ.get("MPK_LMH_TRACE", "0") == "1"):
+            flags = flags + [f"-DMPK_WORKERS_PER_XCD={mpk.num_workers // 8}"]
+        _x = os.environ.get("MPK_LMH_PAD_BYTES")
+        if _x is not None:
+            flags = flags + [f"-DMPK_LMH_PAD_BYTES={int(_x)}"]
+        # MPK_LMH_ARGMAX's tie order: argmax_partial's chunk, set by demo.py
+        # when it drops that task.
+        _x = os.environ.get("MPK_LMH_ARGMAX_CHUNK")
+        if _x is not None and os.environ.get("MPK_LMH_ARGMAX", "0") == "1":
+            flags = flags + [f"-DMPK_LMH_ARGMAX_CHUNK={int(_x)}",
+                             "-DMPK_LMH_ARGMAX_SLOTS="
+                             f"{int(os.environ['MPK_LMH_ARGMAX_SLOTS'])}"]
         # Pricing probe, wrong output: 1 or 2 (mpk_atoms.cuh).
         _x = os.environ.get("MPK_PROBE_DEC_NOQ")
         if _x is not None:
@@ -6103,6 +6117,12 @@ class PersistentKernel:
             assert (batch_size * K) % 32 == 0, (
                 "the fold walks the row as 256 threads x float4")
         total_tiles_per_xcd = batch_size * n_wgs_per_xcd
+        # MPK_LMH_BAL (mpk_atoms.cuh): the LM head as one tile per worker.
+        if (os.environ.get("MPK_LMH_BAL", "0") == "1" and ep
+                and batch_size == 1 and output_per_wg >= 64):
+            assert self.num_workers % 8 == 0
+            assert n_wgs_per_xcd * output_per_wg // 16 >= self.num_workers // 8
+            total_tiles_per_xcd = self.num_workers // 8
         grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(norm_input, (-1, -1, -1), 1, True)
@@ -8224,6 +8244,7 @@ class PersistentKernel:
         vocab_shard: int,
         grid_dim: tuple,
         block_dim: tuple,
+        keys_chunk: int = 0,
     ):
         """argmax_reduce over a vocab-SHARDED logit slice, plus a peer exchange.
 
@@ -8236,6 +8257,11 @@ class PersistentKernel:
         ``xrank`` is a symmetric-heap u64 buffer of at least
         world_size * ARGMAX_XRANK_SLOT_U64 (= 8) words; the kernel writes this
         rank's slot on every peer and spins on the others'.
+
+        ``keys_chunk`` > 0 is MPK_LMH_ARGMAX: ``input_value`` is the LM head's
+        [batch, vocab_shard] logit row, there is no argmax_partial, and the
+        kernel reduces the LM head tiles' keys; ``keys_chunk`` is the chunk
+        argmax_partial would have used, whose tie order the keys carry.
         """
         assert len(input) == 2
         input_value, input_index = input
@@ -8244,8 +8270,12 @@ class PersistentKernel:
         assert output.num_dims == 2  # (batch_size, 1)
         assert self.world_size > 1, "xrank argmax needs more than one rank"
         num_parts = input_value.dim(1)
-        assert vocab_shard % num_parts == 0
-        chunk_size = vocab_shard // num_parts
+        if keys_chunk:
+            assert num_parts == vocab_shard and vocab_shard % keys_chunk == 0
+            chunk_size = keys_chunk
+        else:
+            assert vocab_shard % num_parts == 0
+            chunk_size = vocab_shard // num_parts
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input_value, (1, 0, -1), -1, True)
         tb_graph.new_input(input_index, (1, 0, -1), -1, True)

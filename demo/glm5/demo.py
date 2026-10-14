@@ -808,7 +808,8 @@ def pack_dense_mxfp8(w: torch.Tensor, output_per_wg: int = 64,
                      fp4: bool = False,
                      kmajor: int = 0,
                      fake_exact: bool = False,
-                     fp4_rne: bool = False) -> torch.Tensor:
+                     fp4_rne: bool = False,
+                     lm_head: bool = False) -> torch.Tensor:
     """Quantize + pack a 2-D [out, K] bf16 weight into the MXFP8 per-workgroup
     layout, in row chunks.
 
@@ -847,7 +848,9 @@ def pack_dense_mxfp8(w: torch.Tensor, output_per_wg: int = 64,
     # branch, the LM head or the GEMV kernel a permuted buffer, so refuse
     # rather than clamp: at the two sites that opt in, the width is fixed and
     # a mismatch means the geometry moved out from under this flag.
-    assert not kmajor or output_per_wg == 16, (
+    # MPK_LMH_BAL's LM head (lm_head=True) reads 16-row groups K-major at any
+    # width (_rnlm8_bal_issue).
+    assert not kmajor or output_per_wg == 16 or lm_head, (
         f"K-major is packed for OUTPUT_PER_WG == 16 only, got {output_per_wg}")
     # 64-byte granule regardless of width: it is what one instruction covers.
     parts = [pack_mxfp8_workgroup(*quant(w[r:r + step]), output_per_wg,
@@ -3366,6 +3369,10 @@ if __name__ == "__main__":
         # RMSNorm folded into the LM head, argmax -- differing only in which
         # norm weight, which gather slot and which token buffer.
         _head_w = {}
+        # MPK_LMH_BAL (mpk_atoms.cuh): the balanced LM head, which reads its
+        # weight K-major. The kernel takes that path only at one row under EP.
+        LMH_BAL = (os.environ.get("MPK_LMH_BAL", "0") == "1" and moe_ep
+                   and DENSE_MXFP8 and DENSE_MXFP8_OPW >= 64 and bs == 1)
 
         def _head_weights():
             """model.norm + the packed LM head, attached on first use.
@@ -3380,7 +3387,9 @@ if __name__ == "__main__":
                 _head_w["norm"] = _attach_input_keep(
                     model.model.norm.weight.data, "model_norm_weight")
                 _head_w["lm"] = _attach_input_keep(
-                    pack_dense_mxfp8(lm_head_weight, DENSE_MXFP8_OPW)
+                    pack_dense_mxfp8(lm_head_weight, DENSE_MXFP8_OPW,
+                                     kmajor=2 if LMH_BAL else 0,
+                                     lm_head=LMH_BAL)
                     if DENSE_MXFP8 else lm_head_weight, "lm_head")
             return _head_w
 
@@ -3471,24 +3480,39 @@ if __name__ == "__main__":
                     wgm=GANG_WGM,
                     block_dim=(256, 1, 1),
                 )
-            mpk.argmax_partial_layer(
-                input=logits,
-                output=(part_value, part_index),
-                grid_dim=(argmax_num_tasks, 1, 1),
-                block_dim=(256, 1, 1),
-            )
+            # MPK_LMH_ARGMAX (mpk_atoms.cuh): the balanced LM head's tiles
+            # leave their own argmax keys, and the xrank reduce takes those.
+            lmh_argmax = (LMHEAD_TP and DENSE_MXFP8 and moe_ep and bs == 1
+                          and os.environ.get("MPK_LMH_ARGMAX", "0") == "1")
+            if lmh_argmax:
+                os.environ["MPK_LMH_ARGMAX_CHUNK"] = str(
+                    vocab_shard // argmax_num_tasks)
+                # One key per tile: per worker balanced, per 64-row
+                # workgroup otherwise.
+                os.environ["MPK_LMH_ARGMAX_SLOTS"] = str(
+                    (num_workers // 8) * 8 if LMH_BAL
+                    else vocab_shard // DENSE_MXFP8_OPW)
+            else:
+                mpk.argmax_partial_layer(
+                    input=logits,
+                    output=(part_value, part_index),
+                    grid_dim=(argmax_num_tasks, 1, 1),
+                    block_dim=(256, 1, 1),
+                )
             if LMHEAD_TP:
                 # Each rank reduced only its own vocab slice. Rebase into the
                 # global vocab and take the max across the four ranks, so every
                 # rank emits the same token -- which is what G1 tests.
                 assert xrank is not None
                 mpk.argmax_reduce_xrank_layer(
-                    input=(part_value, part_index),
+                    input=(logits if lmh_argmax else part_value, part_index),
                     xrank=xrank,
                     output=out_tokens_t,
                     vocab_shard=vocab_shard,
                     grid_dim=(1, 1, 1),
                     block_dim=(256, 1, 1),
+                    keys_chunk=(vocab_shard // argmax_num_tasks
+                                if lmh_argmax else 0),
                 )
             else:
                 mpk.argmax_reduce_layer(
