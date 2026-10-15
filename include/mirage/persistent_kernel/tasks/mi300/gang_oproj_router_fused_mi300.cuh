@@ -1267,6 +1267,9 @@ __device__ __attribute__((always_inline)) void
           (!OPROJ_RP || UNABSORB_V || !MPK_OPROJ_MXFP4 || BATCH_SIZE != 1)) {
         __builtin_trap();
       }
+      if (MPK_OPROJ_PF_LDS && OPROJ_RP && t != op_tile) {
+        __builtin_trap();
+      }
       // RP reduces over the rank's own K slice of the activation row.
       void const *const oproj_act =
           OPROJ_RP ? (void const *)(static_cast<unsigned short const *>(
@@ -1288,6 +1291,12 @@ __device__ __attribute__((always_inline)) void
 #if MPK_OLL2_LDS
                              ,
                              /*LDS_OUT=*/OLL2
+#endif
+#if MPK_OPROJ_PF_LDS
+                             ,
+                             // Phase 8 of the fused layer, the only caller
+                             // under RP, left op_tile in LDS.
+                             /*W_LDS=*/OPROJ_RP
 #endif
                              >(
           oproj_act,

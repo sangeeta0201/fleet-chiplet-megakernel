@@ -2694,6 +2694,19 @@ gang_mla_full_layer_fused_kernel_mi300(
             static_cast<uint32_t>(oproj_tiles_per_xcd) * PF_WG_BYTES);
         uint32_t const pf_wg_voff =
             static_cast<uint32_t>(pf_tile) * PF_WG_BYTES;
+#if MPK_OPROJ_PF_LDS
+        // The tile itself into LDS, where the GEMV reads it.
+        static_assert(MPK_OPROJ_MXFP4 && MPK_OPROJ_RP && PF_K == 4096 &&
+                          OPROJ_ROWS_PER_WG == 32 &&
+                          PF_WG_BYTES == 17 * 4096,
+                      "MPK_OPROJ_PF_LDS is the RP MXFP4 o_proj tile");
+        gang_gemv_mxfp4_detail::w_lds_dma<PF_K, OPROJ_ROWS_PER_WG>(
+            pf_rsrc, pf_wg_voff,
+            __builtin_amdgcn_readfirstlane(static_cast<unsigned>(
+                reinterpret_cast<uintptr_t>(_fused_smem))) +
+                MPK_OPROJ_W_LDS_OFF +
+                __builtin_amdgcn_readfirstlane((unsigned)tid >> 6) * 1024u);
+#else
         // buffer_load_lds writes to M0 + lane_id * 16, so one wave64 fills
         // 1024 bytes and the four waves need distinct 1 KB slices.
         auto *pf_dst =
@@ -2750,6 +2763,7 @@ gang_mla_full_layer_fused_kernel_mi300(
           // back-to-back loads, one offset register.
           asm volatile("" : "+v"(pf_voff) : : "memory");
         }
+#endif // MPK_OPROJ_PF_LDS
       }
 #if MPK_OPROJ_PF_DEC && !MPK_OPROJ_PF_IDLE
       }

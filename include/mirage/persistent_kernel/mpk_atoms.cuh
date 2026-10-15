@@ -2356,6 +2356,42 @@ __device__ __forceinline__ bool
 #ifndef MPK_OLL2_LDS
 #define MPK_OLL2_LDS 1
 #endif
+// MPK_OLL2_NOST: under MPK_OLL2_LDS nothing reads the XCD's L2 row block any
+// more (the push builds its words from LDS), so the GEMV's epilogue lanes skip
+// that plain f32 store, which the GEMV's return drained (vmcnt(0)) between
+// the last o_proj FMA and wave 3's push. Same values pushed: bit-identical.
+// MEASURED 2026-10-14 on 98f581f, NP=8 1024/1024, n=3 interleaved, all 1024
+// rank-0 tokens identical: 3.376 3.372 3.383 vs 3.383 3.393 3.381 ms
+// (-0.007, inside the run-to-run spread); test_oproj_lds 2.40 -> 2.36 us a
+// tile. Default off.
+#ifndef MPK_OLL2_NOST
+#define MPK_OLL2_NOST 0
+#endif
+// MPK_OPROJ_PF_LDS: the Phase 8 o_proj weight prefetch lands the tile itself
+// in LDS (68 KB at MPK_OPROJ_W_LDS_OFF, rows XOR-swizzled by 16 B so a wave's
+// eight rows hit distinct banks) instead of only warming L2 through a
+// never-read 4 KB window, and the MXFP4 GEMV reads its weights and scales
+// from LDS (gang_gemv_mxfp4_mi300.cuh, gang_mla_full_layer_fused_mi300.cuh).
+// MPK_TRACE: the GEMV is 2.40 us a tile with every weight an L2 hit, two
+// batches of eight dwordx4 behind the staging. Same bytes, same FMA order:
+// bit-identical.
+// MEASURED 2026-10-14 on 98f581f, tests/standalone/test_oproj_lds.hip (192
+// tiles, L2-warm weights): 2.48 us a tile from LDS vs 2.40 from L2. The GEMV
+// is bound by its activation reads and v_cvt_scalef32_pk_bf16_fp4 (no
+// activation reads 2.08, no cvt 2.16, neither 1.68), not by its weight
+// loads; from LDS the weights queue behind those 64 ds_read_b128 a lane.
+// Default off; not run at NP=8.
+#ifndef MPK_OPROJ_PF_LDS
+#define MPK_OPROJ_PF_LDS 0
+#endif
+#if MPK_OPROJ_PF_LDS && (MPK_OPROJ_PF_IDLE || MPK_OPROJ_PF_DEC || \
+                         MPK_OPROJ_SKIP_TOPK ||                     \
+                         defined(MPK_GLM_OPROJ_PREFETCH_OFF))
+#error "MPK_OPROJ_PF_LDS: each worker prefetches the o_proj tile it runs"
+#endif
+// Past the GEMV's activation staging and LDS_OUT rows, the Phase 8 prefetch
+// window (64 KB) and the router's (68 KB).
+#define MPK_OPROJ_W_LDS_OFF (72 * 1024)
 // Force-inline the task kernels that are otherwise __noinline__. Every call
 // into a non-kernel function opens with s_waitcnt vmcnt(0) expcnt(0)
 // lgkmcnt(0) -- the callee cannot know what its caller left in flight -- so
@@ -2852,6 +2888,29 @@ __device__ __forceinline__ unsigned long long lmh_argmax_key(unsigned bits,
 // trip, not bytes. Off.
 #ifndef MPK_MERGE_LIVE
 #define MPK_MERGE_LIVE 0
+#endif
+// MPK_MERGE_EXP2B: the halves path's 34 exp2 as __builtin_amdgcn_exp2f, one
+// v_exp_f32, instead of exp2f's denormal-safe form (compare, two selects, an
+// add and a v_ldexp around it, plus an s_nop): ~200 of the merge's VALU
+// instructions, all after its loads land. The other operations are pinned to
+// the forms the default's final ISA has (the vectorizer regroups them around a
+// speculatable exp2). The results differ only where exp2f returns a denormal
+// (argument < -126), i.e. a weight under 2^-126 beside the max chunk's 1,
+// below the f32 ulp of every sum it joins.
+// MEASURED 2026-10-14 on 98f581f, NP=8 1024/1024, n=3 interleaved, all 1024
+// rank-0 tokens identical: 3.352 3.361 3.361 vs 3.383 3.393 3.381 ms
+// (-0.028); again in a03, 3.365 3.359 3.350. MPK_TRACE: the merge item
+// 2.00 -> 1.56 us. Defaulted, interleaved n=3 default vs =0: 3.356 3.353
+// 3.350 vs 3.394 3.389 3.384 ms (-0.036), all tokens identical; standalone
+// 90 PASS / 0 FAIL, ppl512 2.3670 on all 8 ranks, longseq 256/512/1024 G1
+// PASS. Default on.
+#ifndef MPK_MERGE_EXP2B
+#define MPK_MERGE_EXP2B 1
+#endif
+#if MPK_MERGE_EXP2B && (MPK_MERGE_LSE_LDS || MPK_DEC_LSE_LL || \
+                        MPK_DEC_MERGE_LL32 || MPK_MERGE_LIVE ||  \
+                        MPK_DEC_PART_F16)
+#error "MPK_MERGE_EXP2B pins the halves path's default load branch only"
 #endif
 // MPK_DEC_PART_F16: the decode's split-KV partials leave as f16 instead of
 // f32 -- 8 KB a decode item instead of 16, one write-through dwordx2 a lane

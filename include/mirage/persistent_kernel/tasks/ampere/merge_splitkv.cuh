@@ -901,10 +901,18 @@ __device__ __forceinline__ void
 #endif
         }
 #else
+#if MPK_MERGE_EXP2B
+        float lr[HC];
+#endif
 #pragma unroll
         for (int c = 0; c < HC; ++c) {
           int const ll = lse0 + c * NUM_QO_HEADS_PER_KV;
+#if MPK_MERGE_EXP2B
+          lr[c] = lse_g[ll];
+          l[c] = lr[c] * 1.44269504088896340736f;
+#else
           l[c] = lse_g[ll] * 1.44269504088896340736f;
+#endif
           // MPK_PROBE_MERGE63: PRICING PROBE, WRONG OUTPUT -- the last o load
           // dropped, so the 2 * HC = 64 loads fit vmcnt's 63 in flight.
           o[c] = (MPK_PROBE_MERGE63 && c == HC - 1) ? 0.f
@@ -921,18 +929,36 @@ __device__ __forceinline__ void
         os = 0.f;
 #pragma unroll
         for (int c = 0; c < HC; ++c) {
+#if MPK_MERGE_EXP2B
+          // Each op pinned to the form the default's final ISA has, which the
+          // vectorizer would otherwise regroup around a speculatable exp2:
+          // fma(lse, log2e, -m), a plain add into d, fma(o, w, os).
+          float const w =
+              __builtin_amdgcn_exp2f(__builtin_fmaf(lr[c], 1.44269504088896340736f, -m));
+          d += w;
+          os = __builtin_fmaf(o[c], w, os);
+#else
           float const w = ptx_exp2(l[c] - m);
           d += w;
           os += w * o[c];
+#endif
         }
       }
       float const mp = __shfl_xor(m, 16);
       float const dp = __shfl_xor(d, 16);
       float const op = __shfl_xor(os, 16);
       float const mm = max(m, mp);
+#if MPK_MERGE_EXP2B
+      float const a = __builtin_amdgcn_exp2f(m - mm);
+      float const b = __builtin_amdgcn_exp2f(mp - mm);
+      // The default's combine: fma(op, b, os * a) over fma(dp, b, d * a).
+      float const out_f = __fdividef(__builtin_fmaf(op, b, os * a),
+                                     __builtin_fmaf(dp, b, d * a));
+#else
       float const a = ptx_exp2(m - mm);
       float const b = ptx_exp2(mp - mm);
       float const out_f = __fdividef(os * a + op * b, d * a + dp * b);
+#endif
       float const partner = __shfl_down(out_f, 1, THREADS_PER_TOKEN);
       if (half == 0 && (thread_in_group & 1) == 0) {
         int const out_offset = first_token_pos * OUT_TOKEN_STRIDE +

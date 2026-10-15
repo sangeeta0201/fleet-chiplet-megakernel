@@ -132,6 +132,57 @@ constexpr size_t lds_out_off() {
          ~(size_t)255;
 }
 #endif
+#if MPK_OPROJ_PF_LDS
+// MPK_OPROJ_PF_LDS: one 32-row x 4096-K tile -- 64 KB of nibbles, then 4 KB of
+// scales -- copied into LDS at MPK_OPROJ_W_LDS_OFF by DMA in 17 4 KB rounds,
+// lane l of wave w writing m0 + 1 KB w + 16 l. Data round j is rows 2j and
+// 2j + 1; the odd row's 16-byte chunks sit XOR 8, so the eight rows a wave
+// reads per trip land on two disjoint sets of bank groups instead of one
+// (w_lds_data below is the read side). The scale round is a straight copy.
+// Every round in one asm block, as mla_dma_tile does: anything the compiler
+// placed between two rounds that touched VMEM would bring a vmcnt wait.
+// m0_base is this wave's slice of round 0. The leading s_nop 4 covers the
+// rsrc words' v_readfirstlane (VALU-written SGPRs read by VMEM).
+typedef int w_i32x4_t __attribute__((ext_vector_type(4)));
+template <int REDUCTION_SIZE, int ROWS_PER_WG>
+__device__ __forceinline__ void w_lds_dma(w_i32x4_t rsrc, unsigned tile_voff,
+                                          unsigned m0_base) {
+  static_assert(REDUCTION_SIZE == 4096 && ROWS_PER_WG == 32,
+                "the round map is the o_proj tile's: two 2 KB rows a round, "
+                "sixteen data rounds and one scale round");
+  int const tid = threadIdx.x;
+  unsigned const va =
+      tile_voff + 16u * (unsigned)(tid ^ ((tid & 128) >> 4));
+  unsigned const vb = tile_voff + 16u * (unsigned)tid;
+  unsigned so;
+#define W_LDS_NEXT(V)                                                          \
+  "s_add_u32 m0, m0, 0x1000\n\t"                                               \
+  "s_add_u32 %[so], %[so], 0x1000\n\t"                                         \
+  "s_nop 0\n\t"                                                                \
+  "buffer_load_dwordx4 %[" V "], %[rsrc], %[so] offen lds\n\t"
+  asm volatile("s_nop 4\n\t"
+               "s_mov_b32 m0, %[m0]\n\t"
+               "s_mov_b32 %[so], 0\n\t"
+               "s_nop 0\n\t"
+               "buffer_load_dwordx4 %[va], %[rsrc], %[so] offen lds\n\t"
+               W_LDS_NEXT("va") W_LDS_NEXT("va") W_LDS_NEXT("va")
+               W_LDS_NEXT("va") W_LDS_NEXT("va") W_LDS_NEXT("va")
+               W_LDS_NEXT("va") W_LDS_NEXT("va") W_LDS_NEXT("va")
+               W_LDS_NEXT("va") W_LDS_NEXT("va") W_LDS_NEXT("va")
+               W_LDS_NEXT("va") W_LDS_NEXT("va") W_LDS_NEXT("va")
+               W_LDS_NEXT("vb")
+               : [so] "=&s"(so)
+               : [rsrc] "s"(rsrc), [va] "v"(va), [vb] "v"(vb),
+                 [m0] "s"(m0_base)
+               : "memory", "m0", "scc");
+#undef W_LDS_NEXT
+}
+// Byte offset of (row, 16-byte chunk c) of the tile's data half in LDS.
+template <int REDUCTION_SIZE>
+__device__ __forceinline__ unsigned w_lds_data(int row, int c) {
+  return (unsigned)(row * (REDUCTION_SIZE / 2) + 16 * (c ^ ((row & 1) << 3)));
+}
+#endif
 } // namespace gang_gemv_mxfp4_detail
 
 template <int BATCH_SIZE, // = m_per_tile
@@ -148,6 +199,11 @@ template <int BATCH_SIZE, // = m_per_tile
 #if MPK_OLL2_LDS
           ,
           bool LDS_OUT = false
+#endif
+#if MPK_OPROJ_PF_LDS
+          ,
+          // The caller's Phase 8 prefetch left this tile in LDS (w_lds_dma).
+          bool W_LDS = false
 #endif
           >
 #if MPK_GEMV4_INLINE
@@ -273,6 +329,18 @@ __device__ __noinline__ void
   unsigned char const *s_row =
       wg + WG_DATA_BYTES +
       static_cast<size_t>(row) * (REDUCTION_SIZE / SCALE_BLOCK);
+#if MPK_OPROJ_PF_LDS
+  unsigned char const *const w_lds =
+      reinterpret_cast<unsigned char const *>(_fused_smem) +
+      MPK_OPROJ_W_LDS_OFF;
+  unsigned char const *const s_lds =
+      w_lds + WG_DATA_BYTES +
+      static_cast<size_t>(row) * (REDUCTION_SIZE / SCALE_BLOCK);
+  static_assert(!W_LDS || (WG_BYTES == 17 * 4096 && BATCH_SIZE == 1 &&
+                           MPK_OPROJ_W_LDS_OFF + WG_BYTES <=
+                               mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE),
+                "W_LDS reads the o_proj tile w_lds_dma lays out");
+#endif
 
   // One wave per SIMD, so the only latency hiding is how many loads a single
   // thread keeps in flight. ITERS is half the fp8 kernel's for the same K, so
@@ -519,6 +587,13 @@ __device__ __noinline__ void
       if (WF_ANY && i0 + u < WF_TRIPS) {
         wv[u] = wv0[i0 + u];
         sv[u] = sv0[i0 + u];
+#if MPK_OPROJ_PF_LDS
+      } else if constexpr (W_LDS) {
+        static_assert(!WF_ANY, "W_LDS has no global weight loads to hoist");
+        wv[u] = *reinterpret_cast<u32x4_t const *>(
+            w_lds + gang_gemv_mxfp4_detail::w_lds_data<REDUCTION_SIZE>(row, c));
+        sv[u] = s_lds[c];
+#endif
       } else {
       // MPK_ATTN_STREAM_NT: weight + scale only. o_proj is the biggest single
       // weight stream in the attention half (100.7 MB/layer/GPU before the
@@ -638,6 +713,10 @@ __device__ __noinline__ void
         float *const Of = static_cast<float *>(output_ptr);
         if constexpr (WRITE_THROUGH) {
           st_wt_u32(&Of[idx], __float_as_uint(v));
+#if MPK_OLL2_LDS && MPK_OLL2_NOST
+        } else if constexpr (LDS_OUT) {
+          (void)Of;
+#endif
         } else {
           Of[idx] = v;
         }
