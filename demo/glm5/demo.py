@@ -1981,6 +1981,9 @@ if __name__ == "__main__":
         # rotation past, where the un-absorbed q_b runs 16-column K-parallel
         # tiles of 33 KB; the slower q_b tile and the extra bytes outweigh
         # the W_UK stage (~3 us + its barrier in the MPK_TRACE profile). Off.
+        # Re-run 2026-10-15 on bdc7930: device trap at launch on all 8 ranks
+        # (HSA_STATUS_ERROR_EXCEPTION 0x1016), 2 of 2 -- the absorbed shard
+        # has not kept up with the LL query path. Not debugged.
         QB_ABS_TP = os.environ.get("GLM_QB_ABS_TP", "0") == "1"
         UNABSORB_K = (int(os.environ.get("GLM_UNABSORB_QB", "1")) == 1
                       and not QB_ABS_TP

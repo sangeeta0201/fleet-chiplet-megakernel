@@ -117,6 +117,16 @@ fi
 #
 # The NP=8 default stays 232 -- the fault above is real and this box reproduces
 # it. Only the NP=4 path moves.
+#
+# The fault needs a scheduler block that cannot share a worker's CU, and at
+# the default MPK_WORKER_LDS_KB=155 a worker leaves 16 B of the CU's 160 KB
+# against the scheduler's 64 B of static LDS. At 154 it leaves 1040 B.
+# MEASURED 2026-10-15 on bdc7930, NP=8 1024/1024, interleaved, every arm's
+# rank-0 tokens identical to the control's:
+#   control (232)                       3.374 3.361 ms
+#   MPK_WORKER_LDS_KB=154               3.356 3.363
+#   MPK_WORKER_LDS_KB=154 + 240 workers 3.360 3.360   (no launch hang, 2/2)
+# -0.008 either way, inside the control's own spread. 232 stays.
 if [ "$NP" -ge 8 ]; then
   export MPK_NUM_WORKERS="${MPK_NUM_WORKERS:-232}"
 else
