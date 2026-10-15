@@ -2147,7 +2147,10 @@ if __name__ == "__main__":
             # ppl512 2.5122 (64 chunks), ppl128 2.7924 (17), longseq
             # 256/512/1024 G1 PASS; NP=8 ppl512 2.5800 2.6163 against 2.6083
             # 2.5410 at cap 32. Default 64. 96 re-measured 2026-10-11 on the
-            # d754c72 defaults: 4.105 vs 4.031 ms (+0.074).
+            # d754c72 defaults: 4.105 vs 4.031 ms (+0.074). 128 re-measured
+            # 2026-10-15 on bdc7930, where every item at 1024-2048 context then
+            # runs one KV trip instead of two: 3.567 3.575 vs 3.366 3.369 ms
+            # (+0.204), text coherent, G1 PASS.
             _hl_chunks_ok = (
                 os.environ.get("MPK_MLA_HEAD_LOCAL", "1") != "0"
                 and moe_ep and world_size > 1 and FUSE_FULL_LAYER
