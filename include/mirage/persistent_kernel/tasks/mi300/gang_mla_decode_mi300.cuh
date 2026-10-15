@@ -343,6 +343,27 @@ __device__ __forceinline__ void mla_tile_bar() { __syncthreads(); }
 #ifndef MPK_MLA_QK_2ACC
 #define MPK_MLA_QK_2ACC 0
 #endif
+// MPK_DEC_QK_KSPLIT: the four waves split QK's 18 k32 steps instead of each
+// running all 18 for the same scores -- wave w takes steps w, w + 4, w + 8,
+// ... (5, 5, 4, 4, one swizzle parity each), stages only those Q fragments,
+// and the four 16 x 16 partials are summed in wave order through the dead Q
+// staging block after one LDS barrier. A wave's chain is 5 deep, not 18, and
+// it reads a quarter of the K tile and of Q. VALUE CHANGE: the score sum is
+// reassociated (((p0 + p1) + p2) + p3), so the tokens may move; ppl-gated.
+// test_mla_decode 66/66 at both WRITE_THROUGH arms (the test sizes its LDS
+// for the 96 KB exchange). Final ISA: 5 QK MFMAs a wave instead of 18,
+// ds_read_b128 72 -> 28, one more s_barrier a trip.
+// MEASURED SLOWER 2026-10-15 on 792d601, NP=8 1024/1024, n=3 interleaved,
+// tokens moved, text coherent, G1 PASS: 3.377 3.380 3.367 vs 3.365 3.371
+// 3.365 ms (+0.008). Sparse trace (S48/S75): the trip-0 QK is 0.40 us as one
+// 18-deep chain and 0.44 us split -- the chain was never latency-bound, the
+// four waves run it side by side on four SIMDs, and the exchange costs what
+// the shorter chain saves. The Q stage shrinks 0.44 -> 0.28 us, but ~1% of
+// items (the newest chunks', three tiles) grow ~1 us and one of them is the
+// last item. Trip 0 on the default: QK 0.40, softmax 0.16, PV 0.44 us. Off.
+#ifndef MPK_DEC_QK_KSPLIT
+#define MPK_DEC_QK_KSPLIT 0
+#endif
 #ifndef MPK_MLA_DECODE_BATCH
 #define MPK_MLA_DECODE_BATCH 0
 #endif
@@ -364,6 +385,14 @@ __device__ __forceinline__ void mla_tile_bar() { __syncthreads(); }
 #if MPK_DEC_QK2T && (MPK_MLA_QK_SPLIT || MPK_MLA_QK_2ACC || !MPK_MLA_QK_PIPE2 || \
                      !MPK_MLA_KV_SWZ || MPK_MLA_DECODE_BATCH || MPK_MLA_DECODE_DMA_PF)
 #error "MPK_DEC_QK2T is a variant of the pipelined swizzled QK and owns a[36:39]"
+#endif
+#if MPK_DEC_QK_KSPLIT && (MPK_MLA_QK_SPLIT || MPK_MLA_QK_2ACC || MPK_DEC_QK2T || \
+                          !MPK_MLA_KV_SWZ || !MPK_MLA_OACC_VGPR ||          \
+                          MPK_MLA_DECODE_BATCH || MPK_MLA_DECODE_DMA_PF || \
+                          MPK_DEC_PRE_NOBAR)
+// PRE_NOBAR: the score exchange relies on every trip's closing barrier to
+// order the next trip's partial writes behind this trip's reads.
+#error "MPK_DEC_QK_KSPLIT replaces the swizzled single-chain QK of the default tile loop"
 #endif
 
 #if MPK_DEC_OUT_B128 || MPK_DEC_MERGE_LL32
@@ -1363,7 +1392,14 @@ __device__ __noinline__ void
   }
 
   // Q first, then one KV tile per loop trip from HBM.
+#if MPK_DEC_QK_KSPLIT
+  // Four waves, as every per-lane index in this kernel already assumes.
+  constexpr int QKS_J = (NUM_K32 + 3) / 4;
+  int const qks_w = __builtin_amdgcn_readfirstlane(warp_id);
+  __bf16 qr[QKS_J][8];
+#else
   __bf16 qr[NUM_K32][8];
+#endif
   if (BATCH_SIZE == 1 && q_ll != nullptr) {
     constexpr int Q_LL_HEADS = 8;
     constexpr int Q_WORDS = Q_LL_HEADS * QK_DIM / 2;
@@ -1512,6 +1548,19 @@ __device__ __noinline__ void
     unsigned short const *const q_row_lds =
         reinterpret_cast<unsigned short const *>(q_lds) +
         (mine ? own : 0) * QK_DIM;
+#if MPK_DEC_QK_KSPLIT
+    // This wave's k32 steps only: qr[j] is step qks_w + 4 j.
+#pragma unroll
+    for (int j = 0; j < QKS_J; j++) {
+      int const kc = qks_w + 4 * j;
+      u32x4_t raw = {0u, 0u, 0u, 0u};
+      if (mine && kc < NUM_K32) {
+        raw = *reinterpret_cast<u32x4_t const *>(q_row_lds + kc * 32 +
+                                                 kgrp * 8);
+      }
+      __builtin_memcpy(&qr[j][0], &raw, 16);
+    }
+#else
 #pragma unroll
     for (int kc = 0; kc < NUM_K32; kc++) {
       int dim_off = kc * 32 + kgrp * 8;
@@ -1521,18 +1570,31 @@ __device__ __noinline__ void
       }
       __builtin_memcpy(&qr[kc][0], &raw, 16);
     }
+#endif
   } else {
     int const q_head = q_head_group * Q_HEADS_PER_GROUP + midx;
     char const *q_ptr = reinterpret_cast<char const *>(q_workspace_ptr) +
                         (static_cast<long>(q_row) * Q_WORKSPACE_STRIDE +
                          static_cast<long>(q_head) * QK_DIM) *
                             2;
+#if MPK_DEC_QK_KSPLIT
+#pragma unroll
+    for (int j = 0; j < QKS_J; j++) {
+      int const kc = qks_w + 4 * j;
+      u32x4_t raw = {0u, 0u, 0u, 0u};
+      if (kc < NUM_K32) {
+        raw = ld_g<u32x4_t>(q_ptr + (kc * 32 + kgrp * 8) * 2);
+      }
+      __builtin_memcpy(&qr[j][0], &raw, 16);
+    }
+#else
 #pragma unroll
     for (int kc = 0; kc < NUM_K32; kc++) {
       int dim_off = kc * 32 + kgrp * 8;
       u32x4_t const raw = ld_g<u32x4_t>(q_ptr + dim_off * 2);
       __builtin_memcpy(&qr[kc][0], &raw, 16);
     }
+#endif
   }
 
   // ===== MAIN LOOP =====
@@ -1821,6 +1883,45 @@ __device__ __noinline__ void
         gang_mla_decode_detail::mla_qk_acc2_mfma<1>(kr1, qr[kc + 1]);
       }
       __mfma_hd64_fp32x4 scores = gang_mla_decode_detail::mla_qk_acc2_read();
+#elif MPK_DEC_QK_KSPLIT
+      __mfma_hd64_fp32x4 scores;
+      {
+        using kq_t = gang_mla_decode_detail::bf16x8_t;
+        // Steps qks_w + 4 j share one parity, so one swizzle base.
+        __bf16 const *const kb =
+            &cur_kv[((qks_w & 1) ? kswz_o : kswz_e) + qks_w * 32];
+        kq_t kq[QKS_J];
+#pragma unroll
+        for (int j = 0; j < QKS_J; j++) {
+          if (qks_w + 4 * j < NUM_K32) {
+            kq[j] = *reinterpret_cast<kq_t const *>(kb + j * 128);
+          }
+        }
+        mla_qk_acc32_zero();
+#pragma unroll
+        for (int j = 0; j < QKS_J; j++) {
+          if (qks_w + 4 * j < NUM_K32) {
+            gang_mla_decode_detail::mla_qk_acc32_mfma_kv(kq[j], qr[j]);
+          }
+        }
+        __mfma_hd64_fp32x4 const part = mla_qk_acc32_read();
+        // The Q staging block is dead past the first trip's tile barrier,
+        // which every wave's Q reads retired ahead of; each trip's closing
+        // barrier orders the next trip's writes after this one's reads.
+        __mfma_hd64_fp32x4 *const qks_x = reinterpret_cast<__mfma_hd64_fp32x4 *>(
+            _mla_decode_smem + 96 * 1024);
+        qks_x[qks_w * 64 + lane] = part;
+        asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+        __builtin_amdgcn_s_barrier();
+        __mfma_hd64_fp32x4 const p0 = qks_x[lane];
+        __mfma_hd64_fp32x4 const p1 = qks_x[64 + lane];
+        __mfma_hd64_fp32x4 const p2 = qks_x[128 + lane];
+        __mfma_hd64_fp32x4 const p3 = qks_x[192 + lane];
+#pragma unroll
+        for (int h = 0; h < 4; h++) {
+          scores[h] = ((p0[h] + p1[h]) + p2[h]) + p3[h];
+        }
+      }
 #elif (MPK_MLA_QK_PIPE || MPK_MLA_QK_PIPE2) && MPK_MLA_KV_SWZ
       __mfma_hd64_fp32x4 scores;
 #if MPK_DEC_QK2T

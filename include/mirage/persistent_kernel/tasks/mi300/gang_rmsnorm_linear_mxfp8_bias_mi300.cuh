@@ -145,6 +145,10 @@ namespace kernel {
 #ifndef MPK_QUANT_V16
 #define MPK_QUANT_V16 0
 #endif
+// See mpk_atoms.cuh.
+#ifndef MPK_PROBE_QKVA_HALFK
+#define MPK_PROBE_QKVA_HALFK 0
+#endif
 template <int REDUCTION_SIZE,
           bool SRC_IS_GLOBAL,
           bool NW_IS_LDS = false,
@@ -4264,7 +4268,9 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
     static_assert(OUTPUT_PER_WG == 16,
                   "the K-parallel branch covers 16 output rows per workgroup");
     constexpr int TOTAL_K_ITERS = MFMA_ITERS;
-    constexpr int ITERS_PER_WAVE = TOTAL_K_ITERS / NUM_WAVES;
+    constexpr int ITERS_PER_WAVE =
+        TOTAL_K_ITERS / NUM_WAVES /
+        ((MPK_PROBE_QKVA_HALFK && FUSE_RESADD) ? 2 : 1);
     static_assert(TOTAL_K_ITERS % NUM_WAVES == 0,
                   "MFMA_ITERS must be divisible by NUM_WAVES for K-parallel");
     static_assert(ITERS_PER_WAVE >= 4,

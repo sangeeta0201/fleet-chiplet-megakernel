@@ -2188,6 +2188,23 @@ __device__ __forceinline__ bool
 #ifndef MPK_PROBE_OPROJ_HALFK
 #define MPK_PROBE_OPROJ_HALFK 0
 #endif
+// MPK_PROBE_QKVA_HALFK: PRICING PROBE, WRONG OUTPUT. qkv_a's K-parallel tile
+// runs half its k-tiles per wave (6 of 12; the hoisted prefill still seeds
+// the first four): how much of a faster qkv_a weight stream the wall keeps.
+// Asked before building a qkv_a tile that DMAs its 99 KB slab into LDS while
+// it waits on the XSPLIT exchange: final ISA has the quantizer's closing
+// barrier behind a vmcnt(9) on the hoisted prefill's first k-tile, so S54 ->
+// S62 (1.13 us) is that load's L2 round trip, and the K-loop (1.64 us) is
+// two more -- the slab would delete both.
+// MEASURED 2026-10-15 on 792d601, NP=8 1024/1024, n=2 interleaved, control
+// tokens identical to the default: 3.364 3.362 vs 3.361 3.379 ms (-0.007,
+// noise). MPK_TRACE, n=1 each: S61 max -0.71 us, and every later stamp of the
+// layer -0.5..-0.7 (period -0.45 us); traced wall 3.536 -> 3.515. The dense
+// trace's stamp stores make qkv_a critical; untraced, the wall keeps ~0.1 us
+// of a 0.7 us faster tile. The LDS slab is not worth building on this.
+#ifndef MPK_PROBE_QKVA_HALFK
+#define MPK_PROBE_QKVA_HALFK 0
+#endif
 // MPK_OPROJ_PF_MIN_US: the Phase 8 o_proj weight prefetch waits until this
 // many us past the worker's layer entry. Under MPK_QKVA_SKIP_PAD four workers
 // on XCD 6 (ranks 20-23, decode-idle at this context) reach Phase 8 ~3.8 us
@@ -3407,6 +3424,17 @@ __device__ __forceinline__ unsigned long long lmh_argmax_key(unsigned bits,
 #else
 #define MPK_ML_PF 0
 #endif
+// Tried 2026-10-15 and not kept: MPK_ML_PF's loads issued behind the layer
+// instead of in front of it. In front, the tile loop's header vmcnt(0) waits
+// them out on every worker (sparse trace S11 -> S10 0.48 us). Behind is not
+// reachable: any load after _execute_gang_task returns, inline asm included,
+// gets the join's vmcnt(0) ahead of it (final ISA); and handing them out of
+// the fused layer's end needs LDS the worker does not have -- 8176 B static
+// + 155648 B dynamic leave 16 B of the CU's 160 KB, and a 488 B transport
+// block fails at dispatch (HSA_STATUS_ERROR_INVALID_ALLOCATION). Nor would it
+// pay where it counts: the qkv_a tiles' S54 is the same (+-0.05 us) whether
+// their worker left the previous layer's W2 2.2, 3.5 or 9.4 us earlier, so
+// the boundary does not start qkv_a.
 
 // MPK_OPROJ_MXFP4: o_proj's weight is E2M1 nibbles rather than E4M3 bytes.
 // Set by GLM_OPROJ_MXFP4, which also switches the host packer -- the two must
