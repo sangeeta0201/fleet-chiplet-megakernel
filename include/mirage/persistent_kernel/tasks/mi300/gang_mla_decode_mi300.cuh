@@ -386,7 +386,12 @@ __device__ __forceinline__ void mla_tile_bar() { __syncthreads(); }
 // step's LSE into one v_fmamk_f32 (1 ulp on a few heads, partials
 // bit-identical under test_mla_decode's TEST_DUMP), which MoE routing
 // near-ties amplify. With the LSE pinned: 2.3670 at =0 and =1, per-position
-// NLL identical to the default's. Off.
+// NLL identical to the default's.
+// MEASURED NULL on d816bd4 (LSE pinned), NP=8 1024/1024, n=3 interleaved,
+// G1 PASS, text coherent, tokens identical across reps: 3.356 3.356 3.356
+// vs 3.359 3.355 3.355 ms. Standalone 66/66, longseq 256/512/1024 G1 PASS.
+// The -0.010 above was measured while only the WPT image had the fused LSE;
+// with it pinned in both, the difference is gone. Off.
 #ifndef MPK_DEC_WPT
 #define MPK_DEC_WPT 0
 #endif
