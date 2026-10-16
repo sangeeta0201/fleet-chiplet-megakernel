@@ -51,10 +51,13 @@ static constexpr int LDS_BASE_BYTES =
 static constexpr int LDS_BATCH_BYTES = MPK_MLA_DECODE_BATCH * 16 * QK_DIM * 2;
 static constexpr int LDS_TILE_BYTES =
     LDS_BATCH_BYTES > LDS_BASE_BYTES ? LDS_BATCH_BYTES : LDS_BASE_BYTES;
-// MPK_MLA_QK_SPLIT hands the scores over at 96 KB of dynamic LDS, and
-// MPK_DEC_QK_KSPLIT its four waves' partials (4 KB there).
+// MPK_MLA_QK_SPLIT hands the scores over at 96 KB of dynamic LDS,
+// MPK_DEC_QK_KSPLIT its four waves' partials (4 KB there), and MPK_DEC_WPT
+// its tiles' weights and maxima (4.25 KB). WPT's extra tile buffers sit
+// below 72 KB, inside that, as do MPK_DEC_VT's V^T tiles (36..76 KB).
 static constexpr int LDS_SCORES_END =
-    MPK_DEC_QK_KSPLIT ? 100 * 1024 : (MPK_MLA_QK_SPLIT ? 98 * 1024 : 0);
+    MPK_DEC_WPT ? 101 * 1024
+    : MPK_DEC_QK_KSPLIT ? 100 * 1024 : (MPK_MLA_QK_SPLIT ? 98 * 1024 : 0);
 static constexpr int LDS_BYTES =
     LDS_TILE_BYTES < LDS_SCORES_END ? LDS_SCORES_END : LDS_TILE_BYTES;
 

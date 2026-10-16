@@ -364,6 +364,64 @@ __device__ __forceinline__ void mla_tile_bar() { __syncthreads(); }
 #ifndef MPK_DEC_QK_KSPLIT
 #define MPK_DEC_QK_KSPLIT 0
 #endif
+// MPK_DEC_WPT: a chunk of 2..4 KV tiles runs its tiles side by side, one per
+// wave, with one cross-wave exchange of the tile maxima and weights before
+// PV, instead of one trip per tile on all four waves (see the tile loop).
+// VALUE CHANGE: the softmax is combined against the chunk max in one step
+// rather than online across trips; ppl-gated.
+// test_mla_decode 66/66 at both WRITE_THROUGH arms; worker_kernel unchanged
+// (offline: 390 VGPRs, 340 SGPR spills). Sparse trace (S48/S77/S49): a
+// two-tile item's QK + exchange + PV is 1.92 us against two 1.0 us trips,
+// compute 2.20 -> 2.08 us and the first tile barrier 0.40 -> 0.20 us; the
+// merge start follows the last decode item, which stays the rendezvous' last
+// arrival by ~4 us.
+// MEASURED 2026-10-16 on 1b7c0ff, NP=8 1024/1024, interleaved, tokens moved,
+// text coherent, G1 PASS: 3.356 3.363 3.353 vs 3.366 3.359 3.373 ms; again
+// 3.352 3.357 vs 3.368 3.359; again 3.351 3.358 vs 3.364 3.370. Pooled n=7
+// pairs: 3.356 vs 3.366 (-0.010); confirmed as the default 3.352 3.349 vs
+// 3.359 3.366. Standalone 90/0 and longseq 256/512/1024 G1 PASS.
+// FAILS PPL: ppl512 2.4493 on all 8 ranks against 2.3670 (=0, same stage).
+// Per-position NLL is identical through position 14 and departs at 15, the
+// first step with two live chunks -- below 1025 tokens every chunk is one
+// tile, so the WPT branch never runs there. It reproduces with the branch
+// compiled in but unreachable (wpt &&= seqlen_k < 0): 2.4493, same first
+// position. So the code's presence changes the one-tile path's result,
+// deterministically; the register-path KV loads stay behind the buffer_inv
+// in both images. Not localized -- a compile-sensitive hazard in the default
+// tile loop the standalone test does not see. Off.
+#ifndef MPK_DEC_WPT
+#define MPK_DEC_WPT 0
+#endif
+// MPK_DEC_VT: under MPK_DEC_WPT, a two-tile chunk's preloaded tiles also
+// exist as V^T -- [512 dims][16 tokens] bf16 (rows padded to 20) at 36 KB of
+// dynamic LDS -- so PV reads a
+// lane's four tokens of one dim as one ds_read_b64 instead of four
+// ds_read_u16 out of the swizzled rows. They are transposed in the decode's
+// prologue, ahead of the query poll (the span the query takes to land); a
+// tile on the register path -- the current row's -- keeps the u16 reads, so
+// the last item pays no transpose after its query. Same values:
+// bit-identical to MPK_DEC_WPT (test_mla_decode 66/66, preload cases
+// bit-identical; megakernel tokens identical to WPT's).
+// MEASURED NULL 2026-10-16 on 1b7c0ff + MPK_DEC_WPT, n=2 interleaved: 3.350
+// 3.355 vs WPT alone 3.351 3.358 ms. The median item's compute drops 2.04 ->
+// 1.64 us (sparse trace), but the worker image grows 390 -> 394 VGPRs and
+// re-allocates. A first form that also transposed the register-path tile
+// after its load, with a bank-conflicted transpose, put ~1.2 us ahead of the
+// last item's QK: +0.03 ms. Off.
+#ifndef MPK_DEC_VT
+#define MPK_DEC_VT 0
+#endif
+#if MPK_DEC_VT && !MPK_DEC_WPT
+#error "MPK_DEC_VT's transposed tiles are read by MPK_DEC_WPT's PV"
+#endif
+// V^T row stride in bf16: 16 tokens padded to 20 (40 B), so the transpose's
+// lane-per-dim b64 stores and PV's lane-per-(dim, token quad) b64 loads both
+// stay within two-way bank conflicts. Two tiles at 36 KB: past the two
+// preloaded tiles, in the buffers MPK_DEC_WPT only uses at three or four
+// tiles, where V^T is off.
+#define MPK_DEC_VTS 20
+#define MPK_DEC_VT_TILE (512 * MPK_DEC_VTS)
+#define MPK_DEC_VT_LDS_OFF (36 * 1024)
 #ifndef MPK_MLA_DECODE_BATCH
 #define MPK_MLA_DECODE_BATCH 0
 #endif
@@ -393,6 +451,10 @@ __device__ __forceinline__ void mla_tile_bar() { __syncthreads(); }
 // PRE_NOBAR: the score exchange relies on every trip's closing barrier to
 // order the next trip's partial writes behind this trip's reads.
 #error "MPK_DEC_QK_KSPLIT replaces the swizzled single-chain QK of the default tile loop"
+#endif
+#if MPK_DEC_WPT && (MPK_DEC_QK_KSPLIT || MPK_MLA_QK_SPLIT || MPK_MLA_QK_2ACC || \
+                    MPK_DEC_QK2T || MPK_MLA_DECODE_BATCH || MPK_MLA_DECODE_DMA_PF)
+#error "MPK_DEC_WPT replaces the default tile loop's trips"
 #endif
 
 #if MPK_DEC_OUT_B128 || MPK_DEC_MERGE_LL32
@@ -1042,6 +1104,37 @@ __device__ __forceinline__ void __ldg_bf16x4_raw(uint2 *__restrict__ dst,
   dst->x = v.x;
   dst->y = v.y;
 }
+#if MPK_DEC_VT
+// V^T of one swizzled KV tile (MPK_MLA_KV_SWZ: 16-byte chunk c of row r at
+// c ^ (r >> 1)): vt[d * MPK_DEC_VTS + r] = tile[r][d] for the 512 latent
+// dims. Wave w, round j takes token quad (w * 8 + j) & 3 and dims
+// ((w * 8 + j) >> 2) * 64 + lane: each of its four u16 reads is one row's 64
+// consecutive dims (one 128 B swizzle group, conflict-free), and each lane
+// stores its dim's four tokens as one b64.
+template <int QK_DIM>
+__device__ __forceinline__ void mla_vt_transpose(__bf16 const *tile,
+                                                 __bf16 *vt) {
+  int const lane = threadIdx.x & 63;
+  int const w = threadIdx.x >> 6;
+#pragma unroll
+  for (int j = 0; j < 8; j++) {
+    int const k = w * 8 + j;
+    int const tg = k & 3;
+    int const d = (k >> 2) * 64 + lane;
+    unsigned short u[4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      int const r = tg * 4 + i;
+      int const idx = r * QK_DIM + ((((d >> 3) ^ (r >> 1)) << 3) | (d & 7));
+      u[i] = reinterpret_cast<unsigned short const *>(tile)[idx];
+    }
+    unsigned long long const v =
+        (unsigned long long)u[0] | ((unsigned long long)u[1] << 16) |
+        ((unsigned long long)u[2] << 32) | ((unsigned long long)u[3] << 48);
+    *reinterpret_cast<unsigned long long *>(vt + d * MPK_DEC_VTS + tg * 4) = v;
+  }
+}
+#endif
 } // namespace gang_mla_decode_detail
 
 template <typename T,
@@ -1391,6 +1484,25 @@ __device__ __noinline__ void
     mpk_stage_stamp(46);
   }
 
+#if MPK_DEC_VT
+  // MPK_DEC_VT: V^T of the tiles a caller left in LDS (MPK_DEC_PRELOAD), ahead
+  // of the query poll -- the span the query takes to land. Their loads are
+  // retired here if the caller has not already (the fused caller has).
+  __bf16 *const vt_lds =
+      reinterpret_cast<__bf16 *>(_mla_decode_smem + MPK_DEC_VT_LDS_OFF);
+  // Two-tile chunks only (every chunk at 1025..2048 tokens): at three or
+  // four, MPK_DEC_WPT's register-path buffers sit where V^T does.
+  int const nvt = (ntiles == 2) ? (tiles_in_lds < 2 ? tiles_in_lds : 2) : 0;
+  if (nvt > 0) {
+    asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)" ::: "memory");
+    __builtin_amdgcn_s_barrier();
+    for (int t = 0; t < nvt; t++) {
+      gang_mla_decode_detail::mla_vt_transpose<QK_DIM>(
+          lds_kv + t * (KV_TILE * QK_DIM), vt_lds + t * MPK_DEC_VT_TILE);
+    }
+  }
+#endif
+
   // Q first, then one KV tile per loop trip from HBM.
 #if MPK_DEC_QK_KSPLIT
   // Four waves, as every per-lane index in this kernel already assumes.
@@ -1643,6 +1755,178 @@ __device__ __noinline__ void
   bool dma_have = false; // tile t was DMA'd into its buffer by trip t - 1
 #endif
 
+#if MPK_DEC_WPT
+  // MPK_DEC_WPT: the chunk's 2..4 tiles side by side, one per wave, instead
+  // of one trip per tile on all four waves. Every tile gets its own buffer
+  // (tile t at lds_kv + t * tile; the preloaded ones are already there, the
+  // rest go in on the register path), wave t runs tile t's QK and its tile
+  // softmax, and parks the tile max and its f32 weights in the dead Q block;
+  // then every wave rescales all tiles' weights against the chunk max and runs
+  // its own 128 dims of PV over all of them. One exchange barrier replaces the
+  // trips' two barriers each, and the per-trip o_acc rescale goes away.
+  bool const wpt = ntiles >= 2 && ntiles <= 4;
+  if (wpt) {
+    static_assert(MPK_MLA_OACC_VGPR && MPK_MLA_KV_SWZ && MPK_MLA_QK_PIPE2,
+                  "MPK_DEC_WPT is written for the default tile loop");
+#pragma unroll 1
+    for (int t = tiles_in_lds; t < ntiles; t++) {
+      __bf16 *const tkv = lds_kv + t * (KV_TILE * QK_DIM);
+      int const tstart = t * KV_TILE;
+      int tlen = effective_len - tstart;
+      tlen = tlen > KV_TILE ? KV_TILE : (tlen < 0 ? 0 : tlen);
+      if (my_tok < tlen) {
+        long const row = get_kv_row(kv_start + tstart + my_tok);
+#pragma unroll
+        for (int r = 0; r < LDG_PER_TILE; r++) {
+          u32x2_t const v =
+              ld_g<u32x2_t>(kv_base + row + (my_dim0 + r * 64) * 2);
+          uint64_t val;
+          __builtin_memcpy(&val, &v, 8);
+          *(__attribute__((address_space(3))) uint64_t *)&tkv
+              [my_tok * QK_DIM + my_wcol + r * 64] = val;
+        }
+      } else {
+#pragma unroll
+        for (int r = 0; r < LDG_PER_TILE; r++) {
+          *(__attribute__((address_space(3))) uint64_t *)&tkv
+              [my_tok * QK_DIM + my_wcol + r * 64] = 0ull;
+        }
+      }
+    }
+    asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+    mla_tile_bar();
+    // MPK_DEC_VT: the prologue's V^T stores are ordered by the barrier above.
+    if (tid == 0) {
+      mpk_stage_stamp(48);
+    }
+    // The Q block is dead: every wave's qr reads retired ahead of the
+    // barrier above.
+    float *const wpt_p = reinterpret_cast<float *>(_mla_decode_smem + 96 * 1024);
+    float *const wpt_m = wpt_p + 4 * 256;
+    int const wv = __builtin_amdgcn_readfirstlane(warp_id);
+    if (wv < ntiles) {
+      __bf16 const *const tkv = lds_kv + wv * (KV_TILE * QK_DIM);
+      int tlen = effective_len - wv * KV_TILE;
+      tlen = tlen > KV_TILE ? KV_TILE : (tlen < 0 ? 0 : tlen);
+      mla_qk_acc32_zero();
+      {
+        using kq_t = gang_mla_decode_detail::bf16x8_t;
+        auto kaddr = [&](int kc) -> kq_t const * {
+          return reinterpret_cast<kq_t const *>(
+              &tkv[((kc & 1) ? kswz_o : kswz_e) + kc * 32]);
+        };
+        kq_t kq[3];
+        kq[0] = *kaddr(0);
+        kq[1] = *kaddr(1);
+#pragma unroll
+        for (int kc = 0; kc < NUM_K32; kc++) {
+          if (kc + 2 < NUM_K32) {
+            kq[(kc + 2) % 3] = *kaddr(kc + 2);
+          }
+          gang_mla_decode_detail::mla_qk_acc32_mfma_kv(kq[kc % 3], qr[kc]);
+        }
+      }
+      __mfma_hd64_fp32x4 s = mla_qk_acc32_read();
+#pragma unroll
+      for (int h = 0; h < 4; h++) {
+        s[h] *= scale_s;
+        if (kgrp * 4 + h >= tlen) {
+          s[h] = -INFINITY;
+        }
+      }
+      float tmax = fmaxf(fmaxf(s[0], s[1]), fmaxf(s[2], s[3]));
+      {
+        float a = tmax, b = tmax;
+        asm volatile("s_nop 1\n\tv_permlane32_swap_b32_e32 %0, %1"
+                     : "+v"(a), "+v"(b));
+        tmax = fmaxf(a, b);
+        a = tmax;
+        b = tmax;
+        asm volatile("s_nop 1\n\tv_permlane16_swap_b32_e32 %0, %1"
+                     : "+v"(a), "+v"(b));
+        tmax = fmaxf(a, b);
+      }
+      using gang_mla_decode_detail::mla_exp2;
+      __mfma_hd64_fp32x4 w;
+#pragma unroll
+      for (int h = 0; h < 4; h++) {
+        w[h] = (tmax == -INFINITY) ? 0.0f : mla_exp2(s[h] - tmax);
+      }
+      reinterpret_cast<__mfma_hd64_fp32x4 *>(wpt_p)[wv * 64 + lane] = w;
+      if (kgrp == 0) {
+        wpt_m[wv * 16 + midx] = tmax;
+      }
+    }
+    asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+    __builtin_amdgcn_s_barrier();
+    float mt[4];
+    float cmax = -INFINITY;
+#pragma unroll
+    for (int t = 0; t < 4; t++) {
+      mt[t] = (t < ntiles) ? wpt_m[t * 16 + midx] : -INFINITY;
+      cmax = fmaxf(cmax, mt[t]);
+    }
+    using gang_mla_decode_detail::mla_exp2;
+    float lp = 0.0f;
+#pragma unroll
+    for (int t = 0; t < 4; t++) {
+      if (t < ntiles) {
+        float const sc = (mt[t] == -INFINITY) ? 0.0f : mla_exp2(mt[t] - cmax);
+        __mfma_hd64_fp32x4 const w =
+            reinterpret_cast<__mfma_hd64_fp32x4 const *>(wpt_p)[t * 64 + lane];
+        bf16x4_t pb;
+#pragma unroll
+        for (int h = 0; h < 4; h++) {
+          float const p = w[h] * sc;
+          lp += p;
+          pb[h] = (__bf16)p;
+        }
+        __bf16 const *const tkv = lds_kv + t * (KV_TILE * QK_DIM);
+        u32x2_t vau[NUM_V_BLOCKS];
+#if MPK_DEC_VT
+        if (t < nvt) {
+          // V^T[d][kgrp * 4 .. + 3], d = vb * 64 + warp_id * 16 + midx.
+          __bf16 const *const vrow = vt_lds + t * MPK_DEC_VT_TILE +
+                                     (warp_id * 16 + midx) * MPK_DEC_VTS +
+                                     kgrp * 4;
+#pragma unroll
+          for (int vb = 0; vb < NUM_V_BLOCKS; vb++) {
+            vau[vb] = *reinterpret_cast<u32x2_t const *>(
+                vrow + vb * 64 * MPK_DEC_VTS);
+          }
+        } else
+#endif
+        {
+#pragma unroll
+        for (int vb = 0; vb < NUM_V_BLOCKS; vb++) {
+          bf16x4_t va;
+          va[0] = tkv[vswz_b0 + vb * 64];
+          va[1] = tkv[vswz_b0 + QK_DIM + vb * 64];
+          va[2] = tkv[vswz_b2 + vb * 64];
+          va[3] = tkv[vswz_b2 + QK_DIM + vb * 64];
+          __builtin_memcpy(&vau[vb], &va, 8);
+        }
+        }
+        u32x2_t pbu;
+        __builtin_memcpy(&pbu, &pb, 8);
+        gang_mla_decode_detail::mla_pv8_vgpr(o_acc_r, vau, pbu);
+      }
+    }
+    m_running = cmax;
+    l_head[0] = lp;
+    l_head[1] = 0.0f;
+    l_head[2] = 0.0f;
+    l_head[3] = 0.0f;
+    if (tid == 0) {
+      mpk_stage_stamp(77);
+    }
+    // Hands the tiles and the exchange back to the caller, as the last trip's
+    // closing barrier does.
+    asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+    __builtin_amdgcn_s_barrier();
+  }
+  if (!wpt) {
+#endif
   // One trip at a time. The compiler otherwise pipelines tile t+1's LDS
   // stores into tile t's QK/PV reads; those stores go through a generic
   // uint64_t* and LLVM does not see them as aliasing the bf16 LDS loads.
@@ -2371,6 +2655,9 @@ __device__ __noinline__ void
     _d_refill += __builtin_amdgcn_s_memrealtime() - _d_b;
 #endif
   }
+#if MPK_DEC_WPT
+  } // !wpt
+#endif
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   unsigned long long _d_t3 = __builtin_amdgcn_s_memrealtime();
