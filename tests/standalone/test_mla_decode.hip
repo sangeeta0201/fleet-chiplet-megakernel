@@ -634,6 +634,17 @@ static int run_case_pre(int seqlen) {
   hipFree(d_q); hipFree(d_kv); hipFree(d_o0); hipFree(d_o1); hipFree(d_l0);
   hipFree(d_l1); hipFree(d_qo); hipFree(d_kvp); hipFree(d_kvi); hipFree(d_lpl);
   hipFree(d_npre);
+  // TEST_DUMP=<file>: append this case's partials and lse (plain call, then
+  // preloaded call) so two builds can be compared byte for byte.
+  if (char const *dump = getenv("TEST_DUMP")) {
+    if (FILE *f = fopen(dump, "ab")) {
+      fwrite(o0.data(), 4, o_elems, f);
+      fwrite(l0.data(), 4, LSE_S, f);
+      fwrite(o1.data(), 4, o_elems, f);
+      fwrite(l1.data(), 4, LSE_S, f);
+      fclose(f);
+    }
+  }
   int bad = 0, pre1 = 0, pre2 = 0, nonzero = 0;
   for (int c = 0; c < NUM_KV_CHUNKS; ++c) {
     pre1 += npre[c] == 1;

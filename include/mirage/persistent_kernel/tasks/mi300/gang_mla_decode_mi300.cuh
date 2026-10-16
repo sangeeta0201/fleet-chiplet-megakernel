@@ -380,15 +380,13 @@ __device__ __forceinline__ void mla_tile_bar() { __syncthreads(); }
 // 3.352 3.357 vs 3.368 3.359; again 3.351 3.358 vs 3.364 3.370. Pooled n=7
 // pairs: 3.356 vs 3.366 (-0.010); confirmed as the default 3.352 3.349 vs
 // 3.359 3.366. Standalone 90/0 and longseq 256/512/1024 G1 PASS.
-// FAILS PPL: ppl512 2.4493 on all 8 ranks against 2.3670 (=0, same stage).
-// Per-position NLL is identical through position 14 and departs at 15, the
-// first step with two live chunks -- below 1025 tokens every chunk is one
-// tile, so the WPT branch never runs there. It reproduces with the branch
-// compiled in but unreachable (wpt &&= seqlen_k < 0): 2.4493, same first
-// position. So the code's presence changes the one-tile path's result,
-// deterministically; the register-path KV loads stay behind the buffer_inv
-// in both images. Not localized -- a compile-sensitive hazard in the default
-// tile loop the standalone test does not see. Off.
+// ppl512: the first image gave 2.4493 on all 8 ranks against 2.3670, and
+// the same with the branch unreachable -- below 1025 tokens every chunk is
+// one tile, so it never runs there. Its presence had fused the output
+// step's LSE into one v_fmamk_f32 (1 ulp on a few heads, partials
+// bit-identical under test_mla_decode's TEST_DUMP), which MoE routing
+// near-ties amplify. With the LSE pinned: 2.3670 at =0 and =1, per-position
+// NLL identical to the default's. Off.
 #ifndef MPK_DEC_WPT
 #define MPK_DEC_WPT 0
 #endif
@@ -2859,9 +2857,13 @@ __device__ __noinline__ void
                      static_cast<long>(q_row) * LSE_STRIDE +
                      q_head_group * NUM_KV_CHUNKS * Q_HEADS_PER_GROUP +
                      kv_chunk_idx * Q_HEADS_PER_GROUP + q_head_local;
-    float lse_val = (l_sum > 0.0f)
-                        ? (m_running * 0.69314718055994530942f + logf(l_sum))
-                        : -1e30f;
+    // Multiply then add, never one FMA. Left to contraction, the choice follows
+    // the block layout of unrelated code in this function, and the 1-ulp LSE
+    // change flips MoE routing near-ties: an unreachable branch added above
+    // moved ppl512 from 2.3670 to 2.4493.
+    float m_ln2 = m_running * 0.69314718055994530942f;
+    asm volatile("" : "+v"(m_ln2));
+    float lse_val = (l_sum > 0.0f) ? (m_ln2 + logf(l_sum)) : -1e30f;
     if (ll_lse != nullptr) {
 #if MPK_DEC_MERGE_LL32
       // [own head][chunk], so head 0's words are the merge gate's 8 lines.
