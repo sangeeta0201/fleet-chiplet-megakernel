@@ -2183,6 +2183,19 @@ __device__ __forceinline__ bool
 #ifndef MPK_PROBE_W13_HALFK
 #define MPK_PROBE_W13_HALFK 0
 #endif
+// MPK_PROBE_W13_NOSHARED: PRICING PROBE, WRONG OUTPUT. The last slot's K_HALF
+// W13 tiles -- the shared expert's under MPK_MOE_TP's fixed slots -- skip their
+// k-loop and emit zeros, so the W13 round streams 8 of its 9 slots: the most
+// that taking the shared expert's W13 off the round could give.
+// MEASURED NULL 2026-10-17 on d355390, NP=8 1024/1024, n=2 interleaved, G1
+// PASS, control tokens identical to the default: 3.376 3.374 vs 3.365 3.370
+// ms (+0.008). With 16 of the round's 144 tiles idle the other 128 finish no
+// sooner, so each tile's own stream (~32 KB in flight per CU) sets the round,
+// not the aggregate HBM rate -- MPK_PROBE_W13_HALFK, which shortens every
+// tile, is -0.087. Running the shared expert's tiles early is not worth it.
+#ifndef MPK_PROBE_W13_NOSHARED
+#define MPK_PROBE_W13_NOSHARED 0
+#endif
 // MPK_PROBE_OPROJ_HALFK: PRICING PROBE, WRONG OUTPUT. The MXFP4 o_proj GEMV
 // runs half its K-loop: how much of a faster o_proj GEMV the wall keeps.
 #ifndef MPK_PROBE_OPROJ_HALFK
