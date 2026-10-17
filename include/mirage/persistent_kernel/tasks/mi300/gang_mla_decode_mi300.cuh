@@ -360,6 +360,21 @@ __device__ __forceinline__ void mla_tile_bar() { __syncthreads(); }
 #ifndef MPK_MLA_QK_2ACC
 #define MPK_MLA_QK_2ACC 0
 #endif
+// MPK_DEC_QK_2CHAIN: MPK_MLA_QK_2ACC's two accumulators inside the swizzled
+// read-ahead loop -- even k32 steps into a[32:35], odd into a[36:39], summed
+// once -- so consecutive MFMAs are independent. Reassociates the scores.
+// MEASURED SLOWER 2026-10-17 on 34de262, NP=8 1024/1024, n=3 interleaved, G1
+// PASS, text coherent, tokens moved (same across reps), test_mla_decode 66/66
+// both WRITE_THROUGH arms: 3.320 3.324 3.325 vs 3.317 3.313 3.315 ms (+0.008).
+// Worker still 390 VGPRs; the chain splits 9/9. Like MPK_MLA_QK_PIPE_DEPTH,
+// MPK_MLA_QK_SPLIT and MPK_DEC_QK_KSPLIT, the QK chain is not what the wall
+// feels. Off.
+#ifndef MPK_DEC_QK_2CHAIN
+#define MPK_DEC_QK_2CHAIN 0
+#endif
+#if MPK_DEC_QK_2CHAIN && (MPK_DEC_QK2T || MPK_MLA_QK_2ACC)
+#error "MPK_DEC_QK_2CHAIN's odd chain is a[36:39], which MPK_DEC_QK2T and MPK_MLA_QK_2ACC also use"
+#endif
 // MPK_DEC_QK_KSPLIT: the four waves split QK's 18 k32 steps instead of each
 // running all 18 for the same scores -- wave w takes steps w, w + 4, w + 8,
 // ... (5, 5, 4, 4, one swizzle parity each), stages only those Q fragments,
@@ -707,7 +722,7 @@ __device__ __forceinline__ void mla_qk_acc32_zero() {
                : "a32", "a33", "a34", "a35");
 }
 
-#if MPK_DEC_QK2T
+#if MPK_DEC_QK2T || MPK_DEC_QK_2CHAIN
 // mla_qk_acc32_mfma_kv on a[36:39]: MPK_DEC_QK2T's second tile's chain.
 __device__ __forceinline__ void mla_qk_acc36_mfma_kv(bf16x8_t av,
                                                     __bf16 const *b) {
@@ -2308,7 +2323,11 @@ __device__ __noinline__ void
       } else
 #endif
       {
+#if MPK_DEC_QK_2CHAIN
+      gang_mla_decode_detail::mla_qk_acc2_zero();
+#else
       mla_qk_acc32_zero();
+#endif
       {
         // The pipelined loop on the swizzled tile: the K reads stop being
         // 8-way bank-conflicted, so the reads in flight can actually overlap.
@@ -2329,10 +2348,22 @@ __device__ __noinline__ void
           if (kc + QD < NUM_K32) {
             kq[(kc + QD) % QR] = *kaddr(kc + QD);
           }
+#if MPK_DEC_QK_2CHAIN
+          if (kc & 1) {
+            gang_mla_decode_detail::mla_qk_acc36_mfma_kv(kq[kc % QR], qr[kc]);
+          } else {
+            gang_mla_decode_detail::mla_qk_acc32_mfma_kv(kq[kc % QR], qr[kc]);
+          }
+#else
           gang_mla_decode_detail::mla_qk_acc32_mfma_kv(kq[kc % QR], qr[kc]);
+#endif
         }
       }
+#if MPK_DEC_QK_2CHAIN
+      scores = gang_mla_decode_detail::mla_qk_acc2_read();
+#else
       scores = mla_qk_acc32_read();
+#endif
       }
 #elif MPK_MLA_QK_PIPE2 && !MPK_MLA_KV_SWZ
       mla_qk_acc32_zero();
