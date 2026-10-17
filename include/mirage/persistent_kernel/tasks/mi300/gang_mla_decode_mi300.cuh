@@ -395,6 +395,24 @@ __device__ __forceinline__ void mla_tile_bar() { __syncthreads(); }
 #ifndef MPK_DEC_WPT
 #define MPK_DEC_WPT 0
 #endif
+// MPK_PROBE_DEC_NOCOMPUTE: PRICING PROBE, WRONG OUTPUT. The decode item keeps
+// its query wait, cache-row flag, preload drain and output step, and skips the
+// tile loop -- QK, softmax, PV and the register-path tile load -- so every
+// partial is zero at LSE -1e30. What the decode's compute costs the wall, as
+// against MPK_MLA_SKIP_DECODE, which deletes the whole item.
+// MEASURED 2026-10-17 on 6c58431, NP=8 1024/1024, n=2 interleaved, G1 PASS,
+// control tokens identical to the default: control 3.370 3.369, this 3.159
+// 3.163 (-0.208 ms, 2.7 us/layer), MPK_MLA_SKIP_DECODE 3.027 3.034 (-0.339).
+// The tile loop is most of the decode's wall cost; the query wait, prologue
+// and output step are the other 0.131. So trip time does reach the wall --
+// MPK_DEC_WPT moved it ~0.12 us an item, MPK_DEC_VT's 0.4 came with a
+// re-allocated worker image.
+#ifndef MPK_PROBE_DEC_NOCOMPUTE
+#define MPK_PROBE_DEC_NOCOMPUTE 0
+#endif
+#if MPK_PROBE_DEC_NOCOMPUTE && MPK_DEC_WPT
+#error "MPK_PROBE_DEC_NOCOMPUTE skips the default tile loop; MPK_DEC_WPT's branch would still compute"
+#endif
 // MPK_DEC_VT: under MPK_DEC_WPT, a two-tile chunk's preloaded tiles also
 // exist as V^T -- [512 dims][16 tokens] bf16 (rows padded to 20) at 36 KB of
 // dynamic LDS -- so PV reads a
@@ -1930,6 +1948,11 @@ __device__ __noinline__ void
   }
   if (!wpt) {
 #endif
+#if MPK_PROBE_DEC_NOCOMPUTE
+  // The caller's preload DMA lands before LDS goes back to it.
+  asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)" ::: "memory");
+  __syncthreads();
+#else
   // One trip at a time. The compiler otherwise pipelines tile t+1's LDS
   // stores into tile t's QK/PV reads; those stores go through a generic
   // uint64_t* and LLVM does not see them as aliasing the bf16 LDS loads.
@@ -2658,6 +2681,7 @@ __device__ __noinline__ void
     _d_refill += __builtin_amdgcn_s_memrealtime() - _d_b;
 #endif
   }
+#endif // MPK_PROBE_DEC_NOCOMPUTE
 #if MPK_DEC_WPT
   } // !wpt
 #endif

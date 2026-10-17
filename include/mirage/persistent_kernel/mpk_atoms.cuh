@@ -2862,6 +2862,11 @@ __device__ __forceinline__ unsigned long long lmh_argmax_key(unsigned bits,
 // 96 KB; when the next tile is already in LDS (MPK_DEC_PRELOAD), wave 1 runs
 // that tile's chain beside it and the next trip skips QK. Same chains: same
 // bits. MPK_MLA_SKIP_DECODE prices the decode item at -0.358 ms (b6c8fa5).
+// MEASURED SLOWER 2026-10-17 on 6c58431, NP=8 1024/1024, n=3 interleaved, G1
+// PASS, tokens identical to the default in both arms (test_mla_decode 66/66,
+// TEST_DUMP byte-identical): 3.419 3.418 3.425 vs 3.368 3.366 3.365 ms
+// (+0.054). Trip 0's chain is no shorter on one wave, and every trip pays the
+// score exchange. Off.
 #ifndef MPK_MLA_QK_SPLIT
 #define MPK_MLA_QK_SPLIT 0
 #endif
