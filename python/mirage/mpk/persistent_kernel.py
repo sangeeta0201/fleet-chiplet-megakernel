@@ -1680,6 +1680,12 @@ def get_compile_command(
             if _x is not None:
                 assert _x in ("0", "1"), f"{_v} is 0 or 1"
                 flags = flags + [f"-D{_v}={_x}"]
+        # The decode QK loop's K read-ahead (MPK_MLA_QK_PIPE_DEPTH, mpk_atoms.cuh).
+        _x = os.environ.get("MPK_MLA_QK_PIPE_DEPTH")
+        if _x is not None:
+            assert _x.isdigit() and 1 <= int(_x) <= 8, \
+                "MPK_MLA_QK_PIPE_DEPTH is 1..8"
+            flags = flags + [f"-DMPK_MLA_QK_PIPE_DEPTH={_x}"]
         # MPK_LMH_BAL's tile map: the LM head's dispatch is one tile per worker.
         if (os.environ.get("MPK_LMH_BAL", "0") == "1" or
                 os.environ.get("MPK_LMH_TRACE", "0") == "1"):

@@ -2274,12 +2274,13 @@ __device__ __noinline__ void
         // The pipelined loop on the swizzled tile: the K reads stop being
         // 8-way bank-conflicted, so the reads in flight can actually overlap.
         using kq_t = gang_mla_decode_detail::bf16x8_t;
-        constexpr int QD = MPK_MLA_QK_PIPE2 ? 2 : 1;
+        constexpr int QD = MPK_MLA_QK_PIPE2 ? MPK_MLA_QK_PIPE_DEPTH : 1;
+        constexpr int QR = QD + 1 > 3 ? QD + 1 : 3;
         auto kaddr = [&](int kc) -> kq_t const * {
           return reinterpret_cast<kq_t const *>(
               &cur_kv[((kc & 1) ? kswz_o : kswz_e) + kc * 32]);
         };
-        kq_t kq[3];
+        kq_t kq[QR];
 #pragma unroll
         for (int d = 0; d < QD; d++) {
           kq[d] = *kaddr(d);
@@ -2287,9 +2288,9 @@ __device__ __noinline__ void
 #pragma unroll
         for (int kc = 0; kc < NUM_K32; kc++) {
           if (kc + QD < NUM_K32) {
-            kq[(kc + QD) % 3] = *kaddr(kc + QD);
+            kq[(kc + QD) % QR] = *kaddr(kc + QD);
           }
-          gang_mla_decode_detail::mla_qk_acc32_mfma_kv(kq[kc % 3], qr[kc]);
+          gang_mla_decode_detail::mla_qk_acc32_mfma_kv(kq[kc % QR], qr[kc]);
         }
       }
       scores = mla_qk_acc32_read();

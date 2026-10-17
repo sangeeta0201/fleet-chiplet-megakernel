@@ -2858,6 +2858,18 @@ __device__ __forceinline__ unsigned long long lmh_argmax_key(unsigned bits,
 // With MPK_MLA_KV_SWZ (see gang_mla_decode_mi300.cuh) on DEC_Q_INC +
 // RESOLVE_POLL_INC, n=2: 3.789 3.783 -> SWZ 3.764 3.763 -> SWZ + PIPE2 3.752
 // 3.753 ms, text identical. Default on with KV_SWZ (gates g14).
+// MPK_MLA_QK_PIPE_DEPTH: K chunks in flight ahead of the MFMA in MPK_MLA_QK_PIPE2's
+// swizzled-tile loop (2 is PIPE2 as measured above). Same MFMA order at any
+// depth: bit-exact.
+// MEASURED NULL 2026-10-17 on 01c0e2d, NP=8 1024/1024, n=3 interleaved, G1
+// PASS, tokens identical to the default in every arm (test_mla_decode 132/0
+// and TEST_DUMP byte-identical at 3 and 4; worker still 390 VGPRs, the chain's
+// waits lgkmcnt(3)/(4)): depth 4 3.347 3.349 3.346, depth 3 3.347 3.354 3.344,
+// vs 3.345 3.354 3.354 ms. The QK chain's LDS latency is not what the wall
+// feels, though MPK_PROBE_DEC_NOCOMPUTE prices the tile loop at -0.208. Stays 2.
+#ifndef MPK_MLA_QK_PIPE_DEPTH
+#define MPK_MLA_QK_PIPE_DEPTH 2
+#endif
 #ifndef MPK_MLA_QK_PIPE2
 #define MPK_MLA_QK_PIPE2 1
 #endif
