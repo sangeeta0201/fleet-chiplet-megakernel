@@ -312,6 +312,23 @@ __device__ __forceinline__ void mla_tile_bar() { __syncthreads(); }
 #ifndef MPK_MLA_OACC_VGPR
 #define MPK_MLA_OACC_VGPR 1
 #endif
+// MPK_DEC_PV_TR: PV's V operand -- lane (midx, kgrp) holds tokens 4*kgrp + s of
+// dim midx -- by one ds_read_b64_tr_b16 per 16-dim block instead of four
+// ds_read_u16. Within each 16-lane group the read hands output lane 4a + b
+// element b of input lane a + 4s (measured on gfx950), so input lane i reads
+// the four dims at 4 * (i & 3) of token row 4 * kgrp + (i >> 2). Same values
+// in the same slots, so the MFMAs are unchanged. Needs EXEC all ones.
+// MEASURED: 2026-10-16 on d355390 (another session, stage g37) 3.333 3.328
+// 3.337 vs 3.355 3.363 3.362; 2026-10-17 on df69487, NP=8 1024/1024, n=3
+// interleaved, G1 PASS, tokens identical to the default in both arms
+// (test_mla_decode 66/66, TEST_DUMP byte-identical): 3.318 3.316 3.302 vs
+// 3.350 3.355 3.359 ms (-0.039). Default on.
+#ifndef MPK_DEC_PV_TR
+#define MPK_DEC_PV_TR 1
+#endif
+#if MPK_DEC_PV_TR && (!MPK_MLA_KV_SWZ || !MPK_MLA_OACC_VGPR || MPK_MLA_PV_ASM)
+#error "MPK_DEC_PV_TR is written for the swizzled tile's MPK_MLA_OACC_VGPR PV"
+#endif
 
 // Two smaller trip levers on top of MPK_MLA_OACC_VGPR, same isolated bench,
 // us per trip: OACC_VGPR 1.875; + QK_2ACC 1.77; + DECODE_BATCH=4 1.57; both
@@ -412,6 +429,22 @@ __device__ __forceinline__ void mla_tile_bar() { __syncthreads(); }
 #endif
 #if MPK_PROBE_DEC_NOCOMPUTE && MPK_DEC_WPT
 #error "MPK_PROBE_DEC_NOCOMPUTE skips the default tile loop; MPK_DEC_WPT's branch would still compute"
+#endif
+// MPK_PROBE_DEC_NOPV / MPK_PROBE_DEC_NOREG: PRICING PROBES, WRONG OUTPUT, the
+// tile loop's parts. NOPV drops PV's V reads and MFMAs (the rescale stays);
+// NOREG zero-fills the register-path tile instead of loading it, so that
+// trip's global loads (the current row's tile) are gone.
+// MEASURED 2026-10-17 on df69487, NP=8 1024/1024, n=2 interleaved, G1 PASS,
+// control tokens identical to the default: control 3.354 3.348, NOPV 3.293
+// 3.288 (-0.061), NOREG 3.330 3.340 (-0.016), MPK_PROBE_DEC_NOCOMPUTE 3.163
+// 3.153 (-0.193). PV is a third of the loop's wall cost, the register-path
+// load a twelfth; QK, softmax, the trip barriers and the LDS stores are the
+// rest.
+#ifndef MPK_PROBE_DEC_NOPV
+#define MPK_PROBE_DEC_NOPV 0
+#endif
+#ifndef MPK_PROBE_DEC_NOREG
+#define MPK_PROBE_DEC_NOREG 0
 #endif
 // MPK_DEC_VT: under MPK_DEC_WPT, a two-tile chunk's preloaded tiles also
 // exist as V^T -- [512 dims][16 tokens] bf16 (rows padded to 20) at 36 KB of
@@ -1389,6 +1422,12 @@ __device__ __noinline__ void
   int const vswz_b0 = kgrp * 4 * QK_DIM + (vswz_h << 3) + (midx & 7);
   int const vswz_b2 =
       kgrp * 4 * QK_DIM + 2 * QK_DIM + ((vswz_h ^ 1) << 3) + (midx & 7);
+#if MPK_DEC_PV_TR
+  int const vtr_off =
+      (4 * kgrp + (midx >> 2)) * QK_DIM +
+      (((2 * warp_id + ((midx & 3) >> 1)) ^ (2 * kgrp + (midx >> 3))) << 3) +
+      4 * (midx & 1);
+#endif
 #endif
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
@@ -2052,7 +2091,7 @@ __device__ __noinline__ void
       // tile_len branch: that wait is divergent on a partial tile and hangs
       // the fused kernel from the first prefill step.
       if (t < tiles_in_lds) {
-      } else if (my_tok < tile_len) {
+      } else if (!MPK_PROBE_DEC_NOREG && my_tok < tile_len) {
         long const row = get_kv_row(kv_start + tile_start + my_tok);
 #pragma unroll
         for (int r = 0; r < LDG_PER_TILE; r++) {
@@ -2587,11 +2626,23 @@ __device__ __noinline__ void
       }
 #elif MPK_MLA_OACC_VGPR
       {
+#if MPK_PROBE_DEC_NOPV
+#pragma unroll
+        for (int vb = 0; vb < NUM_V_BLOCKS; vb++) {
+          o_acc_r[vb] *= rescale;
+        }
+#else
         u32x2_t vau[NUM_V_BLOCKS];
 #pragma unroll
         for (int vb = 0; vb < NUM_V_BLOCKS; vb++) {
           bf16x4_t va;
-#if MPK_MLA_KV_SWZ
+#if MPK_MLA_KV_SWZ && MPK_DEC_PV_TR
+          typedef short mla_tr_v4s_t __attribute__((ext_vector_type(4)));
+          mla_tr_v4s_t const vt = __builtin_amdgcn_ds_read_tr16_b64_v4i16(
+              (__attribute__((address_space(3))) mla_tr_v4s_t *)(
+                  &cur_kv[vtr_off + vb * 64]));
+          __builtin_memcpy(&va, &vt, 8);
+#elif MPK_MLA_KV_SWZ
           va[0] = cur_kv[vswz_b0 + vb * 64];
           va[1] = cur_kv[vswz_b0 + QK_DIM + vb * 64];
           va[2] = cur_kv[vswz_b2 + vb * 64];
@@ -2610,6 +2661,7 @@ __device__ __noinline__ void
         u32x2_t pbu;
         __builtin_memcpy(&pbu, &pb, 8);
         gang_mla_decode_detail::mla_pv8_vgpr(o_acc_r, vau, pbu);
+#endif
       }
 #else
 #pragma unroll

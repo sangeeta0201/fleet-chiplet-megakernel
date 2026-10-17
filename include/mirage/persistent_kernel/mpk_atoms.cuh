@@ -1847,7 +1847,10 @@ __device__ __forceinline__ bool
 // last trip's closing one. At 1025-2048 tokens every live item is two
 // preloaded trips: 3 of 4 barriers go. Same arithmetic: bit-identical.
 // MEASURED NULL 2026-10-13 with MPK_DEC_EXP2_BUILTIN, NP=8 1024/1024, r1,
-// rank-0 tokens identical: 3.505 vs 3.507 ms. Off.
+// rank-0 tokens identical: 3.505 vs 3.507 ms.
+// RE-MEASURED SLOWER 2026-10-17 on df69487 (after MPK_PROBE_DEC_NOCOMPUTE
+// priced the tile loop at -0.193), n=3 interleaved, tokens identical: 3.356
+// 3.356 3.348 vs 3.349 3.352 3.341 ms (+0.006). Off.
 #ifndef MPK_DEC_PRE_NOBAR
 #define MPK_DEC_PRE_NOBAR 0
 #endif
