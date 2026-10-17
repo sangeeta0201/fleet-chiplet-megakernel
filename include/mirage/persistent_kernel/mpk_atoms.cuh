@@ -2109,9 +2109,14 @@ __device__ __forceinline__ bool
 // It wedged at decode iteration 2 until the validation compares were tied
 // below their vmcnt(0) (the scheduler had hoisted them onto words still in
 // flight). Since then it runs, text identical, and MEASURED SLOWER 2026-10-11:
-// 4.027 vs 4.000 ms. Off.
+// 4.027 vs 4.000 ms.
+// RE-MEASURED on the current defaults: 2026-10-16 on d355390 (another session,
+// stage g35/g36) 3.344 3.340 3.333 vs 3.368 3.355 3.367; 2026-10-17 on
+// 18fcef1, NP=8 1024/1024, n=3 interleaved, G1 PASS, tokens identical to the
+// default in both arms: 3.351 3.358 3.348 vs 3.371 3.367 3.365 ms (-0.016).
+// Default on.
 #ifndef MPK_ROUTER_W_LATE
-#define MPK_ROUTER_W_LATE 0
+#define MPK_ROUTER_W_LATE 1
 #endif
 // MPK_WUK_WFIRST: a one-trip MXFP8 GEMV with LL activation input (W_UK) loads
 // its weights and scales ahead of the activation poll and consumes them from
