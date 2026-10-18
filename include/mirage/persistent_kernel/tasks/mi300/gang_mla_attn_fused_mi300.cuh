@@ -1931,7 +1931,8 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
     // decode's own (KV tile + o_acc, ~50 KB).
     if (head_local && (MPK_DEC_PRELOAD || tid >= 64) &&
         kv_cache_ptr != nullptr) {
-      int const hl_item = xcd_id * dec_tiles + dec_rank;
+      int const hl_item = MPK_DEC_CHUNK_ILV ? dec_rank * 8 + xcd_id
+                                            : xcd_id * dec_tiles + dec_rank;
       if (hl_item < HL_DEC_ITEMS) {
         int const chunk = hl_item / HL_GROUPS;
         int const req = request_id;
@@ -2090,7 +2091,8 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
       // chunk * NUM_Q_GROUPS + q_group. Still a bijection onto
       // [0, NUM_Q_GROUPS * NUM_KV_CHUNKS), just a different one. Head-local,
       // local item i covers chunk i / HL_GROUPS of local group i % HL_GROUPS.
-      int const hl_item = xcd_id * dec_tiles + t;
+      int const hl_item =
+          MPK_DEC_CHUNK_ILV ? t * 8 + xcd_id : xcd_id * dec_tiles + t;
       if (head_local && hl_item >= HL_DEC_ITEMS) {
         continue;
       }

@@ -1506,7 +1506,12 @@ if __name__ == "__main__":
         qk_dim = kv_lora + qk_rope                      # 576
         q_lora = config.q_lora_rank
         q_lora_pad = align_up(q_lora, GANG_OUT_ALIGN)
-        kv_a_out_pad = align_up(qk_dim, GANG_OUT_ALIGN)  # 576 -> 1024
+        # GLM_QKVA_PAD_ALIGN: the latent's padding granule. At GANG_OUT_ALIGN
+        # (576 -> 1024) qkv_a is 24 tiles an XCD with one XCD all padding; at
+        # 128 (576 -> 640, the 8 XCDs x 16-row tiles qkv_a needs) it is 21.
+        # -0.044 ms, bit-identical; notes at MPK_QKVA_SKIP_PAD (mpk_atoms.cuh).
+        kv_a_out_pad = align_up(
+            qk_dim, int(os.environ.get("GLM_QKVA_PAD_ALIGN", "128")))
         # q_a_proj and kv_a_proj_with_mqa are one GEMM emitting
         # [q_a (q_lora_pad) | latent (kv_a_out_pad)]; see the layer loop.
         qkv_a_pad = q_lora_pad + kv_a_out_pad

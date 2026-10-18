@@ -1904,6 +1904,18 @@ __device__ __forceinline__ bool
 #ifndef MPK_DEC_REMAP
 #define MPK_DEC_REMAP 1
 #endif
+// MPK_DEC_CHUNK_ILV: the head-local decode's items dealt round robin over the
+// XCDs (item t * 8 + xcd) instead of XCD-major (xcd * dec_tiles + t). The live
+// kv chunks are a prefix -- at 1536 tokens chunks 0..47 of 64 -- so XCD-major
+// leaves two XCDs no decode at all and six with eight items each; dealt round
+// robin every XCD runs six. The same chunks, the same partials: bit-identical.
+// MEASURED NULL 2026-10-18 on the GLM_QKVA_PAD_ALIGN=128 default, NP=8
+// 1024/1024, n=3 interleaved, G1 PASS, tokens identical: 3.245 3.242 3.243 vs
+// 3.239 3.242 3.241 ms. A decode item takes the same 3.6 us on every XCD that
+// runs one (MPK_TRACE h30), so unlike qkv_a it was not contention-bound. Off.
+#ifndef MPK_DEC_CHUNK_ILV
+#define MPK_DEC_CHUNK_ILV 0
+#endif
 // MPK_DEC_PRELOAD: the decode worker DMAs its item's first full KV tile (2:
 // first two) into the decode's LDS tile buffers during the q_b -> decode
 // wait, short of the current token's row. With MPK_DEC_REMAP: 4.904 4.901
@@ -2380,6 +2392,21 @@ __device__ __forceinline__ bool
 // MEASURED 2026-10-11 on the g14 defaults, NP=8 1024/1024, n=3 interleaved,
 // text identical: 3.747 3.753 3.754 -> 3.734 3.746 3.733 ms (-0.013).
 // Default on.
+// What it leaves, MPK_TRACE 2026-10-18 on 43cc07a (h30; the same in every
+// trace since 10-16): six XCDs run 24 live tiles, one runs 20 and one none,
+// and a tile on a 24-tile XCD takes 2.80-3.00 us (S54 -> S61) against
+// 2.52-2.64 on the 20-tile one. The phase ends on the slowest XCD, so the
+// 164 live tiles dealt 20-21 to every XCD should end it sooner. Padding the
+// latent to 640 instead of 1024 (GLM_QKVA_PAD_ALIGN=128, demo.py) does that
+// with nothing else moved: 21 tiles an XCD, the last XCD 17 live.
+// MEASURED 2026-10-18 on 7e89bb7, NP=8 1024/1024, n=3 interleaved, G1 PASS,
+// tokens identical: 3.241 3.240 3.245 vs 3.282 3.289 3.286 ms (-0.044).
+// Default 128.
+// Same traces: the MoE is dealt evenly (18 W13 and 24 W2 tiles an XCD) but
+// two XCDs run every W13 tile 0.08-0.16 us slower and end W2 0.10-0.20 us
+// after the fastest, a gap the next layer's entry inherits. An idle MI350X
+// shows no such XCD (512 KB streams, all 8 devices: +-2%, a different XCD
+// slowest each time), so it is load, not silicon.
 #ifndef MPK_QKVA_SKIP_PAD
 #define MPK_QKVA_SKIP_PAD 1
 #endif
