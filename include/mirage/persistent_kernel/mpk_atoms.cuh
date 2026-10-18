@@ -1978,6 +1978,42 @@ __device__ __forceinline__ bool
 #ifndef MPK_W13_ACT_EARLY
 #define MPK_W13_ACT_EARLY 1
 #endif
+// MPK_W13_SH_PRE: under MPK_MOE_TP the shared expert's slot (TOPK_K, 2 tiles an
+// XCD) takes its expert id as given and starts as soon as MPK_W13_ACT_EARLY
+// has staged the normed row -- in the router/TopK window, ~4.5 us before the
+// routing lands (MPK_TRACE h75: every W13 tile starts at 32.5-32.6 us, the
+// TopK publish at 32.8) -- instead of polling its route word. The routed round
+// then streams 128 tiles, not 144. Same expert, same row: bit-identical.
+// MEASURED SLOWER 2026-10-18 on f0bf5f3, NP=8 1024/1024, n=3 interleaved, G1
+// PASS, all rank-0 tokens identical: 3.211 3.216 3.206 vs 3.205 3.202 3.202
+// ms (+0.008). Released together on an idle GPU
+// (tests/standalone/bench_w13_sync.hip), 128 tiles take 4.16 us against
+// 144's 4.32, so the round's own gain is ~0.16 us a layer at best, under the
+// noise of whatever the early stream costs the router window. Off.
+#ifndef MPK_W13_SH_PRE
+#define MPK_W13_SH_PRE 0
+#endif
+// MPK_W13_HELP_PF=T: the MoE ranks that run no W13 tile (ten an XCD under
+// MPK_MOE_SKIP_TOPK) pull the last T k-tiles of each W13 tile wave's K-half,
+// and the tiles' scale blocks, into L2 as soon as the routing words land,
+// while the tiles stream their heads from HBM. A W13 tile is bound by its
+// CU's bytes in flight, not by HBM (an unreleased launch, idle GPU, 8-deep
+// dwordx4: 144 x 96 KB tiles 3.52 us each, 128 or 112 of them 3.52 / 3.56,
+// 216 x 64 KB 2.48, 232 x 60 KB 2.40; 16-deep only 3.24), so the idle CUs
+// add bandwidth the 144 tile CUs cannot reach. Cache state only:
+// bit-identical.
+// MEASURED NULL 2026-10-18 on f0bf5f3, NP=8 1024/1024, one interleaved screen
+// rep each, G1 PASS, all rank-0 tokens identical: T=6 3.211, T=4 3.227, T=8
+// 3.213 vs control 3.212 3.204 3.210 ms. The premise does not survive a
+// released start: that launch's workgroups start ~2 us apart, and with every
+// tile held to one global release (tests/standalone/bench_w13_sync.hip)
+// 144 x 96 KB take 4.32 us each, 128 4.16, 72 3.68, 224 x 62 KB 3.80 -- the
+// round is bound by the shared memory path at ~3-4.4 TB/s, not per CU -- and
+// ten helpers an XCD pulling 6-12 KB tails slow the tiles to 5.0-5.2 us.
+// MPK_TRACE (h85, T=6): W13 tile 4.06 us against 3.92 without. Off.
+#ifndef MPK_W13_HELP_PF
+#define MPK_W13_HELP_PF 0
+#endif
 // MPK_W2_EARLY_PF: the TP W2 workers pull their tile's weight into L2
 // across the W13 -> W2 wait (gang_oproj_router_fused_mi300.cuh). 5.062 5.068
 // (-0.025).
@@ -1995,6 +2031,10 @@ __device__ __forceinline__ bool
 // (+0.044, the extra pull competes with W13's own stream). Default 1.
 // 3 (mode 2's pull held until W13's words land) MEASURED 2026-10-12 on the
 // MPK_WUK_IDLE_MAP defaults, r1: 3.759 vs 3.564 (+0.195).
+// RE-MEASURED 2026-10-18 on f0bf5f3 (MPK_W2_WPRE and MPK_W13_SELF_TOPK now
+// on), NP=8 1024/1024, one interleaved screen rep, G1 PASS, tokens identical:
+// 2 -> 3.355 vs control 3.209 3.205 ms (+0.148). Mode 2's ~150 KB per W2-idle
+// worker sits in that worker's vmcnt ahead of its own W2 tile's staging. Off.
 #ifndef MPK_W2_PF_MODE
 #define MPK_W2_PF_MODE 1
 #endif
@@ -2109,6 +2149,23 @@ __device__ __forceinline__ bool
 #ifndef MPK_TOPK_2L_MERGE
 #define MPK_TOPK_2L_MERGE 1
 #endif
+// MPK_TK2L_RANK: the two-level TopK's level 1 takes its top 8 of the XCD's 32
+// by rank -- each lane counts the keys above its own over 32 readlanes, and
+// the eight ranked under 8 store at that slot -- instead of the 32-key
+// bitonic sort. The keys are unique (the low byte is the expert), so the same
+// eight words land in the same slots: bit-identical. MPK_TRACE (h93, MPK_TRACE
+// stamps 86/87): sum + sigmoid + sort 0.80 us of level 1's 2.0 after the last
+// router tile's partials; with the rank 0.36 (the traced split is soft: each
+// stamp's own load waits on the candidate stores either side of it).
+// MEASURED 2026-10-18 on f0bf5f3, NP=8 1024/1024, n=6 interleaved, G1 PASS,
+// all rank-0 tokens identical to the default: 3.205 3.187 3.194 3.192 3.197
+// 3.203 vs 3.204 3.210 3.209 3.201 3.210 3.205 ms (-0.010, 5 of 6 pairs).
+// Defaulted: standalone 95/0, ppl512 2.3819 on all 8 ranks with per-position
+// NLL identical to f0bf5f3's, longseq 256/512/1024 G1 PASS, n=3 vs =0
+// 3.195 3.196 3.198 vs 3.201 3.201 3.199 (pooled over 9 pairs -0.008). On.
+#ifndef MPK_TK2L_RANK
+#define MPK_TK2L_RANK 1
+#endif
 // MPK_W13_SELF_TOPK: under MPK_TOPK_2L each routed W13 tile's wave 0 polls the
 // eight XCDs' level-1 candidates and runs the level-2 merge itself, taking its
 // slot's expert from it, instead of waiting for its XCD's TopK to merge, see
@@ -2123,6 +2180,15 @@ __device__ __forceinline__ bool
 // 3.471 vs 3.509 3.504 3.505 ms (-0.030). Default on.
 #ifndef MPK_W13_SELF_TOPK
 #define MPK_W13_SELF_TOPK 1
+#endif
+// MPK_W13_SELF_ALLW: under MPK_W13_SELF_TOPK every wave of a routed W13 tile
+// polls the eight XCDs' candidates and runs the level-2 merge itself, instead
+// of wave 0 alone handing the slot's expert to the others through LDS and a
+// barrier (MPK_TRACE h93: candidates seen -> route seen 0.56 us, the merge
+// ~0.15 of it). The staging quantizer ahead of it ends on a barrier, and
+// every wave reads the same epoch-tagged words: bit-identical.
+#ifndef MPK_W13_SELF_ALLW
+#define MPK_W13_SELF_ALLW 0
 #endif
 // MPK_W2_FOLD: TileRT's expert_down_allreduce shape for the one-row TP W2.
 // A W2 tile is one 64-row block over all nine slots (12 per XCD instead of 24
@@ -2152,6 +2218,8 @@ __device__ __forceinline__ bool
 // 3.476 3.478. Off.
 // RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
 // tokens identical: 3.407 vs control 3.314 3.315 3.313 ms. Off.
+// RE-MEASURED 2026-10-18 on f0bf5f3, same screen, G1 PASS, tokens identical:
+// =1 3.295, =2 3.238 vs control 3.209 3.205 ms (+0.088, +0.031). Off.
 #ifndef MPK_W2_FOLD
 #define MPK_W2_FOLD 0
 #endif
@@ -2234,6 +2302,19 @@ __device__ __forceinline__ bool
 // Default on.
 #ifndef MPK_ROUTER_W_LATE
 #define MPK_ROUTER_W_LATE 1
+#endif
+// MPK_ROUTER_W_LDS: under MPK_ROUTER_W_LATE the K-split router tile's waves
+// 2-3 DMA its 32 gate rows into LDS (8 KB up, rows bank-swizzled) at entry
+// instead of only warming L2, and gamma's slice comes into registers at entry
+// on the slice-summing threads -- 768 B of L2 hits, retired ahead of the
+// validation pass's own loads. After validation the fold uses gamma at once
+// and the gate dot reads LDS, so neither round trip follows S36. Same values,
+// same products in the same order: bit-identical.
+#ifndef MPK_ROUTER_W_LDS
+#define MPK_ROUTER_W_LDS 0
+#endif
+#if MPK_ROUTER_W_LDS && !MPK_ROUTER_W_LATE
+#error "MPK_ROUTER_W_LDS replaces MPK_ROUTER_W_LATE's entry warm"
 #endif
 // MPK_WUK_WFIRST: a one-trip MXFP8 GEMV with LL activation input (W_UK) loads
 // its weights and scales ahead of the activation poll and consumes them from

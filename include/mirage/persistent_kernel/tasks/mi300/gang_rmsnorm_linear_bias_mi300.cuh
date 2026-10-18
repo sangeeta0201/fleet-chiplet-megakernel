@@ -1002,6 +1002,13 @@ __device__ __forceinline__ void topk_2l_ks(int *rll,
     }
     __builtin_amdgcn_s_sleep(1);
   }
+  // Trace stamps 86/87 (MPK_TRACE only, so the untraced block layout stays
+  // put): level-1 words all seen, sorted.
+#if defined(MPK_TRACE) && MPK_TRACE
+  if (lane == 0) {
+    mpk_stage_stamp(86);
+  }
+#endif
   float tot = 0.0f;
 #pragma unroll
   for (int t = 0; t < 16; t++) {
@@ -1024,11 +1031,37 @@ __device__ __forceinline__ void topk_2l_ks(int *rll,
   b = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
   unsigned key = has_p ? ((b & 0xFFFFFF00u) | (unsigned)e) : 0u;
   unsigned pay = lu;
+#if MPK_TK2L_RANK
+  // MPK_TK2L_RANK: each key's rank among the 32 (they are unique: the low
+  // byte is the expert), and the eight lanes ranked under 8 store themselves
+  // at that slot -- the same words in the same slots as the sort's lanes 0-7.
+  unsigned rk[4] = {0u, 0u, 0u, 0u};
+#pragma unroll
+  for (int j = 0; j < 32; j++) {
+    rk[j & 3] += (unsigned)__builtin_amdgcn_readlane((int)key, j) > key ? 1u : 0u;
+  }
+  unsigned const rank = (rk[0] + rk[1]) + (rk[2] + rk[3]);
+#if defined(MPK_TRACE) && MPK_TRACE
+  if (lane == 0) {
+    mpk_stage_stamp(87);
+  }
+#endif
+  if (has_p && rank < 8u) {
+    st_wt_u64((void *)(own + CAND + 2 * rank), hi | key);
+    st_wt_u64((void *)(own + CAND + 2 * rank + 1), hi | pay);
+  }
+#else
   tk2l_sort<32>(key, pay, lane);
+#if defined(MPK_TRACE) && MPK_TRACE
+  if (lane == 0) {
+    mpk_stage_stamp(87);
+  }
+#endif
   if (lane < 8) {
     st_wt_u64((void *)(own + CAND + 2 * lane), hi | key);
     st_wt_u64((void *)(own + CAND + 2 * lane + 1), hi | pay);
   }
+#endif
   // Trace stamps 40/41/4/35 here: candidates out, candidates in, winners
   // sorted, routing out.
   if (lane == 0) {
@@ -1167,6 +1200,13 @@ __device__ __forceinline__ int tk2l_slot_expert(int const *ks_all,
     }
     __builtin_amdgcn_s_sleep(1);
   }
+  // Trace stamp 88 (MPK_TRACE only): the W13 tile's level-2 candidates all
+  // seen.
+#if defined(MPK_TRACE) && MPK_TRACE
+  if (threadIdx.x == 0) {
+    mpk_stage_stamp(88);
+  }
+#endif
   unsigned key = (unsigned)wa;
   unsigned pay = 0u;
 #if MPK_TOPK_2L_MERGE
@@ -1794,6 +1834,9 @@ gang_rmsnorm_linear_bias_topk_kernel(
   // the validation pass's own waits retired both.
   auto ks_load = [&]() {
     static_assert(!KSPLIT || KS_CH == 6, "the vmcnt below counts KS_CH loads");
+    if constexpr (MPK_ROUTER_W_LDS) {
+      return;
+    }
     char const *const ks_wb =
         (char const *)gate_weight_ptr +
         ((size_t)(tid >> 3) * REDUCTION_SIZE + (size_t)tile_idx * KS_SLICE +
@@ -1814,7 +1857,41 @@ gang_rmsnorm_linear_bias_topk_kernel(
     }
     asm volatile("s_waitcnt vmcnt(6)" ::: "memory");
   };
-  if constexpr (KSPLIT) {
+  if constexpr (KSPLIT && MPK_ROUTER_W_LDS) {
+    // MPK_ROUTER_W_LDS: gamma's slice into registers on the slice-summing
+    // threads now (an L2 hit, retired ahead of the validation pass's own
+    // loads), and the 32 gate rows into LDS at 8 KB on waves 2-3, chunk c of
+    // row r in slot r * 48 + (c ^ 8 (r & 1)) so the gate dot's 16-lane
+    // ds_read_b128 groups cover all 64 banks.
+    static_assert(KS_SLICE * 2 / 16 == 48 && KS_CH == 6,
+                  "48 chunks a row, six per thread");
+    if (tid < KS_SLICE / 4) {
+      asm volatile("global_load_dwordx2 %0, %1, off sc0 nt"
+                   : "=v"(ks_g)
+                   : "v"((char const *)norm_weight_ptr +
+                         ((size_t)tile_idx * KS_SLICE + tid * 4) * 2)
+                   : "memory");
+    }
+    if (tid >= 128) {
+      extern __shared__ char _rwl_smem[];
+      _rwl_i32x4_t const w_rsrc = _rwl_rsrc(
+          (char const *)gate_weight_ptr + (size_t)tile_idx * KS_SLICE * 2,
+          (uint32_t)(31 * REDUCTION_SIZE * 2 + KS_SLICE * 2));
+      int const wl = (tid >> 6) - 2;
+      int const lane = tid & 63;
+#pragma unroll
+      for (int k = 0; k < 12; k++) {
+        int const sl = k * 128 + wl * 64;
+        int const p = sl + lane;
+        int const r = p / 48;
+        int const c = (p % 48) ^ (8 * (r & 1));
+        auto *dst = (__attribute__((address_space(3))) uint32_t *)(
+            _rwl_smem + 8192 + sl * 16);
+        _rwl_buffer_load_lds(w_rsrc, dst, 16, r * REDUCTION_SIZE * 2 + c * 16,
+                             0, 0, 1);
+      }
+    }
+  } else if constexpr (KSPLIT) {
     // 32 gate rows x KS_SLICE bf16 plus gamma's KS_SLICE, as 16-byte chunks
     // into a never-read LDS window: L2 only, waves 2-3 only.
     if (tid >= 128) {
@@ -2343,6 +2420,11 @@ gang_rmsnorm_linear_bias_topk_kernel(
 #if MPK_ROUTER_W_LATE
     if constexpr (KSPLIT) {
       ks_load();
+      if constexpr (MPK_ROUTER_W_LDS) {
+        // Gamma came in at entry; the validation pass's vmcnt(0) retired
+        // it. Keep its uses behind that wait.
+        asm volatile("" : "+v"(ks_g));
+      }
     }
 #endif
     if constexpr (KSPLIT) {
@@ -2430,6 +2512,11 @@ gang_rmsnorm_linear_bias_topk_kernel(
           red[wave] = v;
         }
       }
+      if constexpr (MPK_ROUTER_W_LDS) {
+        if (tid >= 128) {
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        }
+      }
       __syncthreads();
       if (tid == 0) {
         mpk_stage_stamp(37);
@@ -2450,10 +2537,21 @@ gang_rmsnorm_linear_bias_topk_kernel(
         ks_f4_t const h0 = *reinterpret_cast<ks_f4_t const *>(ks_lds + c * 8);
         ks_f4_t const h1 =
             *reinterpret_cast<ks_f4_t const *>(ks_lds + c * 8 + 4);
+#if MPK_ROUTER_W_LDS
+        extern __shared__ char _rwd_smem[];
+        int const wr = tid >> 3;
+        uint4 const wv = *reinterpret_cast<uint4 const *>(
+            _rwd_smem + 8192 + (wr * 48 + (c ^ (8 * (wr & 1)))) * 16);
+        unsigned const w0 = wv.x;
+        unsigned const w1 = wv.y;
+        unsigned const w2 = wv.z;
+        unsigned const w3 = wv.w;
+#else
         unsigned const w0 = (unsigned)ks_w[j][0];
         unsigned const w1 = (unsigned)ks_w[j][1];
         unsigned const w2 = (unsigned)ks_w[j][2];
         unsigned const w3 = (unsigned)ks_w[j][3];
+#endif
         acc += __uint_as_float(w0 << 16) * h0[0] +
                __uint_as_float(w0 & 0xFFFF0000u) * h0[1] +
                __uint_as_float(w1 << 16) * h0[2] +

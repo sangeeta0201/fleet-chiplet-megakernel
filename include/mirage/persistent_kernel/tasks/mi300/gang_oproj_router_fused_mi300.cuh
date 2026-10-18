@@ -2592,6 +2592,14 @@ __device__ __attribute__((always_inline)) void
           w13_pre_e = NUM_EXPERTS;
         } else if (MPK_W13_SELF_TOPK && slot < TOPK_K) {
 #if MPK_W13_SELF_TOPK && MPK_ROUTER_LL && MPK_TOPK_2L
+          if constexpr (MPK_W13_SELF_ALLW && !MPK_W2_SELF_IDS) {
+            // MPK_W13_SELF_ALLW: every wave polls the candidates and merges
+            // for itself, so the slot's expert needs no LDS hand-off and no
+            // barrier. The staged row's quantizer ended on one.
+            w13_pre_e = gang_rmsnorm_topk_detail::tk2l_slot_expert(
+                static_cast<int const *>(router_xsplit_ptr),
+                (unsigned)routing_expected, slot, nullptr);
+          } else {
           extern __shared__ char _w13_self_smem[];
           int *const s_self_e =
               reinterpret_cast<int *>(_w13_self_smem + 136 * 1024);
@@ -2610,8 +2618,21 @@ __device__ __attribute__((always_inline)) void
           __syncthreads();
           w13_pre_e = *s_self_e;
           w2_self_ids = s_ids;
+          }
 #endif
         }
+      }
+    }
+#endif
+#if MPK_W13_SH_PRE
+    // MPK_W13_SH_PRE: the shared slot needs no routing (TopK publishes
+    // NUM_EXPERTS for it), so its tiles start on the staged normed row, in the
+    // router/TopK window, instead of on the route word.
+    if constexpr (BATCH_SIZE == 1 && MOE_NUM_TOPK == TOPK_K + 1) {
+      if (w13_pre_e < 0 && ll_route != nullptr && w13_staged &&
+          routed_scaling_factor != 0.0f && num_shared_experts > 0 &&
+          (t * 8 + xcd_id) / MOE_W13_TILES_PER_EXPERT == TOPK_K) {
+        w13_pre_e = NUM_EXPERTS;
       }
     }
 #endif
@@ -2648,6 +2669,23 @@ __device__ __attribute__((always_inline)) void
         w2_act_ll,
         w13_pre_e);
   }
+#if MPK_W13_HELP_PF > 0 && !MPK_MOE_XCD_EXPERT
+  // MPK_W13_HELP_PF: the MoE ranks with no W13 tile pull the W13 tiles' tails
+  // into L2 (_gang_w13_tp_l2_help). MoE layers only: a dense layer publishes
+  // no routing words.
+  if constexpr (BATCH_SIZE == 1 && MPK_MOE_TP && MOE_W13_OPW == 32 &&
+                MOE_WEIGHT_FP4) {
+    int const moe_ranks = tiles_per_xcd - (moe_skip_topk ? 1 : 0);
+    if (ll_route != nullptr && routed_scaling_factor != 0.0f &&
+        mrk >= moe_w13_live && mrk < moe_ranks) {
+      _gang_w13_tp_l2_help<
+          HIDDEN_SIZE, 2 * MOE_INTERMEDIATE, MOE_W13_OPW, MOE_NUM_TOPK,
+          MOE_W13_TILES_PER_EXPERT, MPK_W13_HELP_PF>(
+          moe_gate_up_weight_ptr, mrk - moe_w13_live, moe_ranks - moe_w13_live,
+          moe_w13_live, ll_route, (unsigned)routing_expected);
+    }
+  }
+#endif
 #if MPK_W2_FOLD
   // The shared slot's W13 workers pull theirs behind their (early) W13 tile.
   if constexpr (W2F_ON) {

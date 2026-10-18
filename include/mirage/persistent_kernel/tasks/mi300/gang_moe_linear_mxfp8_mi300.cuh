@@ -3795,6 +3795,87 @@ __device__ __forceinline__ void
   }
 }
 
+// MPK_W13_HELP_PF: one W13-idle worker's share of pulling this XCD's TP W13
+// tiles' tails into L2 while the tiles stream their heads from HBM. A W13
+// tile is bound by its CU's bytes in flight, not by HBM (h57_xcd/
+// test_w13_tiles.hip, idle GPU: 144 x 96 KB tiles 3.52 us each, 128 of them
+// 3.52, 232 x 60 KB 2.40), so the idle CUs add bandwidth the tiles cannot
+// reach alone. A chunk is TAIL_KT k-tiles: the last TAIL_KT of one wave's
+// K-half (K_HALF wave w: row group w & 1, half w >> 1; K-major, so one
+// contiguous run), or a piece of the tile's scale block. Chunks are dealt
+// round-robin over the helpers and their four waves, into a never-read 1 KB
+// LDS window per wave, and retired before returning: a helper with no W2
+// tile goes straight on to phases that reuse that LDS.
+template <int REDUCTION_SIZE,
+          int OUTPUT_STRIDE,
+          int OUTPUT_PER_WG,
+          int NUM_TOPK,
+          int TILES_PER_EXPERT,
+          int TAIL_KT>
+__device__ __forceinline__ void
+    _gang_w13_tp_l2_help(void const *weight_ptr,
+                         int helper,
+                         int n_helpers,
+                         int w13_live,
+                         unsigned long long const *ll_route,
+                         unsigned ll_epoch) {
+  static_assert(OUTPUT_PER_WG == 32 && MPK_MOE_KMAJOR >= 2,
+                "the K-major K_HALF W13 tile");
+  constexpr int W_ROW_BYTES = REDUCTION_SIZE / 2;
+  constexpr int WG_DATA_BYTES = OUTPUT_PER_WG * W_ROW_BYTES;
+  constexpr int WG_SCALE_BYTES = OUTPUT_PER_WG * (REDUCTION_SIZE / 32);
+  constexpr int WG_BYTES = WG_DATA_BYTES + WG_SCALE_BYTES;
+  constexpr int EXPERT_WGS = OUTPUT_STRIDE / OUTPUT_PER_WG;
+  constexpr int64_t EXPERT_BYTES = static_cast<int64_t>(EXPERT_WGS) * WG_BYTES;
+  constexpr int W_KS = _gang_moe_w_kstride<true>();
+  constexpr int KH = REDUCTION_SIZE / 128 / 2;
+  constexpr int CHUNK = TAIL_KT * W_KS;
+  constexpr int SC_CHUNKS = (WG_SCALE_BYTES + CHUNK - 1) / CHUNK;
+  constexpr int CPT = 4 + SC_CHUNKS;
+  static_assert(TAIL_KT > 0 && TAIL_KT <= KH && W_KS == 1024,
+                "a chunk is whole 1 KB k-tiles of one wave's half");
+  if (n_helpers <= 0 || helper < 0 || helper >= n_helpers) {
+    return;
+  }
+  int const xcd = _gang_moe_get_xcd_id();
+  int const wave = threadIdx.x >> 6;
+  int const lane = threadIdx.x & 63;
+  unsigned long long w[NUM_TOPK];
+  _gang_ll_route_words<NUM_TOPK>(ll_route, ll_epoch, w);
+  extern __shared__ char _w13h_smem[];
+  auto *dst = (__attribute__((address_space(3))) uint32_t *)(
+      _w13h_smem + 140 * 1024 + wave * 1024);
+  int const nchunks = w13_live * CPT;
+  for (int c = helper + wave * n_helpers; c < nchunks; c += 4 * n_helpers) {
+    int const t = c / CPT;
+    int const k = c % CPT;
+    int const g = t * 8 + xcd;
+    int const slot = g / TILES_PER_EXPERT;
+    int const e = (int)(unsigned)w[slot < NUM_TOPK ? slot : 0];
+    int off, len;
+    if (k < 4) {
+      off = (k & 1) * (16 * W_ROW_BYTES) + (k >> 1) * KH * W_KS +
+            (KH - TAIL_KT) * W_KS;
+      len = CHUNK;
+    } else {
+      off = WG_DATA_BYTES + (k - 4) * CHUNK;
+      len = WG_SCALE_BYTES - (k - 4) * CHUNK;
+      len = len < CHUNK ? len : CHUNK;
+    }
+    i32x4_t const rsrc = make_w_buffer_rsrc(
+        static_cast<uint8_t const *>(weight_ptr) +
+            static_cast<int64_t>(e) * EXPERT_BYTES +
+            static_cast<int64_t>(g % TILES_PER_EXPERT) * WG_BYTES + off,
+        static_cast<uint32_t>(len));
+#pragma unroll
+    for (int i = 0; i < TAIL_KT; i++) {
+      __llvm_amdgcn_raw_buffer_load_lds(rsrc, dst, 16, lane * 16 + i * 1024, 0,
+                                        0, 1);
+    }
+  }
+  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+}
+
 // The activation half of the fused tile: NSEG gathered SEG_LEN-wide bf16 slabs
 // quantized into one contiguous E4M3 run in LDS with one E8M0 per 128 --
 // _gang_wave_parallel_fp8_quant_nt's math, except that each 32-element
