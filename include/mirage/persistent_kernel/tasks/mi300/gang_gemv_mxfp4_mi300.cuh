@@ -88,6 +88,248 @@ __device__ __forceinline__ unsigned cvt_fp4_pair(unsigned raw, float scale) {
   __builtin_memcpy(&u, &v, 4);
   return u;
 }
+#if MPK_OPROJ_MFMA
+typedef int om_i32x4_t __attribute__((ext_vector_type(4)));
+typedef int om_i32x8_t __attribute__((ext_vector_type(8)));
+typedef float om_f32x4_t __attribute__((ext_vector_type(4)));
+typedef short om_fp8x4_t __attribute__((ext_vector_type(2)));
+// _gang_compute_e8m0_fp8's rule: the smallest power of two that brings the
+// block's amax under E4M3's 448.
+__device__ __forceinline__ unsigned om_e8m0(float amax) {
+  if (amax == 0.0f) {
+    return 0u;
+  }
+  unsigned const u = __float_as_uint(amax * (1.0f / 448.0f));
+  int e = (int)((u >> 23) & 0xFF);
+  if (u & 0x7FFFFF) {
+    e++;
+  }
+  return (unsigned)max(0, min(255, e));
+}
+// MPK_OPROJ_MFMA: one 32-row tile of the MXFP4 o_proj as
+// v_mfma_scale_f32_16x16x128_f8f6f4, FP4 weights against the staged row
+// quantized to E4M3 with one E8M0 per 128 (the quantizer qkv_a and q_b feed
+// their MFMAs). Wave w takes k-tiles [w K/512, (w + 1) K/512) of both 16-row
+// blocks; the four waves' column-0 partials meet in LDS in wave order.
+// The weight tile is read as packed: the A operand's lane group g holds
+// k = 32g..32g+31 of its row, which is bytes 16g..16g+15 of the row's 64-byte
+// k-tile in this layout, and its E8M0 is that row's block 4 kt + g. The B
+// operand's group g holds k = 16g..16g+15 and 64+16g..64+16g+15
+// (CDNA4 ISA 7.1.5.1). Returns row `row`'s value on every thread; the caller
+// reads it on lane 0 of each row as it does the shuffle sum's.
+template <int REDUCTION_SIZE, bool A_PAD, int WG_DATA_BYTES, int LDS_OFF,
+          bool W_LDS = false>
+__device__ __forceinline__ float oproj_mfma(unsigned short const *s_a,
+                                            unsigned char const *wg,
+                                            int row) {
+  constexpr int K = REDUCTION_SIZE;
+  constexpr int KT = K / 128;
+  constexpr int KT_W = KT / 4;
+  constexpr int NCHUNK = K / 8;
+  static_assert(K % 512 == 0 && NCHUNK % 256 == 0,
+                "whole k-tiles per wave and whole quantizer trips");
+  extern __shared__ char _fused_smem[];
+  unsigned char *const s_q =
+      reinterpret_cast<unsigned char *>(_fused_smem) + LDS_OFF;
+  unsigned char *const s_qs = s_q + K;
+  float *const red = reinterpret_cast<float *>(s_qs + 256);
+  static_assert(LDS_OFF + K + 256 + 4 * 32 * (int)sizeof(float) <=
+                    (int)mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE,
+                "the MFMA scratch fits");
+  int const tid = threadIdx.x;
+  int const wave = tid >> 6;
+  int const col = tid & 15;
+  int const g = (tid >> 4) & 3;
+  using gu8 = __attribute__((address_space(1))) unsigned char const *;
+  using gv4 = __attribute__((address_space(1))) om_i32x4_t const *;
+  // The weights first: the quantizer below is LDS only, so their L2 round
+  // trip runs under it. The operand layout reads half a 128-byte line per
+  // row per k-tile, so as loaded each instruction covers whole lines: x
+  // carries rows 0-7 of the block (lanes c < 8 k-tile 2p, lanes c >= 8 the
+  // same rows' 2p + 1), y rows 8-15 (lanes c < 8 k-tile 2p + 1 of rows c + 8,
+  // lanes c >= 8 2p of rows c). k-tile 2p is then x or y by lane, and 2p + 1
+  // the other one from lane c ^ 8 (row_ror:8). Measured in
+  // test_oproj_mfma.hip: the straight layout's 16 half lines a load put the
+  // tile at 4.7 us, all of it in issuing the loads.
+  // The scales: a row's 32 bytes for this wave's eight k-tiles in two 16-byte
+  // loads, the lane's group picked out of each dword.
+  static_assert(KT_W % 2 == 0 && KT_W * 4 == 32, "eight k-tiles a wave");
+  om_i32x4_t x[2][KT_W / 2], y[2][KT_W / 2];
+  om_i32x4_t sw[2][2];
+  bool const lo8 = col < 8;
+  // W_LDS: the Phase 8 prefetch left the tile in LDS (w_lds_dma_mfma), every
+  // chunk at c ^ (row & 7): each operand is one ds_read_b128 at its place.
+  om_i32x4_t av[2][W_LDS ? KT_W : 1];
+  // Issued after the quantizer: LDS returns in order, so ahead of it they
+  // would hold the quantizer's own reads of the row behind them.
+  auto lds_w = [&]() __attribute__((always_inline)) {
+    unsigned char const *const wl =
+        reinterpret_cast<unsigned char const *>(_fused_smem) +
+        MPK_OPROJ_W_LDS_OFF;
+#pragma unroll
+    for (int j = 0; j < KT_W; j++) {
+#pragma unroll
+      for (int rb = 0; rb < 2; rb++) {
+        int const r = rb * 16 + col;
+        int const c = (wave * KT_W + j) * 4 + g;
+        av[rb][j] = *reinterpret_cast<om_i32x4_t const *>(
+            wl + r * (K / 2) + 16 * (c ^ (r & 7)));
+      }
+    }
+#pragma unroll
+    for (int rb = 0; rb < 2; rb++) {
+#pragma unroll
+      for (int hh = 0; hh < 2; hh++) {
+        int const r = rb * 16 + col;
+        int const q = 2 * wave + hh;
+        sw[rb][hh] = *reinterpret_cast<om_i32x4_t const *>(
+            wl + WG_DATA_BYTES + r * (K / 32) + 16 * (q ^ (r & 7)));
+      }
+    }
+  };
+  (void)lds_w;
+  if constexpr (!W_LDS) {
+#pragma unroll
+  for (int pp = 0; pp < KT_W / 2; pp++) {
+#pragma unroll
+    for (int rb = 0; rb < 2; rb++) {
+      int const kt0 = wave * KT_W + 2 * pp;
+      int const rx = rb * 16 + (col & 7);
+      int const ry = rx + 8;
+      int const cx = (kt0 + (lo8 ? 0 : 1)) * 64 + g * 16;
+      int const cy = (kt0 + (lo8 ? 1 : 0)) * 64 + g * 16;
+      gu8 const px = (gu8)(wg + (size_t)rx * (K / 2) + cx);
+      gu8 const py = (gu8)(wg + (size_t)ry * (K / 2) + cy);
+#if MPK_ATTN_STREAM_NT >= 1
+      x[rb][pp] = __builtin_nontemporal_load((gv4)px);
+      y[rb][pp] = __builtin_nontemporal_load((gv4)py);
+#else
+      x[rb][pp] = *(gv4)px;
+      y[rb][pp] = *(gv4)py;
+#endif
+    }
+  }
+#pragma unroll
+  for (int rb = 0; rb < 2; rb++) {
+#pragma unroll
+    for (int h = 0; h < 2; h++) {
+      gu8 const ps = (gu8)(wg + WG_DATA_BYTES +
+                           (size_t)(rb * 16 + col) * (K / 32) + wave * 32 +
+                           h * 16);
+#if MPK_ATTN_STREAM_NT == 1
+      sw[rb][h] = __builtin_nontemporal_load((gv4)ps);
+#else
+      sw[rb][h] = *(gv4)ps;
+#endif
+    }
+  }
+  }
+  // The row to E4M3: sixteen elements a lane, eight lanes a 128-element
+  // block, each wave its own k-tiles -- the only ones its MFMAs read -- so no
+  // barrier: the LDS round trip is the wave's own.
+  static_assert(NCHUNK == 4 * 2 * 64, "1024 elements, one pass, a wave");
+  {
+    int const e0 = wave * (K / 4) + (tid & 63) * 16;
+    om_i32x4_t raw[2];
+#pragma unroll
+    for (int h = 0; h < 2; h++) {
+      int const e = e0 + 8 * h;
+      raw[h] = *reinterpret_cast<om_i32x4_t const *>(
+          s_a + e + (A_PAD ? (e >> 5) * 8 : 0));
+    }
+    float v[16];
+    float amax = 0.0f;
+#pragma unroll
+    for (int e = 0; e < 8; e++) {
+      unsigned const w = (unsigned)raw[e >> 2][e & 3];
+      v[2 * e] = __uint_as_float(w << 16);
+      v[2 * e + 1] = __uint_as_float(w & 0xFFFF0000u);
+      amax = fmaxf(amax, fmaxf(fabsf(v[2 * e]), fabsf(v[2 * e + 1])));
+    }
+    // xor 1, xor 2, then the half-row mirror (lane ^ 7 within eight).
+    amax = fmaxf(amax, __int_as_float(__builtin_amdgcn_mov_dpp(
+                           __float_as_int(amax), 0xB1, 0xF, 0xF, false)));
+    amax = fmaxf(amax, __int_as_float(__builtin_amdgcn_mov_dpp(
+                           __float_as_int(amax), 0x4E, 0xF, 0xF, false)));
+    amax = fmaxf(amax, __int_as_float(__builtin_amdgcn_mov_dpp(
+                           __float_as_int(amax), 0x141, 0xF, 0xF, false)));
+    unsigned const se = om_e8m0(amax);
+    float const scale_f = se == 0u ? 1.0f : __uint_as_float(se << 23);
+    om_i32x4_t q;
+#pragma unroll
+    for (int d = 0; d < 4; d++) {
+      om_fp8x4_t pk = {};
+      pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(pk, v[4 * d], v[4 * d + 1],
+                                                    scale_f, false);
+      pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
+          pk, v[4 * d + 2], v[4 * d + 3], scale_f, true);
+      int pw;
+      __builtin_memcpy(&pw, &pk, 4);
+      q[d] = pw;
+    }
+    *reinterpret_cast<om_i32x4_t *>(s_q + e0) = q;
+    if ((tid & 7) == 0) {
+      s_qs[e0 / 128] = (unsigned char)se;
+    }
+  }
+  // The wave's own stores; the weight loads stay in flight across it.
+  asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+  if constexpr (W_LDS) {
+    lds_w();
+  }
+  om_f32x4_t acc0 = {0.0f, 0.0f, 0.0f, 0.0f};
+  om_f32x4_t acc1 = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+  for (int j = 0; j < KT_W; j++) {
+    int const kt = wave * KT_W + j;
+    om_i32x4_t const lo =
+        *reinterpret_cast<om_i32x4_t const *>(s_q + kt * 128 + g * 16);
+    om_i32x4_t const hi =
+        *reinterpret_cast<om_i32x4_t const *>(s_q + kt * 128 + g * 16 + 64);
+    om_i32x8_t const b = {lo[0], lo[1], lo[2], lo[3],
+                          hi[0], hi[1], hi[2], hi[3]};
+    int const sb = (int)s_qs[kt];
+    int const pp = j >> 1;
+    om_i32x4_t v[2];
+#pragma unroll
+    for (int rb = 0; rb < 2; rb++) {
+      if constexpr (W_LDS) {
+        v[rb] = av[rb][W_LDS ? j : 0];
+      } else if ((j & 1) == 0) {
+        v[rb] = lo8 ? x[rb][pp] : y[rb][pp];
+      } else {
+        om_i32x4_t const w = lo8 ? y[rb][pp] : x[rb][pp];
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+          v[rb][i] = __builtin_amdgcn_mov_dpp(w[i], 0x128, 0xF, 0xF, false);
+        }
+      }
+    }
+    int const s0 = (int)(((unsigned)sw[0][j >> 2][j & 3] >> (8 * g)) & 0xFFu);
+    int const s1 = (int)(((unsigned)sw[1][j >> 2][j & 3] >> (8 * g)) & 0xFFu);
+    om_i32x8_t const a0 = {v[0][0], v[0][1], v[0][2], v[0][3], 0, 0, 0, 0};
+    om_i32x8_t const a1 = {v[1][0], v[1][1], v[1][2], v[1][3], 0, 0, 0, 0};
+    acc0 = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(a0, b, acc0, 4, 0,
+                                                            0, s0, 0, sb);
+    acc1 = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(a1, b, acc1, 4, 0,
+                                                            0, s1, 0, sb);
+  }
+  // Lane (col, g) holds rows 4g..4g+3 of column col, and every column is the
+  // same row of activations, so all sixteen lanes of a group store the same
+  // four values to the same words. Unconditionally: the MFMA ignores EXEC,
+  // and under an `if (col == 0)` the compiler sank the chain into the branch,
+  // where the scale operands' setup ran on column 0's lanes only and the
+  // other rows' scales were stale registers.
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    red[wave * 32 + g * 4 + i] = acc0[i];
+    red[wave * 32 + 16 + g * 4 + i] = acc1[i];
+  }
+  asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+  __builtin_amdgcn_s_barrier();
+  return ((red[row] + red[32 + row]) + red[64 + row]) + red[96 + row];
+}
+#endif
 } // namespace gang_gemv_mxfp4_detail
 
 // Same signature, same tile addressing and the same caller contract as
@@ -121,6 +363,17 @@ constexpr int a_row_elems() {
   return (MPK_OPROJ_A_PAD && BATCH_SIZE == 1) ? REDUCTION_SIZE + REDUCTION_SIZE / 4
                                               : REDUCTION_SIZE;
 }
+#if MPK_OPROJ_MFMA
+// Byte offset of the MFMA LDS scratch: past the staged activation and
+// MPK_OLL2_LDS's row values, which the push reads after this returns.
+template <int BATCH_SIZE, int REDUCTION_SIZE>
+constexpr int om_lds_off() {
+  return ((int)(sizeof(unsigned short) * BATCH_SIZE *
+                a_row_elems<BATCH_SIZE, REDUCTION_SIZE>()) +
+          511) &
+         ~255;
+}
+#endif
 #if MPK_OLL2_LDS
 // MPK_OLL2_LDS: where the epilogue leaves a tile's row values, past the
 // staged activation so a second pass's skipped staging still finds it.
@@ -159,12 +412,12 @@ __device__ __forceinline__ void w_lds_dma(w_i32x4_t rsrc, unsigned tile_voff,
   "s_add_u32 m0, m0, 0x1000\n\t"                                               \
   "s_add_u32 %[so], %[so], 0x1000\n\t"                                         \
   "s_nop 0\n\t"                                                                \
-  "buffer_load_dwordx4 %[" V "], %[rsrc], %[so] offen lds\n\t"
+  "buffer_load_dwordx4 %[" V "], %[rsrc], %[so] offen sc0 lds\n\t"
   asm volatile("s_nop 4\n\t"
                "s_mov_b32 m0, %[m0]\n\t"
                "s_mov_b32 %[so], 0\n\t"
                "s_nop 0\n\t"
-               "buffer_load_dwordx4 %[va], %[rsrc], %[so] offen lds\n\t"
+               "buffer_load_dwordx4 %[va], %[rsrc], %[so] offen sc0 lds\n\t"
                W_LDS_NEXT("va") W_LDS_NEXT("va") W_LDS_NEXT("va")
                W_LDS_NEXT("va") W_LDS_NEXT("va") W_LDS_NEXT("va")
                W_LDS_NEXT("va") W_LDS_NEXT("va") W_LDS_NEXT("va")
@@ -182,6 +435,55 @@ template <int REDUCTION_SIZE>
 __device__ __forceinline__ unsigned w_lds_data(int row, int c) {
   return (unsigned)(row * (REDUCTION_SIZE / 2) + 16 * (c ^ ((row & 1) << 3)));
 }
+#if MPK_OPROJ_MFMA
+// w_lds_dma for MPK_OPROJ_MFMA's reads: row r's 16-byte chunk c, of the data
+// half and of the scale half alike, lands at chunk c ^ (r & 7) of its row, so
+// the eight rows one ds_read_b128 cycle serves (lanes col 0-7 or 8-15 of an
+// operand group) fall on eight bank groups. Round j is rows 2j and 2j + 1, so
+// the data rounds' sources cycle through four lane offsets (round j's rows
+// have r & 7 = 2 (j % 4) + (tid >> 7)); the scale round is rows tid >> 3.
+template <int REDUCTION_SIZE, int ROWS_PER_WG>
+__device__ __forceinline__ void w_lds_dma_mfma(w_i32x4_t rsrc,
+                                               unsigned tile_voff,
+                                               unsigned m0_base) {
+  static_assert(REDUCTION_SIZE == 4096 && ROWS_PER_WG == 32,
+                "the round map is the o_proj tile's: two 2 KB rows a round, "
+                "sixteen data rounds and one scale round");
+  int const tid = threadIdx.x;
+  int const h = tid >> 7;
+  unsigned va[4];
+#pragma unroll
+  for (int k = 0; k < 4; k++) {
+    va[k] = tile_voff +
+            16u * (unsigned)((tid & 128) | ((tid & 127) ^ (2 * k + h)));
+  }
+  unsigned const vb =
+      tile_voff + 16u * (unsigned)((tid & ~7) | ((tid & 7) ^ ((tid >> 3) & 7)));
+  unsigned so;
+#define W_LDS_NEXT(V)                                                          \
+  "s_add_u32 m0, m0, 0x1000\n\t"                                               \
+  "s_add_u32 %[so], %[so], 0x1000\n\t"                                         \
+  "s_nop 0\n\t"                                                                \
+  "buffer_load_dwordx4 %[" V "], %[rsrc], %[so] offen sc0 lds\n\t"
+  asm volatile("s_nop 4\n\t"
+               "s_mov_b32 m0, %[m0]\n\t"
+               "s_mov_b32 %[so], 0\n\t"
+               "s_nop 0\n\t"
+               "buffer_load_dwordx4 %[v0], %[rsrc], %[so] offen sc0 lds\n\t"
+               W_LDS_NEXT("v1") W_LDS_NEXT("v2") W_LDS_NEXT("v3")
+               W_LDS_NEXT("v0") W_LDS_NEXT("v1") W_LDS_NEXT("v2")
+               W_LDS_NEXT("v3") W_LDS_NEXT("v0") W_LDS_NEXT("v1")
+               W_LDS_NEXT("v2") W_LDS_NEXT("v3") W_LDS_NEXT("v0")
+               W_LDS_NEXT("v1") W_LDS_NEXT("v2") W_LDS_NEXT("v3")
+               W_LDS_NEXT("vb")
+               : [so] "=&s"(so)
+               : [rsrc] "s"(rsrc), [v0] "v"(va[0]), [v1] "v"(va[1]),
+                 [v2] "v"(va[2]), [v3] "v"(va[3]), [vb] "v"(vb),
+                 [m0] "s"(m0_base)
+               : "memory", "m0", "scc");
+#undef W_LDS_NEXT
+}
+#endif
 #endif
 } // namespace gang_gemv_mxfp4_detail
 
@@ -531,6 +833,26 @@ __device__ __noinline__ void
     }
   }
 
+#if MPK_OPROJ_MFMA
+  constexpr bool MF = BATCH_SIZE == 1 && ROWS_PER_WG == 32 && STAGE_A &&
+                      REDUCTION_SIZE % 512 == 0 && !WF_ANY;
+#if MPK_OPROJ_PF_LDS
+  constexpr bool MF_WL = W_LDS;
+#else
+  constexpr bool MF_WL = false;
+#endif
+#else
+  constexpr bool MF = false;
+#endif
+  float sum[BATCH_SIZE];
+  if constexpr (MF) {
+#if MPK_OPROJ_MFMA
+    sum[0] = gang_gemv_mxfp4_detail::oproj_mfma<
+        REDUCTION_SIZE, A_PAD, WG_DATA_BYTES,
+        gang_gemv_mxfp4_detail::om_lds_off<BATCH_SIZE, REDUCTION_SIZE>(),
+        MF_WL>(s_a, wg, row);
+#endif
+  } else {
   float acc[BATCH_SIZE][4];
 #pragma unroll
   for (int m = 0; m < BATCH_SIZE; m++) {
@@ -571,7 +893,10 @@ __device__ __noinline__ void
   // backedge before porting a pipelining transform, not just the phase's
   // byte share.
 #pragma unroll
-  for (int i0 = 0; i0 < (MPK_PROBE_OPROJ_HALFK ? ITERS / 2 : ITERS);
+  for (int i0 = 0;
+       i0 < (MPK_PROBE_OPROJ_HALFK == 2 ? 0
+             : MPK_PROBE_OPROJ_HALFK  ? ITERS / 2
+                                      : ITERS);
        i0 += UNROLL) {
     // Indexed only by fully unrolled loops, so these stay in VGPRs. The
     // activation vector is 4 wide rather than 2: 32 elements of weight need
@@ -660,7 +985,6 @@ __device__ __noinline__ void
     }
   }
 
-  float sum[BATCH_SIZE];
 #pragma unroll
   for (int m = 0; m < BATCH_SIZE; m++) {
     sum[m] = (acc[m][0] + acc[m][1]) + (acc[m][2] + acc[m][3]);
@@ -668,6 +992,7 @@ __device__ __noinline__ void
     for (int off = LANES_PER_ROW >> 1; off > 0; off >>= 1) {
       sum[m] += __shfl_xor(sum[m], off);
     }
+  }
   }
 
   if (lane == 0) {

@@ -426,6 +426,22 @@ __device__ __forceinline__ void st_nt_u64(unsigned long long int *addr,
 //     the peer polling the pairs themselves (TileRT's one-shot push) 0.96-1.04 us
 // So data-as-signal saves ~0.8 us per exchange; the multi-microsecond peer
 // waits in the stage stamps are skew between the ranks, not transport.
+//
+// On one idle MI350X, measured 2026-10-18 (one producer lane stores an 8-byte
+// flag at a random phase, one consumer lane polls it; s_memrealtime both
+// ends), one-way, mean of 2980 trials:
+//   system-scope store, poll load-wait-check-s_sleep(1)   409 ns across XCDs,
+//                                                          365 ns within one
+//   the same poll with 2 or 4 loads in flight, each check
+//   waiting only for the oldest (vmcnt(D-1))               350-360 ns
+//   8 in flight                                            425 ns; 663 ns at
+//                                                          s_sleep(2) apart
+// A poll round trip is ~0.3 us, so a single in-flight poll already sees a
+// flag within ~0.05 us of the best a ring can do, and deeper rings are slower:
+// loads to a line with a miss outstanding return with that miss, so they are
+// not independent samples. The 1-2 us hand-offs in the stage stamps are the
+// producer's drain, the consumer's own data loads and load on the memory
+// system, not poll granularity.
 
 // Write-through 64-bit store (4x bf16 or 2x float)
 __device__ __forceinline__ void st_wt_u64(void *addr,
@@ -1169,6 +1185,8 @@ __device__ __forceinline__ bool
 // Re-measured 2026-10-14 on the MPK_KV_LL defaults, where q_b's A tiles land
 // 0.84 us after their issue (MPK_TRACE q05), n=3 interleaved, tokens
 // identical: 3.401 3.402 3.397 vs 3.394 3.379 3.391 ms (+0.012).
+// RE-MEASURED 2026-10-18 on 43cc07a, NP=8 1024/1024, one interleaved screen rep vs
+// control 3.289 ms: 3.326, tokens identical. Off.
 #ifndef MPK_QB_IDLE_PF
 #define MPK_QB_IDLE_PF 0
 #endif
@@ -1192,6 +1210,8 @@ __device__ __forceinline__ bool
 // by its weight fetch. Off.
 // Re-measured on 12ad8d7, where q_b idles in the MPK_QA_LL word poll, n=3:
 // 3.698 3.685 3.702 vs 3.690 3.698 3.691 ms, null.
+// RE-MEASURED 2026-10-18 on 43cc07a, NP=8 1024/1024, one interleaved screen rep vs
+// control 3.289 ms: 3.296, tokens identical. Off.
 #ifndef MPK_QB_SELF_PF
 #define MPK_QB_SELF_PF 0
 #endif
@@ -1486,6 +1506,8 @@ __device__ __forceinline__ bool
 // MEASURED NEGATIVE 2026-10-10, same batch as MPK_ATTN_OUT_LL, text
 // identical: 4.762 4.764 4.759 -> 4.784 4.761 4.783 ms (+0.014). Off.
 // Re-measured 2026-10-11 under MPK_ATTN_OUT_LL: 4.059 vs 4.031 (+0.028).
+// RE-MEASURED 2026-10-18 on 43cc07a, NP=8 1024/1024, one interleaved screen rep vs
+// control 3.289 ms: 3.288, tokens identical. Off.
 #ifndef MPK_OPROJ_WFIRST
 #define MPK_OPROJ_WFIRST 0
 #endif
@@ -1666,6 +1688,19 @@ __device__ __forceinline__ bool
 #ifndef MPK_PROBE_XRANK_NOWAIT
 #define MPK_PROBE_XRANK_NOWAIT 0
 #endif
+// MPK_PROBE_ROUTER_1SLOT: PRICING PROBE, WRONG OUTPUT. Under MPK_ROUTER_POLL_INC
+// the split router's first pass loads only slot 0's words and takes the other
+// slots as zero, so the pass puts 1/8 of its system-scope reads on the fabric
+// (every XCD reads all eight slots of the whole row: ~3.1 MB per rank).
+// Priced against MPK_PROBE_XRANK_NOWAIT=2, which keeps the reads and drops the
+// wait for late slots.
+// MEASURED 2026-10-18 on 43cc07a, NP=8 1024/1024: control 3.293 3.280,
+// NOWAIT=2 3.256 3.240 (-0.039: the wait for the slowest rank), with this
+// 3.238 (-0.018 more). The first pass's traffic is worth ~0.018 ms, about what
+// a cross-XCD reduce-scatter of it would add back as a hop.
+#ifndef MPK_PROBE_ROUTER_1SLOT
+#define MPK_PROBE_ROUTER_1SLOT 0
+#endif
 // MPK_LL_POLL_GATE: the o_proj GEMV's MPK_ATTN_OUT_LL staging re-reads all
 // 2048 words (16 KB) per round from its tile's entry (~19 us into the layer in
 // trace 6) to the merge's last item (~30 us): ~30 MB/layer/rank of
@@ -1737,6 +1772,9 @@ __device__ __forceinline__ bool
 // 256/512/1024 G1 PASS with token dumps identical to g12. Default on.
 #ifndef MPK_ROUTER_POLL_INC
 #define MPK_ROUTER_POLL_INC 1
+#endif
+#if MPK_PROBE_ROUTER_1SLOT && !MPK_ROUTER_POLL_INC
+#error "MPK_PROBE_ROUTER_1SLOT is in MPK_ROUTER_POLL_INC's poll"
 #endif
 // MPK_RESOLVE_POLL_INC: the same per-thread incremental spin for the qkv_a
 // split resolver's EP slots (S70 -> S71 0.19 us in MPK_TRACE: the first pass
@@ -2259,8 +2297,34 @@ __device__ __forceinline__ bool
 #endif
 // MPK_PROBE_OPROJ_HALFK: PRICING PROBE, WRONG OUTPUT. The MXFP4 o_proj GEMV
 // runs half its K-loop: how much of a faster o_proj GEMV the wall keeps.
+// =2 runs none of it: the ceiling of a free o_proj GEMV (staging and epilogue
+// kept).
+// MEASURED 2026-10-18 on 43cc07a, NP=8 1024/1024, n=2 interleaved: control
+// 3.288 3.291, =1 3.236 3.230 (-0.057), =2 3.193 3.199 (-0.094) ms.
 #ifndef MPK_PROBE_OPROJ_HALFK
 #define MPK_PROBE_OPROJ_HALFK 0
+#endif
+// MPK_OPROJ_MFMA: the MXFP4 o_proj tile (32 rows x 4096 K under MPK_OPROJ_RP)
+// as v_mfma_scale_f32_16x16x128_f8f6f4 -- the weight read as packed, the
+// staged row quantized to E4M3 with one E8M0 per 128 -- instead of the VALU
+// dequant-and-FMA GEMV (gang_gemv_mxfp4_mi300.cuh oproj_mfma). The VALU tile
+// is 2.31 us after staging (MPK_TRACE h30) with every weight an L2 hit, bound
+// by FMA issue, its 64 ds_read_b128 a lane and v_cvt_scalef32_pk_bf16_fp4
+// (MPK_OPROJ_PF_LDS's note); the MFMA tile is 16 MFMAs a wave. The activation
+// rounds to E4M3, so it moves the tokens: ppl-gated.
+// tests/standalone/test_oproj_mfma.hip (192 concurrent tiles; the GEMV body,
+// staging skipped): matches the E4M3-quantized row to 1.9e-7 of max|ref|, the
+// exact product to 2.2e-2. VALU 2.44 us (L2-warm) / 2.48 (tile in LDS); MFMA
+// 3.56 from L2 -- bound by L2 -> CU delivery of the 68 KB, all of it in the
+// loads -- and 1.48 with the tile in LDS under MPK_OPROJ_PF_LDS
+// (w_lds_dma_mfma's layout).
+// MEASURED NULL 2026-10-18 on 43cc07a, NP=8 1024/1024, G1 PASS, text coherent,
+// tokens moved: with MPK_OPROJ_PF_LDS 3.284 3.275 3.286 3.286 vs control 3.287
+// 3.282 3.290 3.283 ms. Against PF_LDS alone it is -0.055 (3.343 3.331 3.332
+// 3.321), but PF_LDS costs that much on its own (its note). Ceiling of a free
+// o_proj GEMV, MPK_PROBE_OPROJ_HALFK=2: -0.094. Off.
+#ifndef MPK_OPROJ_MFMA
+#define MPK_OPROJ_MFMA 0
 #endif
 // MPK_PROBE_QKVA_HALFK: PRICING PROBE, WRONG OUTPUT. qkv_a's K-parallel tile
 // runs half its k-tiles per wave (6 of 12; the hoisted prefill still seeds
@@ -2491,6 +2555,15 @@ __device__ __forceinline__ bool
 // Default off; not run at NP=8.
 // RE-MEASURED 2026-10-17 on c2065f2, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
 // tokens identical: 3.340 vs control 3.285 3.293 3.284 ms. Off.
+// Localized 2026-10-18 on 43cc07a, n=2 interleaved, tokens identical: 3.343
+// 3.331 vs 3.287 3.282 (+0.053); with the DMA at sc0 (the L2-warm prefetch's
+// MALL hit-evict) 3.332 3.321 vs 3.290 3.283. The DMA alone is free: the same
+// build with the GEMV still reading L2 3.284 3.281 vs 3.285 3.284. MPK_TRACE:
+// the GEMV is no slower; every W13 tile is +0.16 us (all 224 workers alike)
+// and the router's tail +0.2 -- and the W13 function is instruction for
+// instruction the same, 116 bytes earlier. Not placement alone: under
+// -falign-functions=64 (+0.018 on the default by itself, 3.301 3.303) PF_LDS
+// is still 3.346 3.345. Off.
 #ifndef MPK_OPROJ_PF_LDS
 #define MPK_OPROJ_PF_LDS 0
 #endif
@@ -2727,6 +2800,8 @@ __device__ __forceinline__ bool
 // to HEAD's alignment (MPK_LMH_PAD_BYTES=204), 3.460 3.457 without, vs 3.442
 // 3.451; on MPK_LMH_BAL 3.461 3.454 vs 3.464 3.467. The ~5 us argmax_partial
 // took does not survive the graph change's worker_kernel. Off.
+// RE-MEASURED 2026-10-18 on 43cc07a, NP=8 1024/1024, one interleaved screen rep vs
+// control 3.289 ms: 3.297, tokens identical. Off.
 #ifndef MPK_LMH_ARGMAX
 #define MPK_LMH_ARGMAX 0
 #endif
@@ -2787,6 +2862,8 @@ __device__ __forceinline__ unsigned long long lmh_argmax_key(unsigned bits,
 // MEASURED SLOWER 2026-10-11 on 1f81211: 4.010 vs 3.950 ms (r1). The first
 // pass rarely validates, so the second pass's vmcnt(0) now waits for the
 // whole burst; issued up front it had finished by then. Off.
+// RE-MEASURED 2026-10-18 on 43cc07a, NP=8 1024/1024, one interleaved screen rep vs
+// control 3.289 ms: 3.396, tokens moved. Off.
 #ifndef MPK_ROUTER_KS_MID
 #define MPK_ROUTER_KS_MID 0
 #endif
@@ -2907,6 +2984,7 @@ __device__ __forceinline__ unsigned long long lmh_argmax_key(unsigned bits,
 // MEASURED SLOWER 2026-10-11 on d2d99b1: 3.913 vs 3.894 ms (r1). A group's 16
 // lanes on one lse address coalesce to one transaction, so the duplicates
 // were nearly free and the LDS round trip plus barrier are not. Off.
+// 2026-10-18: does not build: #error with MPK_MERGE_EXP2B (default 1). Off.
 #ifndef MPK_MERGE_LSE_LDS
 #define MPK_MERGE_LSE_LDS 0
 #endif
@@ -3078,6 +3156,7 @@ __device__ __forceinline__ unsigned long long lmh_argmax_key(unsigned bits,
 // doubled both.
 // MEASURED NULL 2026-10-13, r1: 3.506 vs 3.507 ms (with MPK_MERGE_LIVE
 // 3.524). Half the bytes moves neither leg. Off, so never ppl-gated.
+// 2026-10-18: does not build: #error with MPK_MERGE_EXP2B (default 1). Off.
 #ifndef MPK_DEC_PART_F16
 #define MPK_DEC_PART_F16 0
 #endif

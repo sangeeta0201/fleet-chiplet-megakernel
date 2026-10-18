@@ -118,6 +118,8 @@ using bf16 = __hip_bfloat16;
 // write followed by a DPP/PERMLANE read of the same register, and every stage
 // here reads what the previous add just wrote.
 // 2026-10-17 on c2065f2: tokens differ from the default (3.279 vs control 3.285 3.293 3.284, one rep).
+// RE-MEASURED 2026-10-18 on 43cc07a, NP=8 1024/1024, one interleaved screen rep vs
+// control 3.289 ms: 3.285, tokens moved (G1 PASS); needs the ppl gate to be priced further. Off.
 #ifndef MPK_RMSNORM_DPP
 #define MPK_RMSNORM_DPP 0
 #endif
@@ -2167,6 +2169,16 @@ gang_rmsnorm_linear_bias_topk_kernel(
       if (tid < xs_f4) {
         constexpr unsigned ALL_SLOTS = (1u << SUM_SLOTS) - 1u;
         unsigned vmask = 0u;
+#if MPK_PROBE_ROUTER_1SLOT
+        vmask = ALL_SLOTS & ~1u;
+#pragma unroll
+        for (int s = 1; s < SUM_SLOTS; s++) {
+#pragma unroll
+          for (int h = 0; h < 2; h++) {
+            llw[s][h] = ll_u4_t{0u, want, 0u, want};
+          }
+        }
+#endif
         bool first = true;
         while (true) {
 #pragma unroll

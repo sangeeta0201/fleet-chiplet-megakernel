@@ -2700,7 +2700,11 @@ gang_mla_full_layer_fused_kernel_mi300(
                           OPROJ_ROWS_PER_WG == 32 &&
                           PF_WG_BYTES == 17 * 4096,
                       "MPK_OPROJ_PF_LDS is the RP MXFP4 o_proj tile");
+#if MPK_OPROJ_MFMA
+        gang_gemv_mxfp4_detail::w_lds_dma_mfma<PF_K, OPROJ_ROWS_PER_WG>(
+#else
         gang_gemv_mxfp4_detail::w_lds_dma<PF_K, OPROJ_ROWS_PER_WG>(
+#endif
             pf_rsrc, pf_wg_voff,
             __builtin_amdgcn_readfirstlane(static_cast<unsigned>(
                 reinterpret_cast<uintptr_t>(_fused_smem))) +
