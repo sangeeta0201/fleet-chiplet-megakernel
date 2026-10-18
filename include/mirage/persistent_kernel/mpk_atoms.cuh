@@ -2187,8 +2187,14 @@ __device__ __forceinline__ bool
 // barrier (MPK_TRACE h93: candidates seen -> route seen 0.56 us, the merge
 // ~0.15 of it). The staging quantizer ahead of it ends on a barrier, and
 // every wave reads the same epoch-tagged words: bit-identical.
+// MEASURED 2026-10-18 on 6b2ce72, NP=8 1024/1024, n=3 interleaved, G1 PASS,
+// all rank-0 tokens identical to the default: 3.191 3.187 3.188 vs 3.195
+// 3.196 3.194 ms (-0.006, 3 of 3 pairs). Defaulted: standalone 95/0, ppl512
+// 2.3819 on all 8 ranks with per-position NLL identical to f0bf5f3's,
+// longseq 256/512/1024 G1 PASS, n=3 vs =0 3.184 3.193 3.186 vs 3.195 3.202
+// 3.197 (pooled over 6 pairs -0.008). On.
 #ifndef MPK_W13_SELF_ALLW
-#define MPK_W13_SELF_ALLW 0
+#define MPK_W13_SELF_ALLW 1
 #endif
 // MPK_W2_FOLD: TileRT's expert_down_allreduce shape for the one-row TP W2.
 // A W2 tile is one 64-row block over all nine slots (12 per XCD instead of 24
@@ -2310,6 +2316,10 @@ __device__ __forceinline__ bool
 // validation pass's own loads. After validation the fold uses gamma at once
 // and the gate dot reads LDS, so neither round trip follows S36. Same values,
 // same products in the same order: bit-identical.
+// MEASURED SLOWER 2026-10-18 on 6b2ce72, NP=8 1024/1024, n=3 interleaved, G1
+// PASS, all rank-0 tokens identical: 3.200 3.203 3.205 vs 3.195 3.196 3.194
+// ms (+0.008). The gate loads issued at S36 had landed by the gate dot
+// already, and gamma at entry sits in the validating waves' vmcnt. Off.
 #ifndef MPK_ROUTER_W_LDS
 #define MPK_ROUTER_W_LDS 0
 #endif

@@ -1116,6 +1116,14 @@ __device__ __forceinline__ void topk_2l_ks(int *rll,
 #else
   tk2l_sort<64>(key2, pay2, lane);
 #endif
+#if defined(MPK_TRACE) && MPK_TRACE && MPK_TRACE_SPARSE > 0 && \
+    MPK_TRACE_SLOTS >= 98
+  // Trace slots 90..97 (diagnostic): the eight winners' expert ids + 1, so
+  // routing can be compared across decode iterations.
+  if (lane < 8 && s_mpk_trace_slot >= 0) {
+    s_mpk_tl[s_mpk_trace_slot & 1][90 + lane] = (key2 & 0xFFu) + 1u;
+  }
+#endif
   if (lane == 0) {
     mpk_stage_stamp(4);
   }
