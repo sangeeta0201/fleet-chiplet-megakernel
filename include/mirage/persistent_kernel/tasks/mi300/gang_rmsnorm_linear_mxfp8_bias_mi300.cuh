@@ -142,6 +142,8 @@ namespace kernel {
 // block), and any port has to carry that too. Measured on MPK_W13_WARM_BLOCK0:
 // vmcnt(0) landed 19 instructions after the DMA group, ahead of the pack's
 // first ds_write2_b32.
+// RE-MEASURED NULL 2026-10-17 on c2065f2, NP=8 1024/1024, G1 PASS, tokens identical:
+// screen 3.278, then 3.280 3.282 3.279 (mean -0.004) vs control 3.292 3.278 3.283 ms, n=3 interleaved. Off.
 #ifndef MPK_QUANT_V16
 #define MPK_QUANT_V16 0
 #endif
@@ -700,6 +702,7 @@ _rnlm8_ep_fold_slice(unsigned short const *__restrict__ d_res,
 // MPK_FORWARD_VARS: it is compile-time, and it rides MPK_QKV_PRO_HOIST, whose
 // header already records that a rank which misses that flag disagrees on the
 // XCD-local release's writer set and deadlocks rather than erroring.
+// 2026-10-17: does not build or run on c2065f2's defaults.
 #ifndef MPK_COLL_FUSE_NORM
 #define MPK_COLL_FUSE_NORM 0
 #endif
@@ -724,6 +727,7 @@ _rnlm8_ep_fold_slice(unsigned short const *__restrict__ d_res,
 // Removes, versus the default path: the buffer_inv and the 2 KB/slice global
 // re-read. Versus MPK_COLL_FUSE_NORM: those plus the ds_write/ds_read pair.
 // The d_x_out store STAYS -- o_proj adds this row back as its own residual.
+// 2026-10-17: does not build or run on c2065f2's defaults.
 #ifndef MPK_COLL_FUSE_REG
 #define MPK_COLL_FUSE_REG 0
 #endif

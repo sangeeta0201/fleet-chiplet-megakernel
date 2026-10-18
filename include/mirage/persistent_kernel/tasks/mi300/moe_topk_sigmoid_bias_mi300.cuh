@@ -82,6 +82,8 @@
 #ifndef MPK_TOPK_4W
 #define MPK_TOPK_4W 0
 #endif
+// RE-MEASURED 2026-10-17 on c2065f2, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.287 vs control 3.285 3.293 3.284 ms. Off.
 #ifndef MPK_TOPK_DPP
 #define MPK_TOPK_DPP 0
 #endif
@@ -98,6 +100,8 @@
 #ifndef MPK_TOPK_THRESH
 #define MPK_TOPK_THRESH 0
 #endif
+// RE-MEASURED 2026-10-17 on c2065f2, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.286 vs control 3.285 3.293 3.284 ms. Off.
 #ifndef MPK_TOPK_SKIP_CLEARS
 #define MPK_TOPK_SKIP_CLEARS 0
 #endif

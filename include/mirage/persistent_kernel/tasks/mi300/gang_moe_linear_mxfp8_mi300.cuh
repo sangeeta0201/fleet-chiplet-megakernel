@@ -83,6 +83,8 @@
 // into LDS whatever K window the tile will consume. Only meaningful with
 // MPK_W2_KSPLIT > 1 (at 1 the window IS the whole reduction). Exists so the
 // staging A/B is one -D inside one build instead of a cross-batch comparison.
+// RE-MEASURED 2026-10-17 on c2065f2, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.286 vs control 3.285 3.293 3.284 ms. Off.
 #ifndef MPK_W2_STAGE_FULL
 #define MPK_W2_STAGE_FULL 0
 #endif
@@ -891,6 +893,8 @@ __device__ __forceinline__ f32x4_t _gang_mfma_w_x_f8(
 // ~0.07 ms -- UNDER the 0.26 ms noise floor, so a paired A/B cannot resolve it
 // and n=6 pooling would be needed to bound it. Default OFF on that basis, not
 // on a measured wall number; the ISA and the arithmetic are the evidence.
+// RE-MEASURED NULL 2026-10-17 on c2065f2, NP=8 1024/1024, G1 PASS, tokens identical:
+// screen 3.275, then 3.283 3.274 3.288 (mean -0.003) vs control 3.292 3.278 3.283 ms, n=3 interleaved. Off.
 #ifndef MPK_W13_WARM_BLOCK0
 #define MPK_W13_WARM_BLOCK0 0
 #endif

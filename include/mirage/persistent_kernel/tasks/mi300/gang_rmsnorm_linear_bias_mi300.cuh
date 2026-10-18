@@ -117,6 +117,7 @@ using bf16 = __hip_bfloat16;
 // required, not defensive: CDNA4 ISA Table 11 gives two wait states for a VALU
 // write followed by a DPP/PERMLANE read of the same register, and every stage
 // here reads what the previous add just wrote.
+// 2026-10-17 on c2065f2: tokens differ from the default (3.279 vs control 3.285 3.293 3.284, one rep).
 #ifndef MPK_RMSNORM_DPP
 #define MPK_RMSNORM_DPP 0
 #endif

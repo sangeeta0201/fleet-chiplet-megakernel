@@ -158,6 +158,8 @@ __device__ __forceinline__ void mpk_plat_check(unsigned long long t0,
 // MPK_PEER_POLL_NT: the `nt` token on the CROSS-RANK peer poll (ld_sys_u64 and
 // ld_sys_u64_x8). Default 0 = dropped. Same mechanism and same reasoning as
 // MPK_BAR_POLL_NT below, which measured -0.367 us/barrier and -0.206 ms/token.
+// RE-MEASURED 2026-10-17 on c2065f2, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.293 vs control 3.285 3.293 3.284 ms. Off.
 #ifndef MPK_PEER_POLL_NT
 #define MPK_PEER_POLL_NT 0
 #endif
@@ -310,6 +312,8 @@ __device__ __forceinline__ mpk_u64x8
 // still, because the release fan-out is one thread issuing N stores. Eight is
 // near the optimum and 32 is slightly better. s_sleep and buffer_inv are free.
 // Only the `nt` hint is a straight win, and it is a one-token change.
+// RE-MEASURED 2026-10-17 on c2065f2, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.286 vs control 3.285 3.293 3.284 ms. Off.
 #ifndef MPK_BAR_POLL_NT
 #define MPK_BAR_POLL_NT 0
 #endif
@@ -1337,6 +1341,8 @@ __device__ __forceinline__ bool
 #ifndef MPK_TOPK_FLAG_LATE
 #define MPK_TOPK_FLAG_LATE 0
 #endif
+// RE-MEASURED NULL 2026-10-17 on c2065f2, NP=8 1024/1024, G1 PASS, tokens identical:
+// screen 3.281, then 3.291 3.288 3.286 (mean +0.004) vs control 3.292 3.278 3.283 ms, n=3 interleaved. Off.
 #ifndef MPK_TOPK_FLAG_PF
 #define MPK_TOPK_FLAG_PF 0
 #endif
@@ -1363,6 +1369,7 @@ __device__ __forceinline__ bool
 // prologue walk, issued at ~11 us today, slide behind the W_UK tile, and the
 // decode waits on them. A local all-heads W_UK is no way round it: each decode
 // item runs all 8 heads, one per XCD. Off.
+// 2026-10-17: does not build or run on c2065f2's defaults.
 #ifndef MPK_WUK_REMAP
 #define MPK_WUK_REMAP 0
 #endif
@@ -1415,6 +1422,8 @@ __device__ __forceinline__ bool
 // 3.585 3.587 vs 3.595 3.596 3.602 (-0.011). Subsumed by MPK_WUK_IDLE_MAP,
 // which takes the W_UK tiles off the q_b workers: together 3.566 3.568 vs
 // 3.595 3.589, no better than the idle map alone. Off.
+// RE-MEASURED NULL 2026-10-17 on c2065f2, NP=8 1024/1024, G1 PASS, tokens identical:
+// screen 3.280, then 3.285 3.288 3.281 (mean +0.000) vs control 3.292 3.278 3.283 ms, n=3 interleaved. Off.
 #ifndef MPK_QB_LL_NOOUT
 #define MPK_QB_LL_NOOUT 0
 #endif
@@ -1445,6 +1454,8 @@ __device__ __forceinline__ bool
 #ifndef MPK_WUK_VL4_WF
 #define MPK_WUK_VL4_WF 1
 #endif
+// RE-MEASURED 2026-10-17 on c2065f2, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.286 vs control 3.285 3.293 3.284 ms. Off.
 #ifndef MPK_WUK_HOIST
 #define MPK_WUK_HOIST 0
 #endif
@@ -1540,6 +1551,8 @@ __device__ __forceinline__ bool
 // indptr values their prologue walk already loaded, so its dependent
 // qo_indptr -> kv_indptr loads leave the post-barrier path
 // (gang_mla_attn_fused_mi300.cuh, gang_mla_decode_mi300.cuh).
+// RE-MEASURED 2026-10-17 on c2065f2, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.289 vs control 3.285 3.293 3.284 ms. Off.
 #ifndef MPK_DEC_HINTS
 #define MPK_DEC_HINTS 0
 #endif
@@ -1799,6 +1812,8 @@ __device__ __forceinline__ bool
 // then re-reading -- one system-scope round trip less after the last word
 // lands, at ~12 KB per tile per round of polling traffic. Trace 5: the first
 // resolve lands ~4 us after the rank's own last fold.
+// RE-MEASURED 2026-10-17 on c2065f2, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.290 vs control 3.285 3.293 3.284 ms. Off.
 #ifndef MPK_XS_POLL_FULL
 #define MPK_XS_POLL_FULL 0
 #endif
@@ -2133,6 +2148,8 @@ __device__ __forceinline__ bool
 // MPK_W2F_RT_OFF: PROBE, correct output. MPK_W2_FOLD's code compiled in and
 // never taken (the old W2 and fold run), to price its effect on the build.
 // MEASURED 2026-10-13: +0.035, see MPK_W2_FOLD.
+// RE-MEASURED NULL 2026-10-17 on c2065f2, NP=8 1024/1024, G1 PASS, tokens identical:
+// screen 3.280, then 3.285 3.283 3.289 (mean +0.001) vs control 3.292 3.278 3.283 ms, n=3 interleaved. Off.
 #ifndef MPK_W2F_RT_OFF
 #define MPK_W2F_RT_OFF 0
 #endif
@@ -2347,6 +2364,8 @@ __device__ __forceinline__ bool
 // normed row instead of on the routing. Only pays under MPK_MOE_XCD_EXPERT,
 // where it measured +0.012 ms on top of it (4.031 -> 4.043). Alone on the TP
 // default 2026-10-11 (7bc1c7e): 3.949 vs 3.950 ms (r1), null. Off.
+// RE-MEASURED 2026-10-17 on c2065f2, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.284 vs control 3.285 3.293 3.284 ms. Off.
 #ifndef MPK_TOPK_SH_EARLY
 #define MPK_TOPK_SH_EARLY 0
 #endif
@@ -2355,6 +2374,8 @@ __device__ __forceinline__ bool
 // so the W2 workers' loads hit L2. Waves 1-3, never-read LDS window.
 // MEASURED 2026-10-11 on MPK_MOE_XCD_EXPERT + MPK_TOPK_SH_EARLY: 4.043 ->
 // 4.016 ms (-0.027), still behind the striped control. Off with it.
+// RE-MEASURED 2026-10-17 on c2065f2, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.291 vs control 3.285 3.293 3.284 ms. Off.
 #ifndef MPK_XE_W2_PF
 #define MPK_XE_W2_PF 0
 #endif
@@ -2415,6 +2436,8 @@ __device__ __forceinline__ bool
 // was issued before it (the gate slice), so the L1 drop protects nothing --
 // and MPK_TRACE shows the tile 0.9 us between leaving o_proj and S33 with no
 // other instruction there that can wait.
+// RE-MEASURED 2026-10-17 on c2065f2, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.285 vs control 3.285 3.293 3.284 ms. Off.
 #ifndef MPK_ROUTER_NO_INV
 #define MPK_ROUTER_NO_INV 0
 #endif
@@ -2447,6 +2470,8 @@ __device__ __forceinline__ bool
 // rank-0 tokens identical: 3.376 3.372 3.383 vs 3.383 3.393 3.381 ms
 // (-0.007, inside the run-to-run spread); test_oproj_lds 2.40 -> 2.36 us a
 // tile. Default off.
+// RE-MEASURED 2026-10-17 on c2065f2, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.285 vs control 3.285 3.293 3.284 ms. Off.
 #ifndef MPK_OLL2_NOST
 #define MPK_OLL2_NOST 0
 #endif
@@ -2464,6 +2489,8 @@ __device__ __forceinline__ bool
 // activation reads 2.08, no cvt 2.16, neither 1.68), not by its weight
 // loads; from LDS the weights queue behind those 64 ds_read_b128 a lane.
 // Default off; not run at NP=8.
+// RE-MEASURED 2026-10-17 on c2065f2, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.340 vs control 3.285 3.293 3.284 ms. Off.
 #ifndef MPK_OPROJ_PF_LDS
 #define MPK_OPROJ_PF_LDS 0
 #endif
@@ -2497,15 +2524,19 @@ __device__ __forceinline__ bool
 // W13 re-measured 2026-10-13 on the MPK_W13_SELF_TOPK default with
 // MPK_W13_NO_ARRIVE=1, text identical: 3.473 3.473 vs 3.476 3.478
 // (null); + MPK_W13_ACT_W3 3.489 3.478 (+0.006).
+// RE-MEASURED 2026-10-17 on c2065f2, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.298 vs control 3.285 3.293 3.284 ms. Off.
 #ifndef MPK_MOE_W13_INLINE
 #define MPK_MOE_W13_INLINE 0
 #endif
 #ifndef MPK_MOE_W2_INLINE
 #define MPK_MOE_W2_INLINE 1
 #endif
+// 2026-10-17: does not build or run on c2065f2's defaults.
 #ifndef MPK_GEMV4_INLINE
 #define MPK_GEMV4_INLINE 0
 #endif
+// 2026-10-17: does not build or run on c2065f2's defaults.
 #ifndef MPK_RNLM8_INLINE
 #define MPK_RNLM8_INLINE 0
 #endif
@@ -2900,6 +2931,8 @@ __device__ __forceinline__ unsigned long long lmh_argmax_key(unsigned bits,
 // few temporaries -- the next group cannot issue into registers a pending
 // pack still reads. More temporaries (or asm with fixed ones) is the fix,
 // in the function that sets the megakernel's VGPR budget. Off.
+// RE-MEASURED 2026-10-17 on c2065f2, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.289 vs control 3.285 3.293 3.284 ms. Off.
 #ifndef MPK_MLA_PV_PIPE
 #define MPK_MLA_PV_PIPE 0
 #endif
@@ -2969,6 +3002,8 @@ __device__ __forceinline__ unsigned long long lmh_argmax_key(unsigned bits,
 #define MPK_WUK_PF 1
 #endif
 
+// RE-MEASURED 2026-10-17 on c2065f2, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.286 vs control 3.285 3.293 3.284 ms. Off.
 #ifndef MPK_TOPK_PAD_NS
 #define MPK_TOPK_PAD_NS 0
 #endif
