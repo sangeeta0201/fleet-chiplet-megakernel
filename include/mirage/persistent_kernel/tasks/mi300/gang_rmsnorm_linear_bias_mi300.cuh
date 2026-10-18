@@ -1119,7 +1119,11 @@ __device__ __forceinline__ void topk_2l_ks(int *rll,
 #if defined(MPK_TRACE) && MPK_TRACE && MPK_TRACE_SPARSE > 0 && \
     MPK_TRACE_SLOTS >= 98
   // Trace slots 90..97 (diagnostic): the eight winners' expert ids + 1, so
-  // routing can be compared across decode iterations.
+  // routing can be compared across decode iterations. 2026-10-18 on e88953f
+  // (h109, layers 40/41, 160 consecutive 1024/1024 decode steps, all ranks
+  // agree): consecutive tokens share 1.6 of 8 routed experts (chance 0.25),
+  // and the last four tokens' union -- 25 experts -- covers 3.4 of the next
+  // 8, too little to pay for prefetching the previous routing's W13.
   if (lane < 8 && s_mpk_trace_slot >= 0) {
     s_mpk_tl[s_mpk_trace_slot & 1][90 + lane] = (key2 & 0xFFu) + 1u;
   }

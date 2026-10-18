@@ -2382,6 +2382,20 @@ __device__ __forceinline__ bool
 #ifndef MPK_QA_LL
 #define MPK_QA_LL 1
 #endif
+// MPK_QKV_SITE_NODRAIN: under MPK_QA_LL and MPK_KV_LL with the qkv_a -> q_b
+// site tagged, nothing arrives at or waits on that site any more, but every
+// worker still drains its stores there (MPK_TRACE: qkv_a tiles done -> site
+// passed 0.29 us) before q_b. Skip that drain: the q_a and latent words are
+// validated by epoch, and the resolver's write-through x_out retires at the
+// worker's next drain, ahead of every later release it could be read behind.
+// Timing only: bit-identical.
+// MEASURED NULL 2026-10-18 on e88953f, NP=8 1024/1024, n=3 interleaved, G1
+// PASS, all rank-0 tokens identical: 3.186 3.188 3.192 vs 3.188 3.188 3.188
+// ms. q_b's q_a validation is paced by the last qkv_a tile's words, not by
+// this worker's entry. Off.
+#ifndef MPK_QKV_SITE_NODRAIN
+#define MPK_QKV_SITE_NODRAIN 0
+#endif
 // MPK_OPROJ_A_PAD: the o_proj GEMV stages its activation row with 16 bytes
 // after every 32-element chunk (gang_gemv_mxfp4_mi300.cuh). Its 64
 // ds_read_b128 a thread (256 a CU, 1 KB returned each) read eight

@@ -1074,7 +1074,13 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // gpt-oss's measurement. st_wt on the producer side is what makes the
   // cheap fence sufficient.
   __syncthreads();
-  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  // MPK_QKV_SITE_NODRAIN: with the site tagged, MPK_QA_LL and MPK_KV_LL,
+  // nobody arrives or waits here -- every consumer validates epoch words --
+  // so the drain only holds this worker's write-through stores ahead of q_b.
+  if (!(MPK_QKV_SITE_NODRAIN && kv_ll_on &&
+        (MPK_BAR_TAGGED & MPK_TAGBAR_QKV) != 0 && bar_tags != nullptr)) {
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  }
 #if MPK_WUK_EARLY_PF
   // Waves 1-3 only, into the same never-read LDS window as MPK_WUK_PF. Their
   // next counted wait is q_b's first weight load, also an HBM fetch.
