@@ -278,6 +278,8 @@ static constexpr int FULL_LAYER_EP_FOLDERS = 8 * MPK_EP_FOLD_WGS;
 // Re-measured 2026-10-08 under MPK_EP_LL (qkv_a's resolve now waits on the
 // peers' words), NP=8 1024/1024, n=2 interleaved: 6.471 6.476 -> 6.493 6.482
 // ms. Still off.
+// RE-MEASURED 2026-10-18 on 10b9dcf, NP=8 1024/1024, one interleaved screen rep vs
+// control 3.243 3.245 3.243 ms, G1 PASS: 3.447, tokens identical. Off.
 #ifndef MPK_QKVA_ENTRY_PF
 #define MPK_QKVA_ENTRY_PF 0
 #endif

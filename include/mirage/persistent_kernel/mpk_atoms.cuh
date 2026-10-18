@@ -550,6 +550,8 @@ __device__ __forceinline__ void st_wt_u32(void *addr, unsigned int val) {
 // the receiver's HBM, and a sender's own local copy absent from its own.
 // MEASURED NULL, 2026-09-23, 2 runs: prefill still stalled (600 and 1031
 // ms/iter, single stalls of 476 s and 518 s); decode clean at +1.2 ms median.
+// RE-MEASURED 2026-10-18 on 10b9dcf, NP=8 1024/1024, one interleaved screen rep vs
+// control 3.243 3.245 3.243 ms, G1 PASS: 3.358, tokens identical. Off.
 #ifndef MPK_SIG_WBL2
 #define MPK_SIG_WBL2 0
 #endif
@@ -1104,6 +1106,8 @@ __device__ __forceinline__ bool
 // MEASURED NEGATIVE 2026-10-08, NP=8 1024/1024, n=3 interleaved on the
 // FL_INLINE + OPROJ_LL=2 default: 6.164 6.130 6.180 -> 6.242 6.256 6.250 ms,
 // and the tokens move (the inlined gate dot contracts differently). Off.
+// RE-MEASURED 2026-10-18 on 10b9dcf, NP=8 1024/1024, one interleaved screen rep vs
+// control 3.243 3.245 3.243 ms, G1 PASS: 3.262, tokens identical. Off.
 #ifndef MPK_ROUTER_INLINE
 #define MPK_ROUTER_INLINE 0
 #endif
@@ -1115,6 +1119,7 @@ __device__ __forceinline__ bool
 // inlined, the AGPR overflow grows 106 -> 136. Off.
 // Re-run 2026-10-13 on 49d37f8: illegal memory access on ranks 0-1, three
 // attempts of three, so not measurable as it stands. Not debugged.
+// 2026-10-18: an illegal memory access on these defaults (10b9dcf). Off.
 #ifndef MPK_DECODE_INLINE
 #define MPK_DECODE_INLINE 0
 #endif
@@ -1540,6 +1545,8 @@ __device__ __forceinline__ bool
 // identical: 4.762 4.764 -> 4.842 4.861 ms (+0.09). MPK_TRACE puts the
 // network at 1.90 us (stamps 63 -> 42); 64 broadcast ds_read_b128 and 256
 // compare-adds per thread cost more than its shuffle chain. Off.
+// RE-MEASURED 2026-10-18 on 43cc07a, NP=8 1024/1024, one interleaved screen rep vs
+// control 3.282 ms, G1 PASS: 3.285, tokens identical. Off.
 #ifndef MPK_TOPK_RANK
 #define MPK_TOPK_RANK 0
 #endif
@@ -1679,6 +1686,8 @@ __device__ __forceinline__ bool
 // o_proj tile either (the tiles past it move up a rank), so its TopK does not
 // drain o_proj stores (trace 6: selection 1.19 us, publish 0.78 us).
 // MEASURED NEGATIVE 2026-10-10: 4.235 4.239 4.246 -> 4.246 4.252 4.245 ms. Off.
+// RE-MEASURED 2026-10-18 on 43cc07a, NP=8 1024/1024, one interleaved screen rep vs
+// control 3.282 ms, G1 PASS: 3.290, tokens identical. Off.
 #ifndef MPK_OPROJ_SKIP_TOPK
 #define MPK_OPROJ_SKIP_TOPK 0
 #endif
@@ -1945,6 +1954,8 @@ __device__ __forceinline__ bool
 // (gang_mla_decode_mi300.cuh mla_exp2): speculatable, so the rescale's -inf
 // select is a v_cndmask instead of an exec-mask branch. Bit-exact.
 // MEASURED NULL with MPK_DEC_PRE_NOBAR, above. Off.
+// RE-MEASURED 2026-10-18 on 43cc07a, NP=8 1024/1024, one interleaved screen rep vs
+// control 3.282 ms, G1 PASS: 3.288, tokens identical. Off.
 #ifndef MPK_DEC_EXP2_BUILTIN
 #define MPK_DEC_EXP2_BUILTIN 0
 #endif
@@ -2024,6 +2035,8 @@ __device__ __forceinline__ bool
 // release value is passed in rather than read back), so skip its store drain
 // and arrival on every worker of the layer.
 // MEASURED NULL 2026-10-11, same batch: 4.127 vs 4.132 4.128 ms. Off.
+// RE-MEASURED 2026-10-18 on 10b9dcf, NP=8 1024/1024, one interleaved screen rep vs
+// control 3.243 3.245 3.243 ms, G1 PASS: 3.245, tokens identical. Off.
 #ifndef MPK_W13_NO_ARRIVE
 #define MPK_W13_NO_ARRIVE 0
 #endif
@@ -2044,6 +2057,8 @@ __device__ __forceinline__ bool
 // The sums of squares are system-scope stores, which bypass L2 on this
 // multi-L2 part, so an `nt` poll can hit a line it cached before they landed
 // (see MPK_TOPK_2L, which lost 0.106 ms to exactly that).
+// RE-MEASURED 2026-10-18 on 43cc07a, NP=8 1024/1024, one interleaved screen rep vs
+// control 3.282 ms, G1 PASS: 3.288, tokens identical. Off.
 #ifndef MPK_KS_SSQ_NT
 #define MPK_KS_SSQ_NT 0
 #endif
@@ -2226,6 +2241,8 @@ __device__ __forceinline__ bool
 // following the staging (MPK_TRACE: the last q_b worker's W_UK GEMV returns
 // 2.20 us after its q_b tile, 0.8 us behind early workers).
 // MEASURED NULL 2026-10-11, NP=8 1024/1024: 4.041 vs 4.040 ms. Off.
+// RE-MEASURED 2026-10-18 on 43cc07a, NP=8 1024/1024, one interleaved screen rep vs
+// control 3.282 ms, G1 PASS: 3.286, tokens identical. Off.
 #ifndef MPK_WUK_WFIRST
 #define MPK_WUK_WFIRST 0
 #endif
@@ -2403,10 +2420,14 @@ __device__ __forceinline__ bool
 // tokens identical: 3.241 3.240 3.245 vs 3.282 3.289 3.286 ms (-0.044).
 // Default 128.
 // Same traces: the MoE is dealt evenly (18 W13 and 24 W2 tiles an XCD) but
-// two XCDs run every W13 tile 0.08-0.16 us slower and end W2 0.10-0.20 us
-// after the fastest, a gap the next layer's entry inherits. An idle MI350X
-// shows no such XCD (512 KB streams, all 8 devices: +-2%, a different XCD
-// slowest each time), so it is load, not silicon.
+// two XCDs run every W13 tile 0.08-0.16 us slower (every worker slot alike)
+// and end W2 0.10-0.20 us after the fastest, a gap the next layer's entry
+// inherits. A plain 512 KB stream shows no such XCD (all 8 devices: +-2%, a
+// different XCD slowest each time), but the TP W13's own pattern on an idle
+// GPU does (h57_xcd/test_w13_pattern.hip: XCC 0 fastest by ~5% on two
+// devices). Rotating the row blocks by slot does not move it, and padding the
+// expert stride (256 B .. 128 KB) changes which XCDs are slow but never the
+// 0.16-0.28 us spread: it is the pattern's load, not one XCD's offsets.
 #ifndef MPK_QKVA_SKIP_PAD
 #define MPK_QKVA_SKIP_PAD 1
 #endif
@@ -2446,6 +2467,8 @@ __device__ __forceinline__ bool
 // nine XCDs' W2 per column instead of two parts, and W13 + W2 serial on the
 // same 144 workers (per XCD the routed W2 stages 2.3-2.8 us after its last
 // W13 tile, not the ~1 us an L2 hand-off should take). Off.
+// RE-MEASURED 2026-10-18 on 43cc07a, NP=8 1024/1024, one interleaved screen rep vs
+// control 3.282 ms, G1 PASS: 3.516 and the text degenerates (distinct-token ratio 0.031 against 0.178). Off.
 #ifndef MPK_MOE_XCD_EXPERT
 #define MPK_MOE_XCD_EXPERT 0
 #endif
@@ -2518,6 +2541,8 @@ __device__ __forceinline__ bool
 // DO NOT ENABLE: changes the generated text (2026-10-11, 3.997 vs 4.006 ms).
 // The residual row is not final when the fold PE reaches the poll -- the
 // router's slice sum writes it -- so the early read can see the last layer's.
+// RE-MEASURED 2026-10-18 on 10b9dcf, NP=8 1024/1024, one interleaved screen rep vs
+// control 3.243 3.245 3.243 ms, G1 PASS: 3.242 but the text degenerates (distinct-token ratio 0.004): broken on these defaults. Off.
 #ifndef MPK_FOLD_RES_PRE
 #define MPK_FOLD_RES_PRE 0
 #endif
@@ -2591,6 +2616,9 @@ __device__ __forceinline__ bool
 // instruction the same, 116 bytes earlier. Not placement alone: under
 // -falign-functions=64 (+0.018 on the default by itself, 3.301 3.303) PF_LDS
 // is still 3.346 3.345. Off.
+// Nor a lower clock: the trace's compute-only spans (TopK merge S41 -> S4 0.47
+// vs 0.46 us, publish S4 -> S35 0.34 vs 0.35) are unchanged; only the W13
+// stream slows.
 #ifndef MPK_OPROJ_PF_LDS
 #define MPK_OPROJ_PF_LDS 0
 #endif
@@ -4095,6 +4123,8 @@ __device__ __forceinline__ void mpk_ml_boundary_pad() {}
 // 2026-10-11, NP=8 1024/1024 (control 4.240): decode site 4.368, qkv site
 // 4.485, both 4.459 ms -- the waiters' tag polling costs far more than the
 // release hop. MPK_QB_SELF_PF re-measured on the same stack: 4.238 (null).
+// RE-MEASURED 2026-10-18 on 43cc07a, NP=8 1024/1024, one interleaved screen rep vs
+// control 3.282 ms, G1 PASS: 3.281, tokens identical. Off.
 #ifndef MPK_TAG_DIRECT_SITES
 #define MPK_TAG_DIRECT_SITES 0
 #endif

@@ -229,6 +229,8 @@
 // decode median 12.064/12.053/12.071 -> 12.061/12.055/12.049 ms. The loop
 // has no load in flight at either barrier to protect (the register prefetch
 // it was written for is gone), so the vmcnt(0) it removes was already free.
+// RE-MEASURED 2026-10-18 on 10b9dcf, NP=8 1024/1024, one interleaved screen rep vs
+// control 3.243 3.245 3.243 ms, G1 PASS: 3.249, tokens identical. Off.
 #ifndef MPK_MLA_DECODE_BAR_LDS
 #define MPK_MLA_DECODE_BAR_LDS 0
 #endif

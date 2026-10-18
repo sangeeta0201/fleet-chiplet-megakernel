@@ -87,6 +87,7 @@ using bf16 = __hip_bfloat16;
 // nothing. Kept behind the flag as a priced null, not deleted -- if the q_b
 // phase is ever re-tiled such that tile 0 does set the arrival, this is the
 // version to switch on.
+// 2026-10-18: does not build: #error with MPK_KV_LL (default on). Off.
 #ifndef MPK_KVUPD_FAST
 #define MPK_KVUPD_FAST 0
 #endif

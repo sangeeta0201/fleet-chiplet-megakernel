@@ -55,6 +55,8 @@
 // 7.778 off, overlapping): selection 1986 -> 900 ns, but the store drain it
 // used to absorb moved into the logit clear (448 -> 1599). See SKIP_CLEARS.
 // Off by default.
+// RE-MEASURED 2026-10-18 on 10b9dcf, NP=8 1024/1024, one interleaved screen rep vs
+// control 3.243 3.245 3.243 ms, G1 PASS: 3.249, tokens identical. Off.
 #ifndef MPK_TOPK_WIN_SHFL
 #define MPK_TOPK_WIN_SHFL 0
 #endif
