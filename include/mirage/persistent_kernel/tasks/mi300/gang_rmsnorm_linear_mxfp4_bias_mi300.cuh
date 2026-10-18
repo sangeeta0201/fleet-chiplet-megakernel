@@ -1,3 +1,18 @@
+#if defined(MPK_QKV_RED_FAST) && !defined(MPK_QKV_RED_LDS_BAR)
+#error "MPK_QKV_RED_FAST: written for the MPK_QKV_RED_LDS_BAR reduce (4 waves)"
+#endif
+#if defined(MPK_QKV_NQ_FUSED2) && \
+    (defined(MPK_QKV_NQ_FUSED) || !defined(MPK_QKV_LDS_NORM) || \
+     defined(MPK_QKV_KSPLIT_SHARED_NORM) || defined(MPK_QKV_KV_SHARED_ROW))
+#error "MPK_QKV_NQ_FUSED2: LDS-norm path, not with v1 or the s_tok_fp8 copies"
+#endif
+#if defined(MPK_QKV_NQ_FUSED) && !defined(MPK_QKV_LDS_NORM)
+#error "MPK_QKV_NQ_FUSED: the LDS-norm QKV path"
+#endif
+#if defined(MPK_QKV_NQ_FUSED) && \
+    (defined(MPK_QKV_KSPLIT_SHARED_NORM) || defined(MPK_QKV_KV_SHARED_ROW))
+#error "MPK_QKV_NQ_FUSED: these copy s_tok_fp8 out before the ready barrier"
+#endif
 /* Copyright 2025 CMU
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,12 +49,76 @@
 // QKV compute: ~26us -> ~8us per layer.
 
 #pragma once
+#ifndef MPK_MFMA_TAIL_PAD
+#ifdef MPK_MFMA_TAIL_NOP
+// Wait before reading a scaled MFMA's accumulator (threshold measured at 11 wait states on gfx950).
+#define MPK_MFMA_TAIL_STR2(x) #x
+#define MPK_MFMA_TAIL_STR(x) MPK_MFMA_TAIL_STR2(x)
+#define MPK_MFMA_TAIL_PAD "s_nop " MPK_MFMA_TAIL_STR(MPK_MFMA_TAIL_NOP) "\n"
+#else
+#define MPK_MFMA_TAIL_PAD "s_nop 15\n" "s_nop 15\n"
+#endif
+#endif
+#ifndef MPK_TIDX_Q_Q
+#if defined(MPK_TID_FRESH) || defined(MPK_TID_FRESH_Q)
+// threadIdx.x through a volatile v_mov: nothing derived from it can be hoisted out of the
+// persistent loop into kernel-lifetime registers.
+__device__ __forceinline__ unsigned mpk_tid_fresh_Q() {
+  unsigned t;
+  asm volatile("v_mov_b32 %0, %1\n\ts_nop 1" : "=v"(t) : "v"(threadIdx.x));
+  return t;
+}
+#define MPK_TIDX_Q (mpk_tid_fresh_Q())
+#else
+#define MPK_TIDX_Q (threadIdx.x)
+#endif
+#endif
+
+// x_out store. MPK_XOUT_GLOBAL_ST types it AS(1): a generic-pointer store
+// is flat_store_dwordx2, and a pending FLAT access makes every later wait
+// vmcnt(0), splitting the next fold iteration into two round trips.
+#ifdef MPK_XOUT_GLOBAL_ST
+#define MPK_XOUT_STORE(dst, packed)                                           \
+  do {                                                                        \
+    _gl_u32x2 _xo_v;                                                          \
+    _xo_v[0] = (packed).x;                                                    \
+    _xo_v[1] = (packed).y;                                                    \
+    *(__attribute__((address_space(1))) _gl_u32x2 *)(dst) = _xo_v;            \
+  } while (0)
+#else
+#define MPK_XOUT_STORE(dst, packed) __builtin_memcpy((dst), &(packed), 8)
+#endif
+#ifndef MPK_QKVK_MARK
+#define MPK_QKVK_MARK(k) do {} while (0)  // MPK_QKVK_LDS off
+#endif
+// One token per virtual request (MPK_SPEC_VSLOT): the request of a row is that row.
+#if defined(MPK_VT2) && defined(MPK_VT2_QKV) && defined(MPK_SPEC_VSLOT) && defined(MPK_VT2_QPOS)
+#define MPK_QKV_PF_VSLOT 1
+#else
+#define MPK_QKV_PF_VSLOT 0
+#endif
 #include "mpk_atoms.cuh" // st_wt_*, ld_sys_s32 (QKV K-split handshake)
 #include "tasks/mi300/gang_moe_linear_mxfp4_mi300.cuh" // FP4xFP8 type defs + helpers
 #include "tasks/mi300/gang_rmsnorm_linear_bias_mi300.cuh" // RMSNorm prologue
 #include "tasks/mi300/moe_ws_layout.cuh" // MOE_WS_SLOTS, moe_ws_offset()
+#if defined(MPK_WSFC_READ_PRODUCER)
+#define MPK_WSLP_SLOT(s) ((s) + MOE_WS_SLOTS * ((s) >> 1))
+#elif defined(MPK_QKV_WS_LOCAL_PROBE)
+// TIMING ONLY: fold this AID's two ring slots twice (all local reads).
+#define MPK_WSLP_SLOT(s) \
+  (((s) & 1) + ((int)((kernel::mpk_prenorm_xcc() & 0x7) >> 2) << 1))
+#else
+#define MPK_WSLP_SLOT(s) (s)
+#endif
 
 namespace kernel {
+// MPK_PRENORM_AID reads the physical XCD where xcd_id is not in scope.
+__device__ __forceinline__ unsigned mpk_prenorm_xcc() {
+  unsigned x;
+  MPK_GET_XCC_ID32(x);
+  return x;
+}
+
 
 // Native vector types for address-space-qualified loads. HIP's float4/uint2 are
 // class templates (HIP_vector_type), so they cannot be copy-constructed through
@@ -47,7 +126,65 @@ namespace kernel {
 // outright. These ext_vector_types can, which is what lets the ResAdd prologue
 // issue GLOBAL rather than generic FLAT loads -- see the comment at its use.
 typedef float _gl_f32x4 __attribute__((ext_vector_type(4)));
+#ifdef MPK_WS_FARCOPY
+// MPK_WSFC_V2 slow path: a slot of this AID's copy is still poisoned (its
+// far copy has not landed). Re-read all four slots past L2 from their
+// producer copies (slot s lives in copy s >> 1, never poisoned), in one
+// round -- the baseline fold's cost. Same slot order: bit-exact.
+__device__ __noinline__ float4 mpk_ws_farcopy_fold(float const *own,
+                                                   float const *prim0,
+                                                   int h, int off) {
+  (void)own;
+  static_assert(MOE_WS_SLOTS == 4, "four-slot fold");
+#ifdef MPK_WSFC_STATS
+  mpk_wsfc_stat(0, off);
+#endif
+  float4 v0, v1, v2, v3;
+  mpk_fc_ld16x4(prim0 + 0 * h + off, prim0 + 1 * h + off,
+                prim0 + MOE_WS_SLOTS * h + 2 * h + off,
+                prim0 + MOE_WS_SLOTS * h + 3 * h + off, v0, v1, v2, v3);
+  v0.x += v1.x;
+  v0.y += v1.y;
+  v0.z += v1.z;
+  v0.w += v1.w;
+  v0.x += v2.x;
+  v0.y += v2.y;
+  v0.z += v2.z;
+  v0.w += v2.w;
+  v0.x += v3.x;
+  v0.y += v3.y;
+  v0.z += v3.z;
+  v0.w += v3.w;
+  return v0;
+}
+#endif
+#ifdef MPK_WS_SYS_LOAD
+// sc0 sc1 buffer load: bypasses L1 and L2 without allocating, so the
+// workspace W2 rewrote from another XCD is never served from a stale
+// line and none is left behind for the next layer.
+__device__ __forceinline__ _gl_f32x4 mpk_ws_sys_ld(__amdgpu_buffer_rsrc_t rs,
+                                                   int elem) {
+  auto const v = __builtin_amdgcn_raw_buffer_load_b128(rs, elem * 4, 0, 17);
+  return _gl_f32x4{__builtin_bit_cast(float, v[0]), __builtin_bit_cast(float, v[1]),
+                   __builtin_bit_cast(float, v[2]), __builtin_bit_cast(float, v[3])};
+}
+#endif
 typedef unsigned int _gl_u32x2 __attribute__((ext_vector_type(2)));
+#ifdef MPK_WS_SYS_LOAD
+// A __noinline__ callee receives its pointers in VGPRs, and a buffer op
+// needs an SGPR descriptor, so without this every load gets a waterfall.
+__device__ __forceinline__ void *mpk_uniform_ptr(void *p) {
+  unsigned long long const a = (unsigned long long)p;
+  unsigned const lo = __builtin_amdgcn_readfirstlane((unsigned)a);
+  unsigned const hi = __builtin_amdgcn_readfirstlane((unsigned)(a >> 32));
+  return (void *)(((unsigned long long)hi << 32) | lo);
+}
+__device__ __forceinline__ _gl_u32x2 mpk_res_sys_ld(__amdgpu_buffer_rsrc_t rs,
+                                                    int elem) {
+  auto const v = __builtin_amdgcn_raw_buffer_load_b64(rs, elem * 2, 0, 17);
+  return _gl_u32x2{v[0], v[1]};
+}
+#endif
 
 // ── Shared QKV weight-tile LDS geometry ──────────────────────────────────
 //
@@ -117,11 +254,32 @@ struct QkvWeightLds {
 #endif
 
   // Weight region base within the task's dynamic LDS.
+#ifdef MPK_QKV_W_TOP
+  // Weights at the top of LDS, below the layer-index word; the staging that sits
+  // above them in the default layout (X_OFF..X_END) takes the low gap instead.
+  static constexpr int W_LOW = ((TOK_OFF + TOK_REGION + SC_REGION + 15) / 16) * 16;
+  static constexpr int W_OFF =
+      ((mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
+        mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END - TILE_BYTES * NUM_WAVES) /
+       16) *
+      16;
+  static_assert(W_OFF >= W_LOW, "MPK_QKV_W_TOP: weights would overlap the token region");
+  static constexpr int X_OFF = W_LOW;
+  static constexpr int X_END = W_OFF;
+#else
   static constexpr int W_OFF =
       ((TOK_OFF + TOK_REGION + SC_REGION + 15) / 16) * 16;
+#endif
   // Total LDS the weight staging occupies, from the base of _rnlm_smem.
   static constexpr int W_END = W_OFF + TILE_BYTES * NUM_WAVES;
 };
+
+#ifdef MPK_QKV_W_TOP
+#if defined(MPK_KV_SPREAD) || defined(MPK_QKV_LDS_POISON_HI) || \
+    (defined(MPK_QKV_GAMMA_LDS) && !defined(MPK_QKV_GAMMA_NORMREG))
+#error "MPK_QKV_W_TOP moves only the slab staging; these flags stage above G::W_END too"
+#endif
+#endif
 
 #ifdef MPK_QKV_B_MASK
 #if defined(MPK_QKV_TSC_PTR_INCREMENT) || defined(MPK_QKV_DS_BEFORE_ADDR) || \
@@ -156,6 +314,41 @@ __device__ int g_qkv_kpart_tok_ready[8 * MPK_QKV_KSPLIT_MAX_TILE];
 #endif
 #endif
 
+#if defined(MPK_QKV_KV_SHARED_ROW) || defined(MPK_VTN_QROW)
+// Quantized token row (fp8 + scales) published by Q tile 0 for this XCD's
+// K/V tiles; two parity slots per XCD, flag = qkv epoch (64 B apart).
+// MPK_VTN_QROW: published by the rank running token 3's tile 0 for token 3's other tiles.
+constexpr int MPK_QKV_KV_ROW_BYTES = 3072;
+__device__ uint8_t g_qkv_kv_row[8 * 2 * MPK_QKV_KV_ROW_BYTES];
+__device__ int g_qkv_kv_row_epoch[8 * 2 * 16];
+#endif
+#ifdef MPK_VTN_QROW_TAG
+#ifndef MPK_VTN_QROW
+#error "MPK_VTN_QROW_TAG needs MPK_VTN_QROW"
+#endif
+// MPK_VTN_QROW_TAG: tagged-row slots in the AID flag replica, per die (4 per AID) and parity; free gap between the
+// 4-row O-proj output replica (ends 71424) and the router die sums (98304).
+#if defined(MPK_VTN_T) && MPK_VTN_T > 4
+// MPK_VTN_T6: past the MPK_VTN_T-row O-proj output replica, which reaches 73728 above 4 rows.
+constexpr int MPK_AID_QROW_BASE_INTS = 81920;
+static_assert(MPK_AID_QROW_BASE_INTS >= MPK_AID_OUT_BASE_INTS + MPK_VTN_T * 2944 / 2,
+              "MPK_VTN_T6: QROW slots past the O-proj output replica");
+#else
+constexpr int MPK_AID_QROW_BASE_INTS = 73728;
+#endif
+constexpr int MPK_AID_QROW_SLOT_INTS = 1536;
+static_assert(MPK_AID_QROW_BASE_INTS >= MPK_AID_OUT_BASE_INTS + 4 * 2944 / 2 &&
+                  MPK_AID_QROW_BASE_INTS + 8 * MPK_AID_QROW_SLOT_INTS <= MPK_AID_ROP_AGG_BASE_INTS,
+              "MPK_VTN_QROW_TAG slots between the O-proj output replica and the router die sums");
+#endif
+#ifdef MPK_VTN_QROW
+#define MPK_QROW_TAKE (kv_row_epoch > 0 && qrow_role == 2)
+#define MPK_QROW_GIVE (kv_row_epoch > 0 && qrow_role == 1)
+#else
+#define MPK_QROW_TAKE (kv_row_epoch > 0 && wg_idx >= NUM_Q_PER_KV)
+#define MPK_QROW_GIVE (kv_row_epoch > 0 && wg_idx == 0)
+#endif
+
 // Issue the HBM->LDS weight DMA for one QKV tile. Does NOT wait: the caller
 // drains with `s_waitcnt vmcnt(0)` once it has something else to do first.
 // `tile_idx` selects the weight group exactly as the kvupd kernel does, so a
@@ -165,7 +358,20 @@ __device__ int g_qkv_kpart_tok_ready[8 * MPK_QKV_KSPLIT_MAX_TILE];
 // `k_iter0` / `k_niters` select a K-range inside the tile (one MFMA iter =
 // 64 B of packed FP4 per row). k_niters < 0 means the full K, which is the
 // non-split default.
-template <int BATCH_SIZE, int OUTPUT_PER_WG, int REDUCTION_SIZE, int AUX = 3>
+// A prefetch can be split by LDS destination: [LO, HI) keeps the 1 KiB wave chunks
+// whose first byte lies in that range. The default range keeps everything.
+template <int LO, int HI>
+__device__ __forceinline__ bool mpk_pf_keep(int chunk_off) {
+  if constexpr (LO > 0 || HI < (1 << 30)) {
+    int const u = __builtin_amdgcn_readfirstlane(chunk_off);
+    return u >= LO && u < HI;
+  } else {
+    return true;
+  }
+}
+
+template <int BATCH_SIZE, int OUTPUT_PER_WG, int REDUCTION_SIZE, int AUX = 3,
+          int LDS_LO = 0, int LDS_HI = (1 << 30)>
 __device__ __forceinline__ void qkv_prefetch_weights_lds(void const *weight_ptr,
                                                          int n_wgs_per_xcd,
                                                          int tile_idx,
@@ -175,7 +381,7 @@ __device__ __forceinline__ void qkv_prefetch_weights_lds(void const *weight_ptr,
   using G = QkvWeightLds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>;
   extern __shared__ char _rnlm_smem[];
 
-  int const tid = threadIdx.x;
+  int const tid = MPK_TIDX_Q;
   int const warp_id = tid >> 6;
   // Which wave's 1 KiB stripes to issue; by default the caller's own.
   int const sw = stripe >= 0 ? stripe : warp_id;
@@ -187,10 +393,16 @@ __device__ __forceinline__ void qkv_prefetch_weights_lds(void const *weight_ptr,
       W, static_cast<uint32_t>(n_wgs_per_xcd) * G::WG_BYTES);
   uint32_t wg_voff = static_cast<uint32_t>(wg_idx) * G::WG_BYTES;
 
+#ifdef MPK_LDS_DST_S
+  int sws;
+  asm volatile("s_nop 1\n\tv_readfirstlane_b32 %0, %1\n\ts_nop 4" : "=s"(sws) : "v"(sw));
+#else
+  int const sws = sw;
+#endif
   auto *lds_warp_base =
       (__attribute__((address_space(3))) uint32_t *)((uint8_t *)_rnlm_smem +
                                                      G::W_OFF +
-                                                     sw * 1024);
+                                                     sws * 1024);
   constexpr int ROW_BYTES = REDUCTION_SIZE / 2;
   int const k_byte0 = k_iter0 * 64;
   int const k_byte1 = k_niters < 0 ? ROW_BYTES : (k_iter0 + k_niters) * 64;
@@ -201,6 +413,10 @@ __device__ __forceinline__ void qkv_prefetch_weights_lds(void const *weight_ptr,
   for (int t = 0; t < G::NUM_WAVES; t++) {
 #pragma unroll
     for (int j = 0; j < G::LPT; j++) {
+      if (!mpk_pf_keep<LDS_LO, LDS_HI>(G::W_OFF + sw * 1024 + t * G::TILE_BYTES +
+                                       j * 4096)) {
+        continue;
+      }
       int idx = stid + j * 256;
       int clamped = idx < G::N16_DATA ? idx : G::N16_DATA - 1;
       int const off_in_row = (clamped * 16) % ROW_BYTES;
@@ -226,7 +442,9 @@ __device__ __forceinline__ void qkv_prefetch_weights_lds(void const *weight_ptr,
     // HBM round trip serialized behind the first. Only waves 0-1 participate:
     // TILE_SCALE is 16*NUM_BLOCKS_32 bytes, well under the 2 KiB two waves
     // move, and every lane past that would just re-fetch the clamped tail.
-    if (sw < 2) {
+    if (sw < 2 &&
+        mpk_pf_keep<LDS_LO, LDS_HI>(G::W_OFF + sw * 1024 + t * G::TILE_BYTES +
+                                    G::TILE_DATA_PADDED)) {
       constexpr int SCALE_VECTORS = (G::TILE_SCALE + 15) / 16;
       int const vector = sw * 64 + (tid & 63);
       int const clamped = vector < SCALE_VECTORS ? vector : SCALE_VECTORS - 1;
@@ -262,7 +480,7 @@ __device__ __forceinline__ void qkv_warm_weights_l2(void const *weight_ptr,
       (uint8_t const *)weight_ptr +
           static_cast<size_t>(wg_idx) * G::WG_BYTES,
       static_cast<uint32_t>(G::WG_BYTES));
-  uint32_t voff = static_cast<uint32_t>(threadIdx.x) * 16u;
+  uint32_t voff = static_cast<uint32_t>(MPK_TIDX_Q) * 16u;
   unsigned sink;
   // The resource's SGPRs were just written by v_readfirstlane: a VALU SGPR
   // write needs 5 wait states before a VMEM instruction reads it, and the
@@ -292,7 +510,7 @@ __device__ __forceinline__ void qkv_prefetch_kv_extra_lds(
   using G = QkvWeightLds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>;
   extern __shared__ char _rnlm_smem[];
 
-  int const tid = threadIdx.x;
+  int const tid = MPK_TIDX_Q;
   int const warp_id = tid >> 6;
   int const q = tile_idx % n_wgs_per_xcd;
   int const src_wg = NUM_Q_PER_KV + (q >> 2);
@@ -399,7 +617,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_kernel(
   uint8_t *s_tok_fp8 = (uint8_t *)_rnlm_smem;
   uint8_t *s_tok_scales = s_tok_fp8 + FP8_TOK_DATA;
 
-  int const tid = threadIdx.x;
+  int const tid = MPK_TIDX_Q;
   int const warp_id = tid >> 6;
   int const lane_id = tid & 63;
   int const col = lane_id & 15;
@@ -421,9 +639,25 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_kernel(
     unsigned short const *row_in =
         (unsigned short const *)norm_input_ptr + b * REDUCTION_SIZE;
     unsigned short *row_out =
+        #ifdef MPK_PRENORM_AID
+        #define PRENORM_AID_OFF ((int)(kernel::mpk_prenorm_xcc() & 0x7) >= (MPK_NUM_XCDS / 2) ? (long long)BATCH_SIZE * REDUCTION_SIZE : 0)
+        (unsigned short *)norm_output_ptr + PRENORM_AID_OFF + b * REDUCTION_SIZE;
+        #undef PRENORM_AID_OFF
+        #else
         (unsigned short *)norm_output_ptr + b * REDUCTION_SIZE;
+        #endif
     gang_rmsnorm_detail::rmsnorm_inline_amd<REDUCTION_SIZE, ACTUAL_HIDDEN_DIM>(
-        row_in, norm_weight_ptr, row_out);
+        row_in,
+#ifdef MPK_GAMMA_AID
+        (void const *)((unsigned short const *)norm_weight_ptr +
+                       ((int)(kernel::mpk_prenorm_xcc() & 0x7) >=
+                                (MPK_NUM_XCDS / 2)
+                            ? REDUCTION_SIZE
+                            : 0)),
+#else
+        norm_weight_ptr,
+#endif
+        row_out);
   }
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
@@ -445,7 +679,13 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_kernel(
 
   // ── Step 2: Quantize BF16 normalized input -> FP4/FP8 in LDS ────────────
   unsigned short const *input_row =
+      #ifdef MPK_PRENORM_AID
+      #define PRENORM_AID_OFF ((int)(kernel::mpk_prenorm_xcc() & 0x7) >= (MPK_NUM_XCDS / 2) ? (long long)BATCH_SIZE * REDUCTION_SIZE : 0)
+      (unsigned short const *)norm_output_ptr + PRENORM_AID_OFF + tok_idx * REDUCTION_SIZE;
+      #undef PRENORM_AID_OFF
+      #else
       (unsigned short const *)norm_output_ptr + tok_idx * REDUCTION_SIZE;
+      #endif
 
   _gang_wave_parallel_fp8_quant<REDUCTION_SIZE>(
       input_row, s_tok_fp8, s_tok_scales);
@@ -744,7 +984,7 @@ __device__ __noinline__ void gang_mulsumradd_rmsnorm_linear_mxfp4_bias_kernel(
   uint8_t *s_tok_fp8 = (uint8_t *)_rnlm_smem;
   uint8_t *s_tok_scales = s_tok_fp8 + FP8_TOK_DATA;
 
-  int const tid = threadIdx.x;
+  int const tid = MPK_TIDX_Q;
   int const warp_id = tid >> 6;
   int const lane_id = tid & 63;
   int const col = lane_id & 15;
@@ -1130,11 +1370,36 @@ __device__ __noinline__ void gang_mulsumradd_rmsnorm_linear_mxfp4_bias_kernel(
 __device__ __forceinline__ int _kvupd_get_xcd_id() {
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
   int xcd_id;
-  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)" : "=s"(xcd_id));
+  MPK_GET_XCC_ID16(xcd_id);
+  // HW gives the PHYSICAL die (0-7) even when only a subset runs. Every
+  // per-XCD array here is sized for MPK_NUM_XCDS, so fold it. Identity
+  // in the default 8-XCD build.
+  xcd_id %= MPK_NUM_XCDS;
   return xcd_id;
 #else
   return 0;
 #endif
+}
+
+// Splits wg_idx into the KV head it belongs to and the role within that head's
+// group of NUM_Q_PER_KV + 2 tiles. At 8 XCDs a partition owns exactly one group
+// and wg_idx is itself the role; with fewer XCDs it owns several consecutive
+// groups, so the head cannot come from the XCD id alone.
+__device__ __forceinline__ void _kvupd_head_role(int wg_idx,
+                                                 int n_wgs_per_xcd,
+                                                 int num_q_per_kv,
+                                                 int &kv_head,
+                                                 int &kv_role) {
+  int const per_group = num_q_per_kv + 2;
+  int const groups = n_wgs_per_xcd / per_group;
+  int const xcd = _kvupd_get_xcd_id();
+  if (groups <= 1) {
+    kv_head = xcd;
+    kv_role = wg_idx;
+  } else {
+    kv_head = xcd * groups + wg_idx / per_group;
+    kv_role = wg_idx - (wg_idx / per_group) * per_group;
+  }
 }
 
 // ── Inline RoPE epilogue helper ─────────────────────────────────────────
@@ -1149,7 +1414,7 @@ __device__ __forceinline__ void _kvupd_rope_epilogue(
     int wave_tile,                  // wave_tile index
     int g,                          // lane group (0..3)
     int col,                        // lane column (0..15)
-    int tid,                        // threadIdx.x
+    int tid,                        // MPK_TIDX_Q
     unsigned short const *cos_data, // cos[HEAD_DIM] bf16
     unsigned short const *sin_data, // sin[HEAD_DIM] bf16
     unsigned short *dst,            // destination array
@@ -1221,7 +1486,7 @@ __device__ __forceinline__ void _kvupd_rope_epilogue_packed(
     int wave_tile,                // wave_tile index
     int g,                        // lane group (0..3)
     int col,                      // lane column (0..15) == this lane's token
-    int tid,                      // threadIdx.x
+    int tid,                      // MPK_TIDX_Q
     bool tok_active,              // col names a real token
     int n_valid,                  // number of real tokens in this block
     unsigned short const *cos_base, // cos[max_pos][HEAD_DIM] bf16
@@ -1232,7 +1497,16 @@ __device__ __forceinline__ void _kvupd_rope_epilogue_packed(
     int tok_row_base,               // first token row of this column block
     int head_offset,                // head offset within dst row
     int output_per_wg,              // OUTPUT_PER_WG
-    unsigned short *s_rope)         // LDS buffer [TOK_ROWS][HEAD_DIM] bf16
+    unsigned short *s_rope          // LDS buffer [TOK_ROWS][HEAD_DIM] bf16
+#ifdef MPK_QKV_EPI_PF
+    ,
+    bool have_pf = false,           // bias / cos / sin below are loaded
+    unsigned bias_lo = 0,
+    unsigned bias_hi = 0,
+    unsigned short cos_pf = 0,
+    unsigned short sin_pf = 0
+#endif
+    )
 {
   // Step 1: each lane writes its own token's slice.
   //
@@ -1244,6 +1518,11 @@ __device__ __forceinline__ void _kvupd_rope_epilogue_packed(
   if (tok_active) {
     int d0 = wave_tile * 16 + g * 4;
     uint64_t bias4;
+#ifdef MPK_QKV_EPI_PF
+    if (have_pf) {
+      bias4 = (uint64_t)bias_lo | ((uint64_t)bias_hi << 32);
+    } else
+#endif
     __builtin_memcpy(&bias4, &bias[wg_idx * output_per_wg + d0], 8);
     unsigned short const *b4 = (unsigned short const *)&bias4;
 #pragma unroll
@@ -1275,8 +1554,19 @@ __device__ __forceinline__ void _kvupd_rope_epilogue_packed(
     __builtin_memcpy(&v0, &v0_bits, 4);
     __builtin_memcpy(&v1, &v1_bits, 4);
 
+#ifdef MPK_QKV_EPI_PF
+    unsigned c_bits, s_bits;
+    if (have_pf) {
+      c_bits = (unsigned)cos_pf << 16;
+      s_bits = (unsigned)sin_pf << 16;
+    } else {
+      c_bits = (unsigned)cos_data[d] << 16;
+      s_bits = (unsigned)sin_data[d] << 16;
+    }
+#else
     unsigned c_bits = (unsigned)cos_data[d] << 16;
     unsigned s_bits = (unsigned)sin_data[d] << 16;
+#endif
     float c, s;
     __builtin_memcpy(&c, &c_bits, 4);
     __builtin_memcpy(&s, &s_bits, 4);
@@ -1365,7 +1655,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_kvupd_kernel(
   uint8_t *s_tok_fp8 = (uint8_t *)_rnlm_smem;
   uint8_t *s_tok_scales = s_tok_fp8 + FP8_TOK_DATA;
 
-  int const tid = threadIdx.x;
+  int const tid = MPK_TIDX_Q;
   int const warp_id = tid >> 6;
   int const lane_id = tid & 63;
   int const col = lane_id & 15;
@@ -1385,9 +1675,25 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_kvupd_kernel(
     unsigned short const *row_in =
         (unsigned short const *)norm_input_ptr + b * REDUCTION_SIZE;
     unsigned short *row_out =
+        #ifdef MPK_PRENORM_AID
+        #define PRENORM_AID_OFF ((int)(kernel::mpk_prenorm_xcc() & 0x7) >= (MPK_NUM_XCDS / 2) ? (long long)BATCH_SIZE * REDUCTION_SIZE : 0)
+        (unsigned short *)norm_output_ptr + PRENORM_AID_OFF + b * REDUCTION_SIZE;
+        #undef PRENORM_AID_OFF
+        #else
         (unsigned short *)norm_output_ptr + b * REDUCTION_SIZE;
+        #endif
     gang_rmsnorm_detail::rmsnorm_inline_amd<REDUCTION_SIZE, ACTUAL_HIDDEN_DIM>(
-        row_in, norm_weight_ptr, row_out);
+        row_in,
+#ifdef MPK_GAMMA_AID
+        (void const *)((unsigned short const *)norm_weight_ptr +
+                       ((int)(kernel::mpk_prenorm_xcc() & 0x7) >=
+                                (MPK_NUM_XCDS / 2)
+                            ? REDUCTION_SIZE
+                            : 0)),
+#else
+        norm_weight_ptr,
+#endif
+        row_out);
   }
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
@@ -1408,7 +1714,13 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_kvupd_kernel(
   // ── Step 2: Quantize/copy normalized input to LDS ────────────────────
   {
     unsigned short const *input_row =
+        #ifdef MPK_PRENORM_AID
+        #define PRENORM_AID_OFF ((int)(kernel::mpk_prenorm_xcc() & 0x7) >= (MPK_NUM_XCDS / 2) ? (long long)BATCH_SIZE * REDUCTION_SIZE : 0)
+        (unsigned short const *)norm_output_ptr + PRENORM_AID_OFF + tok_idx * REDUCTION_SIZE;
+        #undef PRENORM_AID_OFF
+        #else
         (unsigned short const *)norm_output_ptr + tok_idx * REDUCTION_SIZE;
+        #endif
     _gang_wave_parallel_fp8_quant<REDUCTION_SIZE>(
         input_row, s_tok_fp8, s_tok_scales);
   }
@@ -1480,7 +1792,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_kvupd_kernel(
       }
     }
     // ── Step 4: Fused KV_UPD epilogue ──────────────────────────────────
-    int kv_head = _kvupd_get_xcd_id();
+    int kv_head, kv_role;
+    _kvupd_head_role(wg_idx, n_wgs_per_xcd, NUM_Q_PER_KV, kv_head, kv_role);
     int request_id = 0;
     while (qo_indptr[request_id + 1] <= tok_idx) {
       request_id++;
@@ -1497,8 +1810,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_kvupd_kernel(
     unsigned short const *sin_row =
         (unsigned short const *)sin_ptr + global_pos * HEAD_DIM;
     unsigned short *s_rope = (unsigned short *)_rnlm_smem;
-    if (wg_idx < NUM_Q_PER_KV) {
-      int q_head_global = kv_head * NUM_Q_PER_KV + wg_idx;
+    if (kv_role < NUM_Q_PER_KV) {
+      int q_head_global = kv_head * NUM_Q_PER_KV + kv_role;
       _kvupd_rope_epilogue<HEAD_DIM>((float const *)&acc,
                                      d_bias,
                                      wg_idx,
@@ -1514,7 +1827,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_kvupd_kernel(
                                      q_head_global * HEAD_DIM,
                                      OUTPUT_PER_WG,
                                      s_rope);
-    } else if (wg_idx == NUM_Q_PER_KV) {
+    } else if (kv_role == NUM_Q_PER_KV) {
       int page_num = global_pos / PAGE_SIZE;
       int page_offset = global_pos % PAGE_SIZE;
       int page_idx = kv_indices[first_page + page_num];
@@ -1551,7 +1864,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_kvupd_kernel(
       __syncthreads();
       unsigned short *d_k = (unsigned short *)k_cache_ptr;
       for (int d = tid; d < HEAD_DIM; d += 256) {
-        d_k[dst_idx * kv_stride + kv_head * HEAD_DIM + d] = s_rope[d];
+        d_k[(long long)dst_idx * MPK_KV_TOK_STRIDE(HEAD_DIM, kv_stride) +
+            MPK_KV_HEAD_OFF(kv_head, HEAD_DIM) + d] = s_rope[d];
       }
     } else {
       int page_num = global_pos / PAGE_SIZE;
@@ -1569,7 +1883,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_kvupd_kernel(
           unsigned bt = (unsigned)b4[i] << 16;
           float bv;
           __builtin_memcpy(&bv, &bt, 4);
-          d_v[dst_idx * kv_stride + kv_head * HEAD_DIM + d0 + i] =
+          d_v[(long long)dst_idx * MPK_KV_TOK_STRIDE(HEAD_DIM, kv_stride) +
+              MPK_KV_HEAD_OFF(kv_head, HEAD_DIM) + d0 + i] =
               _gang_float_to_bf16(acc[i] + bv);
         }
       }
@@ -1646,7 +1961,7 @@ __device__ __noinline__ void
   uint8_t *s_tok_fp8 = (uint8_t *)_rnlm_smem;
   uint8_t *s_tok_scales = s_tok_fp8 + FP8_TOK_DATA;
 
-  int const tid = threadIdx.x;
+  int const tid = MPK_TIDX_Q;
   int const warp_id = tid >> 6;
   int const lane_id = tid & 63;
   int const col = lane_id & 15;
@@ -1861,7 +2176,8 @@ __device__ __noinline__ void
       }
     }
     // ── Step 4: Fused KV_UPD epilogue ──────────────────────────────────
-    int kv_head = _kvupd_get_xcd_id();
+    int kv_head, kv_role;
+    _kvupd_head_role(wg_idx, n_wgs_per_xcd, NUM_Q_PER_KV, kv_head, kv_role);
     int request_id = 0;
     while (qo_indptr[request_id + 1] <= tok_idx) {
       request_id++;
@@ -1878,8 +2194,8 @@ __device__ __noinline__ void
     unsigned short const *sin_row =
         (unsigned short const *)sin_ptr + global_pos * HEAD_DIM;
     unsigned short *s_rope = (unsigned short *)_rnlm_smem;
-    if (wg_idx < NUM_Q_PER_KV) {
-      int q_head_global = kv_head * NUM_Q_PER_KV + wg_idx;
+    if (kv_role < NUM_Q_PER_KV) {
+      int q_head_global = kv_head * NUM_Q_PER_KV + kv_role;
       _kvupd_rope_epilogue<HEAD_DIM>((float const *)&acc,
                                      d_bias,
                                      wg_idx,
@@ -1895,7 +2211,7 @@ __device__ __noinline__ void
                                      q_head_global * HEAD_DIM,
                                      OUTPUT_PER_WG,
                                      s_rope);
-    } else if (wg_idx == NUM_Q_PER_KV) {
+    } else if (kv_role == NUM_Q_PER_KV) {
       int page_num = global_pos / PAGE_SIZE;
       int page_offset = global_pos % PAGE_SIZE;
       int page_idx = kv_indices[first_page + page_num];
@@ -1932,7 +2248,8 @@ __device__ __noinline__ void
       __syncthreads();
       unsigned short *d_k = (unsigned short *)k_cache_ptr;
       for (int d = tid; d < HEAD_DIM; d += 256) {
-        d_k[dst_idx * kv_stride + kv_head * HEAD_DIM + d] = s_rope[d];
+        d_k[(long long)dst_idx * MPK_KV_TOK_STRIDE(HEAD_DIM, kv_stride) +
+            MPK_KV_HEAD_OFF(kv_head, HEAD_DIM) + d] = s_rope[d];
       }
     } else {
       int page_num = global_pos / PAGE_SIZE;
@@ -1950,7 +2267,8 @@ __device__ __noinline__ void
           unsigned bt = (unsigned)b4[i] << 16;
           float bv;
           __builtin_memcpy(&bv, &bt, 4);
-          d_v[dst_idx * kv_stride + kv_head * HEAD_DIM + d0 + i] =
+          d_v[(long long)dst_idx * MPK_KV_TOK_STRIDE(HEAD_DIM, kv_stride) +
+              MPK_KV_HEAD_OFF(kv_head, HEAD_DIM) + d0 + i] =
               _gang_float_to_bf16(acc[i] + bv);
         }
       }
@@ -2044,7 +2362,7 @@ __device__ __noinline__ void gang_resaddf32_rmsnorm_linear_mxfp4_bias_kernel(
   uint8_t *s_tok_fp8 = (uint8_t *)_rnlm_smem;
   uint8_t *s_tok_scales = s_tok_fp8 + FP8_TOK_DATA;
 
-  int const tid = threadIdx.x;
+  int const tid = MPK_TIDX_Q;
   int const warp_id = tid >> 6;
   int const lane_id = tid & 63;
   int const col = lane_id & 15;
@@ -2065,7 +2383,19 @@ __device__ __noinline__ void gang_resaddf32_rmsnorm_linear_mxfp4_bias_kernel(
   // Reads f32 workspace (pre-accumulated by W2 atomicAdd), adds bf16 residual,
   // zeros workspace, computes SSQ for RMSNorm — all in a single pass.
   {
+#ifdef MPK_WSF32_AID
+    float *d_ws = (float *)workspace_f32_ptr +
+                  ((int)(kernel::mpk_prenorm_xcc() & 0x7) >=
+                           (MPK_NUM_XCDS / 2)
+                       ? MOE_WS_SLOTS * REDUCTION_SIZE
+                       : 0);
+#else
     float *d_ws = (float *)workspace_f32_ptr;
+#endif
+#ifdef MPK_WSF32_REP
+    if (float *wsr = mpk_wsf32_rep((int)(kernel::mpk_prenorm_xcc() & 0x7) >> 2))
+      d_ws = wsr;
+#endif
     unsigned short const *d_residual = (unsigned short const *)residual_ptr;
     unsigned short *d_x_out = (unsigned short *)x_output_ptr;
     unsigned short const *d_norm_w = (unsigned short const *)norm_weight_ptr;
@@ -2120,6 +2450,17 @@ __device__ __noinline__ void gang_resaddf32_rmsnorm_linear_mxfp4_bias_kernel(
             ws4.w += slot4.w;
           }
 #endif
+#ifdef MPK_WS_FARCOPY
+          // A poisoned slot makes the sum NaN: four self-compares on the
+          // fast path, the validated fold only when one trips.
+          if (__builtin_expect((ws4.x != ws4.x) | (ws4.y != ws4.y) |
+                                   (ws4.z != ws4.z) | (ws4.w != ws4.w),
+                               0)) {
+            ws4 = mpk_ws_farcopy_fold((float const *)ws_base,
+                                      (float const *)workspace_f32_ptr,
+                                      REDUCTION_SIZE, off);
+          }
+#endif
 
           // Vectorized load: 4 bf16 from residual as uint2 (flat_load_dwordx2)
           uint2 res_packed;
@@ -2161,7 +2502,7 @@ __device__ __noinline__ void gang_resaddf32_rmsnorm_linear_mxfp4_bias_kernel(
           uint2 out_packed;
           out_packed.x = (unsigned)o0 | ((unsigned)o1 << 16);
           out_packed.y = (unsigned)o2 | ((unsigned)o3 << 16);
-          __builtin_memcpy(xout_base + off, &out_packed, 8);
+          MPK_XOUT_STORE(xout_base + off, out_packed);
         }
       }
 
@@ -2571,11 +2912,49 @@ __device__ __noinline__ void
         // barrier spin. Defaulted so the standalone generated variant and the
         // layer-0 / world_size>1 caller need no change.
         bool weights_preloaded = false
+#ifdef MPK_QKV_POS_CACHE
+#ifdef MPK_QKV_KSPLIT
+#error "MPK_QKV_POS_CACHE: not wired for MPK_QKV_KSPLIT"
+#endif
+        // 0: compute the KV slot; 1: compute and keep it (a token's first
+        // layer); 2: reuse the kept one (its other layers).
+        ,
+        int pos_cache = 0
+#endif
 #ifdef MPK_QKV_KSPLIT
         // 0 = K-lo (iters [0, K_LO)), 1 = K-hi (iters [K_LO, MFMA_ITERS)).
         // Default 0 so callers that have not opted in keep the full K-range.
         ,
         int k_part = 0
+#endif
+#ifdef MPK_QKV_KV_SHARED_ROW
+        // > 0: this layer's qkv epoch; Q tile 0 publishes the quantized
+        // row under it and the K/V tiles take it. 0: every tile norms.
+        ,
+        int kv_row_epoch = 0
+#endif
+#if defined(MPK_VT2) && defined(MPK_VT2_QKV)
+#if defined(MPK_QKV_POS_CACHE) || defined(MPK_QKV_KSPLIT) || defined(MPK_QKV_KV_SHARED_ROW)
+#error "MPK_VT2_QKV: tok_off follows weights_preloaded directly"
+#endif
+        ,
+        int tok_off = 0  // absolute token index of row 0 (VT2: one call per token)
+#ifdef MPK_VTN_QROW
+        ,
+        int kv_row_epoch = 0,  // > 0 with qrow_role: this layer's qkv epoch
+        int qrow_role = 0      // 1: publish the quantized row, 2: take it instead of fold + norm
+#ifdef MPK_VTN_QPAIR
+        ,
+        int tok_off2 = -1  // >= 0 on a take: a second token, run as MFMA column 1
+#ifdef MPK_VTN_QTRI
+        ,
+        int tok_off3 = -1  // >= 0 (with tok_off2) on a round-0 fold: a third token, MFMA column 2
+#endif
+#endif
+#endif
+#define MPK_QKV_TOK_OFF tok_off +
+#else
+#define MPK_QKV_TOK_OFF
 #endif
         ) {
 
@@ -2645,23 +3024,74 @@ __device__ __noinline__ void
   uint8_t *s_tok_fp8 = (uint8_t *)_rnlm_smem + G::TOK_OFF;
   uint8_t *s_tok_scales = s_tok_fp8 + TOK_REGION;
 
-  int const tid = threadIdx.x;
+  int const tid = MPK_TIDX_Q;
   int const warp_id = tid >> 6;
   int const lane_id = tid & 63;
   int const col = lane_id & 15;
   int const g = lane_id >> 4;
 
   MPK_QKVSUB(0);
-#if defined(MPK_QKV_POS_PREFETCH) && MPK_MAX_NUM_BATCHED_REQUESTS == 1
+#if defined(MPK_QKV_POS_PREFETCH) && (MPK_MAX_NUM_BATCHED_REQUESTS == 1 || MPK_QKV_PF_VSLOT)
   // One request: its KV position metadata depends on nothing this kernel
   // computes, so load it here and let the slab pass cover the latency.
-  int const pf_qo0 = qo_indptr[0];
-  int const pf_qo1 = qo_indptr[1];
-  int const pf_kv0 = kv_indptr[0];
-  int const pf_kv1 = kv_indptr[1];
-  int const pf_lpl = kv_last_page_len[0];
+#if MPK_QKV_PF_VSLOT
+  int const pf_rq = MPK_QKV_TOK_OFF 0;
+#else
+  constexpr int pf_rq = 0;
+#endif
+  int const pf_qo0 = qo_indptr[pf_rq];
+  int const pf_qo1 = qo_indptr[pf_rq + 1];
+  int const pf_kv0 = kv_indptr[pf_rq];
+  int const pf_kv1 = kv_indptr[pf_rq + 1];
+  int const pf_lpl = kv_last_page_len[pf_rq];
   int pf_gp = 0;
   int pf_page = 0;
+#endif
+#ifdef MPK_VTN_QPAIR
+#if !defined(MPK_VTN_QMP) || !defined(MPK_QKV_POS_PREFETCH) || !MPK_QKV_PF_VSLOT || \
+    !defined(MPK_QKV_ROPE_REG) || !defined(MPK_QKV_LDS_NORM) || defined(MPK_QKV_EPI_PF) || \
+    defined(MPK_QKV_EPI_PRELOAD) || defined(MPK_KV_SPREAD) || defined(MPK_QKV_KSPLIT) || \
+    defined(MPK_QKV_PF3)
+#error "MPK_VTN_QPAIR: QMP takes, virtual-slot position prefetch, RoPE in registers, LDS norm block"
+#endif
+  bool const qpair = tok_off2 >= 0;
+  int const pf2_rq = qpair ? tok_off2 : pf_rq;
+#define MPK_QPAIR_DQ (tok_off2 - tok_off)
+  int const pf2_qo0 = qo_indptr[pf2_rq];
+  int const pf2_qo1 = qo_indptr[pf2_rq + 1];
+  int const pf2_kv0 = kv_indptr[pf2_rq];
+  int const pf2_kv1 = kv_indptr[pf2_rq + 1];
+  int const pf2_lpl = kv_last_page_len[pf2_rq];
+  int pf2_gp = 0;
+  int pf2_page = 0;
+  // The second row lives in the LDS norm block, which a take call never uses.
+  static_assert(G::NORM_BYTES >= TOK_ROW_STRIDE + SC_STRIDE, "MPK_VTN_QPAIR: second row in the norm block");
+  uint8_t *const s_tok2 = (uint8_t *)_rnlm_smem + G::NORM_OFF;
+  uint8_t *const s_tsc2 = s_tok2 + TOK_ROW_STRIDE;
+#ifdef MPK_VTN_QTRI
+#if !defined(MPK_VTN_T) || MPK_VTN_T > 9 || defined(MPK_QKV_W_TOP)
+#error "MPK_VTN_QTRI: a third column only on round-0 folds (T <= 9), third row above the default weight region"
+#endif
+  bool const qtri = tok_off3 >= 0;
+  int const pf3_rq = qtri ? tok_off3 : pf_rq;
+#undef MPK_QPAIR_DQ
+#define MPK_QPAIR_DQ (pcol == 2 ? tok_off3 - tok_off : tok_off2 - tok_off)
+  int const pf3_qo0 = qo_indptr[pf3_rq];
+  int const pf3_qo1 = qo_indptr[pf3_rq + 1];
+  int const pf3_kv0 = kv_indptr[pf3_rq];
+  int const pf3_kv1 = kv_indptr[pf3_rq + 1];
+  int const pf3_lpl = kv_last_page_len[pf3_rq];
+  int pf3_gp = 0;
+  int pf3_page = 0;
+  // The third row sits above the weights, where only the fold's slab staging lives; the fold path writes it
+  // after the quant, when the slabs are consumed.
+  static_assert(G::W_END + TOK_ROW_STRIDE + SC_STRIDE <=
+                    mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
+                        mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END,
+                "MPK_VTN_QTRI: third row above the weights");
+  uint8_t *const s_tok3 = (uint8_t *)_rnlm_smem + G::W_END;
+  uint8_t *const s_tsc3 = s_tok3 + TOK_ROW_STRIDE;
+#endif
 #endif
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   unsigned long long _sp_t0 = 0, _sp_t1 = 0, _sp_t2 = 0, _sp_t3 = 0,
@@ -2670,6 +3100,11 @@ __device__ __noinline__ void
   if (_sp_rec) {
     _sp_t0 = __builtin_amdgcn_s_memrealtime();
   }
+#endif
+  MPK_QKVK_MARK(0);
+#ifdef MPK_QT_TS
+  unsigned int qt_t[4] = {0u, 0u, 0u, 0u};  // MPK_QT_TS (timing tool)
+  qt_t[0] = (unsigned int)__builtin_amdgcn_s_memrealtime();
 #endif
   int batch_count =
       (num_active_tokens < BATCH_SIZE) ? num_active_tokens : BATCH_SIZE;
@@ -2681,6 +3116,15 @@ __device__ __noinline__ void
   int wg_idx = tile_idx % n_wgs_per_xcd;
   int tok_row_base = bblk * MFMA_N;
   int tok_row = tok_row_base + col;
+#ifdef MPK_QKV_EPI_PF
+  static_assert(TILES_PER_WAVE == 1, "MPK_QKV_EPI_PF: one output tile per wave");
+  // This lane's epilogue bias quad (d0 = warp_id * 16 + g * 4), issued now so
+  // it lands during the fold. Typed AS(1): a generic load is FLAT and would
+  // turn every fold wait into vmcnt(0).
+  _gl_u32x2 const epi_bias_pf =
+      *(__attribute__((address_space(1))) _gl_u32x2 const *)(
+          d_bias + wg_idx * OUTPUT_PER_WG + warp_id * 16 + g * 4);
+#endif
 
   uint8_t const *wg_data = W + static_cast<int64_t>(wg_idx) * WG_BYTES;
   uint8_t const *wg_scales = wg_data + WG_DATA_BYTES;
@@ -2751,6 +3195,17 @@ __device__ __noinline__ void
   // slab loads and before their use.
   bool const mpk_slab_dma = !weights_preloaded && BATCH_SIZE == 1;
   if (!weights_preloaded && !mpk_slab_dma) {
+#elif defined(MPK_QKV_WDMA_MID)
+#if !defined(MPK_QKV_SLAB_LDS) || !defined(MPK_QKV_PF_SKIP_W2) ||               \
+    !defined(MPK_QKV_RED_LDS_BAR) || !defined(MPK_QKV_NQ_FUSED2) ||            \
+    defined(MPK_QKV_KSPLIT) || defined(MPK_KV_SPREAD) ||                       \
+    defined(MPK_QKV_WDMA_AFTER_SLAB) || defined(MPK_QKV_SLAB_LDS_SHADOW) ||    \
+    defined(MPK_QKV_SLAB_LDS_NODMA)
+#error "MPK_QKV_WDMA_MID needs MPK_QKV_SLAB_LDS, MPK_QKV_PF_SKIP_W2, MPK_QKV_RED_LDS_BAR and MPK_QKV_NQ_FUSED2"
+#endif
+  // Batch 1: issued inside the slab pass, after iteration 0's loads (see the SLAB_LDS block).
+  bool const mpk_wdma_mid = !weights_preloaded && BATCH_SIZE == 1;
+  if (!weights_preloaded && !mpk_wdma_mid) {
 #elif defined(MPK_QKV_WDMA_AFTER_SLAB)
 #if !defined(MPK_QKV_SLAB_LDS) || !defined(MPK_QKV_PF_SKIP_W2) || \
     !defined(MPK_QKV_RED_LDS_BAR) || defined(MPK_QKV_KSPLIT) || \
@@ -2822,9 +3277,161 @@ __device__ __noinline__ void
     }
   } else {
 #endif
+#if defined(MPK_QKV_KV_SHARED_ROW) || defined(MPK_VTN_QROW)
+#if defined(MPK_QKV_KSPLIT) || defined(MPK_KV_SPREAD) || \
+    defined(MPK_QKV_WDMA_AFTER_SLAB) || defined(MPK_QKV_PF_PAGE_LATE)
+#error "MPK_QKV_KV_SHARED_ROW is wired for the unsplit batch-1 kernel"
+#endif
+  static_assert(TOK_ROWS == 1 &&
+                    TOK_REGION + SC_REGION <= MPK_QKV_KV_ROW_BYTES &&
+                    TOK_REGION + SC_REGION <= 2 * 256 * 8,
+                "MPK_QKV_KV_SHARED_ROW: one quantized row per slot");
+  // K/V tiles take the quantized row from Q tile 0 (see the publish
+  // after the quant): the row is the whole hidden vector, the same in
+  // every tile, and Q tile 0 reaches the gate ~1.6 us before the K/V
+  // tiles, which come from a W2 group.
+  int const kvr_slot = _kvupd_get_xcd_id() * 2 + (kv_row_epoch & 1);
+  if (MPK_QROW_TAKE) {
+#if defined(MPK_QKV_POS_PREFETCH) && (MPK_MAX_NUM_BATCHED_REQUESTS == 1 || MPK_QKV_PF_VSLOT)
+    {
+      int const num_pages = pf_kv1 - pf_kv0;
+      int const global_seq_len = (num_pages - 1) * PAGE_SIZE + pf_lpl;
+      int const num_new_tokens = pf_qo1 - pf_qo0;
+      pf_gp = global_seq_len - num_new_tokens + (MPK_QKV_TOK_OFF tok_row_base - pf_qo0);
+    }
+    pf_page = kv_indices[pf_kv0 + pf_gp / PAGE_SIZE];
+#endif
+#ifdef MPK_VTN_QPAIR
+    if (qpair) {
+      int const num_pages2 = pf2_kv1 - pf2_kv0;
+      int const global_seq_len2 = (num_pages2 - 1) * PAGE_SIZE + pf2_lpl;
+      int const num_new_tokens2 = pf2_qo1 - pf2_qo0;
+      pf2_gp = global_seq_len2 - num_new_tokens2 + (tok_off2 + tok_row_base - pf2_qo0);
+      pf2_page = kv_indices[pf2_kv0 + pf2_gp / PAGE_SIZE];
+    }
+#endif
+#ifdef MPK_VTN_QROW_TAG
+    {
+      // MPK_VTN_QROW_TAG: the row's 746 words as {word, epoch} in this AID's replica; one local round trip.
+      constexpr int kvr_nw = (TOK_REGION + SC_REGION) / 4;
+      static_assert((TOK_REGION + SC_REGION) % 4 == 0 && kvr_nw <= 3 * 256 && 2 * kvr_nw <= MPK_AID_QROW_SLOT_INTS,
+                    "MPK_VTN_QROW_TAG: three tagged words per thread in one slot");
+      int const qx = _kvupd_get_xcd_id();
+#ifdef MPK_VTN_QMP
+      // MPK_VTN_QMP: one slot per (die, parity, token) in this AID's NC scratch.
+      int const *const qt = g_aid_nc_rep[qx >> 2] + MPK_NC_QROW_INTS +
+                            (((qx & 3) * 2 + (kv_row_epoch & 1)) * MPK_VTN_T + tok_off) *
+                                MPK_NC_QROW_SLOT_INTS;
+#else
+      int const *const qt = g_aid_flag_rep[qx >> 2] + MPK_AID_QROW_BASE_INTS +
+                            ((qx & 3) * 2 + (kv_row_epoch & 1)) * MPK_AID_QROW_SLOT_INTS;
+#endif
+      bool const qv1 = tid + 256 < kvr_nw, qv2 = tid + 512 < kvr_nw;
+      unsigned const qtag = (unsigned)kv_row_epoch;
+      unsigned long long qw0 = 0ull, qw1 = 0ull, qw2 = 0ull;
+#ifdef MPK_VTN_QPAIR
+      if (qpair) {
+        // Both producers' rows in one tagged batch; the second row goes to the norm block.
+        int const *const qt2 = qt + (tok_off2 - tok_off) * MPK_NC_QROW_SLOT_INTS;
+        unsigned long long qx0 = 0ull, qx1 = 0ull, qx2 = 0ull;
+        while (true) {
+          asm volatile("global_load_dwordx2 %0, %6, off sc0 sc1\n"
+                       "global_load_dwordx2 %1, %7, off sc0 sc1\n"
+                       "global_load_dwordx2 %2, %8, off sc0 sc1\n"
+                       "global_load_dwordx2 %3, %9, off sc0 sc1\n"
+                       "global_load_dwordx2 %4, %10, off sc0 sc1\n"
+                       "global_load_dwordx2 %5, %11, off sc0 sc1\n"
+                       "s_waitcnt vmcnt(0)"
+                       : "=&v"(qw0), "=&v"(qw1), "=&v"(qw2), "=&v"(qx0), "=&v"(qx1), "=&v"(qx2)
+                       : "v"(qt + 2 * tid), "v"(qt + 2 * (tid + 256)), "v"(qt + 2 * (tid + 512)),
+                         "v"(qt2 + 2 * tid), "v"(qt2 + 2 * (tid + 256)), "v"(qt2 + 2 * (tid + 512))
+                       : "memory");
+          if ((unsigned)(qw0 >> 32) == qtag && (!qv1 || (unsigned)(qw1 >> 32) == qtag) &&
+              (!qv2 || (unsigned)(qw2 >> 32) == qtag) && (unsigned)(qx0 >> 32) == qtag &&
+              (!qv1 || (unsigned)(qx1 >> 32) == qtag) && (!qv2 || (unsigned)(qx2 >> 32) == qtag)) {
+            break;
+          }
+          __builtin_amdgcn_s_sleep(1);
+        }
+        ((uint32_t *)s_tok2)[tid] = (uint32_t)qx0;
+        if (qv1) ((uint32_t *)s_tok2)[tid + 256] = (uint32_t)qx1;
+        if (qv2) ((uint32_t *)s_tok2)[tid + 512] = (uint32_t)qx2;
+      } else
+#endif
+      while (true) {
+        asm volatile("global_load_dwordx2 %0, %3, off sc0 sc1\n"
+                     "global_load_dwordx2 %1, %4, off sc0 sc1\n"
+                     "global_load_dwordx2 %2, %5, off sc0 sc1\n"
+                     "s_waitcnt vmcnt(0)"
+                     : "=&v"(qw0), "=&v"(qw1), "=&v"(qw2)
+                     : "v"(qt + 2 * tid), "v"(qt + 2 * (tid + 256)), "v"(qt + 2 * (tid + 512))
+                     : "memory");
+        if ((unsigned)(qw0 >> 32) == qtag && (!qv1 || (unsigned)(qw1 >> 32) == qtag) &&
+            (!qv2 || (unsigned)(qw2 >> 32) == qtag)) {
+          break;
+        }
+        __builtin_amdgcn_s_sleep(1);
+      }
+#ifdef MPK_QT_TS
+      qt_t[1] = (unsigned int)__builtin_amdgcn_s_memrealtime();
+#endif
+      ((uint32_t *)s_tok_fp8)[tid] = (uint32_t)qw0;
+      if (qv1) ((uint32_t *)s_tok_fp8)[tid + 256] = (uint32_t)qw1;
+      if (qv2) ((uint32_t *)s_tok_fp8)[tid + 512] = (uint32_t)qw2;
+      __syncthreads();
+#ifdef MPK_QT_TS
+      qt_t[2] = (unsigned int)__builtin_amdgcn_s_memrealtime();
+#endif
+    }
+    if (false) {
+#endif
+    uint8_t *kvr_src = &g_qkv_kv_row[kvr_slot * MPK_QKV_KV_ROW_BYTES];
+    if (tid == 0) {
+      // Equality, not >=: a relaunch restarts the epoch while the slot
+      // still holds the last launch's value.
+      while (ld_sys_s32(&g_qkv_kv_row_epoch[kvr_slot * 16]) != kv_row_epoch) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+    __syncthreads();
+    constexpr int kvr_nbytes = TOK_REGION + SC_REGION;
+    unsigned long long kvr0 = 0ull, kvr1 = 0ull;
+    asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1"
+                 : "=v"(kvr0)
+                 : "v"(kvr_src + tid * 8)
+                 : "memory");
+    if (tid * 8 + 2048 < kvr_nbytes) {
+      asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1"
+                   : "=v"(kvr1)
+                   : "v"(kvr_src + tid * 8 + 2048)
+                   : "memory");
+    }
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    __builtin_memcpy(s_tok_fp8 + tid * 8, &kvr0, 8);
+    if (tid * 8 + 2048 < kvr_nbytes) {
+      __builtin_memcpy(s_tok_fp8 + tid * 8 + 2048, &kvr1, 8);
+    }
+    __syncthreads();
+#ifdef MPK_VTN_QROW_TAG
+    }
+#endif
+  } else {
+#endif
   // ── Step 0+1 FUSED: ResAddF32 + RMSNorm ───────────────────────────────
   {
+#if defined(MPK_WSF32_AID) && !defined(MPK_WSFC_READ_PRODUCER)
+    float *d_ws = (float *)workspace_f32_ptr +
+                  ((int)(kernel::mpk_prenorm_xcc() & 0x7) >=
+                           (MPK_NUM_XCDS / 2)
+                       ? MOE_WS_SLOTS * REDUCTION_SIZE
+                       : 0);
+#else
     float *d_ws = (float *)workspace_f32_ptr;
+#endif
+#ifdef MPK_WSF32_REP
+    if (float *wsr = mpk_wsf32_rep((int)(kernel::mpk_prenorm_xcc() & 0x7) >> 2))
+      d_ws = wsr;
+#endif
     unsigned short const *d_residual = (unsigned short const *)residual_ptr;
     unsigned short *d_x_out = (unsigned short *)x_output_ptr;
     unsigned short const *d_norm_w = (unsigned short const *)norm_weight_ptr;
@@ -2844,6 +3451,21 @@ __device__ __noinline__ void
       // the issue loop below the pass-1 body for why.
       uint64_t prefetched_norm_weights[_MAX_ITERS];
       int n_cached = 0;
+#ifdef MPK_QKV_PRO_FAST
+      // Static gamma: issue before the fold so it lands during it.
+#pragma unroll
+      for (int iter = 0; iter < _MAX_ITERS; ++iter) {
+        int const off = tid * _VEC + iter * _BLOCK_VEC;
+        if (off < REDUCTION_SIZE) {
+          uint64_t value;
+          asm volatile("global_load_dwordx2 %0, %1, off"
+                       : "=v"(value)
+                       : "v"(d_norm_w + off)
+                       : "memory");
+          prefetched_norm_weights[iter] = value;
+        }
+      }
+#endif
       {
         constexpr int VEC = 4;
         constexpr int BLOCK_VEC = 256 * VEC;
@@ -2863,6 +3485,15 @@ __device__ __noinline__ void
         // the single-slab shape reads one.
         auto const *ws_base = (__attribute__((address_space(1))) float const *)(
             d_ws + moe_ws_offset(b, 0, REDUCTION_SIZE));
+#ifdef MPK_WS_SYS_LOAD
+        __amdgpu_buffer_rsrc_t const ws_rs = __builtin_amdgcn_make_buffer_rsrc(
+            mpk_uniform_ptr((void *)(d_ws + moe_ws_offset(b, 0, REDUCTION_SIZE))),
+            (short)0, MOE_WS_SLOTS * REDUCTION_SIZE * (int)sizeof(float),
+            0x00020000);
+        __amdgpu_buffer_rsrc_t const res_rs = __builtin_amdgcn_make_buffer_rsrc(
+            mpk_uniform_ptr((void *)(d_residual + b * REDUCTION_SIZE)), (short)0,
+            REDUCTION_SIZE * 2, 0x00020000);
+#endif
         auto const *res_base =
             (__attribute__((address_space(1))) unsigned short const *)(
                 d_residual + b * REDUCTION_SIZE);
@@ -2874,17 +3505,28 @@ __device__ __noinline__ void
         {
           constexpr int GV = (REDUCTION_SIZE * 2) / 16;
           static_assert((REDUCTION_SIZE * 2) % 16 == 0 &&
+#ifdef MPK_QKV_W_TOP
+                            true,  // gamma in the low norm block (NORMREG)
+#else
                             G::W_END + ((GV + 255) / 256) * 4096 <=
                                 149 * 1024,
+#endif
                         "MPK_QKV_GAMMA_LDS: norm weight must fit LDS slot NUM_WAVES");
           i32x4_t const g_rsrc =
               make_w_buffer_rsrc(d_norm_w, REDUCTION_SIZE * 2);
 #ifdef MPK_QKV_GAMMA_NORMREG
-#if !defined(MPK_QKV_LDS_NORM) || MPK_MAX_NUM_BATCHED_TOKENS != 1
+#if !defined(MPK_QKV_LDS_NORM) || \
+    (MPK_MAX_NUM_BATCHED_TOKENS != 1 && !(defined(MPK_VT2) && defined(MPK_VT2_QKV)))
 #error "MPK_QKV_GAMMA_NORMREG stages the weight in the one-row LDS norm block"
 #endif
+#ifdef MPK_LDS_DST_S
+          int g_w;
+          asm volatile("s_nop 1\n\tv_readfirstlane_b32 %0, %1\n\ts_nop 4" : "=s"(g_w) : "v"(tid >> 6));
+#else
+          int const g_w = tid >> 6;
+#endif
           auto *g_lds = (__attribute__((address_space(3))) uint32_t *)(
-              (uint8_t *)s_norm_out + (tid >> 6) * 1024);
+              (uint8_t *)s_norm_out + g_w * 1024);
 #else
           auto *g_lds = (__attribute__((address_space(3))) uint32_t *)(
               (uint8_t *)_rnlm_smem + G::W_END + (tid >> 6) * 1024);
@@ -2906,6 +3548,13 @@ __device__ __noinline__ void
         }
 #endif
 
+#ifdef MPK_WS_FARCOPY
+#ifdef MPK_WS_SYS_LOAD
+#error "MPK_WS_FARCOPY's redo loop does not handle MPK_WS_SYS_LOAD"
+#endif
+        float const fc_ssq0 = ssq;  // MPK_WSFC_V4
+        int const fc_nc0 = n_cached;
+#endif
 #ifdef MPK_QKV_LDS_POISON_HI
         {
           typedef unsigned _pz_u32x4 __attribute__((ext_vector_type(4)));
@@ -2999,7 +3648,79 @@ __device__ __noinline__ void
           }
         } else {
 #endif
-#ifdef MPK_QKV_SLAB_HOIST
+#ifdef MPK_FOLD_PIPE
+#if defined(MPK_WS_SYS_LOAD) || defined(MPK_WS_FARCOPY) || defined(MPK_ABLATE_WS_FOLD) || \
+    defined(MPK_QKV_SLAB_HOIST) || defined(MPK_QKV_SLAB_LDS) || defined(MPK_QKV_DMA_IN_SLAB)
+#error "MPK_FOLD_PIPE replaces the plain fold loop only"
+#endif
+        // All loads first, then the unchanged arithmetic in the same order.
+        // The plain loop's x_out store may alias its sources as far as the
+        // compiler knows, so it never hoisted the next iteration's loads.
+        _gl_f32x4 fp_ws[_MAX_ITERS][MOE_WS_SLOTS];
+        _gl_u32x2 fp_rv[_MAX_ITERS];
+#pragma unroll
+        for (int it = 0; it < _MAX_ITERS; it++) {
+          int const off_raw = tid * VEC + it * BLOCK_VEC;
+          int const off =
+              off_raw < REDUCTION_SIZE ? off_raw : REDUCTION_SIZE - VEC;
+#pragma unroll
+          for (int s = 0; s < MOE_WS_SLOTS; s++) {
+            fp_ws[it][s] =
+                *(__attribute__((address_space(1))) _gl_f32x4 const *)(
+                    ws_base + MPK_WSLP_SLOT(s) * REDUCTION_SIZE + off);
+          }
+          fp_rv[it] = *(__attribute__((address_space(1))) _gl_u32x2 const *)(
+              res_base + off);
+        }
+#pragma unroll
+        for (int it = 0; it < _MAX_ITERS; it++) {
+          int const off = tid * VEC + it * BLOCK_VEC;
+          if (off < REDUCTION_SIZE) {
+            float4 ws4;
+            ws4.x = fp_ws[it][0][0];
+            ws4.y = fp_ws[it][0][1];
+            ws4.z = fp_ws[it][0][2];
+            ws4.w = fp_ws[it][0][3];
+#pragma unroll
+            for (int s = 1; s < MOE_WS_SLOTS; s++) {
+              ws4.x += fp_ws[it][s][0];
+              ws4.y += fp_ws[it][s][1];
+              ws4.z += fp_ws[it][s][2];
+              ws4.w += fp_ws[it][s][3];
+            }
+            unsigned r0 = (fp_rv[it][0] & 0xFFFFu) << 16;
+            unsigned r1 = fp_rv[it][0] & 0xFFFF0000u;
+            unsigned r2 = (fp_rv[it][1] & 0xFFFFu) << 16;
+            unsigned r3 = fp_rv[it][1] & 0xFFFF0000u;
+            float rv0, rv1, rv2, rv3;
+            __builtin_memcpy(&rv0, &r0, 4);
+            __builtin_memcpy(&rv1, &r1, 4);
+            __builtin_memcpy(&rv2, &r2, 4);
+            __builtin_memcpy(&rv3, &r3, 4);
+            float s0 = ws4.x + rv0;
+            float s1 = ws4.y + rv1;
+            float s2 = ws4.z + rv2;
+            float s3 = ws4.w + rv3;
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s0));
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s1));
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s2));
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s3));
+            s_cache[n_cached + 0] = s0;
+            s_cache[n_cached + 1] = s1;
+            s_cache[n_cached + 2] = s2;
+            s_cache[n_cached + 3] = s3;
+            n_cached += _VEC;
+            unsigned short o0 = _gang_float_to_bf16(s0);
+            unsigned short o1 = _gang_float_to_bf16(s1);
+            unsigned short o2 = _gang_float_to_bf16(s2);
+            unsigned short o3 = _gang_float_to_bf16(s3);
+            uint2 out_packed;
+            out_packed.x = (unsigned)o0 | ((unsigned)o1 << 16);
+            out_packed.y = (unsigned)o2 | ((unsigned)o3 << 16);
+            MPK_XOUT_STORE(xout_base + off, out_packed);
+          }
+        }
+#elif defined(MPK_QKV_SLAB_HOIST)
 #if defined(MPK_QKV_DMA_IN_SLAB) || defined(MPK_ABLATE_WS_FOLD)
 #error "MPK_QKV_SLAB_HOIST replaces the plain slab loop"
 #endif
@@ -3087,6 +3808,12 @@ __device__ __noinline__ void
         {
           static_assert(_MAX_ITERS == 3 && 2 * BLOCK_VEC <= REDUCTION_SIZE,
                         "MPK_QKV_SLAB_LDS is laid out for three iterations");
+#ifdef MPK_QKV_W_TOP
+          constexpr int SL_WS = G::X_OFF;
+          constexpr int SL_RES = SL_WS + 2 * MOE_WS_SLOTS * 4096;
+          static_assert(SL_RES + 4096 <= G::X_END,
+                        "MPK_QKV_W_TOP: slab staging must fit below the QKV weights");
+#else
 #if defined(MPK_QKV_GAMMA_LDS) && !defined(MPK_QKV_GAMMA_NORMREG)
           constexpr int SL_WS = G::W_END + 8192;
 #else
@@ -3097,13 +3824,20 @@ __device__ __noinline__ void
                             mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
                                 mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END,
                         "MPK_QKV_SLAB_LDS: staging must fit above the QKV weights");
+#endif
           i32x4_t const ws_rsrc = make_w_buffer_rsrc(
               (void const *)(d_ws + moe_ws_offset(b, 0, REDUCTION_SIZE)),
               MOE_WS_SLOTS * REDUCTION_SIZE * 4);
           i32x4_t const res_rsrc = make_w_buffer_rsrc(
               (void const *)(d_residual + b * REDUCTION_SIZE),
               REDUCTION_SIZE * 2);
-          uint8_t *const sl_wave = (uint8_t *)_rnlm_smem + (tid >> 6) * 1024;
+#ifdef MPK_LDS_DST_S
+          int sl_w;
+          asm volatile("s_nop 1\n\tv_readfirstlane_b32 %0, %1\n\ts_nop 4" : "=s"(sl_w) : "v"(tid >> 6));
+#else
+          int const sl_w = tid >> 6;
+#endif
+          uint8_t *const sl_wave = (uint8_t *)_rnlm_smem + sl_w * 1024;
 #ifndef MPK_QKV_SLAB_LDS_NODMA
 #pragma unroll
           for (int it = 1; it < 3; ++it) {
@@ -3117,7 +3851,7 @@ __device__ __noinline__ void
                   MPK_QKV_SLAB_LDS_AUX);
             }
           }
-          uint8_t *const sl_wave4 = (uint8_t *)_rnlm_smem + (tid >> 6) * 256;
+          uint8_t *const sl_wave4 = (uint8_t *)_rnlm_smem + sl_w * 256;
 #pragma unroll
           for (int h = 0; h < 4; ++h) {
             __llvm_amdgcn_raw_buffer_load_lds(
@@ -3132,6 +3866,27 @@ __device__ __noinline__ void
               (uint8_t const *)_rnlm_smem + SL_WS + tid * 16;
           uint8_t const *const sl_res =
               (uint8_t const *)_rnlm_smem + SL_RES + tid * 4;
+#ifdef MPK_QKV_WDMA_MID
+          // Iteration 0's loads first, then this tile's weight DMA: the fold's waits retire the
+          // fold data and leave the younger weight requests in flight until Phase B.
+          using WmG = QkvWeightLds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>;
+          constexpr int kWdmaN = WmG::NUM_WAVES * WmG::LPT;
+          static_assert(kWdmaN > 0 && kWdmaN <= 63, "MPK_QKV_WDMA_MID: vmcnt holds 0..63");
+          _gl_f32x4 wm_ws[MOE_WS_SLOTS];
+          _gl_u32x2 wm_rv;
+#pragma unroll
+          for (int s = 0; s < MOE_WS_SLOTS; s++) {
+            wm_ws[s] = *(__attribute__((address_space(1))) _gl_f32x4 const *)(
+                ws_base + s * REDUCTION_SIZE + tid * VEC);
+          }
+          wm_rv = *(__attribute__((address_space(1))) _gl_u32x2 const *)(res_base + tid * VEC);
+          __builtin_amdgcn_sched_barrier(0);
+          if (mpk_wdma_mid) {
+            qkv_prefetch_weights_lds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>(
+                weight_ptr, n_wgs_per_xcd, tile_idx);
+          }
+          __builtin_amdgcn_sched_barrier(0);
+#endif
 #pragma unroll
           for (int it = 0; it < 3; ++it) {
             int const off = tid * VEC + it * BLOCK_VEC;
@@ -3144,18 +3899,26 @@ __device__ __noinline__ void
               bool const sl_from_lds = it > 0;
 #endif
               if (!sl_from_lds) {
+#ifdef MPK_QKV_WDMA_MID
+                _gl_f32x4 const ws_v = wm_ws[0];
+#else
                 _gl_f32x4 const ws_v =
                     *(__attribute__((address_space(1))) _gl_f32x4 const *)(
                         ws_base + off);
+#endif
                 ws4.x = ws_v[0];
                 ws4.y = ws_v[1];
                 ws4.z = ws_v[2];
                 ws4.w = ws_v[3];
 #pragma unroll
                 for (int s = 1; s < MOE_WS_SLOTS; s++) {
+#ifdef MPK_QKV_WDMA_MID
+                  _gl_f32x4 const sv = wm_ws[s];
+#else
                   _gl_f32x4 const sv =
                       *(__attribute__((address_space(1))) _gl_f32x4 const *)(
                           ws_base + s * REDUCTION_SIZE + off);
+#endif
                   float4 slot4;
                   slot4.x = sv[0];
                   slot4.y = sv[1];
@@ -3166,9 +3929,13 @@ __device__ __noinline__ void
                   ws4.z += slot4.z;
                   ws4.w += slot4.w;
                 }
+#ifdef MPK_QKV_WDMA_MID
+                _gl_u32x2 const rv_v = wm_rv;
+#else
                 _gl_u32x2 const rv_v =
                     *(__attribute__((address_space(1))) _gl_u32x2 const *)(
                         res_base + off);
+#endif
                 res_packed.x = rv_v[0];
                 res_packed.y = rv_v[1];
               } else {
@@ -3233,7 +4000,17 @@ __device__ __noinline__ void
               // The staged LDS lines must have landed before iteration 1
               // reads them; waiting here, ahead of this store, keeps the store
               // ack out of that wait.
+#ifdef MPK_QKV_WDMA_MID
+              if (it == 0) {
+                if (mpk_wdma_mid) {
+                  asm volatile("s_waitcnt vmcnt(%0)" ::"n"(kWdmaN) : "memory");
+                } else {
+                  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+                }
+              }
+#else
               if (it == 0) asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
 #ifdef MPK_QKV_SLAB_LDS_FLATSTORE
               __builtin_memcpy(xout_base + off, &ov, 8);
 #else
@@ -3262,9 +4039,13 @@ __device__ __noinline__ void
           // is declared __host__ and rejects an address-space qualified
           // pointer, and dereferencing the AS(1) type is what makes the
           // backend pick global_load_dwordx4 over flat_load_dwordx4.
+#ifdef MPK_WS_SYS_LOAD
+          _gl_f32x4 const ws_v = mpk_ws_sys_ld(ws_rs, off);
+#else
           _gl_f32x4 const ws_v =
-              *(__attribute__((address_space(1))) _gl_f32x4 const *)(ws_base +
-                                                                     off);
+              *(__attribute__((address_space(1))) _gl_f32x4 const *)(
+                  ws_base + MPK_WSLP_SLOT(0) * REDUCTION_SIZE + off);
+#endif
           float4 ws4;
           ws4.x = ws_v[0];
           ws4.y = ws_v[1];
@@ -3282,9 +4063,13 @@ __device__ __noinline__ void
 #ifndef MPK_ABLATE_WS_FOLD
 #pragma unroll
           for (int s = 1; s < MOE_WS_SLOTS; s++) {
+#ifdef MPK_WS_SYS_LOAD
+            _gl_f32x4 const sv = mpk_ws_sys_ld(ws_rs, s * REDUCTION_SIZE + off);
+#else
             _gl_f32x4 const sv =
                 *(__attribute__((address_space(1))) _gl_f32x4 const *)(
-                    ws_base + s * REDUCTION_SIZE + off);
+                    ws_base + MPK_WSLP_SLOT(s) * REDUCTION_SIZE + off);
+#endif
             float4 slot4;
             slot4.x = sv[0];
             slot4.y = sv[1];
@@ -3296,9 +4081,13 @@ __device__ __noinline__ void
             ws4.w += slot4.w;
           }
 #endif
+#ifdef MPK_WS_SYS_LOAD
+          _gl_u32x2 const rv_v = mpk_res_sys_ld(res_rs, off);
+#else
           _gl_u32x2 const rv_v =
               *(__attribute__((address_space(1))) _gl_u32x2 const *)(res_base +
                                                                      off);
+#endif
           uint2 res_packed;
           res_packed.x = rv_v[0];
           res_packed.y = rv_v[1];
@@ -3318,10 +4107,17 @@ __device__ __noinline__ void
           float s2 = ws4.z + rv2;
           float s3 = ws4.w + rv3;
 
+#ifdef MPK_QKV_PRO_FAST
+          ssq = __builtin_fmaf(s0, s0, ssq);
+          ssq = __builtin_fmaf(s1, s1, ssq);
+          ssq = __builtin_fmaf(s2, s2, ssq);
+          ssq = __builtin_fmaf(s3, s3, ssq);
+#else
           asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s0));
           asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s1));
           asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s2));
           asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s3));
+#endif
 
           // Cache resadd sums in registers for Pass 2 (avoid re-reading x_out)
           s_cache[n_cached + 0] = s0;
@@ -3337,15 +4133,155 @@ __device__ __noinline__ void
           uint2 out_packed;
           out_packed.x = (unsigned)o0 | ((unsigned)o1 << 16);
           out_packed.y = (unsigned)o2 | ((unsigned)o3 << 16);
-          __builtin_memcpy(xout_base + off, &out_packed, 8);
+#ifndef MPK_XOUT_SLICE_WRITER
+          MPK_XOUT_STORE(xout_base + off, out_packed);
+#endif
         }
-#endif  // MPK_QKV_SLAB_HOIST
+#endif  // MPK_FOLD_PIPE / MPK_QKV_SLAB_HOIST / MPK_QKV_SLAB_LDS
+#ifdef MPK_QKVK_FOLD
+        MPK_QKVK_MARK(1);
+#endif
 #ifdef MPK_QKV_DMA_IN_SLAB
+        }
+#endif
+#ifdef MPK_XOUT_SLICE_WRITER
+#if defined(MPK_FOLD_PIPE) || defined(MPK_WS_FARCOPY) || \
+    defined(MPK_QKV_SLAB_HOIST) || defined(MPK_QKV_SLAB_LDS) || defined(MPK_QKV_DMA_IN_SLAB)
+#error "MPK_XOUT_SLICE_WRITER covers the plain fold loop only"
+#endif
+        // One writer per XCD, its own O-proj residual slice only.
+        if (wg_idx == 0) {
+          int const xo_lo =
+              _kvupd_get_xcd_id() * (REDUCTION_SIZE / MPK_NUM_XCDS);
+          int const xo_hi = xo_lo + REDUCTION_SIZE / MPK_NUM_XCDS;
+#pragma unroll
+          for (int it = 0; it < _MAX_ITERS; it++) {
+            int const off = tid * VEC + it * BLOCK_VEC;
+            if (off < REDUCTION_SIZE && off >= xo_lo && off < xo_hi) {
+              unsigned short o0 = _gang_float_to_bf16(s_cache[it * VEC + 0]);
+              unsigned short o1 = _gang_float_to_bf16(s_cache[it * VEC + 1]);
+              unsigned short o2 = _gang_float_to_bf16(s_cache[it * VEC + 2]);
+              unsigned short o3 = _gang_float_to_bf16(s_cache[it * VEC + 3]);
+              uint2 out_packed;
+              out_packed.x = (unsigned)o0 | ((unsigned)o1 << 16);
+              out_packed.y = (unsigned)o2 | ((unsigned)o3 << 16);
+              MPK_XOUT_STORE(xout_base + off, out_packed);
+            }
+          }
+        }
+#endif
+#ifdef MPK_WS_FARCOPY
+        // MPK_WSFC_V4: a far slot of this AID's copy was still poisoned
+        // (NaN reached ssq). Redo this thread's elements with every slot
+        // read from its producer's copy, in the same order.
+        if (__builtin_expect(ssq != ssq, 0)) {
+          ssq = fc_ssq0;
+          n_cached = fc_nc0;
+          int const fc_a = (int)(kernel::mpk_prenorm_xcc() & 0x7) >> 2;
+#define MPK_FC_ADJ(s) ((((s) >> 1) - fc_a) * MOE_WS_SLOTS * REDUCTION_SIZE)
+#pragma unroll
+          for (int off = tid * VEC; off < REDUCTION_SIZE; off += BLOCK_VEC) {
+#ifdef MPK_WS_SYS_LOAD
+            _gl_f32x4 const ws_v = mpk_ws_sys_ld(ws_rs, off);
+#else
+            _gl_f32x4 const ws_v =
+                *(__attribute__((address_space(1))) _gl_f32x4 const *)(
+                    ws_base + MPK_WSLP_SLOT(0) * REDUCTION_SIZE + off + MPK_FC_ADJ(0));
+#endif
+            float4 ws4;
+            ws4.x = ws_v[0];
+            ws4.y = ws_v[1];
+            ws4.z = ws_v[2];
+            ws4.w = ws_v[3];
+#ifndef MPK_ABLATE_WS_FOLD
+#pragma unroll
+            for (int s = 1; s < MOE_WS_SLOTS; s++) {
+#ifdef MPK_WS_SYS_LOAD
+              _gl_f32x4 const sv = mpk_ws_sys_ld(ws_rs, s * REDUCTION_SIZE + off);
+#else
+              _gl_f32x4 const sv =
+                  *(__attribute__((address_space(1))) _gl_f32x4 const *)(
+                      ws_base + MPK_WSLP_SLOT(s) * REDUCTION_SIZE + off + MPK_FC_ADJ(s));
+#endif
+              float4 slot4;
+              slot4.x = sv[0];
+              slot4.y = sv[1];
+              slot4.z = sv[2];
+              slot4.w = sv[3];
+              ws4.x += slot4.x;
+              ws4.y += slot4.y;
+              ws4.z += slot4.z;
+              ws4.w += slot4.w;
+            }
+#endif
+#ifdef MPK_WS_SYS_LOAD
+            _gl_u32x2 const rv_v = mpk_res_sys_ld(res_rs, off);
+#else
+            _gl_u32x2 const rv_v =
+                *(__attribute__((address_space(1))) _gl_u32x2 const *)(res_base +
+                                                                       off);
+#endif
+            uint2 res_packed;
+            res_packed.x = rv_v[0];
+            res_packed.y = rv_v[1];
+
+            unsigned r0 = (res_packed.x & 0xFFFFu) << 16;
+            unsigned r1 = res_packed.x & 0xFFFF0000u;
+            unsigned r2 = (res_packed.y & 0xFFFFu) << 16;
+            unsigned r3 = res_packed.y & 0xFFFF0000u;
+            float rv0, rv1, rv2, rv3;
+            __builtin_memcpy(&rv0, &r0, 4);
+            __builtin_memcpy(&rv1, &r1, 4);
+            __builtin_memcpy(&rv2, &r2, 4);
+            __builtin_memcpy(&rv3, &r3, 4);
+
+            float s0 = ws4.x + rv0;
+            float s1 = ws4.y + rv1;
+            float s2 = ws4.z + rv2;
+            float s3 = ws4.w + rv3;
+
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s0));
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s1));
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s2));
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s3));
+
+            s_cache[n_cached + 0] = s0;
+            s_cache[n_cached + 1] = s1;
+            s_cache[n_cached + 2] = s2;
+            s_cache[n_cached + 3] = s3;
+            n_cached += _VEC;
+
+            unsigned short o0 = _gang_float_to_bf16(s0);
+            unsigned short o1 = _gang_float_to_bf16(s1);
+            unsigned short o2 = _gang_float_to_bf16(s2);
+            unsigned short o3 = _gang_float_to_bf16(s3);
+            uint2 out_packed;
+            out_packed.x = (unsigned)o0 | ((unsigned)o1 << 16);
+            out_packed.y = (unsigned)o2 | ((unsigned)o3 << 16);
+            MPK_XOUT_STORE(xout_base + off, out_packed);
+          }
+#undef MPK_FC_ADJ
         }
 #endif
       }
 
       MPK_QKVSUB(1);
+#if defined(MPK_QKV_PF_PAGE_EARLY) && defined(MPK_QKV_POS_PREFETCH) && \
+    (MPK_MAX_NUM_BATCHED_REQUESTS == 1 || MPK_QKV_PF_VSLOT)
+#if defined(MPK_QKV_PF_PAGE_LATE) || !defined(MPK_QKV_RED_LDS_BAR)
+#error "MPK_QKV_PF_PAGE_EARLY: needs the LDS-only reduction barriers and replaces MPK_QKV_PF_PAGE_LATE"
+#endif
+      // Only the epilogue's K/V store needs the page; issued here, the reduction and the quant
+      // cover its latency instead of the GEMV barrier's fence.
+      {
+        int const num_pages = pf_kv1 - pf_kv0;
+        int const global_seq_len = (num_pages - 1) * PAGE_SIZE + pf_lpl;
+        int const num_new_tokens = pf_qo1 - pf_qo0;
+        pf_gp = global_seq_len - num_new_tokens + (MPK_QKV_TOK_OFF tok_row_base - pf_qo0);
+      }
+      pf_page = ((__attribute__((address_space(1))) int const *)
+                     kv_indices)[pf_kv0 + pf_gp / PAGE_SIZE];
+#endif
       // ── Pass 2's norm weights, issued here rather than at their use ──────
       //
       // The RMSNorm weights are immutable and pass 2 cannot consume them until
@@ -3362,7 +4298,10 @@ __device__ __noinline__ void
       // `s_waitcnt lgkmcnt(0)` in the reduction (there is one, for the LDS
       // s_red write) would drain these too and collapse the overlap this
       // exists to create. GLOBAL touches vmcnt only.
-#ifndef MPK_QKV_GAMMA_LDS
+#if defined(MPK_QKV_PRO_FAST) && defined(MPK_QKV_GAMMA_LDS)
+#error "MPK_QKV_PRO_FAST and MPK_QKV_GAMMA_LDS both replace the pass-2 norm prefetch"
+#endif
+#if !defined(MPK_QKV_PRO_FAST) && !defined(MPK_QKV_GAMMA_LDS)
 #pragma unroll
       for (int iter = 0; iter < _MAX_ITERS; ++iter) {
         int const off = tid * _VEC + iter * _BLOCK_VEC;
@@ -3414,11 +4353,29 @@ __device__ __noinline__ void
 #endif
 
       float rms_rcp;
+#ifdef MPK_QKV_RED_FAST
+      {
+        static_assert(BATCH_SIZE == 1 && TOK_ROWS == 1,
+                      "MPK_QKV_RED_FAST: one row (the next row would reuse s_red)");
+        // wave 0's sum below, (s0 + s2) + (s1 + s3), from one broadcast read in every wave
+        float4 const r4 = *(float4 const *)s_red;
+        float const t = (r4.x + r4.z) + (r4.y + r4.w);
+        rms_rcp = rsqrtf(t / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
+      }
+#else
       if (_wave_id == 0) {
         ssq = (_lane_id < _num_waves) ? s_red[_lane_id] : 0.0f;
+#ifdef MPK_QKV_PRO_FAST
+        static_assert(256 / 64 == 4, "4 waves: xor 2 then xor 1");
+        ssq += __int_as_float(__builtin_amdgcn_mov_dpp(
+            __float_as_int(ssq), 0x4E, 0xF, 0xF, false));  // lane ^ 2
+        ssq += __int_as_float(__builtin_amdgcn_mov_dpp(
+            __float_as_int(ssq), 0xB1, 0xF, 0xF, false));  // lane ^ 1
+#else
         for (int offset = _num_waves >> 1; offset > 0; offset >>= 1) {
           ssq += __shfl_xor(ssq, offset);
         }
+#endif
         if (_lane_id == 0) {
           s_red[0] = rsqrtf(ssq / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
         }
@@ -3431,6 +4388,10 @@ __device__ __noinline__ void
       __syncthreads();
 #endif
       rms_rcp = s_red[0];
+#endif  // MPK_QKV_RED_FAST
+#ifdef MPK_QKVK_FOLD
+      MPK_QKVK_MARK(2);
+#endif
 
       // Pass 2: Apply norm weight using CACHED sums (no re-read of x_out)
 #ifdef MPK_QKV_LDS_NORM
@@ -3451,6 +4412,90 @@ __device__ __noinline__ void
 #else
         bf16 *out = (bf16 *)d_norm_out + b * REDUCTION_SIZE;
 #endif
+#ifdef MPK_QKV_NQ_FUSED2
+        {
+          static_assert(TOK_ROWS == 1 && VEC == 4 && _BLOCK_VEC == 1024 &&
+                            REDUCTION_SIZE > 2 * 1024 && REDUCTION_SIZE <= 3 * 1024 &&
+                            (REDUCTION_SIZE - 2 * 1024) % 128 == 0,
+                        "MPK_QKV_NQ_FUSED2: one row, three passes, whole super-blocks");
+#if !defined(MPK_QKV_GAMMA_LDS) || !defined(MPK_QKV_GAMMA_NORMREG)
+#error "MPK_QKV_NQ_FUSED2 reads gamma from s_norm_out (MPK_QKV_GAMMA_LDS + MPK_QKV_GAMMA_NORMREG)"
+#endif
+          bool const nq_ok2 = tid * VEC + 2 * _BLOCK_VEC < REDUCTION_SIZE;
+          float nq_v[3][VEC];
+          float nq_am[3];
+#pragma unroll
+          for (int it = 0; it < 3; it++) {
+            bool const ok = it < 2 || nq_ok2;
+            uint64_t wv;
+            __builtin_memcpy(&wv, &out[tid * VEC + (ok ? it : 0) * _BLOCK_VEC], 8);
+            bf16 const *wa = (bf16 const *)&wv;
+            nq_am[it] = 0.0f;
+#pragma unroll
+            for (int j = 0; j < VEC; j++) {
+              bf16 const o = __float2bfloat16(s_cache[it * VEC + j] * rms_rcp *
+                                              __bfloat162float(wa[j]));
+              nq_v[it][j] = ok ? __bfloat162float(o) : 0.0f;
+              nq_am[it] = fmaxf(nq_am[it], fabsf(nq_v[it][j]));
+            }
+          }
+          {
+            // max over each 32-lane group (one 128-element super-block): xor 1, xor 2,
+            // row_ror 4, row_ror 8, then lane ^ 16 via permlane16_swap on a copy.
+            float p0, p1, p2;
+            asm volatile(
+                "s_nop 1\n"
+                "v_max_f32_dpp %[a0], %[a0], %[a0] quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf\n"
+                "v_max_f32_dpp %[a1], %[a1], %[a1] quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf\n"
+                "v_max_f32_dpp %[a2], %[a2], %[a2] quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf\n"
+                "v_max_f32_dpp %[a0], %[a0], %[a0] quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf\n"
+                "v_max_f32_dpp %[a1], %[a1], %[a1] quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf\n"
+                "v_max_f32_dpp %[a2], %[a2], %[a2] quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf\n"
+                "v_max_f32_dpp %[a0], %[a0], %[a0] row_ror:4 row_mask:0xf bank_mask:0xf\n"
+                "v_max_f32_dpp %[a1], %[a1], %[a1] row_ror:4 row_mask:0xf bank_mask:0xf\n"
+                "v_max_f32_dpp %[a2], %[a2], %[a2] row_ror:4 row_mask:0xf bank_mask:0xf\n"
+                "v_max_f32_dpp %[a0], %[a0], %[a0] row_ror:8 row_mask:0xf bank_mask:0xf\n"
+                "v_max_f32_dpp %[a1], %[a1], %[a1] row_ror:8 row_mask:0xf bank_mask:0xf\n"
+                "v_max_f32_dpp %[a2], %[a2], %[a2] row_ror:8 row_mask:0xf bank_mask:0xf\n"
+                "v_mov_b32_e32 %[p0], %[a0]\n"
+                "v_mov_b32_e32 %[p1], %[a1]\n"
+                "v_mov_b32_e32 %[p2], %[a2]\n"
+                "s_nop 1\n"
+                "v_permlane16_swap_b32 %[a0], %[p0]\n"
+                "v_permlane16_swap_b32 %[a1], %[p1]\n"
+                "v_permlane16_swap_b32 %[a2], %[p2]\n"
+                "s_nop 1\n"
+                "v_max_f32_e32 %[a0], %[a0], %[p0]\n"
+                "v_max_f32_e32 %[a1], %[a1], %[p1]\n"
+                "v_max_f32_e32 %[a2], %[a2], %[p2]"
+                : [a0] "+v"(nq_am[0]), [a1] "+v"(nq_am[1]), [a2] "+v"(nq_am[2]),
+                  [p0] "=&v"(p0), [p1] "=&v"(p1), [p2] "=&v"(p2));
+          }
+#pragma unroll
+          for (int it = 0; it < 3; it++) {
+            uint8_t const se = _gang_compute_e8m0_fp8(nq_am[it]);
+            float scale = 1.0f;
+            if (se != 0) {
+              union {
+                float f;
+                uint32_t u;
+              } sv;
+              sv.u = (uint32_t)se << 23;
+              scale = sv.f;
+            }
+            fp8x4_t pk = {};
+            pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(pk, nq_v[it][0], nq_v[it][1], scale, false);
+            pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(pk, nq_v[it][2], nq_v[it][3], scale, true);
+            if (it < 2 || nq_ok2) {
+              int const off = tid * VEC + it * _BLOCK_VEC;
+              *(int *)(s_tok_fp8 + off) = *(int const *)&pk;
+              if ((tid & 31) == 0) {
+                s_tok_scales[off >> 7] = se;
+              }
+            }
+          }
+        }
+#else
         int ci = 0;
         int wi = 0;
 #pragma unroll
@@ -3482,25 +4527,93 @@ __device__ __noinline__ void
             ov[j] = __float2bfloat16(s_cache[ci + j] * rms_rcp *
                                      __bfloat162float(wa[j]));
           }
+#ifdef MPK_QKV_NQ_FUSED
+          {
+            // _gang_multirow_fp8_quant's arithmetic on this thread's 4 values; a 128-element
+            // super-block (one scale byte) is 32 consecutive lanes.
+            static_assert(TOK_ROWS == 1 && VEC == 4 && _BLOCK_VEC == 1024 &&
+                              REDUCTION_SIZE % 128 == 0,
+                          "MPK_QKV_NQ_FUSED: one row, 4 values per thread, whole super-blocks");
+            float qv[VEC];
+            float am = 0.0f;
+#pragma unroll
+            for (int j = 0; j < VEC; j++) {
+              qv[j] = __bfloat162float(ov[j]);
+              am = fmaxf(am, fabsf(qv[j]));
+            }
+            am = fmaxf(am, __int_as_float(__builtin_amdgcn_update_dpp(
+                               __float_as_int(am), __float_as_int(am), 0xB1, 0xF, 0xF, false)));
+            am = fmaxf(am, __int_as_float(__builtin_amdgcn_update_dpp(
+                               __float_as_int(am), __float_as_int(am), 0x4E, 0xF, 0xF, false)));
+            am = fmaxf(am, __int_as_float(__builtin_amdgcn_update_dpp(
+                               __float_as_int(am), __float_as_int(am), 0x124, 0xF, 0xF, false)));
+            am = fmaxf(am, __int_as_float(__builtin_amdgcn_update_dpp(
+                               __float_as_int(am), __float_as_int(am), 0x128, 0xF, 0xF, false)));
+            am = fmaxf(am, __shfl_xor(am, 16));
+            uint8_t const nq_se = _gang_compute_e8m0_fp8(am);
+            float nq_scale = 1.0f;
+            if (nq_se != 0) {
+              union {
+                float f;
+                uint32_t u;
+              } nq_sv;
+              nq_sv.u = (uint32_t)nq_se << 23;
+              nq_scale = nq_sv.f;
+            }
+            fp8x4_t nq_pk = {};
+            nq_pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(nq_pk, qv[0], qv[1], nq_scale, false);
+            nq_pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(nq_pk, qv[2], qv[3], nq_scale, true);
+            *(int *)(s_tok_fp8 + off) = *(int const *)&nq_pk;
+            if ((tid & 31) == 0) {
+              s_tok_scales[off >> 7] = nq_se;
+            }
+          }
+#else
           __builtin_memcpy(&out[off], ov, 8);
+#endif
           ci += VEC;
         }
+#endif  // MPK_QKV_NQ_FUSED2
       }
     }
   }
-#if defined(MPK_QKV_POS_PREFETCH) && MPK_MAX_NUM_BATCHED_REQUESTS == 1
+#if defined(MPK_QKV_POS_PREFETCH) && (MPK_MAX_NUM_BATCHED_REQUESTS == 1 || MPK_QKV_PF_VSLOT) && \
+    !defined(MPK_QKV_PF_PAGE_EARLY)
   // compute_pos(0) for the only request (request_id stays 0), with the
   // page lookup issued now so it retires behind RMSNorm and the quant.
   {
     int const num_pages = pf_kv1 - pf_kv0;
     int const global_seq_len = (num_pages - 1) * PAGE_SIZE + pf_lpl;
     int const num_new_tokens = pf_qo1 - pf_qo0;
-    pf_gp = global_seq_len - num_new_tokens + (tok_row_base - pf_qo0);
+    pf_gp = global_seq_len - num_new_tokens + (MPK_QKV_TOK_OFF tok_row_base - pf_qo0);
   }
 #ifndef MPK_QKV_PF_PAGE_LATE
   pf_page = kv_indices[pf_kv0 + pf_gp / PAGE_SIZE];
 #endif
+#ifdef MPK_VTN_QPAIR
+  // MPK_VTN_QPAIR v2: fold + take, the second token's position.
+#if defined(MPK_QKV_PF_PAGE_LATE) || defined(MPK_QKV_PF_PAGE_EARLY)
+#error "MPK_VTN_QPAIR v2 is wired for the default page lookup"
 #endif
+  if (qpair) {
+    int const num_pages2 = pf2_kv1 - pf2_kv0;
+    int const global_seq_len2 = (num_pages2 - 1) * PAGE_SIZE + pf2_lpl;
+    int const num_new_tokens2 = pf2_qo1 - pf2_qo0;
+    pf2_gp = global_seq_len2 - num_new_tokens2 + (tok_off2 + tok_row_base - pf2_qo0);
+    pf2_page = kv_indices[pf2_kv0 + pf2_gp / PAGE_SIZE];
+  }
+#ifdef MPK_VTN_QTRI
+  if (qtri) {
+    int const num_pages3 = pf3_kv1 - pf3_kv0;
+    int const global_seq_len3 = (num_pages3 - 1) * PAGE_SIZE + pf3_lpl;
+    int const num_new_tokens3 = pf3_qo1 - pf3_qo0;
+    pf3_gp = global_seq_len3 - num_new_tokens3 + (tok_off3 + tok_row_base - pf3_qo0);
+    pf3_page = kv_indices[pf3_kv0 + pf3_gp / PAGE_SIZE];
+  }
+#endif
+#endif
+#endif
+#ifndef MPK_QKV_NQ_FUSED2
 #ifdef MPK_QKV_RED_LDS_BAR
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
   __builtin_amdgcn_s_barrier();
@@ -3509,8 +4622,9 @@ __device__ __noinline__ void
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
   __syncthreads();
 #endif
+#endif
 #if defined(MPK_QKV_PF_PAGE_LATE) && defined(MPK_QKV_POS_PREFETCH) && \
-    MPK_MAX_NUM_BATCHED_REQUESTS == 1
+    (MPK_MAX_NUM_BATCHED_REQUESTS == 1 || MPK_QKV_PF_VSLOT)
   // GLOBAL, and after the barrier: as a FLAT load before it, the barrier's
   // lgkmcnt(0) drained it. Here it retires behind the quant.
   pf_page = ((__attribute__((address_space(1))) int const *)
@@ -3524,6 +4638,12 @@ __device__ __noinline__ void
     _sp_t2 = _sp_t1;
   }
 #endif
+#ifdef MPK_QKVK_FOLD
+  MPK_QKVK_MARK(3);
+  MPK_QKVK_MARK(4);
+#else
+  MPK_QKVK_MARK(1);
+#endif
 
   // ── Step 2: Prepare activation in LDS ──────────────────────────────────
 
@@ -3531,6 +4651,7 @@ __device__ __noinline__ void
   // s_norm_out already holds only this block's rows, so the row base is 0 and
   // the clamp bound is TOK_ROWS rather than BATCH_SIZE. The quantizer reads
   // through a generic pointer, which resolves to the LDS aperture here.
+#if !defined(MPK_QKV_NQ_FUSED) && !defined(MPK_QKV_NQ_FUSED2)
   _gang_multirow_fp8_quant<REDUCTION_SIZE, TOK_ROWS, TOK_ROWS, TOK_ROW_STRIDE,
                            SC_STRIDE>(s_norm_out,
                                       REDUCTION_SIZE,
@@ -3538,6 +4659,7 @@ __device__ __noinline__ void
                                       batch_count - tok_row_base,
                                       s_tok_fp8,
                                       s_tok_scales);
+#endif  // quantized in the normalize loop; the barrier below publishes s_tok_fp8
 #else
   _gang_multirow_fp8_quant<REDUCTION_SIZE, TOK_ROWS, BATCH_SIZE, TOK_ROW_STRIDE,
                            SC_STRIDE>(
@@ -3563,6 +4685,106 @@ __device__ __noinline__ void
         st_wt_u32(&g_qkv_kpart_tok_ready[tok_slot], 1u);
       }
     }
+  }
+#endif
+#if defined(MPK_QKV_KV_SHARED_ROW) || defined(MPK_VTN_QROW)
+    if (MPK_QROW_GIVE) {
+      // Publish the row: stores now, flag after Phase B's barrier, whose
+      // vmcnt(0) on every wave has drained them.
+      __syncthreads();
+#ifdef MPK_VTN_QROW_TAG
+      {
+        constexpr int kvr_nw = (TOK_REGION + SC_REGION) / 4;
+        int const qx = _kvupd_get_xcd_id();
+#ifdef MPK_VTN_QMP
+        int *const qt = g_aid_nc_rep[qx >> 2] + MPK_NC_QROW_INTS +
+                        (((qx & 3) * 2 + (kv_row_epoch & 1)) * MPK_VTN_T + tok_off) *
+                            MPK_NC_QROW_SLOT_INTS;
+#else
+        int *const qt = g_aid_flag_rep[qx >> 2] + MPK_AID_QROW_BASE_INTS +
+                        ((qx & 3) * 2 + (kv_row_epoch & 1)) * MPK_AID_QROW_SLOT_INTS;
+#endif
+        unsigned long long const qtag = (unsigned long long)(unsigned)kv_row_epoch << 32;
+#pragma unroll
+        for (int i = tid; i < kvr_nw; i += 256) {
+          st_wt_u64(qt + 2 * i, qtag | ((uint32_t const *)s_tok_fp8)[i]);
+        }
+      }
+#else
+      uint8_t *kvr_dst = &g_qkv_kv_row[kvr_slot * MPK_QKV_KV_ROW_BYTES];
+      constexpr int kvr_nbytes = TOK_REGION + SC_REGION;
+#pragma unroll
+      for (int off = tid * 8; off < kvr_nbytes; off += 256 * 8) {
+        unsigned long long v;
+        __builtin_memcpy(&v, s_tok_fp8 + off, 8);
+        st_wt_u64(kvr_dst + off, v);
+      }
+#endif
+    }
+#ifdef MPK_VTN_QPAIR
+    // MPK_VTN_QPAIR v2 (fold + take): the second token's row into the norm block, which the quant above
+    // has finished reading once every wave reaches the barrier.
+    if (qpair) {
+      constexpr int kvr_nw2 = (TOK_REGION + SC_REGION) / 4;
+      int const qx2 = _kvupd_get_xcd_id();
+      int const *const qtb = g_aid_nc_rep[qx2 >> 2] + MPK_NC_QROW_INTS +
+                             (((qx2 & 3) * 2 + (kv_row_epoch & 1)) * MPK_VTN_T + tok_off2) *
+                                 MPK_NC_QROW_SLOT_INTS;
+      bool const qb1 = tid + 256 < kvr_nw2, qb2 = tid + 512 < kvr_nw2;
+      unsigned const qbtag = (unsigned)kv_row_epoch;
+      unsigned long long qy0 = 0ull, qy1 = 0ull, qy2 = 0ull;
+#ifdef MPK_VTN_QTRI
+      unsigned long long qz0 = 0ull, qz1 = 0ull, qz2 = 0ull;
+      if (qtri) {
+        int const *const qtc = qtb + (tok_off3 - tok_off2) * MPK_NC_QROW_SLOT_INTS;
+        while (true) {
+          asm volatile("global_load_dwordx2 %0, %6, off sc0 sc1\n"
+                       "global_load_dwordx2 %1, %7, off sc0 sc1\n"
+                       "global_load_dwordx2 %2, %8, off sc0 sc1\n"
+                       "global_load_dwordx2 %3, %9, off sc0 sc1\n"
+                       "global_load_dwordx2 %4, %10, off sc0 sc1\n"
+                       "global_load_dwordx2 %5, %11, off sc0 sc1\n"
+                       "s_waitcnt vmcnt(0)"
+                       : "=&v"(qy0), "=&v"(qy1), "=&v"(qy2), "=&v"(qz0), "=&v"(qz1), "=&v"(qz2)
+                       : "v"(qtb + 2 * tid), "v"(qtb + 2 * (tid + 256)), "v"(qtb + 2 * (tid + 512)),
+                         "v"(qtc + 2 * tid), "v"(qtc + 2 * (tid + 256)), "v"(qtc + 2 * (tid + 512))
+                       : "memory");
+          if ((unsigned)(qy0 >> 32) == qbtag && (!qb1 || (unsigned)(qy1 >> 32) == qbtag) &&
+              (!qb2 || (unsigned)(qy2 >> 32) == qbtag) && (unsigned)(qz0 >> 32) == qbtag &&
+              (!qb1 || (unsigned)(qz1 >> 32) == qbtag) && (!qb2 || (unsigned)(qz2 >> 32) == qbtag)) {
+            break;
+          }
+          __builtin_amdgcn_s_sleep(1);
+        }
+      } else
+#endif
+      while (true) {
+        asm volatile("global_load_dwordx2 %0, %3, off sc0 sc1\n"
+                     "global_load_dwordx2 %1, %4, off sc0 sc1\n"
+                     "global_load_dwordx2 %2, %5, off sc0 sc1\n"
+                     "s_waitcnt vmcnt(0)"
+                     : "=&v"(qy0), "=&v"(qy1), "=&v"(qy2)
+                     : "v"(qtb + 2 * tid), "v"(qtb + 2 * (tid + 256)), "v"(qtb + 2 * (tid + 512))
+                     : "memory");
+        if ((unsigned)(qy0 >> 32) == qbtag && (!qb1 || (unsigned)(qy1 >> 32) == qbtag) &&
+            (!qb2 || (unsigned)(qy2 >> 32) == qbtag)) {
+          break;
+        }
+        __builtin_amdgcn_s_sleep(1);
+      }
+      __syncthreads();
+      ((uint32_t *)s_tok2)[tid] = (uint32_t)qy0;
+      if (qb1) ((uint32_t *)s_tok2)[tid + 256] = (uint32_t)qy1;
+      if (qb2) ((uint32_t *)s_tok2)[tid + 512] = (uint32_t)qy2;
+#ifdef MPK_VTN_QTRI
+      if (qtri) {
+        ((uint32_t *)s_tok3)[tid] = (uint32_t)qz0;
+        if (qb1) ((uint32_t *)s_tok3)[tid + 256] = (uint32_t)qz1;
+        if (qb2) ((uint32_t *)s_tok3)[tid + 512] = (uint32_t)qz2;
+      }
+#endif
+    }
+#endif
   }
 #endif
 
@@ -3606,16 +4828,44 @@ __device__ __noinline__ void
     asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
     __syncthreads();
   }
+#if defined(MPK_QKV_KV_SHARED_ROW) || defined(MPK_VTN_QROW)
+  if (MPK_QROW_GIVE && tid == 0) {
+    st_wt_u32(&g_qkv_kv_row_epoch[kvr_slot * 16], (unsigned)kv_row_epoch);
+  }
+#endif
 
   // Whole-block early-out only: a column block with no real tokens at all.
   // Individual inactive lanes within a live block must NOT return here -- they
   // still have to issue their ds_reads and their share of the MFMA, and they
   // participate in the __syncthreads inside the RoPE epilogue.
+#ifndef MPK_QKVK_FOLD
+  MPK_QKVK_MARK(2);
+#endif
+#ifdef MPK_VTN_QPAIR
+#ifdef MPK_VTN_QTRI
+  int const n_valid_tok = batch_count - tok_row_base + (qpair ? 1 : 0) + (qtri ? 1 : 0);
+#else
+  int const n_valid_tok = batch_count - tok_row_base + (qpair ? 1 : 0);
+#endif
+#else
   int const n_valid_tok = batch_count - tok_row_base;
+#endif
   if (n_valid_tok <= 0) {
     return;
   }
   bool const tok_active = col < n_valid_tok;
+#ifdef MPK_VTN_QPAIR
+#ifdef MPK_VTN_QTRI
+  int const pcol = (qpair && col == 1) ? 1 : ((qtri && col == 2) ? 2 : 0);  // the token this lane's column carries
+#else
+  int const pcol = (qpair && col == 1) ? 1 : 0;  // which token this lane's MFMA column carries
+#endif
+#else
+  constexpr int pcol = 0;
+#ifndef MPK_QPAIR_DQ
+#define MPK_QPAIR_DQ 0
+#endif
+#endif
 
   // ── Per-token position metadata ────────────────────────────────────────
   // The single-token path derived request_id / global_pos / dst_idx from one
@@ -3627,14 +4877,24 @@ __device__ __noinline__ void
   // of static LDS to publish a value every thread could recompute. So that
   // case keeps the register form and the tables become thread-private arrays
   // of length 1, which the consumers index identically.
+#ifdef MPK_VTN_QPAIR
+#ifdef MPK_VTN_QTRI
+  int _priv_global_pos[TOK_ROWS + 2];
+  int _priv_dst_idx[TOK_ROWS + 2];
+#else
+  int _priv_global_pos[TOK_ROWS + 1];
+  int _priv_dst_idx[TOK_ROWS + 1];
+#endif
+#else
   int _priv_global_pos[TOK_ROWS];
   int _priv_dst_idx[TOK_ROWS];
+#endif
   __shared__ int s_pos_tbl[TOK_ROWS > 1 ? 2 * MFMA_N : 1];
   int const *s_global_pos;
   int const *s_dst_idx;
 
   auto compute_pos = [&](int t, int &gp_out, int &dst_out) {
-    int my_tok = tok_row_base + (t < n_valid_tok ? t : 0);
+    int my_tok = MPK_QKV_TOK_OFF tok_row_base + (t < n_valid_tok ? t : 0);
     int request_id = 0;
     while (qo_indptr[request_id + 1] <= my_tok) {
       request_id++;
@@ -3661,9 +4921,32 @@ __device__ __noinline__ void
   };
 
   if constexpr (TOK_ROWS == 1) {
-#if defined(MPK_QKV_POS_PREFETCH) && MPK_MAX_NUM_BATCHED_REQUESTS == 1
+#if defined(MPK_QKV_POS_PREFETCH) && (MPK_MAX_NUM_BATCHED_REQUESTS == 1 || MPK_QKV_PF_VSLOT)
+#ifdef MPK_QKV_POS_CACHE
+#error "MPK_QKV_POS_PREFETCH and MPK_QKV_POS_CACHE both replace compute_pos"
+#endif
     _priv_global_pos[0] = pf_gp;
     _priv_dst_idx[0] = pf_page * PAGE_SIZE + pf_gp % PAGE_SIZE;
+#ifdef MPK_VTN_QPAIR
+    _priv_global_pos[1] = qpair ? pf2_gp : pf_gp;
+    _priv_dst_idx[1] = qpair ? pf2_page * PAGE_SIZE + pf2_gp % PAGE_SIZE : _priv_dst_idx[0];
+#ifdef MPK_VTN_QTRI
+    _priv_global_pos[2] = qtri ? pf3_gp : pf_gp;
+    _priv_dst_idx[2] = qtri ? pf3_page * PAGE_SIZE + pf3_gp % PAGE_SIZE : _priv_dst_idx[0];
+#endif
+#endif
+#elif defined(MPK_QKV_POS_CACHE)
+    __shared__ int s_qkv_pos_cache[2];
+    if (pos_cache == 2) {
+      _priv_global_pos[0] = s_qkv_pos_cache[0];
+      _priv_dst_idx[0] = s_qkv_pos_cache[1];
+    } else {
+      compute_pos(0, _priv_global_pos[0], _priv_dst_idx[0]);
+      if (pos_cache == 1 && tid == 0) {
+        s_qkv_pos_cache[0] = _priv_global_pos[0];
+        s_qkv_pos_cache[1] = _priv_dst_idx[0];
+      }
+    }
 #else
     compute_pos(0, _priv_global_pos[0], _priv_dst_idx[0]);
 #endif
@@ -3687,6 +4970,26 @@ __device__ __noinline__ void
     _sp_t3 = __builtin_amdgcn_s_memrealtime();
   }
 #endif
+#ifdef MPK_QKV_EPI_PF
+  // RoPE pair for lane d = tid (the epilogue's only iteration when
+  // TOK_ROWS == 1), issued before the MFMA so it lands under it.
+  unsigned short epi_cos_pf = 0, epi_sin_pf = 0;
+  if constexpr (TOK_ROWS == 1) {
+    if (tid < HEAD_DIM / 2) {
+      long long const rp = (long long)s_global_pos[0] * HEAD_DIM + tid;
+      epi_cos_pf =
+          ((__attribute__((address_space(1))) unsigned short const *)cos_ptr)[rp];
+      epi_sin_pf =
+          ((__attribute__((address_space(1))) unsigned short const *)sin_ptr)[rp];
+    }
+  }
+#endif
+#ifndef MPK_QKVK_FOLD
+  MPK_QKVK_MARK(3);
+#endif
+#ifdef MPK_QT_TS
+  qt_t[3] = (unsigned int)__builtin_amdgcn_s_memrealtime();
+#endif
 
   // ── MFMA + KV Update epilogue ─────────────────────────────────────────
   // ── QKV asm MFMA loop (weights already in LDS from Phase A/B) ──
@@ -3707,6 +5010,13 @@ __device__ __noinline__ void
                   "MPK_QKV_MFMA_UNROLLED assumes an odd MFMA_ITERS "
                   "(REDUCTION_SIZE / 128); at an even count use the default "
                   "branching loop, which emits both tails");
+#endif
+#if defined(MPK_QKV_IMM) &&                                                    \
+    (!defined(MPK_QKV_MFMA_UNROLLED) || !defined(MPK_QKV_PF_BEFORE_WAIT) ||       \
+     defined(MPK_QKV_DS_BEFORE_ADDR) || defined(MPK_QKV_B_MASK) ||                \
+     defined(MPK_QKV_TSC_PTR_INCREMENT) || defined(MPK_ABLATE_QKV_KMAJOR_ADDR) || \
+     defined(MPK_QKV_KSPLIT) || defined(MPK_KV_SPREAD) || defined(MPK_QKV_PF3))
+#error "MPK_QKV_IMM covers the unrolled PF_BEFORE_WAIT QKV body only"
 #endif
 #if defined(MPK_QKV_MFMA_UNROLLED) && defined(MPK_QKV_TSC_PTR_INCREMENT)
 #error                                                                         \
@@ -3759,7 +5069,7 @@ __device__ __noinline__ void
       uint64_t epi_b4 = 0, epi_c = 0, epi_s = 0;
       unsigned long long const epi_pb = (unsigned long long)(
           d_bias + wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4);
-      long long const epi_cs = (long long)s_global_pos[0] * HEAD_DIM +
+      long long const epi_cs = (long long)s_global_pos[pcol] * HEAD_DIM +
                                8 * wave_tile + (g & 1) * 4;
       unsigned long long const epi_pc =
           (unsigned long long)((unsigned short const *)cos_ptr + epi_cs);
@@ -3821,6 +5131,18 @@ __device__ __noinline__ void
             (unsigned)(uintptr_t)(s_tok_fp8 + b_row * TOK_ROW_STRIDE + g * 16);
         unsigned ts_addr =
             (unsigned)(uintptr_t)(s_tok_scales + b_row * SC_STRIDE);
+#ifdef MPK_VTN_QPAIR
+        if (pcol) {
+          t_addr = (unsigned)(uintptr_t)(s_tok2 + g * 16);
+          ts_addr = (unsigned)(uintptr_t)(s_tsc2);
+        }
+#ifdef MPK_VTN_QTRI
+        if (pcol == 2) {
+          t_addr = (unsigned)(uintptr_t)(s_tok3 + g * 16);
+          ts_addr = (unsigned)(uintptr_t)(s_tsc3);
+        }
+#endif
+#endif
 #ifdef MPK_QKV_KSPLIT
         // Start this part's K-range at the natural LDS offset so the other
         // half's hole stays where the full-K layout put it. k_part 1 can
@@ -4201,10 +5523,8 @@ __device__ __noinline__ void
               "s_waitcnt lgkmcnt(0)\n"
               "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
               "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[140:143], v[8:15], a[4:7], v166, v16 op_sel_hi:[0,0,0] cbsz:4\n"
-              "s_nop 15\n"
-              "s_nop 15\n"
-              "s_nop 15\n"
-              "s_nop 15\n"
+              MPK_MFMA_TAIL_PAD
+              MPK_MFMA_TAIL_PAD
               "v_accvgpr_read_b32 %[acc0], a0\n"
               "v_accvgpr_read_b32 %[acc1], a1\n"
               "v_accvgpr_read_b32 %[acc2], a2\n"
@@ -4315,10 +5635,8 @@ __device__ __noinline__ void
               "a[4:7], %[a2s1], v19 op_sel_hi:[0,0,0] cbsz:4\n"
               "KVD_ACC_%=:\n"
               // Two 32-cycle MFMAs may still be in flight.
-              "s_nop 15\n"
-              "s_nop 15\n"
-              "s_nop 15\n"
-              "s_nop 15\n"
+              MPK_MFMA_TAIL_PAD
+              MPK_MFMA_TAIL_PAD
               "v_accvgpr_read_b32 %[acc0], a0\n"
               "v_accvgpr_read_b32 %[acc1], a1\n"
               "v_accvgpr_read_b32 %[acc2], a2\n"
@@ -4537,8 +5855,7 @@ __device__ __noinline__ void
             "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
             "s_waitcnt lgkmcnt(0)\n"
             "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
-            "s_nop 15\n"
-            "s_nop 15\n"
+            MPK_MFMA_TAIL_PAD
             "v_accvgpr_read_b32 %[acc0], a0\n"
             "v_accvgpr_read_b32 %[acc1], a1\n"
             "v_accvgpr_read_b32 %[acc2], a2\n"
@@ -4635,7 +5952,15 @@ __device__ __noinline__ void
 
             // ---- consume bank 0, prefetch into bank 1 ----
 #ifdef MPK_QKV_PF_BEFORE_WAIT
-#ifdef MPK_QKV_DS_BEFORE_ADDR
+#if defined(MPK_QKV_IMM)
+            // Iteration TSC into bank 1 at immediate offsets; the base registers stay put.
+            "ds_read_u8   v19, %[tsa] offset:MPK_QKV_TSC_%=\n"
+            "ds_read_b128 v[26:29], %[wa] offset:(MPK_QKV_TSC_%= * 64)\n"
+            "ds_read_u8   v18, %[wsa] offset:(MPK_QKV_TSC_%= * 4)\n"
+            "ds_read_b128 v[32:35], %[ta] offset:(MPK_QKV_TSC_%= * 0x80)\n"
+            "ds_read_b128 v[36:39], %[ta] offset:(MPK_QKV_TSC_%= * 0x80 + 64)\n"
+            "s_waitcnt lgkmcnt(5)\n"
+#elif defined(MPK_QKV_DS_BEFORE_ADDR)
             "s_add_i32 s13, s13, 1\n"
             "v_add_u32_e32 v17, s13, %[tsa]\n"
             "ds_read_u8   v19, v17\n"
@@ -4727,7 +6052,17 @@ __device__ __noinline__ void
 
             // ---- consume bank 1, prefetch into bank 0 ----
 #ifdef MPK_QKV_PF_BEFORE_WAIT
-#ifdef MPK_QKV_DS_BEFORE_ADDR
+#if defined(MPK_QKV_IMM)
+            // Iteration TSC + 1 into bank 0.
+            "ds_read_u8   v16, %[tsa] offset:(MPK_QKV_TSC_%= + 1)\n"
+            "ds_read_b128 v[22:25], %[wa] offset:((MPK_QKV_TSC_%= + 1) * 64)\n"
+            "ds_read_u8   v7, %[wsa] offset:((MPK_QKV_TSC_%= + 1) * 4)\n"
+            "ds_read_b128 v[8:11], %[ta] offset:((MPK_QKV_TSC_%= + 1) * 0x80)\n"
+            "ds_read_b128 v[12:15], %[ta] offset:((MPK_QKV_TSC_%= + 1) * 0x80 + 64)\n"
+#ifndef MPK_QKV_SKIP_B1_WAIT
+            "s_waitcnt lgkmcnt(5)\n"
+#endif
+#elif defined(MPK_QKV_DS_BEFORE_ADDR)
             "s_add_i32 s13, s13, 1\n"
             "v_add_u32_e32 v17, s13, %[tsa]\n"
             "ds_read_u8   v16, v17\n"
@@ -4850,8 +6185,7 @@ __device__ __noinline__ void
             // 32-cycle op on CDNA4; the previous "s_nop 7; s_nop 0" was 9
             // clocks (the correct wait for a 4-pass MFMA) and returned a
             // partially-retired accumulator on every launch.
-            "s_nop 15\n"
-            "s_nop 15\n"
+            MPK_MFMA_TAIL_PAD
             "v_accvgpr_read_b32 %[acc0], a0\n"
             "v_accvgpr_read_b32 %[acc1], a1\n"
             "v_accvgpr_read_b32 %[acc2], a2\n"
@@ -4960,8 +6294,9 @@ __device__ __noinline__ void
           __builtin_memcpy(&bv, &bt, 4);
           val[i] = _gang_float_to_bf16(qb[i] + bv);
         }
-        long long const kv_row = (long long)s_dst_idx[0] * kv_stride +
-                                 _kvupd_get_xcd_id() * HEAD_DIM;
+        long long const kv_row =
+            (long long)s_dst_idx[0] * MPK_KV_TOK_STRIDE(HEAD_DIM, kv_stride) +
+            (long long)MPK_KV_HEAD_OFF(_kvupd_get_xcd_id(), HEAD_DIM);
         if (wg_idx < 4) {
           // K rows 0..7 of the block are dims 8*block+i and rows 8..15 their
           // RoPE partners (host order), so lane g pairs with lane g ^ 2.
@@ -5044,7 +6379,7 @@ __device__ __noinline__ void
           // part of the rejected K-split's +114 µs.
           asm volatile("buffer_inv" ::: "memory");
 #else
-          asm volatile("buffer_inv sc1" ::: "memory");
+          asm volatile("buffer_inv" MPK_DEV_SC_INV "" ::: "memory");
 #endif
         }
         __syncthreads();
@@ -5117,12 +6452,13 @@ __device__ __noinline__ void
             unsigned short *row;
             if (wg_idx < NUM_Q_PER_KV) {
               row = (unsigned short *)q_workspace_ptr +
-                    (long long)tok_row_base * q_ws_stride +
+                    ((long long)tok_row_base + (pcol ? (long long)(MPK_QPAIR_DQ) : 0ll)) * q_ws_stride +
                     (_kvupd_get_xcd_id() * NUM_Q_PER_KV + wg_idx) * HEAD_DIM;
             } else {
               row = (unsigned short *)k_cache_ptr +
-                    (long long)s_dst_idx[0] * kv_stride +
-                    _kvupd_get_xcd_id() * HEAD_DIM;
+                    (long long)s_dst_idx[pcol] *
+                        MPK_KV_TOK_STRIDE(HEAD_DIM, kv_stride) +
+                    MPK_KV_HEAD_OFF(_kvupd_get_xcd_id(), HEAD_DIM);
             }
             auto *dst = (__attribute__((address_space(1))) uint64_t *)(row + d);
             dst[0] = lo4;
@@ -5165,12 +6501,13 @@ __device__ __noinline__ void
 #else
       __syncthreads();
 #endif
-      int kv_head = _kvupd_get_xcd_id();
+      int kv_head, kv_role;
+      _kvupd_head_role(wg_idx, n_wgs_per_xcd, NUM_Q_PER_KV, kv_head, kv_role);
       unsigned short const *cos_base = (unsigned short const *)cos_ptr;
       unsigned short const *sin_base = (unsigned short const *)sin_ptr;
       unsigned short *s_rope = (unsigned short *)s_tok_fp8;
-      if (wg_idx < NUM_Q_PER_KV) {
-        int q_head_global = kv_head * NUM_Q_PER_KV + wg_idx;
+      if (kv_role < NUM_Q_PER_KV) {
+        int q_head_global = kv_head * NUM_Q_PER_KV + kv_role;
 #ifdef MPK_QKV_EPI_PRELOAD
 #if defined(MPK_KV_SPREAD) || defined(MPK_QKV_PF3) || defined(MPK_QKV_KSPLIT)
 #error "MPK_QKV_EPI_PRELOAD is wired for the single-chain loop"
@@ -5200,8 +6537,17 @@ __device__ __noinline__ void
             tok_row_base,
             q_head_global * HEAD_DIM,
             OUTPUT_PER_WG,
-            s_rope);
-      } else if (wg_idx == NUM_Q_PER_KV) {
+            s_rope
+#ifdef MPK_QKV_EPI_PF
+            ,
+            TOK_ROWS == 1,
+            epi_bias_pf[0],
+            epi_bias_pf[1],
+            epi_cos_pf,
+            epi_sin_pf
+#endif
+            );
+      } else if (kv_role == NUM_Q_PER_KV) {
         // K: bias + RoPE, then scatter to the paged cache. Same three steps as
         // the Q path but the destination row is a page slot, so it cannot go
         // through the shared helper's contiguous store.
@@ -5210,8 +6556,16 @@ __device__ __noinline__ void
           int d0 = wave_tile * 16 + g * 4;
           uint64_t bias4;
 #if defined(MPK_QKV_EPI_PRELOAD) || defined(MPK_QKV_ROPE_REG)
+#ifdef MPK_QKV_EPI_PF
+#error "MPK_QKV_EPI_PF and MPK_QKV_ROPE_REG / EPI_PRELOAD both preload the epilogue bias"
+#endif
           bias4 = epi_b4;
 #else
+#ifdef MPK_QKV_EPI_PF
+          if constexpr (TOK_ROWS == 1) {
+            bias4 = (uint64_t)epi_bias_pf[0] | ((uint64_t)epi_bias_pf[1] << 32);
+          } else
+#endif
           __builtin_memcpy(&bias4, &d_bias[wg_idx * OUTPUT_PER_WG + d0], 8);
 #endif
           unsigned short const *b4 = (unsigned short const *)&bias4;
@@ -5240,11 +6594,20 @@ __device__ __noinline__ void
           float v0, v1;
           __builtin_memcpy(&v0, &v0b, 4);
           __builtin_memcpy(&v1, &v1b, 4);
-#ifdef MPK_QKV_EPI_PRELOAD
+#if defined(MPK_QKV_EPI_PRELOAD)
           (void)cos_row;
           (void)sin_row;
           unsigned cb = (epi_c & 0xFFFFu) << 16;
           unsigned sb_r = (epi_s & 0xFFFFu) << 16;
+#elif defined(MPK_QKV_EPI_PF)
+          unsigned cb, sb_r;
+          if constexpr (TOK_ROWS == 1) {
+            cb = (unsigned)epi_cos_pf << 16;
+            sb_r = (unsigned)epi_sin_pf << 16;
+          } else {
+            cb = (unsigned)cos_row[d] << 16;
+            sb_r = (unsigned)sin_row[d] << 16;
+          }
 #else
           unsigned cb = (unsigned)cos_row[d] << 16;
           unsigned sb_r = (unsigned)sin_row[d] << 16;
@@ -5263,7 +6626,8 @@ __device__ __noinline__ void
             continue;
           }
           int d = idx - t * HEAD_DIM;
-          d_k[(long long)s_dst_idx[t] * kv_stride + kv_head * HEAD_DIM + d] =
+          d_k[(long long)s_dst_idx[t] * MPK_KV_TOK_STRIDE(HEAD_DIM, kv_stride) +
+              MPK_KV_HEAD_OFF(kv_head, HEAD_DIM) + d] =
               s_rope[idx];
         }
       } else {
@@ -5275,11 +6639,17 @@ __device__ __noinline__ void
 #if defined(MPK_QKV_EPI_PRELOAD) || defined(MPK_QKV_ROPE_REG)
           bias4 = epi_b4;
 #else
+#ifdef MPK_QKV_EPI_PF
+          if constexpr (TOK_ROWS == 1) {
+            bias4 = (uint64_t)epi_bias_pf[0] | ((uint64_t)epi_bias_pf[1] << 32);
+          } else
+#endif
           __builtin_memcpy(&bias4, &d_bias[wg_idx * OUTPUT_PER_WG + d0], 8);
 #endif
           unsigned short const *b4 = (unsigned short const *)&bias4;
           long long row_off =
-              (long long)s_dst_idx[col] * kv_stride + kv_head * HEAD_DIM;
+              (long long)s_dst_idx[col] * MPK_KV_TOK_STRIDE(HEAD_DIM, kv_stride) +
+              MPK_KV_HEAD_OFF(kv_head, HEAD_DIM);
 #pragma unroll
           for (int i = 0; i < 4; i++) {
             unsigned bt = (unsigned)b4[i] << 16;
@@ -5320,7 +6690,31 @@ __device__ __noinline__ void
     atomicAdd(&g_subphase_cnt[1], 1ULL);
   }
 #endif
+#ifdef MPK_VTN_QNODRAIN
+#ifndef MPK_QKV_EPOCH_PRODUCER_DRAIN
+#error "MPK_VTN_QNODRAIN relies on the producer drain before the QKV epoch arrival"
+#endif
+  // MPK_VTN_QNODRAIN: LDS-only closing barrier; the global stores drain before the epoch arrival.
+  asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+#else
   __syncthreads();
+#endif
+#ifndef MPK_QKVK_FOLD
+  MPK_QKVK_MARK(4);
+#endif
+#ifdef MPK_QT_TS
+#ifndef MPK_TOPK_SUB
+#error "MPK_QT_TS needs MPK_TOPK_SUB"
+#endif
+  if (tid == 0 && MPK_QROW_TAKE && MPK_TOPK_ARMED()) {
+    unsigned int const qt4 = (unsigned int)__builtin_amdgcn_s_memrealtime();
+    s_tk_acc[0] += (qt_t[1] - qt_t[0]) * 10;
+    s_tk_acc[1] += (qt_t[2] - qt_t[1]) * 10;
+    s_tk_acc[2] += (qt_t[3] - qt_t[2]) * 10;
+    s_tk_acc[3] += (qt4 - qt_t[3]) * 10;
+    s_tk_n++;
+  }
+#endif
 }
 
 } // namespace kernel

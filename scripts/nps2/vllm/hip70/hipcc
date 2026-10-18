@@ -1,0 +1,18 @@
+#!/bin/bash
+# hipcc for the fleet megakernel inside a newer ROCm image (vLLM 0.27.1 / 0.31.0 = ROCm 7.2.3): runs the ROCm 7.0
+# compiler, HIP headers and device libraries from $ROCM70 (default /root/user/rocm70, a copy of /opt/rocm from
+# the ROCm 7.0 fleet image), so the megakernel is the same binary as a ROCm 7.0 build. persistent_kernel.py's
+# -I/opt/rocm/include is redirected to the 7.0 headers; -L stays on /opt/rocm/lib (host link only: rocBLAS/hipBLAS
+# are not in the 7.0 copy, and at run time the process uses the image's own libraries anyway).
+# Use: put this directory first on PATH inside the container (fleet_run_lane.sh: PATH_PREPEND=<this dir>).
+R70=${ROCM70:-/root/user/rocm70}
+args=()
+for a in "$@"; do
+  case "$a" in
+    -I/opt/rocm*/include*) a="-I$R70/include${a#-I/opt/rocm*/include}" ;;
+  esac
+  args+=("$a")
+done
+export HIP_PATH=$R70 ROCM_PATH=$R70 HIP_CLANG_PATH=$R70/llvm/bin HIP_DEVICE_LIB_PATH=$R70/amdgcn/bitcode
+exec "$R70/bin/hipcc" "${args[@]}"
+

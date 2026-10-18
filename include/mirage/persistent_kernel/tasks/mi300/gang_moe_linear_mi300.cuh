@@ -37,7 +37,11 @@ namespace kernel {
 __device__ __forceinline__ int _gang_moe_get_xcd_id() {
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
   int xcd_id;
-  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)" : "=s"(xcd_id));
+  MPK_GET_XCC_ID16(xcd_id);
+  // HW gives the PHYSICAL die (0-7) even when only a subset runs. Every
+  // per-XCD array here is sized for MPK_NUM_XCDS, so fold it. Identity
+  // in the default 8-XCD build.
+  xcd_id %= MPK_NUM_XCDS;
   return xcd_id;
 #else
   return 0;

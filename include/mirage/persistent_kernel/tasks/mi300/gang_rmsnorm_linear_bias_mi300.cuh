@@ -301,7 +301,11 @@ using bf16_t = __hip_bfloat16;
 __device__ __forceinline__ int get_xcd_id() {
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
   int xcd_id;
-  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)" : "=s"(xcd_id));
+  MPK_GET_XCC_ID16(xcd_id);
+  // HW gives the PHYSICAL die (0-7) even when only a subset runs. Every
+  // per-XCD array here is sized for MPK_NUM_XCDS, so fold it. Identity
+  // in the default 8-XCD build.
+  xcd_id %= MPK_NUM_XCDS;
   return xcd_id;
 #else
   return 0;
@@ -325,7 +329,7 @@ __device__ __attribute__((noinline)) void
                   int num_active_tokens,
                   int *early_routing_ready = nullptr,
                   unsigned int early_routing_epoch = 0) {
-  constexpr int CHUNK_N = NUM_EXPERTS / 8;
+  constexpr int CHUNK_N = NUM_EXPERTS / MPK_NUM_XCDS;
   int xcd_id = get_xcd_id();
   void *logits_base = static_cast<T *>(logits_scratch_ptr) -
                       static_cast<int64_t>(xcd_id) * CHUNK_N;

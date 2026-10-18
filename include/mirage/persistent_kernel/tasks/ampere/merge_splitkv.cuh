@@ -14,7 +14,34 @@
  */
 
 #pragma once
+#ifndef MPK_TIDX_M_M
+#if defined(MPK_TID_FRESH) || defined(MPK_TID_FRESH_M)
+// threadIdx.x through a volatile v_mov: nothing derived from it can be hoisted out of the
+// persistent loop into kernel-lifetime registers.
+__device__ __forceinline__ unsigned mpk_tid_fresh_M() {
+  unsigned t;
+  asm volatile("v_mov_b32 %0, %1\n\ts_nop 1" : "=v"(t) : "v"(threadIdx.x));
+  return t;
+}
+#define MPK_TIDX_M (mpk_tid_fresh_M())
+#else
+#define MPK_TIDX_M (threadIdx.x)
+#endif
+#endif
 
+#if defined(MPK_MERGE_O_EARLY2) && (!defined(MPK_MERGE_TWO_PASS) || !defined(MPK_MERGE_KV_OUTER) || \
+                                    defined(MPK_MERGE_O_PRELOAD))
+#error "MPK_MERGE_O_EARLY2 is on the KV-outer two-pass arm, instead of MPK_MERGE_O_PRELOAD"
+#endif
+#if defined(MPK_ATS_MERGE) && defined(MPK_ATSOPS_AT)
+#define MPK_ATS_MRG(k, dep)                                             \
+  do {                                                                   \
+    asm volatile("" ::"v"(dep));                                       \
+    MPK_ATSOPS_AT(k, MPK_TIDX_M == 0);                                   \
+  } while (0)
+#else
+#define MPK_ATS_MRG(k, dep) do {} while (0)
+#endif
 #if defined(MPK_MERGE_O_PRELOAD) && !defined(MPK_MERGE_TWO_PASS)
 #error "MPK_MERGE_O_PRELOAD splits two-pass O loads from FMAs; needs TWO_PASS"
 #endif
@@ -90,8 +117,8 @@ __device__ __forceinline__ void
   constexpr int VAL_PER_THREAD = HEAD_DIM / THREADS_PER_TOKEN;
   constexpr int num_groups = NUM_THREADS / THREADS_PER_TOKEN;
 
-  int thread_in_group = threadIdx.x % THREADS_PER_TOKEN;
-  int group_id = threadIdx.x / THREADS_PER_TOKEN;
+  int thread_in_group = MPK_TIDX_M % THREADS_PER_TOKEN;
+  int group_id = MPK_TIDX_M / THREADS_PER_TOKEN;
   int head_partition = thread_in_group;
 
   // let 16 threads to process one head_dim
@@ -144,7 +171,7 @@ __device__ __forceinline__ void
   }
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
   __syncthreads();
-  if (threadIdx.x == 0 && blockIdx.x == 0) {
+  if (MPK_TIDX_M == 0 && blockIdx.x == 0) {
     unsigned long long _dur = (__builtin_amdgcn_s_memrealtime() - _t0) * 10;
     printf("[ATTN_MERGE] dur_us=%.1f\n", (double)_dur / 1000.0);
   }
@@ -169,7 +196,7 @@ __device__ __forceinline__ float merge_splitkv_sink_log2(void const *sinks_ptr,
   constexpr int THREADS_PER_TOKEN = (NUM_QO_HEADS_PER_KV <= 8) ? 32 : 16;
 #endif
   int const head_idx =
-      (int)(threadIdx.x / THREADS_PER_TOKEN) % NUM_QO_HEADS_PER_KV;
+      (int)(MPK_TIDX_M / THREADS_PER_TOKEN) % NUM_QO_HEADS_PER_KV;
   __hip_bfloat16 const *d_sinks =
       reinterpret_cast<__hip_bfloat16 const *>(sinks_ptr);
   return static_cast<float>(
@@ -177,6 +204,100 @@ __device__ __forceinline__ float merge_splitkv_sink_log2(void const *sinks_ptr,
          1.44269504088896340736f;
 }
 
+#if defined(MPK_VTN_AOQ) && (defined(MPK_VTN_AOQ_ABIP) || defined(MPK_VTN_AOQ_MINN))
+__shared__ int s_aoq_on;  // MPK_VTN_AOQ_ABIP: this layer's pass takes the FP8 path
+#endif
+#ifdef MPK_VTN_AOQ
+#ifdef MPK_MERGE_WIDE_DIM
+#error "MPK_VTN_AOQ: one wave per 128-element block (no MPK_MERGE_WIDE_DIM)"
+#endif
+// MPK_VTN_AOQ: this lane's two bf16 outputs (elements e, e + 1; row e / 4096) as FP8 with their 128-element block's
+// E8M0 scale -- the O-proj staging's quantization (magnitude max of the bf16 values, _gang_compute_e8m0_fp8, the
+// bf16-pair conversion) -- into both AIDs' copies. All 64 lanes of the wave hold one block: lane l elements 2l, 2l+1.
+__device__ __forceinline__ void mpk_aoq_publish(int e, unsigned packed) {
+  unsigned const a = packed & 0x7FFF7FFFu;
+  unsigned m = (a & 0xFFFFu) > (a >> 16) ? (a & 0xFFFFu) : (a >> 16);
+  unsigned d;
+  d = (unsigned)__builtin_amdgcn_update_dpp(0, (int)m, 0xB1, 0xF, 0xF, false);
+  m = m > d ? m : d;
+  d = (unsigned)__builtin_amdgcn_update_dpp(0, (int)m, 0x4E, 0xF, 0xF, false);
+  m = m > d ? m : d;
+  d = (unsigned)__builtin_amdgcn_update_dpp(0, (int)m, 0x141, 0xF, 0xF, false);
+  m = m > d ? m : d;
+  d = (unsigned)__builtin_amdgcn_update_dpp(0, (int)m, 0x140, 0xF, 0xF, false);
+  m = m > d ? m : d;
+  unsigned const m0 = (unsigned)__builtin_amdgcn_readlane((int)m, 0);
+  unsigned const m1 = (unsigned)__builtin_amdgcn_readlane((int)m, 16);
+  unsigned const m2 = (unsigned)__builtin_amdgcn_readlane((int)m, 32);
+  unsigned const m3 = (unsigned)__builtin_amdgcn_readlane((int)m, 48);
+  unsigned const ma = m0 > m1 ? m0 : m1;
+  unsigned const mb = m2 > m3 ? m2 : m3;
+  uint8_t const se = _gang_compute_e8m0_fp8(__uint_as_float((ma > mb ? ma : mb) << 16));
+  float scale_f = 1.0f;
+  if (se != 0) {
+    uint32_t const sbits = (uint32_t)se << 23;
+    __builtin_memcpy(&scale_f, &sbits, 4);
+  }
+  typedef __bf16 aoq_b2 __attribute__((ext_vector_type(2)));
+  aoq_b2 p;
+  __builtin_memcpy(&p, &packed, 4);
+  fp8x4_t pk = {};
+  pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(pk, p, scale_f, false);
+  unsigned short q;
+  __builtin_memcpy(&q, &pk, 2);
+  int const row = e >> 12;
+  int const col = e & 4095;
+  int const off = row * MPK_AOQ_ROW_BYTES + col;
+  st_wt_u16(mpk_aoq_base(0) + off, q);
+  st_wt_u16(mpk_aoq_base(1) + off, q);
+  if ((threadIdx.x & 63) == 0) {
+    int const so = row * MPK_AOQ_ROW_BYTES + 4096 + (col >> 7);
+    st_wt_u8(mpk_aoq_base(0) + so, se);
+    st_wt_u8(mpk_aoq_base(1) + so, se);
+  }
+}
+#ifdef MPK_VTN_AOQ_INPLACE
+// MPK_VTN_AOQ_INPLACE: the same quantization as mpk_aoq_publish, stored into the bf16 row's own bytes.
+__device__ __forceinline__ void mpk_aoq_inplace(char *rows, int e, unsigned packed) {
+  unsigned const a = packed & 0x7FFF7FFFu;
+  unsigned m = (a & 0xFFFFu) > (a >> 16) ? (a & 0xFFFFu) : (a >> 16);
+  unsigned d;
+  d = (unsigned)__builtin_amdgcn_update_dpp(0, (int)m, 0xB1, 0xF, 0xF, false);
+  m = m > d ? m : d;
+  d = (unsigned)__builtin_amdgcn_update_dpp(0, (int)m, 0x4E, 0xF, 0xF, false);
+  m = m > d ? m : d;
+  d = (unsigned)__builtin_amdgcn_update_dpp(0, (int)m, 0x141, 0xF, 0xF, false);
+  m = m > d ? m : d;
+  d = (unsigned)__builtin_amdgcn_update_dpp(0, (int)m, 0x140, 0xF, 0xF, false);
+  m = m > d ? m : d;
+  unsigned const m0 = (unsigned)__builtin_amdgcn_readlane((int)m, 0);
+  unsigned const m1 = (unsigned)__builtin_amdgcn_readlane((int)m, 16);
+  unsigned const m2 = (unsigned)__builtin_amdgcn_readlane((int)m, 32);
+  unsigned const m3 = (unsigned)__builtin_amdgcn_readlane((int)m, 48);
+  unsigned const ma = m0 > m1 ? m0 : m1;
+  unsigned const mb = m2 > m3 ? m2 : m3;
+  uint8_t const se = _gang_compute_e8m0_fp8(__uint_as_float((ma > mb ? ma : mb) << 16));
+  float scale_f = 1.0f;
+  if (se != 0) {
+    uint32_t const sbits = (uint32_t)se << 23;
+    __builtin_memcpy(&scale_f, &sbits, 4);
+  }
+  typedef __bf16 aoq_b2 __attribute__((ext_vector_type(2)));
+  aoq_b2 p;
+  __builtin_memcpy(&p, &packed, 4);
+  fp8x4_t pk = {};
+  pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(pk, p, scale_f, false);
+  unsigned short q;
+  __builtin_memcpy(&q, &pk, 2);
+  char *const r = rows + (e >> 12) * 8192;
+  int const col = e & 4095;
+  st_wt_u16(r + col, q);
+  if ((threadIdx.x & 63) == 0) {
+    st_wt_u8(r + 4096 + (col >> 9) * 128 + ((col >> 7) & 3), se);  // one line per die
+  }
+}
+#endif
+#endif  // MPK_VTN_AOQ
 template <typename T,
           int NUM_QO_HEADS_PER_KV,
           int NUM_QO_GROUPS,
@@ -185,6 +306,7 @@ template <typename T,
           int KV_CHUNK_SIZE = 128,
           int PAGE_SIZE = 4096,
           bool WRITE_THROUGH = false,
+          int LOOP_CHUNKS = NUM_KV_CHUNKS,
           bool META_PRE = false>
 __device__ __forceinline__ void
     merge_splitkv_ck_fmha(float const *lse_ptr,
@@ -207,12 +329,16 @@ __device__ __forceinline__ void
   if (first_token_pos == last_token_pos) {
     return;
   }
+  MPK_ATS_MRG(10, first_token_pos);
   int const num_tokens = last_token_pos - first_token_pos;
 
   // Use NUM_KV_CHUNKS (template param) as the chunk count — the CK FMHA
   // pipeline processes exactly NUM_KV_CHUNKS chunks worth of data into
   // o_acc/lse_acc
-  constexpr int num_chunks = NUM_KV_CHUNKS;
+  // Chunks merged: the first LOOP_CHUNKS slots (the caller guarantees the
+  // rest are empty, weight 0). A compile-time bound keeps the loads batched.
+  constexpr int num_chunks =
+      LOOP_CHUNKS < NUM_KV_CHUNKS ? LOOP_CHUNKS : NUM_KV_CHUNKS;
 
   // Full token stride matches CK FMHA's LSE_STRIDE = NUM_KV_HEADS *
   // NUM_KV_CHUNKS * QO_PER_KV
@@ -243,8 +369,8 @@ __device__ __forceinline__ void
                 "loads in the two-pass arm assume natural alignment at the "
                 "vector width and fall back to scalars otherwise");
 
-  int thread_in_group = threadIdx.x % THREADS_PER_TOKEN;
-  int group_id = threadIdx.x / THREADS_PER_TOKEN;
+  int thread_in_group = MPK_TIDX_M % THREADS_PER_TOKEN;
+  int group_id = MPK_TIDX_M / THREADS_PER_TOKEN;
 
   // Optional sink correction (GPT-OSS): out *= 1 / (1 + exp(sink -
   // LSE_natural)) Layout: sinks[num_q_heads] in bf16, indexed by
@@ -347,11 +473,40 @@ __device__ __forceinline__ void
                 lse_ptr + lse_base0 + kv_idx * NUM_QO_HEADS_PER_KV) *
             1.44269504088896340736f;
       }
+#ifdef MPK_MERGE_O_EARLY2
+      // Every chunk's O slice now, behind the LSE loads: one round trip for both.
+      float o_hold[NUM_KV_CHUNKS][VAL_PER_THREAD];
+#pragma unroll
+      for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
+        int const o_base =
+            (lse_base0 + kv_idx * NUM_QO_HEADS_PER_KV) * HEAD_DIM +
+            thread_in_group * VAL_PER_THREAD;
+        if constexpr (VAL_PER_THREAD == 2) {
+          _mg_f32x2 const t =
+              *(__attribute__((address_space(1))) _mg_f32x2 const *)(o_ptr + o_base);
+          o_hold[kv_idx][0] = t.x;
+          o_hold[kv_idx][1] = t.y;
+        } else if constexpr (VAL_PER_THREAD == 4) {
+          _mg_f32x4 const t =
+              *(__attribute__((address_space(1))) _mg_f32x4 const *)(o_ptr + o_base);
+          o_hold[kv_idx][0] = t.x;
+          o_hold[kv_idx][1] = t.y;
+          o_hold[kv_idx][2] = t.z;
+          o_hold[kv_idx][3] = t.w;
+        } else {
+#pragma unroll
+          for (int i = 0; i < VAL_PER_THREAD; ++i) {
+            o_hold[kv_idx][i] = o_ptr[o_base + i];
+          }
+        }
+      }
+#endif
       float m_max = -inf;
 #pragma unroll
       for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
         m_max = max(m_max, lse_log2[kv_idx]);
       }
+      MPK_ATS_MRG(11, m_max);
       float d_sum = 0.f;
 #ifdef MPK_MERGE_O_PRELOAD
       // Issue every chunk's O load before any FMA so they form one vmcnt
@@ -390,6 +545,16 @@ __device__ __forceinline__ void
 #pragma unroll
       for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
         float const w = w_hold[kv_idx];
+#pragma unroll
+        for (int i = 0; i < VAL_PER_THREAD; ++i) {
+          o_global[i] += o_hold[kv_idx][i] * w;
+        }
+      }
+#elif defined(MPK_MERGE_O_EARLY2)
+#pragma unroll
+      for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
+        float const w = ptx_exp2(lse_log2[kv_idx] - m_max);
+        d_sum += w;
 #pragma unroll
         for (int i = 0; i < VAL_PER_THREAD; ++i) {
           o_global[i] += o_hold[kv_idx][i] * w;
@@ -465,6 +630,7 @@ __device__ __forceinline__ void
         }
       }
 #endif
+      MPK_ATS_MRG(12, o_global[0]);
       m_global = m_max;
       d_global = d_sum;
 #else
@@ -557,7 +723,37 @@ __device__ __forceinline__ void
         memcpy(&lo, &v0, 2);
         memcpy(&hi, &v1, 2);
         packed = lo | ((uint32_t)hi << 16);
+#if defined(MPK_REP_ONLY) && defined(MPK_AID_SPLIT_ATTNOUT) && defined(MPK_AID_SPLIT_FLAGS)
+        if (!mpk_aid_attnout_live())
+#endif
+#ifdef MPK_VTN_AOQ_INPLACE
+        static_assert(OUT_TOKEN_STRIDE == 4096 && VAL_PER_THREAD == 2,
+                      "MPK_VTN_AOQ_INPLACE: 4096-element rows, one bf16 pair per lane");
+#if defined(MPK_VTN_AOQ_ABIP) || defined(MPK_VTN_AOQ_MINN)
+        if (s_aoq_on == 0) st_wt_u32((void *)&output_ptr[out_offset_base + i], packed); else
+#endif
+        mpk_aoq_inplace((char *)output_ptr, out_offset_base + i, packed);  // MPK_VTN_AOQ_INPLACE
+#else
         st_wt_u32((void *)&output_ptr[out_offset_base + i], packed);
+#endif
+        MPK_ATS_MRG(13, packed);
+#if defined(MPK_VTN_AOQ) && !defined(MPK_VTN_AOQ_INPLACE)
+        static_assert(OUT_TOKEN_STRIDE == 4096 && VAL_PER_THREAD == 2,
+                      "MPK_VTN_AOQ: 4096-element rows, one bf16 pair per lane");
+#if defined(MPK_VTN_AOQ_ABIP) || defined(MPK_VTN_AOQ_MINN)
+        if (s_aoq_on != 0)
+#endif
+        mpk_aoq_publish(out_offset_base + i, packed);
+#endif
+#if defined(MPK_AID_SPLIT_ATTNOUT) && defined(MPK_AID_SPLIT_FLAGS)
+        // Mirror into both AID replicas so the O-proj reads this slice from
+        // memory homed in its own range. An MTYPE_NC line is never
+        // probe-invalidated, so the consumer's vL1-only `buffer_inv` cannot
+        // evict a stale copy; an AID-local RW line is invalidated by this very
+        // write-through store. Rides the existing store, so the caller's
+        // post-merge vmcnt drain covers it and no new barrier is added.
+        mpk_aid_attnout_publish32((out_offset_base + i) >> 1, packed);
+#endif
       }
     } else {
 #pragma unroll

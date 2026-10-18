@@ -81,10 +81,95 @@ __device__ __forceinline__ void moe_residual_add_f32_mi300_impl(
   //
   // See the layer-boundary acquire at the top of
   // gang_full_layer_fused_mi300.cuh for the full ablation.
-  asm volatile("buffer_inv sc1" ::: "memory");
+  asm volatile("buffer_inv" MPK_DEV_SC_INV "" ::: "memory");
 
+#ifdef MPK_RESADD_ILP  // MPK_RESADD_ILP_PATCHED
+#if defined(MPK_WSF32_REP) || defined(MPK_WSF32_AID) || defined(MPK_WS_FARCOPY)
+#error "MPK_RESADD_ILP: plain workspace layout only"
+#endif
+#ifndef MPK_RESADD_G
+#define MPK_RESADD_G 4
+#endif
+  {
+    constexpr int NCH = (OUTPUT_SIZE + BLOCK_VEC - 1) / BLOCK_VEC;  // chunks of 256 x 4 per row
+    constexpr int NIT = BATCH_SIZE * NCH;
+    constexpr int G = MPK_RESADD_G;
+    auto f2bf16 = [](float f) -> unsigned short {
+      union {
+        float f;
+        unsigned u;
+      } v;
+      v.f = f;
+      unsigned rounding_bias = ((v.u >> 16) & 1) + 0x7FFF;
+      return (unsigned short)((v.u + rounding_bias) >> 16);
+    };
+#pragma unroll
+    for (int i0 = 0; i0 < NIT; i0 += G) {
+      float4 wsv[G][MOE_WS_SLOTS];
+      uint2 rpk[G];
+#pragma unroll
+      for (int g = 0; g < G; ++g) {
+        int const it = i0 + g;
+        int const row = it / NCH;
+        int const off = (it % NCH) * BLOCK_VEC + threadIdx.x * VEC;
+        if (it < NIT && off < OUTPUT_SIZE) {
+          float const *ws_row = d_ws + moe_ws_offset(row, 0, OUTPUT_STRIDE);
+#pragma unroll
+          for (int sl = 0; sl < MOE_WS_SLOTS; ++sl) {
+            __builtin_memcpy(&wsv[g][sl], ws_row + sl * OUTPUT_STRIDE + off, 16);
+          }
+          __builtin_memcpy(&rpk[g], d_res + row * OUTPUT_STRIDE + off, 8);
+        }
+      }
+#pragma unroll
+      for (int g = 0; g < G; ++g) {
+        int const it = i0 + g;
+        int const row = it / NCH;
+        int const off = (it % NCH) * BLOCK_VEC + threadIdx.x * VEC;
+        if (it < NIT && off < OUTPUT_SIZE) {
+          float *ws_row = d_ws + moe_ws_offset(row, 0, OUTPUT_STRIDE);
+#pragma unroll
+          for (int sl = 0; sl < MOE_WS_SLOTS; ++sl) st_wt_zero128(ws_row + sl * OUTPUT_STRIDE + off);
+          float4 ws4 = wsv[g][0];
+#pragma unroll
+          for (int sl = 1; sl < MOE_WS_SLOTS; sl++) {
+            ws4.x += wsv[g][sl].x;
+            ws4.y += wsv[g][sl].y;
+            ws4.z += wsv[g][sl].z;
+            ws4.w += wsv[g][sl].w;
+          }
+          uint2 const res_packed = rpk[g];
+          unsigned r0 = (res_packed.x & 0xFFFFu) << 16;
+          unsigned r1 = res_packed.x & 0xFFFF0000u;
+          unsigned r2 = (res_packed.y & 0xFFFFu) << 16;
+          unsigned r3 = res_packed.y & 0xFFFF0000u;
+          float rv0, rv1, rv2, rv3;
+          __builtin_memcpy(&rv0, &r0, 4);
+          __builtin_memcpy(&rv1, &r1, 4);
+          __builtin_memcpy(&rv2, &r2, 4);
+          __builtin_memcpy(&rv3, &r3, 4);
+          float s0 = ws4.x + rv0, s1 = ws4.y + rv1;
+          float s2 = ws4.z + rv2, s3 = ws4.w + rv3;
+          uint2 out_packed;
+          out_packed.x = (unsigned)f2bf16(s0) | ((unsigned)f2bf16(s1) << 16);
+          out_packed.y = (unsigned)f2bf16(s2) | ((unsigned)f2bf16(s3) << 16);
+          __builtin_memcpy(d_out + row * OUTPUT_STRIDE + off, &out_packed, 8);
+        }
+      }
+    }
+  }
+#else
   for (int row = 0; row < BATCH_SIZE; ++row) {
     float *ws_row = d_ws + moe_ws_offset(row, 0, OUTPUT_STRIDE);
+    float *ws_rd = ws_row;
+#ifdef MPK_WSF32_REP
+    float *ws_z0 = nullptr, *ws_z1 = nullptr;
+    if (float *wsr = mpk_wsf32_rep(mpk_hof_aid())) {
+      ws_rd = wsr + moe_ws_offset(row, 0, OUTPUT_STRIDE);
+      ws_z0 = mpk_wsf32_rep(0) + moe_ws_offset(row, 0, OUTPUT_STRIDE);
+      ws_z1 = mpk_wsf32_rep(1) + moe_ws_offset(row, 0, OUTPUT_STRIDE);
+    }
+#endif
     unsigned short const *res_row = d_res + row * OUTPUT_STRIDE;
     unsigned short *out_row = d_out + row * OUTPUT_STRIDE;
 
@@ -101,13 +186,44 @@ __device__ __forceinline__ void moe_residual_add_f32_mi300_impl(
       // and add it to the embedding, which is exactly the double-count this
       // zero pass exists to prevent.
       float4 ws4;
-      __builtin_memcpy(&ws4, ws_row + off, 16);
+      __builtin_memcpy(&ws4, ws_rd + off, 16);
       st_wt_zero128(ws_row + off);
+#ifdef MPK_WSF32_REP
+      if (ws_z0) {
+        st_wt_zero128(ws_z0 + off);
+        st_wt_zero128(ws_z1 + off);
+      }
+#endif
+      #ifdef MPK_WSF32_AID
+      // This task runs on ONE XCD but the next iteration's layer 0 reads the
+      // workspace on all 8, so with a copy per range BOTH must be zeroed or
+      // the other AID double-counts the last layer's MoE output.
+      st_wt_zero128((ws_row + off) + MOE_WS_SLOTS * OUTPUT_STRIDE);
+      #endif
 #pragma unroll
       for (int s = 1; s < MOE_WS_SLOTS; s++) {
         float4 slot4;
-        __builtin_memcpy(&slot4, ws_row + s * OUTPUT_STRIDE + off, 16);
+#ifdef MPK_WS_FARCOPY
+        // W2 writes only its own AID's copy, so slots 2-3 live in the AID1
+        // copy; the helper's copy into AID0 is not ordered against this task.
+        __builtin_memcpy(&slot4, ws_rd + (s >= 2 ? MOE_WS_SLOTS * OUTPUT_STRIDE : 0) +
+                                     s * OUTPUT_STRIDE + off, 16);
+#else
+        __builtin_memcpy(&slot4, ws_rd + s * OUTPUT_STRIDE + off, 16);
+#endif
         st_wt_zero128(ws_row + s * OUTPUT_STRIDE + off);
+#ifdef MPK_WSF32_REP
+        if (ws_z0) {
+          st_wt_zero128(ws_z0 + s * OUTPUT_STRIDE + off);
+          st_wt_zero128(ws_z1 + s * OUTPUT_STRIDE + off);
+        }
+#endif
+        #ifdef MPK_WSF32_AID
+        // This task runs on ONE XCD but the next iteration's layer 0 reads the
+        // workspace on all 8, so with a copy per range BOTH must be zeroed or
+        // the other AID double-counts the last layer's MoE output.
+        st_wt_zero128((ws_row + s * OUTPUT_STRIDE + off) + MOE_WS_SLOTS * OUTPUT_STRIDE);
+        #endif
         ws4.x += slot4.x;
         ws4.y += slot4.y;
         ws4.z += slot4.z;
@@ -150,6 +266,7 @@ __device__ __forceinline__ void moe_residual_add_f32_mi300_impl(
       __builtin_memcpy(out_row + off, &out_packed, 8);
     }
   }
+#endif  // MPK_RESADD_ILP
 }
 
 } // namespace kernel

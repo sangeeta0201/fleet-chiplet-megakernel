@@ -173,6 +173,8 @@ def export_to_perfetto_trace(
             tag, num_blocks, num_groups
         )
 
+        # Tolerate task types newer than the table above: a KeyError here
+        # aborts the whole run and loses the capture.
         event = event_name_list.get(event_idx, f"TASK_{event_idx}") + f"_{event_no}"
         tid = tid_map[(block_idx, group_idx)]
 

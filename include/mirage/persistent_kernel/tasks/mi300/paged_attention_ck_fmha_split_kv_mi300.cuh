@@ -298,9 +298,10 @@ __device__ __noinline__ void
     // K element address: cache[phys_page * PAGE_SIZE * kv_cache_stride +
     // page_offset * kv_cache_stride + d] Note: kv_head_idx offset is already
     // applied by the framework's tiling system
-    bf16 const *k_ptr = k_cache +
-                        (long long)phys_page * PAGE_SIZE * kv_cache_stride +
-                        page_offset * kv_cache_stride;
+    bf16 const *k_ptr =
+        k_cache +
+        ((long long)phys_page * PAGE_SIZE + page_offset) *
+            MPK_KV_TOK_STRIDE(HEAD_DIM, kv_cache_stride);
 
     // Compute Q·K^T partial dot product (each thread does Q_PER_THREAD
     // elements)
@@ -339,9 +340,10 @@ __device__ __noinline__ void
     // Add V contribution
     // Note: kv_head_idx offset is already applied by the framework's tiling
     // system
-    bf16 const *v_ptr = v_cache +
-                        (long long)phys_page * PAGE_SIZE * kv_cache_stride +
-                        page_offset * kv_cache_stride;
+    bf16 const *v_ptr =
+        v_cache +
+        ((long long)phys_page * PAGE_SIZE + page_offset) *
+            MPK_KV_TOK_STRIDE(HEAD_DIM, kv_cache_stride);
 #pragma unroll
     for (int i = 0; i < Q_PER_THREAD; i++) {
       int d = lane * Q_PER_THREAD + i;
@@ -493,7 +495,8 @@ __device__ __noinline__ void paged_attention_ck_fmha_prefill(
     const auto k = make_naive_tensor_view<address_space_enum::global>(
         data,
         make_tuple(height, (index_t)HEAD_DIM),
-        make_tuple((index_t)kv_cache_stride, (index_t)1),
+        make_tuple((index_t)MPK_KV_TOK_STRIDE(HEAD_DIM, kv_cache_stride),
+                   (index_t)1),
         number<MyPrefillPipeline::kAlignmentK>{},
         number<1>{});
     return pad_tensor_view(
@@ -504,7 +507,8 @@ __device__ __noinline__ void paged_attention_ck_fmha_prefill(
     const auto v = make_naive_tensor_view<address_space_enum::global>(
         data,
         make_tuple(length, (index_t)HEAD_DIM),
-        make_tuple((index_t)kv_cache_stride, (index_t)1),
+        make_tuple((index_t)MPK_KV_TOK_STRIDE(HEAD_DIM, kv_cache_stride),
+                   (index_t)1),
         number<MyPrefillPipeline::kAlignmentV>{},
         number<1>{});
     const auto vt = transform_tensor_view(
@@ -525,7 +529,8 @@ __device__ __noinline__ void paged_attention_ck_fmha_prefill(
 
   auto k_nav = make_page_block_navigator<const bf16_t, 0>(
       reinterpret_cast<bf16_t const *>(paged_k_cache_ptr),
-      (long_index_t)(PAGE_SIZE * kv_cache_stride),
+      (long_index_t)(PAGE_SIZE *
+                     MPK_KV_TOK_STRIDE(HEAD_DIM, kv_cache_stride)),
       (long_index_t)0,
       block_indices,
       num_blocks,
@@ -535,7 +540,8 @@ __device__ __noinline__ void paged_attention_ck_fmha_prefill(
 
   auto v_nav = make_page_block_navigator<const bf16_t, 1>(
       reinterpret_cast<bf16_t const *>(paged_v_cache_ptr),
-      (long_index_t)(PAGE_SIZE * kv_cache_stride),
+      (long_index_t)(PAGE_SIZE *
+                     MPK_KV_TOK_STRIDE(HEAD_DIM, kv_cache_stride)),
       (long_index_t)0,
       block_indices,
       num_blocks,
@@ -718,7 +724,16 @@ template <typename T,
           bool DECODE_ONLY = false,
           bool META_PRE = false,
           bool KV_STAGED = false>
-__device__ __forceinline__ void paged_attention_ck_fmha_split_kv_impl(
+#ifndef MPK_ATTN_RET_T
+#ifdef MPK_KV_CHUNKS_ADAPTIVE
+#define MPK_ATTN_RET_T int
+#define MPK_ATTN_RETURN(v) return (v)
+#else
+#define MPK_ATTN_RET_T void
+#define MPK_ATTN_RETURN(v) return
+#endif
+#endif
+__device__ __forceinline__ MPK_ATTN_RET_T paged_attention_ck_fmha_split_kv_impl(
     void const *q_workspace_ptr,
     void *paged_k_cache_ptr,
     void *paged_v_cache_ptr,
@@ -740,7 +755,12 @@ __device__ __forceinline__ void paged_attention_ck_fmha_split_kv_impl(
     int pre_k0 = 0,
     int pre_k1 = 0,
     int pre_lpl = 0,
-    int pre_pid0 = 0) {
+    int pre_pid0 = 0
+#ifdef MPK_ATTN_SL_PRE
+    ,
+    mpk_slpre_t slp = MPK_SLPRE_NONE
+#endif
+    ) {
   (void)split_part;
   int const req = request_id;
   // META_PRE: the caller loaded the request metadata ahead of the QKV epoch.
@@ -749,7 +769,7 @@ __device__ __forceinline__ void paged_attention_ck_fmha_split_kv_impl(
   const ck_tile::index_t query_end =
       META_PRE ? pre_q1 : qo_indptr_buffer_ptr[req + 1];
   if (query_start == query_end) {
-    return;
+    MPK_ATTN_RETURN(NUM_KV_CHUNKS);
   }
 
   ck_tile::index_t seqlen_q = query_end - query_start;
@@ -757,7 +777,7 @@ __device__ __forceinline__ void paged_attention_ck_fmha_split_kv_impl(
   if (seqlen_q == 1) {
     if constexpr (HEAD_DIM == 64) {
       // Fast MFMA decode path for HD=64 (GPT-OSS 120B).
-      paged_attention_minimal_decode_hd64<T,
+      return paged_attention_minimal_decode_hd64<T,
                                           NUM_QO_PER_KV,
                                           HEAD_DIM,
                                           PAGE_SIZE,
@@ -788,7 +808,12 @@ __device__ __forceinline__ void paged_attention_ck_fmha_split_kv_impl(
           pre_k0,
           pre_k1,
           pre_lpl,
-          pre_pid0);
+          pre_pid0
+#ifdef MPK_ATTN_SL_PRE
+          ,
+          slp
+#endif
+          );
     } else {
       paged_attention_ck_fmha_decode<T,
                                      NUM_QO_PER_KV,
@@ -843,6 +868,9 @@ __device__ __forceinline__ void paged_attention_ck_fmha_split_kv_impl(
           sinks_ptr);
     }
   }
+#ifdef MPK_KV_CHUNKS_ADAPTIVE
+  return NUM_KV_CHUNKS;
+#endif
 }
 
 } // namespace kernel

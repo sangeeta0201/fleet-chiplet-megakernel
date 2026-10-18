@@ -20,6 +20,30 @@
 #endif
 #include "mpk_atoms.cuh"
 #include "runtime_header.h"
+
+#ifdef MPK_HOST_STOP
+// Every 16th iteration: each read is a round trip to host memory on the iteration boundary.
+#define MPK_HOST_STOP_AT(c, it)                                                  \
+  ((((unsigned long long)(it)) & 15ull) == 0ull && (c).stop_host != nullptr &&  \
+   __hip_atomic_load((c).stop_host, __ATOMIC_RELAXED,                           \
+                     __HIP_MEMORY_SCOPE_SYSTEM) != 0)
+#else
+#define MPK_HOST_STOP_AT(c, it) false
+#endif
+#ifdef MPK_PPROBE
+#include "pprobe.h"
+#endif
+#ifdef MPK_RPROBE
+#include "rprobe.h"
+#endif
+#ifdef MPK_NC_PROBE
+#include "ncprobe.h"
+#endif
+
+#if defined(MPK_AID_LOCAL) || defined(MPK_AID_SPLIT_FLAGS) ||                 \
+    defined(MPK_LM_WEIGHT_AID)
+#include "aid_local.h"
+#endif
 #ifdef USE_NVSHMEM
 #include <mpi.h>
 #include <nvshmem.h>
@@ -131,6 +155,142 @@ __device__ unsigned long long g_w2sub[1024 * 8];
 #define MPK_W2STAMP(k) \
   do {             \
   } while (0)
+#endif
+
+// Dynamic LDS for each scheduler block. A worker takes all but ~4.5 KB of a
+// CU's 160 KB, so a scheduler asking for more than what is left can never be
+// dispatched next to a worker: it takes the grid's spare CU instead. At 0 the
+// dispatcher is free to put a spinning scheduler on a worker's CU (7 of 8
+// did so in one SPX/NPS2 launch), and that worker runs slower for the whole
+// launch.
+#ifndef MPK_SCHED_LDS
+#define MPK_SCHED_LDS 0
+#endif
+
+#ifdef MPK_HWID_MAP
+// Where each worker and scheduler block landed: XCC_ID << 32 | HW_ID, taken
+// once at kernel entry. A scheduler that shares a CU with a worker steals
+// that worker's issue slots for the whole launch.
+__device__ unsigned long long g_hwid_w[1024];
+__device__ unsigned long long g_hwid_s[64];
+__device__ __forceinline__ unsigned long long mpk_hwid_now() {
+  unsigned hw, xcc;
+  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_HW_ID)" : "=s"(hw));
+  MPK_GET_XCC_ID16(xcc);
+  return ((unsigned long long)xcc << 32) | hw;
+}
+#endif
+#ifdef MPK_RESID_MAP
+// Residency map in pinned host memory: slot b = worker block b, slot 1024 + b
+// = scheduler block b; 0x80000000 | XCC_ID << 24 | HW_ID[23:0].
+__device__ unsigned *g_resid_host = nullptr;
+__device__ __forceinline__ void mpk_resid_mark(int slot) {
+  unsigned hw, xcc;
+  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_HW_ID)" : "=s"(hw));
+  MPK_GET_XCC_ID16(xcc);
+  unsigned *p = g_resid_host;
+  if (p != nullptr) {
+    __hip_atomic_store(&p[slot],
+                       0x80000000u | ((xcc & 0xfu) << 24) | (hw & 0xffffffu),
+                       __ATOMIC_RELAXED,
+                       __HIP_MEMORY_SCOPE_SYSTEM);
+  }
+}
+__device__ __forceinline__ void mpk_resid_put(int slot, unsigned v) {
+  unsigned *p = g_resid_host;
+  if (p != nullptr) {
+    __hip_atomic_store(&p[slot], 0x80000000u | v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  }
+}
+#define MPK_RESID_PUT(slot, v) mpk_resid_put((slot), (v))
+// MPK_GATE_RESCUE_V1: raw counters in the host residency buffer, slots 1088 and up.
+__device__ __forceinline__ void mpk_resid_add(int slot, unsigned v) {
+  unsigned *p = g_resid_host;
+  if (p != nullptr) {
+    __hip_atomic_fetch_add(&p[slot], v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  }
+}
+// CU identity = XCC << 8 | HW_ID[15:8] (CU_ID, SH_ID, SE_ID).
+static void mpk_resid_report(unsigned const *hm, int nw, int ns, int gen, int t) {
+  int wst = 0, sst = 0, wx[16] = {0}, sx[16] = {0};
+  std::map<unsigned, int> cu_w, cu_s;
+  char miss_w[512] = {0}, miss_s[256] = {0};
+  size_t lw = 0, ls = 0;
+  for (int b = 0; b < nw && b < 1024; b++) {
+    unsigned const v = __atomic_load_n(&hm[b], __ATOMIC_RELAXED);
+    if (v & 0x80000000u) {
+      unsigned const x = (v >> 24) & 0xfu;
+      wst++;
+      wx[x]++;
+      cu_w[(x << 8) | ((v >> 8) & 0xffu)]++;
+    } else if (lw < sizeof(miss_w) - 8) {
+      lw += snprintf(miss_w + lw, sizeof(miss_w) - lw, " %d", b);
+    }
+  }
+  for (int b = 0; b < ns && b < 64; b++) {
+    unsigned const v = __atomic_load_n(&hm[1024 + b], __ATOMIC_RELAXED);
+    if (v & 0x80000000u) {
+      unsigned const x = (v >> 24) & 0xfu;
+      sst++;
+      sx[x]++;
+      cu_s[(x << 8) | ((v >> 8) & 0xffu)]++;
+    } else if (ls < sizeof(miss_s) - 8) {
+      ls += snprintf(miss_s + ls, sizeof(miss_s) - ls, " %d", b);
+    }
+  }
+  int shared = 0, dupw = 0, dups = 0;
+  for (auto const &kv : cu_s) {
+    shared += cu_w.count(kv.first) ? 1 : 0;
+    dups += kv.second > 1 ? 1 : 0;
+  }
+  for (auto const &kv : cu_w) {
+    dupw += kv.second > 1 ? 1 : 0;
+  }
+  char when[32];
+  if (t < 0) {
+    snprintf(when, sizeof when, "done");
+  } else {
+    snprintf(when, sizeof when, "NOT DONE at %ds", t);
+  }
+  fprintf(stderr,
+          "[RESID] launch %d %s: workers %d/%d schedulers %d/%d; CUs with "
+          "worker+sched %d, 2+ workers %d, 2+ scheds %d; distinct CUs %zu\n",
+          gen, when, wst, nw, sst, ns, shared, dupw, dups,
+          cu_w.size() + cu_s.size() - (size_t)shared);
+  fprintf(stderr,
+          "[RESID]   per XCC workers %d %d %d %d %d %d %d %d | schedulers %d %d "
+          "%d %d %d %d %d %d\n",
+          wx[0], wx[1], wx[2], wx[3], wx[4], wx[5], wx[6], wx[7], sx[0], sx[1],
+          sx[2], sx[3], sx[4], sx[5], sx[6], sx[7]);
+  {  // MPK_GATE_RESCUE_V1
+    unsigned r[8], li[8], tot = 0;
+    for (int x = 0; x < 8; x++) {
+      r[x] = __atomic_load_n(&hm[1088 + x], __ATOMIC_RELAXED);
+      li[x] = __atomic_load_n(&hm[1104 + x], __ATOMIC_RELAXED) & 0x7fffffffu;
+      tot += r[x];
+    }
+    if (tot != 0) {
+      fprintf(stderr,
+              "[RESID]   gate rescues %u: per XCC %u %u %u %u %u %u %u %u | last iter %u %u %u %u %u "
+              "%u %u %u\n",
+              tot, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], li[0], li[1], li[2], li[3], li[4],
+              li[5], li[6], li[7]);
+    }
+  }
+  if (wst < nw) {
+    fprintf(stderr, "[RESID]   workers not resident:%s\n", miss_w);
+  }
+  if (sst < ns) {
+    fprintf(stderr, "[RESID]   schedulers not resident:%s\n", miss_s);
+  }
+  if (t >= 0) {
+    for (auto const &kv : cu_s) {
+      fprintf(stderr, "[RESID]   sched CU xcc=%u hw15_8=0x%02x n=%d%s\n",
+              kv.first >> 8, kv.first & 0xffu, kv.second,
+              cu_w.count(kv.first) ? " SHARES A WORKER CU" : "");
+    }
+  }
+}
 #endif
 
 #ifdef MPK_ILSUB
@@ -260,17 +420,23 @@ __device__ unsigned long long g_il_n;
 //   9  Phase 9 arrival done
 //   10 Phase 9 gate cleared
 //   11 layer exit
-#define MPK_PHASE_SLOT_COUNT 12
+#define MPK_PHASE_SLOT_COUNT 13
+// Per-worker stride padded to a full 128 B line. The arrays are indexed
+// by STRIDE and iterated by COUNT, so only the spacing changes.
+#define MPK_PHASE_SLOT_STRIDE 16
+#define MPK_PHASE_PAD_INT 32   /* 32 * 4 B = 128 B */
+#define MPK_PHASE_PAD_U64 16   /* 16 * 8 B = 128 B */
 #define MPK_PHASE_MAX_WORKERS 256
 __device__ unsigned long long
-    g_phase_ts[MPK_PHASE_MAX_WORKERS * MPK_PHASE_SLOT_COUNT];
+    g_phase_ts[MPK_PHASE_MAX_WORKERS * MPK_PHASE_SLOT_STRIDE];
 // Accumulated per-slot-pair spans, so the reduction is over every layer of
 // every decode iteration rather than whichever layer happened to be last in
 // the buffer. Accumulating rather than sampling one captured layer is
 // strictly more robust and costs one atomic per slot.
 __device__ unsigned long long
-    g_phase_span[MPK_PHASE_MAX_WORKERS * MPK_PHASE_SLOT_COUNT];
-__device__ unsigned long long g_phase_n[MPK_PHASE_MAX_WORKERS];
+    g_phase_span[MPK_PHASE_MAX_WORKERS * MPK_PHASE_SLOT_STRIDE];
+__device__ unsigned long long
+    g_phase_n[MPK_PHASE_MAX_WORKERS * MPK_PHASE_PAD_U64];
 // Only sample steady-state decode.
 //
 // `volatile` is load-bearing, not decoration. The whole layer body is inlined
@@ -279,6 +445,13 @@ __device__ unsigned long long g_phase_n[MPK_PHASE_MAX_WORKERS];
 // out, every mark tests the value read on the very first iteration -- zero --
 // and the recorder silently reports nothing at all. Volatile also gets the
 // cross-XCD visibility this needs, since only worker 0 ever writes it.
+#ifdef MPK_QKV_SPLIT
+// Slot 1 split: setup+barrier vs the QKV GEMM. Same shape as the g_il_*
+// accumulators above -- atomicAdd from tid 0, printed once at the end.
+__device__ unsigned long long g_qkv_setup_sum = 0;
+__device__ unsigned long long g_qkv_gemm_sum = 0;
+__device__ unsigned long long g_qkv_n = 0;
+#endif
 __device__ volatile int g_phase_arm;
 
 // Which iteration to start on. There is no device-side signal that separates
@@ -297,8 +470,669 @@ __device__ volatile int g_phase_arm;
 // late slots only, yet still bumps g_phase_n at slot 11 -- every early-slot
 // mean would then be divided by one layer too many. Set at slot 0, required by
 // every other slot.
-__device__ int g_phase_live[MPK_PHASE_MAX_WORKERS];
+__device__ int g_phase_live[MPK_PHASE_MAX_WORKERS * MPK_PHASE_PAD_INT];
 
+#ifdef MPK_PHASE_LDS
+// LDS-resident recorder: only s_memrealtime and LDS on the hot path, so its
+// cost is the same in NPS1 and NPS2 (the global recorder below is not: its
+// per-mark g_phase_* traffic lands on MTYPE_NC lines in NPS2). A worker arms
+// itself after MPK_PHASE_START_ITER iterations of its own layers, and copies
+// the sums to the globals the printer reads once per iteration.
+#ifndef MPK_PHASE_LAYERS_PER_ITER
+#define MPK_PHASE_LAYERS_PER_ITER 36
+#endif
+#ifndef MPK_PSNAPD_WPD
+#define MPK_PSNAPD_WPD 31
+#endif
+#ifdef MPK_PHASE_SNAP
+// Every slot timestamp of every worker for the layers of iteration
+// MPK_PHASE_SNAP, so the printer can take per-layer min/max over workers.
+__device__ unsigned long long g_phase_snap[MPK_PHASE_LAYERS_PER_ITER *
+                                           MPK_PHASE_MAX_WORKERS *
+                                           MPK_PHASE_SLOT_COUNT];
+#ifdef MPK_MULTI_DEV // MDEV_PSNAP: every device's workers stamp into device 0's g_phase_snap (the printer's)
+__constant__ unsigned long long *g_phase_snap_dst = nullptr;
+#define MPK_PSNAP_RD (g_phase_snap_dst != nullptr ? g_phase_snap_dst : g_phase_snap)
+#else
+#define MPK_PSNAP_RD g_phase_snap
+#endif
+#endif
+#ifdef MPK_VTN_MOETL // MPK_VTN_MOETL: per-call union-MoE timeline of the snapshot pass
+#ifndef MPK_PHASE_SNAP
+#error "MPK_VTN_MOETL needs MPK_PHASE_SNAP"
+#endif
+#define MPK_VTN_TLC 16
+#ifndef MPK_VTN_MOETL_L0
+#define MPK_VTN_MOETL_L0 0
+#endif
+#ifndef MPK_VTN_MOETL_NL
+#define MPK_VTN_MOETL_NL 8
+#endif
+__device__ unsigned long long g_vtn_tl[MPK_PHASE_LAYERS_PER_ITER * MPK_PHASE_MAX_WORKERS * MPK_VTN_TLC * 3];
+#ifdef MPK_MULTI_DEV
+__constant__ unsigned long long *g_vtn_tl_dst = nullptr;
+#define MPK_VTN_TL_RD (g_vtn_tl_dst != nullptr ? g_vtn_tl_dst : g_vtn_tl)
+#else
+#define MPK_VTN_TL_RD g_vtn_tl
+#endif
+#endif
+#ifdef MPK_IL_LDS
+// Low 32 bits of s_memrealtime at the ml loop's top (0) and just before the
+// tile loop (1); spans wrap-safe for anything under 42 s.
+__shared__ unsigned int s_il_ts[2];
+__shared__ unsigned int s_il_acc[3];
+__shared__ unsigned int s_il_n;
+__device__ unsigned int g_il_acc[MPK_PHASE_MAX_WORKERS * 3];
+__device__ unsigned int g_il_n[MPK_PHASE_MAX_WORKERS];
+#define MPK_IL_MARK(k)                                                         \
+  do {                                                                         \
+    if (threadIdx.x == 0)                                                      \
+      s_il_ts[(k)] = (unsigned int)__builtin_amdgcn_s_memrealtime();          \
+  } while (0)
+#endif
+#ifdef MPK_QKV_SUB_LDS
+// QKV epoch and chunk barrier split per worker (iterations >= 40), ns sums:
+// 0 producer drain, 1 arrival atomic, 2 epoch wait, 3 chunk drain, 4 chunk arrival.
+__shared__ unsigned int s_qs_acc[5];
+__shared__ unsigned int s_qs_n[3];  // qkv passes, chunk passes, xcd_id + 1
+__device__ unsigned int g_qs_acc[MPK_PHASE_MAX_WORKERS * 5];
+__device__ unsigned int g_qs_n[MPK_PHASE_MAX_WORKERS * 3];
+#endif
+#ifdef MPK_QKVK_LDS
+// QKV kernel stages per worker, ns sums over armed layers:
+// 0 fold + RMSNorm, 1 quant + weight DMA drain, 2 MFMA setup,
+// 3 MFMA + RoPE / KV epilogue.
+__shared__ unsigned int s_qk_ts[5];
+__shared__ unsigned int s_qk_acc[4];
+__shared__ unsigned int s_qk_n;
+__device__ unsigned int g_qk_acc[MPK_PHASE_MAX_WORKERS * 4];
+__device__ unsigned int g_qk_n[MPK_PHASE_MAX_WORKERS];
+#define MPK_QKVK_MARK(k)                                                      \
+  do {                                                                        \
+    if (threadIdx.x == 0) {                                                   \
+      s_qk_ts[(k)] = (unsigned int)__builtin_amdgcn_s_memrealtime();         \
+      if ((k) == 4 &&                                                         \
+          s_phase_layers >= (unsigned int)(MPK_PHASE_START_ITER *              \
+                                           MPK_PHASE_LAYERS_PER_ITER)) {       \
+        for (int _q = 0; _q < 4; _q++) {                                      \
+          s_qk_acc[_q] += (s_qk_ts[_q + 1] - s_qk_ts[_q]) * 10;               \
+        }                                                                     \
+        s_qk_n++;                                                             \
+      }                                                                       \
+    }                                                                         \
+  } while (0)
+#endif
+#ifdef MPK_TOPK_SUB
+#ifndef MPK_PHASE_LDS
+#error "MPK_TOPK_SUB arms with the LDS phase recorder: set MPK_PHASE_SLOTS=1 MPK_PHASE_LDS=1"
+#endif
+// TopK (ROUTER_OPROJ_PARTIAL phase 7b) steps per worker, ns sums over armed layers:
+// 0 wait for all 8 dies' sum-of-squares stamps, 1 gather the row + 8 x 129 sums,
+// 2 1/rms + expert scores, 3 top 4 with the FP8 MoE-input conversion overlapped.
+__shared__ unsigned int s_tk_acc[4];
+#ifdef MPK_TOPK_SUB2
+__shared__ unsigned int s_tk2_acc[8];
+__device__ unsigned int g_tk2_acc[MPK_PHASE_MAX_WORKERS * 8];
+#endif
+__shared__ unsigned int s_tk_n;
+__device__ unsigned int g_tk_acc[MPK_PHASE_MAX_WORKERS * 4];
+__device__ unsigned int g_tk_n[MPK_PHASE_MAX_WORKERS];
+#define MPK_TOPK_ARMED()                                                        \
+  (s_phase_layers >=                                                          \
+   (unsigned int)(MPK_PHASE_START_ITER * MPK_PHASE_LAYERS_PER_ITER))
+#endif
+#ifdef MPK_OPROJ_SUB
+#ifndef MPK_PHASE_LDS
+#error "MPK_OPROJ_SUB arms with the LDS phase recorder: set MPK_PHASE_SLOTS=1 MPK_PHASE_LDS=1"
+#endif
+// O-proj kernel steps per worker, ns sums over armed layers: 0 weight-tile drain, 1 wait for the
+// last wave's attention slices, 2 convert + MFMA + wave reduce, 3 residual/bias/store + router
+// partial, 4 drain + die combine + publish. s_os_w: each wave's slice-wait end (lane 0).
+__shared__ unsigned int s_os_w[4];
+__shared__ unsigned int s_os_acc[5];
+__shared__ unsigned int s_os_n;
+__device__ unsigned int g_os_acc[MPK_PHASE_MAX_WORKERS * 5];
+__device__ unsigned int g_os_n[MPK_PHASE_MAX_WORKERS];
+#define MPK_OS_ARMED()                                                          \
+  (s_phase_layers >=                                                          \
+   (unsigned int)(MPK_PHASE_START_ITER * MPK_PHASE_LAYERS_PER_ITER))
+#endif
+#ifdef MPK_ATTK_LDS
+// Attention marks, ns sums per cell = sliding * 12 + MPK_AK_SLOT(prev * 10 + id):
+// 0 start>scan0, 1 scan0>pro, 2 pro>ored, 3 ored>pstore, 4 pstore>cbar,
+// 5 start>cbar, 6 cbar>cbdone, 7 cbdone>merged, 8 merged>drain,
+// 9 drain>end, 10 cbdone>end, 11 other (spans ending at start excluded).
+// Kept small: the worker's static LDS has under 2 KB of headroom.
+__shared__ unsigned int s_ak_prev;  // id + 1, 0 = none yet
+__shared__ unsigned int s_ak_t;
+__shared__ unsigned int s_ak_sw;
+__shared__ unsigned int s_ak_acc[24];
+__shared__ unsigned int s_ak_cnt[24];
+__device__ unsigned int g_ak_acc[MPK_PHASE_MAX_WORKERS * 24];
+__device__ unsigned int g_ak_cnt[MPK_PHASE_MAX_WORKERS * 24];
+#define MPK_AK_SLOT(k)                                                   \
+  ((k) == 6 ? 0 : (k) == 67 ? 1 : (k) == 78 ? 2 : (k) == 89 ? 3 :        \
+   (k) == 91 ? 4 : (k) == 1 ? 5 : (k) == 12 ? 6 : (k) == 23 ? 7 :        \
+   (k) == 34 ? 8 : (k) == 45 ? 9 : (k) == 25 ? 10 : 11)
+#define mpk_ak_mark(id_)                                                 \
+  do {                                                                   \
+    if (threadIdx.x == 0) {                                              \
+      unsigned int const _ak_id = (id_);                                 \
+      unsigned int const _ak_t =                                         \
+          (unsigned int)__builtin_amdgcn_s_memrealtime();                \
+      unsigned int const _ak_p = s_ak_prev;                              \
+      if (_ak_p != 0 && _ak_id != 0 &&                                   \
+          s_phase_layers >= (unsigned int)(MPK_PHASE_START_ITER *         \
+                                           MPK_PHASE_LAYERS_PER_ITER)) {  \
+        unsigned int const _ak_c =                                       \
+            s_ak_sw * 12 + MPK_AK_SLOT((_ak_p - 1) * 10 + _ak_id);       \
+        s_ak_acc[_ak_c] += (_ak_t - s_ak_t) * 10;                        \
+        s_ak_cnt[_ak_c]++;                                               \
+      }                                                                  \
+      s_ak_prev = _ak_id + 1;                                            \
+      s_ak_t = _ak_t;                                                    \
+    }                                                                    \
+  } while (0)
+#undef MPK_ATSTAMP
+#define MPK_ATSTAMP(k) mpk_ak_mark((unsigned int)(k))
+#undef MPK_ASSTAMP
+#define MPK_ASSTAMP(k)                                   \
+  do {                                                   \
+    if ((k) == 0 || (k) == 1) {                          \
+      mpk_ak_mark(6u + (unsigned int)(k));               \
+    } else if ((k) == 5 || (k) == 6) {                   \
+      mpk_ak_mark(3u + (unsigned int)(k));               \
+    }                                                    \
+  } while (0)
+#endif
+#ifdef MPK_W13_SUB
+__shared__ unsigned int s_w13_prev;
+__shared__ unsigned int s_w13_acc[10];
+__shared__ unsigned int s_w13_n;
+__device__ unsigned int g_w13_acc[MPK_PHASE_MAX_WORKERS * 10];
+__device__ unsigned int g_w13_n[MPK_PHASE_MAX_WORKERS];
+__device__ unsigned int g_w13_hwid[MPK_PHASE_MAX_WORKERS];
+#define MPK_W13_ARMED()                                                        \
+  (s_phase_layers >=                                                         \
+   (unsigned int)(MPK_PHASE_START_ITER * MPK_PHASE_LAYERS_PER_ITER))
+#define MPK_W13_START()                                                        \
+  do {                                                                         \
+    if (threadIdx.x == 0)                                                      \
+      s_w13_prev = (unsigned int)__builtin_amdgcn_s_memrealtime();            \
+  } while (0)
+#define MPK_W13_MARK(k)                                                        \
+  do {                                                                         \
+    if (threadIdx.x == 0 && MPK_W13_ARMED()) {                                 \
+      unsigned int const _w13t = (unsigned int)__builtin_amdgcn_s_memrealtime(); \
+      s_w13_acc[(k)] += (_w13t - s_w13_prev) * 10;                             \
+      s_w13_prev = _w13t;                                                      \
+    }                                                                          \
+  } while (0)
+#define MPK_W13_DONE()                                                         \
+  do {                                                                         \
+    if (threadIdx.x == 0 && MPK_W13_ARMED()) s_w13_n++;                        \
+  } while (0)
+#endif
+__shared__ unsigned long long s_phase_ts[MPK_PHASE_SLOT_COUNT];
+__shared__ unsigned long long s_phase_span[MPK_PHASE_SLOT_COUNT];
+__shared__ unsigned long long s_phase_prev_end;
+__shared__ unsigned long long s_phase_span_b;
+__shared__ unsigned int s_phase_layers;
+#if defined(MPK_LTK_SNAP) && defined(MPK_PHASE_SNAP)
+// Local-TopK propagation stamps for the layers of iteration
+// MPK_PHASE_SNAP: [0] router logit publish, [1] poll start,
+// [2] poll success, [3] TopK end. Worker id from the slot-0 mark.
+__device__ unsigned long long
+    g_ltk_snap[MPK_PHASE_LAYERS_PER_ITER * MPK_PHASE_MAX_WORKERS * 4];
+__shared__ int s_ltk_worker;
+#define MPK_LTK_MARK(k)                                                        \
+  do {                                                                         \
+    if (threadIdx.x == 0) {                                                    \
+      unsigned int const _ltk_l =                                              \
+          s_phase_layers -                                                     \
+          (unsigned int)(MPK_PHASE_SNAP * MPK_PHASE_LAYERS_PER_ITER);          \
+      if (_ltk_l < (unsigned int)MPK_PHASE_LAYERS_PER_ITER &&                  \
+          (unsigned int)s_ltk_worker < (unsigned int)MPK_PHASE_MAX_WORKERS) {  \
+        g_ltk_snap[((size_t)_ltk_l * MPK_PHASE_MAX_WORKERS + s_ltk_worker) *   \
+                       4 +                                                     \
+                   (k)] = __builtin_amdgcn_s_memrealtime();                    \
+      }                                                                        \
+    }                                                                          \
+  } while (0)
+#endif
+#if defined(MPK_XSNAP) && defined(MPK_PHASE_SNAP)
+// Barrier stamps for the layers of iteration MPK_PHASE_SNAP; see p_xsnap.py.
+__device__ unsigned long long
+    g_xs_snap[MPK_PHASE_LAYERS_PER_ITER * MPK_PHASE_MAX_WORKERS * 16];
+__shared__ int s_xs_worker;
+#define MPK_XS_MARK(k)                                                         \
+  do {                                                                         \
+    if (threadIdx.x == 0) {                                                    \
+      unsigned int const _xs_l =                                               \
+          s_phase_layers -                                                     \
+          (unsigned int)(MPK_PHASE_SNAP * MPK_PHASE_LAYERS_PER_ITER);          \
+      if (_xs_l < (unsigned int)MPK_PHASE_LAYERS_PER_ITER &&                   \
+          (unsigned int)s_xs_worker < (unsigned int)MPK_PHASE_MAX_WORKERS) {   \
+        g_xs_snap[((size_t)_xs_l * MPK_PHASE_MAX_WORKERS + s_xs_worker) * 16 + \
+                  (k)] = __builtin_amdgcn_s_memrealtime();                     \
+      }                                                                        \
+    }                                                                          \
+  } while (0)
+#endif
+#if defined(MPK_TK_OPS) && defined(MPK_PHASE_SNAP)
+// MPK_TK_OPS (timing tool): O-proj / Phase 7b stamps of iteration MPK_PHASE_SNAP, 16 per (layer, worker); under
+// MPK_MULTI_DEV every device stamps one buffer on device 0 (g_tk_ops_dst, as MDEV_PSNAP).
+__device__ unsigned long long g_tk_ops[MPK_PHASE_LAYERS_PER_ITER * MPK_PHASE_MAX_WORKERS * 16];
+__constant__ unsigned long long *g_tk_ops_dst = nullptr;
+__shared__ int s_tkops_worker;
+#ifdef MPK_TK_OPS_LDS
+// MPK_TK_OPS_LDS: stamps into LDS, written out by thread 0 at the next layer's slot-0 mark, so no global store
+// sits in front of a vmcnt wait on the timed path.
+__shared__ unsigned long long s_tkops_v[16];
+__shared__ unsigned int s_tkops_l;
+#define MPK_TKOPS_AT(k, cond)                                                                          \
+  do {                                                                                                 \
+    if (cond) {                                                                                        \
+      unsigned int const _to_l = s_phase_layers - (unsigned int)(MPK_PHASE_SNAP * MPK_PHASE_LAYERS_PER_ITER); \
+      if (_to_l < (unsigned int)MPK_PHASE_LAYERS_PER_ITER &&                                           \
+          (unsigned int)s_tkops_worker < (unsigned int)MPK_PHASE_MAX_WORKERS) {                        \
+        s_tkops_v[(k)] = __builtin_amdgcn_s_memrealtime();                                             \
+        s_tkops_l = _to_l;                                                                             \
+      }                                                                                                \
+    }                                                                                                  \
+  } while (0)
+#else
+#define MPK_TKOPS_AT(k, cond)                                                                          \
+  do {                                                                                                 \
+    if (cond) {                                                                                        \
+      unsigned int const _to_l = s_phase_layers - (unsigned int)(MPK_PHASE_SNAP * MPK_PHASE_LAYERS_PER_ITER); \
+      if (_to_l < (unsigned int)MPK_PHASE_LAYERS_PER_ITER &&                                           \
+          (unsigned int)s_tkops_worker < (unsigned int)MPK_PHASE_MAX_WORKERS) {                        \
+        unsigned long long const _to_t = __builtin_amdgcn_s_memrealtime();                             \
+        __hip_atomic_store(&(g_tk_ops_dst != nullptr ? g_tk_ops_dst : g_tk_ops)                        \
+                               [((size_t)_to_l * MPK_PHASE_MAX_WORKERS + s_tkops_worker) * 16 + (k)],  \
+                           _to_t, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);                        \
+      }                                                                                                \
+    }                                                                                                  \
+  } while (0)
+#endif  // MPK_TK_OPS_LDS
+#endif
+#if defined(MPK_ATS_OPS) && defined(MPK_PHASE_SNAP)
+// MPK_ATS_OPS (timing tool): attention / sync stamps of iteration MPK_PHASE_SNAP, 16 per (layer, worker). Stamps
+// go to LDS (no memory traffic on the timed path); the layer-exit phase mark flushes them with plain stores into
+// device 0's own g_ats_ops, from dies 0..3 only (device 0 runs the printer).
+__device__ unsigned long long g_ats_ops[MPK_PHASE_LAYERS_PER_ITER * MPK_PHASE_MAX_WORKERS * 16];
+__constant__ unsigned long long *g_ats_ops_dst = nullptr;
+#define MPK_ATS_RD (g_ats_ops_dst != nullptr ? g_ats_ops_dst : g_ats_ops)
+__shared__ int s_atsops_worker;
+__shared__ unsigned long long s_ats_buf[16];
+#define MPK_ATSOPS_PUT(k, cond, val)                 \
+  do {                                               \
+    if (cond) {                                      \
+      s_ats_buf[(k)] = (unsigned long long)(val);    \
+    }                                                \
+  } while (0)
+#define MPK_ATSOPS_AT(k, cond) MPK_ATSOPS_PUT(k, cond, __builtin_amdgcn_s_memrealtime())
+#else
+#define MPK_ATSOPS_PUT(k, cond, val) \
+  do {                               \
+  } while (0)
+#define MPK_ATSOPS_AT(k, cond) \
+  do {                         \
+  } while (0)
+#endif
+__shared__ unsigned int s_phase_n;
+
+#ifdef MPK_OPROJ_LDS
+__shared__ unsigned long long s_sub_ts[4];
+__shared__ unsigned long long s_sub_span[4];
+__shared__ unsigned int s_sub_live;
+__shared__ unsigned int s_sub_n;
+__shared__ unsigned int s_sub_pub;
+__shared__ unsigned long long s_sub_last;
+__shared__ unsigned int s_sub_last_n;
+__shared__ unsigned long long s_tk_ts[3];
+__shared__ unsigned long long s_tk_span[3];
+__shared__ unsigned int s_tk_live;
+__shared__ unsigned int s_tk_n;
+__device__ unsigned long long g_tk_span[MPK_PHASE_MAX_WORKERS * 3];
+__device__ unsigned int g_tk_n[MPK_PHASE_MAX_WORKERS];
+__device__ unsigned long long g_sub_last[MPK_PHASE_MAX_WORKERS];
+__device__ unsigned int g_sub_last_n[MPK_PHASE_MAX_WORKERS];
+__device__ unsigned long long g_sub_span[MPK_PHASE_MAX_WORKERS * 4];
+__device__ unsigned int g_sub_n[MPK_PHASE_MAX_WORKERS];
+__device__ __forceinline__ void mpk_sub_mark(int k) {
+  if (threadIdx.x != 0) {
+    return;
+  }
+  asm volatile("" ::: "memory");
+  s_sub_ts[k] = __builtin_amdgcn_s_memrealtime();
+  asm volatile("" ::: "memory");
+  s_sub_live |= 1u << k;
+}
+#define MPK_SUB_MARK(k) mpk_sub_mark(k)
+#define MPK_SUB_TOPK(k)                                                        \
+  do {                                                                         \
+    if (threadIdx.x == 0) {                                                    \
+      s_tk_ts[(k)] = __builtin_amdgcn_s_memrealtime();                         \
+      s_tk_live |= 1u << (k);                                                  \
+    }                                                                          \
+  } while (0)
+#define MPK_SUB_PUBLISHER()                                                    \
+  do {                                                                         \
+    if (threadIdx.x == 0) s_sub_pub = 1u;                                      \
+  } while (0)
+#else
+#define MPK_SUB_MARK(k) do {} while (0)
+#endif
+#ifdef MPK_MOE_LDS
+// Per-worker MoE split, summed over every armed tile: W13 dec/compute/arrive
+// and W2 dec/prep/barrier/compute (ns). Copied out with the phase spans.
+__shared__ unsigned int s_moe_acc[7];
+__shared__ unsigned int s_moe_n[2];
+#ifdef MPK_MOE_LDS_MAX
+// [0] max W13 arrival ns, [1] arrivals > 1 us, [2] max W2 barrier ns,
+// [3] W2 barrier waits > 1 us.
+__shared__ unsigned int s_moe_x[4];
+__device__ unsigned int g_moe_x[MPK_PHASE_MAX_WORKERS * 4];
+#endif
+__device__ unsigned int g_moe_acc[MPK_PHASE_MAX_WORKERS * 7];
+__device__ unsigned int g_moe_n[MPK_PHASE_MAX_WORKERS * 2];
+#ifdef MPK_MOE_CALL_LDS
+// Caller-side ns around each MoE call (entry drain + tile + return drain)
+// and call counts: [0] W13 pass, [1] W2 pass, [2..3] counts.
+__shared__ unsigned int s_moe_call[4];
+__device__ unsigned int g_moe_call[MPK_PHASE_MAX_WORKERS * 4];
+#endif
+#define MPK_MOE_ARMED()                                                        \
+  (s_phase_layers >=                                                         \
+   (unsigned int)(MPK_PHASE_START_ITER * MPK_PHASE_LAYERS_PER_ITER))
+#endif
+__device__ __forceinline__ void mpk_phase_lds_init() {
+  if (threadIdx.x == 0) {
+    for (int s = 0; s < MPK_PHASE_SLOT_COUNT; s++) {
+      s_phase_ts[s] = 0;
+      s_phase_span[s] = 0;
+    }
+    s_phase_prev_end = 0;
+    s_phase_span_b = 0;
+#ifdef MPK_OPROJ_LDS
+    for (int k = 0; k < 4; k++) s_sub_span[k] = 0;
+    s_sub_live = 0;
+    s_sub_n = 0;
+    s_sub_pub = 0;
+    s_sub_last = 0;
+    s_sub_last_n = 0;
+    for (int k = 0; k < 3; k++) s_tk_span[k] = 0;
+    s_tk_live = 0;
+    s_tk_n = 0;
+#endif
+    s_phase_layers = 0;
+    s_phase_n = 0;
+#if defined(MPK_TK_OPS) && defined(MPK_PHASE_SNAP) && defined(MPK_TK_OPS_LDS)
+    for (int k = 0; k < 16; k++) s_tkops_v[k] = 0ull;
+    s_tkops_l = 0xFFFFFFFFu;
+#endif
+#ifdef MPK_W13_SUB
+    for (int k = 0; k < 10; k++) s_w13_acc[k] = 0;
+    s_w13_n = 0;
+    s_w13_prev = 0;
+#endif
+#ifdef MPK_IL_LDS
+    s_il_ts[0] = 0;
+    s_il_ts[1] = 0;
+    for (int k = 0; k < 3; k++) s_il_acc[k] = 0;
+    s_il_n = 0;
+#endif
+#ifdef MPK_QKV_SUB_LDS
+    for (int k = 0; k < 5; k++) s_qs_acc[k] = 0;
+    for (int k = 0; k < 3; k++) s_qs_n[k] = 0;
+#endif
+#ifdef MPK_QKVK_LDS
+    for (int k = 0; k < 4; k++) s_qk_acc[k] = 0;
+    s_qk_n = 0;
+#endif
+#ifdef MPK_OPROJ_SUB
+    for (int k = 0; k < 5; k++) s_os_acc[k] = 0;
+    s_os_n = 0;
+#endif
+#ifdef MPK_TOPK_SUB
+    for (int k = 0; k < 4; k++) s_tk_acc[k] = 0;
+#ifdef MPK_TOPK_SUB2
+    for (int k = 0; k < 8; k++) s_tk2_acc[k] = 0;
+#endif
+    s_tk_n = 0;
+#endif
+#ifdef MPK_ATTK_LDS
+    for (int k = 0; k < 24; k++) {
+      s_ak_acc[k] = 0;
+      s_ak_cnt[k] = 0;
+    }
+    s_ak_prev = 0;
+    s_ak_sw = 0;
+#endif
+#ifdef MPK_MOE_LDS
+    for (int k = 0; k < 7; k++) s_moe_acc[k] = 0;
+    s_moe_n[0] = 0;
+    s_moe_n[1] = 0;
+#ifdef MPK_MOE_LDS_MAX
+    for (int k = 0; k < 4; k++) s_moe_x[k] = 0;
+#endif
+#endif
+#ifdef MPK_MOE_CALL_LDS
+    for (int k = 0; k < 4; k++) s_moe_call[k] = 0;
+#endif
+  }
+}
+
+__device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
+  if (threadIdx.x != 0 || worker >= MPK_PHASE_MAX_WORKERS) {
+    return;
+  }
+  asm volatile("" ::: "memory");
+  unsigned long long const t = __builtin_amdgcn_s_memrealtime();
+  asm volatile("" ::: "memory");
+  s_phase_ts[slot] = t;
+#if defined(MPK_LTK_SNAP) && defined(MPK_PHASE_SNAP)
+  if (slot == 0) {
+    s_ltk_worker = worker;
+  }
+#endif
+#if defined(MPK_XSNAP) && defined(MPK_PHASE_SNAP)
+  if (slot == 0) {
+    s_xs_worker = worker;
+  }
+#endif
+#if defined(MPK_TK_OPS) && defined(MPK_PHASE_SNAP)
+  if (slot == 0) {
+#ifdef MPK_TK_OPS_LDS
+    if (s_tkops_l < (unsigned int)MPK_PHASE_LAYERS_PER_ITER) {
+      unsigned long long *const _tkd = (g_tk_ops_dst != nullptr ? g_tk_ops_dst : g_tk_ops) +
+                                       ((size_t)s_tkops_l * MPK_PHASE_MAX_WORKERS + worker) * 16;
+      for (int _k = 0; _k < 16; _k++) {
+        if (s_tkops_v[_k] != 0ull)
+          __hip_atomic_store(&_tkd[_k], s_tkops_v[_k], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        s_tkops_v[_k] = 0ull;
+      }
+    }
+    s_tkops_l = 0xFFFFFFFFu;
+#endif
+    s_tkops_worker = worker;
+  }
+#endif
+#if defined(MPK_ATS_OPS) && defined(MPK_PHASE_SNAP)
+  if (slot == 0) {
+    s_atsops_worker = worker;
+  }
+#endif
+#ifdef MPK_PHASE_SNAP
+  {
+    // s_phase_layers still counts completed layers here, so it is the
+    // index of the layer this mark belongs to.
+    unsigned int const snap_l =
+        s_phase_layers -
+        (unsigned int)(MPK_PHASE_SNAP * MPK_PHASE_LAYERS_PER_ITER);
+    if (snap_l < (unsigned int)MPK_PHASE_LAYERS_PER_ITER) {
+#ifdef MPK_MULTI_DEV // MDEV_PSNAP: system scope, so the printer on device 0 sees every device's stamps
+      __hip_atomic_store(&(g_phase_snap_dst != nullptr ? g_phase_snap_dst : g_phase_snap)
+                             [((size_t)snap_l * MPK_PHASE_MAX_WORKERS + worker) * MPK_PHASE_SLOT_COUNT + slot],
+                         (unsigned long long)t, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+      g_phase_snap[((size_t)snap_l * MPK_PHASE_MAX_WORKERS + worker) *
+                       MPK_PHASE_SLOT_COUNT +
+                   slot] = t;
+#endif
+    }
+  }
+#endif
+#if defined(MPK_ATS_OPS) && defined(MPK_PHASE_SNAP)
+  if (slot == MPK_PHASE_SLOT_COUNT - 1) {
+    unsigned int const _ao_l =
+        s_phase_layers - (unsigned int)(MPK_PHASE_SNAP * MPK_PHASE_LAYERS_PER_ITER);
+    if (_ao_l < (unsigned int)MPK_PHASE_LAYERS_PER_ITER && worker < 4 * MPK_PSNAPD_WPD) {
+      unsigned long long *const _ao_g = &MPK_ATS_RD[((size_t)_ao_l * MPK_PHASE_MAX_WORKERS + worker) * 16];
+      for (int _k = 0; _k < 16; ++_k) {
+        _ao_g[_k] = s_ats_buf[_k];
+      }
+    }
+    for (int _k = 0; _k < 16; ++_k) {
+      s_ats_buf[_k] = 0ull;
+    }
+  }
+#endif
+  if (slot != MPK_PHASE_SLOT_COUNT - 1) {
+    return;
+  }
+  unsigned int const layers = ++s_phase_layers;
+#ifdef MPK_OPROJ_LDS
+  unsigned int const _sub_live = s_sub_live;
+  s_sub_live = 0;
+#endif
+  unsigned long long const prev_end = s_phase_prev_end;
+  s_phase_prev_end = t;
+  if (layers <= (unsigned int)(MPK_PHASE_START_ITER * MPK_PHASE_LAYERS_PER_ITER)) {
+    return;
+  }
+#ifdef MPK_OPROJ_LDS
+  if (_sub_live == 0xFu && s_phase_ts[6] >= s_sub_ts[3]) {
+    s_sub_span[0] += (s_sub_ts[1] - s_sub_ts[0]) * 10;
+    s_sub_span[1] += (s_sub_ts[2] - s_sub_ts[1]) * 10;
+    s_sub_span[2] += (s_sub_ts[3] - s_sub_ts[2]) * 10;
+    s_sub_span[3] += (s_phase_ts[6] - s_sub_ts[3]) * 10;
+    s_sub_n++;
+    if (s_tk_live == 0x7u && s_tk_ts[0] >= s_sub_ts[3]) {
+      s_tk_span[0] += (s_tk_ts[0] - s_sub_ts[3]) * 10;
+      s_tk_span[1] += (s_tk_ts[1] - s_tk_ts[0]) * 10;
+      s_tk_span[2] += (s_tk_ts[2] - s_tk_ts[1]) * 10;
+      s_tk_n++;
+    }
+    if (s_sub_pub) {
+      s_sub_last += (s_sub_ts[2] - s_sub_ts[1]) * 10;
+      s_sub_last_n++;
+    }
+  }
+  s_sub_pub = 0;
+  s_tk_live = 0;
+#endif
+  // Slot 0 is the inter-layer span (previous layer's last mark to this
+  // layer's first), exactly as in the global recorder.
+  if (prev_end != 0 && s_phase_ts[0] >= prev_end) {
+    unsigned long long const d0 = (s_phase_ts[0] - prev_end) * 10; // ns
+    if ((layers - 1) % MPK_PHASE_LAYERS_PER_ITER == 0) {
+      s_phase_span_b += d0; // layer 0: the span between two forward passes
+    } else {
+      s_phase_span[0] += d0;
+    }
+  }
+#ifdef MPK_IL_LDS
+  if (prev_end != 0 && (layers - 1) % MPK_PHASE_LAYERS_PER_ITER != 0) {
+    unsigned int const pe = (unsigned int)prev_end;
+    unsigned int const ta = s_il_ts[0], tb = s_il_ts[1];
+    unsigned int const tc = (unsigned int)s_phase_ts[0];
+    if ((int)(ta - pe) >= 0 && (int)(tb - ta) >= 0 && (int)(tc - tb) >= 0) {
+      s_il_acc[0] += (ta - pe) * 10;
+      s_il_acc[1] += (tb - ta) * 10;
+      s_il_acc[2] += (tc - tb) * 10;
+      s_il_n++;
+    }
+  }
+#endif
+  for (int s = 1; s < MPK_PHASE_SLOT_COUNT; s++) {
+    unsigned long long const a = s_phase_ts[s - 1];
+    unsigned long long const b = s_phase_ts[s];
+    if (b >= a) {
+      s_phase_span[s] += (b - a) * 10;
+    }
+  }
+  unsigned int const n = ++s_phase_n;
+  if (n % MPK_PHASE_LAYERS_PER_ITER == 0) {
+    int const base = worker * MPK_PHASE_SLOT_STRIDE;
+    for (int s = 0; s < MPK_PHASE_SLOT_COUNT; s++) {
+      g_phase_span[base + s] = s_phase_span[s];
+      g_phase_ts[base + s] = s_phase_ts[s];
+    }
+    g_phase_span[base + MPK_PHASE_SLOT_COUNT] = s_phase_span_b;
+#ifdef MPK_OPROJ_LDS
+    for (int k = 0; k < 4; k++) g_sub_span[worker * 4 + k] = s_sub_span[k];
+    g_sub_n[worker] = s_sub_n;
+    g_sub_last[worker] = s_sub_last;
+    g_sub_last_n[worker] = s_sub_last_n;
+    for (int k = 0; k < 3; k++) g_tk_span[worker * 3 + k] = s_tk_span[k];
+    g_tk_n[worker] = s_tk_n;
+#endif
+#ifdef MPK_MOE_LDS
+    for (int k = 0; k < 7; k++) g_moe_acc[worker * 7 + k] = s_moe_acc[k];
+    g_moe_n[worker * 2] = s_moe_n[0];
+    g_moe_n[worker * 2 + 1] = s_moe_n[1];
+#ifdef MPK_MOE_LDS_MAX
+    for (int k = 0; k < 4; k++) g_moe_x[worker * 4 + k] = s_moe_x[k];
+#endif
+#endif
+#ifdef MPK_MOE_CALL_LDS
+    for (int k = 0; k < 4; k++) g_moe_call[worker * 4 + k] = s_moe_call[k];
+#endif
+#ifdef MPK_IL_LDS
+    for (int k = 0; k < 3; k++) g_il_acc[worker * 3 + k] = s_il_acc[k];
+    g_il_n[worker] = s_il_n;
+#endif
+#ifdef MPK_QKV_SUB_LDS
+    for (int k = 0; k < 5; k++) g_qs_acc[worker * 5 + k] = s_qs_acc[k];
+    for (int k = 0; k < 3; k++) g_qs_n[worker * 3 + k] = s_qs_n[k];
+#endif
+#ifdef MPK_QKVK_LDS
+    for (int k = 0; k < 4; k++) g_qk_acc[worker * 4 + k] = s_qk_acc[k];
+    g_qk_n[worker] = s_qk_n;
+#endif
+#ifdef MPK_OPROJ_SUB
+    for (int k = 0; k < 5; k++) g_os_acc[worker * 5 + k] = s_os_acc[k];
+    g_os_n[worker] = s_os_n;
+#endif
+#ifdef MPK_TOPK_SUB
+    for (int k = 0; k < 4; k++) g_tk_acc[worker * 4 + k] = s_tk_acc[k];
+#ifdef MPK_TOPK_SUB2
+    for (int k = 0; k < 8; k++) g_tk2_acc[worker * 8 + k] = s_tk2_acc[k];
+#endif
+    g_tk_n[worker] = s_tk_n;
+#endif
+#ifdef MPK_ATTK_LDS
+    for (int k = 0; k < 24; k++) {
+      g_ak_acc[worker * 24 + k] = s_ak_acc[k];
+      g_ak_cnt[worker * 24 + k] = s_ak_cnt[k];
+    }
+#endif
+#ifdef MPK_W13_SUB
+    for (int k = 0; k < 10; k++) g_w13_acc[worker * 10 + k] = s_w13_acc[k];
+    g_w13_n[worker] = s_w13_n;
+    {
+      unsigned _hw;
+      asm volatile("s_getreg_b32 %0, hwreg(HW_REG_HW_ID)" : "=s"(_hw));
+      g_w13_hwid[worker] = _hw;
+    }
+#endif
+    g_phase_n[worker * MPK_PHASE_PAD_U64] = n;
+  }
+}
+#else
 __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
   if (threadIdx.x != 0 || worker >= MPK_PHASE_MAX_WORKERS) {
     return;
@@ -307,14 +1141,14 @@ __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
     if (!g_phase_arm) {
       return;
     }
-    g_phase_live[worker] = 1;
-  } else if (!g_phase_live[worker]) {
+    g_phase_live[(worker) * MPK_PHASE_PAD_INT] = 1;
+  } else if (!g_phase_live[(worker) * MPK_PHASE_PAD_INT]) {
     return;
   }
   asm volatile("" ::: "memory");
   unsigned long long const t = __builtin_amdgcn_s_memrealtime();
   asm volatile("" ::: "memory");
-  int const base = worker * MPK_PHASE_SLOT_COUNT;
+  int const base = worker * MPK_PHASE_SLOT_STRIDE;
   // Slot 0 accumulates the *inter-layer* span: last layer's slot 11 to this
   // layer's slot 0. It used to record only a timestamp, which left everything
   // between two layers outside the trace -- and that hole is not small. At
@@ -338,11 +1172,18 @@ __device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
     g_phase_span[base + slot] += (t - prev) * 10; // 100 MHz -> ns
   }
   if (slot == MPK_PHASE_SLOT_COUNT - 1) {
-    g_phase_n[worker]++;
-    g_phase_live[worker] = 0;
+    g_phase_n[(worker) * MPK_PHASE_PAD_U64]++;
+    g_phase_live[(worker) * MPK_PHASE_PAD_INT] = 0;
   }
 }
+#endif // MPK_PHASE_LDS
 #define MPK_PHASE_MARK(worker, slot) mpk_phase_mark((worker), (slot))
+#elif defined(MPK_ATT_MARK)
+// Thread-trace phase marker: an s_mov_b32 m0 whose immediate 0x4D500000 | slot
+// names the phase. Not s_ttracedata: its user data breaks the ATT decoder's
+// code-object mapping, so no instruction can be attributed.
+#define MPK_PHASE_MARK(worker, slot)                                           \
+  asm volatile("s_mov_b32 m0, %0" ::"i"(0x4D500000 | (slot)) : "m0")
 #else
 #define MPK_PHASE_MARK(worker, slot)                                           \
   do {                                                                         \
@@ -416,12 +1257,17 @@ __device__ __forceinline__ void
 // carries all three. The XCD matters because every barrier here is either
 // per-XCD (the QKV epoch) or cross-XCD (attn_global, MoE W13->W2), and
 // telling those apart is exactly what identifies the blocking worker.
+#ifdef MPK_MULTI_DEV
+#define MPK_WS_BLK (g_mpk_dev_worker_base + (int)blockIdx.x)
+#else
+#define MPK_WS_BLK ((int)blockIdx.x)
+#endif
 __device__ int *g_ws_dev;
 
 __device__ __forceinline__ void
     mpk_ws_phase(int phase, int layer, int xcd, int tid) {
   if (tid == 0 && g_ws_dev != nullptr) {
-    __atomic_store_n(&g_ws_dev[blockIdx.x * 4 + 3],
+    __atomic_store_n(&g_ws_dev[MPK_WS_BLK * 4 + 3],
                      50000000 + xcd * 100000 + phase * 1000 + (layer % 1000),
                      __ATOMIC_RELAXED);
   }
@@ -458,7 +1304,7 @@ __device__ int g_ws_nworkers;
 __device__ __forceinline__ void
     mpk_ws_wait_begin(int barrier_id, int expected, int tid) {
   if (tid == 0 && g_ws_dev != nullptr) {
-    int *b = g_ws_dev + g_ws_nworkers * 4 + blockIdx.x * 4;
+    int *b = g_ws_dev + g_ws_nworkers * 4 + MPK_WS_BLK * 4;
     __atomic_store_n(&b[0], barrier_id, __ATOMIC_RELAXED);
     __atomic_store_n(&b[2], expected, __ATOMIC_RELAXED);
     __atomic_store_n(&b[3], 0, __ATOMIC_RELAXED);
@@ -468,7 +1314,7 @@ __device__ __forceinline__ void
 __device__ __forceinline__ void
     mpk_ws_wait_tick(int observed, int spins, int tid) {
   if (tid == 0 && g_ws_dev != nullptr) {
-    int *b = g_ws_dev + g_ws_nworkers * 4 + blockIdx.x * 4;
+    int *b = g_ws_dev + g_ws_nworkers * 4 + MPK_WS_BLK * 4;
     __atomic_store_n(&b[1], observed, __ATOMIC_RELAXED);
     __atomic_store_n(&b[3], spins, __ATOMIC_RELAXED);
   }
@@ -486,7 +1332,7 @@ __device__ __forceinline__ void
 __device__ __forceinline__ void
     mpk_ws_wait_aux(int a0, int a1, int a2, int a3, int tid) {
   if (tid == 0 && g_ws_dev != nullptr) {
-    int *b = g_ws_dev + g_ws_nworkers * 8 + blockIdx.x * 4;
+    int *b = g_ws_dev + g_ws_nworkers * 8 + MPK_WS_BLK * 4;
     __atomic_store_n(&b[0], a0, __ATOMIC_RELAXED);
     __atomic_store_n(&b[1], a1, __ATOMIC_RELAXED);
     // b[2] and b[3] belong to the per-wave masks below -- not written here.
@@ -520,7 +1366,7 @@ __device__ __forceinline__ void
 // Anything less names the waves that never got the release.
 __device__ __forceinline__ void mpk_ws_wave_exit(int wave, int tid) {
   if ((tid & 63) == 0 && g_ws_dev != nullptr) {
-    int *b = g_ws_dev + g_ws_nworkers * 8 + blockIdx.x * 4;
+    int *b = g_ws_dev + g_ws_nworkers * 8 + MPK_WS_BLK * 4;
     __atomic_fetch_or(&b[3], 1 << (wave & 31), __ATOMIC_RELAXED);
   }
 }
@@ -531,7 +1377,7 @@ __device__ __forceinline__ void mpk_ws_wave_exit(int wave, int tid) {
 // reason. Per-wave clears race with nothing, and need no barrier.
 __device__ __forceinline__ void mpk_ws_wave_clear(int wave, int tid) {
   if ((tid & 63) == 0 && g_ws_dev != nullptr) {
-    int *b = g_ws_dev + g_ws_nworkers * 8 + blockIdx.x * 4;
+    int *b = g_ws_dev + g_ws_nworkers * 8 + MPK_WS_BLK * 4;
     __atomic_fetch_and(&b[2], ~(1 << (wave & 31)), __ATOMIC_RELAXED);
     __atomic_fetch_and(&b[3], ~(1 << (wave & 31)), __ATOMIC_RELAXED);
   }
@@ -555,7 +1401,7 @@ __device__ __forceinline__ void mpk_ws_wave_clear(int wave, int tid) {
 // __syncthreads, so the question becomes which wave fails to reach it.
 __device__ __forceinline__ void mpk_ws_wave_sync(int wave, int tid) {
   if ((tid & 63) == 0 && g_ws_dev != nullptr) {
-    int *b = g_ws_dev + g_ws_nworkers * 8 + blockIdx.x * 4;
+    int *b = g_ws_dev + g_ws_nworkers * 8 + MPK_WS_BLK * 4;
     __atomic_fetch_or(&b[2], 1 << (wave & 31), __ATOMIC_RELAXED);
   }
 }
@@ -580,7 +1426,7 @@ __device__ __forceinline__ void mpk_ws_wave_sync(int wave, int tid) {
 // a negative so the host can distinguish it from a poll count.
 __device__ __forceinline__ void mpk_ws_mark(int code, int aux, int tid) {
   if (tid == 0 && g_ws_dev != nullptr) {
-    int *b = g_ws_dev + g_ws_nworkers * 4 + blockIdx.x * 4;
+    int *b = g_ws_dev + g_ws_nworkers * 4 + MPK_WS_BLK * 4;
     __atomic_store_n(
         &b[3], -(code * 100000 + (aux % 100000)), __ATOMIC_RELAXED);
   }
@@ -615,6 +1461,25 @@ __device__ __forceinline__ void mpk_ws_mark(int code, int aux, int tid) {
 #define MPK_WS_WAIT_TICK(observed, spins) ((void)0)
 #endif
 
+#if defined(MPK_MULTI_DEV) && defined(MPK_SPEC_VSLOT) // MDEV_SPEC
+// The virtual-slot spec state is read and written by workers and schedulers on every device, so it lives in
+// one buffer (device 0) whose address each device holds in its constant bank: a __device__ array would exist
+// once per device. volatile: on gfx940+ every access is a system-scope (sc0 sc1) load or store.
+struct MpkSpecShared {
+  int state[4];  // [0] 0 = not admitted, 1 = live, 2 = done; [1] n, [2] start step, [3] kind
+  long long prev_in[MPK_MAX_NUM_BATCHED_TOKENS];
+  int pages[MPK_MAX_NUM_PAGES + 1];
+  unsigned long long stats[4];
+};
+__constant__ MpkSpecShared volatile *g_spec_sh;
+#define g_spec_state (g_spec_sh->state)
+#define g_spec_prev_in (g_spec_sh->prev_in)
+#define g_spec_pages (g_spec_sh->pages)
+#define g_spec_stats (g_spec_sh->stats)
+#define MPK_SPEC_CV volatile
+#else
+#define MPK_SPEC_CV
+#endif
 #if defined(MIRAGE_GRACE_HOPPER)
 #include "tasks/hopper/task_header.cuh"
 #elif defined(MIRAGE_GRACE_BLACKWELL)
@@ -692,6 +1557,27 @@ __device__ __forceinline__ unsigned long long get_wallclock_ns() {
 using bfloat16 = type::bfloat16_t;
 using namespace mirage::runtime;
 using namespace kernel;
+#ifdef MPK_ML_STAGE
+// Inline-asm LDS-DMA for the layer-boundary row staging: invisible to the
+// compiler's wait model, so no vmcnt is inserted before later LDS reads.
+// s_nop 4 covers a readfirstlane'd SGPR operand; s_nop 0 is the M0 wait state.
+__device__ __forceinline__ void mpk_mls_dma(i32x4_t rsrc, unsigned lds, unsigned voff,
+                                            bool b16) {
+  if (b16) {
+    asm volatile("s_nop 4\n\ts_mov_b32 m0, %[l]\n\ts_nop 0\n\t"
+                 "buffer_load_dwordx4 %[v], %[r], 0 offen lds\n"
+                 :
+                 : [v] "v"(voff), [r] "s"(rsrc), [l] "s"(lds)
+                 : "memory", "m0");
+  } else {
+    asm volatile("s_nop 4\n\ts_mov_b32 m0, %[l]\n\ts_nop 0\n\t"
+                 "buffer_load_dword %[v], %[r], 0 offen lds\n"
+                 :
+                 : [v] "v"(voff), [r] "s"(rsrc), [l] "s"(lds)
+                 : "memory", "m0");
+  }
+}
+#endif
 // Configurations for the MPK runtime
 // #define MPK_MAX_NUM_BATCHED_REQUESTS 16
 // #define MPK_MAX_NUM_BATCHED_TOKENS 64
@@ -776,14 +1662,34 @@ using namespace kernel;
 // =============================================================================
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
 
-// Number of XCDs on MI300X
-constexpr int MI300X_NUM_XCDS = 8;
+#ifndef MPK_NUM_XCDS
+#define MPK_NUM_XCDS 8
+#endif
+// Physical XCDs on an SPX agent, independent of how many we choose to use.
+#define MPK_XCD_HW 8
+// First physical XCD of the subset. 0 = the dies close to memory range 0,
+// 4 = those close to range 1.
+#ifndef MPK_XCD_BASE
+#define MPK_XCD_BASE 0
+#endif
+#ifdef MPK_XCD_SUBSET
+// Dense per-die worker-rank counters, zeroed by prepare_kernel each launch.
+__device__ int g_xcd_subset_rank[MPK_XCD_HW];
+__device__ int g_xcd_sched_rank[MPK_XCD_HW];
+#endif
+#ifdef MPK_XCD_SUBSET
+#define MPK_XCD_OVERSUB (2 * MPK_XCD_HW / MPK_NUM_XCDS)
+#else
+#define MPK_XCD_OVERSUB 1
+#endif
+constexpr int MI300X_NUM_XCDS = MPK_NUM_XCDS;
 
-// Get the XCD (XCC) ID for the current thread
+// Physical XCC_ID is 0-7 even in DPX. Fold into the local 0..N-1 index
+// (DPX partition 1 is XCCs 4-7 -> 0-3).
 __device__ __forceinline__ int get_current_xcd_id() {
   int xcd_id;
-  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)" : "=s"(xcd_id));
-  return xcd_id;
+  MPK_GET_XCC_ID16(xcd_id);
+  return xcd_id % MPK_NUM_XCDS;
 }
 
 // Per-block shared state for XCD info (computed once at block start)
@@ -829,6 +1735,49 @@ __device__ __forceinline__ void
 #else
                           int tile_idx);
 #endif
+#endif
+
+#ifdef MPK_LM_PF0
+// MPK_LM_PF0_V1: generated next to _execute_gang_task (persistent_kernel.py).
+__device__ __forceinline__ void _mpk_lm_pf0(TaskDesc const *task_desc,
+                                            int tile_idx);
+#endif
+#ifdef MPK_LM_LEADER_INV
+#ifndef MPK_AID_SPLIT_FLAGS
+#error "MPK_LM_LEADER_INV needs MPK_AID_SPLIT_FLAGS (the AID flag replicas)"
+#endif
+// The LM head's dependency acquire with one L2 invalidate per XCD: every
+// LM-head worker of an XCD waits on the same event, the first to pass it
+// invalidates the shared L2 and publishes the iteration, the rest wait for
+// that and drop only their vL1. Claim word at +xcc*32, published iteration
+// at +16; the flag replicas are cleared per launch and pc_iter starts at 1.
+constexpr int MPK_AID_LMINV_BASE_INTS = MPK_AID_L2CLEAN_BASE_INTS + 8 * 32;
+static_assert(MPK_AID_LMINV_BASE_INTS + 8 * 32 <= MPK_AID_WSF32_BASE_INTS,
+              "MPK_LM_LEADER_INV words overlap MPK_AID_WSF32");
+__device__ __forceinline__ void mpk_lm_dep_acquire(bool lm, int iter) {
+  if (lm) {
+    unsigned xcc;
+    MPK_GET_XCC_ID16(xcc);
+    xcc &= 7;
+    int *w = g_aid_flag_rep[xcc >> 2];
+    if (w != nullptr) {
+      w += MPK_AID_LMINV_BASE_INTS + (int)xcc * 32;
+      if (atomicMax(w, iter) < iter) {
+        asm volatile("buffer_inv" MPK_DEV_SC_INV "\n s_waitcnt vmcnt(0)" ::: "memory");
+        __hip_atomic_store(w + 16, iter, __ATOMIC_RELAXED,
+                           __HIP_MEMORY_SCOPE_AGENT);
+      } else {
+        while (__hip_atomic_load(w + 16, __ATOMIC_RELAXED,
+                                 __HIP_MEMORY_SCOPE_AGENT) < iter) {
+          __builtin_amdgcn_s_sleep(1);
+        }
+        asm volatile("buffer_inv sc0" ::: "memory");
+      }
+      return;
+    }
+  }
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, MPK_DEV_FENCE_ACQ);
+}
 #endif
 
 // Helper: check if a task type is a gang task
@@ -925,6 +1874,23 @@ __global__ void init_kernel(RuntimeConfig config) {
   }
 }
 
+// Increment an event counter and publish the new value into both AID mirrors.
+// Returns the PREVIOUS value, exactly like atom_add_release_gpu_u64, so every
+// `count + amount == expected` test at the call sites is unchanged.
+__device__ __forceinline__ unsigned long long
+    mpk_evctr_add(EventCounter *base, int idx, unsigned long long amt) {
+  unsigned long long old = atom_add_release_gpu_u64(
+      reinterpret_cast<unsigned long long *>(&base[idx]), amt);
+#if defined(MPK_AID_EVCTR2) && defined(MPK_AID_SPLIT_FLAGS)
+  // Monotone per-XCD slot; falls back to the shared counter only if the
+  // replicas are unavailable.
+  (void)mpk_aid_evctr2_pub(idx, amt);
+#elif defined(MPK_AID_EVCTR) && defined(MPK_AID_SPLIT_FLAGS)
+  mpk_aid_evctr_pub(idx, old + amt);
+#endif
+  return old;
+}
+
 __global__ void prepare_kernel(RuntimeConfig config,
                                int end_of_task_graph_event_pos) {
   // Initialize worker queue last task id
@@ -975,7 +1941,12 @@ __global__ void prepare_kernel(RuntimeConfig config,
   }
   if (config.worker_xcd_ready_count != nullptr && blockIdx.x == 0 &&
       threadIdx.x == 0) {
+#ifdef MPK_CPX_SCOPE // MDEV_CPX_BOUNDARY
+    __hip_atomic_store(config.worker_xcd_ready_count, 0, __ATOMIC_RELAXED,
+                       __HIP_MEMORY_SCOPE_SYSTEM);
+#else
     *config.worker_xcd_ready_count = 0;
+#endif
   }
   // Reset per-XCD per-event task thresholds (scheduler will recompute on first
   // iteration) In precomputed dispatch mode, thresholds are set by host — do
@@ -1027,7 +1998,7 @@ __global__ void prepare_kernel(RuntimeConfig config,
   // Per-XCD release flags mirror iter_ready and are polled with ld_nt, so a
   // stale non-zero here would release iteration 1 before it is ready.
   if (config.precomp_iter_xcd_release != nullptr) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < 8 * 16;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < MPK_NUM_XCDS * 16;
          i += blockDim.x * gridDim.x) {
       config.precomp_iter_xcd_release[i] = 0;
     }
@@ -1043,6 +2014,12 @@ __global__ void prepare_kernel(RuntimeConfig config,
       threadIdx.x == 0) {
     *config.dynamic_worker_id_counter = 0;
   }
+#ifdef MPK_XCD_SUBSET
+  if (blockIdx.x == 0 && threadIdx.x < MPK_XCD_HW) {
+    g_xcd_subset_rank[threadIdx.x] = 0;
+    g_xcd_sched_rank[threadIdx.x] = 0;
+  }
+#endif
 #endif
 
   // Send event to scheduler[0]
@@ -1053,9 +2030,680 @@ __global__ void prepare_kernel(RuntimeConfig config,
     config.sched_queues[0][0] = end_of_task_graph_event_pos;
     config.sched_queue_last_ready_event_id[0] = 1;
   }
+#ifdef MPK_CPX_SCOPE // MDEV_CPX_BOUNDARY: write this kernel's resets back past XCC 0's L2
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+#endif
 }
 
-#ifdef MODE_OFFLINE
+#if defined(MODE_OFFLINE) && defined(MPK_SPEC_VSLOT)
+// One real request (0); every token of a pass gets its own batch slot (see the patch notes). Drafts come
+// from g_spec_oracle (host: MPK_SPEC_ORACLE / MPK_SPEC_K / MPK_SPEC_CORRUPT).
+__device__ long long *g_spec_oracle = nullptr;
+#ifdef MPK_SPEC_ORACLE_WINS  // timing tool: oracle drafts win over the drafter's
+#define MPK_SPEC_ORACLE_YIELD && g_spec_oracle == nullptr
+#else
+#define MPK_SPEC_ORACLE_YIELD
+#endif
+__device__ int g_spec_oracle_n = 0;
+__device__ int g_spec_k = 0;
+__device__ int g_spec_corrupt = 0;
+// MPK_SPEC_CONF > 0 (DFlash): a verify pass checks only the confident prefix of the drafts, while the running
+// product of the drafter's chosen-token probabilities stays >= MPK_SPEC_CONF (at least MPK_SPEC_KMIN drafts).
+__device__ float g_spec_conf = 0.f;
+__device__ int g_spec_kmin = 0;
+#if defined(MPK_E3_CONF) && defined(MPK_E3_CONF_LOG)
+__device__ float g_e3_conf_log[8];  // the probabilities of the drafts the last verify pass was built from
+__device__ int g_e3_conf_logn = 0;
+#endif
+#if defined(MPK_E3_CONF) && defined(MPK_E3_CONF_D)
+__device__ float g_spec_confd = 0.f;  // MPK_E3_CONF_D: the EAGLE3 chain continues while the product >= this
+#endif
+#ifndef MPK_MULTI_DEV
+__device__ __attribute__((aligned(16))) int g_spec_state[4];  // [0] 0 = not admitted, 1 = live, 2 = done; [1] n, [2] start step, [3] kind
+__device__ long long g_spec_prev_in[MPK_MAX_NUM_BATCHED_TOKENS];
+__device__ int g_spec_pages[MPK_MAX_NUM_PAGES + 1];  // [0] count, then the request's pages in order
+__device__ unsigned long long g_spec_stats[4];       // passes, decode passes, drafted, accepted
+#endif
+#if defined(MPK_TAIL_NO111) && defined(MPK_TAIL_NO111_CHECK)
+#error "MPK_TAIL_NO111_CHECK keeps task 111: not with MPK_TAIL_NO111"
+#endif
+#if (defined(MPK_TAIL_NO111) || defined(MPK_TAIL_NO111_CHECK)) && \
+    (!defined(MPK_SPEC_VSLOT) || !defined(MPK_VSLOT_FAST) || !defined(MPK_EAGLE3))
+#error "MPK_TAIL_NO111: the MPK_VSLOT_FAST prepare and the EAGLE3 draft"
+#endif
+#ifndef MPK_VSLOT_FAST
+__device__ __forceinline__ bool prepare_next_batch(RuntimeConfig const &config) {
+  constexpr int S = MPK_MAX_NUM_BATCHED_TOKENS;
+  static_assert(MPK_MAX_NUM_BATCHED_REQUESTS == S, "MPK_SPEC_VSLOT: one batch slot per token");
+  int page_queue_head = *config.page_queue_head;
+  int page_queue_tail = *config.page_queue_tail;
+  int MPK_SPEC_CV *const st = g_spec_state;
+  long long *const tok = config.tokens;  // request 0's row
+  int const prompt_len = config.prompt_length[0];
+  bool done = false;
+  // ---- finalize the previous pass
+  if (st[0] == 1) {
+    int const n = st[1], s = st[2], kind = st[3];
+    int step = s + n;
+    if (kind == 0) {  // prefill chunk; only a chunk that ends the prompt predicts a new token
+      if (step >= prompt_len && step < config.max_seq_length) {
+        tok[step] = config.output_tokens[n - 1];
+      }
+    } else {  // inputs [tok[s], d1..d_(n-1)] at positions s..s+n-1; o_j predicts position s+j+1
+      int a = 0;
+      while (a < n - 1 && g_spec_prev_in[a + 1] == config.output_tokens[a]) {
+        a++;
+      }
+      step = s;
+      for (int j = 0; j <= a; j++) {
+        if (s + j + 1 >= config.max_seq_length) {
+          break;
+        }
+        tok[s + j + 1] = config.output_tokens[j];
+        step = s + j + 1;
+        if (config.output_tokens[j] == config.eos_token_id) {
+          break;  // a one-token decode stops right after emitting EOS
+        }
+      }
+#ifdef MPK_SPEC_DEBUG
+#ifndef MPK_SPEC_DEBUG_N
+#define MPK_SPEC_DEBUG_N 12
+#endif
+      if (g_spec_stats[1] < MPK_SPEC_DEBUG_N) {
+        printf("[SPECDBG] s=%d n=%d in=%lld,%lld,%lld,%lld out=%lld,%lld,%lld,%lld acc=%d\n", s, n,
+               g_spec_prev_in[0], n > 1 ? g_spec_prev_in[1] : -1, n > 2 ? g_spec_prev_in[2] : -1,
+               n > 3 ? g_spec_prev_in[3] : -1, config.output_tokens[0], n > 1 ? config.output_tokens[1] : -1,
+               n > 2 ? config.output_tokens[2] : -1, n > 3 ? config.output_tokens[3] : -1, step - s - 1);
+      }
+#endif
+      g_spec_stats[1]++;
+      g_spec_stats[2] += (unsigned long long)(n - 1);
+      g_spec_stats[3] += (unsigned long long)(step - s - 1);
+#if defined(MPK_E3_CONF) && defined(MPK_E3_CONF_LOG)
+      if (g_e3_conf_logn < (MPK_E3_CONF_LOG)) {
+        g_e3_conf_logn++;
+        printf("[E3CONF] k=%d acc=%d p=%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n", n - 1, step - s - 1, g_e3_conf_log[0],
+               g_e3_conf_log[1], g_e3_conf_log[2], g_e3_conf_log[3], g_e3_conf_log[4], g_e3_conf_log[5],
+               g_e3_conf_log[6]);
+      }
+#endif
+    }
+    config.step[0] = step;
+    if (step + 1 >= config.max_seq_length ||
+        (tok[step] == config.eos_token_id && step >= prompt_len)) {
+      done = true;
+    }
+  }
+  if (done) {
+    for (int j = 0; j < g_spec_pages[0]; j++) {
+      config.page_queue[page_queue_tail % MPK_MAX_NUM_PAGES] = g_spec_pages[1 + j];
+      page_queue_tail++;
+    }
+    g_spec_pages[0] = 0;
+    st[0] = 2;
+    printf("[SPEC] passes=%llu decode_passes=%llu drafted=%llu accepted=%llu final_step=%d k=%d corrupt=%d\n",
+           g_spec_stats[0], g_spec_stats[1], g_spec_stats[2], g_spec_stats[3], config.step[0], g_spec_k,
+           g_spec_corrupt);
+  }
+  if (st[0] == 2) {
+    for (int i = 0; i < S; i++) {
+      config.request_ids[i] = -1;
+    }
+    for (int i = 0; i <= S; i++) {
+      config.qo_indptr_buffer[i] = 0;
+      config.paged_kv_indptr_buffer[i] = 0;
+    }
+    *config.page_queue_head = page_queue_head;
+    *config.page_queue_tail = page_queue_tail;
+    return false;
+  }
+  if (st[0] == 0) {
+    if (*config.next_request_id >= config.total_num_requests) {
+      return false;
+    }
+    *config.next_request_id = 1;
+    config.step[0] = 0;
+    g_spec_pages[0] = 0;
+    st[0] = 1;
+  }
+  int const step = config.step[0];
+  // ---- build the next pass
+  int n, kind;
+  if (step < prompt_len) {
+    kind = 0;
+    n = min(S, prompt_len - step);
+    for (int j = 0; j < n; j++) {
+      config.input_tokens[j] = tok[step + j];
+      g_spec_prev_in[j] = tok[step + j];
+    }
+  } else {
+    kind = 1;
+    int k = min(g_spec_k, S - 1);
+    if (step + 1 + k >= config.max_seq_length) {
+      k = max(0, config.max_seq_length - step - 2);
+    }
+#ifdef MPK_DFLASH
+    if (kernel::g_df.enabled && g_spec_conf > 0.f) {
+      float pr = 1.f;
+      int ke = 0;
+      for (int i = 1; i <= k; i++) {
+        pr *= __uint_as_float((unsigned)__hip_atomic_load(&kernel::g_df.draft_out[kernel::DF_CONF_SLOT + i - 1],
+                                                           __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM));
+        if (i > g_spec_kmin && pr < g_spec_conf) {
+          break;
+        }
+        ke = i;
+      }
+      k = ke;
+    }
+#endif
+#if defined(MPK_EAGLE3) && defined(MPK_E3_CONF) && defined(MPK_E3_CONF_LOG)
+    if (kernel::g_e3.enabled)
+      for (int i = 0; i < 7; i++)
+        g_e3_conf_log[i] = i < kernel::E3_K ? __uint_as_float((unsigned)__hip_atomic_load(
+                                                   &kernel::g_e3.draft_out[kernel::E3_CONF_SLOT + i], __ATOMIC_RELAXED,
+                                                   __HIP_MEMORY_SCOPE_SYSTEM))
+                                             : -1.f;
+#endif
+#if defined(MPK_EAGLE3) && defined(MPK_E3_CONF)
+    if (kernel::g_e3.enabled && g_spec_conf > 0.f) {  // the drafts' running probability product, as the chain cut it
+      float pr = 1.f;
+      int ke = 0;
+      for (int i = 1; i <= k && i <= kernel::E3_K; i++) {
+        pr *= __uint_as_float((unsigned)__hip_atomic_load(&kernel::g_e3.draft_out[kernel::E3_CONF_SLOT + i - 1],
+                                                           __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM));
+        if (i > g_spec_kmin && pr < g_spec_conf) {
+          break;
+        }
+        ke = i;
+      }
+      k = ke;
+    }
+#endif
+    n = 1 + k;
+    config.input_tokens[0] = tok[step];
+    g_spec_prev_in[0] = tok[step];
+    for (int i = 1; i <= k; i++) {
+      int const q = step + i - prompt_len;
+      long long d = (g_spec_oracle != nullptr && q >= 0 && q < g_spec_oracle_n) ? g_spec_oracle[q] : 0;
+#ifdef MPK_EAGLE3
+      if (kernel::g_e3.enabled MPK_SPEC_ORACLE_YIELD) {
+        d = i <= kernel::E3_K  // E3_CHAIN: draft i in draft_out[i - 1]
+                ? __hip_atomic_load(&kernel::g_e3.draft_out[i - 1], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM)
+                : 0;
+      }
+#endif
+#ifdef MPK_DFLASH
+      if (kernel::g_df.enabled MPK_SPEC_ORACLE_YIELD) {
+        d = i - 1 < kernel::DF_B - 1
+                ? __hip_atomic_load(&kernel::g_df.draft_out[i - 1], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM)
+                : 0;
+      }
+#endif
+      if (g_spec_corrupt > 0 && ((step + i) % g_spec_corrupt) == 0) {
+        d = d + 1;  // a wrong id
+      }
+      config.input_tokens[i] = d;
+      g_spec_prev_in[i] = d;
+    }
+  }
+  int const need = (step + n + MPK_PAGE_SIZE - 1) / MPK_PAGE_SIZE;
+  while (g_spec_pages[0] < need) {
+    g_spec_pages[1 + g_spec_pages[0]] = config.page_queue[page_queue_head % MPK_MAX_NUM_PAGES];
+    page_queue_head++;
+    g_spec_pages[0]++;
+  }
+  int np = 0;
+  for (int j = 0; j < S; j++) {
+    config.qo_indptr_buffer[j] = j < n ? j : n;
+    config.paged_kv_indptr_buffer[j] = np;
+    if (j < n) {
+      config.request_ids[j] = 0;
+      int const p = step + j;
+      int const pages = p / MPK_PAGE_SIZE + 1;
+      for (int t = 0; t < pages; t++) {
+        config.paged_kv_indices_buffer[np + t] = g_spec_pages[1 + t];
+      }
+      config.paged_kv_last_page_len_buffer[j] = p % MPK_PAGE_SIZE + 1;
+      np += pages;
+    } else {
+      config.request_ids[j] = -1;
+    }
+  }
+  config.qo_indptr_buffer[S] = n;
+  config.paged_kv_indptr_buffer[S] = np;
+  st[1] = n;
+  st[2] = step;
+  st[3] = kind;
+  g_spec_stats[0]++;
+  *config.page_queue_head = page_queue_head;
+  *config.page_queue_tail = page_queue_tail;
+  return true;
+}
+#else  // MPK_VSLOT_FAST
+// The spec-state accesses as relaxed system-scope atomics: the scope of the volatile accesses they replace
+// (sc0 sc1) without the s_waitcnt vmcnt(0) the memory legalizer puts after every volatile access, so the
+// loads below overlap. The iteration release that follows prepare_next_batch (__threadfence, then the
+// release stores) waits for the stores.
+#ifdef MPK_TAIL_NO111_CHECK
+__device__ unsigned long long g_n111_chk[3];  // rows, published != task 111, lower-worker rule != task 111
+#endif
+#ifdef MPK_VSF_TS
+__device__ unsigned long long g_vsf_ts[5];  // preload, finalize, draft count, build (s_memrealtime ticks), calls
+#endif
+template <typename T>
+__device__ __forceinline__ T vsf_ld(T MPK_SPEC_CV const *p) {
+  return __hip_atomic_load(const_cast<T *>(p), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+template <typename T, typename U>
+__device__ __forceinline__ void vsf_st(T MPK_SPEC_CV *p, U v) {
+  __hip_atomic_store(const_cast<T *>(p), (T)v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+// The same virtual-slot prepare with every load it can need issued first. Under MPK_MULTI_DEV the spec state is a
+// system-scope (sc0 sc1) buffer on device 0, and the original walked it in dependent chains (the acceptance compare,
+// the confidence product, the drafts, the page list), one memory round trip per step on the iteration boundary.
+// Same reads (some extra, all in bounds), same writes, same values.
+__device__ __forceinline__ bool prepare_next_batch(RuntimeConfig const &config) {
+#ifdef MPK_VSF_PTRS
+  // The RuntimeConfig fields, read once: a store through one of its arrays may alias the struct for the
+  // compiler, which would otherwise re-read the field (a dependent scalar load) after every store.
+  auto const vcf_output_tokens = config.output_tokens;
+  auto const vcf_page_queue_head = config.page_queue_head;
+  auto const vcf_page_queue_tail = config.page_queue_tail;
+  auto const vcf_prompt_length = config.prompt_length;
+  auto const vcf_max_seq_length = config.max_seq_length;
+  auto const vcf_eos_token_id = config.eos_token_id;
+  auto const vcf_step = config.step;
+  auto const vcf_page_queue = config.page_queue;
+  auto const vcf_request_ids = config.request_ids;
+  auto const vcf_qo_indptr_buffer = config.qo_indptr_buffer;
+  auto const vcf_paged_kv_indptr_buffer = config.paged_kv_indptr_buffer;
+  auto const vcf_next_request_id = config.next_request_id;
+  auto const vcf_total_num_requests = config.total_num_requests;
+  auto const vcf_input_tokens = config.input_tokens;
+  auto const vcf_paged_kv_indices_buffer = config.paged_kv_indices_buffer;
+  auto const vcf_paged_kv_last_page_len_buffer = config.paged_kv_last_page_len_buffer;
+  auto const vcf_tokens = config.tokens;
+#define VCF(f) vcf_##f
+#else
+#define VCF(f) config.f
+#endif
+  constexpr int S = MPK_MAX_NUM_BATCHED_TOKENS;
+  static_assert(MPK_MAX_NUM_BATCHED_REQUESTS == S, "MPK_SPEC_VSLOT: one batch slot per token");
+  constexpr int NPG = MPK_MAX_NUM_PAGES + 1;
+#ifdef MPK_VSF_TS
+  unsigned long long const vts0 = __builtin_amdgcn_s_memrealtime();
+#endif
+#ifdef MPK_VSF_HOIST
+  // The host-set spec knobs are __device__ globals: read here, with the first batch, not one round trip later.
+  int const vh_k = g_spec_k, vh_kmin = g_spec_kmin, vh_cor = g_spec_corrupt, vh_orn = g_spec_oracle_n;
+  float const vh_conf = g_spec_conf;
+  long long *const vh_or = g_spec_oracle;
+#define g_spec_k vh_k
+#define g_spec_kmin vh_kmin
+#define g_spec_corrupt vh_cor
+#define g_spec_oracle_n vh_orn
+#define g_spec_conf vh_conf
+#define g_spec_oracle vh_or
+#endif
+  int MPK_SPEC_CV *const st = g_spec_state;
+  long long *const tok = VCF(tokens);  // request 0's row
+  int const st0 = vsf_ld(&st[0]), st1 = vsf_ld(&st[1]), st2 = vsf_ld(&st[2]), st3 = vsf_ld(&st[3]);
+  long long pin[S], otk[S];
+#pragma unroll
+  for (int j = 0; j < S; j++) {
+    pin[j] = vsf_ld(&g_spec_prev_in[j]);
+#ifdef MPK_TAIL_NO111
+    otk[j] = __hip_atomic_load(&kernel::g_e3.draft_out[kernel::E3_TGT_SLOT + j], __ATOMIC_RELAXED,
+                               __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+    otk[j] = VCF(output_tokens)[j];
+#endif
+  }
+  int pg[NPG];
+#pragma unroll
+  for (int j = 0; j < NPG; j++) {
+    pg[j] = vsf_ld(&g_spec_pages[j]);
+  }
+  unsigned long long sts[4];
+#pragma unroll
+  for (int j = 0; j < 4; j++) {
+    sts[j] = vsf_ld(&g_spec_stats[j]);
+  }
+#ifdef MPK_EAGLE3
+  constexpr int EK = kernel::E3_K;
+  bool const e3on = kernel::g_e3.enabled;
+  long long e3d[EK];
+#ifdef MPK_E3_CONF
+  float e3p[EK];
+#endif
+#pragma unroll
+  for (int i = 0; i < EK; i++) {
+    e3d[i] = e3on ? __hip_atomic_load(&kernel::g_e3.draft_out[i], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) : 0;
+#ifdef MPK_E3_CONF
+    e3p[i] = e3on ? __uint_as_float((unsigned)__hip_atomic_load(&kernel::g_e3.draft_out[kernel::E3_CONF_SLOT + i],
+                                                                __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM))
+                  : 0.f;
+#endif
+  }
+#endif
+  int page_queue_head = *VCF(page_queue_head);
+  int page_queue_tail = *VCF(page_queue_tail);
+  int const prompt_len = VCF(prompt_length)[0];
+  bool done = false;
+  int step_reg = 0;
+  bool tok_known = false;  // tok[step_reg] was written by this call: tok_val
+  long long tok_val = 0;
+#ifdef MPK_VSF_TS
+  asm volatile("" ::"v"(st0), "v"(st1), "v"(st2), "v"(st3), "v"((int)pin[S - 1]), "v"((int)otk[S - 1]),
+               "v"(pg[NPG - 1]), "v"((int)sts[3]), "v"(page_queue_head), "v"(page_queue_tail), "v"(prompt_len));
+#ifdef MPK_EAGLE3
+  asm volatile("" ::"v"((int)e3d[EK - 1]));
+#endif
+  unsigned long long const vts1 = __builtin_amdgcn_s_memrealtime();
+#endif
+#ifdef MPK_TAIL_NO111_CHECK
+  if (st0 == 1 && e3on) {
+#pragma unroll
+    for (int j = 0; j < S; j++) {
+      if (j < st1) {
+        long long const a = __hip_atomic_load(&kernel::g_e3.draft_out[kernel::E3_TGT_SLOT + j], __ATOMIC_RELAXED,
+                                              __HIP_MEMORY_SCOPE_SYSTEM);
+        long long const b = __hip_atomic_load(&kernel::g_e3.draft_out[kernel::E3_TGT_SLOT + 8 + j], __ATOMIC_RELAXED,
+                                              __HIP_MEMORY_SCOPE_SYSTEM);
+        g_n111_chk[0] += 1ull;
+        g_n111_chk[1] += a != otk[j] ? 1ull : 0ull;
+        g_n111_chk[2] += b != otk[j] ? 1ull : 0ull;
+      }
+    }
+  }
+#endif
+  // ---- finalize the previous pass
+  if (st0 == 1) {
+    int const n = st1, s = st2, kind = st3;
+    int step = s + n;
+    if (kind == 0) {  // prefill chunk; only a chunk that ends the prompt predicts a new token
+      if (step >= prompt_len && step < VCF(max_seq_length)) {
+        long long ov = 0;
+#pragma unroll
+        for (int j = 0; j < S; j++) {
+          if (j == n - 1) ov = otk[j];
+        }
+        tok[step] = ov;
+        tok_known = true;
+        tok_val = ov;
+      }
+    } else {  // inputs [tok[s], d1..d_(n-1)] at positions s..s+n-1; o_j predicts position s+j+1
+      int a = 0;
+#pragma unroll
+      for (int j = 0; j + 1 < S; j++) {
+        if (a == j && a < n - 1 && pin[j + 1] == otk[j]) a++;
+      }
+      step = s;
+      bool go = true;  // the original loop's breaks: before j at max_seq_length, after j on EOS
+#pragma unroll
+      for (int j = 0; j < S; j++) {
+        if (go && j <= a) {
+          if (s + j + 1 >= VCF(max_seq_length)) {
+            go = false;
+          } else {
+            tok[s + j + 1] = otk[j];
+            step = s + j + 1;
+            tok_known = true;
+            tok_val = otk[j];
+            if (otk[j] == VCF(eos_token_id)) {
+              go = false;  // a one-token decode stops right after emitting EOS
+            }
+          }
+        }
+      }
+#ifdef MPK_SPEC_DEBUG
+#ifndef MPK_SPEC_DEBUG_N
+#define MPK_SPEC_DEBUG_N 12
+#endif
+      if (sts[1] < MPK_SPEC_DEBUG_N) {
+        printf("[SPECDBG] s=%d n=%d in=%lld,%lld,%lld,%lld out=%lld,%lld,%lld,%lld acc=%d\n", s, n, pin[0],
+               n > 1 ? pin[1] : -1, n > 2 ? pin[2] : -1, n > 3 ? pin[3] : -1, otk[0], n > 1 ? otk[1] : -1,
+               n > 2 ? otk[2] : -1, n > 3 ? otk[3] : -1, step - s - 1);
+      }
+#endif
+      sts[1] += 1ull;
+      sts[2] += (unsigned long long)(n - 1);
+      sts[3] += (unsigned long long)(step - s - 1);
+      vsf_st(&g_spec_stats[1], sts[1]);
+      vsf_st(&g_spec_stats[2], sts[2]);
+      vsf_st(&g_spec_stats[3], sts[3]);
+#if defined(MPK_E3_CONF) && defined(MPK_E3_CONF_LOG)
+      if (g_e3_conf_logn < (MPK_E3_CONF_LOG)) {
+        g_e3_conf_logn++;
+        printf("[E3CONF] k=%d acc=%d p=%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n", n - 1, step - s - 1, g_e3_conf_log[0],
+               g_e3_conf_log[1], g_e3_conf_log[2], g_e3_conf_log[3], g_e3_conf_log[4], g_e3_conf_log[5],
+               g_e3_conf_log[6]);
+      }
+#endif
+    }
+    VCF(step)[0] = step;
+    step_reg = step;
+    if (step + 1 >= VCF(max_seq_length) ||
+        ((tok_known ? tok_val : tok[step]) == VCF(eos_token_id) && step >= prompt_len)) {
+      done = true;
+    }
+  }
+  if (done) {
+#pragma unroll
+    for (int j = 0; j + 1 < NPG; j++) {
+      if (j < pg[0]) {
+        VCF(page_queue)[page_queue_tail % MPK_MAX_NUM_PAGES] = pg[1 + j];
+        page_queue_tail++;
+      }
+    }
+    vsf_st(&g_spec_pages[0], 0);
+    pg[0] = 0;
+    vsf_st(&st[0], 2);
+#ifdef MPK_VSF_TS
+    if (g_vsf_ts[4] > 0) {
+      double const vn = (double)g_vsf_ts[4];
+      printf("[VSFTS] n=%llu preload=%.2f finalize=%.2f k=%.2f build=%.2f us\n", g_vsf_ts[4],
+             g_vsf_ts[0] / vn / 100.0, g_vsf_ts[1] / vn / 100.0, g_vsf_ts[2] / vn / 100.0, g_vsf_ts[3] / vn / 100.0);
+    }
+#endif
+#ifdef MPK_TAIL_NO111_CHECK
+    printf("[N111] rows=%llu mismatch111=%llu mismatch_low=%llu\n", g_n111_chk[0], g_n111_chk[1], g_n111_chk[2]);
+#endif
+    printf("[SPEC] passes=%llu decode_passes=%llu drafted=%llu accepted=%llu final_step=%d k=%d corrupt=%d\n",
+           sts[0], sts[1], sts[2], sts[3], step_reg, g_spec_k, g_spec_corrupt);
+  }
+#ifdef MPK_VSF_TS
+  unsigned long long const vts2 = __builtin_amdgcn_s_memrealtime();
+#endif
+  int const stn = done ? 2 : st0;
+  if (stn == 2) {
+    for (int i = 0; i < S; i++) {
+      VCF(request_ids)[i] = -1;
+    }
+    for (int i = 0; i <= S; i++) {
+      VCF(qo_indptr_buffer)[i] = 0;
+      VCF(paged_kv_indptr_buffer)[i] = 0;
+    }
+    *VCF(page_queue_head) = page_queue_head;
+    *VCF(page_queue_tail) = page_queue_tail;
+    return false;
+  }
+  if (stn == 0) {
+    if (*VCF(next_request_id) >= VCF(total_num_requests)) {
+      return false;
+    }
+    *VCF(next_request_id) = 1;
+    VCF(step)[0] = 0;
+    step_reg = 0;
+    vsf_st(&g_spec_pages[0], 0);
+    pg[0] = 0;
+    vsf_st(&st[0], 1);
+  }
+  int const step = step_reg;
+  // ---- build the next pass
+  int n, kind;
+  if (step < prompt_len) {
+    kind = 0;
+    n = min(S, prompt_len - step);
+    for (int j = 0; j < n; j++) {
+      long long const t = tok[step + j];
+      VCF(input_tokens)[j] = t;
+      vsf_st(&g_spec_prev_in[j], t);
+    }
+  } else {
+    kind = 1;
+    int k = min(g_spec_k, S - 1);
+    if (step + 1 + k >= VCF(max_seq_length)) {
+      k = max(0, VCF(max_seq_length) - step - 2);
+    }
+#ifdef MPK_DFLASH
+    if (kernel::g_df.enabled && g_spec_conf > 0.f) {
+      float pr = 1.f;
+      int ke = 0;
+      for (int i = 1; i <= k; i++) {
+        pr *= __uint_as_float((unsigned)__hip_atomic_load(&kernel::g_df.draft_out[kernel::DF_CONF_SLOT + i - 1],
+                                                           __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM));
+        if (i > g_spec_kmin && pr < g_spec_conf) {
+          break;
+        }
+        ke = i;
+      }
+      k = ke;
+    }
+#endif
+#if defined(MPK_EAGLE3) && defined(MPK_E3_CONF) && defined(MPK_E3_CONF_LOG)
+    if (e3on) {
+#pragma unroll
+      for (int i = 0; i < 7; i++) {
+        float lv = -1.f;
+#pragma unroll
+        for (int q = 0; q < EK; q++) {
+          if (q == i) lv = e3p[q];
+        }
+        g_e3_conf_log[i] = lv;
+      }
+    }
+#endif
+#if defined(MPK_EAGLE3) && defined(MPK_E3_CONF)
+    if (e3on && g_spec_conf > 0.f) {  // the drafts' running probability product, as the chain cut it
+      float pr = 1.f;
+      int ke = 0;
+      bool cut = false;
+#pragma unroll
+      for (int i = 1; i <= EK; i++) {
+        if (!cut && i <= k) {
+          pr *= e3p[i - 1];
+          if (i > g_spec_kmin && pr < g_spec_conf) {
+            cut = true;
+          } else {
+            ke = i;
+          }
+        }
+      }
+      k = ke;
+    }
+#endif
+    n = 1 + k;
+    long long const t0 = tok_known ? tok_val : tok[step];
+    VCF(input_tokens)[0] = t0;
+    vsf_st(&g_spec_prev_in[0], t0);
+#pragma unroll
+    for (int i = 1; i < S; i++) {
+      if (i <= k) {
+        int const q = step + i - prompt_len;
+        long long d = (g_spec_oracle != nullptr && q >= 0 && q < g_spec_oracle_n) ? g_spec_oracle[q] : 0;
+#ifdef MPK_EAGLE3
+        if (e3on MPK_SPEC_ORACLE_YIELD) {
+          long long dv = 0;
+#pragma unroll
+          for (int q2 = 0; q2 < EK; q2++) {
+            if (q2 == i - 1) dv = e3d[q2];
+          }
+          d = i <= EK ? dv : 0;
+        }
+#endif
+#ifdef MPK_DFLASH
+        if (kernel::g_df.enabled MPK_SPEC_ORACLE_YIELD) {
+          d = i - 1 < kernel::DF_B - 1
+                  ? __hip_atomic_load(&kernel::g_df.draft_out[i - 1], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM)
+                  : 0;
+        }
+#endif
+        if (g_spec_corrupt > 0 && ((step + i) % g_spec_corrupt) == 0) {
+          d = d + 1;  // a wrong id
+        }
+        VCF(input_tokens)[i] = d;
+        vsf_st(&g_spec_prev_in[i], d);
+      }
+    }
+  }
+#ifdef MPK_VSF_TS
+  unsigned long long const vts3 = __builtin_amdgcn_s_memrealtime();
+#endif
+  int const need = (step + n + MPK_PAGE_SIZE - 1) / MPK_PAGE_SIZE;
+  if (pg[0] < need) {  // a new page: the original walk, then reload the list
+    while (g_spec_pages[0] < need) {
+      g_spec_pages[1 + g_spec_pages[0]] = VCF(page_queue)[page_queue_head % MPK_MAX_NUM_PAGES];
+      page_queue_head++;
+      g_spec_pages[0]++;
+    }
+#pragma unroll
+    for (int j = 0; j < NPG; j++) {
+      pg[j] = vsf_ld(&g_spec_pages[j]);
+    }
+  }
+  int np = 0;
+#pragma unroll
+  for (int j = 0; j < S; j++) {
+    VCF(qo_indptr_buffer)[j] = j < n ? j : n;
+    VCF(paged_kv_indptr_buffer)[j] = np;
+    if (j < n) {
+      VCF(request_ids)[j] = 0;
+      int const p = step + j;
+      int const pages = p / MPK_PAGE_SIZE + 1;
+#pragma unroll
+      for (int t = 0; t + 1 < NPG; t++) {
+        if (t < pages) {
+          VCF(paged_kv_indices_buffer)[np + t] = pg[1 + t];
+        }
+      }
+      VCF(paged_kv_last_page_len_buffer)[j] = p % MPK_PAGE_SIZE + 1;
+      np += pages;
+    } else {
+      VCF(request_ids)[j] = -1;
+    }
+  }
+  VCF(qo_indptr_buffer)[S] = n;
+  VCF(paged_kv_indptr_buffer)[S] = np;
+  vsf_st(&st[1], n);
+  vsf_st(&st[2], step);
+  vsf_st(&st[3], kind);
+  vsf_st(&g_spec_stats[0], sts[0] + 1ull);
+  *VCF(page_queue_head) = page_queue_head;
+  *VCF(page_queue_tail) = page_queue_tail;
+#ifdef MPK_VSF_TS
+  unsigned long long const vts4 = __builtin_amdgcn_s_memrealtime();
+  g_vsf_ts[0] += vts1 - vts0;
+  g_vsf_ts[1] += vts2 - vts1;
+  g_vsf_ts[2] += vts3 - vts2;
+  g_vsf_ts[3] += vts4 - vts3;
+  g_vsf_ts[4] += 1ull;
+#endif
+  return true;
+}
+#undef VCF
+#ifdef MPK_VSF_HOIST
+#undef g_spec_k
+#undef g_spec_kmin
+#undef g_spec_corrupt
+#undef g_spec_oracle_n
+#undef g_spec_conf
+#undef g_spec_oracle
+#endif
+#endif  // MPK_VSLOT_FAST
+#endif
+#if defined(MODE_OFFLINE) && !defined(MPK_SPEC_VSLOT)
 // TODO: parallelize this processing
 __device__ __forceinline__ bool
     prepare_next_batch(RuntimeConfig const &config) {
@@ -1263,6 +2911,224 @@ __device__ __forceinline__ bool
   }
 }
 #endif
+// MPK_END_DIRECT under MPK_SPEC_VSLOT: the virtual-slot prepare above is single-threaded and uses no
+// LDS, so the argmax worker runs it as is.
+#if defined(MODE_OFFLINE) && defined(MPK_END_DIRECT) && defined(MPK_SPEC_VSLOT)
+__device__ __forceinline__ bool prepare_next_batch_w(RuntimeConfig const &config) {
+  return prepare_next_batch(config);
+}
+// MPK_END_DIRECT_V2: the worker-side copy of prepare_next_batch (MPK_END_DIRECT).
+#elif defined(MODE_OFFLINE) && defined(MPK_END_DIRECT)
+// TODO: parallelize this processing
+__device__ __forceinline__ bool
+    prepare_next_batch_w(RuntimeConfig const &config) {
+  int smem_kv_indices[MPK_MAX_NUM_PAGES]; // local: no worker LDS
+  int page_queue_head = *config.page_queue_head;
+  int page_queue_tail = *config.page_queue_tail;
+  // Step 1: finalize previous batch
+  for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
+    int16_t request_id = config.request_ids[i];
+    if (request_id != -1) {
+      // Step 1.1: move output_tokens to tokens
+      int step = config.step[request_id];
+      int qo_indptr = config.qo_indptr_buffer[i];
+      int num_tokens = config.qo_indptr_buffer[i + 1] - qo_indptr;
+      int prompt_len = config.prompt_length[request_id];
+      for (int j = 0; j < num_tokens; j++) {
+        if (step + j + 1 >= prompt_len &&
+            step + j + 1 < config.max_seq_length) {
+          config.tokens[request_id * MPK_MAX_SEQ_LENGTH + step + j + 1] =
+              config.output_tokens[qo_indptr + j];
+        }
+      }
+      config.step[request_id] = step + num_tokens;
+#ifdef MPK_ENABLE_PROFILING
+      if (config.profiling_num_iters > 0 &&
+          step + num_tokens >= config.profiling_num_iters)
+#else
+      if ((step + num_tokens + 1 >= config.max_seq_length) ||
+          ((config.tokens[request_id * MPK_MAX_SEQ_LENGTH + step +
+                          num_tokens] == config.eos_token_id) &&
+           (step + num_tokens >= prompt_len)))
+#endif
+      {
+        // Request is done
+        config.request_ids[i] = -1;
+        // Free pages
+        int kv_indptr = config.paged_kv_indptr_buffer[i];
+        int num_pages = config.paged_kv_indptr_buffer[i + 1] - kv_indptr;
+        for (int j = 0; j < num_pages; j++) {
+          config.page_queue[page_queue_tail % MPK_MAX_NUM_PAGES] =
+              config.paged_kv_indices_buffer[kv_indptr + j];
+          page_queue_tail++;
+        }
+      }
+    }
+  }
+
+  // Step 2: copy kv_indices to shared mem
+  int num_pages = config.paged_kv_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS];
+  for (int i = 0; i < num_pages; i++) {
+    smem_kv_indices[i] = config.paged_kv_indices_buffer[i];
+  }
+
+  // Step 2.5: fair-share prefill budget.
+  //
+  // MPK_MAX_NUM_BATCHED_TOKENS is both the admission pool and the GEMM M
+  // dimension, so it cannot be raised to make room (budget 8 is
+  // nondeterministic and slower per iteration, 16 hangs). With the pool fixed
+  // at B, letting one prefiller take up to MPK_MAX_TOKENS_PER_REQUEST (28)
+  // drains it: request 0 grabs the whole pool, requests 1..B-1 get nothing
+  // and enter only after it finishes prefilling. Three 512-token prompts
+  // therefore prefill *serially* and the "bs=3" decode tail is 255 iterations
+  // of one decoder, not three -- 1.803 tok/iter instead of 3.000.
+  //
+  // Capping each prefiller at its share of the pool makes the requests enter
+  // and advance in lockstep. Prefill takes more iterations (each request gets
+  // budget/demand tokens per pass instead of up to 28); decode, which is what
+  // TPOT measures, goes fully concurrent. At B=1 demand is 1 and the share is
+  // the whole budget, so this is structurally a no-op there.
+  int prefill_share = MPK_MAX_TOKENS_PER_REQUEST;
+#ifndef MPK_NO_FAIR_PREFILL
+  {
+    int num_live = 0;
+    for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
+      if (config.request_ids[i] != -1) {
+        num_live++;
+      }
+    }
+    int queued = config.total_num_requests - *config.next_request_id;
+    if (queued < 0) {
+      queued = 0;
+    }
+    int demand = num_live + queued;
+    if (demand > MPK_MAX_NUM_BATCHED_REQUESTS) {
+      demand = MPK_MAX_NUM_BATCHED_REQUESTS;
+    }
+    if (demand < 1) {
+      demand = 1;
+    }
+    int share = MPK_MAX_NUM_BATCHED_TOKENS / demand;
+    if (share < 1) {
+      share = 1;
+    }
+    if (share < prefill_share) {
+      prefill_share = share;
+    }
+  }
+#endif
+
+  // Step 3: prepare next batch
+  int num_reqs = 0, num_tokens = 0;
+  num_pages = 0;
+  for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
+    int16_t request_id = config.request_ids[i];
+    if (request_id != -1) {
+      int kv_indptr = config.paged_kv_indptr_buffer[i];
+      int num_old_pages = config.paged_kv_indptr_buffer[i + 1] - kv_indptr;
+      config.request_ids[num_reqs] = request_id;
+      config.qo_indptr_buffer[num_reqs] = num_tokens;
+      config.paged_kv_indptr_buffer[num_reqs] = num_pages;
+      int step = config.step[request_id];
+      int num_new_tokens = config.prompt_length[request_id] - step;
+      if (num_new_tokens > 0) {
+        // Prefill requests: cap per-request tokens to avoid attention LDS
+        // overflow, and to this request's fair share of the pool
+        num_new_tokens = min(num_new_tokens,
+                             min(prefill_share,
+                                 MPK_MAX_NUM_BATCHED_TOKENS - num_tokens));
+      } else {
+        // Decode requests
+        num_new_tokens = min(1, MPK_MAX_NUM_BATCHED_TOKENS - num_tokens);
+      }
+      // Move tokens to input_tokens
+      for (int j = 0; j < num_new_tokens; j++) {
+        config.input_tokens[num_tokens + j] =
+            config.tokens[request_id * MPK_MAX_SEQ_LENGTH + step + j];
+      }
+      // Prepare page indptrs
+      int num_new_pages =
+          (step + num_new_tokens + MPK_PAGE_SIZE - 1) / MPK_PAGE_SIZE;
+      {
+        int last_len = (step + num_new_tokens) % MPK_PAGE_SIZE;
+        config.paged_kv_last_page_len_buffer[num_reqs] =
+            last_len == 0 ? MPK_PAGE_SIZE : last_len;
+      }
+      for (int j = 0; j < num_old_pages; j++) {
+        config.paged_kv_indices_buffer[num_pages + j] =
+            smem_kv_indices[kv_indptr + j];
+      }
+      for (int j = num_old_pages; j < num_new_pages; j++) {
+        config.paged_kv_indices_buffer[num_pages + j] =
+            config.page_queue[page_queue_head % MPK_MAX_NUM_PAGES];
+        page_queue_head++;
+      }
+      num_pages += num_new_pages;
+      num_tokens += num_new_tokens;
+      num_reqs++;
+    }
+  }
+
+  // Add new prefill requests until we reach capacity
+  while (num_reqs < MPK_MAX_NUM_BATCHED_REQUESTS &&
+         num_tokens < MPK_MAX_NUM_BATCHED_TOKENS) {
+    int next_request_id = *config.next_request_id;
+    if (next_request_id >= config.total_num_requests) {
+      break;
+    }
+    config.request_ids[num_reqs] = next_request_id;
+    config.qo_indptr_buffer[num_reqs] = num_tokens;
+    config.paged_kv_indptr_buffer[num_reqs] = num_pages;
+    // Prefill request: cap per-request tokens to avoid attention LDS overflow,
+    // and to this request's fair share of the pool (see Step 2.5)
+    int num_new_tokens = min(config.prompt_length[next_request_id],
+                             min(prefill_share,
+                                 MPK_MAX_NUM_BATCHED_TOKENS - num_tokens));
+    // Move tokens to input tokens
+    for (int j = 0; j < num_new_tokens; j++) {
+      config.input_tokens[num_tokens + j] =
+          config.tokens[next_request_id * MPK_MAX_SEQ_LENGTH + j];
+    }
+    int num_new_pages = (num_new_tokens + MPK_PAGE_SIZE - 1) / MPK_PAGE_SIZE;
+    {
+      int last_len = num_new_tokens % MPK_PAGE_SIZE;
+      config.paged_kv_last_page_len_buffer[num_reqs] =
+          last_len == 0 ? MPK_PAGE_SIZE : last_len;
+    }
+    for (int j = 0; j < num_new_pages; j++) {
+      config.paged_kv_indices_buffer[num_pages + j] =
+          config.page_queue[page_queue_head % MPK_MAX_NUM_PAGES];
+      page_queue_head++;
+    }
+    num_tokens += num_new_tokens;
+    num_pages += num_new_pages;
+    num_reqs++;
+    *config.next_request_id = next_request_id + 1;
+  }
+
+  // Step 4: Update all unused requests slots
+  for (int i = num_reqs; i < MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
+    config.request_ids[i] = -1;
+  }
+  for (int i = num_reqs; i <= MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
+    config.qo_indptr_buffer[i] = num_tokens;
+    config.paged_kv_indptr_buffer[i] = num_pages;
+  }
+
+  // Step 5: update page head tail
+  *config.page_queue_head = page_queue_head;
+  *config.page_queue_tail = page_queue_tail;
+
+  if (num_tokens == 0) {
+    return false;
+  } else {
+    return true;
+  }
+}
+#endif
+#if defined(MPK_END_DIRECT) && !defined(MODE_OFFLINE)
+#define prepare_next_batch_w prepare_next_batch
+#endif
 
 #ifdef MODE_ONLINE
 __device__ __forceinline__ bool
@@ -1374,7 +3240,11 @@ __device__ __forceinline__ void worker_checker(RuntimeConfig config) {
   // int num_schedulers =
   //    config.num_local_schedulers + config.num_remote_schedulers;
 
-  assert(gridDim.x == config.num_workers);
+#ifdef MPK_MULTI_DEV // MDEV_CHECKER: each device launches its share of the workers
+  assert(gridDim.x * MPK_MULTI_DEV == config.num_workers);
+#else
+  assert(gridDim.x == config.num_workers * MPK_XCD_OVERSUB);
+#endif
   assert(config.num_workers <= MAX_NUM_WORKERS);
   // We will reinterpret TaskDesc as an array of integers to
   // collectively load it from device to shared memory
@@ -1494,6 +3364,34 @@ __device__ int g_fwdpass_tokens[FWDPASS_LOG_MAX]; // num_active_tokens
 // Untruncated aggregates: cover every iteration regardless of ring capacity.
 __device__ int g_fwdpass_dropped;
 __device__ unsigned long long g_fwdpass_total_ns;
+#ifdef MPK_END_DIRECT
+// (iteration << 1) | continue, written by the worker that completed that
+// iteration before it pushes the end event to the scheduler.
+__device__ unsigned long long g_end_direct;
+#endif
+#if defined(MPK_END_DIRECT) && defined(MODE_ONLINE_NOTOKEN)
+#error "MPK_END_DIRECT does not support MODE_ONLINE_NOTOKEN"
+#endif
+#if defined(MPK_END_FAST) && !defined(MPK_END_DIRECT)
+#error "MPK_END_FAST needs MPK_END_DIRECT"
+#endif
+#if defined(MPK_END_DIRECT_EMB) && \
+    !(defined(MPK_END_DIRECT) && defined(MPK_EMB_FIRST) && defined(MPK_PC_DROP_BEGIN))
+#error "MPK_END_DIRECT_EMB needs MPK_END_DIRECT, MPK_EMB_FIRST and MPK_PC_DROP_BEGIN"
+#endif
+#ifdef MPK_ITER_TS
+// MPK_ITER_TS_V1: iteration-boundary timestamps, ns (s_memrealtime x 10).
+__device__ unsigned long long g_its_argmax_end;
+__device__ unsigned long long g_its_rel_ts;
+__device__ unsigned long long g_its_sum[8];
+__device__ unsigned long long g_its_n;
+__device__ unsigned long long g_its_emb_sum[2];
+__device__ unsigned long long g_its_emb_n;
+// MPK_ITER_TS2_V1
+__device__ unsigned long long g_its_tr_sum[5];
+__device__ unsigned long long g_its_tr_n;
+__device__ unsigned long long g_its_push_end;
+#endif
 __device__ int g_fwdpass_total_iters;
 
 __device__ __forceinline__ void execute_worker(RuntimeConfig config,
@@ -1528,6 +3426,9 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
   __shared__ int worker_queue_ids[2];
   __shared__ size_t next_task_pos[2];
   __shared__ size_t last_task_pos[2];
+#if defined(MPK_PHASE_SLOTS) && defined(MPK_PHASE_LDS)
+  mpk_phase_lds_init();
+#endif
 
 #ifdef MPK_ENABLE_PROFILING
   PROFILER_CLOSURE_PARAMS_DECL;
@@ -1590,7 +3491,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
       }
       // Fence ensures map write is visible before incrementing ready counter
       threadfence_gpu();
+#ifdef MPK_CPX_SCOPE // MDEV_CPX_BOUNDARY
+      atomicAdd_system(config.worker_xcd_ready_count, 1);
+#else
       atomicAdd(config.worker_xcd_ready_count, 1);
+#endif
     }
     // Elect leader: first worker on each XCD becomes leader
     // Leader polls global counter, others poll local counter
@@ -1605,6 +3510,23 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 
   int const xcd_id = block_xcd_id;
   int const is_xcd_leader = block_is_xcd_leader;
+
+#ifdef MPK_AID_SPLIT_FLAGS
+  // Read the ml pointer tables out of this XCD's own AID. Indexing is
+  // unchanged -- each replica is a full copy, so only the base moves. Falls
+  // back to the shared table when the allocator was unavailable.
+  void **const ml_in_tab = (g_aid_ml_in[xcd_id >> 2] != nullptr)
+                               ? g_aid_ml_in[xcd_id >> 2]
+                               : config.ml_input_table;
+  void **const ml_out_tab = (g_aid_ml_out[xcd_id >> 2] != nullptr)
+                                ? g_aid_ml_out[xcd_id >> 2]
+                                : config.ml_output_table;
+#else
+  void **const ml_in_tab = config.ml_input_table;
+  void **const ml_out_tab = config.ml_output_table;
+#endif
+  (void)ml_in_tab;
+  (void)ml_out_tab;
 
 #ifdef MPK_ENABLE_GANG_TASKS
   // XCD-local rank for gang tasks: computed lazily on first gang task.
@@ -1668,15 +3590,69 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
     int tmpl_len = config.precomp_xcd_template_len[tmpl_flat];
     size_t *tmpl_src =
         config.precomp_xcd_template + tmpl_flat * config.precomp_max_tpw;
+#if defined(MPK_PC_DROP_BEGIN) && !defined(MPK_EMB_FIRST)
+#error "MPK_PC_DROP_BEGIN needs MPK_EMB_FIRST (the embedding's acquire)"
+#endif
 #ifdef MPK_EMB_FIRST
     // The graph-begin marker carries no data: run the embedding it gates
     // first on this worker; its wait on the marker is skipped at dispatch.
     bool const pc_swap =
         tmpl_len >= 2 && tmpl_src[0] == 1 &&
         config.all_tasks[tmpl_src[1]].task_type == TASK_EMBEDDING;
+#ifdef MPK_PC_DROP_BEGIN
+#ifdef MPK_END_DIRECT_EMB
+    // The embedding moves to the worker that runs the argmax reduce. Thread 0
+    // decides and copies (no LDS: the worker is at the static-LDS limit); the
+    // ordered scan gives every worker the same two slots.
+    int pc_drop = 0;
+    int pc_add = 0;
+    if (threadIdx.x == 0) {
+      int emb_slot = -1;
+      int amx_slot = -1;
+      for (int s2 = 0; s2 < MPK_NUM_XCDS * wpx && (emb_slot < 0 || amx_slot < 0);
+           s2++) {
+        size_t const *t2 =
+            config.precomp_xcd_template + (size_t)s2 * config.precomp_max_tpw;
+        int const l2 = config.precomp_xcd_template_len[s2];
+        if (emb_slot < 0 && l2 >= 2 && t2[0] == 1 &&
+            config.all_tasks[t2[1]].task_type == TASK_EMBEDDING) {
+          emb_slot = s2;
+        }
+        for (int j = 0; amx_slot < 0 && j < l2; j++) {
+          if (config.all_tasks[t2[j]].task_type == TASK_ARGMAX_REDUCE) {
+            amx_slot = s2;
+          }
+        }
+      }
+      bool const move =
+          emb_slot >= 0 && amx_slot >= 0 &&
+          (amx_slot == emb_slot ||
+           config.precomp_xcd_template_len[amx_slot] + 1 <= config.precomp_max_tpw);
+      pc_drop = pc_swap ? ((move && tmpl_flat == emb_slot) ? 2 : 1) : 0;
+      pc_add = (move && tmpl_flat == amx_slot) ? 1 : 0;
+      for (int i = pc_drop; i < tmpl_len; i++) {
+        pc_my_queue[i - pc_drop + pc_add] = tmpl_src[i];
+      }
+      if (pc_add) {
+        pc_my_queue[0] = config.precomp_xcd_template[(size_t)emb_slot *
+                                                         config.precomp_max_tpw +
+                                                     1];
+      }
+    }
+#else
+    // MPK_PC_DROP_BEGIN_V1: with the swap, entry 0 of the template is the marker;
+    // drop it and shift the rest down by one.
+    int const pc_drop = pc_swap ? 1 : 0;
+    int const pc_add = 0;
+    for (int i = threadIdx.x + pc_drop; i < tmpl_len; i += blockDim.x) {
+      pc_my_queue[i - pc_drop] = tmpl_src[i];
+    }
+#endif
+#else
     for (int i = threadIdx.x; i < tmpl_len; i += blockDim.x) {
       pc_my_queue[pc_swap && i < 2 ? 1 - i : i] = tmpl_src[i];
     }
+#endif
 #else
     // Parallel copy: each thread copies a chunk
     for (int i = threadIdx.x; i < tmpl_len; i += blockDim.x) {
@@ -1685,10 +3661,17 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #endif
     __syncthreads();
     if (threadIdx.x == 0) {
+#if defined(MPK_EMB_FIRST) && defined(MPK_PC_DROP_BEGIN)
+      config.precomp_queue_len[worker_id] = tmpl_len - pc_drop + pc_add;
+      pc_pos = 0;
+      pc_iter = 1;
+      pc_my_len = tmpl_len - pc_drop + pc_add;
+#else
       config.precomp_queue_len[worker_id] = tmpl_len;
       pc_pos = 0;
       pc_iter = 1;
       pc_my_len = tmpl_len;
+#endif
       pc_terminated = 0;
       pc_xcd_rank = my_rank;
       pc_has_begin = (tmpl_len > 0 && tmpl_src[0] == 1)
@@ -1698,13 +3681,28 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
       if (pc_swap) {
         pc_has_begin = 2; // embedding moved ahead of the marker
       }
+#ifdef MPK_END_DIRECT_EMB
+      if (pc_add) {
+        pc_has_begin = 2; // keeps the embedding's acquire on its new worker
+      }
 #endif
-      if (worker_id < 8) {
-        printf("[PC_INIT] worker=%d xcd=%d rank=%d tmpl_len=%d\n",
-               worker_id,
-               xcd_id,
-               my_rank,
-               tmpl_len);
+#endif
+#ifndef MPK_PC_INIT_N
+#define MPK_PC_INIT_N 8
+#endif
+#ifdef MPK_RESID_MAP
+      MPK_RESID_PUT(256 + worker_id, ((unsigned)my_rank << 16) | (unsigned)tmpl_len);
+#endif
+      if (worker_id < MPK_PC_INIT_N) {
+        int const t0 = tmpl_len > 0 ? (int)tmpl_src[0] : -1;
+        int const t1 = tmpl_len > 1 ? (int)tmpl_src[1] : -1;
+        int const t2 = tmpl_len > 2 ? (int)tmpl_src[2] : -1;
+        printf("[PC_INIT] worker=%d block=%d xcd=%d rank=%d wpx=%d tmpl_len=%d "
+               "tmpl=%d,%d,%d types=%d,%d,%d\n",
+               worker_id, (int)blockIdx.x, xcd_id, my_rank, wpx, tmpl_len, t0, t1, t2,
+               t0 >= 0 ? (int)config.all_tasks[t0].task_type : -1,
+               t1 >= 0 ? (int)config.all_tasks[t1].task_type : -1,
+               t2 >= 0 ? (int)config.all_tasks[t2].task_type : -1);
       }
     }
   }
@@ -1729,20 +3727,132 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
   int fused_count = 0;
 #endif
 
+#ifdef MPK_ITER_TS
+  unsigned long long its_gate_exit = 0;
+  int its_wrap = 0;
+#endif
+#ifdef MPK_END_FAST
+  // MPK_END_FAST_V1: iteration this worker released itself; deferred end event.
+  unsigned long long ed_rel_iter = 0;
+  long long ed_defer_ev = -1;
+  int ed_defer_wait = 0;
+#endif
   while (true) {
     // fetch next task from a task queue if task_descs is empty
     if (queue_pos == queue_len) {
 #ifdef MPK_PRECOMPUTED_DISPATCH
       // ===== Pre-filled queue path =====
+#ifdef MPK_PC_DESC_PREFETCH
+      // The descriptors are static (positions never change between
+      // iterations): wrap first, then every thread starts copying the next
+      // batch into LDS before thread 0 waits at the iteration gate.
+      if (threadIdx.x == 0 && pc_pos >= pc_my_len) {
+        pc_pos = 0;
+        pc_iter++;
+#ifdef MPK_ITER_TS
+        its_wrap = 1;
+#endif
+      }
+      __syncthreads();
+      {
+        int const pf_n = min(pc_my_len - pc_pos, TASK_DESCS_BUFFER_LENGTH);
+        constexpr int PF_TS = sizeof(TaskDesc) / 16;
+        for (int i = threadIdx.x; i < pf_n * PF_TS; i += blockDim.x) {
+          int const ti = i / PF_TS;
+          int const off = i % PF_TS;
+          load_smem(reinterpret_cast<char *>(task_descs) + i * 16,
+                    reinterpret_cast<char *>(
+                        config.all_tasks + pc_my_queue[pc_pos + ti]) +
+                        off * 16);
+        }
+      }
+#endif
       if (threadIdx.x == 0) {
+#ifndef MPK_PC_DESC_PREFETCH
         if (pc_pos >= pc_my_len) {
           // All tasks done for this iteration — wrap around
           pc_pos = 0;
           pc_iter++;
+#ifdef MPK_ITER_TS
+          its_wrap = 1;
+#endif
         }
+#endif
+#ifdef MPK_END_FAST
+        // This worker released iteration pc_iter itself, and its prepare said
+        // the run continues: the gate is open and nothing terminates it.
+        if (ed_rel_iter != (unsigned long long)pc_iter) {
+#endif
         // All workers must wait at iteration boundary because orphan tasks
         // (e.g., embed) have no dependency event and would execute immediately,
         // corrupting activation buffers if the previous iteration isn't done.
+#ifdef MPK_ITER_XCD_POLL
+        // 248 worker blocks polling one spanning-NC u64 is the measured
+        // contention cliff (2426 ns at 1 poller -> 52251 at 256). The
+        // scheduler already mirrors iter_ready into a per-XCD line right after
+        // bumping it; read that instead so the pollers spread over eight
+        // lines. All eight slots hold the same value, so which one a worker
+        // reads cannot affect correctness -- it only changes contention, which
+        // matters because the worker->XCD map is rotated by one.
+        // Lags the counter by one store: can delay a release, never grant one
+        // early. MPK_LD_GATE2 is ld_sys_s32 (sc0 sc1, past L2); an nt load
+        // would never observe the st_wt publish at all.
+        int *_itrel = config.precomp_iter_xcd_release;
+        if (_itrel != nullptr) {
+          unsigned _xcc;
+          MPK_GET_XCC_ID32(_xcc);
+#ifdef MPK_ITER_AID
+          int *_aid = mpk_aid_iter_slot((int)(_xcc & (MPK_NUM_XCDS - 1)));
+          int *_slot = _aid ? _aid
+                            : _itrel + (int)(_xcc & (MPK_NUM_XCDS - 1)) * 16;
+#else
+          int *_slot = _itrel + (int)(_xcc & (MPK_NUM_XCDS - 1)) * 16;
+#endif
+          // BOTH loads must leave the spin. Redirecting only iter_ready is
+          // worthless: vmcnt(0) waits for the MAXIMUM of its outstanding
+          // loads, so one remaining sc0 sc1 terminate load pins the whole
+          // iteration (measured: v1 gave -1.22%, t=-0.59).
+          //
+          // Checking terminate every 64th trip is safe because the terminate
+          // path also bumps iter_ready to release parked workers -- so the
+          // mirror wakes us anyway -- and MPK_TERM_RECHECK re-tests it right
+          // after this loop. Worst case a terminating worker takes up to 63
+          // extra sleeps to notice.
+          unsigned _it = 0;
+#if defined(MPK_ITER_GATE_SC1) && defined(MPK_ITER_AID)
+          // MPK_TAILFIX_V1. The AID slot is an MTYPE_RW replica written with
+          // write-through stores, which probe the pollers' L2 copies out inside
+          // the AID: poll it like the in-layer replica flags (sc1, an L2 hit
+          // until the publish lands) instead of 124 pollers per line past L2.
+          while ((unsigned)(_aid ? ld_aid_s32(_slot) : MPK_LD_GATE2(_slot)) <
+                 (unsigned)pc_iter) {
+#else
+          while ((unsigned)MPK_LD_GATE2(_slot) < (unsigned)pc_iter) {
+#endif
+#if defined(MPK_GATE_RESCUE) && defined(MPK_ITER_GATE_SC1) && defined(MPK_ITER_AID)
+            // MPK_GATE_RESCUE_V1: the sc1 poll may be served from this XCD's L2 copy of the slot, which
+            // only a hardware probe drops. Every MPK_GATE_RESCUE trips, read the slot past L2: a release
+            // found there but not in L2 is taken, and counted per XCC (residency slots 1088 + xcc, the
+            // iteration at 1104 + xcc).
+            if (_aid != nullptr &&
+                (_it & ((unsigned)(MPK_GATE_RESCUE)-1u)) == (unsigned)(MPK_GATE_RESCUE)-1u &&
+                (unsigned)ld_sys_s32(_slot) >= (unsigned)pc_iter) {
+#ifdef MPK_RESID_MAP
+              mpk_resid_add(1088 + (int)(_xcc & 7u), 1u);
+              mpk_resid_put(1104 + (int)(_xcc & 7u), (unsigned)pc_iter);
+#endif
+              break;
+            }
+#endif
+            if ((_it++ & 63u) == 63u &&
+                __atomic_load_n(config.precomp_terminate, __ATOMIC_RELAXED)) {
+              pc_terminated = 1;
+              break;
+            }
+            __builtin_amdgcn_s_sleep(1);
+          }
+        } else
+#endif
         while (__atomic_load_n(config.precomp_iter_ready, __ATOMIC_RELAXED) <
                pc_iter) {
           if (__atomic_load_n(config.precomp_terminate, __ATOMIC_RELAXED)) {
@@ -1752,17 +3862,38 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
           __builtin_amdgcn_s_sleep(1);
         }
 #ifdef MPK_TERM_RECHECK
-        // The terminate path bumps precomp_iter_ready to release parked
-        // workers, so a wait that bump satisfies leaves the loop without
-        // reading precomp_terminate. Test it once more before loading an
-        // iteration that will never be produced.
-        if (__atomic_load_n(config.precomp_terminate, __ATOMIC_RELAXED)) {
+        // The terminate path bumps precomp_iter_ready specifically to release
+        // workers parked in the loop above, so a worker whose condition is
+        // satisfied by that bump can leave without ever evaluating the check
+        // inside it. It then loads tasks for an iteration that will never be
+        // produced and blocks forever in the dependency wait, which has no
+        // terminate check of its own. Re-test here, where the existing
+        // pc_terminated exit below can still catch it.
+        if (!pc_terminated &&
+            __atomic_load_n(config.precomp_terminate, __ATOMIC_RELAXED)) {
           pc_terminated = 1;
+        }
+#endif
+#ifdef MPK_RESID_MAP
+        MPK_RESID_PUT(512 + worker_id, ((unsigned)pc_terminated << 24) | (unsigned)pc_iter);
+#endif
+#ifdef MPK_END_FAST
+        }
+#endif
+#ifdef MPK_ITER_TS
+        if (its_wrap) {
+          its_gate_exit = get_wallclock_ns();
+          its_wrap = 0;
         }
 #endif
       }
       __syncthreads();
       if (pc_terminated) {
+#ifdef MPK_RESID_MAP
+        if (threadIdx.x == 0) {
+          MPK_RESID_PUT(768 + worker_id, (unsigned)pc_iter);
+        }
+#endif
 #ifdef MPK_ENABLE_DEVICE_TASK_ACCUM
         if (threadIdx.x == 0 && worker_id == 0) {
           unsigned long long ni = g_daccum_cnt[4] > 0 ? g_daccum_cnt[4] : 1;
@@ -1833,6 +3964,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
       // Load task descs via cp_async (identical to original)
       static_assert(sizeof(TaskDesc) % 16 == 0);
       constexpr int TASK_SIZE_PC = sizeof(TaskDesc) / 16;
+#ifndef MPK_PC_DESC_PREFETCH
       for (int i = threadIdx.x; i < num_loaded_tasks * TASK_SIZE_PC;
            i += blockDim.x) {
         int task_idx = i / TASK_SIZE_PC;
@@ -1843,6 +3975,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                       get_task_position_index(task_ids[task_idx])) +
                       offset * 16);
       }
+#endif
       kernel::cp_async_fence();
       kernel::cp_async_wait<0>();
       __syncthreads();
@@ -1952,6 +4085,17 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
     }
 #endif
 
+#ifdef MPK_LM_PF0
+    // The LM head's group-zero weights stream during its dependency wait.
+    if (task_desc->task_type == TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300) {
+      int const _pf_r = block_xcd_local_rank;
+      _mpk_lm_pf0(task_desc,
+                  (_pf_r >= 0 &&
+                   _pf_r < (int)task_desc->task_metadata.n_tile_count)
+                      ? (int)task_desc->task_metadata.n_tile_start + _pf_r
+                      : -1);
+    }
+#endif
     // Dependency check: The scheduler only dispatches tasks after their
     // dependency event has fired. The release-acquire chain guarantees:
     //   completing_worker RELEASE → scheduler ACQUIRE → scheduler RELEASE →
@@ -1972,7 +4116,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
       if (pc_has_begin == 2 && task_desc->task_type == TASK_EMBEDDING) {
         // Its only dependency is the graph-begin marker, now queued behind
         // it. Keep the acquire the wait would have ended with.
-        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, MPK_DEV_FENCE_ACQ);
       } else
 #endif
       if (task_desc->dependent_event != EVENT_INVALID_ID) {
@@ -1981,7 +4125,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
         size_t event_index = get_event_position_index(event_id);
         EventCounter needed_counts =
             static_cast<EventCounter>(
-                config.all_event_num_triggers[event_index]) *
+                  MPK_LD_EVCFG(&config.all_event_num_triggers[event_index])) *
             get_task_iteration_num(task_ids[queue_pos]);
         EventCounter actual_counts = 0;
 #ifdef MPK_PRECOMPUTED_DISPATCH
@@ -2006,12 +4150,31 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
           // Single ACQUIRE load — dependency guaranteed satisfied by scheduler
           // dispatch chain.
           actual_counts =
-              __atomic_load_n(reinterpret_cast<unsigned long long *>(
-                                  &config.all_event_counters[event_index]),
-                              __ATOMIC_RELAXED);
+              MPK_LD_EVENT(&config.all_event_counters[event_index]);
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
           // Agent-scope acquire fence (GPU-only, not system scope)
-          __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#ifdef MPK_SCHED_WG_FENCE
+          __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");
+#elif defined(MPK_SCHED_ONE_FENCE)
+          // If the poll below runs, its trailing fence is the acquire.
+          if (actual_counts >= needed_counts) {
+#ifdef MPK_LM_LEADER_INV
+            mpk_lm_dep_acquire(task_desc->task_type ==
+                                   TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300,
+                               (int)pc_iter);
+#else
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, MPK_DEV_FENCE_ACQ);
+#endif
+          }
+#else
+#ifdef MPK_LM_LEADER_INV
+          mpk_lm_dep_acquire(task_desc->task_type ==
+                                   TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300,
+                               (int)pc_iter);
+#else
+          __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, MPK_DEV_FENCE_ACQ);
+#endif
+#endif
 #else
           __atomic_thread_fence(__ATOMIC_ACQUIRE);
 #endif
@@ -2027,11 +4190,16 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                                __ATOMIC_RELAXED);
             }
 #endif
-            while (actual_counts < needed_counts) {
-              actual_counts =
-                  __atomic_load_n(reinterpret_cast<unsigned long long *>(
-                                      &config.all_event_counters[event_index]),
-                                  __ATOMIC_RELAXED);
+            unsigned _ev_spin = 0;
+#ifdef MPK_P7_SKIP
+            // bit 8: skip the dependency wait entirely (timing probe)
+            bool const _dep_skip = ((MPK_P7_SKIP) & 8) != 0;
+#else
+            bool const _dep_skip = false;
+#endif
+            while (!_dep_skip && actual_counts < needed_counts) {
+              actual_counts = MPK_EVCTR_POLL(
+                  config.all_event_counters, event_index, _ev_spin++);
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
               __builtin_amdgcn_s_sleep(1);
 #endif
@@ -2040,7 +4208,15 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #endif
             }
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
-            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#ifdef MPK_SCHED_WG_FENCE
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");
+#elif defined(MPK_LM_LEADER_INV)
+            mpk_lm_dep_acquire(task_desc->task_type ==
+                                   TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300,
+                               (int)pc_iter);
+#else
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, MPK_DEV_FENCE_ACQ);
+#endif
 #else
             __atomic_thread_fence(__ATOMIC_ACQUIRE);
 #endif
@@ -2063,6 +4239,21 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #ifdef MPK_ENABLE_PROFILING
     if (task_desc->task_type != TASK_TERMINATE) {
       PROFILER_EVENT_START(task_desc->task_type, task_counter);
+    }
+#endif
+#ifdef MPK_ITER_TS
+    if (threadIdx.x == 0 && task_desc->task_type == TASK_EMBEDDING &&
+        its_gate_exit != 0) {
+      unsigned long long const _t = get_wallclock_ns();
+      unsigned long long const _rel =
+          __atomic_load_n(&g_its_rel_ts, __ATOMIC_RELAXED);
+      if (_rel != 0 && _rel <= its_gate_exit &&
+          its_gate_exit - _rel < 1000000ull) {
+        atomicAdd(&g_its_emb_sum[0], its_gate_exit - _rel);
+        atomicAdd(&g_its_emb_sum[1], _t - its_gate_exit);
+        atomicAdd(&g_its_emb_n, 1ull);
+      }
+      its_gate_exit = 0;
     }
 #endif
 
@@ -2516,11 +4707,17 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
         }
 #endif
 
-#if defined(MPK_PRECOMPUTED_DISPATCH) && defined(MPK_FUSED_LAYER_BATCHING)
+#if defined(MPK_FUSED_LAYER_BATCHING)
         // ===== Fused-layer batching fast path =====
         if (task_desc->task_type == TASK_GANG_FULL_LAYER_FUSED_MI300 ||
             task_desc->task_type ==
                 TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300) {
+
+#ifdef MPK_PRECOMPUTED_DISPATCH
+          size_t const flb_iter = pc_iter;
+#else
+          size_t const flb_iter = get_task_iteration_num(task_ids[queue_pos]);
+#endif
 
           if (config.ml_num_layers > 0) {
             // ===== Multi-layer all-fused: one task executes all layers =====
@@ -2552,6 +4749,12 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
             void *_pf_in = nullptr;
             void *_pf_out = nullptr;
             void *_pf_cur = nullptr;
+#ifdef MPK_IL_Q4REG
+#if defined(MPK_IL_FAST) || defined(MPK_ML_TABLE_INLAYER)
+#error "MPK_IL_Q4REG replaces the slot-24 source of the plain prefetch path"
+#endif
+            void *_pf_q4 = nullptr;  // thread 4: slot 4 of layer ml+1
+#endif
 #ifdef MPK_IL_CACHE2
 #if !defined(MPK_FUSED_INLINE)
 #error "MPK_IL_CACHE2 needs MPK_FUSED_INLINE (the ml-only dispatch carries qo_len)"
@@ -2560,10 +4763,39 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
             int _pf_var_cur = 0;
             int ml_qo_len = 0;    // qo_indptr_buffer[1], read at layer 0
 #endif
+#ifdef MPK_ML_STAGE
+#if !defined(MPK_PREFETCH_NEXT_QKV) || defined(MPK_IL_FAST) || defined(MPK_IL_Q4REG) || \
+    defined(MPK_IL_CACHE2) || defined(MPK_ML_TABLE_INLAYER)
+#error "MPK_ML_STAGE: plain prefetch path with MPK_PREFETCH_NEXT_QKV only"
+#endif
+            // [0, 28) inputs, [28, 41) outputs, [42] variant id; q4 = row
+            // ml+2's slot 4, slot 24 of the layer after this one.
+            __shared__ __attribute__((aligned(16))) unsigned long long s_mls[44];
+            __shared__ __attribute__((aligned(16))) unsigned long long s_mls_q4[2];
+            bool const _ms_on =
+                g_mpk_mlstage_rt != 0 && config.ml_num_layers > 1 &&
+                blockDim.x >= 64 &&
+                task_desc->task_type == TASK_GANG_FULL_LAYER_FUSED_MI300;
+            unsigned const _ms_lds = __builtin_amdgcn_readfirstlane((unsigned)(uintptr_t)(
+                (__attribute__((address_space(3))) unsigned long long *)s_mls));
+            unsigned const _ms_lds_q4 = __builtin_amdgcn_readfirstlane((unsigned)(uintptr_t)(
+                (__attribute__((address_space(3))) unsigned long long *)s_mls_q4));
+            uint32_t const _ms_rows = (uint32_t)((xcd_id + 1) * config.ml_num_layers);
+            i32x4_t const _ms_rin = make_w_buffer_rsrc(
+                (void const *)ml_in_tab, _ms_rows * (uint32_t)(MAX_INPUTS_PER_TASK * 8));
+            i32x4_t const _ms_rout = make_w_buffer_rsrc(
+                (void const *)ml_out_tab, _ms_rows * (uint32_t)(MAX_OUTPUTS_PER_TASK * 8));
+            i32x4_t const _ms_rvar = make_w_buffer_rsrc(
+                (void const *)config.ml_variant_ids, (uint32_t)(config.ml_num_layers * 4));
+#endif
             bool const _pf_ok =
                 (blockDim.x >= (unsigned)MAX_INPUTS_PER_TASK) &&
                 config.ml_num_layers > 1;
+#ifdef MPK_ML_STAGE
+            if (_pf_ok && !_ms_on) {
+#else
             if (_pf_ok) {
+#endif
               int _pf_base = (xcd_id * config.ml_num_layers + 1);
 #ifdef MPK_IL_CACHE2
               if (threadIdx.x == 0) {
@@ -2571,15 +4803,34 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               }
 #endif
               if ((int)threadIdx.x < MAX_INPUTS_PER_TASK) {
-                _pf_in = config.ml_input_table[_pf_base * MAX_INPUTS_PER_TASK +
+                _pf_in = ml_in_tab[_pf_base * MAX_INPUTS_PER_TASK +
                                                threadIdx.x];
               }
+#ifdef MPK_IL_Q4REG
+              if (threadIdx.x == 4) {
+                _pf_q4 = ml_in_tab[_pf_base * MAX_INPUTS_PER_TASK + 4];
+              }
+#endif
               if ((int)threadIdx.x < MAX_OUTPUTS_PER_TASK) {
                 _pf_out =
-                    config.ml_output_table[_pf_base * MAX_OUTPUTS_PER_TASK +
+                    ml_out_tab[_pf_base * MAX_OUTPUTS_PER_TASK +
                                            threadIdx.x];
               }
             }
+#endif
+#if defined(MPK_ML_TABLE_INLAYER) && defined(MPK_IL_FAST)
+#error "MPK_ML_TABLE_INLAYER and MPK_IL_FAST both replace the per-layer table reads"
+#endif
+#ifdef MPK_ML_TABLE_INLAYER
+            // Layers 1.. get their row written by the previous layer (same
+            // condition as the fused layer's mlt_go); only the variant id is
+            // read here, one layer ahead so its load retires under the call.
+            bool const _mlt_on = g_aid_ml_in[xcd_id >> 2] != nullptr &&
+                                 g_aid_ml_out[xcd_id >> 2] != nullptr &&
+                                 config.ml_num_layers == MPK_MLT_LAYERS;
+            int _mlt_var = config.ml_num_layers > 1
+                               ? (int)config.ml_variant_ids[1]
+                               : 0;
 #endif
 #ifdef MPK_IL_FAST
             if (config.ml_num_layers > 64) {
@@ -2597,13 +4848,99 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
             }
             __syncthreads();
 #endif
+#if defined(MPK_PFIN_RETIRE) && defined(MPK_ML_TABLE_PREFETCH)
+            // The first row's load must be retired in the compiler's wait
+            // model before the loop header, or the header joins it as pending
+            // and every boundary copy below gets a vmcnt(0) that also drains
+            // the Phase 9 QKV weight DMA. The back edge is retired in the fused
+            // layer's Phase 9, before that DMA is issued.
+            __builtin_amdgcn_s_waitcnt(0x0F70);  // vmcnt(0)
+#endif
             for (int ml = 0; ml < config.ml_num_layers; ml++) {
               MPK_ILSTAMP(2, ml == MPK_ILSUB_L0 + 1);
 #ifdef MPK_DRAIN_STATS
               unsigned long long _mlt0 = __builtin_amdgcn_s_memrealtime();
 #endif
+#ifdef MPK_IL_LDS
+              MPK_IL_MARK(0);
+#endif
               // Layer 0: task_desc already loaded from precomputed dispatch
               // buffer with correct per-XCD pointers. Skip the copy.
+#ifdef MPK_ML_TABLE_INLAYER
+              if (_mlt_on && ml > 0) {
+                if (threadIdx.x == 0) {
+                  task_desc->variant_id = _mlt_var;
+                }
+                _mlt_var = (ml + 1 < config.ml_num_layers)
+                               ? (int)config.ml_variant_ids[ml + 1]
+                               : 0;
+              } else
+#endif
+#ifdef MPK_ML_STAGE
+              if (_ms_on) {
+                int const t = threadIdx.x;
+                int const N = config.ml_num_layers;
+                if (ml > 0) {
+                  if (t < MAX_INPUTS_PER_TASK) {
+                    unsigned long long v = s_mls[t];
+                    if (t == 24) {
+                      v = s_mls_q4[0];
+                    } else if (t == 25) {
+                      v = s_mls[4];
+                    }
+                    task_desc->input_ptrs[t] = (void *)v;
+                  }
+                  if (t < MAX_OUTPUTS_PER_TASK) {
+                    task_desc->output_ptrs[t] = (void *)s_mls[MAX_INPUTS_PER_TASK + t];
+                  }
+                  if (t == 0) {
+                    task_desc->variant_id = (unsigned)s_mls[42];
+                  }
+                } else {
+                  if (t == 24) {
+                    task_desc->input_ptrs[24] =
+                        ml_in_tab[(xcd_id * N + 1) * MAX_INPUTS_PER_TASK + 4];
+                  }
+                  if (t == 25) {
+                    task_desc->input_ptrs[25] = nullptr;
+                  }
+                }
+                if (t == 0) {
+                  task_desc->task_metadata._linear_reserved =
+                      (int32_t)((flb_iter - 1) * N + ml);
+#ifdef MPK_ILSUB
+                  s_ilsub_ml = ml;
+#endif
+                }
+                __syncthreads();
+                if (t < 64) {
+                  if (ml + 1 < N) {
+                    unsigned const r = (unsigned)(xcd_id * N + ml + 1);
+                    if (t < MAX_INPUTS_PER_TASK / 2) {
+                      mpk_mls_dma(_ms_rin, _ms_lds,
+                                  r * (unsigned)(MAX_INPUTS_PER_TASK * 8) + (unsigned)t * 16u, true);
+                    }
+                    if (t < MAX_OUTPUTS_PER_TASK * 2) {
+                      mpk_mls_dma(_ms_rout, _ms_lds + MAX_INPUTS_PER_TASK * 8,
+                                  r * (unsigned)(MAX_OUTPUTS_PER_TASK * 8) + (unsigned)t * 4u, false);
+                    }
+                    if (t == 0) {
+                      mpk_mls_dma(_ms_rvar, _ms_lds + 42 * 8, (unsigned)(ml + 1) * 4u, false);
+                    }
+                  }
+                  if (ml + 2 < N) {
+                    if (t < 2) {
+                      mpk_mls_dma(_ms_rin, _ms_lds_q4,
+                                  ((unsigned)(xcd_id * N + ml + 2) * (unsigned)MAX_INPUTS_PER_TASK + 4u) * 8u +
+                                      (unsigned)t * 4u,
+                                  false);
+                    }
+                  } else if (t == 0) {
+                    s_mls_q4[0] = 0ull;
+                  }
+                }
+              } else
+#endif
               if (ml > 0) {
                 // Widths must match the host-side ML_N_IN / ML_N_OUT that
                 // built these tables (see the multi-layer scan), or the
@@ -2646,12 +4983,12 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                   if (_nl < config.ml_num_layers) {
                     int _nb = (xcd_id * config.ml_num_layers + _nl);
                     if ((int)threadIdx.x < MAX_INPUTS_PER_TASK) {
-                      _pf_in = config.ml_input_table[_nb * MAX_INPUTS_PER_TASK +
+                      _pf_in = ml_in_tab[_nb * MAX_INPUTS_PER_TASK +
                                                      threadIdx.x];
                     }
                     if ((int)threadIdx.x < MAX_OUTPUTS_PER_TASK) {
                       _pf_out =
-                          config.ml_output_table[_nb * MAX_OUTPUTS_PER_TASK +
+                          ml_out_tab[_nb * MAX_OUTPUTS_PER_TASK +
                                                  threadIdx.x];
                     }
                   }
@@ -2661,12 +4998,12 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                   for (int i = threadIdx.x; i < MAX_INPUTS_PER_TASK;
                        i += blockDim.x) {
                     task_desc->input_ptrs[i] =
-                        config.ml_input_table[ml_in_base + i];
+                        ml_in_tab[ml_in_base + i];
                   }
                   for (int i = threadIdx.x; i < MAX_OUTPUTS_PER_TASK;
                        i += blockDim.x) {
                     task_desc->output_ptrs[i] =
-                        config.ml_output_table[ml_out_base + i];
+                        ml_out_tab[ml_out_base + i];
                   }
                 }
                 if (threadIdx.x == 0) {
@@ -2747,6 +5084,9 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               // would look cheaper but has no correct initial value: the very
               // first layer of the very first iteration would read whatever
               // was in LDS. Recomputing it host-side from `ml` is stateless.
+#ifdef MPK_ML_STAGE
+              if (!_ms_on) {
+#endif
 #ifdef MPK_ML_TABLE_PREFETCH
               // With the table prefetch running, slot 24 needs no HBM read:
               // thread 4 is already holding layer ml+1's input_ptrs[4] in a
@@ -2756,6 +5096,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               // the second __syncthreads -- slot 25 is thread 4's own
               // register too, so both stores come from the one thread that
               // owns the value and the block rendezvouses once, not twice.
+#ifdef MPK_ML_TABLE_INLAYER
+              if (_mlt_on && ml > 0) {
+                // slots 24 / 25 were written by the previous layer
+              } else
+#endif
               if (task_desc->task_type == TASK_GANG_FULL_LAYER_FUSED_MI300 &&
                   _pf_ok) {
                 if (threadIdx.x == 4) {
@@ -2766,6 +5111,12 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                   task_desc->input_ptrs[24] =
 #ifdef MPK_IL_FAST
                       (ml + 1 < config.ml_num_layers) ? s_ml_qkvw[ml + 1] : nullptr;
+#elif defined(MPK_IL_Q4REG)
+                      (ml + 1 < config.ml_num_layers) ? _pf_q4 : nullptr;
+                  if (ml + 2 < config.ml_num_layers) {
+                    _pf_q4 = ml_in_tab[(xcd_id * config.ml_num_layers +
+                                        ml + 2) * MAX_INPUTS_PER_TASK + 4];
+                  }
 #else
                       (ml + 1 < config.ml_num_layers) ? _pf_in : nullptr;
 #endif
@@ -2782,7 +5133,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                 int const next_ml = ml + 1;
                 task_desc->input_ptrs[24] =
                     (next_ml < config.ml_num_layers)
-                        ? config.ml_input_table[(xcd_id * config.ml_num_layers +
+                        ? ml_in_tab[(xcd_id * config.ml_num_layers +
                                                  next_ml) *
                                                     MAX_INPUTS_PER_TASK +
                                                 4]
@@ -2791,6 +5142,9 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                     (ml > 0) ? task_desc->input_ptrs[4] : nullptr;
               }
               __syncthreads();
+#ifdef MPK_ML_STAGE
+              }
+#endif
 #endif
               MPK_ILSTAMP(4, ml == MPK_ILSUB_L0 + 1);
 #ifdef MPK_DRAIN_STATS
@@ -2828,7 +5182,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                 // pass" from "faults after hundreds of clean ones". The host
                 // only sees that it died within a second of launch, which at
                 // ~2.5 ms/iter is anywhere in the first few hundred.
-                b[6] = (unsigned long long)pc_iter;
+                b[6] = (unsigned long long)flb_iter;
               }
 #endif
 
@@ -2854,14 +5208,20 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               //
               // task_desc is a reused shared-memory slot, so this store must be
               // visible to the whole block before any worker enters the task.
+#ifdef MPK_ML_STAGE
+              if (!_ms_on) {
+#endif
               if (threadIdx.x == 0) {
                 task_desc->task_metadata._linear_reserved =
-                    (int32_t)((pc_iter - 1) * config.ml_num_layers + ml);
+                    (int32_t)((flb_iter - 1) * config.ml_num_layers + ml);
 #ifdef MPK_ILSUB
                 s_ilsub_ml = ml;
 #endif
               }
               __syncthreads();
+#ifdef MPK_ML_STAGE
+              }
+#endif
               MPK_ILSTAMP(5, ml == MPK_ILSUB_L0 + 1);
 
               // Execute this layer
@@ -2875,10 +5235,15 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               // which layer they were actually stuck in -- the counter could
               // not distinguish a worker on layer 0 from one on layer 35.
               // Encoding the layer makes the dump localize the stall.
+#ifdef MPK_PRECOMPUTED_DISPATCH
               if (threadIdx.x == 0 && MPK_WS_ON(config)) {
                 int *ws = config.precomp_dbg_worker_state + worker_id * 4;
                 __atomic_store_n(&ws[3], 40000 + ml, __ATOMIC_RELAXED);
               }
+#endif
+#ifdef MPK_IL_LDS
+              MPK_IL_MARK(1);
+#endif
               for (int t = block_xcd_local_rank; t < ml_n_tile_count;
                    t += block_workers_on_xcd) {
 #ifdef MPK_NIL_TRIPWIRE
@@ -2938,7 +5303,22 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
             // points to the last layer's event (gates FUSE_TAIL). Signal via
             // the two-level path since this task is in the queue.
             if (threadIdx.x == 0) {
-#ifdef MPK_TASK_FENCE_DRAIN
+              // MPK_FI_SIGNAL_DRAIN: every worker runs this once per iteration,
+              // right after the last layer. Everything the last layer hands to
+              // another XCD is already write-through (W2 workspace st_wt, P9
+              // drains before its release), and the KV cache is read back only
+              // by this XCD, so retiring the stores is the whole release. The
+              // 248 simultaneous L2 writebacks cost ~4 us at 216 -> 212 in
+              // SPX/NPS2 against ~0.4 us in NPS1.
+              //
+              // MPK_FI_SIGNAL_XCDFENCE keeps the full release but pays it once
+              // per XCD: each worker only retires its stores into this XCD's L2
+              // before the XCD-local arrival, and the last arriver's L2
+              // writeback then covers all of them -- the gang task-end shape.
+              // In NPS2 the AID-local RW lines are write-back, so each of the
+              // 248 buffer_wbl2 has dirty lines to walk; in NPS1 (NC) none do.
+#if defined(MPK_TASK_FENCE_DRAIN) || defined(MPK_FI_SIGNAL_DRAIN) || \
+    defined(MPK_FI_SIGNAL_XCDFENCE)
               asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 #else
               threadfence_gpu();
@@ -2947,11 +5327,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               size_t ev_idx = get_event_position_index(ev_id);
               int xcd_slot = xcd_id * config.num_events + (int)ev_idx;
               int xcd_thresh = config.xcd_event_num_tasks != nullptr
-                                   ? config.xcd_event_num_tasks[xcd_slot]
-                                   : 0;
+                    ? MPK_LD_EVCFG(&config.xcd_event_num_tasks[xcd_slot])
+                    : 0;
               if (xcd_thresh > 0) {
                 TaskId ml_tid =
-                    compute_task_id(pc_iter, config.ml_task_positions[0]);
+                    compute_task_id(flb_iter, config.ml_task_positions[0]);
                 EventCounter local_cnt =
                     atom_add_local_u64(
                         reinterpret_cast<unsigned long long int *>(
@@ -2962,11 +5342,40 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                     static_cast<EventCounter>(xcd_thresh) *
                     get_task_iteration_num(ml_tid);
                 if (local_cnt == needed_local) {
-                  atom_add_release_gpu_u64(&config.all_event_counters[ev_idx],
-                                           1);
+#if defined(MPK_FI_SIGNAL_XCDFENCE) && !defined(MPK_TASK_FENCE_DRAIN) && \
+    !defined(MPK_FI_SIGNAL_DRAIN)
+                  threadfence_gpu();
+#endif
+#if defined(MPK_AID_EVTIER) && defined(MPK_AID_SPLIT_FLAGS)
+                  // AID tier. The four XCDs of one AID accumulate in an AID-local line,
+                  // and only the last of them crosses the boundary -- adding 4, so the
+                  // global total and every `count == num_triggers * iter` test are
+                  // unchanged while boundary-crossing atomics drop from 8 to 2.
+                  // Gang events only: num_triggers == 8 is one flush per XCD, hence
+                  // exactly 4 per AID per iteration. For any other contributor count the
+                  // per-AID total is not a multiple of 4, which would leave the global
+                  // permanently short, so those keep the original single increment.
+                  int _nt = MPK_LD_EVCFG(&config.all_event_num_triggers[ev_idx]);
+                  unsigned long long _ok = 0, _n = 0;
+                  if (_nt == 2 * MPK_AID_XCDS_PER_AID) {
+                    _n = mpk_aid_evtier_add((int)ev_idx, &_ok);
+                  }
+                  if (!_ok) {
+                    mpk_evctr_add(config.all_event_counters, ev_idx, 1);
+                  } else if ((_n % MPK_AID_XCDS_PER_AID) == 0) {
+                    mpk_evctr_add(config.all_event_counters, ev_idx,
+                                  MPK_AID_XCDS_PER_AID);
+                  }
+#else
+                  mpk_evctr_add(config.all_event_counters, ev_idx, 1);
+#endif
                 }
               } else {
-                atom_add_release_gpu_u64(&config.all_event_counters[ev_idx], 1);
+#if defined(MPK_FI_SIGNAL_XCDFENCE) && !defined(MPK_TASK_FENCE_DRAIN) && \
+    !defined(MPK_FI_SIGNAL_DRAIN)
+                threadfence_gpu();
+#endif
+                mpk_evctr_add(config.all_event_counters, ev_idx, 1);
               }
             }
 
@@ -3008,7 +5417,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               // on this path, so the layer term is 0.
               if (threadIdx.x == 0) {
                 task_desc->task_metadata._linear_reserved =
-                    (int32_t)(pc_iter - 1);
+                    (int32_t)(flb_iter - 1);
               }
               __syncthreads();
               int n_tile_start = (int)task_desc->task_metadata.n_tile_start;
@@ -3024,11 +5433,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                 gang_tiles_executed = my_tiles;
                 EventId ev_id = task_desc->trigger_event;
                 size_t ev_idx = get_event_position_index(ev_id);
-                int num_triggers = config.all_event_num_triggers[ev_idx];
+                int num_triggers = MPK_LD_EVCFG(&config.all_event_num_triggers[ev_idx]);
                 int xcd_slot = xcd_id * config.num_events + (int)ev_idx;
                 int xcd_thresh = config.xcd_event_num_tasks != nullptr
-                                     ? config.xcd_event_num_tasks[xcd_slot]
-                                     : 0;
+                    ? MPK_LD_EVCFG(&config.xcd_event_num_tasks[xcd_slot])
+                    : 0;
                 if (xcd_thresh > 0) {
                   EventCounter local_cnt =
                       atom_add_local_u64(
@@ -3040,27 +5449,48 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                       static_cast<EventCounter>(xcd_thresh) *
                       get_task_iteration_num(task_ids[queue_pos]);
                   if (local_cnt == needed_local) {
-#ifdef MPK_TASK_FENCE_DRAIN
+#if defined(MPK_TASK_FENCE_DRAIN) || (defined(MPK_CPX_ML_DRAIN) && defined(MPK_CPX_SCOPE))
                     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 #else
                     threadfence_gpu();
 #endif
-                    atom_add_release_gpu_u64(&config.all_event_counters[ev_idx],
-                                             1);
+#if defined(MPK_AID_EVTIER) && defined(MPK_AID_SPLIT_FLAGS)
+                    // AID tier. The four XCDs of one AID accumulate in an AID-local line,
+                    // and only the last of them crosses the boundary -- adding 4, so the
+                    // global total and every `count == num_triggers * iter` test are
+                    // unchanged while boundary-crossing atomics drop from 8 to 2.
+                    // Gang events only: num_triggers == 8 is one flush per XCD, hence
+                    // exactly 4 per AID per iteration. For any other contributor count the
+                    // per-AID total is not a multiple of 4, which would leave the global
+                    // permanently short, so those keep the original single increment.
+                    int _nt = num_triggers;
+                    unsigned long long _ok = 0, _n = 0;
+                    if (_nt == 2 * MPK_AID_XCDS_PER_AID) {
+                      _n = mpk_aid_evtier_add((int)ev_idx, &_ok);
+                    }
+                    if (!_ok) {
+                      mpk_evctr_add(config.all_event_counters, ev_idx, 1);
+                    } else if ((_n % MPK_AID_XCDS_PER_AID) == 0) {
+                      mpk_evctr_add(config.all_event_counters, ev_idx,
+                                    MPK_AID_XCDS_PER_AID);
+                    }
+#else
+                    mpk_evctr_add(config.all_event_counters, ev_idx, 1);
+#endif
                   }
                 } else {
-#ifdef MPK_TASK_FENCE_DRAIN
+#if defined(MPK_TASK_FENCE_DRAIN) || (defined(MPK_CPX_ML_DRAIN) && defined(MPK_CPX_SCOPE))
                   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 #else
                   threadfence_gpu();
 #endif
-                  atom_add_release_gpu_u64(&config.all_event_counters[ev_idx],
-                                           1);
+                  mpk_evctr_add(config.all_event_counters, ev_idx, 1);
                 }
               }
 
               int next_qp = queue_pos + 1;
               if (next_qp >= queue_len) {
+#ifdef MPK_PRECOMPUTED_DISPATCH
                 int remaining = pc_my_len - pc_pos;
                 if (remaining <= 0) {
                   break;
@@ -3069,7 +5499,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                 __syncthreads();
                 if (threadIdx.x < num_to_load) {
                   task_ids[threadIdx.x] = compute_task_id(
-                      pc_iter, pc_my_queue[pc_pos + threadIdx.x]);
+                      flb_iter, pc_my_queue[pc_pos + threadIdx.x]);
                 }
                 __syncthreads();
                 if (threadIdx.x == 0) {
@@ -3091,6 +5521,9 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                 queue_pos = 0;
                 queue_len = num_to_load;
                 next_qp = 0;
+#else
+                break;
+#endif
               }
 
               TaskDesc *next_td = task_descs + next_qp;
@@ -3388,6 +5821,12 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
     }
 #endif
 
+#ifdef MPK_ITER_TS
+    if (threadIdx.x == 0 && task_desc->task_type == TASK_ARGMAX_REDUCE) {
+      __atomic_store_n(&g_its_argmax_end, get_wallclock_ns(),
+                       __ATOMIC_RELAXED);
+    }
+#endif
     // Trigger event
 #ifdef MPK_FUSED_LAYER_BATCHING
     if (threadIdx.x == 0 && _flb_skip_signal) {
@@ -3408,13 +5847,17 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
         __atomic_store_n(&ws[3], 20, __ATOMIC_RELAXED);
       }
 #endif
+#ifdef MPK_ITER_TS
+      unsigned long long its_tr[5] = {0, 0, 0, 0, 0};
+      bool const its_on = task_desc->task_type == TASK_ARGMAX_REDUCE;
+#endif
       EventId event_id = task_desc->trigger_event;
       size_t event_index = get_event_position_index(event_id);
       if (!is_nvshmem_event(event_id)) {
         size_t gpu_id = get_event_gpu_id(event_id);
         assert(gpu_id == config.my_gpu_id);
         // Case 1: Trigger a local non-nvshmem event
-        int num_triggers = config.all_event_num_triggers[event_index];
+        int num_triggers = MPK_LD_EVCFG(&config.all_event_num_triggers[event_index]);
 #ifdef MPK_EVT_FAST
         // Read-only and host-built: issued with the counter metadata so its
         // latency overlaps theirs instead of following both atomics.
@@ -3428,8 +5871,8 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
         // this XCD's share is done. Reduces buffer_wbl2 from ~24K to ~300.
         int xcd_slot = xcd_id * config.num_events + (int)event_index;
         int xcd_threshold = config.xcd_event_num_tasks != nullptr
-                                ? config.xcd_event_num_tasks[xcd_slot]
-                                : 0;
+                    ? MPK_LD_EVCFG(&config.xcd_event_num_tasks[xcd_slot])
+                    : 0;
         if (xcd_threshold > 0) {
 #ifdef MPK_ENABLE_GANG_TASKS
           // Gang tasks: each dispatched worker signals 1 to local counter.
@@ -3477,6 +5920,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                 get_task_iteration_num(task_ids[queue_pos]);
 #endif
 
+#ifdef MPK_ITER_TS
+            if (its_on) {
+              its_tr[0] = get_wallclock_ns();
+            }
+#endif
             if (local_count == needed_local) {
               // Last worker/task on this XCD — flush + signal global
 #ifdef MPK_EVT_FAST
@@ -3489,11 +5937,20 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #else
               threadfence_gpu();
 #endif
+#ifdef MPK_ITER_TS
+              if (its_on) {
+                its_tr[1] = get_wallclock_ns();
+              }
+#endif
               // Gang: flush 1 (one task done). Non-gang: flush xcd_threshold.
               int flush_amount =
                   is_gang_task_type(task_desc->task_type) ? 1 : xcd_threshold;
-              count = atom_add_release_gpu_u64(
-                  &config.all_event_counters[event_index], flush_amount);
+              count = mpk_evctr_add(config.all_event_counters, event_index, flush_amount);
+#ifdef MPK_ITER_TS
+              if (its_on) {
+                its_tr[2] = get_wallclock_ns();
+              }
+#endif
               event_fired = (count + flush_amount) ==
                             static_cast<EventCounter>(num_triggers) *
                                 get_task_iteration_num(task_ids[queue_pos]);
@@ -3517,8 +5974,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #else
             threadfence_gpu();
 #endif
-            count = atom_add_release_gpu_u64(
-                &config.all_event_counters[event_index], xcd_threshold);
+            count = mpk_evctr_add(config.all_event_counters, event_index, xcd_threshold);
             event_fired = (count + xcd_threshold) ==
                           static_cast<EventCounter>(num_triggers) *
                               get_task_iteration_num(task_ids[queue_pos]);
@@ -3535,8 +5991,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #else
           threadfence_gpu();
 #endif
-          count = atom_add_release_gpu_u64(
-              &config.all_event_counters[event_index], 1);
+          count = mpk_evctr_add(config.all_event_counters, event_index, 1);
           event_fired =
               (count + 1) == static_cast<EventCounter>(num_triggers) *
                                  get_task_iteration_num(task_ids[queue_pos]);
@@ -3588,6 +6043,57 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #else
           EventDesc event_desc = config.all_events[event_index];
 #endif
+#ifdef MPK_ITER_TS
+          if (its_on) {
+            its_tr[3] = get_wallclock_ns();
+          }
+#endif
+#ifdef MPK_END_FAST
+          bool ed_skip = false;
+#endif
+#ifdef MPK_END_DIRECT
+          if (event_desc.event_type == EVENT_END_OF_TASK_GRAPH) {
+            bool const ed_cont =
+                prepare_next_batch_w(config) && !MPK_HOST_STOP_AT(config, pc_iter);
+            if (ed_cont) {
+              __threadfence();
+#ifdef MPK_END_FAST
+              atomicAdd(config.precomp_iter_ready, 1ULL);
+              unsigned long long const ed_new = (unsigned long long)pc_iter + 1ULL;
+#else
+              unsigned long long const ed_new =
+                  atomicAdd(config.precomp_iter_ready, 1ULL) + 1ULL;
+#endif
+              int *ed_rel = config.precomp_iter_xcd_release;
+#ifdef MPK_ITER_AID
+              mpk_aid_iter_publish((unsigned)ed_new);
+              if (mpk_aid_iter_slot(0) == nullptr) {
+                for (int x = 0; x < MPK_NUM_XCDS; x++) {
+                  st_wt_u32((void *)&ed_rel[x * 16], (unsigned)ed_new);
+                }
+              }
+#else
+              for (int x = 0; x < MPK_NUM_XCDS; x++) {
+                st_wt_u32((void *)&ed_rel[x * 16], (unsigned)ed_new);
+              }
+#endif
+#ifdef MPK_END_FAST
+              ed_rel_iter = (unsigned long long)pc_iter + 1ULL;
+              ed_skip = true;
+              ed_defer_ev = (long long)event_index;
+              ed_defer_wait = 1;
+#endif
+            }
+            __atomic_store_n(&g_end_direct,
+                             ((unsigned long long)pc_iter << 1) |
+                                 (ed_cont ? 1ull : 0ull),
+                             __ATOMIC_RELAXED);
+#ifdef MPK_END_FAST
+            if (!ed_cont)
+#endif
+            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          }
+#endif
           if (event_desc.event_type == EVENT_EMPTY) {
             // Do nothing for empty event
           }
@@ -3597,6 +6103,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
           else if (event_desc.event_type == EVENT_LAUNCH_DEPENDENT_TASKS ||
                    event_desc.event_type == EVENT_LAUNCH_MASSIVE_TASKS) {
             // Workers self-serve — no scheduler dispatch needed
+          }
+#endif
+#ifdef MPK_END_FAST
+          else if (ed_skip) {
+            // pushed at the end of this worker's next trigger
           }
 #endif
           else {
@@ -3647,10 +6158,55 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               } while (old != last_event_pos);
             }
           }
+#ifdef MPK_ITER_TS
+          if (its_on) {
+            its_tr[4] = get_wallclock_ns();
+            unsigned long long const t0 =
+                __atomic_load_n(&g_its_argmax_end, __ATOMIC_RELAXED);
+            if (t0 != 0 && its_tr[0] >= t0 && its_tr[1] >= its_tr[0] &&
+                its_tr[2] >= its_tr[1] && its_tr[3] >= its_tr[2] &&
+                its_tr[4] >= its_tr[3] && its_tr[4] - t0 < 1000000ull) {
+              g_its_tr_sum[0] += its_tr[0] - t0;
+              g_its_tr_sum[1] += its_tr[1] - its_tr[0];
+              g_its_tr_sum[2] += its_tr[2] - its_tr[1];
+              g_its_tr_sum[3] += its_tr[3] - its_tr[2];
+              g_its_tr_sum[4] += its_tr[4] - its_tr[3];
+              g_its_tr_n++;
+            }
+            __atomic_store_n(&g_its_push_end, its_tr[4], __ATOMIC_RELAXED);
+          }
+#endif
 #ifdef MPK_ENABLE_PROFILING
           PROFILER_EVENT_END(TASK_SCHD_EVENTS, task_counter++);
 #endif
         }
+#ifdef MPK_END_FAST
+        if (ed_defer_ev >= 0) {
+          if (ed_defer_wait) {
+            ed_defer_wait = 0;
+          } else {
+            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+            int const ed_sid = get_rand_sched_id((size_t)ed_defer_ev,
+                                                 worker_id,
+                                                 config.num_workers,
+                                                 config.num_local_schedulers,
+                                                 xcd_id);
+            size_t const ed_pos = atom_add_local_u64(
+                &config.sched_queue_next_free_event_id[ed_sid], 1);
+            st_local_u64(
+                &config.sched_queues[ed_sid][ed_pos % config.per_sched_queue_len],
+                (size_t)ed_defer_ev);
+            fence_local();
+            size_t ed_old;
+            do {
+              ed_old = atom_cas_local_u64(
+                  &config.sched_queue_last_ready_event_id[ed_sid], ed_pos,
+                  ed_pos + 1);
+            } while (ed_old != ed_pos);
+            ed_defer_ev = -1;
+          }
+        }
+#endif
       } else {
         // Case 2: trigger a nvshmem event
         assert(task_desc->task_type == TASK_NVSHMEM_COPY);
@@ -3716,7 +6272,11 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
       // Wait for all workers to report their XCD IDs
       if (config.worker_xcd_map != nullptr) {
+#ifdef MPK_CPX_SCOPE // MDEV_CPX_BOUNDARY
+        while (atomicAdd_system(config.worker_xcd_ready_count, 0) <
+#else
         while (atomicAdd(config.worker_xcd_ready_count, 0) <
+#endif
                config.num_workers) {
           __nanosleep(100);
         }
@@ -3764,13 +6324,67 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
 
     int next_worker_idx = 0;
     int queue_idx = 0;
+#ifdef MPK_END_POLL
+#if !defined(MPK_PRECOMPUTED_DISPATCH) || !defined(MPK_TAIL_NO111) || defined(MPK_END_DIRECT) || defined(MPK_END_FAST)
+#error "MPK_END_POLL needs MPK_PRECOMPUTED_DISPATCH and MPK_TAIL_NO111 (an end marker with no work), and neither MPK_END_DIRECT nor MPK_END_FAST"
+#endif
+    // MPK_END_POLL: after the first end event the end marker pushes, wait for the marker's own dependency (the
+    // LM-head task's event) instead of its push; the marker's later pushes are dropped.
+    int ep_ev = -1;
+    bool ep_drop_end = false;
+    EventId ep_end_id = 0;
+    EventCounter ep_target = 0, ep_step = 0;
+    unsigned long long ep_rel_clk = 0, ep_quiet_until = 0, ep_quiet_ns = 800000ull;
+#ifdef MPK_END_POLL_DBG
+    unsigned ep_polled = 0, ep_dropped = 0, ep_armed_at = 0;
+#endif
+#endif
 #ifdef MPK_ENABLE_DISPATCH_TIMING
     unsigned long long last_dep_dispatch_end_ns = 0;
 #endif
 
     while (true) {
+#ifdef MPK_END_POLL
+      bool ep_got = false;
+      if (ep_ev >= 0) {
+#ifndef MPK_END_POLL_EAGER
+        // most of a pass the LM-head event cannot complete: leave the event mirror lines to the layers meanwhile
+        while (get_wallclock_ns() < ep_quiet_until) {
+          __nanosleep(2000);
+        }
+#endif
+        for (unsigned ep_spin = 0;; ep_spin++) {
+          if ((EventCounter)MPK_EVCTR_POLL(config.all_event_counters, ep_ev, ep_spin) >= ep_target) {
+            ep_got = true;
+            break;
+          }
+          // termination, and the marker's own (now late) end events, still come through the own queue
+          if ((ep_spin & 15) == 15 &&
+              ld_local_u64(&config.sched_queue_last_ready_event_id[sched_queue_ids[0]]) > cur_event_pos[0]) {
+            break;
+          }
+          __builtin_amdgcn_s_sleep(1);
+        }
+        if (ep_got) {
+          __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, MPK_DEV_FENCE_ACQ);
+          {
+            unsigned long long const ep_obs = get_wallclock_ns() - ep_rel_clk;
+            if (ep_rel_clk != 0 && ep_obs < 1000000000ull && (ep_obs * 85ull) / 100ull < ep_quiet_ns) {
+              ep_quiet_ns = (ep_obs * 85ull) / 100ull;
+            }
+          }
+#ifdef MPK_END_POLL_DBG
+          ep_polled++;
+#endif
+        }
+      }
+#endif
       int poll_count = 0;
+#ifdef MPK_END_POLL
+      while (!ep_got && cur_event_pos[queue_idx] == last_event_pos[queue_idx]) {
+#else
       while (cur_event_pos[queue_idx] == last_event_pos[queue_idx]) {
+#endif
         // queue_idx 0 = own scheduler queue (XCD-local), 1 = broadcast
         // (cross-XCD)
         if (queue_idx == 0) {
@@ -3796,6 +6410,11 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
       // Read event from queue — use local ops for own queue, global for
       // broadcast
       EventId event_id;
+#ifdef MPK_END_POLL
+      if (ep_got) {
+        event_id = ep_end_id;
+      } else
+#endif
       if (queue_idx == 0) {
         fence_local();
         event_id = ld_local_u64(
@@ -3807,7 +6426,23 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                                      config.per_sched_queue_len]);
       }
       EventDesc e = config.all_events[event_id];
+#ifdef MPK_END_POLL
+      if (!ep_got && ep_drop_end && e.event_type == EVENT_END_OF_TASK_GRAPH) {
+        // the marker's push for a pass the poll already handled
+#ifdef MPK_END_POLL_DBG
+        ep_dropped++;
+#endif
+        cur_event_pos[queue_idx] += 1;
+        continue;
+      }
+#endif
       if (is_termination_event(event_id, e)) {
+#if defined(MPK_END_POLL) && defined(MPK_END_POLL_DBG)
+        if (ep_drop_end) {
+          printf("[EPOLL] sched=%d armed_at=%u polled=%u dropped=%u ep_ev=%d step=%llu\n", sched_id, ep_armed_at,
+                 ep_polled, ep_dropped, ep_ev, (unsigned long long)ep_step);
+        }
+#endif
         // terminate all workers (same XCD — use local ops)
         if (sched_id < config.num_local_schedulers) {
           for (int widx = 0; widx < my_num_workers; widx++) {
@@ -3835,9 +6470,18 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
         int num_active_tokens =
             config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS];
         // Store per-iteration timing (deferred print at termination)
+#ifdef MPK_BOOK_LATE
+        // MPK_BOOK_LATE: run after the iteration release (book_late() below); the pass's values are captured here.
+        auto book_late = [book_valid = prev_end_of_graph_clk != 0, idx = end_of_graph_count,
+                          dur = iter_end_clk - prev_end_of_graph_clk, &num_active_tokens]() {
+          if (!book_valid) {
+            return;
+          }
+#else
         if (prev_end_of_graph_clk != 0) {
           int idx = end_of_graph_count; // 1-based after first iter
           unsigned long long dur = iter_end_clk - prev_end_of_graph_clk;
+#endif
           // Aggregates first: these must cover every iteration, including the
           // ones past the end of the ring.
           g_fwdpass_total_ns += dur;
@@ -3900,9 +6544,16 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
               g_fwdpass_count = idx / g_fwdpass_stride + 1;
             }
           }
+#ifdef MPK_BOOK_LATE
+        };
+#else
         }
+#endif
         prev_end_of_graph_clk = iter_end_clk;
         end_of_graph_count++;
+#ifdef MPK_ITER_TS
+        unsigned long long const its_t1b = get_wallclock_ns();
+#endif
         // Publish decode progress to pinned host memory.
         //
         // config.step[0] -- request 0's token position -- not the iteration
@@ -3923,20 +6574,48 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
         // One entry per request, not just request 0: a batch coalesces
         // prompts of different lengths, so each request reaches its first
         // output token at a different absolute position.
+#ifndef MPK_TAIL_PUB_LATE
         if (config.progress_host != nullptr) {
+#ifdef MPK_TOK_HOST // request 0's newest token id beside its position (bs=1 streaming)
+          {
+            int const tp = (int)config.step[0];
+            for (int _j = 0; _j < 16; _j++) {  // spec: backfill accepted positions committed this pass
+              int const _p = tp - _j;
+              if (_p < 0 || _p >= MPK_MAX_SEQ_LENGTH) break;
+              config.progress_host[MPK_MAX_NUM_BATCHED_REQUESTS + _p] = (int)__hip_atomic_load(
+                  &config.tokens[_p], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            }
+          }
+#endif
           __threadfence_system();
           for (int r = 0; r < MPK_MAX_NUM_BATCHED_REQUESTS; r++) {
             __atomic_store_n(
                 &config.progress_host[r], config.step[r], __ATOMIC_RELEASE);
           }
         }
+#endif
+#ifdef MPK_ITER_TS
+        unsigned long long const its_t2 = get_wallclock_ns();
+#endif
         // Check if we want to continue
-#ifdef MODE_ONLINE_NOTOKEN
+#ifdef MPK_END_DIRECT
+        unsigned long long const ed_word =
+            __atomic_load_n(&g_end_direct, __ATOMIC_RELAXED);
+        bool const end_direct =
+            (ed_word >> 1) == (unsigned long long)end_of_graph_count;
+        if (end_direct ? (ed_word & 1ull) == 0ull
+                       : (!prepare_next_batch(config) ||
+                          MPK_HOST_STOP_AT(config, end_of_graph_count)))
+#elif defined(MODE_ONLINE_NOTOKEN)
         if (!prepare_next_batch(config, iteration_num))
 #else
-        if (!prepare_next_batch(config))
+        if (!prepare_next_batch(config) ||
+            MPK_HOST_STOP_AT(config, end_of_graph_count))
 #endif
         {
+#ifdef MPK_BOOK_LATE
+          book_late();
+#endif
           // Republish after the terminating prepare_next_batch.
           //
           // The publish above runs BEFORE prepare_next_batch, so it reports
@@ -3947,6 +6626,17 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
           // charging the whole FWD_PASS log dump and teardown (~150-490 ms) to
           // the last inter-token gap.
           if (config.progress_host != nullptr) {
+#ifdef MPK_TOK_HOST // request 0's newest token id beside its position (bs=1 streaming)
+            {
+              int const tp = (int)config.step[0];
+              for (int _j = 0; _j < 16; _j++) {  // spec: backfill accepted positions committed this pass
+                int const _p = tp - _j;
+                if (_p < 0 || _p >= MPK_MAX_SEQ_LENGTH) break;
+                config.progress_host[MPK_MAX_NUM_BATCHED_REQUESTS + _p] = (int)__hip_atomic_load(
+                    &config.tokens[_p], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+              }
+            }
+#endif
             __threadfence_system();
             for (int r = 0; r < MPK_MAX_NUM_BATCHED_REQUESTS; r++) {
               __atomic_store_n(
@@ -3959,6 +6649,32 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                  sched_id,
                  iteration_num,
                  (double)(prep_done_clk - iter_end_clk) / 1000.0);
+#endif
+#ifdef MPK_ITER_TS
+          if (g_its_n > 0) {
+            double const n = (double)g_its_n;
+            printf("[ITS] n=%llu argmax_to_deq=%.2f book=%.2f progress=%.2f "
+                   "prepare=%.2f release=%.2f us\n",
+                   g_its_n, g_its_sum[0] / n / 1000.0, g_its_sum[1] / n / 1000.0,
+                   g_its_sum[2] / n / 1000.0, g_its_sum[3] / n / 1000.0,
+                   g_its_sum[4] / n / 1000.0);
+          }
+          if (g_its_emb_n > 0) {
+            double const n = (double)g_its_emb_n;
+            printf("[ITS] emb n=%llu prep_to_gate_exit=%.2f "
+                   "gate_exit_to_embedding=%.2f us\n",
+                   g_its_emb_n, g_its_emb_sum[0] / n / 1000.0,
+                   g_its_emb_sum[1] / n / 1000.0);
+          }
+          if (g_its_tr_n > 0 && g_its_n > 0) {
+            double const n = (double)g_its_tr_n;
+            printf("[ITS] trig n=%llu local=%.2f fence=%.2f counter=%.2f desc=%.2f "
+                   "push=%.2f push_to_deq=%.2f us\n",
+                   g_its_tr_n, g_its_tr_sum[0] / n / 1000.0,
+                   g_its_tr_sum[1] / n / 1000.0, g_its_tr_sum[2] / n / 1000.0,
+                   g_its_tr_sum[3] / n / 1000.0, g_its_tr_sum[4] / n / 1000.0,
+                   g_its_sum[5] / (double)g_its_n / 1000.0);
+          }
 #endif
           // Dump deferred FWD_PASS log (after timing, before terminate).
           // iter is reconstructed from the decimation stride.
@@ -4014,6 +6730,108 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                    g_last_xcd[7]);
           }
 #endif
+#ifdef MPK_GATE_SNAP
+          // Per layer boundary L-1 -> L: the last W2-rank MoE return of layer L-1 over all dies (ranks
+          // 8..30), then the Q ranks' (0..7) first / last gate observation and last QKV start of layer
+          // L, and the K/V ranks' (8, 9) last observation; ns after that last W2 return.
+          for (int L = 1; L < 36; L++) {
+            unsigned long long w2 = 0, qof = ~0ull, qol = 0, qsl = 0, kvl = 0;
+            for (int w = 0; w < 248; w++) {
+              int const r = w % 31;
+              unsigned long long const *a = &g_gs_snap[((size_t)(L - 1) * 256 + w) * 4];
+              unsigned long long const *c = &g_gs_snap[((size_t)L * 256 + w) * 4];
+              if (r >= 8 && a[0] > w2) {
+                w2 = a[0];
+              }
+              if (r < 8 && c[2] != 0) {
+                qof = c[2] < qof ? c[2] : qof;
+                qol = c[2] > qol ? c[2] : qol;
+                qsl = c[3] > qsl ? c[3] : qsl;
+              }
+              if ((r == 8 || r == 9) && c[2] > kvl) {
+                kvl = c[2];
+              }
+            }
+            if (w2 == 0 || qof == ~0ull) {
+              continue;
+            }
+            auto rel = [&](unsigned long long t) -> long long {
+              return t == 0 ? -1ll : ((long long)t - (long long)w2) * 10;
+            };
+            printf("[GATES] L=%d qobs_first=%lld qobs_last=%lld qstart_last=%lld kvobs_last=%lld\n", L,
+                   rel(qof), rel(qol), rel(qsl), rel(kvl));
+#ifdef MPK_QEP_SNAP
+            {
+              // Same base: the epoch marks of layer L (needs MPK_QEP_SNAP == MPK_GATE_SNAP).
+              unsigned long long qa = 0, kva = 0, fo = ~0ull, qe = 0, kvs = 0;
+              for (int w = 0; w < 248; w++) {
+                int const r = w % 31;
+                unsigned long long const *e = &g_qep_snap[((size_t)L * 256 + w) * 2];
+                unsigned long long const *e2 = &g_qep_snap2[((size_t)L * 256 + w) * 2];
+                unsigned long long const *c = &g_gs_snap[((size_t)L * 256 + w) * 4];
+                if (r < 8 && e[0] > qa) qa = e[0];
+                if ((r == 8 || r == 9) && e[0] > kva) kva = e[0];
+                if ((r == 8 || r == 9) && c[3] > kvs) kvs = c[3];
+                if (r < 17 && e2[1] != 0 && e2[1] < fo) fo = e2[1];
+                if (r < 8 && e[1] > qe) qe = e[1];
+              }
+              printf("[GATEQ] L=%d kvstart_last=%lld qarr_last=%lld kvarr_last=%lld obs_first=%lld qexit_last=%lld\n",
+                     L, rel(kvs), rel(qa), rel(kva), rel(fo == ~0ull ? 0ull : fo), rel(qe));
+            }
+#endif
+          }
+#endif
+#ifdef MPK_QEP_SNAP
+          // Per (layer, die): Q producers' last arrival, K / V arrivals, Q ranks' last epoch exit, K's
+          // exit; ns after the die's first arrival in that layer (iteration MPK_QEP_SNAP).
+          for (int L = 0; L < 36; L++) {
+            for (int d = 0; d < 8; d++) {
+              unsigned long long const *q = &g_qep_snap[((size_t)L * 256 + d * 31) * 2];
+              unsigned long long b = ~0ull, qa = 0, qe = 0;
+              for (int r = 0; r < 31; r++) {
+                if (q[r * 2] != 0 && q[r * 2] < b) {
+                  b = q[r * 2];
+                }
+              }
+              if (b == ~0ull) {
+                continue;
+              }
+              for (int r = 0; r < 8; r++) {
+                qa = q[r * 2] > qa ? q[r * 2] : qa;
+                qe = q[r * 2 + 1] > qe ? q[r * 2 + 1] : qe;
+              }
+              unsigned long long const ka = q[8 * 2], va = q[9 * 2], ke = q[8 * 2 + 1];
+              {
+                // v2: last arrival over ranks 0..16, first observer, slowest Q exit's split.
+                unsigned long long const *q2 = &g_qep_snap2[((size_t)L * 256 + d * 31) * 2];
+                unsigned int const *sp = &g_qep_spins[(size_t)L * 256 + d * 31];
+                unsigned long long la = 0, fo = ~0ull;
+                for (int r = 0; r < 17; r++) {
+                  la = q[r * 2] > la ? q[r * 2] : la;
+                  if (q2[r * 2 + 1] != 0 && q2[r * 2 + 1] < fo) {
+                    fo = q2[r * 2 + 1];
+                  }
+                }
+                int sr = 0;
+                for (int r = 1; r < 8; r++) {
+                  sr = q[r * 2 + 1] > q[sr * 2 + 1] ? r : sr;
+                }
+                unsigned long long const sa = q[sr * 2], s0 = q2[sr * 2], s1 = q2[sr * 2 + 1],
+                                         se = q[sr * 2 + 1];
+                printf("[QEPS2] L=%d d=%d lastarr=%llu firstobs=%llu slowq=%d arr=%llu a2p=%llu p2o=%llu "
+                       "o2e=%llu spins=%u\n",
+                       L, d, la >= b ? (la - b) * 10 : 0, (fo != ~0ull && fo >= b) ? (fo - b) * 10 : 0, sr,
+                       sa >= b ? (sa - b) * 10 : 0, (s0 >= sa && s0) ? (s0 - sa) * 10 : 0,
+                       (s1 >= s0 && s0) ? (s1 - s0) * 10 : 0, (se >= s1 && s1) ? (se - s1) * 10 : 0,
+                       sp[sr]);
+              }
+              printf("[QEPS] L=%d d=%d qarr=%llu karr=%llu varr=%llu qexit=%llu kexit=%llu\n", L, d,
+                     qa >= b ? (qa - b) * 10 : 0, ka >= b ? (ka - b) * 10 : 0,
+                     va >= b ? (va - b) * 10 : 0, qe >= b ? (qe - b) * 10 : 0,
+                     ke >= b ? (ke - b) * 10 : 0);
+            }
+          }
+#endif
 #ifdef MPK_PHASE_SLOTS
           // One line per (xcd_rank band, slot): mean ns of each slot-to-slot
           // span over every steady-state decode layer. Printed once at
@@ -4036,7 +6854,7 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                    g_fwdpass_total_iters,
                    MPK_PHASE_START_ITER);
             for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
-              unsigned long long n = g_phase_n[w];
+              unsigned long long n = g_phase_n[w * MPK_PHASE_PAD_U64];
               if (n == 0) {
                 continue;
               }
@@ -4044,9 +6862,13 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
               // (see mpk_phase_mark). Emitting it is what makes the row sum
               // to the real per-layer cost instead of leaving a hole.
               printf("[PSLOTW] w=%d n=%llu", w, n);
+#ifdef MPK_PHASE_LDS
+              for (int s = 0; s <= MPK_PHASE_SLOT_COUNT; s++) {
+#else
               for (int s = 0; s < MPK_PHASE_SLOT_COUNT; s++) {
+#endif
                 printf(" %llu",
-                       g_phase_span[w * MPK_PHASE_SLOT_COUNT + s] / n);
+                       g_phase_span[w * MPK_PHASE_SLOT_STRIDE + s] / n);
               }
               printf("\n");
               // Raw s_memrealtime ticks (10 ns) of each slot boundary for the
@@ -4085,6 +6907,430 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
               printf("\n");
 #endif
             }
+#ifdef MPK_OPROJ_LDS
+            for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+              unsigned int sn = g_sub_n[w];
+              if (sn == 0) {
+                continue;
+              }
+              printf("[PSUBW] w=%d n=%u %llu %llu %llu %llu\n", w, sn,
+                     g_sub_span[w * 4 + 0] / sn, g_sub_span[w * 4 + 1] / sn,
+                     g_sub_span[w * 4 + 2] / sn, g_sub_span[w * 4 + 3] / sn);
+              if (g_tk_n[w] > 0) {
+                unsigned int tn = g_tk_n[w];
+                printf("[PSUBT] w=%d n=%u %llu %llu %llu\n", w, tn,
+                       g_tk_span[w * 3 + 0] / tn, g_tk_span[w * 3 + 1] / tn,
+                       g_tk_span[w * 3 + 2] / tn);
+              }
+              if (g_sub_last_n[w] > 0) {
+                printf("[PSUBL] w=%d nl=%u last=%llu\n", w, g_sub_last_n[w],
+                       g_sub_last[w] / g_sub_last_n[w]);
+              }
+            }
+#endif
+#ifdef MPK_MOE_LDS
+            for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+              unsigned int const a = g_moe_n[w * 2], b = g_moe_n[w * 2 + 1];
+              if (a == 0 && b == 0) {
+                continue;
+              }
+              unsigned int const *m = &g_moe_acc[w * 7];
+              printf("[MSUBW] w=%d n13=%u dec=%u cmp=%u arr=%u n2=%u "
+                     "dec=%u prep=%u bar=%u cmp=%u\n",
+                     w, a, a ? m[0] / a : 0, a ? m[1] / a : 0, a ? m[2] / a : 0,
+                     b, b ? m[3] / b : 0, b ? m[4] / b : 0, b ? m[5] / b : 0,
+                     b ? m[6] / b : 0);
+            }
+#ifdef MPK_MOE_LDS_MAX
+            for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+              unsigned int const a = g_moe_n[w * 2], b = g_moe_n[w * 2 + 1];
+              if (a == 0 && b == 0) {
+                continue;
+              }
+              unsigned int const *x = &g_moe_x[w * 4];
+              printf("[MSUBX] w=%d n13=%u arrmax=%u arr1us=%u n2=%u barmax=%u bar1us=%u\n",
+                     w, a, x[0], x[1], b, x[2], x[3]);
+            }
+#endif
+#endif
+#ifdef MPK_MOE_CALL_LDS
+            for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+              unsigned int const *c = &g_moe_call[w * 4];
+              if (c[2] == 0 && c[3] == 0) {
+                continue;
+              }
+              printf("[MCALLW] w=%d n13=%u call13=%u n2=%u call2=%u\n", w, c[2],
+                     c[2] ? c[0] / c[2] : 0, c[3], c[3] ? c[1] / c[3] : 0);
+            }
+#endif
+#ifdef MPK_PHASE_SNAP
+            for (int L = 0; L < MPK_PHASE_LAYERS_PER_ITER; L++) {
+              unsigned long long mn[MPK_PHASE_SLOT_COUNT];
+              unsigned long long mx[MPK_PHASE_SLOT_COUNT];
+              for (int s = 0; s < MPK_PHASE_SLOT_COUNT; s++) {
+                mn[s] = ~0ull;
+                mx[s] = 0;
+              }
+              for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+                for (int s = 0; s < MPK_PHASE_SLOT_COUNT; s++) {
+                  unsigned long long const v =
+                      MPK_PSNAP_RD[((size_t)L * MPK_PHASE_MAX_WORKERS + w) *
+                                       MPK_PHASE_SLOT_COUNT +
+                                   s];
+                  if (v == 0) {
+                    continue;
+                  }
+                  mn[s] = v < mn[s] ? v : mn[s];
+                  mx[s] = v > mx[s] ? v : mx[s];
+                }
+              }
+              unsigned long long const b = mn[0];
+              printf("[PSNAP] L=%d B=%llu", L, b * 10ull);
+              for (int s = 0; s < MPK_PHASE_SLOT_COUNT; s++) {
+                printf(" %llu:%llu",
+                       (mn[s] != ~0ull && mn[s] >= b) ? (mn[s] - b) * 10 : 0,
+                       mx[s] >= b ? (mx[s] - b) * 10 : 0);
+              }
+              printf("\n");
+#if defined(MPK_ATS_OPS)
+              if (L >= 1 && L <= 8) {
+                unsigned long long const *ao = MPK_ATS_RD;
+                for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+                  unsigned long long const *q = &ao[((size_t)L * MPK_PHASE_MAX_WORKERS + w) * 16];
+                  bool any = false;
+                  for (int k = 0; k < 16; k++) any |= q[k] != 0;
+                  if (!any) continue;
+                  printf("[ATSOPS] L=%d w=%d", L, w);
+                  for (int k = 0; k < 15; k++) {
+                    printf(" %lld", q[k] ? ((long long)q[k] - (long long)b) * 10 : -1ll);
+                  }
+                  printf(" f=%llu |", q[15]);
+                  for (int s = 0; s < MPK_PHASE_SLOT_COUNT; s++) {
+                    unsigned long long const v =
+                        MPK_PSNAP_RD[((size_t)L * MPK_PHASE_MAX_WORKERS + w) * MPK_PHASE_SLOT_COUNT + s];
+                    printf(" %lld", v ? ((long long)v - (long long)b) * 10 : -1ll);
+                  }
+                  printf("\n");
+                }
+              }
+#endif
+#ifdef MPK_TK_OPS
+              if (L >= 1 && L <= 6) {
+                unsigned long long const *tko = g_tk_ops_dst != nullptr ? g_tk_ops_dst : g_tk_ops;
+                for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+                  unsigned long long const *q = &tko[((size_t)L * MPK_PHASE_MAX_WORKERS + w) * 16];
+                  bool any = false;
+                  for (int k = 0; k < 16; k++) any |= q[k] != 0;
+                  if (!any) continue;
+                  printf("[TKOPS] L=%d w=%d", L, w);
+                  for (int k = 0; k < 16; k++) {
+                    printf(" %lld", q[k] ? ((long long)q[k] - (long long)b) * 10 : -1ll);
+                  }
+                  printf(" |");
+                  for (int s = 5; s <= 7; s++) {
+                    unsigned long long const v =
+                        MPK_PSNAP_RD[((size_t)L * MPK_PHASE_MAX_WORKERS + w) * MPK_PHASE_SLOT_COUNT + s];
+                    printf(" %lld", v ? ((long long)v - (long long)b) * 10 : -1ll);
+                  }
+                  printf("\n");
+                }
+              }
+#endif
+            }
+            {
+              // Per die: the die's last worker at slots 7 / 8 / 9, ns after the
+              // layer's first entry, mean over layers; and how often the die
+              // was last to finish the MoE (slot 8) / arrive at Phase 9 (slot 9).
+              constexpr int kWpd = MPK_PHASE_MAX_WORKERS / 8;
+              int const wpd = (int)(MPK_PSNAPD_WPD);
+              unsigned long long sum[8][3] = {};
+              int last8[8] = {}, last9[8] = {}, nl = 0;
+              for (int L = 0; L < MPK_PHASE_LAYERS_PER_ITER; L++) {
+                unsigned long long b = ~0ull;
+                for (int w = 0; w < 8 * wpd && w < MPK_PHASE_MAX_WORKERS; w++) {
+                  unsigned long long const v =
+                      MPK_PSNAP_RD[((size_t)L * MPK_PHASE_MAX_WORKERS + w) *
+                                   MPK_PHASE_SLOT_COUNT];
+                  if (v != 0 && v < b) {
+                    b = v;
+                  }
+                }
+                if (b == ~0ull) {
+                  continue;
+                }
+                unsigned long long dmx[8][3] = {};
+                for (int d = 0; d < 8; d++) {
+                  for (int r = 0; r < wpd; r++) {
+                    int const w = d * wpd + r;
+                    for (int k = 0; k < 3; k++) {
+                      unsigned long long const v =
+                          MPK_PSNAP_RD[((size_t)L * MPK_PHASE_MAX_WORKERS + w) *
+                                           MPK_PHASE_SLOT_COUNT +
+                                       7 + k];
+                      if (v > dmx[d][k]) {
+                        dmx[d][k] = v;
+                      }
+                    }
+                  }
+                }
+                int a8 = 0, a9 = 0;
+                for (int d = 0; d < 8; d++) {
+                  for (int k = 0; k < 3; k++) {
+                    sum[d][k] += dmx[d][k] >= b ? (dmx[d][k] - b) * 10 : 0;
+                  }
+                  a8 = dmx[d][1] > dmx[a8][1] ? d : a8;
+                  a9 = dmx[d][2] > dmx[a9][2] ? d : a9;
+                }
+                last8[a8]++;
+                last9[a9]++;
+                nl++;
+              }
+              (void)kWpd;
+              for (int d = 0; d < 8 && nl > 0; d++) {
+                printf("[PSNAPD] die=%d moe_start_last=%llu moe_end_last=%llu "
+                       "p9_arrive_last=%llu last_moe_end=%d last_p9=%d of %d\n",
+                       d, sum[d][0] / nl, sum[d][1] / nl, sum[d][2] / nl,
+                       last8[d], last9[d], nl);
+              }
+            }
+#ifdef MPK_VTN_MOETL
+            for (int L = MPK_VTN_MOETL_L0;
+                 L < MPK_VTN_MOETL_L0 + MPK_VTN_MOETL_NL && L < MPK_PHASE_LAYERS_PER_ITER; L++) {
+              unsigned long long b = ~0ull;
+              for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+                unsigned long long const v =
+                    MPK_PSNAP_RD[((size_t)L * MPK_PHASE_MAX_WORKERS + w) * MPK_PHASE_SLOT_COUNT];
+                if (v != 0 && v < b) b = v;
+              }
+              if (b == ~0ull) continue;
+              for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+                unsigned long long const *ps =
+                    &MPK_PSNAP_RD[((size_t)L * MPK_PHASE_MAX_WORKERS + w) * MPK_PHASE_SLOT_COUNT];
+                if (ps[0] == 0) continue;
+                unsigned long long const *tl =
+                    &MPK_VTN_TL_RD[((size_t)L * MPK_PHASE_MAX_WORKERS + w) * MPK_VTN_TLC * 3];
+                printf("[MTL] L=%d w=%d s7=%lld s8=%lld", L, w, (long long)(ps[7] - b) * 10,
+                       (long long)(ps[8] - b) * 10);
+                for (int c = 0; c < MPK_VTN_TLC; c++) {
+                  if ((tl[3 * c + 2] >> 63) == 0) break;
+                  printf(" %llu:%lld:%lld", tl[3 * c + 2] & 0xFFFFFFFFull,
+                         (long long)(tl[3 * c] - b) * 10, (long long)(tl[3 * c + 1] - b) * 10);
+                }
+                printf("\n");
+              }
+            }
+#endif
+#endif
+#ifdef MPK_IL_LDS
+            for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+              unsigned int const n_il = g_il_n[w];
+              if (n_il == 0) {
+                continue;
+              }
+              printf("[ILSUBW] w=%d n=%u ret=%u setup=%u call=%u\n", w, n_il,
+                     g_il_acc[w * 3] / n_il, g_il_acc[w * 3 + 1] / n_il,
+                     g_il_acc[w * 3 + 2] / n_il);
+            }
+#endif
+#ifdef MPK_QKV_SUB_LDS
+            for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+              unsigned int const nq = g_qs_n[w * 3], nc = g_qs_n[w * 3 + 1];
+              if (nq == 0 && nc == 0) {
+                continue;
+              }
+              unsigned int const *a = &g_qs_acc[w * 5];
+              printf("[QSUBW] w=%d x=%d nq=%u drain=%u arrive=%u wait=%u nc=%u "
+                     "cdrain=%u carrive=%u\n",
+                     w, (int)g_qs_n[w * 3 + 2] - 1, nq, nq ? a[0] / nq : 0,
+                     nq ? a[1] / nq : 0, nq ? a[2] / nq : 0, nc,
+                     nc ? a[3] / nc : 0, nc ? a[4] / nc : 0);
+            }
+#endif
+#ifdef MPK_OPROJ_SUB
+            for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+              unsigned int const n = g_os_n[w];
+              if (n == 0) {
+                continue;
+              }
+              unsigned int const *a = &g_os_acc[w * 5];
+              printf("[OPSUB] w=%d n=%u wdrain=%u wait=%u mfma=%u store=%u combine=%u\n",
+                     w, n, a[0] / n, a[1] / n, a[2] / n, a[3] / n, a[4] / n);
+            }
+#endif
+#ifdef MPK_TOPK_SUB
+            for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+              unsigned int const n = g_tk_n[w];
+              if (n == 0) {
+                continue;
+              }
+              unsigned int const *a = &g_tk_acc[w * 4];
+              printf("[TOPKSUB] w=%d n=%u wait=%u gather=%u scores=%u pick=%u\n",
+                     w, n, a[0] / n, a[1] / n, a[2] / n, a[3] / n);
+#ifdef MPK_TOPK_SUB2
+              {
+                unsigned int const *b = &g_tk2_acc[w * 8];
+                printf("[TOPKSUB2] w=%d n=%u g_w0=%u g_bar=%u p_bar1=%u p_ksel=%u p_bar2=%u "
+                       "p_ret=%u retry=%u\n",
+                       w, n, b[0] / n, b[1] / n, b[2] / n, b[3] / n, b[4] / n, b[5] / n,
+                       (unsigned int)((unsigned long long)b[6] * 1000ull / n));
+              }
+#endif
+            }
+#endif
+#ifdef MPK_QKVK_LDS
+            for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+              unsigned int const n = g_qk_n[w];
+              if (n == 0) {
+                continue;
+              }
+              unsigned int const *a = &g_qk_acc[w * 4];
+              printf("[QKVKW] w=%d n=%u foldnorm=%u ready=%u setup=%u mfma_epi=%u\n",
+                     w, n, a[0] / n, a[1] / n, a[2] / n, a[3] / n);
+            }
+#endif
+#ifdef MPK_ATTK_LDS
+            for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+              for (int c = 0; c < 24; c++) {
+                unsigned int const n = g_ak_cnt[w * 24 + c];
+                if (n == 0) {
+                  continue;
+                }
+                printf("[ATTKW] w=%d sw=%d slot=%d n=%u ns=%u\n", w, c / 12,
+                       c % 12, n, g_ak_acc[w * 24 + c] / n);
+              }
+            }
+#endif
+#ifdef MPK_W13_SUB
+            for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+              unsigned int const n13 = g_w13_n[w];
+              if (n13 == 0) {
+                continue;
+              }
+              unsigned int const *a = &g_w13_acc[w * 10];
+              printf("[W13SUB] w=%d n=%u %u %u %u %u %u %u %u %u %u %u hw=0x%x\n", w, n13,
+                     a[0] / n13, a[1] / n13, a[2] / n13, a[3] / n13, a[4] / n13,
+                     a[5] / n13, a[6] / n13, a[7] / n13, a[8] / n13, a[9] / n13,
+                     g_w13_hwid[w]);
+            }
+#endif
+            // Raw per-slot timestamps of the last armed layer, so one layer's
+            // timeline can be reconstructed per worker (worker % 8 == XCD) and
+            // exported as a Perfetto trace. The span table above is a mean and
+            // cannot show ordering or overlap; this can.
+            for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+              if (g_phase_n[w * MPK_PHASE_PAD_U64] == 0) {
+                continue;
+              }
+              printf("[PHASETS] w=%d", w);
+              for (int s = 0; s < MPK_PHASE_SLOT_COUNT; s++) {
+                printf(" %llu", g_phase_ts[w * MPK_PHASE_SLOT_STRIDE + s]);
+              }
+              printf("\n");
+            }
+#if defined(MPK_LTK_SNAP) && defined(MPK_PHASE_SNAP)
+            for (int L = 0; L < MPK_PHASE_LAYERS_PER_ITER; L++) {
+              unsigned long long pub[2] = {0, 0}, okmin[2] = {~0ull, ~0ull};
+              unsigned long long okmax[2] = {0, 0}, p0min = ~0ull;
+              unsigned long long endmin = ~0ull, endmax = 0, oksum = 0;
+              int pubn = 0, okn = 0, pubw = -1;
+              for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+                unsigned long long const *v =
+                    &g_ltk_snap[((size_t)L * MPK_PHASE_MAX_WORKERS + w) * 4];
+                int const a = (w / MPK_PSNAPD_WPD) >= 4 ? 1 : 0;
+                if (v[0]) {
+                  if (v[0] > pub[a]) pub[a] = v[0];
+                  if (v[0] >= pub[0] && v[0] >= pub[1]) pubw = w;
+                  pubn++;
+                }
+                if (v[1] && v[1] < p0min) p0min = v[1];
+                if (v[2]) {
+                  if (v[2] < okmin[a]) okmin[a] = v[2];
+                  if (v[2] > okmax[a]) okmax[a] = v[2];
+                  oksum += v[2];
+                  okn++;
+                }
+                if (v[3]) {
+                  if (v[3] < endmin) endmin = v[3];
+                  if (v[3] > endmax) endmax = v[3];
+                }
+              }
+              if (pubn == 0 || okn == 0) {
+                continue;
+              }
+              printf("[LTKSNAP] L=%d pubn=%d pubw=%d pub0=%llu pub1=%llu p0min=%llu "
+                     "okmin0=%llu okmin1=%llu okmax0=%llu okmax1=%llu okmean=%llu "
+                     "endmin=%llu endmax=%llu okn=%d\n",
+                     L, pubn, pubw, pub[0], pub[1], p0min, okmin[0], okmin[1],
+                     okmax[0], okmax[1], oksum / okn, endmin, endmax, okn);
+            }
+#endif
+#if defined(MPK_XSNAP) && defined(MPK_PHASE_SNAP)
+            for (int L = 0; L < MPK_PHASE_LAYERS_PER_ITER; L++) {
+              unsigned long long b = ~0ull;
+              for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+                unsigned long long const v =
+                    MPK_PSNAP_RD[((size_t)L * MPK_PHASE_MAX_WORKERS + w) *
+                                 MPK_PHASE_SLOT_COUNT];
+                if (v && v < b) b = v;
+              }
+              if (b == ~0ull) continue;
+              printf("[XSNAPB] L=%d b=%llu\n", L, b);
+#ifdef MPK_XSNAP_WORKERS
+              if (L >= 1 && L <= (MPK_XSNAP_WORKERS)) {
+                for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+                  printf("[XSW] L=%d w=%d", L, w);
+                  for (int k = 0; k < 16; k++) {
+                    unsigned long long const v =
+                        g_xs_snap[((size_t)L * MPK_PHASE_MAX_WORKERS + w) * 16 + k];
+                    printf(" %lld", v ? ((long long)v - (long long)b) * 10 : -1ll);
+                  }
+                  printf(" |");
+                  for (int k = 0; k < MPK_PHASE_SLOT_COUNT; k++) {
+                    unsigned long long const v =
+                        MPK_PSNAP_RD[((size_t)L * MPK_PHASE_MAX_WORKERS + w) *
+                                         MPK_PHASE_SLOT_COUNT + k];
+                    printf(" %lld", v ? ((long long)v - (long long)b) * 10 : -1ll);
+                  }
+                  printf("\n");
+                }
+              }
+#endif
+              int const wpd = (int)(MPK_PSNAPD_WPD);
+              for (int k = 0; k < 16; k++) {
+                printf("[XSNAP] L=%d k=%d", L, k);
+                for (int x = 0; x < 8; x++) {
+                  unsigned long long mn = ~0ull, mx = 0;
+                  for (int w = x * wpd; w < (x + 1) * wpd && w < MPK_PHASE_MAX_WORKERS; w++) {
+                    unsigned long long const v =
+                        g_xs_snap[((size_t)L * MPK_PHASE_MAX_WORKERS + w) * 16 + k];
+                    if (!v) continue;
+                    mn = v < mn ? v : mn;
+                    mx = v > mx ? v : mx;
+                  }
+                  if (mx == 0) printf(" -1:-1");
+                  else {
+#ifdef MPK_XSNAP_LAT
+                    long long const bb = (k == 12 || k >= 14) ? 0 : (long long)b;
+#else
+                    long long const bb = (long long)b;
+#endif
+                    printf(" %lld:%lld", ((long long)mn - bb) * 10,
+                           ((long long)mx - bb) * 10);
+                  }
+                }
+                printf("\n");
+              }
+            }
+#endif
+          }
+#endif
+#ifdef MPK_QKV_SPLIT
+          if (g_qkv_n > 0) {
+            printf("[QKVSPLIT] n=%llu setup=%llu gemm=%llu total=%llu\n",
+                   g_qkv_n,
+                   g_qkv_setup_sum / g_qkv_n,
+                   g_qkv_gemm_sum / g_qkv_n,
+                   (g_qkv_setup_sum + g_qkv_gemm_sum) / g_qkv_n);
           }
 #endif
 #ifdef MPK_INTERLAYER_SPLIT
@@ -4128,6 +7374,20 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
           }
 #endif
 #endif
+#ifdef MPK_HWID_MAP
+          for (int w = 0; w < 1024; w++) {
+            if (g_hwid_w[w] != 0) {
+              printf("[HWID] w b=%d xcc=%u hw=%x\n", w,
+                     (unsigned)(g_hwid_w[w] >> 32), (unsigned)g_hwid_w[w]);
+            }
+          }
+          for (int s = 0; s < 64; s++) {
+            if (g_hwid_s[s] != 0) {
+              printf("[HWID] s b=%d xcc=%u hw=%x\n", s,
+                     (unsigned)(g_hwid_s[s] >> 32), (unsigned)g_hwid_s[s]);
+            }
+          }
+#endif
 #ifdef MPK_ENABLE_MOE_SUBPHASE
           // Raw timestamps: scratch[0]=entry, [1]=before_lds,
           // [4]=after_compute, [2]=after_barrier
@@ -4158,31 +7418,173 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
           {
             unsigned long long new_val = *config.precomp_iter_ready;
             int *rel = config.precomp_iter_xcd_release;
-            for (int x = 0; x < 8; x++) {
+#ifdef MPK_ITER_AID
+            // Two stores, not eight, and into AID-local MTYPE_RW replicas
+            // rather than the 512 B gpu_malloc line -- which is plain
+            // spanning VRAM, i.e. MTYPE_NC wholly inside ONE range, so half
+            // the XCDs were polling it remotely AND uncached.
+            mpk_aid_iter_publish((unsigned)new_val);
+            if (mpk_aid_iter_slot(0) == nullptr) {
+              for (int x = 0; x < MPK_NUM_XCDS; x++) {
+                st_wt_u32((void *)&rel[x * 16], (unsigned)new_val);
+              }
+            }
+#else
+            for (int x = 0; x < MPK_NUM_XCDS; x++) {
               st_wt_u32((void *)&rel[x * 16], (unsigned)new_val);
             }
+#endif
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
           }
 #endif
           terminate_schedulers(config);
+#ifdef MPK_END_POLL
+          ep_ev = -1;  // the termination event comes through the own queue
+#endif
         } else {
           unsigned long long prep_done_clk = get_wallclock_ns();
+#ifdef MPK_END_POLL
+          if (ep_ev >= 0) {
+            ep_target += ep_step;
+          } else if (!ep_drop_end && !ep_got && (sched_id != 0 || cur_event_pos[0] > 0)) {
+            // an end event the marker pushed (the launch's first one is the host's, scheduler 0 slot 0): the
+            // event the marker waits on is the one that launches it
+            size_t const end_pos = get_event_position_index(event_id);
+            int found = -1;
+            for (int ev = config.num_events - 1; ev >= 0 && found < 0; ev--) {
+              EventDesc const d = config.all_events[ev];
+              if (d.first_task_id == TASK_INVALID_ID || d.last_task_id == TASK_INVALID_ID) {
+                continue;
+              }
+              size_t const t0 = get_task_position_index(d.first_task_id);
+              size_t const t1 = get_task_position_index(d.last_task_id);
+              for (size_t t = t0; t < t1 && t < t0 + 4; t++) {
+                EventId const tr = config.all_tasks[t].trigger_event;
+                if (tr != EVENT_INVALID_ID && get_event_position_index(tr) == end_pos) {
+                  found = ev;
+                  break;
+                }
+              }
+            }
+            if (found >= 0) {
+              EventCounter const st = (EventCounter)MPK_LD_EVCFG(&config.all_event_num_triggers[found]);
+              EventCounter const c = (EventCounter)MPK_EVCTR_READ(config.all_event_counters, found);
+              // the marker saw exactly st * (its pass) before pushing; anything else: stay on the queue
+              if (st > 0 && c > 0 && c % st == 0) {
+                ep_ev = found;
+                ep_step = st;
+                ep_target = c + st;
+                ep_end_id = event_id;
+                ep_drop_end = true;
+#ifdef MPK_END_POLL_DBG
+                ep_armed_at = (unsigned)end_of_graph_count;
+#endif
+              }
+            }
+          }
+          ep_rel_clk = get_wallclock_ns();
+          ep_quiet_until = ep_rel_clk + ep_quiet_ns;
+#endif
 #ifdef MPK_PRECOMPUTED_DISPATCH
           // Signal workers to start next iteration.
+#ifdef MPK_ITER_DELAY_NS
+          // MPK_ITER_DELAY_V1: timing probe.
+          while (get_wallclock_ns() < prep_done_clk + (MPK_ITER_DELAY_NS)) {
+          }
+#endif
+#ifdef MPK_ITER_TS
+          __atomic_store_n(&g_its_rel_ts, prep_done_clk, __ATOMIC_RELAXED);
+#endif
           // iter_ready starts at 0; every END_OF_TASK_GRAPH bumps it.
           // First bump (from prepare_kernel) enables iteration 1.
+#ifdef MPK_END_DIRECT
+          if (!end_direct) {
+#endif
           __threadfence();
+#ifdef MPK_REL_RET
+          unsigned long long const rel_ret = atomicAdd(config.precomp_iter_ready, 1ULL) + 1ULL;
+#else
           atomicAdd(config.precomp_iter_ready, 1ULL);
+#endif
           // Fan out per-XCD release flags via st_wt (write-through to HBM)
           // so workers can poll via ld_nt without cross-XCD L2 contention.
           {
+#ifdef MPK_REL_RET
+            unsigned long long new_val = rel_ret;  // what the load behind the add read, without its round trip
+#else
             unsigned long long new_val = *config.precomp_iter_ready;
+#endif
             int *rel = config.precomp_iter_xcd_release;
-            for (int x = 0; x < 8; x++) {
+#ifdef MPK_ITER_AID
+            // Two stores, not eight, and into AID-local MTYPE_RW replicas
+            // rather than the 512 B gpu_malloc line -- which is plain
+            // spanning VRAM, i.e. MTYPE_NC wholly inside ONE range, so half
+            // the XCDs were polling it remotely AND uncached.
+            mpk_aid_iter_publish((unsigned)new_val);
+            if (mpk_aid_iter_slot(0) == nullptr) {
+              for (int x = 0; x < MPK_NUM_XCDS; x++) {
+                st_wt_u32((void *)&rel[x * 16], (unsigned)new_val);
+              }
+            }
+#else
+            for (int x = 0; x < MPK_NUM_XCDS; x++) {
               st_wt_u32((void *)&rel[x * 16], (unsigned)new_val);
             }
+#endif
+#ifdef MPK_ITER_TS
+          {
+            unsigned long long const its_t4 = get_wallclock_ns();
+            unsigned long long const its_t0 =
+                __atomic_load_n(&g_its_argmax_end, __ATOMIC_RELAXED);
+            if (g_fwdpass_total_iters >= 40 && its_t0 != 0 &&
+                its_t0 <= iter_end_clk && iter_end_clk - its_t0 < 1000000ull) {
+              g_its_sum[0] += iter_end_clk - its_t0;
+              g_its_sum[1] += its_t1b - iter_end_clk;
+              g_its_sum[2] += its_t2 - its_t1b;
+              g_its_sum[3] += prep_done_clk - its_t2;
+              g_its_sum[4] += its_t4 - prep_done_clk;
+              {
+                unsigned long long const pe =
+                    __atomic_load_n(&g_its_push_end, __ATOMIC_RELAXED);
+                if (pe != 0 && pe <= iter_end_clk && iter_end_clk - pe < 1000000ull) {
+                  g_its_sum[5] += iter_end_clk - pe;
+                }
+              }
+              g_its_n++;
+            }
+          }
+#endif
+#ifdef MPK_TAIL_PUB_LATE
+          // After the release: the next iteration does not need it, and the
+          // value read now (after prepare_next_batch) already names the token
+          // this iteration produced.
+          if (config.progress_host != nullptr) {
+#ifdef MPK_TOK_HOST // request 0's newest token id beside its position (bs=1 streaming)
+            {
+              int const tp = (int)config.step[0];
+              for (int _j = 0; _j < 16; _j++) {  // spec: backfill accepted positions committed this pass
+                int const _p = tp - _j;
+                if (_p < 0 || _p >= MPK_MAX_SEQ_LENGTH) break;
+                config.progress_host[MPK_MAX_NUM_BATCHED_REQUESTS + _p] = (int)__hip_atomic_load(
+                    &config.tokens[_p], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+              }
+            }
+#endif
+            __threadfence_system();
+            for (int r = 0; r < MPK_MAX_NUM_BATCHED_REQUESTS; r++) {
+              __atomic_store_n(&config.progress_host[r], config.step[r],
+                               __ATOMIC_RELEASE);
+            }
+          }
+#endif
+#ifdef MPK_BOOK_LATE
+            book_late();
+#endif
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
           }
+#ifdef MPK_END_DIRECT
+          }
+#endif
 #else
           // Launch task 1 (begin_task_graph) for the next iteration (same XCD)
           int nw = my_workers[next_worker_idx];
@@ -4474,6 +7876,9 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
           }
         } // end non-gang dispatch in else branch
       }
+#ifdef MPK_END_POLL
+      if (!ep_got)
+#endif
       cur_event_pos[queue_idx] += 1;
     }
   }
@@ -4535,28 +7940,290 @@ __global__ __launch_bounds__(WORKER_NUM_THREADS,
 #endif
 }
 
+#ifdef MPK_PLACE_GUARD
+// MPK_PLACE_GUARD_V1: a block that never gets a CU deadlocks the launch (a worker fills a CU, so nothing can share
+// one). Every block checks in at entry, before it touches shared state; the first block that sees all of them
+// sets GO, a block whose MPK_PLACE_GUARD ms run out first sets ABORT, and every block follows the one decision.
+static unsigned *g_mpk_place_h = nullptr;  // MPK_PLACE_SERIAL_V1: host view of the check-in words
+__device__ unsigned *g_place_host = nullptr;  // pinned: [0] check-ins, [1] 0 pending / 1 go / 2 abort, [2] blocks
+__device__ __forceinline__ bool mpk_place_guard_abort(int is_sched) {  // MPK_PLACE_GUARD_V2 MPK_PLACE_GUARD_V3
+  // No __shared__ here: a static LDS variable moves the dynamic LDS rings off 16-byte alignment (1.9x slower).
+  unsigned *const g = g_place_host;
+  if (g == nullptr) {
+    return false;
+  }
+  if (threadIdx.x == 0) {
+    unsigned const want = __hip_atomic_load(&g[2], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    unsigned long long const t0 = __builtin_amdgcn_s_memrealtime();
+#ifdef MPK_MULTI_DEV
+    int const slot = is_sched ? (int)g[3] + g_mpk_dev_xcd_base + (int)blockIdx.x
+                              : g_mpk_dev_worker_base + (int)blockIdx.x;
+#else
+    int const slot = is_sched ? (int)g[3] + (int)blockIdx.x : (int)blockIdx.x;
+#endif
+    if (slot >= 0 && slot < 1000) {
+      __hip_atomic_store((unsigned long long *)(g + 16) + slot, t0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+    __hip_atomic_fetch_add(&g[0], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    while (__hip_atomic_load(&g[1], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) == 0u) {
+      unsigned e = 0u;
+      if (__hip_atomic_load(&g[0], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) >= want) {
+        __hip_atomic_compare_exchange_strong(&g[1], &e, 1u, __ATOMIC_RELAXED, __ATOMIC_RELAXED,
+                                             __HIP_MEMORY_SCOPE_SYSTEM);
+      } else if (__builtin_amdgcn_s_memrealtime() - t0 > (unsigned long long)(MPK_PLACE_GUARD) * 100000ull) {
+        __hip_atomic_compare_exchange_strong(&g[1], &e, 2u, __ATOMIC_RELAXED, __ATOMIC_RELAXED,
+                                             __HIP_MEMORY_SCOPE_SYSTEM);
+      } else {
+        __builtin_amdgcn_s_sleep(8);
+      }
+    }
+  }
+  __syncthreads();
+  // g[1] only changes from 0, so every thread reads the decision thread 0 waited for.
+  return __hip_atomic_load(&g[1], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) == 2u;
+}
+#endif
 __global__ __launch_bounds__(WORKER_NUM_THREADS,
                              1) void worker_kernel(RuntimeConfig config) {
+#ifdef MPK_RESID_MAP
+  if (threadIdx.x == 0 && blockIdx.x < 1024) {
+#ifdef MPK_MULTI_DEV // MDEV_RESID
+    mpk_resid_mark(g_mpk_dev_worker_base + (int)blockIdx.x);
+#else
+    mpk_resid_mark(blockIdx.x);
+#endif
+  }
+#endif
+#ifdef MPK_PLACE_GUARD
+  if (mpk_place_guard_abort(0)) {
+    return;
+  }
+#endif
   worker_checker(config);
+#ifdef MPK_CPX_SCOPE // MDEV_CPX_BOUNDARY: no line another kernel left in this XCC's L2
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+#endif
+#ifdef MPK_LDS_PAD
+  // Static LDS pad of MPK_LDS_PAD bytes: shifts every later LDS offset
+  // (and the dynamic base) without adding any work. The asm keeps it live.
+  __shared__ unsigned char s_mpk_lds_pad[MPK_LDS_PAD];
+  asm volatile("" ::"v"((unsigned)(size_t)s_mpk_lds_pad));
+#endif
+#ifdef MPK_HWID_MAP
+  if (threadIdx.x == 0 && blockIdx.x < 1024) {
+    g_hwid_w[blockIdx.x] = mpk_hwid_now();
+  }
+#endif
+#ifdef MPK_XCD_SUBSET
+  // Elect by hardware die, never by blockIdx: this gate retires most of the
+  // grid at once, the freed CUs are refilled out of round-robin order, and a
+  // block's index then says nothing about where it ran. Each surviving block
+  // claims a dense rank on its own die, so the participating XCDs see exactly
+  // workers_per_xcd workers however the dispatcher placed them.
+  __shared__ int s_subset_wid;
+  if (threadIdx.x == 0) {
+    int phys;
+    MPK_GET_XCC_ID16(phys);
+    s_subset_wid = -1;
+    // get_current_xcd_id() folds with %MPK_NUM_XCDS, which only agrees with
+    // (phys - MPK_XCD_BASE) when the base is a whole number of subsets in.
+    static_assert(MPK_XCD_BASE % MPK_NUM_XCDS == 0,
+                  "MPK_XCD_BASE must be a multiple of MPK_NUM_XCDS");
+    int const lx = phys - MPK_XCD_BASE;
+    if (lx >= 0 && lx < MPK_NUM_XCDS) {
+      int const wpx = config.precomp_workers_per_xcd > 0
+                          ? config.precomp_workers_per_xcd
+                          : config.num_workers / MPK_NUM_XCDS;
+      int const rank = atomicAdd(&g_xcd_subset_rank[lx], 1);
+      if (rank < wpx) {
+        s_subset_wid = rank * MPK_NUM_XCDS + lx;
+      }
+    }
+  }
+  __syncthreads();
+  if (s_subset_wid < 0) {
+    return;
+  }
+  execute_worker(config, s_subset_wid);
+#elif defined(MPK_MULTI_DEV) // MDEV_WORKER_ID
+  execute_worker(config, g_mpk_dev_worker_base + (int)blockIdx.x);
+#else
   execute_worker(config);
+#endif
 }
 
 __global__ void scheduler_kernel(RuntimeConfig config) {
+#ifdef MPK_RESID_MAP
+  if (threadIdx.x == 0 && blockIdx.x < 64) {
+#ifdef MPK_MULTI_DEV // MDEV_RESID
+    mpk_resid_mark(1024 + g_mpk_dev_xcd_base + (int)blockIdx.x);
+#else
+    mpk_resid_mark(1024 + blockIdx.x);
+#endif
+  }
+#endif
+#ifdef MPK_PLACE_GUARD
+  if (mpk_place_guard_abort(1)) {
+    return;
+  }
+#endif
   scheduler_checker(config);
+#ifdef MPK_CPX_SCOPE // MDEV_CPX_BOUNDARY: no line another kernel left in this XCC's L2
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+#endif
+#ifdef MPK_HWID_MAP
+  if (threadIdx.x == 0 && blockIdx.x < 64) {
+    g_hwid_s[blockIdx.x] = mpk_hwid_now();
+  }
+#endif
+#ifdef MPK_XCD_SUBSET
+  // One scheduler per participating die, claimed by the first block to land
+  // there. The whole block leaves together, so the syncthreads stays uniform
+  // -- and it must happen before the return, because execute_scheduler runs
+  // thread 0 only and cannot be entered divergently.
+  __shared__ int s_sched_id;
+  if (threadIdx.x == 0) {
+    int phys;
+    MPK_GET_XCC_ID16(phys);
+    s_sched_id = -1;
+    int const lx = phys - MPK_XCD_BASE;
+    if (lx >= 0 && lx < MPK_NUM_XCDS &&
+        atomicAdd(&g_xcd_sched_rank[lx], 1) == 0) {
+      s_sched_id = lx;
+    }
+  }
+  __syncthreads();
+  if (s_sched_id < 0) {
+    return;
+  }
+  execute_scheduler(config, 0, s_sched_id);
+#elif defined(MPK_MULTI_DEV) // MDEV_SCHED_ID
+  execute_scheduler(config, 0, get_current_xcd_id());
+#else
   execute_scheduler(config, 0);
+#endif
 }
 #pragma clang diagnostic pop
 
+#ifdef MPK_AID_LOCAL
+#include "aid_local.h"
+#endif
+
+// Allocator for state that several XCDs read and write.
+//
+// Under DPX+NPS2 a device is 4 XCDs spanning two AIDs, and device VRAM there
+// is coherent only within one AID -- so a counter incremented on one die is
+// never observed by the two XCDs on the other. Host memory is system-coherent,
+// so every XCD sees the same value. The buffers routed here are a few KB of
+// counters polled in spin loops, not bandwidth-bound data.
+//
+// MPK_UNCACHED_SYNC prefers UNCACHED DEVICE VRAM over host memory. It needs
+// the driver's aid_local_uncached_mtype=1, which maps an UNCACHED-marked BO to
+// MTYPE_NC instead of upstream's MTYPE_UC -- NC is the one MTYPE this
+// protocol was measured correct on, and UC drops the coherence point
+// device-scope atomics resolve at, so these counters' atomicAdd would never
+// land. Staying on the device avoids a PCIe round trip per poll, which is
+// what made the host-memory arm 21.3 ms/token against 3.9 in DPX+NPS1.
+template <typename DT>
+DT *mpk_sync_malloc(size_t size) {
+  static bool const use_uncached = (getenv("MPK_UNCACHED_SYNC") != nullptr &&
+                                    atoi(getenv("MPK_UNCACHED_SYNC")) != 0);
+  static bool const use_host = (getenv("MPK_HOST_EVCTR") != nullptr &&
+                                atoi(getenv("MPK_HOST_EVCTR")) != 0);
+  void *dst_ptr = nullptr;
+  if (use_uncached) {
+    if (hipExtMallocWithFlags(&dst_ptr, size, hipDeviceMallocUncached) ==
+        hipSuccess) {
+      (void)hipMemset(dst_ptr, 0, size);
+      fprintf(stderr, "[SYNCMEM] %zu bytes uncached VRAM @ %p\n", size,
+              dst_ptr);
+      return static_cast<DT *>(dst_ptr);
+    }
+    fprintf(stderr, "[SYNCMEM] hipExtMallocWithFlags failed\n");
+  }
+  if (use_host) {
+    if (hipHostMalloc(&dst_ptr, size,
+                      hipHostMallocMapped | hipHostMallocCoherent) ==
+        hipSuccess) {
+      memset(dst_ptr, 0, size);
+      fprintf(stderr, "[SYNCMEM] %zu bytes host-coherent @ %p\n", size,
+              dst_ptr);
+      return static_cast<DT *>(dst_ptr);
+    }
+    fprintf(stderr, "[SYNCMEM] hipHostMalloc failed, falling back to VRAM\n");
+  }
+  (void)cudaMalloc(&dst_ptr, size);
+  return static_cast<DT *>(dst_ptr);
+}
+
+static int g_mpk_unc_seq = 0;  // MPK_UNC_SEQ numbering, shared by every gpu_malloc<DT>
 template <typename DT>
 DT *gpu_malloc(size_t size) {
   void *dst_ptr;
 #ifdef USE_NVSHMEM
   dst_ptr = nvshmem_malloc(size);
 #else
+  // MPK_UNCACHED_ALL routes every runtime allocation -- task descriptors,
+  // the per-worker queues, the multi-layer pointer tables -- to NC as well.
+  // A worker reads its queue entry before it can enter its first task, and
+  // the multi-layer refresh WRITES task_desc->input_ptrs from the kernel, so
+  // this state is not merely host-uploaded and read-only. Blunt on purpose:
+  // it leaves only the torch-owned weights and KV cache on RW, which is the
+  // bisect that says whether anything outside the weights still needs NC.
+  static bool const unc_all = (getenv("MPK_UNCACHED_ALL") != nullptr &&
+                               atoi(getenv("MPK_UNCACHED_ALL")) != 0);
+  static int unc_lo = -1, unc_hi = -1;
+  static bool const unc_log = getenv("MPK_UNC_LOG") != nullptr;
+  if (unc_lo < 0 && getenv("MPK_UNC_SEQ") != nullptr) {
+    if (sscanf(getenv("MPK_UNC_SEQ"), "%d:%d", &unc_lo, &unc_hi) != 2) {
+      unc_lo = unc_hi = 0;
+    }
+  }
+  int const my_seq = g_mpk_unc_seq++;
+  bool const unc = unc_all || (unc_lo >= 0 && my_seq >= unc_lo && my_seq < unc_hi);
+  if (unc_log) {
+    fprintf(stderr, "[UNC] seq=%d bytes=%zu elem=%zu uncached=%d\n", my_seq, size, sizeof(DT),
+            (int)unc);
+  }
+  if (unc) {
+    dst_ptr = nullptr;
+    if (hipExtMallocWithFlags(&dst_ptr, size, hipDeviceMallocUncached) ==
+        hipSuccess) {
+      (void)hipMemset(dst_ptr, 0, size);
+      return static_cast<DT *>(dst_ptr);
+    }
+  }
   (void)cudaMalloc(&dst_ptr, size);
 #endif
   return static_cast<DT *>(dst_ptr);
 }
+
+#ifdef MPK_EVCTR_HOST
+// Pinned, device-mapped allocation for the event counters (debug only).
+//
+// See MPK_EVCTR_HOST at the call sites: device memory is unreadable by the host
+// during a hang, because reading it needs HIP and HIP is wedged behind the
+// spinning persistent kernel. Falls back to device memory if pinning fails, so
+// a build with the flag still runs.
+template <typename DT>
+DT *host_mapped_malloc(size_t bytes, void **host_out) {
+  void *h = nullptr;
+  (void)hipHostMalloc(&h, bytes, hipHostMallocMapped);
+  if (h == nullptr) {
+    fprintf(stderr, "[MPK] EVCTR_HOST: hipHostMalloc(%zu) failed, using VRAM\n",
+            bytes);
+    *host_out = nullptr;
+    return gpu_malloc<DT>(bytes);
+  }
+  memset(h, 0, bytes);
+  void *d = nullptr;
+  if (hipHostGetDevicePointer(&d, h, 0) != hipSuccess || d == nullptr) {
+    d = h;
+  }
+  *host_out = h;
+  return static_cast<DT *>(d);
+}
+#endif
 
 void gpu_free(void *ptr) {
 #ifdef USE_NVSHMEM
@@ -4582,8 +8249,6 @@ static unsigned long long *g_dbg_h_tasks_done =
 static int *g_dbg_h_worker_state =
     nullptr; // [num_workers*4] host-mapped debug state
 static int g_dbg_num_workers = 0;
-// Host-side view of the decode-progress counter (pinned, device-mapped).
-static int *g_progress_host = nullptr;
 static EventCounter *g_dbg_h_event_counters =
     nullptr; // host-mapped event counters
 static EventCounter *g_dbg_h_xcd_local_counters =
@@ -4591,6 +8256,18 @@ static EventCounter *g_dbg_h_xcd_local_counters =
 static int *g_dbg_h_xcd_event_thresholds = nullptr; // host copy of thresholds
 static int g_dbg_num_events = 0;
 static int g_dbg_num_xcds = 0;
+#endif
+// Host-side view of the decode-progress counter (pinned, device-mapped).
+// Not gated on MPK_PRECOMPUTED_DISPATCH: reset_decode_progress /
+// get_decode_progress / launch_persistent_kernel all compile in either mode.
+#ifdef MPK_TOK_HOST // request 0's token ids after the progress slots, one int per position
+#define MPK_TOK_HOST_N MPK_MAX_SEQ_LENGTH
+#else
+#define MPK_TOK_HOST_N 0
+#endif
+static int *g_progress_host = nullptr;
+#ifdef MPK_HOST_STOP
+static int *g_stop_host = nullptr;
 #endif
 
 #ifdef MPK_NIL_TRIPWIRE
@@ -4737,10 +8414,38 @@ static void install_tripwire_handler() {
 // meta_tensors[8]: paged_kv_indices_buffer
 // meta_tensors[9]: paged_kv_last_page_len_buffer
 
+#if defined(MODE_OFFLINE) && defined(MPK_SPEC_VSLOT) && defined(MPK_MULTI_DEV)
+// MDEV_SPEC: the shared spec-state buffer and the device it was allocated on (set at the first launch).
+static void *g_mpk_spec_sh_host = nullptr;
+static int g_mpk_spec_sh_dev = 0;
+#endif
+
 extern "C" void init_request_resources() {
   init_kernel<<<dim3(1, 1, 1), dim3(INIT_NUM_THREADS, 1, 1)>>>(
       global_runtime_config);
   (void)cudaStreamSynchronize(NULL);
+#if defined(MODE_OFFLINE) && defined(MPK_SPEC_VSLOT) // MPK_SPEC_REQ_RESET
+  // A new request starts with the virtual-slot spec state at zero, as the first launch does; otherwise the next
+  // launch in this process finds request 0 done and ends at once (one launch per served request).
+#ifdef MPK_MULTI_DEV
+  if (g_mpk_spec_sh_host != nullptr) {
+    int cur = 0;
+    (void)hipGetDevice(&cur);
+    (void)hipSetDevice(g_mpk_spec_sh_dev);
+    (void)hipMemset(g_mpk_spec_sh_host, 0, sizeof(MpkSpecShared));
+    (void)hipDeviceSynchronize();
+    (void)hipSetDevice(cur);
+  }
+#else
+  {
+    int const zero4[4] = {0, 0, 0, 0};
+    unsigned long long const zst[4] = {0ull, 0ull, 0ull, 0ull};
+    (void)hipMemcpyToSymbol(HIP_SYMBOL(g_spec_state), zero4, sizeof zero4);
+    (void)hipMemcpyToSymbol(HIP_SYMBOL(g_spec_stats), zst, sizeof zst);
+    (void)hipDeviceSynchronize();
+  }
+#endif
+#endif
 }
 
 // Zero the progress counters from the host, synchronously.
@@ -4751,18 +8456,52 @@ extern "C" void init_request_resources() {
 // response was already generated, and emit every token at once -- which
 // reports a near-zero TTFT and a near-zero inter-token latency for every
 // request after the first. Call this before the poller starts.
+// Ask the running launch to end. The iteration-end decision reads the word every 16th iteration
+// and then takes the normal end-of-request path. reset_decode_progress() clears it.
+extern "C" void request_decode_stop() {
+#ifdef MPK_HOST_STOP
+  if (g_stop_host != nullptr) {
+    __atomic_store_n(g_stop_host, 1, __ATOMIC_RELEASE);
+  }
+#endif
+}
+
 extern "C" void reset_decode_progress() {
+#ifdef MPK_HOST_STOP
+  if (g_stop_host != nullptr) {
+    __atomic_store_n(g_stop_host, 0, __ATOMIC_RELEASE);
+  }
+#endif
   if (g_progress_host == nullptr) {
     return;
   }
   for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
     __atomic_store_n(&g_progress_host[i], 0, __ATOMIC_RELEASE);
   }
+#ifdef MPK_TOK_HOST
+  for (int i = 0; i < MPK_TOK_HOST_N; i++) {
+    __atomic_store_n(&g_progress_host[MPK_MAX_NUM_BATCHED_REQUESTS + i], -1, __ATOMIC_RELAXED);
+  }
+#endif
 }
 
 // Token position reached by batch slot `slot` in the currently-running launch,
 // or -1 if unavailable. Safe to call from another thread while the kernel runs
 // -- that is the point.
+// Token id at position pos of request 0 in the running launch (MPK_TOK_HOST), or -1. Valid once
+// get_decode_progress(0) >= pos: the publish orders the id before the position.
+extern "C" int get_decode_token(int pos) {
+#ifdef MPK_TOK_HOST
+  if (g_progress_host == nullptr || pos < 0 || pos >= MPK_MAX_SEQ_LENGTH) {
+    return -1;
+  }
+  return __atomic_load_n(&g_progress_host[MPK_MAX_NUM_BATCHED_REQUESTS + pos], __ATOMIC_ACQUIRE);
+#else
+  (void)pos;
+  return -1;
+#endif
+}
+
 extern "C" int get_decode_progress(int slot) {
   if (g_progress_host == nullptr || slot < 0 ||
       slot >= MPK_MAX_NUM_BATCHED_REQUESTS) {
@@ -4792,6 +8531,12 @@ extern "C" void set_rope_tables(void *cos_ptr, void *sin_ptr) {
   global_runtime_config.rope_sin_ptr = sin_ptr;
 }
 
+#ifdef MPK_MULTI_DEV // MDEV_FWD_DECL
+#if defined(MPK_ATTN_QWAIT_RT) || defined(MPK_RPROBE)
+#error "MPK_MULTI_DEV: ATTN_QWAIT_RT / RPROBE set symbols on one device only"
+#endif
+static void mpk_mdev_init();
+#endif
 extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
                                        void *profiler_buffer,
                                        int my_rank,
@@ -4890,6 +8635,19 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
     all_tasks.push_back(task_desc);
   }
 
+#ifdef MPK_LM_WEIGHT_AID
+  // Task 218 input 3 is a static dim-0 bijection: descriptor x owns exactly
+  // one eighth of the vocabulary weight. Give each consumer its own local RW
+  // BO; do not replicate the 315 MiB weight.
+  if (!mirage::aid::relocate_gang_sliced_input(
+          all_tasks,
+          (int)TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300,
+          3)) {
+    fprintf(stderr, "[AID LM] fatal: LM-head split did not complete\n");
+    abort();
+  }
+#endif
+
   // Dump task graph for dispatch benchmark
   {
     char const *dump_path = getenv("MPK_DUMP_TASK_GRAPH");
@@ -4946,16 +8704,16 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
     }
   }
 
-#ifdef MPK_PRECOMPUTED_DISPATCH
   // =========================================================================
   // Multi-layer fusion: build pointer table from all 36 layers, then compact
   // the task graph by removing redundant layers 1..35 (280 tasks, 35 events).
   // Must happen BEFORE template queue building so the template uses compacted
-  // indices.
+  // indices. Not gated on MPK_PRECOMPUTED_DISPATCH: the fused task graph is
+  // the same either way; precomputed dispatch only fills per-worker queues.
   // =========================================================================
 #ifdef MPK_FUSED_LAYER_BATCHING
   {
-    constexpr int NUM_XCDS_ML = 8;
+    constexpr int NUM_XCDS_ML = MPK_NUM_XCDS;
     // Must cover every slot the fused layer kernels read, not just the ones
     // the plain variant uses. The LM-head variant
     // (TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300, FUSE_TAIL=1) reads
@@ -4999,6 +8757,150 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
 
     if (ml_layers > 1) {
       // Build per-XCD pointer tables from all layers BEFORE compaction
+#ifdef MPK_AID_LOCAL
+      // Move the XCD-sliced weight tensors named by MPK_AID_LOCAL_SLOTS
+      // into AID-local VRAM before the pointer tables are built.
+      // all_tasks is still pre-compaction here, so fused_layer_positions[L]
+      // + xcd is XCD xcd's descriptor for layer L; the table below is built
+      // from all_tasks, so one rewrite covers layer 0 and layers 1+.
+      mirage::aid::relocate_xcd_sliced_inputs(
+          all_tasks, fused_layer_positions, ML_N_IN);
+#endif
+#ifdef MPK_PPROBE
+      mpk_pprobe::run(all_tasks, fused_layer_positions);
+#endif
+#ifdef MPK_AID_RW
+      {
+        // MPK_AID_RW_MAP = "p0:p1:n,...": XCDs of the upper AID read the AID1
+        // copy of every listed input. Any slot pointing inside [p0, p0+n) moves
+        // to the same offset in p1, so sliced / offset pointers follow too.
+        struct RwRange { char *p0, *p1; size_t n; };
+        std::vector<RwRange> rr;
+        if (char const *m = getenv("MPK_AID_RW_MAP")) {
+          char const *q = m;
+          while (*q) {
+            char *e = nullptr;
+            unsigned long long a = strtoull(q, &e, 16);
+            if (*e != ':') break;
+            unsigned long long b = strtoull(e + 1, &e, 16);
+            if (*e != ':') break;
+            unsigned long long n = strtoull(e + 1, &e, 16);
+            rr.push_back({(char *)a, (char *)b, (size_t)n});
+            q = (*e == ',') ? e + 1 : e;
+            if (!*e) break;
+          }
+        }
+        int moved = 0, moved_out = 0;
+        std::vector<int> per_slot(ML_N_IN, 0);
+        for (int L = 0; L < ml_layers; L++) {
+          for (int xcd = NUM_XCDS_ML / 2; xcd < NUM_XCDS_ML; xcd++) {
+            for (int slot = 0; slot < ML_N_IN; slot++) {
+              void *&p = all_tasks[fused_layer_positions[L] + xcd].input_ptrs[slot];
+              char *c = (char *)p;
+              for (auto const &r : rr) {
+                if (c >= r.p0 && c < r.p0 + r.n) {
+                  p = r.p1 + (c - r.p0);
+                  moved++;
+                  per_slot[slot]++;
+                  break;
+                }
+              }
+            }
+            for (int slot = 0; slot < ML_N_OUT; slot++) {
+              void *&p = all_tasks[fused_layer_positions[L] + xcd].output_ptrs[slot];
+              char *c = (char *)p;
+              for (auto const &r : rr) {
+                if (c >= r.p0 && c < r.p0 + r.n) {
+                  p = r.p1 + (c - r.p0);
+                  moved_out++;
+                  break;
+                }
+              }
+            }
+          }
+        }
+        printf("[AID_RW] ranges=%zu repointed=%d out=%d slots:", rr.size(), moved, moved_out);
+        for (int s = 0; s < ML_N_IN; s++)
+          if (per_slot[s]) printf(" %d:%d", s, per_slot[s]);
+        printf("\n");
+      }
+#endif
+#ifdef MPK_MOE_RW
+      {
+        // XCDs of the upper AID read the AID1 copy of every MoE weight
+        // (slots 17 gate_up, 18 down). Rewriting all_tasks before the tables
+        // are built covers layer 0 and layers 1+.
+        std::vector<std::pair<void *, void *>> rw;
+        if (char const *m = getenv("MPK_MOE_RW_MAP")) {
+          std::string s(m);
+          size_t i = 0;
+          while (i < s.size()) {
+            size_t const c = s.find(':', i);
+            size_t e = s.find(',', i);
+            if (c == std::string::npos) break;
+            if (e == std::string::npos) e = s.size();
+            rw.push_back({(void *)strtoull(s.substr(i, c - i).c_str(), nullptr, 16),
+                          (void *)strtoull(s.substr(c + 1, e - c - 1).c_str(), nullptr, 16)});
+            i = e + 1;
+          }
+        }
+        int moved = 0;
+        for (int L = 0; L < ml_layers; L++) {
+          for (int xcd = NUM_XCDS_ML / 2; xcd < NUM_XCDS_ML; xcd++) {
+            for (int slot = 17; slot <= 18; slot++) {
+              void *&p = all_tasks[fused_layer_positions[L] + xcd].input_ptrs[slot];
+              for (auto const &pr : rw) {
+                if (pr.first == p) {
+                  p = pr.second;
+                  moved++;
+                  break;
+                }
+              }
+            }
+          }
+        }
+        printf("[MOE_RW] pairs=%zu repointed=%d (expect %d)\n", rw.size(), moved,
+               ml_layers * (NUM_XCDS_ML / 2) * 2);
+      }
+#endif
+      if (char const *os = getenv("MPK_ORACLE_MALL_SLOTS")) {
+        // MALL-residency probe (wrong output): layers 1+ read layer 0's
+        // pointer in the listed slots, per XCD.
+        int moved = 0;
+        for (char const *q = os; *q;) {
+          char *e = nullptr;
+          long const slot = strtol(q, &e, 10);
+          if (e == q) break;
+          if (slot >= 0 && slot < ML_N_IN)
+            for (int L = 1; L < ml_layers; L++)
+              for (int xcd = 0; xcd < NUM_XCDS_ML; xcd++) {
+                all_tasks[fused_layer_positions[L] + xcd].input_ptrs[slot] =
+                    all_tasks[fused_layer_positions[0] + xcd].input_ptrs[slot];
+                moved++;
+              }
+          q = (*e == ',') ? e + 1 : e;
+        }
+        printf("[ORACLE_MALL] slots=%s repointed=%d\n", os, moved);
+      }
+      if (getenv("MPK_DBG_XCD_PTRS")) {
+        // Which descriptors actually carry the LM head weight (slot 26)?
+        int shown = 0;
+        for (size_t t = 0; t < all_tasks.size() && shown < 24; t++) {
+          if (all_tasks[t].input_ptrs[26] != nullptr) {
+            printf("[LMSCAN] idx=%zu task_type=%d lm_W=%p lm_bias=%p "
+                   "norm_w=%p norm_in=%p\n",
+                   t,
+                   (int)all_tasks[t].task_type,
+                   all_tasks[t].input_ptrs[26],
+                   all_tasks[t].input_ptrs[27],
+                   all_tasks[t].input_ptrs[24],
+                   all_tasks[t].input_ptrs[25]);
+            shown++;
+          }
+        }
+        printf("[LMSCAN] total_tasks=%zu with_slot26=%d\n",
+               all_tasks.size(), shown);
+      }
       std::vector<void *> h_input_table(NUM_XCDS_ML * ml_layers * ML_N_IN);
       std::vector<void *> h_output_table(NUM_XCDS_ML * ml_layers * ML_N_OUT);
       std::vector<EventId> h_trigger_events(ml_layers);
@@ -5011,6 +8913,32 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
           int base = (xcd * ml_layers + L) * ML_N_IN;
           for (int i = 0; i < ML_N_IN; i++) {
             h_input_table[base + i] = td_xcd.input_ptrs[i];
+          }
+          // LM head pointers live on the TAIL layer, not layer 0, and in
+          // slots 24-27 which no existing dump covers. Eight distinct,
+          // uniformly-strided values here == a real per-XCD bijection;
+          // eight identical values == every XCD reading the same weight.
+          if (L == ml_layers - 1 && getenv("MPK_DBG_XCD_PTRS")) {
+            printf("[LMPTR] tail L=%d xcd=%d norm_w=%p norm_in=%p "
+                   "lm_W=%p lm_bias=%p\n",
+                   L,
+                   xcd,
+                   td_xcd.input_ptrs[24],
+                   td_xcd.input_ptrs[25],
+                   td_xcd.input_ptrs[26],
+                   td_xcd.input_ptrs[27]);
+          }
+          if (L == 0 && getenv("MPK_DBG_XCD_PTRS")) {
+            printf("[XCDPTR] L0 xcd=%d qkv_w=%p oproj_w=%p router_w=%p "
+                   "resid=%p w13=%p w2=%p\n",
+                   xcd,
+                   td_xcd.input_ptrs[4],
+                   td_xcd.input_ptrs[9],
+                   td_xcd.input_ptrs[13],
+                   td_xcd.input_ptrs[1],
+                   td_xcd.input_ptrs[17],
+                   td_xcd.input_ptrs[18]);
+            fflush(stdout);
           }
           int obase = (xcd * ml_layers + L) * ML_N_OUT;
           for (int i = 0; i < ML_N_OUT; i++) {
@@ -5260,22 +9188,26 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
                        ml_layers * sizeof(unsigned),
                        cudaMemcpyHostToDevice);
 
-      // Barrier counters (zeroed)
+      // Barrier counters (zeroed). This is the cross-XCD layer rendezvous, so
+      // it goes through mpk_sync_malloc: in DPX+NPS2 plain VRAM is MTYPE_RW,
+      // coherent only within an AID, and a device's 4 XCDs span two -- an
+      // arrival published by one pair is never observed by the other, which
+      // parks the run at the first layer boundary with zero forward passes.
       global_runtime_config.ml_barrier_arrive =
-          gpu_malloc<int>(8 * 16 * sizeof(int));
+          mpk_sync_malloc<int>(MPK_NUM_XCDS * 16 * sizeof(int));
       (void)cudaMemset(
-          global_runtime_config.ml_barrier_arrive, 0, 8 * 16 * sizeof(int));
+          global_runtime_config.ml_barrier_arrive, 0, MPK_NUM_XCDS * 16 * sizeof(int));
       global_runtime_config.ml_barrier_global =
-          gpu_malloc<int>(16 * sizeof(int));
+          mpk_sync_malloc<int>(16 * sizeof(int));
       (void)cudaMemset(
           global_runtime_config.ml_barrier_global, 0, 16 * sizeof(int));
       global_runtime_config.ml_barrier_release =
-          gpu_malloc<int>(8 * 16 * sizeof(int));
+          mpk_sync_malloc<int>(MPK_NUM_XCDS * 16 * sizeof(int));
       (void)cudaMemset(
-          global_runtime_config.ml_barrier_release, 0, 8 * 16 * sizeof(int));
+          global_runtime_config.ml_barrier_release, 0, MPK_NUM_XCDS * 16 * sizeof(int));
 
       global_runtime_config.ml_num_layers = ml_layers;
-      // ml_workers_per_xcd set later after workers_per_xcd is computed
+      global_runtime_config.ml_workers_per_xcd = num_workers / NUM_XCDS_ML;
 
       printf(
           "[MPK] Multi-layer table: %d fused layers, pointer tables uploaded\n",
@@ -5288,10 +9220,9 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
       fflush(stdout);
     }
   }
-#else
-  global_runtime_config.ml_num_layers = 0;
 #endif // MPK_FUSED_LAYER_BATCHING
 
+#ifdef MPK_PRECOMPUTED_DISPATCH
   // =========================================================================
   // Build per-XCD-slot template queues on host.
   // At runtime, workers discover their hardware XCD via get_current_xcd_id(),
@@ -5304,7 +9235,7 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   {
     int n_tasks = (int)all_tasks.size();
     int n_events = (int)all_events.size();
-    constexpr int NUM_XCDS_PC = 8;
+    constexpr int NUM_XCDS_PC = MPK_NUM_XCDS;
     int workers_per_xcd = num_workers / NUM_XCDS_PC;
     int max_tpw = 512;
 
@@ -5477,21 +9408,22 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
     // Use device memory for iter_ready and terminate (GPU-only polling)
     {
       global_runtime_config.precomp_iter_ready =
-          gpu_malloc<unsigned long long>(sizeof(unsigned long long));
+          mpk_sync_malloc<unsigned long long>(sizeof(unsigned long long));
       (void)cudaMemset(global_runtime_config.precomp_iter_ready,
                        0,
                        sizeof(unsigned long long));
 
-      global_runtime_config.precomp_terminate = gpu_malloc<int>(sizeof(int));
+      global_runtime_config.precomp_terminate =
+          mpk_sync_malloc<int>(sizeof(int));
       (void)cudaMemset(global_runtime_config.precomp_terminate, 0, sizeof(int));
 
       // Per-XCD release flags for fast cross-XCD iteration barrier
       // [8*16 ints] padded to cache lines to avoid false sharing
       global_runtime_config.precomp_iter_xcd_release =
-          gpu_malloc<int>(8 * 16 * sizeof(int));
+          gpu_malloc<int>(MPK_NUM_XCDS * 16 * sizeof(int));
       (void)cudaMemset(global_runtime_config.precomp_iter_xcd_release,
                        0,
-                       8 * 16 * sizeof(int));
+                       MPK_NUM_XCDS * 16 * sizeof(int));
 
       // Debug task counter — device memory, read via cudaMemcpy in debug loop
       global_runtime_config.precomp_dbg_tasks_done =
@@ -5573,40 +9505,6 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
 #else
       global_runtime_config.tripwire = nullptr;
 #endif
-
-      // Decode-progress counters in pinned host memory, one per batch slot.
-      // Always allocated (one page, one store per slot per iteration); the
-      // serving path reads them to stream tokens while the launch is still
-      // running, and nothing else touches them.
-      //
-      // Per-slot, not a single counter: a batch coalesces requests with
-      // different prompt lengths, so slot r's first *output* token lands at a
-      // different absolute position than slot 0's. One shared counter would
-      // make every request in the batch inherit request 0's schedule and
-      // report the wrong TTFT for all the others.
-      {
-        int *pg_host = nullptr;
-        if (hipHostMalloc(reinterpret_cast<void **>(&pg_host),
-                          sizeof(int) * MPK_MAX_NUM_BATCHED_REQUESTS,
-                          hipHostMallocMapped | hipHostMallocNonCoherent) ==
-                hipSuccess &&
-            pg_host != nullptr) {
-          for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
-            pg_host[i] = 0;
-          }
-          g_progress_host = pg_host;
-          int *pg_dev = nullptr;
-          if (hipHostGetDevicePointer(
-                  reinterpret_cast<void **>(&pg_dev), pg_host, 0) ==
-              hipSuccess) {
-            global_runtime_config.progress_host = pg_dev;
-          } else {
-            (void)hipHostFree(pg_host);
-            g_progress_host = nullptr;
-            global_runtime_config.progress_host = nullptr;
-          }
-        }
-      }
 
       // Clear host debug pointers (no longer host-mapped)
       g_dbg_h_iter_ready = nullptr;
@@ -5725,18 +9623,99 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
                      NUM_XCDS_PC * n_events * sizeof(int),
                      cudaMemcpyHostToDevice);
     // Also need xcd_local_event_counters for two-level counting
+#ifdef MPK_EVCTR_HOST
+    {
+      void *h = nullptr;
+      global_runtime_config.xcd_local_event_counters =
+          host_mapped_malloc<EventCounter>(
+              NUM_XCDS_PC * n_events * sizeof(EventCounter), &h);
+      g_dbg_h_xcd_local_counters = static_cast<EventCounter *>(h);
+      // Thresholds never change after upload, so a plain host copy is enough.
+      g_dbg_h_xcd_event_thresholds = new int[NUM_XCDS_PC * n_events];
+      memcpy(g_dbg_h_xcd_event_thresholds,
+             h_xcd_evt.data(),
+             NUM_XCDS_PC * n_events * sizeof(int));
+      printf("[MPK] EVCTR_HOST: xcd_local host=%p dev=%p thresholds mirrored\n",
+             h,
+             (void *)global_runtime_config.xcd_local_event_counters);
+      fflush(stdout);
+    }
+#else
     global_runtime_config.xcd_local_event_counters =
-        gpu_malloc<EventCounter>(NUM_XCDS_PC * n_events * sizeof(EventCounter));
+        mpk_sync_malloc<EventCounter>(NUM_XCDS_PC * n_events * sizeof(EventCounter));
     (void)cudaMemset(global_runtime_config.xcd_local_event_counters,
                      0,
                      NUM_XCDS_PC * n_events * sizeof(EventCounter));
+#endif
     g_dbg_num_xcds = NUM_XCDS_PC;
 
     // Set ml_workers_per_xcd (pointer tables uploaded earlier, before
     // compaction)
+#ifdef MPK_FUSED_LAYER_BATCHING
     if (global_runtime_config.ml_num_layers > 0) {
       global_runtime_config.ml_workers_per_xcd = workers_per_xcd;
     }
+#endif
+  }
+#endif
+
+  // Decode-progress counters in pinned host memory, one per batch slot.
+  // Always allocated (one page, one store per slot per iteration); the
+  // serving path reads them to stream tokens while the launch is still
+  // running, and nothing else touches them. Not gated on
+  // MPK_PRECOMPUTED_DISPATCH: the scheduler publishes from the shared
+  // EVENT_END_OF_TASK_GRAPH path.
+  //
+  // Per-slot, not a single counter: a batch coalesces requests with
+  // different prompt lengths, so slot r's first *output* token lands at a
+  // different absolute position than slot 0's. One shared counter would
+  // make every request in the batch inherit request 0's schedule and
+  // report the wrong TTFT for all the others.
+#if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
+  {
+    int *pg_host = nullptr;
+    if (hipHostMalloc(reinterpret_cast<void **>(&pg_host),
+                      sizeof(int) * (MPK_MAX_NUM_BATCHED_REQUESTS + MPK_TOK_HOST_N),
+                      hipHostMallocMapped | hipHostMallocNonCoherent) ==
+            hipSuccess &&
+        pg_host != nullptr) {
+      for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS + MPK_TOK_HOST_N; i++) {
+        pg_host[i] = 0;
+      }
+      g_progress_host = pg_host;
+      int *pg_dev = nullptr;
+      if (hipHostGetDevicePointer(reinterpret_cast<void **>(&pg_dev),
+                                 pg_host,
+                                 0) == hipSuccess) {
+        global_runtime_config.progress_host = pg_dev;
+      } else {
+        (void)hipHostFree(pg_host);
+        g_progress_host = nullptr;
+        global_runtime_config.progress_host = nullptr;
+      }
+    }
+  }
+#endif
+#if defined(MPK_HOST_STOP) && (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  {
+    // Fine-grained (coherent) so the kernel's system-scope load sees the host's store, portable
+    // so every device of an MPK_MULTI_DEV launch can read it.
+    int *st_host = nullptr;
+    int *st_dev = nullptr;
+    if (hipHostMalloc(reinterpret_cast<void **>(&st_host), 64,
+                      hipHostMallocMapped | hipHostMallocCoherent |
+                          hipHostMallocPortable) == hipSuccess &&
+        st_host != nullptr) {
+      __atomic_store_n(st_host, 0, __ATOMIC_RELEASE);
+      if (hipHostGetDevicePointer(reinterpret_cast<void **>(&st_dev), st_host, 0) ==
+          hipSuccess) {
+        g_stop_host = st_host;
+      } else {
+        (void)hipHostFree(st_host);
+        st_dev = nullptr;
+      }
+    }
+    global_runtime_config.stop_host = st_dev;
   }
 #endif
 
@@ -5775,8 +9754,22 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   //            (num_schedulers + 1) * sizeof(unsigned long long int),
   //            cudaMemcpyHostToDevice);
   //  Initialize all event counters
+#ifdef MPK_EVCTR_HOST
+  {
+    void *h = nullptr;
+    global_runtime_config.all_event_counters = host_mapped_malloc<EventCounter>(
+        all_events.size() * sizeof(EventCounter), &h);
+    g_dbg_h_event_counters = static_cast<EventCounter *>(h);
+    printf("[MPK] EVCTR_HOST: all_event_counters host=%p dev=%p n=%zu\n",
+           h,
+           (void *)global_runtime_config.all_event_counters,
+           all_events.size());
+    fflush(stdout);
+  }
+#else
   global_runtime_config.all_event_counters =
       gpu_malloc<EventCounter>(all_events.size() * sizeof(EventCounter));
+#endif
 #ifdef MPK_PRECOMPUTED_DISPATCH
   g_dbg_num_events = (int)all_events.size();
 #endif
@@ -5799,11 +9792,11 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   // Initialize per-XCD local event counters for hierarchical polling
   // This reduces cross-XCD atomic contention by having leaders poll global
   // and other workers poll XCD-local counters
-  constexpr int NUM_XCDS_INIT = 8; // MI300X has 8 XCDs
+  constexpr int NUM_XCDS_INIT = MPK_NUM_XCDS;
   global_runtime_config.num_xcds = NUM_XCDS_INIT;
   // xcd_local_event_counters may already be allocated by precomputed dispatch
   if (global_runtime_config.xcd_local_event_counters == nullptr) {
-    global_runtime_config.xcd_local_event_counters = gpu_malloc<EventCounter>(
+    global_runtime_config.xcd_local_event_counters = mpk_sync_malloc<EventCounter>(
         NUM_XCDS_INIT * all_events.size() * sizeof(EventCounter));
     // Initialize to 0 (same initial state as global counters)
     (void)cudaMemset(global_runtime_config.xcd_local_event_counters,
@@ -5909,8 +9902,9 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   (void)cudaFuncSetAttribute(worker_kernel,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                              MAX_DYNAMIC_SHARED_MEMORY_SIZE);
-  (void)cudaFuncSetAttribute(
-      scheduler_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 1024);
+  (void)cudaFuncSetAttribute(scheduler_kernel,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             MPK_SCHED_LDS > 1024 ? MPK_SCHED_LDS : 1024);
   (void)cudaFuncSetAttribute(persistent_kernel,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                              MAX_DYNAMIC_SHARED_MEMORY_SIZE);
@@ -5926,6 +9920,9 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
                                  cudaEventDisableTiming);
   (void)cudaEventCreateWithFlags(&global_runtime_config.scheduler_done_event,
                                  cudaEventDisableTiming);
+#ifdef MPK_MULTI_DEV // MDEV_INIT_CALL
+  mpk_mdev_init();
+#endif
 
   init_request_resources();
 #ifdef USE_NVSHMEM
@@ -5936,8 +9933,948 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
 
 // Entry point for C/C++
 // TODO: change launch config
+
+#ifdef MPK_MULTI_DEV // MDEV_HOST
+// Devices of the group: the current device at init and the next MPK_MULTI_DEV - 1 visible ones
+// (HIP_VISIBLE_DEVICES lists exactly the partitions of one GPU, partition 0 first).
+struct MpkMdev {
+  int dev[MPK_MULTI_DEV];
+  hipStream_t ws[MPK_MULTI_DEV], ss[MPK_MULTI_DEV];
+  hipEvent_t wdone[MPK_MULTI_DEV], sdone[MPK_MULTI_DEV];
+};
+static MpkMdev g_mdev;
+
+static void mpk_mdev_check(hipError_t e, char const *what, int d) {
+  if (e != hipSuccess && e != hipErrorPeerAccessAlreadyEnabled) {
+    fprintf(stderr, "[MDEV] %s on device %d: %s\n", what, d, hipGetErrorString(e));
+    abort();
+  }
+  (void)hipGetLastError();
+}
+
+// Write one host value into a __constant__ symbol on every device of the group.
+static void mpk_mdev_symbol_all(void const *sym, void const *src, size_t bytes) {
+  int cur = 0;
+  (void)hipGetDevice(&cur);
+  for (int d = 0; d < MPK_MULTI_DEV; d++) {
+    mpk_mdev_check(hipSetDevice(g_mdev.dev[d]), "hipSetDevice", d);
+    mpk_mdev_check(hipMemcpyToSymbol(sym, src, bytes), "hipMemcpyToSymbol", d);
+  }
+  (void)hipSetDevice(cur);
+}
+
+static void mpk_mdev_init() {
+  constexpr int XPD = MPK_NUM_XCDS / MPK_MULTI_DEV;
+  static_assert(MPK_NUM_XCDS % MPK_MULTI_DEV == 0, "MPK_MULTI_DEV must divide MPK_NUM_XCDS");
+  int cur = 0, ndev = 0;
+  (void)hipGetDevice(&cur);
+  (void)hipGetDeviceCount(&ndev);
+  if (cur + MPK_MULTI_DEV > ndev) {
+    fprintf(stderr, "[MDEV] need %d devices from %d, only %d visible\n", MPK_MULTI_DEV, cur, ndev);
+    abort();
+  }
+  int const nw = global_runtime_config.num_workers;
+  int const ns = global_runtime_config.num_local_schedulers;
+  if (nw % MPK_MULTI_DEV != 0 || ns != MPK_NUM_XCDS || global_runtime_config.num_remote_schedulers) {
+    fprintf(stderr, "[MDEV] workers %d / schedulers %d+%d do not split over %d devices\n", nw, ns,
+            global_runtime_config.num_remote_schedulers, MPK_MULTI_DEV);
+    abort();
+  }
+  for (int d = 0; d < MPK_MULTI_DEV; d++) {
+    g_mdev.dev[d] = cur + d;
+  }
+  for (int d = 0; d < MPK_MULTI_DEV; d++) {
+    int const hd = g_mdev.dev[d];
+    mpk_mdev_check(hipSetDevice(hd), "hipSetDevice", d);
+    for (int e = 0; e < MPK_MULTI_DEV; e++) {
+      if (e != d) {
+        mpk_mdev_check(hipDeviceEnablePeerAccess(g_mdev.dev[e], 0), "hipDeviceEnablePeerAccess", d);
+      }
+    }
+    (void)cudaFuncSetAttribute(worker_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                               MAX_DYNAMIC_SHARED_MEMORY_SIZE);
+    (void)cudaFuncSetAttribute(scheduler_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                               MPK_SCHED_LDS > 1024 ? MPK_SCHED_LDS : 1024);
+    int const xb = d * XPD;
+    int const wb = d * (nw / MPK_MULTI_DEV);
+    mpk_mdev_check(hipMemcpyToSymbol(HIP_SYMBOL(g_mpk_dev_xcd_base), &xb, sizeof xb), "xcd base", d);
+    mpk_mdev_check(hipMemcpyToSymbol(HIP_SYMBOL(g_mpk_dev_worker_base), &wb, sizeof wb), "worker base", d);
+    if (d == 0) {
+      g_mdev.ws[0] = global_runtime_config.worker_stream;
+      g_mdev.ss[0] = global_runtime_config.scheduler_stream;
+      g_mdev.wdone[0] = global_runtime_config.worker_done_event;
+      g_mdev.sdone[0] = global_runtime_config.scheduler_done_event;
+    } else {
+      mpk_mdev_check(cudaStreamCreateWithFlags(&g_mdev.ws[d], cudaStreamNonBlocking), "stream", d);
+      mpk_mdev_check(cudaStreamCreateWithFlags(&g_mdev.ss[d], cudaStreamNonBlocking), "stream", d);
+      mpk_mdev_check(cudaEventCreateWithFlags(&g_mdev.wdone[d], cudaEventDisableTiming), "event", d);
+      mpk_mdev_check(cudaEventCreateWithFlags(&g_mdev.sdone[d], cudaEventDisableTiming), "event", d);
+    }
+    char bus[64] = {0};
+    (void)hipDeviceGetPCIBusId(bus, sizeof bus, hd);
+    printf("[MDEV] device %d = hip %d (%s): logical XCDs %d-%d, workers %d-%d, %d scheduler(s)\n",
+           d, hd, bus, xb, xb + XPD - 1, wb, wb + nw / MPK_MULTI_DEV - 1, XPD);
+  }
+#ifdef MPK_PHASE_SNAP // MDEV_PSNAP
+  {
+    void *snap0 = nullptr;
+    size_t const nb = sizeof g_phase_snap;
+    mpk_mdev_check(hipSetDevice(g_mdev.dev[0]), "hipSetDevice", 0);
+    mpk_mdev_check(hipMalloc(&snap0, nb), "phase snapshot", 0);
+    mpk_mdev_check(hipMemset(snap0, 0, nb), "phase snapshot clear", 0);
+    mpk_mdev_symbol_all(&g_phase_snap_dst, &snap0, sizeof snap0);
+    printf("[MDEV] phase snapshot: every device stamps one buffer on device 0 at %p\n", snap0);
+  }
+#endif
+#if defined(MPK_TK_OPS) && defined(MPK_PHASE_SNAP)
+  {
+    void *tko0 = nullptr;
+    size_t const nb = sizeof g_tk_ops;
+    mpk_mdev_check(hipSetDevice(g_mdev.dev[0]), "hipSetDevice", 0);
+    mpk_mdev_check(hipMalloc(&tko0, nb), "tk_ops snapshot", 0);
+    mpk_mdev_check(hipMemset(tko0, 0, nb), "tk_ops snapshot clear", 0);
+    mpk_mdev_symbol_all(&g_tk_ops_dst, &tko0, sizeof tko0);
+  }
+#endif
+#if defined(MPK_ATS_OPS) && defined(MPK_PHASE_SNAP)
+  {
+    void *ao0 = nullptr;
+    size_t const nb = sizeof g_ats_ops;
+    mpk_mdev_check(hipSetDevice(g_mdev.dev[0]), "hipSetDevice", 0);
+    mpk_mdev_check(hipMalloc(&ao0, nb), "ats_ops snapshot", 0);
+    mpk_mdev_check(hipMemset(ao0, 0, nb), "ats_ops snapshot clear", 0);
+    mpk_mdev_symbol_all(&g_ats_ops_dst, &ao0, sizeof ao0);
+  }
+#endif
+#ifdef MPK_VTN_MOETL
+  {
+    void *tl0 = nullptr;
+    size_t const nb = sizeof g_vtn_tl;
+    mpk_mdev_check(hipSetDevice(g_mdev.dev[0]), "hipSetDevice", 0);
+    mpk_mdev_check(hipMalloc(&tl0, nb), "moe timeline", 0);
+    mpk_mdev_check(hipMemset(tl0, 0, nb), "moe timeline clear", 0);
+    mpk_mdev_symbol_all(&g_vtn_tl_dst, &tl0, sizeof tl0);
+    printf("[MDEV] MoE timeline: every device stamps one buffer on device 0 at %p\n", tl0);
+  }
+#endif
+  (void)hipSetDevice(cur);
+  fflush(stdout);
+}
+
+#ifdef MPK_AID_SPLIT_FLAGS
+// Flag replica pointers for devices 1.. (device 0's go through the single-device path): each
+// device gets its own VA of the two shared replica BOs.
+static void mpk_mdev_rep_symbols(void *rep[2][MPK_MULTI_DEV]) {
+  int cur = 0;
+  (void)hipGetDevice(&cur);
+  for (int d = 1; d < MPK_MULTI_DEV; d++) {
+    int *rp[2] = {static_cast<int *>(rep[0][d]), static_cast<int *>(rep[1][d])};
+    mpk_mdev_check(hipSetDevice(g_mdev.dev[d]), "hipSetDevice", d);
+    mpk_mdev_check(hipMemcpyToSymbol(HIP_SYMBOL(g_aid_flag_rep), rp, sizeof rp), "g_aid_flag_rep", d);
+#ifdef MPK_ROUTER_OPROJ_PARTIAL
+    mpk_mdev_check(hipMemcpyToSymbol(HIP_SYMBOL(g_rop_rep), rp, sizeof rp), "g_rop_rep", d);
+#endif
+  }
+  (void)hipSetDevice(cur);
+}
+#endif
+
+// Worker and scheduler kernels on every device of the group, each after prepare_kernel; the
+// caller's stream (device 0) then waits for all of them.
+static void mpk_mdev_launch(cudaStream_t default_stream) {
+  int cur = 0;
+  (void)hipGetDevice(&cur);
+  int const wpd = global_runtime_config.num_workers / MPK_MULTI_DEV;
+  int const spd = global_runtime_config.num_local_schedulers / MPK_MULTI_DEV;
+#if defined(MPK_PLACE_GUARD) && defined(MPK_PLACE_SERIAL)
+  // MPK_PLACE_SERIAL_V1: workers of every device first; schedulers once every worker block is resident.
+  for (int d = 0; d < MPK_MULTI_DEV; d++) {
+    (void)hipSetDevice(g_mdev.dev[d]);
+    (void)cudaStreamWaitEvent(g_mdev.ws[d], global_runtime_config.prepare_done_event, 0);
+    (void)cudaStreamWaitEvent(g_mdev.ss[d], global_runtime_config.prepare_done_event, 0);
+    worker_kernel<<<dim3(wpd, 1, 1), dim3(WORKER_NUM_THREADS, 1, 1),
+                    MAX_DYNAMIC_SHARED_MEMORY_SIZE, g_mdev.ws[d]>>>(global_runtime_config);
+    (void)cudaEventRecord(g_mdev.wdone[d], g_mdev.ws[d]);
+  }
+  if (g_mpk_place_h != nullptr) {
+    unsigned const want = (unsigned)(global_runtime_config.num_workers * MPK_XCD_OVERSUB);
+    auto const t0 = std::chrono::steady_clock::now();
+    while (__atomic_load_n(&g_mpk_place_h[0], __ATOMIC_ACQUIRE) < want &&
+           std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(2000)) {
+      std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
+  }
+  for (int d = 0; d < MPK_MULTI_DEV; d++) {
+    (void)hipSetDevice(g_mdev.dev[d]);
+    scheduler_kernel<<<dim3(spd, 1, 1), dim3(128, 1, 1), MPK_SCHED_LDS, g_mdev.ss[d]>>>(
+        global_runtime_config);
+    (void)cudaEventRecord(g_mdev.sdone[d], g_mdev.ss[d]);
+  }
+#else
+  for (int d = 0; d < MPK_MULTI_DEV; d++) {
+    (void)hipSetDevice(g_mdev.dev[d]);
+    (void)cudaStreamWaitEvent(g_mdev.ws[d], global_runtime_config.prepare_done_event, 0);
+    (void)cudaStreamWaitEvent(g_mdev.ss[d], global_runtime_config.prepare_done_event, 0);
+    worker_kernel<<<dim3(wpd, 1, 1), dim3(WORKER_NUM_THREADS, 1, 1),
+                    MAX_DYNAMIC_SHARED_MEMORY_SIZE, g_mdev.ws[d]>>>(global_runtime_config);
+    scheduler_kernel<<<dim3(spd, 1, 1), dim3(128, 1, 1), MPK_SCHED_LDS, g_mdev.ss[d]>>>(
+        global_runtime_config);
+    (void)cudaEventRecord(g_mdev.wdone[d], g_mdev.ws[d]);
+    (void)cudaEventRecord(g_mdev.sdone[d], g_mdev.ss[d]);
+  }
+#endif
+  (void)hipSetDevice(cur);
+  for (int d = 0; d < MPK_MULTI_DEV; d++) {
+    (void)cudaStreamWaitEvent(default_stream, g_mdev.wdone[d], 0);
+    (void)cudaStreamWaitEvent(default_stream, g_mdev.sdone[d], 0);
+  }
+}
+#endif
 extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
   fprintf(stderr, "[HOST_DBG] launch_persistent_kernel ENTER\n");
+  static bool const s_lts = getenv("MPK_LAUNCH_TS") != nullptr;
+  if (s_lts) {
+    fprintf(stderr, "[LAUNCH_TS] enter %.6f\n",
+            std::chrono::duration<double>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+  }
+#ifdef MPK_AID_SPLIT_FLAGS
+  // Every replicated flag family also lives in oproj_topk_counters, which
+  // demo.py clears wholesale in reset_device_barriers() between launches. The
+  // replicas must mirror that exactly: clear them here, per launch, before
+  // the kernel starts -- never between layers of one launch.
+  //
+  // Both directions of divergence hang. A layer-derived target like
+  // attn_release would find a stale high flag already satisfying this
+  // launch's early gates; a snapshot target like layer_release would snapshot
+  // the previous launch's terminal value and then wait for a bump that the
+  // freshly-zeroed epoch counter never reaches.
+  {
+    static void *s_rep[2] = {nullptr, nullptr};
+    static bool s_tried = false;
+    if (!s_tried) {
+      s_tried = true;
+#ifdef MPK_MULTI_DEV // MDEV_FLAG_REPS: device 0 below as before, devices 1.. here
+      void *s_rep_dev[2][MPK_MULTI_DEV] = {};
+      bool const s_rep_ok =
+          mirage::aid::alloc_flag_replicas_mdev(s_rep_dev, MPK_MULTI_DEV, g_mdev.dev);
+      if (s_rep_ok) {
+        s_rep[0] = s_rep_dev[0][0];
+        s_rep[1] = s_rep_dev[1][0];
+        mpk_mdev_rep_symbols(s_rep_dev);
+      }
+      if (s_rep_ok) {
+#else
+      if (mirage::aid::alloc_flag_replicas(s_rep)) {
+#endif
+        int *dev[2] = {static_cast<int *>(s_rep[0]),
+                       static_cast<int *>(s_rep[1])};
+        // Async-on-default_stream + synchronize, for the same reason as the
+        // clear below: the plain form lands on the NULL stream, which does not
+        // synchronize with the hipStreamNonBlocking streams this kernel runs
+        // on. If that write raced the launch, some workgroups would read
+        // g_aid_flag_rep as null and fall back to the shared buffer while
+        // others read the replica -- publisher and consumer split across two
+        // different buffers, which deadlocks instead of merely being slow.
+#ifdef MPK_MULTI_DEV // MDEV_SYM_BCAST: runtime switches, spec settings and the EAGLE3 table on every device
+#define hipMemcpyToSymbol(sym, src, bytes) (mpk_mdev_symbol_all(&(sym), (src), (bytes)), hipSuccess)
+#endif
+#ifdef MPK_ATTN_QWAIT_RT
+        {
+          char const *qw = getenv("MPK_QWAIT_RT");
+          int const qwv = qw ? atoi(qw) : 1;
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(g_mpk_qwait_rt), &qwv, sizeof qwv);
+          fprintf(stderr, "[QWAIT] runtime switch %d\n", qwv);
+        }
+#endif
+#ifdef MPK_LTK_TIE_RT
+        {
+          char const *tr = getenv("MPK_TIE_RT");
+          int const trv = tr ? atoi(tr) : 1;
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(g_mpk_tie_rt), &trv, sizeof trv);
+          fprintf(stderr, "[TIE_RT] runtime switch %d\n", trv);
+        }
+#endif
+#ifdef MPK_ARGMAX_FUSED
+#ifndef MPK_RT_CONST
+        {
+          char const *ar = getenv("MPK_AMX_RT");
+          int const arv = ar ? atoi(ar) : 1;
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(g_mpk_amx_rt), &arv, sizeof arv);
+          fprintf(stderr, "[AMX_RT] runtime switch %d\n", arv);
+        }
+#endif
+#endif
+#ifdef MPK_ROP_ROW_EARLY
+#ifndef MPK_RT_CONST
+        {
+          char const *rr = getenv("MPK_RRE_RT");
+          int const rrv = rr ? atoi(rr) : 1;
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(g_mpk_rre_rt), &rrv, sizeof rrv);
+          fprintf(stderr, "[RRE_RT] runtime switch %d\n", rrv);
+        }
+#endif
+#endif
+#ifdef MPK_LTK_STATS_W0
+#ifndef MPK_RT_CONST
+        {
+          char const *sw = getenv("MPK_STW0_RT");
+          int const swv = sw ? atoi(sw) : 1;
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(g_mpk_stw0_rt), &swv, sizeof swv);
+          fprintf(stderr, "[STW0_RT] runtime switch %d\n", swv);
+        }
+#endif
+#endif
+#ifdef MPK_LTK_STW0_FAST
+#ifndef MPK_RT_CONST
+        {
+          char const *sf = getenv("MPK_STWF_RT");
+          int const sfv = sf ? atoi(sf) : 1;
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(g_mpk_stwf_rt), &sfv, sizeof sfv);
+          fprintf(stderr, "[STWF_RT] runtime switch %d\n", sfv);
+        }
+#endif
+#endif
+#ifdef MPK_ROP_QUANT_FAST
+#ifndef MPK_RT_CONST
+        {
+          char const *qf = getenv("MPK_RQF_RT");
+          int const qfv = qf ? atoi(qf) : 1;
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(g_mpk_rqf_rt), &qfv, sizeof qfv);
+          fprintf(stderr, "[RQF_RT] runtime switch %d\n", qfv);
+        }
+#endif
+#endif
+#ifdef MPK_KSEL_MERGE
+#ifndef MPK_RT_CONST
+        {
+          char const *km = getenv("MPK_KMRG_RT");
+          int const kmv = km ? atoi(km) : 1;
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(g_mpk_kmrg_rt), &kmv, sizeof kmv);
+          fprintf(stderr, "[KMRG_RT] runtime switch %d\n", kmv);
+        }
+#endif
+#endif
+#ifdef MPK_VT2_MPOLL_RT
+        {
+          char const *mv = getenv("MPK_MPOLL");
+          int const mp = mv ? atoi(mv) : 0;
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(kernel::g_mpk_mpoll_rt), &mp, sizeof mp);
+          fprintf(stderr, "[VT2_MPOLL] runtime switch %d\n", mp);
+        }
+#endif
+#ifdef MPK_VT2_QKV_EARLY
+        {
+          char const *ev = getenv("MPK_QKVE");
+          int const qe = ev ? atoi(ev) : 0;
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(kernel::g_mpk_qkve_rt), &qe, sizeof qe);
+          fprintf(stderr, "[VT2_QKVE] runtime switch %d\n", qe);
+        }
+#endif
+#ifdef MPK_VT2_T1ROW_LATE
+        {
+          char const *tv = getenv("MPK_T1LATE");
+          int const tl = tv ? atoi(tv) : 0;
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(kernel::g_mpk_t1late_rt), &tl, sizeof tl);
+          fprintf(stderr, "[VT2_T1LATE] runtime switch %d\n", tl);
+        }
+#endif
+#ifdef MPK_ML_STAGE
+        {
+          char const *mv = getenv("MPK_MLSTAGE");
+          int const ms = mv ? atoi(mv) : 0;
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(kernel::g_mpk_mlstage_rt), &ms, sizeof ms);
+          fprintf(stderr, "[ML_STAGE] runtime switch %d\n", ms);
+        }
+#endif
+#ifdef MPK_VTN_N7B2
+        {
+          char const *nv = getenv("MPK_N7B2");
+          int const ns = nv ? atoi(nv) : 1;
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(kernel::g_mpk_n7b2_rt), &ns, sizeof ns);
+          fprintf(stderr, "[VTN_N7B2] runtime switch %d\n", ns);
+        }
+#endif
+#if defined(MPK_VTN_N7S2) && defined(MPK_VTN_N7S2_RT)
+        {
+          char const *sv2 = getenv("MPK_N7S2");
+          int const s2 = sv2 ? atoi(sv2) : 1;
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(kernel::g_mpk_n7s2_rt), &s2, sizeof s2);
+          fprintf(stderr, "[VTN_N7S2] runtime switch %d\n", s2);
+        }
+#endif
+#ifdef MPK_VTN_BAL
+        {
+          char const *bv = getenv("MPK_VTNBAL");
+          int const bs = bv ? atoi(bv) : 1;
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(kernel::g_mpk_vtnbal_rt), &bs, sizeof bs);
+          fprintf(stderr, "[VTN_BAL] runtime switch %d\n", bs);
+        }
+#endif
+#ifdef MPK_VT2_QSPLIT_RT
+        {
+          char const *qv = getenv("MPK_QSPLIT");
+          int const qs = qv ? atoi(qv) : 1;
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(kernel::g_mpk_qsplit_rt), &qs, sizeof qs);
+          fprintf(stderr, "[VT2_QSPLIT] runtime switch %d\n", qs);
+        }
+#endif
+#ifdef MPK_VT2_W2DELAY
+        {
+          char const *wv = getenv("MPK_VT2_W2D");
+          int const w2d = wv ? atoi(wv) : 0;
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(kernel::g_mpk_vt2_w2d), &w2d, sizeof w2d);
+          fprintf(stderr, "[VT2_W2D] round-1 W2 delay %d ns\n", w2d);
+        }
+#endif
+#ifdef MPK_ATTN_META_LDS_RT
+        {
+          char const *mv = getenv("MPK_METALDS");
+          int const ms = mv ? atoi(mv) : 1;
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(kernel::g_mpk_metalds_rt), &ms, sizeof ms);
+          fprintf(stderr, "[ATTN_METALDS] runtime switch %d\n", ms);
+        }
+#endif
+#ifdef MPK_ATTN_FIXED_MERGER_RT
+        {
+          char const *fv = getenv("MPK_FM");
+          int const fs = fv ? atoi(fv) : 1;
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(kernel::g_mpk_fm_rt), &fs, sizeof fs);
+          fprintf(stderr, "[ATTN_FM] runtime switch %d\n", fs);
+        }
+#endif
+#ifdef MPK_D89_RT
+        {
+          char const *dv = getenv("MPK_D89_NS");
+          unsigned const dt = dv ? (unsigned)(atoi(dv) / 10) : 400u;
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(g_mpk_d89_ticks), &dt, sizeof dt);
+          fprintf(stderr, "[D89_RT] ranks 8-9 W2 entry delay %u ticks\n", dt);
+        }
+#endif
+#if defined(MODE_OFFLINE) && defined(MPK_SPEC_VSLOT)
+        {
+          static long long *spec_oracle_dev = nullptr;
+          static int spec_oracle_n = 0;
+          char const *op = getenv("MPK_SPEC_ORACLE");
+          if (op != nullptr && op[0] != 0 && spec_oracle_dev == nullptr) {
+            std::vector<long long> ids;
+            FILE *f = fopen(op, "r");
+            if (f != nullptr) {
+              long long v;
+              while (fscanf(f, "%lld", &v) == 1) {
+                ids.push_back(v);
+              }
+              fclose(f);
+            }
+            if (!ids.empty()) {
+              (void)hipMalloc(&spec_oracle_dev, ids.size() * sizeof(long long));
+              (void)hipMemcpy(spec_oracle_dev, ids.data(), ids.size() * sizeof(long long),
+                              hipMemcpyHostToDevice);
+              spec_oracle_n = (int)ids.size();
+            }
+          }
+          char const *kv = getenv("MPK_SPEC_K");
+          char const *cv = getenv("MPK_SPEC_CORRUPT");
+          int const k = kv ? atoi(kv) : 0;
+          int const corrupt = cv ? atoi(cv) : 0;
+          int zero4[4] = {0, 0, 0, 0};
+          unsigned long long zst[4] = {0ull, 0ull, 0ull, 0ull};
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(g_spec_oracle), &spec_oracle_dev, sizeof spec_oracle_dev);
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(g_spec_oracle_n), &spec_oracle_n, sizeof spec_oracle_n);
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(g_spec_k), &k, sizeof k);
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(g_spec_corrupt), &corrupt, sizeof corrupt);
+          char const *cfv = getenv("MPK_SPEC_CONF");
+          char const *kmv = getenv("MPK_SPEC_KMIN");
+          float const conf = cfv ? (float)atof(cfv) : 0.f;
+          int const kmin = kmv ? atoi(kmv) : 0;
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(g_spec_conf), &conf, sizeof conf);
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(g_spec_kmin), &kmin, sizeof kmin);
+#if defined(MPK_E3_CONF) && defined(MPK_E3_CONF_D)
+          {
+            char const *cdv = getenv("MPK_SPEC_CONF_D");
+            float const confd = cdv ? (float)atof(cdv) : conf;
+            (void)hipMemcpyToSymbol(HIP_SYMBOL(g_spec_confd), &confd, sizeof confd);
+            fprintf(stderr, "[SPEC] EAGLE3 chain continues while the probability product >= %.3f\n", confd);
+          }
+#endif
+#ifdef MPK_MULTI_DEV // MDEV_SPEC: one shared state buffer on device 0, its address on every device
+          {
+            static void *s_spec_sh = nullptr;
+            if (s_spec_sh == nullptr) {
+              mpk_mdev_check(hipMalloc(&s_spec_sh, sizeof(MpkSpecShared)), "spec state", 0);
+              (void)hipMemsetAsync(s_spec_sh, 0, sizeof(MpkSpecShared), default_stream);
+              mpk_mdev_symbol_all(&g_spec_sh, &s_spec_sh, sizeof s_spec_sh);
+              g_mpk_spec_sh_host = s_spec_sh;  // MPK_SPEC_REQ_RESET
+              (void)hipGetDevice(&g_mpk_spec_sh_dev);
+            }
+            (void)hipMemsetAsync(s_spec_sh, 0, sizeof zero4, default_stream);
+            (void)hipMemsetAsync(static_cast<char *>(s_spec_sh) + offsetof(MpkSpecShared, stats), 0,
+                                 sizeof zst, default_stream);
+            (void)hipStreamSynchronize(default_stream);
+          }
+#else
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(g_spec_state), zero4, sizeof zero4);
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(g_spec_stats), zst, sizeof zst);
+#endif
+          fprintf(stderr, "[SPEC] virtual slots %d, k=%d, corrupt=%d, oracle %d tokens (%s)\n",
+                  MPK_MAX_NUM_BATCHED_TOKENS, k, corrupt, spec_oracle_n, op ? op : "none");
+          fprintf(stderr, "[SPEC] confidence gate %.3f, kmin %d\n", conf, kmin);
+        }
+#endif
+#ifdef MPK_EAGLE3
+        {
+          kernel::MpkEagle3 e3{};
+          std::vector<unsigned long long> pp;
+          if (char const *pv = getenv("MPK_EAGLE3_PTRS")) {
+            char const *c = pv;
+            while (*c) {
+              char *end = nullptr;
+              unsigned long long const v = strtoull(c, &end, 16);
+              if (end == c) {
+                break;
+              }
+              pp.push_back(v);
+              c = (*end == ',') ? end + 1 : end;
+            }
+          }
+#ifdef MPK_EAGLE3_FP8
+          size_t const e3_want = 34;  // + nine per-row scales
+#else
+          size_t const e3_want = 25;
+#endif
+          if (pp.size() == e3_want) {
+            size_t k = 0;
+            auto U = [&]() { return (unsigned short const *)(uintptr_t)pp[k++]; };
+            e3.fc = U(); e3.wq = U(); e3.wk = U(); e3.wv = U(); e3.wo = U();
+            e3.wg = U(); e3.wu = U(); e3.wd = U(); e3.wlm = U();
+            e3.n_hidden = U(); e3.n_input = U(); e3.n_post = U(); e3.n_final = U(); e3.embed = U();
+            e3.d2t = (long long const *)(uintptr_t)pp[k++];
+            e3.kc = (unsigned short *)(uintptr_t)pp[k++];
+            e3.vc = (unsigned short *)(uintptr_t)pp[k++];
+            e3.vec = (float *)(uintptr_t)pp[k++];
+            e3.draft_out = (long long *)(uintptr_t)pp[k++];
+            for (int a = 0; a < 3; ++a) e3.apo[a] = U();
+            for (int a = 0; a < 3; ++a) e3.ws[a] = (float const *)(uintptr_t)pp[k++];
+#ifdef MPK_EAGLE3_FP8
+            auto F = [&]() { return (float const *)(uintptr_t)pp[k++]; };
+            e3.sfc = F(); e3.swq = F(); e3.swk = F(); e3.swv = F(); e3.swo = F();
+            e3.swg = F(); e3.swu = F(); e3.swd = F(); e3.swlm = F();
+#endif
+            e3.tokens = global_runtime_config.tokens;
+            e3.prompt_len = global_runtime_config.prompt_length;
+            char const *wsv = getenv("MPK_EAGLE3_WS_STRIDE");
+            char const *mpv = getenv("MPK_EAGLE3_MAXPOS");
+            char const *nwv = getenv("MPK_EAGLE3_NW");
+            e3.ws_stride = wsv ? atoi(wsv) : 0;
+            e3.maxpos = mpv ? atoi(mpv) : 0;
+            e3.nworkers = nwv ? atoi(nwv) : 0;
+            e3.enabled = (e3.ws_stride > 0 && e3.maxpos > 0 && e3.nworkers > 0) ? 1 : 0;
+          }
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(kernel::g_e3), &e3, sizeof e3);
+          fprintf(stderr, "[EAGLE3] draft head %s: %zu pointers, ws stride %d, maxpos %d, workers %d\n",
+                  e3.enabled ? "on" : "OFF", pp.size(), e3.ws_stride, e3.maxpos, e3.nworkers);
+        }
+#endif
+#ifdef MPK_DFLASH
+        {
+          kernel::MpkDflash df{};
+          std::vector<unsigned long long> pp;
+          if (char const *pv = getenv("MPK_DFLASH_PTRS")) {
+            char const *c = pv;
+            while (*c) {
+              char *end = nullptr;
+              unsigned long long const v = strtoull(c, &end, 16);
+              if (end == c) {
+                break;
+              }
+              pp.push_back(v);
+              c = (*end == ',') ? end + 1 : end;
+            }
+          }
+          if (pp.size() == 44) {
+            size_t k = 0;
+            auto B8 = [&]() { return (unsigned char const *)(uintptr_t)pp[k++]; };
+            auto F = [&]() { return (float const *)(uintptr_t)pp[k++]; };
+            auto U = [&]() { return (unsigned short const *)(uintptr_t)pp[k++]; };
+            df.fc = B8(); df.wq = B8(); df.wk = B8(); df.wv = B8(); df.wo = B8(); df.wg = B8(); df.wu = B8();
+            df.wd = B8();
+            df.sfc = F(); df.swq = F(); df.swk = F(); df.swv = F(); df.swo = F(); df.swg = F(); df.swu = F();
+            df.swd = F();
+            df.bq = F(); df.bk = F(); df.bv = F(); df.bo = F();
+            df.nq = U(); df.nk = U(); df.nin = U(); df.npost = U(); df.nhid = U(); df.nfin = U();
+            df.wlm = B8(); df.slm = B8(); df.embed = U(); df.rope = F();
+            df.kc = (unsigned short *)(uintptr_t)pp[k++];
+            df.vc = (unsigned short *)(uintptr_t)pp[k++];
+            df.vec = (float *)(uintptr_t)pp[k++];
+            df.draft_out = (long long *)(uintptr_t)pp[k++];
+            for (int a = 0; a < kernel::DF_NTL; ++a) df.apo[a] = U();
+            for (int a = 0; a < kernel::DF_NTL; ++a) df.ws[a] = F();
+            df.tokens = global_runtime_config.tokens;
+            df.prompt_len = global_runtime_config.prompt_length;
+            char const *wsv = getenv("MPK_DFLASH_WS_STRIDE");
+            char const *mpv = getenv("MPK_DFLASH_MAXPOS");
+            char const *nwv = getenv("MPK_DFLASH_NW");
+            df.ws_stride = wsv ? atoi(wsv) : 0;
+            df.maxpos = mpv ? atoi(mpv) : 0;
+            df.nworkers = nwv ? atoi(nwv) : 0;
+            df.enabled = (df.ws_stride > 0 && df.maxpos > 0 && df.nworkers > 0) ? 1 : 0;
+          }
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(kernel::g_df), &df, sizeof df);
+          fprintf(stderr, "[DFLASH] drafter %s: %zu pointers, block %d, ws stride %d, maxpos %d, workers %d, scratch %d floats\n",
+                  df.enabled ? "on" : "OFF", pp.size(), kernel::DF_B, df.ws_stride, df.maxpos, df.nworkers,
+                  kernel::DF_V_FLOATS);
+        }
+#endif
+#ifdef MPK_W2_MALLPF
+        {
+          char const *mv = getenv("MPK_W2PF");
+          unsigned const md = mv ? (unsigned)atoi(mv) : 0u;
+          char const *tv = getenv("MPK_W2PF_NS");
+          unsigned const td = tv ? (unsigned)(atoi(tv) / 10) : 0u;
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(g_mpk_w2pf_mode), &md, sizeof md);
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(g_mpk_w2pf_ticks), &td, sizeof td);
+          fprintf(stderr, "[W2PF] mover W2 MALL prefetch mode %u, start %u ticks\n", md, td);
+        }
+#endif
+#ifdef MPK_PFD89_RT
+        {
+          char const *pv = getenv("MPK_PFD89_NS");
+          unsigned const pt = pv ? (unsigned)(atoi(pv) / 10) : 0u;
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(g_mpk_pfd89_ticks), &pt, sizeof pt);
+          fprintf(stderr, "[PFD89_RT] ranks 8-9 Phase 9 DMA delay %u ticks\n", pt);
+        }
+#endif
+#ifdef MPK_KV_EARLY_STAGE
+        {
+          char const *kv = getenv("MPK_KVES");
+          int const ks = kv ? atoi(kv) : 0;
+          (void)hipMemcpyToSymbol(HIP_SYMBOL(g_mpk_kves), &ks, sizeof ks);
+          fprintf(stderr, "[KVES_RT] K/V early staging %d (split at %d)\n", ks,
+                  (int)MPK_KVES_LO);
+        }
+#endif
+#ifdef MPK_MULTI_DEV
+#undef hipMemcpyToSymbol
+#endif
+        if (hipMemcpyToSymbolAsync(HIP_SYMBOL(g_aid_flag_rep),
+                                   dev,
+                                   sizeof dev,
+                                   0,
+                                   hipMemcpyHostToDevice,
+                                   default_stream) != hipSuccess ||
+            hipStreamSynchronize(default_stream) != hipSuccess) {
+          fprintf(stderr,
+                  "[AID] split flags: hipMemcpyToSymbol failed, falling "
+                  "back to the shared buffer\n");
+          s_rep[0] = s_rep[1] = nullptr;
+        }
+#ifdef MPK_RPROBE
+        mpk_rprobe::g_rep[0] = s_rep[0];
+        mpk_rprobe::g_rep[1] = s_rep[1];
+#endif
+      }
+    }
+    // On `default_stream`, then synchronized, rather than a bare hipMemset.
+    // hipMemset lands on the NULL stream, and every stream this kernel uses is
+    // created hipStreamNonBlocking -- which by definition does NOT synchronize
+    // with the NULL stream. The clear could therefore still be in flight when
+    // the megakernel starts, and zero a flag that had already been published:
+    // a lost release, i.e. a hang rather than a wrong answer, on whichever
+    // fraction of runs the timing happened to overlap.
+    for (int i = 0; i < 2; i++) {
+      if (s_rep[i] != nullptr) {
+        (void)hipMemsetAsync(
+            s_rep[i], 0, mirage::aid::kFlagRepBytes, default_stream);
+      }
+    }
+#ifdef MPK_ROUTER_OPROJ_PARTIAL
+    // The router partials need scratch even without the replicas (NPS1, stock
+    // driver): one plain buffer then serves as both AIDs' copy. Its tags are
+    // layer epochs, so it is cleared per launch like the replicas.
+    {
+      static void *s_rop[2] = {nullptr, nullptr};
+      static bool s_rop_tried = false;
+      if (!s_rop_tried) {
+        s_rop_tried = true;
+        if (s_rep[0] != nullptr && s_rep[1] != nullptr) {
+          s_rop[0] = s_rep[0];
+          s_rop[1] = s_rep[1];
+        } else if (hipExtMallocWithFlags(&s_rop[0],
+                                         mirage::aid::kFlagRepBytes,
+                                         hipDeviceMallocUncached) ==
+                   hipSuccess) {
+          // Uncached: in NPS1 the lines interleave over both AIDs, and a
+          // reader XCD on the far AID would otherwise keep polling a stale
+          // L2 copy of the aggregate tags.
+          s_rop[1] = s_rop[0];
+          printf("[AID] router partials: shared uncached scratch %p (no replicas)\n",
+                 s_rop[0]);
+        }
+        int *dev[2] = {static_cast<int *>(s_rop[0]),
+                       static_cast<int *>(s_rop[1])};
+        (void)hipMemcpyToSymbolAsync(HIP_SYMBOL(g_rop_rep),
+                                     dev,
+                                     sizeof dev,
+                                     0,
+                                     hipMemcpyHostToDevice,
+                                     default_stream);
+      }
+      if (s_rop[0] != nullptr && s_rop[0] != s_rep[0]) {
+        (void)hipMemsetAsync(
+            s_rop[0], 0, mirage::aid::kFlagRepBytes, default_stream);
+      }
+    }
+#endif
+    (void)hipStreamSynchronize(default_stream);
+  }
+#if defined(MPK_AID_NC_REP) && defined(MPK_AID_SPLIT_FLAGS)
+  // AID-local NC scratch: one plain allocation, large enough to be its own
+  // BO, so halves placement puts its first half in AID0 and its second in
+  // AID1. Counters there take device-scope atomics at local memory. Cleared
+  // per launch on default_stream, like the replicas.
+  {
+    static char *s_nc = nullptr;
+    static bool s_nc_tried = false;
+    constexpr size_t kNcBytes = 64ull << 20;
+    if (!s_nc_tried) {
+      s_nc_tried = true;
+      if (hipMalloc(reinterpret_cast<void **>(&s_nc), kNcBytes) == hipSuccess) {
+        int *dev[2] = {reinterpret_cast<int *>(s_nc),
+                       reinterpret_cast<int *>(s_nc + kNcBytes / 2)};
+#ifdef MPK_MULTI_DEV // MDEV_NC_AID1: the AID1 half on the first partition of AID1
+        static char *s_nc1 = nullptr;
+        {
+          int cur = 0;
+          (void)hipGetDevice(&cur);
+          (void)hipSetDevice(g_mdev.dev[MPK_MULTI_DEV / 2]);
+          mpk_mdev_check(hipMalloc(reinterpret_cast<void **>(&s_nc1), kNcBytes / 2), "nc AID1", MPK_MULTI_DEV / 2);
+          (void)hipSetDevice(cur);
+        }
+        dev[1] = reinterpret_cast<int *>(s_nc1);
+#endif
+        // MPK_AID_NC_REP_NULL: the no-op arm -- allocate and clear, but
+        // leave the pointers null so every counter keeps its old address.
+        if (getenv("MPK_AID_NC_REP_NULL") != nullptr) {
+          dev[0] = nullptr;
+          dev[1] = nullptr;
+          printf("[AID] nc scratch: MPK_AID_NC_REP_NULL, pointers left null\n");
+        }
+        if (hipMemcpyToSymbolAsync(HIP_SYMBOL(g_aid_nc_rep), dev, sizeof dev, 0,
+                                   hipMemcpyHostToDevice,
+                                   default_stream) != hipSuccess ||
+            hipStreamSynchronize(default_stream) != hipSuccess) {
+          fprintf(stderr, "[AID] nc scratch: hipMemcpyToSymbol failed\n");
+          s_nc = nullptr;
+        } else {
+#ifdef MPK_MULTI_DEV // MDEV_NC_REP: one peer-visible allocation, same pointers everywhere
+          mpk_mdev_symbol_all(HIP_SYMBOL(g_aid_nc_rep), dev, sizeof dev);
+#endif
+          printf("[AID] nc scratch at %p (AID0 half) and %p (AID1 half)\n",
+                 (void *)dev[0], (void *)dev[1]);
+#ifdef MPK_NC_PROBE
+          {
+            auto probe_buf = [](char const *tag, char *p, size_t bytes, int n) {
+              void *rb = nullptr;
+              size_t rs = 0;
+              hipMemGetAddressRange((hipDeviceptr_t *)&rb, &rs,
+                                    (hipDeviceptr_t)p);
+              printf("[NCPROBE] %s ptr %p: allocation range base %p size %zu MiB\n",
+                     tag, (void *)p, rb, rs >> 20);
+              std::vector<unsigned long long> a;
+              for (int k = 0; k < n; k++) {
+                a.push_back((unsigned long long)p + (bytes / n) * k + 4096);
+              }
+              mpk_ncprobe::probe_list(tag, a, (unsigned long long)p);
+            };
+            probe_buf("nc64", s_nc, kNcBytes, 32);
+            char *t256 = nullptr;
+            if (hipMalloc(reinterpret_cast<void **>(&t256), 256ull << 20) ==
+                hipSuccess) {
+              probe_buf("tmp256", t256, 256ull << 20, 16);
+              hipFree(t256);
+            }
+          }
+#endif
+        }
+      } else {
+        s_nc = nullptr;
+      }
+    }
+    if (s_nc != nullptr) {
+      (void)hipMemsetAsync(s_nc, 0, 64 << 10, default_stream);
+      (void)hipMemsetAsync(s_nc + kNcBytes / 2, 0, 64 << 10, default_stream);
+#ifdef MPK_VTN_MOE
+      // MPK_VTN_N7B: the per-token router tile slots (slot 23 is never written and must read zero).
+      (void)hipMemsetAsync(s_nc + (size_t)MPK_NC_ROP1_INTS * 4, 0,
+                           (size_t)(mpk_rop_nc_ints(MPK_ROP_NTOK) - MPK_NC_ROP1_INTS) * 4 /* MPK_VTN_T6 */, default_stream);
+#ifdef MPK_VTN_QMP
+      (void)hipMemsetAsync(s_nc + (size_t)MPK_NC_QROW_INTS * 4, 0, (size_t)MPK_NC_QROW_TOTAL_INTS * 4, default_stream);
+#endif
+      (void)hipMemsetAsync(s_nc + kNcBytes / 2 + (size_t)MPK_NC_ROP1_INTS * 4, 0,
+                           (size_t)(mpk_rop_nc_ints(MPK_ROP_NTOK) - MPK_NC_ROP1_INTS) * 4 /* MPK_VTN_T6 */, default_stream);
+#ifdef MPK_VTN_QMP
+      (void)hipMemsetAsync(s_nc + kNcBytes / 2 + (size_t)MPK_NC_QROW_INTS * 4, 0, (size_t)MPK_NC_QROW_TOTAL_INTS * 4, default_stream);
+#endif
+#endif
+#ifdef MPK_MULTI_DEV // MDEV_NC_CLEAR: the AID1 half is its own allocation on the first partition of AID1
+      {
+        int *nc1 = nullptr;
+        (void)hipMemcpyFromSymbol(&nc1, HIP_SYMBOL(g_aid_nc_rep), sizeof nc1, sizeof nc1);
+        if (nc1 != nullptr) {
+          (void)hipMemsetAsync(nc1, 0, 64 << 10, default_stream);
+#ifdef MPK_VTN_MOE
+          (void)hipMemsetAsync(reinterpret_cast<char *>(nc1) + (size_t)MPK_NC_ROP1_INTS * 4, 0,
+                               (size_t)(mpk_rop_nc_ints(MPK_ROP_NTOK) - MPK_NC_ROP1_INTS) * 4 /* MPK_VTN_T6 */, default_stream);
+#ifdef MPK_VTN_QMP
+          (void)hipMemsetAsync(reinterpret_cast<char *>(nc1) + (size_t)MPK_NC_QROW_INTS * 4, 0, (size_t)MPK_NC_QROW_TOTAL_INTS * 4, default_stream);
+#endif
+#endif
+        }
+      }
+#endif
+      (void)hipStreamSynchronize(default_stream);
+    }
+  }
+#endif
+  // Per-AID copies of the ml pointer tables. Read-only after setup, so plain
+  // AID_LOCAL (MTYPE_RW) is enough -- no COHERENT, and therefore no DF-CS
+  // directory pressure. Done once; nothing rewrites them between launches.
+  {
+    static bool s_ml_tried = false;
+    if (!s_ml_tried) {
+      s_ml_tried = true;
+      int const nl = global_runtime_config.ml_num_layers;
+      if (nl > 0 && global_runtime_config.ml_input_table != nullptr) {
+        size_t const in_b = (size_t)8 * nl * MAX_INPUTS_PER_TASK * sizeof(void *);
+        size_t const out_b =
+            (size_t)8 * nl * MAX_OUTPUTS_PER_TASK * sizeof(void *);
+        void *ml[2][2] = {{nullptr, nullptr}, {nullptr, nullptr}};
+        bool ok = true;
+#ifdef MPK_MULTI_DEV // MDEV_ML_TABLES: [aid][in/out][device] VAs of one GEM BO each
+        void *mlv[2][2][MPK_MULTI_DEV] = {};
+#endif
+        for (int aid = 0; aid < 2 && ok; aid++) {
+#ifdef MPK_MULTI_DEV
+          ok = mirage::aid::alloc_in_aid_mdev(in_b, aid, 0, MPK_MULTI_DEV, g_mdev.dev, mlv[aid][0]) &&
+               mirage::aid::alloc_in_aid_mdev(out_b, aid, 0, MPK_MULTI_DEV, g_mdev.dev, mlv[aid][1]);
+          ml[aid][0] = ok ? mlv[aid][0][0] : nullptr;
+          ml[aid][1] = ok ? mlv[aid][1][0] : nullptr;
+#else
+          ml[aid][0] = mirage::aid::alloc_in_aid(in_b, aid);
+          ml[aid][1] = mirage::aid::alloc_in_aid(out_b, aid);
+#endif
+          ok = ml[aid][0] != nullptr && ml[aid][1] != nullptr;
+          if (ok) {
+            ok = hipMemcpy(ml[aid][0],
+                           global_runtime_config.ml_input_table,
+                           in_b,
+                           hipMemcpyDeviceToDevice) == hipSuccess &&
+                 hipMemcpy(ml[aid][1],
+                           global_runtime_config.ml_output_table,
+                           out_b,
+                           hipMemcpyDeviceToDevice) == hipSuccess;
+          }
+        }
+        if (ok) {
+          void *in_p[2] = {ml[0][0], ml[1][0]};
+          void *out_p[2] = {ml[0][1], ml[1][1]};
+          ok = hipMemcpyToSymbol(HIP_SYMBOL(g_aid_ml_in),
+                                 in_p,
+                                 sizeof in_p) == hipSuccess &&
+               hipMemcpyToSymbol(HIP_SYMBOL(g_aid_ml_out),
+                                 out_p,
+                                 sizeof out_p) == hipSuccess;
+        }
+#ifdef MPK_MULTI_DEV // MDEV_ML_SYMS
+        if (ok) {
+          int cur = 0;
+          (void)hipGetDevice(&cur);
+          for (int d = 1; d < MPK_MULTI_DEV; d++) {
+            void *ip[2] = {mlv[0][0][d], mlv[1][0][d]};
+            void *op[2] = {mlv[0][1][d], mlv[1][1][d]};
+            (void)hipSetDevice(g_mdev.dev[d]);
+            mpk_mdev_check(hipMemcpyToSymbol(HIP_SYMBOL(g_aid_ml_in), ip, sizeof ip), "g_aid_ml_in", d);
+            mpk_mdev_check(hipMemcpyToSymbol(HIP_SYMBOL(g_aid_ml_out), op, sizeof op), "g_aid_ml_out", d);
+          }
+          (void)hipSetDevice(cur);
+        }
+#endif
+        printf("[AID] ml tables: %s (%zu + %zu B per AID)\n",
+               ok ? "replicated per AID" : "unavailable, using shared",
+               in_b,
+               out_b);
+      }
+    }
+  }
+#endif
+#ifdef MPK_PLACE_GUARD
+  // MPK_PLACE_GUARD_V1: the pinned decision words, mapped on every device.
+  static unsigned *s_place_h = nullptr;
+  if (s_place_h == nullptr) {
+    void *h = nullptr;
+    if (hipHostMalloc(&h, 8192, hipHostMallocMapped) == hipSuccess && h != nullptr) {
+      memset(h, 0, 8192);
+      void *d = nullptr;
+      if (hipHostGetDevicePointer(&d, h, 0) != hipSuccess || d == nullptr) {
+        d = h;
+      }
+      if (hipMemcpyToSymbolAsync(HIP_SYMBOL(g_place_host), &d, sizeof d, 0, hipMemcpyHostToDevice,
+                                 default_stream) == hipSuccess &&
+          hipStreamSynchronize(default_stream) == hipSuccess) {
+        s_place_h = static_cast<unsigned *>(h);
+        g_mpk_place_h = s_place_h;
+#ifdef MPK_MULTI_DEV
+        mpk_mdev_symbol_all((void const *)&g_place_host, &d, sizeof d);
+#endif
+      }
+    }
+    fprintf(stderr, "[PLACE] guard %s (%d ms)\n", s_place_h ? "armed" : "FAILED", (int)(MPK_PLACE_GUARD));
+  }
+mpk_place_retry:;
+  if (s_place_h != nullptr) {
+    memset(s_place_h + 16, 0, 8192 - 64);
+    __atomic_store_n(&s_place_h[3], (unsigned)(global_runtime_config.num_workers * MPK_XCD_OVERSUB),
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&s_place_h[0], 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_place_h[1], 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_place_h[2],
+                     (unsigned)((global_runtime_config.num_workers + global_runtime_config.num_local_schedulers) *
+                                MPK_XCD_OVERSUB),
+                     __ATOMIC_RELEASE);
+  }
+#endif
+#ifdef MPK_RESID_MAP
+  static unsigned *s_resid_h = nullptr;
+  static std::atomic<int> s_resid_done{0};
+  static int s_resid_gen = 0;
+  if (s_resid_h == nullptr) {
+    void *h = nullptr;
+    if (hipHostMalloc(&h, 1152 * sizeof(unsigned), hipHostMallocMapped) ==
+            hipSuccess &&
+        h != nullptr) {
+      memset(h, 0, 1152 * sizeof(unsigned));
+      void *d = nullptr;
+      if (hipHostGetDevicePointer(&d, h, 0) != hipSuccess || d == nullptr) {
+        d = h;
+      }
+      if (hipMemcpyToSymbolAsync(HIP_SYMBOL(g_resid_host), &d, sizeof d, 0,
+                                 hipMemcpyHostToDevice,
+                                 default_stream) == hipSuccess &&
+          hipStreamSynchronize(default_stream) == hipSuccess) {
+        s_resid_h = static_cast<unsigned *>(h);
+#ifdef MPK_MULTI_DEV // MDEV_RESID
+        mpk_mdev_symbol_all((void const *)&g_resid_host, &d, sizeof d);
+#endif
+      }
+    }
+    fprintf(stderr, "[RESID] host map %s\n", s_resid_h ? "armed" : "FAILED");
+  }
+  int const resid_gen = ++s_resid_gen;
+  if (s_resid_h != nullptr) {
+    memset(s_resid_h, 0, 1152 * sizeof(unsigned));
+  }
+#endif
   // Progress is per-launch, so clear it before the kernel starts rather than
   // after it ends: a streaming reader polling from another thread must never
   // see the previous request's count and emit tokens that do not exist yet.
@@ -5963,6 +10900,53 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
   int num_schedulers = global_runtime_config.num_local_schedulers +
                        global_runtime_config.num_remote_schedulers;
   if (global_runtime_config.split_worker_scheduler) {
+#ifdef MPK_MULTI_DEV // MDEV_LAUNCH
+    mpk_mdev_launch(default_stream);
+#ifdef MPK_RESID_MAP // MDEV_RESID
+    if (s_resid_h != nullptr) {
+      int const rnw = global_runtime_config.num_workers;
+      int const rns = global_runtime_config.num_local_schedulers;
+      unsigned *const rhm = s_resid_h;
+      fprintf(stderr, "[RESID] launch %d: kernels enqueued on %d devices\n", resid_gen,
+              MPK_MULTI_DEV);
+      std::thread([rhm, rnw, rns, resid_gen]() {
+        for (int t = 1; t <= 60; t++) {
+          std::this_thread::sleep_for(std::chrono::seconds(1));
+          if (s_resid_done.load() >= resid_gen) {
+            return;
+          }
+          if (t == 15 || t == 45) {
+            mpk_resid_report(rhm, rnw, rns, resid_gen, t);
+            int nogate = 0, exited = 0;
+            for (int w = 0; w < rnw && w < 248; w++) {
+              unsigned const a = __atomic_load_n(&rhm[256 + w], __ATOMIC_RELAXED);
+              unsigned const g = __atomic_load_n(&rhm[512 + w], __ATOMIC_RELAXED);
+              unsigned const e = __atomic_load_n(&rhm[768 + w], __ATOMIC_RELAXED);
+              nogate += !(g & 0x80000000u);
+              exited += (e & 0x80000000u) != 0;
+              if (w < rnw / MPK_MULTI_DEV || !(g & 0x80000000u) || (e & 0x80000000u)) {
+                fprintf(stderr, "[RESID]   w%d claim=%s rank=%u len=%u | gate=%s iter=%u term=%u | exit=%s\n",
+                        w, (a & 0x80000000u) ? "y" : "n", (a >> 16) & 0x7fffu, a & 0xffffu,
+                        (g & 0x80000000u) ? "y" : "n", g & 0xffffffu, (g >> 24) & 1u,
+                        (e & 0x80000000u) ? "y" : "n");
+              }
+            }
+            fprintf(stderr, "[RESID]   workers never past the gate %d, exited early %d\n", nogate, exited);
+#ifdef MPK_TOPK_SPINREC  // MPK_TOPK_SPINREC_V1
+            for (int w = 0; w < rnw && w < 248; w++) {
+              unsigned const e = __atomic_load_n(&rhm[768 + w], __ATOMIC_RELAXED);
+              if (e != 0u && !(e & 0x80000000u)) {
+                fprintf(stderr, "[RESID]   w%d topk poll: %uK spins, first stale word %u, %u layers old\n", w,
+                        (e >> 16) & 0x7fffu, (e >> 11) & 31u, e & 2047u);
+              }
+            }
+#endif
+          }
+        }
+      }).detach();
+    }
+#endif
+#else
     (void)cudaStreamWaitEvent(global_runtime_config.worker_stream,
                               global_runtime_config.prepare_done_event,
                               0);
@@ -5973,16 +10957,42 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
     // The split kernel does not support NVSHMEM because
     // nvshmemx_collective_launch launches kernels sequentially, which blocks
     // the interaction between the worker kernel and the scheduler kernel
-    worker_kernel<<<dim3(global_runtime_config.num_workers, 1, 1),
+    worker_kernel<<<dim3(global_runtime_config.num_workers * MPK_XCD_OVERSUB,
+                         1,
+                         1),
                     dim3(WORKER_NUM_THREADS, 1, 1),
                     MAX_DYNAMIC_SHARED_MEMORY_SIZE /*smem*/,
                     global_runtime_config.worker_stream>>>(
         global_runtime_config);
-    scheduler_kernel<<<dim3(global_runtime_config.num_local_schedulers, 1, 1),
+    scheduler_kernel<<<dim3(global_runtime_config.num_local_schedulers *
+                             MPK_XCD_OVERSUB,
+                         1,
+                         1),
                        dim3(128, 1, 1),
-                       0 /*smem*/,
+                       MPK_SCHED_LDS /*smem*/,
                        global_runtime_config.scheduler_stream>>>(
         global_runtime_config);
+#ifdef MPK_RESID_MAP
+    if (s_resid_h != nullptr) {
+      int const rnw = global_runtime_config.num_workers * MPK_XCD_OVERSUB;
+      int const rns =
+          global_runtime_config.num_local_schedulers * MPK_XCD_OVERSUB;
+      unsigned *const rhm = s_resid_h;
+      fprintf(stderr, "[RESID] launch %d: worker + scheduler kernels enqueued\n",
+              resid_gen);
+      std::thread([rhm, rnw, rns, resid_gen]() {
+        for (int t = 1; t <= 60; t++) {
+          std::this_thread::sleep_for(std::chrono::seconds(1));
+          if (s_resid_done.load() >= resid_gen) {
+            return;
+          }
+          if (t == 15 || t == 45) {
+            mpk_resid_report(rhm, rnw, rns, resid_gen, t);
+          }
+        }
+      }).detach();
+    }
+#endif
 
     (void)cudaEventRecord(global_runtime_config.worker_done_event,
                           global_runtime_config.worker_stream);
@@ -5993,6 +11003,7 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
         default_stream, global_runtime_config.worker_done_event, 0);
     (void)cudaStreamWaitEvent(
         default_stream, global_runtime_config.scheduler_done_event, 0);
+#endif
 
 #ifdef MPK_PRECOMPUTED_DISPATCH
     // Hang-diagnosis watchdog. OFF unless MPK_HOST_WATCHDOG=1.
@@ -6712,7 +11723,7 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
           } // verbose
         }
         // Dump event counters to diagnose which events haven't fired
-        if (g_dbg_h_event_counters && dbg_i == 5 * dbg_ticks_per_s) {
+        if (g_dbg_h_event_counters && dbg_i % (5 * dbg_ticks_per_s) == 0) {
           fprintf(stderr,
                   "  === Event counters: last 20 events + event 158 ===\n");
           // Show events 140-158 (the tail where workers are stuck)
@@ -6778,6 +11789,66 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
 #endif
     (void)cudaStreamSynchronize(global_runtime_config.worker_stream);
     (void)cudaStreamSynchronize(global_runtime_config.scheduler_stream);
+    if (s_lts) {
+      fprintf(stderr, "[LAUNCH_TS] exit %.6f\n",
+              std::chrono::duration<double>(
+                  std::chrono::system_clock::now().time_since_epoch())
+                  .count());
+    }
+#ifdef MPK_RESID_MAP
+    if (s_resid_h != nullptr) {
+      s_resid_done.store(resid_gen);
+      mpk_resid_report(s_resid_h,
+                       global_runtime_config.num_workers * MPK_XCD_OVERSUB,
+                       global_runtime_config.num_local_schedulers *
+                           MPK_XCD_OVERSUB,
+                       resid_gen, -1);
+    }
+#endif
+#ifdef MPK_PLACE_GUARD
+    if (s_place_h != nullptr) {
+      (void)hipStreamSynchronize(default_stream);
+      {
+        int const pnw = (int)s_place_h[3], pnb = (int)s_place_h[2];
+        unsigned long long const *pt = (unsigned long long const *)(s_place_h + 16);
+        unsigned long long tmin = ~0ull, tmax = 0ull;
+        int last = -1, seen = 0;
+        for (int b = 0; b < pnb && b < 1000; b++) {
+          unsigned long long const t = __atomic_load_n(&pt[b], __ATOMIC_RELAXED);
+          if (t == 0ull) {
+            continue;
+          }
+          seen++;
+          tmin = t < tmin ? t : tmin;
+          if (t > tmax) {
+            tmax = t;
+            last = b;
+          }
+        }
+        double const spread_ms = seen ? (double)(tmax - tmin) / 1.0e5 : 0.0;
+        if (spread_ms > 20.0 || __atomic_load_n(&s_place_h[1], __ATOMIC_ACQUIRE) == 2u) {
+          fprintf(stderr, "[PLACE] start spread %.1f ms over %d blocks; last to start: %s %d\n", spread_ms,
+                  seen, last < pnw ? "worker" : "scheduler", last < pnw ? last : last - pnw);
+        }
+      }
+      if (__atomic_load_n(&s_place_h[1], __ATOMIC_ACQUIRE) == 2u) {
+        static int s_place_n = 0;
+        fprintf(stderr, "[PLACE] launch abandoned: %u of %u blocks resident within %d ms; relaunching (%d)\n",
+                __atomic_load_n(&s_place_h[0], __ATOMIC_RELAXED), __atomic_load_n(&s_place_h[2], __ATOMIC_RELAXED),
+                (int)(MPK_PLACE_GUARD), ++s_place_n);
+        goto mpk_place_retry;
+      }
+    }
+#endif
+#ifdef MPK_RPROBE
+    {
+      static bool s_rprobe_ran = false;
+      if (!s_rprobe_ran) {
+        s_rprobe_ran = true;
+        mpk_rprobe::run(mpk_rprobe::g_rep);
+      }
+    }
+#endif
   } else {
     int num_sms_to_use = global_runtime_config.num_workers + num_schedulers;
 #ifdef USE_NVSHMEM

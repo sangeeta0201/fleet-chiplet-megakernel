@@ -9,7 +9,7 @@ import sysconfig
 
 from ..core import *
 from ..kernel import get_key_paths, KNGraph, TBGraph
-from ..utils import mpk_opt, mpk_w13_prequant, mpk_workers_per_xcd
+from ..utils import mpk_opt, mpk_w13_prequant, mpk_workers_per_xcd, mpk_num_xcds
 from .speculative import (
     SpecDecodeConfig,
     PromptLookupConfig,
@@ -97,8 +97,22 @@ static PyObject *decode_progress_func(PyObject *self, PyObject *args) {
   return PyLong_FromLong(get_decode_progress(slot));
 }
 
+static PyObject *decode_token_func(PyObject *self, PyObject *args) {
+  int pos = 0;
+  if (!PyArg_ParseTuple(args, "i", &pos)) {
+    PyErr_SetString(PyExc_TypeError, "Expected (pos,)");
+    return NULL;
+  }
+  return PyLong_FromLong(get_decode_token(pos));
+}
+
 static PyObject *reset_decode_progress_func(PyObject *self, PyObject *args) {
   reset_decode_progress();
+  Py_RETURN_NONE;
+}
+
+static PyObject *request_stop_func(PyObject *self, PyObject *args) {
+  request_decode_stop();
   Py_RETURN_NONE;
 }
 
@@ -137,6 +151,8 @@ static PyMethodDef ModuleMethods[] = {
   {"launch_func", launch_func, METH_VARARGS, "launch persistent kernel"},
   {"decode_progress_func", decode_progress_func, METH_VARARGS, "token position reached by batch slot N in the running launch (-1 if unavailable)"},
   {"reset_decode_progress_func", reset_decode_progress_func, METH_VARARGS, "zero the decode-progress counters before a launch"},
+  {"request_stop_func", request_stop_func, METH_VARARGS, "end the running launch at its next 16-iteration check (MPK_HOST_STOP; no-op otherwise)"},
+  {"decode_token_func", decode_token_func, METH_VARARGS, "token id at position pos of request 0 in the running launch (MPK_TOK_HOST; -1 otherwise)"},
   {"finalize_func", finalize_func, METH_VARARGS, "finalize persistent kernel"},
   {"set_rope_tables_func", set_rope_tables_func, METH_VARARGS, "set RoPE cos/sin tables"},
   {NULL, NULL, 0, NULL} // sentinel
@@ -436,6 +452,116 @@ def get_compile_command(
         # Per-worker phase slots: twelve s_memrealtime stamps per layer at
         # the phase boundaries, accumulated per worker and printed once at
         # termination -- no printf on the hot path, unlike MPK_DEVICE_TIMING.
+        if int(os.environ.get("MPK_OPROJ_LDS", "0")) == 1:
+            flags = flags + ["-DMPK_OPROJ_LDS"]
+        if int(os.environ.get("MPK_OPROJ_NUDGE", "0")) > 0:
+            flags = flags + [
+                f"-DMPK_OPROJ_NUDGE={int(os.environ['MPK_OPROJ_NUDGE'])}",
+                f"-DMPK_OPROJ_NUDGE_KIND={int(os.environ.get('MPK_OPROJ_NUDGE_KIND', '2'))}"]
+        if int(os.environ.get("MPK_LDS_PAD", "0")) > 0:
+            flags = flags + [f"-DMPK_LDS_PAD={int(os.environ['MPK_LDS_PAD'])}"]
+        if int(os.environ.get("MPK_HWID_MAP", "0")) == 1:
+            flags = flags + ["-DMPK_HWID_MAP"]
+        if int(os.environ.get("MPK_SCHED_LDS", "0")) > 0:
+            flags = flags + [f"-DMPK_SCHED_LDS={int(os.environ['MPK_SCHED_LDS'])}"]
+        if int(os.environ.get("MPK_MOE_BIAS_REP", "0")) == 1:
+            flags = flags + ["-DMPK_MOE_BIAS_REP"]
+        if int(os.environ.get("MPK_PHASE_SNAP", "0")) > 0:
+            flags = flags + [f"-DMPK_PHASE_SNAP={int(os.environ['MPK_PHASE_SNAP'])}"]
+        if int(os.environ.get("MPK_INLINE_FUSED_LAYER", "0")) == 1:
+            flags = flags + ["-DMPK_INLINE_FUSED_LAYER"]
+        if int(os.environ.get("MPK_W13_SUB", "0")) == 1:
+            flags = flags + ["-DMPK_W13_SUB"]
+        if int(os.environ.get("MPK_IL_LDS", "0")) == 1:
+            flags = flags + ["-DMPK_IL_LDS"]
+        if int(os.environ.get("MPK_ML_TABLE_INLAYER", "0")) == 1:
+            flags = flags + ["-DMPK_ML_TABLE_INLAYER"]
+        if int(os.environ.get("MPK_QKV_EPI_PF", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_EPI_PF"]
+        if int(os.environ.get("MPK_QKV_POS_CACHE", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_POS_CACHE"]
+        if int(os.environ.get("MPK_XOUT_GLOBAL_ST", "0")) == 1:
+            flags = flags + ["-DMPK_XOUT_GLOBAL_ST"]
+        if int(os.environ.get("MPK_RET_WARM", "0")) == 1:
+            flags = flags + ["-DMPK_RET_WARM"]
+        if int(os.environ.get("MPK_QKV_PRO_FAST", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_PRO_FAST"]
+        if int(os.environ.get("MPK_XOUT_SLICE_WRITER", "0")) == 1:
+            flags = flags + ["-DMPK_XOUT_SLICE_WRITER"]
+        if int(os.environ.get("MPK_QKVK_LDS", "0")) == 1:
+            flags = flags + ["-DMPK_QKVK_LDS"]
+        if int(os.environ.get("MPK_QKV_RED_FAST", "0")) == 1:
+            # QKV: RMSNorm cross-wave reduce with one barrier (every wave sums the 4 partials).
+            flags = flags + ["-DMPK_QKV_RED_FAST"]
+        if int(os.environ.get("MPK_QKV_NQ_FUSED", "0")) == 1:
+            # QKV: FP8 quantization of the normalized row in the normalize loop.
+            flags = flags + ["-DMPK_QKV_NQ_FUSED"]
+        if int(os.environ.get("MPK_QKV_NQ_FUSED2", "0")) == 1:
+            # QKV: v2 of the fused normalize + FP8 quant (branch-free passes, one interleaved max).
+            flags = flags + ["-DMPK_QKV_NQ_FUSED2"]
+        if int(os.environ.get("MPK_VT2_KSEL2", "0")) == 1:
+            flags = flags + ["-DMPK_VT2_KSEL2"]
+        if int(os.environ.get("MPK_VT2_QKV", "0")) == 1:
+            flags = flags + ["-DMPK_VT2_QKV"]
+        if int(os.environ.get("MPK_QKVK_FOLD", "0")) == 1:
+            flags = flags + ["-DMPK_QKVK_FOLD"]
+        if int(os.environ.get("MPK_ATTK_LDS", "0")) == 1:
+            flags = flags + ["-DMPK_ATTK_LDS"]
+        if int(os.environ.get("MPK_TOPK_SUB", "0")) == 1:
+            flags = flags + ["-DMPK_TOPK_SUB"]
+        if int(os.environ.get("MPK_OPROJ_SUB", "0")) == 1:
+            flags = flags + ["-DMPK_OPROJ_SUB"]
+        if int(os.environ.get("MPK_KSEL_FAST", "0")) == 1:
+            flags = flags + ["-DMPK_KSEL_FAST"]
+        if int(os.environ.get("MPK_TOPK_SUB2", "0")) == 1:
+            flags = flags + ["-DMPK_TOPK_SUB2"]
+        if int(os.environ.get("MPK_ROP_GATHER_SC1", "0")) == 1:
+            flags = flags + ["-DMPK_ROP_GATHER_SC1"]
+        if int(os.environ.get("MPK_ROP_WAIT_SC1", "0")) == 1:
+            flags = flags + ["-DMPK_ROP_WAIT_SC1"]
+        if int(os.environ.get("MPK_ROP_MERGED_POLL", "0")) >= 1:
+            flags = flags + ["-DMPK_ROP_MERGED_POLL="
+                             + str(int(os.environ["MPK_ROP_MERGED_POLL"]))]
+        if int(os.environ.get("MPK_GATE_DEFER", "0")) == 1:
+            flags = flags + ["-DMPK_GATE_DEFER"]
+        if int(os.environ.get("MPK_QKV_PF_ABLATE", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_PF_ABLATE"]
+        if int(os.environ.get("MPK_QKV_L2PF", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_L2PF"]
+        if int(os.environ.get("MPK_GATE_DEFER_PF_LATE", "0")) == 1:
+            flags = flags + ["-DMPK_GATE_DEFER_PF_LATE"]
+        if int(os.environ.get("MPK_FOLD_PIPE", "0")) == 1:
+            flags = flags + ["-DMPK_FOLD_PIPE"]
+        if int(os.environ.get("MPK_PQ_AMAX_DPP", "0")) == 1:
+            flags = flags + ["-DMPK_PQ_AMAX_DPP"]
+        if int(os.environ.get("MPK_LTK_DPP", "0")) == 1:
+            flags = flags + ["-DMPK_LTK_DPP"]
+        if int(os.environ.get("MPK_LTK_SNAP", "0")) == 1:
+            flags = flags + ["-DMPK_LTK_SNAP"]
+        if int(os.environ.get("MPK_XSNAP", "0")) == 1:
+            flags = flags + ["-DMPK_XSNAP"]
+        if int(os.environ.get("MPK_XSNAP_WORKERS", "0")) > 0:
+            flags = flags + ["-DMPK_XSNAP_WORKERS=" + os.environ["MPK_XSNAP_WORKERS"]]
+        if int(os.environ.get("MPK_XSNAP_LAT", "0")) > 0:
+            flags = flags + ["-DMPK_XSNAP_LAT=" + os.environ["MPK_XSNAP_LAT"]]
+        if int(os.environ.get("MPK_QKV_SUB_LDS", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_SUB_LDS"]
+        if int(os.environ.get("MPK_W13_REC_BATCH", "0")) > 1:
+            flags = flags + [f"-DMPK_W13_REC_BATCH={int(os.environ['MPK_W13_REC_BATCH'])}"]
+        if int(os.environ.get("MPK_W13_REC_AHEAD1", "0")) == 1:
+            flags = flags + ["-DMPK_W13_REC_AHEAD1"]
+        if int(os.environ.get("MPK_MOE_LDS", "0")) == 1:
+            flags = flags + ["-DMPK_MOE_LDS"]
+        if int(os.environ.get("MPK_MOE_INLINE", "0")) == 1:
+            flags = flags + ["-DMPK_MOE_INLINE"]
+        if int(os.environ.get("MPK_MOE_CALL_LDS", "0")) == 1:
+            flags = flags + ["-DMPK_MOE_CALL_LDS"]
+        if int(os.environ.get("MPK_ATT_MARK", "0")) == 1:
+            # s_ttracedata at every phase mark, for thread-trace phase views.
+            flags = flags + ["-DMPK_ATT_MARK"]
+        if int(os.environ.get("MPK_PHASE_LDS", "0")) == 1:
+            # LDS-resident phase recorder; needs MPK_PHASE_SLOTS.
+            flags = flags + ["-DMPK_PHASE_LDS"]
         if int(os.environ.get("MPK_PHASE_SLOTS", "0")) == 1:
             flags = flags + ["-DMPK_PHASE_SLOTS"]
             # Which forward-pass iteration to start recording on. There is no
@@ -488,6 +614,37 @@ def get_compile_command(
         # computes QK on all four waves and barriers twice per 16-token tile.
         if int(os.environ.get("MPK_ATTN_NO_WAVE_LOCAL", "0")) == 1:
             flags = flags + ["-DMPK_ATTN_NO_WAVE_LOCAL"]
+        if int(os.environ.get("MPK_KV_CHUNKS_ADAPTIVE", "0")) == 1:
+            # Split-KV chunks used follow the live context (compile-time rule
+            # applied at runtime); the merge reads 8 / 16 / all partials.
+            flags = flags + ["-DMPK_KV_CHUNKS_ADAPTIVE"]
+        if int(os.environ.get("MPK_KV_FULL_IDLE", "0")) == 1:
+            # Full-attention layers skip idle chunk workers too (needs MPK_KV_SW_IDLE).
+            flags = flags + ["-DMPK_KV_FULL_IDLE"]
+        if int(os.environ.get("MPK_KV_SW_IDLE", "0")) == 1:
+            flags = flags + ["-DMPK_KV_SW_IDLE"]
+        if int(os.environ.get("MPK_ATTN_KV_PF_SELF", "0")) == 1:
+            # Attention ranks load their own past-KV chunk into L2 during
+            # the QKV epoch wait (needs MPK_ATTN_META_EARLY).
+            flags = flags + ["-DMPK_ATTN_KV_PF_SELF"]
+        if int(os.environ.get("MPK_KV_PF_SELF_RANKS", "0")) > 0:
+            flags = flags + ["-DMPK_KV_PF_SELF_RANKS=" + os.environ["MPK_KV_PF_SELF_RANKS"]]
+        if int(os.environ.get("MPK_QKV_KV_SHARED_ROW", "0")) == 1:
+            # K/V QKV tiles take the quantized row from Q tile 0.
+            flags = flags + ["-DMPK_QKV_KV_SHARED_ROW"]
+        if int(os.environ.get("MPK_KV_SW_1TILE", "0")) == 1:
+            # Window layers: one tile per chunk (needs MPK_KV_SW_IDLE).
+            flags = flags + ["-DMPK_KV_SW_1TILE"]
+        if int(os.environ.get("MPK_KV_FULL_TPC", "0")) > 0:
+            # Full layers: target tiles per chunk for the adaptive split.
+            flags = flags + ["-DMPK_KV_FULL_TPC=" + os.environ["MPK_KV_FULL_TPC"]]
+        if _opt("MPK_GATE_ATTN_JOIN"):
+            # Attention chunk workers wait at the Phase 9 layer gate. Without
+            # it, MPK_W2_CONSUMER_GATE lets ranks >= total_qkv_tiles_per_xcd
+            # skip the gate while holding live attention chunks, which they do
+            # once NUM_KV_CHUNKS > 10 (max_seq_length > ~1344): long prompts
+            # then decode differently on every run. No-op at <= 10 chunks.
+            flags = flags + ["-DMPK_GATE_ATTN_JOIN"]
         # Opt-in: at ntiles=4 (ctx512 full-attn, 8 chunks × 64 tokens) enter
         # the wave-local scan as 2 waves × 2 sequential tiles, not the
         # shared-LDS loop. 4 waves × 1 tile failed PPL; T=8 (2 tiles/wave)
@@ -495,6 +652,11 @@ def get_compile_command(
         # softmax -- hash will move; PPL-gate a TPOT win.
         if int(os.environ.get("MPK_ATTN_WL_PAIR", "0")) == 1:
             flags = flags + ["-DMPK_ATTN_WL_PAIR"]
+        if int(os.environ.get("MPK_ATTN_KV_PREFETCH2", "0")) >= 1:
+            # Idle-rank past-KV L2 prefetch that fires at 16 chunks: 1 = sliding layers,
+            # 2 = also full layers up to 256 tiles (with MPK_ATTN_WL_NT=0).
+            flags = flags + ["-DMPK_ATTN_KV_PREFETCH2="
+                             + str(int(os.environ["MPK_ATTN_KV_PREFETCH2"]))]
         if int(os.environ.get("MPK_ATTN_KV_PREFETCH", "0")) == 1:
             # Idle ranks 23-30 issue this XCD's past-KV into L2 during QKV.
             # Attention CUs then hit XCD L2 instead of refilling after MoE
@@ -553,6 +715,8 @@ def get_compile_command(
             flags = flags + ["-DMPK_QKV_KV_L2WARM"]
         if int(os.environ.get("MPK_QKV_KV_PF_PLAIN", "0")) == 1:
             flags = flags + ["-DMPK_QKV_KV_PF_PLAIN"]
+        if int(os.environ.get("MPK_QKV_KV_PF_SC0", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_KV_PF_SC0"]
         if int(os.environ.get("MPK_OPROJ_DATA_POLL", "0")) == 1:
             flags = flags + ["-DMPK_OPROJ_DATA_POLL"]
         if int(os.environ.get("MPK_MERGE_META_PRE", "0")) == 1:
@@ -689,6 +853,70 @@ def get_compile_command(
             flags = flags + ["-DMPK_ATTN_LHEAD_FMA"]
         # Tiles-per-chunk threshold for the wave-local scan (default 8; 4 is
         # faster but fails the perplexity gate -- see the header comment).
+        _wl_dma = os.environ.get("MPK_ATTN_WL_DMA", "")
+        if _wl_dma != "":
+            # LDS-DMA ring depth for the wave-local scan (default 0: registers).
+            flags = flags + [f"-DMPK_ATTN_WL_DMA={int(_wl_dma)}"]
+        if os.environ.get("MPK_ATTN_PROBE", "") != "":
+            # Timing-only scan probes (wrong output): 1 no KV traffic, 2 no compute.
+            flags = flags + [f"-DMPK_ATTN_PROBE={int(os.environ['MPK_ATTN_PROBE'])}"]
+        if int(os.environ.get("MPK_ATTN_KV_MOD", "0")) > 0:
+            flags = flags + [
+                "-DMPK_ATTN_KV_MOD=" + str(int(os.environ["MPK_ATTN_KV_MOD"]))
+            ]
+        if int(os.environ.get("MPK_ATTN_WL_NT", "0")) == 1:
+            # sc0 nt on the wave-local scan's K/V DMA loads.
+            flags = flags + ["-DMPK_ATTN_WL_NT=1"]
+        if int(os.environ.get("MPK_ATTN_WL_BF16", "0")) == 1:
+            # bf16 MFMAs in the lean DMA scan (needs MPK_ATTN_WL_LEAN).
+            flags = flags + ["-DMPK_ATTN_WL_BF16=1"]
+        if os.environ.get("MPK_MOE_NOPS"):
+            # code-layout probe: s_nop count at MoE entry
+            flags = flags + [f"-DMPK_MOE_NOPS={int(os.environ['MPK_MOE_NOPS'])}"]
+        if int(os.environ.get("MPK_TOPK_OWN_AID_PROBE", "0")) == 1:
+            flags = flags + ["-DMPK_TOPK_OWN_AID_PROBE=1"]  # timing only
+        if int(os.environ.get("MPK_W2_NO_REFRESH", "0")) == 1:
+            flags = flags + ["-DMPK_W2_NO_REFRESH=1"]
+        if _opt("MPK_AID_REP_CONST"):
+            # Replica / ml-table pointer arrays as __constant__: scalar loads,
+            # so their waits cannot drain in-flight asm DMA loads.
+            flags = flags + ["-DMPK_AID_REP_CONST=1"]
+        for _f in ("MPK_AID_NC_REP", "MPK_MOE_NCLOCAL", "MPK_AID_P9_NC", "MPK_NC_PROBE", "MPK_OPROJ_HIER_NC", "MPK_MOE_LDS_MAX"):
+            # AID-local NC scratch for counters, and the counters placed there.
+            if int(os.environ.get(_f, "0")) == 1:
+                flags = flags + [f"-D{_f}=1"]
+        if int(os.environ.get("MPK_AID_P9_LOCAL", "0")) == 1:
+            # Phase 9 per-die arrival counter on the local AID replica (needs MPK_P9_FLAT).
+            flags = flags + ["-DMPK_AID_P9_LOCAL=1"]
+        if int(os.environ.get("MPK_P9_ARRREC", "0")) == 1:
+            # Timing only: Phase 9 arrival atomic per physical die ([P9ARR]).
+            flags = flags + ["-DMPK_P9_ARRREC=1"]
+        if int(os.environ.get("MPK_MOE_FLAT", "0")) == 1:
+            # MoE W13->W2 barrier kept inside the pair's AID (per-die counters + done slots).
+            flags = flags + ["-DMPK_MOE_FLAT=1"]
+        if int(os.environ.get("MPK_MOE_ARRREC", "0")) == 1:
+            # Timing only: MoE arrival and W2 wait per physical die ([MARR]).
+            flags = flags + ["-DMPK_MOE_ARRREC=1"]
+        if int(os.environ.get("MPK_ATTN_WAITREC", "0")) == 1:
+            # Timing only: ring-wait vs loop time of long scans ([ASCAN]).
+            flags = flags + ["-DMPK_ATTN_WAITREC=1"]
+        if int(os.environ.get("MPK_ATTN_EPI_AS1", "0")) == 1:
+            # Attention partial stores through AS(1) pointers (global, not flat).
+            flags = flags + ["-DMPK_ATTN_EPI_AS1"]
+        if int(os.environ.get("MPK_ATTN_WL_DUAL", "0")) in (1, 2):
+            # Two softmax chains per wave in the lean DMA scan (needs MPK_ATTN_WL_LEAN);
+            # 2 issues the two tiles of a pair stage by stage.
+            flags = flags + ["-DMPK_ATTN_WL_DUAL=" + os.environ["MPK_ATTN_WL_DUAL"]]
+        if int(os.environ.get("MPK_ATTN_WL_LEAN", "0")) == 1:
+            # DMA scan without per-tile bookkeeping (needs MPK_ATTN_WL_DMA >= 2).
+            flags = flags + ["-DMPK_ATTN_WL_LEAN=1"]
+        if int(os.environ.get("MPK_ATTN_WL_PIPE", "0")) == 1:
+            # Software-pipelined DMA scan (needs MPK_ATTN_WL_DMA >= 2).
+            flags = flags + ["-DMPK_ATTN_WL_PIPE=1"]
+        _wl_ring = os.environ.get("MPK_ATTN_WL_RING", "")
+        if _wl_ring != "":
+            # K/V tiles in flight per wave in the wave-local scan (default 1).
+            flags = flags + [f"-DMPK_ATTN_WL_RING={int(_wl_ring)}"]
         _wl_min = os.environ.get("MPK_ATTN_WAVE_LOCAL_MIN_TILES")
         if _wl_min is not None:
             flags = flags + [f"-DMPK_ATTN_WAVE_LOCAL_MIN_TILES={int(_wl_min)}"]
@@ -879,6 +1107,12 @@ def get_compile_command(
         # alternating pairs (-22/+11/-12 and -22/-21/-34 us/token);
         # aggregate median improved 1.761 -> 1.745 ms/token. Control and
         # pipeline PPL were identical (NLL 2.599956, 0 argmax mismatches).
+        if int(os.environ.get("MPK_LM_MALL_PCT", "0")) > 0:
+            flags = flags + [
+                "-DMPK_LM_MALL_PCT=" + str(int(os.environ["MPK_LM_MALL_PCT"]))
+            ]
+        if int(os.environ.get("MPK_LM_MALL_SC0", "0")) == 1:
+            flags = flags + ["-DMPK_LM_MALL_SC0"]
         if _opt("MPK_LM_HEAD_GROUP_PIPELINE"):
             flags = flags + [
                 "-DMPK_LM_HEAD_GROUP_PIPELINE",
@@ -1001,6 +1235,10 @@ def get_compile_command(
             flags = flags + ["-DMPK_ATTN_WL_PF2"]
         if int(os.environ.get("MPK_TASK_FENCE_DRAIN", "0")) == 1:
             flags = flags + ["-DMPK_TASK_FENCE_DRAIN"]
+        if int(os.environ.get("MPK_FI_SIGNAL_DRAIN", "0")) == 1:
+            flags = flags + ["-DMPK_FI_SIGNAL_DRAIN"]
+        if int(os.environ.get("MPK_FI_SIGNAL_XCDFENCE", "0")) == 1:
+            flags = flags + ["-DMPK_FI_SIGNAL_XCDFENCE"]
         if int(os.environ.get("MPK_ATTSUB", "0")) == 1:
             flags = flags + ["-DMPK_ATTSUB"]
         if int(os.environ.get("MPK_ATTSUB_SLIDING", "0")) == 1:
@@ -1009,6 +1247,36 @@ def get_compile_command(
             flags = flags + ["-DMPK_ATTSCAN"]
         if int(os.environ.get("MPK_ATTN_Q_EPOCH", "0")) == 1:
             flags = flags + ["-DMPK_ATTN_Q_EPOCH"]
+        if int(os.environ.get("MPK_W13_T1_IMM2", "0")) == 1:
+            # T1_IMM in MPK_W2_IMM's shape: bank-0 reads before the bank-1 wait.
+            flags = flags + ["-DMPK_W13_T1_IMM2"]
+        if int(os.environ.get("MPK_MOE_TAGS", "0")) == 1:
+            # W13 -> W2 release as one done tag per W13 tile (no counter atomic, no publish hop).
+            flags = flags + ["-DMPK_MOE_TAGS"]
+        if int(os.environ.get("MPK_W13_T0_IMM", "0")) == 1:
+            # W13 tile-0 recycle loop with immediate LDS offsets (no pointer bumps, no inner nops).
+            flags = flags + ["-DMPK_W13_T0_IMM"]
+        if os.environ.get("MPK_GATE_SNAP"):
+            # Layer-boundary stamps (gate poll / observe / QKV start) for iteration MPK_GATE_SNAP.
+            flags = flags + ["-DMPK_GATE_SNAP=" + str(int(os.environ["MPK_GATE_SNAP"]))]
+        if os.environ.get("MPK_QEP_SNAP"):
+            # QKV-epoch arrival / exit stamps per rank for iteration MPK_QEP_SNAP (no phase recorder).
+            flags = flags + ["-DMPK_QEP_SNAP=" + str(int(os.environ["MPK_QEP_SNAP"]))]
+        if int(os.environ.get("MPK_QKV_EPOCH_NORET", "0")) == 1:
+            # QKV-epoch arrival without waiting for the atomic's return (DIRECT epoch only).
+            flags = flags + ["-DMPK_QKV_EPOCH_NORET"]
+        if int(os.environ.get("MPK_W13_T1_IMM", "0")) == 1:
+            # W13 tile-1 pair loop with immediate LDS offsets (no pointer bumps, no inner nops).
+            flags = flags + ["-DMPK_W13_T1_IMM"]
+        if int(os.environ.get("MPK_ATTN_KV_OFF", "0")) == 1:
+            # Attention chunks 8-9 off the K/V producer ranks (onto ranks NUM_KV_CHUNKS, +1).
+            flags = flags + ["-DMPK_ATTN_KV_OFF"]
+        if int(os.environ.get("MPK_ATTN_QWAIT_RT", "0")) == 1:
+            # Runtime switch for MPK_ATTN_QWAIT (env MPK_QWAIT_RT at run time, default 1).
+            flags = flags + ["-DMPK_ATTN_QWAIT_RT"]
+        if int(os.environ.get("MPK_ATTN_QWAIT", "0")) == 1:
+            # Attention chunks without the newest token wait only for the Q heads (direct epoch).
+            flags = flags + ["-DMPK_ATTN_QWAIT"]
         if int(os.environ.get("MPK_P9_DEFER_INV_L1", "0")) == 1:
             flags = flags + ["-DMPK_P9_DEFER_INV_L1"]
         if int(os.environ.get("MPK_MOE_BAR_NO_REFRESH", "0")) == 1:
@@ -1019,16 +1287,138 @@ def get_compile_command(
             flags = flags + ["-DMPK_OPROJ_TILE_FLAGS"]
         if int(os.environ.get("MPK_LM_STAMPS", "0")) == 1:
             flags = flags + ["-DMPK_LM_STAMPS"]
+        if int(os.environ.get("MPK_LMX", "0")) > 0:
+            flags = flags + ["-DMPK_LMX=%d" % int(os.environ["MPK_LMX"])]
+            if int(os.environ.get("MPK_LMX_EVERY", "0")) > 0:
+                flags = flags + ["-DMPK_LMX_EVERY=%d" % int(os.environ["MPK_LMX_EVERY"])]
+            if int(os.environ.get("MPK_LMXB", "0")) == 1:
+                flags = flags + ["-DMPK_LMXB"]
         if int(os.environ.get("MPK_EMB_FIRST", "0")) == 1:
             flags = flags + ["-DMPK_EMB_FIRST"]
+        if int(os.environ.get("MPK_ITER_TS", "0")) == 1:
+            flags = flags + ["-DMPK_ITER_TS"]
+        if os.environ.get("MPK_W2_SPOLL_VEC_EVERY"):
+            flags = flags + ["-DMPK_W2_SPOLL_VEC_EVERY=" + str(int(os.environ["MPK_W2_SPOLL_VEC_EVERY"]))]
+        # Multi-partition (DPX/CPX) builds get the hang fixes by default: gate rescue, serialized
+        # worker/scheduler launch and the launch guard. MPK_GATE_RESCUE / MPK_PLACE_SERIAL /
+        # MPK_PLACE_GUARD set to 0 turn one off.  # MPK_HANG_FIX_DEFAULT_V1
+        _hang_fix = int(os.environ.get("MPK_MULTI_DEV", "0") or 0) > 1
+        _gr = os.environ.get("MPK_GATE_RESCUE", "16384" if _hang_fix else "")
+        if _gr not in ("", "0"):  # MPK_GATE_RESCUE_V1
+            flags = flags + ["-DMPK_GATE_RESCUE=" + str(int(_gr))]
+        if os.environ.get("MPK_MDEV_SYS_SCOPE") == "1":  # cross-device sync at system scope (DPX)
+            flags = flags + ["-DMPK_CPX_SCOPE=1"]
+        if os.environ.get("MPK_TOPK_SPINREC"):  # MPK_TOPK_SPINREC_V1
+            flags = flags + ["-DMPK_TOPK_SPINREC"]
+        if os.environ.get("MPK_PLACE_SERIAL", "1" if _hang_fix else "") not in ("", "0"):  # MPK_PLACE_SERIAL_V1
+            flags = flags + ["-DMPK_PLACE_SERIAL"]
+        _pg = os.environ.get("MPK_PLACE_GUARD", "1000" if _hang_fix else "")
+        if _pg not in ("", "0"):  # MPK_PLACE_GUARD_V1
+            flags = flags + ["-DMPK_PLACE_GUARD=" + str(int(_pg))]
+        if os.environ.get("MPK_ITER_DELAY_NS"):
+            flags = flags + ["-DMPK_ITER_DELAY_NS=" + str(int(os.environ["MPK_ITER_DELAY_NS"]))]
+        for _tf in ("MPK_ITER_GATE_SC1", "MPK_PC_DESC_PREFETCH", "MPK_TAIL_PUB_LATE",
+                    "MPK_PC_DROP_BEGIN", "MPK_EVCTR2_SC1", "MPK_END_DIRECT",
+                    "MPK_END_DIRECT_EMB", "MPK_END_FAST", "MPK_LM_PF0",
+                    "MPK_LM_LEADER_INV", "MPK_W2_SPOLL", "MPK_W2_POLL_FIRST",
+                    "MPK_TAIL_NO111", "MPK_TAIL_NO111_CHECK"):
+            if int(os.environ.get(_tf, "0")) == 1:
+                flags = flags + ["-D" + _tf]
         if int(os.environ.get("MPK_LM_RESADD", "0")) == 1:
             flags = flags + ["-DMPK_LM_RESADD"]
+        if int(os.environ.get("MPK_LTK_TIE_FIX", "0")) == 1:
+            # Local TopK: break logit ties by expert index; a tie no longer drops an expert.
+            flags = flags + ["-DMPK_LTK_TIE_FIX"]
+        if int(os.environ.get("MPK_LTK_TIE_RT", "0")) == 1:
+            # Runtime switch for MPK_LTK_TIE_FIX (env MPK_TIE_RT at run time, default 1).
+            flags = flags + ["-DMPK_LTK_TIE_RT"]
+        if int(os.environ.get("MPK_TOPK_CHECK", "0")) == 1:
+            # Debug: check every TopK selection against the true top four of its own logits.
+            flags = flags + ["-DMPK_TOPK_CHECK"]
         if int(os.environ.get("MPK_LTK_SEL64", "0")) == 1:
             flags = flags + ["-DMPK_LTK_SEL64"]
         if int(os.environ.get("MPK_LM_NORM_LDS", "0")) == 1:
             flags = flags + ["-DMPK_LM_NORM_LDS"]
         if int(os.environ.get("MPK_ARGMAX_IDX_PF", "0")) == 1:
             flags = flags + ["-DMPK_ARGMAX_IDX_PF"]
+        if int(os.environ.get("MPK_ARGMAX_FUSED", "0")) == 1:
+            flags = flags + ["-DMPK_ARGMAX_FUSED"]
+        if int(os.environ.get("MPK_ROP_ROW_EARLY", "0")) == 1:
+            flags = flags + ["-DMPK_ROP_ROW_EARLY"]
+        if int(os.environ.get("MPK_LTK_STATS_W0", "0")) == 1:
+            flags = flags + ["-DMPK_LTK_STATS_W0"]
+        if int(os.environ.get("MPK_LTK_STW0_FAST", "0")) == 1:
+            flags = flags + ["-DMPK_LTK_STW0_FAST"]
+        if int(os.environ.get("MPK_ROP_QUANT_FAST", "0")) == 1:
+            flags = flags + ["-DMPK_ROP_QUANT_FAST"]
+        if int(os.environ.get("MPK_KSEL_MERGE", "0")) == 1:
+            flags = flags + ["-DMPK_KSEL_MERGE"]
+        if int(os.environ.get("MPK_W2_MALLPF", "0")) == 1:
+            # W2-only movers prefetch the dual ranks' W2 tiles into the MALL (runtime env MPK_W2PF).
+            flags = flags + ["-DMPK_W2_MALLPF"]
+        if int(os.environ.get("MPK_ROP_STAGE_ROW", "0")) == 1:
+            # Stage dumps: the router-partial path also publishes the MoE row.
+            flags = flags + ["-DMPK_ROP_STAGE_ROW"]
+        if int(os.environ.get("MPK_SPEC_DEBUG", "0")) == 1:
+            flags = flags + ["-DMPK_SPEC_DEBUG"]
+        if int(os.environ.get("MPK_BS_LAYER_INV_W0", "0")) == 1:
+            flags = flags + ["-DMPK_BS_LAYER_INV_W0"]
+        if int(os.environ.get("MPK_BS_LAYER_INV_L1", "0")) == 1:
+            flags = flags + ["-DMPK_BS_LAYER_INV_L1"]
+        if int(os.environ.get("MPK_EAGLE3", "0")) == 1:
+            flags = flags + ["-DMPK_EAGLE3"]
+        if int(os.environ.get("MPK_DFLASH", "0")) == 1:
+            # DFlash block drafter in the LM-head task (demo.py loads it).
+            flags = flags + ["-DMPK_DFLASH"]
+        if int(os.environ.get("MPK_EAGLE3_FP8", "0")) == 1:
+            # Draft projections as e4m3 + per-row scale (demo.py quantizes them).
+            flags = flags + ["-DMPK_EAGLE3_FP8"]
+        if int(os.environ.get("MPK_SPEC_VSLOT", "0")) == 1:
+            # One real request, one batch slot per token (spec-decode verify / chunked prefill).
+            flags = flags + ["-DMPK_SPEC_VSLOT"]
+        if int(os.environ.get("MPK_VT2", "0")) == 1:
+            # 2-token verify pass on the batch-1 routing + MoE map (local TopK + XCD pair per token).
+            flags = flags + ["-DMPK_VT2"]
+            if int(os.environ.get("MPK_VT2_SCHED3", "1")) == 1:
+                # 3 MoE calls per rank over all 31 ranks instead of 4 on ranks 0-22.
+                flags = flags + ["-DMPK_VT2_SCHED3"]
+        if int(os.environ.get("MPK_D89_RT", "0")) == 1:
+            # Ranks 8-9's W2 entry delay as a runtime value (env MPK_D89_NS), same binary for every value.
+            flags = flags + ["-DMPK_D89_RT"]
+        if int(os.environ.get("MPK_PFD89_RT", "0")) == 1:
+            # Ranks 8-9's Phase 9 weight-DMA delay as a runtime value (env MPK_PFD89_NS).
+            flags = flags + ["-DMPK_PFD89_RT"]
+        for _tf in "FQAM":
+            if int(os.environ.get("MPK_TID_FRESH_" + _tf, "0")) == 1:
+                flags = flags + ["-DMPK_TID_FRESH_" + _tf]
+        if int(os.environ.get("MPK_TID_FRESH", "0")) == 1:
+            # threadIdx.x through a volatile v_mov in the inlined per-layer code (no hoisted lane masks).
+            flags = flags + ["-DMPK_TID_FRESH"]
+        if int(os.environ.get("MPK_QKV_PF_PAGE_EARLY", "0")) == 1:
+            # QKV kernel: KV page lookup right after the fold (not in front of the GEMV barrier).
+            flags = flags + ["-DMPK_QKV_PF_PAGE_EARLY"]
+        if int(os.environ.get("MPK_P9_KV_EARLY_DMA", "0")) == 1:
+            # K/V ranks: waves 1-3 issue the next layer's weight DMA beside wave 0's Phase 9 arrival.
+            flags = flags + ["-DMPK_P9_KV_EARLY_DMA"]
+        if os.environ.get("MPK_MFMA_TAIL_NOP"):
+            # s_nop N (one instruction) before the accumulator read of the scaled-MFMA loops.
+            flags = flags + ["-DMPK_MFMA_TAIL_NOP=" + str(int(os.environ["MPK_MFMA_TAIL_NOP"]))]
+        if int(os.environ.get("MPK_LM_PIPE_S", "0")) == 1:
+            # LM head: next-group refill DMA with a scalar LDS destination (no readfirstlane per refill).
+            flags = flags + ["-DMPK_LM_PIPE_S"]
+        if int(os.environ.get("MPK_LDS_DST_S", "0")) == 1:
+            # LDS-DMA destinations from a scalar wave index read at the use site (no hoisted VGPRs).
+            flags = flags + ["-DMPK_LDS_DST_S"]
+        if int(os.environ.get("MPK_KV_EARLY_STAGE", "0")) == 1:
+            # QKV weights at the top of LDS; ranks 8-9 stage the part above the W2 window
+            # during their MoE entry delay (runtime switch env MPK_KVES).
+            flags = flags + ["-DMPK_KV_EARLY_STAGE", "-DMPK_QKV_W_TOP"]
+        elif int(os.environ.get("MPK_QKV_W_TOP", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_W_TOP"]
+        if int(os.environ.get("MPK_W2_GATHER_SC1", "0")) == 1:
+            flags = flags + ["-DMPK_W2_GATHER_SC1"]
+        if int(os.environ.get("MPK_RT_CONST", "0")) == 1:
+            flags = flags + ["-DMPK_RT_CONST"]
         if int(os.environ.get("MPK_EVT_FAST", "0")) == 1:
             flags = flags + ["-DMPK_EVT_FAST"]
         # Keep the QKV RMSNorm result in LDS instead of round-tripping it
@@ -1078,6 +1468,9 @@ def get_compile_command(
         # three of the four pairs worse). The same transform pays off on the
         # MoE loops below, but fleet's QKV loop already carries a different
         # LDS wait structure and there is no bubble left for it to remove.
+        if int(os.environ.get("MPK_QKV_IMM", "0")) == 1:
+            # Unrolled QKV MFMA body with immediate LDS offsets (needs MPK_QKV_MFMA_UNROLLED=1).
+            flags = flags + ["-DMPK_QKV_IMM"]
         if int(os.environ.get("MPK_QKV_MFMA_UNROLLED", "0")) == 1:
             # TESTED AND NOT ADOPTED (short of gate / hash) even with
             # PF_BEFORE_WAIT. Hash e86d7dc except C2 87918d87 flake.
@@ -1172,6 +1565,36 @@ def get_compile_command(
             flags = flags + ["-DMPK_W13_T0_MFMA_UNROLLED"]
         if _opt("MPK_W2_T0_MFMA_UNROLLED"):
             flags = flags + ["-DMPK_W2_T0_MFMA_UNROLLED"]
+        if int(os.environ.get("MPK_ATTN_CVT_BUILTIN", "0")) == 1:
+            # HD64 attention bf16 -> f32 as plain bits, not inline asm.
+            flags = flags + ["-DMPK_ATTN_CVT_BUILTIN"]
+        if int(os.environ.get("MPK_KSEL_GROUP", "0")) == 1:
+            # TopK selection rounds on sorted 8-expert group heads (needs MPK_KSEL_FAST).
+            flags = flags + ["-DMPK_KSEL_GROUP"]
+        if int(os.environ.get("MPK_ATTN_EXP2_BUILTIN", "0")) == 1:
+            # HD64 attention exp2 as the intrinsic (speculatable), not inline asm.
+            flags = flags + ["-DMPK_ATTN_EXP2_BUILTIN"]
+        if int(os.environ.get("MPK_ATTN_EPIREC", "0")) == 1:
+            # Timing recorder for the wave-local scan's cross-wave merge epilogue: [EPIREC].
+            flags = flags + ["-DMPK_ATTN_EPIREC"]
+        if int(os.environ.get("MPK_ATTN_SLREC", "0")) == 1:
+            # Timing recorder for the shared-LDS (sliding-window) attention path: [SLREC].
+            flags = flags + ["-DMPK_ATTN_SLREC"]
+        if int(os.environ.get("MPK_W2_TAGGED", "0")) == 1:
+            # Tagged SwiGLU hand-off: W2 validates (pair, layer) words instead of polling.
+            flags = flags + ["-DMPK_W2_TAGGED"]
+        if int(os.environ.get("MPK_ROP_SPLIT4", "0")) == 1:
+            # O-proj router partial on all four waves (32 experts each).
+            flags = flags + ["-DMPK_ROP_SPLIT4"]
+        if int(os.environ.get("MPK_W2_ORACLE_EARLYG", "0")) == 1:
+            # timing only (wrong output): non-mover W2 gather before its fragments, no poll
+            flags = flags + ["-DMPK_W2_ORACLE_EARLYG"]
+        if int(os.environ.get("MPK_W2_SCB4", "0")) == 1:
+            # W2 loop: B scale once per 4 K-steps (op_sel byte select), no fragment waits.
+            flags = flags + ["-DMPK_W2_SCB4"]
+        if int(os.environ.get("MPK_W2_IMM", "0")) == 1:
+            # Unrolled W2 MFMA body: immediate LDS offsets, wait behind the next reads.
+            flags = flags + ["-DMPK_W2_IMM"]
         if int(os.environ.get("MPK_W2_PF_BEFORE_WAIT", "0")) == 1:
             # TESTED AND NOT ADOPTED (confirm failed). First A/B +6 / −16 /
             # −26 µs. Confirm C=ON V=0: −15 / +8 / +8. OFF was faster on
@@ -1525,6 +1948,21 @@ def get_compile_command(
             # Worth roughly 0.036 ms/token.
             flags = flags + ["-DMPK_W13_T1_SPLIT_LDS_STAGE"]
         # Level, not a boolean: 2 is the shipped default, 0 restores `nt`.
+        if os.environ.get("MPK_AID_LOCAL_SLOTS", "") != "":
+            flags = flags + ["-DMPK_AID_LOCAL"]
+        if os.environ.get("MPK_AID_SPLIT_FLAGS", "0") == "1":
+            # SPX+NPS2 only. Hold the eight per-XCD attention release flags in
+            # two COHERENT AID-local replicas instead of one spanning buffer,
+            # and have each XCD poll the copy homed in its own AID. A spanning
+            # hipMalloc is MTYPE_NC in NPS2 -- local to neither range -- so
+            # every poll costs 182 ns near / 279 ns far against 97 ns for an
+            # AID-local line, and the O-proj slice wait polls these ~184 times
+            # a layer. phase7-bench measured slicewait 14.16 -> 0.36 us with
+            # this, exact SPX+NPS1 parity.
+            #
+            # Inert on a stock driver or in NPS1: the allocator reports
+            # unavailable and every guarded site uses the shared buffer.
+            flags = flags + ["-DMPK_AID_SPLIT_FLAGS"]
         _sp = int(os.environ.get("MPK_SYS_POLL_LOAD", "2"))
         if _sp >= 1:
             # Poll the inter-XCD release flags with `global_load_dword sc0 sc1`
@@ -1600,6 +2038,144 @@ def get_compile_command(
             # 1.826/1.820 -- one loss, one tie, one small win. The extra
             # barrier pays back the contention it removes on this path.
             flags = flags + ["-DMPK_NARROW_GATE_POLL"]
+        if int(os.environ.get("MPK_NARROW_HIER_POLL", "0")) == 1:
+            flags = flags + ["-DMPK_NARROW_HIER_POLL"]
+        if int(os.environ.get("MPK_NO_LOGIT_RESET", "0")) == 1:
+            # skip the TopK logit write-through reset (opt-in here; hash-gate it).
+            flags = flags + ["-DMPK_NO_LOGIT_RESET"]
+        if int(os.environ.get("MPK_LOCAL_TOPK", "0")) == 1:
+            # No serial TopK completer: every workgroup rebuilds routing
+            # from tagged logits on its AID replica (bs=1).
+            flags = flags + ["-DMPK_LOCAL_TOPK"]
+        if int(os.environ.get("MPK_PAIR_LOCAL_PUB", "0")) == 1:
+            # XCD pair: swiglu + W13->W2 release published to the own AID only.
+            flags = flags + ["-DMPK_PAIR_LOCAL_PUB"]
+        if int(os.environ.get("MPK_MOE_RW", "0")) == 1:
+            # MoE replicas on AID-local RW BOs; XCD 4-7 descriptors repointed.
+            flags = flags + ["-DMPK_MOE_RW"]
+        if int(os.environ.get("MPK_ORACLE_EXPERTS", "0")) == 1:
+            # MALL-residency probe: every layer loads experts 0-3's bytes.
+            flags = flags + ["-DMPK_ORACLE_EXPERTS"]
+        if os.environ.get("MPK_AID_RW_PAT", ""):
+            # Per-AID RW copies of the named inputs; XCD 4-7 descriptors repointed.
+            flags = flags + ["-DMPK_AID_RW"]
+        if int(os.environ.get("MPK_AID_SPLIT_ROUTING", "0")) == 1:
+            flags = flags + ["-DMPK_AID_SPLIT_ROUTING"]
+        if int(os.environ.get("MPK_ROUTING_NARROW_AID", "0")) == 1:
+            # Routing release: one slot per AID replica, polled locally.
+            flags = flags + ["-DMPK_ROUTING_NARROW_AID"]
+        if int(os.environ.get("MPK_RESID_REP", "0")) == 1:
+            flags = flags + ["-DMPK_RESID_REP"]
+        if int(os.environ.get("MPK_RESID_REP_RING", "0")) == 1:
+            flags = flags + ["-DMPK_RESID_REP_RING"]
+        if int(os.environ.get("MPK_AID_SPLIT_OUT", "0")) == 1:
+            flags = flags + ["-DMPK_AID_SPLIT_OUT"]
+        if int(os.environ.get("MPK_AID_EVCTR2", "0")) == 1:
+            flags = flags + ["-DMPK_AID_EVCTR2"]
+        if int(os.environ.get("MPK_SWIGLU_AID", "0")) == 1:
+            flags = flags + ["-DMPK_SWIGLU_AID"]
+        if int(os.environ.get("MPK_KV_HEAD_MAJOR", "0")) == 1:
+            # Head-major (H*ND) KV cache: head becomes the outer dim, so each
+            # head is contiguous and halves placement lands heads 0-3 in
+            # range 0 and 4-7 in range 1. attn_kv_head == xcd_id, so every
+            # XCD then reads only its own AID. Targets slot 1 (QKV/kvupd).
+            flags = flags + ["-DMPK_KV_HEAD_MAJOR"]
+        if int(os.environ.get("MPK_LMNORM_AID", "0")) == 1:
+            flags = flags + ["-DMPK_LMNORM_AID"]
+        if int(os.environ.get("MPK_MOENORM_AID", "0")) == 1:
+            flags = flags + ["-DMPK_MOENORM_AID"]
+        if int(os.environ.get("MPK_W13_HANDOFF_SC1", "0")) == 1:
+            flags = flags + ["-DMPK_W13_HANDOFF_SC1"]
+        if int(os.environ.get("MPK_P9_NO_L2INV", "0")) == 1:
+            flags = flags + ["-DMPK_P9_NO_L2INV"]
+        if int(os.environ.get("MPK_SCHED_WG_FENCE", "0")) == 1:
+            flags = flags + ["-DMPK_SCHED_WG_FENCE"]
+        if int(os.environ.get("MPK_SCHED_ONE_FENCE", "0")) == 1:
+            flags = flags + ["-DMPK_SCHED_ONE_FENCE"]
+        if int(os.environ.get("MPK_W13_HOF_AIDREP", "0")) == 1:
+            flags = flags + ["-DMPK_W13_HOF_AIDREP"]
+        if int(os.environ.get("MPK_W13_HOF_XCDREP", "0")) == 1:
+            flags = flags + ["-DMPK_W13_HOF_XCDREP"]
+        if int(os.environ.get("MPK_P9_LEADER_INV", "0")) == 1:
+            flags = flags + ["-DMPK_P9_LEADER_INV"]
+        if int(os.environ.get("MPK_P9_PREINV", "0")) == 1:
+            flags = flags + ["-DMPK_P9_PREINV"]
+        if int(os.environ.get("MPK_P9_PREINV_SKIP", "0")) == 1:
+            flags = flags + ["-DMPK_P9_PREINV_SKIP"]
+        if int(os.environ.get("MPK_W13_PREDRAIN", "0")) == 1:
+            flags = flags + ["-DMPK_W13_PREDRAIN"]
+        if int(os.environ.get("MPK_W13_DELAY", "0")) == 1:
+            flags = flags + ["-DMPK_W13_DELAY"]
+        if int(os.environ.get("MPK_WS_SYS_LOAD", "0")) == 1:
+            flags = flags + ["-DMPK_WS_SYS_LOAD", "-DMPK_P9_NO_L2INV"]
+        if int(os.environ.get("MPK_PRENORM_AID", "0")) == 1:
+            flags = flags + ["-DMPK_PRENORM_AID"]
+        if int(os.environ.get("MPK_GAMMA_AID", "0")) == 1:
+            flags = flags + ["-DMPK_GAMMA_AID"]
+        if os.environ.get("MPK_W2_KWIN") is not None:
+            _kw = int(os.environ["MPK_W2_KWIN"])
+            assert 0 <= _kw <= 23, "MPK_W2_KWIN is a W2 fragment count 0..23"
+            flags = flags + [f"-DMPK_W2_KWIN={_kw}", f"-DMPK_W2_KWIN_TAIL={23 - _kw}"]
+        if int(os.environ.get("MPK_REP_ONLY", "0")) == 1:
+            flags = flags + ["-DMPK_REP_ONLY"]
+        if int(os.environ.get("MPK_WSF32_REP", "0")) == 1:
+            flags = flags + ["-DMPK_WSF32_REP"]
+        if int(os.environ.get("MPK_WSF32_AID", "0")) == 1:
+            flags = flags + ["-DMPK_WSF32_AID"]
+        if int(os.environ.get("MPK_WSFC_READ_PRODUCER", "0")) == 1:
+            flags = flags + ["-DMPK_WSFC_READ_PRODUCER"]
+        if int(os.environ.get("MPK_WSFC_NO_WRITERS", "0")) == 1:
+            flags = flags + ["-DMPK_WSFC_NO_WRITERS"]
+        if int(os.environ.get("MPK_WSFC_STATS", "0")) == 1:
+            flags = flags + ["-DMPK_WSFC_STATS"]
+        if int(os.environ.get("MPK_WS_FARCOPY", "0")) == 1:
+            # own-AID workspace fold; needs MPK_WSF32_AID + ring + P9 flat
+            flags = flags + ["-DMPK_WS_FARCOPY"]
+        if int(os.environ.get("MPK_LMHEAD_DEDICATED", "0")) == 1:
+            flags = flags + ["-DMPK_LMHEAD_DEDICATED"]
+        if int(os.environ.get("MPK_AID_LMBAR", "0")) == 1:
+            flags = flags + ["-DMPK_AID_LMBAR"]
+        if int(os.environ.get("MPK_LM_XCC", "0")) == 1:
+            flags = flags + ["-DMPK_LM_XCC"]
+        if int(os.environ.get("MPK_LM_HW_XCC", "0")) == 1:
+            flags = flags + ["-DMPK_LM_HW_XCC"]
+        if int(os.environ.get("MPK_LM_INNER", "0")) == 1:
+            flags = flags + ["-DMPK_LM_INNER"]
+        if int(os.environ.get("MPK_LM_HW_XCC2", "0")) == 1:
+            flags = flags + ["-DMPK_LM_HW_XCC2"]
+        if int(os.environ.get("MPK_LM_WEIGHT_AID", "0")) == 1:
+            flags = flags + ["-DMPK_LM_WEIGHT_AID"]
+        if int(os.environ.get("MPK_AID_EVCTR", "0")) == 1:
+            flags = flags + ["-DMPK_AID_EVCTR"]
+        if int(os.environ.get("MPK_HIER_WAIT_TIMER", "0")) == 1:
+            flags = flags + ["-DMPK_HIER_WAIT_TIMER"]
+        if int(os.environ.get("MPK_TOPK_HIER", "0")) == 1:
+            flags = flags + ["-DMPK_TOPK_HIER"]
+        _p7skip = int(os.environ.get("MPK_P7_SKIP", "0"))
+        _wskip = int(os.environ.get("MPK_WAIT_SKIP", "0"))
+        if _wskip != 0:
+            flags = flags + ["-DMPK_WAIT_SKIP=%d" % _wskip]
+        if _p7skip != 0:
+            flags = flags + ["-DMPK_P7_SKIP=%d" % _p7skip]
+        if int(os.environ.get("MPK_AID_EVTIER", "0")) == 1:
+            flags = flags + ["-DMPK_AID_EVTIER"]
+        if int(os.environ.get("MPK_AID_SPLIT_HIER_LOCAL", "0")) == 1:
+            flags = flags + ["-DMPK_AID_SPLIT_HIER_LOCAL"]
+        _only_op = os.environ.get("MPK_ONLY_OP", "")
+        if _only_op != "":
+            flags = flags + ["-DMPK_ONLY_OP=" + str(int(_only_op))]
+        if int(os.environ.get("MPK_AID_SPLIT_QKV", "0")) == 1:
+            flags = flags + ["-DMPK_AID_SPLIT_QKV"]
+        if int(os.environ.get("MPK_AID_QKV_ARRIVE", "0")) == 1:
+            flags = flags + ["-DMPK_AID_QKV_ARRIVE"]
+        if int(os.environ.get("MPK_QKV_EPOCH_DIRECT", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_EPOCH_DIRECT"]
+        if int(os.environ.get("MPK_AID_CHUNK_BAR", "0")) == 1:
+            flags = flags + ["-DMPK_AID_CHUNK_BAR"]
+        if int(os.environ.get("MPK_AID_SPLIT_ATTNOUT", "0")) == 1:
+            flags = flags + ["-DMPK_AID_SPLIT_ATTNOUT"]
+        if int(os.environ.get("MPK_NARROW_MOE_BAR_POLL", "0")) == 1:
+            flags = flags + ["-DMPK_NARROW_MOE_BAR_POLL"]
         if int(os.environ.get("MPK_LAYER_GATE_BUSY_POLL", "0")) == 1:
             # Drop s_sleep(1) from the Phase 9 layer-gate spin only.
             # A/B 2026-08-30: −12 / −13 / +3 µs, hash e86d7dc all six. Two of
@@ -1642,6 +2218,22 @@ def get_compile_command(
             # Hash e86d7dc all six. A/B −6 / −33 / +7 µs; only pair 2 clears
             # 10 us, and C2 1.758 looks like a control spike.
             flags = flags + ["-DMPK_OPROJ_AMAX_DPP"]
+        if int(os.environ.get("MPK_OPROJ_AID_AGG", "0")) == 1:
+            flags = flags + ["-DMPK_OPROJ_AID_AGG"]
+        if int(os.environ.get("MPK_OPROJ_LOCAL_SLICE_PROBE", "0")) == 1:
+            # TIMING ONLY: O-proj waves read only their own AID's slices.
+            flags = flags + ["-DMPK_OPROJ_LOCAL_SLICE_PROBE"]
+        if int(os.environ.get("MPK_ROP_LOCAL_PROBE", "0")) == 1:
+            # TIMING ONLY: Phase 7b ROP aggregate waits on its AID's 4 XCDs.
+            flags = flags + ["-DMPK_ROP_LOCAL_PROBE"]
+        if int(os.environ.get("MPK_OPROJ_LOCAL_BAR_PROBE", "0")) == 1:
+            # TIMING ONLY: O-proj release readers wait on their own AID's
+            # four XCD flags (with LOCAL_SLICE_PROBE: upper bound of split-K).
+            flags = flags + ["-DMPK_OPROJ_LOCAL_BAR_PROBE"]
+        if int(os.environ.get("MPK_OPROJ_AID_TIER", "0")) == 1:
+            # Phase-2 barrier: per-AID arrival on the AID's own replica, one
+            # write-through publish per AID; no cross-AID atomic.
+            flags = flags + ["-DMPK_OPROJ_AID_TIER"]
         if _opt("MPK_NARROW_OPROJ_HIER"):
             # One tid polls the O-proj hierarchical release; the acquire
             # __syncthreads already below carries the other 255. Unlike
@@ -1673,6 +2265,20 @@ def get_compile_command(
             # ignored, so a shape that cannot use it fails the build instead of
             # quietly falling back.
             flags = flags + ["-DMPK_ATTN_SLICE_RELEASE"]
+        if _opt("MPK_FORCE_NARROW_LAYER_GATE"):
+            # Restore the 8-XCD narrow Phase 9 wait at 4 XCDs. Slot 10 is the
+            # most expensive phase in DPX+NPS2 (15.4 us/layer in NPS1 vs
+            # 134.1 in NPS2) and the 4-XCD arm makes all 31 workers per XCD
+            # poll instead of just the QKV ranks. Opt-in: the wide arm exists
+            # for a documented hazard, so verify the generated text.
+            flags = flags + ["-DMPK_FORCE_NARROW_LAYER_GATE"]
+        if _opt("MPK_POLL_NO_INV"):
+            # Drop the per-spin `buffer_inv sc1` from the O-proj gate poll.
+            # The poll load is already ld_sys_s32 (sc0 sc1, cache-bypassing),
+            # so the invalidate buys no freshness -- it just discards this
+            # XCD's L2 every iteration, which is what slots 6 and 8 refetch
+            # the MXFP4 weights against.
+            flags = flags + ["-DMPK_POLL_NO_INV"]
         if _opt("MPK_W13_T0_COUNTED_HANDOFF"):
             # Issue the W13 handoff payload -- the prequantized activation row
             # and this workgroup's block scales -- *above* the 23 KiB tile-0
@@ -1818,6 +2424,83 @@ def get_compile_command(
             # first-selected expert; also d_routing[carried] can miss the
             # pick-time st_wt. Do not default-on. Use MPK_MOE_XCD_PAIR.
             flags = flags + ["-DMPK_EARLY_ROUTING"]
+        if int(os.environ.get("MPK_MOE_AID_EXPERT", "0")) == 1:
+            # Expert parallelism by routing slot: AID0's dies own slots 0,1
+            # and AID1's own slots 2,3, so a slot's W13 producers and W2
+            # consumers share four XCDs and its barrier stays inside one AID.
+            # Permutation of the existing tile space -> bit-identical output.
+            flags = flags + ["-DMPK_MOE_AID_EXPERT"]
+        if int(os.environ.get("MPK_MOE_AID_NSPLIT", "0")) == 1:
+            # N-split both MoE GEMMs across the AIDs without confining any
+            # expert to a die: per slot, tiles 0..22 -> AID0, 23..45 -> AID1.
+            flags = flags + ["-DMPK_MOE_AID_NSPLIT"]
+        if int(os.environ.get("MPK_MOE_NARROW_RELEASE", "0")) == 1:
+            # Publish one W13->W2 release slot per AID instead of eight.
+            # Targets the measured 6.88us `arrive` on the last-arriving tile.
+            flags = flags + ["-DMPK_MOE_NARROW_RELEASE"]
+        # Replica-backed release polls may hit L2: the AID replicas are
+        # MTYPE_RW (hardware-coherent within their own AID), so the `sc0 sc1`
+        # full-memory read every gate inherited from the MTYPE_NC era is
+        # stronger than needed. Guarded on MPK_AID_SPLIT_FLAGS in the header.
+        # Publisher-side narrowing: these gates wrote one identical value
+        # into all eight per-XCD slots, so the fan-out was pure redundancy and
+        # every store drained under the same vmcnt. Same fix as
+        # MPK_MOE_NARROW_RELEASE. MPK_ITER_AID additionally moves the gate off
+        # a spanning-NC gpu_malloc line into the per-AID RW replicas.
+        if int(os.environ.get("MPK_QKV_SPLIT", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_SPLIT"]
+        if int(os.environ.get("MPK_OPROJ_NARROW_REL", "0")) == 1:
+            flags = flags + ["-DMPK_OPROJ_NARROW_REL"]
+        if int(os.environ.get("MPK_LAYER_NARROW_REL", "0")) == 1:
+            flags = flags + ["-DMPK_LAYER_NARROW_REL"]
+        if int(os.environ.get("MPK_P9_FLAT", "0")) == 1:
+            flags = flags + ["-DMPK_P9_FLAT"]
+        if int(os.environ.get("MPK_PUB_NOWAIT", "0")) == 1:
+            # Release publishers do not wait for their flag stores to land.
+            flags = flags + ["-DMPK_PUB_NOWAIT"]
+        if int(os.environ.get("MPK_RPROBE", "0")) == 1:
+            # Home-die probe of the flag replica lines (rprobe.h).
+            flags = flags + ["-DMPK_RPROBE"]
+        if int(os.environ.get("MPK_RESID_MAP", "0")) == 1:
+            # Host-visible worker/scheduler residency map (hang diagnosis).
+            flags = flags + ["-DMPK_RESID_MAP"]
+        if int(os.environ.get("MPK_OPROJ_FLAT", "0")) == 1:
+            flags = flags + ["-DMPK_OPROJ_FLAT"]
+        if int(os.environ.get("MPK_ATTN_PAGE_CACHE", "0")) == 1:
+            flags = flags + ["-DMPK_ATTN_PAGE_CACHE"]
+        if int(os.environ.get("MPK_ITER_AID", "0")) == 1:
+            flags = flags + ["-DMPK_ITER_AID"]
+        if int(os.environ.get("MPK_AID_GATE_CACHED", "0")) == 1:
+            flags = flags + ["-DMPK_AID_GATE_CACHED"]
+        if int(os.environ.get("MPK_SWIGLU_AIDREP", "0")) == 1:
+            # swiglu's two copies in real per-AID BOs (reusing the split-flag
+            # replicas) instead of two halves of one single-range tensor.
+            # Targets MoE's largest ATT site: the nt gather at 6188 cyc/hit.
+            flags = flags + ["-DMPK_SWIGLU_AIDREP"]
+        if int(os.environ.get("MPK_ITER_XCD_POLL", "0")) == 1:
+            # Poll the per-XCD mirror of iter_ready at the iteration boundary
+            # instead of the shared spanning-NC counter. Targets the largest
+            # NPS1->NPS2 gap: worker_kernel at 3.96x.
+            flags = flags + ["-DMPK_ITER_XCD_POLL"]
+        if int(os.environ.get("MPK_MOE_AID_EXPERT_W13", "0")) == 1:
+            # Bisection: AID-own the W13 region only, W2 on the stock stripe.
+            # Implies MPK_MOE_AID_EXPERT (it edits that block).
+            flags = flags + ["-DMPK_MOE_AID_EXPERT", "-DMPK_MOE_AID_EXPERT_W13"]
+        if int(os.environ.get("MPK_MOE_LOCAL_PROBE", "0")) == 1:
+            # TIMING PROBE ONLY -- W13->W2 handoff on an XCD-local L2
+            # counter (what a W2 K-split would pay). Output wrong by design.
+            flags = flags + ["-DMPK_MOE_LOCAL_PROBE"]
+        if int(os.environ.get("MPK_MOE_SKIP_ARR", "0")) == 1:
+            # Timing only: skip the W13 arrival (needs MPK_MOE_SKIP_BAR).
+            flags = flags + ["-DMPK_MOE_SKIP_ARR"]
+        if int(os.environ.get("MPK_MOE_SKIP_W13DRAIN", "0")) == 1:
+            # Timing only: no SwiGLU store drain at the end of the W13 tile.
+            flags = flags + ["-DMPK_MOE_SKIP_W13DRAIN"]
+        if int(os.environ.get("MPK_MOE_SKIP_BAR", "0")) == 1:
+            # TIMING PROBE ONLY -- deletes the W13->W2 wait (keeps the
+            # release). Output is garbage by design; the delta against the
+            # control is the upper bound on removing the barrier.
+            flags = flags + ["-DMPK_MOE_SKIP_BAR"]
         if int(os.environ.get("MPK_TERM_RECHECK", "0")) == 1:
             # Re-test terminate after the iteration-boundary wait.
             flags = flags + ["-DMPK_TERM_RECHECK"]
@@ -1896,6 +2579,19 @@ def get_compile_command(
             # Ablation 2026-08-30 (=0): +21 / −4 / −14 µs, hash e86d7dc all
             # six. Mixed; keep default ON.
             flags = flags + ["-DMPK_ML_TABLE_PREFETCH"]
+        if int(os.environ.get("MPK_PFIN_RETIRE", "0")) == 1:
+            flags = flags + ["-DMPK_PFIN_RETIRE"]
+        if int(os.environ.get("MPK_QKV_L2PRE", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_L2PRE"]
+        if int(os.environ.get("MPK_QKV_WDMA_MID", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_WDMA_MID"]
+        if int(os.environ.get("MPK_QKV_PF_SKIP_ALL", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_PF_SKIP_ALL"]
+        if int(os.environ.get("MPK_OPROJ_IMM", "0")) == 1:
+            flags = flags + ["-DMPK_OPROJ_IMM"]
+        if int(os.environ.get("MPK_W2_EARLY", "0")) == 1:
+            # W13+W2 ranks stream their W2 tile into the W13 slots tile-1 frees.
+            flags = flags + ["-DMPK_W2_EARLY"]
         if int(os.environ.get("MPK_QKV_PF_WAVE_SPLIT", "0")) == 1:
             # Keep wave 0 out of the pre-gate half of MPK_PREFETCH_NEXT_QKV and
             # re-issue its quarter of the tile after the gate. tid 0 is the only
@@ -1916,7 +2612,7 @@ def get_compile_command(
         flags = flags + [
             "-DMPK_MOE_PAD_MULTIPLE="
             + str(
-                8 * mpk_workers_per_xcd()
+                mpk_num_xcds() * mpk_workers_per_xcd()
                 if int(os.environ.get("MPK_MOE_PAD_ROUND", "0")) == 1
                 else 240
             )
@@ -1953,6 +2649,12 @@ def get_compile_command(
             # A/B 2026-08-30: −23 / +6 / −6 µs, hash e86d7dc all six.
             # Only pair 1 >10 µs (C1 1.757). Stays opt-in.
             flags = flags + ["-DMPK_MERGE_WIDE_DIM"]
+        if int(os.environ.get("MPK_MERGE_O_EARLY", "0")) == 1:
+            # Merge: o loads in the same batch as the lse loads (one round trip).
+            flags = flags + ["-DMPK_MERGE_O_EARLY"]
+        if int(os.environ.get("MPK_ATTN_INLINE", "0")) == 1:
+            # Attention decode + wave-local scan __forceinline__ (-0.47%).
+            flags = flags + ["-DMPK_ATTN_INLINE"]
         if int(os.environ.get("MPK_MERGE_O_PRELOAD", "0")) == 1:
             # TESTED AND NOT ADOPTED (mixed). Load-all then FMA in two-pass
             # merge. Hash e86d7dc all six. A/B −26 / +28 / −3 µs. C1 1.753
@@ -2106,6 +2808,10 @@ def get_compile_command(
             # than fixing it. See the correctness note at the post-arrival
             # site in gang_full_layer_fused_mi300.cuh.
             flags = flags + ["-DMPK_DRAIN_OVERLAP"]
+        if int(os.environ.get("MPK_BAR_SPLIT", "0")) == 1:
+            flags = flags + ["-DMPK_BAR_SPLIT"]
+        if int(os.environ.get("MPK_BAR_SPLIT_ONLY", "0")) == 1:
+            flags = flags + ["-DMPK_BAR_SPLIT_ONLY"]
         if int(os.environ.get("MPK_OPROJ_INNER_TIMING", "0")) == 1:
             flags = flags + ["-DMPK_OPROJ_INNER_TIMING"]
         if int(os.environ.get("MPK_MOE_INNER_TIMING", "0")) == 1:
@@ -2126,6 +2832,13 @@ def get_compile_command(
             if int(os.environ.get("MPK_LOCAL_TOPK", "0")) != 1:
                 raise RuntimeError("MPK_LTK_EARLY_TAG requires MPK_LOCAL_TOPK=1")
             flags = flags + ["-DMPK_LTK_EARLY_TAG"]
+        if int(os.environ.get("MPK_ROUTER_OPROJ_PARTIAL", "0")) == 1:
+            flags = flags + ["-DMPK_ROUTER_OPROJ_PARTIAL"]
+            for _rop in ("MPK_ROP_QOVL", "MPK_ROP_PROBE", "MPK_ROP_PROBE_TWICE", "MPK_ROP_KSEL",
+                         "MPK_ROP_RELAY", "MPK_ROP_ST1", "MPK_ROP_HOME", "MPK_ROP_NO_REL",
+                         "MPK_XSNAP_EARLY"):
+                if int(os.environ.get(_rop, "0")) == 1:
+                    flags = flags + ["-D" + _rop]
         if int(os.environ.get("MPK_SUBKERNEL_INLINE", "0")) == 1:
             flags = flags + ["-DMPK_SUBKERNEL_INLINE"]
         if int(os.environ.get("MPK_LTK_POLL_SC1", "0")) == 1:
@@ -2140,6 +2853,8 @@ def get_compile_command(
             flags = flags + ["-DMPK_ROUTER_BIAS_PF3"]
         if int(os.environ.get("MPK_IL_CACHE2", "0")) == 1:
             flags = flags + ["-DMPK_IL_CACHE2"]
+        if int(os.environ.get("MPK_IL_Q4REG", "0")) == 1:
+            flags = flags + ["-DMPK_IL_Q4REG"]
         if int(os.environ.get("MPK_P9_POLL_GLOBAL", "0")) == 1:
             flags = flags + ["-DMPK_P9_POLL_GLOBAL"]
         if int(os.environ.get("MPK_OPROJ_POLL_GLOBAL", "0")) == 1:
@@ -2178,6 +2893,37 @@ def get_compile_command(
             flags = flags + ["-DMPK_W13_LDS_WEIGHTS"]
         if int(os.environ.get("W13_LDS_PREFETCH", "1")) == 1:
             flags = flags + ["-DMPK_W13_LDS_PREFETCH"]
+        if os.environ.get("MPK_W2_NO_NT", "0") == "1":
+            flags = flags + ["-DMPK_W2_NO_NT"]
+        if int(os.environ.get("MPK_MOE_PAD_SKIP", "0")) == 1:
+            flags = flags + ["-DMPK_MOE_PAD_SKIP"]
+        if int(os.environ.get("MPK_MOE_KPAD", "0")) == 1:
+            flags = flags + ["-DMPK_MOE_KPAD"]
+        if int(os.environ.get("MPK_MOE_CACHEABLE", "0")) == 1:
+            # MoE weight loads cacheable (sc0) so prefetched/MALL-resident experts are hit.
+            flags = flags + ["-DMPK_MOE_CACHEABLE"]
+        if int(os.environ.get("MPK_SEP_PREFETCH", "0")) == 1:
+            # SEP: prev-token expert predictor + idle-rank W13 prefetch into cache.
+            flags = flags + ["-DMPK_SEP_PREFETCH"]
+        if int(os.environ.get("MPK_SEP_ORACLE", "0")) == 1:
+            # SEP oracle: full-range capture; pass-1 warmup fills, pass-2 reads actual expert.
+            flags = flags + ["-DMPK_SEP_ORACLE"]
+        if int(os.environ.get("MPK_SEP_W2", "0")) == 1:
+            flags = flags + ["-DMPK_SEP_W2"]
+        if int(os.environ.get("MPK_SEP_LDS", "0")) == 1:
+            flags = flags + ["-DMPK_SEP_LDS"]
+        _emu = os.environ.get("MPK_MOE_W_EMU", "0")
+        if _emu not in ("0", ""):
+            flags = flags + ["-DMPK_MOE_W_EMU=" + _emu]
+        if int(os.environ.get("MPK_MOE_WARM_ORACLE", "0")) == 1:
+            # Timing-only: warm the real expert-half into MALL before the W13 compute.
+            flags = flags + ["-DMPK_MOE_WARM_ORACLE"]
+        if os.environ.get("MPK_W2_GATHER_NO_NT", "0") == "1":
+            flags = flags + ["-DMPK_W2_GATHER_NO_NT"]
+        if os.environ.get("MPK_MOE_REPLICA_SWAP", "0") == "1":
+            flags = flags + ["-DMPK_MOE_REPLICA_SWAP"]
+        if os.environ.get("MPK_PPROBE", "0") == "1":
+            flags = flags + ["-DMPK_PPROBE"]
         if int(os.environ.get("MPK_PREFETCH_NEXT_QKV", "1")) == 1:
             # Issue the next layer's QKV weight HBM->LDS DMA during the Phase 9
             # layer-barrier spin, where the memory system is otherwise idle for
@@ -2199,6 +2945,8 @@ def get_compile_command(
         # Timing-only, and wrong by three quarters of the MoE output: drops the
         # MOE_WS_SLOTS-1 extra workspace slabs the QKV prologue folds. Bounds
         # what moving that fold out of QKV's serial window could recover.
+        if int(os.environ.get("MPK_QKV_WS_LOCAL_PROBE", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_WS_LOCAL_PROBE"]  # timing only
         if int(os.environ.get("MPK_ABLATE_WS_FOLD", "0")) == 1:
             flags = flags + ["-DMPK_ABLATE_WS_FOLD"]
         if int(os.environ.get("MPK_GAP_TIMING", "0")) == 1:
@@ -2214,16 +2962,79 @@ def get_compile_command(
             flags = flags + ["-DMPK_K2944_DEBUG"]
         # Escape hatch for one-off diagnostic defines (e.g. -DMPK_DIAG_SETTLE).
         # Space-separated; passed through verbatim to the JIT compile.
+        if os.environ.get("MPK_TOK_HOST", "0") == "1":
+            flags = flags + ["-DMPK_TOK_HOST"]
+        if os.environ.get("MPK_HOST_STOP", "0") == "1":
+            flags = flags + ["-DMPK_HOST_STOP"]
         if os.environ.get("MPK_EXTRA_FLAGS"):
-            flags = flags + os.environ["MPK_EXTRA_FLAGS"].split()
+            # Commas separate flags too: the runners split env tokens on spaces.
+            flags = flags + os.environ["MPK_EXTRA_FLAGS"].replace(",", " ").split()
+        if int(os.environ.get("MPK_OPROJ_SCALAR_XCD", "0")) == 1:
+            flags = flags + ["-DMPK_OPROJ_SCALAR_XCD"]
+        if os.environ.get("MPK_W2_DELAY_NS"):
+            flags = flags + ["-DMPK_MOE_W2_REMAP_DELAY_NS=" + os.environ["MPK_W2_DELAY_NS"]]
+        # Backend options, comma-separated: MPK_LLVM_OPTS=-amdgpu-sched-strategy=max-ilp
+        if os.environ.get("MPK_LLVM_OPTS"):
+            for _o in os.environ["MPK_LLVM_OPTS"].split(","):
+                if _o:
+                    flags = flags + ["-mllvm", _o]
+        # Fused-layer batching (36 layers in one gang task) is the production
+        # recipe and is independent of PRECOMPUTED_DISPATCH. Bundling the two
+        # meant PRECOMPUTED_DISPATCH=0 also dropped compaction and ran the
+        # unmaintained 36-event scheduler path, which emitted garbage. Isolate
+        # dispatch: same fused task graph, only the queue vs scheduler changes.
+        flags = flags + ["-DMPK_FUSED_LAYER_BATCHING"]
+        flags = flags + [f"-DMPK_NUM_XCDS={mpk_num_xcds()}"]
+        # The 4-XCD second-pass loops never iterate at 8 XCDs, but compiled in they
+        # push the O-proj kernel from 86 to 248 VGPRs and 16 to 288 B of scratch.
+        # They are compiled out at 8 XCDs; this puts them back for A/B only.
+        if os.environ.get("MPK_MULTI_PASS_8XCD", "0") == "1":
+            flags = flags + ["-DMPK_MULTI_PASS_8XCD"]
+        # SPX only: confine workers to physical XCDs [0, MPK_NUM_XCDS) so they
+        # all sit close to one NPS2 memory range. DPX needs nothing here --
+        # its dies are already a single partition.
+        # Any non-empty MPK_AID_LOCAL_SLOTS turns on the relocator; the
+        # variable itself is read on the host at run time, not baked in.
+        if (os.environ.get("MPK_AID_LOCAL_SLOTS", "") != ""
+                or os.environ.get("MPK_AID_LOCAL_MAP", "") != ""):
+            flags = flags + ["-DMPK_AID_LOCAL"]
+        if os.environ.get("MPK_MOE_REPLICA", "0") == "1":
+            flags = flags + ["-DMPK_MOE_REPLICA"]
+        if os.environ.get("MPK_MOE_SPLIT", "0") == "1":
+            flags = flags + ["-DMPK_MOE_SPLIT"]
+        if os.environ.get("MPK_MOE_XPAIR", "0") == "1":
+            flags = flags + ["-DMPK_MOE_XPAIR"]
+        # MPK_MULTI_DEV=N: the 8-XCD megakernel over N DPX/CPX partitions of one GPU.
+        _mdev = int(os.environ.get("MPK_MULTI_DEV", "0") or 0)
+        if _mdev > 1:
+            flags = flags + [f"-DMPK_MULTI_DEV={_mdev}"]
+        if os.environ.get("MPK_XCD_SUBSET", "0") == "1":
+            flags = flags + ["-DMPK_XCD_SUBSET"]
+            _base = int(os.environ.get("MPK_XCD_BASE", "0"))
+            if _base:
+                flags = flags + [f"-DMPK_XCD_BASE={_base}"]
+        flags = flags + [f"-DMPK_OPROJ_MAX_RANKS={mpk_workers_per_xcd()}"]
         if int(os.environ.get("PRECOMPUTED_DISPATCH", "1")) == 1:
             flags = flags + ["-DMPK_PRECOMPUTED_DISPATCH"]
-            flags = flags + ["-DMPK_FUSED_LAYER_BATCHING"]
         if int(os.environ.get("MPK_NIL_TRIPWIRE", "0")) == 1:
             # Breadcrumbs in pinned host memory + SIGABRT dump, to attribute
             # the nil-address memory fault. Off by default: the per-layer
             # writes cost a little and only matter while chasing that bug.
             flags = flags + ["-DMPK_NIL_TRIPWIRE"]
+        if int(os.environ.get("MPK_TERM_RECHECK", "0")) == 1:
+            flags = flags + ["-DMPK_TERM_RECHECK"]
+        if int(os.environ.get("MPK_EVCTR_HOST", "0")) == 1:
+            flags = flags + ["-DMPK_EVCTR_HOST"]
+        if int(os.environ.get("MPK_NPS2_EVENT_POLL", "0")) == 1:
+            flags = flags + ["-DMPK_NPS2_EVENT_POLL"]
+        if int(os.environ.get("MPK_NPS2_L2_ACQUIRE", "0")) == 1:
+            # Unconditional layer-boundary `buffer_inv sc0 sc1`. Required in
+            # SPX+NPS2, where plain hipMalloc is MTYPE_NC and nothing keeps L2
+            # coherent across XCDs; the batch-1 path otherwise acquires nothing
+            # at all. Off by default: in NPS1 the acquire is redundant (MTYPE_RW
+            # is hardware-coherent) and dropping L2 per layer costs ~0.26
+            # ms/token by this file's own ablation.
+            flags = flags + ["-DMPK_NPS2_L2_ACQUIRE"]
         if int(os.environ.get("MPK_WORKER_STATE", "0")) == 1:
             # Per-phase worker-state breadcrumbs: which phase/barrier each
             # worker is in, dumped on a hang. This is how the fused-layer
@@ -2295,6 +3106,11 @@ class PersistentKernel:
         self.page_size = page_size
         self.eos_token_id = eos_token_id
         self.kn_graph = KNGraph(CyKNGraph(disable_fingerprint=True))
+        # MPK_PLACE_REPORT=1: name -> (data_ptr, nbytes) of every attached tensor, for the
+        # placement report that compile() prints (placement.py; report only).
+        self._place_records = {} if os.environ.get("MPK_PLACE_REPORT", "0") == "1" else None
+        # Placement arena (arena_reserve, MPK_PLACE_ARENA=1 in demo.py); None = off.
+        self._arena = None
         self.meta_tensors = meta_tensors
         self.profiler_tensor = profiler_tensor
         self.trace_name = trace_name
@@ -2363,7 +3179,60 @@ class PersistentKernel:
             f"Tasks for this layer: {supported_tasks}."
         )
 
+    def _maybe_aid_local(self, torch_tensor, name):
+        """Copy a read-only weight into an AID_LOCAL BO so it gets MTYPE_RW.
+
+        In SPX+NPS2 plain VRAM is MTYPE_NC because the single XCP spans both
+        memory ranges. Measured on this box, cacheable VRAM is worth 1.85x
+        (9.115 -> 4.920 ms/token) -- but only read-only data may take it:
+        MTYPE_RW is coherent within one hardware AID, so anything written
+        during the kernel must stay NC.
+        """
+        import os
+
+        if os.environ.get("MPK_AID_LOCAL", "0") != "1":
+            return torch_tensor
+        pats = os.environ.get("MPK_AID_LOCAL_W", "gate_up_proj,down_proj")
+        pats = [p for p in pats.split(",") if p]
+        if not any(p in (name or "") for p in pats):
+            return torch_tensor
+        # The KV cache is excluded because it is WRITTEN during the kernel
+        # and MTYPE_RW is coherent only inside one AID. That is correct for
+        # genuinely shared written data, and over-conservative for per-XCD
+        # private written data (policy: private/split -> RW ALWAYS).
+        # Whether the cache is private here depends on the kernel's internal
+        # head indexing, NOT on the imap -- the gang path attaches it with
+        # (-1,-1,-1), the same pointer for every XCD. So MPK_KV_AID is a
+        # hypothesis and the OUTPUT HASH is the arbiter: a cross-AID stale
+        # head changes the tokens.
+        if os.environ.get("MPK_KV_AID", "0") != "1":
+            if any(bad in (name or "") for bad in ("k_cache", "v_cache")):
+                return torch_tensor
+        try:
+            from . import aid_hbm
+
+            return aid_hbm.local_tensor(torch_tensor)
+        except Exception as e:  # placement is an optimisation, never a gate
+            print(f"[AID_LOCAL] {name}: falling back to default VRAM ({e})", flush=True)
+            return torch_tensor
+
+    def arena_reserve(self, chunk_per_domain: int, machine: str = "mi355x_spx_nps2"):
+        """Enable the placement arena; attach_input then copies placed tensors into it."""
+        from . import placement
+
+        assert self._arena is None, "arena_reserve() called twice"
+        self._arena = placement.Arena(chunk_per_domain, placement.MACHINES[machine])
+
+    def placed_tensor(self, name: str):
+        """The arena view a tensor was re-homed to, or None."""
+        return self._arena.view(name) if self._arena is not None else None
+
     def attach_input(self, torch_tensor: torch.Tensor, name: str = None) -> DTensor:
+        torch_tensor = self._maybe_aid_local(torch_tensor, name)
+        if self._arena is not None:
+            placed = self._arena.place(torch_tensor, name)
+            if placed is not None:
+                torch_tensor = placed
         dims = tuple([d for d in torch_tensor.shape])
         strides = tuple([s for s in torch_tensor.stride()])
         # Assert a row-major layout
@@ -2374,6 +3243,9 @@ class PersistentKernel:
         # FIXME: currently assert that name is not None
         assert name is not None
         self.kn_graph.attach_torch_tensor(t, torch_tensor, name)
+        if self._place_records is not None:
+            self._place_records[name] = (torch_tensor.data_ptr(),
+                                         torch_tensor.numel() * torch_tensor.element_size())
         return t
 
     def new_tensor(
@@ -2504,8 +3376,8 @@ class PersistentKernel:
         assert output.num_dims == 2  # (batch_size, hidden_size / world_size)
         assert k_cache.num_dims == 4  # (batch_size, seq_len, kv_heads, head_dim)
         assert v_cache.num_dims == 4  # (batch_size, seq_len, kv_heads, head_dim)
-        head_dim = k_cache.dim(3)
-        num_kv_heads = k_cache.dim(2)
+        num_kv_heads, head_dim, kv_tok_stride, kv_head_axis = \
+            self._kv_geom(k_cache)
         num_q_heads = output.dim(1) // head_dim
         rotary_embed = 0
         if cos_pos_embed is not None or sin_pos_embed is not None:
@@ -2570,8 +3442,8 @@ class PersistentKernel:
         assert output.num_dims == 2  # (batch_size, hidden_size / world_size)
         assert k_cache.num_dims == 4  # (batch_size, seq_len, kv_heads, head_dim)
         assert v_cache.num_dims == 4  # (batch_size, seq_len, kv_heads, head_dim)
-        head_dim = k_cache.dim(3)
-        num_kv_heads = k_cache.dim(2)
+        num_kv_heads, head_dim, kv_tok_stride, kv_head_axis = \
+            self._kv_geom(k_cache)
         num_q_heads = output.dim(1) // head_dim # 32
         rotary_embed = 0
         output_stride = output.dim(1)
@@ -2641,12 +3513,13 @@ class PersistentKernel:
         assert output.num_dims == 2  # (num_tokens, hidden_size / world_size)
         assert k_cache.num_dims == 4  # (num_pages, page_size, kv_heads, head_dim)
         assert v_cache.num_dims == 4  # (num_pages, page_size, kv_heads, head_dim)
-        assert k_cache.dim(0) == self.max_num_pages
-        assert v_cache.dim(0) == self.max_num_pages
-        assert k_cache.dim(1) == self.page_size
-        assert v_cache.dim(1) == self.page_size
-        head_dim = k_cache.dim(3)
-        num_kv_heads = k_cache.dim(2)
+        _pg, _ps = (1, 2) if self._kv_head_major() else (0, 1)
+        assert k_cache.dim(_pg) == self.max_num_pages
+        assert v_cache.dim(_pg) == self.max_num_pages
+        assert k_cache.dim(_ps) == self.page_size
+        assert v_cache.dim(_ps) == self.page_size
+        num_kv_heads, head_dim, kv_tok_stride, kv_head_axis = \
+            self._kv_geom(k_cache)
         num_q_heads = output.dim(1) // head_dim
         rotary_embed = 0
         if cos_pos_embed is not None or sin_pos_embed is not None:
@@ -2689,8 +3562,8 @@ class PersistentKernel:
         assert grid_dim[0] == self.max_num_batched_requests
         assert grid_dim[1] == num_kv_heads
         tb_graph.new_input(input, (-1, 1, -1), -1, True)
-        tb_graph.new_input(k_cache, (-1, 2, -1), 1, True)
-        tb_graph.new_input(v_cache, (-1, 2, -1), 1, True)
+        tb_graph.new_input(k_cache, (-1, kv_head_axis, -1), 1, True)
+        tb_graph.new_input(v_cache, (-1, kv_head_axis, -1), 1, True)
         tb_graph.new_input(q_norm, (-1, -1, -1), -1, True)
         tb_graph.new_input(k_norm, (-1, -1, -1), -1, True)
         tb_graph.new_input(cos_pos_embed, (-1, -1, -1), -1, True)
@@ -2736,15 +3609,16 @@ class PersistentKernel:
         assert input.num_dims == 2  # (num_tokens, fused_outdim / world_size)
         assert k_cache.num_dims == 4  # (num_pages, page_size, kv_heads, head_dim)
         assert v_cache.num_dims == 4  # (num_pages, page_size, kv_heads, head_dim)
-        assert k_cache.dim(0) == self.max_num_pages
-        assert v_cache.dim(0) == self.max_num_pages
-        assert k_cache.dim(1) == self.page_size
-        assert v_cache.dim(1) == self.page_size
+        _pg, _ps = (1, 2) if self._kv_head_major() else (0, 1)
+        assert k_cache.dim(_pg) == self.max_num_pages
+        assert v_cache.dim(_pg) == self.max_num_pages
+        assert k_cache.dim(_ps) == self.page_size
+        assert v_cache.dim(_ps) == self.page_size
         assert output.num_dims == 3  # (num_tokens, num_kv_chunks * num_qo_per_kv * head_dim / world_size, num_kv_heads)
         assert lse.num_dims == 3  # (num_tokens, num_kv_chunks * num_qo_per_kv / world_size, num_kv_heads)
 
-        head_dim = k_cache.dim(3)
-        num_kv_heads = k_cache.dim(2)
+        num_kv_heads, head_dim, kv_tok_stride, kv_head_axis = \
+            self._kv_geom(k_cache)
         num_q_heads = attention_params[0]
         num_kv_chunks = attention_params[1]
         
@@ -2776,8 +3650,8 @@ class PersistentKernel:
         assert grid_dim[0] == self.max_num_batched_requests
         assert grid_dim[1] == num_kv_heads
         tb_graph.new_input(input, (-1, 1, -1), -1, True)
-        tb_graph.new_input(k_cache, (-1, 2, -1), 1, True)
-        tb_graph.new_input(v_cache, (-1, 2, -1), 1, True)
+        tb_graph.new_input(k_cache, (-1, kv_head_axis, -1), 1, True)
+        tb_graph.new_input(v_cache, (-1, kv_head_axis, -1), 1, True)
         tb_graph.new_input(q_norm, (-1, -1, -1), -1, True)
         tb_graph.new_input(k_norm, (-1, -1, -1), -1, True)
         tb_graph.new_input(cos_pos_embed, (-1, -1, -1), -1, True)
@@ -2850,6 +3724,25 @@ class PersistentKernel:
         else:
             raise ValueError(f"Unsupported target CC: {self.target_cc}")
 
+    @staticmethod
+    def _kv_head_major():
+        return os.environ.get("MPK_KV_HEAD_MAJOR", "0") == "1"
+
+    @classmethod
+    def _kv_geom(cls, k_cache):
+        """(num_kv_heads, head_dim, tok_stride, head_axis) for either layout.
+
+        NHD  : (pages, page_size, heads, dim) -- head axis 2, tok stride
+               heads*dim, because a token's heads sit side by side.
+        H*ND : (heads, pages, page_size, dim) -- head axis 0, tok stride dim,
+               because within one head the tokens are contiguous.
+        """
+        head_dim = k_cache.dim(3)
+        if cls._kv_head_major():
+            return k_cache.dim(0), head_dim, head_dim, 0
+        num_kv_heads = k_cache.dim(2)
+        return num_kv_heads, head_dim, num_kv_heads * head_dim, 2
+
     def kv_cache_update_layer(
         self,
         input: DTensor,
@@ -2867,8 +3760,8 @@ class PersistentKernel:
         assert k_cache.num_dims == 4  # (num_pages, page_size, kv_heads, head_dim)
         assert v_cache.num_dims == 4
         assert q_workspace.num_dims == 2  # (num_tokens, q_workspace_stride)
-        head_dim = k_cache.dim(3)
-        num_kv_heads = k_cache.dim(2)
+        num_kv_heads, head_dim, kv_tok_stride, kv_head_axis = \
+            self._kv_geom(k_cache)
         num_q_heads = q_workspace.dim(1) // head_dim
         q_workspace_stride = q_workspace.dim(1)
         rotary_embed = 1 if cos_pos_embed is not None else 0
@@ -2894,8 +3787,8 @@ class PersistentKernel:
 
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, 1, -1), -1, True)
-        tb_graph.new_input(k_cache, (-1, 2, -1), 1, True)
-        tb_graph.new_input(v_cache, (-1, 2, -1), 1, True)
+        tb_graph.new_input(k_cache, (-1, kv_head_axis, -1), 1, True)
+        tb_graph.new_input(v_cache, (-1, kv_head_axis, -1), 1, True)
         tb_graph.new_input(q_norm, (-1, -1, -1), -1, True)
         tb_graph.new_input(k_norm, (-1, -1, -1), -1, True)
         tb_graph.new_input(cos_pos_embed, (-1, -1, -1), -1, True)
@@ -2927,13 +3820,14 @@ class PersistentKernel:
         assert o_acc.num_dims == 2   # (num_tokens, kv_heads*chunks*qo_per_kv*head_dim)
         assert lse_acc.num_dims == 2 # (num_tokens, kv_heads*chunks*qo_per_kv)
 
-        head_dim = k_cache.dim(3)
-        num_kv_heads = k_cache.dim(2)
+        num_kv_heads, head_dim, kv_tok_stride, kv_head_axis = \
+            self._kv_geom(k_cache)
         num_q_heads = attention_params[0]
         num_kv_chunks = attention_params[1]
         max_num_requests = attention_params[2]
         q_workspace_stride = q_workspace.dim(1)
-        kv_cache_stride = num_kv_heads * head_dim
+        kv_cache_stride = (head_dim if self._kv_head_major()
+                           else num_kv_heads * head_dim)
 
         # params: num_q_heads, num_kv_heads, head_dim, page_size, max_seq_len,
         #         num_kv_chunks, q_workspace_stride, kv_cache_stride,
@@ -2947,8 +3841,8 @@ class PersistentKernel:
         assert grid_dim[1] == num_kv_heads
         assert grid_dim[2] == num_kv_chunks
         tb_graph.new_input(q_workspace, (-1, -1, -1), -1, True)
-        tb_graph.new_input(k_cache, (-1, 2, -1), 1, True)
-        tb_graph.new_input(v_cache, (-1, 2, -1), 1, True)
+        tb_graph.new_input(k_cache, (-1, kv_head_axis, -1), 1, True)
+        tb_graph.new_input(v_cache, (-1, kv_head_axis, -1), 1, True)
         # Optional sinks input (GPT-OSS per-head attention sinks).
         # When provided, sink correction is fused into the attention epilogue,
         # eliminating the standalone attention_sink_layer task.
@@ -3074,8 +3968,8 @@ class PersistentKernel:
         assert v_cache.num_dims == 4
         assert self.target_cc in (94, 95), "Gang attention only supported on MI300X"
 
-        head_dim = k_cache.dim(3)
-        num_kv_heads = k_cache.dim(2)
+        num_kv_heads, head_dim, kv_tok_stride, kv_head_axis = \
+            self._kv_geom(k_cache)
         num_q_heads = attention_params[0]
         num_kv_chunks = attention_params[1]
         q_workspace_stride = attention_params[2]
@@ -3094,7 +3988,7 @@ class PersistentKernel:
         # Total work items = max_requests * num_kv_heads
         total_work_items = self.max_num_batched_requests * num_kv_heads
         import math
-        total_work_items_per_xcd = math.ceil(total_work_items / 8)
+        total_work_items_per_xcd = math.ceil(total_work_items / mpk_num_xcds())
 
         # params: [num_q_heads, num_kv_heads, qk_norm, rotary_embed,
         #          max_seq_len, page_size, num_kv_chunks,
@@ -3105,7 +3999,7 @@ class PersistentKernel:
                   total_work_items_per_xcd, total_work_items,
                   q_workspace_stride]
 
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         # 7 inputs: qkv, k_cache, v_cache, q_norm, k_norm, cos, sin
         tb_graph.new_input(input, (-1, -1, -1), 1, True)
@@ -3147,7 +4041,7 @@ class PersistentKernel:
 
         total_work_items = self.max_num_batched_requests * num_kv_heads
         import math
-        total_work_items_per_xcd = math.ceil(total_work_items / 8)
+        total_work_items_per_xcd = math.ceil(total_work_items / mpk_num_xcds())
 
         # params: [num_qo_heads_per_kv, head_dim, max_seq_len, page_size,
         #          num_kv_heads, total_work_items_per_xcd, total_work_items]
@@ -3155,7 +4049,7 @@ class PersistentKernel:
                   self.page_size, num_kv_heads, total_work_items_per_xcd,
                   total_work_items]
 
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         # No bid.y partitioning — full tensors
         tb_graph.new_input(lse, (-1, -1, -1), -1, True)
@@ -3484,11 +4378,11 @@ class PersistentKernel:
         m_tiles = max(1, batch_size // 16)
         tiles_per_expert = m_tiles * n_tiles
         total_tiles_all = num_experts * tiles_per_expert
-        total_tiles_per_xcd = (total_tiles_all + 7) // 8
+        total_tiles_per_xcd = (total_tiles_all + mpk_num_xcds() - 1) // mpk_num_xcds()
         assert total_tiles_per_xcd <= 65535, \
             f"total_tiles_per_xcd={total_tiles_per_xcd} exceeds uint16_t (bs={batch_size})"
 
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, -1, -1), 1, True)
         tb_graph.new_input(weight, (-1, 1, -1), 2, True)
@@ -3537,11 +4431,11 @@ class PersistentKernel:
         # W2: one token at a time, so tiles_per_expert = n_tiles * batch_size
         tiles_per_expert = n_tiles * batch_size
         total_tiles_all = num_experts * tiles_per_expert
-        total_tiles_per_xcd = (total_tiles_all + 7) // 8
+        total_tiles_per_xcd = (total_tiles_all + mpk_num_xcds() - 1) // mpk_num_xcds()
         assert total_tiles_per_xcd <= 65535, \
             f"total_tiles_per_xcd={total_tiles_per_xcd} exceeds uint16_t (bs={batch_size})"
 
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, -1, -1), 2, True)
         tb_graph.new_input(weight, (-1, 1, -1), 2, True)
@@ -3593,11 +4487,11 @@ class PersistentKernel:
         num_topk = output.dim(1)  # topk dimension from output shape
         max_activated = min(num_topk * batch_size, num_experts)
         total_tiles_all = max_activated * tiles_per_expert
-        total_tiles_per_xcd = (total_tiles_all + 7) // 8
+        total_tiles_per_xcd = (total_tiles_all + mpk_num_xcds() - 1) // mpk_num_xcds()
         assert total_tiles_per_xcd <= 65535, \
             f"total_tiles_per_xcd={total_tiles_per_xcd} exceeds uint16_t"
 
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, -1, -1), 1, True)
         tb_graph.new_input(weight, (-1, 1, -1), 2, True)
@@ -3648,11 +4542,11 @@ class PersistentKernel:
         num_topk = output.dim(1)
         max_activated = min(num_topk * batch_size, num_experts)
         total_tiles_all = max_activated * tiles_per_expert
-        total_tiles_per_xcd = (total_tiles_all + 7) // 8
+        total_tiles_per_xcd = (total_tiles_all + mpk_num_xcds() - 1) // mpk_num_xcds()
         assert total_tiles_per_xcd <= 65535, \
             f"total_tiles_per_xcd={total_tiles_per_xcd} exceeds uint16_t"
 
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, -1, -1), 1, True)
         tb_graph.new_input(weight, (-1, 1, -1), 2, True)
@@ -3699,11 +4593,11 @@ class PersistentKernel:
         num_topk = input.dim(1)  # topk dimension from input shape
         max_activated = min(num_topk * batch_size, num_experts)
         total_tiles_all = max_activated * tiles_per_expert
-        total_tiles_per_xcd = (total_tiles_all + 7) // 8
+        total_tiles_per_xcd = (total_tiles_all + mpk_num_xcds() - 1) // mpk_num_xcds()
         assert total_tiles_per_xcd <= 65535, \
             f"total_tiles_per_xcd={total_tiles_per_xcd} exceeds uint16_t"
 
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, -1, -1), 2, True)
         tb_graph.new_input(weight, (-1, 1, -1), 2, True)
@@ -3800,18 +4694,18 @@ class PersistentKernel:
         # W13->W2 barrier that 240's straggler pattern was hiding. Worth
         # chasing on its own; not worth shipping for 0.01 ms.
         if int(_os_pad.environ.get("MPK_MOE_PAD_ROUND", "0")) == 1:
-            PAD_MULTIPLE = 8 * mpk_workers_per_xcd()
+            PAD_MULTIPLE = mpk_num_xcds() * mpk_workers_per_xcd()
         else:
             PAD_MULTIPLE = 240
         total_w13_real = max_activated * w13_tiles
         total_w13_padded = ((total_w13_real + PAD_MULTIPLE - 1) // PAD_MULTIPLE) * PAD_MULTIPLE
         total_w2 = max_activated * w2_tiles
         total_tiles_all = total_w13_padded + total_w2
-        total_tiles_per_xcd = (total_tiles_all + 7) // 8
+        total_tiles_per_xcd = (total_tiles_all + mpk_num_xcds() - 1) // mpk_num_xcds()
         assert total_tiles_per_xcd <= 65535, \
             f"total_tiles_per_xcd={total_tiles_per_xcd} exceeds uint16_t"
 
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         # 8 inputs
         tb_graph.new_input(input, (-1, -1, -1), 1, True)
@@ -3872,11 +4766,11 @@ class PersistentKernel:
         num_topk = w13_output.dim(1)
         max_activated = min(num_topk * batch_size, num_experts)
         total_tiles_all = max_activated * tiles_per_expert
-        total_tiles_per_xcd = (total_tiles_all + 7) // 8
+        total_tiles_per_xcd = (total_tiles_all + mpk_num_xcds() - 1) // mpk_num_xcds()
         assert total_tiles_per_xcd <= 65535, \
             f"total_tiles_per_xcd={total_tiles_per_xcd} exceeds uint16_t"
 
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(w13_output, (-1, -1, -1), 2, True)
         tb_graph.new_input(weight, (-1, 1, -1), 2, True)
@@ -3970,10 +4864,10 @@ class PersistentKernel:
         reduction_size = weight.dim(1) if weight.num_dims == 2 else input.dim(1)
         assert reduction_size % k_splits == 0
         n_tiles = output_size // tile_n
-        n_cols_per_xcd = output_size // 8
+        n_cols_per_xcd = output_size // mpk_num_xcds()
 
         # Phase 1: K-split GEMM — each XCD reads full input+weight, writes to workspace
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, -1, -1), 1, True)     # full input
         tb_graph.new_input(weight, (-1, -1, -1), 1, True)    # full weight
@@ -4015,13 +4909,13 @@ class PersistentKernel:
         batch_size = self.max_num_batched_tokens
         output_size = weight.dim(0)
         assert output_size % 8 == 0
-        chunk_n = output_size // 8
+        chunk_n = output_size // mpk_num_xcds()
         assert chunk_n % tile_n == 0
         n_tiles_per_xcd = chunk_n // tile_n
         reduction_size = weight.dim(1) if weight.num_dims == 2 else input.dim(1)
         assert reduction_size % k_splits == 0, f"K={reduction_size} not divisible by k_splits={k_splits}"
         total_tiles = n_tiles_per_xcd * k_splits
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, -1, -1), 1, True)        # input_ptrs[0]
         tb_graph.new_input(weight, (0, -1, -1), 1, True)        # input_ptrs[1]
@@ -4044,7 +4938,7 @@ class PersistentKernel:
         """Gang RMSNorm: 8 tasks (1 per XCD), each computes same RMSNorm.
         Enables XCD-local event counting to avoid cross-XCD barrier."""
         assert self.target_cc in (94, 95), "Gang RMSNorm only supported on MI300X"
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, -1, -1), 1, True)
         tb_graph.new_input(weight, (-1, -1, -1), 0, True)
@@ -4077,13 +4971,13 @@ class PersistentKernel:
         batch_size = self.max_num_batched_tokens
         output_size = weight.dim(0)
         assert output_size % 8 == 0, f"Output size {output_size} must be divisible by 8"
-        chunk_n = output_size // 8
+        chunk_n = output_size // mpk_num_xcds()
         assert chunk_n % tile_n == 0, f"Chunk {chunk_n} must be divisible by tile_n {tile_n}"
         n_tiles_per_xcd = chunk_n // tile_n
         assert batch_size % m_tiles == 0, f"batch {batch_size} must be divisible by m_tiles {m_tiles}"
         m_per_tile = batch_size // m_tiles
         total_tiles_per_xcd = n_tiles_per_xcd * m_tiles
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, -1, -1), 1, True)
         # weight: partition dim 0 (rows) by bid.x → each XCD gets chunk of weight rows
@@ -4120,13 +5014,13 @@ class PersistentKernel:
         batch_size = self.max_num_batched_tokens
         output_size = weight.dim(0)
         assert output_size % 8 == 0
-        chunk_n = output_size // 8
+        chunk_n = output_size // mpk_num_xcds()
         assert chunk_n % tile_n == 0
         n_tiles_per_xcd = chunk_n // tile_n
         assert batch_size % m_tiles == 0
         m_per_tile = batch_size // m_tiles
         total_tiles_per_xcd = n_tiles_per_xcd * m_tiles
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, -1, -1), 1, True)
         # weight: partition dim 0 (rows) by bid.x
@@ -4166,13 +5060,13 @@ class PersistentKernel:
         batch_size = self.max_num_batched_tokens
         output_size = weight.dim(0)
         assert output_size % 8 == 0
-        chunk_n = output_size // 8
+        chunk_n = output_size // mpk_num_xcds()
         assert chunk_n % tile_n == 0
         n_tiles_per_xcd = chunk_n // tile_n
         assert batch_size % m_tiles == 0
         m_per_tile = batch_size // m_tiles
         total_tiles_per_xcd = n_tiles_per_xcd * m_tiles
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, -1, -1), 1, True)
         tb_graph.new_input(weight, (0, -1, -1), 1, True)
@@ -4222,13 +5116,13 @@ class PersistentKernel:
         batch_size = self.max_num_batched_tokens
         output_size = linear_weight.dim(0)
         assert output_size % 8 == 0
-        chunk_n = output_size // 8
+        chunk_n = output_size // mpk_num_xcds()
         assert chunk_n % tile_n == 0
         n_tiles_per_xcd = chunk_n // tile_n
         assert batch_size % m_tiles == 0
         m_per_tile = batch_size // m_tiles
         total_tiles_per_xcd = n_tiles_per_xcd * m_tiles
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         # forloop_dim must reference an existing dim for each tensor
         tb_graph.new_input(norm_input, (-1, -1, -1), 1, True)
@@ -4286,14 +5180,14 @@ class PersistentKernel:
         num_experts = output_stride  # router output width = num_experts
         output_size = linear_weight.dim(0)
         assert output_size % 8 == 0
-        chunk_n = output_size // 8
+        chunk_n = output_size // mpk_num_xcds()
         assert chunk_n % tile_n == 0
         n_tiles_per_xcd = chunk_n // tile_n
         assert batch_size % m_tiles == 0
         m_per_tile = batch_size // m_tiles
         total_tiles_per_xcd = n_tiles_per_xcd * m_tiles
-        total_gang_tiles = total_tiles_per_xcd * 8  # 8 XCDs on MI300X
-        grid_dim = (8, 1, 1)
+        total_gang_tiles = total_tiles_per_xcd * mpk_num_xcds()  # 8 XCDs on MI300X
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         # 7 inputs
         tb_graph.new_input(norm_input, (-1, -1, -1), 1, True)
@@ -4360,9 +5254,9 @@ class PersistentKernel:
         batch_size = self.max_num_batched_tokens
         n_wgs = mxfp4_weight.dim(0)
         assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
-        n_wgs_per_xcd = n_wgs // 8
+        n_wgs_per_xcd = n_wgs // mpk_num_xcds()
         total_tiles_per_xcd = batch_size * n_wgs_per_xcd
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(norm_input, (-1, -1, -1), 1, True)
         tb_graph.new_input(norm_weight, (-1, -1, -1), 0, True)
@@ -4415,10 +5309,10 @@ class PersistentKernel:
         assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
         n_wgs = mxfp4_weight.dim(0)
         assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
-        n_wgs_per_xcd = n_wgs // 8
-        workers_per_xcd = self.num_workers // 8
+        n_wgs_per_xcd = n_wgs // mpk_num_xcds()
+        workers_per_xcd = self.num_workers // mpk_num_xcds()
         total_tiles_per_xcd = workers_per_xcd
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(norm_input, (-1, -1, -1), 1, True)
         tb_graph.new_input(norm_weight, (-1, -1, -1), 0, True)
@@ -4487,9 +5381,9 @@ class PersistentKernel:
         batch_size = self.max_num_batched_tokens
         n_wgs = mxfp4_weight.dim(0)
         assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
-        n_wgs_per_xcd = n_wgs // 8
+        n_wgs_per_xcd = n_wgs // mpk_num_xcds()
         total_tiles_per_xcd = batch_size * n_wgs_per_xcd
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         # 7 inputs
         tb_graph.new_input(mlp_out, (-1, -1, -1), 1, True)
@@ -4544,9 +5438,9 @@ class PersistentKernel:
         batch_size = self.max_num_batched_tokens
         n_wgs = mxfp4_weight.dim(0)
         assert n_wgs % 8 == 0
-        n_wgs_per_xcd = n_wgs // 8
+        n_wgs_per_xcd = n_wgs // mpk_num_xcds()
         total_tiles_per_xcd = batch_size * n_wgs_per_xcd
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         # 5 inputs
         tb_graph.new_input(norm_input, (-1, -1, -1), 1, True)
@@ -4609,9 +5503,9 @@ class PersistentKernel:
         batch_size = self.max_num_batched_tokens
         n_wgs = mxfp4_weight.dim(0)
         assert n_wgs % 8 == 0
-        n_wgs_per_xcd = n_wgs // 8
+        n_wgs_per_xcd = n_wgs // mpk_num_xcds()
         total_tiles_per_xcd = batch_size * n_wgs_per_xcd
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         # 7 inputs
         tb_graph.new_input(mlp_out, (-1, -1, -1), 1, True)
@@ -4670,9 +5564,9 @@ class PersistentKernel:
         batch_size = self.max_num_batched_tokens
         n_wgs = mxfp4_weight.dim(0)
         assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
-        n_wgs_per_xcd = n_wgs // 8
+        n_wgs_per_xcd = n_wgs // mpk_num_xcds()
         total_tiles_per_xcd = batch_size * n_wgs_per_xcd
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         # 6 inputs
         tb_graph.new_input(workspace_f32, (-1, -1, -1), 1, True)
@@ -4733,9 +5627,9 @@ class PersistentKernel:
         n_bblk = (batch_size + 15) // 16
         n_wgs = mxfp4_weight.dim(0)
         assert n_wgs % 8 == 0
-        n_wgs_per_xcd = n_wgs // 8
+        n_wgs_per_xcd = n_wgs // mpk_num_xcds()
         total_tiles_per_xcd = n_bblk * n_wgs_per_xcd
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         # 6 inputs
         tb_graph.new_input(workspace_f32, (-1, -1, -1), 1, True)
@@ -4809,14 +5703,15 @@ class PersistentKernel:
         n_bblk = (batch_size + 15) // 16
         n_wgs = mxfp4_weight.dim(0)
         assert n_wgs % 8 == 0
-        n_wgs_per_xcd = n_wgs // 8
+        n_wgs_per_xcd = n_wgs // mpk_num_xcds()
         total_qkv_tiles_per_xcd = n_bblk * n_wgs_per_xcd
 
         has_sinks = 1 if sinks is not None else 0
         q_workspace_stride = q_workspace.dim(1)
-        kv_cache_stride = num_kv_heads * head_dim
+        kv_cache_stride = (head_dim if self._kv_head_major()
+                           else num_kv_heads * head_dim)
 
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         # 9 inputs: slot[6] is sinks (or barrier as placeholder when no sinks)
         tb_graph.new_input(workspace_f32, (-1, -1, -1), 1, True)   # [0]
@@ -4903,9 +5798,9 @@ class PersistentKernel:
         batch_size = self.max_num_batched_tokens
         n_wgs = mxfp4_weight.dim(0)
         assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
-        n_wgs_per_xcd = n_wgs // 8
+        n_wgs_per_xcd = n_wgs // mpk_num_xcds()
         total_tiles_per_xcd = batch_size * n_wgs_per_xcd
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, -1, -1), 1, True)
         tb_graph.new_input(mxfp4_weight, (0, -1, -1), 1, True)
@@ -4971,22 +5866,23 @@ class PersistentKernel:
         # O-PROJ tiling
         n_wgs = mxfp4_weight.dim(0)
         assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
-        n_wgs_per_xcd = n_wgs // 8
+        n_wgs_per_xcd = n_wgs // mpk_num_xcds()
         oproj_tiles_per_xcd = n_bblk * n_wgs_per_xcd
 
         # TopK tiling (one expert per worker)
         router_output_size = router_weight.dim(0)
         assert router_output_size % 8 == 0
-        router_tile_n = router_output_size // 8  # chunk_N per XCD
+        router_tile_n = router_output_size // mpk_num_xcds()  # chunk_N per XCD
         topk_tiles_per_xcd = router_tile_n  # 1 tile per expert
-        total_topk_tiles = topk_tiles_per_xcd * 8
+        _n_router_part = min(router_tile_n, mpk_workers_per_xcd())
+        total_topk_tiles = _n_router_part * mpk_num_xcds()
 
         # Gang dispatch uses max of both tile counts
         total_tiles_per_xcd = max(oproj_tiles_per_xcd, topk_tiles_per_xcd)
         # All dispatched workers enter the oproj barrier, not just oproj workers
-        total_oproj_tiles = total_tiles_per_xcd * 8
+        total_oproj_tiles = total_tiles_per_xcd * mpk_num_xcds()
 
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         # 10 inputs
         tb_graph.new_input(input, (-1, -1, -1), 1, True)
@@ -5081,16 +5977,17 @@ class PersistentKernel:
         # O-PROJ tiling (same as task 213)
         n_wgs = oproj_weight.dim(0)
         assert n_wgs % 8 == 0
-        n_wgs_per_xcd = n_wgs // 8
+        n_wgs_per_xcd = n_wgs // mpk_num_xcds()
         oproj_tiles_per_xcd = n_bblk * n_wgs_per_xcd
 
         # TopK tiling (same as task 213)
         router_output_size = router_weight.dim(0)
         assert router_output_size % 8 == 0
-        router_tile_n = router_output_size // 8
+        router_tile_n = router_output_size // mpk_num_xcds()
         topk_tiles_per_xcd = router_tile_n
-        total_topk_tiles = topk_tiles_per_xcd * 8
-        total_oproj_tiles = max(oproj_tiles_per_xcd, topk_tiles_per_xcd) * 8
+        _n_router_part = min(router_tile_n, mpk_workers_per_xcd())
+        total_topk_tiles = _n_router_part * mpk_num_xcds()
+        total_oproj_tiles = max(oproj_tiles_per_xcd, topk_tiles_per_xcd) * mpk_num_xcds()
 
         # MoE dimensions from tensors
         # hidden_size for MoE = norm_output dimension (PADDED_HIDDEN_SIZE),
@@ -5119,7 +6016,7 @@ class PersistentKernel:
         # W13->W2 barrier that 240's straggler pattern was hiding. Worth
         # chasing on its own; not worth shipping for 0.01 ms.
         if int(_os_pad.environ.get("MPK_MOE_PAD_ROUND", "0")) == 1:
-            PAD_MULTIPLE = 8 * mpk_workers_per_xcd()
+            PAD_MULTIPLE = mpk_num_xcds() * mpk_workers_per_xcd()
         else:
             PAD_MULTIPLE = 240
 
@@ -5134,7 +6031,7 @@ class PersistentKernel:
         total_w13_padded = ((total_w13_real + PAD_MULTIPLE - 1) // PAD_MULTIPLE) * PAD_MULTIPLE
         total_w2 = max_activated * w2_tiles
         total_tiles_all = total_w13_padded + total_w2
-        moe_total_tiles_per_xcd = (total_tiles_all + 7) // 8
+        moe_total_tiles_per_xcd = (total_tiles_all + mpk_num_xcds() - 1) // mpk_num_xcds()
         import os as _os
         if _os.environ.get("MPK_MOE_TILE_DEBUG"):
             print(f"[MOETILE] max_activated={max_activated} n_bblk={n_bblk} "
@@ -5143,11 +6040,11 @@ class PersistentKernel:
                   f"per_xcd={moe_total_tiles_per_xcd} mod30={moe_total_tiles_per_xcd%30}", flush=True)
 
         # Match standalone MoE worker count (30 = 240 workers / 8 XCDs)
-        workers_per_xcd = self.num_workers // 8  # 30
+        workers_per_xcd = self.num_workers // mpk_num_xcds()  # 30
 
         reduction_size = input.dim(1)
 
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         # 16 inputs
         tb_graph.new_input(input, (-1, -1, -1), 1, True)            # [0] attn_out
@@ -5276,26 +6173,28 @@ class PersistentKernel:
         # QKV tiling (from type 214)
         qkv_n_wgs = qkv_weight.dim(0)
         assert qkv_n_wgs % 8 == 0
-        qkv_n_wgs_per_xcd = qkv_n_wgs // 8
+        qkv_n_wgs_per_xcd = qkv_n_wgs // mpk_num_xcds()
         total_qkv_tiles_per_xcd = n_bblk * qkv_n_wgs_per_xcd
 
         has_sinks = 1 if sinks is not None else 0
         q_workspace_stride = q_workspace.dim(1)
-        kv_cache_stride = num_kv_heads * head_dim
+        kv_cache_stride = (head_dim if self._kv_head_major()
+                           else num_kv_heads * head_dim)
 
         # O-PROJ tiling (from type 215)
         oproj_n_wgs = oproj_weight.dim(0)
         assert oproj_n_wgs % 8 == 0
-        oproj_n_wgs_per_xcd = oproj_n_wgs // 8
+        oproj_n_wgs_per_xcd = oproj_n_wgs // mpk_num_xcds()
         oproj_tiles_per_xcd = n_bblk * oproj_n_wgs_per_xcd
         oproj_output_stride = norm_scratch_post.dim(1)
 
         # TopK tiling
         router_output_size = router_weight.dim(0)
         assert router_output_size % 8 == 0
-        router_tile_n = router_output_size // 8
-        total_topk_tiles = router_tile_n * 8
-        total_oproj_tiles = max(oproj_tiles_per_xcd, router_tile_n) * 8
+        router_tile_n = router_output_size // mpk_num_xcds()
+        _n_router_part = min(router_tile_n, mpk_workers_per_xcd())
+        total_topk_tiles = _n_router_part * mpk_num_xcds()
+        total_oproj_tiles = max(oproj_tiles_per_xcd, router_tile_n) * mpk_num_xcds()
 
         # MoE tiling (from type 187/215)
         moe_num_experts = gate_up_weight.dim(0)
@@ -5318,7 +6217,7 @@ class PersistentKernel:
         # W13->W2 barrier that 240's straggler pattern was hiding. Worth
         # chasing on its own; not worth shipping for 0.01 ms.
         if int(_os_pad.environ.get("MPK_MOE_PAD_ROUND", "0")) == 1:
-            PAD_MULTIPLE = 8 * mpk_workers_per_xcd()
+            PAD_MULTIPLE = mpk_num_xcds() * mpk_workers_per_xcd()
         else:
             PAD_MULTIPLE = 240
 
@@ -5335,7 +6234,7 @@ class PersistentKernel:
         total_w13_padded = ((total_w13_real + PAD_MULTIPLE - 1) // PAD_MULTIPLE) * PAD_MULTIPLE
         total_w2 = max_activated * w2_tiles
         total_tiles_all = total_w13_padded + total_w2
-        moe_total_tiles_per_xcd = (total_tiles_all + 7) // 8
+        moe_total_tiles_per_xcd = (total_tiles_all + mpk_num_xcds() - 1) // mpk_num_xcds()
         import os as _os
         if _os.environ.get("MPK_MOE_TILE_DEBUG"):
             print(f"[MOETILE2] max_activated={max_activated} n_bblk={n_bblk} "
@@ -5343,9 +6242,18 @@ class PersistentKernel:
                   f"w2={total_w2} all={total_tiles_all} "
                   f"per_xcd={moe_total_tiles_per_xcd} mod30={moe_total_tiles_per_xcd%30}", flush=True)
 
-        workers_per_xcd = self.num_workers // 8  # 30
+        workers_per_xcd = self.num_workers // mpk_num_xcds()  # 30
+        print(f"[GEOM] xcds={mpk_num_xcds()} workers_per_xcd={workers_per_xcd} "
+              f"num_workers={self.num_workers} | qkv_n_wgs={qkv_n_wgs} "
+              f"qkv_per_xcd={qkv_n_wgs_per_xcd} qkv_tiles={total_qkv_tiles_per_xcd} "
+              f"| oproj_n_wgs={oproj_n_wgs} oproj_per_xcd={oproj_n_wgs_per_xcd} "
+              f"oproj_tiles={oproj_tiles_per_xcd} total_oproj_tiles={total_oproj_tiles} "
+              f"| router_tile_n={router_tile_n} total_topk={total_topk_tiles} "
+              f"| moe_per_xcd={moe_total_tiles_per_xcd} "
+              f"| num_kv_heads={num_kv_heads} head_dim={head_dim} "
+              f"num_q_per_kv={num_q_per_kv}", flush=True)
 
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         # 24 inputs
         tb_graph.new_input(workspace_f32, (-1, -1, -1), 1, True)         # [0]
@@ -5500,25 +6408,27 @@ class PersistentKernel:
         # QKV tiling
         qkv_n_wgs = qkv_weight.dim(0)
         assert qkv_n_wgs % 8 == 0
-        qkv_n_wgs_per_xcd = qkv_n_wgs // 8
+        qkv_n_wgs_per_xcd = qkv_n_wgs // mpk_num_xcds()
         total_qkv_tiles_per_xcd = n_bblk * qkv_n_wgs_per_xcd
 
         has_sinks = 1 if sinks is not None else 0
         q_workspace_stride = q_workspace.dim(1)
-        kv_cache_stride = num_kv_heads * head_dim
+        kv_cache_stride = (head_dim if self._kv_head_major()
+                           else num_kv_heads * head_dim)
 
         # O-PROJ tiling
         oproj_n_wgs = oproj_weight.dim(0)
         assert oproj_n_wgs % 8 == 0
-        oproj_tiles_per_xcd = n_bblk * (oproj_n_wgs // 8)
+        oproj_tiles_per_xcd = n_bblk * (oproj_n_wgs // mpk_num_xcds())
         oproj_output_stride = norm_scratch_post.dim(1)
 
         # TopK tiling
         router_output_size = router_weight.dim(0)
         assert router_output_size % 8 == 0
-        router_tile_n = router_output_size // 8
-        total_topk_tiles = router_tile_n * 8
-        total_oproj_tiles = max(oproj_tiles_per_xcd, router_tile_n) * 8
+        router_tile_n = router_output_size // mpk_num_xcds()
+        _n_router_part = min(router_tile_n, mpk_workers_per_xcd())
+        total_topk_tiles = _n_router_part * mpk_num_xcds()
+        total_oproj_tiles = max(oproj_tiles_per_xcd, router_tile_n) * mpk_num_xcds()
 
         # MoE tiling
         moe_num_experts = gate_up_weight.dim(0)
@@ -5541,7 +6451,7 @@ class PersistentKernel:
         # W13->W2 barrier that 240's straggler pattern was hiding. Worth
         # chasing on its own; not worth shipping for 0.01 ms.
         if int(_os_pad.environ.get("MPK_MOE_PAD_ROUND", "0")) == 1:
-            PAD_MULTIPLE = 8 * mpk_workers_per_xcd()
+            PAD_MULTIPLE = mpk_num_xcds() * mpk_workers_per_xcd()
         else:
             PAD_MULTIPLE = 240
 
@@ -5558,7 +6468,7 @@ class PersistentKernel:
         total_w13_padded = ((total_w13_real + PAD_MULTIPLE - 1) // PAD_MULTIPLE) * PAD_MULTIPLE
         total_w2 = max_activated * w2_tiles
         total_tiles_all = total_w13_padded + total_w2
-        moe_total_tiles_per_xcd = (total_tiles_all + 7) // 8
+        moe_total_tiles_per_xcd = (total_tiles_all + mpk_num_xcds() - 1) // mpk_num_xcds()
         import os as _os
         if _os.environ.get("MPK_MOE_TILE_DEBUG"):
             print(f"[MOETILE2] max_activated={max_activated} n_bblk={n_bblk} "
@@ -5566,14 +6476,14 @@ class PersistentKernel:
                   f"w2={total_w2} all={total_tiles_all} "
                   f"per_xcd={moe_total_tiles_per_xcd} mod30={moe_total_tiles_per_xcd%30}", flush=True)
 
-        workers_per_xcd = self.num_workers // 8  # 30
+        workers_per_xcd = self.num_workers // mpk_num_xcds()  # 30
 
         # LM head tiling
         lm_n_wgs = lm_mxfp4_weight.dim(0)
         assert lm_n_wgs % 8 == 0
-        lm_n_wgs_per_xcd = lm_n_wgs // 8
+        lm_n_wgs_per_xcd = lm_n_wgs // mpk_num_xcds()
 
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         # 24 base inputs (same as type 216)
         tb_graph.new_input(workspace_f32, (-1, -1, -1), 1, True)         # [0]
@@ -5673,13 +6583,13 @@ class PersistentKernel:
         batch_size = self.max_num_batched_tokens
         output_size = weight.dim(0)
         assert output_size % 8 == 0
-        chunk_n = output_size // 8
+        chunk_n = output_size // mpk_num_xcds()
         assert chunk_n % tile_n == 0
         n_tiles_per_xcd = chunk_n // tile_n
         reduction_size = weight.dim(1) if weight.num_dims == 2 else input.dim(1)
         assert reduction_size % k_splits == 0
         total_tiles = n_tiles_per_xcd * k_splits
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, -1, -1), 1, True)
         tb_graph.new_input(weight, (0, -1, -1), 1, True)
@@ -5740,14 +6650,14 @@ class PersistentKernel:
         batch_size = self.max_num_batched_tokens
         gate_up_size = weight.dim(0)
         assert gate_up_size % 8 == 0
-        chunk_n_gateup = gate_up_size // 8  # weight rows per XCD
+        chunk_n_gateup = gate_up_size // mpk_num_xcds()  # weight rows per XCD
         # Each group = 4 tiles (2 gate + 2 up). Output tiles = half of weight tiles.
         n_weight_tiles = chunk_n_gateup // tile_n
         n_tiles_per_xcd = n_weight_tiles // 2  # output tiles (one per gate+up pair)
         assert batch_size % m_tiles == 0
         m_per_tile = batch_size // m_tiles
         total_tiles_per_xcd = n_tiles_per_xcd * m_tiles
-        grid_dim = (8, 1, 1)
+        grid_dim = (mpk_num_xcds(), 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, -1, -1), 1, True)
         # weight: partition dim 0 (rows) by bid.x → each XCD gets its interleaved chunk
@@ -6296,13 +7206,30 @@ class PersistentKernel:
         MIRAGE_ROOT, INCLUDE_PATH, DEPS_PATH = get_key_paths()
         if self.mode == "online_notoken" or self.mode == "online" or self.mode == "multi_turn":
             # We will init for multiple times so the output directory should be permanent
-            tempdir = "./permanent_output_dir/"
+            tempdir = os.environ.get("MPK_OUTPUT_DIR", "./permanent_output_dir/")
         else:
             tempdir_obj = tempfile.TemporaryDirectory()
             #tempdir = tempdir_obj.name
-            tempdir = "./permanent_output_dir/"
+            tempdir = os.environ.get("MPK_OUTPUT_DIR", "./permanent_output_dir/")
         os.makedirs(tempdir, exist_ok=True)
         results = self.kn_graph.generate_task_graph(num_gpus=self.world_size, my_gpu_id=self.mpi_rank)
+        if self._place_records is not None:
+            from . import placement
+
+            placement.report_safe(results["json_file"], dict(os.environ), out_dir=tempdir,
+                                  records=self._place_records, arena=self._arena)
+        graph_json = results["json_file"]
+        if self._arena is not None:
+            graph_json, n_bound, n_tasks = self._arena.bind(graph_json)
+            print(f"[ARENA] {len(self._arena.placed)} tensors in "
+                  f"{len(self._arena.chunks)} chunks + {len(self._arena.rings)} ring BOs, "
+                  f"{self._arena.m.domains} x "
+                  f"{self._arena.used / 2**30:.2f} GiB used of "
+                  f"{self._arena.reserved / 2**30:.2f} GiB; rebased {n_bound} instance "
+                  f"pointers in {n_tasks} gang tasks", flush=True)
+            for fam, (mode, cnt, part) in self._arena.summary().items():
+                print(f"[ARENA]   {fam}: {mode} x{cnt}, {part / 2**20:.1f} MiB per domain",
+                      flush=True)
 
         cuda_code_path = os.path.join(tempdir, "test.cu")
         so_path = os.path.join(tempdir, "test.cpython-38-x86_64-linux-gnu.so")
@@ -6311,7 +7238,7 @@ class PersistentKernel:
         # build if files are not exist
             
         with open(json_file_path, "w") as f:
-            f.write(results["json_file"])
+            f.write(graph_json)
 
         # Event fusion DISABLED to match NVIDIA implementation
         # Original event fusion code (AMD only) reduced events but didn't improve performance
@@ -6377,6 +7304,60 @@ class PersistentKernel:
                 raise RuntimeError("MPK_FUSED_INLINE: no fused-layer call in the dispatch")
             cuda_code = cuda_code[:_j + 1] + "\n\n" + _ml + cuda_code[_j + 1:]
             print(f"MPK_FUSED_INLINE: ml dispatch with {_n} inlined fused-layer calls")
+        if int(os.environ.get("MPK_LM_PF0", "0")) == 1:
+            # The LM head's group-zero prefetch (worker loop, before the task's
+            # dependency wait) takes the dispatch's own template and size
+            # arguments, copied from the generated call.
+            _hdr = "__device__ __forceinline__\nvoid _execute_gang_task(TaskDesc const* task_desc,"
+            _i = cuda_code.find(_hdr)
+            if _i < 0:
+                raise RuntimeError("MPK_LM_PF0: _execute_gang_task definition not found")
+            _j, _depth = cuda_code.find("{", _i), 0
+            while True:
+                _c = cuda_code[_j]
+                if _c == "{":
+                    _depth += 1
+                elif _c == "}":
+                    _depth -= 1
+                    if _depth == 0:
+                        break
+                _j += 1
+            _body = cuda_code[_i:_j + 1]
+            _key = ("task_desc->task_type == TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300"
+                    " && task_desc->variant_id == ")
+            if _body.count(_key) != 1 or (_key + "0)") not in _body:
+                raise RuntimeError("MPK_LM_PF0: expected one LM-head variant (0) in the dispatch")
+            _call = "kernel::gang_rmsnorm_linear_mxfp4_bias_argmax_kernel<"
+            _a = _body.find(_call, _body.find(_key))
+            _t1 = _body.find(">(", _a)
+            if _a < 0 or _t1 < 0:
+                raise RuntimeError("MPK_LM_PF0: LM-head call not found")
+            _targs = _body[_a + len(_call):_t1]
+            _k, _depth, _args, _cur = _t1 + 2, 1, [], ""
+            while _depth > 0:
+                _c = _body[_k]
+                if _c in "([":
+                    _depth += 1
+                elif _c in ")]":
+                    _depth -= 1
+                if _depth == 1 and _c == ",":
+                    _args.append(_cur.strip())
+                    _cur = ""
+                elif _depth > 0:
+                    _cur += _c
+                _k += 1
+            _args.append(_cur.strip())
+            if len(_args) != 14:
+                raise RuntimeError("MPK_LM_PF0: LM-head call has %d arguments, expected 14" % len(_args))
+            _pf = ("\n\n__device__ __forceinline__\n"
+                   "void _mpk_lm_pf0(TaskDesc const* task_desc, int tile_idx) {\n"
+                   "  kernel::gang_rmsnorm_linear_mxfp4_bias_argmax_pf0<" + _targs + ">(\n"
+                   "      " + _args[3] + ", " + _args[10] + ", " + _args[11] + ",\n"
+                   "      task_desc->variant_id == 0 ? tile_idx : -1);\n"
+                   "}\n")
+            cuda_code = cuda_code[:_j + 1] + _pf + cuda_code[_j + 1:]
+            print("MPK_LM_PF0: group-zero prefetch <%s> weight=%s n_wgs=%s workers=%s"
+                  % (_targs, _args[3], _args[10], _args[11]))
         with open(cuda_code_path, "w") as f:
             f.write(cuda_code + HARD_CODE)
 
@@ -6504,6 +7485,9 @@ class PersistentKernel:
             num_remote_schedulers=self.num_remote_schedulers,
             use_cutlass_kernel=self.use_cutlass_kernel,
         )
+        if os.environ.get("MPK_PROVIDER_EXPORT"):
+            from . import provider_export
+            provider_export.export_source(cuda_code, graph_json, cc_cmd)
         print("Compiling megakernel using the following command line:")
         print(cc_cmd)
         subprocess.check_call(cc_cmd)
@@ -6523,6 +7507,8 @@ class PersistentKernel:
             mod, "set_max_seq_length_func", None)
         self.reset_decode_progress_func = getattr(
             mod, "reset_decode_progress_func", None)
+        self.decode_token_func = getattr(mod, "decode_token_func", None)
+        self.request_stop_func = getattr(mod, "request_stop_func", None)
         print("Finished megakernel compilation...")
 
         #meta_tensors_ptr = [tensor.data_ptr() for tensor in self.meta_tensors]
@@ -6542,6 +7528,14 @@ class PersistentKernel:
             self.profiler_tensor.data_ptr() if self.profiler_tensor is not None else 0
         )
         self.eos_token_id = kwargs.get("eos_token_id", self.eos_token_id)
+        if os.environ.get("MPK_PROVIDER_EXPORT"):
+            from . import provider_export
+            provider_export.export_init_args(
+                my_rank=self.mpi_rank, num_workers=self.num_workers,
+                num_local_schedulers=self.num_local_schedulers,
+                num_remote_schedulers=self.num_remote_schedulers,
+                max_seq_length=self.max_seq_length, total_num_requests=self.total_num_requests,
+                eos_token_id=int(self.eos_token_id), profiler=bool(profiler_buffer_ptr))
         self.init_func(
             meta_tensors_ptr,
             profiler_buffer_ptr,
@@ -6562,6 +7556,7 @@ class PersistentKernel:
         """Set RoPE cos/sin tables in RuntimeConfig (call after compile)."""
         assert self._is_compiled, "Must call compile() before set_rope_tables()"
         assert self._set_rope_tables_func is not None
+        self._rope_tensors = (cos_tensor, sin_tensor)  # MPK_PROVIDER_EXPORT records them
         self._set_rope_tables_func(cos_tensor.data_ptr(), sin_tensor.data_ptr())
 
     def __call__(self, **kwargs):
@@ -6595,9 +7590,10 @@ class PersistentKernel:
             raw_path = trace_name.replace(".perfetto-trace", ".pt")
             torch.save(self.profiler_tensor.cpu(), raw_path)
             print(f"Saved raw profiler tensor to {raw_path}")
-            export_to_perfetto_trace(
-                self.profiler_tensor, trace_name
-            )
+            if os.environ.get("MPK_PROF_RAW_ONLY", "0") != "1":
+                export_to_perfetto_trace(
+                    self.profiler_tensor, trace_name
+                )
 
     def __del__(self):
         if not self.__finalized__:

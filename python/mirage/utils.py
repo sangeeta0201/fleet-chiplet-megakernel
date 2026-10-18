@@ -97,6 +97,11 @@ def mpk_w13_prequant(batch_size):
     return mpk_opt("MPK_W13_PREQUANT", batch_size)
 
 
+def mpk_num_xcds():
+    """XCDs visible to this HIP device. 8 in SPX, 4 in DPX."""
+    return int(__import__("os").environ.get("MPK_NUM_XCDS", "8"))
+
+
 def mpk_workers_per_xcd():
     """Worker blocks per XCD on MI350.
 
@@ -125,6 +130,15 @@ def get_configurations_from_gpu(rank):
 
     worker = 0
     if is_amd:
+        # Honor MPK_NUM_XCDS so DPX (4 XCDs / ~128 CUs) does not fall into
+        # the leftover sm_cnt>=120 branch (96 workers, not 4-XCD aligned).
+        _nx = int(__import__("os").environ.get("MPK_NUM_XCDS", "0"))
+        if _nx:
+            workers_per_xcd = mpk_workers_per_xcd()
+            worker = _nx * workers_per_xcd
+            scheduler = _nx
+            print(f"AMD MPK_NUM_XCDS={_nx}: workers={worker}, schedulers={scheduler}, CUs={sm_cnt}")
+            return worker, scheduler
         # AMD MI300X configuration (split_worker_scheduler mode)
         # XCD-aligned scheduling: 1 scheduler per XCD (8 total for MI300X).
         # Each scheduler handles all workers on its XCD via stride-based mapping.

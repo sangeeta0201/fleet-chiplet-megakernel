@@ -970,7 +970,7 @@ __device__ __forceinline__ void
 
   // Phase 2: Track completion with atomic counter
   // Agent-scope release fence — L2 NOT coherent across XCDs, need writeback
-  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, MPK_DEV_FENCE_REL);
   int *d_done = reinterpret_cast<int *>(__uniform_addr(done_counter_ptr));
   __shared__ int is_last;
   if (threadIdx.x == 0) {

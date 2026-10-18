@@ -18,6 +18,18 @@
 // Adapted from topk_softmax_sm100.cuh for HIP/AMD.
 
 #pragma once
+#if defined(MPK_LTK_TIE_RT) && !defined(MPK_LTK_TIE_FIX)
+#error "MPK_LTK_TIE_RT switches MPK_LTK_TIE_FIX at run time; define both"
+#endif
+#ifdef MPK_LTK_TIE_RT
+// Runtime switch (host: env MPK_TIE_RT, default 1): one binary runs both arms.
+__constant__ int g_mpk_tie_rt = 1;
+#define MPK_TIE_ON (g_mpk_tie_rt != 0)
+#define MPK_TIE_SEL(r) (MPK_TIE_ON ? (r) : ksel_bitrev4((r) >> 3) * 8 + ((r) & 7))
+#else
+#define MPK_TIE_ON true
+#define MPK_TIE_SEL(r) (r)
+#endif
 
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
@@ -477,10 +489,19 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
           unsigned long long const record =
               (unsigned long long)early_routing_epoch |
               ((unsigned long long)(unsigned)expert << 32);
+#ifdef MPK_AID_SPLIT_ROUTING
+          mpk_aid_publish_at_u64((void *)early_routing_ready,
+                                 (1 + k_idx * 2) * 16 + 2, record,
+                                 MPK_AID_ROUTING_BASE_INTS);
+          mpk_aid_publish_at_u64((void *)early_routing_ready,
+                                 (1 + k_idx * 2 + 1) * 16 + 2, record,
+                                 MPK_AID_ROUTING_BASE_INTS);
+#else
           st_wt_u64((void *)&early_routing_ready[(1 + k_idx * 2) * 16 + 2],
                     record);
           st_wt_u64((void *)&early_routing_ready[(1 + k_idx * 2 + 1) * 16 + 2],
                     record);
+#endif
           if (active_expert_ids != nullptr) {
             st_wt_u32((void *)&active_expert_ids[k_idx], (unsigned)expert);
           }
@@ -497,7 +518,13 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
               (unsigned long long)early_routing_epoch |
               ((unsigned long long)(unsigned)expert << 32);
           for (int x = 0; x < 8; x++) {
+#ifdef MPK_AID_SPLIT_ROUTING
+            mpk_aid_publish_at_u64((void *)early_routing_ready,
+                                   (1 + x) * 16 + 2, record,
+                                   MPK_AID_ROUTING_BASE_INTS);
+#else
             st_wt_u64((void *)&early_routing_ready[(1 + x) * 16 + 2], record);
+#endif
           }
         }
 #endif
@@ -592,6 +619,12 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
 }
 
 
+#ifdef MPK_LTK_STATS_W0
+#define MPK_LTK_STW0_ON (g_mpk_stw0_rt != 0)
+#else
+#define MPK_LTK_STW0_ON false
+#endif
+#define MPK_LTK_STW0_OFF (!MPK_LTK_STW0_ON)
 #ifdef MPK_LOCAL_TOPK
 // Every workgroup rebuilds this layer's routing from the 128 epoch-tagged
 // router logits. The row arithmetic is topk_softmax_mi300_task_impl's for one
@@ -623,10 +656,238 @@ __device__ __forceinline__ int ltk_bitrev4(int r) {
 }
 #endif
 
-template <int NUM_EXPERTS, int K>
+#if defined(MPK_ROP_KSEL) || defined(MPK_VT2_KSEL2)
+__device__ __forceinline__ int ksel_bitrev4(int r) {
+  return ((r & 1) << 3) | ((r & 2) << 1) | ((r & 4) >> 1) | ((r & 8) >> 3);
+}
+
+// Wave-wide u32 max, broadcast from lane 63 (the ltk_wave_max steps).
+__device__ __forceinline__ unsigned ksel_wave_max(unsigned v) {
+  int x = (int)v;
+#define KSEL_WMAX_STEP(CTRL, ROW_MASK)                                          {                                                                               unsigned const o = (unsigned)__builtin_amdgcn_update_dpp(                         x, x, CTRL, ROW_MASK, 0xF, false);                                        x = (int)((unsigned)x > o ? (unsigned)x : o);                               }
+  KSEL_WMAX_STEP(0xB1, 0xF);  // quad_perm [1,0,3,2]
+  KSEL_WMAX_STEP(0x4E, 0xF);  // quad_perm [2,3,0,1]
+  KSEL_WMAX_STEP(0x124, 0xF); // row_ror:4
+  KSEL_WMAX_STEP(0x128, 0xF); // row_ror:8
+  KSEL_WMAX_STEP(0x142, 0xA); // row_bcast:15 into rows 1 and 3
+  KSEL_WMAX_STEP(0x143, 0xC); // row_bcast:31 into rows 2 and 3
+#undef KSEL_WMAX_STEP
+  return (unsigned)__builtin_amdgcn_readlane(x, 63);
+}
+
+#ifdef MPK_KSEL_FAST
+// ksel_wave_max with each step a single v_max_u32_dpp on x. The compiler does
+// not insert wait states into inline asm: five before the first DPP (an exec
+// write may precede the block), two before each later one, five after the
+// readlane.
+__device__ __forceinline__ unsigned ksel_wave_max_fast(unsigned v) {
+  unsigned x = v;
+  unsigned g;
+  asm volatile(
+      "s_nop 4\n"
+      "v_max_u32_dpp %0, %0, %0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf\n"
+      "s_nop 1\n"
+      "v_max_u32_dpp %0, %0, %0 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf\n"
+      "s_nop 1\n"
+      "v_max_u32_dpp %0, %0, %0 row_ror:4 row_mask:0xf bank_mask:0xf\n"
+      "s_nop 1\n"
+      "v_max_u32_dpp %0, %0, %0 row_ror:8 row_mask:0xf bank_mask:0xf\n"
+      "s_nop 1\n"
+      "v_max_u32_dpp %0, %0, %0 row_bcast:15 row_mask:0xa bank_mask:0xf\n"
+      "s_nop 1\n"
+      "v_max_u32_dpp %0, %0, %0 row_bcast:31 row_mask:0xc bank_mask:0xf\n"
+      "s_nop 1\n"
+      "v_readlane_b32 %1, %0, 63\n"
+      "s_nop 4"
+      : "+v"(x), "=s"(g));
+  return g;
+}
+#ifdef MPK_KSEL_MERGE
+#if defined(MPK_KSEL_GROUP) || !defined(MPK_LTK_TIE_FIX) || defined(MPK_LTK_TIE_RT)
+#error "MPK_KSEL_MERGE needs unique keys and the single-expert clear (MPK_LTK_TIE_FIX)"
+#endif
+// One merge stage: the partner list (DPP) against this lane's, both sorted descending.
+// e_i = max(c_i, partner c_(3-i)) holds the top four of the union as a bitonic sequence;
+// two compare-exchange layers sort it. Masked rows keep stale e and are not read later.
+#define KMRG_STAGE(CTRL, RM)                                                              \
+  "s_nop 1\n"                                                                             \
+  "v_max_u32_dpp %[e0], %[c3], %[c0] " CTRL " row_mask:" RM " bank_mask:0xf\n"            \
+  "v_max_u32_dpp %[e1], %[c2], %[c1] " CTRL " row_mask:" RM " bank_mask:0xf\n"            \
+  "v_max_u32_dpp %[e2], %[c1], %[c2] " CTRL " row_mask:" RM " bank_mask:0xf\n"            \
+  "v_max_u32_dpp %[e3], %[c0], %[c3] " CTRL " row_mask:" RM " bank_mask:0xf\n"            \
+  "v_max_u32 %[t0], %[e0], %[e2]\n"                                                      \
+  "v_min_u32 %[e2], %[e0], %[e2]\n"                                                      \
+  "v_max_u32 %[t1], %[e1], %[e3]\n"                                                      \
+  "v_min_u32 %[e3], %[e1], %[e3]\n"                                                      \
+  "v_max_u32 %[c0], %[t0], %[t1]\n"                                                      \
+  "v_min_u32 %[c1], %[t0], %[t1]\n"                                                      \
+  "v_max_u32 %[c2], %[e2], %[e3]\n"                                                      \
+  "v_min_u32 %[c3], %[e2], %[e3]\n"
+// The four largest of the wave's 128 keys (two per lane), descending, in SGPRs. Same pairings
+// as ksel_wave_max_fast; the first stage merges two sorted pairs. Five wait states up front
+// (an exec write may precede the block), two before every DPP that reads a fresh VALU result.
+__device__ __forceinline__ void ksel_top4_merge(unsigned k0, unsigned k1, unsigned (&g)[4]) {
+  unsigned c0, c1, c2, c3, e0, e1, e2, e3, t0, t1, g0, g1, g2, g3;
+  asm volatile(
+      "v_max_u32 %[c0], %[k0], %[k1]\n"
+      "v_min_u32 %[c1], %[k0], %[k1]\n"
+      "s_nop 4\n"
+      "v_min_u32_dpp %[e1], %[c0], %[c0] quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf\n"
+      "v_max_u32_dpp %[c0], %[c0], %[c0] quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf\n"
+      "v_max_u32_dpp %[e2], %[c1], %[c1] quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf\n"
+      "v_min_u32_dpp %[c3], %[c1], %[c1] quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf\n"
+      "v_max_u32 %[c1], %[e1], %[e2]\n"
+      "v_min_u32 %[c2], %[e1], %[e2]\n"
+      KMRG_STAGE("quad_perm:[2,3,0,1]", "0xf")
+      KMRG_STAGE("row_ror:4", "0xf")
+      KMRG_STAGE("row_ror:8", "0xf")
+      KMRG_STAGE("row_bcast:15", "0xa")
+      KMRG_STAGE("row_bcast:31", "0xc")
+      "s_nop 1\n"
+      "v_readlane_b32 %[g0], %[c0], 63\n"
+      "v_readlane_b32 %[g1], %[c1], 63\n"
+      "v_readlane_b32 %[g2], %[c2], 63\n"
+      "v_readlane_b32 %[g3], %[c3], 63\n"
+      "s_nop 4"
+      : [c0] "=&v"(c0), [c1] "=&v"(c1), [c2] "=&v"(c2), [c3] "=&v"(c3), [e0] "=&v"(e0),
+        [e1] "=&v"(e1), [e2] "=&v"(e2), [e3] "=&v"(e3), [t0] "=&v"(t0), [t1] "=&v"(t1),
+        [g0] "=s"(g0), [g1] "=s"(g1), [g2] "=s"(g2), [g3] "=s"(g3)
+      : [k0] "v"(k0), [k1] "v"(k1));
+  g[0] = g0;
+  g[1] = g1;
+  g[2] = g2;
+  g[3] = g3;
+}
+#undef KMRG_STAGE
+#endif
+#ifdef MPK_LTK_STW0_FAST
+// ksel_wave_max_fast with the hazard waits the rounds need: 2 before the first DPP (the max that
+// writes x is VALU, and no exec write sits inside the rounds), none after the readlane (its SGPR is
+// read as a VALU operand, not as a lane select).
+__device__ __forceinline__ unsigned ksel_wave_max_fast2(unsigned v) {
+  unsigned x = v;
+  unsigned g;
+  asm volatile(
+      "s_nop 1\n"
+      "v_max_u32_dpp %0, %0, %0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf\n"
+      "s_nop 1\n"
+      "v_max_u32_dpp %0, %0, %0 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf\n"
+      "s_nop 1\n"
+      "v_max_u32_dpp %0, %0, %0 row_ror:4 row_mask:0xf bank_mask:0xf\n"
+      "s_nop 1\n"
+      "v_max_u32_dpp %0, %0, %0 row_ror:8 row_mask:0xf bank_mask:0xf\n"
+      "s_nop 1\n"
+      "v_max_u32_dpp %0, %0, %0 row_bcast:15 row_mask:0xa bank_mask:0xf\n"
+      "s_nop 1\n"
+      "v_max_u32_dpp %0, %0, %0 row_bcast:31 row_mask:0xc bank_mask:0xf\n"
+      "s_nop 1\n"
+      "v_readlane_b32 %1, %0, 63"
+      : "+v"(x), "=s"(g));
+  return g;
+}
+#endif
+#ifdef MPK_KSEL_GROUP
+// Max over the lane's quad (one 8-expert group), left in every lane of the quad.
+__device__ __forceinline__ unsigned ksel_quad_max_fast(unsigned v) {
+  unsigned x = v;
+  asm volatile(
+      "s_nop 4\n"
+      "v_max_u32_dpp %0, %0, %0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf\n"
+      "s_nop 1\n"
+      "v_max_u32_dpp %0, %0, %0 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf\n"
+      "s_nop 1"
+      : "+v"(x));
+  return x;
+}
+// Wave max of a value that is uniform within each quad (the group heads), broadcast from
+// lane 63: ksel_wave_max_fast without its two quad steps.
+__device__ __forceinline__ unsigned ksel_heads_max_fast(unsigned v) {
+  unsigned x = v;
+  unsigned g;
+  asm volatile(
+      "s_nop 4\n"
+      "v_max_u32_dpp %0, %0, %0 row_ror:4 row_mask:0xf bank_mask:0xf\n"
+      "s_nop 1\n"
+      "v_max_u32_dpp %0, %0, %0 row_ror:8 row_mask:0xf bank_mask:0xf\n"
+      "s_nop 1\n"
+      "v_max_u32_dpp %0, %0, %0 row_bcast:15 row_mask:0xa bank_mask:0xf\n"
+      "s_nop 1\n"
+      "v_max_u32_dpp %0, %0, %0 row_bcast:31 row_mask:0xc bank_mask:0xf\n"
+      "s_nop 1\n"
+      "v_readlane_b32 %1, %0, 63\n"
+      "s_nop 4"
+      : "+v"(x), "=s"(g));
+  return g;
+}
+#endif
+#endif
+
+// Expert e's selection key. High half: the bf16 logit's bits mapped so u32
+// order is float order (-0 folded onto +0, which the float compare ties).
+// Low half: 127 - the 16-lane path's tie rank. That path's butterfly keeps
+// the lower lane at every step, so among equal values the lane with the
+// lower bit-reversed index wins, then the lower column within the lane.
+__device__ __forceinline__ unsigned ksel_key(unsigned b, int e) {
+  b = b == 0x8000u ? 0u : b;
+  unsigned const o = (b & 0x8000u) ? (~b & 0xFFFFu) : (b | 0x8000u);
+#ifdef MPK_LTK_TIE_FIX
+  // Ties: the lower expert index wins (the 16-lane order under MPK_LTK_TIE_FIX).
+#ifdef MPK_LTK_TIE_RT
+  if (!MPK_TIE_ON) {
+    int const r = ksel_bitrev4(e >> 3) * 8 + (e & 7);
+    return (o << 16) | (unsigned)(127 - r);
+  }
+#endif
+  return (o << 16) | (unsigned)(127 - e);
+#else
+  int const r = ksel_bitrev4(e >> 3) * 8 + (e & 7);
+  return (o << 16) | (unsigned)(127 - r);
+#endif
+}
+#endif
+
+struct mpk_ltk_noside {
+  __device__ __forceinline__ void operator()() const {}
+};
+
+// side: work for the waves the TopK leaves idle, run by every thread right
+// after the logits are published and ordered by the trailing __syncthreads.
+#if defined(MPK_LTK_TIE_FIX) && (defined(MPK_KSEL_GROUP) || defined(MPK_LTK_SEL64))
+#error "MPK_LTK_TIE_FIX: not with MPK_KSEL_GROUP / MPK_LTK_SEL64 (they keep the old tie order)"
+#endif
+#if defined(MPK_LTK_TIE_FIX) && !defined(MPK_LTK_DPP) && !defined(MPK_ROP_KSEL)
+#error "MPK_LTK_TIE_FIX covers the DPP reduction (MPK_LTK_DPP) and MPK_ROP_KSEL"
+#endif
+#ifdef MPK_VT2
+// One wave reads 128 tagged words (two per lane, system scope) until every tag is `expected`'s, into dst.
+__device__ __forceinline__ void mpk_vt2_poll_tags(int const *tags, int expected, unsigned short *dst) {
+  int const l = threadIdx.x & 63;
+  unsigned const want = mpk_ltk_tag(expected);
+  unsigned long long const *const tp = reinterpret_cast<unsigned long long const *>(tags) + l;
+  unsigned long long v;
+  while (true) {
+    v = __hip_atomic_load(tp, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    bool const ok = ((((unsigned)(v >> 16)) & 0xFFFFu) == want) &&
+                    ((((unsigned)(v >> 48)) & 0xFFFFu) == want);
+    if (__all(ok)) {
+      break;
+    }
+    __builtin_amdgcn_s_sleep(1);
+  }
+  dst[2 * l] = (unsigned short)(v & 0xFFFFu);
+  dst[2 * l + 1] = (unsigned short)((v >> 32) & 0xFFFFu);
+}
+#endif
+template <int NUM_EXPERTS, int K, typename Side = mpk_ltk_noside>
 __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
                                                int const *norm_flags = nullptr,
-                                               int n_norm = 0) {
+                                               int n_norm = 0,
+                                               Side const &side = Side{}
+#ifdef MPK_TOPK_SUB2
+                                               ,
+                                               unsigned int *mpk_tk_ts = nullptr
+#endif
+                                               ) {
   static_assert(NUM_EXPERTS == 128, "MPK_LOCAL_TOPK: s_ltk_* sized for 128");
   static_assert(K <= 8, "MPK_LOCAL_TOPK: topk_vals holds 8");
   constexpr int VPT = 8;
@@ -634,7 +895,9 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
   static_assert(THREADS_PER_ROW == 16, "one 16-lane row");
   int const tid = threadIdx.x;
   unsigned const want = mpk_ltk_tag(expected);
-  if (tid < 64) {
+  // tags == nullptr: the caller already wrote s_ltk_logit (see
+  // MPK_ROUTER_OPROJ_PARTIAL in gang_full_layer_fused_mi300.cuh).
+  if (tags != nullptr && tid < 64) {
     // One wave reads all 128 words, two per lane, at the same system scope as
     // the routing_ready poll this replaces. Each word is a single
     // write-through store, so a matching tag carries its own logit.
@@ -714,6 +977,11 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
     s_ltk_logit[2 * tid + 1] = (unsigned short)((v >> 32) & 0xFFFFu);
   }
   __syncthreads();
+#ifdef MPK_TOPK_SUB2
+  if (mpk_tk_ts != nullptr && tid == 0)
+    mpk_tk_ts[0] = (unsigned int)__builtin_amdgcn_s_memrealtime();
+#endif
+  side();
 #ifdef MPK_LTK_EARLY_TAG
   if (n_norm > 0 && tid >= 64 && tid < 128) {
     // Wave 1 waits for this XCD's normed row while wave 0 runs the TopK.
@@ -744,7 +1012,7 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
 #ifdef MPK_LTK_SEL64
 #error "MPK_LTK_SELLOGIT replaces the 16-lane softmax that MPK_LTK_SEL64 builds on"
 #endif
-  if (tid >= 128 && tid < 128 + THREADS_PER_ROW) {
+  if (MPK_LTK_STW0_OFF && tid >= 128 && tid < 128 + THREADS_PER_ROW) {
     // The original softmax statistics, on wave 2's first row.
     int const sl = tid - 128;
     float row_chunk[VPT];
@@ -794,7 +1062,245 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
     }
   }
 #endif
+#ifdef MPK_ROP_KSEL
+#ifndef MPK_LTK_SELLOGIT
+#error "MPK_ROP_KSEL selects on raw logits (MPK_LTK_SELLOGIT)"
+#endif
+#ifdef MPK_LTK_STW0_FAST
+#if !defined(MPK_LTK_STATS_W0) || !defined(MPK_KSEL_FAST) || !defined(MPK_LTK_TIE_FIX) || defined(MPK_KSEL_GROUP)
+#error "MPK_LTK_STW0_FAST needs MPK_LTK_STATS_W0 + MPK_KSEL_FAST + MPK_LTK_TIE_FIX"
+#endif
+  unsigned ltk_top_key = 0u;
+#endif
+  if (tid < 64) {
+    unsigned k0 = ksel_key(s_ltk_logit[2 * tid], 2 * tid);
+    unsigned k1 = ksel_key(s_ltk_logit[2 * tid + 1], 2 * tid + 1);
+#ifdef MPK_KSEL_FAST
+    unsigned ksel_g[K];
+#ifdef MPK_KSEL_GROUP
+    // The group's sorted top K, in every lane of its quad.
+    unsigned hq[K];
+    {
+      unsigned a = k0, b = k1;
+#pragma unroll
+      for (int r = 0; r < K; ++r) {
+        unsigned const m = ksel_quad_max_fast(a > b ? a : b);
+        hq[r] = m;
+        a = (a == m) ? 0u : a;
+        b = (b == m) ? 0u : b;
+      }
+    }
+#pragma unroll
+    for (int k_idx = 0; k_idx < K; ++k_idx) {
+      unsigned const g = ksel_heads_max_fast(hq[0]);
+      ksel_g[k_idx] = g;
+      bool const pop = (hq[0] >> 16) == (g >> 16);
+#pragma unroll
+      for (int r = 0; r + 1 < K; ++r) {
+        hq[r] = pop ? hq[r + 1] : hq[r];
+      }
+      hq[K - 1] = pop ? 0u : hq[K - 1];
+    }
+#else
+#ifdef MPK_KSEL_MERGE
+    static_assert(K == 4, "MPK_KSEL_MERGE keeps four keys");
+    if (g_mpk_kmrg_rt != 0) {
+      ksel_top4_merge(k0, k1, ksel_g);
+#ifdef MPK_LTK_STW0_FAST
+      ltk_top_key = ksel_g[0];
+#endif
+    } else {
+#endif
+#pragma unroll
+    for (int k_idx = 0; k_idx < K; ++k_idx) {
+#ifdef MPK_LTK_STW0_FAST
+      unsigned const g = (k_idx > 0 && g_mpk_stwf_rt != 0)
+                             ? ksel_wave_max_fast2(k0 > k1 ? k0 : k1)
+                             : ksel_wave_max_fast(k0 > k1 ? k0 : k1);
+      if (k_idx == 0) ltk_top_key = g;
+#else
+      unsigned const g = ksel_wave_max_fast(k0 > k1 ? k0 : k1);
+#endif
+      ksel_g[k_idx] = g;
+#ifdef MPK_LTK_TIE_FIX
+      // Keys are unique, so at most one of k0 / k1 matches: clear only the
+      // selected expert, never a tie of it.
+#ifdef MPK_LTK_TIE_RT
+      if (MPK_TIE_ON) {
+#endif
+      if (k0 == g) k0 = 0u;
+      if (k1 == g) k1 = 0u;
+#ifdef MPK_LTK_TIE_RT
+      } else {
+      unsigned const gv = g >> 16;
+      bool const t0 = (k0 >> 16) == gv;
+      bool const t1 = (k1 >> 16) == gv;
+      unsigned long long const tm = __ballot(t0 || t1);
+      unsigned const grp = (unsigned)(tm >> (tid & ~3)) & 0xFu;
+      if ((t0 || t1) && (grp & ((1u << (tid & 3)) - 1u)) == 0u) {
+        if (t0) {
+          k0 = 0u;
+        } else {
+          k1 = 0u;
+        }
+      }
+      }
+#endif
+#else
+      unsigned const gv = g >> 16;
+      bool const t0 = (k0 >> 16) == gv;
+      bool const t1 = (k1 >> 16) == gv;
+      unsigned long long const tm = __ballot(t0 || t1);
+      unsigned const grp = (unsigned)(tm >> (tid & ~3)) & 0xFu;
+      if ((t0 || t1) && (grp & ((1u << (tid & 3)) - 1u)) == 0u) {
+        if (t0) {
+          k0 = 0u;
+        } else {
+          k1 = 0u;
+        }
+      }
+#endif
+    }
+#ifdef MPK_KSEL_MERGE
+    }
+#endif
+#endif
+    if (tid == 0) {
+#pragma unroll
+      for (int k_idx = 0; k_idx < K; ++k_idx) {
+        unsigned const g = ksel_g[k_idx];
+        int const r = 127 - (int)(g & 0xFFFFu);
+        unsigned const o = g >> 16;
+        unsigned const b = (o & 0x8000u) ? (o & 0x7FFFu) : (~o & 0xFFFFu);
+#ifdef MPK_LTK_TIE_FIX
+        s_ltk_sel[k_idx] = MPK_TIE_SEL(r);
+#else
+        s_ltk_sel[k_idx] = ksel_bitrev4(r >> 3) * 8 + (r & 7);
+#endif
+        s_ltk_w[k_idx] = __uint_as_float(b << 16);
+      }
+    }
+#else
+    for (int k_idx = 0; k_idx < K; ++k_idx) {
+      unsigned const g = ksel_wave_max(k0 > k1 ? k0 : k1);
+      if (tid == 0) {
+        int const r = 127 - (int)(g & 0xFFFFu);
+        unsigned const o = g >> 16;
+        unsigned const b = (o & 0x8000u) ? (o & 0x7FFFu) : (~o & 0xFFFFu);
+#ifdef MPK_LTK_TIE_FIX
+        s_ltk_sel[k_idx] = MPK_TIE_SEL(r);
+#else
+        s_ltk_sel[k_idx] = ksel_bitrev4(r >> 3) * 8 + (r & 7);
+#endif
+        s_ltk_w[k_idx] = __uint_as_float(b << 16);
+      }
+      // Clear, as the 16-lane path does, the lowest column equal to the
+      // round's max in every 8-column group (= quad). 0 is below every key.
+#ifdef MPK_LTK_TIE_FIX
+      // Keys are unique, so at most one of k0 / k1 matches: clear only the
+      // selected expert, never a tie of it.
+#ifdef MPK_LTK_TIE_RT
+      if (MPK_TIE_ON) {
+#endif
+      if (k0 == g) k0 = 0u;
+      if (k1 == g) k1 = 0u;
+#ifdef MPK_LTK_TIE_RT
+      } else {
+      unsigned const gv = g >> 16;
+      bool const t0 = (k0 >> 16) == gv;
+      bool const t1 = (k1 >> 16) == gv;
+      unsigned long long const tm = __ballot(t0 || t1);
+      unsigned const grp = (unsigned)(tm >> (tid & ~3)) & 0xFu;
+      if ((t0 || t1) && (grp & ((1u << (tid & 3)) - 1u)) == 0u) {
+        if (t0) {
+          k0 = 0u;
+        } else {
+          k1 = 0u;
+        }
+      }
+      }
+#endif
+#else
+      unsigned const gv = g >> 16;
+      bool const t0 = (k0 >> 16) == gv;
+      bool const t1 = (k1 >> 16) == gv;
+      unsigned long long const tm = __ballot(t0 || t1);
+      unsigned const grp = (unsigned)(tm >> (tid & ~3)) & 0xFu;
+      if ((t0 || t1) && (grp & ((1u << (tid & 3)) - 1u)) == 0u) {
+        if (t0) {
+          k0 = 0u;
+        } else {
+          k1 = 0u;
+        }
+      }
+#endif
+    }
+#endif
+  }
+  if (MPK_LTK_STW0_ON && tid < THREADS_PER_ROW) {
+    // The same statistics on wave 0's first row, after its selection: wave 2 also quantizes.
+    int const sl = tid;
+    float row_chunk[VPT];
+    for (int e = 0; e < VPT; ++e) {
+      row_chunk[e] =
+          __uint_as_float(((unsigned)s_ltk_logit[sl * VPT + e]) << 16);
+    }
+    float thread_max;
+#ifdef MPK_LTK_STW0_FAST
+    if (g_mpk_stwf_rt != 0) {
+      // The largest logit is the selection's top key.
+      unsigned const to = ltk_top_key >> 16;
+      unsigned const tb = (to & 0x8000u) ? (to & 0x7FFFu) : (~to & 0xFFFFu);
+      thread_max = __uint_as_float(tb << 16);
+    } else
+#endif
+    {
+    thread_max = row_chunk[0];
+    for (int ii = 1; ii < VPT; ++ii) {
+      thread_max = fmaxf(thread_max, row_chunk[ii]);
+    }
+#ifdef MPK_TOPK_DPP_REDUCE
+    thread_max = topk_dpp_row_max_to_lane_zero(thread_max);
+#ifdef MPK_LTK_DPP
+    thread_max = __int_as_float(__builtin_amdgcn_readfirstlane(__float_as_int(thread_max)));
+#else
+    thread_max = __shfl(thread_max, 0, THREADS_PER_ROW);
+#endif
+#else
+    for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
+      float other = __shfl_xor(thread_max, mask, THREADS_PER_ROW);
+      thread_max = fmaxf(thread_max, other);
+    }
+#endif
+    }
+    float row_sum = 0.f;
+    for (int ii = 0; ii < VPT; ++ii) {
+      row_chunk[ii] = __builtin_amdgcn_exp2f((row_chunk[ii] - thread_max) *
+                                             1.4426950408889634f);
+      row_sum += row_chunk[ii];
+    }
+#ifdef MPK_TOPK_DPP_REDUCE
+    row_sum = topk_dpp_row_sum_to_lane_zero(row_sum);
+#ifdef MPK_LTK_DPP
+    row_sum = __int_as_float(__builtin_amdgcn_readfirstlane(__float_as_int(row_sum)));
+#else
+    row_sum = __shfl(row_sum, 0, THREADS_PER_ROW);
+#endif
+#else
+    for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
+      row_sum += __shfl_xor(row_sum, mask, THREADS_PER_ROW);
+    }
+#endif
+    float const inv_sum = 1.f / row_sum;
+    if (sl == 0) {
+      s_ltk_w[4] = thread_max;
+      s_ltk_w[5] = inv_sum;
+    }
+  }
+  if (false) {
+#else
   if (tid < THREADS_PER_ROW) {
+#endif
     float row_chunk[VPT];
     for (int e = 0; e < VPT; ++e) {
       // bf16 -> f32 is exact: the bf16 bits are the float's top half.
@@ -930,6 +1436,19 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
         // xor 8 = row_ror:8; xor 4 = row_shl:4 for lanes with bit 2 clear, row_shr:4
         // for the rest; xor 2 / xor 1 = quad_perm [2,3,0,1] / [1,0,3,2].
         bool const ltk_hi4 = (tid & 4) != 0;
+#ifdef MPK_LTK_TIE_FIX
+        // (value, -index) order: every lane ends on the same winner, so the clear
+        // below removes only that column and a tied expert stays selectable.
+#define MPK_LTK_STEP(OM, OE)                                              \
+        do {                                                                    \
+          float const other_max = __int_as_float(OM);                           \
+          int const other_expert = (OE);                                        \
+          bool const take = other_max > max_val ||                              \
+                            (MPK_TIE_ON && other_max == max_val && other_expert < expert);    \
+          max_val = take ? other_max : max_val;                                 \
+          expert = take ? other_expert : expert;                                \
+        } while (0)
+#else
 #define MPK_LTK_STEP(OM, OE)                                              \
         do {                                                                    \
           float const other_max = __int_as_float(OM);                           \
@@ -941,6 +1460,7 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
                        : [om] "v"(other_max), [oe] "v"(other_expert)            \
                        : "vcc");                                                 \
         } while (0)
+#endif
         MPK_LTK_STEP(__builtin_amdgcn_update_dpp(0, __float_as_int(max_val), 0x128, 0xF, 0xF, false),
                      __builtin_amdgcn_update_dpp(0, expert, 0x128, 0xF, 0xF, false));
         {
@@ -1069,7 +1589,15 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
   }
 #endif
   MPK_ILSTAMP(19, s_ilsub_ml == MPK_ILSUB_L0 + 1);
+#ifdef MPK_TOPK_SUB2
+  if (mpk_tk_ts != nullptr && tid == 0)
+    mpk_tk_ts[1] = (unsigned int)__builtin_amdgcn_s_memrealtime();
+#endif
   __syncthreads();
+#ifdef MPK_TOPK_SUB2
+  if (mpk_tk_ts != nullptr && tid == 0)
+    mpk_tk_ts[2] = (unsigned int)__builtin_amdgcn_s_memrealtime();
+#endif
 #ifdef MPK_LTK_SELLOGIT
   if (tid == 128) {
     // Read only by W2, behind the MoE's own barriers.

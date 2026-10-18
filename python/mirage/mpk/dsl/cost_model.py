@@ -4,7 +4,9 @@ import os
 
 
 def select_strategy(output_size, reduction_size, batch_size, target_cc,
-                    num_xcds=8, l2_per_xcd=4 * 1024 * 1024):
+                    num_xcds=None, l2_per_xcd=4 * 1024 * 1024):
+    if num_xcds is None:
+        num_xcds = int(__import__("os").environ.get("MPK_NUM_XCDS", "8"))
     """Select the best linear strategy for given dimensions and hardware.
 
     Returns one of: "standard", "gang", "gang_coop", "gang_splitk"

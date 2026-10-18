@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fleet-megakernel-vllm"
+version = "0.2.0"
+description = "Serve the fleet persistent decode megakernel (gpt-oss-120b MoE, dense Qwen3) through vLLM: a native free-running launch with a host token mirror, selected per-server, no change to any other vLLM path."
+requires-python = ">=3.10"
+dependencies = ["torch"]
+
+# Discovered by vLLM at startup. register() only wires fleet_mk's model/worker classes; it does nothing
+# unless the server opts in via VLLM_PLUGINS=fleet_mk and (for the native path) --worker-cls
+# fleet_megakernel_vllm.native_worker.FleetNativeWorker. A server that merely has the package installed
+# behaves exactly as stock for every other model.
+[project.entry-points."vllm.general_plugins"]
+fleet_mk = "fleet_megakernel_vllm.plugin:register"
+
+[tool.setuptools]
+packages = ["fleet_megakernel_vllm"]

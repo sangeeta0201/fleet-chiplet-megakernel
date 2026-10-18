@@ -26,7 +26,7 @@ DEFAULT_MODEL_PATH = os.environ.get("GPT_OSS_MODEL_PATH", "openai/gpt-oss-120b")
 # CI correctness-dump defaults. Torch vs Mirage token dumps land here for
 # tests/ci-tests/test_gpt_oss_inference_output.py.
 DEFAULT_SAVE_DIR = os.path.join("outputs", "gpt_oss")
-MAX_SAVE_TOKENS = 100
+MAX_SAVE_TOKENS = int(os.environ.get("MPK_MAX_SAVE_TOKENS", "100"))
 
 # GPT-OSS 120B dimensions
 # hidden_size=2880, intermediate_size=2880
@@ -317,7 +317,11 @@ def quantize_bf16_to_mxfp4(weight: torch.Tensor,
     num_blocks = in_dim // 32
 
     # Work in float32
-    w = weight.float().reshape(out_dim, num_blocks, 32)
+    print(f">>> quantize enter {tuple(weight.shape)} {weight.dtype} {weight.device}", flush=True)
+    w = weight.float()
+    print(">>> quantize float32", flush=True)
+    w = w.reshape(out_dim, num_blocks, 32)
+    print(">>> quantize reshape", flush=True)
 
     # Per-block max absolute value
     max_abs = w.abs().amax(dim=2)  # [out_dim, num_blocks]
@@ -342,16 +346,15 @@ def quantize_bf16_to_mxfp4(weight: torch.Tensor,
 
     # Round to nearest FP4 using midpoint thresholds
     # FP4 values: 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0
-    nibble = torch.zeros_like(w_abs, dtype=torch.uint8)
-    nibble[w_abs >= 0.25] = 1   # 0.5
-    nibble[w_abs >= 0.75] = 2   # 1.0
-    nibble[w_abs >= 1.25] = 3   # 1.5
-    nibble[w_abs >= 1.75] = 4   # 2.0
-    nibble[w_abs >= 2.50] = 5   # 3.0
-    nibble[w_abs >= 3.50] = 6   # 4.0
-    nibble[w_abs >= 5.00] = 7   # 6.0
-    # Set sign bit (bit 3) for negative values
-    nibble[w_sign < 0] |= 8
+    # Vectorized: 8 boolean-index writes on ~6e8 elements deadlock/starve HIP
+    # when the 120B model already occupies VRAM (measured hang >40 min).
+    print(">>> quantize nibble-bucketize", flush=True)
+    _thr = torch.tensor(
+        [0.25, 0.75, 1.25, 1.75, 2.50, 3.50, 5.00],
+        device=w_abs.device, dtype=w_abs.dtype)
+    nibble = torch.bucketize(w_abs, _thr, right=True).to(torch.uint8)
+    nibble = nibble | ((w_sign < 0).to(torch.uint8) << 3)
+    print(">>> quantize nibble-done", flush=True)
 
     # Pack pairs of nibbles into bytes: byte = lo_nibble | (hi_nibble << 4)
     even = nibble[:, :, 0::2]  # [out_dim, num_blocks, 16]
@@ -492,6 +495,169 @@ def shuffle_oproj_workgroups_kmajor(packed: torch.Tensor,
 # losing all three pairs). The batch-1 group pipeline below also requires this
 # layout and is resolved at the pack site where batch size is available.
 LM_HEAD_KMAJOR = os.environ.get("MPK_LM_HEAD_KMAJOR", "0") == "1"
+
+
+_OWN_BO_KEEPALIVE = []
+_MOE_RW_KEEPALIVE = []
+_AID_RW_PTRS = set()  # data_ptrs already on AID-local RW BOs: never own-BO copied
+_AID_RW_MAP = []      # "p0:p1:n" per MPK_AID_RW_PAT tensor (MPK_AID_RW_MAP)
+
+
+def _aid_rw_maybe(t, name):
+    """MPK_AID_RW_PAT: per-AID MTYPE_RW copies of a read-only input."""
+    pats = [p for p in os.environ.get("MPK_AID_RW_PAT", "").split(",") if p]
+    kv_rw = (os.environ.get("MPK_KV_AID_RW", "0") == "1"
+             and ("k_cache" in name or "v_cache" in name))
+    if (not pats or not any(p in name for p in pats) or ("_cache" in name and not kv_rw)
+            or not isinstance(t, torch.Tensor) or not t.is_cuda
+            or t.data_ptr() in _AID_RW_PTRS):
+        return t
+    import ctypes as _ct
+    lib = _ct.CDLL(os.environ.get("MPK_AID_ALLOC_SO",
+        "/root/user/aid-local-hbm/tools/libmpk_aid_alloc.so"))
+    lib.mpk_aid_alloc.restype = _ct.c_void_p
+    lib.mpk_aid_alloc.argtypes = [_ct.c_ulonglong, _ct.c_int]
+    n = t.numel() * t.element_size()
+    src = t.contiguous().view(torch.uint8).view(-1)
+    out = []
+    for aid in (0, 1):
+        p = lib.mpk_aid_alloc(n, aid)
+        if not p:
+            print(f"[AID_RW] {name}: mpk_aid_alloc({n}, {aid}) failed, keeping original", flush=True)
+            return t
+
+        class _CAI:
+            pass
+
+        cai = _CAI()
+        cai.__cuda_array_interface__ = {"shape": (n,), "typestr": "|u1",
+                                        "data": (p, False), "version": 2,
+                                        "strides": None}
+        dst = torch.as_tensor(cai, device="cuda")
+        dst.copy_(src)
+        out.append((dst.view(t.dtype).view(t.shape), p))
+    torch.cuda.synchronize()
+    _MOE_RW_KEEPALIVE.append(out[1][0])
+    _AID_RW_PTRS.add(out[0][1])
+    _AID_RW_MAP.append("%x:%x:%x" % (out[0][1], out[1][1], n))
+    os.environ["MPK_AID_RW_MAP"] = ",".join(_AID_RW_MAP)
+    if len(_AID_RW_MAP) <= 8 or os.environ.get("MPK_BOMAP", "0") == "1":
+        print(f"[AID_RW] {name} n={n} -> AID0 {out[0][1]:#x} / AID1 {out[1][1]:#x}", flush=True)
+    return out[0][0]
+
+
+# Allocations whose used region is only the first half: the split point is at
+# a quarter of the tensor (MPK_ATTN_SPLIT_CHUNK helper partials, off by default,
+# live in the second half).
+_OWN_BO_SPLIT = {"ck_fmha_lse_acc": 0.25, "ck_fmha_o_acc": 0.25}
+
+# MPK_OWN_BO_RINGS=ws,ao,apo: every copy of these MPK_LAYER_RING buffers gets
+# its own BO cut at its midpoint, which is where the writers change AID
+# (workspace expert slots 0-1 | 2-3 under MPK_MOE_XCD_PAIR, attn_out heads
+# 0-3 | 4-7, residual columns of dies 0-3 | 4-7).
+_OWN_BO_RINGS = {"ws": "moe_workspace_f32", "ao": "attn_out", "apo": "attn_proj_out"}
+
+
+def _own_bo_ring(name):
+    for key in os.environ.get("MPK_OWN_BO_RINGS", "").split(","):
+        base = _OWN_BO_RINGS.get(key.strip())
+        if base and (name == base or (name.startswith(base + "_r")
+                                      and name[len(base) + 2:].isdigit())):
+            return True
+    return False
+
+
+def _own_bo_maybe(t, name, scratch=False):
+    """[BOMAP] / own-BO copy for one attached tensor (see MPK_OWN_BO_PAT).
+
+    MPK_KV_OWN_BO=1 also copies each layer's K and V cache. The copy is
+    authoritative only because on the --use-mirage path the megakernel is the
+    sole reader and writer of the cache (it prefills the prompt itself);
+    model.model.kv_cache is stale afterwards, which only --verify reads.
+    """
+    bomap = os.environ.get("MPK_BOMAP", "0") == "1"
+    if isinstance(t, torch.Tensor) and t.is_cuda and t.data_ptr() in _AID_RW_PTRS:
+        if bomap:
+            print(f"[BOMAP] {name} on AID-local RW BO, not copying", flush=True)
+        return t
+    pats = [p for p in os.environ.get("MPK_OWN_BO_PAT", "").split(",") if p]
+    kv = "k_cache" in name or "v_cache" in name
+    kv_own = kv and os.environ.get("MPK_KV_OWN_BO", "0") == "1"
+    forced = scratch and (name in os.environ.get("MPK_OWN_BO_SCRATCH", "").split(",")
+                          or _own_bo_ring(name))
+    if scratch and not forced:
+        # make_tensor buffers move only when named exactly, never by pattern.
+        return t
+    if kv_own and os.environ.get("MPK_KV_HEAD_MAJOR", "0") != "1":
+        # NHD keeps a token's heads side by side: its midpoint is a position
+        # cut, which puts every head of the early positions in range 0.
+        print(f"[KVOWN] {name}: needs MPK_KV_HEAD_MAJOR=1, not copying", flush=True)
+        kv_own = False
+    if not (bomap or pats or kv_own or forced) or not isinstance(t, torch.Tensor) or not t.is_cuda:
+        return t
+    n = t.numel() * t.element_size()
+    if n < (1 << 20) and not any(p in name for p in pats) and not forced:
+        return t
+    import ctypes as _ct
+    hip = _ct.CDLL("libamdhip64.so")
+
+    def where(x):
+        base, size = _ct.c_void_p(), _ct.c_size_t()
+        hip.hipMemGetAddressRange(_ct.byref(base), _ct.byref(size),
+                                  _ct.c_void_p(x.data_ptr()))
+        p, b, s = x.data_ptr(), base.value or 0, size.value
+        cut = b + ((s >> 1) // (2 << 20)) * (2 << 20)
+        lo = max(0, min(p + n, cut) - p)
+        return b, s, p - b, lo / n
+
+    b, s, off, f = where(t)
+    # Already its own BO and cut at the midpoint: halves placement is right.
+    placed = off == 0 and s < n + (4 << 20) and abs(f - 0.5) < 0.05
+    copy = (((any(p in name for p in pats) and not kv) or kv_own or forced)
+            and t.is_contiguous() and not placed)
+    if bomap:
+        print(f"[BOMAP] {name} n={n} bo=+{s} off={off} in_first_half={f:.3f}"
+              f"{' -> own' if copy else ''}", flush=True)
+    if not copy:
+        return t
+    ptr = _ct.c_void_p()
+    if os.environ.get("MPK_OWN_BO_ALIGN", "0") == "1" or kv_own or forced:
+        # Split point on the halves cut: BO of 2*ALIGN_UP(max side, 2 MiB),
+        # tensor offset so that off + split == size/2 (to 256 B).
+        chunk = 2 << 20
+        split = int(n * _OWN_BO_SPLIT.get(name, 0.5)) if forced else n // 2
+        half = -(-max(split, n - split) // chunk) * chunk
+        bo_n = 2 * half
+        off_in = ((half - split) // 256) * 256
+    else:
+        bo_n, off_in = n, 0
+    if int(os.environ.get("MPK_MULTI_DEV", "0") or 0) > 1:  # MDEV_OWN_BO: halves over AIDs
+        from mirage.mpk.placement import halves_malloc
+        ptr.value, rc = halves_malloc(bo_n), 0
+    else:
+        rc = hip.hipMalloc(_ct.byref(ptr), _ct.c_size_t(bo_n))
+    if rc != 0 or not ptr.value:
+        print(f"[BOMAP] {name}: hipMalloc rc={rc}, keeping original", flush=True)
+        return t
+
+    class _CAI:
+        pass
+
+    cai = _CAI()
+    cai.__cuda_array_interface__ = {"shape": (n,), "typestr": "|u1",
+                                    "data": (ptr.value + off_in, False),
+                                    "version": 2,
+                                    "strides": None}
+    own = torch.as_tensor(cai, device="cuda").view(t.dtype).view(t.shape)
+    own.copy_(t)
+    torch.cuda.synchronize()
+    if bomap or kv_own or forced:
+        b2, s2, off2, f2 = where(own)
+        tag = "KVOWN" if kv_own else ("PART" if forced else "BOMAP")
+        print(f"[{tag}] {name}(own BO) n={n} bo=+{s2} "
+              f"off={off2} in_first_half={f2:.3f}", flush=True)
+    _OWN_BO_KEEPALIVE.append((hip, ptr, own))
+    return own
 
 
 # Ships on for batch-1. Host permute (pack site) and kernel flag both go
@@ -1149,6 +1315,9 @@ if __name__ == "__main__":
     parser.add_argument("--max-seq-length", default=512, type=int)
     parser.add_argument("--model-path", type=str, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--ignore-eos", action="store_true")
+    parser.add_argument("--vllm-session", action="store_true",
+                        help="build the megakernel, then hand it to an in-process driver "
+                             "(fleet_native_vllm) instead of running or serving")
     parser.add_argument("--serve", action="store_true",
                         help="Serve an OpenAI-compatible /v1/completions "
                              "endpoint instead of running the batch demo, so "
@@ -1200,6 +1369,13 @@ if __name__ == "__main__":
         help="Dump the PPL_MODE result to this JSON path.",
     )
     args = parser.parse_args()
+    if os.environ.get("PPL_STAGE_DUMP") and os.environ.get("MPK_ROUTER_OPROJ_PARTIAL") == "1":
+        # The stage dump reads rmsnorm_out_moe, which the router-partial path keeps in LDS
+        # (MPK_ROP_STAGE_ROW publishes it) and the arena would replicate (MPK_ARENA_SKIP).
+        os.environ.setdefault("MPK_ROP_STAGE_ROW", "1")
+        _skip = [x for x in os.environ.get("MPK_ARENA_SKIP", "").split(",") if x]
+        if "rmsnorm_out_moe" not in _skip:
+            os.environ["MPK_ARENA_SKIP"] = ",".join(_skip + ["rmsnorm_out_moe"])
 
     # Serving measures per-token latency, and the [FWD_PASS] trace is device
     # printf: inline it perturbs the iteration it reports, and its end-of-launch
@@ -1245,9 +1421,15 @@ if __name__ == "__main__":
             f"{args.max_num_batched_requests} requests x {_pages_per_req} pages "
             f"of {args.page_size} tokens needs {_pages_needed}. The page free "
             f"list would run dry mid-run.")
+        if os.environ.get("MPK_SPEC_VSLOT", "0") == "1":
+            # One real request; prepare_next_batch gives each of its tokens its own batch slot.
+            assert args.max_num_batched_requests == args.max_num_batched_tokens, (
+                "MPK_SPEC_VSLOT: --max-num-batched-requests must equal --max-num-batched-tokens")
+            args.num_requests = 1
         if args.num_requests is None:
             args.num_requests = args.max_num_batched_requests
-        assert args.num_requests >= args.max_num_batched_requests, (
+        assert os.environ.get("MPK_SPEC_VSLOT", "0") == "1" or \
+            args.num_requests >= args.max_num_batched_requests, (
             f"--num-requests ({args.num_requests}) must be >= "
             f"--max-num-batched-requests ({args.max_num_batched_requests})")
 
@@ -1380,12 +1562,17 @@ if __name__ == "__main__":
             """Tokenize one prompt, applying the chat template if there is one."""
             if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template:
                 messages = [{"role": "user", "content": text}]
+                # The template dates the system message with strftime_now();
+                # a render variable of that name overrides it.
+                _chat_kw = ({"strftime_now": (lambda fmt: os.environ["MPK_CHAT_DATE"])}
+                            if os.environ.get("MPK_CHAT_DATE") else {})
                 _fixed_date = os.environ.get("MPK_FIXED_DATE")
                 if _fixed_date and 'strftime_now("%Y-%m-%d")' in tokenizer.chat_template:
                     tokenizer.chat_template = tokenizer.chat_template.replace(
                         'strftime_now("%Y-%m-%d")', repr(_fixed_date))
                 formatted = tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True)
+                    messages, tokenize=False, add_generation_prompt=True,
+                    **_chat_kw)
                 enc = tokenizer([formatted], return_tensors="pt",
                                 add_special_tokens=False).to("cuda")
             else:
@@ -1497,6 +1684,7 @@ if __name__ == "__main__":
     print(f"Padding: hidden {hidden_size} -> {PADDED_HIDDEN_SIZE}, "
           f"intermediate {intermediate_size} -> {PADDED_INTERMEDIATE_SIZE}")
     print(f"RMSNorm scale factor: {rmsnorm_scale_factor:.6f}")
+    print(">>> after RMSNorm, about to enter use_mirage", flush=True)
 
     # === Triton kernels MoE setup (vLLM's fast MXFP4 path) ===
     if args.use_triton:
@@ -1953,8 +2141,19 @@ if __name__ == "__main__":
         print(f"  Patched {num_layers} layers with AITER MoE + profiled forward\n")
 
     if args.use_mirage:
+        print(">>> importing mirage", flush=True)
         import mirage as mi
+        print(">>> mirage imported", flush=True)
+        # MPK_PLACE_ARENA=1: the compiler's arena places the split weights, the MoE
+        # replicas and the KV caches (mirage/mpk/placement.py), so the per-tensor flags
+        # that did it by hand are turned off before anything reads them.
+        _arena_mode = os.environ.get("MPK_PLACE_ARENA", "0") == "1"
+        if _arena_mode:
+            from mirage.mpk import placement as _placement
+            _placement.arena_env(os.environ)
         from mirage.utils import mpk_w13_prequant
+        print(">>> starting lm_head pack", flush=True)
+        print(f">>> lm_head {tuple(model.lm_head.weight.shape)} {model.lm_head.weight.device} {model.lm_head.weight.dtype}", flush=True)
 
         # Gang dispatch is required for MXFP4 MoE kernels on MI300/MI350
         os.environ.setdefault("USE_GANG", "1")
@@ -1965,7 +2164,7 @@ if __name__ == "__main__":
         lm_head_weight = torch.cat(
             (
                 # Pad lm_head output_dim (hidden_size -> PADDED_HIDDEN_SIZE)
-                pad_weight_2d(model.lm_head.weight, target_cols=PADDED_HIDDEN_SIZE),
+                (print(">>> pad_weight_2d", flush=True) or pad_weight_2d(model.lm_head.weight, target_cols=PADDED_HIDDEN_SIZE)),
                 torch.zeros(
                     (padded_vocab_size - config.vocab_size, PADDED_HIDDEN_SIZE),
                     device="cuda",
@@ -1979,17 +2178,31 @@ if __name__ == "__main__":
         # Quantize LM head to MXFP4 for FP4×FP8 MFMA (3.7x less HBM traffic)
         # OPW must be >= 64 (4 waves × 16 rows/MFMA tile = 64 minimum)
         lm_head_output_per_wg = 64
-        lm_blocks, lm_scales = quantize_bf16_to_mxfp4(lm_head_weight)
-        lm_head_packed = pack_mxfp4_workgroup(
-            lm_blocks, lm_scales, output_per_wg=lm_head_output_per_wg,
-        ).squeeze(0)  # [n_wgs, wg_bytes]
-        lm_head_kmajor = LM_HEAD_KMAJOR or _mpk_opt(
-            "MPK_LM_HEAD_GROUP_PIPELINE", args.max_num_batched_tokens)
-        if lm_head_kmajor:
-            lm_head_packed = shuffle_lm_head_record_kmajor(
-                lm_head_packed, output_per_wg=lm_head_output_per_wg)
-        print(f"LM head MXFP4: {lm_head_weight.shape} BF16 ({lm_head_weight.numel()*2/1e6:.0f} MB) "
-              f"-> {lm_head_packed.shape} packed ({lm_head_packed.numel()/1e6:.0f} MB)")
+        if os.environ.get("MPK_LM_BF16", "0") == "1":
+            # MPK_LM_BF16: the checkpoint's BF16 LM head, as vLLM runs it. K-major records
+            # [n_wgs, 4 tiles, K/32 steps, 64 lanes, 8 bf16], lane = 16 * (K8 group) + row.
+            _lm_nw = lm_head_weight.shape[0] // lm_head_output_per_wg
+            _lm_k = lm_head_weight.shape[1]
+            assert lm_head_weight.dtype == torch.bfloat16 and _lm_k % 32 == 0
+            lm_head_packed = (lm_head_weight.reshape(_lm_nw, 4, 16, _lm_k // 32, 4, 8)
+                              .permute(0, 1, 3, 4, 2, 5).contiguous()
+                              .view(torch.uint8).reshape(_lm_nw, -1))
+            print(f"LM head BF16 (MPK_LM_BF16): {lm_head_weight.shape} -> {lm_head_packed.shape} "
+                  f"K-major records ({lm_head_packed.numel()/1e6:.0f} MB)", flush=True)
+        else:
+            print(">>> cat done, quantize", flush=True)
+            lm_blocks, lm_scales = quantize_bf16_to_mxfp4(lm_head_weight)
+            print(">>> quantize done, pack", flush=True)
+            lm_head_packed = pack_mxfp4_workgroup(
+                lm_blocks, lm_scales, output_per_wg=lm_head_output_per_wg,
+            ).squeeze(0)  # [n_wgs, wg_bytes]
+            lm_head_kmajor = LM_HEAD_KMAJOR or _mpk_opt(
+                "MPK_LM_HEAD_GROUP_PIPELINE", args.max_num_batched_tokens)
+            if lm_head_kmajor:
+                lm_head_packed = shuffle_lm_head_record_kmajor(
+                    lm_head_packed, output_per_wg=lm_head_output_per_wg)
+            print(f"LM head MXFP4: {lm_head_weight.shape} BF16 ({lm_head_weight.numel()*2/1e6:.0f} MB) "
+                  f"-> {lm_head_packed.shape} packed ({lm_head_packed.numel()/1e6:.0f} MB)")
 
         num_kv_cache_chunks = max(1, (args.max_seq_length + 127) // 128)
         use_ck_fmha = int(os.environ.get("USE_CK_FMHA", "1")) == 1
@@ -2020,7 +2233,9 @@ if __name__ == "__main__":
         # occupancy-driven split-K decision vLLM makes (partition only when the
         # machine is not already full), just expressed as a compile-time shape.
         _nw, _ = mi.get_configurations_from_gpu(rank)
-        _workers_per_xcd = _nw // 8  # 240/8 = 30 on MI350
+        _nx = int(os.environ.get("MPK_NUM_XCDS", "8"))
+        print(f"[DPX] MPK_NUM_XCDS={_nx} workers={_nw} wpx={_nw // _nx} sm-derived")
+        _workers_per_xcd = _nw // _nx
         MAX_KV_CHUNKS = _workers_per_xcd // args.max_num_batched_requests
         assert MAX_KV_CHUNKS >= 1, (
             f"max_num_batched_requests={args.max_num_batched_requests} exceeds "
@@ -2102,6 +2317,10 @@ if __name__ == "__main__":
             spec_decode_config=None,
             use_cutlass_kernel=use_cutlass_kernel
         )
+        if _arena_mode:
+            # Chunks of 2 x MPK_ARENA_CHUNK_GIB, allocated as tensors are placed (the
+            # originals are dropped layer by layer, so the peak stays where it was).
+            mpk.arena_reserve(int(float(os.environ.get("MPK_ARENA_CHUNK_GIB", "16")) * (1 << 30)))
 
         bs = args.max_num_batched_tokens
 
@@ -2129,28 +2348,179 @@ if __name__ == "__main__":
         # megakernel internal memory aliasing that causes wrong output.
         verify_tensors = {}
         _tensor_refs = {}  # prevent GC of backing tensors
+        # MPK_HOST_BARRIERS: put the cross-XCD sync flags in pinned host
+        # memory instead of device VRAM.
+        #
+        # A DPX device is 4 XCDs, and under NPS2 those 4 XCDs span two AIDs.
+        # Plain device VRAM there is MTYPE_RW, which is coherent only *within*
+        # an AID -- so a release published by one die is never observed by the
+        # two XCDs on the other AID. Measured signature: three workers reading
+        # the same four flags at the same moment report [8,7,7,7], [7,7,7,8]
+        # and [8,7,7,8], and every stall splits the four XCDs 2-vs-2. Pinned
+        # host memory is system-coherent, so all four XCDs agree.
+        _host_barriers = os.environ.get("MPK_HOST_BARRIERS", "0") == "1"
+        # Every activation into system-coherent memory.
+        #
+        # Under DPX+NPS2 a device's XCP maps onto a single NPS2 memory range,
+        # so plain device VRAM is MTYPE_RW: cacheable, but coherent only
+        # within one AID. The activations here are read cross-XCD with plain
+        # cached loads -- the post-attention RMSNorm reads the whole O-proj
+        # row, the MoE reads the routing output -- so a reader on the far AID
+        # sees a stale line. Measured: rmsnorm_out_moe came back with 1436 of
+        # 2944 elements written, almost exactly half, and values at 1e30.
+        #
+        # At batch size 1 the whole set is ~130 KB, so correctness costs a
+        # PCIe round trip per access and nothing in footprint.
+        _host_acts = os.environ.get("MPK_HOST_ACTIVATIONS", "0") == "1"
+        _host_barrier_names = ("oproj_topk_counters", "qkv_attn_barrier",
+                               "moe_fused_barrier", "router_topk_counter")
+        # MPK_UNCACHED_BARRIERS: the sync flags in UNCACHED DEVICE VRAM rather
+        # than pinned host memory.
+        #
+        # Host memory is coherent but every cross-XCD poll becomes a PCIe round
+        # trip: measured 21.3 ms/iter against 3.9 in DPX+NPS1 with the same
+        # binary, and the barriers are the whole of that gap (pinning the
+        # activations on top costs a further 6.4 and buys nothing).
+        #
+        # Uncached VRAM is coherent for the same reason SPX+NPS2's MTYPE_NC
+        # was -- no line is ever held in an AID's L2, so every access goes to
+        # memory and is unconditionally fresh -- but stays on the device. It
+        # also leaves the bulk (weights, activations) on MTYPE_RW, which is the
+        # thing DPX+NPS2 uniquely offers: VRAM that is both AID-local AND
+        # cacheable. SPX+NPS2 never had that, which is why it sat at 8.5 ms.
+        _uncached_barriers = os.environ.get("MPK_UNCACHED_BARRIERS", "0") == "1"
+        # MPK_UNCACHED_ACTS: every activation AND flag on NC, weights left RW.
+        #
+        # This is the split the hardware actually wants in DPX+NPS2. The
+        # weights are ~155 GB and read-only, so they can never go stale and
+        # they are the only thing that benefits from being cached (the O-proj
+        # weight runs at a 97% L2 hit rate). Everything written cross-XCD is
+        # ~130 KB at batch size 1. Forcing mtype_local=NC globally is correct
+        # but uncaches the weights too, which is the whole 10.6-vs-3.9 gap.
+        _uncached_acts = os.environ.get("MPK_UNCACHED_ACTS", "0") == "1"
+        _uncached_keepalive = []
+        # bfloat16 has no numpy typestr, so it is wrapped as uint16 of the same
+        # width and viewed back -- __cuda_array_interface__ only needs to agree
+        # on the byte layout.
+        _UNC_TYPESTR = {
+            torch.int32: ("<i4", 4, None),
+            torch.float32: ("<f4", 4, None),
+            torch.float16: ("<f2", 2, None),
+            torch.bfloat16: ("<u2", 2, torch.bfloat16),
+            torch.int64: ("<i8", 8, None),
+        }
+
+        def _alloc_uncached(dims, torch_dtype, name):
+            spec = _UNC_TYPESTR.get(torch_dtype)
+            if spec is None:
+                return None
+            typestr, itemsize, view_as = spec
+            import ctypes
+            n = 1
+            for d in dims:
+                n *= int(d)
+            nbytes = n * itemsize
+            try:
+                # hipExtMallocWithFlags(hipDeviceMallocUncached) returns
+                # HOST memory on this ROCm -- the driver reports the BO as
+                # is_vram=0 -- so every cross-XCD access became a PCIe round
+                # trip and no iteration ever completed. A GEM BO with
+                # AMDGPU_GEM_CREATE_UNCACHED stays in VRAM and still takes
+                # MTYPE_NC, which is what these buffers need.
+                from mirage.mpk import aid_hbm as _aid
+                ptr = ctypes.c_void_p(_aid.uncached_take(nbytes))
+                if not ptr.value:
+                    print(f"[UNCACHED] {name}: uncached VRAM alloc failed",
+                          flush=True)
+                    return None
+
+                class _CAI:
+                    pass
+
+                cai = _CAI()
+                cai.__cuda_array_interface__ = {
+                    "shape": tuple(int(d) for d in dims),
+                    "typestr": typestr,
+                    "data": (ptr.value, False),
+                    "version": 2,
+                    "strides": None,
+                }
+                t = torch.as_tensor(cai, device="cuda")
+                if view_as is not None:
+                    t = t.view(view_as)
+                print(f"[UNCACHED] {name} in uncached device VRAM "
+                      f"@ 0x{t.data_ptr():x} ({nbytes} B)", flush=True)
+                return t
+            except Exception as _e:
+                print(f"[UNCACHED] {name}: failed ({_e}), falling back",
+                      flush=True)
+                return None
+
         def make_tensor(name, dims, torch_dtype=torch.bfloat16):
-            t = torch.zeros(dims, dtype=torch_dtype, device="cuda")
+            if _uncached_acts or (_uncached_barriers
+                                  and name in _host_barrier_names):
+                t = _alloc_uncached(dims, torch_dtype, name)
+                if t is not None:
+                    _tensor_refs[name] = t
+                    if args.verify:
+                        verify_tensors[name] = t
+                    return mpk.attach_input(torch_tensor=t, name=name)
+            if _host_acts or (_host_barriers and name in _host_barrier_names):
+                t = torch.zeros(dims, dtype=torch_dtype).pin_memory()
+                print(f"[HOSTBAR] {name} in pinned host memory "
+                      f"@ 0x{t.data_ptr():x}", flush=True)
+            else:
+                t = torch.zeros(dims, dtype=torch_dtype, device="cuda")
+                t = _own_bo_maybe(t, name, scratch=True)
+            dt = mpk.attach_input(torch_tensor=t, name=name)
+            # Under MPK_PLACE_ARENA the graph uses the arena copy; later writes through
+            # _tensor_refs (barrier reset, poll fills) must reach that copy.
+            placed = mpk.placed_tensor(name)
+            if placed is not None:
+                t = placed
             _tensor_refs[name] = t
             if args.verify:
                 verify_tensors[name] = t
-            return mpk.attach_input(torch_tensor=t, name=name)
+            return dt
         y = make_tensor("embed_out", (bs, PADDED_HIDDEN_SIZE))
-        rmsnorm_out = make_tensor("rmsnorm_out", (bs, PADDED_HIDDEN_SIZE))
+        # MPK_LMNORM_AID: the LM head keeps one normalized-row copy per
+        # memory range in this buffer. Doubling the row count gives it the
+        # second copy; the layer's norm_scratch_pre use touches only the
+        # first rows and is unaffected.
+        _lmn_mul = 2 if (os.environ.get("MPK_LMNORM_AID", "0") == "1"
+                         or os.environ.get("MPK_PRENORM_AID", "0") == "1") else 1
+        rmsnorm_out = make_tensor("rmsnorm_out",
+                                  (bs * _lmn_mul, PADDED_HIDDEN_SIZE))
         attn_in = make_tensor("attn_in", (bs, fused_qkv_dim))
         # CK FMHA workspaces
         num_qo_per_kv = num_local_q_heads // num_local_kv_heads
         q_ws_stride = num_local_q_heads * head_dim
-        ck_fmha_q_ws_tensor = torch.zeros(
-            bs, q_ws_stride, dtype=torch.bfloat16, device="cuda")
+        # The CK FMHA workspaces are the only written buffers that never went
+        # through make_tensor, so they stayed on MTYPE_RW while everything else
+        # moved to NC -- and RW is coherent only within an AID. Route them the
+        # same way; they are a few tens of KB.
+        def _dev_or_unc(dims, torch_dtype, name):
+            if _uncached_acts:
+                t = _alloc_uncached(dims, torch_dtype, name)
+                if t is not None:
+                    _tensor_refs[name] = t
+                    return t
+            return torch.zeros(dims, dtype=torch_dtype, device="cuda")
+
+        ck_fmha_q_ws_tensor = _dev_or_unc(
+            (bs, q_ws_stride), torch.bfloat16, "ck_fmha_q_workspace")
+        ck_fmha_q_ws_tensor = _own_bo_maybe(
+            ck_fmha_q_ws_tensor, "ck_fmha_q_workspace", scratch=True)
         ck_fmha_q_ws = mpk.attach_input(
             torch_tensor=ck_fmha_q_ws_tensor, name="ck_fmha_q_workspace")
         lse_dim1 = num_local_kv_heads * ck_fmha_num_kv_chunks * num_qo_per_kv
         # Always 2x: MPK_ATTN_SPLIT_CHUNK helper partials live in the second
         # half (offset +LSE_S). Unused when the flag is off.
         lse_dim1 = lse_dim1 * 2
-        ck_fmha_lse_acc_tensor = torch.zeros(
-            bs, lse_dim1, dtype=torch.float32, device="cuda")
+        ck_fmha_lse_acc_tensor = _dev_or_unc(
+            (bs, lse_dim1), torch.float32, "ck_fmha_lse_acc")
+        ck_fmha_lse_acc_tensor = _own_bo_maybe(
+            ck_fmha_lse_acc_tensor, "ck_fmha_lse_acc", scratch=True)
         ck_fmha_lse_acc = mpk.attach_input(
             torch_tensor=ck_fmha_lse_acc_tensor, name="ck_fmha_lse_acc")
         if args.verify:
@@ -2166,8 +2536,10 @@ if __name__ == "__main__":
         # partials into ck_fmha_o_acc; merge step combines them into attn_out.
         if use_split_attn_chunks or fuse_full_layer:
             o_acc_dim1 = num_local_kv_heads * ck_fmha_num_kv_chunks * num_qo_per_kv * head_dim * 2
-            ck_fmha_o_acc_tensor = torch.zeros(
-                bs, o_acc_dim1, dtype=torch.float32, device="cuda")
+            ck_fmha_o_acc_tensor = _dev_or_unc(
+                (bs, o_acc_dim1), torch.float32, "ck_fmha_o_acc")
+            ck_fmha_o_acc_tensor = _own_bo_maybe(
+                ck_fmha_o_acc_tensor, "ck_fmha_o_acc", scratch=True)
             ck_fmha_o_acc = mpk.attach_input(
                 torch_tensor=ck_fmha_o_acc_tensor, name="ck_fmha_o_acc")
             if args.verify:
@@ -2191,7 +2563,10 @@ if __name__ == "__main__":
         else:
             allreduce_buf = make_tensor("all_reduce_buf", (world_size, bs, PADDED_HIDDEN_SIZE))
             attn_allreduce_out = make_tensor("attn_allreduce_out", (bs, PADDED_HIDDEN_SIZE))
-        rmsnorm_out_moe = make_tensor("rmsnorm_out_moe", (bs, PADDED_HIDDEN_SIZE))
+        # MPK_MOENORM_AID: one post-attention normed row per memory range.
+        _mnn_mul = 2 if os.environ.get("MPK_MOENORM_AID", "0") == "1" else 1
+        rmsnorm_out_moe = make_tensor("rmsnorm_out_moe",
+                                      (bs * _mnn_mul, PADDED_HIDDEN_SIZE))
         moe_gate_out = make_tensor("moe_gate_out", (bs, num_experts))
         moe_routing_indices = make_tensor("moe_routing_indices", (num_experts, bs), torch_dtype=torch.int32)
         moe_mask = make_tensor("moe_mask", (num_experts + 1,), torch_dtype=torch.int32)
@@ -2232,7 +2607,10 @@ if __name__ == "__main__":
             # +128 ints: 8 per-XCD O-proj slice-ready flags (MPK_ROUTER_XCD_FOLD).
             # See FULL_LAYER_OPROJ_XCD_READY_SLOT in gang_full_layer_fused_mi300.cuh.
             counter_size = 768 + 128 * args.max_num_batched_requests + 272 + 128
-            if os.environ.get("MPK_LOCAL_TOPK", "0") == "1":
+            # MPK_LTK_COUNTERS_COMPACT: keep the pre-merge block size. With live
+            # AID replicas the tags and norm flags live in the replicas, not here.
+            if (os.environ.get("MPK_LOCAL_TOPK", "0") == "1"
+                    and os.environ.get("MPK_LTK_COUNTERS_COMPACT", "0") != "1"):
                 # +128 ints: epoch-tagged router logits at MPK_LTK_TAG_SLOT
                 # (mpk_atoms.cuh).
                 counter_size = max(counter_size, 2048 + 128)
@@ -2297,7 +2675,10 @@ if __name__ == "__main__":
                     _t.zero_()
         # W13+SwiGLU fused output: [bs, top_k, padded_intermediate]
         # (SwiGLU is fused into W13 epilogue — no separate mlp_mid buffer)
-        swiglu_out = make_tensor("swiglu_out", (bs, num_experts_per_tok, PADDED_INTERMEDIATE_SIZE))
+        # MPK_SWIGLU_AID: one copy per memory range (doubled along dim 0, so
+        # copy c starts at c * bs * topk * PADDED_INTERMEDIATE_SIZE).
+        _sw_bs = bs * 2 if os.environ.get("MPK_SWIGLU_AID", "0") == "1" else bs
+        swiglu_out = make_tensor("swiglu_out", (_sw_bs, num_experts_per_tok, PADDED_INTERMEDIATE_SIZE))
         # W2 output: [bs, top_k, padded_hidden]
         mlp_out = make_tensor("mlp_out", (bs, num_experts_per_tok, PADDED_HIDDEN_SIZE))
         # F32 workspace for W2 output: one private slab per (token, topk slot),
@@ -2306,7 +2687,9 @@ if __name__ == "__main__":
         # deterministic -- W2 stores (no atomicAdd) and the consumer sums the
         # slots of its own row in fixed order. See moe_ws_layout.cuh, whose
         # MOE_WS_SLOTS must equal num_experts_per_tok.
-        moe_workspace_f32 = make_tensor("moe_workspace_f32", (bs, num_experts_per_tok * PADDED_HIDDEN_SIZE), torch_dtype=torch.float32)
+        # MPK_WSF32_AID: one MoE f32 workspace per memory range.
+        _ws_mul = 2 if os.environ.get("MPK_WSF32_AID", "0") == "1" else 1
+        moe_workspace_f32 = make_tensor("moe_workspace_f32", (bs, _ws_mul * num_experts_per_tok * PADDED_HIDDEN_SIZE), torch_dtype=torch.float32)
         # MPK_LM_RESADD: the LM head adds the last layer's MoE slabs to the
         # residual itself, so layer 0 reads a workspace that is always zero
         # instead of one the final residual-add task clears.
@@ -2430,6 +2813,129 @@ if __name__ == "__main__":
         print(f"  Packed {num_layers} layers: gate_up {list(moe_gate_up_proj_weights[0].shape)}, "
               f"down {list(moe_down_proj_weights[0].shape)}")
 
+        if os.environ.get("MPK_MOE_SPLIT", "0") == "1":
+            # MPK_MOE_SPLIT: one copy of the MoE weights, laid out by halves. Weight
+            # groups 0..W/2-1 of every expert come first, then the rest: [2E, W/2, bytes]
+            # and [2E, OUT/2] biases. The own-BO midpoint placement puts the first half
+            # in range 0 and the second in range 1; XCD d and XCD d+4 compute the two
+            # halves of routing slot d (gang_moe_fused_mxfp4_mi300.cuh).
+            if (os.environ.get("MPK_MOE_REPLICA", "0") == "1"
+                    or os.environ.get("MPK_MOE_BIAS_REP", "0") == "1"
+                    or os.environ.get("MPK_MOE_RW", "0") == "1"):
+                raise RuntimeError("MPK_MOE_SPLIT replaces MPK_MOE_REPLICA, "
+                                   "MPK_MOE_BIAS_REP and MPK_MOE_RW: set them to 0")
+            _split_bytes = 0
+            for _l in range(len(moe_gate_up_proj_weights)):
+                for _lst in (moe_gate_up_proj_weights, moe_down_proj_weights,
+                             moe_gate_up_proj_biases, moe_down_proj_biases):
+                    _w = _lst[_l]
+                    assert _w.dim() >= 2 and _w.shape[1] % 2 == 0, list(_w.shape)
+                    _h = _w.shape[1] // 2
+                    _lst[_l] = torch.cat([_w[:, :_h], _w[:, _h:]], dim=0).contiguous()
+                    _split_bytes += _lst[_l].numel() * _lst[_l].element_size()
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            print(f"[MOE_SPLIT] gate_up {list(moe_gate_up_proj_weights[0].shape)} "
+                  f"down {list(moe_down_proj_weights[0].shape)} "
+                  f"biases {list(moe_gate_up_proj_biases[0].shape)} "
+                  f"{list(moe_down_proj_biases[0].shape)}; one copy, "
+                  f"{_split_bytes / 2**30:.2f} GiB", flush=True)
+        if os.environ.get("MPK_MOE_BIAS_REP", "0") == "1":
+            # [2E, n] per bias; with MPK_OWN_BO_PAT=...,gate_up_bias,down_bias
+            # and MPK_OWN_BO_ALIGN=1 the upper copy lands in range 1, and the
+            # kernel reads it from XCDs 4-7 (see gang_moe_fused_mxfp4_mi300.cuh).
+            for _l in range(len(moe_gate_up_proj_biases)):
+                moe_gate_up_proj_biases[_l] = torch.cat(
+                    [moe_gate_up_proj_biases[_l]] * 2, dim=0).contiguous()
+                moe_down_proj_biases[_l] = torch.cat(
+                    [moe_down_proj_biases[_l]] * 2, dim=0).contiguous()
+            print(f"[MOE_BIAS_REP] biases {list(moe_gate_up_proj_biases[0].shape)} "
+                  f"{list(moe_down_proj_biases[0].shape)}", flush=True)
+        # MPK_MOE_REPLICA: a full copy of the MoE weights per memory range.
+        # Duplicating along the expert axis makes the tensor [2E, wgs, bytes];
+        # the driver's halves placement puts [0,E) in range 0 and [E,2E) in
+        # range 1, and the kernel shifts expert_id by NUM_EXPERTS on XCDs 4-7.
+        # Read-only, so no coherence is needed and the MTYPE stays NC.
+        if os.environ.get("MPK_MOE_RW", "0") == "1":
+            # One copy per AID on AID-local GEM BOs (MTYPE_RW). The halves of a
+            # spanning hipMalloc are MTYPE_NC, whose loads measured ~390 ns even
+            # from the local range vs ~100-155 ns for an AID-local BO.
+            import ctypes as _ct
+            _lib = _ct.CDLL(os.environ.get("MPK_AID_ALLOC_SO",
+                "/root/user/aid-local-hbm/tools/libmpk_aid_alloc.so"))
+            _lib.mpk_aid_alloc.restype = _ct.c_void_p
+            _lib.mpk_aid_alloc.argtypes = [_ct.c_ulonglong, _ct.c_int]
+
+            def _aid_copy(t, aid):
+                n = t.numel() * t.element_size()
+                p = _lib.mpk_aid_alloc(n, aid)
+                if not p:
+                    raise RuntimeError("mpk_aid_alloc(%d, %d) failed" % (n, aid))
+
+                class _CAI:
+                    pass
+
+                cai = _CAI()
+                cai.__cuda_array_interface__ = {"shape": (n,), "typestr": "|u1",
+                                                "data": (p, False), "version": 2,
+                                                "strides": None}
+                dst = torch.as_tensor(cai, device="cuda")
+                dst.copy_(t.contiguous().view(torch.uint8).view(-1))
+                return dst.view(t.dtype).view(t.shape), p
+
+            _rw_pairs = []
+            for _l in range(len(moe_gate_up_proj_weights)):
+                for _lst in (moe_gate_up_proj_weights, moe_down_proj_weights):
+                    _c0, _p0 = _aid_copy(_lst[_l], 0)
+                    _c1, _p1 = _aid_copy(_lst[_l], 1)
+                    _MOE_RW_KEEPALIVE.append(_c1)
+                    _AID_RW_PTRS.add(_c0.data_ptr())
+                    _lst[_l] = _c0
+                    _rw_pairs.append("%x:%x" % (_p0, _p1))
+                torch.cuda.synchronize()
+                # Return this layer's freed originals to the driver before the
+                # next layer's GEM allocations.
+                torch.cuda.empty_cache()
+            os.environ["MPK_MOE_RW_MAP"] = ",".join(_rw_pairs)
+            print(f"[MOE_RW] {len(_rw_pairs)} MoE weights in AID-local RW pairs, "
+                  f"gate_up {list(moe_gate_up_proj_weights[0].shape)}", flush=True)
+        elif os.environ.get("MPK_MOE_REPLICA", "0") == "1":
+            _rep_align = os.environ.get("MPK_MOE_REP_ALIGN", "0") == "1"
+            if _rep_align:
+                import ctypes as _ct
+                _hip = _ct.CDLL("libamdhip64.so")
+            for _l in range(len(moe_gate_up_proj_weights)):
+                if _rep_align:
+                    # Copy 0 ends and copy 1 starts on the halves cut, and both
+                    # halves are 2 MiB multiples (min_block_size stays 2 MiB).
+                    _w = moe_gate_up_proj_weights[_l]
+                    _n = _w.numel() * _w.element_size()
+                    _h = -(-_n // (2 << 20)) * (2 << 20)
+                    _p = _ct.c_void_p()
+                    if _hip.hipMalloc(_ct.byref(_p), _ct.c_size_t(2 * _h)) == 0 and _p.value:
+                        class _CAI:
+                            pass
+                        _cai = _CAI()
+                        _cai.__cuda_array_interface__ = {
+                            "shape": (2 * _n,), "typestr": "|u1",
+                            "data": (_p.value + _h - _n, False),
+                            "version": 2, "strides": None}
+                        _rep = torch.as_tensor(_cai, device="cuda").view(_w.dtype)
+                        _rep = _rep.view((2 * _w.shape[0],) + tuple(_w.shape[1:]))
+                        _rep[: _w.shape[0]].copy_(_w)
+                        _rep[_w.shape[0]:].copy_(_w)
+                        torch.cuda.synchronize()
+                        moe_gate_up_proj_weights[_l] = _rep
+                        continue
+                    print(f"[MOE_REP_ALIGN] layer {_l}: hipMalloc failed, torch.cat", flush=True)
+                moe_gate_up_proj_weights[_l] = torch.cat(
+                    [moe_gate_up_proj_weights[_l]] * 2, dim=0).contiguous()
+            for _l in range(len(moe_down_proj_weights)):
+                moe_down_proj_weights[_l] = torch.cat(
+                    [moe_down_proj_weights[_l]] * 2, dim=0).contiguous()
+            print(f"[MOE_REPLICA] gate_up {list(moe_gate_up_proj_weights[0].shape)} "
+                  f"down {list(moe_down_proj_weights[0].shape)}", flush=True)
+
         # --- Build task graph ---
         # Embed layer
         embed_weight = pad_weight_2d(
@@ -2471,9 +2977,395 @@ if __name__ == "__main__":
 
         def _attach_input_keep(torch_tensor, name):
             """attach_input + keep tensor alive to prevent pointer reuse."""
-            _layer_weight_refs.append(torch_tensor)
-            return mpk.attach_input(torch_tensor=torch_tensor, name=name)
+            torch_tensor = _aid_rw_maybe(torch_tensor, name)
+            torch_tensor = _own_bo_maybe(torch_tensor, name)
+            t = mpk.attach_input(torch_tensor=torch_tensor, name=name)
+            # Under MPK_PLACE_ARENA the arena owns the copy: keep its view, so the
+            # original can be freed.
+            placed = mpk.placed_tensor(name)
+            _layer_weight_refs.append(placed if placed is not None else torch_tensor)
+            return t
 
+        # MPK_LAYER_RING: one copy per layer of the buffers a later die reads
+        # across the layer boundary, so no address is reused within a token.
+        _ring = os.environ.get("MPK_LAYER_RING", "0") == "1"
+        if _ring:
+            _ws_ring = [moe_workspace_f32] + [
+                make_tensor(f"moe_workspace_f32_r{j}",
+                            (bs, _ws_mul * num_experts_per_tok * PADDED_HIDDEN_SIZE),
+                            torch_dtype=torch.float32)
+                for j in range(1, num_layers + 1)]
+            _ao_ring = [attn_out] + [
+                make_tensor(f"attn_out_r{j}", (bs, num_local_q_heads * head_dim))
+                for j in range(1, num_layers)]
+            if os.environ.get("MPK_OPROJ_DATA_POLL", "0") == "1":
+                # Every ring copy starts at the value the O-proj polls for.
+                for j in range(1, num_layers):
+                    _tensor_refs[f"attn_out_r{j}"].view(torch.int16).fill_(-1)
+            _apo_ring = [attn_proj_out] + [
+                make_tensor(f"attn_proj_out_r{j}", (bs, PADDED_HIDDEN_SIZE))
+                for j in range(1, num_layers)]
+            if os.environ.get("MPK_WS_FARCOPY", "0") == "1":
+                # Slots a Phase 9 helper copies (the other AID's pairs, in each
+                # AID's copy) start poisoned; the reader waits for the copy.
+                # W[0] (layer 0 reads it) and W[L] (task 212) stay zero.
+                assert _ws_mul == 2, "MPK_WS_FARCOPY needs MPK_WSF32_AID=1"
+                _H = PADDED_HIDDEN_SIZE
+                for _j in range(1, num_layers):
+                    _t = _tensor_refs[f"moe_workspace_f32_r{_j}"]
+                    _t.view(torch.int32)[:, 2 * _H:6 * _H] = 0x7FBADBAD
+                torch.cuda.synchronize()
+                print(f"[WS_FARCOPY] poisoned {num_layers - 1} ring copies", flush=True)
+            print(f"[LAYER_RING] {num_layers} layers: workspace x{len(_ws_ring)}, "
+                  f"attn_out x{len(_ao_ring)}, attn_proj_out x{len(_apo_ring)}", flush=True)
+        if os.environ.get("MPK_EAGLE3", "0") == "1":
+            # EAGLE3 draft head (LMSYS): weights, its KV cache and scratch; the kernel reads the target
+            # features straight from the ring copies of layers 1, 17, 33.
+            assert _ring, "MPK_EAGLE3 reads the MPK_LAYER_RING copies"
+            from safetensors.torch import load_file as _e3_load
+            _e3p = os.environ.get("MPK_EAGLE3_PATH", "/root/user/nps1/models/eagle3/"
+                                  "lmsys_EAGLE3-gpt-oss-120b-bf16/model.safetensors")
+            _e3w = {k: v.to("cuda").contiguous() for k, v in _e3_load(_e3p).items()}
+            _e3_maxpos = int(args.max_seq_length) + 8
+            _e3_kc = torch.zeros((_e3_maxpos, 8, 128), dtype=torch.bfloat16, device="cuda")
+            _e3_vc = torch.zeros_like(_e3_kc)
+            import re as _e3re
+            _e3k = _e3re.search(r"-DMPK_E3_CHAIN=(\d+)", os.environ.get("MPK_EXTRA_FLAGS", ""))
+            _e3k = int(_e3k.group(1)) if _e3k else 1
+            _e3g = _e3re.search(r"-DMPK_E3_ATTN_GQA=(\d+)", os.environ.get("MPK_EXTRA_FLAGS", ""))
+            _e3g = int(_e3g.group(1)) if _e3g else 0
+            # E3_V_TOTAL (chain steps >= 1 at 131072 + (step - 1) * 65536), then E3_K x E3_GQA_SZ
+            _e3t = _e3re.search(r"-DMPK_VTN_T=(\d+)", os.environ.get("MPK_EXTRA_FLAGS", ""))
+            _e3b = 163840 if (_e3t and int(_e3t.group(1)) > 4) else 131072  # E3_V_FLOATS (block > 4 layout)
+            _e3_vec = torch.zeros((_e3b + (_e3k - 1) * 65536 + _e3k * 8 * _e3g * 4 * 130,),
+                                  dtype=torch.float32, device="cuda")
+            _e3_out = torch.zeros((32 if (os.environ.get("MPK_TAIL_NO111", "0") == "1" or
+                                          os.environ.get("MPK_TAIL_NO111_CHECK", "0") == "1") else 16,),
+                                  dtype=torch.int64, device="cuda")  # MPK_E3_CONF: probabilities in 8..15
+            _e3_apo = [_tensor_refs[f"attn_proj_out_r{_L}"] for _L in (1, 17, 33)]
+            _e3_ws = [_tensor_refs[f"moe_workspace_f32_r{_L + 1}"] for _L in (1, 17, 33)]
+            _m = "midlayer."
+            _e3_list = [_e3w["fc.weight"], _e3w[_m + "self_attn.q_proj.weight"], _e3w[_m + "self_attn.k_proj.weight"],
+                        _e3w[_m + "self_attn.v_proj.weight"], _e3w[_m + "self_attn.o_proj.weight"],
+                        _e3w[_m + "mlp.gate_proj.weight"], _e3w[_m + "mlp.up_proj.weight"],
+                        _e3w[_m + "mlp.down_proj.weight"], _e3w["lm_head.weight"],
+                        _e3w[_m + "hidden_norm.weight"], _e3w[_m + "input_layernorm.weight"],
+                        _e3w[_m + "post_attention_layernorm.weight"], _e3w["norm.weight"],
+                        _e3w["embed_tokens.weight"], _e3w["d2t"],
+                        _e3_kc, _e3_vc, _e3_vec, _e3_out] + _e3_apo + _e3_ws
+            if os.environ.get("MPK_EAGLE3_FP8", "0") == "1":
+                # e4m3 per output row (scale = max|row| / 448); scales appended after the 25 pointers.
+                _e3_sc = []
+                _e3_q4 = "MPK_E3_FP4" in os.environ.get("MPK_EXTRA_FLAGS", "")
+
+                def _e3_mxfp4(_x):
+                    # e2m1 nibbles (value 2j in the low nibble of byte j), one E8M0 scale per 32 values; the
+                    # scales lane-pair major for 16-value chunks c = lane + 64 i: byte (lane >> 1) * ITP + i
+                    # is block (lane >> 1) + 32 i (the kernel's E3Q4 layout).
+                    _O, _K = _x.shape
+                    _it = (_K // 16 + 63) // 64
+                    _itp = (_it + 3) & ~3
+                    _wf = _x.float().view(_O, _K // 32, 32)
+                    _amax = _wf.abs().amax(-1, keepdim=True).clamp_min(1e-30)
+                    _ex = (torch.floor(torch.log2(_amax)) - 2).clamp(-126, 127)
+                    _q = (_wf / torch.pow(2.0, _ex)).clamp(-6.0, 6.0)
+                    _grid = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=_x.device)
+                    _code = torch.empty(_q.shape, dtype=torch.uint8, device=_x.device)
+                    for _r0 in range(0, _O, 1024):
+                        _qm = _q[_r0:_r0 + 1024]
+                        _ix = (_qm.abs().unsqueeze(-1) - _grid).abs().argmin(-1).to(torch.uint8)
+                        _code[_r0:_r0 + 1024] = _ix | ((_qm < 0).to(torch.uint8) << 3)
+                    _code = _code.view(_O, _K)
+                    _data = (_code[:, 0::2] | (_code[:, 1::2] << 4)).contiguous()
+                    _e8 = (_ex.view(_O, _K // 32) + 127).to(torch.uint8)
+                    _sc = torch.full((_O, 32, _itp), 127, dtype=torch.uint8, device=_x.device)
+                    for _j in range(_it):
+                        _b = torch.arange(32, device=_x.device) + 32 * _j
+                        _ok = _b < _K // 32
+                        _sc[:, _ok, _j] = _e8[:, _b[_ok]]
+                    return _data, _sc.view(_O, 32 * _itp).contiguous()
+
+                _e3_q4m = "MPK_E3_Q4M" in os.environ.get("MPK_EXTRA_FLAGS", "")
+
+                def _e3_mxfp4n(_x):
+                    # MXFP4 for the draft's MFMA GEMVs: rows padded to a multiple of 128 inputs, value 2j in the
+                    # low nibble of byte j, one E8M0 scale per 32 contiguous values -> ([O, Kp/2], [O, Kp/32]).
+                    _O, _K = _x.shape
+                    _Kp = (_K + 127) // 128 * 128
+                    _wf = torch.nn.functional.pad(_x.float(), (0, _Kp - _K)).view(_O, _Kp // 32, 32)
+                    _amax = _wf.abs().amax(-1, keepdim=True).clamp_min(1e-30)
+                    _ex = (torch.floor(torch.log2(_amax)) - 2).clamp(-126, 127)
+                    _q = (_wf / torch.pow(2.0, _ex)).clamp(-6.0, 6.0)
+                    _grid = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=_x.device)
+                    _code = torch.empty(_q.shape, dtype=torch.uint8, device=_x.device)
+                    for _r0 in range(0, _O, 1024):
+                        _qm = _q[_r0:_r0 + 1024]
+                        _ix = (_qm.abs().unsqueeze(-1) - _grid).abs().argmin(-1).to(torch.uint8)
+                        _code[_r0:_r0 + 1024] = _ix | ((_qm < 0).to(torch.uint8) << 3)
+                    _code = _code.view(_O, _Kp)
+                    _data = (_code[:, 0::2] | (_code[:, 1::2] << 4)).contiguous()
+                    _e8 = (_ex.view(_O, _Kp // 32) + 127).to(torch.uint8)
+                    return _e3_mxfp4k(_data, _e8)
+
+                def _e3_mxfp4k(_data, _e8):
+                    # K-major MFMA tiles: fragment (16-row tile, K tile kt) = 1 KB in lane order, lane = g * 16 +
+                    # col holding row 16 tile + col, bytes kt * 64 + g * 16 .. + 16; scales 64 bytes per K tile in
+                    # lane order, 4 K tiles per 256-byte group (byte j of lane l's word = K tile 4 kq + j).
+                    _O, _H = _data.shape
+                    _KT = _H // 64
+                    _KQ = (_KT + 3) // 4
+                    _dk = _data.view(_O // 16, 16, _KT, 4, 16).permute(0, 2, 3, 1, 4).contiguous()
+                    _ek = _e8.view(_O // 16, 16, _KT, 4)
+                    _ek = torch.nn.functional.pad(_ek, (0, 0, 0, _KQ * 4 - _KT), value=127)
+                    _ek = _ek.view(_O // 16, 16, _KQ, 4, 4).permute(0, 2, 4, 1, 3).contiguous()
+                    return _dk.view(_O // 16, -1), _ek.view(_O // 16, -1)
+
+                for _i in range(9):
+                    if _e3_q4m and _i >= 5:  # gate, up, down, lm_head
+                        _d4, _s4 = _e3_mxfp4n(_e3_list[_i])
+                        _e3_list[_i] = _d4
+                        _e3_sc.append(_s4)
+                        continue
+                    if _e3_q4 and _i >= 5:  # gate, up, down, lm_head
+                        _d4, _s4 = _e3_mxfp4(_e3_list[_i])
+                        _e3_list[_i] = _d4
+                        _e3_sc.append(_s4)
+                        continue
+                    _w = _e3_list[_i].float()
+                    _s = (_w.abs().amax(dim=1, keepdim=True) / 448.0).clamp_min(1e-12)
+                    _e3_list[_i] = (_w / _s).to(torch.float8_e4m3fn).view(torch.uint8).contiguous()
+                    _e3_sc.append(_s.reshape(-1).contiguous())
+                    del _w
+                if "MPK_E3_Q8M" in os.environ.get("MPK_EXTRA_FLAGS", ""):
+                    def _e3_q8k(_dd, _ss, _rope):
+                        # K-major e4m3 MFMA tiles: rows padded to 128 inputs; fragment (16-row tile, K tile kt) =
+                        # 2 KB, half h = 1 KB in lane order (lane = g * 16 + col: row col's bytes kt * 128 + h * 64 +
+                        # g * 16 .. + 16). _rope: tile j of head h = rows h * 128 + {8j..8j+7, 64+8j..64+8j+7}.
+                        _O, _K = _dd.shape
+                        if _rope:
+                            _hh = torch.arange(_O // 128, device=_dd.device).view(-1, 1, 1)
+                            _jj = torch.arange(8, device=_dd.device).view(1, -1, 1)
+                            _ii = torch.arange(16, device=_dd.device).view(1, 1, -1)
+                            _pm = (_hh * 128 + torch.where(_ii < 8, 8 * _jj + _ii, 64 + 8 * _jj + _ii - 8)).reshape(-1)
+                            _dd, _ss = _dd[_pm], _ss[_pm]
+                        _Kp = (_K + 127) // 128 * 128
+                        _dp = torch.zeros((_O, _Kp), dtype=torch.uint8, device=_dd.device)
+                        _dp[:, :_K] = _dd
+                        _dk = _dp.view(_O // 16, 16, _Kp // 128, 2, 4, 16).permute(0, 2, 3, 4, 1, 5).contiguous()
+                        return _dk.view(_O // 16, -1), _ss.contiguous()
+
+                    for _i, _rp in ((0, False), (1, True), (2, True), (3, True), (4, False)):
+                        _e3_list[_i], _e3_sc[_i] = _e3_q8k(_e3_list[_i], _e3_sc[_i], _rp)
+                    print("[EAGLE3] fc, q, k, v, o_proj as K-major e4m3 MFMA tiles", flush=True)
+                _e3_list = _e3_list + _e3_sc
+                print("[EAGLE3] draft projections in fp8 e4m3 (per-row scale)%s" % (
+                    "; gate, up, down, lm_head in MXFP4" if _e3_q4 else
+                    "; gate, up, down, lm_head in MXFP4 (MFMA)" if _e3_q4m else ""), flush=True)
+            if os.environ.get("MPK_E3_OWN_BO", "0") == "1" or os.environ.get("MPK_E3_BOMAP", "0") == "1":
+                # The workers on dies 0-3 read the first half of each projection's rows, dies 4-7 the second.
+                import ctypes as _e3ct
+                _e3hip = _e3ct.CDLL("libamdhip64.so")
+
+                def _e3_where(_x):
+                    _b, _sz = _e3ct.c_void_p(), _e3ct.c_size_t()
+                    _e3hip.hipMemGetAddressRange(_e3ct.byref(_b), _e3ct.byref(_sz), _e3ct.c_void_p(_x.data_ptr()))
+                    _n = _x.numel() * _x.element_size()
+                    _p, _bb, _ss = _x.data_ptr(), _b.value or 0, _sz.value
+                    _cut = _bb + ((_ss >> 1) // (2 << 20)) * (2 << 20)
+                    return _ss, _p - _bb, max(0, min(_p + _n, _cut) - _p) / _n
+
+                for _i, _nm in enumerate(("fc", "wq", "wk", "wv", "wo", "wg", "wu", "wd", "wlm")):
+                    _t = _e3_list[_i]
+                    _n = _t.numel() * _t.element_size()
+                    _s0, _o0, _f0 = _e3_where(_t)
+                    _msg = f"[E3BO] {_nm} n={_n} bo=+{_s0} off={_o0} in_first_half={_f0:.3f}"
+                    if os.environ.get("MPK_E3_OWN_BO", "0") == "1":
+                        _chunk = 2 << 20
+                        _split = _n // 2
+                        _half = -(-max(_split, _n - _split) // _chunk) * _chunk
+                        _off_in = ((_half - _split) // 256) * 256
+                        _ptr = _e3ct.c_void_p()
+                        if int(os.environ.get("MPK_MULTI_DEV", "0") or 0) > 1:  # MDEV_E3_OWN_BO: halves over AIDs
+                            from mirage.mpk.placement import halves_malloc, w_swap
+                            _ptr.value, _rc = halves_malloc(2 * _half, swap=w_swap()), 0
+                        else:
+                            _rc = _e3hip.hipMalloc(_e3ct.byref(_ptr), _e3ct.c_size_t(2 * _half))
+                        if _rc == 0 and _ptr.value:
+                            class _E3CAI:
+                                pass
+
+                            _cai = _E3CAI()
+                            _cai.__cuda_array_interface__ = {"shape": (_n,), "typestr": "|u1",
+                                                             "data": (_ptr.value + _off_in, False),
+                                                             "version": 2, "strides": None}
+                            _own = torch.as_tensor(_cai, device="cuda").view(_t.dtype).view(_t.shape)
+                            _own.copy_(_t)
+                            torch.cuda.synchronize()
+                            _OWN_BO_KEEPALIVE.append((_e3hip, _ptr, _own))
+                            _e3_list[_i] = _own
+                            _s1, _o1, _f1 = _e3_where(_own)
+                            _msg += f" -> own bo=+{_s1} off={_o1} in_first_half={_f1:.3f}"
+                        else:
+                            _msg += f" -> hipMalloc rc={_rc}, kept"
+                    print(_msg, flush=True)
+            os.environ["MPK_EAGLE3_PTRS"] = ",".join("%x" % _t.data_ptr() for _t in _e3_list)
+            os.environ["MPK_EAGLE3_WS_STRIDE"] = str(_e3_ws[0].shape[-1])
+            os.environ["MPK_EAGLE3_MAXPOS"] = str(_e3_maxpos)
+            os.environ["MPK_EAGLE3_NW"] = str(mpk.num_workers)
+            if os.environ.get("MPK_EAGLE3_OFF", "0") == "1":
+                os.environ.pop("MPK_EAGLE3_PTRS")  # compiled in, disabled at launch
+            globals()["_E3_KEEP"] = (_e3w, _e3_list)
+            print(f"[EAGLE3] {len(_e3w)} tensors from {_e3p}; maxpos {_e3_maxpos}, ws stride "
+                  f"{_e3_ws[0].shape[-1]}, workers {mpk.num_workers}", flush=True)
+        if os.environ.get("MPK_DFLASH", "0") == "1":
+            # DFlash block drafter (z-lab): weights as e4m3 K-major MFMA tiles (per-row scales), the target LM head
+            # as MXFP4 tiles, the per-layer context K/V cache and scratch; the kernel reads the target features
+            # straight from the ring copies of layers 1, 9, 17, 25, 33.
+            assert _ring, "MPK_DFLASH reads the MPK_LAYER_RING copies"
+            assert os.environ.get("MPK_EAGLE3", "0") != "1", "MPK_DFLASH replaces MPK_EAGLE3"
+            from safetensors.torch import load_file as _df_load
+            _dfd = os.environ.get("MPK_DFLASH_PATH", "/root/user/nps1/models/drafters/z-lab_gpt-oss-120b-DFlash")
+            _dfc = json.load(open(os.path.join(_dfd, "config.json")))
+            assert _dfc["dflash_config"]["target_layer_ids"] == [1, 9, 17, 25, 33]
+            assert _dfc["dflash_config"]["mask_token_id"] == 200000 and _dfc["num_hidden_layers"] == 8
+            _dfw = {(_k[6:] if _k.startswith("model.") else _k): _v.to("cuda")
+                    for _k, _v in _df_load(os.path.join(_dfd, "model.safetensors")).items()}
+            _df_maxpos = int(args.max_seq_length) + 16
+
+            def _df_q8(_w):
+                # e4m3 per output row; fragment (16-row tile, 128-wide K tile) = 2 KB, half h = 1 KB in lane order
+                # (lane g * 16 + c holds row c's bytes kt * 128 + h * 64 + g * 16 .. + 16).
+                _w = _w.float()
+                _O, _K = _w.shape
+                _s = (_w.abs().amax(dim=1, keepdim=True) / 448.0).clamp_min(1e-12)
+                _q = (_w / _s).to(torch.float8_e4m3fn).view(torch.uint8)
+                _Kp = (_K + 127) // 128 * 128
+                _dp = torch.zeros((_O, _Kp), dtype=torch.uint8, device="cuda")
+                _dp[:, :_K] = _q
+                _dk = _dp.view(_O // 16, 16, _Kp // 128, 2, 4, 16).permute(0, 2, 3, 4, 1, 5).contiguous()
+                return _dk.view(-1), _s.reshape(-1).contiguous()
+
+            def _df_layers(_name):
+                _dd, _ss = zip(*[_df_q8(_dfw["layers.%d.%s.weight" % (_l, _name)]) for _l in range(8)])
+                return torch.cat(_dd).contiguous(), torch.cat(_ss).contiguous()
+
+            def _df_cat(_name, _dt):
+                return torch.cat([_dfw["layers.%d.%s" % (_l, _name)].reshape(-1).to(_dt) for _l in range(8)]).contiguous()
+
+            _df_fc, _df_sfc = _df_q8(_dfw["fc.weight"])
+            _df_names = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+                         "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+            _df_m = {_nm: _df_layers(_nm) for _nm in _df_names}
+            _df_bias = [_df_cat("self_attn.%s_proj.bias" % _x, torch.float32) for _x in "qkvo"]
+            _df_norm = [_df_cat(_x, torch.bfloat16) for _x in ("self_attn.q_norm.weight", "self_attn.k_norm.weight",
+                                                                "input_layernorm.weight", "post_attention_layernorm.weight")]
+            _df_nhid = _dfw["hidden_norm.weight"].to(torch.bfloat16).contiguous()
+            _df_nfin = _dfw["norm.weight"].to(torch.bfloat16).contiguous()
+
+            def _df_mxfp4(_x):
+                # MXFP4 K-major tiles: K padded to 128; value 2j in the low nibble of byte j, one E8M0 scale per 32
+                # values; fragment (tile, K tile) = 1 KB in lane order (lane g * 16 + c: row c, bytes kt * 64 +
+                # g * 16 .. + 16); scales 64 bytes per K tile in lane order, 4 K tiles per 256-byte group.
+                _O, _K = _x.shape
+                _Kp = (_K + 127) // 128 * 128
+                _KT = _Kp // 128
+                _KQ = (_KT + 3) // 4
+                _grid = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device="cuda")
+                _dk_all, _ek_all = [], []
+                for _r0 in range(0, _O, 4096):
+                    _wf = torch.nn.functional.pad(_x[_r0:_r0 + 4096].float(), (0, _Kp - _K))
+                    _o = _wf.shape[0]
+                    _wf = _wf.view(_o, _Kp // 32, 32)
+                    _amax = _wf.abs().amax(-1, keepdim=True).clamp_min(1e-30)
+                    _ex = (torch.floor(torch.log2(_amax)) - 2).clamp(-126, 127)
+                    _q = (_wf / torch.pow(2.0, _ex)).clamp(-6.0, 6.0)
+                    _ix = (_q.abs().unsqueeze(-1) - _grid).abs().argmin(-1).to(torch.uint8)
+                    _code = (_ix | ((_q < 0).to(torch.uint8) << 3)).view(_o, _Kp)
+                    _data = (_code[:, 0::2] | (_code[:, 1::2] << 4)).contiguous()
+                    _e8 = (_ex.view(_o, _Kp // 32) + 127).to(torch.uint8)
+                    _dk = _data.view(_o // 16, 16, _KT, 4, 16).permute(0, 2, 3, 1, 4).contiguous()
+                    _ek = _e8.view(_o // 16, 16, _KT, 4)
+                    _ek = torch.nn.functional.pad(_ek, (0, 0, 0, _KQ * 4 - _KT), value=127)
+                    _ek = _ek.view(_o // 16, 16, _KQ, 4, 4).permute(0, 2, 4, 1, 3).contiguous()
+                    _dk_all.append(_dk.view(-1))
+                    _ek_all.append(_ek.view(-1))
+                    del _wf, _amax, _ex, _q, _ix, _code, _data, _e8
+                return torch.cat(_dk_all).contiguous(), torch.cat(_ek_all).contiguous()
+
+            _df_lmw = model.lm_head.weight
+            assert tuple(_df_lmw.shape) == (201088, 2880), _df_lmw.shape
+            _df_wlm, _df_slm = _df_mxfp4(_df_lmw)
+            _df_emb = model.model.embed_tokens.weight
+            assert tuple(_df_emb.shape) == (201088, 2880) and _df_emb.dtype == torch.bfloat16 and _df_emb.is_contiguous()
+            # YaRN RoPE (transformers _compute_yarn_parameters), cos/sin rounded to bf16 as the reference applies them
+            _rs = _dfc["rope_scaling"]
+            _rb, _rdim, _rfac = float(_dfc["rope_theta"]), 64, float(_rs["factor"])
+            _romax = _rs["original_max_position_embeddings"]
+            _ratt = 0.1 * math.log(_rfac) + 1.0
+
+            def _df_corr(_nr):
+                return (_rdim * math.log(_romax / (_nr * 2 * math.pi))) / (2 * math.log(_rb))
+            _rlo, _rhi = _df_corr(_rs.get("beta_fast", 32)), _df_corr(_rs.get("beta_slow", 1))
+            if _rs.get("truncate", True):
+                _rlo, _rhi = math.floor(_rlo), math.ceil(_rhi)
+            _rlo, _rhi = max(_rlo, 0), min(_rhi, _rdim - 1)
+            if _rlo == _rhi:
+                _rhi += 0.001
+            _rpf = _rb ** (torch.arange(0, _rdim, 2, dtype=torch.float32, device="cuda") / _rdim)
+            _rramp = ((torch.arange(_rdim // 2, dtype=torch.float32, device="cuda") - _rlo) / (_rhi - _rlo)).clamp(0, 1)
+            _rinv = (1.0 / (_rfac * _rpf)) * _rramp + (1.0 / _rpf) * (1 - _rramp)
+            _rfr = torch.arange(_df_maxpos, dtype=torch.float32, device="cuda")[:, None] * _rinv[None, :]
+            _df_rope = torch.cat([(_rfr.cos() * _ratt).to(torch.bfloat16).float(),
+                                  (_rfr.sin() * _ratt).to(torch.bfloat16).float()], -1).contiguous()
+            _df_kc = torch.zeros((8, _df_maxpos, 8, 64), dtype=torch.bfloat16, device="cuda")
+            _df_vc = torch.zeros_like(_df_kc)
+            _df_vec = torch.zeros((4194304,), dtype=torch.float32, device="cuda")
+            _df_out = torch.zeros((16,), dtype=torch.int64, device="cuda")
+            _df_apo = [_tensor_refs[f"attn_proj_out_r{_L}"] for _L in (1, 9, 17, 25, 33)]
+            _df_ws = [_tensor_refs[f"moe_workspace_f32_r{_L + 1}"] for _L in (1, 9, 17, 25, 33)]
+            _df_list = ([_df_fc] + [_df_m[_nm][0] for _nm in _df_names] + [_df_sfc] + [_df_m[_nm][1] for _nm in _df_names] +
+                        _df_bias + _df_norm + [_df_nhid, _df_nfin, _df_wlm, _df_slm, _df_emb, _df_rope,
+                                               _df_kc, _df_vc, _df_vec, _df_out] + _df_apo + _df_ws)
+            assert len(_df_list) == 44
+            torch.cuda.synchronize()
+            _df_ptrs = [_t.data_ptr() for _t in _df_list]
+            if "-DMPK_DF_NO_HALVES" not in os.environ.get("MPK_EXTRA_FLAGS", ""):
+                # MPK_DF_HALVES (the kernel's default): each large weight is one halves_malloc buffer whose region d
+                # (physically on AID d) holds the tiles of device d's workers for every layer: [layer][tile][bytes],
+                # tiles [0, T / 2) in region 0 and [T / 2, T) in region 1. Every weight byte is read from the reader's
+                # own AID, and both AIDs' HBM stream at once.
+                from mirage.mpk.placement import halves_malloc as _df_hm, copy_d2d as _df_cp
+
+                def _df_halves(_t, _L, _T, _TB):
+                    _T0 = _T // 2
+                    _half = -(-(_L * max(_T0, _T - _T0) * _TB) // (2 << 20)) * (2 << 20)
+                    _p = _df_hm(2 * _half)
+                    assert _p, "[DFLASH] halves_malloc failed"
+                    _v = _t.view(torch.uint8).reshape(_L, _T, _TB)
+                    _df_cp(_p, _v[:, :_T0].contiguous())
+                    _df_cp(_p + _half, _v[:, _T0:].contiguous())
+                    return _p
+
+                _df_spl = {0: (1, 180, 113 * 2048), 1: (8, 256, 23 * 2048), 2: (8, 32, 23 * 2048), 3: (8, 32, 23 * 2048),
+                           4: (8, 180, 32 * 2048), 5: (8, 480, 23 * 2048), 6: (8, 480, 23 * 2048),
+                           7: (8, 180, 60 * 2048), 26: (1, 12568, 23 * 1024), 27: (1, 12568, 1536)}
+                for _i, (_L, _T, _TB) in _df_spl.items():
+                    _t = _df_list[_i]
+                    assert _t.numel() * _t.element_size() == _L * _T * _TB, (_i, _t.numel(), _L, _T, _TB)
+                    _df_ptrs[_i] = _df_halves(_t, _L, _T, _TB)
+                torch.cuda.synchronize()
+                print("[DFLASH] weights split over the two AIDs (fc, q/k/v/o, gate/up/down, LM head + scales)", flush=True)
+            os.environ["MPK_DFLASH_PTRS"] = ",".join("%x" % _p for _p in _df_ptrs)
+            os.environ["MPK_DFLASH_WS_STRIDE"] = str(_df_ws[0].shape[-1])
+            os.environ["MPK_DFLASH_MAXPOS"] = str(_df_maxpos)
+            os.environ["MPK_DFLASH_NW"] = str(mpk.num_workers)
+            if os.environ.get("MPK_DFLASH_OFF", "0") == "1":
+                os.environ.pop("MPK_DFLASH_PTRS")  # compiled in, disabled at launch
+            globals()["_DF_KEEP"] = (_dfw, _df_list, _df_m)
+            print(f"[DFLASH] {len(_dfw)} tensors from {_dfd}; maxpos {_df_maxpos}; e4m3 drafter "
+                  f"{sum(_t.numel() for _t in [_df_fc] + [_df_m[_nm][0] for _nm in _df_names]) / 1e6:.0f} MB, "
+                  f"LM head MXFP4 {(_df_wlm.numel() + _df_slm.numel()) / 1e6:.0f} MB, workers {mpk.num_workers}",
+                  flush=True)
         fused_tail_done = False
         for i in range(num_layers):
             layer = model.model.layers[i]
@@ -2484,6 +3376,11 @@ if __name__ == "__main__":
                 layer.input_layernorm.weight,
                 PADDED_HIDDEN_SIZE, pad_value=0.0
             )
+            # MPK_GAMMA_AID: one gamma copy per memory range (read-only,
+            # so the copies are identical and need no publish).
+            if os.environ.get("MPK_GAMMA_AID", "0") == "1":
+                norm_w_padded = torch.cat([norm_w_padded, norm_w_padded],
+                                          dim=0).contiguous()
             w_norm = _attach_input_keep(
                 norm_w_padded,
                 f"layer_{i}_input_layernorm",
@@ -2629,6 +3526,11 @@ if __name__ == "__main__":
                         layer.post_attention_layernorm.weight,
                         PADDED_HIDDEN_SIZE, pad_value=0.0
                     )
+                    # MPK_GAMMA_AID: one gamma copy per memory range.
+                    if os.environ.get("MPK_GAMMA_AID", "0") == "1":
+                        post_norm_w_padded = torch.cat(
+                            [post_norm_w_padded, post_norm_w_padded],
+                            dim=0).contiguous()
                     w_norm_moe = _attach_input_keep(
                         post_norm_w_padded, f"layer_{i}_post_attn_layernorm",
                     )
@@ -2651,6 +3553,10 @@ if __name__ == "__main__":
                     w2_bias = _attach_input_keep(
                         moe_down_proj_biases[i], f"layer_{i}_down_bias"
                     )
+                    if _arena_mode:
+                        # The arena now holds this layer's MoE copies.
+                        moe_gate_up_proj_weights[i] = moe_down_proj_weights[i] = None
+                        moe_gate_up_proj_biases[i] = moe_down_proj_biases[i] = None
                     if fuse_tail and i == num_layers - 1:
                         # Last layer: fuse tail (resadd + LM head + argmax) into type 217
                         final_norm_w_padded = pad_weight_1d(
@@ -2737,7 +3643,10 @@ if __name__ == "__main__":
                     else:
                         mpk.gang_full_layer_fused_layer(
                             # QKV+Attn inputs
-                            workspace_f32=(moe_ws_zero if (_lm_resadd and i == 0) else moe_workspace_f32),
+                            # Under the ring nothing writes _ws_ring[0], so it stays zero.
+                            workspace_f32=(_ws_ring[i] if _ring
+                                           else (moe_ws_zero if (_lm_resadd and i == 0)
+                                                 else moe_workspace_f32)),
                             residual=x,
                             norm_weight_pre=w_norm,
                             norm_scratch_pre=rmsnorm_out,
@@ -2768,14 +3677,14 @@ if __name__ == "__main__":
                             k_cache=k_cache,
                             v_cache=v_cache,
                             q_workspace=ck_fmha_q_ws,
-                            o_acc=attn_out,
+                            o_acc=(_ao_ring[i] if _ring else attn_out),
                             # O-proj+TopK+MoE outputs
-                            attn_proj_out=attn_proj_out,
+                            attn_proj_out=(_apo_ring[i] if _ring else attn_proj_out),
                             topk_weight=moe_topk_weight,
                             routing_indices=moe_routing_indices,
                             active_expert_ids=moe_mask,
                             routing_weight_moe=moe_topk_weight,
-                            moe_workspace_f32=moe_workspace_f32,
+                            moe_workspace_f32=(_ws_ring[i + 1] if _ring else moe_workspace_f32),
                             # Parameters
                             actual_hidden_dim=hidden_size,
                             qkv_output_per_wg=qkv_output_per_wg,
@@ -2793,11 +3702,11 @@ if __name__ == "__main__":
                             w2_output_per_wg=w2_output_per_wg,
                             block_dim=(256, 1, 1),
                         )
-                    x = attn_proj_out
+                    x = (_apo_ring[i] if _ring else attn_proj_out)
                     # Last layer needs explicit residual add (f32→bf16)
                     if i == num_layers - 1 and not fused_tail_done and not _lm_resadd:
                         mpk.moe_residual_add_f32_layer(
-                            workspace_f32=moe_workspace_f32,
+                            workspace_f32=(_ws_ring[num_layers] if _ring else moe_workspace_f32),
                             residual=x,
                             output=mlp_weighted_sum_out,
                             grid_dim=(1, 1, 1),
@@ -3230,6 +4139,51 @@ if __name__ == "__main__":
             w_norm = mpk.attach_input(
                 torch_tensor=final_norm_w_padded, name="model_norm_weight"
             )
+            if (os.environ.get("MPK_BOMAP", "0") == "1"
+                    or os.environ.get("MPK_LM_OWN_BO", "0") == "1"):
+                import ctypes as _ct
+                _hip = _ct.CDLL("libamdhip64.so")
+
+                def _bomap(t, what):
+                    # Halves placement cuts a BO at its own midpoint, so a
+                    # tensor carved from a bigger segment can sit in one range.
+                    base, size = _ct.c_void_p(), _ct.c_size_t()
+                    rc = _hip.hipMemGetAddressRange(
+                        _ct.byref(base), _ct.byref(size),
+                        _ct.c_void_p(t.data_ptr()))
+                    p = t.data_ptr()
+                    n = t.numel() * t.element_size()
+                    b, s = base.value or 0, size.value
+                    cut = b + ((s >> 1) // (2 << 20)) * (2 << 20)
+                    lo = max(0, min(p + n, cut) - p)
+                    print(f"[BOMAP] {what} rc={rc} tensor=0x{p:x}+{n} "
+                          f"bo=0x{b:x}+{s} off={p - b} "
+                          f"in_first_half={lo / max(n, 1):.3f}", flush=True)
+
+                _bomap(lm_head_packed, "lm_head_packed")
+                if os.environ.get("MPK_LM_OWN_BO", "0") == "1":
+                    _n = lm_head_packed.numel() * lm_head_packed.element_size()
+                    _ptr = _ct.c_void_p()
+                    _rc = _hip.hipMalloc(_ct.byref(_ptr), _ct.c_size_t(_n))
+                    assert _rc == 0 and _ptr.value, f"hipMalloc rc={_rc}"
+
+                    class _CAI:
+                        pass
+
+                    _cai = _CAI()
+                    _cai.__cuda_array_interface__ = {
+                        "shape": (_n,), "typestr": "|u1",
+                        "data": (_ptr.value, False), "version": 2,
+                        "strides": None,
+                    }
+                    _own = torch.as_tensor(_cai, device="cuda").view(
+                        lm_head_packed.dtype).view(lm_head_packed.shape)
+                    _own.copy_(lm_head_packed)
+                    torch.cuda.synchronize()
+                    globals().setdefault("_LM_OWN_KEEPALIVE", []).append(
+                        (_hip, _ptr, _own))
+                    lm_head_packed = _own
+                    _bomap(lm_head_packed, "lm_head_packed(own BO)")
             w_proj_mxfp4 = mpk.attach_input(
                 torch_tensor=lm_head_packed, name="lm_head_mxfp4")
             lm_head_zero_bias = torch.zeros(
@@ -3252,8 +4206,10 @@ if __name__ == "__main__":
                 output_per_wg=lm_head_output_per_wg,
                 output_stride=vocab_size,
                 block_dim=(256, 1, 1),
-                ppl_logits=(moe_workspace_f32 if _lm_resadd else ppl_logits),
+                ppl_logits=((_ws_ring[num_layers] if _ring else moe_workspace_f32)
+                            if _lm_resadd else ppl_logits),
             )
+            # MPK_TAIL_NO111 keeps this task as the end-of-pass marker (its body returns at once).
             mpk.argmax_reduce_layer(
                 input=(argmax_part_value, argmax_part_index),
                 output=argmax_out,
@@ -3284,6 +4240,19 @@ if __name__ == "__main__":
     # methodology requires MPK to be reachable the same way. Everything above
     # -- weights, tensors, the compiled megakernel -- is already resident, so
     # serving hangs off this point rather than duplicating the setup.
+    if os.environ.get("MPK_PROVIDER_EXPORT") and args.use_mirage:
+        # libAiterMK provider export: the device state the kernel's pointers land in, before any launch.
+        from mirage.mpk import provider_export
+        provider_export.dump_state(mpk, _tensor_refs)
+    if getattr(args, "vllm_session", False):
+        # The caller exec'd this file in a namespace it keeps alive (the compiled kernel holds raw
+        # pointers into these tensors); hand it the session and stop here.
+        class MPKSessionReady(Exception):
+            pass
+        raise MPKSessionReady(dict(
+            args=args, mpk=mpk, tokenizer=tokenizer, tokens=tokens,
+            prompt_lengths=prompt_lengths, step=step, num_new_tokens=num_new_tokens,
+            config=config, reset_device_barriers=reset_device_barriers))
     if getattr(args, "serve", False):
         serve_mpk(
             args=args, mpk=mpk, tokenizer=tokenizer, tokens=tokens,
@@ -3660,6 +4629,13 @@ if __name__ == "__main__":
             r"\[FWD_PASS\] iter=(\d+) time_ms=([\d.]+)", _captured
         ):
             _fwd_times[int(_m.group(1))] = float(_m.group(2))
+        # Long runs: emit the per-iteration trace (latency vs context), 250 per line.
+        if len(_fwd_times) >= int(os.environ.get("MPK_FWDTRACE_MIN", "2000")):
+            _it = sorted(_fwd_times.items())
+            for _c in range(0, len(_it), 250):
+                print("[FWDTRACE] " + " ".join(
+                    f"{_k}:{_v:.3f}" for _k, _v in _it[_c:_c + 250]))
+            sys.stdout.flush()
 
         # The device-side per-iter ring holds FWDPASS_LOG_MAX (8192) samples.
         # Longer runs drop the tail, and since per-iter latency grows with
@@ -3788,11 +4764,12 @@ if __name__ == "__main__":
                 # `n_last = ((n_ppl - 1) % bt) + 1` of them.
                 n_last = ((n_ppl - 1) % bt) + 1
                 last_base = n_ppl - n_last + 1
-                wpx = mpk.num_workers // 8               # workers per XCD
-                nwg = (vocab_size // lm_head_output_per_wg) // 8
+                _nx = int(os.environ.get("MPK_NUM_XCDS", "8"))
+                wpx = mpk.num_workers // _nx
+                nwg = (vocab_size // lm_head_output_per_wg) // _nx
                 # Column sets are token-independent -- build them once.
                 col_sets = []
-                for p in range(8):
+                for p in range(int(os.environ.get("MPK_NUM_XCDS", "8"))):
                     pstart = p * nwg * lm_head_output_per_wg
                     for r in range(wpx):
                         col_sets.append(torch.cat([
@@ -3902,6 +4879,7 @@ if __name__ == "__main__":
             slice_end = min(end0, pl0 + MAX_SAVE_TOKENS)
             out = {
                 "token_ids": gen0[pl0:slice_end].tolist(),
+                "prompt_ids": gen0[:pl0].tolist(),
                 "text": tokenizer.decode(gen0[:end0], skip_special_tokens=True),
                 "generate_length": max(0, end0 - pl0),
                 "mode": "mpk",
@@ -3909,6 +4887,35 @@ if __name__ == "__main__":
             with open(save_path, "w") as f:
                 json.dump(out, f, indent=2)
             print(f"Saved tokens to {save_path}")
+
+        if os.environ.get("MPK_EAGLE3_SPAN") == "1" and "_E3_KEEP" in globals() and rank == 0:
+            _sp = _E3_KEEP[1][17][90000:90000 + 3 * 248].view(torch.int32).cpu().to(torch.int64).view(248, 3)
+            _sp = (_sp - _sp[:, 0].min()) % (1 << 32)
+            _lm = (_sp[:, 1] - _sp[:, 0]).float() / 100.0
+            _dr = (_sp[:, 2] - _sp[:, 1]).float() / 100.0
+            print("[E3SPAN] us after the first LM-head start: LM-head start max %.1f | draft start min %.1f max %.1f | "
+                  "draft end min %.1f max %.1f | LM head per worker %.1f..%.1f | draft per worker %.1f..%.1f"
+                  % (_sp[:, 0].max() / 100.0, _sp[:, 1].min() / 100.0, _sp[:, 1].max() / 100.0,
+                     _sp[:, 2].min() / 100.0, _sp[:, 2].max() / 100.0, _lm.min(), _lm.max(), _dr.min(), _dr.max()),
+                  flush=True)
+            if os.environ.get("MPK_EAGLE3_SPAN_ALL") == "1":
+                _le = _E3_KEEP[1][17][90000 + 3 * 248:90000 + 4 * 248].view(torch.int32).cpu().to(torch.int64)
+                _le = ((_le - _E3_KEEP[1][17][90000:90000 + 3 * 248].view(torch.int32).cpu().to(torch.int64).view(248, 3)[:, 0].min()) % (1 << 32)).float() / 100.0
+                print("[E3SPANW] " + " ".join("%d:%.1f:%.1f:%.1f:%.1f" % (_w, _sp[_w, 0].item() / 100.0, _lm[_w].item(),
+                                                                   _sp[_w, 2].item() / 100.0, _le[_w].item()) for _w in range(248)),
+                      flush=True)
+        if os.environ.get("MPK_KV_DUMP") and rank == 0:
+            _kd = []
+            for _i in range(len(model.model.kv_cache[0])):
+                for _c in (model.model.kv_cache[0][_i], model.model.kv_cache[1][_i]):
+                    if os.environ.get("MPK_KV_HEAD_MAJOR", "0") == "1":
+                        _c = _c.permute(1, 2, 0, 3)
+                    _x = _c.reshape(_c.shape[0] * _c.shape[1], -1).contiguous().view(torch.int16).to(torch.int64)
+                    _w = torch.arange(1, _x.shape[1] + 1, device=_x.device, dtype=torch.int64)
+                    _kd.append(((_x * _w).sum(dim=1) % 2147483647).to(torch.int32).cpu())
+                    del _x
+            torch.save(torch.stack(_kd), os.environ["MPK_KV_DUMP"])
+            print(f"Saved KV checksums to {os.environ['MPK_KV_DUMP']}")
 
         prompt_len = prompt_lengths[0].item()
         total_tokens = step.max().item() + 1
@@ -4120,11 +5127,42 @@ if __name__ == "__main__":
             print("VERIFICATION: Comparing Mirage intermediates with PyTorch reference")
             print("=" * 80)
             torch.cuda.synchronize()
+            # MPK_HOST_ACTIVATIONS puts the activations in pinned host memory,
+            # which the kernel reads fine but which every comparison below
+            # would hit as a cuda-vs-cpu device mismatch. Snapshot to device
+            # after the run so the harness is unchanged.
+            for _vk in list(verify_tensors):
+                _vv = verify_tensors[_vk]
+                if hasattr(_vv, "is_cuda") and not _vv.is_cuda:
+                    verify_tensors[_vk] = _vv.cuda()
 
             # Debug: check q_workspace and k_cache values
             q_ws_nz = (ck_fmha_q_ws_tensor.abs() > 1e-6).sum().item()
             print(f"  [DEBUG] q_workspace non-zero: {q_ws_nz} / {ck_fmha_q_ws_tensor.numel()}")
             print(f"  [DEBUG] q_workspace[:8]: {ck_fmha_q_ws_tensor[0, :8].float().tolist()}")
+            # Which slices of each cross-XCD buffer actually got written.
+            # An aggregate non-zero count cannot distinguish "half the heads
+            # are missing" from "every head is half sparse", and those point
+            # at completely different partitioning bugs.
+            def _slice_nz(tag, ten, group):
+                try:
+                    f = ten.detach().cpu().reshape(-1).float()
+                    n = (f.numel() // group) * group
+                    m = (f[:n].abs() > 1e-9).reshape(-1, group).sum(1).tolist()
+                    empt = [i for i, c in enumerate(m) if c == 0]
+                    print(f"  [SLICE] {tag}: {len(m)} groups of {group}, "
+                          f"{len(empt)} all-zero -> {empt[:24]}", flush=True)
+                    print(f"  [SLICE] {tag} counts: {m[:40]}", flush=True)
+                except Exception as _e:
+                    print(f"  [SLICE] {tag}: FAILED {_e}", flush=True)
+            _slice_nz("q_workspace(64 heads x 64)", ck_fmha_q_ws_tensor, 64)
+            for _nm, _g in (("attn_out", 64), ("attn_proj_out", 16),
+                            ("rmsnorm_out_moe", 16), ("embed_out", 16),
+                            ("moe_gate_out", 8), ("swiglu_out", 64),
+                            ("moe_workspace_f32", 64)):
+                _t2 = verify_tensors.get(_nm)
+                if _t2 is not None:
+                    _slice_nz(_nm, _t2, _g)
             k_cache_t = model.model.kv_cache[0][0]
             v_cache_t = model.model.kv_cache[1][0]
             k_nz = (k_cache_t[:, 0, :].abs() > 1e-6).sum().item()

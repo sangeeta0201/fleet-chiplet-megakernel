@@ -1,3 +1,4 @@
+// MPK_VT2_PATCHED
 /* Copyright 2025 CMU
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -46,8 +47,83 @@
 //   active_expert_ids [NUM_EXPERTS+1] int32
 
 #pragma once
+// MPK_LTK_SNAP fallback
+#ifndef MPK_LTK_MARK
+#define MPK_LTK_MARK(k) do {} while (0)
+#endif
+#ifndef MPK_XS_MARK
+#define MPK_XS_MARK(k) do {} while (0)
+#endif
+#ifndef MPK_TKOPS_AT
+#define MPK_TKOPS_AT(k, cond) do {} while (0)
+#endif
+#if !defined(MPK_SUB_MARK) && defined(MPK_OPROJ_NUDGE)
+// Experiment: reproduce what MPK_OPROJ_LDS's sub-span marks do to this kernel
+// without the recorder. MPK_OPROJ_NUDGE is a mask of the marks 0..3 to keep.
+// KIND 1: compiler memory fence only (tests instruction scheduling).
+// KIND 2: tid 0 also reads s_memrealtime into LDS, as the mark does (tests
+// the delay on wave 0).
+#ifndef MPK_OPROJ_NUDGE_KIND
+#define MPK_OPROJ_NUDGE_KIND 2
+#endif
+__shared__ unsigned long long s_oproj_nudge[4];
+#define MPK_SUB_MARK(k)                                                        \
+  do {                                                                         \
+    if ((MPK_OPROJ_NUDGE >> (k)) & 1) {                                        \
+      if (MPK_OPROJ_NUDGE_KIND == 2 && threadIdx.x == 0) {                     \
+        asm volatile("" ::: "memory");                                         \
+        s_oproj_nudge[(k)] = __builtin_amdgcn_s_memrealtime();                 \
+      }                                                                        \
+      asm volatile("" ::: "memory");                                           \
+    }                                                                          \
+  } while (0)
+#endif
+#ifndef MPK_SUB_MARK
+#define MPK_SUB_MARK(k) do {} while (0)
+#endif
+#ifndef MPK_SUB_PUBLISHER
+#define MPK_SUB_PUBLISHER() do {} while (0)
+#endif
+#ifndef MPK_SUB_TOPK
+#define MPK_SUB_TOPK(k) do {} while (0)
+#endif
 #include "tasks/mi300/gang_moe_linear_mxfp4_mi300.cuh"    // FP4xFP8 helpers
 #include "tasks/mi300/gang_rmsnorm_linear_bias_mi300.cuh" // topk_noinline
+
+// MPK_P7_SKIP bisection: remove one class of wait at a time. Releases are
+// never removed, so nothing can deadlock; results are garbage by design and
+// only the timing is meaningful.
+#ifdef MPK_P7_SKIP
+#define MPK_P7_SK(bit) (((MPK_P7_SKIP) & (bit)) != 0)
+#else
+#define MPK_P7_SK(bit) false
+#endif
+
+#ifdef MPK_ROUTER_OPROJ_PARTIAL
+#if !defined(MPK_LOCAL_TOPK) || !defined(MPK_W13_PREQUANT) ||                  \
+    !defined(MPK_W13_KMAJOR_RECYCLE) || !defined(MPK_AID_SPLIT_OUT) ||         \
+    !defined(MPK_AID_SPLIT_FLAGS) || !defined(MPK_OPROJ_FLAT) ||               \
+    !defined(MPK_OPROJ_TREE_BARRIER) || defined(MPK_MULTI_PASS_8XCD) ||        \
+    defined(MPK_POLL_PIPE)
+#error "MPK_ROUTER_OPROJ_PARTIAL: LOCAL_TOPK + W13_PREQUANT + W13_KMAJOR_RECYCLE + AID_SPLIT_OUT/FLAGS + OPROJ_FLAT + OPROJ_TREE_BARRIER, 8 XCDs single pass"
+#endif
+// O-proj workers publish router partials and leave; nobody waits on the
+// global O-proj release any more (Phase 7b waits on the partial sums).
+#define MPK_ROP_SKIP true
+#ifdef MPK_ROP_HOME
+#define MPK_ROP_A0 (xcd_id >> 2)
+#define MPK_ROP_A1 ((xcd_id >> 2) + 1)
+#else
+#define MPK_ROP_A0 0
+#define MPK_ROP_A1 2
+#endif
+typedef int __attribute__((ext_vector_type(4))) rop_i32x4_t;
+typedef float __attribute__((ext_vector_type(4))) rop_f32x4_t;
+#else
+#define MPK_ROP_SKIP false
+#endif
+
+
 
 namespace kernel {
 
@@ -84,6 +160,96 @@ constexpr int oproj_lds_w_off(int batch_size, int reduction_size) {
   return ((oproj_lds_red_off(batch_size, reduction_size) + 4096 + 15) / 16) *
          16;
 }
+
+// Stage one O-proj weight group into the LDS weight region.
+//
+// The fused layer issues this for a worker's FIRST tile during the Phase 6
+// attention-barrier wait, so the DMA overlaps the spin. There is only one
+// weight region in LDS, so every later tile the same worker owns has to
+// re-stage: whatever group the previous pass staged is still sitting there,
+// and stale MXFP4 bytes decode cleanly into wrong numbers rather than
+// faulting. That only bites once tiles_per_xcd exceeds the workers per XCD,
+// which is why 8 XCDs (23 tiles, 31 workers) never needed it and 4 XCDs
+// (46 tiles) does.
+//
+// Callers must drain with `s_waitcnt vmcnt(0)` and rendezvous before the MFMA
+// reads LDS: the DMA is per wave, and the waves' 1 KiB slices interleave
+// across the K range every wave reads.
+#ifdef MPK_VTN_AOQ_CHECK
+__device__ unsigned g_aoq_chk[2];  // MPK_VTN_AOQ_CHECK: staged-row checks, mismatches
+#endif
+template <int BATCH_SIZE, int OUTPUT_PER_WG, int REDUCTION_SIZE>
+__device__ __forceinline__ void oproj_stage_weight_lds(uint8_t const *W,
+                                                       int n_wgs_per_xcd,
+                                                       int wg_idx,
+                                                       int tid,
+                                                       char *smem) {
+  constexpr int WG_DATA = OUTPUT_PER_WG * (REDUCTION_SIZE / 2);
+  constexpr int WG_SCALE = OUTPUT_PER_WG * (REDUCTION_SIZE / 32);
+  constexpr int WG_TOTAL = WG_DATA + WG_SCALE;
+  constexpr int N16_DATA = WG_DATA / 16;
+  constexpr int LPT = (N16_DATA + 255) / 256;
+  constexpr int DATA_PAD = LPT * 256 * 16;
+  constexpr int N16_SCALE = (WG_SCALE + 15) / 16;
+  constexpr int SLPT = (N16_SCALE + 255) / 256;
+  constexpr int LDS_W_OFF = oproj_lds_w_off(BATCH_SIZE, REDUCTION_SIZE);
+
+  i32x4_t rsrc =
+      make_w_buffer_rsrc(W, static_cast<uint32_t>(n_wgs_per_xcd) * WG_TOTAL);
+  uint32_t const wg_voff = static_cast<uint32_t>(wg_idx) * WG_TOTAL;
+  auto *lds_base =
+      (__attribute__((address_space(3))) uint32_t *)(smem + LDS_W_OFF);
+  // buffer_load_lds writes to M0 + lane_id*16, so each wave fills 1024 bytes
+  // and must be offset by warp_id*1024 to keep the four slices distinct.
+#ifdef MPK_LDS_DST_S
+  int pf_warp_id;
+  asm volatile("s_nop 1\n\tv_readfirstlane_b32 %0, %1\n\ts_nop 4" : "=s"(pf_warp_id) : "v"(tid >> 6));
+#else
+  int const pf_warp_id = tid >> 6;
+#endif
+
+#pragma unroll
+  for (int j = 0; j < LPT; j++) {
+    int idx = tid + j * 256;
+    int clamped = idx < N16_DATA ? idx : N16_DATA - 1;
+    uint32_t voff = wg_voff + static_cast<uint32_t>(clamped) * 16;
+    auto *lds_dst =
+        (__attribute__((address_space(3)))
+         uint32_t *)((uint8_t __attribute__((address_space(3))) *)lds_base +
+                     j * 4096 + pf_warp_id * 1024);
+    __llvm_amdgcn_raw_buffer_load_lds(
+        rsrc, lds_dst, 16, static_cast<int>(voff), 0, 0, 3);
+  }
+#pragma unroll
+  for (int j = 0; j < SLPT; j++) {
+    int idx = tid + j * 256;
+    int clamped = idx < N16_SCALE ? idx : N16_SCALE - 1;
+    uint32_t voff = wg_voff + WG_DATA + static_cast<uint32_t>(clamped) * 16;
+    auto *lds_dst =
+        (__attribute__((address_space(3)))
+         uint32_t *)((uint8_t __attribute__((address_space(3))) *)lds_base +
+                     DATA_PAD + j * 4096 + pf_warp_id * 1024);
+    __llvm_amdgcn_raw_buffer_load_lds(
+        rsrc, lds_dst, 16, static_cast<int>(voff), 0, 0, 3);
+  }
+}
+
+#ifdef MPK_PQ_AMAX_DPP
+// 16-lane all-reduce max for non-negative values on DPP. A source lane
+// that is out of range or inactive reads 0, which cannot raise an amax.
+__device__ __forceinline__ float _mpk_amax16_dpp(float a) {
+  int v = __float_as_int(a);
+  v = __float_as_int(fmaxf(__int_as_float(v), __int_as_float(
+      __builtin_amdgcn_update_dpp(0, v, 0xB1, 0xF, 0xF, true))));
+  v = __float_as_int(fmaxf(__int_as_float(v), __int_as_float(
+      __builtin_amdgcn_update_dpp(0, v, 0x4E, 0xF, 0xF, true))));
+  v = __float_as_int(fmaxf(__int_as_float(v), __int_as_float(
+      __builtin_amdgcn_update_dpp(0, v, 0x141, 0xF, 0xF, true))));
+  v = __float_as_int(fmaxf(__int_as_float(v), __int_as_float(
+      __builtin_amdgcn_update_dpp(0, v, 0x140, 0xF, 0xF, true))));
+  return __int_as_float(v);
+}
+#endif
 
 #ifdef MPK_OPROJ_AMAX_DPP
 // 8-lane amax butterfly (xor 1/2/4) via DPP, matching
@@ -132,11 +298,11 @@ __device__ __forceinline__ void
   constexpr int kScale = 128;
   constexpr int kSlice = 512;
   constexpr int kTps = kScale / kElem;
-  while (ld_sys_s32(rel) < layer_epoch) {
+  while (!MPK_P7_SK(1) && MPK_LD_GATE_AID(rel) < layer_epoch) {
     __builtin_amdgcn_s_sleep(1);
   }
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-  asm volatile("buffer_inv" ::: "memory");
+  MPK_XCD_ACQUIRE();
   int const lane = tid & 63;
   if ((pair_idx == 0 && lane < 32) || (pair_idx == 1 && lane >= 32)) {
     int const sl_lane = lane & 31;
@@ -278,6 +444,23 @@ __device__ __forceinline__ void router_dual_wave_sum_to_lane_zero(float &ssq,
 }
 #endif
 
+#ifndef MPK_OPROJ_MAX_RANKS
+// Workers per XCD. Phase 7's tile count per XCD may exceed it (DPX).
+#define MPK_OPROJ_MAX_RANKS 31
+#endif
+
+// Cross-XCD acquire. An unscoped `buffer_inv` is an architectural NOP on
+// gfx950, so it only invalidates anything with `sc1`. At 4 XCDs the partition
+// spans two AIDs: a reader's L2 holds the far die's pre-barrier line
+// indefinitely and never observes the write-through publish, so the scope is
+// required for correctness rather than being a conservatism. The 8-XCD builds
+// keep the unscoped form they were measured with.
+#if MPK_NUM_XCDS == 4
+#define MPK_XCD_ACQUIRE() asm volatile("buffer_inv" MPK_DEV_SC_INV "" ::: "memory")
+#else
+#define MPK_XCD_ACQUIRE() asm volatile("buffer_inv" ::: "memory")
+#endif
+
 template <int BATCH_SIZE,
           int OUTPUT_PER_WG,
           int REDUCTION_SIZE,
@@ -375,7 +558,14 @@ __device__ __attribute__((noinline)) void
   constexpr int ATTN_SLICE = REDUCTION_SIZE / 8;
   constexpr int ELEMENTS_PER_THREAD = REDUCTION_SIZE / 256;
   constexpr int ELEMENTS_PER_SCALE = 128;
-#if defined(MPK_ATTN_SLICE_RELEASE)
+#if defined(MPK_ATTN_SLICE_RELEASE) && defined(MPK_OPROJ_SLICE2)
+#if !defined(MPK_VT2_SLICE_REL) || defined(MPK_OPROJ_PIPE_SLICE_MFMA) || defined(MPK_OPROJ_SPLIT_SLICE_WAIT) || \
+    defined(MPK_OPROJ_DATA_POLL) || defined(MPK_OPROJ_LOCAL_SLICE_PROBE)
+#error "MPK_OPROJ_SLICE2: default slice path with MPK_VT2_SLICE_REL only"
+#endif
+  constexpr bool SLICE_RELEASE = OUTPUT_PER_WG < 64 && BATCH_SIZE >= 1 && BATCH_SIZE <= MPK_ROP_NTOK &&
+                                 ELEMENTS_PER_THREAD == 16;
+#elif defined(MPK_ATTN_SLICE_RELEASE)
   constexpr bool SLICE_RELEASE =
       OUTPUT_PER_WG < 64 && BATCH_SIZE == 1 && ELEMENTS_PER_THREAD == 16;
 #else
@@ -392,7 +582,49 @@ __device__ __attribute__((noinline)) void
   constexpr int TOK_REGION = TOK_ROWS * TOK_ROW_STRIDE;
   constexpr int SC_REGION = TOK_ROWS * SC_STRIDE;
 
+#if defined(MPK_AID_SPLIT_ATTNOUT) && defined(MPK_AID_SPLIT_FLAGS)
+  static_assert((size_t)BATCH_SIZE * REDUCTION_SIZE * 2 <=
+                    MPK_AID_ATTNOUT_MAX_BYTES,
+                "attn_out does not fit the AID replica region");
+  unsigned short const *A = (unsigned short const *)mpk_aid_attnout_base(
+      input_ptr, tile_idx / tiles_per_xcd);
+#else
   unsigned short const *A = (unsigned short const *)input_ptr;
+#endif
+#ifdef MPK_VTN_AOQ
+#if !defined(MPK_OPROJ_SLICE2) || !defined(MPK_OPROJ_SLICE2_PRE) || !defined(MPK_VTN_OPQ) || \
+    defined(MPK_OPROJ_LOCAL_SLICE_PROBE) || defined(MPK_OPROJ_ORC_CONV1)
+#error "MPK_VTN_AOQ: the MPK_OPROJ_SLICE2_PRE + MPK_VTN_OPQ staging path"
+#endif
+  static_assert((long)BATCH_SIZE * MPK_AOQ_ROW_BYTES <= MPK_AID_ATTNOUT_MAX_BYTES &&
+                    REDUCTION_SIZE == 4096,
+                "MPK_VTN_AOQ: FP8 rows in the attn_out replica region");
+#ifdef MPK_VTN_AOQ_ABIP
+#ifndef MPK_ABIP
+#error "MPK_VTN_AOQ_ABIP needs MPK_ABIP"
+#endif
+#ifndef MPK_ABIP_PH
+#define MPK_ABIP_PH 1
+#endif
+  bool const aoq_pass = (((layer_epoch - 1) / 36) & 1) == (MPK_ABIP_PH);
+#endif
+#if defined(MPK_VTN_AOQ_MINN)
+  // MPK_VTN_AOQ_MINN: the merge published FP8 rows only if the pass has at least N live tokens.
+  bool const aoq_go =
+#ifdef MPK_VTN_AOQ_ABIP
+      aoq_pass &&
+#endif
+      (num_active_tokens < BATCH_SIZE ? num_active_tokens : BATCH_SIZE) >= (MPK_VTN_AOQ_MINN);
+#elif defined(MPK_VTN_AOQ_ABIP)
+  bool const aoq_go = aoq_pass;
+#endif
+#ifdef MPK_VTN_AOQ_INPLACE
+  char const *const aoq_rows = (char const *)A;  // MPK_VTN_AOQ_INPLACE: the attn_out rows themselves
+#else
+  // This AID's copy of the merge's FP8 rows.
+  char const *const aoq_rows = mpk_aoq_base((tile_idx / tiles_per_xcd) >> 2);
+#endif
+#endif
   uint8_t const *W = (uint8_t const *)weight_ptr;
   unsigned short const *d_residual = (unsigned short const *)residual_ptr;
   unsigned short const *d_bias = (unsigned short const *)bias_ptr;
@@ -403,6 +635,16 @@ __device__ __attribute__((noinline)) void
   //   total_oproj_tiles) [9*16]:    topk_counter
   constexpr int HIER_STRIDE = 16;
   int *hier_barrier = (int *)counters_ptr;
+#ifdef MPK_AID_SPLIT_FLAGS
+  // Replica view, used ONLY for the eight per-XCD release flags at [x*16].
+  // Every other slot of this buffer is an atomic and keeps using
+  // `hier_barrier` directly. `xcd_id` below is derived from tile_idx, so the
+  // replica is chosen from the hardware XCC id instead.
+  int *hier_release =
+      mpk_aid_flags_hw(hier_barrier, MPK_AID_REGION_HIER_RELEASE);
+#else
+  int *hier_release = hier_barrier;
+#endif
   int *topk_counter = hier_barrier + 9 * HIER_STRIDE;
   // MPK_OPROJ_TREE_BARRIER: eight per-XCD arrival lines for the two-level
   // form of the Phase 2 barrier. Slots 28..35 are dead space -- the chunk
@@ -410,7 +652,47 @@ __device__ __attribute__((noinline)) void
   // FULL_LAYER_CHUNK_BARRIER_SLOT), and the tail counters this file's fused
   // caller pins are at 44..47. The buffer is sized well past 36 lines by
   // demo.py's counter_size, so this needs no allocation change.
+#if defined(MPK_AID_SPLIT_HIER_LOCAL) && defined(MPK_AID_SPLIT_FLAGS)
+  // Arrival tree on this AID's replica. XCD-private, so the atomic and every
+  // read of it stay on the same die and cannot straddle replicas.
+  int *hier_local = mpk_aid_flags_hw(hier_barrier + 28 * HIER_STRIDE,
+                                     MPK_AID_REGION_HIER_LOCAL);
+#elif defined(MPK_OPROJ_HIER_NC)
+#if !defined(MPK_AID_NC_REP)
+#error "MPK_OPROJ_HIER_NC needs MPK_AID_NC_REP"
+#endif
+  // XCD-private counter, memory-side atomic in this die's own AID.
+  int *hier_local =
+      mpk_aid_nc_hw(hier_barrier + 28 * HIER_STRIDE, MPK_NC_OPROJ_INTS);
+#else
   int *hier_local = hier_barrier + 28 * HIER_STRIDE;
+#endif
+#ifdef MPK_OPROJ_AID_TIER
+#if !defined(MPK_OPROJ_TREE_BARRIER) || !defined(MPK_AID_SPLIT_FLAGS) ||       \
+    !defined(MPK_OPROJ_NARROW_REL)
+#error "MPK_OPROJ_AID_TIER needs TREE_BARRIER, AID_SPLIT_FLAGS and OPROJ_NARROW_REL"
+#endif
+#if defined(MPK_OPROJ_AID_AGG) || defined(MPK_ROUTER_XCD_FOLD)
+#error "MPK_OPROJ_AID_TIER replaces AID_AGG and is not wired for ROUTER_XCD_FOLD"
+#endif
+  // Only this AID's four XCDs touch its tier counter, so the level-2 atomic
+  // stays inside the AID. The physical XCC picks both the replica and the
+  // publish slot: `xcd_id` here is derived from tile_idx.
+  int *oproj_tier = mpk_aid_flags_hw(hier_barrier, MPK_AID_REGION_OPROJ_TIER);
+  int oproj_aid_hw;
+  MPK_GET_XCC_ID16(oproj_aid_hw);
+  oproj_aid_hw = (oproj_aid_hw & 7) >> 2;
+#define MPK_OPROJ_REL_SLOT (1 + oproj_aid_hw)
+#else
+#define MPK_OPROJ_REL_SLOT 0
+#endif
+#if defined(MPK_OPROJ_FLAT) &&                                                 \
+    (MPK_NUM_XCDS != 8 || !defined(MPK_OPROJ_TREE_BARRIER) ||                  \
+     !defined(MPK_OPROJ_NARROW_REL) || !defined(MPK_AID_SPLIT_FLAGS) ||         \
+     defined(MPK_OPROJ_AID_TIER) || defined(MPK_OPROJ_AID_AGG) ||              \
+     defined(MPK_ROUTER_XCD_FOLD))
+#error "MPK_OPROJ_FLAT needs 8 XCDs, MPK_OPROJ_TREE_BARRIER, MPK_OPROJ_NARROW_REL and MPK_AID_SPLIT_FLAGS"
+#endif
 #ifdef MPK_ROUTER_XCD_FOLD
 #ifndef MPK_OPROJ_TREE_BARRIER
 #error "MPK_ROUTER_XCD_FOLD publishes from the tree-barrier local-last"
@@ -421,7 +703,15 @@ __device__ __attribute__((noinline)) void
   // 8 lines after the fused layer-barrier region. Matches
   // FULL_LAYER_OPROJ_XCD_READY_SLOT in gang_full_layer_fused_mi300.cuh and
   // demo.py counter_size (+128).
-  int *oproj_xcd_ready = hier_barrier + (48 * 16 + 128 * MPK_MAX_NUM_BATCHED_REQUESTS + 272);
+  int *oproj_xcd_ready_shared = hier_barrier + (48 * 16 + 128 * MPK_MAX_NUM_BATCHED_REQUESTS + 272);
+#ifdef MPK_AID_SPLIT_FLAGS
+  // Same producer shape as attn_release: each XCD publishes only its own slot,
+  // and every reader polls all eight from the replica homed in its own AID.
+  int *oproj_xcd_ready =
+      mpk_aid_flags_hw(oproj_xcd_ready_shared, MPK_AID_REGION_OPROJ_READY);
+#else
+  int *oproj_xcd_ready = oproj_xcd_ready_shared;
+#endif
 #endif
 
   extern __shared__ char _lm_smem[];
@@ -438,6 +728,10 @@ __device__ __attribute__((noinline)) void
   unsigned long long _sp_t0 = __builtin_amdgcn_s_memrealtime();
 #endif
 
+  MPK_SUB_MARK(0);
+#ifdef MPK_OPROJ_SUB
+  unsigned int _os0 = (unsigned int)__builtin_amdgcn_s_memrealtime(), _os1 = _os0, _os2 = _os0, _os3 = _os0;
+#endif
 #ifdef MPK_OPROJ_INNER_TIMING
   // Self-contained inner split of Phase 7. The ts_base slots below are the
   // older mechanism and every caller passes nullptr for that pointer, so they
@@ -459,12 +753,23 @@ __device__ __attribute__((noinline)) void
 
   // Decode XCD index from globally-unique tile_idx
   // tile_idx = xcd_id * tiles_per_xcd + local_tile
+#ifdef MPK_OPROJ_SCALAR_XCD
+  // The noinline arguments arrive in VGPRs; without readfirstlane every replica-table
+  // index below is a vector load that retires behind the write-through output stores.
+  int xcd_id = __builtin_amdgcn_readfirstlane(tile_idx / tiles_per_xcd);
+#else
   int xcd_id = tile_idx / tiles_per_xcd;
+#endif
   int local_tile = tile_idx % tiles_per_xcd;
 #ifdef MPK_LOCAL_TOPK
   // This router tile's epoch-tagged logit, published at the TopK barrier
   // once every wave's stores have drained.
   unsigned ltk_word = 0u;
+#ifdef MPK_VT2
+  // Token 1's tagged word. The router loop covers only the live rows (batch_count), so a pass with
+  // one live row still publishes this layer's tag for token 1 (logit 0) and its consumer completes.
+  unsigned ltk_word1 = mpk_ltk_tag(layer_epoch) << 16;
+#endif
 #endif
 #ifdef MPK_LTK_EARLY_TAG
 #if !(defined(MPK_LOCAL_TOPK) && defined(MPK_ROUTER_FUSED_DP) && \
@@ -477,6 +782,14 @@ __device__ __attribute__((noinline)) void
 #else
 #define MPK_NORMROW_SC ""
 #endif
+// Pre-quantized row stores: write-through if either the early-tag release or
+// the AID-replicated W13 handoff needs it (never both modifiers twice).
+#if defined(MPK_LTK_EARLY_TAG) ||                                              \
+    (defined(MPK_W13_HOF_AIDREP) && !defined(MPK_W13_HOF_XCDREP))
+#define MPK_PQROW_SC " sc0 sc1"
+#else
+#define MPK_PQROW_SC ""
+#endif
   int xcd_output_col_offset = xcd_id * n_wgs_per_xcd * OUTPUT_PER_WG;
 
   // ════════════════════════════════════════════════════════════════════════
@@ -486,8 +799,18 @@ __device__ __attribute__((noinline)) void
   // Tile space is (column block, weight group), not (token, weight group):
   // the token axis moved into the MFMA's N dimension, so the host emits
   // n_bblk * n_wgs_per_xcd tiles rather than batch_size * n_wgs_per_xcd.
-  int bblk = local_tile / n_wgs_per_xcd;
-  int wg_idx = local_tile % n_wgs_per_xcd;
+  // tiles_per_xcd exceeds the workers per XCD whenever the O-proj N-split is
+  // coarser than the dispatch (46 tiles vs 31 workers at MPK_NUM_XCDS==4).
+  // Each worker then walks its tiles at this stride and arrives once below,
+  // so the barrier's modulus is the worker count, not the tile count.
+  int const n_oproj_part =
+      tiles_per_xcd < MPK_OPROJ_MAX_RANKS ? tiles_per_xcd : MPK_OPROJ_MAX_RANKS;
+  int oproj_lt = local_tile;
+#if MPK_NUM_XCDS != 8 || defined(MPK_MULTI_PASS_8XCD)
+oproj_tile_pass:;
+#endif
+  int bblk = oproj_lt / n_wgs_per_xcd;
+  int wg_idx = oproj_lt % n_wgs_per_xcd;
   // At TOK_ROWS == 1 there is exactly one column block, so every tile that
   // survives the guard below has bblk == 0 and the base is a literal zero.
   // The compiler cannot derive that from `batch_count - bblk*16 > 0`, and
@@ -535,9 +858,14 @@ __device__ __attribute__((noinline)) void
       // The payoff is the tail: under the default rendezvous *every* wave on
       // *every* XCD starts when the slowest of eight merges lands. Here wave
       // 0 starts when XCDs 0 and 1 land.
+#ifdef MPK_OPROJ_SLICE2
+      static_assert(TOK_ROWS == BATCH_SIZE && BATCH_SIZE <= MPK_ROP_NTOK,
+                    "the slice arm stages its own run of each token row");
+#else
       static_assert(TOK_ROWS == 1 && BATCH_SIZE == 1,
                     "the slice arm stages one token row and drops the "
                     "block-wide barrier that multi-row staging needs");
+#endif
       static_assert(REDUCTION_SIZE == 256 * ELEMENTS_PER_THREAD,
                     "one contiguous 16-element run per thread is what makes "
                     "wave w's staged range equal to its K range");
@@ -561,6 +889,10 @@ __device__ __attribute__((noinline)) void
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       __syncthreads();
 #endif
+      MPK_TKOPS_AT(0, tid == 0);
+#ifdef MPK_OPROJ_SUB
+      if (tid == 0) _os1 = (unsigned int)__builtin_amdgcn_s_memrealtime();
+#endif
 
 #ifdef MPK_OPROJ_PIPE_SLICE_MFMA
       // Default wave→slice map (XCD 2w, 2w+1). Convert slice 0, then the
@@ -579,7 +911,19 @@ __device__ __attribute__((noinline)) void
                                    tid,
                                    layer_epoch);
 #else
+#ifdef MPK_OPROJ_LOCAL_SLICE_PROBE
+#ifdef MPK_OPROJ_SPLIT_SLICE_WAIT
+#error "MPK_OPROJ_LOCAL_SLICE_PROBE covers the default two-slice path only"
+#endif
+      // TIMING ONLY, wrong output: wait on and read this AID's own slices.
+      int _lsp_xcc;
+      MPK_GET_XCC_ID16(_lsp_xcc);
+      int const first_xcd = ((_lsp_xcc & 7) >> 2) * 4 + (warp_id & 1) * 2;
+      int const lsp_shift = (first_xcd - warp_id * 2) * ATTN_SLICE;
+#else
       int const first_xcd = warp_id * 2;
+      constexpr int lsp_shift = 0;
+#endif
       // ld_sys_s32 takes a mutable pointer only because every other caller
       // hands it one; the load itself is read-only.
       int *rel0 = const_cast<int *>(attn_slice_release) + first_xcd * 16;
@@ -604,11 +948,11 @@ __device__ __attribute__((noinline)) void
                     "split-slice wait assumes 32 lanes cover one 512-elem XCD");
       for (int sl = 0; sl < 2; sl++) {
         int *rel = sl == 0 ? rel0 : rel1;
-        while (ld_sys_s32(rel) < layer_epoch) {
+        while (!MPK_P7_SK(1) && MPK_LD_GATE_AID(rel) < layer_epoch) {
           __builtin_amdgcn_s_sleep(1);
         }
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-        asm volatile("buffer_inv" ::: "memory");
+        MPK_XCD_ACQUIRE();
         if (((tid & 63) < 32) == (sl == 0)) {
           i32x4_t const *src = (i32x4_t const *)(A + base);
           i32x4_t v0 = src[0];
@@ -717,22 +1061,35 @@ __device__ __attribute__((noinline)) void
       int s0, s1;
       do {
         ld_sys_s32x2(rel0, rel1, s0, s1);
-        if (s0 >= layer_epoch && s1 >= layer_epoch) {
+        if (MPK_P7_SK(1) || (s0 >= layer_epoch && s1 >= layer_epoch)) {
           break;
         }
         __builtin_amdgcn_s_sleep(1);
       } while (true);
 #else
-#ifdef MPK_POLL_PIPE
+#if defined(MPK_PIPE_POLL) && ((MPK_PIPE_POLL) & 1)
+      if (!MPK_P7_SK(1)) {
+#if defined(MPK_SYS_POLL_LOAD) && (MPK_SYS_POLL_LOAD) >= 1
+        mpk_pipe_ge2<true>(rel0, rel1, layer_epoch);
+#else
+        mpk_pipe_ge2<false>(rel0, rel1, layer_epoch);
+#endif
+      }
+#elif defined(MPK_POLL_PIPE)
       mpk_poll_ge2_s32(rel0, rel1, layer_epoch);
 #else
-      while (ld_sys_s32(rel0) < layer_epoch || ld_sys_s32(rel1) < layer_epoch) {
+      while (!MPK_P7_SK(1) &&
+             (MPK_LD_GATE_AID(rel0) < layer_epoch || MPK_LD_GATE_AID(rel1) < layer_epoch)) {
 #ifndef MPK_SLICE_BUSY_POLL
         __builtin_amdgcn_s_sleep(1);
 #endif
       }
 #endif
 #endif
+#ifdef MPK_OPROJ_SUB
+      if (lane_id == 0) s_os_w[warp_id] = (unsigned int)__builtin_amdgcn_s_memrealtime();
+#endif
+      MPK_TKOPS_AT(1 + warp_id, lane_id == 0);
       // Cross-XCD acquire, per wave, placed at this wave's observation. The
       // caller's Phase 6 `buffer_inv` runs before any flag has been seen on
       // this path, so it cannot be the acquire for attn_out: a line cached
@@ -740,16 +1097,213 @@ __device__ __attribute__((noinline)) void
       // buffer_inv is a per-wave instruction, so four of them is the correct
       // shape, not a redundancy -- each wave invalidates for itself.
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-      asm volatile("buffer_inv" ::: "memory");
+      MPK_XCD_ACQUIRE();
 #ifdef MPK_OPROJ_POLL_BEFORE_DRAIN
       __syncthreads();
 #endif
 
-      i32x4_t const *src = (i32x4_t const *)(A + base);
+#ifdef MPK_OPROJ_SLICE2
+#ifdef MPK_OPROJ_SLICE2_PRE
+      // Both rows' slice loads before either row's conversion: one round trip, not two.
+      i32x4_t s2v0[BATCH_SIZE], s2v1[BATCH_SIZE];
+#pragma unroll
+      for (int s2q = 0; s2q < BATCH_SIZE; ++s2q) {
+#ifdef MPK_VTN_LIVEB  // MPK_VTN_LIVEB_PATCHED
+        if (s2q > 0 && s2q >= n_valid_tok) continue;
+#endif
+#if defined(MPK_VTN_AOQ) && !defined(MPK_VTN_AOQ_CHECK)
+#if defined(MPK_VTN_AOQ_ABIP) || defined(MPK_VTN_AOQ_MINN)
+        if (aoq_go) {
+        {
+          // MPK_VTN_AOQ: the row's 16 FP8 bytes and the dword holding its block scale.
+          char const *const aq = aoq_rows + (long)(s2q < n_valid_tok ? s2q : 0) * MPK_AOQ_RSTRIDE;
+          s2v0[s2q] = MPK_AOQ_LD16(aq + base);
+          s2v1[s2q][0] = (int)MPK_AOQ_LD32(aq + REDUCTION_SIZE + MPK_AOQ_SOFF(scale_block));
+        }
+        } else {
+        i32x4_t const *s2src = (i32x4_t const *)(A + (long)(s2q < n_valid_tok ? s2q : 0) * REDUCTION_SIZE +
+                                                 base + lsp_shift);
+        s2v0[s2q] = s2src[0];
+        s2v1[s2q] = s2src[1];
+        }
+#else
+        {
+          // MPK_VTN_AOQ: the row's 16 FP8 bytes and the dword holding its block scale.
+          char const *const aq = aoq_rows + (long)(s2q < n_valid_tok ? s2q : 0) * MPK_AOQ_RSTRIDE;
+          s2v0[s2q] = MPK_AOQ_LD16(aq + base);
+          s2v1[s2q][0] = (int)MPK_AOQ_LD32(aq + REDUCTION_SIZE + MPK_AOQ_SOFF(scale_block));
+        }
+#endif
+#else
+        i32x4_t const *s2src = (i32x4_t const *)(A + (long)(s2q < n_valid_tok ? s2q : 0) * REDUCTION_SIZE +
+                                                 base + lsp_shift);
+        s2v0[s2q] = s2src[0];
+        s2v1[s2q] = s2src[1];
+#endif
+      }
+#pragma unroll
+#endif
+      for (int s2r = 0; s2r < BATCH_SIZE; ++s2r) {
+#ifdef MPK_VTN_LIVEB
+      if (s2r > 0 && s2r >= n_valid_tok) continue;
+#endif
+#ifdef MPK_OPROJ_SLICE2_PRE
+      i32x4_t v0 = s2v0[s2r];
+      i32x4_t v1 = s2v1[s2r];
+#else
+      i32x4_t const *src = (i32x4_t const *)(A + (long)(s2r < n_valid_tok ? s2r : 0) * REDUCTION_SIZE +
+                                             base + lsp_shift);
       i32x4_t v0 = src[0];
       i32x4_t v1 = src[1];
+#endif
+#define MPK_S2_TOK (s2r * TOK_ROW_STRIDE)
+#define MPK_S2_SC (s2r * SC_STRIDE)
+#else
+      i32x4_t const *src = (i32x4_t const *)(A + base + lsp_shift);
+#define MPK_S2_TOK 0
+#define MPK_S2_SC 0
+      i32x4_t v0 = src[0];
+      i32x4_t v1 = src[1];
+#endif
 #endif // MPK_OPROJ_DATA_POLL
+#ifndef MPK_S2_TOK
+#define MPK_S2_TOK 0
+#define MPK_S2_SC 0
+#endif
 
+#ifdef MPK_OPROJ_ORC_CONV1
+      // MPK_OPROJ_ORC_CONV1 (timing only, wrong output): rows past the first are not converted.
+      if (MPK_S2_TOK == 0)
+#endif
+      {
+#if defined(MPK_VTN_AOQ) && !defined(MPK_VTN_AOQ_CHECK)
+      // MPK_VTN_AOQ: the merge's FP8 bytes and block scale, copied (the same quantization).
+#if defined(MPK_VTN_AOQ_ABIP) || defined(MPK_VTN_AOQ_MINN)
+      if (aoq_go) {
+      *(int *)(s_tok_fp8 + MPK_S2_TOK + base) = v0[0];
+      *(int *)(s_tok_fp8 + MPK_S2_TOK + base + 4) = v0[1];
+      *(int *)(s_tok_fp8 + MPK_S2_TOK + base + 8) = v0[2];
+      *(int *)(s_tok_fp8 + MPK_S2_TOK + base + 12) = v0[3];
+      if (lane_in_scale == 0) {
+        s_tok_scales[MPK_S2_SC + scale_block] =
+            (uint8_t)(((unsigned)v1[0] >> ((scale_block & 3) * 8)) & 0xFFu);
+      }
+      } else {
+      // MPK_VTN_OPQ: packed magnitude max and the bf16 pairs straight into the FP8 conversion (same bytes).
+      typedef unsigned short opq_u2 __attribute__((ext_vector_type(2)));
+      typedef __bf16 opq_b2 __attribute__((ext_vector_type(2)));
+      unsigned const opq_w[8] = {(unsigned)v0[0], (unsigned)v0[1], (unsigned)v0[2], (unsigned)v0[3],
+                                 (unsigned)v1[0], (unsigned)v1[1], (unsigned)v1[2], (unsigned)v1[3]};
+      opq_u2 opq_am = {0, 0};
+#pragma unroll
+      for (int d = 0; d < 8; ++d) {
+        unsigned const ab = opq_w[d] & 0x7FFF7FFFu;
+        opq_u2 abv;
+        __builtin_memcpy(&abv, &ab, 4);
+        opq_am = __builtin_elementwise_max(opq_am, abv);
+      }
+      float amax = __uint_as_float((unsigned)(opq_am[0] > opq_am[1] ? opq_am[0] : opq_am[1]) << 16);
+#ifdef MPK_OPROJ_AMAX_DPP
+      amax = _oproj_amax8_dpp(amax);
+#else
+      amax = fmaxf(amax, __shfl_xor(amax, 1));
+      amax = fmaxf(amax, __shfl_xor(amax, 2));
+      amax = fmaxf(amax, __shfl_xor(amax, 4));
+#endif
+      uint8_t const se = _gang_compute_e8m0_fp8(amax);
+      float scale_f;
+      if (se == 0) {
+        scale_f = 1.0f;
+      } else {
+        uint32_t const sbits = (uint32_t)se << 23;
+        __builtin_memcpy(&scale_f, &sbits, 4);
+      }
+#pragma unroll
+      for (int j = 0; j < ELEMENTS_PER_THREAD; j += 4) {
+        opq_b2 p0, p1;
+        __builtin_memcpy(&p0, &opq_w[j / 2], 4);
+        __builtin_memcpy(&p1, &opq_w[j / 2 + 1], 4);
+        fp8x4_t pk = {};
+        pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(pk, p0, scale_f, false);
+        pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(pk, p1, scale_f, true);
+        *(int *)(s_tok_fp8 + MPK_S2_TOK + base + j) = *(int const *)&pk;
+      }
+      if (lane_in_scale == 0) {
+        s_tok_scales[MPK_S2_SC + scale_block] = se;
+      }
+      }
+#else
+      *(int *)(s_tok_fp8 + MPK_S2_TOK + base) = v0[0];
+      *(int *)(s_tok_fp8 + MPK_S2_TOK + base + 4) = v0[1];
+      *(int *)(s_tok_fp8 + MPK_S2_TOK + base + 8) = v0[2];
+      *(int *)(s_tok_fp8 + MPK_S2_TOK + base + 12) = v0[3];
+      if (lane_in_scale == 0) {
+        s_tok_scales[MPK_S2_SC + scale_block] =
+            (uint8_t)(((unsigned)v1[0] >> ((scale_block & 3) * 8)) & 0xFFu);
+      }
+#endif
+#elif defined(MPK_VTN_OPQ)
+      // MPK_VTN_OPQ: packed magnitude max and the bf16 pairs straight into the FP8 conversion (same bytes).
+      typedef unsigned short opq_u2 __attribute__((ext_vector_type(2)));
+      typedef __bf16 opq_b2 __attribute__((ext_vector_type(2)));
+      unsigned const opq_w[8] = {(unsigned)v0[0], (unsigned)v0[1], (unsigned)v0[2], (unsigned)v0[3],
+                                 (unsigned)v1[0], (unsigned)v1[1], (unsigned)v1[2], (unsigned)v1[3]};
+      opq_u2 opq_am = {0, 0};
+#pragma unroll
+      for (int d = 0; d < 8; ++d) {
+        unsigned const ab = opq_w[d] & 0x7FFF7FFFu;
+        opq_u2 abv;
+        __builtin_memcpy(&abv, &ab, 4);
+        opq_am = __builtin_elementwise_max(opq_am, abv);
+      }
+      float amax = __uint_as_float((unsigned)(opq_am[0] > opq_am[1] ? opq_am[0] : opq_am[1]) << 16);
+#ifdef MPK_OPROJ_AMAX_DPP
+      amax = _oproj_amax8_dpp(amax);
+#else
+      amax = fmaxf(amax, __shfl_xor(amax, 1));
+      amax = fmaxf(amax, __shfl_xor(amax, 2));
+      amax = fmaxf(amax, __shfl_xor(amax, 4));
+#endif
+      uint8_t const se = _gang_compute_e8m0_fp8(amax);
+      float scale_f;
+      if (se == 0) {
+        scale_f = 1.0f;
+      } else {
+        uint32_t const sbits = (uint32_t)se << 23;
+        __builtin_memcpy(&scale_f, &sbits, 4);
+      }
+#pragma unroll
+      for (int j = 0; j < ELEMENTS_PER_THREAD; j += 4) {
+        opq_b2 p0, p1;
+        __builtin_memcpy(&p0, &opq_w[j / 2], 4);
+        __builtin_memcpy(&p1, &opq_w[j / 2 + 1], 4);
+        fp8x4_t pk = {};
+        pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(pk, p0, scale_f, false);
+        pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(pk, p1, scale_f, true);
+        *(int *)(s_tok_fp8 + MPK_S2_TOK + base + j) = *(int const *)&pk;
+      }
+      if (lane_in_scale == 0) {
+        s_tok_scales[MPK_S2_SC + scale_block] = se;
+      }
+#ifdef MPK_VTN_AOQ_CHECK
+      {
+        // MPK_VTN_AOQ_CHECK: the merge's bytes for this row against the conversion just stored.
+        char const *const aq = aoq_rows + (long)MPK_S2_TOK / TOK_ROW_STRIDE * MPK_AOQ_ROW_BYTES;
+        mpk_aoq_i32x4 const q8 = mpk_aoq_ld16(aq + base);
+        unsigned const qw = mpk_aoq_ld32(aq + REDUCTION_SIZE + (scale_block & ~3));
+        unsigned const qs = (qw >> ((scale_block & 3) * 8)) & 0xFFu;
+        int const *const st = (int const *)(s_tok_fp8 + MPK_S2_TOK + base);
+        bool const bad = q8[0] != st[0] || q8[1] != st[1] || q8[2] != st[2] || q8[3] != st[3] ||
+                         qs != (unsigned)se;
+        unsigned long long const bm = __builtin_amdgcn_ballot_w64(bad);
+        if ((tid & 63) == 0) {
+          unsigned const n = atomicAdd(&g_aoq_chk[0], 1u) + 1u;
+          if (bm != 0ull) atomicAdd(&g_aoq_chk[1], 1u);
+          if ((n & 0x7FFFu) == 0u) printf("[AOQCHK] checks=%u bad=%u\n", n, g_aoq_chk[1]);
+        }
+      }
+#endif
+#else
       float vals[ELEMENTS_PER_THREAD];
       float amax = 0.0f;
       unsigned short const *vs0 = (unsigned short const *)&v0;
@@ -795,11 +1349,18 @@ __device__ __attribute__((noinline)) void
             pk, vals[j], vals[j + 1], scale_f, false);
         pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
             pk, vals[j + 2], vals[j + 3], scale_f, true);
-        *(int *)(s_tok_fp8 + base + j) = *(int const *)&pk;
+        *(int *)(s_tok_fp8 + MPK_S2_TOK + base + j) = *(int const *)&pk;
       }
       if (lane_in_scale == 0) {
-        s_tok_scales[scale_block] = se;
+        s_tok_scales[MPK_S2_SC + scale_block] = se;
       }
+#endif
+      }
+#ifdef MPK_OPROJ_SLICE2
+      }
+#endif
+#undef MPK_S2_TOK
+#undef MPK_S2_SC
       // Deliberately NOT __syncthreads. Every byte this wave just wrote is
       // read back by this same wave and by no other, so a wave-scope drain is
       // the whole requirement -- and keeping it wave-scope is the point of
@@ -1076,6 +1637,10 @@ __device__ __attribute__((noinline)) void
               (unsigned long long)o0 | ((unsigned long long)o1 << 16) |
               ((unsigned long long)o2 << 32) | ((unsigned long long)o3 << 48);
           st_wt_u64(&d_output[out_idx_base], out64);
+#if defined(MPK_AID_SPLIT_OUT) && defined(MPK_AID_SPLIT_FLAGS)
+          mpk_aid_out_publish(out_idx_base, out64,
+                              BATCH_SIZE * output_stride * 2);
+#endif
         }
       }
     } else {
@@ -1101,7 +1666,12 @@ __device__ __attribute__((noinline)) void
       // the MFMA loop + K-parallel reduction (~800 ns away).  Addresses
       // depend only on tile indices, not on MFMA results.
       uint2 pf_bias = {0, 0}, pf_res = {0, 0};
+#if defined(MPK_ROP_SPLIT4)
+      // Every wave rebuilds the output row for its share of the router partial.
+      if (tok_active) {
+#else
       if (warp_id == 0 && tok_active) {
+#endif
         int out_n_local_pf = wg_idx * OUTPUT_PER_WG + g * 4;
         int res_idx_pf = my_tok * output_stride + out_n_local_pf;
         unsigned short const *bias_addr = &d_bias[out_n_local_pf];
@@ -1112,6 +1682,75 @@ __device__ __attribute__((noinline)) void
                      : "v"(bias_addr), "v"(res_addr)
                      : "memory");
       }
+#ifdef MPK_ROUTER_OPROJ_PARTIAL
+      // This tile's 16 columns of router rows `lane` and `lane + 64`, and of
+      // the post-norm gamma. The router pointer is pre-offset to this XCD's
+      // 16 rows; undo that. Retired by the bias/residual vmcnt(0) below.
+#ifdef MPK_VT2
+      static_assert(BATCH_SIZE <= MPK_ROP_NTOK && OUTPUT_PER_WG == 16 &&
+                        NUM_EXPERTS == 128 && MPK_NUM_XCDS == 8,
+                    "MPK_ROUTER_OPROJ_PARTIAL + MPK_VT2: 1 or 2 tokens / 16-col O-proj / 128 experts");
+#else
+      static_assert(BATCH_SIZE == 1 && OUTPUT_PER_WG == 16 &&
+                        NUM_EXPERTS == 128 && MPK_NUM_XCDS == 8,
+                    "MPK_ROUTER_OPROJ_PARTIAL is bs1 / 16-col O-proj / 128 experts");
+#endif
+      int const rop_c0 = xcd_output_col_offset + wg_idx * OUTPUT_PER_WG;
+      // 2880 is a multiple of 16, so a tile is all real or all padding.
+      bool const rop_live = rop_c0 < ACTUAL_HIDDEN_DIM;
+      rop_i32x4_t rop_w0 = {}, rop_w1 = {}, rop_w2 = {}, rop_w3 = {};
+      rop_i32x4_t rop_g0 = {}, rop_g1 = {};
+#if defined(MPK_ROP_SPLIT4)
+      if (rop_live) {
+        // Wave w, lane l: router row 32w + (l & 31); lanes 32..63 repeat 0..31.
+        char const *rop_rw =
+            (char const *)((unsigned short const *)router_weight_ptr +
+                           ((int64_t)(warp_id * 32 + (lane_id & 31)) -
+                            xcd_id * (NUM_EXPERTS / MPK_NUM_XCDS)) *
+                               output_stride +
+                           rop_c0);
+        char const *rop_gm =
+            (char const *)((unsigned short const *)norm_weight_ptr +
+#ifdef MPK_GAMMA_AID
+                           ((xcd_id >= (MPK_NUM_XCDS / 2)) ? output_stride : 0) +
+#endif
+                           rop_c0);
+        asm volatile("global_load_dwordx4 %0, %4, off\n"
+                     "global_load_dwordx4 %1, %4, off offset:16\n"
+                     "global_load_dwordx4 %2, %5, off\n"
+                     "global_load_dwordx4 %3, %5, off offset:16"
+                     : "=&v"(rop_w0), "=&v"(rop_w1), "=&v"(rop_g0), "=&v"(rop_g1)
+                     : "v"(rop_rw), "v"(rop_gm)
+                     : "memory");
+      }
+#else
+      if (warp_id == 0 && rop_live) {
+        char const *rop_rw =
+            (char const *)((unsigned short const *)router_weight_ptr +
+                           ((int64_t)lane_id -
+                            xcd_id * (NUM_EXPERTS / MPK_NUM_XCDS)) *
+                               output_stride +
+                           rop_c0);
+        char const *rop_rw1 = rop_rw + (int64_t)64 * output_stride * 2;
+        char const *rop_gm =
+            (char const *)((unsigned short const *)norm_weight_ptr +
+#ifdef MPK_GAMMA_AID
+                           ((xcd_id >= (MPK_NUM_XCDS / 2)) ? output_stride : 0) +
+#endif
+                           rop_c0);
+        asm volatile("global_load_dwordx4 %0, %6, off\n"
+                     "global_load_dwordx4 %1, %6, off offset:16\n"
+                     "global_load_dwordx4 %2, %7, off\n"
+                     "global_load_dwordx4 %3, %7, off offset:16\n"
+                     "global_load_dwordx4 %4, %8, off\n"
+                     "global_load_dwordx4 %5, %8, off offset:16"
+                     : "=&v"(rop_w0), "=&v"(rop_w1), "=&v"(rop_w2),
+                       "=&v"(rop_w3), "=&v"(rop_g0), "=&v"(rop_g1)
+                     : "v"(rop_rw), "v"(rop_rw1), "v"(rop_gm)
+                     : "memory");
+      }
+#endif
+#endif
 
       // Read weights from LDS (populated by Phase 6 buffer_load_lds DMA).
       // LDS layout mirrors HBM tile layout: data at [0..WG_DATA_BYTES),
@@ -1324,6 +1963,88 @@ __device__ __attribute__((noinline)) void
         DO_MFMA_LDS_FP8(ki1 + 2);
         DO_MFMA_LDS_FP8(ki1 + 3);
       }
+#elif defined(MPK_OPROJ_IMM)
+#ifndef MPK_OPROJ_KMAJOR
+#error "MPK_OPROJ_IMM: needs MPK_OPROJ_KMAJOR (one 1 KiB A block per K-step)"
+#endif
+      {
+        static_assert(KP_BASE == 8 && KP_EXTRA == 0 && K_PER_MFMA == 128 &&
+                          LDS_DATA_K_STRIDE == 1024,
+                      "MPK_OPROJ_IMM: 8 K-steps of 128 per wave, K-major A");
+#define MPK_OI_LDS(p)                                                          \
+  static_cast<unsigned>(reinterpret_cast<uintptr_t>(                           \
+      (__attribute__((address_space(3))) uint8_t const *)(p)))
+        unsigned const oi_w = MPK_OI_LDS(MPK_OPROJ_W_ADDR(kp_ki_start));
+        unsigned const oi_sa = MPK_OI_LDS(lds_w_scales + lds_row_scale_base +
+                                          kp_ki_start * 4 + g);
+        unsigned const oi_b =
+            MPK_OI_LDS(b_tok + kp_ki_start * K_PER_MFMA + g * 16);
+        unsigned const oi_sb = MPK_OI_LDS(b_scl + kp_ki_start);
+#undef MPK_OI_LDS
+        asm volatile(
+            "ds_read_b128 v[80:83], %[vw] offset:0\n"
+            "ds_read_u8 v84, %[vsa] offset:0\n"
+            "ds_read_b128 v[64:67], %[vb] offset:0\n"
+            "ds_read_b128 v[68:71], %[vb] offset:64\n"
+            "ds_read_u8 v85, %[vsb] offset:0\n"
+            "ds_read_b128 v[96:99], %[vw] offset:1024\n"
+            "ds_read_u8 v86, %[vsa] offset:4\n"
+            "ds_read_b128 v[48:51], %[vb] offset:128\n"
+            "ds_read_b128 v[52:55], %[vb] offset:192\n"
+            "ds_read_u8 v87, %[vsb] offset:1\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 %[acc], v[80:83], v[64:71], %[acc], v84, v85 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[80:83], %[vw] offset:2048\n"
+            "ds_read_u8 v84, %[vsa] offset:8\n"
+            "ds_read_b128 v[64:67], %[vb] offset:256\n"
+            "ds_read_b128 v[68:71], %[vb] offset:320\n"
+            "ds_read_u8 v85, %[vsb] offset:2\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 %[acc], v[96:99], v[48:55], %[acc], v86, v87 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[96:99], %[vw] offset:3072\n"
+            "ds_read_u8 v86, %[vsa] offset:12\n"
+            "ds_read_b128 v[48:51], %[vb] offset:384\n"
+            "ds_read_b128 v[52:55], %[vb] offset:448\n"
+            "ds_read_u8 v87, %[vsb] offset:3\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 %[acc], v[80:83], v[64:71], %[acc], v84, v85 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[80:83], %[vw] offset:4096\n"
+            "ds_read_u8 v84, %[vsa] offset:16\n"
+            "ds_read_b128 v[64:67], %[vb] offset:512\n"
+            "ds_read_b128 v[68:71], %[vb] offset:576\n"
+            "ds_read_u8 v85, %[vsb] offset:4\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 %[acc], v[96:99], v[48:55], %[acc], v86, v87 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[96:99], %[vw] offset:5120\n"
+            "ds_read_u8 v86, %[vsa] offset:20\n"
+            "ds_read_b128 v[48:51], %[vb] offset:640\n"
+            "ds_read_b128 v[52:55], %[vb] offset:704\n"
+            "ds_read_u8 v87, %[vsb] offset:5\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 %[acc], v[80:83], v[64:71], %[acc], v84, v85 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[80:83], %[vw] offset:6144\n"
+            "ds_read_u8 v84, %[vsa] offset:24\n"
+            "ds_read_b128 v[64:67], %[vb] offset:768\n"
+            "ds_read_b128 v[68:71], %[vb] offset:832\n"
+            "ds_read_u8 v85, %[vsb] offset:6\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 %[acc], v[96:99], v[48:55], %[acc], v86, v87 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[96:99], %[vw] offset:7168\n"
+            "ds_read_u8 v86, %[vsa] offset:28\n"
+            "ds_read_b128 v[48:51], %[vb] offset:896\n"
+            "ds_read_b128 v[52:55], %[vb] offset:960\n"
+            "ds_read_u8 v87, %[vsb] offset:7\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 %[acc], v[80:83], v[64:71], %[acc], v84, v85 op_sel_hi:[0,0,0] cbsz:4\n"
+            "s_waitcnt lgkmcnt(0)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 %[acc], v[96:99], v[48:55], %[acc], v86, v87 op_sel_hi:[0,0,0] cbsz:4\n"
+            "s_nop 7\n"
+            "s_nop 7\n"
+            "s_nop 2\n"
+            : [acc] "+v"(acc)
+            : [vw] "v"(oi_w), [vsa] "v"(oi_sa), [vb] "v"(oi_b), [vsb] "v"(oi_sb)
+            : "v48", "v49", "v50", "v51", "v52", "v53", "v54", "v55", "v64", "v65", "v66", "v67", "v68", "v69", "v70", "v71", "v80", "v81", "v82", "v83", "v84", "v85", "v86", "v87", "v96", "v97", "v98", "v99", "memory");
+      }
 #else
       DO_MFMA_LDS_FP8(kp_ki_start + 0);
       DO_MFMA_LDS_FP8(kp_ki_start + 1);
@@ -1380,8 +2101,19 @@ __device__ __attribute__((noinline)) void
       }
 #endif
       __syncthreads();
+      MPK_TKOPS_AT(5, tid == 0);
+#ifdef MPK_OPROJ_SUB
+      if (tid == 0) _os2 = (unsigned int)__builtin_amdgcn_s_memrealtime();
+#endif
 
+#ifdef MPK_ROUTER_OPROJ_PARTIAL
+      unsigned rop_y01 = 0u, rop_y23 = 0u;
+#endif
+#if defined(MPK_ROP_SPLIT4)
+      if (tok_active) {
+#else
       if (warp_id == 0 && tok_active) {
+#endif
         float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
         // Each lane reduces its own (g, col) slot: output columns g*4..g*4+3
         // of token col. At TOK_ROWS == 1 that slot is always g*16, and saying
@@ -1465,10 +2197,355 @@ __device__ __attribute__((noinline)) void
         unsigned long long out64 =
             (unsigned long long)o0 | ((unsigned long long)o1 << 16) |
             ((unsigned long long)o2 << 32) | ((unsigned long long)o3 << 48);
+#ifdef MPK_ROUTER_OPROJ_PARTIAL
+        rop_y01 = (unsigned)out64;
+        rop_y23 = (unsigned)(out64 >> 32);
+#endif
+#if defined(MPK_ROP_SPLIT4)
+        if (warp_id == 0) {
+#endif
         st_wt_u64(&d_output[out_idx_base], out64);
+#if defined(MPK_AID_SPLIT_OUT) && defined(MPK_AID_SPLIT_FLAGS)
+        mpk_aid_out_publish(out_idx_base, out64,
+                            BATCH_SIZE * output_stride * 2);
+#endif
+#if defined(MPK_ROP_SPLIT4)
+        }
+#endif
       }
+#ifdef MPK_ROUTER_OPROJ_PARTIAL
+#if defined(MPK_ROP_SPLIT4)
+      {
+        // Wave w, lanes 0..31: expert 32w + lane over this tile's 16 columns, in the
+        // one-wave form's j order and contraction; wave 3 also takes the ssq.
+        static_assert(NUM_WAVES == 4 && NUM_EXPERTS == 128, "MPK_ROP_SPLIT4: 4 waves x 32 experts");
+#if defined(MPK_VT2) && defined(MPK_VTN_MOE)
+        if constexpr (BATCH_SIZE > 2) {
+          // MPK_ROP_SPLIT4 + MPK_VTN_N7B: lanes 0..31 tokens 0, 2, ..., lanes 32..63 tokens 1, 3, ...
+          // (MPK_VTN_T6: one pass per token pair).
+          static_assert(BATCH_SIZE % 2 == 0 && BATCH_SIZE <= 16,
+                        "MPK_ROP_SPLIT4 + MPK_VTN_N7B: token pairs");
+          unsigned const rop_wd[8] = {
+              (unsigned)rop_w0[0], (unsigned)rop_w0[1], (unsigned)rop_w0[2],
+              (unsigned)rop_w0[3], (unsigned)rop_w1[0], (unsigned)rop_w1[1],
+              (unsigned)rop_w1[2], (unsigned)rop_w1[3]};
+          unsigned const rop_gd[8] = {
+              (unsigned)rop_g0[0], (unsigned)rop_g0[1], (unsigned)rop_g0[2],
+              (unsigned)rop_g0[3], (unsigned)rop_g1[0], (unsigned)rop_g1[1],
+              (unsigned)rop_g1[2], (unsigned)rop_g1[3]};
+          bool const rop_hi = lane_id >= 32;
+#pragma unroll
+          for (int rp = 0; rp < BATCH_SIZE / 2; ++rp) {
+#ifdef MPK_VTN_LIVEB
+            if (2 * rp >= batch_count) break;
+#endif
+            float rop_y[16];
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+              unsigned const a0 = __builtin_amdgcn_readlane(rop_y01, q * 16 + 2 * rp);
+              unsigned const b0 = __builtin_amdgcn_readlane(rop_y23, q * 16 + 2 * rp);
+              unsigned const a1 = __builtin_amdgcn_readlane(rop_y01, q * 16 + 2 * rp + 1);
+              unsigned const b1 = __builtin_amdgcn_readlane(rop_y23, q * 16 + 2 * rp + 1);
+              unsigned const a = rop_hi ? a1 : a0;
+              unsigned const b = rop_hi ? b1 : b0;
+              rop_y[q * 4 + 0] = __uint_as_float(a << 16);
+              rop_y[q * 4 + 1] = __uint_as_float(a & 0xFFFF0000u);
+              rop_y[q * 4 + 2] = __uint_as_float(b << 16);
+              rop_y[q * 4 + 3] = __uint_as_float(b & 0xFFFF0000u);
+            }
+            float rop_p0 = 0.0f, rop_ssq = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+              int const d = j >> 1;
+              int const sh = (j & 1) ? 0 : 16;
+              unsigned const msk = 0xFFFF0000u;
+              float const gj = __uint_as_float((rop_gd[d] << sh) & msk);
+              float const w0 = __uint_as_float((rop_wd[d] << sh) & msk);
+              float const yg = rop_y[j] * gj;
+              rop_p0 += w0 * yg;
+            }
+            if (warp_id == NUM_WAVES - 1) {
+#pragma unroll
+              for (int j = 0; j < 16; ++j) {
+                rop_ssq += rop_y[j] * rop_y[j];
+              }
+            }
+            if (!rop_live) {
+              rop_p0 = 0.0f;
+              rop_ssq = 0.0f;
+            }
+            int const rt = 2 * rp + (rop_hi ? 1 : 0);
+            int const rop_si = (((layer_epoch & 1) * MPK_NUM_XCDS + xcd_id) * MPK_AID_ROP_WG_SLOTS + wg_idx) *
+                               MPK_AID_ROP_WG_INTS;
+            float *const rop_slt =
+                rt == 0 ? (float *)(g_rop_rep[xcd_id >> 2] + MPK_AID_ROP_WG_BASE_INTS + rop_si)
+                        : (float *)(g_aid_nc_rep[xcd_id >> 2] + mpk_rop_nc_ints(rt) + rop_si);
+            rop_slt[warp_id * 32 + (lane_id & 31)] = rop_p0;
+            if (warp_id == NUM_WAVES - 1 && (lane_id & 31) == 0) {
+              rop_slt[128] = rop_ssq;
+            }
+          }
+        } else
+#endif
+        {
+        // MPK_ROP_SPLIT4_VT2: at 2 tokens lanes 32..63 take token 1 (N column 1).
+#ifdef MPK_VT2
+        bool const rop_t1 = BATCH_SIZE == 2 && lane_id >= 32;
+#endif
+        float rop_y[16];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+#ifdef MPK_VT2
+          unsigned a = __builtin_amdgcn_readlane(rop_y01, q * 16);
+          unsigned b = __builtin_amdgcn_readlane(rop_y23, q * 16);
+          if constexpr (BATCH_SIZE == 2) {
+            unsigned const a1 = __builtin_amdgcn_readlane(rop_y01, q * 16 + 1);
+            unsigned const b1 = __builtin_amdgcn_readlane(rop_y23, q * 16 + 1);
+            a = rop_t1 ? a1 : a;
+            b = rop_t1 ? b1 : b;
+          }
+#else
+          unsigned const a = __builtin_amdgcn_readlane(rop_y01, q * 16);
+          unsigned const b = __builtin_amdgcn_readlane(rop_y23, q * 16);
+#endif
+          rop_y[q * 4 + 0] = __uint_as_float(a << 16);
+          rop_y[q * 4 + 1] = __uint_as_float(a & 0xFFFF0000u);
+          rop_y[q * 4 + 2] = __uint_as_float(b << 16);
+          rop_y[q * 4 + 3] = __uint_as_float(b & 0xFFFF0000u);
+        }
+        unsigned const rop_wd[8] = {
+            (unsigned)rop_w0[0], (unsigned)rop_w0[1], (unsigned)rop_w0[2],
+            (unsigned)rop_w0[3], (unsigned)rop_w1[0], (unsigned)rop_w1[1],
+            (unsigned)rop_w1[2], (unsigned)rop_w1[3]};
+        unsigned const rop_gd[8] = {
+            (unsigned)rop_g0[0], (unsigned)rop_g0[1], (unsigned)rop_g0[2],
+            (unsigned)rop_g0[3], (unsigned)rop_g1[0], (unsigned)rop_g1[1],
+            (unsigned)rop_g1[2], (unsigned)rop_g1[3]};
+        float rop_p0 = 0.0f, rop_ssq = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+          int const d = j >> 1;
+          int const sh = (j & 1) ? 0 : 16;
+          unsigned const msk = 0xFFFF0000u;
+          float const gj = __uint_as_float((rop_gd[d] << sh) & msk);
+          float const w0 = __uint_as_float((rop_wd[d] << sh) & msk);
+          float const yg = rop_y[j] * gj;
+          rop_p0 += w0 * yg;
+        }
+        if (warp_id == NUM_WAVES - 1) {
+#pragma unroll
+          for (int j = 0; j < 16; ++j) {
+            rop_ssq += rop_y[j] * rop_y[j];
+          }
+        }
+        if (!rop_live) {
+          rop_p0 = 0.0f;
+          rop_ssq = 0.0f;
+        }
+        float *const rop_slot =
+            (float *)(g_rop_rep[xcd_id >> 2] + MPK_AID_ROP_WG_BASE_INTS +
+                      (((layer_epoch & 1) * MPK_NUM_XCDS + xcd_id) *
+                           MPK_AID_ROP_WG_SLOTS +
+                       wg_idx) *
+                          MPK_AID_ROP_WG_INTS);
+        if (lane_id < 32) {
+          rop_slot[warp_id * 32 + lane_id] = rop_p0;
+        }
+        if (warp_id == NUM_WAVES - 1 && lane_id == 0) {
+          rop_slot[128] = rop_ssq;
+        }
+#ifdef MPK_VT2
+        if constexpr (BATCH_SIZE == 2) {
+          float *const rop_slot1 =
+              (float *)(g_aid_nc_rep[xcd_id >> 2] + MPK_NC_ROP1_INTS +
+                        (((layer_epoch & 1) * MPK_NUM_XCDS + xcd_id) * MPK_AID_ROP_WG_SLOTS +
+                         wg_idx) *
+                            MPK_AID_ROP_WG_INTS);
+          if (lane_id >= 32) {
+            rop_slot1[warp_id * 32 + lane_id - 32] = rop_p0;
+          }
+          if (warp_id == NUM_WAVES - 1 && lane_id == 32) {
+            rop_slot1[128] = rop_ssq;
+          }
+        }
+#endif
+        }
+      }
+#else
+      if (warp_id == 0) {
+        // Lane l: sum_j w[l][j] * (y_j * g_j) and the same for expert l + 64
+        // over this tile's 16 columns; y is the bf16 hidden exactly as stored.
+        // The rmsnorm scale is uniform, so it is applied once in Phase 7b.
+        float rop_y[16];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          unsigned const a = __builtin_amdgcn_readlane(rop_y01, q * 16);
+          unsigned const b = __builtin_amdgcn_readlane(rop_y23, q * 16);
+          rop_y[q * 4 + 0] = __uint_as_float(a << 16);
+          rop_y[q * 4 + 1] = __uint_as_float(a & 0xFFFF0000u);
+          rop_y[q * 4 + 2] = __uint_as_float(b << 16);
+          rop_y[q * 4 + 3] = __uint_as_float(b & 0xFFFF0000u);
+        }
+        unsigned const rop_wd[16] = {
+            (unsigned)rop_w0[0], (unsigned)rop_w0[1], (unsigned)rop_w0[2],
+            (unsigned)rop_w0[3], (unsigned)rop_w1[0], (unsigned)rop_w1[1],
+            (unsigned)rop_w1[2], (unsigned)rop_w1[3], (unsigned)rop_w2[0],
+            (unsigned)rop_w2[1], (unsigned)rop_w2[2], (unsigned)rop_w2[3],
+            (unsigned)rop_w3[0], (unsigned)rop_w3[1], (unsigned)rop_w3[2],
+            (unsigned)rop_w3[3]};
+        unsigned const rop_gd[8] = {
+            (unsigned)rop_g0[0], (unsigned)rop_g0[1], (unsigned)rop_g0[2],
+            (unsigned)rop_g0[3], (unsigned)rop_g1[0], (unsigned)rop_g1[1],
+            (unsigned)rop_g1[2], (unsigned)rop_g1[3]};
+        float rop_p0 = 0.0f, rop_p1 = 0.0f, rop_ssq = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+          int const d = j >> 1;
+          int const sh = (j & 1) ? 0 : 16;
+          unsigned const msk = 0xFFFF0000u;
+          float const gj = __uint_as_float((rop_gd[d] << sh) & msk);
+          float const w0 = __uint_as_float((rop_wd[d] << sh) & msk);
+          float const w1 = __uint_as_float((rop_wd[8 + d] << sh) & msk);
+          float const yg = rop_y[j] * gj;
+          rop_p0 += w0 * yg;
+          rop_p1 += w1 * yg;
+          rop_ssq += rop_y[j] * rop_y[j];
+        }
+        if (!rop_live) {
+          rop_p0 = 0.0f;
+          rop_p1 = 0.0f;
+          rop_ssq = 0.0f;
+        }
+        // Plain stores into this XCD's L2; the local-last reads them there.
+        // Drained by the vmcnt(0) ahead of this block's arrival.
+        float *const rop_slot =
+            (float *)(g_rop_rep[xcd_id >> 2] + MPK_AID_ROP_WG_BASE_INTS +
+                      (((layer_epoch & 1) * MPK_NUM_XCDS + xcd_id) *
+                           MPK_AID_ROP_WG_SLOTS +
+                       wg_idx) *
+                          MPK_AID_ROP_WG_INTS);
+        rop_slot[lane_id] = rop_p0;
+        rop_slot[64 + lane_id] = rop_p1;
+        if (lane_id == 0) {
+          rop_slot[128] = rop_ssq;
+        }
+#ifdef MPK_VT2
+        if constexpr (BATCH_SIZE == 2) {
+          // Token 1's 16 columns sit in lanes q * 16 + 1 (N column 1); zero when the row is dead.
+          float y1[16];
+#pragma unroll
+          for (int q = 0; q < 4; ++q) {
+            unsigned const a = __builtin_amdgcn_readlane(rop_y01, q * 16 + 1);
+            unsigned const b = __builtin_amdgcn_readlane(rop_y23, q * 16 + 1);
+            y1[q * 4 + 0] = __uint_as_float(a << 16);
+            y1[q * 4 + 1] = __uint_as_float(a & 0xFFFF0000u);
+            y1[q * 4 + 2] = __uint_as_float(b << 16);
+            y1[q * 4 + 3] = __uint_as_float(b & 0xFFFF0000u);
+          }
+          float p0 = 0.0f, p1 = 0.0f, sq = 0.0f;
+#pragma unroll
+          for (int j = 0; j < 16; ++j) {
+            int const d = j >> 1;
+            int const sh = (j & 1) ? 0 : 16;
+            unsigned const msk = 0xFFFF0000u;
+            float const gj = __uint_as_float((rop_gd[d] << sh) & msk);
+            float const w0 = __uint_as_float((rop_wd[d] << sh) & msk);
+            float const w1 = __uint_as_float((rop_wd[8 + d] << sh) & msk);
+            float const yg = y1[j] * gj;
+            p0 += w0 * yg;
+            p1 += w1 * yg;
+            sq += y1[j] * y1[j];
+          }
+          if (!rop_live) {
+            p0 = 0.0f;
+            p1 = 0.0f;
+            sq = 0.0f;
+          }
+          float *const rop_slot1 =
+              (float *)(g_aid_nc_rep[xcd_id >> 2] + MPK_NC_ROP1_INTS +
+                        (((layer_epoch & 1) * MPK_NUM_XCDS + xcd_id) * MPK_AID_ROP_WG_SLOTS +
+                         wg_idx) *
+                            MPK_AID_ROP_WG_INTS);
+          rop_slot1[lane_id] = p0;
+          rop_slot1[64 + lane_id] = p1;
+          if (lane_id == 0) {
+            rop_slot1[128] = sq;
+          }
+        } else if constexpr (BATCH_SIZE > 2) {
+          // MPK_VTN_N7B: token t's 16 columns in lanes q * 16 + t (N column t), slots at mpk_rop_nc_ints(t).
+#pragma unroll
+          for (int rt = 1; rt < BATCH_SIZE; ++rt) {
+#ifdef MPK_VTN_LIVEB
+            if (rt >= batch_count) break;
+#endif
+            float yt[16];
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+              unsigned const a = __builtin_amdgcn_readlane(rop_y01, q * 16 + rt);
+              unsigned const b = __builtin_amdgcn_readlane(rop_y23, q * 16 + rt);
+              yt[q * 4 + 0] = __uint_as_float(a << 16);
+              yt[q * 4 + 1] = __uint_as_float(a & 0xFFFF0000u);
+              yt[q * 4 + 2] = __uint_as_float(b << 16);
+              yt[q * 4 + 3] = __uint_as_float(b & 0xFFFF0000u);
+            }
+            float p0 = 0.0f, p1 = 0.0f, sq = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+              int const d = j >> 1;
+              int const sh = (j & 1) ? 0 : 16;
+              unsigned const msk = 0xFFFF0000u;
+              float const gj = __uint_as_float((rop_gd[d] << sh) & msk);
+              float const w0 = __uint_as_float((rop_wd[d] << sh) & msk);
+              float const w1 = __uint_as_float((rop_wd[8 + d] << sh) & msk);
+              float const yg = yt[j] * gj;
+              p0 += w0 * yg;
+              p1 += w1 * yg;
+              sq += yt[j] * yt[j];
+            }
+            if (!rop_live) {
+              p0 = 0.0f;
+              p1 = 0.0f;
+              sq = 0.0f;
+            }
+            float *const rop_slott =
+                (float *)(g_aid_nc_rep[xcd_id >> 2] + mpk_rop_nc_ints(rt) +
+                          (((layer_epoch & 1) * MPK_NUM_XCDS + xcd_id) * MPK_AID_ROP_WG_SLOTS +
+                           wg_idx) *
+                              MPK_AID_ROP_WG_INTS);
+            rop_slott[lane_id] = p0;
+            rop_slott[64 + lane_id] = p1;
+            if (lane_id == 0) {
+              rop_slott[128] = sq;
+            }
+          }
+        }
+#endif
+      }
+#endif  // MPK_ROP_SPLIT4
+#endif
     }
   }
+
+  // Next tile owned by this worker. The syncthreads is required: the pass
+  // below re-stages weights into the same LDS the pass above just read.
+#if MPK_NUM_XCDS != 8 || defined(MPK_MULTI_PASS_8XCD)
+  oproj_lt += n_oproj_part;
+  if (oproj_lt < tiles_per_xcd) {
+    __syncthreads();
+    // Phase 6 staged only this worker's first tile, so re-stage for this one.
+    // Without it the MFMA below reads the previous pass's weight group and
+    // computes cleanly against it -- measured as exactly the tiles with
+    // local_tile >= n_oproj_part coming out wrong in attn_proj_out.
+    //
+    // No overlap to buy here, unlike Phase 6: there is no barrier left to
+    // hide the DMA behind, so drain and rendezvous before jumping back.
+    oproj_stage_weight_lds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>(
+        W, n_wgs_per_xcd, oproj_lt % n_wgs_per_xcd, tid, _lm_smem);
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    __syncthreads();
+    goto oproj_tile_pass;
+  }
+#endif
 
 oproj_barrier :
   // ════════════════════════════════════════════════════════════════════════
@@ -1493,6 +2570,11 @@ oproj_barrier :
 #endif
 #ifdef MPK_OPROJ_INNER_TIMING
   _op_t1 = __builtin_amdgcn_s_memrealtime();
+#endif
+  MPK_SUB_MARK(1);
+MPK_TKOPS_AT(6, tid == 0);
+#ifdef MPK_OPROJ_SUB
+  if (tid == 0) _os3 = (unsigned int)__builtin_amdgcn_s_memrealtime();
 #endif
   MPK_ILSTAMP(21, s_ilsub_ml == MPK_ILSUB_L0 + 1);
   // Drain BEFORE the rendezvous, not after. `s_waitcnt` is a per-wave
@@ -1556,7 +2638,18 @@ oproj_barrier :
     // to race with.
     int const oproj_release_expected =
         layer_epoch > 0 ? layer_epoch
-                        : ld_nt_s32(&hier_barrier[xcd_id * HIER_STRIDE]) + 1;
+#ifdef MPK_OPROJ_NARROW_REL
+#ifdef MPK_OPROJ_AID_TIER
+                        : min(ld_nt_s32(&hier_release[16]),
+                              ld_nt_s32(&hier_release[32])) + 1;
+#elif defined(MPK_OPROJ_FLAT)
+                        : ld_aid_min8_s32(hier_release) + 1;
+#else
+                        : ld_nt_s32(&hier_release[0]) + 1;
+#endif
+#else
+                        : ld_nt_s32(&hier_release[xcd_id * HIER_STRIDE]) + 1;
+#endif
 
     // ── Release fan-out: one wave instruction, not eight serial stores ────
     //
@@ -1580,6 +2673,11 @@ oproj_barrier :
     // value. Zero means "not the releaser", which is unambiguous because a
     // real epoch is >= 1.
     int oproj_rel_epoch = 0;
+    // This worker's own round at this barrier, from its own arrival index.
+    int oproj_my_round = -1;
+#ifdef MPK_VTN_ROP2
+    int rop2_wait = 0;  // MPK_VTN_ROP2: > 0 on the die's second-to-last arrival
+#endif
 #ifdef MPK_OPROJ_TILE_FLAGS
     bool const mpk_tf = layer_epoch > 0;
     if (tid == 0 && mpk_tf) {
@@ -1641,6 +2739,7 @@ oproj_barrier :
       // load-bearing if any store on this path is ever changed away from
       // write-through: the failure signature to watch for is rows of
       // rmsnorm_out differing run to run while attn_proj_out is bit-identical.
+      MPK_XS_MARK(7);
 #ifndef MPK_OPROJ_NO_WB
       threadfence_gpu();
 #else
@@ -1685,7 +2784,15 @@ oproj_barrier :
       // arrival" is `prev % N == N - 1` rather than a compare against N.
       int const local_prev =
           atom_add_xcd_local_s32(&hier_local[xcd_id * HIER_STRIDE], 1);
-      if ((local_prev % tiles_per_xcd) == tiles_per_xcd - 1) {
+      oproj_my_round = local_prev / n_oproj_part;
+#ifdef MPK_VTN_ROP2
+      if (n_oproj_part >= 2 && (local_prev % n_oproj_part) == n_oproj_part - 2) {
+        rop2_wait = local_prev + 2;
+      }
+#endif
+      MPK_WS_MARK(7000, (unsigned)local_prev);
+      if ((local_prev % n_oproj_part) == n_oproj_part - 1) {
+        MPK_WS_MARK(7010, (unsigned)n_oproj_part);
         // Last worker on this XCD. Its own stores are drained (above) and so
         // are every other arriving worker's on this XCD -- each drained
         // before its own arrival, and all of those arrivals precede this one
@@ -1694,10 +2801,44 @@ oproj_barrier :
         // This XCD's 368-col attn_proj_out slice is in HBM. Router workers
         // on every die poll this flag and FMA the slice without waiting
         // for the other seven XCDs.
+#ifdef MPK_AID_SPLIT_FLAGS
+        mpk_aid_publish(oproj_xcd_ready_shared,
+                        xcd_id,
+                        (unsigned)oproj_release_expected,
+                        MPK_AID_REGION_OPROJ_READY);
+#else
         st_wt_u32((void *)&oproj_xcd_ready[xcd_id * HIER_STRIDE],
                   (unsigned)oproj_release_expected);
+#endif
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 #endif
+#if defined(MPK_OPROJ_AID_TIER)
+        int const _tier_prev = atom_add_release_gpu_s32(&oproj_tier[0], 1);
+        if ((_tier_prev % 4) == 3) {
+          oproj_rel_epoch = oproj_release_expected;
+        }
+#elif defined(MPK_OPROJ_AID_AGG)
+        // Aggregate inside the AID first, so only one atomic per AID reaches
+        // the shared counter and exactly ONE crosses the boundary. Slots 26
+        // and 27 are free in the hier_barrier map (0-7 release, 8 counter,
+        // 9 topk_counter, 28 hier_local) and are separate lines, so the two
+        // AIDs do not contend with each other.
+        int const _agg_aid = xcd_id >> 2;
+        int const _agg_prev = atom_add_release_gpu_s32(
+            &hier_barrier[(26 + _agg_aid) * HIER_STRIDE], 1);
+        if ((_agg_prev % 4) == 3) {
+          // Last of this AID's four XCDs.
+          int const prev_global =
+              atom_add_release_gpu_s32(&hier_barrier[8 * HIER_STRIDE], 1);
+          if ((prev_global % 2) == 1) {
+            oproj_rel_epoch = oproj_release_expected;
+          }
+        }
+#elif defined(MPK_OPROJ_FLAT)
+        // Flat: this XCD publishes its own slot; the gate takes the
+        // minimum over all eight.
+        oproj_rel_epoch = oproj_release_expected;
+#else
 #ifdef MPK_OPROJ_POLL_GLOBAL
         if (layer_epoch > 0) {
           // The gates poll this counter itself; nobody needs the old value.
@@ -1710,16 +2851,19 @@ oproj_barrier :
         {
           int const prev_global =
               atom_add_release_gpu_s32(&hier_barrier[8 * HIER_STRIDE], 1);
-          if ((prev_global % 8) == 7) {
+          MPK_WS_MARK(7020, (unsigned)prev_global);
+          if ((prev_global % MPK_NUM_XCDS) == (MPK_NUM_XCDS - 1)) {
             oproj_rel_epoch = oproj_release_expected;
           }
         }
+#endif
       }
 #else
       // Single global arrival (all workers increment one counter)
       int prev_global =
           atom_add_release_gpu_s32(&hier_barrier[8 * HIER_STRIDE], 1);
-      if ((prev_global % total_oproj_tiles) == total_oproj_tiles - 1) {
+      int const n_flat_arrivals = n_oproj_part * MPK_NUM_XCDS;
+      if ((prev_global % n_flat_arrivals) == n_flat_arrivals - 1) {
         oproj_rel_epoch = oproj_release_expected;
       }
 #endif
@@ -1729,16 +2873,399 @@ oproj_barrier :
     // the note above the arrival for why readfirstlane carries the epoch and
     // why 0 is a safe "not the releaser" sentinel.
     oproj_rel_epoch = __builtin_amdgcn_readfirstlane(oproj_rel_epoch);
+    MPK_TKOPS_AT(7, tid == 0);
+#if defined(MPK_VTN_ROPW) && defined(MPK_ROUTER_OPROJ_PARTIAL) && defined(MPK_VT2) && defined(MPK_VTN_MOE)
+#define MPK_ROPW_ON 1
+#if defined(MPK_ROP_ST1) || defined(MPK_ROP_RELAY) || defined(MPK_ROP_HOME)
+#error "MPK_VTN_ROPW: wired for the plain router-partial publish"
+#endif
+    // MPK_VTN_ROPW: the die's last arrival sums the tokens' router partials on all four waves (wave w: tokens
+    // w, w + 4); the decision reaches waves 1-3 through one LDS word.
+    int ropw_epoch = oproj_rel_epoch;
+#ifdef MPK_VTN_ROP2
+    constexpr bool rop2_on = BATCH_SIZE > NUM_WAVES;
+    int rop2_w = 0;
+#else
+    constexpr bool rop2_on = false;
+#endif
+    if constexpr (BATCH_SIZE > 2) {
+      __shared__ int s_ropw_epoch;
+#ifdef MPK_VTN_ROP2
+      __shared__ int s_rop2_wait;
+#endif
+      if (tid == 0) {
+        s_ropw_epoch = oproj_rel_epoch;
+#ifdef MPK_VTN_ROP2
+        s_rop2_wait = rop2_wait;
+#endif
+      }
+      __syncthreads();
+      ropw_epoch = s_ropw_epoch;
+#ifdef MPK_VTN_ROP2
+      rop2_w = s_rop2_wait;
+#endif
+    }
+#else
+#define MPK_ROPW_ON 0
+    constexpr bool rop2_on = false;
+#endif
+#if defined(MPK_VTN_ROP2_ABIP) || defined(MPK_VTN_LIVEB2_ABIP)
+#ifndef MPK_ABIP
+#error "MPK_VTN_ROP2_ABIP / MPK_VTN_LIVEB2_ABIP need MPK_ABIP"
+#endif
+#ifndef MPK_ABIP_PH
+#define MPK_ABIP_PH 1
+#endif
+#endif
+#if defined(MPK_VTN_ROP2) && defined(MPK_VTN_ROP2_ABIP)
+    // MPK_VTN_ROP2_ABIP: ROP2's split on MPK_ABIP's on-passes only.
+    bool const rop2_pass = rop2_on && (((layer_epoch - 1) / 36) & 1) == (MPK_ABIP_PH)
+#ifdef MPK_VTN_LIVEB
+                           && batch_count > NUM_WAVES
+#endif
+        ;
+#elif defined(MPK_VTN_ROP2) && defined(MPK_VTN_LIVEB)
+    bool const rop2_pass = rop2_on && batch_count > NUM_WAVES;  // tokens 4 / 5 live
+#else
+    constexpr bool rop2_pass = rop2_on;
+#endif
+#if defined(MPK_VTN_LIVEB2) && defined(MPK_VTN_LIVEB2_ABIP)
+    bool const liveb2_on = (((layer_epoch - 1) / 36) & 1) == (MPK_ABIP_PH);
+#elif defined(MPK_VTN_LIVEB2)
+    constexpr bool liveb2_on = true;
+#endif
     if (oproj_rel_epoch != 0) {
+      MPK_SUB_PUBLISHER();
+#ifdef MPK_ROUTER_OPROJ_PARTIAL
+      {
+        // Last O-proj arrival on this XCD (wave 0 only). Every WG's partials
+        // precede its arrival in this L2; sum them in WG order and publish
+        // 129 epoch-tagged floats to both AIDs. This is the only cross-AID
+        // traffic the router needs: 8 XCDs x 1 KiB.
+        static_assert(MPK_AID_ROP_WG_SLOTS >= 23, "23 O-proj WGs per XCD");
+        int const rop_l = tid & 63;
+        int const rop_par = layer_epoch & 1;
+        float const *const rop_wg =
+            (float const *)(g_rop_rep[xcd_id >> 2] +
+                            MPK_AID_ROP_WG_BASE_INTS +
+                            (rop_par * MPK_NUM_XCDS + xcd_id) *
+                                MPK_AID_ROP_WG_SLOTS * MPK_AID_ROP_WG_INTS);
+        MPK_XS_MARK(3);
+        // vL1 may hold these lines from two layers ago.
+        asm volatile("buffer_inv" ::: "memory");
+#ifdef MPK_ROP_ST1
+        {
+          // Sums over the 23 WGs as before (lane l < 33 holds 4l..4l+3), then
+          // lane j takes sums 2j, 2j+1 from lane j/2 so each lane stores one
+          // contiguous 16 B.
+          rop_f32x4_t rop_s = {0.0f, 0.0f, 0.0f, 0.0f};
+          if (rop_l < 33) {
+#pragma unroll
+            for (int w = 0; w < MPK_AID_ROP_WG_SLOTS; ++w) {
+              rop_s += *(rop_f32x4_t const *)(rop_wg + w * MPK_AID_ROP_WG_INTS +
+                                              rop_l * 4);
+            }
+          }
+          int const rop_tg = layer_epoch;
+#ifdef MPK_XSNAP
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          MPK_XS_MARK(8);
+#endif
+          int const rop_src = rop_l >> 1;
+          float const q0 = __shfl(rop_s[0], rop_src);
+          float const q1 = __shfl(rop_s[1], rop_src);
+          float const q2 = __shfl(rop_s[2], rop_src);
+          float const q3 = __shfl(rop_s[3], rop_src);
+          float const t0 = __shfl(rop_s[0], 32);
+          float const t1 = __shfl(rop_s[1], 32);
+          bool const rop_odd = (rop_l & 1) != 0;
+          rop_i32x4_t const v = {__float_as_int(rop_odd ? q2 : q0), rop_tg,
+                                 __float_as_int(rop_odd ? q3 : q1), rop_tg};
+          rop_i32x4_t const t = {__float_as_int(t0), rop_tg,
+                                 __float_as_int(t1), rop_tg};
+          for (int a = MPK_ROP_A0; a < MPK_ROP_A1; ++a) {
+            char *const dst =
+                (char *)(g_rop_rep[a] + MPK_AID_ROP_AGG_BASE_INTS +
+                         (rop_par * MPK_NUM_XCDS + xcd_id) *
+                             MPK_AID_ROP_AGG_INTS);
+            asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1" ::"v"(
+                             dst + rop_l * 16),
+                         "v"(v)
+                         : "memory");
+            if (rop_l == 0) {
+              asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1" ::"v"(
+                               dst + 1024),
+                           "v"(t)
+                           : "memory");
+            }
+          }
+        }
+#else
+        if (rop_l < 33) {
+          rop_f32x4_t rop_s = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+          for (int w = 0; w < MPK_AID_ROP_WG_SLOTS; ++w) {
+            rop_s += *(rop_f32x4_t const *)(rop_wg + w * MPK_AID_ROP_WG_INTS +
+                                            rop_l * 4);
+          }
+          int const rop_tg = layer_epoch;
+#ifdef MPK_XSNAP
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          MPK_XS_MARK(8);
+#endif
+          rop_i32x4_t const lo = {__float_as_int(rop_s[0]), rop_tg,
+                                  __float_as_int(rop_s[1]), rop_tg};
+          rop_i32x4_t const hi = {__float_as_int(rop_s[2]), rop_tg,
+                                  __float_as_int(rop_s[3]), rop_tg};
+#pragma unroll
+          for (int a = MPK_ROP_A0; a < MPK_ROP_A1; ++a) {
+            char *const dst =
+                (char *)(g_rop_rep[a] + MPK_AID_ROP_AGG_BASE_INTS +
+                         (rop_par * MPK_NUM_XCDS + xcd_id) *
+                             MPK_AID_ROP_AGG_INTS) +
+                rop_l * 32;
+            asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1\n"
+                         "global_store_dwordx4 %0, %2, off offset:16 sc0 sc1" ::
+                             "v"(dst),
+                         "v"(lo), "v"(hi)
+                         : "memory");
+          }
+        }
+#endif  // MPK_ROP_ST1
+#ifdef MPK_VT2
+#ifdef MPK_ROP_ST1
+#error "MPK_VT2: token 1's die sums are wired for the plain (non-ST1) publish"
+#endif
+        if constexpr (BATCH_SIZE == 2) {
+          float const *const rop_wg1 =
+              (float const *)(g_aid_nc_rep[xcd_id >> 2] + MPK_NC_ROP1_INTS +
+                              (rop_par * MPK_NUM_XCDS + xcd_id) * MPK_AID_ROP_WG_SLOTS *
+                                  MPK_AID_ROP_WG_INTS);
+          if (rop_l < 33) {
+            rop_f32x4_t s1 = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+            for (int w = 0; w < MPK_AID_ROP_WG_SLOTS; ++w) {
+              s1 += *(rop_f32x4_t const *)(rop_wg1 + w * MPK_AID_ROP_WG_INTS + rop_l * 4);
+            }
+            int const tg1 = layer_epoch;
+            rop_i32x4_t const lo1 = {__float_as_int(s1[0]), tg1, __float_as_int(s1[1]), tg1};
+            rop_i32x4_t const hi1 = {__float_as_int(s1[2]), tg1, __float_as_int(s1[3]), tg1};
+#pragma unroll
+            for (int a = MPK_ROP_A0; a < MPK_ROP_A1; ++a) {
+              char *const dst =
+                  (char *)(g_rop_rep[a] + MPK_AID_ROP_AGG1_BASE_INTS +
+                           (rop_par * MPK_NUM_XCDS + xcd_id) * MPK_AID_ROP_AGG_INTS) +
+                  rop_l * 32;
+              asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1\n"
+                           "global_store_dwordx4 %0, %2, off offset:16 sc0 sc1" ::"v"(dst),
+                           "v"(lo1), "v"(hi1)
+                           : "memory");
+            }
+          }
+        } else if constexpr (BATCH_SIZE > 2) {
+          // MPK_VTN_N7B: tokens 1..N-1, the same sums and tagged publish as token 1.
+#pragma unroll
+          for (int rt = 1; rt < BATCH_SIZE; ++rt) {
+#ifdef MPK_VTN_LIVEB
+            if (rt >= batch_count) break;
+#endif
+            if (MPK_ROPW_ON && ((rt & 3) != 0 || (rop2_pass && rt >= NUM_WAVES))) continue;  // MPK_VTN_ROPW
+            float const *const rop_wgt =
+                (float const *)(g_aid_nc_rep[xcd_id >> 2] + mpk_rop_nc_ints(rt) +
+                                (rop_par * MPK_NUM_XCDS + xcd_id) * MPK_AID_ROP_WG_SLOTS *
+                                    MPK_AID_ROP_WG_INTS);
+            if (rop_l < 33) {
+              rop_f32x4_t st = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+              for (int w = 0; w < MPK_AID_ROP_WG_SLOTS; ++w) {
+                st += *(rop_f32x4_t const *)(rop_wgt + w * MPK_AID_ROP_WG_INTS + rop_l * 4);
+              }
+              int const tgt = layer_epoch;
+              rop_i32x4_t const lot = {__float_as_int(st[0]), tgt, __float_as_int(st[1]), tgt};
+              rop_i32x4_t const hit = {__float_as_int(st[2]), tgt, __float_as_int(st[3]), tgt};
+#pragma unroll
+              for (int a = MPK_ROP_A0; a < MPK_ROP_A1; ++a) {
+                char *const dst =
+                    (char *)(g_rop_rep[a] + mpk_rop_agg_ints(rt) +
+                             (rop_par * MPK_NUM_XCDS + xcd_id) * MPK_AID_ROP_AGG_INTS) +
+                    rop_l * 32;
+                asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1\n"
+                             "global_store_dwordx4 %0, %2, off offset:16 sc0 sc1" ::"v"(dst),
+                             "v"(lot), "v"(hit)
+                             : "memory");
+              }
+            }
+          }
+        }
+#endif
+      }
+#endif
+#if defined(MPK_ROP_NO_REL) && defined(MPK_ROUTER_OPROJ_PARTIAL)
+      // Nobody polls the O-proj release under ROP (MPK_ROP_SKIP), and
+      // layer_epoch > 0 skips the snapshot read, so publishing it only
+      // adds write-through stores to the drain below.
+#elif defined(MPK_OPROJ_NARROW_REL)
+      // One slot per AID instead of eight. Every slot received the identical
+      // `oproj_rel_epoch`, so the eight are pure redundancy, and all 16
+      // write-through stores drain under the one vmcnt below -- making the
+      // release cost the SLOWEST of them. This is the MoE narrow-release fix
+      // (16 -> 2 stores, -5.60%, t=-5.39) applied to the O-proj barrier.
+      if (tid == 0) {
+#ifdef MPK_AID_SPLIT_FLAGS
+        mpk_aid_publish(hier_barrier,
+#ifdef MPK_OPROJ_FLAT
+                        xcd_id,
+#else
+                        MPK_OPROJ_REL_SLOT,
+#endif
+                        (unsigned)oproj_rel_epoch,
+                        MPK_AID_REGION_HIER_RELEASE);
+#else
+        st_wt_u32((void *)&hier_barrier[0], (unsigned)oproj_rel_epoch);
+#endif
+      }
+#else
       if (tid < 8) {
+#ifdef MPK_AID_SPLIT_FLAGS
+        mpk_aid_publish(hier_barrier,
+                        tid,
+                        (unsigned)oproj_rel_epoch,
+                        MPK_AID_REGION_HIER_RELEASE);
+#else
         st_wt_u32((void *)&hier_barrier[tid * HIER_STRIDE],
                   (unsigned)oproj_rel_epoch);
+#endif
       }
+#endif
+#ifndef MPK_PUB_NOWAIT
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
+      MPK_XS_MARK(13);
+      MPK_TKOPS_AT(8, tid == 0);
     }
+#if MPK_ROPW_ON
+    if constexpr (BATCH_SIZE > 2) {
+      if (ropw_epoch != 0 && warp_id != 0) {
+        // MPK_VTN_ROPW: tokens warp_id, warp_id + 4: the same sums and tagged publish as wave 0's tokens.
+        int const rop_l = tid & 63;
+        int const rop_par = layer_epoch & 1;
+        asm volatile("buffer_inv" ::: "memory");  // vL1 may hold these lines from two layers ago
+#ifdef MPK_ROPW_TS
+        // MPK_ROPW_TS (timing tool): wave 1's two tokens into the [TOPKSUB] slots.
+        unsigned int rw_t0 = (unsigned int)__builtin_amdgcn_s_memrealtime();
+        unsigned int rw_l0 = rw_t0, rw_s0 = rw_t0, rw_l1 = rw_t0, rw_s1 = rw_t0;
+#endif
+        for (int rt = warp_id; rt < (rop2_pass ? NUM_WAVES : BATCH_SIZE); rt += NUM_WAVES) {
+#ifdef MPK_VTN_LIVEB2
+          if (liveb2_on && rt >= batch_count) break;  // MPK_VTN_LIVEB2: dead tokens
+#endif
+          float const *const rop_wgt =
+              (float const *)(g_aid_nc_rep[xcd_id >> 2] + mpk_rop_nc_ints(rt) +
+                              (rop_par * MPK_NUM_XCDS + xcd_id) * MPK_AID_ROP_WG_SLOTS *
+                                  MPK_AID_ROP_WG_INTS);
+          if (rop_l < 33) {
+            rop_f32x4_t st = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+            for (int w = 0; w < MPK_AID_ROP_WG_SLOTS; ++w) {
+              st += *(rop_f32x4_t const *)(rop_wgt + w * MPK_AID_ROP_WG_INTS + rop_l * 4);
+            }
+            int const tgt = layer_epoch;
+            rop_i32x4_t const lot = {__float_as_int(st[0]), tgt, __float_as_int(st[1]), tgt};
+            rop_i32x4_t const hit = {__float_as_int(st[2]), tgt, __float_as_int(st[3]), tgt};
+#ifdef MPK_ROPW_TS
+            {
+              unsigned long long rw_a;
+              asm volatile("s_memrealtime %0\n\ts_waitcnt lgkmcnt(0)" : "=s"(rw_a) : "v"(st[0]), "v"(st[3]) : "memory");
+              if (rt < NUM_WAVES) rw_l0 = (unsigned int)rw_a; else rw_l1 = (unsigned int)rw_a;
+            }
+#endif
+#pragma unroll
+            for (int a = MPK_ROP_A0; a < MPK_ROP_A1; ++a) {
+              char *const dst =
+                  (char *)(g_rop_rep[a] + mpk_rop_agg_ints(rt) +
+                           (rop_par * MPK_NUM_XCDS + xcd_id) * MPK_AID_ROP_AGG_INTS) +
+                  rop_l * 32;
+              asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1\n"
+                           "global_store_dwordx4 %0, %2, off offset:16 sc0 sc1" ::"v"(dst),
+                           "v"(lot), "v"(hit)
+                           : "memory");
+            }
+#ifdef MPK_ROPW_TS
+            {
+              unsigned long long rw_a;
+              asm volatile("s_memrealtime %0\n\ts_waitcnt lgkmcnt(0)" : "=s"(rw_a) :: "memory");
+              if (rt < NUM_WAVES) rw_s0 = (unsigned int)rw_a; else rw_s1 = (unsigned int)rw_a;
+            }
+#endif
+          }
+        }
+#ifndef MPK_PUB_NOWAIT
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
+#ifdef MPK_ROPW_TS
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        if (tid == 64 && MPK_TOPK_ARMED()) {
+          unsigned int const rw_e = (unsigned int)__builtin_amdgcn_s_memrealtime();
+          s_tk_acc[0] += (rw_l0 - rw_t0) * 10;
+          s_tk_acc[1] += (rw_l1 - rw_s0) * 10;
+          s_tk_acc[2] += (rw_s0 - rw_l0 + rw_s1 - rw_l1) * 10;
+          s_tk_acc[3] += (rw_e - rw_t0) * 10;
+          s_tk_n++;
+        }
+#endif
+      }
+#ifdef MPK_VTN_ROP2
+      if constexpr (rop2_on) {
+        if (rop2_pass && rop2_w != 0) {
+          // MPK_VTN_ROP2: the die's second-to-last arrival; once the last one has arrived (every partial is
+          // then in this XCD's L2), wave w sums and publishes token NUM_WAVES + w.
+          while (ld_aid_s32(&hier_local[xcd_id * HIER_STRIDE]) < rop2_w) {
+            __builtin_amdgcn_s_sleep(1);
+          }
+          asm volatile("buffer_inv" ::: "memory");
+          int const rop_l = tid & 63;
+          int const rop_par = layer_epoch & 1;
+          int const rt = NUM_WAVES + warp_id;
+          if (rt < BATCH_SIZE && rop_l < 33
+#ifdef MPK_VTN_LIVEB
+              && rt < batch_count
+#endif
+          ) {
+            float const *const rop_wgt =
+                (float const *)(g_aid_nc_rep[xcd_id >> 2] + mpk_rop_nc_ints(rt) +
+                                (rop_par * MPK_NUM_XCDS + xcd_id) * MPK_AID_ROP_WG_SLOTS *
+                                    MPK_AID_ROP_WG_INTS);
+            rop_f32x4_t st = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+            for (int w = 0; w < MPK_AID_ROP_WG_SLOTS; ++w) {
+              st += *(rop_f32x4_t const *)(rop_wgt + w * MPK_AID_ROP_WG_INTS + rop_l * 4);
+            }
+            int const tgt = layer_epoch;
+            rop_i32x4_t const lot = {__float_as_int(st[0]), tgt, __float_as_int(st[1]), tgt};
+            rop_i32x4_t const hit = {__float_as_int(st[2]), tgt, __float_as_int(st[3]), tgt};
+#pragma unroll
+            for (int a = MPK_ROP_A0; a < MPK_ROP_A1; ++a) {
+              char *const dst =
+                  (char *)(g_rop_rep[a] + mpk_rop_agg_ints(rt) +
+                           (rop_par * MPK_NUM_XCDS + xcd_id) * MPK_AID_ROP_AGG_INTS) +
+                  rop_l * 32;
+              asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1\n"
+                           "global_store_dwordx4 %0, %2, off offset:16 sc0 sc1" ::"v"(dst),
+                           "v"(lot), "v"(hit)
+                           : "memory");
+            }
+          }
+#ifndef MPK_PUB_NOWAIT
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
+        }
+      }
+#endif
+    }
+#endif
 
     // Issue prefetch loads AFTER barrier atomics but BEFORE poll loop.
-    if (local_tile < router_tile_n) {
+    if (!MPK_ROP_SKIP && local_tile < router_tile_n) {
       char const *g_base_pf = (char const *)norm_weight_ptr;
       char const *w_base_pf = (char const *)router_weight_ptr +
                               (int64_t)local_tile * output_stride * 2;
@@ -1848,6 +3375,12 @@ oproj_barrier :
     // other 255 threads do not need their own sc0 sc1 reads of this line.
     if (tid == 0)
 #endif
+#if defined(MPK_OPROJ_POLL_GLOBAL) || defined(MPK_POLL_PIPE)
+#if defined(MPK_AID_SPLIT_FLAGS) || defined(MPK_OPROJ_NARROW_REL) ||           \
+    defined(MPK_OPROJ_AID_TIER) || defined(MPK_OPROJ_FLAT)
+#error "MPK_OPROJ_POLL_GLOBAL / MPK_POLL_PIPE poll the shared hier_barrier lines"
+#endif
+#endif
 #ifdef MPK_OPROJ_POLL_GLOBAL
 #ifndef MPK_OPROJ_TREE_BARRIER
 #error "MPK_OPROJ_POLL_GLOBAL relies on the tree barrier's 8 arrivals per layer"
@@ -1857,13 +3390,30 @@ oproj_barrier :
                        8 * oproj_release_expected
                  : MPK_LD_GATE2(&hier_barrier[xcd_id * HIER_STRIDE]) <
                        oproj_release_expected) {
-#else
-#ifdef MPK_POLL_PIPE
+#elif defined(MPK_POLL_PIPE)
       mpk_poll_ge_s32(&hier_barrier[xcd_id * HIER_STRIDE],
                       oproj_release_expected);
       while (false) {
 #else
-      while (MPK_LD_GATE2(&hier_barrier[xcd_id * HIER_STRIDE]) <
+      while (!MPK_ROP_SKIP && !MPK_P7_SK(2) &&
+#ifdef MPK_OPROJ_NARROW_REL
+#ifdef MPK_OPROJ_AID_TIER
+             ld_aid_min2_s32(&hier_release[16], &hier_release[32]) <
+                 oproj_release_expected) {
+#elif defined(MPK_OPROJ_FLAT) && defined(MPK_OPROJ_LOCAL_BAR_PROBE)
+             // TIMING ONLY: wait on this AID's four XCD flags, not all eight.
+             min(ld_aid_min2_s32(&hier_release[(xcd_id >> 2) * 64],
+                                 &hier_release[(xcd_id >> 2) * 64 + 16]),
+                 ld_aid_min2_s32(&hier_release[(xcd_id >> 2) * 64 + 32],
+                                 &hier_release[(xcd_id >> 2) * 64 + 48])) <
+                 oproj_release_expected) {
+#elif defined(MPK_OPROJ_FLAT)
+             ld_aid_min8_s32(hier_release) < oproj_release_expected) {
+#else
+             MPK_LD_GATE_AID(&hier_release[0]) < oproj_release_expected) {
+#endif
+#else
+             MPK_LD_GATE_AID(&hier_release[xcd_id * HIER_STRIDE]) <
              oproj_release_expected) {
 #endif
 #endif
@@ -1942,7 +3492,7 @@ oproj_barrier :
   // `rmsnorm_out` differing between two runs whose `attn_proj_out` (the
   // settled HBM content) is bit-identical -- the norm read something that is
   // not what is in memory.
-  asm volatile("buffer_inv" ::: "memory");
+  MPK_XCD_ACQUIRE();
   // Drain prefetched gamma + router weight loads (issued before barrier).
   // NT loads bypass L2, unaffected by buffer_inv.
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
@@ -1966,6 +3516,23 @@ oproj_barrier :
 #ifdef MPK_OPROJ_INNER_TIMING
   _op_t2 = __builtin_amdgcn_s_memrealtime();
 #endif
+  MPK_SUB_MARK(2);
+#ifdef MPK_OPROJ_SUB
+  if (tid == 0 && MPK_OS_ARMED()) {
+    unsigned int const _os4 = (unsigned int)__builtin_amdgcn_s_memrealtime();
+    static_assert(NUM_WAVES <= 4, "s_os_w holds 4 waves");
+    unsigned int _wm = s_os_w[0];
+    for (int _w = 1; _w < NUM_WAVES; _w++) {
+      _wm = (int)(s_os_w[_w] - _wm) > 0 ? s_os_w[_w] : _wm;
+    }
+    s_os_acc[0] += (_os1 - _os0) * 10;
+    s_os_acc[1] += (_wm - _os1) * 10;
+    s_os_acc[2] += (_os2 - _wm) * 10;
+    s_os_acc[3] += (_os3 - _os2) * 10;
+    s_os_acc[4] += (_os4 - _os3) * 10;
+    s_os_n++;
+  }
+#endif
   MPK_ILSTAMP(22, s_ilsub_ml == MPK_ILSUB_L0 + 1);
 
   // ════════════════════════════════════════════════════════════════════════
@@ -1974,18 +3541,50 @@ oproj_barrier :
   // All workers redundantly compute RMSNorm on d_output (O-PROJ result).
   // Each worker computes one router expert's logit.
 
-  if (local_tile >= router_tile_n) {
+  int const n_router_part =
+      router_tile_n < MPK_OPROJ_MAX_RANKS ? router_tile_n : MPK_OPROJ_MAX_RANKS;
+  int router_lt = local_tile;
+  if (MPK_ROP_SKIP || local_tile >= n_router_part) {
     // This worker has no TopK tile — skip TopK entirely.
     // Do NOT participate in topk_counter atomicAdd.
     goto done;
   }
 
+#if MPK_NUM_XCDS != 8 || defined(MPK_MULTI_PASS_8XCD)
+router_tile_pass:;
+#endif
   {
     using bf16 = __hip_bfloat16;
+#if defined(MPK_AID_SPLIT_OUT) && defined(MPK_AID_SPLIT_FLAGS)
+    // Read the copy homed in this XCD's own range. Same bound as the publish,
+    // so writer and reader can only ever agree on which buffer is live.
+    bf16 const *__restrict__ d_hidden = static_cast<bf16 const *>(
+        mpk_aid_out_base(output_ptr, xcd_id, BATCH_SIZE * output_stride * 2));
+#else
     bf16 const *__restrict__ d_hidden = static_cast<bf16 const *>(output_ptr);
+#endif
+#ifdef MPK_GAMMA_AID
+    // output_stride, not ACTUAL_HIDDEN_DIM: the gamma is padded and
+    // ACTUAL_HIDDEN_DIM is the unpadded width.
+    bf16 const *__restrict__ d_gamma =
+        static_cast<bf16 const *>(norm_weight_ptr) +
+        ((xcd_id >= (MPK_NUM_XCDS / 2)) ? output_stride : 0);
+#else
     bf16 const *__restrict__ d_gamma =
         static_cast<bf16 const *>(norm_weight_ptr);
+#endif
+#ifdef MPK_MOENORM_AID
+    // One normed-row copy per memory range. Writers are already
+    // redundant (one WG per XCD stores the whole row), so each AID
+    // simply fills its own copy -- no publish needed.
+    bf16 *__restrict__ d_normed =
+        static_cast<bf16 *>(norm_output_ptr) +
+        ((xcd_id >= (MPK_NUM_XCDS / 2))
+             ? (long long)BATCH_SIZE * output_stride
+             : 0);
+#else
     bf16 *__restrict__ d_normed = static_cast<bf16 *>(norm_output_ptr);
+#endif
     bf16 const *__restrict__ d_gate_w =
         static_cast<bf16 const *>(router_weight_ptr);
     bf16 const *__restrict__ d_rbias =
@@ -2006,7 +3605,7 @@ oproj_barrier :
     // Max iterations per thread: ceil(H4 / 256)
     constexpr int MAX_ITERS = (H4 + 255) / 256;
 
-    bf16 const *my_gate = d_gate_w + local_tile * output_stride;
+    bf16 const *my_gate = d_gate_w + router_lt * output_stride;
 
     char const *g_base = (char const *)d_gamma;
     char const *w_base = (char const *)my_gate;
@@ -2068,6 +3667,17 @@ oproj_barrier :
       char const *h_base =
           (char const *)(d_hidden + (int64_t)b * output_stride);
       char *n_base = (char *)(d_normed + (int64_t)b * output_stride);
+#if defined(MPK_W13_HOF_AIDREP) && defined(MPK_W13_PREQUANT)
+      // W13's handoff row in this die's AID-local RW replica (see
+      // MPK_AID_W13HOF_BASE_INTS): every W13 tile reads it with sc0 sc1,
+      // an L2 hit on RW but never on the NC torch copy, where ~92 tiles
+      // per AID fetch the same lines from one channel.
+      if (g_aid_flag_rep[0] != nullptr && g_aid_flag_rep[1] != nullptr) {
+        n_base = (char *)(g_aid_flag_rep[mpk_hof_aid()] +
+                          MPK_AID_W13HOF_BASE_INTS + mpk_hof_copy_ints()) +
+                 (int64_t)b * output_stride * 2;
+      }
+#endif
 
       float ssq = 0.0f;
       float dp = 0.0f;
@@ -2125,15 +3735,17 @@ oproj_barrier :
         // Adjacent XCDs' 368-col slices share a 128 B line (736 % 128 != 0).
         // Waiting for x+1 before reading x keeps that line from tearing.
         // All 256 threads poll so there is no per-slice syncthreads.
-        while (MPK_LD_GATE(&oproj_xcd_ready[x * 16]) < slice_epoch) {
+        while (!MPK_P7_SK(4) &&
+               MPK_LD_GATE_AID(&oproj_xcd_ready[x * 16]) < slice_epoch) {
           __builtin_amdgcn_s_sleep(1);
         }
         if (x < 7) {
-          while (MPK_LD_GATE(&oproj_xcd_ready[(x + 1) * 16]) < slice_epoch) {
+          while (!MPK_P7_SK(4) &&
+                 MPK_LD_GATE_AID(&oproj_xcd_ready[(x + 1) * 16]) < slice_epoch) {
             __builtin_amdgcn_s_sleep(1);
           }
         }
-        asm volatile("buffer_inv" ::: "memory");
+        MPK_XCD_ACQUIRE();
         int const d0 = x * cols_per_xcd;
         int const d1 = d0 + cols_per_xcd;
 #pragma unroll
@@ -2346,15 +3958,25 @@ oproj_barrier :
         }
         s *= irms_t0;
         if (d_rbias) {
+#if (defined(MPK_ROUTER_BIAS_PF3) || defined(MPK_ROUTER_BIAS_PF)) &&          \
+    (MPK_NUM_XCDS != 8 || defined(MPK_MULTI_PASS_8XCD))
+#error "MPK_ROUTER_BIAS_PF* prefetch the first pass's bias only"
+#endif
 #if defined(MPK_ROUTER_BIAS_PF3)
           s += __uint_as_float(rbias_pf3 << 16);
 #elif defined(MPK_ROUTER_BIAS_PF)
           s += __uint_as_float(rbias_pf << 16);
 #else
-          s += __bfloat162float(d_rbias[local_tile]);
+          s += __bfloat162float(d_rbias[router_lt]);
 #endif
         }
         bf16 bval = __float2bfloat16(s);
+#if defined(MPK_LOCAL_TOPK) && defined(MPK_VT2)
+        if (b == 1) {
+          ltk_word1 = (mpk_ltk_tag(layer_epoch) << 16) |
+                      (unsigned)__builtin_bit_cast(unsigned short, bval);
+        }
+#endif
 #ifdef MPK_LOCAL_TOPK
         if (b == 0) {
           ltk_word = (mpk_ltk_tag(layer_epoch) << 16) |
@@ -2362,16 +3984,25 @@ oproj_barrier :
 #ifdef MPK_LTK_EARLY_TAG
           // The tag carries only the logit; the normed row has its own flag.
           MPK_ILSTAMP(20, s_ilsub_ml == MPK_ILSUB_L0 + 1);
+#ifdef MPK_AID_SPLIT_FLAGS
+          mpk_aid_publish_at(routing_ready_ptr,
+                             MPK_AID_LTK_OFF_INTS +
+                                 gang_rmsnorm_topk_detail::get_xcd_id() *
+                                     (NUM_EXPERTS / MPK_NUM_XCDS) +
+                                 router_lt,
+                             ltk_word, MPK_AID_ROUTING_BASE_INTS);
+#else
           st_wt_u32((void *)&routing_ready_ptr[MPK_LTK_ROUTING_REL +
                                                gang_rmsnorm_topk_detail::get_xcd_id() *
                                                    (NUM_EXPERTS / 8) +
                                                local_tile],
                     ltk_word);
 #endif
+#endif
         }
 #endif
 #if !(defined(MPK_LOCAL_TOPK) && defined(MPK_LTK_NO_LOGIT_STORE))
-        st_wt_u16(&d_logits[(int64_t)b * NUM_EXPERTS + local_tile],
+        st_wt_u16(&d_logits[(int64_t)b * NUM_EXPERTS + router_lt],
                   *reinterpret_cast<unsigned short *>(&bval));
 #endif
 #endif
@@ -2570,10 +4201,14 @@ oproj_barrier :
           // Butterfly over the 16-lane DPP row, then across the two rows of
           // the half-wave. Every lane in the domain ends up holding the full
           // amax, so no separate broadcast pass is needed.
+#ifdef MPK_PQ_AMAX_DPP
+          amax = _mpk_amax16_dpp(amax);
+#else
           amax = fmaxf(amax, __shfl_xor(amax, 8));
           amax = fmaxf(amax, __shfl_xor(amax, 4));
           amax = fmaxf(amax, __shfl_xor(amax, 2));
           amax = fmaxf(amax, __shfl_xor(amax, 1));
+#endif
           if (scale_block != last_block) {
             amax = fmaxf(amax, __shfl_xor(amax, 16));
           }
@@ -2603,12 +4238,12 @@ oproj_barrier :
               router_norm_writer;
 #endif
           if (pq_store) {
-            asm volatile("global_store_dword %0, %1, off" MPK_NORMROW_SC ::"v"(n_base +
+            asm volatile("global_store_dword %0, %1, off" MPK_PQROW_SC ::"v"(n_base +
                                                                 i_cur_q * 4),
                          "v"(pk_bits)
                          : "memory");
             if ((lane & 31) == 0) {
-              asm volatile("global_store_byte %0, %1, off" MPK_NORMROW_SC ::"v"(
+              asm volatile("global_store_byte %0, %1, off" MPK_PQROW_SC ::"v"(
                                n_base + output_stride + scale_block),
                            "v"((unsigned)se)
                            : "memory");
@@ -2669,7 +4304,7 @@ oproj_barrier :
       if (router_norm_writer && (pq_my_iter <= 0)) {
         int const pad_dw = (output_stride - ACTUAL_HIDDEN_DIM) / 4;
         if ((int)tid < pad_dw) {
-          asm volatile("global_store_dword %0, %1, off" MPK_NORMROW_SC ::"v"(
+          asm volatile("global_store_dword %0, %1, off" MPK_PQROW_SC ::"v"(
                            n_base + ACTUAL_HIDDEN_DIM + (int)tid * 4),
                        "v"(0u)
                        : "memory");
@@ -2701,9 +4336,15 @@ oproj_barrier :
           s += red_dp[w];
         }
         if (d_rbias) {
-          s += __bfloat162float(d_rbias[local_tile]);
+          s += __bfloat162float(d_rbias[router_lt]);
         }
         bf16 bval = __float2bfloat16(s);
+#if defined(MPK_LOCAL_TOPK) && defined(MPK_VT2)
+        if (b == 1) {
+          ltk_word1 = (mpk_ltk_tag(layer_epoch) << 16) |
+                      (unsigned)__builtin_bit_cast(unsigned short, bval);
+        }
+#endif
 #ifdef MPK_LOCAL_TOPK
         if (b == 0) {
           ltk_word = (mpk_ltk_tag(layer_epoch) << 16) |
@@ -2711,7 +4352,7 @@ oproj_barrier :
         }
 #endif
 #if !(defined(MPK_LOCAL_TOPK) && defined(MPK_LTK_NO_LOGIT_STORE))
-        st_wt_u16(&d_logits[(int64_t)b * NUM_EXPERTS + local_tile],
+        st_wt_u16(&d_logits[(int64_t)b * NUM_EXPERTS + router_lt],
                   *reinterpret_cast<unsigned short *>(&bval));
 #endif
       }
@@ -2725,6 +4366,35 @@ oproj_barrier :
       }
     }
   }
+#if MPK_NUM_XCDS != 8 || defined(MPK_MULTI_PASS_8XCD)
+  router_lt += n_router_part;
+  if (router_lt < router_tile_n) {
+    __syncthreads();
+    // Re-prefetch this pass's gate row. The pre-barrier prefetch above filled
+    // w_pf_buf for `local_tile` only, and the dot product reads those
+    // registers rather than `my_gate` -- so without this the logit stored to
+    // d_logits[router_lt] is computed from the FIRST expert's row. Only bites
+    // when router_tile_n exceeds the workers per XCD: 16 == 16 at 8 XCDs
+    // never takes this edge, 32 vs 31 at 4 XCDs leaves one expert per XCD.
+    //
+    // gamma (g_pf_buf) is expert-invariant and is deliberately not reloaded.
+    char const *w_base_next = (char const *)router_weight_ptr +
+                              (int64_t)router_lt * output_stride * 2;
+#pragma unroll
+    for (int iter = 0; iter < MAX_ITERS_PF; iter++) {
+      int i_cur = tid + iter * 256;
+      if (i_cur >= H4_PF) {
+        break;
+      }
+      asm volatile("global_load_dwordx2 %0, %1, off sc0 nt"
+                   : "=v"(w_pf_buf[iter])
+                   : "v"(w_base_next + i_cur * 8)
+                   : "memory");
+    }
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    goto router_tile_pass;
+  }
+#endif
 
 topk_barrier :
   // ════════════════════════════════════════════════════════════════════════
@@ -2748,19 +4418,37 @@ topk_barrier :
 #ifdef MPK_OPROJ_INNER_TIMING
   _op_t3 = __builtin_amdgcn_s_memrealtime();
 #endif
+  MPK_SUB_MARK(3);
   // Drain BEFORE the rendezvous, not after. `s_waitcnt` is a per-wave
   // guarantee: run after __syncthreads it only retires wave 0's stores, and
   // tid 0 then publishes an arrival advertising output that waves 1..3 may
   // still have in flight. Draining first makes every wave's stores retire,
   // and the barrier then makes that true block-wide.
-  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-  __syncthreads();
+#if defined(MPK_LOCAL_TOPK) && defined(MPK_LTK_EARLY_TAG)
+  // The tag is already out; only a normed-row writer still has a release
+  // (its row flag) to order behind its stores. ltk_norm_slot is uniform.
+  if (ltk_norm_slot >= 0)
+#endif
+  {
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    __syncthreads();
+  }
 
 #ifdef MPK_LOCAL_TOPK
 #if defined(MPK_EARLY_ROUTING) || !defined(MPK_MOE_XCD_PAIR)
 #error "MPK_LOCAL_TOPK replaces EARLY_ROUTING and is wired for the MOE_XCD_PAIR map"
 #endif
+#if MPK_NUM_XCDS != 8 || defined(MPK_MULTI_PASS_8XCD)
+#error "MPK_LOCAL_TOPK publishes one router tile per worker; no multi-pass router"
+#endif
+#ifdef MPK_VT2
+#ifdef MPK_LTK_EARLY_TAG
+#error "MPK_VT2: not with MPK_LTK_EARLY_TAG (one norm flag set per token)"
+#endif
+  static_assert(BATCH_SIZE <= MPK_ROP_NTOK, "MPK_VT2: 1 or 2 tokens (4 with MPK_VTN_N7B)");
+#else
   static_assert(BATCH_SIZE == 1, "MPK_LOCAL_TOPK is bs=1");
+#endif
   static_assert(NUM_EXPERTS == 128, "MPK_LOCAL_TOPK: 128 tag words");
   // No rendezvous and no serial completer: publish this tile's tagged
   // logit. The drain above retired every wave's stores, including this
@@ -2773,31 +4461,73 @@ topk_barrier :
   // stores; the flag is read only through this XCD's L2 (sc1 poll).
   MPK_ILSTAMP(28, ltk_norm_slot >= 0 && s_ilsub_ml == MPK_ILSUB_L0 + 1);
   if (tid == 0 && ltk_norm_slot >= 0) {
-    asm volatile("global_store_dword %0, %1, off" ::"v"(
-                     &routing_ready_ptr[MPK_LTK_NORM_REL +
-                                        gang_rmsnorm_topk_detail::get_xcd_id() * 32 +
-                                        ltk_norm_slot]),
+    int const ltk_hw = gang_rmsnorm_topk_detail::get_xcd_id();
+#ifdef MPK_AID_SPLIT_FLAGS
+    // This XCD's own AID replica (RW): its readers are this XCD's workers,
+    // whose sc1 poll hits the line this plain store left in their L2. The
+    // shared block is MTYPE NC in NPS2, where that poll bypasses L2.
+    int *const ltk_flag =
+        mpk_aid_flags_at(routing_ready_ptr, ltk_hw, MPK_AID_ROUTING_BASE_INTS) +
+        MPK_AID_LTK_NORM_OFF_INTS + ltk_hw * 32 + ltk_norm_slot;
+#else
+    int *const ltk_flag =
+        &routing_ready_ptr[MPK_LTK_NORM_REL + ltk_hw * 32 + ltk_norm_slot];
+#endif
+    asm volatile("global_store_dword %0, %1, off" ::"v"(ltk_flag),
                  "v"(mpk_ltk_tag(layer_epoch))
                  : "memory");
   }
 #else
   MPK_ILSTAMP(20, s_ilsub_ml == MPK_ILSUB_L0 + 1);
   if (tid == 0) {
+#ifdef MPK_AID_SPLIT_FLAGS
+    mpk_aid_publish_at(routing_ready_ptr,
+                       MPK_AID_LTK_OFF_INTS +
+                           gang_rmsnorm_topk_detail::get_xcd_id() *
+                               (NUM_EXPERTS / MPK_NUM_XCDS) +
+                           local_tile,
+                       ltk_word, MPK_AID_ROUTING_BASE_INTS);
+#ifdef MPK_VT2
+    if (BATCH_SIZE == 2) {
+      mpk_aid_publish_at(routing_ready_ptr,
+                         MPK_AID_LTK_OFF_INTS + 512 +
+                             gang_rmsnorm_topk_detail::get_xcd_id() *
+                                 (NUM_EXPERTS / MPK_NUM_XCDS) +
+                             local_tile,
+                         ltk_word1, MPK_AID_ROUTING_BASE_INTS);
+    }
+#endif
+#else
     st_wt_u32((void *)&routing_ready_ptr[MPK_LTK_ROUTING_REL +
                                          gang_rmsnorm_topk_detail::get_xcd_id() *
                                              (NUM_EXPERTS / 8) +
                                          local_tile],
               ltk_word);
+#endif
   }
 #endif
 #else
   __shared__ int s_topk_done;
   if (tid == 0) {
+#if defined(MPK_TOPK_HIER) && defined(MPK_AID_SPLIT_FLAGS)
+    // Two-level: accumulate on this AID's RW replica, and let only this
+    // XCD's last participant add router_tile_n to the shared counter. The
+    // global total, and therefore which worker runs top-k, is unchanged.
+    int *topk_local =
+        mpk_aid_flags_hw(hier_barrier, MPK_AID_REGION_TOPK);
+    int const v = atom_add_xcd_local_s32(&topk_local[xcd_id * HIER_STRIDE], 1) + 1;
+    s_topk_done = 0;
+    if (v == router_tile_n * layer_epoch) {
+      s_topk_done = atomicAdd(topk_counter, router_tile_n) + router_tile_n;
+    }
+#else
     s_topk_done = atomicAdd(topk_counter, 1) + 1;
+#endif
   }
   __syncthreads();
 
-  if (s_topk_done == total_topk_tiles) {
+  if (s_topk_done == n_router_part * MPK_NUM_XCDS) {
+    MPK_SUB_TOPK(0);
 #ifdef MPK_ROUTING_LANE_RELEASE
     // Carries the release epoch from tid 0 to lanes 1..7 of wave 0 by
     // readfirstlane; see the fan-out at the end of this block. Declared here
@@ -2835,6 +4565,7 @@ topk_barrier :
     // stores first; the barrier then makes that true block-wide.
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     __syncthreads();
+    MPK_SUB_TOPK(1);
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
     if (tid == 0 && ts_base) {
       ts_base[15] =
@@ -2918,17 +4649,36 @@ topk_barrier :
 #else
         int epoch = ld_nt_s32(routing_ready_ptr) + 1;
 #endif
-        st_wt_u32((void *)routing_ready_ptr, (unsigned)epoch);
+        st_rel_max_u32((void *)routing_ready_ptr, (unsigned)epoch);
 #ifdef MPK_ROUTING_LANE_RELEASE
         rr_epoch = epoch;
+#elif defined(MPK_ROUTING_NARROW_AID)
+#ifndef MPK_AID_SPLIT_FLAGS
+#error "MPK_ROUTING_NARROW_AID publishes into the AID flag replicas"
+#endif
+#ifdef MPK_EARLY_ROUTING
+#error "MPK_ROUTING_NARROW_AID is wired for the non-early routing gate only"
+#endif
+        // One slot per AID replica instead of eight per-XCD lines on the
+        // shared buffer: every XCD received the identical epoch.
+        mpk_aid_publish_at(routing_ready_ptr, 1 * 16, (unsigned)epoch,
+                           MPK_AID_ROUTING_BASE_INTS);
 #else
         for (int x = 0; x < 8; x++) {
+#ifdef MPK_AID_SPLIT_ROUTING
+          // Must hit BOTH replicas: a reader in the other AID polls the other
+          // copy, and missing it is a hang, not a slowdown.
+          mpk_aid_publish_at(routing_ready_ptr, (1 + x) * 16, (unsigned)epoch,
+                             MPK_AID_ROUTING_BASE_INTS);
+#else
           st_wt_u32((void *)&routing_ready_ptr[(1 + x) * 16], (unsigned)epoch);
+#endif
         }
 #endif
       }
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
+    MPK_SUB_TOPK(2);
 #ifdef MPK_ROUTING_LANE_RELEASE
     // ── Fan the eight per-XCD flags out over lanes, not over time ─────────
     //
@@ -2975,7 +4725,13 @@ topk_barrier :
     // store to routing_ready_ptr[0] before any of these eight flags issue.
     rr_epoch = __builtin_amdgcn_readfirstlane(rr_epoch);
     if (rr_epoch != 0 && tid < 8) {
+#ifdef MPK_AID_SPLIT_ROUTING
+      // Both replicas: a reader in the other AID polls the other copy.
+      mpk_aid_publish_at(routing_ready_ptr, (1 + tid) * 16,
+                         (unsigned)rr_epoch, MPK_AID_ROUTING_BASE_INTS);
+#else
       st_wt_u32((void *)&routing_ready_ptr[(1 + tid) * 16], (unsigned)rr_epoch);
+#endif
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
 #endif

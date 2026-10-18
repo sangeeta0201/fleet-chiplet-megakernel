@@ -51,6 +51,49 @@ __device__ __forceinline__ void
   T const *__restrict__ embedding = static_cast<T const *>(embedding_ptr);
   T *__restrict__ output = static_cast<T *>(output_ptr);
 
+#ifdef MPK_EMBED_ROWS  // MPK_EMBED_ROWS_PATCHED
+  if constexpr (BATCH_SIZE > 1) {
+    constexpr int RV = 16 / sizeof(T);
+    constexpr int RNV = CHUNK_SIZE / RV;
+    constexpr int RL = 128;
+    constexpr int RPL = (RNV + RL - 1) / RL;
+    constexpr bool ROK = sizeof(T) * RV == 16 && CHUNK_SIZE % RV == 0 && OUTPUT_DIM_SIZE % RV == 0;
+    bool const ral = ((reinterpret_cast<uintptr_t>(embedding) | reinterpret_cast<uintptr_t>(output)) & 15u) == 0;
+    if (ROK && ral && blockDim.x >= RL) {
+      int64_t ids[BATCH_SIZE];
+#pragma unroll
+      for (int b = 0; b < BATCH_SIZE; ++b) {
+        ids[b] = input_ids[b];
+      }
+      uint4 v[BATCH_SIZE][RPL];
+#pragma unroll
+      for (int b = 0; b < BATCH_SIZE; ++b) {
+        uint4 const *__restrict__ src = reinterpret_cast<uint4 const *>(embedding) +
+                                        (ids[b] >= 0 ? ids[b] : 0) * (OUTPUT_DIM_SIZE / RV);
+#pragma unroll
+        for (int k = 0; k < RPL; ++k) {
+          int const i = threadIdx.x + k * blockDim.x;
+          v[b][k] = make_uint4(0u, 0u, 0u, 0u);
+          if (i < RNV && ids[b] >= 0) {
+            v[b][k] = src[i];
+          }
+        }
+      }
+#pragma unroll
+      for (int b = 0; b < BATCH_SIZE; ++b) {
+        uint4 *__restrict__ dst = reinterpret_cast<uint4 *>(output) + b * (OUTPUT_DIM_SIZE / RV);
+#pragma unroll
+        for (int k = 0; k < RPL; ++k) {
+          int const i = threadIdx.x + k * blockDim.x;
+          if (i < RNV) {
+            dst[i] = v[b][k];
+          }
+        }
+      }
+      return;
+    }
+  }
+#endif
 #pragma unroll
   for (int batch_idx = 0; batch_idx < BATCH_SIZE; batch_idx++) {
     int64_t wordIdx = input_ids[batch_idx];

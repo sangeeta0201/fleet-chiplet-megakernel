@@ -191,7 +191,13 @@ __device__ __attribute__((always_inline)) void
   // TopK worker wrote per-XCD flags via st_wt after threadfence_gpu,
   // so polling is XCD-local (hot in L2, no cross-XCD contention).
   if (tid == 0) {
+#ifdef MPK_AID_SPLIT_ROUTING
+    int *my_release = &mpk_aid_flags_at(routing_ready, xcd_id,
+                                        MPK_AID_ROUTING_BASE_INTS)
+                           [(1 + xcd_id) * 16];
+#else
     int *my_release = &routing_ready[(1 + xcd_id) * 16];
+#endif
     while (ld_nt_s32(my_release) < expected) {
       __builtin_amdgcn_s_sleep(1);
     }
@@ -217,8 +223,7 @@ __device__ __attribute__((always_inline)) void
                                       NUM_EXPERTS,
                                       TOPK_K,
                                       MOE_W13_OUTPUT_PER_WG,
-                                      MOE_W2_OUTPUT_PER_WG>(
-        norm_output_ptr,
+                                      MOE_W2_OUTPUT_PER_WG>(MPK_MOE_HOF_IN(norm_output_ptr),
         moe_gate_up_weight_ptr,
         moe_down_weight_ptr,
         routing_indices_ptr,

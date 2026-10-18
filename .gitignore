@@ -91,4 +91,5 @@ tests/standalone/test_mfma_pipeline_hazards
 *-host-x86_64-unknown-linux-gnu.bc
 *-host-x86_64-unknown-linux-gnu.hipi
 *-host-x86_64-unknown-linux-gnu.s
-*-hip-amdgcn-amd-amdhsa.hipfb
+*-hip-amdgcn-amd-amdhsa.hipfbgpucore.*
+demo/gpt_oss/gpucore.*
