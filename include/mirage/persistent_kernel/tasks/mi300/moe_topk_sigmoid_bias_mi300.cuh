@@ -77,6 +77,8 @@
 // NP=8 1024/1024: 4.243 4.246 -> 4.299 4.306 ms (+0.06). Re-measured on the
 // same stack, MPK_TOPK_WIN_SHFL 4.234 4.253 -> 4.270 4.267 (worse),
 // MPK_TOPK_SKIP_CLEARS 4.245 4.237 and MPK_TOPK_DPP 4.232 4.228 (null).
+// RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.314 vs control 3.315 3.319 3.319 ms. Off.
 #ifndef MPK_TOPK_4W
 #define MPK_TOPK_4W 0
 #endif
@@ -91,6 +93,8 @@
 // 4.603 -> 4.739 ms. Its two 32-lane bitonic sorts are 30 DEPENDENT cross-lane
 // steps (ds_bpermute without MPK_TOPK_DPP), where each of the network's five
 // merge rounds issues its eight exchanges independently. Off.
+// RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.320 vs control 3.315 3.319 3.319 ms. Off.
 #ifndef MPK_TOPK_THRESH
 #define MPK_TOPK_THRESH 0
 #endif

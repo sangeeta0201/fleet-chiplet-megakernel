@@ -117,6 +117,8 @@
 // 5.084 -> 5.100 5.095 5.090 5.114 ms. The k-loop issues its whole weight
 // reduction only once the staging is done (it needs the segment offsets),
 // so the tile waits on that weight stream, not on the staging. Off.
+// RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.358 vs control 3.314 3.315 3.313 ms. Off.
 #ifndef MPK_W2_LL_BATCH
 #define MPK_W2_LL_BATCH 0
 #endif

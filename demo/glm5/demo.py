@@ -1202,6 +1202,11 @@ if __name__ == "__main__":
     if (moe_ep and world_size == 8 and args.max_num_batched_tokens == 1
             and _ckpt_is_mxfp4()):
         os.environ.setdefault("MPK_MOE_TP", "1")
+        # MPK_LMH_BAL (mpk_atoms.cuh): the balanced LM head, one tile per worker. Read
+        # here and by persistent_kernel.py for the tile map, so it is defaulted where
+        # both see it. -0.024 ms with the re-priced batch it shipped in; notes at the
+        # define.
+        os.environ.setdefault("MPK_LMH_BAL", "1")
     MOE_TP = os.environ.get("MPK_MOE_TP", "0") == "1"
     if MOE_TP:
         # The fused W2 tile split into two reduction parts (24 tiles/XCD),

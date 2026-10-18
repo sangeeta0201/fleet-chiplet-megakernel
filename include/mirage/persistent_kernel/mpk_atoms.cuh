@@ -1332,6 +1332,8 @@ __device__ __forceinline__ bool
 // DO NOT ENABLE either flag until it is.
 // MPK_TOPK_FLAG_PF (needs FLAG_LATE): issue that read ahead of the selection
 // and wait on it only at the gate.
+// RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.317 vs control 3.314 3.313 3.322 ms. Off.
 #ifndef MPK_TOPK_FLAG_LATE
 #define MPK_TOPK_FLAG_LATE 0
 #endif
@@ -1343,8 +1345,12 @@ __device__ __forceinline__ bool
 // logit pass (S40 -> S41 0.45 us; S41 -> S63 0.27 us today). The poll and its
 // barrier stay ahead of the selection, unlike MPK_TOPK_FLAG_LATE.
 // MEASURED NULL 2026-10-11 r1, text identical: 3.884 vs 3.881. Off.
+// RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, n=3 interleaved, G1 PASS, tokens
+// identical: 3.303 3.310 3.307 vs 3.312 3.316 3.315 (-0.008) ms. Together with the other five of this batch (MPK_WUK_LL_NOOUT, MPK_WUK_VL4_WF, MPK_TOPK_FLAG_OVL,
+// MPK_QUANT_WIDE, MPK_W2_ACT_SENT, MPK_LMH_BAL) on 747f21b, n=3 interleaved, tokens identical:
+// 3.287 3.293 3.289 vs 3.310 3.316 3.316 ms (-0.024). Default on.
 #ifndef MPK_TOPK_FLAG_OVL
-#define MPK_TOPK_FLAG_OVL 0
+#define MPK_TOPK_FLAG_OVL 1
 #endif
 // MPK_WUK_REMAP: under MPK_WUK_LL + MPK_DEC_REMAP, W_UK tile t runs on the
 // XCD's decode worker t (idle-polling for its query from the attention entry)
@@ -1432,8 +1438,12 @@ __device__ __forceinline__ bool
 // row sums 0.73 -> 0.67 us. The step is the VALU chain -- 48 fp8 converts
 // and packed FMAs a thread at one wave per SIMD -- not the weights' round
 // trip. Off.
+// RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, n=3 interleaved, G1 PASS, tokens
+// identical: 3.308 3.303 3.311 vs 3.312 3.316 3.315 (-0.007) ms. Together with the other five of this batch (MPK_WUK_LL_NOOUT, MPK_WUK_VL4_WF, MPK_TOPK_FLAG_OVL,
+// MPK_QUANT_WIDE, MPK_W2_ACT_SENT, MPK_LMH_BAL) on 747f21b, n=3 interleaved, tokens identical:
+// 3.287 3.293 3.289 vs 3.310 3.316 3.316 ms (-0.024). Default on.
 #ifndef MPK_WUK_VL4_WF
-#define MPK_WUK_VL4_WF 0
+#define MPK_WUK_VL4_WF 1
 #endif
 #ifndef MPK_WUK_HOIST
 #define MPK_WUK_HOIST 0
@@ -1483,6 +1493,8 @@ __device__ __forceinline__ bool
 // The more weight traffic issued beside the merge's tail, the worse -- the
 // same barrier interference the Phase 8 o_proj prefetch note measures with a
 // second round. Off.
+// RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.356 vs control 3.315 3.319 3.319 ms. Off.
 #ifndef MPK_OPROJ_WALL_GATE
 #define MPK_OPROJ_WALL_GATE 0
 #endif
@@ -1551,6 +1563,7 @@ __device__ __forceinline__ bool
 // per-lane out-of-line copy contracted differently and moved the tokens):
 // 3.754 -> 3.818 ms (+0.064). The partials' round trip now follows the
 // words', and the merge ranks poll from their W_UK tile onward. Off.
+// 2026-10-17: does not build on 747f21b: #error with MPK_MERGE_EXP2B (default 1).
 #ifndef MPK_DEC_LSE_LL
 #define MPK_DEC_LSE_LL 0
 #endif
@@ -1569,6 +1582,7 @@ __device__ __forceinline__ bool
 // us against the stock barrier's 22.48 -- no earlier -- then validating the
 // 2.2 MB of words took 3.7 us, and the decode's output step went 0.83 ->
 // 1.69 us. The rendezvous was never the slow part. Off.
+// 2026-10-17: does not build on 747f21b: #error with MPK_MERGE_EXP2B (default 1).
 #ifndef MPK_DEC_MERGE_LL32
 #define MPK_DEC_MERGE_LL32 0
 #endif
@@ -1610,8 +1624,12 @@ __device__ __forceinline__ bool
 // memory side -- in the window where the words land (gang_gemv_mxfp8_mi300).
 // MEASURED NULL 2026-10-13, r1, rank-0 tokens identical: 3.510 vs 3.507
 // ms. Off.
+// RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, n=3 interleaved, G1 PASS, tokens
+// identical: 3.308 3.292 3.304 vs 3.312 3.316 3.315 (-0.013) ms. Together with the other five of this batch (MPK_WUK_LL_NOOUT, MPK_WUK_VL4_WF, MPK_TOPK_FLAG_OVL,
+// MPK_QUANT_WIDE, MPK_W2_ACT_SENT, MPK_LMH_BAL) on 747f21b, n=3 interleaved, tokens identical:
+// 3.287 3.293 3.289 vs 3.310 3.316 3.316 ms (-0.024). Default on.
 #ifndef MPK_WUK_LL_NOOUT
-#define MPK_WUK_LL_NOOUT 0
+#define MPK_WUK_LL_NOOUT 1
 #endif
 // MPK_QXS_ROW_LL: the qkv_a split resolve's row exchange as epoch words in the
 // XCD's L2 -- no drain, no per-tile flag, no flag poll before the row read.
@@ -1672,6 +1690,8 @@ __device__ __forceinline__ bool
 // round beside the merge's tail. Same words staged: bit-identical.
 // MEASURED NULL 2026-10-13, r1, rank-0 tokens identical: 3.512 vs 3.506
 // 3.501 ms. Off.
+// RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.323 vs control 3.314 3.313 3.322 ms. Off.
 #ifndef MPK_OPROJ_POLL_INC
 #define MPK_OPROJ_POLL_INC 0
 #endif
@@ -1685,6 +1705,8 @@ __device__ __forceinline__ bool
 // MEASURED SLOWER 2026-10-13, n=2 interleaved, rank-0 tokens identical:
 // 5.113 5.106 vs 3.502 3.495 ms (+1.6 ms, ~20 us a layer). Far past what a
 // moved prefetch can cost; the stall was not traced. Off.
+// RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 4.924 vs control 3.314 3.313 3.322 ms. Off.
 #ifndef MPK_OPROJ_PF_DEC
 #define MPK_OPROJ_PF_DEC 0
 #endif
@@ -1927,6 +1949,8 @@ __device__ __forceinline__ bool
 // lgkmcnt(0), ten back-to-back MFMAs.
 // MEASURED SLOWER 2026-10-12 with =1, n=3, text identical: 3.569 3.576 3.574
 // vs 3.554 3.559 3.555 (+0.017; -0.007 without it).
+// RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.316 vs control 3.314 3.315 3.313 ms. Off.
 #ifndef MPK_W2_WPRE_BB
 #define MPK_W2_WPRE_BB 0
 #endif
@@ -2046,6 +2070,8 @@ __device__ __forceinline__ bool
 // rounds 3.528 3.530 vs 3.499 3.502; on the MPK_W13_SELF_TOPK default with
 // MPK_MOE_W13_INLINE + MPK_W13_NO_ARRIVE + MPK_W13_ACT_W3 3.514 3.513 vs
 // 3.476 3.478. Off.
+// RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.407 vs control 3.314 3.315 3.313 ms. Off.
 #ifndef MPK_W2_FOLD
 #define MPK_W2_FOLD 0
 #endif
@@ -2073,6 +2099,8 @@ __device__ __forceinline__ bool
 // MEASURED SLOWER 2026-10-13 on the MPK_W13_SELF_TOPK default, n=3
 // interleaved, text identical: 3.488 3.484 3.478 vs 3.471 3.473 3.475
 // (+0.010): the preload burst lands earlier in W13's tail. Off.
+// RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.319 vs control 3.314 3.315 3.313 ms. Off.
 #ifndef MPK_W2_SELF_IDS
 #define MPK_W2_SELF_IDS 0
 #endif
@@ -2085,6 +2113,8 @@ __device__ __forceinline__ bool
 // MEASURED SLOWER 2026-10-13, r1, text identical: 3.656 vs 3.471-3.476
 // (+0.18) -- without the preload the tile's weight stream starts after the
 // staging, in the depth-4 k-loop's dependent trips. Off.
+// RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.496 vs control 3.314 3.315 3.313 ms. Off.
 #ifndef MPK_W2_WPRE_LATE
 #define MPK_W2_WPRE_LATE 0
 #endif
@@ -2095,6 +2125,8 @@ __device__ __forceinline__ bool
 // MEASURED SLOWER 2026-10-13 on 49d37f8, n=2 interleaved, text identical:
 // 3.549 3.536 vs 3.499 3.505 (+0.04); with MPK_W2_PF_MODE=2 3.608 (r1). The
 // pulls start earlier, inside W13's stream. Off.
+// RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.362 vs control 3.314 3.315 3.313 ms. Off.
 #ifndef MPK_ROUTE_BATCH
 #define MPK_ROUTE_BATCH 0
 #endif
@@ -2152,6 +2184,8 @@ __device__ __forceinline__ bool
 // the resolvers reaching it -- while the folders, now resolving before their
 // MPK_QKVA_IDLE_PF share, arrive last at qkv_a -> q_b (+1.58 us) and the late
 // prefetch slows the qkv_a K-loop (+0.53 us). Off.
+// RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.414 vs control 3.315 3.319 3.319 ms. Off.
 #ifndef MPK_QXS_EARLY_RES
 #define MPK_QXS_EARLY_RES 0
 #endif
@@ -2182,6 +2216,8 @@ __device__ __forceinline__ bool
 // MEASURED NULL 2026-10-12 on 12ad8d7, NP=8 1024/1024, n=3 interleaved, all
 // 1024 tokens identical: 3.701 3.691 3.689 -> 3.686 3.683 3.695 ms (-0.006,
 // inside the spread). Off.
+// RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.314 vs control 3.315 3.319 3.319 ms. Off.
 #ifndef MPK_OPROJ_A_PAD
 #define MPK_OPROJ_A_PAD 0
 #endif
@@ -2247,8 +2283,12 @@ __device__ __forceinline__ bool
 // W2 tiles that set the phase's makespan still take their first pass whole.
 // MEASURED NULL 2026-10-12 on 12ad8d7, n=3, text identical: 3.703 3.688
 // 3.690 -> 3.697 3.689 3.692 ms. Off.
+// RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, n=3 interleaved, G1 PASS, tokens
+// identical: 3.314 3.313 3.309, paired -0.007 -0.008 -0.005 ms. Together with the other five of this batch (MPK_WUK_LL_NOOUT, MPK_WUK_VL4_WF, MPK_TOPK_FLAG_OVL,
+// MPK_QUANT_WIDE, MPK_W2_ACT_SENT, MPK_LMH_BAL) on 747f21b, n=3 interleaved, tokens identical:
+// 3.287 3.293 3.289 vs 3.310 3.316 3.316 ms (-0.024). Default on.
 #ifndef MPK_W2_ACT_SENT
-#define MPK_W2_ACT_SENT 0
+#define MPK_W2_ACT_SENT 1
 #endif
 // MPK_QKVA_SKIP_PAD: qkv_a's row is [q_a | latent | padding] with the latent
 // padded 576 -> 1024 for the output alignment, and nothing reads the padding.
@@ -2326,6 +2366,8 @@ __device__ __forceinline__ bool
 // Re-measured 2026-10-14 on dfa7148 (q_b's chain now sets the decode's
 // query): 3.480 vs 3.443 ms (+0.037, r1, tokens identical). See
 // MPK_QB_BIAS_PRE.
+// RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.346 vs control 3.315 3.319 3.319 ms. Off.
 #ifndef MPK_RNLM8_BIAS_PRE
 #define MPK_RNLM8_BIAS_PRE 0
 #endif
@@ -2340,6 +2382,8 @@ __device__ __forceinline__ bool
 // ms (+0.008); on the MPK_KV_LL defaults 3.402 3.395 vs 3.389 3.390 3.387
 // (+0.010). MPK_TRACE (q05): the epilogue's read 0.27 -> 0.16 us, given back
 // elsewhere. Off.
+// RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.319 vs control 3.315 3.319 3.319 ms. Off.
 #ifndef MPK_QB_BIAS_PRE
 #define MPK_QB_BIAS_PRE 0
 #endif
@@ -2351,6 +2395,7 @@ __device__ __forceinline__ bool
 // MEASURED NULL 2026-10-11 on 5df165e, n=3: 3.995 3.997 4.003 vs 4.006 3.994
 // 3.998 ms, text identical. (One earlier r1 wedged rank 6 in iteration 1, the
 // box's random first-iteration wedge; the rerun was clean.) Off.
+// 2026-10-17: on 747f21b tokens differ from the default: 3.321 vs control 3.315 3.319 3.319.
 #ifndef MPK_GEMV4_EPI_PRE
 #define MPK_GEMV4_EPI_PRE 0
 #endif
@@ -2527,6 +2572,8 @@ __device__ __forceinline__ bool
 // MPK_QUANT_WIDE 3.539. MPK_TRACE (q09): wave 0's poll, entry -> words valid,
 // 0.54 -> 1.62 us. vmcnt is per wave but the CU's request path is not: the
 // other waves' 32 KB of tiles sit ahead of the poll's loads. Off.
+// RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.412 vs control 3.315 3.319 3.319 ms. Off.
 #ifndef MPK_QB_WEARLY
 #define MPK_QB_WEARLY 0
 #endif
@@ -2540,6 +2587,8 @@ __device__ __forceinline__ bool
 // (+0.031). MPK_TRACE (q11): the first tile still lands at ~11.06 us (S80 ->
 // S81 0.84 -> 1.42 us) -- its arrival is the slab fetch's (MPK_QB_DEC_PF),
 // not the issue's -- and the norm behind the issue goes 0.42 -> 0.74 us. Off.
+// RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.324 vs control 3.315 3.319 3.319 ms. Off.
 #ifndef MPK_QB_PF_EARLY
 #define MPK_QB_PF_EARLY 0
 #endif
@@ -2581,6 +2630,11 @@ __device__ __forceinline__ bool
 // nearly all of it in qkv_a's resolve + norm (S71 -> S54, -0.20 to -0.26),
 // the interval the c07 dense trace had +0.14 slower. The per-layer sign
 // follows the build (traced, untraced, aligned), not the head's traffic.
+// RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, n=3 interleaved, G1 PASS, tokens identical:
+// 3.312 3.313 3.320, paired -0.009 -0.008 +0.006. Together with the other five of this batch (MPK_WUK_LL_NOOUT, MPK_WUK_VL4_WF, MPK_TOPK_FLAG_OVL,
+// MPK_QUANT_WIDE, MPK_W2_ACT_SENT, MPK_LMH_BAL) on 747f21b, n=3 interleaved, tokens identical:
+// 3.287 3.293 3.289 vs 3.310 3.316 3.316 ms (-0.024). On by default from demo.py at 8
+// ranks, one row, MPK_MOE_TP (the host builds the tile map); this define stays 0.
 #ifndef MPK_LMH_BAL
 #define MPK_LMH_BAL 0
 #endif
@@ -2612,6 +2666,8 @@ __device__ __forceinline__ bool
 // MEASURED SLOWER 2026-10-13 on e275027, n=3 interleaved, tokens identical:
 // 3.460 3.455 3.454 vs 3.452 3.447 3.447 (+0.008); behind the wall 3.466
 // 3.471 vs 3.453 3.458. Off.
+// RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.327 vs control 3.314 3.315 3.313 ms. Off.
 #ifndef MPK_LMH_NT
 #define MPK_LMH_NT 0
 #endif
@@ -2745,8 +2801,12 @@ __device__ __forceinline__ unsigned long long lmh_argmax_key(unsigned bits,
 // 3.461 vs 3.447 3.450 3.449 ms (null). MPK_TRACE (q05, k-loop stamps): the A
 // tiles land 0.84 us after their issue and the default quantizer takes 0.75,
 // so it was hiding them (MPK_QB_PF_EARLY, MPK_QB_WEARLY).
+// RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, n=3 interleaved, G1 PASS, tokens
+// identical: 3.314 3.311 3.299 vs 3.312 3.316 3.315 (-0.006) ms. Together with the other five of this batch (MPK_WUK_LL_NOOUT, MPK_WUK_VL4_WF, MPK_TOPK_FLAG_OVL,
+// MPK_QUANT_WIDE, MPK_W2_ACT_SENT, MPK_LMH_BAL) on 747f21b, n=3 interleaved, tokens identical:
+// 3.287 3.293 3.289 vs 3.310 3.316 3.316 ms (-0.024). Default on.
 #ifndef MPK_QUANT_WIDE
-#define MPK_QUANT_WIDE 0
+#define MPK_QUANT_WIDE 1
 #endif
 // MPK_W13_ACT_W3: the K_HALF W13 tile parks its SwiGLU epoch words in LDS and
 // wave 3 alone stores them. They were issued by waves 0/1 -- exactly the
@@ -2757,6 +2817,8 @@ __device__ __forceinline__ unsigned long long lmh_argmax_key(unsigned bits,
 // MPK_W13_NO_ARRIVE, whose all-wave drain would otherwise put it back.
 // MEASURED NULL 2026-10-11 on 7bc1c7e, with MPK_W13_NO_ARRIVE: 3.954 vs 3.950
 // ms (r1), text identical. Off.
+// RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.328 vs control 3.314 3.315 3.313 ms. Off.
 #ifndef MPK_W13_ACT_W3
 #define MPK_W13_ACT_W3 0
 #endif
@@ -2789,6 +2851,8 @@ __device__ __forceinline__ unsigned long long lmh_argmax_key(unsigned bits,
 // rest of the gang, costs ~1.2 us/layer somewhere downstream; the
 // NODECWAIT probe's -0.085 came with wrong attention output, hence wrong
 // routing and a different MoE, and is not a price for this wait. Off.
+// RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.377 vs control 3.314 3.313 3.322 ms. Off.
 #ifndef MPK_DEC_DIRECT_WAIT
 #define MPK_DEC_DIRECT_WAIT 0
 #endif
@@ -2926,6 +2990,7 @@ __device__ __forceinline__ unsigned long long lmh_argmax_key(unsigned bits,
 // bytes over 18 cases (accuracy PASS), so the tokens may move.
 // MEASURED SLOWER 2026-10-13, n=2 interleaved, tokens moved: 3.516 3.516 vs
 // 3.502 3.495 ms (+0.017). Off.
+// 2026-10-17: on 747f21b tokens differ from the default and it is slower: 3.378 vs control 3.314 3.313 3.322.
 #ifndef MPK_MERGE_QUAD
 #define MPK_MERGE_QUAD 0
 #endif
@@ -2941,6 +3006,7 @@ __device__ __forceinline__ unsigned long long lmh_argmax_key(unsigned bits,
 // MEASURED NULL 2026-10-13, r1, rank-0 tokens identical: 3.513 vs 3.507 ms.
 // A quarter fewer partial lines does not move the merge: it is a round
 // trip, not bytes. Off.
+// 2026-10-17: does not build on 747f21b: #error with MPK_MERGE_EXP2B (default 1).
 #ifndef MPK_MERGE_LIVE
 #define MPK_MERGE_LIVE 0
 #endif
