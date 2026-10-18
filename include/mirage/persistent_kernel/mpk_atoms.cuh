@@ -2351,7 +2351,15 @@ __device__ __forceinline__ bool
 // tokens moved: with MPK_OPROJ_PF_LDS 3.284 3.275 3.286 3.286 vs control 3.287
 // 3.282 3.290 3.283 ms. Against PF_LDS alone it is -0.055 (3.343 3.331 3.332
 // 3.321), but PF_LDS costs that much on its own (its note). Ceiling of a free
-// o_proj GEMV, MPK_PROBE_OPROJ_HALFK=2: -0.094. Off.
+// o_proj GEMV, MPK_PROBE_OPROJ_HALFK=2: -0.094.
+// RE-MEASURED 2026-10-18 on 11de63a (GLM_QKVA_PAD_ALIGN=128), n=3
+// interleaved: 3.207 3.204 3.211 vs 3.243 3.246 3.240 ms (-0.036); PF_LDS
+// alone +0.035 there. Gates: standalone 95 PASS (test_oproj_mfma included),
+// ppl512 2.3819 on all 8 ranks (2.3670 bit-identical before; per-position
+// NLL median +0.0000, mean +0.0063, 49% of positions worse -- inside what
+// rounding alone moves it, MPK_DEC_WPT's note), longseq 256/512/1024 G1 PASS,
+// A/B 3.205 3.200 vs 3.244 3.244. Default on from demo.py, with
+// MPK_OPROJ_PF_LDS, where the row-parallel tile is 32 rows x 4096 K; 0 here.
 #ifndef MPK_OPROJ_MFMA
 #define MPK_OPROJ_MFMA 0
 #endif

@@ -2730,6 +2730,13 @@ if __name__ == "__main__":
             if (os.environ.get("MPK_ROUTER_XSPLIT") == "1"
                     and os.environ.get("MPK_OPROJ_RP_BF16", "0") != "1"):
                 os.environ.setdefault("MPK_OPROJ_LL", "2")
+            # The o_proj tile left in LDS by the Phase 8 prefetch and run as
+            # FP4 x FP8 MFMAs against the row rounded to E4M3 (notes at both
+            # defines in mpk_atoms.cuh): -0.036 ms on the GLM_QKVA_PAD_ALIGN
+            # default, tokens moved. Only the tile w_lds_dma lays out.
+            if _rp_k == 4096 and OPROJ_RP_ROWS == 32:
+                os.environ.setdefault("MPK_OPROJ_PF_LDS", "1")
+                os.environ.setdefault("MPK_OPROJ_MFMA", "1")
             print(f"[CFG] o_proj rp=1 absorbed={int(not UNABSORB_V)} "
                   f"k_per_rank={_rp_k} rows={OPROJ_RP_ROWS} "
                   f"tiles_per_xcd={OPROJ_TILES_PER_XCD}")
