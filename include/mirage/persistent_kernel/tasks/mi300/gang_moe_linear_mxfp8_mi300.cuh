@@ -1711,6 +1711,8 @@ __device__ __host__ constexpr int _gang_moe_pf_groups(int ki, int req) {
 // Re-swept 2026-10-10 on the TP + MPK_W2_ACT_LL + MPK_ATTN_OUT_LL default,
 // NP=8 1024/1024, interleaved, text identical: 6 (control) 4.667 4.651
 // 4.655 -> 8: 4.603 4.607, 12: 4.630 4.617 ms. 8 now.
+// RE-MEASURED 2026-10-18 on a69d899, one interleaved screen rep, G1 PASS,
+// tokens identical: 12 -> 3.185 vs control 3.189 3.186 ms, null. 8 stays.
 #ifndef MPK_MOE_PF_GROUPS_W13
 #define MPK_MOE_PF_GROUPS_W13 8
 #endif
