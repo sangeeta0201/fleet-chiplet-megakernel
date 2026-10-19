@@ -398,6 +398,48 @@ __device__ __forceinline__ void mla_tile_bar() { __syncthreads(); }
 #ifndef MPK_DEC_QK_KSPLIT
 #define MPK_DEC_QK_KSPLIT 0
 #endif
+// MPK_DEC_T2 (needs MPK_DEC_QK_KSPLIT): a two-tile item -- every item at
+// 1025-2048 tokens -- runs one trip over its 32 tokens instead of two. Each
+// wave runs its k32 steps of both tiles' QK side by side (a[32:35] and
+// a[36:39]), the four waves' partials are summed through one exchange instead
+// of one per trip, the softmax takes the chunk max in one step, and PV is
+// eight 16x16x32 MFMAs whose K index 8 kgrp + j is token 4 kgrp + j of tile
+// 0 for j < 4 and of tile 1 for j >= 4 -- the lane's own scores either way,
+// so P needs no shuffle. VALUE CHANGE (one softmax step, K = 32 PV): ppl-gated.
+// test_mla_decode 66/66 at both WRITE_THROUGH arms (the test sizes its LDS
+// for the 104 KB exchange); errors at the K-split floor (rel 1.3-3.0e-3).
+// MEASURED SLOWER without MPK_DEC_WALL, 2026-10-19 on b728685, NP=8 1024/1024,
+// n=2 interleaved, G1 PASS, text coherent: 3.131 3.131 vs 3.098 3.105 ms;
+// MPK_DEC_QK_KSPLIT alone 3.098. MPK_TRACE: the two-tile item's tile loop
+// 1.76 -> 1.28 us, the last decode output -0.53 us, the merge -0.32 us, but
+// W13 and its act hand-off +0.6 us: the decode's extra registers re-allocate
+// worker_kernel (2926 hunks), MoE code included.
+#ifndef MPK_DEC_T2
+#define MPK_DEC_T2 0
+#endif
+// MPK_DEC_WALL: gang_mla_decode_kernel declares every caller-saved register
+// clobbered after its call (the LM head's MPK_LMH_WALL_FULL set). The decode
+// sets the megakernel's allocation (see mla_decode_absorbed), so without it
+// any register change in the decode re-allocates worker_kernel -- MoE
+// included -- which is what MPK_DEC_VT and MPK_DEC_T2 paid for. Behind it,
+// worker_kernel between the default decode and MPK_DEC_T2 differs by one
+// swapped register pair (20 lines of 32465).
+// MEASURED SLOWER 2026-10-19 on b728685, NP=8 1024/1024, n=2 interleaved, G1
+// PASS, tokens identical: 3.125 3.123 vs 3.095 3.104 ms (+0.025; SGPR
+// spills 361 -> 585 around the call). With MPK_DEC_QK_KSPLIT + MPK_DEC_T2
+// behind it: 3.137 3.142 (+0.015 on the wall). Off.
+// Not the MoE re-absorbing an earlier start: with the routing held 1 us late
+// in both arms (MPK_PROBE_DELAY_SITE=4) MPK_DEC_T2 is still 3.208 3.208 vs
+// 3.190 3.185 (2026-10-19, b728685, G1 PASS; its tokens differ, as a value
+// change's do).
+#ifndef MPK_DEC_WALL
+#define MPK_DEC_WALL 0
+#endif
+#if MPK_DEC_T2 && (!MPK_DEC_QK_KSPLIT || !MPK_MLA_OACC_VGPR || \
+                   !MPK_MLA_KV_SWZ || !MPK_DEC_PV_TR || MPK_MLA_DECODE_DMA_PF || \
+                   MPK_MLA_DECODE_BATCH)
+#error "MPK_DEC_T2 is written for the K-split, VGPR-o_acc, swizzled PV_TR tile loop"
+#endif
 // MPK_DEC_WPT: a chunk of 2..4 KV tiles runs its tiles side by side, one per
 // wave, with one cross-wave exchange of the tile maxima and weights before
 // PV, instead of one trip per tile on all four waves (see the tile loop).
@@ -724,7 +766,7 @@ __device__ __forceinline__ void mla_qk_acc32_zero() {
                : "a32", "a33", "a34", "a35");
 }
 
-#if MPK_DEC_QK2T || MPK_DEC_QK_2CHAIN
+#if MPK_DEC_QK2T || MPK_DEC_QK_2CHAIN || MPK_DEC_T2
 // mla_qk_acc32_mfma_kv on a[36:39]: MPK_DEC_QK2T's second tile's chain.
 __device__ __forceinline__ void mla_qk_acc36_mfma_kv(bf16x8_t av,
                                                     __bf16 const *b) {
@@ -1117,6 +1159,26 @@ __device__ __forceinline__ void mla_pv8_vgpr(__mfma_hd64_fp32x4 (&acc)[8],
                  [a3] "v"(va[3]), [a4] "v"(va[4]), [a5] "v"(va[5]),
                  [a6] "v"(va[6]), [a7] "v"(va[7]), [pb] "v"(pb));
 }
+
+#if MPK_DEC_T2
+// Four of mla_pv8_vgpr's blocks over 32 tokens: 16x16x32, A = eight tokens
+// of one dim, B the matching eight weights of one head. Same 8-pass hazard
+// padding.
+__device__ __forceinline__ void
+    mla_pv4_vgpr32(__mfma_hd64_fp32x4 &c0, __mfma_hd64_fp32x4 &c1,
+                   __mfma_hd64_fp32x4 &c2, __mfma_hd64_fp32x4 &c3,
+                   u32x4_t const (&va)[4], u32x4_t pb) {
+  asm volatile("s_nop 1\n\t"
+               "v_mfma_f32_16x16x32_bf16 %[c0], %[a0], %[pb], %[c0]\n\t"
+               "v_mfma_f32_16x16x32_bf16 %[c1], %[a1], %[pb], %[c1]\n\t"
+               "v_mfma_f32_16x16x32_bf16 %[c2], %[a2], %[pb], %[c2]\n\t"
+               "v_mfma_f32_16x16x32_bf16 %[c3], %[a3], %[pb], %[c3]\n\t"
+               "s_nop 15"
+               : [c0] "+v"(c0), [c1] "+v"(c1), [c2] "+v"(c2), [c3] "+v"(c3)
+               : [a0] "v"(va[0]), [a1] "v"(va[1]), [a2] "v"(va[2]),
+                 [a3] "v"(va[3]), [pb] "v"(pb));
+}
+#endif
 
 template <int KV_BYTES, int VB>
 __device__ __forceinline__ void
@@ -2025,6 +2087,173 @@ __device__ __noinline__ void
     if (tile_len < 0) {
       tile_len = 0;
     }
+#if MPK_DEC_T2
+    if (t == 0 && ntiles == 2) {
+      // Tile tt lives at lds_kv + tt * tile: the preloaded ones already, the
+      // rest go in on the register path here.
+      int const len1 = effective_len - KV_TILE < KV_TILE
+                           ? effective_len - KV_TILE
+                           : KV_TILE;
+#pragma unroll
+      for (int tt = 0; tt < 2; tt++) {
+        if (tt < tiles_in_lds) {
+          continue;
+        }
+        __bf16 *const dkv = lds_kv + tt * (KV_TILE * QK_DIM);
+        int const tl = tt ? len1 : tile_len;
+        if (!MPK_PROBE_DEC_NOREG && my_tok < tl) {
+          long const row = get_kv_row(kv_start + tt * KV_TILE + my_tok);
+#pragma unroll
+          for (int r = 0; r < LDG_PER_TILE; r++) {
+            u32x2_t const v =
+                ld_g<u32x2_t>(kv_base + row + (my_dim0 + r * 64) * 2);
+            uint64_t val;
+            __builtin_memcpy(&val, &v, 8);
+            *(__attribute__((address_space(3))) uint64_t *)&dkv
+                [my_tok * QK_DIM + my_wcol + r * 64] = val;
+          }
+        } else {
+#pragma unroll
+          for (int r = 0; r < LDG_PER_TILE; r++) {
+            *(__attribute__((address_space(3))) uint64_t *)&dkv
+                [my_tok * QK_DIM + my_wcol + r * 64] = 0ull;
+          }
+        }
+      }
+      asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+      mla_tile_bar();
+      if (tid == 0) {
+        mpk_stage_stamp(48);
+      }
+      __bf16 const *const kv0 = lds_kv;
+      __bf16 const *const kv1 = lds_kv + KV_TILE * QK_DIM;
+      __mfma_hd64_fp32x4 s0, s1;
+      {
+        using kq_t = gang_mla_decode_detail::bf16x8_t;
+        int const kbo = ((qks_w & 1) ? kswz_o : kswz_e) + qks_w * 32;
+        // One step of each tile in flight ahead of its MFMA, as the one-tile
+        // loop's read-ahead: two arrays of QKS_J would double the live K.
+        kq_t ka[2], kb[2];
+        ka[0] = *reinterpret_cast<kq_t const *>(kv0 + kbo);
+        kb[0] = *reinterpret_cast<kq_t const *>(kv1 + kbo);
+        gang_mla_decode_detail::mla_qk_acc2_zero();
+#pragma unroll
+        for (int j = 0; j < QKS_J; j++) {
+          if (j + 1 < QKS_J && qks_w + 4 * (j + 1) < NUM_K32) {
+            ka[(j + 1) & 1] =
+                *reinterpret_cast<kq_t const *>(kv0 + kbo + (j + 1) * 128);
+            kb[(j + 1) & 1] =
+                *reinterpret_cast<kq_t const *>(kv1 + kbo + (j + 1) * 128);
+          }
+          if (qks_w + 4 * j < NUM_K32) {
+            gang_mla_decode_detail::mla_qk_acc32_mfma_kv(ka[j & 1], qr[j]);
+            gang_mla_decode_detail::mla_qk_acc36_mfma_kv(kb[j & 1], qr[j]);
+          }
+        }
+        __mfma_hd64_fp32x4 p0, p1;
+        gang_mla_decode_detail::mla_qk_acc2_read_pair(p0, p1);
+        // The dead Q staging block, as the one-tile K-split exchange uses it.
+        __mfma_hd64_fp32x4 *const qks_x =
+            reinterpret_cast<__mfma_hd64_fp32x4 *>(_mla_decode_smem +
+                                                   96 * 1024);
+        qks_x[qks_w * 64 + lane] = p0;
+        qks_x[256 + qks_w * 64 + lane] = p1;
+        asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+        __builtin_amdgcn_s_barrier();
+        __mfma_hd64_fp32x4 const a0 = qks_x[lane], a1 = qks_x[64 + lane],
+                                 a2 = qks_x[128 + lane], a3 = qks_x[192 + lane];
+        __mfma_hd64_fp32x4 const b0 = qks_x[256 + lane],
+                                 b1 = qks_x[320 + lane],
+                                 b2 = qks_x[384 + lane],
+                                 b3 = qks_x[448 + lane];
+#pragma unroll
+        for (int h = 0; h < 4; h++) {
+          s0[h] = ((a0[h] + a1[h]) + a2[h]) + a3[h];
+          s1[h] = ((b0[h] + b1[h]) + b2[h]) + b3[h];
+        }
+      }
+      if (tid == 0) {
+        mpk_stage_stamp(75);
+      }
+#pragma unroll
+      for (int h = 0; h < 4; h++) {
+        s0[h] *= scale_s;
+        s1[h] *= scale_s;
+        if (kgrp * 4 + h >= tile_len) {
+          s0[h] = -INFINITY;
+        }
+        if (kgrp * 4 + h >= len1) {
+          s1[h] = -INFINITY;
+        }
+      }
+      float cmax = fmaxf(fmaxf(fmaxf(s0[0], s0[1]), fmaxf(s0[2], s0[3])),
+                         fmaxf(fmaxf(s1[0], s1[1]), fmaxf(s1[2], s1[3])));
+      {
+        float a = cmax, b = cmax;
+        asm volatile("s_nop 1\n\tv_permlane32_swap_b32_e32 %0, %1"
+                     : "+v"(a), "+v"(b));
+        cmax = fmaxf(a, b);
+        a = cmax;
+        b = cmax;
+        asm volatile("s_nop 1\n\tv_permlane16_swap_b32_e32 %0, %1"
+                     : "+v"(a), "+v"(b));
+        cmax = fmaxf(a, b);
+      }
+      using gang_mla_decode_detail::mla_exp2;
+      gang_mla_decode_detail::bf16x8_t pb;
+#pragma unroll
+      for (int h = 0; h < 4; h++) {
+        float const w0 = mla_exp2(s0[h] - cmax);
+        float const w1 = mla_exp2(s1[h] - cmax);
+        l_head[h] = w0 + w1;
+        pb[h] = (__bf16)w0;
+        pb[4 + h] = (__bf16)w1;
+      }
+      m_running = cmax;
+      if (tid == 0) {
+        mpk_stage_stamp(76);
+      }
+      {
+        typedef short mla_tr_v4s_t __attribute__((ext_vector_type(4)));
+        u32x4_t pbu;
+        __builtin_memcpy(&pbu, &pb, 16);
+        // Two halves of four blocks, so only 16 VGPRs of V are live at once.
+#pragma unroll
+        for (int hv = 0; hv < 2; hv++) {
+          u32x4_t vau[4];
+#pragma unroll
+          for (int q = 0; q < 4; q++) {
+            int const vb = hv * 4 + q;
+            mla_tr_v4s_t const v0 = __builtin_amdgcn_ds_read_tr16_b64_v4i16(
+                (__attribute__((address_space(3))) mla_tr_v4s_t *)(
+                    &kv0[vtr_off + vb * 64]));
+            mla_tr_v4s_t const v1 = __builtin_amdgcn_ds_read_tr16_b64_v4i16(
+                (__attribute__((address_space(3))) mla_tr_v4s_t *)(
+                    &kv1[vtr_off + vb * 64]));
+            __builtin_memcpy(&vau[q], &v0, 8);
+            __builtin_memcpy(reinterpret_cast<char *>(&vau[q]) + 8, &v1, 8);
+          }
+          if (hv == 0) {
+            gang_mla_decode_detail::mla_pv4_vgpr32(o_acc_r[0], o_acc_r[1],
+                                                   o_acc_r[2], o_acc_r[3],
+                                                   vau, pbu);
+          } else {
+            gang_mla_decode_detail::mla_pv4_vgpr32(o_acc_r[4], o_acc_r[5],
+                                                   o_acc_r[6], o_acc_r[7],
+                                                   vau, pbu);
+          }
+        }
+      }
+      if (tid == 0) {
+        mpk_stage_stamp(77);
+      }
+      // Hands the tiles and the exchange back to the caller, as the last
+      // trip's closing barrier does.
+      asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+      __builtin_amdgcn_s_barrier();
+      break;
+    }
+#endif
 #if MPK_MLA_DECODE_BATCH
     constexpr int NB = MPK_MLA_DECODE_BATCH;
     static_assert(PAGE_SIZE % KV_TILE == 0,
@@ -2778,6 +3007,7 @@ __device__ __noinline__ void
   if (tid == 0) {
     mpk_stage_stamp(49);
   }
+  mpk_probe_delay<1>();
 
   // ===== Output =====
   // l_head lives on the kgrp lanes; fold them into one value per q head.
@@ -3134,6 +3364,39 @@ __device__ __noinline__ void
                                        q_ll_epoch,
                                        q_ll_own_lo,
                                        kv_flag);
+#if MPK_DEC_WALL
+  // The call's clobbers as worker_kernel sees them, fixed to every
+  // caller-saved register (MPK_LMH_WALL_FULL's set), so that a change behind
+  // this wrapper no longer re-allocates the megakernel.
+  asm volatile(""
+               :
+               :
+               : "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+      "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20",
+      "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30",
+      "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v48",
+      "v49", "v50", "v51", "v52", "v53", "v54", "v55", "v64", "v65", "v66",
+      "v67", "v68", "v69", "v70", "v71", "v80", "v81", "v82", "v83", "v84",
+      "v85", "v86", "v87", "v96", "v97", "v98", "v99", "v100", "v101", "v102",
+      "v103", "v112", "v113", "v114", "v115", "v116", "v117", "v118", "v119",
+      "v128", "v129", "v130", "v131", "v132", "v133", "v134", "v135", "v144",
+      "v145", "v146", "v147", "v148", "v149", "v150", "v151", "v160", "v161",
+      "v162", "v163", "v164", "v165", "v166", "v167", "v176", "v177", "v178",
+      "v179", "v180", "v181", "v182", "v183", "v192", "v193", "v194", "v195",
+      "v196", "v197", "v198", "v199", "v208", "v209", "v210", "v211", "v212",
+      "v213", "v214", "v215", "v224", "v225", "v226", "v227", "v228", "v229",
+      "v230", "v231", "v240", "v241", "v242", "v243", "v244", "v245", "v246",
+      "v247", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9",
+      "a10", "a11", "a12", "a13", "a14", "a15", "a16", "a17", "a18", "a19",
+      "a20", "a21", "a22", "a23", "a24", "a25", "a26", "a27", "a28", "a29",
+      "a30", "a31", "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8",
+      "s9", "s10", "s11", "s12", "s13", "s14", "s15", "s16", "s17", "s18",
+      "s19", "s20", "s21", "s22", "s23", "s24", "s25", "s26", "s27", "s28",
+      "s29", "s40", "s41", "s42", "s43", "s44", "s45", "s46", "s47", "s56",
+      "s57", "s58", "s59", "s60", "s61", "s62", "s63", "s72", "s73", "s74",
+      "s75", "s76", "s77", "s78", "s79", "s88", "s89", "s90", "s91", "s92",
+      "s93", "s94", "s95", "vcc");
+#endif
 }
 
 } // namespace kernel

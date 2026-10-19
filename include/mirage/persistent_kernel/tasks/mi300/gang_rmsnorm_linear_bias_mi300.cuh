@@ -1031,6 +1031,7 @@ __device__ __forceinline__ void topk_2l_ks(int *rll,
   b = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
   unsigned key = has_p ? ((b & 0xFFFFFF00u) | (unsigned)e) : 0u;
   unsigned pay = lu;
+  mpk_probe_delay<4>();
 #if MPK_TK2L_RANK
   // MPK_TK2L_RANK: each key's rank among the 32 (they are unique: the low
   // byte is the expert), and the eight lanes ranked under 8 store themselves

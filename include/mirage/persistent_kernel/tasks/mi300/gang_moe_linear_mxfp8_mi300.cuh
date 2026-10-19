@@ -2738,6 +2738,7 @@ __device__ __noinline__ void
     if (threadIdx.x == 0) {
       mpk_stage_stamp(56);
     }
+    mpk_probe_delay<5>();
     if (kh == 0 && col == 0) {
 #pragma unroll
       for (int i = 0; i < 4; i++) {

@@ -56,7 +56,8 @@ static constexpr int LDS_TILE_BYTES =
 // its tiles' weights and maxima (4.25 KB). WPT's extra tile buffers sit
 // below 72 KB, inside that, as do MPK_DEC_VT's V^T tiles (36..76 KB).
 static constexpr int LDS_SCORES_END =
-    MPK_DEC_WPT ? 101 * 1024
+    MPK_DEC_T2 ? 104 * 1024
+    : MPK_DEC_WPT ? 101 * 1024
     : MPK_DEC_QK_KSPLIT ? 100 * 1024 : (MPK_MLA_QK_SPLIT ? 98 * 1024 : 0);
 static constexpr int LDS_BYTES =
     LDS_TILE_BYTES < LDS_SCORES_END ? LDS_SCORES_END : LDS_TILE_BYTES;

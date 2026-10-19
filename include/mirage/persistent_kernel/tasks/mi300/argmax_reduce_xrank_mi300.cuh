@@ -269,8 +269,13 @@ __device__ __forceinline__ void
     }
 
     if (tidx == 0) {
+#if MPK_PROBE_FIXED_TOKEN
+      (void)mine;
+      final_output[batch_idx] = (long long)MPK_PROBE_FIXED_TOKEN;
+#else
       final_output[batch_idx] =
           (long long)(unsigned int)(~(unsigned int)(mine & 0xFFFFFFFFull));
+#endif
     }
     __syncthreads();
   }

@@ -1856,6 +1856,19 @@ __device__ __forceinline__ bool
 // 26.79 -> 24.87), and the decode then waits on its own KV preload. The Q
 // path is worth up to 0.09 ms with the latent tile's flag where it is
 // (S66 ~14.4 us), 0.25 with the flag out of the way too.
+// MPK_PROBE_FIXED_TOKEN=id: PRICING CONTROL, WRONG OUTPUT. The cross-rank
+// argmax writes token id instead of the winner, so the decode generates one
+// repeated token with every phase's work intact -- the degenerate text the
+// wrong-output probes produce (G2 distinct ~0.001), without removing anything.
+// What those probes' numbers owe to the text alone.
+// MEASURED 2026-10-19 on b728685, NP=8 1024/1024, interleaved, G1 PASS: =13
+// 3.109 3.095 vs control 3.106 3.100 ms; MPK_PROBE_DEC_NOCOMPUTE 2.914 in the
+// same batch. The repeated token buys nothing. It does not fix the routing,
+// though: attention still varies with the position, where NOCOMPUTE's zero
+// attention output makes every step's routing the same.
+#ifndef MPK_PROBE_FIXED_TOKEN
+#define MPK_PROBE_FIXED_TOKEN 0
+#endif
 #ifndef MPK_PROBE_DEC_NOQ
 #define MPK_PROBE_DEC_NOQ 0
 #endif
@@ -1917,6 +1930,18 @@ __device__ __forceinline__ bool
 // META_PF's prologue walk had nothing to hide under. 5.011 4.989 (-0.090).
 #ifndef MPK_DEC_REMAP
 #define MPK_DEC_REMAP 1
+#endif
+// MPK_DEC_REMAP_LOW: see dec_base in gang_mla_attn_fused_mi300.cuh. Only
+// changes anything when the decode items do not fit past q_b's tiles.
+// MEASURED LOSS 2026-10-19 on b728685 with GLM_MLA_HL_CHUNK_CAP=128 (16 items
+// an XCD, one trip each), NP=8 1024/1024, one rep, G1 PASS, text coherent:
+// 3.237 vs control 3.096 ms; without it (items on ranks 0..) 3.350 vs 3.101.
+// MPK_TRACE: the items on q_b's ranks still start ~2.7 us after the default's
+// (S46 15.77 vs 13.02), so the single trip (query -> output 2.66 vs 3.60 us)
+// buys nothing on the last item, and the 128-chunk merge takes 1.35 us more.
+// Off.
+#ifndef MPK_DEC_REMAP_LOW
+#define MPK_DEC_REMAP_LOW 0
 #endif
 // MPK_DEC_CHUNK_ILV: the head-local decode's items dealt round robin over the
 // XCDs (item t * 8 + xcd) instead of XCD-major (xcd * dec_tiles + t). The live
@@ -3217,6 +3242,10 @@ __device__ __forceinline__ unsigned long long lmh_argmax_key(unsigned bits,
 // routing and a different MoE, and is not a price for this wait. Off.
 // RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
 // tokens identical: 3.377 vs control 3.314 3.313 3.322 ms. Off.
+// RE-MEASURED 2026-10-19 on b728685, one interleaved rep, G1 PASS, tokens
+// identical: 3.106 vs control 3.100 ms. Sparse trace pair (h175): every stamp
+// from the query on 0.07-0.18 us earlier, upstream of the change too -- trace
+// noise, no rendezvous saving to see. Off.
 #ifndef MPK_DEC_DIRECT_WAIT
 #define MPK_DEC_DIRECT_WAIT 0
 #endif
@@ -4259,6 +4288,43 @@ __device__ __forceinline__ void mpk_ml_boundary_pad() {
 #else
 __device__ __forceinline__ void mpk_ml_boundary_pad() {}
 #endif
+
+// MPK_PROBE_DELAY_SITE / MPK_PROBE_DELAY_NS: PRICING PROBE, RIGHT OUTPUT. Every
+// worker that reaches site MPK_PROBE_DELAY_SITE spins MPK_PROBE_DELAY_NS there
+// and goes on; nothing else changes. The wall's growth over layers x delay is
+// the site's share of the critical path, for an addition -- an upper bound on
+// what shortening that phase buys (MPK_ML_BOUNDARY_PAD's retraction). Two
+// delays at one site give the slope without the spin's own code-shape cost.
+// Sites: 1 decode item after its tile loop, 2 W_UK tile before its query
+// words, 3 o_proj tile before its push, 4 TopK level 1 before its
+// candidates, 5 W13 tile before its SwiGLU words, 6 merge item before it
+// starts.
+// MEASURED 2026-10-19 on b728685, NP=8 1024/1024, one interleaved rep each,
+// G1 PASS, tokens identical to the control at every site: control 3.097
+// 3.104; at 1000 ns site 1 3.175, 2 3.174, 3 3.184, 4 3.186, 5 3.201, 6
+// 3.179; at 2000 ns site 1 3.253, site 2 3.245. Every site costs at least
+// its delay on every layer (+0.078 ms per us at 78 layers, +0.075 for the 75
+// MoE layers; W13's 1.39x, TopK's 1.19x and o_proj's 1.12x more), linearly
+// from 1 to 2 us. No phase on the decode -> W13 chain has slack to add into,
+// yet shortening the decode items (MPK_DEC_T2, ~0.4 us an item) bought
+// nothing: the earlier start comes back as a slower W13 k-loop.
+#ifndef MPK_PROBE_DELAY_SITE
+#define MPK_PROBE_DELAY_SITE 0
+#endif
+#ifndef MPK_PROBE_DELAY_NS
+#define MPK_PROBE_DELAY_NS 1000
+#endif
+template <int SITE>
+__device__ __forceinline__ void mpk_probe_delay() {
+  if constexpr (SITE == MPK_PROBE_DELAY_SITE) {
+    unsigned long long const t0 =
+        (unsigned long long)__builtin_amdgcn_s_memrealtime();
+    while (((unsigned long long)__builtin_amdgcn_s_memrealtime() - t0) <
+           (unsigned long long)(MPK_PROBE_DELAY_NS / 10)) {
+      __builtin_amdgcn_s_sleep(1);
+    }
+  }
+}
 
 // MPK_BAR_TREE: use the two-level arrival above for every GPU-wide
 // Mechanism-C rendezvous. Off by default so the flat mechanism stays the

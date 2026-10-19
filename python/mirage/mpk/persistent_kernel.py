@@ -1674,7 +1674,7 @@ def get_compile_command(
             "MPK_DEC_HINTS",
             # Ceiling probes, wrong output (gang_mla_attn_fused_mi300.cuh).
             "MPK_ATTN_PROBE_NOQBWAIT",
-            "MPK_ATTN_PROBE_NODECWAIT",
+            "MPK_ATTN_PROBE_NODECWAIT", "MPK_DEC_REMAP_LOW", "MPK_DEC_T2", "MPK_DEC_WALL",
         ):
             _x = os.environ.get(_v)
             if _x is not None:
@@ -1769,6 +1769,17 @@ def get_compile_command(
         if _x is not None and _x != "" and _x != "0":
             assert _x.isdigit() and int(_x) % 4 == 0 and int(_x) <= 256, "MPK_QKVA_W13PF is 0..256 KB, a multiple of 4"
             flags = flags + [f"-DMPK_QKVA_W13PF={_x}"]
+        _x = os.environ.get("MPK_PROBE_FIXED_TOKEN")
+        if _x is not None and _x not in ("", "0"):
+            assert _x.isdigit() and int(_x) < 155648, "MPK_PROBE_FIXED_TOKEN is a token id"
+            flags = flags + [f"-DMPK_PROBE_FIXED_TOKEN={_x}"]
+        _x = os.environ.get("MPK_PROBE_DELAY_SITE")
+        if _x is not None and _x not in ("", "0"):
+            assert _x.isdigit() and int(_x) <= 6, "MPK_PROBE_DELAY_SITE is 0..6"
+            flags = flags + [f"-DMPK_PROBE_DELAY_SITE={_x}"]
+            _y = os.environ.get("MPK_PROBE_DELAY_NS", "1000")
+            assert _y.isdigit() and int(_y) <= 20000, "MPK_PROBE_DELAY_NS is 0..20000"
+            flags = flags + [f"-DMPK_PROBE_DELAY_NS={_y}"]
         _x = os.environ.get("MPK_W2F_PF_STAGGER_NS")
         if _x is not None:
             assert _x.isdigit() and int(_x) <= 2000, "MPK_W2F_PF_STAGGER_NS is 0..2000"

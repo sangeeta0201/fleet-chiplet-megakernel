@@ -532,6 +532,7 @@ __device__ __noinline__ void
       mpk_stage_stamp(79);
     }
     if (o_ll != nullptr) {
+      mpk_probe_delay<2>();
       if (Bs != nullptr) {
         __builtin_trap();
       }

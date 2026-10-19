@@ -510,9 +510,16 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // reach the q_b -> decode barrier, so MPK_ATTN_META_PF's prologue walk had
   // nothing to hide under. Those workers also skip Phase 3b's XCD wait (they
   // have no W_UK tile), so the walk runs across q_b and W_UK.
+  // MPK_DEC_REMAP_LOW: when the items do not fit past q_b's tiles (16 an
+  // XCD at 128 chunks against 13 ranks), they start at rank 1 instead of 0:
+  // q_b's workers are free from its K-loop on, and rank 0 and the folders
+  // past dec_base + dec_tiles keep MPK_WUK_IDLE_MAP's W_UK tiles.
   int const dec_base = (MPK_DEC_REMAP && head_local &&
                         qb_tiles_per_xcd + dec_tiles <= tiles_per_xcd)
                            ? qb_tiles_per_xcd
+                       : (MPK_DEC_REMAP_LOW && MPK_DEC_REMAP && head_local &&
+                          1 + dec_tiles <= tiles_per_xcd - MPK_EP_FOLD_WGS)
+                           ? 1
                            : 0;
   int const dec_rank = xcd_rank - dec_base;
 #if MPK_OPROJ_PF_DEC
@@ -2411,6 +2418,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         head_local ? (hl_g0 + mrg_item / MERGE_DIM_SPLITS) * MERGE_DIM_SPLITS +
                          mrg_item % MERGE_DIM_SPLITS
                    : mrg_item;
+    mpk_probe_delay<6>();
     merge_splitkv_ck_fmha<bfloat16,
                           /*NUM_QO_HEADS_PER_KV=*/16,
                           NUM_Q_GROUPS,

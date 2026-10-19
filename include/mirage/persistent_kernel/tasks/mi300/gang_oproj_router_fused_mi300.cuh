@@ -1335,6 +1335,7 @@ __device__ __attribute__((always_inline)) void
       if (tid == 0 && t == op_tile) {
         mpk_stage_stamp(59);
       }
+      mpk_probe_delay<3>();
       // Push the tile straight into every peer's copy of the hidden row, at
       // the identical offset -- the slices are disjoint, so the all-gather is
       // EP_NPEER stores of the bytes this workgroup just produced and no
