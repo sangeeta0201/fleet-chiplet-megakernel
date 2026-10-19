@@ -3107,7 +3107,7 @@ gang_mla_full_layer_fused_kernel_mi300(
                                HIER_STRIDE)
           : nullptr,
       (unsigned)(task_layer_idx + 1)
-#if MPK_QKVA_PF_KB > 0
+#if MPK_QKVA_PF_KB > 0 || MPK_QKVA_W13PF > 0
       ,
       /*next_qkv_weight=*/input_ptrs[MPK_QKVA_PF_SLOT]
 #endif

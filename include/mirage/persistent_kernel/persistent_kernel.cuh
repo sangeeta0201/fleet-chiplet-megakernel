@@ -3404,7 +3404,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               }
               __syncthreads();
 #endif
-#if MPK_QKVA_PF_KB > 0
+#if MPK_QKVA_PF_KB > 0 || MPK_QKVA_W13PF > 0
               // Next layer's qkv_a. Slot 33 is a legal vehicle (current [3]
               // via slot 33: 11.353 G1 PASS). The same-heap guard is purely
               // defensive: it never fires on this box (layers' qkv_a are

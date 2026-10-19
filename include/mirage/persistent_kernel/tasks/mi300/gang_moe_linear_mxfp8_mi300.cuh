@@ -4740,6 +4740,17 @@ __device__ __forceinline__ void
   int const g = (tid & 63) >> 4;
   unsigned long long w[NUM_TOPK];
   _gang_ll_route_words<NUM_TOPK>(ll_route, ll_epoch, w);
+#if MPK_W2F_PF_DELAY_NS > 0
+  // MPK_W2F_PF_DELAY_NS: hold the weight loads this long past the routing,
+  // so they share HBM with W13's tail rather than with all of its stream.
+  {
+    unsigned long long const t0 = __builtin_amdgcn_s_memrealtime();
+    while ((__builtin_amdgcn_s_memrealtime() - t0) * 10ull <
+           (unsigned long long)MPK_W2F_PF_DELAY_NS) {
+      __builtin_amdgcn_s_sleep(8);
+    }
+  }
+#endif
   uint8_t const *const wg_data = static_cast<uint8_t const *>(weight_ptr) +
                                  static_cast<int64_t>(wg_idx) * P::WG_BYTES;
   _gang_gp8 const p_wdr =

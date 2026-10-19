@@ -1213,6 +1213,10 @@ if __name__ == "__main__":
         # run_mp8_dp_ep_fused.sh's NP=8 default. -0.042 ms, bit-identical.
         os.environ.setdefault("MPK_W2_FOLD", "2")
         os.environ.setdefault("MPK_W2F_TOPK", "1")
+        # MPK_W2F_PF_DELAY_NS (mpk_atoms.cuh): the fold tiles' weight loads
+        # start 1.5 us after the routing, off the head of W13's stream.
+        # Bit-identical; the measured curve is at the define.
+        os.environ.setdefault("MPK_W2F_PF_DELAY_NS", "1500")
     MOE_TP = os.environ.get("MPK_MOE_TP", "0") == "1"
     if MOE_TP:
         # The fused W2 tile split into two reduction parts (24 tiles/XCD),

@@ -2254,8 +2254,32 @@ __device__ __forceinline__ bool
 // accumulators (k-tiles 0, 10, 1, 11, ...) instead of running ten on acc0
 // and then eight on acc1, so the two dependent chains overlap. Each half
 // keeps its ascending k order: bit-identical.
+// MEASURED NULL 2026-10-19 on 3cef116, NP=8 1024/1024, n=3 interleaved, G1
+// PASS, all rank-0 tokens identical: 3.154 3.151 3.154 vs 3.146 3.150 3.151
+// ms (+0.004). The fold tile's MFMAs are not what its last tile waits on. Off.
 #ifndef MPK_W2F_ILV
 #define MPK_W2F_ILV 0
+#endif
+// MPK_W2F_PF_DELAY_NS: MPK_W2_FOLD=2's fold tiles issue their 81 KB of weight
+// loads this long after the routing words land instead of at once. The
+// weights are first used when W13's words land, ~2.2 us after its last tile
+// (MPK_TRACE h130), and the loads take ~3 us, so up to ~3 us of delay moves
+// them off the first part of W13's stream (W13 5.23 us there against 4.72
+// without the fold's preload) without making the fold wait. Timing only:
+// bit-identical.
+// MEASURED 2026-10-19 on 3cef116, NP=8 1024/1024, one interleaved screen rep
+// per value, G1 PASS, all rank-0 tokens identical, decode median ms:
+//   0 (control)  3.150 3.148 3.145 3.148
+//   1000 3.117   1500 3.101   1750 3.105   2000 3.111 3.105
+//   2250 3.119   2500 3.140   3000 3.166
+// Past ~2 us the loads land after W13's words and the fold waits on them, so
+// the default (1500, demo.py, under MPK_W2_FOLD=2) sits off that edge.
+// Confirmed n=3 interleaved against 0, G1 PASS, all rank-0 tokens identical:
+// 3.100 3.109 3.100 vs 3.139 3.146 3.154 ms (-0.043). Gated: standalone 95
+// PASS (both WRITE_THROUGH arms), ppl512 2.3819 on all 8 ranks with every
+// position's NLL identical to the default's, longseq 256/512/1024 G1 PASS.
+#ifndef MPK_W2F_PF_DELAY_NS
+#define MPK_W2F_PF_DELAY_NS 0
 #endif
 // MPK_MOE_DPP: the MoE chain's intra-wave exchanges as DPP and gfx950
 // register swaps instead of ds_bpermute -- the K-split router tile's sum of
@@ -3476,6 +3500,28 @@ __device__ __forceinline__ unsigned long long lmh_argmax_key(unsigned bits,
 #ifndef MPK_QKVA_PF_AT
 #define MPK_QKVA_PF_AT 2
 #endif
+
+// MPK_QKVA_W13PF: KB of the next layer's qkv_a region each W13 tile's worker
+// pulls into L2 after its tile, under MPK_W2_FOLD (0 = off). The fold layout
+// changes the case MPK_QKVA_PF_AT=13 measured neutral: the fold tiles' weights
+// are already in registers when W13 ends, so nothing streams over the lines
+// between these workers' exit and qkv_a(L+1)'s K-loop. Register loads, not
+// LDS DMA: a W13 worker re-enters the layer loop next, and the first
+// __syncthreads there would drain a DMA at ~12 GB/s/CU. 116 x 18 workers
+// covers the 21 x 101376 B region; offsets past it are clamped.
+// MEASURED LOSS 2026-10-19 on 3cef116 + MPK_W2F_PF_DELAY_NS=1500, NP=8
+// 1024/1024, one interleaved screen rep, G1 PASS, rank-0 tokens identical:
+// control 3.106, KB=64 3.118 (+0.012), KB=116 3.204 (+0.098). The W13
+// workers' return to the layer loop is on the critical path well inside the
+// ~5 us the trace shows between their tile and the next resolve; nothing the
+// bytes buy repays it. Off.
+#ifndef MPK_QKVA_W13PF
+#define MPK_QKVA_W13PF 0
+#endif
+// One XCD's qkv_a region at GLM-5.2's shapes: 21 tiles of 16 rows x
+// (6144 B + 192 scale bytes). Under MPK_QKVA_SKIP_PAD XCD 7 runs 17 of them;
+// the last 4 are pad rows, still allocated.
+#define MPK_QKVA_W13PF_BYTES (21u * (16u * 6144u + 16u * 192u))
 
 // MPK_QKVA_REPS: how many times the qkv_a tile loop runs. 1 is the shipping
 // path. CORRECT OUTPUT at any value, and that is the point of the probe --

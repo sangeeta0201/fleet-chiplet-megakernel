@@ -417,7 +417,7 @@ __device__ __attribute__((always_inline)) void
         // MPK_W2_PARTS_LL only: the W2 parts' f32 rows as epoch-tagged words.
         unsigned long long *w2_pl_ptr = nullptr,
         unsigned w2_pl_epoch = 0
-#if MPK_QKVA_PF_KB > 0
+#if MPK_QKVA_PF_KB > 0 || MPK_QKVA_W13PF > 0
         ,
         // Next layer's qkv_a weight for this XCD. Null on the last layer of
         // a run. The fused caller passes input_ptrs[MPK_QKVA_PF_SLOT].
@@ -2914,6 +2914,34 @@ __device__ __attribute__((always_inline)) void
   if constexpr (W2F_ON) {
     if (w2f_layer) {
       if (w2f_j < 0) {
+#if MPK_QKVA_W13PF > 0
+        if (mrk >= 0 && mrk < moe_w13_live && next_qkv_weight_ptr != nullptr &&
+            (((uintptr_t)next_qkv_weight_ptr) & 15u) == 0u) {
+          constexpr uint32_t PF_STEP = (uint32_t)MPK_NT * 16u;
+          constexpr uint32_t PF_B = (uint32_t)MPK_QKVA_W13PF * 1024u;
+          static_assert(PF_B % PF_STEP == 0u,
+                        "MPK_QKVA_W13PF must be a whole number of steps");
+          constexpr int PF_N = (int)(PF_B / PF_STEP);
+          constexpr uint32_t PF_LAST = MPK_QKVA_W13PF_BYTES - 16u;
+          char const *const base = (char const *)next_qkv_weight_ptr;
+          uint32_t const lo = (uint32_t)mrk * PF_B + (uint32_t)tid * 16u;
+          uint4 v[PF_N];
+#pragma unroll
+          for (int i = 0; i < PF_N; i++) {
+            uint32_t const o = lo + (uint32_t)i * PF_STEP;
+            v[i] = *(uint4 const *)(base + (o < PF_LAST ? o : PF_LAST));
+          }
+          uint4 acc = make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll
+          for (int i = 0; i < PF_N; i++) {
+            acc.x += v[i].x;
+            acc.y += v[i].y;
+            acc.z += v[i].z;
+            acc.w += v[i].w;
+          }
+          asm volatile("" ::"v"(acc.x), "v"(acc.y), "v"(acc.z), "v"(acc.w));
+        }
+#endif
         return;
       }
       if (tid == 0) {
