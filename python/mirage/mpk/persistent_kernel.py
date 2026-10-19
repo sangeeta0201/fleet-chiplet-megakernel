@@ -1769,6 +1769,10 @@ def get_compile_command(
         if _x is not None and _x != "" and _x != "0":
             assert _x.isdigit() and int(_x) % 4 == 0 and int(_x) <= 256, "MPK_QKVA_W13PF is 0..256 KB, a multiple of 4"
             flags = flags + [f"-DMPK_QKVA_W13PF={_x}"]
+        _x = os.environ.get("MPK_W2F_PF_STAGGER_NS")
+        if _x is not None:
+            assert _x.isdigit() and int(_x) <= 2000, "MPK_W2F_PF_STAGGER_NS is 0..2000"
+            flags = flags + [f"-DMPK_W2F_PF_STAGGER_NS={_x}"]
         _x = os.environ.get("MPK_W2F_PF_DELAY_NS")
         if _x is not None:
             assert _x.isdigit() and int(_x) <= 20000, "MPK_W2F_PF_DELAY_NS is 0..20000"
@@ -1806,7 +1810,7 @@ def get_compile_command(
         # (gang_mla_attn_fused_mi300.cuh).
         _x = os.environ.get("MPK_QKVA_IDLE_PF")
         if _x is not None:
-            assert _x in ("0", "1"), "MPK_QKVA_IDLE_PF is 0 or 1"
+            assert _x in ("0", "1", "2"), "MPK_QKVA_IDLE_PF is 0..2"
             flags = flags + [f"-DMPK_QKVA_IDLE_PF={_x}"]
         # The o_proj partials as epoch-tagged words: 1 from the GEMV epilogue,
         # 2 from the push (gang_oproj_router_fused_mi300.cuh, mpk_atoms.cuh).

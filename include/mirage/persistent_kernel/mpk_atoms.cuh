@@ -1178,6 +1178,9 @@ __device__ __forceinline__ bool
 // MEASURED 2026-10-09, NP=8 1024/1024, n=3 interleaved, tokens
 // identical: 6.160 6.145 6.157 -> 6.119 6.093 6.094 ms (-0.05). Gated with
 // MPK_TOPK_LL_PREBIAS: ppl512 2.4838, longseq 256/512/1024 G1 PASS. Default 1.
+// RE-MEASURED 2026-10-19 on ae6447e (the fold layout: the idle ranks are fold
+// tiles that enter ~1 us later than the W13 ranks), n=2 interleaved, G1 PASS,
+// tokens identical: =0 3.154 3.151 vs 3.109 3.102 ms. Still worth 0.047.
 #ifndef MPK_QKVA_IDLE_PF
 #define MPK_QKVA_IDLE_PF 1
 #endif
@@ -1679,6 +1682,8 @@ __device__ __forceinline__ bool
 // folds long done. MEASURED NEGATIVE 2026-10-11, NP=8 1024/1024, interleaved,
 // text identical: 4.243 4.246 4.244 -> 4.278 4.274 4.264 ms (+0.028) -- every
 // qkv_a tile polling 24 KB of row words costs more than the flag hop. Off.
+// 2026-10-19: does not build on ae6447e -- static_assert against MPK_QA_LL
+// (default on) in gang_mla_full_layer_fused_mi300.cuh.
 #ifndef MPK_QXS_ROW_LL
 #define MPK_QXS_ROW_LL 0
 #endif
@@ -2273,13 +2278,32 @@ __device__ __forceinline__ bool
 //   1000 3.117   1500 3.101   1750 3.105   2000 3.111 3.105
 //   2250 3.119   2500 3.140   3000 3.166
 // Past ~2 us the loads land after W13's words and the fold waits on them, so
-// the default (1500, demo.py, under MPK_W2_FOLD=2) sits off that edge.
+// the default sits off that edge: 1000 with MPK_W2F_PF_STAGGER_NS=90
+// (demo.py, under MPK_W2_FOLD=2), every tile in by 2.0 us. The numbers below
+// are the 1500 flat default this replaced.
 // Confirmed n=3 interleaved against 0, G1 PASS, all rank-0 tokens identical:
 // 3.100 3.109 3.100 vs 3.139 3.146 3.154 ms (-0.043). Gated: standalone 95
 // PASS (both WRITE_THROUGH arms), ppl512 2.3819 on all 8 ranks with every
 // position's NLL identical to the default's, longseq 256/512/1024 G1 PASS.
 #ifndef MPK_W2F_PF_DELAY_NS
 #define MPK_W2F_PF_DELAY_NS 0
+#endif
+// MPK_W2F_PF_STAGGER_NS: under MPK_W2F_PF_DELAY_NS, fold tile j of an XCD
+// (wg_idx >> 3) holds j * this much longer, so the 96 tiles' 7.8 MB enter
+// W13's tail spread out rather than at one instant. Timing only.
+// SCREEN 2026-10-19 on ae6447e (delay 1500 flat: 3.107 3.105), NP=8
+// 1024/1024, one interleaved rep each, G1 PASS, tokens identical, delay +
+// stagger: 1000 + 90 3.098, 750 + 120 3.106, 1250 + 50 3.104 ms.
+// n=3 interleaved against the 1500 flat default, G1 PASS, tokens and text
+// identical: 1000 + 90 3.102 3.099 3.099, 1000 + 70 3.102 3.097 3.101, vs
+// 3.102 3.108 3.102 ms (-0.004 each, inside one run's spread). Default 90
+// with delay 1000 from demo.py; this define stays 0. With MPK_QXS_XOUT_LATE,
+// n=3 interleaved against ae6447e's 1500 flat default, G1 PASS, tokens and
+// text identical: 3.097 3.096 3.104 vs 3.107 3.108 3.111 ms (-0.010).
+// Gated: standalone 95 PASS (both WRITE_THROUGH arms), ppl512 2.3819 on all
+// 8 ranks with every position's NLL identical, longseq 256/512/1024 G1 PASS.
+#ifndef MPK_W2F_PF_STAGGER_NS
+#define MPK_W2F_PF_STAGGER_NS 0
 #endif
 // MPK_MOE_DPP: the MoE chain's intra-wave exchanges as DPP and gfx950
 // register swaps instead of ds_bpermute -- the K-split router tile's sum of
@@ -2398,6 +2422,8 @@ __device__ __forceinline__ bool
 // so not in L2) sat in the validating waves' vmcnt ahead of the first pass.
 // It is first used at the gather, behind the XCD exchange.
 // MEASURED NULL 2026-10-11, NP=8 1024/1024: 4.040 vs 4.040 ms. Off.
+// RE-MEASURED 2026-10-19 on ae6447e, one interleaved screen rep, G1 PASS,
+// tokens identical: 3.114 vs control 3.107 ms. Off.
 #ifndef MPK_RESOLVE_NW_LATE
 #define MPK_RESOLVE_NW_LATE 0
 #endif
@@ -2607,6 +2633,10 @@ __device__ __forceinline__ bool
 // MEASURED NULL 2026-10-11, NP=8 1024/1024: 4.043 vs 4.037 ms. Off.
 // Re-measured on 12ad8d7 (MPK_QA_LL), n=3: 3.698 3.701 3.688 vs 3.701 3.691
 // 3.689, null.
+// RE-MEASURED 2026-10-19 on ae6447e (fold layout), G1 PASS, tokens identical:
+// screen 3.098 vs control 3.107 3.107; then n=3 interleaved on the delay
+// 1000 + stagger 90 candidate, 3.096 3.104 3.095 vs 3.101 3.104 3.105 ms
+// (-0.005). On from demo.py at NP=8 under MPK_W2_FOLD=2; this define stays 0.
 #ifndef MPK_QXS_XOUT_LATE
 #define MPK_QXS_XOUT_LATE 0
 #endif
@@ -3151,6 +3181,8 @@ __device__ __forceinline__ unsigned long long lmh_argmax_key(unsigned bits,
 // ms (r1), text identical. Off.
 // RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
 // tokens identical: 3.328 vs control 3.314 3.315 3.313 ms. Off.
+// RE-MEASURED 2026-10-19 on ae6447e (fold layout), one interleaved screen
+// rep, G1 PASS, tokens identical: 3.111 vs control 3.107 ms. Off.
 #ifndef MPK_W13_ACT_W3
 #define MPK_W13_ACT_W3 0
 #endif

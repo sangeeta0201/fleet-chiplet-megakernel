@@ -2897,6 +2897,8 @@ __device__ __host__ constexpr int _rnlm8_pf_groups(int ki, int req) {
 // (ITERS_PER_WAVE 12). MEASURED 2026-10-10, NP=8 1024/1024, n=3 interleaved
 // on the 9ef34be + MPK_DEC_PRELOAD=2 default, text identical:
 // 4.795 4.807 4.795 -> 6: 4.749 4.759 4.772, 12: 4.767 4.763 4.759 ms.
+// RE-MEASURED 2026-10-19 on ae6447e, n=2 interleaved, G1 PASS, tokens
+// identical: 12 -> 3.114 3.117 vs 3.118 3.110 ms, null. 6 stays.
 #ifndef MPK_ATTN_PF_GROUPS_K
 #define MPK_ATTN_PF_GROUPS_K 6
 #endif

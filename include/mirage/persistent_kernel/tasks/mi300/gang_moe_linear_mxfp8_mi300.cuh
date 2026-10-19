@@ -1713,6 +1713,10 @@ __device__ __host__ constexpr int _gang_moe_pf_groups(int ki, int req) {
 // 4.655 -> 8: 4.603 4.607, 12: 4.630 4.617 ms. 8 now.
 // RE-MEASURED 2026-10-18 on a69d899, one interleaved screen rep, G1 PASS,
 // tokens identical: 12 -> 3.185 vs control 3.189 3.186 ms, null. 8 stays.
+// RE-MEASURED 2026-10-19 on ae6447e (fold preload held off W13's head), one
+// interleaved screen rep, G1 PASS, tokens identical: 12 -> 3.108 vs control
+// 3.107 ms, null. W13's round is bound by the shared memory path, not by a
+// tile's bytes in flight (tests/standalone/bench_w13_sync.hip). 8 stays.
 #ifndef MPK_MOE_PF_GROUPS_W13
 #define MPK_MOE_PF_GROUPS_W13 8
 #endif
@@ -4743,10 +4747,13 @@ __device__ __forceinline__ void
 #if MPK_W2F_PF_DELAY_NS > 0
   // MPK_W2F_PF_DELAY_NS: hold the weight loads this long past the routing,
   // so they share HBM with W13's tail rather than with all of its stream.
+  // MPK_W2F_PF_STAGGER_NS adds that much more per fold tile of the XCD.
   {
+    unsigned long long const hold =
+        (unsigned long long)MPK_W2F_PF_DELAY_NS +
+        (unsigned long long)MPK_W2F_PF_STAGGER_NS * (unsigned)(wg_idx >> 3);
     unsigned long long const t0 = __builtin_amdgcn_s_memrealtime();
-    while ((__builtin_amdgcn_s_memrealtime() - t0) * 10ull <
-           (unsigned long long)MPK_W2F_PF_DELAY_NS) {
+    while ((__builtin_amdgcn_s_memrealtime() - t0) * 10ull < hold) {
       __builtin_amdgcn_s_sleep(8);
     }
   }

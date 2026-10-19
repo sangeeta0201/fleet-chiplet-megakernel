@@ -1213,10 +1213,16 @@ if __name__ == "__main__":
         # run_mp8_dp_ep_fused.sh's NP=8 default. -0.042 ms, bit-identical.
         os.environ.setdefault("MPK_W2_FOLD", "2")
         os.environ.setdefault("MPK_W2F_TOPK", "1")
-        # MPK_W2F_PF_DELAY_NS (mpk_atoms.cuh): the fold tiles' weight loads
-        # start 1.5 us after the routing, off the head of W13's stream.
-        # Bit-identical; the measured curve is at the define.
-        os.environ.setdefault("MPK_W2F_PF_DELAY_NS", "1500")
+        # MPK_W2F_PF_DELAY_NS + MPK_W2F_PF_STAGGER_NS (mpk_atoms.cuh): fold
+        # tile j's weight loads start 1.0 + 0.09 j us after the routing, off
+        # the head of W13's stream. Bit-identical; the curves are at the
+        # defines.
+        os.environ.setdefault("MPK_W2F_PF_DELAY_NS", "1000")
+        os.environ.setdefault("MPK_W2F_PF_STAGGER_NS", "90")
+        # MPK_QXS_XOUT_LATE (mpk_atoms.cuh): the qkv_a split resolver's
+        # write-through x_out store goes out after the norm, so the exchange
+        # flag's drain waits on L2 stores only. Bit-identical.
+        os.environ.setdefault("MPK_QXS_XOUT_LATE", "1")
     MOE_TP = os.environ.get("MPK_MOE_TP", "0") == "1"
     if MOE_TP:
         # The fused W2 tile split into two reduction parts (24 tiles/XCD),

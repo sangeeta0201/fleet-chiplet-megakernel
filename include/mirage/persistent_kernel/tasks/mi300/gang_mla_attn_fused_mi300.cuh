@@ -917,6 +917,57 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         ((total + (uint32_t)n_idle - 1u) / (uint32_t)n_idle + 4095u) & ~4095u;
     uint32_t const lo = (uint32_t)(xcd_rank - qkv_tiles_per_xcd) * chunk;
     uint32_t const hi = (lo + chunk < total) ? lo + chunk : total;
+#if MPK_QKVA_IDLE_PF == 2
+    // =2: the same 4 KB loads dealt tile-interleaved -- order slot o of every
+    // tile before slot o + 1 of any -- so whatever lands before the K-loops
+    // start is the head of every tile, not all of a few. Within a tile the
+    // slots run scales first, then the four waves' K-quarters in step (the
+    // K-parallel K-major tile: wave w reads quarter w front to back), so the
+    // first nine slots are every wave's depth-4 fill. A first form that ran
+    // each tile front to back -- wave 0's quarter first -- measured null on
+    // ae6447e, n=2 interleaved, tokens identical: 3.104 3.103 vs 3.104 3.105.
+    // MEASURED LOSS 2026-10-19 on ae6447e, this form, n=2 interleaved, tokens
+    // identical: 3.138 3.132 vs 3.103 3.106 ms (+0.030). What the K-loops
+    // gain is bytes in L2, and a worker's one contiguous chunk moves the
+    // most of them; 4 KB hops across 21 tiles move fewer. Off.
+    (void)lo;
+    (void)hi;
+    {
+      constexpr uint32_t QIP_DATA = QKV_OUTPUT_PER_WG * QKV_REDUCTION_SIZE;
+      static_assert(QKV_OUTPUT_PER_WG == 16 && QIP_DATA % (4u * 4096u) == 0u &&
+                        QIP_WG_BYTES - QIP_DATA <= 4096u,
+                    "=2's slot order is the 16-row K-major qkv_a tile's");
+      constexpr uint32_t QIP_QG = QIP_DATA / (4u * 4096u);
+      constexpr uint32_t QIP_GROUPS = 1u + 4u * QIP_QG;
+      extern __shared__ char _qip_smem[];
+      i32x4_t const rsrc = make_w_buffer_rsrc(qkv_weight_ptr, total);
+      auto *dst = (__attribute__((address_space(3)))
+                   uint32_t *)(_qip_smem + (tid >> 6) * 1024);
+      uint32_t const pw = (uint32_t)qkv_pf_wgs;
+      uint32_t const step = (uint32_t)n_idle;
+      uint32_t wg = (uint32_t)(xcd_rank - qkv_tiles_per_xcd);
+      uint32_t grp = 0u;
+      while (pw > 0u && wg >= pw) {
+        wg -= pw;
+        ++grp;
+      }
+      while (pw > 0u && grp < QIP_GROUPS) {
+        uint32_t const base =
+            grp == 0u ? QIP_DATA
+                      : (((grp - 1u) & 3u) * QIP_QG + ((grp - 1u) >> 2)) * 4096u;
+        uint32_t o = base + (uint32_t)tid * 16u;
+        o = o < QIP_WG_BYTES - 16u ? o : QIP_WG_BYTES - 16u;
+        int const v = (int)(wg * QIP_WG_BYTES + o);
+        __llvm_amdgcn_raw_buffer_load_lds(rsrc, dst, 16, v, 0, 0, 1);
+        asm volatile("" : : "v"(v) : "memory");
+        wg += step;
+        while (wg >= pw) {
+          wg -= pw;
+          ++grp;
+        }
+      }
+    }
+#else
     if (lo < hi) {
       extern __shared__ char _qip_smem[];
       i32x4_t const rsrc = make_w_buffer_rsrc(qkv_weight_ptr, total);
@@ -933,6 +984,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         asm volatile("" : "+v"(voff) : : "memory");
       }
     }
+#endif
   }
 #endif
 #if MPK_QB_IDLE_PF
