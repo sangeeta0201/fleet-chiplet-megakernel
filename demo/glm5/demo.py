@@ -1207,6 +1207,12 @@ if __name__ == "__main__":
         # both see it. -0.024 ms with the re-priced batch it shipped in; notes at the
         # define.
         os.environ.setdefault("MPK_LMH_BAL", "1")
+        # MPK_W2_FOLD=2 with MPK_W2F_TOPK (mpk_atoms.cuh): W2 as 12 full-K fold
+        # tiles an XCD with their weight in registers from the routing on, on
+        # the 11 W13-idle MoE ranks and the TopK worker -- 30 workers an XCD,
+        # run_mp8_dp_ep_fused.sh's NP=8 default. -0.042 ms, bit-identical.
+        os.environ.setdefault("MPK_W2_FOLD", "2")
+        os.environ.setdefault("MPK_W2F_TOPK", "1")
     MOE_TP = os.environ.get("MPK_MOE_TP", "0") == "1"
     if MOE_TP:
         # The fused W2 tile split into two reduction parts (24 tiles/XCD),

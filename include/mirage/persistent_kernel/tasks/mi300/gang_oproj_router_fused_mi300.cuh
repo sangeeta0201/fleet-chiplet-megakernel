@@ -2491,20 +2491,32 @@ __device__ __attribute__((always_inline)) void
   // part words, so this layer must push wherever it would write them.
   bool const w2f_layer = w2_pl_ptr != nullptr && !fold_next_is_tail &&
                          (!MPK_W2F_RT_OFF || fold_next_gather_ptr != nullptr);
-  int const w2f_base = (moe_w13_live + 12 <= tiles_per_xcd - 1)
+  // MPK_W2F_TOPK: at 30 workers an XCD (MPK_NUM_WORKERS=240) the 11 W13-idle
+  // MoE ranks take tiles 0-10 and the routing TopK worker, free once it has
+  // published, takes tile 11, so no tile waits behind a W13 tile. A dense
+  // layer's 12 W13-idle ranks still take all 12 at either worker count.
+  bool const w2f_topk = MPK_W2F_TOPK && moe_skip_topk &&
+                        moe_w13_live + 11 == tiles_per_xcd - 1;
+  int const w2f_ranks = w2f_topk ? 11 : 12;
+  int const w2f_base = (w2f_topk || moe_w13_live + 12 <= tiles_per_xcd - 1)
                            ? moe_w13_live
                            : moe_w13_live - MOE_W13_TILES_PER_EXPERT / 8;
   if (w2f_layer &&
       (!W2F_ON || ll_route == nullptr || w2_act_ll == nullptr ||
        !moe_skip_topk || fold_next_gather_ptr == nullptr ||
-       ep_signal_ptr == nullptr || tiles_per_xcd != 29 ||
+       ep_signal_ptr == nullptr ||
+       (w2f_topk ? tiles_per_xcd != 30
+                 : tiles_per_xcd != 29 && tiles_per_xcd != 30) ||
        moe_w13_live != MOE_NUM_TOPK * MOE_W13_TILES_PER_EXPERT / 8 ||
-       w2f_base + 12 > tiles_per_xcd - 1)) {
+       w2f_base + w2f_ranks > tiles_per_xcd - 1)) {
     __builtin_trap();
   }
-  int const w2f_j = (w2f_layer && mrk >= w2f_base && mrk < w2f_base + 12)
-                        ? mrk - w2f_base
-                        : -1;
+  int const w2f_j =
+      !w2f_layer ? -1
+      : (w2f_topk && xcd_rank == router_tile_n)
+          ? 11
+          : (mrk >= w2f_base && mrk < w2f_base + w2f_ranks) ? mrk - w2f_base
+                                                            : -1;
 #else
   constexpr bool w2f_layer = false;
   int const w2f_j = -1;

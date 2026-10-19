@@ -2229,6 +2229,34 @@ __device__ __forceinline__ bool
 #ifndef MPK_W2_FOLD
 #define MPK_W2_FOLD 0
 #endif
+// MPK_W2F_TOPK: MPK_W2_FOLD's 12 tiles an XCD on W13-free workers only. At
+// 29 workers an XCD there are ten W13-idle MoE ranks, so the shared slot's two
+// W13 workers take the last two tiles, and MPK_TRACE (h119, MPK_W2_FOLD=2 on
+// c0bbc89) has them enter W2 2.0 us after the last W13 tile, 3.3 us after the
+// idle ones, and finish the layer's last tile (45.48 us against the idle
+// tiles' 43.83). At 30 (MPK_NUM_WORKERS=240, MPK_WORKER_LDS_KB=154) the 11
+// W13-idle ranks take tiles 0-10 and the routing TopK worker, which has the
+// routing first and no MoE tile, takes tile 11. Same tiles, same fold.
+// MEASURED 2026-10-19 on c0bbc89, NP=8 1024/1024, n=2 interleaved, G1 PASS,
+// all rank-0 tokens identical to the default: 240 workers + MPK_WORKER_LDS_KB
+// =154 + MPK_W2_FOLD=2 + MPK_W2F_TOPK=1 3.155 3.154 ms against the 232-worker
+// default's 3.199 3.193 and 240 workers alone 3.202 3.202 (-0.042 / -0.048).
+// The same fold at 232 workers, with the shared slot's two W13 workers
+// holding tiles 10-11: 3.241 3.243 (+0.048). Defaulted from demo.py with
+// MPK_W2_FOLD=2 at NP=8; this define stays 0. Gates: standalone 95/0, ppl512
+// 2.3819 on all 8 ranks with per-position NLL identical to f0bf5f3's,
+// longseq 256/512/1024 G1 PASS, n=3 vs the 232-worker default 3.150 3.157
+// 3.147 vs 3.193 3.191 3.193 (-0.041).
+#ifndef MPK_W2F_TOPK
+#define MPK_W2F_TOPK 0
+#endif
+// MPK_W2F_ILV: MPK_W2_FOLD's 18 MFMAs alternate between the two halves'
+// accumulators (k-tiles 0, 10, 1, 11, ...) instead of running ten on acc0
+// and then eight on acc1, so the two dependent chains overlap. Each half
+// keeps its ascending k order: bit-identical.
+#ifndef MPK_W2F_ILV
+#define MPK_W2F_ILV 0
+#endif
 // MPK_MOE_DPP: the MoE chain's intra-wave exchanges as DPP and gfx950
 // register swaps instead of ds_bpermute -- the K-split router tile's sum of
 // squares (lane 0's tree) and gate-dot reduction, the two cross-row steps of
@@ -2289,6 +2317,10 @@ __device__ __forceinline__ bool
 // MEASURED 2026-10-13: +0.035, see MPK_W2_FOLD.
 // RE-MEASURED NULL 2026-10-17 on c2065f2, NP=8 1024/1024, G1 PASS, tokens identical:
 // screen 3.280, then 3.285 3.283 3.289 (mean +0.001) vs control 3.292 3.278 3.283 ms, n=3 interleaved. Off.
+// RE-MEASURED 2026-10-19 on c0bbc89 with MPK_W2_FOLD=2, n=2 interleaved,
+// tokens identical: 3.199 3.196 vs control 3.194 3.194 ms (+0.0035), against
+// the fold itself 3.241 3.243 -- the 232-worker fold's loss is its layout,
+// not its build (see MPK_W2F_TOPK). Off.
 #ifndef MPK_W2F_RT_OFF
 #define MPK_W2F_RT_OFF 0
 #endif

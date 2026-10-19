@@ -4845,10 +4845,20 @@ __device__ __forceinline__ void
   // W2F_GROUP k-tiles' operands in flight at a time: unbounded, the
   // scheduler hoists all 18 tiles' LDS reads (~250 VGPRs) to the top.
   constexpr int W2F_GROUP = 6;
+  // MPK_W2F_ILV: the two halves' k-tiles alternate (0, A0, 1, A0 + 1, ...),
+  // so the MFMAs on acc0 and acc1 overlap instead of running as one
+  // dependent chain; each half still accumulates in ascending k.
+  constexpr int W2F_A0 = SPLIT * SEG_KT;
+  constexpr int W2F_A1 = KT - W2F_A0;
+  static_assert(W2F_A0 >= W2F_A1, "the first half is the longer one");
 #pragma unroll
   for (int k0 = 0; k0 < KT; k0 += W2F_GROUP) {
 #pragma unroll
-    for (int k = k0; k < k0 + W2F_GROUP && k < KT; k++) {
+    for (int ki = k0; ki < k0 + W2F_GROUP && ki < KT; ki++) {
+      int const k = !MPK_W2F_ILV      ? ki
+                    : ki >= 2 * W2F_A1 ? ki - W2F_A1
+                    : (ki & 1)         ? W2F_A0 + ki / 2
+                                       : ki / 2;
       int const s = k / SEG_KT;
       int const kin = k % SEG_KT;
       int const a_off = s * P::SEG_STRIDE + warp * (16 * P::W_ROW_BYTES) +

@@ -127,8 +127,14 @@ fi
 #   MPK_WORKER_LDS_KB=154               3.356 3.363
 #   MPK_WORKER_LDS_KB=154 + 240 workers 3.360 3.360   (no launch hang, 2/2)
 # -0.008 either way, inside the control's own spread. 232 stays.
+# 2026-10-19: the NP=8 default moves to 240 with MPK_WORKER_LDS_KB=154 (the
+# schedulers then fit beside a worker, so no XCD runs out of CUs), because
+# MPK_W2F_TOPK needs the 30th worker an XCD: on c0bbc89, n=2 interleaved, all
+# rank-0 tokens identical, G1 PASS, 232 3.199 3.193; 240 alone 3.202 3.202;
+# 240 + MPK_W2_FOLD=2 + MPK_W2F_TOPK=1 (demo.py) 3.155 3.154 ms.
 if [ "$NP" -ge 8 ]; then
-  export MPK_NUM_WORKERS="${MPK_NUM_WORKERS:-232}"
+  export MPK_NUM_WORKERS="${MPK_NUM_WORKERS:-240}"
+  export MPK_WORKER_LDS_KB="${MPK_WORKER_LDS_KB:-154}"
 else
   export MPK_NUM_WORKERS="${MPK_NUM_WORKERS:-240}"
 fi
