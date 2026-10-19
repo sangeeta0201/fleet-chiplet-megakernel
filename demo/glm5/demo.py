@@ -3878,7 +3878,15 @@ if __name__ == "__main__":
             # Absorbed q_b's 576-wide head span is only divisible by the rope
             # width, so only the un-absorbed layers get the wider tile. See
             # QB_GEMM_OPW.
-            qb_opw_this = QB_GEMM_OPW if unabsorb_k_this else qk_rope
+            # MPK_QB_ABS_LL: the absorbed head shard at 16-row tiles too, its
+            # rope rotated in the tiles' epilogue (gang_mla_attn_fused).
+            qb_abs_ll_this = (QB_ABS_TP and qb_tp and fuse_full_layer
+                              and os.environ.get("MPK_QB_ABS_LL", "0") == "1")
+            # 32 puts the head's 18 tiles and the latent in one round on the
+            # 22 workers below the decode items; 16 needs two.
+            qb_opw_this = (QB_GEMM_OPW if unabsorb_k_this
+                           else int(os.environ.get("GLM_QB_ABS_OPW", "32"))
+                           if qb_abs_ll_this else qk_rope)
             if QB_MXFP8:
                 # The weight is packed per workgroup of qb_opw_this columns, so
                 # the pack width and the kernel's OUTPUT_PER_WG are the same

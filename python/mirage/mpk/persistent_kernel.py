@@ -1675,6 +1675,7 @@ def get_compile_command(
             # Ceiling probes, wrong output (gang_mla_attn_fused_mi300.cuh).
             "MPK_ATTN_PROBE_NOQBWAIT",
             "MPK_ATTN_PROBE_NODECWAIT", "MPK_DEC_REMAP_LOW", "MPK_DEC_T2", "MPK_DEC_WALL",
+            "MPK_QB_ABS_LL",
         ):
             _x = os.environ.get(_v)
             if _x is not None:
@@ -3698,7 +3699,10 @@ class PersistentKernel:
         # slice needed, and runs it on the last W_UK tile of each head. The
         # switch is compile-time off exactly this comparison, so the two sides
         # cannot disagree.
-        assert (unabsorb_k or qb_output_per_wg >= qk_rope_head_dim) and \
+        # MPK_QB_ABS_LL rotates the absorbed head's rope inside 16-row tiles.
+        assert (unabsorb_k or qb_output_per_wg >= qk_rope_head_dim
+                or (os.environ.get("MPK_QB_ABS_LL", "0") == "1"
+                    and qb_output_per_wg in (16, 32))) and \
             qb_head_span % qb_output_per_wg == 0, (
                 "output_per_wg must be at least qk_rope_head_dim (absorbed "
                 "only) and divide the head span")

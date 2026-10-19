@@ -1662,6 +1662,32 @@ __device__ __forceinline__ bool
 #ifndef MPK_DEC_Q_LL
 #define MPK_DEC_Q_LL 1
 #endif
+// MPK_QB_ABS_LL (demo.py GLM_QB_ABS_TP=1): W_UK folded back into q_b, head-
+// sharded, at 16-row K-parallel tiles -- 36 an XCD plus the latent, on the
+// XCD's first tiles_per_xcd - dec_tiles workers -- and the tiles write the
+// decode's query words themselves: the 512 latent rows as MPK_DEC_Q_LL's
+// words, each 16-row rope tile rotated in its epilogue lanes (two whole
+// pairs a lane). No W_UK stage, no rope tail, and the decode items get the
+// last dec_tiles workers to themselves, so their KV preload is issued from
+// the qkv_a phase on. VALUE CHANGE (one MXFP8 product weight instead of q_b
+// then W_UK): ppl-gated.
+// MEASURED SLOWER 2026-10-19 on 67da20e, NP=8 1024/1024, one interleaved rep
+// each, G1 PASS, text coherent (tokens move, G2 distinct 0.179 vs 0.195):
+// 16-row tiles, two rounds, 3.243 vs 3.112 ms; 32-row tiles (GLM_QB_ABS_OPW,
+// one round) 3.249 vs 3.111; + both blocks' weights issued at the tile's
+// entry (KP2_EARLY) 3.219 vs 3.105; + the decode workers DMAing the slabs
+// into L2 in place of qkv_a's idle prefetch 3.262 vs 3.105; + the tiles' own
+// waves DMAing their slab after qkv_a 3.283 vs 3.109. MPK_TRACE (h192, h195,
+// h200, h202): the decode items do start 2.2-2.4 us earlier, but the query
+// lands 1.0-1.7 us later. The absorbed weight is 9.7 MB a rank against 5.1
+// for q_b + W_UK; at a CU's ~26 GB/s a 68 KB tile is a 2.6 us K-loop from
+// HBM, issued early it holds the q_a word poll behind it (S72 10.7 -> 12.9
+// us), and moved into L2 by the decode workers it costs qkv_a its idle
+// prefetch (K-loop 1.9 -> 3.0 us). The bytes are the problem, not the hop.
+// Off.
+#ifndef MPK_QB_ABS_LL
+#define MPK_QB_ABS_LL 0
+#endif
 // MPK_WUK_LL_NOOUT: under MPK_DEC_Q_LL the W_UK GEMV leaves its rows as the
 // decode's query words only, not also as the bf16 query row: the decode
 // stages the words and nothing else reads the row. That row was 128 two-byte

@@ -3117,7 +3117,10 @@ template <int BATCH_SIZE,
           // another XCD.
           bool LL_WT = false,
           // The LM head instance behind its call wall (MPK_LMH_WRAP).
-          bool LMH_INNER = false>
+          bool LMH_INNER = false,
+          // MPK_QB_ABS_LL: the head's rope width. Columns past ll_cols are
+          // its rope rows, rotated in the epilogue into rope_ll's words.
+          int ROPE_LL_DIM = 0>
 #if MPK_RNLM8_INLINE
 __device__ __attribute__((always_inline)) void
 #else
@@ -3166,6 +3169,22 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
 
   static_assert(OUTPUT_PER_WG % 16 == 0,
                 "OUTPUT_PER_WG must be multiple of 16");
+  // ROPE_LL_DIM: the rotated rope's words (element pair (2j, 2j+1) at
+  // rope_ll[j]) and the token position's bf16 cos / sin rows ride in the
+  // FUSE_RESADD / PRO_PUB pointers, which this instance never reads, so the
+  // signature -- and every other instance's call -- stays as it is.
+  static_assert(ROPE_LL_DIM == 0 ||
+                    ((OUTPUT_PER_WG == 16 || OUTPUT_PER_WG == 32) && LL_WT &&
+                     BATCH_SIZE == 1 && !FOLD_ROWS && !FUSE_RESADD && !PRO_PUB),
+                "the in-epilogue rope is the one-row K-parallel tile's");
+  unsigned long long *const rope_ll =
+      ROPE_LL_DIM > 0 ? static_cast<unsigned long long *>(
+                            const_cast<void *>(pro_pub_ptr))
+                      : nullptr;
+  void const *const rope_cos =
+      ROPE_LL_DIM > 0 ? resadd_workspace_f32_ptr : nullptr;
+  void const *const rope_sin =
+      ROPE_LL_DIM > 0 ? static_cast<void const *>(resadd_x_out_ptr) : nullptr;
   // The LM head instance: the only caller with the EP residual fold at
   // OUTPUT_PER_WG >= 64.
   constexpr bool LMH_SHAPE = FUSE_RESADD && EP_PEER_SLOTS > 1 &&
@@ -3469,6 +3488,32 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
   uint8_t const *wg_data = W + static_cast<int64_t>(wg_idx) * WG_BYTES;
   uint8_t const *wg_scales = wg_data + WG_DATA_BYTES;
 
+  // OUTPUT_PER_WG 32 (K-parallel, two 16-row blocks): this wave's K-quarter
+  // of both blocks, all of it, ahead of the row's wait. A 68 KB tile at a
+  // CU's ~26 GB/s is ~2.6 us, the whole K-loop if it starts behind the
+  // norm; issued here it lands under the wait, and the K-loop only
+  // multiplies.
+  constexpr bool KP2_EARLY = OUTPUT_PER_WG == 32;
+  i32x8_t kp2_a[KP2_EARLY ? 8 : 1];
+  int kp2_sa[KP2_EARLY ? 8 : 1];
+  if constexpr (KP2_EARLY) {
+    static_assert(MFMA_ITERS / NUM_WAVES == 4 && !W_KMAJOR && !SC_KMAJOR,
+                  "four row-major k-tiles a wave");
+    int const ki0 = warp_id * 4;
+#pragma unroll
+    for (int b = 0; b < 2; b++) {
+      uint8_t const *const wd =
+          wg_data + static_cast<int64_t>(col + 16 * b) * W_ROW_BYTES;
+      uint8_t const *const ws = wg_scales + (col + 16 * b) * NUM_BLOCKS_32;
+#pragma unroll
+      for (int kk = 0; kk < 4; kk++) {
+        kp2_a[b * 4 + kk] = _rnlm8_load_w<W_KMUL, W_HIOFF>(
+            wd, (ki0 + kk) * K_PER_MFMA, g);
+        kp2_sa[b * 4 + kk] = _rnlm8_load_sc<SC_KMUL>(ws, (ki0 + kk) * 4, g);
+      }
+    }
+  }
+
   // ── Step 1+2: RMSNorm and quantize, with no bf16 round trip ─────────────
   //
   // norm_output_ptr is not written. It used to carry the normalized row from
@@ -3492,7 +3537,8 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
   // outlive the loop -- it is the tile's weights, which no longer depend on
   // the row.
   constexpr bool HOIST_PREFILL =
-      LDS_PROLOGUE && (OUTPUT_PER_WG >= 64 ? (TILES_PER_WAVE == 1) : true);
+      LDS_PROLOGUE && (OUTPUT_PER_WG >= 64 ? (TILES_PER_WAVE == 1)
+                                           : OUTPUT_PER_WG == 16);
   i32x8_t ph_a[HOIST_PREFILL ? 4 : 1];
   int ph_sa[HOIST_PREFILL ? 4 : 1];
   // MPK_LMH_BAL: the LM head instance takes tile_idx as a worker index and
@@ -4267,12 +4313,15 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
 #endif
   } else {
     // K-parallel: 4 waves all process same 16 rows, split K across waves.
-    // Note this branch emits exactly 16 rows per workgroup regardless of
-    // OUTPUT_PER_WG -- w_row is `col` and the epilogue writes g*4+i -- so 16
-    // is the only value it is correct for. The FP4 original leaves that
-    // implicit; make it a hard error here.
-    static_assert(OUTPUT_PER_WG == 16,
-                  "the K-parallel branch covers 16 output rows per workgroup");
+    // Note this branch emits 16 rows per MFMA block -- w_row is `col` and the
+    // epilogue writes g*4+i. OUTPUT_PER_WG 32 (MPK_QB_ABS_LL's q_b) runs a
+    // second block, rows 16..31, behind the first, row-major only.
+    constexpr int KP_BLOCKS = OUTPUT_PER_WG / 16;
+    static_assert(OUTPUT_PER_WG == 16 ||
+                      (OUTPUT_PER_WG == 32 && !W_KMAJOR && !SC_KMAJOR &&
+                       !QB_WEARLY && !FOLD_ROWS && BATCH_SIZE == 1),
+                  "the K-parallel branch covers 16 output rows per block, and "
+                  "a second block only row-major at one row");
     constexpr int TOTAL_K_ITERS = MFMA_ITERS;
     constexpr int ITERS_PER_WAVE =
         TOTAL_K_ITERS / NUM_WAVES /
@@ -4295,6 +4344,19 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
           d_bias + wg_idx * OUTPUT_PER_WG + g * 4);
     }
 #endif
+
+    // KP_BLOCKS 2: both blocks' bias quads now, behind the K-loop, not as
+    // two serial round trips in the epilogue.
+    uint2 bias_kb[KP_BLOCKS == 2 ? 2 : 1];
+    if constexpr (KP_BLOCKS == 2) {
+      if (warp_id == 0 && col == 0) {
+#pragma unroll
+        for (int b = 0; b < 2; b++) {
+          bias_kb[b] = *reinterpret_cast<uint2 const *>(
+              d_bias + wg_idx * OUTPUT_PER_WG + b * 16 + g * 4);
+        }
+      }
+    }
 
     int w_row = col; // All 4 waves process same 16 output rows
     // w_row is `col` in [0,16) here, so under K-major w_row/16 is 0 and the
@@ -4319,7 +4381,20 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
     constexpr int KGR = _rnlm8_pf_groups(ITERS_PER_WAVE, MPK_ATTN_PF_GROUPS_K);
     // MPK_QB_WEARLY: wave 1 runs chains 0 and 1, waves 2 and 3 chains 2 and 3.
     f32x4_t we_acc1 = {0.0f, 0.0f, 0.0f, 0.0f};
-    if constexpr (QB_WEARLY) {
+    // KP2_EARLY: both blocks' weights are in registers since the tile's entry;
+    // each k-tile's token operand feeds the two blocks' MFMAs.
+    f32x4_t acc1 = {0.0f, 0.0f, 0.0f, 0.0f};
+    if constexpr (KP2_EARLY) {
+#pragma unroll
+      for (int kk = 0; kk < 4; kk++) {
+        int const ki = ki_start + kk;
+        i32x8_t const b = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
+        int const sb = (int)s_tok_scales[ki];
+        acc = _rnlm8_mfma<W_HIOFF == 0>(kp2_a[kk], b, acc, kp2_sa[kk], sb);
+        acc1 = _rnlm8_mfma<W_HIOFF == 0>(kp2_a[4 + kk], b, acc1,
+                                         kp2_sa[4 + kk], sb);
+      }
+    } else if constexpr (QB_WEARLY) {
       static_assert(ITERS_PER_WAVE == 4, "four chains of four k-tiles");
       if (warp_id == 1) {
         acc = _rnlm8_kloop_deep<4, 4, true, W_KMUL, W_HIOFF, SC_KMUL>(
@@ -4415,6 +4490,9 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
 
     } // KGR < 2: the rotating depth-4 loop
 
+    static_assert(KP_BLOCKS == 1 || KP2_EARLY,
+                  "a second block is the early-issue tile's");
+
     // Cross-wave LDS reduction (reuse token scratch area, dead after MFMA).
     // Folded, lane column `col` carries batch row `col`, so the scratch grows
     // a row axis: [wave][row][n]. At TOK_ROWS 2 and OUTPUT_PER_WG 16 that is
@@ -4462,6 +4540,11 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
           lds_reduce[warp_id * RED_STRIDE + r * OUTPUT_PER_WG + g * 4 + i] =
               acc[i];
         }
+        if constexpr (KP_BLOCKS == 2) {
+          for (int i = 0; i < 4; i++) {
+            lds_reduce[warp_id * RED_STRIDE + 16 + g * 4 + i] = acc1[i];
+          }
+        }
       }
     }
     __syncthreads();
@@ -4476,63 +4559,115 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
     // reduces is again `col` -- the same lane that produced it.
     if (warp_id == 0 && (FOLD_ROWS ? (col < rows_here) : (col == 0))) {
       int const r = FOLD_ROWS ? col : 0;
-      unsigned short packed[4];
-      for (int i = 0; i < 4; i++) {
-        float v = 0.0f;
-        for (int w = 0; w < NUM_WAVES; w++) {
-          v += lds_reduce[w * RED_STRIDE + r * OUTPUT_PER_WG + g * 4 + i];
-        }
+#pragma unroll
+      for (int blk = 0; blk < KP_BLOCKS; blk++) {
+        int const bo = blk * 16;
+        unsigned short packed[4];
+        for (int i = 0; i < 4; i++) {
+          float v = 0.0f;
+          for (int w = 0; w < NUM_WAVES; w++) {
+            v += lds_reduce[w * RED_STRIDE + r * OUTPUT_PER_WG + bo + g * 4 + i];
+          }
 
-        int out_n = wg_idx * OUTPUT_PER_WG + g * 4 + i;
+          int out_n = wg_idx * OUTPUT_PER_WG + bo + g * 4 + i;
 
 #if MPK_RNLM8_BIAS_PRE || MPK_QB_BIAS_PRE
-        unsigned bt;
-        if constexpr (KP_BIAS_PRE) {
-          unsigned const bq = (i < 2) ? bias_q.x : bias_q.y;
-          bt = ((i & 1) ? (bq >> 16) : (bq & 0xFFFFu)) << 16;
-        } else {
-          bt = (unsigned)d_bias[out_n] << 16;
-        }
-        (void)out_n;
-#else
-        unsigned bt = (unsigned)d_bias[out_n] << 16;
-#endif
-        float bv;
-        __builtin_memcpy(&bv, &bt, 4);
-
-        packed[i] = _gang_float_to_bf16(v + bv);
-      }
-#if _RNLM8_QB_TR
-      if (!FUSE_RESADD && threadIdx.x == 0) {
-        asm volatile("" ::"v"(packed[0]) : "memory");
-        mpk_stage_stamp(84);
-      }
-#endif
-      int out_idx = (FOLD_ROWS ? (tok_base + r) : tok_base) * output_stride +
-                    wg_idx * OUTPUT_PER_WG + g * 4;
-      if (!(MPK_QB_LL_NOOUT && !LL_WT && BATCH_SIZE == 1 && ll_out != nullptr &&
-            wg_idx * OUTPUT_PER_WG + g * 4 < ll_cols)) {
-        _rnlm8_store4<WRITE_THROUGH>(
-            d_output + ppl_row_off + out_idx,
-            packed[0], packed[1], packed[2], packed[3]);
-      }
-      if (BATCH_SIZE == 1 && ll_out != nullptr) {
-        int const lc = wg_idx * OUTPUT_PER_WG + g * 4;
-        if (lc < ll_cols) {
-          if constexpr (LL_WT) {
-            _rnlm8_ll_store4_wt(ll_out + lc / 2, ll_epoch, packed[0],
-                                packed[1], packed[2], packed[3]);
+          unsigned bt;
+          if constexpr (KP_BIAS_PRE && KP_BLOCKS == 1) {
+            unsigned const bq = (i < 2) ? bias_q.x : bias_q.y;
+            bt = ((i & 1) ? (bq >> 16) : (bq & 0xFFFFu)) << 16;
+          } else if constexpr (KP_BLOCKS == 2) {
+            unsigned const bq = (i < 2) ? bias_kb[blk].x : bias_kb[blk].y;
+            bt = ((i & 1) ? (bq >> 16) : (bq & 0xFFFFu)) << 16;
           } else {
-            _rnlm8_ll_store4(ll_out + lc / 2, ll_epoch, packed[0], packed[1],
-                             packed[2], packed[3]);
+            bt = (unsigned)d_bias[out_n] << 16;
+          }
+          (void)out_n;
+#else
+          unsigned bt;
+          if constexpr (KP_BLOCKS == 2) {
+            unsigned const bq = (i < 2) ? bias_kb[blk].x : bias_kb[blk].y;
+            bt = ((i & 1) ? (bq >> 16) : (bq & 0xFFFFu)) << 16;
+          } else {
+            bt = (unsigned)d_bias[out_n] << 16;
+          }
+          (void)out_n;
+#endif
+          float bv;
+          __builtin_memcpy(&bv, &bt, 4);
+
+          packed[i] = _gang_float_to_bf16(v + bv);
+        }
+#if _RNLM8_QB_TR
+        if (!FUSE_RESADD && threadIdx.x == 0 && blk == KP_BLOCKS - 1) {
+          asm volatile("" ::"v"(packed[0]) : "memory");
+          mpk_stage_stamp(84);
+        }
+#endif
+        int out_idx = (FOLD_ROWS ? (tok_base + r) : tok_base) * output_stride +
+                      wg_idx * OUTPUT_PER_WG + bo + g * 4;
+        // ROPE_LL_DIM: the query leaves as words only; nothing reads the row.
+        if (ROPE_LL_DIM == 0 &&
+            !(MPK_QB_LL_NOOUT && !LL_WT && BATCH_SIZE == 1 && ll_out != nullptr &&
+              wg_idx * OUTPUT_PER_WG + bo + g * 4 < ll_cols)) {
+          _rnlm8_store4<WRITE_THROUGH>(
+              d_output + ppl_row_off + out_idx,
+              packed[0], packed[1], packed[2], packed[3]);
+        }
+        if (BATCH_SIZE == 1 && ll_out != nullptr) {
+          int const lc = wg_idx * OUTPUT_PER_WG + bo + g * 4;
+          if (lc < ll_cols) {
+            if constexpr (LL_WT) {
+              _rnlm8_ll_store4_wt(ll_out + lc / 2, ll_epoch, packed[0],
+                                  packed[1], packed[2], packed[3]);
+            } else {
+              _rnlm8_ll_store4(ll_out + lc / 2, ll_epoch, packed[0], packed[1],
+                               packed[2], packed[3]);
+            }
           }
         }
-      }
+        if constexpr (ROPE_LL_DIM > 0) {
+          // This lane's four columns are rope elements d..d+3: pairs j, j+1 at
+          // j = d / 2, even. Same arithmetic and word layout as
+          // rope_tile_from_ll: r0 -> element j, r1 -> element j + half.
+          constexpr int ROPE_HALF = ROPE_LL_DIM / 2;
+          int const d = wg_idx * OUTPUT_PER_WG + bo + g * 4 - ll_cols;
+          if (rope_ll != nullptr && d >= 0 && d < ROPE_LL_DIM) {
+            int const j = d / 2;
+            unsigned short const *const cs =
+                static_cast<unsigned short const *>(rope_cos);
+            unsigned short const *const sn =
+                static_cast<unsigned short const *>(rope_sin);
+            auto f = [](unsigned short b) {
+              return __uint_as_float((unsigned)b << 16);
+            };
+            auto bits = [](float v) -> unsigned {
+              __hip_bfloat16 const b = static_cast<__hip_bfloat16>(v);
+              unsigned short raw;
+              __builtin_memcpy(&raw, &b, 2);
+              return raw;
+            };
+            float const c0 = f(cs[j]), s0 = f(sn[j]);
+            float const c1 = f(cs[j + 1]), s1 = f(sn[j + 1]);
+            float const x0 = f(packed[0]), x1 = f(packed[1]);
+            float const x2 = f(packed[2]), x3 = f(packed[3]);
+            float const r0a = x0 * c0 - x1 * s0;
+            float const r1a = x1 * c0 + x0 * s0;
+            float const r0b = x2 * c1 - x3 * s1;
+            float const r1b = x3 * c1 + x2 * s1;
+            unsigned long long const eh = (unsigned long long)ll_epoch << 32;
+            st_wt_u64((void *)(rope_ll + j / 2),
+                      eh | bits(r0a) | (bits(r0b) << 16));
+            st_wt_u64((void *)(rope_ll + (ROPE_HALF + j) / 2),
+                      eh | bits(r1a) | (bits(r1b) << 16));
+          }
+        }
 #if _RNLM8_QB_TR
-      if (!FUSE_RESADD && threadIdx.x == 0) {
-        mpk_stage_stamp(85);
-      }
+        if (!FUSE_RESADD && threadIdx.x == 0 && blk == KP_BLOCKS - 1) {
+          mpk_stage_stamp(85);
+        }
 #endif
+      }
     }
   }
 

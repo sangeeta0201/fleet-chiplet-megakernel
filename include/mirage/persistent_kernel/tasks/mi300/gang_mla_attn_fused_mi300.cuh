@@ -461,6 +461,13 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // Absorbed (GLM_QB_ABS_TP), a head is QB_QK_DIM wide and there is no
   // W_UK stage: the per-XCD head's nine q_b tiles write the query row itself.
   constexpr int QB_SPAN = UNABSORB_K ? QB_HEAD_SPAN : QB_QK_DIM;
+  // MPK_QB_ABS_LL (mpk_atoms.cuh): that head's 16-row tiles write the
+  // decode's query words themselves, rope rotated in their epilogue.
+  constexpr bool QB_ABS_LL = MPK_QB_ABS_LL && !UNABSORB_K;
+  static_assert(!QB_ABS_LL ||
+                    ((QB_OUTPUT_PER_WG == 16 || QB_OUTPUT_PER_WG == 32) &&
+                     BATCH_SIZE == 1 && QB_QK_DIM % QB_OUTPUT_PER_WG == 0),
+                "MPK_QB_ABS_LL is the one-row, K-parallel absorbed q_b");
   bool const qb_tp = (EP_WORLD_SIZE > 1) && (ep_signal_ptr != nullptr) &&
                      (qb_n_wgs_per_xcd * QB_OUTPUT_PER_WG * 8 ==
                       QB_TP_HEADS * QB_SPAN);
@@ -514,8 +521,12 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // XCD at 128 chunks against 13 ranks), they start at rank 1 instead of 0:
   // q_b's workers are free from its K-loop on, and rank 0 and the folders
   // past dec_base + dec_tiles keep MPK_WUK_IDLE_MAP's W_UK tiles.
-  int const dec_base = (MPK_DEC_REMAP && head_local &&
-                        qb_tiles_per_xcd + dec_tiles <= tiles_per_xcd)
+  // MPK_QB_ABS_LL: q_b's 37 tiles cannot leave room past them, so the items
+  // take the XCD's last dec_tiles workers and q_b the rest.
+  int const dec_base = (QB_ABS_LL && head_local && dec_tiles < tiles_per_xcd)
+                           ? tiles_per_xcd - dec_tiles
+                       : (MPK_DEC_REMAP && head_local &&
+                          qb_tiles_per_xcd + dec_tiles <= tiles_per_xcd)
                            ? qb_tiles_per_xcd
                        : (MPK_DEC_REMAP_LOW && MPK_DEC_REMAP && head_local &&
                           1 + dec_tiles <= tiles_per_xcd - MPK_EP_FOLD_WGS)
@@ -580,7 +591,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // (one head per XCD, the rope deferred to W_UK's last tile), so the W_UK
   // tiles and the rotation validate the words instead of the XCD barrier.
   constexpr int WUKLL_XCD_WORDS = 128;
-  bool const wk_ll = wuk_ll != nullptr && BATCH_SIZE == 1;
+  bool const wk_ll = wuk_ll != nullptr && BATCH_SIZE == 1 && !QB_ABS_LL;
   if (wk_ll && (!QB_DEFER_ROPE || !head_local ||
                 (QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM) / 2 > WUKLL_XCD_WORDS ||
                 qb_n_wgs_per_xcd * QB_OUTPUT_PER_WG !=
@@ -620,7 +631,13 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // validates its query instead of waiting at the q_b -> decode barrier.
   constexpr int QLL_HEAD_WORDS = (KV_LORA_RANK + QK_ROPE_HEAD_DIM) / 2;
   bool const dq_ll = dec_q_ll != nullptr && BATCH_SIZE == 1;
-  if (dq_ll && (!wk_ll || MRG_HEADS != QB_TP_HEADS || QB_TP_HEADS != 8)) {
+  if (dq_ll && (!(wk_ll || QB_ABS_LL) || MRG_HEADS != QB_TP_HEADS ||
+                QB_TP_HEADS != 8)) {
+    __builtin_trap();
+  }
+  // One head per XCD, whole, and the decode on its own workers.
+  if (QB_ABS_LL && (!dq_ll || !head_local || dec_base == 0 ||
+                    qb_n_wgs_per_xcd * QB_OUTPUT_PER_WG != QB_QK_DIM)) {
     __builtin_trap();
   }
   unsigned long long *const dq_flag =
@@ -914,7 +931,38 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // decode iteration 3/3 with MPK_TOPK_LL_PREBIAS, and 1/1 at level 2, while
   // this form passed 7/7 and the gates. Not localized; do not reintroduce it
   // without a worker-state capture.
-  if (xcd_rank >= qkv_tiles_per_xcd && qkv_weight_ptr != nullptr) {
+  // MPK_QB_ABS_LL: the decode workers take the absorbed q_b slabs instead
+  // (below); the slab is 2.3x the un-absorbed q_b + W_UK and its K-loop is
+  // the query path's.
+  bool const qab_pf = QB_ABS_LL && dec_rank >= 0 && dec_rank < dec_tiles;
+  if (QB_ABS_LL && qab_pf && qb_weight_ptr != nullptr) {
+    constexpr uint32_t QAB_WG_BYTES =
+        QB_OUTPUT_PER_WG * QB_REDUCTION_SIZE +
+        QB_OUTPUT_PER_WG * (QB_REDUCTION_SIZE / 32);
+    uint32_t const qab_total = (uint32_t)qb_n_wgs_per_xcd * QAB_WG_BYTES;
+    uint32_t const qab_chunk =
+        ((qab_total + (uint32_t)dec_tiles - 1u) / (uint32_t)dec_tiles +
+         4095u) & ~4095u;
+    uint32_t const qab_lo = (uint32_t)dec_rank * qab_chunk;
+    uint32_t const qab_hi =
+        (qab_lo + qab_chunk < qab_total) ? qab_lo + qab_chunk : qab_total;
+    if (qab_lo < qab_hi) {
+      extern __shared__ char _qab_smem[];
+      i32x4_t const qab_rsrc = make_w_buffer_rsrc(qb_weight_ptr, qab_total);
+      auto *qab_dst = (__attribute__((address_space(3)))
+                       uint32_t *)(_qab_smem + (tid >> 6) * 1024);
+      int qab_voff = (int)qab_lo + tid * 16;
+      int const qab_last = (int)qab_hi - 16;
+      int const qab_n = (int)((qab_hi - qab_lo + 4095u) / 4096u);
+      for (int i = 0; i < qab_n; i++) {
+        int const v = qab_voff < qab_last ? qab_voff : qab_last;
+        __llvm_amdgcn_raw_buffer_load_lds(qab_rsrc, qab_dst, 16, v, 0, 0, 1);
+        qab_voff += 4096;
+        asm volatile("" : "+v"(qab_voff) : : "memory");
+      }
+    }
+  }
+  if (xcd_rank >= qkv_tiles_per_xcd && !qab_pf && qkv_weight_ptr != nullptr) {
     constexpr uint32_t QIP_WG_BYTES =
         QKV_OUTPUT_PER_WG * QKV_REDUCTION_SIZE +
         QKV_OUTPUT_PER_WG * (QKV_REDUCTION_SIZE / 32);
@@ -1329,7 +1377,11 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // 512 columns over 30 workers is 17.07 tiles' worth of work at a 16-column
   // granularity. Nothing that keeps 16-column tiles can beat 2 rounds, and
   // nothing wider is cheaper. See glm-qb-tile-width-is-closed-at-16.
-  for (int t = xcd_rank; t < qb_tiles_per_xcd; t += tiles_per_xcd) {
+  // MPK_QB_ABS_LL: the tiles stride over the workers below the decode items.
+  int const qb_stride = QB_ABS_LL ? dec_base : tiles_per_xcd;
+  int const qb_t0 =
+      (QB_ABS_LL && xcd_rank >= dec_base) ? qb_tiles_per_xcd : xcd_rank;
+  for (int t = qb_t0; t < qb_tiles_per_xcd; t += qb_stride) {
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     // The W_UK barrier at [0][4] charges 10.6 us/layer of spin, and q_b's own
     // 33-tiles-on-29-workers straggler only accounts for ~5 of it. Time the
@@ -1363,7 +1415,10 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
                                                     KV_INPUT_OFFSET,
                                                     /*WRITE_THROUGH=*/true,
                                                     QK_NOPE_HEAD_DIM,
-                                                    QB_DEFER_ROPE>(
+                                                    QB_DEFER_ROPE,
+                                                    QB_ABS_LL
+                                                        ? QK_ROPE_HEAD_DIM
+                                                        : 0>(
         qkv_a_out_ptr,
         q_a_norm_weight_ptr,
         q_a_norm_scratch_ptr,
@@ -1389,17 +1444,33 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
         // workgroup count, which under QB_TP is a *rank-local* head index.
         // Biasing the pointer by this rank's head base is what makes it land
         // on the global head, and costs the kernel nothing.
-        /*q_rope_out_ptr=*/static_cast<unsigned short *>(q_workspace_ptr) +
-            static_cast<size_t>(qb_head_base) * QB_QK_DIM,
-        wk_words,
-        (unsigned)wuk_expected_in,
-        QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM
+        // MPK_QB_ABS_LL: the head's rope words instead, after its latent's.
+        /*q_rope_out_ptr=*/QB_ABS_LL
+            ? static_cast<void *>(dec_q_ll + (size_t)xcd_id * QLL_HEAD_WORDS +
+                                  KV_LORA_RANK / 2)
+            : static_cast<void *>(
+                  static_cast<unsigned short *>(q_workspace_ptr) +
+                  static_cast<size_t>(qb_head_base) * QB_QK_DIM),
+        QB_ABS_LL ? dec_q_ll + (size_t)xcd_id * QLL_HEAD_WORDS : wk_words,
+        QB_ABS_LL ? (unsigned)qb_expected : (unsigned)wuk_expected_in,
+        QB_ABS_LL ? KV_LORA_RANK : QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM
 #if MPK_QA_LL
         ,
         qa_ll,
         (unsigned)qkv_expected
 #endif
         );
+    // MPK_QB_ABS_LL: XCD 0's rank 0 also has a second tile; flag the cache
+    // row as soon as the latent tile's stores are acknowledged.
+    if (QB_ABS_LL && t == 0 && dq_ll && xcd_id == 0) {
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      __syncthreads();
+      if (tid == 0) {
+        st_wt_u64((void *)dq_flag,
+                  ((unsigned long long)(unsigned)qb_expected << 32) | 1ull);
+        mpk_stage_stamp(66);
+      }
+    }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
     if (tid == 0 && g_subphase_active) {
       unsigned long long _d =
@@ -1444,7 +1515,7 @@ __device__ __attribute__((always_inline)) void gang_mla_attn_fused_kernel_mi300(
   // the round-2 tiles, so the makespan floor stays 20.6 + 2.52.
   // MPK_DEC_Q_LL: q_b tile 0 on XCD 0 appended the current token's cache row;
   // flag it once those stores are acknowledged.
-  if (dq_ll && xcd_id == 0 && xcd_rank == 0) {
+  if (!QB_ABS_LL && dq_ll && xcd_id == 0 && xcd_rank == 0) {
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     __syncthreads();
     if (tid == 0) {

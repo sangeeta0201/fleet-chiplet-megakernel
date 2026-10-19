@@ -94,7 +94,11 @@ template <int BATCH_SIZE,
           // un-absorbed path's XCD-local W_UK release -- can rotate on the far
           // side of it and free the tile width entirely. See the note on the
           // static_assert below.
-          bool DEFER_ROPE = false>
+          bool DEFER_ROPE = false,
+          // MPK_QB_ABS_LL: absorbed, at a tile narrower than the rope. The
+          // GEMM writes the query as words and rotates each rope tile's rows
+          // in its epilogue (see gang_rmsnorm_linear_mxfp8_bias_kernel).
+          int ROPE_LL_DIM = 0>
 #if MPK_KVUPD_INLINE
 __device__ __attribute__((always_inline)) void
 #else
@@ -164,8 +168,13 @@ __device__ __attribute__((noinline)) void
   // assert, and the caller that wants it already has the barrier the rotation
   // needs. So it rotates there, and this kernel just leaves the un-roped
   // columns in the scratch.
-  static_assert(DEFER_ROPE || OUTPUT_PER_WG >= QK_ROPE_HEAD_DIM,
+  static_assert(DEFER_ROPE || ROPE_LL_DIM > 0 ||
+                    OUTPUT_PER_WG >= QK_ROPE_HEAD_DIM,
                 "a head's rope slice must fit inside one workgroup");
+  static_assert(ROPE_LL_DIM == 0 ||
+                    (!UNABSORB_K && !DEFER_ROPE &&
+                     ROPE_LL_DIM == QK_ROPE_HEAD_DIM && BATCH_SIZE == 1),
+                "the epilogue rope is the absorbed one-row head's");
   static_assert(!DEFER_ROPE || UNABSORB_K,
                 "only the un-absorbed path has a barrier after this GEMM and "
                 "a separate scratch to leave the un-roped columns in");
@@ -214,6 +223,26 @@ __device__ __attribute__((noinline)) void
   }
   int const gemm_tile_idx = tile_idx - 1;
 
+  // ROPE_LL_DIM: a rope tile's epilogue needs this token's cos / sin rows.
+  // The tile owns the head's rows from KV_LORA_RANK on. q_rope_out_ptr is
+  // the head's rope words here (the un-absorbed query row otherwise).
+  void const *rope_cos = nullptr;
+  void const *rope_sin = nullptr;
+  void const *const rope_ll = ROPE_LL_DIM > 0 ? q_rope_out_ptr : nullptr;
+  if constexpr (ROPE_LL_DIM > 0) {
+    int const wg = gemm_tile_idx % n_wgs_per_xcd;
+    if ((wg % (QK_DIM / OUTPUT_PER_WG)) * OUTPUT_PER_WG >= KV_LORA_RANK) {
+      int const req = request_id;
+      int const ntok = qo_indptr[req + 1] - qo_indptr[req];
+      int const pos = (kv_indptr[req + 1] - kv_indptr[req] - 1) * PAGE_SIZE +
+                      kv_last_page_len[req] - ntok;
+      rope_cos = static_cast<bf16 const *>(cos_ptr) +
+                 (long)pos * QK_ROPE_HEAD_DIM;
+      rope_sin = static_cast<bf16 const *>(sin_ptr) +
+                 (long)pos * QK_ROPE_HEAD_DIM;
+    }
+  }
+
   // norm_input_ptr is the [q_a | latent] row, KV_INPUT_STRIDE wide, and this
   // GEMM reduces over its REDUCTION_SIZE-wide q_a prefix. The two differ, so
   // the row stride has to be handed over explicitly; without it the second
@@ -232,7 +261,14 @@ __device__ __attribute__((noinline)) void
                                         // 4 tiles per XCD against 29 workers
                                         // is one round at bs=2 either way.
                                         /*FOLD_ROWS=*/false,
-                                        KV_INPUT_STRIDE>(norm_input_ptr,
+                                        KV_INPUT_STRIDE,
+                                        /*PPL_SINK=*/false,
+                                        /*WEIGHT_FP4=*/false,
+                                        // The decode reads the words from
+                                        // every XCD.
+                                        /*LL_WT=*/(ROPE_LL_DIM > 0),
+                                        /*LMH_INNER=*/false,
+                                        ROPE_LL_DIM>(norm_input_ptr,
                                                            norm_weight_ptr,
                                                            norm_output_ptr,
                                                            weight_ptr,
@@ -242,9 +278,12 @@ __device__ __attribute__((noinline)) void
                                                            n_wgs_per_xcd,
                                                            o_stride,
                                                            gemm_tile_idx,
-                                                           nullptr,
-                                                           nullptr,
-                                                           nullptr,
+                                                           // ROPE_LL_DIM:
+                                                           // cos, sin, words
+                                                           rope_cos,
+                                                           const_cast<void *>(
+                                                               rope_sin),
+                                                           rope_ll,
                                                            0,
                                                            nullptr,
 #if MPK_QA_LL
@@ -260,7 +299,7 @@ __device__ __attribute__((noinline)) void
                                                            ll_cols);
 #endif
 
-  if constexpr (DEFER_ROPE) {
+  if constexpr (DEFER_ROPE || ROPE_LL_DIM > 0) {
     // The caller rotates, after its own barrier. Nothing below this point --
     // the rope-slice test, the position arithmetic, the cos/sin loads -- has
     // any other purpose, so the whole tail goes away and the tile is a plain

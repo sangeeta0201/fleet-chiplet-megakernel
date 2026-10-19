@@ -4283,7 +4283,10 @@ int TaskRegister::register_gang_mla_full_layer_fused_mi300_task(
   // the far side of Phase 3b's XCD-local W_UK release, which is the barrier a
   // split slice needs, and that switch is compile-time off exactly this
   // comparison (QB_DEFER_ROPE), so the two sides cannot disagree.
-  assert((unabsorb_k || qb_opw >= qk_rope_head_dim) &&
+  // MPK_QB_ABS_LL rotates the absorbed head's rope inside 16- or 32-row
+  // tiles; its kernel static_asserts that pairing, so both are legal here.
+  assert((unabsorb_k || qb_opw >= qk_rope_head_dim || qb_opw == 16 ||
+          qb_opw == 32) &&
          qb_head_span % qb_opw == 0 &&
          "a head's rope slice has to fit inside one q_b workgroup");
   assert((qb_n_wgs_per_xcd * qb_opw) % qb_head_span == 0 &&
