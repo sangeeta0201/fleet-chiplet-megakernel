@@ -2,10 +2,12 @@
 """blog_tab.py: the GPT-OSS-120B numbers of the blog from the runs of run_dpx.sh / run_default.sh and the served
 GSM8K-128 results. Prints markdown tables, BF16 LM head first (the checkpoint's head, as vLLM runs it: the
 precision-matched configuration), then the default build's MXFP4 head; --charts writes the data file
-blog_charts.py draws from (BF16 head). The GSM8K and 1K-conversation speculation tables come from gsm8k/table.py.
+blog_charts.py draws from, its figures with the LM head of --charts-head (mx, the default: the MXFP4 head of the
+released builds, as in the blog's figures; bf: the BF16 head). The GSM8K and 1K-conversation speculation tables
+come from gsm8k/table.py.
 
 usage: blog_tab.py [--dpx DIR] [--default DIR] [--served DIR] [--served-bf DIR] [--served-bf-logs DIR]
-                   [--stock JSON] [--charts OUT.json]
+                   [--stock JSON] [--charts OUT.json] [--charts-head mx|bf]
   --dpx            logs of run_dpx.sh      (default $FLEET_LOG_ROOT/lane_fair)
   --default        logs of run_default.sh  (default $FLEET_LOG_ROOT/lane_fair2)
   --served         WORK/results of libAiterMK's gpt_oss_build_and_repro.sh (MXFP4 head, the released 32K builds):
@@ -15,6 +17,9 @@ usage: blog_tab.py [--dpx DIR] [--default DIR] [--served DIR] [--served-bf DIR] 
   --served-bf-logs their logs, <pre>_<cfg>_bf<k>.log (default $FLEET_LOG_ROOT/lane_fair)
   --served-bf-pre  file prefix of those serves (default f31: the vLLM 0.31.0 sweep)
   --stock          stock vLLM summary (gsm128_vllm_summary.py JSON; default stock_vllm_031.json next to this script)
+  --charts-head    LM head of the figures blog_charts.py draws (figure 3 swap, figure 4 phase, the served panel):
+                   mx (default, the blog's figures) or bf; the file keeps both (swap_mx, swap_bf, served_mx,
+                   served_bf, the phase entry's mx and bf values)
 A label with a rerun next to it (<label>x.log) uses the rerun.
 Definitions: single-stream ms/token = the run's "Decode: ... avg" (generated tokens only); speculative ms/token =
 ms per pass / tokens per pass, tokens per pass = (accepted + decode passes) / decode passes ([SPEC] counters);
@@ -39,6 +44,7 @@ ap.add_argument("--served-bf-logs", default=ROOT + "/lane_fair")
 ap.add_argument("--served-bf-pre", default="f31")
 ap.add_argument("--stock", default=os.path.join(HERE, "stock_vllm_031.json"))
 ap.add_argument("--charts")
+ap.add_argument("--charts-head", choices=("mx", "bf"), default="mx")
 A = ap.parse_args()
 NOTES = []
 
@@ -151,8 +157,8 @@ def locality(hd, title):
         print("| EAGLE3, 1 draft | %.3f | %.3f | +%.1f%% | %s |" % (s0[2], s1[2], pct(s1[2], s0[2]),
                                                                   same(e3, texthash(D, "bl_dpx_sp%s1024_swap" % s))))
         if a and b:
-            charts["swap" if hd == "bf" else "swap_mx"] = {"ns": [round(a, 3), round(b, 3)],
-                                                           "e3": [round(s0[2], 3), round(s1[2], 3)], "head": title}
+            charts["swap_" + hd] = {"ns": [round(a, 3), round(b, 3)],
+                                    "e3": [round(s0[2], 3), round(s1[2], 3)], "head": title}
     print()
 
 
@@ -202,7 +208,7 @@ for j, (nm, kind, _) in enumerate(BLOG + [("outside the layers: LM head, argmax,
     print("| %s%s | %s | %s |" % (nm, " (%s)" % kind if kind else "", *["%.1f%%" % sp[a][j] if a in sp else "missing"
                                                                        for a in ("bf", "mx")]))
 if "mx" in sp and "bf" in sp:
-    charts["phase"] = {"labels": [b[0] for b in BLOG], "kinds": [b[1] for b in BLOG], "lead": "bf",
+    charts["phase"] = {"labels": [b[0] for b in BLOG], "kinds": [b[1] for b in BLOG], "lead": A.charts_head,
                        "mx": [round(x, 1) for x in sp["mx"][:5]], "bf": [round(x, 1) for x in sp["bf"][:5]],
                        "lm_label": "outside the layers: LM head, argmax, embedding",
                        "lm": {"mx": round(sp["mx"][5], 1), "bf": round(sp["bf"][5], 1)}}
@@ -350,8 +356,8 @@ if A.served_bf:
         runs[c] = [(j, os.path.join(A.served_bf_logs, os.path.basename(j)[:-5] + ".log")) for j in js]
     mkb = served_block("BF16 LM head, GSM8K-length builds", runs, "MXFP4 reference")
     if stock and len(mkb) == 3:
-        charts["served"] = {"stock": {k: round(v["pooled"]) for k, v in stock.items()},
-                            "mk": {k: round(v) for k, v in mkb.items()}, "head": "BF16 LM head"}
+        charts["served_bf"] = {"stock": {k: round(v["pooled"]) for k, v in stock.items()},
+                               "mk": {k: round(v) for k, v in mkb.items()}, "head": "BF16 LM head"}
     # the MXFP4 arm of the same sweep (same builds but for the head, same session, alternated with the BF16 serves)
     runs = {}
     for c in ("ns", "e3", "df8"):
@@ -371,6 +377,10 @@ if A.served:
 if NOTES:
     print("\nNotes: " + "; ".join(sorted(set(NOTES))))
 if A.charts:
+    for k in ("swap", "served"):  # the sections blog_charts.py draws, from the head of --charts-head
+        if "%s_%s" % (k, A.charts_head) in charts:
+            charts[k] = charts["%s_%s" % (k, A.charts_head)]
     json.dump(charts, open(A.charts, "w"), indent=1)
-    print("\nchart data -> %s (%s)" % (A.charts, ", ".join(charts)))
+    print("\nchart data -> %s (%s); figures with the %s" % (A.charts, ", ".join(charts),
+                                                         dict(HEADS)[A.charts_head]))
 

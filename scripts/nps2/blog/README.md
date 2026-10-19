@@ -13,7 +13,7 @@ for the standalone half (locality, per-phase, speculation outside vLLM):
 | `setup_lane.sh NAME` | a worktree for the runs, reusing built dependencies (one per GPU that runs at the same time) |
 | `run_dpx.sh [phase length swap lengthbf swapbf ckbf]` | DPX+NPS2 runs, stock driver (GPU already switched with `../dpx/to_dpx_nps2_stock.sh`). `*bf` groups: the BF16 LM head; `ckbf`: the 32K BF16 single stream at 15 KV chunks, the reference EAGLE3's outputs must equal |
 | `run_default.sh [phase length lengthbf]` | default-mode runs (stock SPX+NPS1, the factory mode) |
-| `blog_tab.py` | the tables from those logs and from the served results (`--served`, `--served-bf`); `--charts FILE` writes the chart data |
+| `blog_tab.py` | the tables from those logs and from the served results (`--served`, `--served-bf`); `--charts FILE` writes the chart data, its figures with the MXFP4 LM head as in the blog (`--charts-head bf`: the BF16 head) |
 | `blog_charts.py DATA OUTDIR` | the figures, in the blog's style |
 | `dry_check.py REF DRY` | compares the environments of a `DRY=1` run with the ones recorded in run logs |
 | `envs_ref_oct18.txt` | the environments recorded by 16 of the 27 runs of the groups `phase length swap` (MXFP4 head, and the BF16 phase runs) behind the Oct 18 2026 numbers: every distinct composition (the other 11 differ from one of them only in length). Check with `DRY=1 bash run_dpx.sh phase length swap > a; DRY=1 bash run_default.sh phase length >> a; python3 dry_check.py envs_ref_oct18.txt a`. The `*bf` runs ran through these scripts themselves |
