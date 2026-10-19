@@ -51,7 +51,8 @@ images). Another compiler builds other device code: the output can differ from t
 - Provider exports: `MPK_PROVIDER_EXPORT=<dir>` makes `demo.py` write `<dir>/src` (the generated kernel with its
   device addresses replaced by a pointer table, the task graph, the compile command and the `MPK_*` environment) and
   `<dir>/state` (the device memory the kernel's pointers land in) where `--vllm-session` hands over.
-  `scripts/nps2/aitermk/exp_run.sh ns|e3|df8` made the published exports (`ARENA=32769` for the 32K builds), with
+  `scripts/nps2/aitermk/exp_run.sh ns|e3|df8` made the published exports (`ARENA=32769` for the 32K builds; `LM=bf16 ARENA=466` for the BF16-LM-head builds behind the
+  matched-precision numbers, written to `<cfg>_bf16`), with
   the flag files `scripts/nps2/spec/s15/lead/best.flags` and `best.env`. Each export's compile flags and
   environment are also recorded in the aitermk tree, `aitermk/megakernels/fleet/src/gpt_oss_gfx950_mpk/configs/`.
 

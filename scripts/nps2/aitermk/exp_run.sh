@@ -7,10 +7,19 @@
 # PAGES = KV pages of 4,096 tokens (--max-num-pages). A virtual-slot (speculative) build lists the request's pages once
 # per slot, so it needs slots x ceil(ARENA / 4096): 54 for EAGLE3 (6 slots) and 72 for DFlash (8) at the default arena.
 # NOHANG=1: the standalone decode of a full 32K arena outlasts run.sh's 45 s launch-hang guard.
+# LM=bf16: the checkpoint's BF16 LM head (-DMPK_LM_BF16), the precision vLLM runs, into $PROVIDERS/CFG_bf16;
+# ARENA=466 gives the builds behind the published BF16-head numbers. Default LM=mxfp4.
 set -u
 CFG=${1:?cfg ns|e3|df8}; LN=${LANE:-ak4}
 case $CFG in ns) SLOTS=1 ;; e3) SLOTS=6 ;; df8) SLOTS=8 ;; *) echo "cfg ns|e3|df8" >&2; exit 1 ;; esac
 ARENA=${ARENA:-32769}
+LM=${LM:-mxfp4}
+case $LM in
+  mxfp4) XB=""; BFX=""; DIR=$CFG ;;
+  bf16)  XB=",-DMPK_LM_BF16"; DIR=${CFG}_bf16
+         BFX="MPK_LM_BF16=1 MPK_LM_PF0=0 MPK_LM_PIPE_S=0 MPK_LM_HEAD_GROUP_PIPELINE=0 MPK_LM_HEAD_KMAJOR=0 MPK_LM_HEAD_WAVE_TILE_DMA=0 MPK_LMT_FQ=0" ;;
+  *) echo "LM mxfp4|bf16" >&2; exit 1 ;;
+esac
 NEED=$(( SLOTS * ((ARENA + 4095) / 4096) ))
 PAGES=${PAGES:-$(( NEED > 16 ? NEED : 16 ))}
 [ $NEED -le $PAGES ] || { echo "ARENA $ARENA needs $NEED KV pages ($SLOTS slots), PAGES=$PAGES" >&2; exit 1; }
@@ -25,20 +34,20 @@ L = [len(json.load(open('/home/user/nps1/opt/spec/tok_g128_k0b6_q%03d.json' % q)
 q = max(range(128), key=lambda i: L[i]); print('%03d %d' % (q, L[q]))")
 set -- $LQ
 NEW=$((ARENA - $2)); [ $NEW -ge 264 ] || { echo "ARENA $ARENA leaves $NEW < 264 new tokens"; exit 1; }
-SFX=${SFX:-_a$ARENA}
+SFX=${SFX:-_a$ARENA${XB:+_bf16}}
 echo "######## export $CFG $(date -u +%FT%TZ) arena from q$1 ($2 prompt tokens); HIP bus map:"
 rocm-smi --showbus 2>/dev/null | grep -E 'GPU\[(0|1)\]' | head -n 2
 PROVIDERS=${PROVIDERS:-/home/user/mk1/providers}  # host path under /home/user
-OUT=${PROVIDERS/#\/home\/user/\/root\/user}/$CFG  # as the container sees it
-rm -rf $PROVIDERS/$CFG
-SV="MPK_TOK_HOST=1 MPK_HOST_STOP=1 MPK_PROVIDER_EXPORT=$OUT MPK_MAX_SAVE_TOKENS=$((NEW + 64))"
+OUT=${PROVIDERS/#\/home\/user/\/root\/user}/$DIR  # as the container sees it
+rm -rf $PROVIDERS/$DIR
+SV="$BFX MPK_TOK_HOST=1 MPK_HOST_STOP=1 MPK_PROVIDER_EXPORT=$OUT MPK_MAX_SAVE_TOKENS=$((NEW + 64))"
 echo "arena $ARENA: prompt $2 + $NEW new tokens, KV pages $PAGES"
 case $CFG in
-  ns)  MSL=$ARENA LANE=$LN PROMPT=$PD/q$1.txt TO=2400 PS="$SV" bash $M/s15/prod.sh akx_ns$SFX $NEW ;;
-  e3)  NOHANG=1 MSL=$ARENA XARGS="--max-num-pages $PAGES" LANE=$LN DRAFTER=eagle3 PROMPT=$PD/q$1.txt T=6 K=5 XF="$BEST" PS="$BENV $SV" TO=2400 bash $M/s15/run.sh akx_e3$SFX $NEW ;;
-  df8) NOHANG=1 MSL=$ARENA XARGS="--max-num-pages $PAGES" LANE=$LN DRAFTER=dflash PROMPT=$PD/q$1.txt T=8 K=7 XF="$A" PS="MPK_TAIL_PUB_LATE=1 $SV" TO=2400 bash $M/s15/run.sh akx_df8$SFX $NEW ;;
+  ns)  XF="$XB" MSL=$ARENA LANE=$LN PROMPT=$PD/q$1.txt TO=2400 PS="$SV" bash $M/s15/prod.sh akx_ns$SFX $NEW ;;
+  e3)  NOHANG=1 MSL=$ARENA XARGS="--max-num-pages $PAGES" LANE=$LN DRAFTER=eagle3 PROMPT=$PD/q$1.txt T=6 K=5 XF="$BEST$XB" PS="$BENV $SV" TO=2400 bash $M/s15/run.sh akx_e3$SFX $NEW ;;
+  df8) NOHANG=1 MSL=$ARENA XARGS="--max-num-pages $PAGES" LANE=$LN DRAFTER=dflash PROMPT=$PD/q$1.txt T=8 K=7 XF="$A$XB" PS="MPK_TAIL_PUB_LATE=1 $SV" TO=2400 bash $M/s15/run.sh akx_df8$SFX $NEW ;;
 esac
 L=/home/user/nps1/fleet_baselines/lane_$LN/akx_$CFG$SFX.log
 grep -aE '\[PROVIDER\]|\[CFG\]|Decode:|\[SPEC\] passes|Traceback|Error' $L | head -n 14 | cut -c1-250
-ls -la $PROVIDERS/$CFG/src 2>/dev/null
+ls -la $PROVIDERS/$DIR/src 2>/dev/null
 echo "AGENT_LOOP_WAKE_EXPORT $CFG $(date -u +%T)"
