@@ -1823,6 +1823,10 @@ __device__ __attribute__((always_inline)) void
           ,
           rks_pre
 #endif
+#if MPK_PREROUTE_DBG
+          ,
+          /*prd_hl=*/oproj_residual_ptr
+#endif
           );
     }
 #ifdef MPK_ENABLE_SUBPHASE_TIMING

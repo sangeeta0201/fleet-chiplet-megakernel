@@ -1129,6 +1129,71 @@ __device__ __forceinline__ void topk_2l_ks(int *rll,
     s_mpk_tl[s_mpk_trace_slot & 1][90 + lane] = (key2 & 0xFFu) + 1u;
   }
 #endif
+#if MPK_PREROUTE_DBG
+  if (xcd == 0 && s_mpk_trace_slot >= 0) {
+    int const ps = s_mpk_trace_slot & 1;
+    float pss = 0.0f;
+    float ps4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int t = 0; t < 16; t++) {
+      unsigned v[5];
+#pragma unroll
+      for (int k = 0; k < 4; k++) {
+        int const e = lane * 4 + k;
+        asm volatile("global_load_dword %0, %1, off sc0 sc1"
+                     : "=v"(v[k])
+                     : "v"(&g_prd[ps][e >> 5][t][e & 31])
+                     : "memory");
+      }
+      asm volatile("global_load_dword %0, %1, off sc0 sc1\n"
+                   "s_waitcnt vmcnt(0)"
+                   : "=v"(v[4])
+                   : "v"(&g_prd[ps][0][t][32])
+                   : "memory");
+#pragma unroll
+      for (int k = 0; k < 4; k++) {
+        ps4[k] += __uint_as_float(v[k]);
+      }
+      pss += __uint_as_float(v[4]);
+    }
+    float const pirms = rsqrtf(pss / ks_hidden + 1e-5f);
+    unsigned pk[4];
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+      int const e = lane * 4 + k;
+      __hip_bfloat16 const plb = __float2bfloat16(ps4[k] * pirms);
+      unsigned short plu;
+      __builtin_memcpy(&plu, &plb, 2);
+      T plt;
+      __builtin_memcpy(&plt, &plu, 2);
+      float const prb =
+          fast_sigmoid(static_cast<float>(plt)) +
+          static_cast<float>(static_cast<T const *>(bias_ptr)[e]);
+      unsigned b = __float_as_uint(prb);
+      b = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+      pk[k] = (b & 0xFFFFFF00u) | (unsigned)e;
+    }
+    unsigned pid = 0u;
+    for (int r = 0; r < 24; r++) {
+      unsigned best = max(max(pk[0], pk[1]), max(pk[2], pk[3]));
+#pragma unroll
+      for (int off = 32; off > 0; off >>= 1) {
+        best = max(best, (unsigned)__shfl_xor((int)best, off));
+      }
+#pragma unroll
+      for (int k = 0; k < 4; k++) {
+        if (pk[k] == best) {
+          pk[k] = 0u;
+        }
+      }
+      if (lane == r) {
+        pid = best & 0xFFu;
+      }
+    }
+    if (lane < 24) {
+      s_mpk_tl[s_mpk_trace_slot & 1][98 + lane] = pid + 1u;
+    }
+  }
+#endif
   if (lane == 0) {
     mpk_stage_stamp(4);
   }
@@ -1776,6 +1841,11 @@ gang_rmsnorm_linear_bias_topk_kernel(
 #if MPK_ROUTER_KS_EARLY
     ,
     gang_rmsnorm_topk_detail::RouterKsPre<REDUCTION_SIZE> ks_pre = {}
+#endif
+#if MPK_PREROUTE_DBG
+    ,
+    // MPK_PREROUTE_DBG: the layer's pre-attention residual row (bf16).
+    void const *prd_hl = nullptr
 #endif
     ) {
 
@@ -2460,6 +2530,9 @@ gang_rmsnorm_linear_bias_topk_kernel(
       float hk[4] = {0.0f, 0.0f, 0.0f, 0.0f};
       float g4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
       float ssq_t = 0.0f;
+#if MPK_PREROUTE_DBG
+      float prd_ssq_t = 0.0f;
+#endif
 #if MPK_ROUTER_HOUT_LATE
       unsigned long long hout_w = 0ull;
 #endif
@@ -2510,7 +2583,38 @@ gang_rmsnorm_linear_bias_topk_kernel(
         hg[2] = hk[2] * g4[2];
         hg[3] = hk[3] * g4[3];
         *reinterpret_cast<ks_f4_t *>(ks_lds + tid * 4) = hg;
+#if MPK_PREROUTE_DBG
+        if (prd_hl != nullptr && s_mpk_trace_slot >= 0) {
+          uint2 const pv = *reinterpret_cast<uint2 const *>(
+              static_cast<unsigned short const *>(prd_hl) + i * 4);
+          float const pp[4] = {__uint_as_float(pv.x << 16),
+                               __uint_as_float(pv.x & 0xFFFF0000u),
+                               __uint_as_float(pv.y << 16),
+                               __uint_as_float(pv.y & 0xFFFF0000u)};
+          ks_f4_t pg;
+#pragma unroll
+          for (int j = 0; j < 4; j++) {
+            pg[j] = pp[j] * g4[j];
+            prd_ssq_t += pp[j] * pp[j];
+          }
+          *reinterpret_cast<ks_f4_t *>(
+              reinterpret_cast<float *>(_rks_dyn_smem + 6144) + tid * 4) = pg;
+        }
+#endif
       }
+#if MPK_PREROUTE_DBG
+      __shared__ float prd_red[4];
+      {
+        float v = prd_ssq_t;
+#pragma unroll
+        for (int off = 32; off > 0; off >>= 1) {
+          v += __shfl_xor(v, off);
+        }
+        if (lane == 0) {
+          prd_red[wave] = v;
+        }
+      }
+#endif
       {
 #if MPK_MOE_DPP
         float const v = gang_rmsnorm_detail::_moe_wave_sum_lane0(ssq_t);
@@ -2586,6 +2690,47 @@ gang_rmsnorm_linear_bias_topk_kernel(
       if (tid == 0) {
         mpk_stage_stamp(38);
       }
+#if MPK_PREROUTE_DBG
+      if (prd_hl != nullptr && s_mpk_trace_slot >= 0) {
+        static_assert(!MPK_ROUTER_W_LDS,
+                      "MPK_PREROUTE_DBG reads the gate slice from registers");
+        typedef float prd_f4_t __attribute__((ext_vector_type(4)));
+        float const *const pl =
+            reinterpret_cast<float const *>(_rks_dyn_smem + 6144);
+        float accp = 0.0f;
+#pragma unroll
+        for (int j = 0; j < KS_CH; j++) {
+          int const c = (tid & 7) + 8 * j;
+          prd_f4_t const h0 = *reinterpret_cast<prd_f4_t const *>(pl + c * 8);
+          prd_f4_t const h1 =
+              *reinterpret_cast<prd_f4_t const *>(pl + c * 8 + 4);
+          unsigned const w0 = (unsigned)ks_w[j][0];
+          unsigned const w1 = (unsigned)ks_w[j][1];
+          unsigned const w2 = (unsigned)ks_w[j][2];
+          unsigned const w3 = (unsigned)ks_w[j][3];
+          accp += __uint_as_float(w0 << 16) * h0[0] +
+                  __uint_as_float(w0 & 0xFFFF0000u) * h0[1] +
+                  __uint_as_float(w1 << 16) * h0[2] +
+                  __uint_as_float(w1 & 0xFFFF0000u) * h0[3] +
+                  __uint_as_float(w2 << 16) * h1[0] +
+                  __uint_as_float(w2 & 0xFFFF0000u) * h1[1] +
+                  __uint_as_float(w3 << 16) * h1[2] +
+                  __uint_as_float(w3 & 0xFFFF0000u) * h1[3];
+        }
+        accp += __shfl_xor(accp, 1);
+        accp += __shfl_xor(accp, 2);
+        accp += __shfl_xor(accp, 4);
+        float *const pd = &g_prd[s_mpk_trace_slot & 1][xs_x][xs_t][0];
+        if ((tid & 7) == 0) {
+          st_wt_u32(pd + (tid >> 3), __float_as_uint(accp));
+        }
+        if (tid == 0) {
+          st_wt_u32(pd + 32, __float_as_uint((prd_red[0] + prd_red[1]) +
+                                             (prd_red[2] + prd_red[3])));
+        }
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      }
+#endif
       unsigned long long *const ks_blk = ks_own + xs_t * 64;
 #if MPK_TOPK_2L >= 4
       // MPK_TOPK_2L >= 4: only this XCD reads these words (its TopK's level 1

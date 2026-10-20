@@ -1867,6 +1867,40 @@ __device__ __forceinline__ bool
 #ifndef MPK_OPROJ_POLL_X4
 #define MPK_OPROJ_POLL_X4 1
 #endif
+// MPK_PREROUTE_DBG: MEASUREMENT, MPK_TRACE builds only. How well does the
+// router run on the layer's PRE-attention residual (the o_proj residual)
+// predict the experts the real router picks? Each K-split router tile also
+// contracts its slice of that row against its gate weights and leaves the 32
+// partials and the slice's sum of squares in g_prd; XCD 0's TopK then ranks
+// all 256 pre-attention scores (sigmoid + correction bias, as the real
+// selection) and stamps the top 24 ids + 1 into trace slots 98..121, beside
+// the real winners in 90..97. Needs MPK_TRACE_SLOTS >= 122 (122 still fits
+// the 154 KB sparse-trace LDS request; 128 does not launch). Values only: the
+// routing itself is untouched.
+// MEASURED 2026-10-20 on c35f01f (h241, 160 consecutive 1024/1024 decode
+// steps, layers 40/41, all 8 ranks agree): of the real 8, the pre-attention
+// top 8 / 12 / 16 / 24 hold 5.56 / 6.40 / 6.88 / 7.42 on layer 40 and 6.06 /
+// 6.97 / 7.39 / 7.72 on layer 41; all 8 covered in 4 / 16 / 30 / 54% and
+// 8 / 35 / 53 / 74% of steps. W13 ends with its slowest expert, and a warm
+// expert only pays when all are warm (MPK_W13_REPS=2: +0.229 ms for an
+// L2-warm second pass, i.e. ~2.9 vs ~5.4 us cold; h238: an Infinity-Cache-
+// resident W13-shaped read 3.9 vs 5.2 us cold). Covering all 8 in most steps
+// needs ~24 candidates, ~38 MB of W13 per layer per rank, 2-3x what the
+// idle workers can pull in the attention phase. Speculative expert prefetch
+// does not pay on this predictor.
+#ifndef MPK_PREROUTE_DBG
+#define MPK_PREROUTE_DBG 0
+#endif
+#if MPK_PREROUTE_DBG
+#if !(defined(MPK_TRACE) && MPK_TRACE && MPK_TRACE_SPARSE > 0)
+#error "MPK_PREROUTE_DBG stamps into the sparse trace"
+#endif
+#if !defined(MPK_TRACE_SLOTS) || MPK_TRACE_SLOTS < 122
+#error "MPK_PREROUTE_DBG stamps trace slots 98..121"
+#endif
+// [traced layer parity][xcd][router tile][32 partial logits, sum of squares].
+__device__ float g_prd[2][8][16][36];
+#endif
 // MPK_OPROJ_PF_DEC: under the head-local decode (MPK_DEC_REMAP) a decode
 // worker skips its own Phase 8 o_proj weight prefetch and the q_b worker
 // dec_tiles ranks below it -- same XCD, same L2, at Phase 8 ~7 us earlier --
