@@ -1675,12 +1675,20 @@ def get_compile_command(
             # Ceiling probes, wrong output (gang_mla_attn_fused_mi300.cuh).
             "MPK_ATTN_PROBE_NOQBWAIT",
             "MPK_ATTN_PROBE_NODECWAIT", "MPK_DEC_REMAP_LOW", "MPK_DEC_T2", "MPK_DEC_WALL",
-            "MPK_QB_ABS_LL",
+            "MPK_QB_ABS_LL", "MPK_QB_XL_PF",
         ):
             _x = os.environ.get(_v)
             if _x is not None:
                 assert _x in ("0", "1"), f"{_v} is 0 or 1"
                 flags = flags + [f"-D{_v}={_x}"]
+        # MPK_QXS_QPUB (mpk_atoms.cuh): 1 publishes the quantized qkv_a
+        # token from the split resolve, 2 also issues the hoisted A tiles
+        # ahead of its flag poll, 3 all of the wave's k-tiles there, 4 those
+        # as an LDS slab the K-loop reads.
+        _x = os.environ.get("MPK_QXS_QPUB")
+        if _x is not None:
+            assert _x in ("0", "1", "2", "3", "4"), "MPK_QXS_QPUB is 0..4"
+            flags = flags + [f"-DMPK_QXS_QPUB={_x}"]
         # The decode QK loop's K read-ahead (MPK_MLA_QK_PIPE_DEPTH, mpk_atoms.cuh).
         _x = os.environ.get("MPK_MLA_QK_PIPE_DEPTH")
         if _x is not None:

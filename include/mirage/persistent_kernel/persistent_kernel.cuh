@@ -3435,6 +3435,32 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               }
               __syncthreads();
 #endif
+#if MPK_QB_XL_PF
+              // MPK_QB_XL_PF: the next layer's q_b weight (the fused MLA
+              // layer's input 7), same guards as the qkv_a slot above.
+              static_assert(!(MPK_QKVA_PF_KB > 0 || MPK_QKVA_W13PF > 0),
+                            "MPK_QB_XL_PF takes MPK_QKVA_PF_SLOT");
+              if (threadIdx.x == 0) {
+                void *nxt = nullptr;
+                void *cur = task_desc->input_ptrs[7];
+                if (ml + 1 < ml_end) {
+                  nxt = config.ml_input_table[(xcd_id * config.ml_num_layers +
+                                               ml + 1) *
+                                                  MAX_INPUTS_PER_TASK +
+                                              7];
+                  intptr_t d = (intptr_t)nxt - (intptr_t)cur;
+                  if (d < 0) {
+                    d = -d;
+                  }
+                  if (cur == nullptr || nxt == nullptr ||
+                      ((uintptr_t)nxt & 15u) != 0u || d >= ((intptr_t)1 << 38)) {
+                    nxt = nullptr;
+                  }
+                }
+                task_desc->input_ptrs[MPK_QKVA_PF_SLOT] = nxt;
+              }
+              __syncthreads();
+#endif
 
               // Execute this layer
               int my_tiles = 0;

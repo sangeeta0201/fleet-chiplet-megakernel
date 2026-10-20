@@ -3112,6 +3112,34 @@ gang_mla_full_layer_fused_kernel_mi300(
       /*next_qkv_weight=*/input_ptrs[MPK_QKVA_PF_SLOT]
 #endif
   );
+#if MPK_QB_XL_PF
+  // MPK_QB_XL_PF (mpk_atoms.cuh): this worker's slab of the NEXT layer's
+  // absorbed q_b, into L2 through a per-wave 1 KB LDS sink nothing reads.
+  // The layer loop's __syncthreads drains it.
+  if constexpr (QK_NOPE_HEAD_DIM == 0) {
+    void const *const xlp_w = input_ptrs[MPK_QKVA_PF_SLOT];
+    if (ml_mode && xlp_w != nullptr && xcd_rank < qb_n_wgs_per_xcd) {
+      constexpr int XLP_WG_BYTES =
+          QB_OUTPUT_PER_WG * QB_REDUCTION_SIZE +
+          QB_OUTPUT_PER_WG * (QB_REDUCTION_SIZE / 32);
+      extern __shared__ char _xlp_smem[];
+      i32x4_t const xlp_rsrc = make_w_buffer_rsrc(
+          xlp_w, (uint32_t)qb_n_wgs_per_xcd * XLP_WG_BYTES);
+      auto *xlp_dst = (__attribute__((address_space(3)))
+                       uint32_t *)(_xlp_smem + (tid >> 6) * 1024);
+      int const xlp_base = xcd_rank * XLP_WG_BYTES;
+      int xlp_voff = xlp_base + tid * 16;
+      int const xlp_last = xlp_base + XLP_WG_BYTES - 16;
+      constexpr int XLP_N = (XLP_WG_BYTES + 4095) / 4096;
+      for (int i = 0; i < XLP_N; i++) {
+        int const v = xlp_voff < xlp_last ? xlp_voff : xlp_last;
+        __llvm_amdgcn_raw_buffer_load_lds(xlp_rsrc, xlp_dst, 16, v, 0, 0, 1);
+        xlp_voff += 4096;
+        asm volatile("" : "+v"(xlp_voff) : : "memory");
+      }
+    }
+  }
+#endif
   // Stages 4-6: the MoE half's buffers. `hidden` and `norm_output` are both
   // published before the routing barrier every worker passes, and the swiglu
   // scratch before the W13 -> W2 one, so none of the three is still being

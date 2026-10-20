@@ -1379,7 +1379,11 @@ _rnlm8_resadd_norm_rcp(float const *__restrict__ d_ws,
 // thread mapping as the unsplit loop -- so s_x, x_out and rms are identical to
 // it. The flags and the row live in this XCD's L2: plain stores, `nt` loads
 // (see MPK_ROUTER_XSPLIT for why exactly those).
-template <int REDUCTION_SIZE, int EP_PEER_SLOTS, int EP_SLOT_ELEMS>
+struct _rnlm8_no_pf {
+  __device__ __forceinline__ void operator()() const {}
+};
+template <int REDUCTION_SIZE, int EP_PEER_SLOTS, int EP_SLOT_ELEMS,
+          bool QPUB = false, typename BEFORE_POLL = _rnlm8_no_pf>
 __device__ __forceinline__ float
 _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
                               unsigned short *__restrict__ d_x_out,
@@ -1393,7 +1397,15 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
                               // MPK_QXS_ROW_LL: this XCD's resolved row as
                               // (epoch << 32 | bf16x2) words in its L2; the
                               // tiles validate the words instead of a flag.
-                              unsigned long long *row_ll = nullptr) {
+                              unsigned long long *row_ll = nullptr,
+                              // QPUB (MPK_QXS_QPUB): the token planes the
+                              // quantizer would have written; the returned
+                              // rcp then multiplies the GEMV sums instead.
+                              uint8_t *q_fp8 = nullptr,
+                              uint8_t *q_sc = nullptr,
+                              // Issued after this tile's flag store and
+                              // ahead of the flag poll (MPK_QXS_QPUB=2).
+                              BEFORE_POLL before_poll = BEFORE_POLL()) {
   constexpr int VEC = 4;
   constexpr int NTHREADS = 256;
   constexpr int ITERS = REDUCTION_SIZE / (NTHREADS * VEC);
@@ -1417,10 +1429,18 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
   unsigned short *const row =
       reinterpret_cast<unsigned short *>(xs + MPK_XSPLIT_FLAG_LINES * 16);
 
+  static_assert(!QPUB || (XS_RES && !MPK_QXS_ROW_LL && XS_F4 % 32 == 0 &&
+                          REDUCTION_SIZE + 64 + 4 * XS_N * ((XS_F4 + 63) / 64) <=
+                              MPK_XSPLIT_ROW_LINES * 64),
+                "QPUB quantizes whole 128-element blocks in each slice and "
+                "publishes them in the row's place");
   // The norm weight does not depend on the exchange; get it in flight first.
   uint64_t nw[ITERS];
 #if MPK_RESOLVE_NW_LATE
   auto nw_load = [&]() {
+    if constexpr (QPUB) {
+      return;
+    }
 #pragma unroll
     for (int v = 0; v < ITERS; v++) {
       nw[v] = *(__attribute__((address_space(1))) uint64_t const *)(
@@ -1428,10 +1448,12 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
     }
   };
 #else
+  if constexpr (!QPUB) {
 #pragma unroll
   for (int v = 0; v < ITERS; v++) {
     nw[v] = *(__attribute__((address_space(1))) uint64_t const *)(
         reinterpret_cast<uint64_t const *>(d_nw + (v * NTHREADS + tid) * VEC));
+  }
   }
 #endif
 
@@ -1567,6 +1589,7 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
 #if MPK_QXS_XOUT_LATE
   unsigned long long xo_packed = 0;
 #endif
+  unsigned long long qp_packed = 0;
   if (XS_RES && wg_idx < XS_N && tid < XS_F4) {
     int const off = (wg_idx * XS_F4 + tid) * VEC;
     float f[4];
@@ -1587,7 +1610,9 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
         ((unsigned long long)((unsigned)_gang_float_to_bf16(f[2]) |
                               ((unsigned)_gang_float_to_bf16(f[3]) << 16))
          << 32);
-    if (MPK_QXS_ROW_LL && row_ll != nullptr) {
+    if constexpr (QPUB) {
+      qp_packed = packed;
+    } else if (MPK_QXS_ROW_LL && row_ll != nullptr) {
       unsigned long long const eh = (unsigned long long)epoch << 32;
       unsigned long long const w0 = eh | (unsigned)packed;
       unsigned long long const w1 = eh | (unsigned)(packed >> 32);
@@ -1616,6 +1641,81 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
 #else
     st_wt_u64((void *)(d_x_out + off), packed);
 #endif
+  }
+  // QPUB: slice layout in the row's place -- E4M3 at element offsets, then
+  // the E8M0 per 128 at +REDUCTION_SIZE, then per resolver one sum of
+  // squares a wave at +REDUCTION_SIZE + 64.
+  constexpr int QP_SS_PER = (XS_F4 + 63) / 64;
+  uint8_t *const qp8 = reinterpret_cast<uint8_t *>(row);
+  uint8_t *const qp_sc = qp8 + REDUCTION_SIZE;
+  float *const qp_ss = reinterpret_cast<float *>(qp8 + REDUCTION_SIZE + 64);
+  if constexpr (QPUB) {
+    if (wg_idx < XS_N) {
+      bool const act = tid < XS_F4;
+      int const off = (wg_idx * XS_F4 + tid) * VEC;
+      uint2 nwq = make_uint2(0u, 0u);
+      if (act) {
+        nwq = _rnlm8_ld_g_u2((void const *)(d_nw + off));
+      }
+      unsigned const nwb[4] = {nwq.x & 0xFFFFu, nwq.x >> 16, nwq.y & 0xFFFFu,
+                               nwq.y >> 16};
+      float v[4];
+      float amax = 0.0f;
+      float ss = 0.0f;
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        float const xb = _gang_bf16_to_float(
+            (unsigned short)((qp_packed >> (16 * i)) & 0xFFFFull));
+        v[i] = xb * _gang_bf16_to_float((unsigned short)nwb[i]);
+        amax = fmaxf(amax, fabsf(v[i]));
+        ss += xb * xb;
+      }
+      // One E8M0 block is 32 lanes' four elements.
+#pragma unroll
+      for (int m = 1; m < 32; m <<= 1) {
+        amax = fmaxf(amax, __shfl_xor(amax, m));
+      }
+#pragma unroll
+      for (int m = 32; m > 0; m >>= 1) {
+        ss += __shfl_xor(ss, m);
+      }
+      uint8_t const se = _gang_compute_e8m0_fp8(amax);
+      float scale_f;
+      if (se == 0) {
+        scale_f = 1.0f;
+      } else {
+        union {
+          float f;
+          uint32_t u;
+        } sv;
+        sv.u = (uint32_t)se << 23;
+        scale_f = sv.f;
+      }
+      fp8x4_t pk4 = {};
+      pk4 = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(pk4, v[0], v[1], scale_f,
+                                                     false);
+      pk4 = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(pk4, v[2], v[3], scale_f,
+                                                     true);
+      if (act) {
+        asm volatile("global_store_dword %0, %1, off"
+                     :
+                     : "v"(qp8 + off), "v"(*(int const *)&pk4)
+                     : "memory");
+        if ((tid & 31) == 0) {
+          asm volatile("global_store_byte %0, %1, off"
+                       :
+                       : "v"(qp_sc + off / 128), "v"((unsigned)se)
+                       : "memory");
+        }
+        if ((tid & 63) == 0) {
+          asm volatile("global_store_dword %0, %1, off"
+                       :
+                       : "v"(qp_ss + wg_idx * QP_SS_PER + (tid >> 6)),
+                         "v"(ss)
+                       : "memory");
+        }
+      }
+    }
   }
   float ssq = 0.0f;
   unsigned long long rv[ITERS];
@@ -1650,6 +1750,9 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
                  : "memory");
   }
   }
+  if constexpr (QPUB) {
+    before_poll();
+  }
   if (tid < 64) {
     while (true) {
       unsigned seen = epoch;
@@ -1667,6 +1770,61 @@ _rnlm8_resadd_norm_rcp_xsplit(unsigned short const *__restrict__ d_res,
     }
   }
   __syncthreads();
+  if constexpr (QPUB) {
+    typedef unsigned int qp_u4 __attribute__((ext_vector_type(4)));
+    constexpr int QP_N16 = REDUCTION_SIZE / 16;
+    constexpr int QP_TRIPS = (QP_N16 + NTHREADS - 1) / NTHREADS;
+    constexpr int QP_SCW = REDUCTION_SIZE / 128 / 4;
+    static_assert(XS_N * QP_SS_PER <= 64 && (REDUCTION_SIZE / 128) % 4 == 0,
+                  "one wave sums the partials; whole scale dwords");
+    qp_u4 qv[QP_TRIPS];
+#pragma unroll
+    for (int j = 0; j < QP_TRIPS; j++) {
+      int const i = tid + j * NTHREADS;
+      if (i < QP_N16) {
+        qv[j] = __builtin_nontemporal_load(
+            reinterpret_cast<qp_u4 const *>(qp8) + i);
+      }
+    }
+    unsigned scw = 0u;
+    if (tid < QP_SCW) {
+      scw = __builtin_nontemporal_load(
+          reinterpret_cast<unsigned const *>(qp_sc) + tid);
+    }
+    float ssp = 0.0f;
+    if (tid < XS_N * QP_SS_PER) {
+      ssp = __builtin_nontemporal_load(qp_ss + tid);
+    }
+#pragma unroll
+    for (int j = 0; j < QP_TRIPS; j++) {
+      int const i = tid + j * NTHREADS;
+      if (i < QP_N16) {
+        *reinterpret_cast<qp_u4 *>(q_fp8 + i * 16) = qv[j];
+      }
+    }
+    if (tid < QP_SCW) {
+      reinterpret_cast<unsigned *>(q_sc)[tid] = scw;
+    }
+#pragma unroll
+    for (int m = 32; m > 0; m >>= 1) {
+      ssp += __shfl_xor(ssp, m);
+    }
+    // Past the 48 scale bytes, inside the scale plane.
+    float *const qred = reinterpret_cast<float *>(q_sc + 64);
+    if (tid == 0) {
+      *qred = ssp;
+    }
+    __syncthreads();
+    float const qtot = *qred;
+#if MPK_QXS_XOUT_LATE
+    if (wg_idx < XS_N && tid < XS_F4) {
+      st_wt_u64((void *)(d_x_out + (wg_idx * XS_F4 + tid) * VEC), xo_packed);
+    }
+#endif
+    (void)s_x;
+    (void)s_nw;
+    return rsqrtf(qtot / float(REDUCTION_SIZE) + eps);
+  }
 #pragma unroll
   for (int v = 0; v < ITERS; v++) {
     rv[v] = __builtin_nontemporal_load(reinterpret_cast<unsigned long long const *>(
@@ -3627,6 +3785,46 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
     }
   }
 
+  // MPK_QXS_QPUB (mpk_atoms.cuh): the split resolve fills the token planes;
+  // its 1/rms scales the K-parallel sums in the epilogue.
+#if MPK_QKV_XSPLIT && MPK_QXS_QPUB
+  constexpr bool QXS_QPUB = FUSE_RESADD && EP_PEER_SLOTS > 1 &&
+                            !EP_PRE_FOLDED && LDS_PROLOGUE &&
+                            BATCH_SIZE == 1 && !FOLD_ROWS && !PRO_PUB &&
+                            OUTPUT_PER_WG < 64;
+#else
+  constexpr bool QXS_QPUB = false;
+#endif
+  // MPK_QXS_QPUB=2: the hoisted A tiles go out ahead of the split resolve's
+  // flag poll, where the quantizer used to cover their latency.
+  constexpr bool QXS_QPUB_EARLY = QXS_QPUB && MPK_QXS_QPUB >= 2;
+  static_assert(!QXS_QPUB_EARLY || (HOIST_PREFILL && OUTPUT_PER_WG == 16),
+                "MPK_QXS_QPUB=2 issues the K-parallel tile's four hoisted "
+                "k-tiles");
+  // MPK_QXS_QPUB=3: all of the wave's k-tiles, not four; the K-loop then
+  // runs out of registers.
+  constexpr bool QXS_QPUB_FULL = QXS_QPUB && MPK_QXS_QPUB == 3;
+  constexpr int QF_N = QXS_QPUB_FULL ? MFMA_ITERS / NUM_WAVES : 1;
+  i32x8_t qf_a[QF_N];
+  int qf_sa[QF_N];
+  // MPK_QXS_QPUB=4: each wave's k-tiles and their scales DMA'd into an LDS
+  // slab instead (byte-exact copies of the K-major blocks), and the K-loop
+  // reads its A operand from there.
+  constexpr bool QXS_QPUB_LDS = QXS_QPUB && MPK_QXS_QPUB == 4;
+  constexpr int QS_OFF = 8192;
+  constexpr int QS_WAVE = (MFMA_ITERS / NUM_WAVES) * 2048;
+  constexpr int QS_SC_OFF = QS_OFF + MFMA_ITERS * 2048;
+  constexpr int QS_SC_WAVE = (MFMA_ITERS / NUM_WAVES) * 64;
+  static_assert(!QXS_QPUB_LDS ||
+                    (W_KMAJOR && SC_KMAJOR && W_HIOFF == 1024 &&
+                     MFMA_ITERS % NUM_WAVES == 0 && QS_WAVE % 1024 == 0 &&
+                     QS_SC_WAVE <= 1024 &&
+                     QS_OFF >= RESADD_SMEM_OFF &&
+                     QS_SC_OFF + MFMA_ITERS * 64 + 1024 <=
+                         mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE),
+                "the slab holds the tile's K-major E4M3 blocks past the "
+                "token planes");
+  float qpub_rcp = 1.0f;
   // Steps 1 and 2 run once per folded row, each into its own LDS plane.
   // rows_here is 1 unless FOLD_ROWS, so this is a no-op loop everywhere else.
   for (int _row = 0; _row < rows_here; ++_row) {
@@ -3653,13 +3851,83 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
     bool qxs_done = false;
     if constexpr (EP_PEER_SLOTS > 1 && !EP_PRE_FOLDED && LDS_PROLOGUE &&
                   BATCH_SIZE == 1) {
+      if constexpr (QXS_QPUB) {
+        if (qxs == nullptr) {
+          __builtin_trap();
+        }
+      }
       if (qxs != nullptr) {
         if (n_wgs_per_xcd < 16) {
           __builtin_trap();
         }
+        if constexpr (QXS_QPUB_EARLY) {
+          auto qpub_pf = [&]() __attribute__((always_inline)) {
+            int const h_ki0 = warp_id * (MFMA_ITERS / NUM_WAVES);
+            uint8_t const *const h_data =
+                wg_data + (W_KMAJOR ? static_cast<int64_t>(col % 16) * 64
+                                    : static_cast<int64_t>(col) * W_ROW_BYTES);
+            uint8_t const *const h_scale =
+                wg_scales + (SC_KMAJOR ? (col % 16) * 4 : col * NUM_BLOCKS_32);
+            if constexpr (QXS_QPUB_LDS) {
+              (void)h_data;
+              (void)h_scale;
+              i32x4_t const rs_w =
+                  make_w_buffer_rsrc(wg_data, (uint32_t)(MFMA_ITERS * 2048));
+              i32x4_t const rs_s =
+                  make_w_buffer_rsrc(wg_scales, (uint32_t)(MFMA_ITERS * 64));
+              auto *const dw = (__attribute__((address_space(3))) uint32_t *)(
+                  _rnlm8_smem + QS_OFF + warp_id * QS_WAVE);
+              int const vo = warp_id * QS_WAVE + lane_id * 16;
+#pragma unroll
+              for (int i = 0; i < QS_WAVE / 1024; i++) {
+                __llvm_amdgcn_raw_buffer_load_lds(rs_w, dw + i * 256, 16,
+                                                  vo + i * 1024, 0, 0, 0);
+              }
+              auto *const dsc = (__attribute__((address_space(3))) uint32_t *)(
+                  _rnlm8_smem + QS_SC_OFF + warp_id * QS_SC_WAVE);
+              __llvm_amdgcn_raw_buffer_load_lds(
+                  rs_s, dsc, 16, warp_id * QS_SC_WAVE + lane_id * 16, 0, 0, 0);
+            } else if constexpr (QXS_QPUB_FULL) {
+#pragma unroll
+              for (int ki = 0; ki < QF_N; ki++) {
+                qf_a[ki] = _rnlm8_load_w<W_KMUL, W_HIOFF, W_NT>(
+                    h_data, (h_ki0 + ki) * K_PER_MFMA, g);
+                qf_sa[ki] = _rnlm8_load_sc<SC_KMUL, W_NT>(
+                    h_scale, (h_ki0 + ki) * 4, g);
+              }
+            } else {
+#pragma unroll
+            for (int ki = 0; ki < 4; ki++) {
+              ph_a[ki] = _rnlm8_load_w<W_KMUL, W_HIOFF, W_NT>(
+                  h_data, (h_ki0 + ki) * K_PER_MFMA, g);
+              ph_sa[ki] =
+                  _rnlm8_load_sc<SC_KMUL, W_NT>(h_scale, (h_ki0 + ki) * 4, g);
+            }
+            }
+          };
+          rms_rcp = _rnlm8_resadd_norm_rcp_xsplit<REDUCTION_SIZE,
+                                                  EP_PEER_SLOTS,
+                                                  BATCH_SIZE * REDUCTION_SIZE,
+                                                  QXS_QPUB,
+                                                  decltype(qpub_pf)>(
+              (unsigned short const *)norm_input_ptr,
+              (unsigned short *)resadd_x_out_ptr,
+              s_x_bf16,
+              /*eps=*/1e-5f,
+              (unsigned short const *)norm_weight_ptr,
+              s_nw_bf16,
+              qxs,
+              qxs_epoch,
+              wg_idx,
+              qxs_row_ll,
+              s_tok_fp8,
+              s_tok_scales,
+              qpub_pf);
+        } else {
         rms_rcp = _rnlm8_resadd_norm_rcp_xsplit<REDUCTION_SIZE,
                                                 EP_PEER_SLOTS,
-                                                BATCH_SIZE * REDUCTION_SIZE>(
+                                                BATCH_SIZE * REDUCTION_SIZE,
+                                                QXS_QPUB>(
             (unsigned short const *)norm_input_ptr,
             (unsigned short *)resadd_x_out_ptr,
             s_x_bf16,
@@ -3669,8 +3937,14 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
             qxs,
             qxs_epoch,
             wg_idx,
-            qxs_row_ll);
+            qxs_row_ll,
+            s_tok_fp8,
+            s_tok_scales);
+        }
         qxs_done = true;
+        if constexpr (QXS_QPUB) {
+          qpub_rcp = rms_rcp;
+        }
       }
     }
     if (!qxs_done)
@@ -3831,7 +4105,8 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
     }
     _rnlm8_bal_issue<BAL_H, REDUCTION_SIZE, OUTPUT_PER_WG>(
         W, bal_g0, warp_id * BAL_KQ, col, g, bal_a, bal_sa);
-  } else if constexpr (HOIST_PREFILL && !QB_WEARLY && !QB_PF_EARLY) if (_row == 0) {
+  } else if constexpr (HOIST_PREFILL && !QB_WEARLY && !QB_PF_EARLY &&
+                       !QXS_QPUB_EARLY) if (_row == 0) {
     // N-parallel gives each wave its own 16 rows starting at k-tile 0;
     // K-parallel gives all four waves the same 16 rows and splits K.
     int const h_row = (OUTPUT_PER_WG >= 64) ? (warp_id * 16 + col) : col;
@@ -3900,6 +4175,9 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
     } else {
       __syncthreads();
     }
+  } else if constexpr (QXS_QPUB) {
+    // The split resolve has filled the token planes, behind its barrier.
+    (void)input_row;
   } else {
     _gang_wave_parallel_fp8_quant_rmsnorm<REDUCTION_SIZE,
                                           /*SRC_IS_GLOBAL=*/!FUSE_RESADD &&
@@ -4384,7 +4662,47 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
     // KP2_EARLY: both blocks' weights are in registers since the tile's entry;
     // each k-tile's token operand feeds the two blocks' MFMAs.
     f32x4_t acc1 = {0.0f, 0.0f, 0.0f, 0.0f};
-    if constexpr (KP2_EARLY) {
+    if constexpr (QXS_QPUB_LDS) {
+      // This wave's own DMA, so its own vmcnt orders it.
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      uint8_t const *const sw =
+          (uint8_t const *)_rnlm8_smem + QS_OFF + col * 64 + g * 16;
+      uint8_t const *const ssc =
+          (uint8_t const *)_rnlm8_smem + QS_SC_OFF + col * 4 + g;
+      // Fully unrolled, every LDS read is hoisted ahead of the MFMAs and the
+      // registers spill into worker_kernel's allocation.
+#ifndef MPK_QS_UNROLL
+#define MPK_QS_UNROLL 4
+#endif
+#pragma unroll MPK_QS_UNROLL
+      for (int kk = 0; kk < ITERS_PER_WAVE; kk++) {
+        int const ki = ki_start + kk;
+        i32x4_t const lo = *(i32x4_t const *)(sw + ki * 2048);
+        i32x4_t const hi = *(i32x4_t const *)(sw + ki * 2048 + 1024);
+        i32x8_t a;
+        a[0] = lo[0];
+        a[1] = lo[1];
+        a[2] = lo[2];
+        a[3] = lo[3];
+        a[4] = hi[0];
+        a[5] = hi[1];
+        a[6] = hi[2];
+        a[7] = hi[3];
+        int const sa = (int)ssc[ki * 64];
+        i32x8_t const b = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
+        int const sb = (int)s_tok_scales[ki];
+        acc = _rnlm8_mfma<W_HIOFF == 0>(a, b, acc, sa, sb);
+      }
+    } else if constexpr (QXS_QPUB_FULL) {
+      static_assert(QF_N == ITERS_PER_WAVE, "one register tile per k-tile");
+#pragma unroll
+      for (int kk = 0; kk < QF_N; kk++) {
+        int const ki = ki_start + kk;
+        i32x8_t const b = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
+        int const sb = (int)s_tok_scales[ki];
+        acc = _rnlm8_mfma<W_HIOFF == 0>(qf_a[kk], b, acc, qf_sa[kk], sb);
+      }
+    } else if constexpr (KP2_EARLY) {
 #pragma unroll
       for (int kk = 0; kk < 4; kk++) {
         int const ki = ki_start + kk;
@@ -4596,6 +4914,9 @@ gang_rmsnorm_linear_mxfp8_bias_kernel(
           float bv;
           __builtin_memcpy(&bv, &bt, 4);
 
+          if constexpr (QXS_QPUB) {
+            v *= qpub_rcp;
+          }
           packed[i] = _gang_float_to_bf16(v + bv);
         }
 #if _RNLM8_QB_TR

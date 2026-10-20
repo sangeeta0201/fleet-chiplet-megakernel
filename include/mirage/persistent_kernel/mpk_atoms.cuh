@@ -1688,6 +1688,23 @@ __device__ __forceinline__ bool
 #ifndef MPK_QB_ABS_LL
 #define MPK_QB_ABS_LL 0
 #endif
+// MPK_QB_XL_PF (needs MPK_QB_ABS_LL): gpt-oss's MPK_PREFETCH_NEXT_QKV shape at
+// the absorbed q_b. Each worker that owns a q_b slab DMAs its NEXT layer's
+// slab into L2 once this layer's MoE half hands it back, so the next layer's
+// q_b tile issues its weights against L2 instead of HBM. The pointer rides in
+// MPK_QKVA_PF_SLOT from ml_input_table[ml + 1][7]; the layer boundary's
+// __syncthreads drains the DMA, inside the worker's wait for the next
+// layer's entry words.
+// MEASURED SLOWER 2026-10-19 on 46e9469, NP=8 1024/1024, one interleaved rep,
+// G1 PASS, text coherent (absorbed tokens): 3.295 vs MPK_QB_ABS_LL alone
+// 3.254 vs control 3.104 ms. The 9.7 MB/rank lands in the W2 stream's
+// window, which is HBM-bound and critical. Off.
+#ifndef MPK_QB_XL_PF
+#define MPK_QB_XL_PF 0
+#endif
+#if MPK_QB_XL_PF && !MPK_QB_ABS_LL
+#error "MPK_QB_XL_PF prefetches the absorbed q_b's slabs"
+#endif
 // MPK_WUK_LL_NOOUT: under MPK_DEC_Q_LL the W_UK GEMV leaves its rows as the
 // decode's query words only, not also as the bf16 query row: the decode
 // stages the words and nothing else reads the row. That row was 128 two-byte
@@ -1712,6 +1729,34 @@ __device__ __forceinline__ bool
 // (default on) in gang_mla_full_layer_fused_mi300.cuh.
 #ifndef MPK_QXS_ROW_LL
 #define MPK_QXS_ROW_LL 0
+#endif
+// MPK_QXS_QPUB: the qkv_a split resolvers quantize their own 384-element
+// slice -- three whole E8M0 blocks of 128 -- of x * norm_weight, without the
+// 1/rms, and publish E4M3 + scales + the slice's sum of squares in place of
+// the bf16 row. Every tile copies 6 KB into its token planes, sums 32
+// partials for rms, skips the quantizer (MPK_TRACE: S54 -> S62 1.12 us on
+// every tile) and scales its GEMV sums by 1/rms instead. VALUE CHANGE: the
+// E4M3 rounding of x * g is not that of x * g / rms; ppl-gated. =2 also
+// issues the four hoisted A tiles ahead of the resolve's flag poll, where
+// the quantizer used to cover their latency; =3 all twelve of the wave's.
+// MEASURED 2026-10-20 on 46e9469, NP=8 1024/1024, n=2 interleaved, G1 PASS,
+// tokens first differ at 92 (as every value change's do), text coherent:
+// =1 3.128 3.127, =2 3.103 3.103, control 3.106 3.106 ms. MPK_TRACE (=2 vs
+// control): the quantize 1.12 -> 0.12 us, but the row lands 1.20 us later
+// (the poll now waits on the A tiles) and every XCD's last K-loop ends at
+// 8.84 vs 8.85 us: qkv_a is bound by its weight stream, not by the token.
+// =3 not run: the twelve k-tiles held across the poll spill (130 scratch
+// ops) and re-allocate worker_kernel. =4 (the wave's k-tiles + scales as an
+// LDS slab DMA'd ahead of the poll, MPK_QS_UNROLL=4 K-loop out of LDS, no
+// spills; worker_kernel -192 B): 3.135 3.134 vs control 3.108 3.108 ms
+// (+0.027), same tokens as =1/=2 -- the poll now waits on the whole 99 KB.
+// 9d42271 found the same from the other side: warming qkv_a's lines ahead
+// buys nothing. Off.
+#ifndef MPK_QXS_QPUB
+#define MPK_QXS_QPUB 0
+#endif
+#if MPK_QXS_QPUB && (MPK_QXS_ROW_LL || MPK_QXS_EARLY_RES)
+#error "MPK_QXS_QPUB publishes through the split resolve's flag-and-row form"
 #endif
 // MPK_OPROJ_SKIP_TOPK: under MPK_OPROJ_SHIFT the routing TopK worker holds no
 // o_proj tile either (the tiles past it move up a rank), so its TopK does not
