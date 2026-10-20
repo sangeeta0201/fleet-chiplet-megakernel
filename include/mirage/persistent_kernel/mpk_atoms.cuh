@@ -160,6 +160,8 @@ __device__ __forceinline__ void mpk_plat_check(unsigned long long t0,
 // MPK_BAR_POLL_NT below, which measured -0.367 us/barrier and -0.206 ms/token.
 // RE-MEASURED 2026-10-17 on c2065f2, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
 // tokens identical: 3.293 vs control 3.285 3.293 3.284 ms. Off.
+// RE-SCREENED 2026-10-20 on ca41934, one interleaved rep, tokens identical:
+// 3.101 vs controls 3.113 3.109 3.094 3.101 ms (two compiled-out arms: 3.100 3.097). Off.
 #ifndef MPK_PEER_POLL_NT
 #define MPK_PEER_POLL_NT 0
 #endif
@@ -314,6 +316,8 @@ __device__ __forceinline__ mpk_u64x8
 // Only the `nt` hint is a straight win, and it is a one-token change.
 // RE-MEASURED 2026-10-17 on c2065f2, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
 // tokens identical: 3.286 vs control 3.285 3.293 3.284 ms. Off.
+// RE-SCREENED 2026-10-20 on ca41934, one interleaved rep, tokens identical:
+// 3.100 vs controls 3.113 3.109 3.094 3.101 ms (two compiled-out arms: 3.100 3.097). Off.
 #ifndef MPK_BAR_POLL_NT
 #define MPK_BAR_POLL_NT 0
 #endif
@@ -1585,6 +1589,8 @@ __device__ __forceinline__ bool
 // (gang_mla_attn_fused_mi300.cuh, gang_mla_decode_mi300.cuh).
 // RE-MEASURED 2026-10-17 on c2065f2, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
 // tokens identical: 3.289 vs control 3.285 3.293 3.284 ms. Off.
+// RE-SCREENED 2026-10-20 on ca41934, one interleaved rep, tokens identical:
+// 3.104 vs controls 3.113 3.109 3.094 3.101 ms. Off.
 #ifndef MPK_DEC_HINTS
 #define MPK_DEC_HINTS 0
 #endif
@@ -1640,6 +1646,8 @@ __device__ __forceinline__ bool
 // (gang_oproj_router_fused_mi300.cuh, gang_mla_full_layer_fused_mi300.cuh).
 // MEASURED 2026-10-10, NP=8 1024/1024, interleaved, text identical:
 // 4.437 4.421 4.432 -> 4.347 4.343 4.344 ms (-0.085). Default 4.
+// RE-SWEPT 2026-10-20 on ca41934, one interleaved rep each, tokens identical,
+// controls 3.113 3.105 3.105: 5 3.112, 3 3.265. Stays 4.
 #ifndef MPK_OPROJ_SHIFT
 #define MPK_OPROJ_SHIFT 4
 #endif
@@ -1793,6 +1801,8 @@ __device__ __forceinline__ bool
 // merge item until half have landed, then the full rounds. MEASURED
 // 2026-10-10, NP=8 1024/1024, interleaved, text identical: 4.287 4.279 4.283
 // -> 4.261 4.258 4.267 ms (-0.021). Default on.
+// RE-SCREENED 2026-10-20 off, under MPK_LL_POLL_GATE_N=1: 3.146 vs ~3.089 ms,
+// tokens identical. Still on.
 #ifndef MPK_LL_POLL_GATE
 #define MPK_LL_POLL_GATE 1
 #endif
@@ -1807,9 +1817,15 @@ __device__ __forceinline__ bool
 // interleaved, text identical: control 3.885 3.882 3.878; ROUTER_POLL_INC
 // 3.855 3.855 3.866; + GATE_N 8 3.850 3.842 3.841 (-0.038); GATE_N 4 alone
 // 3.863 3.860 3.865. Value-independent (every word is validated before the
-// staging either way); gated with ROUTER_POLL_INC in g13. Default 8.
+// staging either way); gated with ROUTER_POLL_INC in g13. Was 8.
+// RE-SWEPT 2026-10-20 on ca41934 (3.10 ms), NP=8 1024/1024, each value next to
+// its own control, G1 PASS, rank-0 tokens identical every run: 16 3.118 (ctl
+// 3.107); 4 3.100 3.091 3.098 3.097 (ctl 3.107 3.106 3.106 3.097); 2 3.087
+// 3.096 3.098 3.094 (ctl 3.101 3.100 3.099 3.100); 1 3.092 3.086 3.090
+// 3.089 (ctl 3.099 3.100 3.106 3.098). At today's merge the full rounds pay
+// from the first item. Default 1.
 #ifndef MPK_LL_POLL_GATE_N
-#define MPK_LL_POLL_GATE_N 8
+#define MPK_LL_POLL_GATE_N 1
 #endif
 // MPK_LL_POLL_GATE_SLEEP: s_sleep between that sentinel poll's rounds. A
 // round is 32 lanes x 16 B per tile, ~100 KB across the GPU.
@@ -1950,6 +1966,8 @@ __device__ __forceinline__ bool
 // resolve lands ~4 us after the rank's own last fold.
 // RE-MEASURED 2026-10-17 on c2065f2, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
 // tokens identical: 3.290 vs control 3.285 3.293 3.284 ms. Off.
+// 2026-10-20: compiled out under MPK_RESOLVE_POLL_INC (default 1) -- its one
+// rep, 3.100 vs controls 3.113 3.109 3.094 3.101 ms, is a control.
 #ifndef MPK_XS_POLL_FULL
 #define MPK_XS_POLL_FULL 0
 #endif
@@ -2674,6 +2692,10 @@ __device__ __forceinline__ bool
 // 0.012 ms, and combined with MPK_ROUTER_L2PF won three more runs at
 // 3.496/3.501/3.492 ms versus 3.520/3.509 ms controls. The combined arm was
 // token-identical to control and passed PPL (2.3670) and 256/512/1024 longseq.
+// RE-SWEPT 2026-10-20 on ca41934, NP=8 1024/1024, one interleaved rep each,
+// controls 3.113 3.105 3.105 3.107 3.106: 18 3.140 (tokens identical); 10
+// never got past iteration 1 (GPUs busy, no progress for 3+ min), so do not
+// go below 14 without finding out why. Stays 14.
 #ifndef MPK_OPROJ_PF_MIN_US
 #define MPK_OPROJ_PF_MIN_US 14
 #endif
@@ -2775,6 +2797,8 @@ __device__ __forceinline__ bool
 // default 2026-10-11 (7bc1c7e): 3.949 vs 3.950 ms (r1), null. Off.
 // RE-MEASURED 2026-10-17 on c2065f2, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
 // tokens identical: 3.284 vs control 3.285 3.293 3.284 ms. Off.
+// RE-SCREENED 2026-10-20 on ca41934, one interleaved rep, tokens identical:
+// 3.110 vs controls 3.113 3.109 3.094 3.101 ms. Off.
 #ifndef MPK_TOPK_SH_EARLY
 #define MPK_TOPK_SH_EARLY 0
 #endif
@@ -2785,6 +2809,8 @@ __device__ __forceinline__ bool
 // 4.016 ms (-0.027), still behind the striped control. Off with it.
 // RE-MEASURED 2026-10-17 on c2065f2, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
 // tokens identical: 3.291 vs control 3.285 3.293 3.284 ms. Off.
+// 2026-10-20: compiled out without MPK_MOE_XCD_EXPERT (default 0) -- its one
+// rep, 3.097 vs controls 3.113 3.109 3.094 3.101 ms, is a control.
 #ifndef MPK_XE_W2_PF
 #define MPK_XE_W2_PF 0
 #endif
@@ -2849,6 +2875,8 @@ __device__ __forceinline__ bool
 // other instruction there that can wait.
 // RE-MEASURED 2026-10-17 on c2065f2, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
 // tokens identical: 3.285 vs control 3.285 3.293 3.284 ms. Off.
+// RE-SCREENED 2026-10-20 on ca41934, one interleaved rep, tokens identical:
+// 3.104 vs controls 3.113 3.109 3.094 3.101 ms. Off.
 #ifndef MPK_ROUTER_NO_INV
 #define MPK_ROUTER_NO_INV 0
 #endif
