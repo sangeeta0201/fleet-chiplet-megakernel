@@ -1856,6 +1856,17 @@ __device__ __forceinline__ bool
 #ifndef MPK_OPROJ_POLL_INC
 #define MPK_OPROJ_POLL_INC 0
 #endif
+// MPK_OPROJ_POLL_X4: the o_proj staging's full rounds load each pair of
+// activation words as one 16-byte system-scope load (the LL poll gate's
+// form) instead of two 8-byte atomic loads, halving the round's loads. Every
+// word is still checked against its own epoch: bit-identical.
+// MEASURED 2026-10-20 on ba6b7c7, NP=8 1024/1024, six pairs each next to its
+// own control, G1 PASS, rank-0 tokens identical: 3.080 3.084 3.083 3.083
+// 3.084 3.081 vs 3.086 3.091 3.079 3.087 3.086 3.085 ms (-0.003, five pairs
+// of six lower; about two standard errors). Default on.
+#ifndef MPK_OPROJ_POLL_X4
+#define MPK_OPROJ_POLL_X4 1
+#endif
 // MPK_OPROJ_PF_DEC: under the head-local decode (MPK_DEC_REMAP) a decode
 // worker skips its own Phase 8 o_proj weight prefetch and the q_b worker
 // dec_tiles ranks below it -- same XCD, same L2, at Phase 8 ~7 us earlier --

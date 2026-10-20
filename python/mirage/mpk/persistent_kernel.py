@@ -1675,7 +1675,7 @@ def get_compile_command(
             # Ceiling probes, wrong output (gang_mla_attn_fused_mi300.cuh).
             "MPK_ATTN_PROBE_NOQBWAIT",
             "MPK_ATTN_PROBE_NODECWAIT", "MPK_DEC_REMAP_LOW", "MPK_DEC_T2", "MPK_DEC_WALL",
-            "MPK_QB_ABS_LL", "MPK_QB_XL_PF",
+            "MPK_QB_ABS_LL", "MPK_QB_XL_PF", "MPK_OPROJ_POLL_X4",
         ):
             _x = os.environ.get(_v)
             if _x is not None:

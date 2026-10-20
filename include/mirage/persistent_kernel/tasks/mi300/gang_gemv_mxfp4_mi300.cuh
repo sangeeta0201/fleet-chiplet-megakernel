@@ -777,6 +777,22 @@ __device__ __noinline__ void
       }
 #else
       while (true) {
+#if MPK_OPROJ_POLL_X4
+        // MPK_OPROJ_POLL_X4: a pair as one 16-byte load, the gate's form;
+        // each word still carries and is checked against its own epoch.
+#pragma unroll
+        for (int j = 0; j < PER_T; j++) {
+          asm volatile("global_load_dwordx4 %0, %1, off sc0 sc1"
+                       : "=v"(w[j])
+                       : "v"(a_ll + 2 * (tid + j * NTHREADS))
+                       : "memory");
+        }
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#pragma unroll
+        for (int j = 0; j < PER_T; j++) {
+          asm volatile("" : "+v"(w[j]));
+        }
+#else
         // Compiler-visible loads (see merge_splitkv_ck_fmha's
         // MPK_DEC_MERGE_LL read): asm outputs ahead of a separate vmcnt(0)
         // can be moved before they land.
@@ -788,6 +804,7 @@ __device__ __noinline__ void
           w[j].y = __hip_atomic_load(pp + 1, __ATOMIC_RELAXED,
                                      __HIP_MEMORY_SCOPE_SYSTEM);
         }
+#endif
         bool ok = true;
 #pragma unroll
         for (int j = 0; j < PER_T; j++) {
