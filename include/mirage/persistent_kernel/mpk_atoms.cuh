@@ -556,6 +556,8 @@ __device__ __forceinline__ void st_wt_u32(void *addr, unsigned int val) {
 // ms/iter, single stalls of 476 s and 518 s); decode clean at +1.2 ms median.
 // RE-MEASURED 2026-10-18 on 10b9dcf, NP=8 1024/1024, one interleaved screen rep vs
 // control 3.243 3.245 3.243 ms, G1 PASS: 3.358, tokens identical. Off.
+// RE-SCREENED 2026-10-20 on ba6b7c7, one interleaved rep, tokens identical:
+// 3.154 vs controls 3.086 3.093 3.088 3.083 ms. Off.
 #ifndef MPK_SIG_WBL2
 #define MPK_SIG_WBL2 0
 #endif
@@ -1370,11 +1372,15 @@ __device__ __forceinline__ bool
 // and wait on it only at the gate.
 // RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
 // tokens identical: 3.317 vs control 3.314 3.313 3.322 ms. Off.
+// RE-SCREENED 2026-10-20 on ba6b7c7, one interleaved rep, tokens identical:
+// 3.093 vs controls 3.088 3.083 3.088 3.085 3.093 ms. Off.
 #ifndef MPK_TOPK_FLAG_LATE
 #define MPK_TOPK_FLAG_LATE 0
 #endif
 // RE-MEASURED NULL 2026-10-17 on c2065f2, NP=8 1024/1024, G1 PASS, tokens identical:
 // screen 3.281, then 3.291 3.288 3.286 (mean +0.004) vs control 3.292 3.278 3.283 ms, n=3 interleaved. Off.
+// RE-SCREENED 2026-10-20 on ba6b7c7, one interleaved rep, tokens identical:
+// 3.090 vs controls 3.086 3.093 3.088 3.083 ms. Off.
 #ifndef MPK_TOPK_FLAG_PF
 #define MPK_TOPK_FLAG_PF 0
 #endif
@@ -1488,6 +1494,8 @@ __device__ __forceinline__ bool
 #endif
 // RE-MEASURED 2026-10-17 on c2065f2, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
 // tokens identical: 3.286 vs control 3.285 3.293 3.284 ms. Off.
+// RE-SCREENED 2026-10-20 on ba6b7c7, one interleaved rep, tokens identical:
+// 3.091 vs controls 3.086 3.093 3.088 3.083 ms. Off.
 #ifndef MPK_WUK_HOIST
 #define MPK_WUK_HOIST 0
 #endif
@@ -1829,6 +1837,8 @@ __device__ __forceinline__ bool
 #endif
 // MPK_LL_POLL_GATE_SLEEP: s_sleep between that sentinel poll's rounds. A
 // round is 32 lanes x 16 B per tile, ~100 KB across the GPU.
+// RE-SCREENED 2026-10-20 under MPK_LL_POLL_GATE_N=1, one rep each, tokens
+// identical: 2 3.086, 16 3.086 vs controls 3.086 3.093 3.088 3.083 ms. Stays 8.
 #ifndef MPK_LL_POLL_GATE_SLEEP
 #define MPK_LL_POLL_GATE_SLEEP 8
 #endif
@@ -1841,6 +1851,8 @@ __device__ __forceinline__ bool
 // 3.501 ms. Off.
 // RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
 // tokens identical: 3.323 vs control 3.314 3.313 3.322 ms. Off.
+// RE-SCREENED 2026-10-20 on ba6b7c7, one interleaved rep, tokens identical:
+// 3.096 vs controls 3.088 3.083 3.088 3.085 3.093 ms. Off.
 #ifndef MPK_OPROJ_POLL_INC
 #define MPK_OPROJ_POLL_INC 0
 #endif
@@ -2066,6 +2078,8 @@ __device__ __forceinline__ bool
 // RE-MEASURED SLOWER 2026-10-17 on df69487 (after MPK_PROBE_DEC_NOCOMPUTE
 // priced the tile loop at -0.193), n=3 interleaved, tokens identical: 3.356
 // 3.356 3.348 vs 3.349 3.352 3.341 ms (+0.006). Off.
+// RE-SCREENED 2026-10-20 on ba6b7c7, one interleaved rep, tokens identical:
+// 3.093 vs controls 3.088 3.083 3.088 3.085 3.093 ms. Off.
 #ifndef MPK_DEC_PRE_NOBAR
 #define MPK_DEC_PRE_NOBAR 0
 #endif
@@ -2075,6 +2089,8 @@ __device__ __forceinline__ bool
 // MEASURED NULL with MPK_DEC_PRE_NOBAR, above. Off.
 // RE-MEASURED 2026-10-18 on 43cc07a, NP=8 1024/1024, one interleaved screen rep vs
 // control 3.282 ms, G1 PASS: 3.288, tokens identical. Off.
+// RE-SCREENED 2026-10-20 on ba6b7c7, one interleaved rep, tokens identical:
+// 3.094 vs controls 3.086 3.093 3.088 3.083 ms. Off.
 #ifndef MPK_DEC_EXP2_BUILTIN
 #define MPK_DEC_EXP2_BUILTIN 0
 #endif
@@ -2196,6 +2212,8 @@ __device__ __forceinline__ bool
 // MEASURED NULL 2026-10-11, same batch: 4.127 vs 4.132 4.128 ms. Off.
 // RE-MEASURED 2026-10-18 on 10b9dcf, NP=8 1024/1024, one interleaved screen rep vs
 // control 3.243 3.245 3.243 ms, G1 PASS: 3.245, tokens identical. Off.
+// RE-SCREENED 2026-10-20 on ba6b7c7, one interleaved rep, tokens identical:
+// 3.091 vs controls 3.086 3.093 3.088 3.083 ms. Off.
 #ifndef MPK_W13_NO_ARRIVE
 #define MPK_W13_NO_ARRIVE 0
 #endif
@@ -2218,6 +2236,8 @@ __device__ __forceinline__ bool
 // (see MPK_TOPK_2L, which lost 0.106 ms to exactly that).
 // RE-MEASURED 2026-10-18 on 43cc07a, NP=8 1024/1024, one interleaved screen rep vs
 // control 3.282 ms, G1 PASS: 3.288, tokens identical. Off.
+// RE-SCREENED 2026-10-20 on ba6b7c7, one interleaved rep, tokens identical:
+// 3.086 vs controls 3.088 3.083 3.088 3.085 3.093 ms. Off.
 #ifndef MPK_KS_SSQ_NT
 #define MPK_KS_SSQ_NT 0
 #endif
@@ -2376,6 +2396,8 @@ __device__ __forceinline__ bool
 // MEASURED NULL 2026-10-19 on 3cef116, NP=8 1024/1024, n=3 interleaved, G1
 // PASS, all rank-0 tokens identical: 3.154 3.151 3.154 vs 3.146 3.150 3.151
 // ms (+0.004). The fold tile's MFMAs are not what its last tile waits on. Off.
+// RE-SCREENED 2026-10-20 on ba6b7c7, one interleaved rep, tokens identical:
+// 3.092 vs controls 3.088 3.083 3.088 3.085 3.093 ms. Off.
 #ifndef MPK_W2F_ILV
 #define MPK_W2F_ILV 0
 #endif
@@ -2483,6 +2505,8 @@ __device__ __forceinline__ bool
 // tokens identical: 3.199 3.196 vs control 3.194 3.194 ms (+0.0035), against
 // the fold itself 3.241 3.243 -- the 232-worker fold's loss is its layout,
 // not its build (see MPK_W2F_TOPK). Off.
+// RE-SCREENED 2026-10-20 on ba6b7c7, one interleaved rep, tokens identical:
+// 3.184 vs controls 3.088 3.083 3.088 3.085 3.093 ms. Off.
 #ifndef MPK_W2F_RT_OFF
 #define MPK_W2F_RT_OFF 0
 #endif
@@ -2589,6 +2613,8 @@ __device__ __forceinline__ bool
 // PASS, all rank-0 tokens identical: 3.186 3.188 3.192 vs 3.188 3.188 3.188
 // ms. q_b's q_a validation is paced by the last qkv_a tile's words, not by
 // this worker's entry. Off.
+// RE-SCREENED 2026-10-20 on ba6b7c7, one interleaved rep, tokens identical:
+// 3.100 vs controls 3.088 3.083 3.088 3.085 3.093 ms. Off.
 #ifndef MPK_QKV_SITE_NODRAIN
 #define MPK_QKV_SITE_NODRAIN 0
 #endif
@@ -2603,6 +2629,8 @@ __device__ __forceinline__ bool
 // inside the spread). Off.
 // RE-MEASURED 2026-10-17 on 747f21b, NP=8 1024/1024, one interleaved screen rep, G1 PASS,
 // tokens identical: 3.314 vs control 3.315 3.319 3.319 ms. Off.
+// RE-SCREENED 2026-10-20 on ba6b7c7, one interleaved rep, tokens identical:
+// 3.090 vs controls 3.088 3.083 3.088 3.085 3.093 ms. Off.
 #ifndef MPK_OPROJ_A_PAD
 #define MPK_OPROJ_A_PAD 0
 #endif
@@ -3307,6 +3335,8 @@ __device__ __forceinline__ unsigned long long lmh_argmax_key(unsigned bits,
 // tokens identical: 3.328 vs control 3.314 3.315 3.313 ms. Off.
 // RE-MEASURED 2026-10-19 on ae6447e (fold layout), one interleaved screen
 // rep, G1 PASS, tokens identical: 3.111 vs control 3.107 ms. Off.
+// RE-SCREENED 2026-10-20 on ba6b7c7, one interleaved rep, tokens identical:
+// 3.092 vs controls 3.088 3.083 3.088 3.085 3.093 ms. Off.
 #ifndef MPK_W13_ACT_W3
 #define MPK_W13_ACT_W3 0
 #endif
@@ -3504,6 +3534,8 @@ __device__ __forceinline__ unsigned long long lmh_argmax_key(unsigned bits,
 // A quarter fewer partial lines does not move the merge: it is a round
 // trip, not bytes. Off.
 // 2026-10-17: does not build on 747f21b: #error with MPK_MERGE_EXP2B (default 1).
+// 2026-10-20: does not build on ba6b7c7 -- MPK_MERGE_EXP2B (default)
+// #errors against it, and merge_splitkv.cuh reads an undeclared `lr`.
 #ifndef MPK_MERGE_LIVE
 #define MPK_MERGE_LIVE 0
 #endif
